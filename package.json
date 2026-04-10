@@ -1,0 +1,26 @@
+{
+  "private": true,
+  "version": "0.5.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "debug:h264": "node scripts/h264-debug.mjs",
+    "debug:h264-rebuild": "node scripts/h264-rebuild.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "version:sync": "node scripts/sync-versions.mjs",
+    "smoke:exports": "node scripts/smoke-exports.mjs",
+    "release": "node scripts/release.mjs",
+    "release:dry": "node scripts/release.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "packageManager": "pnpm@10.32.1+sha512.a706938f0e89ac1456b6563eab4edf1d1faf3368d1191fc5c59790e96dc918e4456ab2e67d613de1043d2e8c81f87303e6b40d4ffeca9df15ef1ad567348f2be"
+}

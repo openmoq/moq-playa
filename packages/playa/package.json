@@ -1,0 +1,28 @@
+{
+  "name": "@playa/player",
+  "version": "0.5.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./browser": {
+      "import": "./dist/browser/index.js",
+      "default": "./dist/browser/index.js"
+    }
+  },
+  "files": ["dist"],
+  "dependencies": {
+    "@moqt/player": "workspace:*",
+    "@moqt/msf": "workspace:*",
+    "@moqt/browser": "workspace:*",
+    "@moqt/webtransport": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc && tsup",
+    "build:browser": "tsup"
+  }
+}

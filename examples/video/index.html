@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MoQ — A/V Playback</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 1024px; margin: 2rem auto; }
+    canvas { background: #000; display: block; max-width: 100%; }
+    pre { background: #1a1a2e; color: #e0e0e0; padding: 1rem; border-radius: 6px;
+      font-size: 0.85rem; max-height: 40vh; overflow-y: auto; white-space: pre-wrap; }
+    #stats { font-family: monospace; font-size: 0.85rem; margin-bottom: 0.5rem; color: #666; }
+    button { font-size: 1.1rem; padding: 0.5rem 1.5rem; margin-bottom: 1rem; cursor: pointer; }
+  </style>
+</head>
+<body>
+<h1>A/V Playback</h1>
+<p>Full vertical slice: WebTransport → MoqtConnection → LOC → WebCodecs → Canvas + AudioContext</p>
+<button id="start">Start</button>
+<div id="stats"></div>
+<canvas id="canvas" width="1920" height="1080"></canvas>
+<pre id="log"></pre>
+<script type="module" src="main.ts"></script>
+</body>
+</html>

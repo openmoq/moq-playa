@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MoQ Examples</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; line-height: 1.5; }
+    a { color: #0066cc; }
+    code { background: #f0f0f0; padding: 0.15em 0.3em; border-radius: 3px; font-size: 0.9em; }
+    li { margin-bottom: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>@moqt examples</h1>
+  <p>Each example demonstrates one aspect of the MoQ client stack.</p>
+  <p>
+    Pass <code>?hash=&lt;hex&gt;</code> with the relay's certificate hash
+    and optionally <code>&amp;url=&lt;relay-url&gt;</code> (default: <code>https://localhost:4443</code>).
+  </p>
+  <ul>
+    <li>
+      <strong><a href="/simple/">Simple (Playa)</a></strong> —
+      Full player with UI controls using <code>@playa/player</code> (~30 lines of player code)
+    </li>
+    <li>
+      <a href="/connect/">Connect + Catalog</a> —
+      WebTransport handshake, subscribe to catalog, print tracks
+    </li>
+    <li>
+      <strong><a href="/catalog/">Catalog Integration</a></strong> —
+      Real-server integration harness: subscribe to the namespace catalog track, display raw JSON,
+      and materialize MSF/CMSF catalog state
+    </li>
+    <li>
+      <a href="/video/">Video Playback</a> —
+      Decode video with WebCodecs, render to canvas (manual wiring, 588 lines)
+    </li>
+    <li>
+      <a href="/player/">Player API</a> —
+      Same A/V result using <code>@moqt/player</code> (protocol handled by player, ~250 lines)
+    </li>
+    <li>
+      <strong><a href="/broadcast/">Broadcast</a></strong> —
+      Publish camera or screen to a MoQ relay. Share the viewer URL for sub-second latency playback.
+    </li>
+  </ul>
+</body>
+</html>

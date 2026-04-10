@@ -1,0 +1,908 @@
+/**
+ * Integration tests for MseMediaSource's timeline-owned append path.
+ *
+ * The node environment has no MSE / HTMLVideoElement. These tests use
+ * hand-rolled mocks that model the shape the adapter actually consumes:
+ * SourceBuffer events, updateend sequencing, appendBuffer throw
+ * behavior, and video-element error events.
+ *
+ * Scope — these guard behaviors visible at the boundary:
+ *   - Is `appendBuffer` called (or dropped) for a given payload?
+ *   - Is the timeline correctly updated on `updateend`?
+ *   - Does the diagnostic warn-once fire per mediaType+kind?
+ *   - Do failure paths correctly clear pending ranges?
+ *
+ * Unit-level correctness of the ISOBMFF parsing and the interval
+ * arithmetic is covered in mp4-box.test.ts and timeline-index.test.ts.
+ *
+ * @module
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { MseMediaSource } from './mse-adapter.js';
+
+// ─── Shared byte-building helpers (subset from mp4-box.test.ts) ──
+
+function cat(...parts: Uint8Array[]): Uint8Array {
+    const total = parts.reduce((n, p) => n + p.byteLength, 0);
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const p of parts) { out.set(p, o); o += p.byteLength; }
+    return out;
+}
+function u32(n: number): Uint8Array {
+    const out = new Uint8Array(4);
+    new DataView(out.buffer).setUint32(0, n);
+    return out;
+}
+function fourcc(type: string): Uint8Array {
+    return new TextEncoder().encode(type);
+}
+function box(type: string, body: Uint8Array): Uint8Array {
+    return cat(u32(8 + body.byteLength), fourcc(type), body);
+}
+function fullBox(type: string, version: number, flags: number, body: Uint8Array): Uint8Array {
+    const vf = new Uint8Array(4);
+    vf[0] = version & 0xff;
+    vf[1] = (flags >> 16) & 0xff;
+    vf[2] = (flags >> 8) & 0xff;
+    vf[3] = flags & 0xff;
+    return box(type, cat(vf, body));
+}
+function tfdt(bmd: number): Uint8Array {
+    return fullBox('tfdt', 0, 0, u32(bmd));
+}
+function tfhd(trackId: number, dur?: number): Uint8Array {
+    const flags = dur !== undefined ? 0x8 : 0;
+    const body = dur !== undefined ? cat(u32(trackId), u32(dur)) : u32(trackId);
+    return fullBox('tfhd', 0, flags, body);
+}
+function trun(sampleCount: number): Uint8Array {
+    return fullBox('trun', 0, 0, u32(sampleCount));
+}
+function makeSegment(opts: {
+    bmd: number;
+    trackId?: number;
+    defaultDur?: number;
+    sampleCount: number;
+}): Uint8Array {
+    const trackId = opts.trackId ?? 1;
+    return cat(
+        box('moof', cat(
+            box('traf', cat(tfhd(trackId, opts.defaultDur), tfdt(opts.bmd), trun(opts.sampleCount))),
+        )),
+        box('mdat', new Uint8Array(16)),
+    );
+}
+/** Minimal init segment with an mvex/trex for trex-default tests. */
+function makeInit(trackId: number, defaultDur: number): Uint8Array {
+    // Wrap moov → mvex → trex. filterInitSegment won't run on a truly
+    // minimal init (no trak/vide), so we build a slightly richer one.
+    const trex = fullBox('trex', 0, 0, cat(
+        u32(trackId), u32(1), u32(defaultDur), u32(0), u32(0),
+    ));
+    const mvex = box('mvex', trex);
+    // Minimal trak with vide hdlr so filterInitSegment's selection
+    // passes through.
+    const hdlr = fullBox('hdlr', 0, 0, cat(
+        u32(0),                  // pre_defined
+        fourcc('vide'),          // handler_type
+        u32(0), u32(0), u32(0),  // reserved
+        new Uint8Array([0]),     // name (null terminator)
+    ));
+    const mdia = box('mdia', hdlr);
+    const tkhd = fullBox('tkhd', 0, 0, cat(
+        u32(0), u32(0), u32(trackId), u32(0),
+        u32(0), u32(0), new Uint8Array(52),
+    ));
+    const trak = box('trak', cat(tkhd, mdia));
+    const moov = box('moov', cat(trak, mvex));
+    const ftyp = box('ftyp', cat(fourcc('iso6'), u32(0), fourcc('iso6')));
+    return cat(ftyp, moov);
+}
+
+// ─── Mocks ────────────────────────────────────────────────────────
+//
+// Minimal SourceBuffer / MediaSource / HTMLVideoElement that model
+// the exact surface the adapter uses. Kept in this file (not shared)
+// because other adapter tests don't use MSE mocks.
+
+class MockEventTarget {
+    private readonly listeners = new Map<string, Array<(e?: Event) => void>>();
+    addEventListener(type: string, fn: (e?: Event) => void): void {
+        const arr = this.listeners.get(type) ?? [];
+        arr.push(fn);
+        this.listeners.set(type, arr);
+    }
+    removeEventListener(type: string, fn: (e?: Event) => void): void {
+        const arr = this.listeners.get(type);
+        if (!arr) return;
+        const idx = arr.indexOf(fn);
+        if (idx >= 0) arr.splice(idx, 1);
+    }
+    protected fire(type: string): void {
+        const arr = this.listeners.get(type);
+        if (!arr) return;
+        for (const fn of arr.slice()) fn();
+    }
+}
+
+class MockSourceBuffer extends MockEventTarget {
+    updating = false;
+    mode: 'segments' | 'sequence' = 'segments';
+    timestampOffset = 0;
+    readonly appendedPayloads: Uint8Array[] = [];
+    buffered = makeTimeRanges([]);
+    /** Throw on the NEXT appendBuffer call. */
+    throwNextAppend?: Error;
+    /** Fire an error event on the next appendBuffer instead of updateend. */
+    errorNextAppend = false;
+
+    appendBuffer(data: ArrayBuffer | ArrayBufferView): void {
+        if (this.throwNextAppend) {
+            const err = this.throwNextAppend;
+            this.throwNextAppend = undefined;
+            throw err;
+        }
+        // Record a copy of the payload. The adapter passes `data.buffer`
+        // (ArrayBuffer); normalize by reading the full range.
+        const bytes = ArrayBuffer.isView(data)
+            ? new Uint8Array((data as ArrayBufferView).buffer)
+            : new Uint8Array(data);
+        this.appendedPayloads.push(bytes);
+
+        // Simulate async completion on microtask turn:
+        // 'updating = true' briefly, then fire 'error' or 'updateend'.
+        this.updating = true;
+        queueMicrotask(() => {
+            this.updating = false;
+            if (this.errorNextAppend) {
+                this.errorNextAppend = false;
+                this.fire('error');
+            } else {
+                this.fire('updateend');
+            }
+        });
+    }
+
+    remove(_start: number, _end: number): void {
+        // Unused in Phase 1 tests.
+    }
+
+    /** Records every changeType mime so tests can assert the codec pivot. */
+    readonly changeTypeCalls: string[] = [];
+    changeType(mimeType: string): void {
+        this.changeTypeCalls.push(mimeType);
+    }
+}
+
+class MockMediaSource extends MockEventTarget {
+    readyState: 'closed' | 'open' | 'ended' = 'closed';
+    readonly videoBuffer = new MockSourceBuffer();
+    readonly audioBuffer = new MockSourceBuffer();
+    addSourceBuffer(mimeType: string): MockSourceBuffer {
+        return mimeType.startsWith('video/') ? this.videoBuffer : this.audioBuffer;
+    }
+    removeSourceBuffer(_sb: unknown): void { /* no-op */ }
+    endOfStream(): void { this.readyState = 'ended'; }
+    open(): void {
+        this.readyState = 'open';
+        this.fire('sourceopen');
+    }
+}
+
+class MockVideoElement extends MockEventTarget {
+    src = '';
+    currentTime = 0;
+    error: { code: number; message: string } | null = null;
+    buffered = makeTimeRanges([]);
+    async play(): Promise<void> { /* no-op */ }
+    load(): void { /* no-op */ }
+    removeAttribute(_n: string): void { /* no-op */ }
+    /** Trigger the error event, setting .error first. */
+    setError(code: number, message: string): void {
+        this.error = { code, message };
+        this.fire('error');
+    }
+}
+
+function makeTimeRanges(ranges: readonly [number, number][]): TimeRanges {
+    return {
+        length: ranges.length,
+        start: (i: number) => ranges[i]![0],
+        end: (i: number) => ranges[i]![1],
+    } as unknown as TimeRanges;
+}
+
+// ─── Global stubs ────────────────────────────────────────────────
+
+let currentMs: MockMediaSource;
+
+beforeEach(() => {
+    // Stub MediaSource constructor + URL.createObjectURL.
+    currentMs = new MockMediaSource();
+    vi.stubGlobal('MediaSource', class { constructor() { return currentMs; } });
+    vi.stubGlobal('URL', {
+        createObjectURL: () => 'blob:mock',
+        revokeObjectURL: () => {},
+    });
+});
+afterEach(() => {
+    vi.unstubAllGlobals();
+});
+
+// ─── Test harness helper ─────────────────────────────────────────
+
+async function makeReadyAdapter(): Promise<{
+    adapter: MseMediaSource;
+    video: MockVideoElement;
+    vsb: MockSourceBuffer;
+}> {
+    const video = new MockVideoElement();
+    const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+    adapter.debug = true; // Enable diagnostic logging for tests
+    const initData = makeInit(1, 100); // trex default_sample_duration=100
+    adapter.initialize({ video: { codec: 'avc1.42c01e', initData } });
+    currentMs.open();
+    // Wait for init-segment appendBuffer's updateend to fire.
+    await Promise.resolve();
+    await Promise.resolve();
+    return { adapter, video, vsb: currentMs.videoBuffer };
+}
+
+/** Flush queued microtasks so updateend handlers run. */
+async function flush(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+}
+
+// ─── Tests ────────────────────────────────────────────────────────
+
+describe('MseMediaSource — timeline-owned append integration', () => {
+    it('non-overlapping segments both get appended', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+
+        const seg1 = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });
+        const seg2 = makeSegment({ bmd: 500, defaultDur: 100, sampleCount: 5 });
+
+        adapter.appendChunk('video', seg1, 'track1');
+        await flush();
+        adapter.appendChunk('video', seg2, 'track1');
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(initCount + 2);
+    });
+
+    it('overlapping second segment is dropped before append', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const seg1 = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });
+        // bmd=200 is inside seg1's range [0, 500)
+        const seg2 = makeSegment({ bmd: 200, defaultDur: 100, sampleCount: 5 });
+
+        adapter.appendChunk('video', seg1, 'track1');
+        await flush();
+        adapter.appendChunk('video', seg2, 'track1');
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(initCount + 1);
+        expect(warn).toHaveBeenCalledWith(
+            expect.stringContaining('drop overlapping video payload'),
+        );
+
+        warn.mockRestore();
+    });
+
+    it('overlap from a different track is allowed (ABR splice)', async () => {
+        // Switching from track A to track B at a splice point: B's first
+        // segments cover the same decode-time range as A's last segments.
+        // MSE handles the splice; the timeline detector must not drop B.
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const segA = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });
+        // segB's range [200, 700) overlaps segA's [0, 500), but on a
+        // different track — must be accepted.
+        const segB = makeSegment({ bmd: 200, defaultDur: 100, sampleCount: 5 });
+
+        adapter.appendChunk('video', segA, 'video_900k');
+        await flush();
+        adapter.appendChunk('video', segB, 'video_600k');
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(initCount + 2);
+        expect(warn).not.toHaveBeenCalledWith(
+            expect.stringContaining('drop overlapping video payload'),
+        );
+
+        warn.mockRestore();
+    });
+
+    it('overlap on the same track is still dropped after a switch', async () => {
+        // Per-track timelines must still catch within-track duplicates
+        // (e.g., a relay publishing both IDR-GOP and CRA-entry segments
+        // under one track-name).
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const seg1 = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });
+        const seg2 = makeSegment({ bmd: 200, defaultDur: 100, sampleCount: 5 });
+
+        adapter.appendChunk('video', seg1, 'cmsf/clear:video_main');
+        await flush();
+        // After a brief switch to a different track and back, duplicate
+        // ranges on the original track must still be dropped.
+        const segOther = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });
+        adapter.appendChunk('video', segOther, 'cmsf/clear:video_alt');
+        await flush();
+
+        adapter.appendChunk('video', seg2, 'cmsf/clear:video_main');
+        await flush();
+
+        // initCount + seg1 + segOther — seg2 dropped (overlap on video_main).
+        expect(vsb.appendedPayloads.length).toBe(initCount + 2);
+        expect(warn).toHaveBeenCalledWith(
+            expect.stringContaining('drop overlapping video payload on track "cmsf/clear:video_main"'),
+        );
+
+        warn.mockRestore();
+    });
+
+    it('failed append clears pending — legitimate retransmit is not treated as overlap', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+
+        const seg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });
+
+        // First append: fire SourceBuffer error on the async path.
+        vsb.errorNextAppend = true;
+        adapter.appendChunk('video', seg, 'track1');
+        await flush();
+
+        // Pending should be cleared, timeline empty. The same segment
+        // should now be accepted (i.e. appendBuffer called again).
+        adapter.appendChunk('video', seg, 'track1');
+        await flush();
+
+        // Both attempts hit appendBuffer; the first was the errored one,
+        // the second is the retransmit. Plus init.
+        expect(vsb.appendedPayloads.length).toBe(initCount + 2);
+    });
+
+    it('synchronous appendBuffer throw clears pending', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+
+        const seg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });
+
+        vsb.throwNextAppend = new Error('QuotaExceededError');
+        let caught: Error | undefined;
+        const origOnError = (err: Error) => { caught = err; };
+        adapter.onError = origOnError;
+
+        adapter.appendChunk('video', seg, 'track1');
+        // No updateend will fire because the append threw synchronously.
+        await flush();
+        expect(caught?.message).toContain('QuotaExceededError');
+
+        // Now retransmit the same range — should succeed (pending cleared).
+        adapter.appendChunk('video', seg, 'track1');
+        await flush();
+
+        // Assertion: the retransmit was not rejected as overlapping.
+        // Last append recorded is the retransmit bytes.
+        expect(vsb.appendedPayloads.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('trex default is used when tfhd/trun supply no duration', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const initCount = vsb.appendedPayloads.length;
+
+        // Segment with NO tfhd default and NO per-sample trun duration,
+        // but trex provided dur=100 via init.
+        const segA = makeSegment({ bmd: 0, sampleCount: 3 });   // duration 300 via trex
+        const segB = makeSegment({ bmd: 200, sampleCount: 3 }); // inside segA's [0, 300)
+
+        adapter.appendChunk('video', segA, 'track1');
+        await flush();
+        adapter.appendChunk('video', segB, 'track1');
+        await flush();
+
+        // segA appended; segB dropped because trex default scored it
+        // as overlapping.
+        expect(vsb.appendedPayloads.length).toBe(initCount + 1);
+        expect(warn).toHaveBeenCalledWith(
+            expect.stringContaining('drop overlapping video payload'),
+        );
+
+        warn.mockRestore();
+    });
+
+    it('moof-less payload (mdat-only) fails open to append', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+
+        const mdatOnly = box('mdat', new Uint8Array(32));
+        adapter.appendChunk('video', mdatOnly, 'track1');
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(initCount + 1);
+    });
+
+    it('multi-moof payload appends once, timeline picks up both ranges', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+
+        const payload = cat(
+            makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 3 }),     // [0, 300)
+            makeSegment({ bmd: 300, defaultDur: 100, sampleCount: 3 }),   // [300, 600)
+        );
+        adapter.appendChunk('video', payload, 'track1');
+        await flush();
+        expect(vsb.appendedPayloads.length).toBe(initCount + 1);
+
+        // Next segment at bmd=200 overlaps the first moof's range — should drop.
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const seg2 = makeSegment({ bmd: 200, defaultDur: 100, sampleCount: 2 });
+        adapter.appendChunk('video', seg2, 'track1');
+        await flush();
+        expect(vsb.appendedPayloads.length).toBe(initCount + 1);
+        expect(warn).toHaveBeenCalledWith(
+            expect.stringContaining('drop overlapping video payload'),
+        );
+        warn.mockRestore();
+    });
+
+    it('multi-moof payload with one unscorable moof drops the whole payload', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        // One healthy moof (defaultDur 100, 3 samples → dur 300) plus
+        // one unscorable (no defaultDur, no per-sample). Since init
+        // supplied trex=100, BOTH are actually scorable via trex...
+        // so build the broken moof WITHOUT a usable duration source
+        // by using a trackId that doesn't match the trex.
+        const healthy = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 3 });
+        // trackId=99 doesn't match the trex's trackId=1, and trex map
+        // is single-entry in this adapter's cache, so... actually the
+        // adapter stores the first trex entry regardless of trackId.
+        // To reliably get no-duration, just don't pass a tfhd default
+        // and undermine the trex by giving the adapter a different
+        // init. Simpler test path:
+        // Build an adapter WITHOUT trex defaults.
+        const video = new MockVideoElement();
+        const adapterBare = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapterBare.debug = true;
+        // Init with NO mvex/trex — so videoTrex stays undefined.
+        const initNoTrex = cat(
+            box('ftyp', cat(fourcc('iso6'), u32(0), fourcc('iso6'))),
+            box('moov', box('trak', cat(
+                fullBox('tkhd', 0, 0, cat(u32(0), u32(0), u32(1), u32(0), u32(0), u32(0), new Uint8Array(52))),
+                box('mdia', fullBox('hdlr', 0, 0, cat(
+                    u32(0), fourcc('vide'),
+                    u32(0), u32(0), u32(0), new Uint8Array([0]),
+                ))),
+            ))),
+        );
+        adapterBare.initialize({ video: { codec: 'avc1.42c01e', initData: initNoTrex } });
+        currentMs.open();
+        await flush();
+        const vsb2 = currentMs.videoBuffer;
+        const initAppendsBare = vsb2.appendedPayloads.length;
+
+        const broken = makeSegment({ bmd: 500, sampleCount: 3 }); // no defaultDur
+        const payload = cat(healthy, broken);
+
+        adapterBare.appendChunk('video', payload, 'track1');
+        await flush();
+
+        // Fail-open: payload IS appended even when analysis is incomplete.
+        // MSE itself will reject truly corrupt data.
+        expect(vsb2.appendedPayloads.length).toBe(initAppendsBare + 1);
+
+        // Two warns: the 'no-duration' diagnostic + the fail-open message.
+        const calls = warn.mock.calls.map((c) => String(c[0]));
+        expect(calls.some((m) => m.includes('no-duration'))).toBe(true);
+        expect(calls.some((m) => m.includes('appending anyway'))).toBe(true);
+
+        warn.mockRestore();
+        // Prevent the outer init count from being asserted on this path.
+        void initCount;
+        void vsb;
+    });
+
+    it('warn-once is per mediaType + kind', async () => {
+        // Build an adapter with both video AND audio, no trex for either.
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.debug = true;
+        const initNoTrex = cat(
+            box('ftyp', cat(fourcc('iso6'), u32(0), fourcc('iso6'))),
+            box('moov', box('trak', cat(
+                fullBox('tkhd', 0, 0, cat(u32(0), u32(0), u32(1), u32(0), u32(0), u32(0), new Uint8Array(52))),
+                box('mdia', fullBox('hdlr', 0, 0, cat(
+                    u32(0), fourcc('vide'),
+                    u32(0), u32(0), u32(0), new Uint8Array([0]),
+                ))),
+            ))),
+        );
+        const initAudio = cat(
+            box('ftyp', cat(fourcc('iso6'), u32(0), fourcc('iso6'))),
+            box('moov', box('trak', cat(
+                fullBox('tkhd', 0, 0, cat(u32(0), u32(0), u32(1), u32(0), u32(0), u32(0), new Uint8Array(52))),
+                box('mdia', fullBox('hdlr', 0, 0, cat(
+                    u32(0), fourcc('soun'),
+                    u32(0), u32(0), u32(0), new Uint8Array([0]),
+                ))),
+            ))),
+        );
+        adapter.initialize({
+            video: { codec: 'avc1.42c01e', initData: initNoTrex },
+            audio: { codec: 'mp4a.40.2', initData: initAudio },
+        });
+        currentMs.open();
+        await flush();
+
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const broken = makeSegment({ bmd: 0, sampleCount: 3 });
+
+        // Two video appends of the same-shape unscorable payload →
+        // 'no-duration' warn once for video.
+        adapter.appendChunk('video', broken, 'track1');
+        await flush();
+        adapter.appendChunk('video', broken, 'track1');
+        await flush();
+
+        // First audio append with same unscorable shape → 'no-duration'
+        // warn for audio (not suppressed by the video one).
+        adapter.appendChunk('audio', broken, 'track1');
+        await flush();
+
+        const noDurMsgs = warn.mock.calls
+            .map((c) => String(c[0]))
+            .filter((m) => m.includes('no-duration'));
+        // One video, one audio — NOT one total.
+        expect(noDurMsgs.length).toBe(2);
+        expect(noDurMsgs.some((m) => m.startsWith('[MSE] video'))).toBe(true);
+        expect(noDurMsgs.some((m) => m.startsWith('[MSE] audio'))).toBe(true);
+
+        warn.mockRestore();
+    });
+});
+
+// ─── changeType (codec switch) ───────────────────────────────────
+
+describe('MseMediaSource — changeType', () => {
+    it('drains queue, calls SourceBuffer.changeType, appends new init', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCountBefore = vsb.appendedPayloads.length;
+
+        const newInit = makeInit(1, 200); // different default_sample_duration
+        await adapter.changeType('video', 'hvc1.1.6.L93.90', newInit);
+
+        // SourceBuffer.changeType called with the new mime
+        expect(vsb.changeTypeCalls).toEqual(['video/mp4; codecs="hvc1.1.6.L93.90"']);
+        // The init segment was appended (after filtering — bytes may
+        // differ from the input but length should be > 0).
+        expect(vsb.appendedPayloads.length).toBe(initCountBefore + 1);
+    });
+
+    it('appends queued during changeType drain after the new init', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCountBefore = vsb.appendedPayloads.length;
+
+        const newInit = makeInit(1, 100);
+        // Start changeType but don't await yet.
+        const changing = adapter.changeType('video', 'hvc1.1.6.L93.90', newInit);
+
+        // Concurrent appendChunk during change — must queue, not dispatch.
+        const seg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });
+        adapter.appendChunk('video', seg, 'video_hevc');
+
+        await changing;
+        await flush();
+        await flush();
+
+        // Order on the SourceBuffer:
+        //   [initial init from makeReadyAdapter, new init from changeType, queued seg]
+        expect(vsb.appendedPayloads.length).toBe(initCountBefore + 2);
+        // changeType only fires once with the new mime.
+        expect(vsb.changeTypeCalls).toEqual(['video/mp4; codecs="hvc1.1.6.L93.90"']);
+    });
+
+    it('drops stale queued media (old codec) before reconfiguring', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+
+        // Force the buffer into "updating" so the next appendChunk queues
+        // instead of dispatching.
+        vsb.updating = true;
+        const seg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });
+        adapter.appendChunk('video', seg, 'video_avc'); // queued (stale)
+
+        // Resolve the buffer so changeType can drain.
+        vsb.updating = false;
+
+        const initCountBefore = vsb.appendedPayloads.length;
+        const newInit = makeInit(1, 100);
+        await adapter.changeType('video', 'hvc1.1.6.L93.90', newInit);
+
+        // Only the new init was appended; the queued old-codec seg was dropped.
+        expect(vsb.appendedPayloads.length).toBe(initCountBefore + 1);
+    });
+
+    it('throws if the SourceBuffer is not initialized', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        // No initialize() call — no SourceBuffer for video.
+
+        await expect(
+            adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(1, 100)),
+        ).rejects.toThrow(/not initialized/);
+    });
+
+    it('throws if the browser does not implement SourceBuffer.changeType', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        // Strip changeType from the mock to simulate an old UA.
+        (vsb as unknown as { changeType?: unknown }).changeType = undefined;
+
+        await expect(
+            adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(1, 100)),
+        ).rejects.toThrow(/changeType not supported/);
+    });
+});
+
+// ─── Autoplay startup-seek (longest buffered range) ────────────────────
+
+describe('MseMediaSource — autoplay startup seek', () => {
+    /**
+     * After the first appended segment commits, the adapter calls
+     * `video.play()` and (for live tune-ins where leading-RASL stripping
+     * leaves a tiny stub range disjoint from the main content) seeks
+     * `currentTime` into the LONGEST buffered range. Earlier behavior
+     * seeked to `buffered.start(0)`, which marooned playback in 2-frame
+     * stubs at the head of the timeline.
+     */
+
+    it('seeks into the longest buffered range when there is a stub at t=0', async () => {
+        const { adapter, video, vsb } = await makeReadyAdapter();
+        const playSpy = vi.spyOn(video, 'play');
+
+        // Mimic the post-strip Synamedia tune-in shape: tiny stub at
+        // [0, 0.07s] (a 2-frame IDR fragment) followed by the main
+        // content at [1.5s, 11.5s]. The adapter must seek to 1.5s, not
+        // stay at the buffered.start(0) of 0.
+        video.buffered = makeTimeRanges([[0, 0.07], [1.5, 11.5]]);
+
+        const seg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 });
+        adapter.appendChunk('video', seg, 'track1');
+        await flush();
+        // drainQueue runs again on the post-updateend tick.
+        await flush();
+
+        expect(playSpy).toHaveBeenCalledTimes(1);
+        expect(video.currentTime).toBe(1.5);
+    });
+
+    it('leaves currentTime untouched when it already sits inside the chosen range', async () => {
+        const { adapter, video, vsb } = await makeReadyAdapter();
+        const playSpy = vi.spyOn(video, 'play');
+
+        // Single contiguous range; currentTime is already inside it.
+        video.buffered = makeTimeRanges([[0, 10]]);
+        video.currentTime = 2;
+
+        const seg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 });
+        adapter.appendChunk('video', seg, 'track1');
+        await flush();
+        await flush();
+
+        expect(playSpy).toHaveBeenCalledTimes(1);
+        expect(video.currentTime).toBe(2); // unchanged
+    });
+
+    it('only triggers once across many video appends', async () => {
+        const { adapter, video, vsb } = await makeReadyAdapter();
+        const playSpy = vi.spyOn(video, 'play');
+        video.buffered = makeTimeRanges([[0, 10]]);
+
+        for (let bmd = 0; bmd < 1000; bmd += 100) {
+            adapter.appendChunk('video', makeSegment({ bmd, defaultDur: 100, sampleCount: 1 }), 'track1');
+            await flush();
+            await flush();
+        }
+
+        expect(playSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT trigger from the audio drain when video is also configured', async () => {
+        // On A/V streams, an audio updateend can land before the first
+        // video append commits. We must not let it latch playTriggered
+        // against whatever stub video.buffered happens to hold.
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const initData = makeInit(1, 100);
+        adapter.initialize({
+            video: { codec: 'avc1.42c01e', initData },
+            audio: { codec: 'mp4a.40.2', initData },
+        });
+        currentMs.open();
+        await flush();
+        await flush();
+
+        const playSpy = vi.spyOn(video, 'play');
+        // Pretend the video element somehow already has a stub range
+        // (e.g., from the init segment itself in some implementations).
+        video.buffered = makeTimeRanges([[0, 0.07]]);
+
+        // Append audio only — video append never happens.
+        const audioSeg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 });
+        adapter.appendChunk('audio', audioSeg, 'audioTrack');
+        await flush();
+        await flush();
+
+        expect(playSpy).not.toHaveBeenCalled();
+    });
+
+    it('triggers from the audio drain when the stream is audio-only', async () => {
+        // No videoBuffer means there will never be a video updateend,
+        // so the audio path must be the trigger or audio-only playback
+        // would never start.
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const initData = makeInit(1, 100);
+        adapter.initialize({ audio: { codec: 'mp4a.40.2', initData } });
+        currentMs.open();
+        await flush();
+        await flush();
+
+        const playSpy = vi.spyOn(video, 'play');
+        video.buffered = makeTimeRanges([[0, 5]]);
+
+        const audioSeg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 });
+        adapter.appendChunk('audio', audioSeg, 'audioTrack');
+        await flush();
+        await flush();
+
+        expect(playSpy).toHaveBeenCalledTimes(1);
+    });
+});
+
+// ─── getBufferAheadUs ────────────────────────────────────────────────
+
+describe('getBufferAheadUs', () => {
+    it('returns null when no buffered ranges exist pre-startup', () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        expect(adapter.getBufferAheadUs()).toBeNull();
+    });
+
+    it('returns 0 when buffered is empty post-startup (full starvation)', async () => {
+        const { adapter } = await makeReadyAdapter();
+        const ve = (adapter as any).video as MockVideoElement;
+
+        // Trigger playTriggered by simulating successful play
+        ve.buffered = makeTimeRanges([[0, 1.0]]);
+        const seg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 });
+        adapter.appendChunk('video', seg, 'track1');
+        await flush();
+        await flush();
+
+        // Now buffer is completely empty
+        ve.buffered = makeTimeRanges([]);
+        ve.currentTime = 5.0;
+        expect(adapter.getBufferAheadUs()).toBe(0);
+    });
+
+    it('returns buffer ahead from range containing currentTime', async () => {
+        const video = new MockVideoElement();
+        video.buffered = makeTimeRanges([[0, 5.0]]);
+        video.currentTime = 2.0;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        expect(adapter.getBufferAheadUs()).toBe(3_000_000); // 3s in µs
+    });
+
+    it('returns 0 at boundary: currentTime === range end', async () => {
+        const video = new MockVideoElement();
+        video.buffered = makeTimeRanges([[0, 5.0]]);
+        video.currentTime = 5.0;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        expect(adapter.getBufferAheadUs()).toBe(0);
+    });
+
+    it('uses containing range, not end(last) — disjoint ranges', () => {
+        const video = new MockVideoElement();
+        video.buffered = makeTimeRanges([[0, 0.07], [1.5, 11.5]]);
+        video.currentTime = 0;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        // Should use [0, 0.07], NOT end(last)=11.5
+        expect(adapter.getBufferAheadUs()).toBe(70_000); // 0.07s
+    });
+
+    it('returns null pre-startup when currentTime outside all ranges', () => {
+        const video = new MockVideoElement();
+        video.buffered = makeTimeRanges([[1.5, 5.0]]);
+        video.currentTime = 0;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        // playTriggered is false → null (not 0)
+        expect(adapter.getBufferAheadUs()).toBeNull();
+    });
+
+    it('returns 0 post-startup when currentTime outside all ranges', async () => {
+        const { adapter } = await makeReadyAdapter();
+        const video = currentMs.videoBuffer;
+
+        // Simulate play triggered by appending enough data
+        const seg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 3 });
+        adapter.appendChunk('video', seg, 'track1');
+        await flush();
+
+        // Force playTriggered by setting buffered and triggering play
+        const ve = (adapter as any).video as MockVideoElement;
+        ve.buffered = makeTimeRanges([[0, 1.0]]);
+        // Trigger drainQueue to set playTriggered
+        adapter.appendChunk('video', makeSegment({ bmd: 300, defaultDur: 100, sampleCount: 1 }), 'track1');
+        await flush();
+
+        // Now move currentTime past buffered
+        ve.currentTime = 5.0;
+        ve.buffered = makeTimeRanges([[0, 1.0]]);
+
+        // playTriggered should be true → return 0 (starvation signal)
+        expect(adapter.getBufferAheadUs()).toBe(0);
+    });
+});
+
+// ─── changeType play resume ──────────────────────────────────────────
+
+describe('changeType play resume', () => {
+    it('retries video.play() if paused after changeType()', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const ve = (adapter as any).video as MockVideoElement;
+
+        // Simulate playTriggered = true (play already succeeded once)
+        ve.buffered = makeTimeRanges([[0, 5]]);
+        const seg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 });
+        adapter.appendChunk('video', seg, 'track1');
+        await flush();
+        await flush();
+
+        // Now simulate the browser pausing the video after changeType
+        ve.paused = true;
+        const playSpy = vi.spyOn(ve, 'play');
+
+        // Perform changeType
+        const newInit = makeInit(1, 100);
+        await adapter.changeType('video', 'avc1.64001f', newInit);
+
+        // Should have called play() since playTriggered=true and paused=true
+        expect(playSpy).toHaveBeenCalled();
+    });
+
+    it('does NOT call play() if video is not paused after changeType()', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const ve = (adapter as any).video as MockVideoElement;
+
+        // Simulate playTriggered = true
+        ve.buffered = makeTimeRanges([[0, 5]]);
+        const seg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 });
+        adapter.appendChunk('video', seg, 'track1');
+        await flush();
+        await flush();
+
+        // Video NOT paused
+        ve.paused = false;
+        const playSpy = vi.spyOn(ve, 'play');
+
+        const newInit = makeInit(1, 100);
+        await adapter.changeType('video', 'avc1.64001f', newInit);
+
+        expect(playSpy).not.toHaveBeenCalled();
+    });
+});

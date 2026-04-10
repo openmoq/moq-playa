@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Playa — Simple Example</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: #111; color: #eee; }
+
+    .wrapper { max-width: 960px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 1.4rem; margin-bottom: 8px; }
+    .subtitle { color: #888; font-size: 0.9rem; margin-bottom: 20px; }
+    .subtitle code { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; }
+
+    /* Player container */
+    #player-container {
+      width: 100%;
+      aspect-ratio: 16/9;
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* Controls bar */
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 0;
+    }
+    button {
+      background: #333;
+      color: #eee;
+      border: 1px solid #555;
+      padding: 8px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.9rem;
+      transition: background 0.15s;
+    }
+    button:hover { background: #444; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    button.active { background: #2a6; border-color: #2a6; }
+
+    /* Seek bar */
+    .seek-bar {
+      flex: 1;
+      height: 4px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: #333;
+      border-radius: 2px;
+      outline: none;
+    }
+    .seek-bar::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 14px; height: 14px;
+      background: #eee;
+      border-radius: 50%;
+      cursor: pointer;
+    }
+
+    /* Volume */
+    .volume-group { display: flex; align-items: center; gap: 6px; }
+    .volume-bar {
+      width: 80px;
+      height: 4px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: #333;
+      border-radius: 2px;
+      outline: none;
+    }
+    .volume-bar::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 12px; height: 12px;
+      background: #eee;
+      border-radius: 50%;
+      cursor: pointer;
+    }
+
+    /* Time display */
+    .time { font-size: 0.85rem; color: #aaa; font-variant-numeric: tabular-nums; min-width: 50px; }
+
+    /* Quality selector */
+    select {
+      background: #333; color: #eee; border: 1px solid #555;
+      padding: 6px 10px; border-radius: 6px; font-size: 0.85rem;
+    }
+
+    /* Stats overlay */
+    .stats {
+      font-size: 0.8rem;
+      color: #888;
+      padding: 12px 0;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.6;
+    }
+    .stats span { color: #bbb; }
+
+    /* State badge */
+    .state-badge {
+      font-size: 0.8rem;
+      padding: 3px 10px;
+      border-radius: 12px;
+      background: #333;
+      color: #888;
+    }
+    .state-badge.playing { background: #1a3a1a; color: #4d4; }
+    .state-badge.loading { background: #3a3a1a; color: #cc4; }
+    .state-badge.error { background: #3a1a1a; color: #c44; }
+
+    /* Log */
+    #log {
+      background: #1a1a2e;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-family: monospace;
+      font-size: 0.8rem;
+      max-height: 200px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      line-height: 1.5;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+    <h1>Playa — Simple Example</h1>
+    <p class="subtitle">
+      The entire player in <code>~30 lines</code> of TypeScript.
+      Pass <code>?url=</code>, <code>&ns=</code>, and optionally <code>&hash=</code> / <code>&v=14</code>.
+    </p>
+
+    <div id="player-container"></div>
+
+    <div class="controls">
+      <button id="play-btn" disabled>Play</button>
+      <input type="range" class="seek-bar" id="seek" min="0" max="1000" value="0" disabled>
+      <span class="time" id="time">0:00</span>
+      <div class="volume-group">
+        <button id="mute-btn" disabled>Mute</button>
+        <input type="range" class="volume-bar" id="volume" min="0" max="100" value="100">
+      </div>
+      <select id="quality" disabled><option>Auto</option></select>
+      <span class="state-badge" id="state">idle</span>
+    </div>
+
+    <div class="stats" id="stats"></div>
+    <pre id="log"></pre>
+  </div>
+
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+{
+  "name": "@moqt/examples",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build"
+  },
+  "dependencies": {
+    "@moqt/transport": "workspace:*",
+    "@moqt/webtransport": "workspace:*",
+    "@moqt/msf": "workspace:*",
+    "@moqt/loc": "workspace:*",
+    "@moqt/playback": "workspace:*",
+    "@moqt/player": "workspace:*",
+    "@moqt/browser": "workspace:*",
+    "@playa/player": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "^6.3.0"
+  }
+}

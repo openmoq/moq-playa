@@ -1,0 +1,28 @@
+{
+  "name": "@moqt/browser",
+  "version": "0.5.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./browser": {
+      "import": "./dist/browser/index.js",
+      "default": "./dist/browser/index.js"
+    }
+  },
+  "files": ["dist"],
+  "dependencies": {
+    "@moqt/playback": "workspace:*",
+    "@moqt/player": "workspace:*",
+    "@moqt/webtransport": "workspace:*",
+    "@moqt/loc": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc && tsup",
+    "build:browser": "tsup"
+  }
+}
