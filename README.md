@@ -1,4 +1,4 @@
-# MoQT TypeScript
+# Red5 Playa – Modular MOQ Player Framework for Scalable Real-Time Streaming
 
 > **Pre-release.** The API surface is under active development and may change between minor versions. Pin to exact versions in production.
 
