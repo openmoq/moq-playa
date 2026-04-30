@@ -310,6 +310,10 @@ npx tsc --noEmit -p packages/browser/tsconfig.json
 
 ---
 
+## Related Content
+- [Learn more about Playa player](https://www.red5.net/blog/consensus-on-a-moq-media-layer-player-framework/#the-playa-connection)
+- [Start streaming with MOQ ](https://www.red5.net/media-over-quic-moq/)
+
 ## Author
 
 Raymond Lucke and the Red5 Team
