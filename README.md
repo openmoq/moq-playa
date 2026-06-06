@@ -316,7 +316,7 @@ Example pages:
 ## Testing
 
 ```bash
-# Run all tests (2400+ tests across all packages)
+# Run all tests (3,300+ tests across all packages)
 pnpm test
 
 # Watch mode
