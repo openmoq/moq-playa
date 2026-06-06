@@ -102,8 +102,8 @@ export function encodeSubgroupObject(
     );
   }
 
-  // Compute delta
-  let delta: Varint;
+  // Compute delta (semantic bigint; writeVarint range-checks for draft-14/16).
+  let delta: bigint;
   if (isFirstObject) {
     delta = object.objectId;
   } else {

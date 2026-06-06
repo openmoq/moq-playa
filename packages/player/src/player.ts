@@ -21,7 +21,7 @@
  */
 
 import type { ControlMessage, Parameters } from '@moqt/transport';
-import { varint, PublishDoneCode } from '@moqt/transport';
+import { varint, PublishDoneCode, PublishDoneCode18 } from '@moqt/transport';
 import { MoqtConnectionError } from '@moqt/webtransport';
 import type { MoqtConnection } from '@moqt/webtransport';
 import type { MoqtObject } from '@moqt/transport';
@@ -2981,10 +2981,16 @@ export class MoqtPlayer {
         }
       },
       onPublishDone: (_requestId, trackName, _trackAlias, statusCode, errorReason) => {
-        // §13.4.3: TOO_FAR_BEHIND means the subscriber fell behind the
-        // live edge. Resubscribe from the current position instead of
-        // giving up — the relay will send fresh data from live.
-        if (statusCode === BigInt(PublishDoneCode.TOO_FAR_BEHIND)) {
+        // TOO_FAR_BEHIND means the subscriber fell behind the live edge —
+        // resubscribe from the current position instead of giving up; the relay
+        // sends fresh data from live. The wire value is VERSION-SPECIFIC: draft-18
+        // uses 0x5 (§15.10.3), draft-14/16 use 0x6 (§13.4.3). On draft-18, 0x6 is
+        // EXPIRED, so comparing against the wrong table would both miss real
+        // TOO_FAR_BEHIND and mis-fire recovery on EXPIRED.
+        const tooFarBehind = this.connection?.draftVersion === 18
+          ? PublishDoneCode18.TOO_FAR_BEHIND
+          : PublishDoneCode.TOO_FAR_BEHIND;
+        if (statusCode === BigInt(tooFarBehind)) {
           this.log.warn('PUBLISH_DONE(TOO_FAR_BEHIND) "%s": resubscribing from live edge', trackName);
           this.resubscribeAfterPublishDone(trackName);
           return;

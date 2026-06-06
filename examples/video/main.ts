@@ -48,7 +48,7 @@ if (!('VideoDecoder' in window)) {
 
 // ─── Video State ─────────────────────────────────────────────────────
 
-let videoTrackAlias: Varint | null = null;
+let videoTrackAlias: bigint | null = null;
 let videoDecoder: VideoDecoder | null = null;
 let videoConfigured = false;
 let needsKeyframe = true; // Start true — need first keyframe before decoding
@@ -60,7 +60,7 @@ let videoInitData: Uint8Array | undefined;
 
 // ─── Audio State ─────────────────────────────────────────────────────
 
-let audioTrackAlias: Varint | null = null;
+let audioTrackAlias: bigint | null = null;
 let audioDecoder: AudioDecoder | null = null;
 let audioCtx: AudioContext | null = null;
 let audioCodec = '';
@@ -480,7 +480,7 @@ function handleVideoObject(obj: MoqtObject): void {
 
     // ── Parse LOC headers ──────────────────────────────────────────
     // @see draft-ietf-moq-loc-01 §2.3 (LOC Header Extensions)
-    const headers = parseLocHeaders(obj.extensions);
+    const headers = parseLocHeaders(obj.properties);
     const chunkInit = toVideoChunkInit(obj.payload!, headers);
 
     // ── Keyframe gating ────────────────────────────────────────────
@@ -535,7 +535,7 @@ function handleAudioObject(obj: MoqtObject): void {
     const frameDurationUs = Math.round(1024 / audioSampleRate * 1_000_000);
     let timestamp = audioSubmitCount * frameDurationUs;
     try {
-        const headers = parseLocHeaders(obj.extensions);
+        const headers = parseLocHeaders(obj.properties);
         if (headers.captureTimestamp !== undefined) {
             timestamp = Number(headers.captureTimestamp);
         }

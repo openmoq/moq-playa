@@ -3,12 +3,21 @@
  * @module
  */
 
-import { readVarint, writeVarint, varintEncodingLength, type Varint } from './varint.js';
+import { readVarint, writeVarint, varintEncodingLength } from './varint.js';
 
-/** Identifies a particular Object in a Group within a Track. */
+/**
+ * Identifies a particular Object in a Group within a Track.
+ *
+ * Fields are `bigint`: draft-18 encodes Location as two vi64s spanning the full
+ * unsigned 64-bit range. The QUIC-varint helpers below ({@link readLocation} /
+ * {@link writeLocation}) remain the draft-14/16 wire codec and stay range-guarded
+ * — `writeVarint` throws for values above 2^62-1 — so a draft-14/16 Location can
+ * never encode out of range. The draft-18 codec serializes Location with vi64
+ * directly (not via these helpers).
+ */
 export interface Location {
-  readonly group: Varint;
-  readonly object: Varint;
+  readonly group: bigint;
+  readonly object: bigint;
 }
 
 /** Read a Location (two consecutive varints). */

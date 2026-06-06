@@ -7,6 +7,15 @@
 import type { Varint } from '../primitives/varint.js';
 
 /**
+ * Requested Group Order for a FETCH; governs Group ID Delta arithmetic.
+ *
+ * Draft-neutral: lives here (not in a draft-specific decoder) so the sans-I/O
+ * session core can reference it without importing a wire-format module.
+ * @see draft-ietf-moq-transport-18 §11.4.4
+ */
+export type GroupOrder = 'ascending' | 'descending';
+
+/**
  * SUBGROUP_HEADER parsed from a data stream.
  * @see draft-ietf-moq-transport-16 §10.4.2
  */
@@ -14,17 +23,25 @@ export interface SubgroupHeader {
   /** Raw type byte (0x10-0x1F or 0x30-0x3F). */
   readonly typeByte: number;
   /** Track alias identifying the track. */
-  readonly trackAlias: Varint;
+  readonly trackAlias: bigint;
   /** Group ID for all objects on this stream. */
-  readonly groupId: Varint;
+  readonly groupId: bigint;
   /** Subgroup ID (derived from mode or explicit). */
-  readonly subgroupId: Varint;
+  readonly subgroupId: bigint;
   /** Publisher priority (0-255), or undefined if DEFAULT_PRIORITY flag set. */
   readonly publisherPriority: number | undefined;
   /** Whether extensions are present in objects on this stream. */
   readonly hasExtensions: boolean;
   /** Whether this subgroup contains the largest object in the group. */
   readonly isEndOfGroup: boolean;
+  /**
+   * draft-18 FIRST_OBJECT bit (0x40): the first object on this stream is the
+   * first object ever published in the subgroup. Undefined for draft-14/16 (no
+   * such bit). This is distinct from SUBGROUP_ID_MODE 0b01 (which derives the
+   * *Subgroup ID* from the first object's *Object ID*); the two are unrelated
+   * draft-18 concepts (§11.4.2).
+   */
+  readonly isFirstObjectInSubgroup?: boolean;
 }
 
 /**
@@ -32,8 +49,11 @@ export interface SubgroupHeader {
  * @see draft-ietf-moq-transport-16 §10.4.4
  */
 export interface FetchHeader {
-  /** Request ID matching the FETCH control message. */
-  readonly requestId: Varint;
+  /**
+   * Request ID matching the FETCH control message. vi64 (full uint64) on
+   * draft-18, so `bigint`; draft-14/16 read it from a range-checked QUIC varint.
+   */
+  readonly requestId: bigint;
 }
 
 /**
@@ -42,13 +62,13 @@ export interface FetchHeader {
  */
 export interface SubgroupObject {
   /** Object ID (computed from delta). */
-  readonly objectId: Varint;
+  readonly objectId: bigint;
   /** Extension headers if present. */
   readonly extensions: Uint8Array | undefined;
   /** Object payload (empty if status object). */
   readonly payload: Uint8Array;
   /** Object status (only meaningful if payload is empty). */
-  readonly status: Varint | undefined;
+  readonly status: bigint | undefined;
 }
 
 /**
@@ -59,11 +79,11 @@ export interface FetchObject {
   /** Serialization flags byte. */
   readonly flags: Varint;
   /** Group ID (may be inherited from prior object). */
-  readonly groupId: Varint;
+  readonly groupId: bigint;
   /** Subgroup ID (may be inherited or derived). */
-  readonly subgroupId: Varint;
+  readonly subgroupId: bigint;
   /** Object ID (may be inherited from prior object + 1). */
-  readonly objectId: Varint;
+  readonly objectId: bigint;
   /** Publisher priority (may be inherited). */
   readonly publisherPriority: number | undefined;
   /** Whether this object was sent as a datagram originally. */
@@ -82,9 +102,9 @@ export interface FetchEndOfRange {
   /** The special flags value (0x8C or 0x10C). */
   readonly flags: Varint;
   /** Group ID of the range end. */
-  readonly groupId: Varint;
+  readonly groupId: bigint;
   /** Object ID of the range end. */
-  readonly objectId: Varint;
+  readonly objectId: bigint;
   /** Whether objects are known to not exist (true) or status unknown (false). */
   readonly nonExistent: boolean;
   /**
@@ -104,11 +124,11 @@ export interface ObjectDatagram {
   /** Raw type byte (0x00-0x0F or 0x20-0x2F). */
   readonly typeByte: number;
   /** Track alias identifying the track. */
-  readonly trackAlias: Varint;
+  readonly trackAlias: bigint;
   /** Group ID. */
-  readonly groupId: Varint;
+  readonly groupId: bigint;
   /** Object ID (1 if ZERO_OBJECT_ID flag set). */
-  readonly objectId: Varint;
+  readonly objectId: bigint;
   /** Publisher priority, or undefined if DEFAULT_PRIORITY flag set. */
   readonly publisherPriority: number | undefined;
   /** Whether this is the last object in the group. */
@@ -118,7 +138,7 @@ export interface ObjectDatagram {
   /** Object payload (empty if status object). */
   readonly payload: Uint8Array;
   /** Object status (only present if STATUS flag set). */
-  readonly status: Varint | undefined;
+  readonly status: bigint | undefined;
 }
 
 /**
@@ -142,12 +162,15 @@ export type MoqtObject =
  */
 export interface MoqtObjectData {
   readonly kind: 'data';
-  readonly trackAlias: Varint;
-  readonly groupId: Varint;
-  readonly subgroupId: Varint;
-  readonly objectId: Varint;
+  readonly trackAlias: bigint;
+  readonly groupId: bigint;
+  readonly subgroupId: bigint;
+  readonly objectId: bigint;
   readonly publisherPriority: number | undefined;
-  readonly extensions: Uint8Array | undefined;
+  /** draft-18 Object Properties (raw bytes; §2.5). draft-14/16 "Extensions". */
+  readonly properties?: Uint8Array | undefined;
+  /** @deprecated draft-18 renamed Object "Extensions" → "Properties". Use {@link properties}. */
+  readonly extensions?: Uint8Array | undefined;
   readonly payload: Uint8Array;
 }
 
@@ -156,10 +179,10 @@ export interface MoqtObjectData {
  */
 export interface MoqtObjectGap {
   readonly kind: 'gap';
-  readonly trackAlias: Varint;
-  readonly groupId: Varint;
-  readonly subgroupId: Varint;
-  readonly objectId: Varint;
+  readonly trackAlias: bigint;
+  readonly groupId: bigint;
+  readonly subgroupId: bigint;
+  readonly objectId: bigint;
   /** The status code explaining the gap. */
-  readonly status: Varint;
+  readonly status: bigint;
 }

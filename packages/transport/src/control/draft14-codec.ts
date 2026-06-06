@@ -30,6 +30,9 @@ import type {
   Subscribe,
   SubscribeOk,
   ClientSetup,
+  ServerSetup,
+  RequestErrorMsg,
+  RequestErrorKind,
   Fetch,
   RequestUpdate,
   TrackExtensions,
@@ -38,7 +41,6 @@ import type {
   PublishDone,
 } from './messages.js';
 import type { Varint } from '../primitives/varint.js';
-import type { KvpValue } from '../primitives/kvp.js';
 import type { Location } from '../primitives/location.js';
 import { varint, readVarint, writeVarint, varintEncodingLength } from '../primitives/varint.js';
 import {
@@ -55,6 +57,7 @@ import {
 import { readLocation, writeLocation, locationEncodingLength } from '../primitives/location.js';
 import { readReasonPhrase, writeReasonPhrase, reasonPhraseEncodingLength } from '../primitives/reason.js';
 import { MessageParam } from './parameters.js';
+import { toKvpParams } from './kvp-params.js';
 import { ProtocolViolationError } from '../errors.js';
 
 // ─── Draft-14 Wire Codes ─────────────────────────────────────────────
@@ -111,6 +114,7 @@ export class Draft14Codec implements ControlCodec {
   encode(msg: ControlMessage): Uint8Array {
     switch (msg.type) {
       case 'CLIENT_SETUP': return this.encodeClientSetup(msg);
+      case 'SERVER_SETUP': return this.encodeServerSetup(msg);
       case 'SUBSCRIBE': return this.encodeSubscribe(msg);
       case 'REQUEST_UPDATE': return this.encodeSubscribeUpdate(msg);
       case 'SUBSCRIBE_NAMESPACE': return this.encodeSubscribeNamespace(msg);
@@ -127,8 +131,7 @@ export class Draft14Codec implements ControlCodec {
       case 'SUBSCRIBE_OK': return this.encodeSubscribeOk(msg);
       case 'PUBLISH_DONE': return this.encodePublishDone(msg);
       case 'PUBLISH_NAMESPACE_DONE': return this.encodeNamespaceTuple(D14.PUBLISH_NAMESPACE_DONE, msg.trackNamespace!);
-      case 'REQUEST_ERROR':
-        throw new Error('Draft-14 does not have generic REQUEST_ERROR — use specific error types');
+      case 'REQUEST_ERROR': return this.encodeRequestError(msg);
       case 'REQUEST_OK':
         throw new Error('Draft-14 does not have generic REQUEST_OK — use specific OK types');
       default:
@@ -222,15 +225,17 @@ export class Draft14Codec implements ControlCodec {
 
   private writeParams(params: Parameters, buf: Uint8Array, offset: number): number {
     let pos = offset;
-    const count = kvpListEntryCount(params);
+    const kvp = toKvpParams(params);
+    const count = kvpListEntryCount(kvp);
     pos += writeVarint(varint(count), buf, pos);
-    pos += writeKvpListAbsolute(params, buf, pos);
+    pos += writeKvpListAbsolute(kvp, buf, pos);
     return pos - offset;
   }
 
   private paramsLength(params: Parameters): number {
-    const count = kvpListEntryCount(params);
-    return varintEncodingLength(varint(count)) + kvpListAbsoluteEncodingLength(params);
+    const kvp = toKvpParams(params);
+    const count = kvpListEntryCount(kvp);
+    return varintEncodingLength(varint(count)) + kvpListAbsoluteEncodingLength(kvp);
   }
 
   /**
@@ -253,7 +258,7 @@ export class Draft14Codec implements ControlCodec {
     }
   }
 
-  private encodeSimpleRequestId(typeCode: number, requestId: Varint): Uint8Array {
+  private encodeSimpleRequestId(typeCode: number, requestId: bigint): Uint8Array {
     const payloadLen = varintEncodingLength(requestId);
     const payload = new Uint8Array(payloadLen);
     writeVarint(requestId, payload, 0);
@@ -276,6 +281,60 @@ export class Draft14Codec implements ControlCodec {
     pos += this.writeParams(msg.parameters, payload, pos);
 
     return this.frame16(D14.CLIENT_SETUP, payload);
+  }
+
+  private encodeServerSetup(msg: ServerSetup): Uint8Array {
+    // Draft-14 §9.3: Selected Version (i), Params. Unlike CLIENT_SETUP (which
+    // advertises a version list), the server echoes the single negotiated
+    // version. This mirrors the SERVER_SETUP decode path below and differs from
+    // Playa's draft-16 codec, which frames both SETUPs as params-only.
+    const selectedVersion = varint(0xff00000e); // draft-14
+    const payloadLen =
+      varintEncodingLength(selectedVersion) +          // Selected Version
+      this.paramsLength(msg.parameters);
+
+    const payload = new Uint8Array(payloadLen);
+    let pos = 0;
+    pos += writeVarint(selectedVersion, payload, pos);
+    pos += this.writeParams(msg.parameters, payload, pos);
+
+    return this.frame16(D14.SERVER_SETUP, payload);
+  }
+
+  /**
+   * Encode a (normalized) REQUEST_ERROR back to its specific draft-14 wire type.
+   *
+   * Draft-14 has no generic REQUEST_ERROR; it splits into SUBSCRIBE_ERROR (§9.9),
+   * FETCH_ERROR (§9.18), TRACK_STATUS_ERROR (§9.22), and SUBSCRIBE_NAMESPACE_ERROR
+   * (§9.30) — all sharing the identical [Request ID, Error Code, Reason] payload
+   * and differing only by type code. The session stamps `requestKind` so we
+   * recover the type WITHOUT guessing from the Request ID. Without that context
+   * we cannot disambiguate, so we throw (loudly) rather than mis-encode.
+   */
+  private encodeRequestError(msg: RequestErrorMsg): Uint8Array {
+    const typeByKind: Record<RequestErrorKind, number> = {
+      SUBSCRIBE: D14.SUBSCRIBE_ERROR,
+      FETCH: D14.FETCH_ERROR,
+      TRACK_STATUS: D14.TRACK_STATUS_ERROR,
+      SUBSCRIBE_NAMESPACE: D14.SUBSCRIBE_NAMESPACE_ERROR,
+    };
+    if (msg.requestKind === undefined) {
+      throw new Error('Draft-14 does not have generic REQUEST_ERROR — use specific error types');
+    }
+    const typeCode = typeByKind[msg.requestKind];
+
+    const payloadLen =
+      varintEncodingLength(msg.requestId) +
+      varintEncodingLength(msg.errorCode) +
+      reasonPhraseEncodingLength(msg.errorReason);
+
+    const payload = new Uint8Array(payloadLen);
+    let pos = 0;
+    pos += writeVarint(msg.requestId, payload, pos);
+    pos += writeVarint(msg.errorCode, payload, pos);
+    pos += writeReasonPhrase(msg.errorReason, payload, pos);
+
+    return this.frame16(typeCode, payload);
   }
 
   private encodeSubscribe(msg: Subscribe): Uint8Array {
@@ -1081,10 +1140,10 @@ export class Draft14Codec implements ControlCodec {
 
   /** Clone a parameters map, removing specified keys. */
   private cloneParamsWithout(params: Parameters, keysToRemove: Varint[]): Parameters {
-    const result = new Map<Varint, KvpValue[]>();
+    const result: Parameters = new Map();
     const removeSet = new Set(keysToRemove.map(k => k as bigint));
     for (const [key, values] of params) {
-      if (!removeSet.has(key as bigint)) {
+      if (!removeSet.has(key)) {
         result.set(key, values);
       }
     }
@@ -1389,9 +1448,13 @@ export class Draft14Codec implements ControlCodec {
         if (typeof val === 'bigint') {
           paramsTotalLen += varintEncodingLength(varint(varintEncodingLength(val)));
           paramsTotalLen += varintEncodingLength(val);
-        } else {
+        } else if (val instanceof Uint8Array) {
           paramsTotalLen += varintEncodingLength(varint(BigInt(val.byteLength)));
           paramsTotalLen += val.byteLength;
+        } else {
+          throw new ProtocolViolationError(
+            'Location-valued parameter cannot be encoded as draft-14 KVP',
+          );
         }
       }
     }

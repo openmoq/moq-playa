@@ -16,7 +16,6 @@
  * @module
  */
 
-import { type Varint } from '../primitives/varint.js';
 import { FetchState, type FetchStateValue } from './types.js';
 
 /**
@@ -24,28 +23,28 @@ import { FetchState, type FetchStateValue } from './types.js';
  */
 export class FetchStateMachine {
   private _state: FetchStateValue = FetchState.PENDING;
-  private _errorCode: Varint | undefined;
+  private _errorCode: bigint | undefined;
   private _errorReason: string | undefined;
   private _wasCanceled: boolean = false;
 
   private constructor(
-    private readonly _requestId: Varint,
+    private readonly _requestId: bigint,
     private readonly _isPublisher: boolean,
-    private readonly _startGroup?: Varint,
-    private readonly _startObject?: Varint,
-    private readonly _endGroup?: Varint,
-    private readonly _endObject?: Varint,
+    private readonly _startGroup?: bigint,
+    private readonly _startObject?: bigint,
+    private readonly _endGroup?: bigint,
+    private readonly _endObject?: bigint,
   ) {}
 
   /**
    * Create a fetch state machine as fetcher (sending FETCH).
    */
   static createAsFetcher(
-    requestId: Varint,
-    startGroup?: Varint,
-    startObject?: Varint,
-    endGroup?: Varint,
-    endObject?: Varint,
+    requestId: bigint,
+    startGroup?: bigint,
+    startObject?: bigint,
+    endGroup?: bigint,
+    endObject?: bigint,
   ): FetchStateMachine {
     return new FetchStateMachine(
       requestId,
@@ -61,11 +60,11 @@ export class FetchStateMachine {
    * Create a fetch state machine as publisher (receiving FETCH).
    */
   static createAsPublisher(
-    requestId: Varint,
-    startGroup?: Varint,
-    startObject?: Varint,
-    endGroup?: Varint,
-    endObject?: Varint,
+    requestId: bigint,
+    startGroup?: bigint,
+    startObject?: bigint,
+    endGroup?: bigint,
+    endObject?: bigint,
   ): FetchStateMachine {
     return new FetchStateMachine(
       requestId,
@@ -85,12 +84,12 @@ export class FetchStateMachine {
   }
 
   /** Request ID for this fetch. */
-  get requestId(): Varint {
+  get requestId(): bigint {
     return this._requestId;
   }
 
   /** Error code if completed with REQUEST_ERROR. */
-  get errorCode(): Varint | undefined {
+  get errorCode(): bigint | undefined {
     return this._errorCode;
   }
 
@@ -110,22 +109,22 @@ export class FetchStateMachine {
   }
 
   /** Start group of the fetch range. */
-  get startGroup(): Varint | undefined {
+  get startGroup(): bigint | undefined {
     return this._startGroup;
   }
 
   /** Start object of the fetch range. */
-  get startObject(): Varint | undefined {
+  get startObject(): bigint | undefined {
     return this._startObject;
   }
 
   /** End group of the fetch range. */
-  get endGroup(): Varint | undefined {
+  get endGroup(): bigint | undefined {
     return this._endGroup;
   }
 
   /** End object of the fetch range. */
-  get endObject(): Varint | undefined {
+  get endObject(): bigint | undefined {
     return this._endObject;
   }
 
@@ -163,7 +162,7 @@ export class FetchStateMachine {
    * Handle REQUEST_ERROR received (fetcher side).
    * Transitions to COMPLETED.
    */
-  handleRequestError(errorCode: Varint, errorReason: string): void {
+  handleRequestError(errorCode: bigint, errorReason: string): void {
     this.assertNotCompleted('handleRequestError');
     this.assertNotTransferring('handleRequestError');
     this.assertNotPublisher('handleRequestError');
@@ -190,7 +189,7 @@ export class FetchStateMachine {
    * Send REQUEST_ERROR (publisher side).
    * Transitions to COMPLETED.
    */
-  sendRequestError(errorCode: Varint, errorReason: string): void {
+  sendRequestError(errorCode: bigint, errorReason: string): void {
     this.assertNotCompleted('sendRequestError');
     this.assertNotTransferring('sendRequestError');
     this.assertPublisher('sendRequestError');

@@ -4,7 +4,7 @@
  */
 
 export { MoqtConnection } from './adapter.js';
-export type { TrackSubscription, TrackSubscribeOptions } from './adapter.js';
+export type { TrackSubscription, TrackSubscribeOptions, IncomingPublish } from './adapter.js';
 export type {
   WebTransportLike,
   WebTransportBidirectionalStream,
@@ -17,3 +17,13 @@ export type { MoqtConnectionErrorSource, MoqtConnectionErrorOptions } from './ad
 export { ControlStreamFramer } from './framer.js';
 /** @experimental Advanced API — may change between minor versions. */
 export type { FramedMessage } from './framer.js';
+
+/** @experimental Stream topology seam — draft-14/16 single-bidi control stream. */
+export { createBidiControlTopology } from './topology/bidi-control.js';
+/** @experimental */
+export type { BidiControlTopology } from './topology/bidi-control.js';
+
+/** @experimental draft-18 uni control-stream pair topology (handshake skeleton). */
+export { createUniPairTopology, UniPairTopology } from './topology/uni-pair.js';
+/** @experimental */
+export type { RequestStream } from './topology/uni-pair.js';

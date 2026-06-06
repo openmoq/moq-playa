@@ -12,8 +12,6 @@
  * @module
  */
 
-import { varint, type Varint } from '../primitives/varint.js';
-
 /**
  * Track identity (namespace + name).
  */
@@ -41,7 +39,7 @@ export class TrackAliasManager {
    * @throws {Error} If alias is already registered to a different track
    * @throws {Error} If track is already registered with a different alias
    */
-  register(alias: Varint, namespace: Uint8Array[], name: Uint8Array): void {
+  register(alias: bigint, namespace: Uint8Array[], name: Uint8Array): void {
     const trackKey = this.computeTrackKey(namespace, name);
     const aliasNum = alias as bigint;
 
@@ -72,7 +70,7 @@ export class TrackAliasManager {
    *
    * @param alias - The numeric track alias to remove
    */
-  unregister(alias: Varint): void {
+  unregister(alias: bigint): void {
     const aliasNum = alias as bigint;
     const track = this.aliasToTrack.get(aliasNum);
 
@@ -89,7 +87,7 @@ export class TrackAliasManager {
    * @param alias - The numeric track alias
    * @returns The track identity, or undefined if not found
    */
-  getByAlias(alias: Varint): TrackIdentity | undefined {
+  getByAlias(alias: bigint): TrackIdentity | undefined {
     return this.aliasToTrack.get(alias as bigint);
   }
 
@@ -100,10 +98,11 @@ export class TrackAliasManager {
    * @param name - Track name
    * @returns The track alias, or undefined if not found
    */
-  getAliasByTrack(namespace: Uint8Array[], name: Uint8Array): Varint | undefined {
+  getAliasByTrack(namespace: Uint8Array[], name: Uint8Array): bigint | undefined {
     const trackKey = this.computeTrackKey(namespace, name);
-    const alias = this.trackToAlias.get(trackKey);
-    return alias !== undefined ? varint(alias) : undefined;
+    // Returns the raw bigint alias: a draft-18 server-assigned alias may exceed
+    // the QUIC-varint range, so it must not be re-branded through varint().
+    return this.trackToAlias.get(trackKey);
   }
 
   /**
@@ -112,7 +111,7 @@ export class TrackAliasManager {
    * @param alias - The numeric track alias
    * @returns True if the alias is registered
    */
-  hasAlias(alias: Varint): boolean {
+  hasAlias(alias: bigint): boolean {
     return this.aliasToTrack.has(alias as bigint);
   }
 

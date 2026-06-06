@@ -12,19 +12,21 @@
  * @module
  */
 
-import { varint, type Varint, writeVarint, varintEncodingLength } from '../primitives/varint.js';
+import { varint, type Varint } from '../primitives/varint.js';
 import { readLocation } from '../primitives/location.js';
-import { readVarint } from '../primitives/varint.js';
-import { type KvpValue } from '../primitives/kvp.js';
-import { validateTrackNamespace } from '../primitives/bytes.js';
+import { encodeSubscriptionFilter, validateSubscriptionFilter, type SubscriptionFilter } from '../control/subscription-filter.js';
+import { validateTrackNamespace, validateTrackNamespacePrefix, validateFullTrackName, isReservedSessionNamespace, isReservedDotNamespace } from '../primitives/bytes.js';
 import { SessionError as SessionErrorCode, RequestError as RequestErrorCode } from '../errors.js';
 import type {
   ControlMessage,
   ClientSetup,
   ServerSetup,
+  Setup,
   Subscribe,
   SubscribeOk,
   SubscribeNamespace,
+  SubscribeTracks,
+  PublishBlocked,
   RequestUpdate,
   RequestOk,
   RequestErrorMsg,
@@ -50,11 +52,12 @@ import type {
   PublishOk,
   PublishError,
 } from '../control/messages.js';
-import type { DraftVersion } from '../control/codec.js';
+import type { DraftVersion, DecodedControlMessage } from '../control/codec.js';
 import {
   SessionState,
   EndpointRole,
   ForwardState,
+  SubscriptionState,
   type SessionStateValue,
   type EndpointRoleValue,
   type ForwardStateValue,
@@ -66,14 +69,17 @@ import {
 } from './types.js';
 import { SetupGate, SetupError } from './setup.js';
 import { RequestIdAllocator, RequestIdError } from './request-id.js';
+import { getProtocolProfile, type ProtocolProfile } from '../profile.js';
+import type { RequestEndpoint } from './request-endpoint.js';
 import { SubscriptionStateMachine } from './subscription.js';
 import { FetchStateMachine } from './fetch.js';
+import type { GroupOrder } from '../data/types.js';
 import { NamespaceStateMachine } from './namespace.js';
 import { TrackAliasManager } from './track-alias.js';
 import { MessageParam } from '../control/parameters.js';
-import type { Parameters } from '../control/messages.js';
+import type { Parameters, ParameterValue, TrackProperties } from '../control/messages.js';
 import { AuthTokenCache, AuthCacheError } from './auth-cache.js';
-import { AliasType, parseAuthorizationToken, type AuthorizationToken, type ResolvedToken } from '../control/auth-token.js';
+import { AliasType, parseAuthorizationToken, parseAuthorizationToken18, type AuthorizationToken, type ResolvedToken } from '../control/auth-token.js';
 
 /**
  * Set of known message parameter type codes.
@@ -89,6 +95,7 @@ const KNOWN_MESSAGE_PARAMS = new Set<bigint>([
   MessageParam.SUBSCRIPTION_FILTER as bigint,
   MessageParam.GROUP_ORDER as bigint,
   MessageParam.NEW_GROUP_REQUEST as bigint,
+  MessageParam.TRACK_NAMESPACE_PREFIX as bigint, // draft-18 §10.2.14
 ]);
 
 /**
@@ -120,7 +127,92 @@ const VALID_PARAMS_FOR_MESSAGE_TYPE: Map<bigint, Set<string>> = new Map([
   [MessageParam.GROUP_ORDER as bigint, new Set(['SUBSCRIBE', 'PUBLISH_OK', 'FETCH'])],
   // §9.2.2.9: NEW_GROUP_REQUEST MAY appear in PUBLISH_OK, SUBSCRIBE, REQUEST_UPDATE
   [MessageParam.NEW_GROUP_REQUEST as bigint, new Set(['PUBLISH_OK', 'SUBSCRIBE', 'REQUEST_UPDATE'])],
+  // draft-18 §10.2.14: TRACK_NAMESPACE_PREFIX MAY appear in REQUEST_UPDATE (to
+  // change the prefix of a SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS).
+  [MessageParam.TRACK_NAMESPACE_PREFIX as bigint, new Set(['REQUEST_UPDATE'])],
 ]);
+
+/**
+ * draft-18 known message-parameter type codes (§15.7). Distinct from the
+ * draft-14/16 set: draft-18 adds RENDEZVOUS_TIMEOUT, SUBGROUP_DELIVERY_TIMEOUT
+ * and FILL_TIMEOUT, and treats every unknown type as a PROTOCOL_VIOLATION.
+ * @see draft-ietf-moq-transport-18 §10.2, §15.7
+ */
+const KNOWN_MESSAGE_PARAMS_18 = new Set<bigint>([
+  MessageParam.OBJECT_DELIVERY_TIMEOUT as bigint, // 0x02
+  MessageParam.AUTHORIZATION_TOKEN as bigint,      // 0x03
+  MessageParam.RENDEZVOUS_TIMEOUT as bigint,       // 0x04
+  MessageParam.SUBGROUP_DELIVERY_TIMEOUT as bigint, // 0x06
+  MessageParam.EXPIRES as bigint,                  // 0x08
+  MessageParam.LARGEST_OBJECT as bigint,           // 0x09
+  MessageParam.FILL_TIMEOUT as bigint,             // 0x0a
+  MessageParam.FORWARD as bigint,                  // 0x10
+  MessageParam.SUBSCRIBER_PRIORITY as bigint,      // 0x20
+  MessageParam.SUBSCRIPTION_FILTER as bigint,      // 0x21
+  MessageParam.GROUP_ORDER as bigint,              // 0x22
+  MessageParam.NEW_GROUP_REQUEST as bigint,        // 0x32
+  MessageParam.TRACK_NAMESPACE_PREFIX as bigint,   // 0x34
+]);
+
+/**
+ * draft-18 message-parameter scope table (§10.2.2–§10.2.14). Keys include the
+ * request message types AND the response *contexts* a REQUEST_OK can answer
+ * (PUBLISH_OK, REQUEST_UPDATE_OK, TRACK_STATUS_OK) plus the distinct response
+ * messages SUBSCRIBE_OK — see {@link Session.d18RequestOkContext}. Per §10.2.1,
+ * a known parameter appearing OUT of scope is a PROTOCOL_VIOLATION (draft-14/16
+ * instead silently ignore it).
+ * @see draft-ietf-moq-transport-18 §10.2.1
+ */
+const VALID_PARAMS_FOR_MESSAGE_TYPE_18: Map<bigint, Set<string>> = new Map([
+  // §10.2.4
+  [MessageParam.OBJECT_DELIVERY_TIMEOUT as bigint, new Set(['PUBLISH_OK', 'SUBSCRIBE', 'REQUEST_UPDATE'])],
+  // §10.2.2
+  [MessageParam.AUTHORIZATION_TOKEN as bigint, new Set([
+    'PUBLISH', 'SUBSCRIBE', 'REQUEST_UPDATE', 'SUBSCRIBE_NAMESPACE', 'SUBSCRIBE_TRACKS',
+    'PUBLISH_NAMESPACE', 'TRACK_STATUS', 'FETCH',
+  ])],
+  // §10.2.6
+  [MessageParam.RENDEZVOUS_TIMEOUT as bigint, new Set(['SUBSCRIBE'])],
+  // §10.2.3
+  [MessageParam.SUBGROUP_DELIVERY_TIMEOUT as bigint, new Set(['PUBLISH_OK', 'SUBSCRIBE', 'REQUEST_UPDATE'])],
+  // §10.2.10
+  [MessageParam.EXPIRES as bigint, new Set(['SUBSCRIBE_OK', 'PUBLISH', 'PUBLISH_OK', 'REQUEST_UPDATE_OK'])],
+  // §10.2.11
+  [MessageParam.LARGEST_OBJECT as bigint, new Set(['SUBSCRIBE_OK', 'PUBLISH', 'REQUEST_UPDATE_OK', 'TRACK_STATUS_OK'])],
+  // §10.2.5
+  [MessageParam.FILL_TIMEOUT as bigint, new Set(['FETCH'])],
+  // §10.2.12
+  [MessageParam.FORWARD as bigint, new Set(['SUBSCRIBE', 'REQUEST_UPDATE', 'PUBLISH', 'PUBLISH_OK', 'SUBSCRIBE_TRACKS'])],
+  // §10.2.7
+  [MessageParam.SUBSCRIBER_PRIORITY as bigint, new Set(['SUBSCRIBE', 'FETCH', 'REQUEST_UPDATE', 'PUBLISH_OK'])],
+  // §10.2.9
+  [MessageParam.SUBSCRIPTION_FILTER as bigint, new Set(['SUBSCRIBE', 'PUBLISH_OK', 'REQUEST_UPDATE'])],
+  // §10.2.8
+  [MessageParam.GROUP_ORDER as bigint, new Set(['SUBSCRIBE', 'PUBLISH_OK', 'FETCH'])],
+  // §10.2.13
+  [MessageParam.NEW_GROUP_REQUEST as bigint, new Set(['PUBLISH_OK', 'SUBSCRIBE', 'REQUEST_UPDATE'])],
+  // §10.2.14 — generic REQUEST_UPDATE scope; the namespace/tracks-target restriction
+  // is enforced contextually in handleIncomingRequestUpdate.
+  [MessageParam.TRACK_NAMESPACE_PREFIX as bigint, new Set(['REQUEST_UPDATE'])],
+]);
+
+/**
+ * Whether two Track Namespace Prefixes overlap: one is a (field-wise) prefix of
+ * the other, so a single PUBLISH_NAMESPACE could match both. Used to reject an
+ * overlapping incoming SUBSCRIBE_NAMESPACE with PREFIX_OVERLAP (§10.18).
+ */
+function prefixesOverlap(a: Uint8Array[], b: Uint8Array[]): boolean {
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  for (let i = 0; i < shorter.length; i++) {
+    const x = shorter[i]!, y = longer[i]!;
+    if (x.length !== y.length) return false;
+    for (let j = 0; j < x.length; j++) {
+      if (x[j] !== y[j]) return false;
+    }
+  }
+  return true; // every field of the shorter prefix matches the longer's
+}
 
 /**
  * Error thrown for session-level protocol violations.
@@ -167,12 +259,13 @@ export interface SetupOptions {
   authority?: string;
   implementation?: string;
   /**
-   * Our MAX_AUTH_TOKEN_CACHE_SIZE to advertise to the peer.
-   * Declares how many bytes of token aliases we are willing to cache.
-   * Default 0 = aliases prohibited.
-   * @see draft-ietf-moq-transport-16 §9.3.1.4
+   * Our MAX_AUTH_TOKEN_CACHE_SIZE to advertise to the peer. Declares how many bytes
+   * of token aliases we are willing to cache. Default 0 = aliases prohibited. Raw
+   * `bigint`: draft-18 §10.3.1.3 carries it as a vi64 (full uint64); draft-14/16
+   * encode it as a QUIC varint, where an above-range value throws on encode.
+   * @see draft-ietf-moq-transport-18 §10.3.1.3
    */
-  maxAuthTokenCacheSize?: Varint;
+  maxAuthTokenCacheSize?: bigint;
   /**
    * Raw AUTHORIZATION_TOKEN parameter values to include in setup.
    * Each Uint8Array is a serialized Token structure (Figure 4).
@@ -188,24 +281,6 @@ export interface SetupOptions {
  * Options for creating a subscription.
  * @see draft-ietf-moq-transport-16 §9.2.2
  */
-/**
- * Subscription filter — controls which objects pass through a subscription.
- *
- * @see draft-ietf-moq-transport-16 §5.1.2 (Subscription Filters)
- * @see draft-ietf-moq-transport-16 §9.2.2.5 (SUBSCRIPTION_FILTER parameter)
- */
-export type SubscriptionFilter =
-  /** §5.1.2: Start at next group after Largest Object. */
-  | { readonly type: 'NextGroupStart' }
-  /** §5.1.2: Start after the Largest Object. */
-  | { readonly type: 'LargestObject' }
-  /** @deprecated Use 'LargestObject'. Alias kept for backward compatibility. */
-  | { readonly type: 'LatestObject' }
-  /** §5.1.2: Start at an explicit location (open-ended). */
-  | { readonly type: 'AbsoluteStart'; readonly startGroup: Varint; readonly startObject: Varint }
-  /** §5.1.2: Explicit start and end group. */
-  | { readonly type: 'AbsoluteRange'; readonly startGroup: Varint; readonly startObject: Varint; readonly endGroup: Varint };
-
 export interface SubscribeOptions {
   /** §9.2.2.2: Duration in milliseconds. MUST be > 0. */
   deliveryTimeout?: Varint;
@@ -230,23 +305,75 @@ export interface RequestUpdateOptions {
   subscriberPriority?: Varint;
   /** §9.2.2.5: SUBSCRIPTION_FILTER MAY appear in REQUEST_UPDATE to change subscription range. */
   subscriptionFilter?: SubscriptionFilter;
+  /**
+   * draft-18 §10.9.2 / §10.2.14: a new Track Namespace Prefix. Valid ONLY when
+   * `existingRequestId` is an outbound SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS;
+   * sets the TRACK_NAMESPACE_PREFIX (0x34) parameter and, on REQUEST_OK, replaces
+   * the stored prefix. Supplying it for a normal subscription update throws (it is
+   * a draft-18-only concept; there is no such update in draft-14/16).
+   */
+  trackNamespacePrefix?: Uint8Array[];
 }
 
 /**
  * Options for creating a fetch.
  */
 export interface FetchOptions {
-  startGroup: Varint;
-  startObject: Varint;
-  endGroup?: Varint;
-  endObject?: Varint;
+  // Fetch Locations are vi64 (full uint64) on draft-18, so `bigint`. The
+  // draft-14/16 FETCH encoder still range-checks them against the QUIC-varint
+  // range on encode (a value above 2^62-1 throws there).
+  startGroup: bigint;
+  startObject: bigint;
+  endGroup?: bigint;
+  endObject?: bigint;
+  /**
+   * Requested Group Order (§9.2.2.4 / §10.2). Sets the GROUP_ORDER (0x22)
+   * parameter (Ascending = 0x1, Descending = 0x2). When omitted, the parameter
+   * is not sent and the response is decoded as Ascending per spec.
+   */
+  groupOrder?: GroupOrder;
+}
+
+/**
+ * Options for accepting an incoming FETCH (FETCH_OK metadata, §10.13). Locations
+ * are vi64 (full uint64) on draft-18, so `bigint`.
+ */
+export interface FetchAcceptOptions {
+  /** 1 if the End Location is the final Object in the Track, else 0. */
+  endOfTrack?: number;
+  /** End of the range covered by the FETCH response. */
+  endLocation?: { group: bigint; object: bigint };
+  /** Response parameters. */
+  parameters?: Parameters;
+  /** draft-18 Track Properties (§2.5) on the FETCH_OK; non-empty on draft-14/16 throws. */
+  trackProperties?: TrackProperties;
+}
+
+/**
+ * Options for accepting an incoming TRACK_STATUS (TRACK_STATUS_OK, §10.14).
+ * `parameters` are the REQUEST_OK message parameters (as for SUBSCRIBE_OK).
+ * `trackProperties` are the draft-18 Track Properties (§2.5) — draft-14/16 have
+ * no such field, so supplying non-empty Track Properties there throws.
+ */
+export interface TrackStatusAcceptOptions {
+  parameters?: Parameters;
+  trackProperties?: TrackProperties;
+}
+
+/** Local state for an outgoing SUBSCRIBE_TRACKS request (draft-18 §10.19). */
+export interface TrackSubscriptionState {
+  /** Mutable: a §10.9.2 prefix update replaces it on REQUEST_OK. */
+  trackNamespacePrefix: Uint8Array[];
+  state: 'pending' | 'active' | 'terminated';
+  /** Tracks the publisher reported it cannot serve, via PUBLISH_BLOCKED. */
+  readonly blockedTracks: Array<{ trackNamespaceSuffix: Uint8Array[]; trackName: Uint8Array }>;
 }
 
 /**
  * Result of subscribe/fetch operations.
  */
 export interface RequestResult {
-  requestId: Varint;
+  requestId: bigint;
   actions: SessionOutboundAction[];
 }
 
@@ -257,6 +384,13 @@ export interface RequestResult {
  */
 export class Session {
   private readonly setupGate: SetupGate;
+  /**
+   * Per-draft behavior bundle. Today only its {@link ProtocolProfile.requestPolicy}
+   * is consumed; the {@link ProtocolProfile.capabilities} flags are installed for
+   * the upcoming branch-cleanup slice (they let the session key off named
+   * capabilities instead of raw `_draftVersion` comparisons).
+   */
+  private readonly _profile: ProtocolProfile;
   private readonly requestIdAllocator: RequestIdAllocator;
   private readonly trackAliases = new TrackAliasManager();
 
@@ -268,6 +402,15 @@ export class Session {
   /** Outgoing fetches (as fetcher). */
   private readonly fetches = new Map<bigint, FetchStateMachine>();
 
+  /**
+   * Outgoing PUBLISH requests (as publisher, draft-18 §10.10). We initiate a
+   * PUBLISH on its own bidi request stream, advertise a Track Alias, and the peer
+   * replies REQUEST_OK (PUBLISH_OK shorthand) / REQUEST_ERROR. Distinct from
+   * {@link incomingSubscriptions} (peer-initiated SUBSCRIBE we serve) so response
+   * correlation never crosses the two roles.
+   */
+  private readonly outgoingPublishes = new Map<bigint, SubscriptionStateMachine>();
+
   /** Incoming subscriptions (as publisher). */
   private readonly incomingSubscriptions = new Map<bigint, SubscriptionStateMachine>();
 
@@ -277,8 +420,27 @@ export class Session {
   /** Outgoing namespace subscriptions (as namespace subscriber). */
   private readonly namespaceSubscriptions = new Map<bigint, NamespaceStateMachine>();
 
-  /** Pending REQUEST_UPDATEs: maps update requestId → pending update info. */
-  private readonly pendingUpdates = new Map<bigint, { existingRequestId: bigint; forward?: ForwardStateValue }>();
+  /**
+   * Outgoing SUBSCRIBE_TRACKS requests (draft-18 §10.19), keyed by Request ID.
+   * `pending` → `active` on REQUEST_OK, `terminated` on REQUEST_ERROR / stream
+   * close. `blockedTracks` accumulates PUBLISH_BLOCKED received on the response
+   * stream. (PUBLISH for matched tracks arrives on its own inbound bidi stream,
+   * handled by the inbound-request path.)
+   */
+  private readonly trackSubscriptions = new Map<bigint, TrackSubscriptionState>();
+
+  /**
+   * Pending REQUEST_UPDATEs: maps update requestId → pending update info.
+   * `forward` applies to a subscription update; `namespacePrefix` + `prefixTarget`
+   * apply a draft-18 §10.9.2 prefix change to an outbound SUBSCRIBE_NAMESPACE
+   * (`'namespace'`) or SUBSCRIBE_TRACKS (`'tracks'`) on REQUEST_OK.
+   */
+  private readonly pendingUpdates = new Map<bigint, {
+    existingRequestId: bigint;
+    forward?: ForwardStateValue;
+    namespacePrefix?: Uint8Array[];
+    prefixTarget?: 'namespace' | 'tracks';
+  }>();
 
   /**
    * Pending outgoing TRACK_STATUS requests (as subscriber).
@@ -306,6 +468,35 @@ export class Session {
   private readonly incomingTrackStatuses = new Map<bigint, { namespace: Uint8Array[]; name: Uint8Array }>();
 
   /**
+   * Incoming PUBLISH_NAMESPACE requests we accepted (draft-18, as the receiver).
+   * Maps requestId → announced namespace. Each rides its own bidi request stream;
+   * a FIN/reset of that stream withdraws the namespace (§3.3.2), handled via
+   * {@link handleInboundPublishNamespaceClosed}. Populated only for draft-18,
+   * where PUBLISH_NAMESPACE is a request stream rather than a control message.
+   */
+  private readonly incomingPublishNamespaces = new Map<bigint, { namespace: Uint8Array[] }>();
+
+  /**
+   * Incoming SUBSCRIBE_NAMESPACE requests we are serving as the publisher
+   * (draft-18, §10.18). Each rides its own continuing bidi request stream; we
+   * answer NAMESPACE / NAMESPACE_DONE on it until the subscriber cancels
+   * (FIN/reset), handled via {@link handleInboundSubscribeNamespaceClosed}.
+   * Kept separate from {@link namespaceSubscriptions} (our OUTBOUND, subscriber
+   * side) so prefix-match scans never confuse the two roles.
+   */
+  private readonly incomingNamespaceSubscriptions = new Map<bigint, NamespaceStateMachine>();
+
+  /**
+   * Incoming SUBSCRIBE_TRACKS requests we are serving as the publisher
+   * (draft-18 §10.19). Each rides its own continuing bidi request stream on which
+   * we may send PUBLISH (new streams) and PUBLISH_BLOCKED until the subscriber
+   * cancels (FIN/reset). Kept separate from {@link trackSubscriptions} (our
+   * OUTBOUND, subscriber side) AND from {@link incomingNamespaceSubscriptions}
+   * (SUBSCRIBE_NAMESPACE) so prefix-overlap checks never cross request types.
+   */
+  private readonly incomingTrackSubscriptions = new Map<bigint, { trackNamespacePrefix: Uint8Array[]; state: 'pending' | 'active' }>();
+
+  /**
    * Auth token alias cache for tokens the peer registers with us.
    * Created after setup when we know our MAX_AUTH_TOKEN_CACHE_SIZE.
    * @see draft-ietf-moq-transport-16 §9.3.1.4
@@ -323,7 +514,8 @@ export class Session {
    * Limits how many token aliases we can register with them.
    * @see draft-ietf-moq-transport-16 §9.3.1.4
    */
-  private _peerMaxAuthTokenCacheSize: Varint = varint(0n);
+  // draft-18 §10.3.1.3: vi64 (full uint64), so a raw `bigint`.
+  private _peerMaxAuthTokenCacheSize: bigint = 0n;
 
   private _state: SessionStateValue = SessionState.IDLE;
   private _newSessionUri: string | undefined;
@@ -333,9 +525,16 @@ export class Session {
   constructor(
     private readonly _role: EndpointRoleValue,
     private readonly _draftVersion: DraftVersion = 16,
+    /**
+     * Session-level policy. `webtransport: true` enables the §10.3.1.1/§10.3.1.2
+     * rule that PATH/AUTHORITY MUST NOT appear in SETUP over WebTransport (the WT
+     * adapter sets this); default `false` = native QUIC.
+     */
+    options: { webtransport?: boolean } = {},
   ) {
-    this.setupGate = new SetupGate(_role);
-    this.requestIdAllocator = new RequestIdAllocator(_role);
+    this.setupGate = new SetupGate(_role, _draftVersion, options.webtransport ?? false);
+    this._profile = getProtocolProfile(_draftVersion);
+    this.requestIdAllocator = new RequestIdAllocator(_role, undefined, this._profile.requestPolicy);
   }
 
   // ─── Getters ──────────────────────────────────────────────────────────
@@ -370,7 +569,7 @@ export class Session {
    * Limits how many token alias bytes we can register with them.
    * @see draft-ietf-moq-transport-16 §9.3.1.4
    */
-  get peerMaxAuthTokenCacheSize(): Varint {
+  get peerMaxAuthTokenCacheSize(): bigint {
     return this._peerMaxAuthTokenCacheSize;
   }
 
@@ -382,6 +581,16 @@ export class Session {
    */
   initiateSetup(options: SetupOptions = {}): SessionOutboundAction[] {
     this.assertState(SessionState.IDLE, 'initiateSetup');
+
+    if (this._draftVersion === 18) {
+      // draft-18: send the unified SETUP (no MAX_REQUEST_ID — QUIC stream limits).
+      const setup = this.setupGate.createSetup18(options);
+      if (options.maxAuthTokenCacheSize !== undefined) {
+        this._ownMaxAuthTokenCacheSize = Number(options.maxAuthTokenCacheSize);
+      }
+      this._state = SessionState.SETUP_PENDING;
+      return [this.sendControl(setup)];
+    }
 
     const clientSetup = this.setupGate.createClientSetup(options);
 
@@ -411,6 +620,15 @@ export class Session {
       throw new SessionError('Only server can call completeSetup', 'INVALID_STATE');
     }
 
+    if (this._draftVersion === 18) {
+      const setup = this.setupGate.createSetup18(options);
+      if (options.maxAuthTokenCacheSize !== undefined) {
+        this._ownMaxAuthTokenCacheSize = Number(options.maxAuthTokenCacheSize);
+      }
+      this._state = SessionState.ESTABLISHED;
+      return [this.sendControl(setup)];
+    }
+
     const serverSetup = this.setupGate.createServerSetup(options);
 
     // Set our MAX_REQUEST_ID so validateIncoming() knows what we advertised
@@ -434,7 +652,14 @@ export class Session {
    * Handle an incoming control message.
    * Returns actions to execute in response.
    */
-  handleControlMessage(msg: ControlMessage): SessionOutboundAction[] {
+  handleControlMessage(decoded: DecodedControlMessage, endpoint?: RequestEndpoint): SessionOutboundAction[] {
+    // Draft-18 correlation seam: when this message arrived on a request stream,
+    // the I/O/topology layer supplies the stream-derived Request ID (responses)
+    // or update target (REQUEST_UPDATE). For draft-14/16 the Request ID is on
+    // the wire and `endpoint` is omitted, so this is a passthrough that simply
+    // re-types the decoded message as a fully-correlated ControlMessage.
+    const msg = this.applyRequestEndpoint(decoded, endpoint);
+
     // Setup phase validation
     if (this._state === SessionState.IDLE || this._state === SessionState.SETUP_PENDING) {
       return this.handleSetupMessage(msg);
@@ -490,6 +715,21 @@ export class Session {
           return this.handleIncomingTrackStatus(msg as TrackStatus);
         case 'PUBLISH_NAMESPACE':
           return this.handleIncomingPublishNamespace(msg as PublishNamespace);
+        case 'SUBSCRIBE_NAMESPACE':
+          // draft-18 only: inbound SUBSCRIBE_NAMESPACE is a publisher-side
+          // continuing request stream (§10.18). For draft-14/16 it is not handled
+          // as an inbound message — fall through to the unsupported-type path.
+          if (this._draftVersion === 18) {
+            return this.handleIncomingSubscribeNamespace(msg as SubscribeNamespace);
+          }
+          return this.handleUnsupportedControlMessage(msg);
+        case 'SUBSCRIBE_TRACKS':
+          // draft-18 only: inbound SUBSCRIBE_TRACKS is a publisher-side continuing
+          // request stream (§10.19). It has no draft-14/16 inbound form.
+          if (this._draftVersion === 18) {
+            return this.handleIncomingSubscribeTracks(msg as SubscribeTracks);
+          }
+          return this.handleUnsupportedControlMessage(msg);
         case 'PUBLISH_NAMESPACE_DONE':
           return this.handlePublishNamespaceDone(msg as PublishNamespaceDone);
         case 'PUBLISH_NAMESPACE_CANCEL':
@@ -501,27 +741,7 @@ export class Session {
         case 'UNSUBSCRIBE_NAMESPACE':
           return this.handleIncomingUnsubscribeNamespace(msg as UnsubscribeNamespace);
         default:
-          // Draft-14: no generic REQUEST_ERROR on wire (0x05 is SUBSCRIBE_ERROR).
-          // Receiving a truly unsupported message type is a protocol violation.
-          if (this._draftVersion === 14) {
-            return this.closeWithError(
-              SessionErrorCode.PROTOCOL_VIOLATION,
-              `Unsupported message type ${msg.type}`,
-            );
-          }
-          // §3.1: "Limited endpoints SHOULD respond to any unsupported messages
-          // with the appropriate NOT_SUPPORTED error code, rather than ignoring them."
-          if ('requestId' in msg && typeof (msg as { requestId: unknown }).requestId === 'bigint') {
-            const reqId = (msg as { requestId: Varint }).requestId;
-            return [this.sendControl({
-              type: 'REQUEST_ERROR',
-              requestId: reqId,
-              errorCode: RequestErrorCode.NOT_SUPPORTED,
-              retryInterval: varint(0n),
-              errorReason: `Message type ${msg.type} is not supported`,
-            })];
-          }
-          return [];
+          return this.handleUnsupportedControlMessage(msg);
       }
     } catch (e) {
       return this.closeWithError(
@@ -529,6 +749,72 @@ export class Session {
         e instanceof Error ? e.message : String(e),
       );
     }
+  }
+
+  /**
+   * Default handling for a control message type this session does not process.
+   * Draft-14: PROTOCOL_VIOLATION (no generic REQUEST_ERROR on the wire). Draft-16+:
+   * respond NOT_SUPPORTED (§3.1) when the message carries a Request ID, else ignore.
+   */
+  private handleUnsupportedControlMessage(msg: ControlMessage): SessionOutboundAction[] {
+    if (this._draftVersion === 14) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        `Unsupported message type ${msg.type}`,
+      );
+    }
+    // §3.1: "Limited endpoints SHOULD respond to any unsupported messages with the
+    // appropriate NOT_SUPPORTED error code, rather than ignoring them."
+    if ('requestId' in msg && typeof (msg as { requestId: unknown }).requestId === 'bigint') {
+      const reqId = (msg as { requestId: bigint }).requestId;
+      return [this.sendControl({
+        type: 'REQUEST_ERROR',
+        requestId: reqId,
+        errorCode: RequestErrorCode.NOT_SUPPORTED,
+        retryInterval: varint(0n),
+        errorReason: `Message type ${msg.type} is not supported`,
+      })];
+    }
+    return [];
+  }
+
+  /**
+   * Overlay stream-derived correlation onto a decoded control message.
+   *
+   * Draft-14/16 carry every Request ID on the wire, so the relevant field is
+   * already present and this returns the message unchanged. Draft-18 omits the
+   * Request ID from responses (correlated by request stream) and omits the
+   * "Existing Request ID" from REQUEST_UPDATE (the stream identifies the
+   * target); in those cases the topology layer recovers the value from stream
+   * context and supplies it here — never a placeholder.
+   */
+  private applyRequestEndpoint(msg: DecodedControlMessage, endpoint?: RequestEndpoint): ControlMessage {
+    // No stream-derived context (draft-14/16): the wire already carried every
+    // Request ID, so the decoded message is already a full ControlMessage.
+    if (endpoint === undefined) {
+      return msg as ControlMessage;
+    }
+    // REQUEST_UPDATE: the wire Request ID is the update's own (new) ID; the
+    // removed "Existing Request ID" target comes from stream context.
+    if (msg.type === 'REQUEST_UPDATE') {
+      const m = msg as RequestUpdate;
+      if (endpoint.existingRequestId !== undefined && m.existingRequestId === undefined) {
+        // Assign the raw bigint — endpoint IDs are stream-derived and may span
+        // the full draft-18 uint64 range; re-branding through varint() would
+        // throw for values above the QUIC range, defeating the widening.
+        return { ...m, existingRequestId: endpoint.existingRequestId } as ControlMessage;
+      }
+      return msg as ControlMessage;
+    }
+    // Responses whose Request ID is absent on the wire (draft-18) correlate via
+    // the endpoint. When the wire already carried a Request ID (draft-14/16),
+    // it is left untouched.
+    const withId = msg as { requestId?: bigint };
+    if (withId.requestId === undefined) {
+      // Raw bigint — see note above; the endpoint seam carries full uint64.
+      return { ...msg, requestId: endpoint.requestId } as ControlMessage;
+    }
+    return msg as ControlMessage;
   }
 
   private handleSetupMessage(msg: ControlMessage): SessionOutboundAction[] {
@@ -571,6 +857,23 @@ export class Session {
           this.processSetupAuthTokens(result.authTokens, false);
         }
         this._state = SessionState.ESTABLISHED;
+      } else if (msg.type === 'SETUP') {
+        // draft-18 unified SETUP (role-neutral wire; this side interprets it).
+        const result = this.setupGate.handleSetup18(msg as Setup);
+        this._peerMaxRequestId = result.peerMaxRequestId; // 0 — draft-18 has no credit
+        // No MAX_REQUEST_ID in draft-18: do NOT update the request-id allocator credit.
+        if (result.peerMaxAuthTokenCacheSize !== undefined) {
+          this._peerMaxAuthTokenCacheSize = result.peerMaxAuthTokenCacheSize;
+        }
+        this.initAuthCache();
+        if (result.authTokens) {
+          // §10.3.1.4: ANY endpoint receiving a SETUP REGISTER that exceeds its
+          // MAX_AUTH_TOKEN_CACHE_SIZE MUST treat it as USE_VALUE (downgrade) rather
+          // than failing with AUTH_TOKEN_CACHE_OVERFLOW — both client and server,
+          // not only the server processing a CLIENT_SETUP.
+          this.processSetupAuthTokens(result.authTokens, true);
+        }
+        this._state = this.setupGate.sessionState;
       }
 
       return [];
@@ -699,11 +1002,15 @@ export class Session {
    * @see draft-ietf-moq-transport-16 §9.2.2.1
    */
   private processMessageAuthTokens(
-    values: (Varint | Uint8Array)[],
+    values: ParameterValue[],
   ): { error: Varint; reason: string } | undefined {
     if (!this.authCache) return undefined;
 
     const resolved: ResolvedToken[] = [];
+
+    // draft-18 Token internals (Alias Type / Token Alias / Token Type) are vi64
+    // (full uint64); draft-14/16 use QUIC varint. Pick the wire parser by version.
+    const parseToken = this._draftVersion === 18 ? parseAuthorizationToken18 : parseAuthorizationToken;
 
     for (const rawValue of values) {
       if (!(rawValue instanceof Uint8Array)) continue;
@@ -711,7 +1018,7 @@ export class Session {
       // Parse token structure
       let token: AuthorizationToken;
       try {
-        token = parseAuthorizationToken(rawValue);
+        token = parseToken(rawValue);
       } catch {
         // §9.2.2.1: malformed → KEY_VALUE_FORMATTING_ERROR
         return {
@@ -759,21 +1066,46 @@ export class Session {
     return true;
   }
 
+  /**
+   * Handle a GOAWAY received on the CONTROL stream (§9.4 / §10.4). This does NOT
+   * close, migrate, or start timers — it transitions to DRAINING so local new
+   * requests are refused, and stores the New Session URI for the application.
+   * A GOAWAY arriving on a request stream is handled separately by the topology.
+   */
   private handleGoaway(msg: Goaway): SessionOutboundAction[] {
-    // §9.4: Multiple GOAWAYs are a protocol violation
+    // §9.4 / §10.4: at most one GOAWAY on the control stream.
     if (this._goawayReceived) {
       return this.closeWithError(
         SessionErrorCode.PROTOCOL_VIOLATION,
-        'Received multiple GOAWAY messages',
+        'Received multiple GOAWAY messages on the control stream',
       );
     }
 
-    // §9.4: Server receiving GOAWAY with non-empty New Session URI is PROTOCOL_VIOLATION
+    // §9.4 / §10.4: a server MUST close if it receives a non-empty New Session URI
+    // (clients cannot instruct servers to initiate connections).
     if (this._role === EndpointRole.SERVER && msg.newSessionUri.length > 0) {
       return this.closeWithError(
         SessionErrorCode.PROTOCOL_VIOLATION,
         'Server received GOAWAY with non-empty New Session URI',
       );
+    }
+
+    // draft-18 §10.4: a control-stream GOAWAY MUST carry the Request ID, and its
+    // parity MUST match the receiver's own request-id parity (the GOAWAY refers
+    // to the smallest of OUR requests the peer may not have processed).
+    if (this._draftVersion === 18) {
+      if (msg.requestId === undefined) {
+        return this.closeWithError(
+          SessionErrorCode.PROTOCOL_VIOLATION,
+          'draft-18 control-stream GOAWAY is missing the Request ID',
+        );
+      }
+      if ((msg.requestId & 1n) !== this.requestIdAllocator.parityBit) {
+        return this.closeWithError(
+          SessionErrorCode.INVALID_REQUEST_ID,
+          `GOAWAY Request ID ${msg.requestId} has the wrong parity for this endpoint`,
+        );
+      }
     }
 
     this._goawayReceived = true;
@@ -827,7 +1159,7 @@ export class Session {
    * (caller should append these to its own output).
    * Returns `{}` when validation passes with no replenishment needed.
    */
-  private validateAndReplenish(requestId: Varint): {
+  private validateAndReplenish(requestId: bigint): {
     error?: SessionOutboundAction[];
     replenish?: SessionOutboundAction[];
   } {
@@ -892,6 +1224,14 @@ export class Session {
   }
 
   private handleRequestError(msg: RequestErrorMsg): SessionOutboundAction[] {
+    // draft-18 §10.6.2: a Redirect is only valid for certain request CONTEXTS,
+    // which only the session knows (the codec parsed it blind). Validate before
+    // the normal per-request dispatch terminates the request as usual.
+    if (msg.redirect) {
+      const invalid = this.validateRedirectContext(msg);
+      if (invalid) return invalid;
+    }
+
     // Could be for pending REQUEST_UPDATE
     const pending = this.pendingUpdates.get(msg.requestId as bigint);
     if (pending) {
@@ -927,10 +1267,25 @@ export class Session {
       return [];
     }
 
+    // draft-18 §10.19: SUBSCRIBE_TRACKS rejected (REQUEST_ERROR on its stream).
+    const trackSubErr = this.trackSubscriptions.get(msg.requestId as bigint);
+    if (trackSubErr) {
+      trackSubErr.state = 'terminated';
+      this.trackSubscriptions.delete(msg.requestId as bigint);
+      return [];
+    }
+
     // PUBLISH_NAMESPACE rejection (§9.20)
     const pubNsErr = this.publishedNamespaces.get(msg.requestId as bigint);
     if (pubNsErr && pubNsErr.state === 'pending') {
       this.publishedNamespaces.delete(msg.requestId as bigint);
+      return [];
+    }
+
+    // draft-18 §10.10: our outbound PUBLISH rejected — terminate only that publish.
+    const outPubErr = this.outgoingPublishes.get(msg.requestId as bigint);
+    if (outPubErr) {
+      this.outgoingPublishes.delete(msg.requestId as bigint);
       return [];
     }
 
@@ -939,6 +1294,58 @@ export class Session {
       SessionErrorCode.INVALID_REQUEST_ID,
       `Unknown request ID ${msg.requestId} for REQUEST_ERROR`,
     );
+  }
+
+  /**
+   * Validate a Redirect against the request CONTEXT it answers (§10.6.2). Returns
+   * a session-close action if invalid, or `null` if the Redirect is acceptable
+   * (the normal handleRequestError dispatch then terminates the request).
+   *
+   *   - REDIRECT is valid only for SUBSCRIBE / FETCH / TRACK_STATUS /
+   *     PUBLISH_NAMESPACE / SUBSCRIBE_NAMESPACE responses; on any other request
+   *     type (REQUEST_UPDATE / SUBSCRIBE_TRACKS / PUBLISH / …) it is a violation.
+   *   - A server endpoint MUST NOT receive a non-empty Connect URI.
+   *   - A namespace-scoped request (PUBLISH_NAMESPACE / SUBSCRIBE_NAMESPACE) MUST
+   *     NOT carry a replacement Track Name.
+   */
+  private validateRedirectContext(msg: RequestErrorMsg): SessionOutboundAction[] | null {
+    const rid = msg.requestId as bigint;
+    const redirect = msg.redirect!;
+
+    // §10.6.2: a server never receives a relocation to another session.
+    if (this._role === EndpointRole.SERVER && redirect.connectUri.length > 0) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        'REQUEST_ERROR Redirect with a non-empty Connect URI received by a server endpoint (§10.6.2)',
+      );
+    }
+
+    // Request types for which REDIRECT is explicitly NOT allowed.
+    if (this.pendingUpdates.has(rid) || this.trackSubscriptions.has(rid) || this.outgoingPublishes.has(rid)) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        `REQUEST_ERROR Redirect is not valid for this request type (request ${rid})`,
+      );
+    }
+
+    const isPubNs = this.publishedNamespaces.has(rid);
+    const isSubNs = this.namespaceSubscriptions.has(rid);
+    const allowed = this.subscriptions.has(rid) || this.fetches.has(rid)
+      || this.pendingTrackStatuses.has(rid) || isPubNs || isSubNs;
+    if (!allowed) {
+      // Unknown request ID — let the normal dispatch close with INVALID_REQUEST_ID.
+      return null;
+    }
+
+    // §10.6.2: a namespace-scoped request must not carry a replacement Track Name.
+    if ((isPubNs || isSubNs) && redirect.trackName.length > 0) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        'REQUEST_ERROR Redirect for a namespace-scoped request must have an empty Track Name (§10.6.2)',
+      );
+    }
+
+    return null; // valid — terminate the request as usual
   }
 
   private handleFetchOk(msg: FetchOk): SessionOutboundAction[] {
@@ -975,16 +1382,93 @@ export class Session {
     return [];
   }
 
+  /**
+   * Terminate a pending OUTGOING subscription or fetch as a malformed track
+   * (§2.4.2) — e.g. a SUBSCRIBE_OK / FETCH_OK whose Track Properties carried a
+   * data-Object-only Property (wrong scope, not a wire-format error). This is NOT
+   * a session close: only the one request is reset (the I/O layer RESETs its
+   * stream). No-op for an unknown request ID.
+   *
+   * @see draft-ietf-moq-transport-18 §2.4.2
+   */
+  handleMalformedTrack(requestId: bigint): SessionOutboundAction[] {
+    const sub = this.subscriptions.get(requestId as bigint);
+    if (sub) {
+      if (!sub.isTerminated) sub.handleRequestError(RequestErrorCode.MALFORMED_TRACK, 'malformed track');
+      return [];
+    }
+    const fetch = this.fetches.get(requestId as bigint);
+    if (fetch && !fetch.isCompleted) {
+      fetch.handleRequestError(RequestErrorCode.MALFORMED_TRACK, 'malformed track');
+    }
+    return [];
+  }
+
+  /**
+   * draft-18: resolve which response a REQUEST_OK stands in for, by the outbound
+   * request state it correlates to. Returns the effective response message type
+   * used for parameter-scope validation (§10.2), or `undefined` if the Request ID
+   * matches no pending request (the caller then closes with INVALID_REQUEST_ID).
+   * Each Request ID lives in exactly one of these maps.
+   */
+  private d18RequestOkContext(requestId: bigint): string | undefined {
+    if (this.pendingUpdates.has(requestId)) return 'REQUEST_UPDATE_OK';
+    if (this.pendingTrackStatuses.has(requestId)) return 'TRACK_STATUS_OK';
+    if (this.namespaceSubscriptions.has(requestId)) return 'SUBSCRIBE_NAMESPACE_OK';
+    if (this.trackSubscriptions.has(requestId)) return 'SUBSCRIBE_TRACKS_OK';
+    if (this.publishedNamespaces.has(requestId)) return 'PUBLISH_NAMESPACE_OK';
+    if (this.outgoingPublishes.has(requestId)) return 'PUBLISH_OK';
+    return undefined;
+  }
+
   private handleRequestOk(msg: RequestOk): SessionOutboundAction[] {
+    // draft-18 Track Properties are CONTEXT-dependent on a REQUEST_OK: valid only
+    // when it answers a TRACK_STATUS (TRACK_STATUS_OK). For every other REQUEST_OK
+    // context (REQUEST_UPDATE / PUBLISH_NAMESPACE / SUBSCRIBE_NAMESPACE /
+    // SUBSCRIBE_TRACKS / PUBLISH responses) they MUST be empty — the codec decoded
+    // them blind, so we enforce the request-stream context here.
+    if (((msg.trackProperties ?? msg.trackExtensions)?.size ?? 0) > 0 && !this.pendingTrackStatuses.has(msg.requestId as bigint)) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        `Track Properties are not valid on this REQUEST_OK (request ${msg.requestId})`,
+      );
+    }
+
+    // draft-18 §10.2.1: validate the REQUEST_OK's Message Parameters against the
+    // scope of the RESPONSE it stands in for, resolved from the request stream
+    // (PUBLISH_OK / REQUEST_UPDATE_OK / TRACK_STATUS_OK / namespace responses).
+    if (this._draftVersion === 18 && (msg.parameters?.size ?? 0) > 0) {
+      const context = this.d18RequestOkContext(msg.requestId as bigint);
+      if (context) {
+        const paramError = this.validateMessageParams(msg.parameters, context);
+        if (paramError) return this.closeWithError(paramError.error, paramError.reason);
+      }
+      // context === undefined → unknown request id; the dispatch below closes with
+      // INVALID_REQUEST_ID, so no parameter validation is needed here.
+    }
+
     const pending = this.pendingUpdates.get(msg.requestId as bigint);
     if (pending) {
       this.pendingUpdates.delete(msg.requestId as bigint);
 
-      // Apply the update to the subscription
+      // Apply the update to the subscription (outgoing or, for a draft-18
+      // PUBLISH-initiated subscription, the incoming one).
       if (pending.forward !== undefined) {
-        const sub = this.subscriptions.get(pending.existingRequestId);
+        const sub = this.subscriptions.get(pending.existingRequestId)
+          ?? this.incomingSubscriptions.get(pending.existingRequestId);
         if (sub) {
           sub.updateForwardState(pending.forward);
+        }
+      }
+
+      // draft-18 §10.9.2: a prefix update is confirmed — replace the stored
+      // Track Namespace Prefix on the outbound namespace/tracks subscription.
+      if (pending.namespacePrefix && pending.prefixTarget) {
+        if (pending.prefixTarget === 'namespace') {
+          this.namespaceSubscriptions.get(pending.existingRequestId)?.updatePrefix(pending.namespacePrefix);
+        } else {
+          const ts = this.trackSubscriptions.get(pending.existingRequestId);
+          if (ts) ts.trackNamespacePrefix = pending.namespacePrefix;
         }
       }
 
@@ -1005,10 +1489,25 @@ export class Session {
       return [];
     }
 
+    // draft-18 §10.19: SUBSCRIBE_TRACKS accepted (REQUEST_OK on its stream).
+    const trackSubOk = this.trackSubscriptions.get(msg.requestId as bigint);
+    if (trackSubOk) {
+      trackSubOk.state = 'active';
+      return [];
+    }
+
     // PUBLISH_NAMESPACE response (§9.20)
     const pubNs = this.publishedNamespaces.get(msg.requestId as bigint);
     if (pubNs && pubNs.state === 'pending') {
       pubNs.state = 'active';
+      return [];
+    }
+
+    // draft-18 §10.10: our outbound PUBLISH accepted (REQUEST_OK = PUBLISH_OK
+    // shorthand). Establish the publisher-side subscription; keep the stream.
+    const outPub = this.outgoingPublishes.get(msg.requestId as bigint);
+    if (outPub && outPub.state === SubscriptionState.PENDING) {
+      outPub.acceptOutboundPublish();
       return [];
     }
 
@@ -1055,10 +1554,54 @@ export class Session {
     );
   }
 
+  /**
+   * Draft-18 §2.4.1 defensive name validation for inbound full-track-name requests.
+   * The codec validates on decode, but a message can be constructed directly and
+   * passed to {@link handleControlMessage} (tests / programmatic APIs), so we re-check
+   * BEFORE any state/alias/request map is mutated. Returns a PROTOCOL_VIOLATION close
+   * action on violation, or `null` when valid (or not draft-18, which keeps legacy
+   * behavior unchanged). An empty namespace is permitted (allowEmptyNamespace).
+   */
+  private validateFullName18(namespace: Uint8Array[], trackName: Uint8Array): SessionOutboundAction[] | null {
+    if (this._draftVersion !== 18) return null;
+    try {
+      validateFullTrackName(namespace, trackName, { allowEmptyNamespace: true });
+    } catch (e) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        e instanceof Error ? e.message : 'invalid Full Track Name (§2.4.1)',
+      );
+    }
+    return null;
+  }
+
+  /** Draft-18 §2.4.1 defensive validation for a full Track Namespace (no track name,
+   *  e.g. PUBLISH_NAMESPACE). Same contract as {@link validateFullName18}. */
+  private validateNamespace18(namespace: Uint8Array[]): SessionOutboundAction[] | null {
+    if (this._draftVersion !== 18) return null;
+    try {
+      validateTrackNamespace(namespace, { allowEmpty: true });
+    } catch (e) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        e instanceof Error ? e.message : 'invalid Track Namespace (§2.4.1)',
+      );
+    }
+    return null;
+  }
+
   private handleIncomingSubscribe(msg: Subscribe): SessionOutboundAction[] {
+    // §2.4.1: validate the Full Track Name BEFORE creating any state.
+    const nameError = this.validateFullName18(msg.trackNamespace, msg.trackName);
+    if (nameError) return nameError;
+
     // Validate incoming request ID and auto-replenish MAX_REQUEST_ID §9.5
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
+
+    // §3.2: reserved `.`/`.session` namespace → REQUEST_ERROR DOES_NOT_EXIST.
+    const reserved = this.rejectReservedNamespace(msg.trackNamespace, msg.requestId, validated.replenish);
+    if (reserved) return reserved;
 
     // Create publisher-side subscription state machine
     const sub = SubscriptionStateMachine.createAsPublisher(
@@ -1079,6 +1622,10 @@ export class Session {
    * @see draft-ietf-moq-transport-14 §9.13
    */
   private handleIncomingPublish(msg: Publish): SessionOutboundAction[] {
+    // §2.4.1: validate the Full Track Name BEFORE registering an alias or state.
+    const nameError = this.validateFullName18(msg.trackNamespace, msg.trackName);
+    if (nameError) return nameError;
+
     // Validate incoming request ID and auto-replenish MAX_REQUEST_ID §9.5
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
@@ -1111,17 +1658,29 @@ export class Session {
   }
 
   private handleIncomingFetch(msg: Fetch): SessionOutboundAction[] {
+    // §2.4.1: a standalone FETCH carries a Full Track Name — validate it BEFORE any
+    // state. (A joining FETCH references an existing request and carries no name.)
+    if (msg.fetch.fetchType === 0x1) {
+      const sf = msg.fetch as StandaloneFetch;
+      const nameError = this.validateFullName18(sf.trackNamespace, sf.trackName);
+      if (nameError) return nameError;
+    }
+
     // Validate incoming request ID and auto-replenish MAX_REQUEST_ID §9.5
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
 
     // Extract range from standalone fetch
-    let startGroup: Varint | undefined;
-    let startObject: Varint | undefined;
-    let endGroup: Varint | undefined;
-    let endObject: Varint | undefined;
+    let startGroup: bigint | undefined;
+    let startObject: bigint | undefined;
+    let endGroup: bigint | undefined;
+    let endObject: bigint | undefined;
     if (msg.fetch.fetchType === 0x1) {
       const sf = msg.fetch as StandaloneFetch;
+      // §3.2: reserved `.`/`.session` namespace → REQUEST_ERROR DOES_NOT_EXIST.
+      // (Joining FETCH references an existing request and carries no namespace.)
+      const reserved = this.rejectReservedNamespace(sf.trackNamespace, msg.requestId, validated.replenish);
+      if (reserved) return reserved;
       startGroup = sf.startLocation.group;
       startObject = sf.startLocation.object;
       endGroup = sf.endLocation.group;
@@ -1166,17 +1725,51 @@ export class Session {
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
 
-    // §9.11: Look up Existing Request ID — must match an active subscription or fetch
-    const sub = this.incomingSubscriptions.get(msg.existingRequestId as bigint);
-    const fetch = this.incomingFetches.get(msg.existingRequestId as bigint);
+    // draft-18 §10.9.2: a peer prefix update on an inbound SUBSCRIBE_NAMESPACE /
+    // SUBSCRIBE_TRACKS we serve (separate maps — handle before the generic lookup,
+    // which would otherwise treat the Existing Request ID as unknown and close).
+    if (this.incomingNamespaceSubscriptions.has(msg.existingRequestId as bigint)
+      || this.incomingTrackSubscriptions.has(msg.existingRequestId as bigint)) {
+      return this.handleIncomingPrefixUpdate(msg, validated.replenish);
+    }
 
-    if (!sub && !fetch) {
+    // draft-18 §10.2.14: TRACK_NAMESPACE_PREFIX is in scope for REQUEST_UPDATE
+    // ONLY when it targets a SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS (handled
+    // above). On a REQUEST_UPDATE for a normal subscription/fetch/publish it is
+    // out of scope → PROTOCOL_VIOLATION.
+    if (this._draftVersion === 18 && msg.parameters.has(MessageParam.TRACK_NAMESPACE_PREFIX as bigint)) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        `TRACK_NAMESPACE_PREFIX is out of scope for a REQUEST_UPDATE that does not target a SUBSCRIBE_NAMESPACE/SUBSCRIBE_TRACKS (§10.2.14)`,
+      );
+    }
+
+    // §9.11: Look up Existing Request ID — must match an active subscription we
+    // serve, an OUTBOUND PUBLISH we initiated (draft-18 §10.9, a peer update on
+    // our PUBLISH stream), a fetch, or an inbound PUBLISH_NAMESPACE we accepted.
+    // An outbound PUBLISH is a publisher-side subscription, so it follows the
+    // same established-state / FORWARD / REQUEST_OK path as an inbound one.
+    const sub = this.incomingSubscriptions.get(msg.existingRequestId as bigint)
+      ?? this.outgoingPublishes.get(msg.existingRequestId as bigint);
+    const fetch = this.incomingFetches.get(msg.existingRequestId as bigint);
+    const pubNs = this.incomingPublishNamespaces.get(msg.existingRequestId as bigint);
+
+    if (!sub && !fetch && !pubNs) {
       // §9.11: "MUST close the session with PROTOCOL_VIOLATION if the sender
       // specifies an invalid Existing Request ID"
       return this.closeWithError(
         SessionErrorCode.PROTOCOL_VIOLATION,
         `REQUEST_UPDATE references unknown Existing Request ID ${msg.existingRequestId}`,
       );
+    }
+
+    // draft-18 §10.9: a PUBLISH_NAMESPACE may be updated on its request stream.
+    // We have no per-namespace mutable state to apply yet — acknowledge with
+    // REQUEST_OK (or, for v14, no response). Params are accepted as-is.
+    if (pubNs && !sub && !fetch) {
+      if (this._draftVersion === 14) return validated.replenish ?? [];
+      const requestOk: RequestOk = { type: 'REQUEST_OK', requestId: msg.requestId, parameters: new Map() };
+      return [this.sendControl(requestOk), ...(validated.replenish ?? [])];
     }
 
     // Must be ESTABLISHED to accept updates
@@ -1242,6 +1835,108 @@ export class Session {
   }
 
   /**
+   * draft-18 §10.9.2: a peer REQUEST_UPDATE changing the Track Namespace Prefix of
+   * an inbound SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS we serve. Validates the
+   * prefix, enforces the overlap rule independently per type, and either applies
+   * the new prefix (REQUEST_OK) or rejects with PREFIX_OVERLAP. A malformed prefix
+   * (>32 fields / >4096 bytes) closes the session with PROTOCOL_VIOLATION.
+   */
+  private handleIncomingPrefixUpdate(
+    msg: RequestUpdate,
+    replenish: SessionOutboundAction[] | undefined,
+  ): SessionOutboundAction[] {
+    const existingRid = msg.existingRequestId as bigint;
+    const incNs = this.incomingNamespaceSubscriptions.get(existingRid);
+    const incTracks = this.incomingTrackSubscriptions.get(existingRid);
+
+    // §6.1 / §10.9.2: the original SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS must get
+    // its single REQUEST_OK / REQUEST_ERROR as the FIRST response, and a prefix
+    // update is only permitted for an ESTABLISHED request. A REQUEST_UPDATE before
+    // we have accepted the request is a PROTOCOL_VIOLATION.
+    const accepted = incNs ? incNs.isActive : incTracks?.state === 'active';
+    if (!accepted) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        `REQUEST_UPDATE for ${incNs ? 'SUBSCRIBE_NAMESPACE' : 'SUBSCRIBE_TRACKS'} ${existingRid} before it was accepted`,
+      );
+    }
+
+    // §10.9: a parameter absent from REQUEST_UPDATE leaves its value unchanged.
+    // No TRACK_NAMESPACE_PREFIX → nothing to change; acknowledge.
+    const prefixVals = msg.parameters.get(MessageParam.TRACK_NAMESPACE_PREFIX as bigint);
+    const newPrefix = prefixVals && prefixVals.length > 0 ? prefixVals[prefixVals.length - 1] : undefined;
+    if (newPrefix === undefined) {
+      const ok: RequestOk = { type: 'REQUEST_OK', requestId: msg.requestId, parameters: new Map() };
+      return [this.sendControl(ok), ...(replenish ?? [])];
+    }
+    if (!Array.isArray(newPrefix)) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        'TRACK_NAMESPACE_PREFIX value is not a Track Namespace tuple',
+      );
+    }
+    try {
+      validateTrackNamespacePrefix(newPrefix);
+    } catch (e) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        e instanceof Error ? e.message : 'Malformed Track Namespace Prefix in REQUEST_UPDATE',
+      );
+    }
+
+    // Overlap is checked against OTHER subscriptions of the SAME type only
+    // (§10.18/§10.19 independent overlap spaces), excluding this request itself.
+    if (incNs) {
+      for (const [rid, existing] of this.incomingNamespaceSubscriptions) {
+        if (rid === existingRid || existing.isTerminated) continue;
+        if (prefixesOverlap(existing.namespacePrefix, newPrefix)) {
+          return this.prefixOverlapError(msg.requestId, 'SUBSCRIBE_NAMESPACE', existingRid, replenish);
+        }
+      }
+      incNs.updatePrefix(newPrefix);
+    } else if (incTracks) {
+      for (const [rid, existing] of this.incomingTrackSubscriptions) {
+        if (rid === existingRid) continue;
+        if (prefixesOverlap(existing.trackNamespacePrefix, newPrefix)) {
+          return this.prefixOverlapError(msg.requestId, 'SUBSCRIBE_TRACKS', existingRid, replenish);
+        }
+      }
+      incTracks.trackNamespacePrefix = newPrefix;
+    }
+
+    const ok: RequestOk = { type: 'REQUEST_OK', requestId: msg.requestId, parameters: new Map() };
+    return [this.sendControl(ok), ...(replenish ?? [])];
+  }
+
+  /**
+   * Reject a prefix update with REQUEST_ERROR / PREFIX_OVERLAP (§10.6.2). For a
+   * SUBSCRIBE_NAMESPACE, §10.9.1 requires the responder to close the bidi stream,
+   * so the publisher-side state is terminated here (the I/O layer closes the
+   * stream after writing the error). A SUBSCRIBE_TRACKS keeps its existing prefix.
+   */
+  private prefixOverlapError(
+    requestId: bigint,
+    kind: 'SUBSCRIBE_NAMESPACE' | 'SUBSCRIBE_TRACKS',
+    existingRid: bigint,
+    replenish: SessionOutboundAction[] | undefined,
+  ): SessionOutboundAction[] {
+    if (kind === 'SUBSCRIBE_NAMESPACE') {
+      this.incomingNamespaceSubscriptions.delete(existingRid);
+    }
+    const err: RequestErrorMsg = {
+      type: 'REQUEST_ERROR',
+      requestId,
+      errorCode: RequestErrorCode.PREFIX_OVERLAP,
+      retryInterval: varint(0n),
+      errorReason: `Track Namespace Prefix overlaps an existing ${kind}`,
+      // draft-14 → SUBSCRIBE_NAMESPACE_ERROR. SUBSCRIBE_TRACKS is draft-18-only
+      // (no draft-14 wire error), so it carries no requestKind. Ignored by 16/18.
+      ...(kind === 'SUBSCRIBE_NAMESPACE' ? { requestKind: 'SUBSCRIBE_NAMESPACE' as const } : {}),
+    };
+    return [this.sendControl(err), ...(replenish ?? [])];
+  }
+
+  /**
    * Handle incoming TRACK_STATUS from a potential subscriber.
    *
    * §9.19: "The receiver of a TRACK_STATUS message treats it identically as if it
@@ -1254,9 +1949,17 @@ export class Session {
    * @see draft-ietf-moq-transport-16 §9.19
    */
   private handleIncomingTrackStatus(msg: TrackStatus): SessionOutboundAction[] {
+    // §2.4.1: validate the Full Track Name BEFORE recording any state.
+    const nameError = this.validateFullName18(msg.trackNamespace, msg.trackName);
+    if (nameError) return nameError;
+
     // Validate incoming request ID and auto-replenish MAX_REQUEST_ID §9.5
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
+
+    // §3.2: reserved `.`/`.session` namespace → REQUEST_ERROR DOES_NOT_EXIST.
+    const reserved = this.rejectReservedNamespace(msg.trackNamespace, msg.requestId, validated.replenish);
+    if (reserved) return reserved;
 
     // §9.19: Do NOT create subscription state
     this.incomingTrackStatuses.set(msg.requestId as bigint, {
@@ -1306,7 +2009,7 @@ export class Session {
       parameters.set(MessageParam.GROUP_ORDER, [options.groupOrder]);
     }
     if (options.subscriptionFilter !== undefined) {
-      const filterBytes = this.encodeSubscriptionFilter(options.subscriptionFilter);
+      const filterBytes = encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
       parameters.set(MessageParam.SUBSCRIPTION_FILTER, [filterBytes]);
       // Store for draft-14 SUBSCRIBE_UPDATE replay
       sub.currentFilter = filterBytes;
@@ -1327,24 +2030,87 @@ export class Session {
   }
 
   /**
+   * Initiate an outbound PUBLISH (draft-18 §10.10). We are the publisher: this
+   * allocates a Request ID, records publisher-side subscription state with the
+   * advertised Track Alias (PENDING until the peer's REQUEST_OK), and produces a
+   * PUBLISH control message. The I/O layer opens a dedicated bidi request stream.
+   *
+   * `trackAlias` is a full uint64-capable bigint; the draft-18 encoder accepts the
+   * whole range, while draft-14/16 encoders still range-check it.
+   *
+   * @param namespace Track namespace tuple
+   * @param name Track name bytes
+   * @param trackAlias The Track Alias the publisher advertises for this track
+   * @param options Optional PUBLISH `parameters` and draft-18 `trackProperties`
+   *   (§2.5; non-empty Track Properties on draft-14/16 throw).
+   * @see draft-ietf-moq-transport-18 §10.10
+   */
+  publish(
+    namespace: Uint8Array[],
+    name: Uint8Array,
+    trackAlias: bigint,
+    options: { parameters?: Parameters; trackProperties?: TrackProperties } = {},
+  ): RequestResult {
+    this.assertEstablishedOrDraining('publish');
+    this.assertNotReservedNamespace(namespace, 'publish');
+
+    if (this._state === SessionState.DRAINING) {
+      throw new SessionDrainingError(
+        'Cannot PUBLISH after GOAWAY; session is DRAINING',
+        this._newSessionUri ?? '',
+      );
+    }
+
+    const trackProperties = this.resolveTrackProperties(options.trackProperties, 'PUBLISH');
+
+    const requestId = this.requestIdAllocator.allocate();
+
+    const sub = SubscriptionStateMachine.createAsPublisher(requestId, namespace, name);
+    sub.setOutboundPublishAlias(trackAlias);
+    this.outgoingPublishes.set(requestId as bigint, sub);
+
+    const publishMsg: Publish = {
+      type: 'PUBLISH',
+      requestId,
+      trackNamespace: namespace,
+      trackName: name,
+      trackAlias,
+      parameters: options.parameters ?? new Map(),
+      trackProperties,
+    };
+
+    return {
+      requestId,
+      actions: [this.sendControl(publishMsg)],
+    };
+  }
+
+  /** Get an outgoing PUBLISH (publisher-side) subscription by request ID. */
+  getOutgoingPublish(requestId: bigint): SubscriptionStateMachine | undefined {
+    return this.outgoingPublishes.get(requestId as bigint);
+  }
+
+  /**
    * Get a subscription by request ID.
    */
-  getSubscription(requestId: Varint): SubscriptionStateMachine | undefined {
+  getSubscription(requestId: bigint): SubscriptionStateMachine | undefined {
     return this.subscriptions.get(requestId as bigint);
   }
 
   /**
-   * Send UNSUBSCRIBE for an established subscriber-side subscription.
+   * Cancel an established subscriber-side subscription.
    *
    * §2.4.2: "When a subscriber detects a Malformed Track, it MUST
    * UNSUBSCRIBE any subscription [...] for that Track from that publisher."
    *
    * @param requestId The request ID of the subscription to unsubscribe
-   * @returns Actions to send the UNSUBSCRIBE message
+   * @returns draft-14/16: a `send_control` action with the UNSUBSCRIBE message;
+   *   draft-18: no actions (UNSUBSCRIBE was removed — the I/O layer tears down the
+   *   request stream instead).
    * @see draft-ietf-moq-transport-16 §2.4.2 (Malformed Track)
    * @see draft-ietf-moq-transport-16 §5.1 (Subscription lifecycle)
    */
-  unsubscribe(requestId: Varint): SessionOutboundAction[] {
+  unsubscribe(requestId: bigint): SessionOutboundAction[] {
     const sub = this.subscriptions.get(requestId as bigint);
     if (!sub) {
       throw new SessionError(
@@ -1363,6 +2129,15 @@ export class Session {
       this.trackAliases.unregister(sub.trackAlias);
     }
 
+    if (this._draftVersion === 18) {
+      // draft-18 removed the UNSUBSCRIBE message; the subscriber cancels by
+      // tearing down the request stream (RESET_STREAM + STOP_SENDING, §3.3.2).
+      // Terminate local subscription state and emit NO control message — the I/O
+      // layer resets the request stream.
+      this.subscriptions.delete(requestId as bigint);
+      return [];
+    }
+
     const msg: Unsubscribe = {
       type: 'UNSUBSCRIBE',
       requestId,
@@ -1379,15 +2154,32 @@ export class Session {
    * @see draft-ietf-moq-transport-16 §9.11
    */
   requestUpdate(
-    existingRequestId: Varint,
+    existingRequestId: bigint,
     options: RequestUpdateOptions = {},
   ): RequestResult {
     this.assertEstablishedOrDraining('requestUpdate');
+
+    // draft-18 §10.9.2: a prefix update targets an outbound SUBSCRIBE_NAMESPACE /
+    // SUBSCRIBE_TRACKS request (tracked in separate maps, not `subscriptions`).
+    if (this.namespaceSubscriptions.has(existingRequestId as bigint)
+      || this.trackSubscriptions.has(existingRequestId as bigint)) {
+      return this.requestUpdatePrefix(existingRequestId, options);
+    }
 
     const sub = this.subscriptions.get(existingRequestId as bigint);
     if (!sub) {
       throw new SessionError(
         `Unknown subscription ${existingRequestId} for REQUEST_UPDATE`,
+        'INVALID_STATE',
+      );
+    }
+
+    // §10.9.2: a Track Namespace Prefix update is only valid for a
+    // SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS, never a normal subscription — reject
+    // it loudly rather than silently dropping the option.
+    if (options.trackNamespacePrefix !== undefined) {
+      throw new SessionError(
+        `trackNamespacePrefix is only valid for a SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS update, not subscription ${existingRequestId}`,
         'INVALID_STATE',
       );
     }
@@ -1426,7 +2218,7 @@ export class Session {
 
     // §9.2.2.5: SUBSCRIPTION_FILTER MAY appear in REQUEST_UPDATE
     if (options.subscriptionFilter !== undefined) {
-      const filterBytes = this.encodeSubscriptionFilter(options.subscriptionFilter);
+      const filterBytes = encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
       parameters.set(MessageParam.SUBSCRIPTION_FILTER, [filterBytes]);
       // Update stored filter for future draft-14 replays
       sub.currentFilter = filterBytes;
@@ -1466,6 +2258,57 @@ export class Session {
     };
   }
 
+  /**
+   * draft-18 §10.9.2: send a REQUEST_UPDATE that changes the Track Namespace
+   * Prefix of an outbound SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS. The update
+   * rides the request's existing (continuing) bidi stream; the new prefix is
+   * applied locally only when the matching REQUEST_OK arrives.
+   */
+  private requestUpdatePrefix(
+    existingRequestId: bigint,
+    options: RequestUpdateOptions,
+  ): RequestResult {
+    if (this._draftVersion !== 18) {
+      throw new SessionError(
+        `Track Namespace Prefix REQUEST_UPDATE requires draft-18 (current draft-${this._draftVersion})`,
+        'INVALID_STATE',
+      );
+    }
+    const nsSub = this.namespaceSubscriptions.get(existingRequestId as bigint);
+    const trackSub = this.trackSubscriptions.get(existingRequestId as bigint);
+    const target: 'namespace' | 'tracks' = nsSub ? 'namespace' : 'tracks';
+
+    if (nsSub && !nsSub.isActive) {
+      throw new SessionError(`Cannot update SUBSCRIBE_NAMESPACE ${existingRequestId}: not active`, 'INVALID_STATE');
+    }
+    if (trackSub && trackSub.state !== 'active') {
+      throw new SessionError(`Cannot update SUBSCRIBE_TRACKS ${existingRequestId}: not active`, 'INVALID_STATE');
+    }
+
+    const prefix = options.trackNamespacePrefix;
+    if (!prefix) {
+      throw new SessionError(
+        `REQUEST_UPDATE for a ${target === 'namespace' ? 'SUBSCRIBE_NAMESPACE' : 'SUBSCRIBE_TRACKS'} requires trackNamespacePrefix`,
+        'INVALID_STATE',
+      );
+    }
+    try {
+      validateTrackNamespacePrefix(prefix);
+    } catch (e) {
+      throw new SessionError(e instanceof Error ? e.message : 'Malformed Track Namespace Prefix', 'PROTOCOL_VIOLATION');
+    }
+
+    const requestId = this.requestIdAllocator.allocate();
+    const parameters: Parameters = new Map([[MessageParam.TRACK_NAMESPACE_PREFIX as bigint, [prefix]]]);
+    this.pendingUpdates.set(requestId as bigint, {
+      existingRequestId: existingRequestId as bigint,
+      namespacePrefix: prefix,
+      prefixTarget: target,
+    });
+    const updateMsg: RequestUpdate = { type: 'REQUEST_UPDATE', requestId, existingRequestId, parameters };
+    return { requestId, actions: [this.sendControl(updateMsg)] };
+  }
+
   // ─── Fetch Operations ─────────────────────────────────────────────────
 
   /**
@@ -1502,8 +2345,8 @@ export class Session {
       object: options.startObject,
     };
     const endLocation = {
-      group: options.endGroup ?? varint(0n),
-      object: options.endObject ?? varint(0n),
+      group: options.endGroup ?? 0n,
+      object: options.endObject ?? 0n,
     };
 
     // §9.16: "End Location MUST specify the same or a larger Location
@@ -1527,11 +2370,18 @@ export class Session {
       endLocation,
     };
 
+    // §10.2: a requested Group Order travels as the GROUP_ORDER (0x22) parameter
+    // — Ascending = 0x1, Descending = 0x2. Omitted ⇒ Ascending on decode.
+    const parameters: Parameters = new Map();
+    if (options.groupOrder !== undefined) {
+      parameters.set(MessageParam.GROUP_ORDER, [varint(options.groupOrder === 'descending' ? 2n : 1n)]);
+    }
+
     const fetchMsg: Fetch = {
       type: 'FETCH',
       requestId,
       fetch: standaloneFetch,
-      parameters: new Map(),
+      parameters,
     };
 
     return {
@@ -1543,27 +2393,28 @@ export class Session {
   /**
    * Get a fetch by request ID.
    */
-  getFetch(requestId: Varint): FetchStateMachine | undefined {
+  getFetch(requestId: bigint): FetchStateMachine | undefined {
     return this.fetches.get(requestId as bigint);
   }
 
   /**
-   * Cancel an outgoing fetch request.
+   * Cancel an outgoing fetch request, transitioning the fetch to COMPLETED.
    *
-   * Sends FETCH_CANCEL on the control stream and transitions the fetch
-   * to COMPLETED.
+   * draft-14/16: returns a FETCH_CANCEL to send on the control stream.
+   *   §9.18: "A subscriber sends a FETCH_CANCEL message to a publisher to
+   *   indicate it is no longer interested in receiving objects for the fetch
+   *   identified by the 'Request ID'."
+   *   §5.2: "A subscriber keeps FETCH state until it sends FETCH_CANCEL,
+   *   receives REQUEST_ERROR, or receives a FIN or RESET_STREAM for the FETCH
+   *   data stream."
    *
-   * §9.18: "A subscriber sends a FETCH_CANCEL message to a publisher
-   * to indicate it is no longer interested in receiving objects for the
-   * fetch identified by the 'Request ID'."
+   * draft-18: FETCH_CANCEL was removed (§3.3.2); this marks the fetch completed
+   * and returns NO actions — the I/O layer cancels the request + data streams
+   * (STOP_SENDING / RESET_STREAM).
    *
-   * §5.2: "A subscriber keeps FETCH state until it sends FETCH_CANCEL,
-   * receives REQUEST_ERROR, or receives a FIN or RESET_STREAM for the
-   * FETCH data stream."
-   *
-   * @see draft-ietf-moq-transport-16 §5.2, §9.18
+   * @see draft-ietf-moq-transport-16 §5.2, §9.18; draft-ietf-moq-transport-18 §3.3.2
    */
-  fetchCancel(requestId: Varint): SessionOutboundAction[] {
+  fetchCancel(requestId: bigint): SessionOutboundAction[] {
     const fetch = this.fetches.get(requestId as bigint);
     if (!fetch) {
       throw new SessionError(
@@ -1573,6 +2424,15 @@ export class Session {
     }
 
     fetch.sendFetchCancel();
+
+    if (this._draftVersion === 18) {
+      // draft-18 removed the FETCH_CANCEL control message (§3.3.2): cancellation
+      // is STOP_SENDING / RESET_STREAM on the request + data streams, performed
+      // by the I/O layer. The fetch state is marked completed above; no control
+      // message is emitted. Drop the fetch from tracking.
+      this.fetches.delete(requestId as bigint);
+      return [];
+    }
 
     const fetchCancelMsg: FetchCancel = {
       type: 'FETCH_CANCEL',
@@ -1647,6 +2507,87 @@ export class Session {
     };
   }
 
+  // ─── SUBSCRIBE_TRACKS Operations (draft-18 §10.19) ───────────────────
+
+  /**
+   * Create a SUBSCRIBE_TRACKS request (draft-18 §10.19): ask a publisher for
+   * PUBLISH messages for all tracks within matching namespaces. Like
+   * SUBSCRIBE_NAMESPACE, it travels on a CONTINUING bidi request stream; the
+   * I/O layer opens the stream and routes the first REQUEST_OK / REQUEST_ERROR
+   * plus follow-up PUBLISH_BLOCKED messages.
+   */
+  subscribeTracks(namespacePrefix: Uint8Array[]): RequestResult {
+    this.assertEstablishedOrDraining('subscribeTracks');
+    if (this._state === SessionState.DRAINING) {
+      throw new SessionDrainingError(
+        'Cannot create new track subscriptions after GOAWAY; session is DRAINING',
+        this._newSessionUri ?? '',
+      );
+    }
+    if (this._draftVersion !== 18) {
+      throw new SessionError('SUBSCRIBE_TRACKS is a draft-18 message', 'INVALID_STATE');
+    }
+
+    const requestId = this.requestIdAllocator.allocate();
+    this.trackSubscriptions.set(requestId as bigint, {
+      trackNamespacePrefix: namespacePrefix,
+      state: 'pending',
+      blockedTracks: [],
+    });
+
+    const msg: SubscribeTracks = {
+      type: 'SUBSCRIBE_TRACKS',
+      requestId,
+      trackNamespacePrefix: namespacePrefix,
+      parameters: new Map(),
+    };
+    return { requestId, actions: [this.sendControl(msg)] };
+  }
+
+  /** Get a SUBSCRIBE_TRACKS request's local state by Request ID. */
+  getTrackSubscription(requestId: bigint): TrackSubscriptionState | undefined {
+    return this.trackSubscriptions.get(requestId as bigint);
+  }
+
+  /**
+   * Handle a message received on a SUBSCRIBE_TRACKS response stream AFTER the
+   * first REQUEST_OK — i.e. PUBLISH_BLOCKED (§10.20). The first REQUEST_OK /
+   * REQUEST_ERROR is routed through the normal stamped pipeline, not here.
+   */
+  handleSubscribeTracksStreamMessage(requestId: bigint, msg: ControlMessage): SessionOutboundAction[] {
+    const ts = this.trackSubscriptions.get(requestId as bigint);
+    if (!ts) {
+      return this.closeWithError(
+        SessionErrorCode.INVALID_REQUEST_ID,
+        `Unknown request ID ${requestId} for SUBSCRIBE_TRACKS stream message`,
+      );
+    }
+    if (msg.type === 'PUBLISH_BLOCKED') {
+      if (ts.state !== 'active') {
+        return this.closeWithError(
+          SessionErrorCode.PROTOCOL_VIOLATION,
+          'PUBLISH_BLOCKED received before SUBSCRIBE_TRACKS was accepted',
+        );
+      }
+      const pb = msg as PublishBlocked;
+      ts.blockedTracks.push({ trackNamespaceSuffix: pb.trackNamespaceSuffix, trackName: pb.trackName });
+      return [];
+    }
+    return this.closeWithError(
+      SessionErrorCode.PROTOCOL_VIOLATION,
+      `Unexpected ${msg.type} on a SUBSCRIBE_TRACKS response stream`,
+    );
+  }
+
+  /** Handle FIN / reset on a SUBSCRIBE_TRACKS response stream — terminate it. */
+  handleSubscribeTracksStreamClosed(requestId: bigint): SessionOutboundAction[] {
+    const ts = this.trackSubscriptions.get(requestId as bigint);
+    if (!ts) return [];
+    ts.state = 'terminated';
+    this.trackSubscriptions.delete(requestId as bigint);
+    return [];
+  }
+
   // ─── PUBLISH_NAMESPACE Operations (§6.2) ──────────────────────────────
 
   /**
@@ -1663,6 +2604,7 @@ export class Session {
     namespace: Uint8Array[],
   ): RequestResult {
     this.assertEstablishedOrDraining('publishNamespace');
+    this.assertNotReservedNamespace(namespace, 'publishNamespace');
 
     if (this._state === SessionState.DRAINING) {
       throw new SessionDrainingError(
@@ -1691,14 +2633,19 @@ export class Session {
   }
 
   /**
-   * Send PUBLISH_NAMESPACE_DONE for an accepted namespace.
-   * Terminates the namespace — stops serving new subscriptions.
+   * Withdraw an accepted namespace — stops serving new subscriptions.
+   *
+   * draft-14/16: emits PUBLISH_NAMESPACE_DONE on the control stream.
+   * draft-18: PUBLISH_NAMESPACE_DONE was removed; withdrawal is a cancellation of
+   * the PUBLISH_NAMESPACE request stream (§3.3.2). This method only terminates
+   * local state and returns NO send_control action — the I/O layer cancels the
+   * request stream.
    *
    * @param requestId The request ID from publishNamespace()
    * @throws If requestId is unknown or namespace is not yet accepted
-   * @see draft-ietf-moq-transport-16 §9.22
+   * @see draft-ietf-moq-transport-16 §9.22, draft-ietf-moq-transport-18 §3.3.2
    */
-  publishNamespaceDone(requestId: Varint): SessionOutboundAction[] {
+  publishNamespaceDone(requestId: bigint): SessionOutboundAction[] {
     this.assertEstablishedOrDraining('publishNamespaceDone');
 
     const entry = this.publishedNamespaces.get(requestId as bigint);
@@ -1710,12 +2657,18 @@ export class Session {
     }
     if (entry.state !== 'active') {
       throw new SessionError(
-        `Cannot send PUBLISH_NAMESPACE_DONE for pending namespace (requestId=${requestId})`,
+        `Cannot withdraw pending namespace (requestId=${requestId})`,
         'INVALID_STATE',
       );
     }
 
     this.publishedNamespaces.delete(requestId as bigint);
+
+    // draft-18 §3.3.2: no PUBLISH_NAMESPACE_DONE on the wire — withdrawal is a
+    // request-stream cancellation handled by the I/O layer. Terminate state only.
+    if (this._draftVersion === 18) {
+      return [];
+    }
 
     // v16 §9.22: PUBLISH_NAMESPACE_DONE { RequestID }
     // v14 §9.26: PUBLISH_NAMESPACE_DONE { TrackNamespace (tuple) }
@@ -1773,14 +2726,41 @@ export class Session {
   }
 
   /**
-   * Accept an incoming TRACK_STATUS request (publisher-side).
+   * Resolve Track Properties (§2.5) for an outbound message. The `trackProperties`
+   * send API is draft-18-only: draft-14/16 carry the legacy "Track Extensions" but
+   * this API does not target them, so non-empty Track Properties on draft-14/16
+   * throw rather than being silently encoded. Returns the map to attach (possibly
+   * empty).
+   */
+  private resolveTrackProperties(trackProperties: TrackProperties | undefined, context: string): TrackProperties {
+    const props = trackProperties ?? new Map();
+    if (this._draftVersion !== 18 && props.size > 0) {
+      throw new SessionError(
+        `Track Properties on ${context} require draft-18 (current draft-${this._draftVersion})`,
+        'INVALID_STATE',
+      );
+    }
+    return props;
+  }
+
+  /**
+   * Accept an incoming TRACK_STATUS request (publisher-side, TRACK_STATUS_OK).
    *
    * §9.19: "If successful, the publisher responds with a REQUEST_OK message
-   * with the same parameters it would have set in a SUBSCRIBE_OK."
+   * with the same parameters it would have set in a SUBSCRIBE_OK." draft-18 also
+   * allows Track Properties (§2.5) on the TRACK_STATUS_OK.
    *
-   * @see draft-ietf-moq-transport-16 §9.19
+   * Backwards-compatible: the second argument may be the legacy `Parameters` map,
+   * or a {@link TrackStatusAcceptOptions} carrying `parameters` and/or
+   * `trackProperties`. Non-empty Track Properties on draft-14/16 throw (no such
+   * field exists on the wire there).
+   *
+   * @see draft-ietf-moq-transport-16 §9.19, draft-ietf-moq-transport-18 §10.14
    */
-  acceptTrackStatus(requestId: Varint, params: Parameters = new Map()): SessionOutboundAction[] {
+  acceptTrackStatus(
+    requestId: bigint,
+    paramsOrOptions: Parameters | TrackStatusAcceptOptions = new Map(),
+  ): SessionOutboundAction[] {
     const entry = this.incomingTrackStatuses.get(requestId as bigint);
     if (!entry) {
       throw new SessionError(
@@ -1789,12 +2769,22 @@ export class Session {
       );
     }
 
+    // The legacy second arg is a Parameters Map; otherwise it is an options object.
+    const opts: TrackStatusAcceptOptions =
+      paramsOrOptions instanceof Map ? { parameters: paramsOrOptions } : paramsOrOptions;
+    const parameters = opts.parameters ?? new Map();
+    const trackProperties = this.resolveTrackProperties(opts.trackProperties, 'TRACK_STATUS_OK');
+
     this.incomingTrackStatuses.delete(requestId as bigint);
 
     const requestOk: RequestOk = {
       type: 'REQUEST_OK',
       requestId,
-      parameters: params,
+      parameters,
+      // Carry Track Properties only when present; the codec encodes an empty
+      // block as zero bytes regardless, but keeping it absent is cleaner for
+      // draft-14/16 (whose codec has no Track Properties field).
+      ...(trackProperties.size > 0 ? { trackProperties } : {}),
     };
 
     return [this.sendControl(requestOk)];
@@ -1808,7 +2798,7 @@ export class Session {
    *
    * @see draft-ietf-moq-transport-16 §9.19
    */
-  rejectTrackStatus(requestId: Varint, errorCode: Varint, errorReason: string): SessionOutboundAction[] {
+  rejectTrackStatus(requestId: bigint, errorCode: bigint, errorReason: string): SessionOutboundAction[] {
     const entry = this.incomingTrackStatuses.get(requestId as bigint);
     if (!entry) {
       throw new SessionError(
@@ -1825,6 +2815,7 @@ export class Session {
       errorCode,
       retryInterval: varint(0n),
       errorReason,
+      requestKind: 'TRACK_STATUS', // draft-14 → TRACK_STATUS_ERROR; ignored by 16/18
     };
 
     return [this.sendControl(requestError)];
@@ -1834,8 +2825,17 @@ export class Session {
    * Get an incoming TRACK_STATUS request by request ID.
    * @see draft-ietf-moq-transport-16 §9.19
    */
-  getIncomingTrackStatus(requestId: Varint): { namespace: Uint8Array[]; name: Uint8Array } | undefined {
+  getIncomingTrackStatus(requestId: bigint): { namespace: Uint8Array[]; name: Uint8Array } | undefined {
     return this.incomingTrackStatuses.get(requestId as bigint);
+  }
+
+  /**
+   * Get a still-pending OUTGOING TRACK_STATUS request (one we sent, awaiting its
+   * REQUEST_OK / REQUEST_ERROR). Cleared once the response is handled.
+   * @see draft-ietf-moq-transport-16 §9.19
+   */
+  getPendingTrackStatus(requestId: bigint): { namespace: Uint8Array[]; name: Uint8Array } | undefined {
+    return this.pendingTrackStatuses.get(requestId as bigint);
   }
 
   /**
@@ -1843,8 +2843,27 @@ export class Session {
    * The adapter routes messages by the requestId associated with the stream.
    * @see draft-ietf-moq-transport-16 §6.1
    */
+  /**
+   * Handle a FIN / reset on a SUBSCRIBE_NAMESPACE response stream.
+   *
+   * §6.1 / §10.18: "When a subscriber receives a stream reset or FIN on a
+   * SUBSCRIBE_NAMESPACE response stream, it SHOULD treat this as though each
+   * active namespace received a NAMESPACE_DONE." We terminate the (subscriber)
+   * namespace subscription and drop it. No-op for an unknown / already-terminated
+   * request.
+   */
+  handleNamespaceStreamClosed(requestId: bigint): SessionOutboundAction[] {
+    const nsSm = this.namespaceSubscriptions.get(requestId as bigint);
+    if (!nsSm) return [];
+    if (nsSm.isActive) {
+      nsSm.handleNamespaceDone(); // ACTIVE → TERMINATED (treat actives as done)
+    }
+    this.namespaceSubscriptions.delete(requestId as bigint);
+    return [];
+  }
+
   handleNamespaceStreamMessage(
-    requestId: Varint,
+    requestId: bigint,
     msg: ControlMessage,
   ): SessionOutboundAction[] {
     const nsSm = this.namespaceSubscriptions.get(requestId as bigint);
@@ -1908,7 +2927,7 @@ export class Session {
   /**
    * Get a namespace subscription by request ID.
    */
-  getNamespaceSubscription(requestId: Varint): NamespaceStateMachine | undefined {
+  getNamespaceSubscription(requestId: bigint): NamespaceStateMachine | undefined {
     return this.namespaceSubscriptions.get(requestId as bigint);
   }
 
@@ -1939,9 +2958,17 @@ export class Session {
    * @see draft-ietf-moq-transport-16 §9.20, §6.2
    */
   private handleIncomingPublishNamespace(msg: PublishNamespace): SessionOutboundAction[] {
+    // §2.4.1: validate the Track Namespace BEFORE creating any namespace state.
+    const nsError = this.validateNamespace18(msg.trackNamespace);
+    if (nsError) return nsError;
+
     // Validate incoming request ID and auto-replenish MAX_REQUEST_ID §9.5
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
+
+    // §3.2: reserved `.`/`.session` namespace → REQUEST_ERROR DOES_NOT_EXIST.
+    const reserved = this.rejectReservedNamespace(msg.trackNamespace, msg.requestId, validated.replenish);
+    if (reserved) return reserved;
 
     const match = this.findNamespaceSubscriptionByPrefix(msg.trackNamespace);
     const isV14 = this._draftVersion === 14;
@@ -1969,11 +2996,18 @@ export class Session {
         requestId: msg.requestId,
         message: msg,
       };
+      // draft-18: track the inbound announce so a stream FIN/reset can withdraw it.
+      if (this._draftVersion === 18) {
+        this.incomingPublishNamespaces.set(msg.requestId as bigint, { namespace: msg.trackNamespace });
+      }
       return [this.sendControl(okMsg), notifyAction, ...(validated.replenish ?? [])];
     }
 
     // Match found — record the announced namespace.
     match.nsSm.handleNamespace(msg.trackNamespace);
+    if (this._draftVersion === 18) {
+      this.incomingPublishNamespaces.set(msg.requestId as bigint, { namespace: msg.trackNamespace });
+    }
 
     const okMsg: ControlMessage = isV14
       ? { type: 'PUBLISH_NAMESPACE_OK', requestId: msg.requestId }
@@ -1986,6 +3020,322 @@ export class Session {
     };
 
     return [this.sendControl(okMsg), notifyAction, ...(validated.replenish ?? [])];
+  }
+
+  /**
+   * Withdraw an inbound PUBLISH_NAMESPACE on a FIN/reset of its request stream
+   * (draft-18 §3.3.2 — PUBLISH_NAMESPACE_DONE was removed). If we tracked the
+   * announce, drop it and withdraw it from any matching namespace subscription.
+   * No-op if no state exists for `requestId` (e.g. already withdrawn). Returns no
+   * outbound actions — the withdrawal signal is the stream close itself.
+   *
+   * @see draft-ietf-moq-transport-18 §3.3.2
+   */
+  handleInboundPublishNamespaceClosed(requestId: bigint): SessionOutboundAction[] {
+    const entry = this.incomingPublishNamespaces.get(requestId as bigint);
+    if (!entry) return [];
+    this.incomingPublishNamespaces.delete(requestId as bigint);
+    const match = this.findNamespaceSubscriptionByPrefix(entry.namespace);
+    if (match) match.nsSm.withdrawNamespace(entry.namespace);
+    return [];
+  }
+
+  // ─── Inbound SUBSCRIBE_NAMESPACE (publisher side, draft-18 §10.18) ─────────
+
+  /**
+   * Handle an incoming SUBSCRIBE_NAMESPACE (we are the publisher). Validates the
+   * Request ID (d18 inbound policy) and the prefix, then either:
+   *   - rejects an overlapping prefix with REQUEST_ERROR / PREFIX_OVERLAP (NOT a
+   *     session close — the request simply fails); or
+   *   - creates a PENDING publisher-side {@link NamespaceStateMachine} and returns
+   *     no response, leaving accept/reject to the application.
+   * A malformed prefix or params closes the session with PROTOCOL_VIOLATION.
+   *
+   * @see draft-ietf-moq-transport-18 §10.18
+   */
+  private handleIncomingSubscribeNamespace(msg: SubscribeNamespace): SessionOutboundAction[] {
+    const validated = this.validateAndReplenish(msg.requestId);
+    if (validated.error) return validated.error;
+
+    // Malformed prefix (>32 fields or >4096 bytes) → PROTOCOL_VIOLATION.
+    try {
+      validateTrackNamespacePrefix(msg.trackNamespacePrefix);
+    } catch (e) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        e instanceof Error ? e.message : 'Malformed SUBSCRIBE_NAMESPACE prefix',
+      );
+    }
+
+    // §3.2: reserved `.`/`.session` prefix → REQUEST_ERROR DOES_NOT_EXIST.
+    const reserved = this.rejectReservedNamespace(msg.trackNamespacePrefix, msg.requestId, validated.replenish);
+    if (reserved) return reserved;
+
+    // Reject a prefix that overlaps an existing non-terminated incoming sub.
+    for (const existing of this.incomingNamespaceSubscriptions.values()) {
+      if (existing.isTerminated) continue;
+      if (prefixesOverlap(existing.namespacePrefix, msg.trackNamespacePrefix)) {
+        const errorMsg: RequestErrorMsg = {
+          type: 'REQUEST_ERROR',
+          requestId: msg.requestId,
+          errorCode: RequestErrorCode.PREFIX_OVERLAP,
+          retryInterval: varint(0n),
+          errorReason: 'Track Namespace Prefix overlaps an existing SUBSCRIBE_NAMESPACE',
+          requestKind: 'SUBSCRIBE_NAMESPACE', // draft-14 → SUBSCRIBE_NAMESPACE_ERROR; ignored by 16/18
+        };
+        return [this.sendControl(errorMsg), ...(validated.replenish ?? [])];
+      }
+    }
+
+    const nsSm = NamespaceStateMachine.createAsPublisher(msg.requestId as bigint, msg.trackNamespacePrefix);
+    this.incomingNamespaceSubscriptions.set(msg.requestId as bigint, nsSm);
+    // No auto-ack — the application accepts/rejects via accept/rejectSubscribeNamespace.
+    return validated.replenish ?? [];
+  }
+
+  /**
+   * Accept an incoming SUBSCRIBE_NAMESPACE: send REQUEST_OK and move the
+   * publisher-side machine PENDING → ACTIVE. The request stream stays open for
+   * NAMESPACE / NAMESPACE_DONE announcements.
+   */
+  acceptSubscribeNamespace(requestId: bigint, params: Parameters = new Map()): SessionOutboundAction[] {
+    const nsSm = this.incomingNamespaceSubscriptions.get(requestId as bigint);
+    if (!nsSm) {
+      throw new SessionError(`Unknown incoming SUBSCRIBE_NAMESPACE ${requestId}`, 'INVALID_STATE');
+    }
+    nsSm.sendRequestOk(); // PENDING → ACTIVE
+    const requestOk: RequestOk = { type: 'REQUEST_OK', requestId, parameters: params };
+    return [this.sendControl(requestOk)];
+  }
+
+  /**
+   * Reject an incoming SUBSCRIBE_NAMESPACE: send REQUEST_ERROR and drop the
+   * publisher-side state. The I/O layer FINs the request stream afterward.
+   */
+  rejectSubscribeNamespace(requestId: bigint, errorCode: bigint, errorReason: string): SessionOutboundAction[] {
+    const nsSm = this.incomingNamespaceSubscriptions.get(requestId as bigint);
+    if (!nsSm) {
+      throw new SessionError(`Unknown incoming SUBSCRIBE_NAMESPACE ${requestId}`, 'INVALID_STATE');
+    }
+    this.incomingNamespaceSubscriptions.delete(requestId as bigint);
+    const errorMsg: RequestErrorMsg = {
+      type: 'REQUEST_ERROR',
+      requestId,
+      errorCode,
+      retryInterval: varint(0n),
+      errorReason,
+      requestKind: 'SUBSCRIBE_NAMESPACE', // draft-14 → SUBSCRIBE_NAMESPACE_ERROR; ignored by 16/18
+    };
+    return [this.sendControl(errorMsg)];
+  }
+
+  /**
+   * Announce a matching namespace on an accepted incoming SUBSCRIBE_NAMESPACE
+   * stream (NAMESPACE, §10.18). The stream stays ACTIVE for further updates.
+   */
+  sendNamespace(requestId: bigint, suffix: Uint8Array[]): SessionOutboundAction[] {
+    const nsSm = this.requireActiveIncomingNamespaceSub(requestId, 'sendNamespace');
+    nsSm.sendNamespace(suffix);
+    const msg: Namespace = { type: 'NAMESPACE', trackNamespaceSuffix: suffix };
+    return [this.sendControl(msg)];
+  }
+
+  /**
+   * Publisher-side: emit NAMESPACE_DONE for a previously announced suffix on an
+   * accepted incoming SUBSCRIBE_NAMESPACE stream (§10.18). Locally this is a
+   * PER-SUFFIX withdrawal from our publisher bookkeeping (via `withdrawNamespace`,
+   * NOT the terminal `NamespaceStateMachine.sendNamespaceDone()`), so our incoming
+   * machine stays ACTIVE and may emit further NAMESPACE / NAMESPACE_DONE. The
+   * RECEIVING subscriber, however, treats NAMESPACE_DONE as TERMINATING its
+   * namespace subscription (§6.1, `handleNamespaceDone`).
+   */
+  sendNamespaceDone(requestId: bigint, suffix: Uint8Array[]): SessionOutboundAction[] {
+    const nsSm = this.requireActiveIncomingNamespaceSub(requestId, 'sendNamespaceDone');
+    nsSm.withdrawNamespace(suffix); // per-suffix removal; machine stays ACTIVE
+    const msg: NamespaceDone = { type: 'NAMESPACE_DONE', trackNamespaceSuffix: suffix };
+    return [this.sendControl(msg)];
+  }
+
+  private requireActiveIncomingNamespaceSub(requestId: bigint, op: string): NamespaceStateMachine {
+    const nsSm = this.incomingNamespaceSubscriptions.get(requestId as bigint);
+    if (!nsSm) {
+      throw new SessionError(`Unknown incoming SUBSCRIBE_NAMESPACE ${requestId}`, 'INVALID_STATE');
+    }
+    if (!nsSm.isActive) {
+      throw new SessionError(`Cannot ${op} for SUBSCRIBE_NAMESPACE ${requestId}: not accepted`, 'INVALID_STATE');
+    }
+    return nsSm;
+  }
+
+  /** Whether we are serving an accepted incoming SUBSCRIBE_NAMESPACE. */
+  getIncomingNamespaceSubscription(requestId: bigint): NamespaceStateMachine | undefined {
+    return this.incomingNamespaceSubscriptions.get(requestId as bigint);
+  }
+
+  /**
+   * Cancel an incoming SUBSCRIBE_NAMESPACE on a FIN/reset of its request stream
+   * (draft-18 §10.18). Drops publisher-side state; no-op if none exists. The
+   * cancellation signal is the stream close itself, so no outbound actions.
+   */
+  handleInboundSubscribeNamespaceClosed(requestId: bigint): SessionOutboundAction[] {
+    this.incomingNamespaceSubscriptions.delete(requestId as bigint);
+    return [];
+  }
+
+  // ─── Inbound SUBSCRIBE_TRACKS (publisher side, draft-18 §10.19) ────────────
+
+  /**
+   * Handle an incoming SUBSCRIBE_TRACKS (we are the publisher). Validates the
+   * Request ID (d18 inbound policy) and the prefix, then either:
+   *   - rejects an overlapping prefix — only against OTHER incoming
+   *     SUBSCRIBE_TRACKS, never SUBSCRIBE_NAMESPACE — with REQUEST_ERROR /
+   *     PREFIX_OVERLAP (NOT a session close); or
+   *   - records a PENDING incoming track subscription and returns no response,
+   *     leaving accept/reject to the application.
+   * A malformed prefix closes the session with PROTOCOL_VIOLATION.
+   *
+   * @see draft-ietf-moq-transport-18 §10.19
+   */
+  private handleIncomingSubscribeTracks(msg: SubscribeTracks): SessionOutboundAction[] {
+    const validated = this.validateAndReplenish(msg.requestId);
+    if (validated.error) return validated.error;
+
+    try {
+      validateTrackNamespacePrefix(msg.trackNamespacePrefix);
+    } catch (e) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        e instanceof Error ? e.message : 'Malformed SUBSCRIBE_TRACKS prefix',
+      );
+    }
+
+    // §3.2: reserved `.`/`.session` prefix → REQUEST_ERROR DOES_NOT_EXIST.
+    const reserved = this.rejectReservedNamespace(msg.trackNamespacePrefix, msg.requestId, validated.replenish);
+    if (reserved) return reserved;
+
+    // Overlap is checked ONLY against other incoming SUBSCRIBE_TRACKS — a
+    // SUBSCRIBE_TRACKS prefix may coexist with a SUBSCRIBE_NAMESPACE prefix.
+    for (const existing of this.incomingTrackSubscriptions.values()) {
+      if (prefixesOverlap(existing.trackNamespacePrefix, msg.trackNamespacePrefix)) {
+        const errorMsg: RequestErrorMsg = {
+          type: 'REQUEST_ERROR',
+          requestId: msg.requestId,
+          errorCode: RequestErrorCode.PREFIX_OVERLAP,
+          retryInterval: varint(0n),
+          errorReason: 'Track Namespace Prefix overlaps an existing SUBSCRIBE_TRACKS',
+        };
+        return [this.sendControl(errorMsg), ...(validated.replenish ?? [])];
+      }
+    }
+
+    this.incomingTrackSubscriptions.set(msg.requestId as bigint, {
+      trackNamespacePrefix: msg.trackNamespacePrefix,
+      state: 'pending',
+    });
+    return validated.replenish ?? [];
+  }
+
+  /**
+   * Accept an incoming SUBSCRIBE_TRACKS: send REQUEST_OK and mark it ACTIVE. The
+   * request stream stays open for PUBLISH (new streams) and PUBLISH_BLOCKED.
+   */
+  acceptSubscribeTracks(requestId: bigint, params: Parameters = new Map()): SessionOutboundAction[] {
+    const ts = this.incomingTrackSubscriptions.get(requestId as bigint);
+    if (!ts) {
+      throw new SessionError(`Unknown incoming SUBSCRIBE_TRACKS ${requestId}`, 'INVALID_STATE');
+    }
+    ts.state = 'active';
+    const requestOk: RequestOk = { type: 'REQUEST_OK', requestId, parameters: params };
+    return [this.sendControl(requestOk)];
+  }
+
+  /**
+   * Reject an incoming SUBSCRIBE_TRACKS: send REQUEST_ERROR and drop state. The
+   * I/O layer FINs the request stream afterward.
+   */
+  rejectSubscribeTracks(requestId: bigint, errorCode: bigint, errorReason: string): SessionOutboundAction[] {
+    const ts = this.incomingTrackSubscriptions.get(requestId as bigint);
+    if (!ts) {
+      throw new SessionError(`Unknown incoming SUBSCRIBE_TRACKS ${requestId}`, 'INVALID_STATE');
+    }
+    this.incomingTrackSubscriptions.delete(requestId as bigint);
+    const errorMsg: RequestErrorMsg = {
+      type: 'REQUEST_ERROR',
+      requestId,
+      errorCode,
+      retryInterval: varint(0n),
+      errorReason,
+    };
+    return [this.sendControl(errorMsg)];
+  }
+
+  /**
+   * Indicate a Track cannot be served within an accepted incoming
+   * SUBSCRIBE_TRACKS (PUBLISH_BLOCKED, §10.20). Valid only after the request is
+   * ACTIVE; the stream stays open (no seal/close).
+   */
+  sendPublishBlocked(requestId: bigint, suffix: Uint8Array[], trackName: Uint8Array): SessionOutboundAction[] {
+    const ts = this.incomingTrackSubscriptions.get(requestId as bigint);
+    if (!ts) {
+      throw new SessionError(`Unknown incoming SUBSCRIBE_TRACKS ${requestId}`, 'INVALID_STATE');
+    }
+    if (ts.state !== 'active') {
+      throw new SessionError(`Cannot sendPublishBlocked for SUBSCRIBE_TRACKS ${requestId}: not accepted`, 'INVALID_STATE');
+    }
+    const msg: PublishBlocked = { type: 'PUBLISH_BLOCKED', trackNamespaceSuffix: suffix, trackName };
+    return [this.sendControl(msg)];
+  }
+
+  /** Whether we are serving an incoming SUBSCRIBE_TRACKS (pending or active). */
+  getIncomingTrackSubscription(requestId: bigint): { trackNamespacePrefix: Uint8Array[]; state: 'pending' | 'active' } | undefined {
+    return this.incomingTrackSubscriptions.get(requestId as bigint);
+  }
+
+  /**
+   * Cancel an incoming SUBSCRIBE_TRACKS on a FIN/reset of its request stream
+   * (draft-18 §10.19). Drops publisher-side state; no-op if none exists.
+   */
+  handleInboundSubscribeTracksClosed(requestId: bigint): SessionOutboundAction[] {
+    this.incomingTrackSubscriptions.delete(requestId as bigint);
+    return [];
+  }
+
+  /**
+   * Cancel an inbound PUBLISH / SUBSCRIBE / FETCH on a FIN/reset of its request
+   * stream (draft-18 §3.3.2) — a normal lifecycle end, not a protocol error. Drops
+   * the publisher-/subscriber-side request state; no-op if none exists. Track
+   * Alias routing for an inbound PUBLISH is owned by the I/O layer (kept for late
+   * data), so it is not touched here.
+   */
+  handleInboundRequestClosed(requestId: bigint): SessionOutboundAction[] {
+    this.incomingSubscriptions.delete(requestId as bigint);
+    this.incomingFetches.delete(requestId as bigint);
+    return [];
+  }
+
+  /**
+   * Clean local state for an OUTBOUND request whose bidi request stream the PEER
+   * closed (FIN/reset). §11.4.1: "Termination of a bidi request stream terminates
+   * the Subscription, Fetch, Track Status, Publish Namespace, or Subscribe
+   * Namespace request." Drops every map keyed by this Request ID and unregisters a
+   * SUBSCRIBE's Track Alias. No-op for a request already ended. (The continuing
+   * SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS streams have their own closed handlers —
+   * {@link handleNamespaceStreamClosed} / {@link handleSubscribeTracksStreamClosed}.)
+   *
+   * @see draft-ietf-moq-transport-18 §11.4.1
+   */
+  handleOutboundRequestClosed(requestId: bigint): SessionOutboundAction[] {
+    const sub = this.subscriptions.get(requestId as bigint);
+    if (sub) {
+      if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias);
+      this.subscriptions.delete(requestId as bigint);
+      this.subscriptionTracks.delete(requestId as bigint);
+    }
+    this.fetches.delete(requestId as bigint);
+    this.pendingTrackStatuses.delete(requestId as bigint);
+    this.outgoingPublishes.delete(requestId as bigint);
+    this.publishedNamespaces.delete(requestId as bigint);
+    return [];
   }
 
   /**
@@ -2157,7 +3507,7 @@ export class Session {
    *   UNSUBSCRIBE_NAMESPACE message to a publisher indicating it is no
    *   longer interested."
    */
-  cancelNamespace(requestId: Varint): SessionOutboundAction[] {
+  cancelNamespace(requestId: bigint): SessionOutboundAction[] {
     const nsSm = this.namespaceSubscriptions.get(requestId as bigint);
     if (!nsSm) {
       throw new SessionError(`Unknown namespace subscription ${requestId}`, 'INVALID_STATE');
@@ -2209,9 +3559,18 @@ export class Session {
   /**
    * Accept an incoming subscription request.
    * Sends SUBSCRIBE_OK and transitions the subscription to ESTABLISHED.
-   * @see draft-ietf-moq-transport-16 §9.10
+   *
+   * `options` (draft-18) may carry SUBSCRIBE_OK `parameters` and `trackProperties`
+   * (§2.5); non-empty Track Properties on draft-14/16 throw. The two-argument form
+   * remains valid.
+   *
+   * @see draft-ietf-moq-transport-16 §9.10, draft-ietf-moq-transport-18 §10.4
    */
-  acceptSubscribe(requestId: Varint, trackAlias: Varint): SessionOutboundAction[] {
+  acceptSubscribe(
+    requestId: bigint,
+    trackAlias: bigint,
+    options: { parameters?: Parameters; trackProperties?: TrackProperties } = {},
+  ): SessionOutboundAction[] {
     const sub = this.incomingSubscriptions.get(requestId as bigint);
     if (!sub) {
       throw new SessionError(
@@ -2220,11 +3579,33 @@ export class Session {
       );
     }
 
+    // Validate ALL misuse up-front, BEFORE any state mutation: draft-14/16 Track
+    // Properties, and Track Properties on a PUBLISH acceptance (which is a
+    // REQUEST_OK / PUBLISH_OK, not a SUBSCRIBE_OK — §10.10). sendSubscribeOk()
+    // mutates the subscription to ESTABLISHED, so it must run only after these
+    // checks pass.
+    const trackProperties = this.resolveTrackProperties(options.trackProperties, 'SUBSCRIBE_OK');
+    if (sub.isPublishInitiated && trackProperties.size > 0) {
+      throw new SessionError(
+        'Track Properties are not valid on a PUBLISH acceptance (only SUBSCRIBE_OK / TRACK_STATUS_OK / FETCH_OK)',
+        'INVALID_STATE',
+      );
+    }
+
     sub.sendSubscribeOk(trackAlias);
 
-    // Draft-14 §9.14: PUBLISH-initiated subscriptions respond with PUBLISH_OK.
-    // Only carry fields that intentionally define the initial subscription state.
+    // PUBLISH-initiated subscriptions respond with a publish-acceptance message
+    // (PUBLISH_OK / REQUEST_OK), not SUBSCRIBE_OK.
     if (sub.isPublishInitiated) {
+      if (this._draftVersion === 18) {
+        // draft-18 §10.10: PUBLISH_OK is REQUEST_OK shorthand (wire 0x07, no
+        // Request ID); the I/O layer writes it on the inbound PUBLISH request
+        // stream, not the control stream.
+        const requestOk: RequestOk = { type: 'REQUEST_OK', requestId, parameters: new Map() };
+        return [this.sendControl(requestOk)];
+      }
+      // Draft-14/16 §9.14: respond with PUBLISH_OK. Only carry fields that
+      // intentionally define the initial subscription state.
       const params = this.buildPublishOkParamsFromPublish(sub.publishParameters);
       const publishOk: PublishOk = {
         type: 'PUBLISH_OK',
@@ -2238,8 +3619,8 @@ export class Session {
       type: 'SUBSCRIBE_OK',
       requestId,
       trackAlias,
-      parameters: new Map(),
-      trackExtensions: new Map(),
+      parameters: options.parameters ?? new Map(),
+      trackProperties,
     };
 
     return [this.sendControl(subscribeOk)];
@@ -2250,7 +3631,7 @@ export class Session {
    * Sends REQUEST_ERROR and transitions the subscription to TERMINATED.
    * @see draft-ietf-moq-transport-16 §9.8
    */
-  rejectSubscribe(requestId: Varint, errorCode: Varint, errorReason: string): SessionOutboundAction[] {
+  rejectSubscribe(requestId: bigint, errorCode: bigint, errorReason: string): SessionOutboundAction[] {
     const sub = this.incomingSubscriptions.get(requestId as bigint);
     if (!sub) {
       throw new SessionError(
@@ -2261,12 +3642,22 @@ export class Session {
 
     sub.sendRequestError(errorCode, errorReason);
 
-    // Draft-14 §9.15: PUBLISH-initiated subscriptions respond with PUBLISH_ERROR
+    // PUBLISH-initiated subscriptions respond with a publish-rejection message.
     if (sub.isPublishInitiated) {
+      if (this._draftVersion === 18) {
+        // draft-18 §10.10: reject with REQUEST_ERROR (no Request ID on wire),
+        // written on the inbound PUBLISH request stream by the I/O layer.
+        const requestError: RequestErrorMsg = {
+          type: 'REQUEST_ERROR', requestId, errorCode, retryInterval: varint(0n), errorReason,
+        };
+        return [this.sendControl(requestError)];
+      }
+      // Draft-14/16 §9.15: respond with PUBLISH_ERROR. The draft-14 field is a
+      // QUIC Varint — range-guard the (now full-uint64) errorCode at this boundary.
       const publishError: PublishError = {
         type: 'PUBLISH_ERROR',
         requestId,
-        errorCode,
+        errorCode: varint(errorCode),
         errorReason,
       };
       return [this.sendControl(publishError)];
@@ -2278,9 +3669,73 @@ export class Session {
       errorCode,
       retryInterval: varint(0n),
       errorReason,
+      requestKind: 'SUBSCRIBE', // draft-14 → SUBSCRIBE_ERROR; ignored by 16/18
     };
 
     return [this.sendControl(requestError)];
+  }
+
+  /**
+   * Handle PUBLISH_DONE received on an inbound PUBLISH stream (draft-18 §10.11):
+   * terminate the PUBLISH-initiated subscription. Stream/alias teardown is the
+   * I/O layer's concern — late data streams may still arrive, so the caller keeps
+   * alias routing alive until delivery is accounted for.
+   */
+  handleInboundPublishDone(requestId: bigint): SessionOutboundAction[] {
+    const sub = this.incomingSubscriptions.get(requestId as bigint);
+    if (!sub) {
+      return this.closeWithError(
+        SessionErrorCode.INVALID_REQUEST_ID,
+        `Unknown PUBLISH ${requestId} for PUBLISH_DONE`,
+      );
+    }
+    this.incomingSubscriptions.delete(requestId as bigint);
+    return [];
+  }
+
+  /**
+   * Build a REQUEST_UPDATE for a PUBLISH-initiated (incoming) subscription
+   * (draft-18). The publisher opened the stream; as the subscriber we update the
+   * subscription (e.g. FORWARD) by writing REQUEST_UPDATE on that PUBLISH stream.
+   * The matching REQUEST_OK / REQUEST_ERROR applies the update (see the REQUEST_OK
+   * handler, which also looks up incoming subscriptions).
+   */
+  updateIncomingSubscription(
+    existingRequestId: bigint,
+    options: RequestUpdateOptions = {},
+  ): RequestResult {
+    const sub = this.incomingSubscriptions.get(existingRequestId as bigint);
+    if (!sub) {
+      throw new SessionError(
+        `Unknown incoming subscription ${existingRequestId} for REQUEST_UPDATE`,
+        'INVALID_STATE',
+      );
+    }
+    if (sub.state !== 'established') {
+      throw new SessionError(
+        `Cannot update incoming subscription in state ${sub.state}; expected established`,
+        'INVALID_STATE',
+      );
+    }
+
+    const requestId = this.requestIdAllocator.allocate();
+    const parameters: Parameters = new Map();
+    if (options.forward !== undefined) {
+      parameters.set(MessageParam.FORWARD, [varint(BigInt(options.forward))]);
+    }
+    if (options.subscriberPriority !== undefined) {
+      parameters.set(MessageParam.SUBSCRIBER_PRIORITY, [options.subscriberPriority]);
+    }
+
+    this.pendingUpdates.set(requestId as bigint, {
+      existingRequestId,
+      ...(options.forward !== undefined
+        ? { forward: options.forward ? ForwardState.ACTIVE : ForwardState.PAUSED }
+        : {}),
+    });
+
+    const updateMsg: RequestUpdate = { type: 'REQUEST_UPDATE', requestId, existingRequestId, parameters };
+    return { requestId, actions: [this.sendControl(updateMsg)] };
   }
 
   /**
@@ -2288,8 +3743,12 @@ export class Session {
    * Terminates the subscription from the publisher side.
    * @see draft-ietf-moq-transport-16 §9.15
    */
-  publishDone(requestId: Varint, statusCode: Varint, errorReason: string): SessionOutboundAction[] {
-    const sub = this.incomingSubscriptions.get(requestId as bigint);
+  publishDone(requestId: bigint, statusCode: Varint, errorReason: string): SessionOutboundAction[] {
+    // PUBLISH_DONE applies to a publisher-side subscription — either one we serve
+    // for a peer SUBSCRIBE (incomingSubscriptions) or one WE initiated via an
+    // outbound PUBLISH (outgoingPublishes, draft-18 §10.10).
+    const sub = this.incomingSubscriptions.get(requestId as bigint)
+      ?? this.outgoingPublishes.get(requestId as bigint);
     if (!sub) {
       throw new SessionError(
         `Unknown incoming subscription ${requestId} for PUBLISH_DONE`,
@@ -2298,6 +3757,7 @@ export class Session {
     }
 
     sub.sendPublishDone(statusCode, errorReason);
+    this.outgoingPublishes.delete(requestId as bigint);
 
     const publishDoneMsg: PublishDone = {
       type: 'PUBLISH_DONE',
@@ -2313,7 +3773,7 @@ export class Session {
   /**
    * Get an incoming subscription (publisher-side) by request ID.
    */
-  getIncomingSubscription(requestId: Varint): SubscriptionStateMachine | undefined {
+  getIncomingSubscription(requestId: bigint): SubscriptionStateMachine | undefined {
     return this.incomingSubscriptions.get(requestId as bigint);
   }
 
@@ -2322,7 +3782,7 @@ export class Session {
    * Sends FETCH_OK and transitions the fetch to TRANSFERRING.
    * @see draft-ietf-moq-transport-16 §9.17
    */
-  acceptFetch(requestId: Varint): SessionOutboundAction[] {
+  acceptFetch(requestId: bigint, options: FetchAcceptOptions = {}): SessionOutboundAction[] {
     const fetch = this.incomingFetches.get(requestId as bigint);
     if (!fetch) {
       throw new SessionError(
@@ -2331,15 +3791,17 @@ export class Session {
       );
     }
 
+    const trackProperties = this.resolveTrackProperties(options.trackProperties, 'FETCH_OK');
+
     fetch.sendFetchOk();
 
     const fetchOk: FetchOk = {
       type: 'FETCH_OK',
       requestId,
-      endOfTrack: 0,
-      endLocation: { group: varint(0n), object: varint(0n) },
-      parameters: new Map(),
-      trackExtensions: new Map(),
+      endOfTrack: options.endOfTrack ?? 0,
+      endLocation: options.endLocation ?? { group: 0n, object: 0n },
+      parameters: options.parameters ?? new Map(),
+      trackProperties,
     };
 
     return [this.sendControl(fetchOk)];
@@ -2350,7 +3812,7 @@ export class Session {
    * Sends REQUEST_ERROR and transitions the fetch to COMPLETED.
    * @see draft-ietf-moq-transport-16 §9.8
    */
-  rejectFetch(requestId: Varint, errorCode: Varint, errorReason: string): SessionOutboundAction[] {
+  rejectFetch(requestId: bigint, errorCode: bigint, errorReason: string): SessionOutboundAction[] {
     const fetch = this.incomingFetches.get(requestId as bigint);
     if (!fetch) {
       throw new SessionError(
@@ -2367,6 +3829,7 @@ export class Session {
       errorCode,
       retryInterval: varint(0n),
       errorReason,
+      requestKind: 'FETCH', // draft-14 → FETCH_ERROR; ignored by 16/18
     };
 
     return [this.sendControl(requestError)];
@@ -2375,7 +3838,7 @@ export class Session {
   /**
    * Get an incoming fetch (publisher-side) by request ID.
    */
-  getIncomingFetch(requestId: Varint): FetchStateMachine | undefined {
+  getIncomingFetch(requestId: bigint): FetchStateMachine | undefined {
     return this.incomingFetches.get(requestId as bigint);
   }
 
@@ -2431,6 +3894,61 @@ export class Session {
   }
 
   /**
+   * §3.2.1 / §3.2.2: the Application MUST NOT publish tracks or namespaces whose
+   * first Track Namespace field is reserved — exactly `.` (a single period) or
+   * `.session` (session-level, managed by the implementation). Reject such local
+   * API calls before any wire is emitted (cf. the invalid-filter local guard).
+   * @throws {SessionError} for local misuse of a reserved namespace.
+   */
+  private assertNotReservedNamespace(namespace: Uint8Array[], operation: string): void {
+    if (isReservedSessionNamespace(namespace)) {
+      throw new SessionError(
+        `Cannot ${operation} under the reserved .session namespace (§3.2.2)`,
+        'PROTOCOL_VIOLATION',
+      );
+    }
+    if (isReservedDotNamespace(namespace)) {
+      throw new SessionError(
+        `Cannot ${operation} under the reserved '.' namespace (§3.2.1)`,
+        'PROTOCOL_VIOLATION',
+      );
+    }
+  }
+
+  /**
+   * §3.2.1 / §3.2.2: a draft-18 inbound request for a track or namespace whose
+   * Track Namespace first field is reserved — exactly `.` (§3.2.1) or `.session`
+   * (§3.2.2, and we recognize no session-level tracks) — MUST be rejected
+   * per-request with REQUEST_ERROR DOES_NOT_EXIST, NOT a session close. Other
+   * `.`-prefixed namespaces are unrecognized reserved namespaces that §3.2.1
+   * leaves application-visible, so they pass through here.
+   *
+   * Returns the reject actions (REQUEST_ERROR + replenish) when reserved — built
+   * BEFORE any request state is created, so nothing is left dangling — otherwise
+   * `undefined`. draft-14/16 are unaffected (§3.2 is a draft-18 rule).
+   * @see draft-ietf-moq-transport-18 §3.2.1, §3.2.2
+   */
+  private rejectReservedNamespace(
+    namespace: Uint8Array[],
+    requestId: bigint,
+    replenish: SessionOutboundAction[] | undefined,
+  ): SessionOutboundAction[] | undefined {
+    if (this._draftVersion !== 18) return undefined;
+    const isDot = isReservedDotNamespace(namespace);
+    if (!isDot && !isReservedSessionNamespace(namespace)) return undefined;
+    const errorMsg: RequestErrorMsg = {
+      type: 'REQUEST_ERROR',
+      requestId,
+      errorCode: RequestErrorCode.DOES_NOT_EXIST,
+      retryInterval: varint(0n),
+      errorReason: isDot
+        ? "Reserved '.' namespace does not exist (§3.2.1)"
+        : 'Unrecognized .session namespace does not exist (§3.2.2)',
+    };
+    return [this.sendControl(errorMsg), ...(replenish ?? [])];
+  }
+
+  /**
    * Validate combined namespace (prefix + suffix) per §2.4.1.
    * "Track Namespace is an ordered set of between 1 and 32 Track Namespace Fields"
    * "The length of a Track Namespace is the sum of the Track Namespace Field Length fields.
@@ -2444,7 +3962,8 @@ export class Session {
   ): SessionOutboundAction[] | undefined {
     const combined = [...prefix, ...suffix];
     try {
-      validateTrackNamespace(combined);
+      // §2.4.1: draft-18 permits a zero-field full namespace; draft-14/16 do not.
+      validateTrackNamespace(combined, { allowEmpty: this._draftVersion === 18 });
     } catch (e) {
       return this.closeWithError(
         SessionErrorCode.PROTOCOL_VIOLATION,
@@ -2466,7 +3985,7 @@ export class Session {
    *
    * Draft-14 includes GROUP_ORDER inline on PUBLISH; draft-16 does not.
    */
-  private isParamValidForMessageType(key: Varint, messageType: string): boolean {
+  private isParamValidForMessageType(key: bigint, messageType: string): boolean {
     if (
       this._draftVersion === 14 &&
       key === MessageParam.GROUP_ORDER &&
@@ -2475,7 +3994,10 @@ export class Session {
       return true;
     }
 
-    return VALID_PARAMS_FOR_MESSAGE_TYPE.get(key as bigint)?.has(messageType) ?? false;
+    const table = this._draftVersion === 18
+      ? VALID_PARAMS_FOR_MESSAGE_TYPE_18
+      : VALID_PARAMS_FOR_MESSAGE_TYPE;
+    return table.get(key as bigint)?.has(messageType) ?? false;
   }
 
   /**
@@ -2486,18 +4008,26 @@ export class Session {
    * @returns Error with code and reason if validation fails, undefined if valid
    */
   private validateMessageParams(params: Parameters, messageType: string): { error: Varint; reason: string } | undefined {
+    const isDraft18 = this._draftVersion === 18;
+    const knownParams = isDraft18 ? KNOWN_MESSAGE_PARAMS_18 : KNOWN_MESSAGE_PARAMS;
     for (const [key, values] of params) {
-      // §9.2: Unknown message parameters are a protocol violation (draft-16).
+      // §9.2: Unknown message parameters are a protocol violation (draft-16/18).
       // Draft-14: ignore unknown params — different param sets between versions.
-      if (!KNOWN_MESSAGE_PARAMS.has(key as bigint)) {
+      if (!knownParams.has(key as bigint)) {
         if (this._draftVersion === 14) continue;
         return { error: SessionErrorCode.PROTOCOL_VIOLATION, reason: `Unknown message parameter type: ${key}` };
       }
 
-      // §9.2.2: "If it appears in some other type of message, it MUST be ignored"
-      // Skip validation for parameters that are not valid for this message type
+      // Scope check. draft-18 §10.2.1: a KNOWN parameter out of scope MUST close
+      // with PROTOCOL_VIOLATION. draft-14/16 §9.2.2: it MUST be ignored instead.
       if (!this.isParamValidForMessageType(key, messageType)) {
-        continue; // Ignore parameters not defined for this message type
+        if (isDraft18) {
+          return {
+            error: SessionErrorCode.PROTOCOL_VIOLATION,
+            reason: `Parameter 0x${(key as bigint).toString(16)} is out of scope for ${messageType} (§10.2.1)`,
+          };
+        }
+        continue; // draft-14/16: ignore parameters not defined for this message type
       }
 
       // §9.2.2.1: AUTHORIZATION_TOKEN may appear multiple times
@@ -2529,14 +4059,16 @@ export class Session {
    * @see draft-ietf-moq-transport-16 §9.2.2, §3.4
    * @returns Error with code and reason if validation fails, undefined if valid
    */
-  private validateParamValue(key: Varint, value: KvpValue, messageType: string): { error: Varint; reason: string } | undefined {
+  private validateParamValue(key: bigint, value: ParameterValue, messageType: string): { error: Varint; reason: string } | undefined {
     // Even-type parameters: varint value constraint checks → PROTOCOL_VIOLATION
     if (typeof value === 'bigint') {
       switch (key) {
-        // §9.2.2.2: DELIVERY_TIMEOUT, if present, MUST be > 0 (draft-16).
-        // Draft-14 allows DELIVERY_TIMEOUT=0.
+        // DELIVERY_TIMEOUT (0x02). draft-16 §9.2.2.2: MUST be > 0. draft-14 allows
+        // 0; draft-18 §10.2.4 renames it OBJECT_DELIVERY_TIMEOUT where 0 means
+        // "no timeout" (and SUBGROUP_DELIVERY_TIMEOUT 0x06 is unconstrained) — so
+        // only draft-16 rejects 0.
         case MessageParam.DELIVERY_TIMEOUT:
-          if (value === 0n && this._draftVersion !== 14) {
+          if (value === 0n && this._draftVersion === 16) {
             return { error: SessionErrorCode.PROTOCOL_VIOLATION, reason: 'DELIVERY_TIMEOUT must be greater than 0' };
           }
           break;
@@ -2575,23 +4107,46 @@ export class Session {
       return undefined;
     }
 
-    // Odd-type parameters: byte-format structural validation
-    // §3.4: "If a receiver understands a Type, and the following Value or Length/Value
-    // does not match the serialization defined by that Type, the receiver MUST close
-    // the session with error code KEY_VALUE_FORMATTING_ERROR."
-    const bytes = value as Uint8Array;
+    // Non-varint parameter values. Draft-14/16 carry a byte string that is
+    // validated structurally (§3.4 KEY_VALUE_FORMATTING_ERROR). Draft-18 carries
+    // a typed Location for LARGEST_OBJECT, which is valid by construction.
+    if (value instanceof Uint8Array) {
+      switch (key) {
+        // §9.2.2.7: LARGEST_OBJECT is a Location structure (two varints).
+        case MessageParam.LARGEST_OBJECT:
+          return this.validateLargestObject(value);
 
-    switch (key) {
-      // §9.2.2.7: LARGEST_OBJECT is a Location structure (two varints: group, object)
-      case MessageParam.LARGEST_OBJECT:
-        return this.validateLargestObject(bytes);
-
-      // §9.2.2.5: SUBSCRIPTION_FILTER is a Subscription Filter structure
-      case MessageParam.SUBSCRIPTION_FILTER:
-        return this.validateSubscriptionFilter(bytes);
+        // §9.2.2.5 / §5.1.2: SUBSCRIPTION_FILTER is a Subscription Filter structure.
+        case MessageParam.SUBSCRIPTION_FILTER: {
+          const reason = validateSubscriptionFilter(value, this._draftVersion);
+          return reason ? { error: SessionErrorCode.PROTOCOL_VIOLATION, reason } : undefined;
+        }
+      }
+      return undefined;
     }
 
-    return undefined;
+    // Track Namespace tuple value (draft-18): only TRACK_NAMESPACE_PREFIX is a
+    // namespace tuple. The prefix handler validates its shape (≤32 fields) and
+    // overlap; here we only reject the tuple form on any other parameter.
+    if (Array.isArray(value)) {
+      if (key !== MessageParam.TRACK_NAMESPACE_PREFIX) {
+        return {
+          error: SessionErrorCode.KEY_VALUE_FORMATTING_ERROR,
+          reason: `Parameter 0x${(key as bigint).toString(16)} must not be encoded as a Track Namespace tuple`,
+        };
+      }
+      return undefined;
+    }
+
+    // Typed Location value (draft-18): only LARGEST_OBJECT is defined as a
+    // Location. Any other parameter supplied as a Location is malformed.
+    if (key !== MessageParam.LARGEST_OBJECT) {
+      return {
+        error: SessionErrorCode.KEY_VALUE_FORMATTING_ERROR,
+        reason: `Parameter 0x${(key as bigint).toString(16)} must not be encoded as a Location`,
+      };
+    }
+    return undefined; // LARGEST_OBJECT as a typed Location is valid by construction
   }
 
   /**
@@ -2618,152 +4173,6 @@ export class Session {
   }
 
   /**
-   * Validate SUBSCRIPTION_FILTER parameter bytes (§9.2.2.5, §5.1.2).
-   * Structure: Filter Type (varint), [Start Location], [End Group]
-   * §9.2.2.5: Length mismatch → PROTOCOL_VIOLATION
-   * Encode a SubscriptionFilter into wire-format bytes.
-   *
-   * §5.1.2: Filter Type (varint), [Start Location (group + object varints)], [End Group (varint)]
-   * @see draft-ietf-moq-transport-16 §5.1.2
-   */
-  private encodeSubscriptionFilter(filter: SubscriptionFilter): Uint8Array {
-    const filterTypeMap = {
-      NextGroupStart: varint(0x1n),
-      LargestObject: varint(0x2n),
-      LatestObject: varint(0x2n),  // deprecated alias
-      AbsoluteStart: varint(0x3n),
-      AbsoluteRange: varint(0x4n),
-    } as const;
-
-    const filterType = filterTypeMap[filter.type];
-    let size = varintEncodingLength(filterType);
-
-    if (filter.type === 'AbsoluteStart' || filter.type === 'AbsoluteRange') {
-      size += varintEncodingLength(filter.startGroup);
-      size += varintEncodingLength(filter.startObject);
-    }
-    if (filter.type === 'AbsoluteRange') {
-      size += varintEncodingLength(filter.endGroup);
-    }
-
-    const buf = new Uint8Array(size);
-    let offset = writeVarint(filterType, buf, 0);
-
-    if (filter.type === 'AbsoluteStart' || filter.type === 'AbsoluteRange') {
-      offset += writeVarint(filter.startGroup, buf, offset);
-      offset += writeVarint(filter.startObject, buf, offset);
-    }
-    if (filter.type === 'AbsoluteRange') {
-      writeVarint(filter.endGroup, buf, offset);
-    }
-
-    return buf;
-  }
-
-  /**
-   * §5.1.2: Unknown filter type → PROTOCOL_VIOLATION
-   * §5.1.2: AbsoluteRange End Group < Start Group → PROTOCOL_VIOLATION
-   * @returns Error if malformed, undefined if valid
-   */
-  private validateSubscriptionFilter(bytes: Uint8Array): { error: Varint; reason: string } | undefined {
-    if (bytes.length === 0) {
-      return {
-        error: SessionErrorCode.PROTOCOL_VIOLATION,
-        reason: 'SUBSCRIPTION_FILTER is empty',
-      };
-    }
-
-    let pos = 0;
-
-    // Read Filter Type
-    let filterType: bigint;
-    try {
-      const { value, bytesRead } = readVarint(bytes, pos);
-      filterType = value as bigint;
-      pos += bytesRead;
-    } catch {
-      return {
-        error: SessionErrorCode.PROTOCOL_VIOLATION,
-        reason: 'SUBSCRIPTION_FILTER has malformed Filter Type varint',
-      };
-    }
-
-    // §5.1.2: Valid filter types are 0x1 (NextGroupStart), 0x2 (LargestObject),
-    // 0x3 (AbsoluteStart), 0x4 (AbsoluteRange)
-    if (filterType < 1n || filterType > 4n) {
-      return {
-        error: SessionErrorCode.PROTOCOL_VIOLATION,
-        reason: `SUBSCRIPTION_FILTER has unknown Filter Type ${filterType}`,
-      };
-    }
-
-    // NextGroupStart (0x1) and LargestObject (0x2): no additional fields
-    if (filterType === 1n || filterType === 2n) {
-      if (pos !== bytes.length) {
-        return {
-          error: SessionErrorCode.PROTOCOL_VIOLATION,
-          reason: `SUBSCRIPTION_FILTER length mismatch: ${bytes.length - pos} trailing bytes for Filter Type ${filterType}`,
-        };
-      }
-      return undefined;
-    }
-
-    // AbsoluteStart (0x3) and AbsoluteRange (0x4): Start Location required
-    let startGroup: bigint;
-    try {
-      const { value: loc, bytesRead } = readLocation(bytes, pos);
-      startGroup = loc.group as bigint;
-      pos += bytesRead;
-    } catch {
-      return {
-        error: SessionErrorCode.PROTOCOL_VIOLATION,
-        reason: 'SUBSCRIPTION_FILTER has malformed Start Location',
-      };
-    }
-
-    if (filterType === 3n) {
-      // AbsoluteStart: no End Group
-      if (pos !== bytes.length) {
-        return {
-          error: SessionErrorCode.PROTOCOL_VIOLATION,
-          reason: `SUBSCRIPTION_FILTER length mismatch: ${bytes.length - pos} trailing bytes for AbsoluteStart`,
-        };
-      }
-      return undefined;
-    }
-
-    // AbsoluteRange (0x4): End Group required
-    let endGroup: bigint;
-    try {
-      const { value, bytesRead } = readVarint(bytes, pos);
-      endGroup = value as bigint;
-      pos += bytesRead;
-    } catch {
-      return {
-        error: SessionErrorCode.PROTOCOL_VIOLATION,
-        reason: 'SUBSCRIPTION_FILTER has malformed End Group varint for AbsoluteRange',
-      };
-    }
-
-    if (pos !== bytes.length) {
-      return {
-        error: SessionErrorCode.PROTOCOL_VIOLATION,
-        reason: `SUBSCRIPTION_FILTER length mismatch: ${bytes.length - pos} trailing bytes for AbsoluteRange`,
-      };
-    }
-
-    // §5.1.2: "End Group MUST specify the same or a larger Group than specified in Start Location"
-    if (endGroup < startGroup) {
-      return {
-        error: SessionErrorCode.PROTOCOL_VIOLATION,
-        reason: `SUBSCRIPTION_FILTER AbsoluteRange End Group ${endGroup} < Start Group ${startGroup}`,
-      };
-    }
-
-    return undefined;
-  }
-
-  /**
    * Validate message parameters for any control message that has them.
    * Setup messages are excluded (handled separately with different rules).
    * @returns Error with code and reason if validation fails, undefined if valid
@@ -2773,6 +4182,14 @@ export class Session {
     if ('parameters' in msg && msg.parameters instanceof Map) {
       // Skip CLIENT_SETUP and SERVER_SETUP - they have setup parameters, not message parameters
       if (msg.type === 'CLIENT_SETUP' || msg.type === 'SERVER_SETUP') {
+        return undefined;
+      }
+      // draft-18 §10.5: REQUEST_OK is a context-sensitive shorthand (PUBLISH_OK /
+      // REQUEST_UPDATE_OK / TRACK_STATUS_OK / namespace responses). Its parameter
+      // scope depends on WHICH request it answers, which is only known once the
+      // request stream is resolved — so defer to handleRequestOk. (draft-14/16
+      // REQUEST_OK keeps the by-type scope here.)
+      if (this._draftVersion === 18 && msg.type === 'REQUEST_OK') {
         return undefined;
       }
       return this.validateMessageParams(msg.parameters, msg.type);

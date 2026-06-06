@@ -46,9 +46,20 @@ export function varint(n: number | bigint): Varint {
 
 /**
  * Determine the wire encoding length of a varint value.
+ *
+ * Accepts a raw `bigint` (not just a branded {@link Varint}) so that message
+ * fields widened to `bigint` for draft-18 (full uint64) can pass through the
+ * draft-14/16 QUIC encoders — but a value outside the QUIC range is rejected
+ * here rather than silently truncated, which is what keeps a draft-14/16 message
+ * from ever encoding a value > 2^62-1.
+ *
  * @see RFC 9000 §16 — first 2 bits encode length
+ * @throws {RangeError} if value is negative or exceeds MAX_VARINT (2^62-1).
  */
-export function varintEncodingLength(value: Varint): 1 | 2 | 4 | 8 {
+export function varintEncodingLength(value: bigint): 1 | 2 | 4 | 8 {
+  if (value < 0n || value > MAX_VARINT) {
+    throw new RangeError(`QUIC varint value out of range (0..${MAX_VARINT}): ${value}`);
+  }
   if (value <= 63n) return 1;
   if (value <= 16383n) return 2;
   if (value <= 1073741823n) return 4;
@@ -115,11 +126,16 @@ export function readVarint(
 
 /**
  * Write a varint to a buffer at the given offset.
+ *
+ * Accepts a raw `bigint`; out-of-QUIC-range values throw via
+ * {@link varintEncodingLength} rather than being silently truncated.
+ *
  * @see RFC 9000 §16
  * @returns Number of bytes written.
+ * @throws {RangeError} if value is negative or exceeds MAX_VARINT (2^62-1).
  */
 export function writeVarint(
-  value: Varint,
+  value: bigint,
   buf: Uint8Array,
   offset: number,
 ): number {

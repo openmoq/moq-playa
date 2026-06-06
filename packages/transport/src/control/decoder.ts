@@ -190,6 +190,10 @@ function decodePayloadFields(
       return { message: { type: typeName, parameters }, finalPos: pos };
     }
 
+    case 'SETUP':
+      // draft-18-only; the draft-14/16 decoder never produces this typeName.
+      throw new Error('SETUP is a draft-18 message; not produced by the draft-14/16 codec');
+
     case 'GOAWAY': {
       const { value: uriLen, bytesRead: uriLenBytes } = readVarint(buf, pos);
       pos += uriLenBytes;
@@ -438,5 +442,9 @@ function decodePayloadFields(
     case 'PUBLISH_NAMESPACE_ERROR':
     case 'PUBLISH_ERROR':
       throw new ProtocolViolationError(`Draft-14-only message type "${typeName}" cannot be decoded by draft-16 decoder`);
+    // Draft-18-only types — not decodable by the draft-14/16 decoder
+    case 'SUBSCRIBE_TRACKS':
+    case 'PUBLISH_BLOCKED':
+      throw new ProtocolViolationError(`Draft-18-only message type "${typeName}" cannot be decoded by draft-16 decoder`);
   }
 }

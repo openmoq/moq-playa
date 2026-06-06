@@ -40,10 +40,11 @@ export interface Location {
 export class SubscriptionStateMachine {
   private _state: SubscriptionStateValue = SubscriptionState.PENDING;
   private _forwardState: ForwardStateValue = ForwardState.ACTIVE;
-  private _trackAlias: Varint | undefined;
-  private _errorCode: Varint | undefined;
+  private _trackAlias: bigint | undefined;
+  private _errorCode: bigint | undefined;
   private _errorReason: string | undefined;
-  private _terminationCode: Varint | undefined;
+  // PUBLISH_DONE Status Code — vi64 (full uint64) on draft-18, so `bigint`.
+  private _terminationCode: bigint | undefined;
   private _largestLocation: Location | undefined;
   private _trackKey: string | undefined;
   /**
@@ -81,7 +82,7 @@ export class SubscriptionStateMachine {
   private _publishParameters: Parameters = new Map();
 
   private constructor(
-    private readonly _requestId: Varint,
+    private readonly _requestId: bigint,
     private readonly _isPublisher: boolean,
     private readonly _trackNamespace?: Uint8Array[],
     private readonly _trackName?: Uint8Array,
@@ -96,7 +97,7 @@ export class SubscriptionStateMachine {
    * Create a subscription state machine as subscriber (sending SUBSCRIBE).
    */
   static createAsSubscriber(
-    requestId: Varint,
+    requestId: bigint,
     trackNamespace?: Uint8Array[],
     trackName?: Uint8Array,
   ): SubscriptionStateMachine {
@@ -107,7 +108,7 @@ export class SubscriptionStateMachine {
    * Create a subscription state machine as publisher (receiving SUBSCRIBE).
    */
   static createAsPublisher(
-    requestId: Varint,
+    requestId: bigint,
     trackNamespace?: Uint8Array[],
     trackName?: Uint8Array,
   ): SubscriptionStateMachine {
@@ -121,7 +122,7 @@ export class SubscriptionStateMachine {
    * @see draft-ietf-moq-transport-14 §9.13
    */
   static createFromPublish(
-    requestId: Varint,
+    requestId: bigint,
     trackNamespace?: Uint8Array[],
     trackName?: Uint8Array,
     parameters?: Parameters,
@@ -147,17 +148,17 @@ export class SubscriptionStateMachine {
   }
 
   /** Request ID for this subscription. */
-  get requestId(): Varint {
+  get requestId(): bigint {
     return this._requestId;
   }
 
   /** Track alias assigned on SUBSCRIBE_OK. */
-  get trackAlias(): Varint | undefined {
+  get trackAlias(): bigint | undefined {
     return this._trackAlias;
   }
 
   /** Error code if terminated with REQUEST_ERROR. */
-  get errorCode(): Varint | undefined {
+  get errorCode(): bigint | undefined {
     return this._errorCode;
   }
 
@@ -166,8 +167,8 @@ export class SubscriptionStateMachine {
     return this._errorReason;
   }
 
-  /** Termination code if terminated with PUBLISH_DONE. */
-  get terminationCode(): Varint | undefined {
+  /** Termination code if terminated with PUBLISH_DONE (vi64, full uint64 on draft-18). */
+  get terminationCode(): bigint | undefined {
     return this._terminationCode;
   }
 
@@ -269,7 +270,7 @@ export class SubscriptionStateMachine {
    * Handle SUBSCRIBE_OK received (subscriber side).
    * Transitions from PENDING to ESTABLISHED.
    */
-  handleSubscribeOk(trackAlias: Varint): void {
+  handleSubscribeOk(trackAlias: bigint): void {
     this.assertState(SubscriptionState.PENDING, 'handleSubscribeOk');
     this.assertNotPublisher('handleSubscribeOk');
 
@@ -281,7 +282,7 @@ export class SubscriptionStateMachine {
    * Handle REQUEST_ERROR received (subscriber side).
    * Transitions to TERMINATED.
    */
-  handleRequestError(errorCode: Varint, errorReason: string): void {
+  handleRequestError(errorCode: bigint, errorReason: string): void {
     this.assertNotTerminated('handleRequestError');
     this.assertNotPublisher('handleRequestError');
 
@@ -294,7 +295,7 @@ export class SubscriptionStateMachine {
    * Handle PUBLISH_DONE received (subscriber side).
    * Transitions from ESTABLISHED to TERMINATED.
    */
-  handlePublishDone(statusCode: Varint, errorReason: string): void {
+  handlePublishDone(statusCode: bigint, errorReason: string): void {
     this.assertState(SubscriptionState.ESTABLISHED, 'handlePublishDone');
     this.assertNotPublisher('handlePublishDone');
 
@@ -309,7 +310,7 @@ export class SubscriptionStateMachine {
    * Send SUBSCRIBE_OK (publisher side).
    * Transitions from PENDING to ESTABLISHED.
    */
-  sendSubscribeOk(trackAlias: Varint): void {
+  sendSubscribeOk(trackAlias: bigint): void {
     this.assertState(SubscriptionState.PENDING, 'sendSubscribeOk');
     this.assertPublisher('sendSubscribeOk');
 
@@ -318,10 +319,35 @@ export class SubscriptionStateMachine {
   }
 
   /**
+   * Record the Track Alias we advertise in an OUTBOUND PUBLISH (publisher side,
+   * draft-18 §10.10). The alias is chosen by the publisher and carried on the
+   * PUBLISH; the subscription stays PENDING until the peer's REQUEST_OK.
+   */
+  setOutboundPublishAlias(trackAlias: bigint): void {
+    this.assertState(SubscriptionState.PENDING, 'setOutboundPublishAlias');
+    this.assertPublisher('setOutboundPublishAlias');
+
+    this._trackAlias = trackAlias;
+    this._publishInitiated = true;
+  }
+
+  /**
+   * Peer accepted our OUTBOUND PUBLISH with REQUEST_OK (PUBLISH_OK shorthand,
+   * draft-18 §10.10). Transitions PENDING → ESTABLISHED; the alias was already set
+   * via {@link setOutboundPublishAlias}.
+   */
+  acceptOutboundPublish(): void {
+    this.assertState(SubscriptionState.PENDING, 'acceptOutboundPublish');
+    this.assertPublisher('acceptOutboundPublish');
+
+    this._state = SubscriptionState.ESTABLISHED;
+  }
+
+  /**
    * Send REQUEST_ERROR (publisher side).
    * Transitions to TERMINATED.
    */
-  sendRequestError(errorCode: Varint, errorReason: string): void {
+  sendRequestError(errorCode: bigint, errorReason: string): void {
     this.assertNotTerminated('sendRequestError');
     this.assertPublisher('sendRequestError');
 

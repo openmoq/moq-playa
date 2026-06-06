@@ -51,11 +51,20 @@ export const RequestError = {
   DUPLICATE_SUBSCRIPTION: varint(0x19),
   UNINTERESTED: varint(0x20),
   PREFIX_OVERLAP: varint(0x30),
+  NAMESPACE_TOO_LARGE: varint(0x31),
   INVALID_JOINING_REQUEST_ID: varint(0x32),
+  /** draft-18 §2.5.1: a Mandatory Track Property the endpoint does not understand. */
+  UNSUPPORTED_EXTENSION: varint(0x33),
+  /** draft-18 §10.6.2: the request is redirected; the body carries a Redirect. */
+  REDIRECT: varint(0x34),
 } as const;
 
 /**
- * PUBLISH_DONE Status Codes.
+ * PUBLISH_DONE Status Codes — **draft-14/16** (legacy).
+ *
+ * NOTE: draft-18 renumbers this table — EXPIRED and TOO_FAR_BEHIND are swapped
+ * (0x5↔0x6) and EXCESSIVE_LOAD (0x9) is added. Use {@link PublishDoneCode18} for
+ * draft-18; this export is retained unchanged for draft-14/16 compatibility.
  * @see draft-ietf-moq-transport-16 §13.4.3
  */
 export const PublishDoneCode = {
@@ -71,7 +80,11 @@ export const PublishDoneCode = {
 } as const;
 
 /**
- * Data Stream Reset Error Codes.
+ * Data Stream Reset Error Codes — **draft-14/16** (legacy).
+ *
+ * NOTE: draft-18 renumbers this table (see {@link StreamResetCode18}) —
+ * UNKNOWN_OBJECT_STATUS moves from 0x4 to 0x6, and 0x4 becomes GOING_AWAY. This
+ * export is retained unchanged for draft-14/16 compatibility.
  * @see draft-ietf-moq-transport-16 §13.4.4
  */
 export const DataStreamError = {
@@ -82,6 +95,75 @@ export const DataStreamError = {
   UNKNOWN_OBJECT_STATUS: varint(0x4),
   MALFORMED_TRACK: varint(0x12),
 } as const;
+
+// ─── draft-18 error code registries (canonical) ──────────────────────────────
+// draft-18 renumbers several registries; these are the authoritative draft-18
+// tables. The legacy exports above stay frozen for draft-14/16. Consumers select
+// the registry by the negotiated draft version.
+
+/**
+ * REQUEST_ERROR codes — **draft-18** (§15.10.2). Superset of the legacy table:
+ * adds GOING_AWAY (0x6) and EXCESSIVE_LOAD (0x9).
+ */
+export const RequestError18 = {
+  INTERNAL_ERROR: varint(0x0),
+  UNAUTHORIZED: varint(0x1),
+  TIMEOUT: varint(0x2),
+  NOT_SUPPORTED: varint(0x3),
+  MALFORMED_AUTH_TOKEN: varint(0x4),
+  EXPIRED_AUTH_TOKEN: varint(0x5),
+  GOING_AWAY: varint(0x6),
+  EXCESSIVE_LOAD: varint(0x9),
+  DOES_NOT_EXIST: varint(0x10),
+  INVALID_RANGE: varint(0x11),
+  MALFORMED_TRACK: varint(0x12),
+  DUPLICATE_SUBSCRIPTION: varint(0x19),
+  UNINTERESTED: varint(0x20),
+  PREFIX_OVERLAP: varint(0x30),
+  NAMESPACE_TOO_LARGE: varint(0x31),
+  INVALID_JOINING_REQUEST_ID: varint(0x32),
+  UNSUPPORTED_EXTENSION: varint(0x33),
+  REDIRECT: varint(0x34),
+} as const;
+
+/**
+ * PUBLISH_DONE Status Codes — **draft-18** (§15.10.3). Differs from legacy:
+ * TOO_FAR_BEHIND = 0x5 and EXPIRED = 0x6 (swapped), plus EXCESSIVE_LOAD (0x9).
+ */
+export const PublishDoneCode18 = {
+  INTERNAL_ERROR: varint(0x0),
+  UNAUTHORIZED: varint(0x1),
+  TRACK_ENDED: varint(0x2),
+  SUBSCRIPTION_ENDED: varint(0x3),
+  GOING_AWAY: varint(0x4),
+  TOO_FAR_BEHIND: varint(0x5),
+  EXPIRED: varint(0x6),
+  UPDATE_FAILED: varint(0x8),
+  EXCESSIVE_LOAD: varint(0x9),
+  MALFORMED_TRACK: varint(0x12),
+} as const;
+
+/**
+ * Stream Reset Error Codes — **draft-18** (§15.10.4), the canonical draft-18 name
+ * for what draft-14/16 called {@link DataStreamError}. Differs from legacy:
+ * GOING_AWAY = 0x4, TOO_FAR_BEHIND = 0x5, UNKNOWN_OBJECT_STATUS moves to 0x6, plus
+ * EXPIRED_AUTH_TOKEN (0x7) and EXCESSIVE_LOAD (0x9).
+ */
+export const StreamResetCode18 = {
+  INTERNAL_ERROR: varint(0x0),
+  CANCELLED: varint(0x1),
+  DELIVERY_TIMEOUT: varint(0x2),
+  SESSION_CLOSED: varint(0x3),
+  GOING_AWAY: varint(0x4),
+  TOO_FAR_BEHIND: varint(0x5),
+  UNKNOWN_OBJECT_STATUS: varint(0x6),
+  EXPIRED_AUTH_TOKEN: varint(0x7),
+  EXCESSIVE_LOAD: varint(0x9),
+  MALFORMED_TRACK: varint(0x12),
+} as const;
+
+/** @deprecated Use {@link StreamResetCode18} — the canonical draft-18 name. */
+export const DataStreamError18 = StreamResetCode18;
 
 // ─── Typed Error Classes ──────────────────────────────────────────────
 

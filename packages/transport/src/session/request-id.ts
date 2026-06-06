@@ -13,6 +13,7 @@
 
 import { varint, type Varint } from '../primitives/varint.js';
 import { EndpointRole, type EndpointRoleValue } from './types.js';
+import type { RequestPolicy } from './request-policy.js';
 
 /**
  * Error thrown when request ID allocation fails.
@@ -82,7 +83,28 @@ export class RequestIdAllocator {
   /** Window size for auto-replenishment. @see §9.5 */
   private readonly windowSize: bigint;
 
-  constructor(private readonly role: EndpointRoleValue, config?: RequestIdAllocatorConfig) {
+  /**
+   * Whether outbound allocation is gated by a MAX_REQUEST_ID credit window
+   * (draft-14/16). Draft-18 has no request credit — QUIC stream limits replace
+   * it — so allocation is never gated and never becomes blocked.
+   */
+  private readonly hasCredit: boolean;
+
+  /** Inbound validation mode (§10.1). 'strict-sequence' for draft-14/16 (credit
+   *  window + exactly-next-in-sequence); 'parity-and-duplicate' for draft-18
+   *  (no credit window; reject only wrong parity / duplicate Request IDs). */
+  private readonly inboundValidation: 'strict-sequence' | 'parity-and-duplicate';
+
+  /** Request IDs already seen from the peer — duplicate tracker for draft-18. */
+  private readonly seenIncoming = new Set<bigint>();
+
+  constructor(
+    private readonly role: EndpointRoleValue,
+    config?: RequestIdAllocatorConfig,
+    policy?: RequestPolicy,
+  ) {
+    this.hasCredit = policy?.hasCredit ?? true;
+    this.inboundValidation = policy?.inboundValidation ?? 'strict-sequence';
     // Client starts at 0 (even), server starts at 1 (odd)
     this.nextOutgoingId = role === EndpointRole.CLIENT ? 0n : 1n;
 
@@ -170,7 +192,7 @@ export class RequestIdAllocator {
    * Returns false if next ID would exceed peer's MAX_REQUEST_ID.
    */
   canAllocate(): boolean {
-    return this.nextOutgoingId < this.peerMaxRequestId;
+    return !this.hasCredit || this.nextOutgoingId < this.peerMaxRequestId;
   }
 
   /**
@@ -196,8 +218,10 @@ export class RequestIdAllocator {
    * @throws {RequestIdError} If allocation would exceed MAX_REQUEST_ID
    * @see draft-ietf-moq-transport-16 §9.1
    */
-  allocate(): Varint {
-    if (this.nextOutgoingId >= this.peerMaxRequestId) {
+  allocate(): bigint {
+    // draft-14/16: gated by the peer's MAX_REQUEST_ID credit window. draft-18
+    // (hasCredit = false): no credit gate, and we never become blocked.
+    if (this.hasCredit && this.nextOutgoingId >= this.peerMaxRequestId) {
       this.blocked = true;
       throw new RequestIdError(
         `Cannot allocate request ID ${this.nextOutgoingId}: exceeds peer MAX_REQUEST_ID ${this.peerMaxRequestId}`,
@@ -205,7 +229,9 @@ export class RequestIdAllocator {
       );
     }
 
-    const id = varint(this.nextOutgoingId);
+    // Return a semantic bigint request ID (no QUIC-varint cap); the draft-14/16
+    // encoders enforce the QUIC range on the wire.
+    const id = this.nextOutgoingId;
     this.nextOutgoingId += 2n; // Increment by 2 to maintain parity
     return id;
   }
@@ -221,8 +247,8 @@ export class RequestIdAllocator {
    * @param requestId The incoming request ID
    * @throws {RequestIdError} If validation fails
    */
-  validateIncoming(requestId: Varint): void {
-    // Check parity
+  validateIncoming(requestId: bigint): void {
+    // Check parity (both modes): peer Request IDs must have the peer's parity.
     const parity = requestId & 1n;
     if (parity !== this.peerParityBit) {
       throw new RequestIdError(
@@ -231,7 +257,19 @@ export class RequestIdAllocator {
       );
     }
 
-    // Check against our MAX_REQUEST_ID
+    if (this.inboundValidation === 'parity-and-duplicate') {
+      // draft-18 §10.1: each request rides its own stream, so requests can arrive
+      // out of order. QUIC stream limits replace the MAX_REQUEST_ID window, so we
+      // only reject a wrong parity (above) or a DUPLICATE Request ID.
+      if (this.seenIncoming.has(requestId)) {
+        throw new RequestIdError(`Duplicate incoming Request ID ${requestId}`, 'INVALID_REQUEST_ID');
+      }
+      this.seenIncoming.add(requestId);
+      if (requestId > this.highestIncomingId) this.highestIncomingId = requestId;
+      return;
+    }
+
+    // strict-sequence (draft-14/16): credit window + exactly-next-in-sequence.
     // §9.5: receiving a request ID >= our MAX_REQUEST_ID is TOO_MANY_REQUESTS
     if (requestId >= this.ourMaxRequestId) {
       throw new RequestIdError(
@@ -259,7 +297,7 @@ export class RequestIdAllocator {
    * @param requestId The request ID in the response
    * @throws {RequestIdError} If parity doesn't match our outgoing requests
    */
-  validateOurRequestId(requestId: Varint): void {
+  validateOurRequestId(requestId: bigint): void {
     const parity = requestId & 1n;
     if (parity !== this.parityBit) {
       throw new RequestIdError(

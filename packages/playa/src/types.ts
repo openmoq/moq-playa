@@ -29,7 +29,7 @@ export interface PlayerOptions {
   /** SHA-256 cert hash for self-signed certs (local dev). */
   readonly certHash?: ArrayBuffer;
   /** MOQT draft version. Default: 16. */
-  readonly draftVersion?: 14 | 16;
+  readonly draftVersion?: 14 | 16 | 18;
   /** Auth tokens for CLIENT_SETUP. */
   readonly authTokens?: Uint8Array[];
 

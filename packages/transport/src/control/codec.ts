@@ -12,9 +12,50 @@
  * @module
  */
 
-import type { ControlMessage } from './messages.js';
+import type {
+  ControlMessage,
+  RequestId,
+  SubscribeOk,
+  RequestOk,
+  RequestErrorMsg,
+  FetchOk,
+  PublishOk,
+  PublishDone,
+  RequestUpdate,
+} from './messages.js';
+import type { DraftVersion } from '../versions.js';
 
-export type DraftVersion = 14 | 16;
+export type { DraftVersion };
+
+/**
+ * draft-18 response messages — these OMIT the Request ID on the wire because the
+ * request's bidirectional stream is the correlation. (PUBLISH_OK is a REQUEST_OK
+ * sent in response to PUBLISH.)
+ */
+type ResponseMessage = SubscribeOk | RequestOk | RequestErrorMsg | FetchOk | PublishOk | PublishDone;
+
+// Distributive (`T extends unknown ?`) so it applies per-member of the response
+// union — otherwise Omit over the union would drop member-specific fields.
+type OptionalRequestId<T> = T extends unknown ? Omit<T, 'requestId'> & { requestId?: RequestId } : never;
+
+/**
+ * The result of decoding a control message off the wire, before the topology
+ * layer has supplied stream-derived correlation. Precisely models draft-18:
+ *
+ *   - Request messages (SUBSCRIBE, FETCH, PUBLISH, …) KEEP their Request ID — it
+ *     is always on the wire.
+ *   - Response messages OMIT it: the Draft18 codec leaves `requestId` absent
+ *     (never a placeholder) and the topology stamps the stream-correlated value.
+ *   - REQUEST_UPDATE keeps its own (new) Request ID but omits the "Existing
+ *     Request ID", which the topology fills from stream context.
+ *
+ * A draft-14/16 `ControlMessage` (every field present) is assignable to this
+ * type, so the framer/session can carry either.
+ */
+export type DecodedControlMessage =
+  | Exclude<ControlMessage, ResponseMessage | RequestUpdate>
+  | OptionalRequestId<ResponseMessage>
+  | (Omit<RequestUpdate, 'existingRequestId'> & { existingRequestId?: RequestId });
 
 export interface ControlCodec {
   readonly version: DraftVersion;
@@ -23,7 +64,7 @@ export interface ControlCodec {
   encode(msg: ControlMessage): Uint8Array;
 
   /** Decode a framed wire message starting at offset. */
-  decode(buf: Uint8Array, offset: number): { message: ControlMessage; bytesRead: number };
+  decode(buf: Uint8Array, offset: number): { message: DecodedControlMessage; bytesRead: number };
 
   /**
    * Peek at the buffer to determine the total frame size, or undefined
@@ -44,6 +85,11 @@ export function createControlCodec(version: DraftVersion = 16): ControlCodec {
       return new Draft16Codec();
     case 14:
       return new Draft14Codec();
+    case 18:
+      return new Draft18Codec();
+    default:
+      // Unknown/unwired draft: a programming error, not a silent fallback.
+      throw new Error(`createControlCodec: draft-${version as number} control codec is not yet implemented`);
   }
 }
 
@@ -52,6 +98,7 @@ export function createControlCodec(version: DraftVersion = 16): ControlCodec {
 import { encodeControlMessage } from './encoder.js';
 import { decodeControlMessage } from './decoder.js';
 import { Draft14Codec } from './draft14-codec.js';
+import { Draft18Codec } from './draft18-codec.js';
 
 /**
  * Draft-16 codec — thin wrapper around existing encode/decode functions.

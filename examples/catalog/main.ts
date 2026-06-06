@@ -163,7 +163,7 @@ async function run(): Promise<void> {
   const ns = (document.getElementById('namespace') as HTMLInputElement).value.trim();
   const vRaw = (document.getElementById('draft-version') as HTMLSelectElement).value;
   const hashHex = (document.getElementById('cert-hash') as HTMLInputElement).value.trim();
-  const v: 14 | 16 | undefined = vRaw === '14' ? 14 : vRaw === '16' ? 16 : undefined;
+  const v: 14 | 16 | 18 | undefined = vRaw === '14' ? 14 : vRaw === '16' ? 16 : vRaw === '18' ? 18 : undefined;
 
   if (!url || !ns) { setStatus('URL and namespace required.', 'error'); return; }
 

@@ -5,7 +5,7 @@
  * If absolute Type is even → Value is a single varint.
  * If absolute Type is odd → Value is Length (varint) + bytes.
  *
- * Note: Parameters are stored as Map<Varint, KvpValue[]> to support
+ * Note: Parameters are stored as Map<bigint, KvpValue[]> to support
  * multiple values per type (e.g., AUTHORIZATION_TOKEN in setup, §9.3.1.5).
  *
  * @module
@@ -27,8 +27,8 @@ export function readKvpList(
   buf: Uint8Array,
   offset: number,
   count: number,
-): { value: Map<Varint, KvpValue[]>; bytesRead: number } {
-  const result = new Map<Varint, KvpValue[]>();
+): { value: Map<bigint, KvpValue[]>; bytesRead: number } {
+  const result = new Map<bigint, KvpValue[]>();
   let pos = offset;
   let prevType = 0n;
 
@@ -76,7 +76,7 @@ export function readKvpList(
  * @returns bytes written
  */
 export function writeKvpList(
-  params: Map<Varint, KvpValue[]>,
+  params: Map<bigint, KvpValue[]>,
   buf: Uint8Array,
   offset: number,
 ): number {
@@ -115,7 +115,7 @@ export function writeKvpList(
 }
 
 /** Calculate encoding length for a KVP list. */
-export function kvpListEncodingLength(params: Map<Varint, KvpValue[]>): number {
+export function kvpListEncodingLength(params: Map<bigint, KvpValue[]>): number {
   let len = 0;
   let prevType = 0n;
 
@@ -153,8 +153,8 @@ export function readKvpListAbsolute(
   buf: Uint8Array,
   offset: number,
   count: number,
-): { value: Map<Varint, KvpValue[]>; bytesRead: number } {
-  const result = new Map<Varint, KvpValue[]>();
+): { value: Map<bigint, KvpValue[]>; bytesRead: number } {
+  const result = new Map<bigint, KvpValue[]>();
   let pos = offset;
 
   for (let i = 0; i < count; i++) {
@@ -197,7 +197,7 @@ export function readKvpListAbsolute(
  * @returns bytes written
  */
 export function writeKvpListAbsolute(
-  params: Map<Varint, KvpValue[]>,
+  params: Map<bigint, KvpValue[]>,
   buf: Uint8Array,
   offset: number,
 ): number {
@@ -233,7 +233,7 @@ export function writeKvpListAbsolute(
  *
  * @see draft-ietf-moq-transport-14 §1.4.2
  */
-export function kvpListAbsoluteEncodingLength(params: Map<Varint, KvpValue[]>): number {
+export function kvpListAbsoluteEncodingLength(params: Map<bigint, KvpValue[]>): number {
   let len = 0;
 
   const sortedKeys = [...params.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
@@ -258,7 +258,7 @@ export function kvpListAbsoluteEncodingLength(params: Map<Varint, KvpValue[]>): 
 /**
  * Count total number of KVP entries (for wire format count field).
  */
-export function kvpListEntryCount(params: Map<Varint, KvpValue[]>): number {
+export function kvpListEntryCount(params: Map<bigint, KvpValue[]>): number {
   let count = 0;
   for (const values of params.values()) {
     count += values.length;
@@ -271,7 +271,7 @@ export function kvpListEntryCount(params: Map<Varint, KvpValue[]>): number {
  * Used for message parameter validation (§9.2 requires no duplicates).
  * @returns The first duplicate key found, or undefined if no duplicates
  */
-export function findDuplicateKey(params: Map<Varint, KvpValue[]>): Varint | undefined {
+export function findDuplicateKey(params: Map<bigint, KvpValue[]>): bigint | undefined {
   for (const [key, values] of params) {
     if (values.length > 1) {
       return key;

@@ -189,6 +189,9 @@ export interface SendControlAction {
 export interface OpenDataStreamAction {
   readonly type: 'open_data_stream';
   readonly streamType: 'subgroup' | 'fetch';
+  // Publisher-side action feeding the draft-14/16 object encoder. It stays
+  // `Varint` because there is no draft-18 publisher/encode path yet; the
+  // draft-18 data *decoder* already reads track aliases as full-uint64 `bigint`.
   readonly trackAlias: Varint;
   readonly groupId: Varint;
   readonly subgroupId?: Varint;
@@ -251,7 +254,7 @@ export interface CloseConnectionAction {
  */
 export interface OpenNamespaceStreamAction {
   readonly type: 'open_namespace_stream';
-  readonly requestId: Varint;
+  readonly requestId: bigint;
   readonly message: ControlMessage;
 }
 
@@ -266,7 +269,7 @@ export interface OpenNamespaceStreamAction {
  */
 export interface NotifyNamespaceAction {
   readonly type: 'notify_namespace';
-  readonly requestId: Varint;
+  readonly requestId: bigint;
   readonly message: ControlMessage;
 }
 
@@ -302,11 +305,11 @@ export interface SessionStateChangedEvent {
  */
 export interface SubscriptionStateChangedEvent {
   readonly type: 'subscription_state_changed';
-  readonly requestId: Varint;
+  readonly requestId: bigint;
   readonly previousState: SubscriptionStateValue;
   readonly newState: SubscriptionStateValue;
   /** Track alias assigned on SUBSCRIBE_OK. */
-  readonly trackAlias?: Varint;
+  readonly trackAlias?: bigint;
   /** Error code if terminated with error. */
   readonly error?: Varint;
   /** Error reason if terminated with error. */
@@ -318,7 +321,7 @@ export interface SubscriptionStateChangedEvent {
  */
 export interface FetchStateChangedEvent {
   readonly type: 'fetch_state_changed';
-  readonly requestId: Varint;
+  readonly requestId: bigint;
   readonly previousState: FetchStateValue;
   readonly newState: FetchStateValue;
   /** Error code if completed with error. */
@@ -330,7 +333,7 @@ export interface FetchStateChangedEvent {
  */
 export interface ObjectDeliveryEvent {
   readonly type: 'object_delivery';
-  readonly requestId: Varint;
+  readonly requestId: bigint;
   readonly object: MoqtObject;
 }
 

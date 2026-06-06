@@ -8,7 +8,8 @@
  * @module
  */
 
-import { varint, readVarint, writeVarint, varintEncodingLength, type Varint } from '../primitives/varint.js';
+import { varint, readVarint, writeVarint, varintEncodingLength } from '../primitives/varint.js';
+import { readVi64, writeVi64, vi64EncodingLength } from '../primitives/vi64.js';
 import { ProtocolViolationError } from '../errors.js';
 
 // ─── Alias Type Constants ─────────────────────────────────────────────
@@ -36,7 +37,12 @@ export const AliasType = {
  */
 export interface DeleteToken {
   readonly aliasType: typeof AliasType.DELETE;
-  readonly tokenAlias: Varint;
+  /**
+   * Token Alias — semantic value is a raw `bigint`. On draft-14/16 it is a QUIC
+   * varint (≤ 2^62-1, enforced by the wire parser/encoder); on draft-18 it is a
+   * vi64 (full uint64). See {@link parseAuthorizationToken18}.
+   */
+  readonly tokenAlias: bigint;
 }
 
 /**
@@ -45,8 +51,10 @@ export interface DeleteToken {
  */
 export interface RegisterToken {
   readonly aliasType: typeof AliasType.REGISTER;
-  readonly tokenAlias: Varint;
-  readonly tokenType: Varint;
+  /** Token Alias — see {@link DeleteToken.tokenAlias} (vi64 on draft-18). */
+  readonly tokenAlias: bigint;
+  /** Token Type — QUIC varint on draft-14/16, vi64 (full uint64) on draft-18. */
+  readonly tokenType: bigint;
   readonly tokenValue: Uint8Array;
 }
 
@@ -56,7 +64,8 @@ export interface RegisterToken {
  */
 export interface UseAliasToken {
   readonly aliasType: typeof AliasType.USE_ALIAS;
-  readonly tokenAlias: Varint;
+  /** Token Alias — see {@link DeleteToken.tokenAlias} (vi64 on draft-18). */
+  readonly tokenAlias: bigint;
 }
 
 /**
@@ -65,7 +74,8 @@ export interface UseAliasToken {
  */
 export interface UseValueToken {
   readonly aliasType: typeof AliasType.USE_VALUE;
-  readonly tokenType: Varint;
+  /** Token Type — QUIC varint on draft-14/16, vi64 (full uint64) on draft-18. */
+  readonly tokenType: bigint;
   readonly tokenValue: Uint8Array;
 }
 
@@ -80,7 +90,8 @@ export type AuthorizationToken = DeleteToken | RegisterToken | UseAliasToken | U
  * This is the output of processing any token through the alias cache.
  */
 export interface ResolvedToken {
-  readonly tokenType: Varint;
+  /** Token Type — vi64 (full uint64) on draft-18, QUIC varint on draft-14/16. */
+  readonly tokenType: bigint;
   readonly tokenValue: Uint8Array;
 }
 
@@ -230,5 +241,119 @@ export function encodeAuthorizationToken(token: AuthorizationToken): Uint8Array 
 
     default:
       throw new ProtocolViolationError(`Unknown Alias Type: ${(token as AuthorizationToken).aliasType}`);
+  }
+}
+
+// ─── draft-18 (vi64) ──────────────────────────────────────────────────
+//
+// draft-18 encodes the Token structure's Alias Type, Token Alias, and Token Type
+// as vi64 (full uint64), not the QUIC varint of draft-14/16. The wire bytes are
+// identical for small values; they differ only above the QUIC range (2^62-1).
+// The parse/encode helpers below mirror the legacy ones but with vi64, so a
+// draft-18 token alias / type can carry any uint64.
+//
+// The SEMANTIC token shape is shared: the legacy {@link AuthorizationToken} types
+// already carry `bigint` Token Alias / Token Type, so the `*18` names are aliases.
+// Only the WIRE codec differs (QUIC varint vs vi64). The Alias Type discriminant
+// values (0x0–0x3) are shared with draft-14/16.
+// @see draft-ietf-moq-transport-18 §10.2 (message parameters), §9.2.2.1 (Token)
+
+/** draft-18 DELETE token (vi64 wire); semantically identical to {@link DeleteToken}. */
+export type DeleteToken18 = DeleteToken;
+/** draft-18 REGISTER token (vi64 wire); semantically identical to {@link RegisterToken}. */
+export type RegisterToken18 = RegisterToken;
+/** draft-18 USE_ALIAS token (vi64 wire); semantically identical to {@link UseAliasToken}. */
+export type UseAliasToken18 = UseAliasToken;
+/** draft-18 USE_VALUE token (vi64 wire); semantically identical to {@link UseValueToken}. */
+export type UseValueToken18 = UseValueToken;
+/** draft-18 Authorization Token (vi64-encoded internals); alias of {@link AuthorizationToken}. */
+export type AuthorizationToken18 = AuthorizationToken;
+
+/**
+ * Parse a draft-18 Authorization Token from raw parameter bytes (vi64 internals).
+ * @throws {ProtocolViolationError} on a malformed / truncated / unknown-alias token.
+ * @see draft-ietf-moq-transport-18 §9.2.2.1
+ */
+export function parseAuthorizationToken18(data: Uint8Array): AuthorizationToken18 {
+  if (data.length === 0) {
+    throw new ProtocolViolationError('Empty AUTHORIZATION_TOKEN parameter');
+  }
+  let pos = 0;
+  const { value: aliasTypeRaw, bytesRead: atBytes } = readVi64(data, pos);
+  pos += atBytes;
+
+  switch (aliasTypeRaw) {
+    case AliasType.DELETE as bigint: {
+      if (pos >= data.length) throw new ProtocolViolationError('DELETE token missing Token Alias');
+      const { value: tokenAlias, bytesRead } = readVi64(data, pos); pos += bytesRead;
+      if (pos !== data.length) throw new ProtocolViolationError(`DELETE token has ${data.length - pos} trailing bytes`);
+      return { aliasType: AliasType.DELETE, tokenAlias };
+    }
+    case AliasType.REGISTER as bigint: {
+      if (pos >= data.length) throw new ProtocolViolationError('REGISTER token missing Token Alias');
+      const ta = readVi64(data, pos); pos += ta.bytesRead;
+      if (pos >= data.length) throw new ProtocolViolationError('REGISTER token missing Token Type');
+      const tt = readVi64(data, pos); pos += tt.bytesRead;
+      return { aliasType: AliasType.REGISTER, tokenAlias: ta.value, tokenType: tt.value, tokenValue: data.slice(pos) };
+    }
+    case AliasType.USE_ALIAS as bigint: {
+      if (pos >= data.length) throw new ProtocolViolationError('USE_ALIAS token missing Token Alias');
+      const { value: tokenAlias, bytesRead } = readVi64(data, pos); pos += bytesRead;
+      if (pos !== data.length) throw new ProtocolViolationError(`USE_ALIAS token has ${data.length - pos} trailing bytes`);
+      return { aliasType: AliasType.USE_ALIAS, tokenAlias };
+    }
+    case AliasType.USE_VALUE as bigint: {
+      if (pos >= data.length) throw new ProtocolViolationError('USE_VALUE token missing Token Type');
+      const { value: tokenType, bytesRead } = readVi64(data, pos); pos += bytesRead;
+      return { aliasType: AliasType.USE_VALUE, tokenType, tokenValue: data.slice(pos) };
+    }
+    default:
+      throw new ProtocolViolationError(`Unknown AUTHORIZATION_TOKEN Alias Type: ${aliasTypeRaw}`);
+  }
+}
+
+/**
+ * Encode a draft-18 Authorization Token to wire bytes (vi64 internals).
+ * @see draft-ietf-moq-transport-18 §9.2.2.1
+ */
+export function encodeAuthorizationToken18(token: AuthorizationToken18): Uint8Array {
+  switch (token.aliasType) {
+    case AliasType.DELETE as bigint: {
+      const t = token as DeleteToken18;
+      const buf = new Uint8Array(vi64EncodingLength(AliasType.DELETE) + vi64EncodingLength(t.tokenAlias));
+      let p = writeVi64(AliasType.DELETE, buf, 0);
+      writeVi64(t.tokenAlias, buf, p);
+      return buf;
+    }
+    case AliasType.REGISTER as bigint: {
+      const t = token as RegisterToken18;
+      const buf = new Uint8Array(
+        vi64EncodingLength(AliasType.REGISTER) + vi64EncodingLength(t.tokenAlias) + vi64EncodingLength(t.tokenType) + t.tokenValue.length,
+      );
+      let p = writeVi64(AliasType.REGISTER, buf, 0);
+      p += writeVi64(t.tokenAlias, buf, p);
+      p += writeVi64(t.tokenType, buf, p);
+      buf.set(t.tokenValue, p);
+      return buf;
+    }
+    case AliasType.USE_ALIAS as bigint: {
+      const t = token as UseAliasToken18;
+      const buf = new Uint8Array(vi64EncodingLength(AliasType.USE_ALIAS) + vi64EncodingLength(t.tokenAlias));
+      let p = writeVi64(AliasType.USE_ALIAS, buf, 0);
+      writeVi64(t.tokenAlias, buf, p);
+      return buf;
+    }
+    case AliasType.USE_VALUE as bigint: {
+      const t = token as UseValueToken18;
+      const buf = new Uint8Array(
+        vi64EncodingLength(AliasType.USE_VALUE) + vi64EncodingLength(t.tokenType) + t.tokenValue.length,
+      );
+      let p = writeVi64(AliasType.USE_VALUE, buf, 0);
+      p += writeVi64(t.tokenType, buf, p);
+      buf.set(t.tokenValue, p);
+      return buf;
+    }
+    default:
+      throw new ProtocolViolationError(`Unknown Alias Type: ${(token as AuthorizationToken18).aliasType}`);
   }
 }

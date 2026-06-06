@@ -99,7 +99,7 @@ player.play();
 
 ```
 packages/
-  transport/      @moqt/transport     — Sans-I/O protocol core (draft-14 + draft-16)
+  transport/      @moqt/transport     — Sans-I/O protocol core (draft-14 / -16 / -18)
   webtransport/   @moqt/webtransport  — MoQT connection over WebTransport
   loc/            @moqt/loc           — Low Overhead Container (CaptureTimestamp, VideoFrameMarking)
   msf/            @moqt/msf           — MSF catalog parsing, track selection, timeline
@@ -171,7 +171,7 @@ player.on('statechange',    ({ from, to }) => { ... });
 |--------|------|---------|-------------|
 | `url` | string | — | WebTransport relay URL |
 | `namespace` | string | — | Track namespace (e.g. `live/broadcast`) |
-| `draftVersion` | 14 \| 16 | 16 | MOQT draft version |
+| `draftVersion` | 14 \| 16 \| 18 | 16 | MOQT draft version |
 | `certHash` | ArrayBuffer | — | SHA-256 hash for self-signed certs |
 | `autoplay` | boolean | false | Start playback after load |
 | `volume` | number | 1 | Initial volume 0–1 |
@@ -216,7 +216,7 @@ player.on('catch_up_changed', ({ active, rate, latencyMs }) => { ... });
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `draftVersion` | 14 \| 16 | 16 | Protocol version (14 for moq-rs / Red5 compat) |
+| `draftVersion` | 14 \| 16 \| 18 | 16 | Protocol version (14 for moq-rs / Red5 compat, 18 for draft-18 relays) |
 | `maxRequestId` | number | 100 | Initial MOQT MAX_REQUEST_ID (auto-replenished) |
 | `knownTracks` | object | — | Pre-known codec metadata for TTFF optimization |
 | `catalog` | `{tracks}` | — | Inject catalog externally, skip catalog subscription |
@@ -231,6 +231,7 @@ player.on('catch_up_changed', ({ active, rate, latencyMs }) => { ... });
 
 ## Protocol Support
 
+- **draft-ietf-moq-transport-18** — uni control-stream pair + per-request bidi streams (`draftVersion: 18` / `moqt-18`)
 - **draft-ietf-moq-transport-16** — default supported transport draft
 - **draft-ietf-moq-transport-14** — Red5/moq-rs interop (`draftVersion: 14`)
 - **draft-ietf-moq-msf-00** — Catalog, track selection, ABR (`altGroup`), timeline
@@ -239,7 +240,15 @@ player.on('catch_up_changed', ({ active, rate, latencyMs }) => { ... });
 
 ### Draft version selection
 
-Browser WebTransport may expose `transport.protocol` (e.g., `'moqt-16'`), enabling automatic draft detection. Node/polyfill WebTransport typically has `protocol` undefined — the connection defaults to **draft 16**.
+Browser WebTransport may expose `transport.protocol`, enabling automatic draft detection from the negotiated `WT-Available-Protocols`:
+
+- `moqt-18` → draft 18
+- `moqt-16` → draft 16
+- `moq-00` → draft 14
+
+When `protocol` is undefined (Node/polyfill WebTransport) or no supported token is negotiated, the connection **defaults to draft 16** for backwards compatibility. Opt into draft 18 explicitly with `draftVersion: 18` (or `?v=18` in the examples); the transport factory then offers `["moqt-18"]`. An explicit `new MoqtConnection(18)` always wins over the negotiated protocol.
+
+draft-18 is an architectural change, not just a wire bump: the control stream becomes a **unidirectional pair**, each request rides its **own bidirectional stream** (responses correlate by stream, not Request ID), and integers use the full-uint64 `vi64` encoding.
 
 For **draft-14 relays** (moq-rs, Red5, moqtail), you must explicitly specify the version:
 
@@ -247,11 +256,22 @@ For **draft-14 relays** (moq-rs, Red5, moqtail), you must explicitly specify the
 const conn = new MoqtConnection(14); // required — CLIENT_SETUP is draft-specific
 ```
 
-If you provide your own `WebTransport` instance, construct it with the appropriate `protocols` option; Playa can only auto-negotiate when using its transport factory. Some Node/polyfill transports may not support `protocols` yet.
+`MoqtConnection` auto-detects the draft from **any** `WebTransportLike` whose `protocol` exposes a supported token (`moqt-18`, `moqt-16`, or `moq-00`) — there's nothing factory-specific about detection. The browser transport factory is just the convenience that sets the WebTransport `protocols` offer for you. If you construct your own `WebTransport`, pass the appropriate `protocols` option yourself and make sure `transport.protocol` is readable; Playa reads it the same way. Some Node/polyfill transports may not support `protocols` yet.
+
+#### draft-18 known gaps (non-blocking)
+
+draft-18 support is functional for the subscriber and publisher paths. The one deliberately deferred edge is documented as an intentional gap rather than silently dropped:
+
+- **Redirect** (`REQUEST_ERROR` code `0x34`) is decoded, context-validated, and surfaced — but automatic redirect-follow is **not** implemented; the application decides whether to reconnect.
+
+Track Properties (§2.5) are fully wired in both directions: received on `SUBSCRIBE_OK` / `FETCH_OK` / `TRACK_STATUS_OK` / `PUBLISH`, and sent via the `trackProperties` option on `acceptSubscribe()`, `acceptFetch()`, `acceptTrackStatus()`, and `publish()`. (The send API is draft-18-only; supplying non-empty Track Properties on draft-14/16 throws.)
+
+`REQUEST_UPDATE` is supported on the request streams that allow it: `SUBSCRIBE` and outbound `PUBLISH` (subscription updates), and `SUBSCRIBE_NAMESPACE` / `SUBSCRIBE_TRACKS` (§10.9.2 Track Namespace Prefix updates, with per-type prefix-overlap enforcement). It is **not** valid on a one-shot `TRACK_STATUS` stream.
 
 After `publishNamespace(ns)`, wait for acceptance via `onMessage` before calling `publishNamespaceDone(requestId)`:
-- **v16**: `REQUEST_OK` with the matching `requestId`
-- **v14**: `PUBLISH_NAMESPACE_OK` with the matching `requestId`
+- **v18**: `REQUEST_OK` on the PUBLISH_NAMESPACE request stream. The advertisement is persistent: `publishNamespaceDone(requestId)` withdraws it by closing/resetting that request stream — it does **not** emit a `PUBLISH_NAMESPACE_DONE` message (that message was removed in draft-18).
+- **v16**: `REQUEST_OK` with the matching `requestId`. `publishNamespaceDone(requestId)` emits `PUBLISH_NAMESPACE_DONE` on the control stream.
+- **v14**: `PUBLISH_NAMESPACE_OK` with the matching `requestId`. `publishNamespaceDone(requestId)` emits `PUBLISH_NAMESPACE_DONE` on the control stream.
 
 Do not use a fixed sleep. If `onClose` fires before acceptance, treat the operation as failed.
 
@@ -306,6 +326,7 @@ npx tsc --noEmit -p packages/browser/tsconfig.json
 
 ## Docs
 
+- [Simulation](docs/simulation.md) — Deterministic protocol-confidence harness (golden vectors, codec property tests, seeded scenario runner) for MoQT drafts 14/16/18
 - [Catalog Testing](docs/catalog-testing.md) — Integration harness for validating catalog subscription against a live relay
 
 ---

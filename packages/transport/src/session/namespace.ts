@@ -16,7 +16,6 @@
  * @module
  */
 
-import { type Varint } from '../primitives/varint.js';
 import { NamespaceState, type NamespaceStateValue } from './types.js';
 
 /**
@@ -24,24 +23,35 @@ import { NamespaceState, type NamespaceStateValue } from './types.js';
  */
 export class NamespaceStateMachine {
   private _state: NamespaceStateValue = NamespaceState.PENDING;
-  private _errorCode: Varint | undefined;
+  private _errorCode: bigint | undefined;
   private _errorReason: string | undefined;
   private _discoveredNamespaces: Uint8Array[][] = [];
   private _prefixKey: string;
 
   private constructor(
-    private readonly _requestId: Varint,
+    private readonly _requestId: bigint,
     private readonly _isPublisher: boolean,
-    private readonly _namespacePrefix: Uint8Array[],
+    private _namespacePrefix: Uint8Array[],
   ) {
     this._prefixKey = this.computePrefixKey(_namespacePrefix);
+  }
+
+  /**
+   * Replace the Track Namespace Prefix (draft-18 §10.9.2). Used when a
+   * REQUEST_UPDATE carrying TRACK_NAMESPACE_PREFIX is accepted — on either side:
+   * the subscriber applies it on REQUEST_OK, the publisher applies it when it
+   * accepts the peer's update. Recomputes the prefix key.
+   */
+  updatePrefix(newPrefix: Uint8Array[]): void {
+    this._namespacePrefix = newPrefix;
+    this._prefixKey = this.computePrefixKey(newPrefix);
   }
 
   /**
    * Create a namespace state machine as subscriber (sending SUBSCRIBE_NAMESPACE).
    */
   static createAsSubscriber(
-    requestId: Varint,
+    requestId: bigint,
     namespacePrefix: Uint8Array[],
   ): NamespaceStateMachine {
     return new NamespaceStateMachine(requestId, false, namespacePrefix);
@@ -51,7 +61,7 @@ export class NamespaceStateMachine {
    * Create a namespace state machine as publisher (receiving SUBSCRIBE_NAMESPACE).
    */
   static createAsPublisher(
-    requestId: Varint,
+    requestId: bigint,
     namespacePrefix: Uint8Array[],
   ): NamespaceStateMachine {
     return new NamespaceStateMachine(requestId, true, namespacePrefix);
@@ -65,7 +75,7 @@ export class NamespaceStateMachine {
   }
 
   /** Request ID for this namespace discovery. */
-  get requestId(): Varint {
+  get requestId(): bigint {
     return this._requestId;
   }
 
@@ -75,7 +85,7 @@ export class NamespaceStateMachine {
   }
 
   /** Error code if terminated with REQUEST_ERROR. */
-  get errorCode(): Varint | undefined {
+  get errorCode(): bigint | undefined {
     return this._errorCode;
   }
 
@@ -133,7 +143,7 @@ export class NamespaceStateMachine {
    * Handle REQUEST_ERROR received (subscriber side).
    * Transitions to TERMINATED.
    */
-  handleRequestError(errorCode: Varint, errorReason: string): void {
+  handleRequestError(errorCode: bigint, errorReason: string): void {
     this.assertNotTerminated('handleRequestError');
     this.assertNotPublisher('handleRequestError');
 
@@ -215,7 +225,7 @@ export class NamespaceStateMachine {
    * Send REQUEST_ERROR (publisher side).
    * Transitions to TERMINATED.
    */
-  sendRequestError(errorCode: Varint, errorReason: string): void {
+  sendRequestError(errorCode: bigint, errorReason: string): void {
     this.assertNotTerminated('sendRequestError');
     this.assertPublisher('sendRequestError');
 

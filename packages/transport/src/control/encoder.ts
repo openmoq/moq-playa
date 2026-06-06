@@ -21,7 +21,8 @@ import {
   validateTrackNamespaceSuffix,
   validateFullTrackName,
 } from '../primitives/bytes.js';
-import { writeKvpList, kvpListEncodingLength, kvpListEntryCount } from '../primitives/kvp.js';
+import { writeKvpList, kvpListEncodingLength, kvpListEntryCount, type KvpValue } from '../primitives/kvp.js';
+import { toKvpParams } from './kvp-params.js';
 import { MessageParam } from './parameters.js';
 import { writeLocation, locationEncodingLength } from '../primitives/location.js';
 import { writeReasonPhrase, reasonPhraseEncodingLength } from '../primitives/reason.js';
@@ -157,6 +158,8 @@ function messageTypeCode(type: ControlMessage['type']): Varint {
   switch (type) {
     case 'CLIENT_SETUP': return MessageType.CLIENT_SETUP;
     case 'SERVER_SETUP': return MessageType.SERVER_SETUP;
+    case 'SETUP':
+      throw new Error('SETUP is a draft-18 message; the draft-14/16 codec uses CLIENT_SETUP/SERVER_SETUP');
     case 'GOAWAY': return MessageType.GOAWAY;
     case 'MAX_REQUEST_ID': return MessageType.MAX_REQUEST_ID;
     case 'REQUESTS_BLOCKED': return MessageType.REQUESTS_BLOCKED;
@@ -185,35 +188,46 @@ function messageTypeCode(type: ControlMessage['type']): Varint {
     case 'PUBLISH_NAMESPACE_ERROR':
     case 'PUBLISH_ERROR':
       throw new Error(`Cannot encode draft-14-only message type "${type}" with draft-16 encoder`);
+    // Draft-18-only types — not valid in the draft-14/16 encoder
+    case 'SUBSCRIBE_TRACKS':
+    case 'PUBLISH_BLOCKED':
+      throw new Error(`Cannot encode draft-18-only message type "${type}" with draft-16 encoder`);
   }
 }
 
 /** Calculate parameters encoding length: varint(count) + KVP data. */
 function paramsLength(params: Parameters): number {
-  const count = kvpListEntryCount(params);
-  return varintEncodingLength(varint(count)) + kvpListEncodingLength(params);
+  const kvp = toKvpParams(params);
+  const count = kvpListEntryCount(kvp);
+  return varintEncodingLength(varint(count)) + kvpListEncodingLength(kvp);
 }
 
 /** Write parameters: varint(count) + KVP data. Returns bytes written. */
 function writeParams(params: Parameters, buf: Uint8Array, offset: number): number {
   let pos = offset;
-  const count = kvpListEntryCount(params);
+  const kvp = toKvpParams(params);
+  const count = kvpListEntryCount(kvp);
   pos += writeVarint(varint(count), buf, pos);
-  pos += writeKvpList(params, buf, pos);
+  pos += writeKvpList(kvp, buf, pos);
   return pos - offset;
 }
+
+// draft-14/16 Track Extensions are QUIC-range KVP; the shared TrackProperties type
+// is now vi64-wide (full uint64), so cast at this draft-16 boundary — the KVP
+// writer still range-validates each value via writeVarint().
+const asKvp = (ext: TrackExtensions): Map<bigint, KvpValue[]> => ext as unknown as Map<bigint, KvpValue[]>;
 
 /** Calculate track extensions encoding length. Extensions consume remaining bytes, no count prefix. */
 function extensionsLength(ext: TrackExtensions): number {
   if (ext.size === 0) return 0;
   // Extensions are written as KVP entries without a count prefix
-  return kvpListEncodingLength(ext);
+  return kvpListEncodingLength(asKvp(ext));
 }
 
 /** Write track extensions (no count prefix). */
 function writeExtensions(ext: TrackExtensions, buf: Uint8Array, offset: number): number {
   if (ext.size === 0) return 0;
-  return writeKvpList(ext, buf, offset);
+  return writeKvpList(asKvp(ext), buf, offset);
 }
 
 /** Track name: varint length + bytes. */
@@ -230,6 +244,9 @@ function payloadLength(msg: ControlMessage): number {
     case 'CLIENT_SETUP':
     case 'SERVER_SETUP':
       return paramsLength(msg.parameters);
+
+    case 'SETUP':
+      throw new Error('SETUP is a draft-18 message; not supported by the draft-14/16 codec');
 
     case 'GOAWAY': {
       const encoded = new TextEncoder().encode(msg.newSessionUri);
@@ -272,7 +289,7 @@ function payloadLength(msg: ControlMessage): number {
         varintEncodingLength(msg.requestId) +
         varintEncodingLength(msg.trackAlias) +
         paramsLength(msg.parameters) +
-        extensionsLength(msg.trackExtensions)
+        extensionsLength(msg.trackProperties ?? msg.trackExtensions ?? new Map())
       );
 
     case 'REQUEST_UPDATE':
@@ -292,7 +309,7 @@ function payloadLength(msg: ControlMessage): number {
         trackNameLength(msg.trackName) +
         varintEncodingLength(msg.trackAlias) +
         paramsLength(msg.parameters) +
-        extensionsLength(msg.trackExtensions)
+        extensionsLength(msg.trackProperties ?? msg.trackExtensions ?? new Map())
       );
 
     case 'PUBLISH_OK':
@@ -332,7 +349,7 @@ function payloadLength(msg: ControlMessage): number {
         1 + // End Of Track (uint8)
         locationEncodingLength(msg.endLocation) +
         paramsLength(msg.parameters) +
-        extensionsLength(msg.trackExtensions)
+        extensionsLength(msg.trackProperties ?? msg.trackExtensions ?? new Map())
       );
 
     case 'FETCH_CANCEL':
@@ -375,6 +392,10 @@ function payloadLength(msg: ControlMessage): number {
     case 'PUBLISH_NAMESPACE_ERROR':
     case 'PUBLISH_ERROR':
       throw new Error(`Cannot encode draft-14-only message type "${msg.type}" with draft-16 encoder`);
+    // Draft-18-only types — unreachable (messageTypeCode throws first)
+    case 'SUBSCRIBE_TRACKS':
+    case 'PUBLISH_BLOCKED':
+      throw new Error(`Cannot encode draft-18-only message type "${msg.type}" with draft-16 encoder`);
   }
 }
 
@@ -427,7 +448,7 @@ function writePayload(msg: ControlMessage, buf: Uint8Array, offset: number): num
       pos += writeVarint(msg.requestId, buf, pos);
       pos += writeVarint(msg.trackAlias, buf, pos);
       pos += writeParams(msg.parameters, buf, pos);
-      pos += writeExtensions(msg.trackExtensions, buf, pos);
+      pos += writeExtensions(msg.trackProperties ?? msg.trackExtensions ?? new Map(), buf, pos);
       break;
 
     case 'REQUEST_UPDATE':
@@ -446,7 +467,7 @@ function writePayload(msg: ControlMessage, buf: Uint8Array, offset: number): num
       pos += writeTrackName(msg.trackName, buf, pos);
       pos += writeVarint(msg.trackAlias, buf, pos);
       pos += writeParams(msg.parameters, buf, pos);
-      pos += writeExtensions(msg.trackExtensions, buf, pos);
+      pos += writeExtensions(msg.trackProperties ?? msg.trackExtensions ?? new Map(), buf, pos);
       break;
 
     case 'PUBLISH_OK':
@@ -481,7 +502,7 @@ function writePayload(msg: ControlMessage, buf: Uint8Array, offset: number): num
       buf[pos++] = msg.endOfTrack & 0xff;
       pos += writeLocation(msg.endLocation, buf, pos);
       pos += writeParams(msg.parameters, buf, pos);
-      pos += writeExtensions(msg.trackExtensions, buf, pos);
+      pos += writeExtensions(msg.trackProperties ?? msg.trackExtensions ?? new Map(), buf, pos);
       break;
 
     case 'FETCH_CANCEL':
@@ -525,6 +546,10 @@ function writePayload(msg: ControlMessage, buf: Uint8Array, offset: number): num
     case 'PUBLISH_NAMESPACE_ERROR':
     case 'PUBLISH_ERROR':
       throw new Error(`Cannot encode draft-14-only message type "${msg.type}" with draft-16 encoder`);
+    // Draft-18-only types — unreachable (messageTypeCode throws first)
+    case 'SUBSCRIBE_TRACKS':
+    case 'PUBLISH_BLOCKED':
+      throw new Error(`Cannot encode draft-18-only message type "${msg.type}" with draft-16 encoder`);
   }
 
   return pos - offset;

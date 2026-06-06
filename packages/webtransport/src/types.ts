@@ -47,9 +47,18 @@ export interface WebTransportLike {
   /** Server-initiated unidirectional streams (data streams). */
   readonly incomingUnidirectionalStreams: ReadableStream<ReadableStream<Uint8Array>>;
 
-  /** Datagram channel. */
+  /**
+   * Peer-initiated bidirectional streams. In draft-18 these carry inbound
+   * request-stream openers (e.g. a publisher's PUBLISH, §10.10). Optional so
+   * existing transports/tests that never receive them need not provide it.
+   */
+  readonly incomingBidirectionalStreams?: ReadableStream<WebTransportBidirectionalStream>;
+
+  /** Datagram channel. `writable` is present on transports that support sending
+   *  datagrams (draft-18 publisher path). */
   readonly datagrams: {
     readonly readable: ReadableStream<Uint8Array>;
+    readonly writable?: WritableStream<Uint8Array>;
   };
 
   /**

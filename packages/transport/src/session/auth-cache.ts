@@ -91,8 +91,8 @@ export class AuthTokenCache {
    * @see draft-ietf-moq-transport-16 §9.2.2.1, §9.3.1.4, §9.3.1.5
    */
   register(
-    alias: Varint,
-    tokenType: Varint,
+    alias: bigint,
+    tokenType: bigint,
     tokenValue: Uint8Array,
     isClientSetup: boolean,
   ): ResolvedToken | null {
@@ -143,7 +143,7 @@ export class AuthTokenCache {
    * @throws {AuthCacheError} UNKNOWN_AUTH_TOKEN_ALIAS if alias not registered
    * @see draft-ietf-moq-transport-16 §9.2.2.1
    */
-  delete(alias: Varint): void {
+  delete(alias: bigint): void {
     const entry = this.cache.get(alias as bigint);
     if (!entry) {
       throw new AuthCacheError(
@@ -165,7 +165,7 @@ export class AuthTokenCache {
    * @throws {AuthCacheError} UNKNOWN_AUTH_TOKEN_ALIAS if alias not found
    * @see draft-ietf-moq-transport-16 §9.2.2.1
    */
-  resolve(alias: Varint): ResolvedToken {
+  resolve(alias: bigint): ResolvedToken {
     const entry = this.cache.get(alias as bigint);
     if (!entry) {
       throw new AuthCacheError(

@@ -38,14 +38,15 @@ export interface WebTransportFactoryOptions {
    * sends the `WT-Available-Protocols` header to the server. The server
    * selects a protocol and the result is available on `transport.protocol`.
    *
+   * - 18 → `["moqt-18"]`
    * - 16 → `["moqt-16"]`
    * - 14 → no protocols sent (h3 ALPN fallback, in-band CLIENT_SETUP negotiation)
-   * - undefined → `["moqt-16"]` (default)
+   * - undefined → `["moqt-16"]` (default, kept for backward compatibility)
    *
    * @see draft-ietf-moq-transport-16 §3.1 (version negotiation)
    * @see W3C WebTransport §3.3 (WT-Available-Protocols)
    */
-  readonly draftVersion?: 14 | 16;
+  readonly draftVersion?: 14 | 16 | 18;
 }
 
 /**
@@ -111,6 +112,9 @@ export function createWebTransport(
       createBidirectionalStream: () => wt.createBidirectionalStream(),
       createUnidirectionalStream: () => (transport as any).createUnidirectionalStream(),
       get incomingUnidirectionalStreams() { return wt.incomingUnidirectionalStreams; },
+      // draft-18 inbound request streams (e.g. a publisher's PUBLISH, §10.10)
+      // arrive as peer-initiated bidi streams; surface them when present.
+      get incomingBidirectionalStreams() { return (transport as any).incomingBidirectionalStreams; },
       get datagrams() { return wt.datagrams; },
       close: (info) => wt.close(info),
       get closed() { return wt.closed; },

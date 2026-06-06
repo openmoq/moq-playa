@@ -172,7 +172,7 @@ export function decodeSubgroupObject(
   buf: Uint8Array,
   offset: number,
   hasExtensions: boolean,
-  previousObjectId: Varint,
+  previousObjectId: bigint,
   isFirstObject: boolean = true,
   version: 14 | 16 = 16,
 ): { object: SubgroupObject; bytesRead: number } {
@@ -447,6 +447,11 @@ export function decodeFetchObject(
   // Normal object - validate first object constraints
   if (isFirstObject) {
     validateFirstFetchObject(flags);
+  } else if (prior === undefined) {
+    // A non-first object inherits Group/Subgroup/Object/Priority from the prior
+    // object; without one there is nothing to inherit. Fail cleanly rather than
+    // dereferencing an undefined prior.
+    throw new ProtocolViolationError('Non-first fetch object requires prior-object context');
   }
 
   const numFlags = Number(flags);

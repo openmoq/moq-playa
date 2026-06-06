@@ -12,14 +12,18 @@
  * @module
  */
 
-import type { ControlMessage } from '@moqt/transport';
 import { createControlCodec } from '@moqt/transport';
-import type { ControlCodec } from '@moqt/transport';
+import type { ControlCodec, DecodedControlMessage } from '@moqt/transport';
 
 /** Result of decoding a single framed message. */
 export interface FramedMessage {
-  /** The decoded control message. */
-  message: ControlMessage;
+  /**
+   * The decoded control message. Typed as {@link DecodedControlMessage}: a
+   * draft-18 response may not carry its Request ID on the wire (the request
+   * stream is the correlation), so it is supplied by the topology/session
+   * before dispatch. For draft-14/16 the Request ID is always present.
+   */
+  message: DecodedControlMessage;
   /** Total bytes consumed from the stream (type + length + payload). */
   bytesRead: number;
 }

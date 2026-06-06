@@ -10,10 +10,12 @@
  */
 
 import { varint, type Varint } from '../primitives/varint.js';
-import type { ControlMessage, ClientSetup, ServerSetup, Parameters } from '../control/messages.js';
+import type { ControlMessage, ClientSetup, ServerSetup, Parameters, Setup, SetupOptionMap } from '../control/messages.js';
 import { SetupParam } from '../control/parameters.js';
+import { SetupOption18 } from '../control/codes-18.js';
+import type { DraftVersion } from '../control/codec.js';
 import { EndpointRole, type EndpointRoleValue, SessionState, type SessionStateValue } from './types.js';
-import { AliasType, parseAuthorizationToken, type AuthorizationToken } from '../control/auth-token.js';
+import { AliasType, parseAuthorizationToken, parseAuthorizationToken18, type AuthorizationToken } from '../control/auth-token.js';
 
 /**
  * Error thrown for setup handshake violations.
@@ -50,10 +52,11 @@ export interface SetupResult {
   /**
    * MAX_AUTH_TOKEN_CACHE_SIZE from peer's setup.
    * Indicates how many bytes of token aliases the peer is willing to cache.
-   * Default 0 = aliases prohibited.
-   * @see draft-ietf-moq-transport-16 §9.3.1.4
+   * Default 0 = aliases prohibited. Raw `bigint`: draft-18 §10.3.1.3 carries this
+   * as a vi64 (full uint64); draft-14/16 use a QUIC varint (range-guarded there).
+   * @see draft-ietf-moq-transport-18 §10.3.1.3
    */
-  readonly peerMaxAuthTokenCacheSize?: Varint;
+  readonly peerMaxAuthTokenCacheSize?: bigint;
   /**
    * Parsed AUTHORIZATION_TOKEN parameters from the peer's setup message.
    * These are the raw parsed tokens — caller must process through AuthTokenCache.
@@ -86,11 +89,34 @@ export interface SetupResult {
  * // send serverSetup...
  * ```
  */
+
+/**
+ * Known draft-18 Setup Options that MUST NOT be repeated (§10.3). Every known
+ * option except AUTHORIZATION_TOKEN (0x03, explicitly repeatable). Unknown
+ * options may be duplicated and are ignored.
+ */
+const KNOWN_SINGLETON_SETUP_OPTIONS_18: ReadonlySet<number> = new Set([
+  SetupOption18.PATH,                     // 0x01
+  SetupOption18.MAX_AUTH_TOKEN_CACHE_SIZE, // 0x04
+  SetupOption18.AUTHORITY,                // 0x05
+  SetupOption18.MOQT_IMPLEMENTATION,      // 0x07
+]);
+
 export class SetupGate {
   private state: SessionStateValue = SessionState.IDLE;
   private setupResult: SetupResult | undefined;
 
-  constructor(private readonly role: EndpointRoleValue) {}
+  constructor(
+    private readonly role: EndpointRoleValue,
+    private readonly draftVersion: DraftVersion = 16,
+    /**
+     * Whether the underlying transport is WebTransport. Per §10.3.1.1/§10.3.1.2,
+     * PATH and AUTHORITY MUST NOT be used over WebTransport — a received PATH /
+     * AUTHORITY closes the session with INVALID_PATH / INVALID_AUTHORITY. Default
+     * `false` = native QUIC, where the legacy client→server PATH semantics apply.
+     */
+    private readonly webtransport: boolean = false,
+  ) {}
 
   /**
    * Get the current session state.
@@ -122,6 +148,14 @@ export class SetupGate {
    * @throws {SetupError} If message violates handshake rules
    */
   validateMessage(msg: ControlMessage): void {
+    if (this.draftVersion === 18) {
+      // draft-18: each side sends a single unified SETUP on its uni control
+      // stream; the first message received before ESTABLISHED must be SETUP.
+      if (this.state !== SessionState.ESTABLISHED && msg.type !== 'SETUP') {
+        throw new SetupError(`draft-18 expects SETUP, got ${msg.type}`, 'PROTOCOL_VIOLATION');
+      }
+      return;
+    }
     if (this.state === SessionState.IDLE) {
       // First message must be CLIENT_SETUP (client sends) or we receive it (server)
       if (this.role === EndpointRole.CLIENT) {
@@ -154,6 +188,130 @@ export class SetupGate {
     // After ESTABLISHED, other messages are valid (handled by session)
   }
 
+  // ── draft-18 unified SETUP ──────────────────────────────────────────
+
+  /**
+   * Create a draft-18 unified SETUP message (both roles). Setup Options carry
+   * the same inputs as draft-14/16 EXCEPT MAX_REQUEST_ID, which draft-18 removes
+   * (QUIC stream limits replace request credit). Advances IDLE → SETUP_PENDING
+   * (the side that opens) or SETUP_PENDING → ESTABLISHED (the responder).
+   */
+  createSetup18(options: {
+    path?: string;
+    authority?: string;
+    implementation?: string;
+    // §10.3.1.3: vi64 (full uint64) — emitted as a vi64 Setup Option below.
+    maxAuthTokenCacheSize?: bigint;
+    authTokens?: Uint8Array[];
+  } = {}): Setup {
+    const enc = new TextEncoder();
+    const setupOptions: SetupOptionMap = new Map();
+    if (options.path !== undefined) {
+      setupOptions.set(BigInt(SetupOption18.PATH), [enc.encode(options.path)]);
+    }
+    if (options.authority !== undefined) {
+      setupOptions.set(BigInt(SetupOption18.AUTHORITY), [enc.encode(options.authority)]);
+    }
+    if (options.implementation !== undefined) {
+      setupOptions.set(BigInt(SetupOption18.MOQT_IMPLEMENTATION), [enc.encode(options.implementation)]);
+    }
+    if (options.maxAuthTokenCacheSize !== undefined) {
+      setupOptions.set(BigInt(SetupOption18.MAX_AUTH_TOKEN_CACHE_SIZE), [options.maxAuthTokenCacheSize]);
+    }
+    if (options.authTokens !== undefined && options.authTokens.length > 0) {
+      setupOptions.set(BigInt(SetupOption18.AUTHORIZATION_TOKEN), options.authTokens);
+    }
+    // Deliberately NO MAX_REQUEST_ID for draft-18.
+    this.state = this.state === SessionState.IDLE ? SessionState.SETUP_PENDING : SessionState.ESTABLISHED;
+    return { type: 'SETUP', setupOptions };
+  }
+
+  /**
+   * Handle a received draft-18 SETUP (either role). Interprets Setup Options
+   * (unknown options ignored) and advances the handshake state.
+   */
+  handleSetup18(msg: Setup): SetupResult {
+    const result = this.extractSetupOptions18(msg.setupOptions);
+    this.setupResult = result;
+    this.state = this.state === SessionState.IDLE ? SessionState.SETUP_PENDING : SessionState.ESTABLISHED;
+    return result;
+  }
+
+  /** Interpret draft-18 Setup Options into a {@link SetupResult}. */
+  private extractSetupOptions18(options: SetupOptionMap): SetupResult {
+    // §10.3.1.1 / §10.3.1.2: over WebTransport, PATH and AUTHORITY MUST NOT be used
+    // at all — a received one closes the session with INVALID_PATH / INVALID_AUTHORITY
+    // (regardless of role). This takes precedence over the native role policy below.
+    if (this.webtransport) {
+      if (options.has(BigInt(SetupOption18.PATH))) {
+        throw new SetupError('PATH MUST NOT be used over WebTransport (§10.3.1.2)', 'INVALID_PATH');
+      }
+      if (options.has(BigInt(SetupOption18.AUTHORITY))) {
+        throw new SetupError('AUTHORITY MUST NOT be used over WebTransport (§10.3.1.1)', 'INVALID_AUTHORITY');
+      }
+    }
+    // Native-QUIC role policy: PATH and AUTHORITY are client→server only. If WE are
+    // the client, the SETUP we are reading came from the server, which MUST NOT
+    // include them.
+    if (this.role === EndpointRole.CLIENT) {
+      if (options.has(BigInt(SetupOption18.PATH)) || options.has(BigInt(SetupOption18.AUTHORITY))) {
+        throw new SetupError('Server SETUP must not contain PATH or AUTHORITY', 'PROTOCOL_VIOLATION');
+      }
+    }
+
+    const dec = new TextDecoder();
+    let peerImplementation: string | undefined;
+    let path: string | undefined;
+    let authority: string | undefined;
+    // draft-18 §10.3.1.3 MAX_AUTH_TOKEN_CACHE_SIZE is a vi64 (full uint64) — store
+    // the raw bigint without folding it through the QUIC-varint range.
+    let peerMaxAuthTokenCacheSize: bigint | undefined;
+    let authTokens: AuthorizationToken[] | undefined;
+
+    for (const [type, values] of options) {
+      // §10.3 / §10.3.1: a known singleton Setup Option MUST NOT be repeated
+      // (AUTHORIZATION_TOKEN is the only repeatable known option; unknown options
+      // may be duplicated and are ignored). Reject duplicates on receive.
+      if (values.length > 1 && KNOWN_SINGLETON_SETUP_OPTIONS_18.has(Number(type))) {
+        throw new SetupError(
+          `Repeated Setup Option 0x${type.toString(16)} (singleton)`,
+          'PROTOCOL_VIOLATION',
+        );
+      }
+      const first = values[0];
+      switch (Number(type)) {
+        case SetupOption18.MOQT_IMPLEMENTATION:
+          if (first instanceof Uint8Array) peerImplementation = dec.decode(first);
+          break;
+        case SetupOption18.PATH:
+          if (first instanceof Uint8Array) path = dec.decode(first);
+          break;
+        case SetupOption18.AUTHORITY:
+          if (first instanceof Uint8Array) authority = dec.decode(first);
+          break;
+        case SetupOption18.MAX_AUTH_TOKEN_CACHE_SIZE:
+          if (typeof first === 'bigint') peerMaxAuthTokenCacheSize = first;
+          break;
+        case SetupOption18.AUTHORIZATION_TOKEN:
+          // draft-18 Token internals are vi64 (full uint64), not QUIC varint.
+          authTokens = values
+            .filter((v): v is Uint8Array => v instanceof Uint8Array)
+            .map((v) => parseAuthorizationToken18(v));
+          break;
+        // Unknown Setup Options are ignored (§10.3).
+      }
+    }
+    // draft-18 has no MAX_REQUEST_ID; request flow control is QUIC stream limits.
+    return {
+      peerMaxRequestId: varint(0n),
+      ...(peerImplementation !== undefined ? { peerImplementation } : {}),
+      ...(path !== undefined ? { path } : {}),
+      ...(authority !== undefined ? { authority } : {}),
+      ...(peerMaxAuthTokenCacheSize !== undefined ? { peerMaxAuthTokenCacheSize } : {}),
+      ...(authTokens !== undefined ? { authTokens } : {}),
+    };
+  }
+
   /**
    * Create CLIENT_SETUP message (client only).
    * @param options Setup options
@@ -165,7 +323,8 @@ export class SetupGate {
     path?: string;
     authority?: string;
     implementation?: string;
-    maxAuthTokenCacheSize?: Varint;
+    // draft-14/16: QUIC varint — the encoder range-guards an above-range value.
+    maxAuthTokenCacheSize?: bigint;
     authTokens?: Uint8Array[];
   } = {}): ClientSetup {
     if (this.role !== EndpointRole.CLIENT) {
@@ -245,7 +404,8 @@ export class SetupGate {
   createServerSetup(options: {
     maxRequestId?: Varint;
     implementation?: string;
-    maxAuthTokenCacheSize?: Varint;
+    // draft-14/16: QUIC varint — the encoder range-guards an above-range value.
+    maxAuthTokenCacheSize?: bigint;
     authTokens?: Uint8Array[];
   } = {}): ServerSetup {
     if (this.role !== EndpointRole.SERVER) {
@@ -389,7 +549,9 @@ export class SetupGate {
 
       if (key === SetupParam.MAX_REQUEST_ID) {
         if (typeof value === 'bigint') {
-          peerMaxRequestId = value;
+          // Request IDs are QUIC-varint range; re-validate (a raw vi64-range
+          // bigint above 2^62-1 is out of range for this setup parameter).
+          peerMaxRequestId = varint(value);
         }
       } else if (key === SetupParam.MOQT_IMPLEMENTATION) {
         if (value instanceof Uint8Array) {
@@ -399,7 +561,7 @@ export class SetupGate {
         // §9.3.1.4: MAX_AUTH_TOKEN_CACHE_SIZE — max bytes of token aliases
         // the peer is willing to store
         if (typeof value === 'bigint') {
-          peerMaxAuthTokenCacheSize = value;
+          peerMaxAuthTokenCacheSize = varint(value);
         }
       } else if (key === SetupParam.PATH) {
         if (isClientSetup && value instanceof Uint8Array) {
@@ -427,7 +589,7 @@ export class SetupGate {
       (result as { authority: string }).authority = authority;
     }
     if (peerMaxAuthTokenCacheSize !== undefined) {
-      (result as { peerMaxAuthTokenCacheSize: Varint }).peerMaxAuthTokenCacheSize = peerMaxAuthTokenCacheSize;
+      (result as { peerMaxAuthTokenCacheSize: bigint }).peerMaxAuthTokenCacheSize = peerMaxAuthTokenCacheSize;
     }
     if (authTokens.length > 0) {
       (result as { authTokens: AuthorizationToken[] }).authTokens = authTokens;

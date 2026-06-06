@@ -147,13 +147,24 @@ function validateFieldLengths(segments: Uint8Array[]): void {
 
 /**
  * Validate a Track Namespace (full namespace, not prefix).
+ *
+ * Field-count lower bound is version-specific: draft-18 §2.4.1 allows a Track
+ * Namespace of **0 to 32** fields (an empty full namespace is legal), so callers
+ * on draft-18 pass `{ allowEmpty: true }`. draft-14/16 require at least one field
+ * — the default — so legacy callers are unchanged.
+ *
  * @param segments Array of namespace field byte arrays
- * @throws {Error} If field count not 1-32, any field is empty, or total > 4096 bytes
- * @see draft-ietf-moq-transport-16 §2.4.1
+ * @param opts.allowEmpty Permit a zero-field namespace (draft-18 §2.4.1).
+ * @throws {ProtocolViolationError} If field count is out of range, any field is
+ *   empty, or the total exceeds 4096 bytes.
+ * @see draft-ietf-moq-transport-18 §2.4.1
  */
-export function validateTrackNamespace(segments: Uint8Array[]): void {
-  // Must have 1-32 fields
-  if (segments.length === 0) {
+export function validateTrackNamespace(
+  segments: Uint8Array[],
+  opts: { allowEmpty?: boolean } = {},
+): void {
+  // §2.4.1: draft-18 allows 0 fields; draft-14/16 require ≥ 1.
+  if (segments.length === 0 && !opts.allowEmpty) {
     throw new ProtocolViolationError(
       ' Track Namespace must have at least 1 field (§2.4.1)',
     );
@@ -174,6 +185,39 @@ export function validateTrackNamespace(segments: Uint8Array[]): void {
       ` Track Namespace length ${totalLength} exceeds maximum 4096 bytes (§2.4.1)`,
     );
   }
+}
+
+/** The `.session` reserved first-field value: bytes of the ASCII string ".session". */
+const SESSION_NAMESPACE_FIELD = new Uint8Array([0x2e, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e]);
+
+/** True if a namespace's first field equals `expected` (exact byte comparison). */
+function firstFieldEquals(segments: Uint8Array[], expected: Uint8Array): boolean {
+  const first = segments[0];
+  if (first === undefined || first.length !== expected.length) return false;
+  for (let i = 0; i < expected.length; i++) {
+    if (first[i] !== expected[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * §3.2.2: whether a Track Namespace is in the reserved `.session` namespace —
+ * its first field is exactly `.session`. Such tracks/namespaces are managed by
+ * the MOQT implementation; the Application MUST NOT publish under them.
+ * @see draft-ietf-moq-transport-18 §3.2.2
+ */
+export function isReservedSessionNamespace(segments: Uint8Array[]): boolean {
+  return firstFieldEquals(segments, SESSION_NAMESPACE_FIELD);
+}
+
+/**
+ * §3.2.1: whether a Track Namespace's first field is exactly a single period
+ * (`.`, 0x2e). This value is reserved and MUST NOT be used for any purpose.
+ * @see draft-ietf-moq-transport-18 §3.2.1
+ */
+export function isReservedDotNamespace(segments: Uint8Array[]): boolean {
+  const first = segments[0];
+  return first !== undefined && first.length === 1 && first[0] === 0x2e;
 }
 
 /**
@@ -204,18 +248,29 @@ export function validateTrackNamespacePrefix(segments: Uint8Array[]): void {
 
 /**
  * Validate a Full Track Name (namespace + track name).
- * The namespace must be valid (1-32 fields) and combined length ≤ 4096.
+ *
+ * The namespace must be valid (each field non-empty, ≤ 32 fields) and the combined
+ * namespace + track-name byte length must be ≤ 4096 (§2.4.1). The namespace
+ * field-count lower bound is version-specific: draft-14/16 require ≥ 1 field (the
+ * default), while draft-18 §2.4.1 permits an empty namespace — pass
+ * `{ allowEmptyNamespace: true }` there. Note that an *empty namespace* (0 fields)
+ * is distinct from an *empty field* (a present field of length 0): the latter is
+ * always a violation.
+ *
  * @param namespace Array of namespace field byte arrays
  * @param trackName Track name byte array
- * @throws {Error} If namespace invalid or combined length > 4096 bytes
- * @see draft-ietf-moq-transport-16 §2.4.1
+ * @param opts.allowEmptyNamespace Permit a zero-field namespace (draft-18 §2.4.1).
+ * @throws {ProtocolViolationError} If namespace invalid or combined length > 4096 bytes
+ * @see draft-ietf-moq-transport-18 §2.4.1
  */
 export function validateFullTrackName(
   namespace: Uint8Array[],
   trackName: Uint8Array,
+  opts: { allowEmptyNamespace?: boolean } = {},
 ): void {
-  // Validate namespace itself (1-32 fields, non-empty fields)
-  validateTrackNamespace(namespace);
+  // Validate namespace itself (≤ 32 fields, each non-empty; empty namespace only
+  // when explicitly allowed for draft-18).
+  validateTrackNamespace(namespace, opts.allowEmptyNamespace ? { allowEmpty: true } : {});
 
   // Total = namespace field lengths + track name length
   const totalLength = namespaceByteLength(namespace) + trackName.length;
