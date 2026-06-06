@@ -59,6 +59,30 @@ describe('createWebTransport', () => {
     expect(capturedOptions.protocols).toEqual(['moqt-16']);
   });
 
+  it('draft-18: sends ["moqt-18"]', async () => {
+    const factory = createWebTransport({ draftVersion: 18 });
+    await factory('https://relay.example.com/moq');
+
+    expect(capturedOptions.protocols).toEqual(['moqt-18']);
+  });
+
+  it('returned wrapper exposes incomingBidirectionalStreams when the transport has it', async () => {
+    // draft-18 inbound request streams arrive as peer-initiated bidi streams; the
+    // wrapper must surface the real transport's incomingBidirectionalStreams.
+    const incoming = new ReadableStream();
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      protocol = '';
+      incomingBidirectionalStreams = incoming;
+      constructor(url: string, options?: any) { capturedUrl = url; capturedOptions = options; }
+    });
+
+    const factory = createWebTransport();
+    const transport = await factory('https://relay.example.com/moq');
+
+    expect(transport.incomingBidirectionalStreams).toBe(incoming);
+  });
+
   it('cert hash with draft-14: no protocols, hash present', async () => {
     const hash = new Uint8Array([0xAB, 0xCD]).buffer;
     const factory = createWebTransport({ certHash: hash, draftVersion: 14 });

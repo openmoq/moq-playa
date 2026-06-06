@@ -5,13 +5,16 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { Session, SessionError as SessionErr } from './session.js';
+import type { SubscriptionFilter } from '../control/subscription-filter.js';
 import { SessionState, EndpointRole, SubscriptionState, FetchState, ForwardState, NamespaceState, type CloseConnectionAction, type OpenNamespaceStreamAction, type SendControlAction } from './types.js';
 import { varint } from '../primitives/varint.js';
+import { writeVi64, MAX_VI64 } from '../primitives/vi64.js';
 import { SetupParam, MessageParam } from '../control/parameters.js';
+import { SetupOption18 } from '../control/codes-18.js';
 import { SessionError as SessionErrorCode, RequestError, PublishDoneCode } from '../errors.js';
-import type { ClientSetup, ServerSetup, Parameters, Subscribe, SubscribeOk, RequestErrorMsg, RequestUpdate, RequestOk, Publish, PublishOk, PublishError, Fetch, StandaloneFetch, FetchOk, FetchCancel, PublishDone, MaxRequestId, RequestsBlocked, Unsubscribe, TrackStatus, PublishNamespace, PublishNamespaceDone, PublishNamespaceCancel, PublishNamespaceOk, PublishNamespaceError, UnsubscribeNamespace } from '../control/messages.js';
+import type { ClientSetup, ServerSetup, Parameters, Setup, Subscribe, SubscribeOk, RequestErrorMsg, RequestUpdate, RequestOk, Publish, PublishOk, PublishError, Fetch, StandaloneFetch, FetchOk, FetchCancel, PublishDone, MaxRequestId, RequestsBlocked, Unsubscribe, TrackStatus, PublishNamespace, PublishNamespaceDone, PublishNamespaceCancel, PublishNamespaceOk, PublishNamespaceError, UnsubscribeNamespace } from '../control/messages.js';
 import type { NotifyNamespaceAction } from './types.js';
-import { AliasType, encodeAuthorizationToken } from '../control/auth-token.js';
+import { AliasType, encodeAuthorizationToken, encodeAuthorizationToken18 } from '../control/auth-token.js';
 
 describe('Session', () => {
   describe('client role', () => {
@@ -2708,6 +2711,12 @@ describe('Session', () => {
         // Cannot accept again — already ESTABLISHED
         expect(() => session.acceptSubscribe(varint(0n), varint(42n))).toThrow();
       });
+
+      it('rejects non-empty Track Properties on draft-16 (SUBSCRIBE_OK)', () => {
+        session.handleControlMessage(incomingSubscribe(0n));
+        const trackProperties = new Map<bigint, (bigint | Uint8Array)[]>([[0x0en, [3n]]]);
+        expect(() => session.acceptSubscribe(varint(0n), varint(42n), { trackProperties })).toThrow(/Track Properties.*draft-18/i);
+      });
     });
 
     // ─── rejectSubscribe ─────────────────────────────────────────────────
@@ -2872,6 +2881,21 @@ describe('Session', () => {
 
       it('throws for unknown request ID', () => {
         expect(() => session.acceptFetch(varint(999n))).toThrow();
+      });
+
+      it('rejects non-empty Track Properties on draft-16 (FETCH_OK)', () => {
+        session.handleControlMessage(incomingFetch(0n));
+        const trackProperties = new Map<bigint, (bigint | Uint8Array)[]>([[0x0en, [3n]]]);
+        expect(() => session.acceptFetch(varint(0n), { trackProperties })).toThrow(/Track Properties.*draft-18/i);
+      });
+    });
+
+    // ─── publish Track Properties (draft-16 rejection) ────────────────────
+
+    describe('publish (draft-16 Track Properties)', () => {
+      it('rejects non-empty Track Properties on draft-16 (PUBLISH)', () => {
+        const trackProperties = new Map<bigint, (bigint | Uint8Array)[]>([[0x0en, [3n]]]);
+        expect(() => session.publish([new Uint8Array([0x6c])], new Uint8Array([0x76]), 5n, { trackProperties })).toThrow(/Track Properties.*draft-18/i);
       });
     });
 
@@ -3314,10 +3338,16 @@ describe('Session', () => {
         expect(okMsg.type).toBe('REQUEST_OK');
         expect(okMsg.requestId).toBe(requestId);
 
+        // Client tracked the outgoing TRACK_STATUS while pending...
+        expect(client.getPendingTrackStatus(requestId)).toBeDefined();
+
         // Client handles REQUEST_OK — no subscription created
         const clientActions = client.handleControlMessage(okMsg);
         expect(clientActions).toHaveLength(0);
         expect(client.getSubscription(requestId)).toBeUndefined();
+
+        // ...and clears it after the stamped REQUEST_OK (no quiet leak).
+        expect(client.getPendingTrackStatus(requestId)).toBeUndefined();
 
         // Incoming request cleaned up on server
         expect(server.getIncomingTrackStatus(requestId)).toBeUndefined();
@@ -3351,6 +3381,13 @@ describe('Session', () => {
 
         const okMsg = (okActions[0] as SendControlAction).message as RequestOk;
         expect(okMsg.parameters).toBe(params);
+      });
+
+      it('rejects non-empty Track Properties on draft-16 (no such field on the wire)', () => {
+        const { requestId, actions } = client.trackStatus(ns, name);
+        server.handleControlMessage((actions[0] as SendControlAction).message);
+        const trackProperties = new Map<bigint, (bigint | Uint8Array)[]>([[0x0en, [3n]]]);
+        expect(() => server.acceptTrackStatus(requestId, { trackProperties })).toThrow(/Track Properties.*draft-18/i);
       });
 
       it('publisher receives TRACK_STATUS and rejects with REQUEST_ERROR', () => {
@@ -4880,6 +4917,21 @@ describe('Session', () => {
       expect(() => session.publishNamespaceDone(varint(reqId))).toThrow();
     });
 
+    it('draft-18: terminates local state and emits NO send_control action (withdrawal is stream cancellation)', () => {
+      const s18 = new Session(EndpointRole.CLIENT, 18);
+      s18.initiateSetup();
+      s18.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as never);
+
+      const ns = [new Uint8Array([0x6c, 0x69, 0x76, 0x65])];
+      const { requestId } = s18.publishNamespace(ns);
+      s18.handleControlMessage({ type: 'REQUEST_OK', requestId } as RequestOk); // accept
+
+      const actions = s18.publishNamespaceDone(requestId);
+      expect(actions).toEqual([]); // no PUBLISH_NAMESPACE_DONE on the wire (§3.3.2)
+      // State terminated → a second withdrawal throws.
+      expect(() => s18.publishNamespaceDone(requestId)).toThrow();
+    });
+
     it('v14: emits trackNamespace, no requestId', () => {
       const s14 = new Session(EndpointRole.CLIENT, 14);
       s14.initiateSetup({ maxRequestId: varint(100n) });
@@ -4903,5 +4955,942 @@ describe('Session', () => {
       expect(msg.trackNamespace).toEqual(ns);
       expect(msg.requestId).toBeUndefined();
     });
+  });
+});
+
+describe('SUBSCRIBE_TRACKS lifecycle (draft-18 §10.19–10.20)', () => {
+  function established18(): Session {
+    const s = new Session(EndpointRole.CLIENT, 18);
+    s.initiateSetup();
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as never);
+    return s;
+  }
+  const prefix = [new TextEncoder().encode('a')];
+  const suffix = [new TextEncoder().encode('s1')];
+  const name = new TextEncoder().encode('vid');
+
+  it('subscribeTracks → pending; REQUEST_OK → active; PUBLISH_BLOCKED recorded', () => {
+    const s = established18();
+    const { requestId, actions } = s.subscribeTracks(prefix);
+    expect((actions[0] as SendControlAction).message.type).toBe('SUBSCRIBE_TRACKS');
+    expect(s.getTrackSubscription(requestId)?.state).toBe('pending');
+
+    // First REQUEST_OK arrives through the stamped pipeline.
+    s.handleControlMessage({ type: 'REQUEST_OK', requestId, parameters: new Map() } as RequestOk, { requestId });
+    expect(s.getTrackSubscription(requestId)?.state).toBe('active');
+
+    // PUBLISH_BLOCKED on the response stream is recorded against the request.
+    const out = s.handleSubscribeTracksStreamMessage(requestId, {
+      type: 'PUBLISH_BLOCKED', trackNamespaceSuffix: suffix, trackName: name,
+    } as never);
+    expect(out).toEqual([]);
+    const blocked = s.getTrackSubscription(requestId)!.blockedTracks;
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]!.trackName).toEqual(name);
+  });
+
+  it('REQUEST_ERROR terminates and removes the track subscription', () => {
+    const s = established18();
+    const { requestId } = s.subscribeTracks(prefix);
+    s.handleControlMessage(
+      { type: 'REQUEST_ERROR', requestId, errorCode: varint(1n), retryInterval: varint(0n), errorReason: 'no' } as RequestErrorMsg,
+      { requestId },
+    );
+    expect(s.getTrackSubscription(requestId)).toBeUndefined();
+  });
+
+  it('PUBLISH_BLOCKED before REQUEST_OK is a PROTOCOL_VIOLATION', () => {
+    const s = established18();
+    const { requestId } = s.subscribeTracks(prefix);
+    const out = s.handleSubscribeTracksStreamMessage(requestId, {
+      type: 'PUBLISH_BLOCKED', trackNamespaceSuffix: suffix, trackName: name,
+    } as never);
+    expect(out.some((a) => a.type === 'close_connection')).toBe(true);
+  });
+
+  it('stream close terminates and removes the subscription', () => {
+    const s = established18();
+    const { requestId } = s.subscribeTracks(prefix);
+    s.handleControlMessage({ type: 'REQUEST_OK', requestId, parameters: new Map() } as RequestOk, { requestId });
+    s.handleSubscribeTracksStreamClosed(requestId);
+    expect(s.getTrackSubscription(requestId)).toBeUndefined();
+  });
+});
+
+describe('inbound PUBLISH lifecycle helpers (draft-18 §10.11, §10.9)', () => {
+  function established18Publish(): { s: Session; requestId: bigint } {
+    const s = new Session(EndpointRole.CLIENT, 18);
+    s.initiateSetup();
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as never);
+    s.handleControlMessage({
+      type: 'PUBLISH', requestId: 1n, trackNamespace: [new Uint8Array([1])], trackName: new Uint8Array([2]),
+      trackAlias: 42n, parameters: new Map(), trackExtensions: new Map(),
+    } as never);
+    s.acceptSubscribe(1n, 42n);
+    return { s, requestId: 1n };
+  }
+
+  it('handleInboundPublishDone terminates the incoming subscription', () => {
+    const { s, requestId } = established18Publish();
+    expect(s.getIncomingSubscription(requestId)).toBeDefined();
+    const out = s.handleInboundPublishDone(requestId);
+    expect(out).toEqual([]);
+    expect(s.getIncomingSubscription(requestId)).toBeUndefined();
+  });
+
+  it('handleInboundPublishDone for an unknown PUBLISH is a PROTOCOL_VIOLATION', () => {
+    const { s } = established18Publish();
+    const out = s.handleInboundPublishDone(999n);
+    expect(out.some((a) => a.type === 'close_connection')).toBe(true);
+  });
+
+  it('a peer REQUEST_UPDATE applies to the original PUBLISH subscription, not the update id', () => {
+    const { s, requestId } = established18Publish();
+    // Peer sends REQUEST_UPDATE (its own id 3) with FORWARD=0; existingRequestId
+    // comes from the PUBLISH stream context (the original PUBLISH id 1).
+    s.handleControlMessage(
+      { type: 'REQUEST_UPDATE', requestId: 3n, parameters: new Map([[varint(0x10n), [varint(0n)]]]) } as never,
+      { requestId: 3n, existingRequestId: requestId } as never,
+    );
+    // FORWARD applied to the ORIGINAL subscription (1), and no sub exists for 3.
+    expect(s.getIncomingSubscription(requestId)?.forwardState).toBe(ForwardState.PAUSED);
+    expect(s.getIncomingSubscription(3n)).toBeUndefined();
+  });
+
+  it('updateIncomingSubscription builds a REQUEST_UPDATE and REQUEST_OK applies FORWARD', () => {
+    const { s, requestId } = established18Publish();
+    const { requestId: updateId, actions } = s.updateIncomingSubscription(requestId, { forward: false });
+    const upd = (actions[0] as SendControlAction).message;
+    expect(upd.type).toBe('REQUEST_UPDATE');
+    // The matching REQUEST_OK applies the pending update to the incoming sub.
+    s.handleControlMessage({ type: 'REQUEST_OK', requestId: updateId, parameters: new Map() } as RequestOk, { requestId: updateId });
+    expect(s.getIncomingSubscription(requestId)?.forwardState).toBe(ForwardState.PAUSED);
+  });
+});
+
+describe('acceptFetch options (draft-18 §10.13)', () => {
+  function established18(): Session {
+    const s = new Session(EndpointRole.CLIENT, 18);
+    s.initiateSetup();
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as never);
+    return s;
+  }
+
+  it('acceptFetch carries the provided endOfTrack + endLocation (full uint64)', () => {
+    const s = established18();
+    s.handleControlMessage({
+      type: 'FETCH', requestId: 1n,
+      fetch: { fetchType: 0x1, trackNamespace: [new Uint8Array([1])], trackName: new Uint8Array([2]), startLocation: { group: 0n, object: 0n }, endLocation: { group: 9n, object: 0n } },
+      parameters: new Map(),
+    } as never);
+    const big = 1n << 63n;
+    const actions = s.acceptFetch(1n, { endOfTrack: 1, endLocation: { group: big, object: big + 1n } });
+    const fetchOk = (actions[0] as SendControlAction).message as { type: string; endOfTrack: number; endLocation: { group: bigint; object: bigint } };
+    expect(fetchOk.type).toBe('FETCH_OK');
+    expect(fetchOk.endOfTrack).toBe(1);
+    expect(fetchOk.endLocation).toEqual({ group: big, object: big + 1n });
+  });
+
+  it('acceptFetch defaults to endOfTrack 0 + {0,0} when no options are given', () => {
+    const s = established18();
+    s.handleControlMessage({
+      type: 'FETCH', requestId: 1n,
+      fetch: { fetchType: 0x1, trackNamespace: [new Uint8Array([1])], trackName: new Uint8Array([2]), startLocation: { group: 0n, object: 0n }, endLocation: { group: 9n, object: 0n } },
+      parameters: new Map(),
+    } as never);
+    const actions = s.acceptFetch(1n);
+    const fetchOk = (actions[0] as SendControlAction).message as { endOfTrack: number; endLocation: { group: bigint; object: bigint } };
+    expect(fetchOk.endOfTrack).toBe(0);
+    expect(fetchOk.endLocation).toEqual({ group: 0n, object: 0n });
+  });
+});
+
+describe('REQUEST_ERROR Redirect semantics (draft-18 §10.6.2)', () => {
+  const NS = [new TextEncoder().encode('live')];
+  const NAME = new TextEncoder().encode('vid');
+  const URI = new TextEncoder().encode('https://r.example/moq');
+  const range = { startGroup: varint(0n), startObject: varint(0n), endGroup: varint(9n), endObject: varint(0n) };
+
+  function established18(role = EndpointRole.CLIENT): Session {
+    const s = new Session(role, 18);
+    s.initiateSetup();
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as never);
+    return s;
+  }
+  const redirectErr = (requestId: bigint, redirect: { connectUri: Uint8Array; trackNamespace: Uint8Array[]; trackName: Uint8Array }): RequestErrorMsg =>
+    ({ type: 'REQUEST_ERROR', requestId, errorCode: RequestError.REDIRECT, retryInterval: varint(0n), errorReason: '', redirect } as never);
+  const sameSessionTrack = { connectUri: new Uint8Array(0), trackNamespace: NS, trackName: NAME };
+  const namespaceRedirect = { connectUri: new Uint8Array(0), trackNamespace: NS, trackName: new Uint8Array(0) };
+  const closeOf = (actions: ReturnType<Session['handleControlMessage']>) =>
+    actions.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
+
+  it('accepts REDIRECT for SUBSCRIBE and terminates the subscription (no session close)', () => {
+    const s = established18();
+    const { requestId } = s.subscribe(NS, NAME);
+    const actions = s.handleControlMessage(redirectErr(requestId, sameSessionTrack));
+    expect(closeOf(actions)).toBeUndefined();
+    expect(s.getSubscription(requestId)?.isTerminated).toBe(true);
+  });
+
+  it('accepts REDIRECT for FETCH, TRACK_STATUS, PUBLISH_NAMESPACE, and SUBSCRIBE_NAMESPACE', () => {
+    let s = established18();
+    let rid = s.fetch(NS, NAME, range).requestId;
+    expect(closeOf(s.handleControlMessage(redirectErr(rid, sameSessionTrack)))).toBeUndefined();
+
+    s = established18();
+    rid = s.trackStatus(NS, NAME).requestId;
+    expect(closeOf(s.handleControlMessage(redirectErr(rid, sameSessionTrack)))).toBeUndefined();
+
+    s = established18();
+    rid = s.publishNamespace(NS).requestId;
+    expect(closeOf(s.handleControlMessage(redirectErr(rid, namespaceRedirect)))).toBeUndefined();
+
+    s = established18();
+    rid = s.subscribeNamespace(NS).requestId;
+    expect(closeOf(s.handleControlMessage(redirectErr(rid, namespaceRedirect)))).toBeUndefined();
+  });
+
+  it('rejects REDIRECT for SUBSCRIBE_TRACKS / PUBLISH / REQUEST_UPDATE as PROTOCOL_VIOLATION', () => {
+    let s = established18();
+    let rid = s.subscribeTracks(NS).requestId;
+    expect(closeOf(s.handleControlMessage(redirectErr(rid, sameSessionTrack)))?.error).toBe(BigInt(SessionErrorCode.PROTOCOL_VIOLATION));
+
+    s = established18();
+    rid = s.publish(NS, NAME, 5n).requestId;
+    expect(closeOf(s.handleControlMessage(redirectErr(rid, sameSessionTrack)))?.error).toBe(BigInt(SessionErrorCode.PROTOCOL_VIOLATION));
+
+    s = established18();
+    const subId = s.subscribe(NS, NAME).requestId;
+    s.handleControlMessage({ type: 'SUBSCRIBE_OK', requestId: subId, trackAlias: 9n, parameters: new Map(), trackExtensions: new Map() } as never);
+    const updId = s.requestUpdate(subId, { forward: false }).requestId;
+    expect(closeOf(s.handleControlMessage(redirectErr(updId, sameSessionTrack)))?.error).toBe(BigInt(SessionErrorCode.PROTOCOL_VIOLATION));
+  });
+
+  it('a SERVER receiving a Redirect with a non-empty Connect URI closes (PROTOCOL_VIOLATION)', () => {
+    const s = established18(EndpointRole.SERVER);
+    const rid = s.subscribe(NS, NAME).requestId;
+    const actions = s.handleControlMessage(redirectErr(rid, { connectUri: URI, trackNamespace: NS, trackName: NAME }));
+    expect(closeOf(actions)?.error).toBe(BigInt(SessionErrorCode.PROTOCOL_VIOLATION));
+  });
+
+  it('a CLIENT may receive a relocation Connect URI (no close)', () => {
+    const s = established18(EndpointRole.CLIENT);
+    const rid = s.subscribe(NS, NAME).requestId;
+    const actions = s.handleControlMessage(redirectErr(rid, { connectUri: URI, trackNamespace: NS, trackName: NAME }));
+    expect(closeOf(actions)).toBeUndefined();
+  });
+
+  it('a namespace-scoped Redirect with a non-empty Track Name closes (PROTOCOL_VIOLATION)', () => {
+    const s = established18();
+    const rid = s.publishNamespace(NS).requestId;
+    const actions = s.handleControlMessage(redirectErr(rid, { connectUri: new Uint8Array(0), trackNamespace: NS, trackName: NAME }));
+    expect(closeOf(actions)?.error).toBe(BigInt(SessionErrorCode.PROTOCOL_VIOLATION));
+  });
+});
+
+describe('outbound request-stream peer-close terminates the request (draft-18 §11.4.1)', () => {
+  const NS = [new TextEncoder().encode('live')];
+  const NAME = new TextEncoder().encode('vid');
+  const range = { startGroup: varint(0n), startObject: varint(0n), endGroup: varint(9n), endObject: varint(0n) };
+  function s18(): Session {
+    const s = new Session(EndpointRole.CLIENT, 18);
+    s.initiateSetup();
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as never);
+    return s;
+  }
+
+  it('SUBSCRIBE: peer close drops the subscription AND unregisters its Track Alias', () => {
+    const s = s18();
+    const { requestId } = s.subscribe(NS, NAME);
+    s.handleControlMessage({ type: 'SUBSCRIBE_OK', requestId, trackAlias: 7n, parameters: new Map(), trackProperties: new Map() } as never);
+    expect(s.getSubscription(requestId)).toBeDefined();
+    expect(s.getTrackByAlias(7n)).toBeDefined();
+
+    s.handleOutboundRequestClosed(requestId); // peer FIN/reset of the SUBSCRIBE stream
+    expect(s.getSubscription(requestId)).toBeUndefined();
+    expect(s.getTrackByAlias(7n)).toBeUndefined(); // alias freed — late data must not route
+  });
+
+  it('FETCH: peer close drops the fetch state', () => {
+    const s = s18();
+    const { requestId } = s.fetch(NS, NAME, range);
+    expect(s.getFetch(requestId)).toBeDefined();
+    s.handleOutboundRequestClosed(requestId);
+    expect(s.getFetch(requestId)).toBeUndefined();
+  });
+
+  it('TRACK_STATUS: peer close clears the pending track status', () => {
+    const s = s18();
+    const { requestId } = s.trackStatus(NS, NAME);
+    expect(s.getPendingTrackStatus(requestId)).toBeDefined();
+    s.handleOutboundRequestClosed(requestId);
+    expect(s.getPendingTrackStatus(requestId)).toBeUndefined();
+  });
+
+  it('PUBLISH: peer close drops the outbound publish (existing behavior preserved)', () => {
+    const s = s18();
+    const { requestId } = s.publish(NS, NAME, 9n);
+    expect(s.getOutgoingPublish(requestId)).toBeDefined();
+    s.handleOutboundRequestClosed(requestId);
+    expect(s.getOutgoingPublish(requestId)).toBeUndefined();
+  });
+
+  it('PUBLISH_NAMESPACE: peer close drops the advertised namespace (a later withdrawal then throws)', () => {
+    const s = s18();
+    const { requestId } = s.publishNamespace(NS);
+    s.handleControlMessage({ type: 'REQUEST_OK', requestId, parameters: new Map() } as never); // active
+    s.handleOutboundRequestClosed(requestId);
+    expect(() => s.publishNamespaceDone(requestId)).toThrow(); // state gone
+  });
+});
+
+describe('draft-18 AUTHORIZATION_TOKEN message-parameter processing (vi64 inner token, §9.2.2.1)', () => {
+  // The session must parse the inner Token of a draft-18 message AUTHORIZATION_TOKEN
+  // with the vi64 parser. We prove it by behavior: REGISTER an above-QUIC Token
+  // Alias on one request, then USE_ALIAS it on a later request — the alias only
+  // resolves if both inner tokens were parsed as vi64 and stored/looked-up as the
+  // same 2^63 value. (2^63 is above the QUIC-varint ceiling and is unrepresentable
+  // by the legacy encoder, so this exercises the full-uint64 path end to end.)
+  const big = 1n << 63n; // > 2^62-1
+
+  function established18(): Session {
+    const s = new Session(EndpointRole.CLIENT, 18);
+    // Size the auth cache so a non-setup REGISTER actually stores (entry ≈ 16 + value bytes).
+    s.initiateSetup({ maxAuthTokenCacheSize: varint(1024n) });
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as Setup);
+    return s;
+  }
+
+  // An inbound PUBLISH is an auth-scoped request (§9.2.2.1) that creates observable
+  // incoming-subscription state, carrying the token as the AUTHORIZATION_TOKEN param.
+  // Peer-initiated request IDs are odd (LSB=1), so each request uses a distinct odd id.
+  function inboundPublish(requestId: bigint, nsByte: number, trackAlias: bigint, tokenBytes: Uint8Array): Publish {
+    const params: Parameters = new Map();
+    params.set(varint(0x03n), [tokenBytes]); // AUTHORIZATION_TOKEN (type 0x03), bytes value
+    return {
+      type: 'PUBLISH', requestId, trackNamespace: [new Uint8Array([nsByte])], trackName: new Uint8Array([2]),
+      trackAlias, parameters: params, trackExtensions: new Map(),
+    } as unknown as Publish;
+  }
+
+  it('registers an above-QUIC vi64 Token Alias, then resolves it via USE_ALIAS on a later request', () => {
+    const s = established18();
+
+    // Request 1 (id 1): REGISTER alias=2^63 with type=2^63 (vi64-encoded inner token).
+    const register = encodeAuthorizationToken18({
+      aliasType: AliasType.REGISTER, tokenAlias: big, tokenType: big,
+      tokenValue: new Uint8Array([0xaa, 0xbb]),
+    });
+    const a1 = s.handleControlMessage(inboundPublish(1n, 0x10, 42n, register) as never);
+    expect(a1.every((a) => a.type !== 'close_connection')).toBe(true);
+    expect(s.getIncomingSubscription(1n)).toBeDefined();
+
+    // Request 2 (id 3): USE_ALIAS the same above-QUIC alias — resolves only if it was
+    // registered as 2^63, i.e. both requests parsed the inner token as vi64.
+    const useAlias = encodeAuthorizationToken18({ aliasType: AliasType.USE_ALIAS, tokenAlias: big });
+    const a2 = s.handleControlMessage(inboundPublish(3n, 0x11, 43n, useAlias) as never);
+    expect(a2.every((a) => a.type !== 'close_connection')).toBe(true);
+    expect(s.getIncomingSubscription(3n)).toBeDefined();
+  });
+});
+
+describe('draft-18 message-parameter scope validation (§10.2.1)', () => {
+  const NS = [new Uint8Array([0x6c])];
+  const NAME = new Uint8Array([0x76]);
+  const PRIO = MessageParam.SUBSCRIBER_PRIORITY;
+
+  function client18(): Session {
+    const s = new Session(EndpointRole.CLIENT, 18);
+    s.initiateSetup();
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as Setup);
+    return s;
+  }
+  const noClose = (actions: ReturnType<Session['handleControlMessage']>) =>
+    actions.every((a) => a.type !== 'close_connection');
+  const protocolViolation = (actions: ReturnType<Session['handleControlMessage']>) => {
+    const close = actions.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
+    return close?.error === SessionErrorCode.PROTOCOL_VIOLATION;
+  };
+  // A valid USE_VALUE token so AUTHORIZATION_TOKEN survives auth processing — keeps
+  // these tests focused on parameter SCOPE, not token semantics.
+  const authToken = () => encodeAuthorizationToken18({
+    aliasType: AliasType.USE_VALUE, tokenType: 1n, tokenValue: new Uint8Array([0x01]),
+  });
+  const incSubscribe = (requestId: bigint, params: Parameters) =>
+    ({ type: 'SUBSCRIBE', requestId, trackNamespace: NS, trackName: NAME, parameters: params } as Subscribe);
+  const incFetch = (requestId: bigint, params: Parameters) => ({
+    type: 'FETCH', requestId,
+    fetch: { fetchType: 0x1, trackNamespace: NS, trackName: NAME, startLocation: { group: 0n, object: 0n }, endLocation: { group: 9n, object: 0n } },
+    parameters: params,
+  });
+  const incSubscribeTracks = (requestId: bigint, params: Parameters) =>
+    ({ type: 'SUBSCRIBE_TRACKS', requestId, trackNamespacePrefix: [new Uint8Array([0x61])], parameters: params });
+
+  // ── Valid draft-18 params accepted (red-first: 0x04/0x06/0x0A were "unknown") ──
+  it('accepts RENDEZVOUS_TIMEOUT (0x04) on SUBSCRIBE', () => {
+    const s = client18();
+    const a = s.handleControlMessage(incSubscribe(1n, new Map([[MessageParam.RENDEZVOUS_TIMEOUT, [5000n]]])) as never);
+    expect(noClose(a)).toBe(true);
+  });
+  it('accepts SUBGROUP_DELIVERY_TIMEOUT (0x06) on SUBSCRIBE', () => {
+    const s = client18();
+    const a = s.handleControlMessage(incSubscribe(1n, new Map([[MessageParam.SUBGROUP_DELIVERY_TIMEOUT, [3000n]]])) as never);
+    expect(noClose(a)).toBe(true);
+  });
+  it('accepts FILL_TIMEOUT (0x0A) on FETCH', () => {
+    const s = client18();
+    const a = s.handleControlMessage(incFetch(1n, new Map([[MessageParam.FILL_TIMEOUT, [2000n]]])) as never);
+    expect(noClose(a)).toBe(true);
+  });
+  it('accepts AUTHORIZATION_TOKEN on SUBSCRIBE_TRACKS', () => {
+    const s = client18();
+    const a = s.handleControlMessage(incSubscribeTracks(1n, new Map([[MessageParam.AUTHORIZATION_TOKEN, [authToken()]]])) as never);
+    expect(noClose(a)).toBe(true);
+  });
+  it('accepts FORWARD on SUBSCRIBE_TRACKS', () => {
+    const s = client18();
+    const a = s.handleControlMessage(incSubscribeTracks(1n, new Map([[MessageParam.FORWARD, [1n]]])) as never);
+    expect(noClose(a)).toBe(true);
+  });
+
+  // ── Out-of-scope known params → PROTOCOL_VIOLATION (§10.2.1) ──
+  it('rejects FILL_TIMEOUT on SUBSCRIBE', () => {
+    const s = client18();
+    const a = s.handleControlMessage(incSubscribe(1n, new Map([[MessageParam.FILL_TIMEOUT, [2000n]]])) as never);
+    expect(protocolViolation(a)).toBe(true);
+  });
+  it('rejects RENDEZVOUS_TIMEOUT on FETCH', () => {
+    const s = client18();
+    const a = s.handleControlMessage(incFetch(1n, new Map([[MessageParam.RENDEZVOUS_TIMEOUT, [5000n]]])) as never);
+    expect(protocolViolation(a)).toBe(true);
+  });
+  it('rejects FORWARD on FETCH', () => {
+    const s = client18();
+    const a = s.handleControlMessage(incFetch(1n, new Map([[MessageParam.FORWARD, [1n]]])) as never);
+    expect(protocolViolation(a)).toBe(true);
+  });
+  it('rejects AUTHORIZATION_TOKEN on SUBSCRIBE_OK', () => {
+    const s = client18();
+    const { requestId } = s.subscribe(NS, NAME);
+    const a = s.handleControlMessage({
+      type: 'SUBSCRIBE_OK', requestId, trackAlias: 7n,
+      parameters: new Map([[MessageParam.AUTHORIZATION_TOKEN, [authToken()]]]), trackExtensions: new Map(),
+    } as never);
+    expect(protocolViolation(a)).toBe(true);
+  });
+  it('rejects TRACK_NAMESPACE_PREFIX on a normal subscription REQUEST_UPDATE', () => {
+    const s = client18();
+    // An inbound PUBLISH creates a regular incoming subscription (id 1); accept it
+    // so it is ESTABLISHED — then the ONLY reason to reject the REQUEST_UPDATE is
+    // the out-of-scope prefix (§10.2.14), not an unrelated state error.
+    s.handleControlMessage({
+      type: 'PUBLISH', requestId: 1n, trackNamespace: NS, trackName: NAME, trackAlias: 9n,
+      parameters: new Map(), trackExtensions: new Map(),
+    } as never);
+    s.acceptSubscribe(1n, 9n);
+    const a = s.handleControlMessage({
+      type: 'REQUEST_UPDATE', requestId: 3n, existingRequestId: 1n,
+      parameters: new Map([[MessageParam.TRACK_NAMESPACE_PREFIX, [[new Uint8Array([0x78])]]]]),
+    } as never);
+    expect(protocolViolation(a)).toBe(true);
+  });
+
+  // ── REQUEST_OK context-sensitive scope (§10.5) ──
+  it('REQUEST_OK answering PUBLISH carries PUBLISH_OK-scoped params (EXPIRES, SUBSCRIBER_PRIORITY)', () => {
+    const s = client18();
+    const { requestId } = s.publish(NS, NAME, 9n);
+    const a = s.handleControlMessage({
+      type: 'REQUEST_OK', requestId,
+      parameters: new Map([[MessageParam.EXPIRES, [1000n]], [PRIO, [5n]]]),
+    } as never);
+    expect(noClose(a)).toBe(true);
+  });
+  it('REQUEST_OK answering TRACK_STATUS carries TRACK_STATUS_OK-scoped params (LARGEST_OBJECT)', () => {
+    const s = client18();
+    const { requestId } = s.trackStatus(NS, NAME);
+    const a = s.handleControlMessage({
+      type: 'REQUEST_OK', requestId,
+      parameters: new Map([[MessageParam.LARGEST_OBJECT, [{ group: 5n, object: 2n }]]]),
+    } as never);
+    expect(noClose(a)).toBe(true);
+  });
+  it('REQUEST_OK answering PUBLISH_NAMESPACE rejects a subscribe-scoped param', () => {
+    const s = client18();
+    const { requestId } = s.publishNamespace(NS);
+    const a = s.handleControlMessage({
+      type: 'REQUEST_OK', requestId, parameters: new Map([[PRIO, [5n]]]),
+    } as never);
+    expect(protocolViolation(a)).toBe(true);
+  });
+
+  // ── Legacy guard: draft-16 still IGNORES an out-of-scope known param ──
+  it('draft-16 ignores an out-of-scope known param (SUBSCRIBER_PRIORITY on SUBSCRIBE_OK) — no violation', () => {
+    const s16 = new Session(EndpointRole.CLIENT);
+    s16.initiateSetup({ maxRequestId: varint(100n) });
+    s16.handleControlMessage({
+      type: 'SERVER_SETUP', parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
+    });
+    const { requestId } = s16.subscribe(NS, NAME);
+    const a = s16.handleControlMessage({
+      type: 'SUBSCRIBE_OK', requestId, trackAlias: varint(7n),
+      parameters: new Map([[PRIO, [varint(5n)]]]), trackExtensions: [],
+    } as never);
+    expect(noClose(a)).toBe(true); // draft-16: out-of-scope param is silently ignored (§9.2.2)
+  });
+});
+
+describe('draft-18 SUBSCRIPTION_FILTER wire correctness (§5.1.2)', () => {
+  const NS = [new Uint8Array([0x6c])];
+  const NAME = new Uint8Array([0x76]);
+  const FILTER = MessageParam.SUBSCRIPTION_FILTER;
+
+  function client18(): Session {
+    const s = new Session(EndpointRole.CLIENT, 18);
+    s.initiateSetup();
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as Setup);
+    return s;
+  }
+  function client16(): Session {
+    const s = new Session(EndpointRole.CLIENT);
+    s.initiateSetup({ maxRequestId: varint(100n) });
+    s.handleControlMessage({ type: 'SERVER_SETUP', parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]) });
+    return s;
+  }
+  // Build a draft-18 filter byte string from raw vi64 fields.
+  function f18(...fields: bigint[]): Uint8Array {
+    const parts = fields.map((v) => { const b = new Uint8Array(9); return b.subarray(0, writeVi64(v, b, 0)); });
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let off = 0;
+    for (const p of parts) { out.set(p, off); off += p.length; }
+    return out;
+  }
+  function filterParamBytes(s: Session, filter: SubscriptionFilter): Uint8Array {
+    const { actions } = s.subscribe(NS, NAME, { subscriptionFilter: filter });
+    const msg = (actions[0] as SendControlAction).message as Subscribe;
+    return msg.parameters.get(FILTER as bigint)![0] as Uint8Array;
+  }
+  const incomingWithFilter = (s: Session, requestId: bigint, bytes: Uint8Array) =>
+    s.handleControlMessage({
+      type: 'SUBSCRIBE', requestId, trackNamespace: NS, trackName: NAME,
+      parameters: new Map([[FILTER, [bytes]]]),
+    } as never);
+  const noClose = (a: ReturnType<Session['handleControlMessage']>) => a.every((x) => x.type !== 'close_connection');
+  const protocolViolation = (a: ReturnType<Session['handleControlMessage']>) => {
+    const c = a.find((x) => x.type === 'close_connection') as CloseConnectionAction | undefined;
+    return c?.error === SessionErrorCode.PROTOCOL_VIOLATION;
+  };
+
+  // ── ENCODE: AbsoluteRange writes an End Group DELTA, not the absolute End Group ──
+  it('AbsoluteRange(start=5, end=10) encodes End Group Delta 5 (not absolute 10)', () => {
+    const bytes = filterParamBytes(client18(), { type: 'AbsoluteRange', startGroup: 5n, startObject: 0n, endGroup: 10n });
+    expect(bytes).toEqual(new Uint8Array([0x04, 0x05, 0x00, 0x05])); // type, start group, start object, DELTA
+  });
+  it('AbsoluteRange with End Group Delta 0 (end === start) encodes 0x00 and is accepted', () => {
+    const bytes = filterParamBytes(client18(), { type: 'AbsoluteRange', startGroup: 5n, startObject: 0n, endGroup: 5n });
+    expect(bytes).toEqual(new Uint8Array([0x04, 0x05, 0x00, 0x00]));
+    expect(noClose(incomingWithFilter(client18(), 1n, bytes))).toBe(true);
+  });
+
+  // ── above-QUIC vi64 values round-trip (encode → accept) ──
+  it('supports an above-QUIC vi64 startGroup (2^63): encodes then validates as accepted', () => {
+    const big = 1n << 63n; // > 2^62-1
+    const bytes = filterParamBytes(client18(), { type: 'AbsoluteStart', startGroup: big, startObject: 0n });
+    expect(noClose(incomingWithFilter(client18(), 1n, bytes))).toBe(true);
+  });
+
+  // ── overflow: Start Group + End Group Delta MUST NOT exceed 2^64-1 ──
+  it('rejects AbsoluteRange whose Start Group + End Group Delta overflows uint64', () => {
+    const bytes = f18(0x4n, MAX_VI64, 0n, 1n); // 2^64-1 + 1
+    expect(protocolViolation(incomingWithFilter(client18(), 1n, bytes))).toBe(true);
+  });
+  it('accepts AbsoluteRange exactly at the uint64 boundary (Start Group + Delta === 2^64-1)', () => {
+    const bytes = f18(0x4n, MAX_VI64 - 1n, 0n, 1n); // == 2^64-1
+    expect(noClose(incomingWithFilter(client18(), 1n, bytes))).toBe(true);
+  });
+
+  // ── OUTBOUND overflow: a valid delta can still encode an out-of-range absolute
+  //    End Group; the encoder must reject the semantic endGroup before emitting bytes. ──
+  it('rejects (RangeError) an outbound AbsoluteRange whose ABSOLUTE endGroup exceeds 2^64-1', () => {
+    expect(() => client18().subscribe(NS, NAME, {
+      subscriptionFilter: { type: 'AbsoluteRange', startGroup: 1n, startObject: 0n, endGroup: MAX_VI64 + 1n },
+    })).toThrow(RangeError); // delta would be 2^64-1 (valid on the wire), but endGroup overflows
+  });
+  it('encodes an outbound AbsoluteRange at the boundary (startGroup=endGroup=2^64-1) as Delta 0', () => {
+    const bytes = filterParamBytes(client18(), { type: 'AbsoluteRange', startGroup: MAX_VI64, startObject: 0n, endGroup: MAX_VI64 });
+    expect(bytes[bytes.length - 1]).toBe(0x00); // End Group Delta == 0
+    expect(noClose(incomingWithFilter(client18(), 1n, bytes))).toBe(true);
+  });
+
+  // ── malformed / trailing ──
+  it('rejects trailing bytes after an AbsoluteRange filter', () => {
+    const bytes = new Uint8Array([0x04, 0x05, 0x00, 0x00, 0xff]);
+    expect(protocolViolation(incomingWithFilter(client18(), 1n, bytes))).toBe(true);
+  });
+  it('rejects a truncated AbsoluteRange (missing End Group Delta)', () => {
+    const bytes = new Uint8Array([0x04, 0x05, 0x00]);
+    expect(protocolViolation(incomingWithFilter(client18(), 1n, bytes))).toBe(true);
+  });
+
+  // ── draft-14/16 unchanged: ABSOLUTE End Group + QUIC-varint guardrail ──
+  it('draft-16 still encodes an ABSOLUTE End Group (10), not a delta', () => {
+    const bytes = filterParamBytes(client16(), { type: 'AbsoluteRange', startGroup: 5n, startObject: 0n, endGroup: 10n });
+    expect(bytes).toEqual(new Uint8Array([0x04, 0x05, 0x00, 0x0a]));
+  });
+  it('draft-16 rejects an above-QUIC startGroup at encode (writeVarint guardrail)', () => {
+    expect(() => client16().subscribe(NS, NAME, {
+      subscriptionFilter: { type: 'AbsoluteStart', startGroup: 1n << 63n, startObject: 0n },
+    })).toThrow(RangeError);
+  });
+});
+
+describe('draft-18 Track Namespace rules — empty namespace + reserved .session (§2.4.1, §3.2)', () => {
+  const f = (s: string) => new TextEncoder().encode(s);
+  const NAME = new Uint8Array([0x76]);
+
+  function client18(): Session {
+    const s = new Session(EndpointRole.CLIENT, 18);
+    s.initiateSetup();
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as Setup);
+    return s;
+  }
+  function client16(): Session {
+    const s = new Session(EndpointRole.CLIENT);
+    s.initiateSetup({ maxRequestId: varint(100n) });
+    s.handleControlMessage({ type: 'SERVER_SETUP', parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]) });
+    return s;
+  }
+  const hasClose = (a: ReturnType<Session['handleControlMessage']>) => a.some((x) => x.type === 'close_connection');
+
+  // ── §2.4.1: draft-18 permits a zero-field full namespace; draft-14/16 do not ──
+  it('draft-18 accepts a zero-field combined full namespace (empty prefix + empty suffix)', () => {
+    const s = client18();
+    const { requestId } = s.subscribeNamespace([]); // empty prefix (0-32 fields allowed)
+    s.handleNamespaceStreamMessage(requestId, { type: 'REQUEST_OK', requestId, parameters: new Map() }); // activate
+    const actions = s.handleNamespaceStreamMessage(requestId, { type: 'NAMESPACE', trackNamespaceSuffix: [] });
+    expect(hasClose(actions)).toBe(false); // combined = 0 fields → legal in draft-18
+  });
+  it('draft-16 rejects a zero-field combined full namespace with PROTOCOL_VIOLATION', () => {
+    const s = client16();
+    const { requestId } = s.subscribeNamespace([]);
+    s.handleNamespaceStreamMessage(requestId, { type: 'REQUEST_OK', requestId, parameters: new Map() });
+    const actions = s.handleNamespaceStreamMessage(requestId, { type: 'NAMESPACE', trackNamespaceSuffix: [] });
+    const close = actions.find((x) => x.type === 'close_connection') as CloseConnectionAction | undefined;
+    expect(close?.error).toBe(SessionErrorCode.PROTOCOL_VIOLATION);
+  });
+
+  // ── §3.2.2 / §3.2.1: Application MUST NOT publish under a reserved first field ──
+  it('publish() throws under the reserved .session namespace (§3.2.2)', () => {
+    expect(() => client18().publish([f('.session')], NAME, 1n)).toThrow(/\.session/);
+  });
+  it('publish() throws under the reserved single-period namespace (§3.2.1)', () => {
+    expect(() => client18().publish([f('.')], NAME, 1n)).toThrow(/reserved/i);
+  });
+  it('publishNamespace() throws under the reserved .session namespace', () => {
+    expect(() => client18().publishNamespace([f('.session'), f('a')])).toThrow(/\.session/);
+  });
+  it('publish() allows an ordinary (non-reserved) namespace', () => {
+    expect(() => client18().publish([f('live')], NAME, 1n)).not.toThrow();
+  });
+  it('draft-16 also guards publish() under .session (reserved rule is version-independent)', () => {
+    expect(() => client16().publish([f('.session')], NAME, 1n)).toThrow(/\.session/);
+  });
+});
+
+describe('draft-18 inbound reserved namespace → REQUEST_ERROR DOES_NOT_EXIST (§3.2)', () => {
+  const f = (s: string) => new TextEncoder().encode(s);
+  const NAME = new Uint8Array([0x76]);
+
+  function client18(): Session {
+    const s = new Session(EndpointRole.CLIENT, 18);
+    s.initiateSetup();
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as Setup);
+    return s;
+  }
+  const reqError = (actions: ReturnType<Session['handleControlMessage']>): RequestErrorMsg | undefined => {
+    const a = actions.find((x) => x.type === 'send_control' && (x as SendControlAction).message.type === 'REQUEST_ERROR');
+    return a ? (a as SendControlAction).message as RequestErrorMsg : undefined;
+  };
+  const noClose = (a: ReturnType<Session['handleControlMessage']>) => a.every((x) => x.type !== 'close_connection');
+  const inSubscribe = (requestId: bigint, ns: Uint8Array[]) =>
+    ({ type: 'SUBSCRIBE', requestId, trackNamespace: ns, trackName: NAME, parameters: new Map() });
+
+  it('inbound SUBSCRIBE under .session → DOES_NOT_EXIST; no incoming subscription; no session close', () => {
+    const s = client18();
+    const actions = s.handleControlMessage(inSubscribe(1n, [f('.session')]) as never);
+    expect(reqError(actions)?.errorCode).toBe(RequestError.DOES_NOT_EXIST);
+    expect(s.getIncomingSubscription(1n)).toBeUndefined(); // no dangling request state
+    expect(noClose(actions)).toBe(true); // per-request error, NOT a session close
+  });
+  it('inbound SUBSCRIBE under a single-period "." namespace → DOES_NOT_EXIST', () => {
+    const s = client18();
+    const actions = s.handleControlMessage(inSubscribe(1n, [f('.')]) as never);
+    expect(reqError(actions)?.errorCode).toBe(RequestError.DOES_NOT_EXIST);
+    expect(s.getIncomingSubscription(1n)).toBeUndefined();
+  });
+  it('inbound SUBSCRIBE under a non-.session reserved namespace (.future) passes through to the application', () => {
+    const s = client18();
+    const actions = s.handleControlMessage(inSubscribe(1n, [f('.future')]) as never);
+    expect(reqError(actions)).toBeUndefined(); // §3.2.1: unrecognized reserved → application-visible
+    expect(s.getIncomingSubscription(1n)).toBeDefined();
+  });
+
+  // Track request (§3.2): FETCH + TRACK_STATUS
+  it('inbound standalone FETCH under .session → DOES_NOT_EXIST; no fetch state', () => {
+    const s = client18();
+    const actions = s.handleControlMessage({
+      type: 'FETCH', requestId: 1n,
+      fetch: { fetchType: 0x1, trackNamespace: [f('.session')], trackName: NAME, startLocation: { group: 0n, object: 0n }, endLocation: { group: 9n, object: 0n } },
+      parameters: new Map(),
+    } as never);
+    expect(reqError(actions)?.errorCode).toBe(RequestError.DOES_NOT_EXIST);
+    expect(s.getIncomingFetch(1n)).toBeUndefined();
+  });
+  it('inbound TRACK_STATUS under "." → DOES_NOT_EXIST', () => {
+    const s = client18();
+    const actions = s.handleControlMessage({ type: 'TRACK_STATUS', requestId: 1n, trackNamespace: [f('.')], trackName: NAME, parameters: new Map() } as never);
+    expect(reqError(actions)?.errorCode).toBe(RequestError.DOES_NOT_EXIST);
+  });
+
+  // Namespace-scoped request (§3.2): PUBLISH_NAMESPACE
+  it('inbound PUBLISH_NAMESPACE under .session → DOES_NOT_EXIST; no namespace announce surfaced', () => {
+    const s = client18();
+    const actions = s.handleControlMessage({ type: 'PUBLISH_NAMESPACE', requestId: 1n, trackNamespace: [f('.session')], parameters: new Map() } as never);
+    expect(reqError(actions)?.errorCode).toBe(RequestError.DOES_NOT_EXIST);
+    expect(actions.every((x) => x.type !== 'notify_namespace')).toBe(true); // not passed to the application
+  });
+
+  // §3.2 has NO inbound-PUBLISH rule — PUBLISH is publisher-initiated, not a
+  // consumer request for a track. It is intentionally NOT intercepted here.
+  it('inbound PUBLISH under .session is NOT intercepted in this slice (state is created as usual)', () => {
+    const s = client18();
+    s.handleControlMessage({
+      type: 'PUBLISH', requestId: 1n, trackNamespace: [f('.session')], trackName: NAME, trackAlias: 9n,
+      parameters: new Map(), trackExtensions: new Map(),
+    } as never);
+    expect(s.getIncomingSubscription(1n)).toBeDefined();
+  });
+});
+
+describe('draft-18 GOAWAY on the control stream (§10.4)', () => {
+  function client18(): Session {
+    const s = new Session(EndpointRole.CLIENT, 18);
+    s.initiateSetup();
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as Setup);
+    return s;
+  }
+  function server18(): Session {
+    const s = new Session(EndpointRole.SERVER, 18);
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as Setup);
+    s.completeSetup();
+    return s;
+  }
+  const goaway = (uri: string, timeout: bigint, requestId?: bigint) =>
+    ({ type: 'GOAWAY', newSessionUri: uri, timeout, ...(requestId !== undefined ? { requestId } : {}) });
+  const closeOf = (actions: ReturnType<Session['handleControlMessage']>) =>
+    actions.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
+
+  it('client → DRAINING and stores the New Session URI (even-parity Request ID); no close', () => {
+    const s = client18();
+    const actions = s.handleControlMessage(goaway('https://relay.example', 5000n, 0n) as never);
+    expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+    expect(s.state).toBe(SessionState.DRAINING);
+    expect(s.newSessionUri).toBe('https://relay.example');
+  });
+  it('missing Request ID on the control stream → PROTOCOL_VIOLATION', () => {
+    const actions = client18().handleControlMessage(goaway('', 0n) as never); // no requestId
+    expect(closeOf(actions)?.error).toBe(SessionErrorCode.PROTOCOL_VIOLATION);
+  });
+  it('wrong-parity Request ID (odd at a client) → INVALID_REQUEST_ID', () => {
+    const actions = client18().handleControlMessage(goaway('', 0n, 1n) as never);
+    expect(closeOf(actions)?.error).toBe(SessionErrorCode.INVALID_REQUEST_ID);
+  });
+  it('server parity is odd: even Request ID → INVALID_REQUEST_ID; odd accepted', () => {
+    expect(closeOf(server18().handleControlMessage(goaway('', 0n, 0n) as never))?.error)
+      .toBe(SessionErrorCode.INVALID_REQUEST_ID);
+    const ok = server18();
+    const a = ok.handleControlMessage(goaway('', 0n, 1n) as never);
+    expect(a.every((x) => x.type !== 'close_connection')).toBe(true);
+    expect(ok.state).toBe(SessionState.DRAINING);
+  });
+  it('server receiving a non-empty New Session URI → PROTOCOL_VIOLATION', () => {
+    const actions = server18().handleControlMessage(goaway('https://x', 0n, 1n) as never);
+    expect(closeOf(actions)?.error).toBe(SessionErrorCode.PROTOCOL_VIOLATION);
+  });
+  it('a second control-stream GOAWAY → PROTOCOL_VIOLATION', () => {
+    const s = client18();
+    s.handleControlMessage(goaway('', 0n, 0n) as never); // first → DRAINING
+    const actions = s.handleControlMessage(goaway('', 0n, 2n) as never); // second
+    expect(closeOf(actions)?.error).toBe(SessionErrorCode.PROTOCOL_VIOLATION);
+  });
+  it('after GOAWAY, a new local SUBSCRIBE is refused (DRAINING guard, no auto-close)', () => {
+    const s = client18();
+    s.handleControlMessage(goaway('', 0n, 0n) as never);
+    expect(() => s.subscribe([new Uint8Array([0x6c])], new Uint8Array([0x76]))).toThrow();
+    expect(s.state).toBe(SessionState.DRAINING); // still draining; no auto session close
+  });
+});
+
+describe('draft-18 OBJECT/SUBGROUP_DELIVERY_TIMEOUT = 0 (§10.2.4/§10.2.3)', () => {
+  const NS = [new Uint8Array([0x6c])];
+  const NAME = new Uint8Array([0x76]);
+  function client18(): Session {
+    const s = new Session(EndpointRole.CLIENT, 18);
+    s.initiateSetup();
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as Setup);
+    return s;
+  }
+  const incSub = (requestId: bigint, params: Parameters) =>
+    ({ type: 'SUBSCRIBE', requestId, trackNamespace: NS, trackName: NAME, parameters: params });
+  const noClose = (a: ReturnType<Session['handleControlMessage']>) => a.every((x) => x.type !== 'close_connection');
+
+  it('accepts OBJECT_DELIVERY_TIMEOUT (0x02) = 0 on a draft-18 SUBSCRIBE (0 = no timeout)', () => {
+    const a = client18().handleControlMessage(incSub(1n, new Map([[MessageParam.OBJECT_DELIVERY_TIMEOUT, [0n]]])) as never);
+    expect(noClose(a)).toBe(true);
+  });
+  it('accepts SUBGROUP_DELIVERY_TIMEOUT (0x06) = 0 on a draft-18 SUBSCRIBE', () => {
+    const a = client18().handleControlMessage(incSub(1n, new Map([[MessageParam.SUBGROUP_DELIVERY_TIMEOUT, [0n]]])) as never);
+    expect(noClose(a)).toBe(true);
+  });
+  it('draft-16 still rejects DELIVERY_TIMEOUT (0x02) = 0 with PROTOCOL_VIOLATION (legacy guard)', () => {
+    const s16 = new Session(EndpointRole.CLIENT);
+    s16.initiateSetup({ maxRequestId: varint(100n) });
+    s16.handleControlMessage({ type: 'SERVER_SETUP', parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]) });
+    const a = s16.handleControlMessage({
+      type: 'SUBSCRIBE', requestId: varint(1n), trackNamespace: NS, trackName: NAME,
+      parameters: new Map([[varint(0x02n), [varint(0n)]]]),
+    } as never);
+    const close = a.find((x) => x.type === 'close_connection') as CloseConnectionAction | undefined;
+    expect(close?.error).toBe(SessionErrorCode.PROTOCOL_VIOLATION);
+  });
+});
+
+describe('draft-18 SETUP AUTHORIZATION_TOKEN overflow downgrade applies to any endpoint (§10.3.1.4)', () => {
+  // A REGISTER token whose entry (16 + value bytes) exceeds the receiver's default
+  // MAX_AUTH_TOKEN_CACHE_SIZE of 0 — it MUST be treated as USE_VALUE, not closed
+  // with AUTH_TOKEN_CACHE_OVERFLOW, at EITHER endpoint.
+  const registerToken = encodeAuthorizationToken18({
+    aliasType: AliasType.REGISTER, tokenAlias: 1n, tokenType: 2n, tokenValue: new Uint8Array([0xaa, 0xbb]),
+  });
+  const setupWithToken = () =>
+    ({ type: 'SETUP', setupOptions: new Map([[BigInt(SetupOption18.AUTHORIZATION_TOKEN), [registerToken]]]) });
+  const noClose = (a: ReturnType<Session['handleControlMessage']>) => a.every((x) => x.type !== 'close_connection');
+
+  it('CLIENT processing a server SETUP REGISTER that overflows downgrades (no AUTH_TOKEN_CACHE_OVERFLOW)', () => {
+    const c = new Session(EndpointRole.CLIENT, 18);
+    c.initiateSetup(); // own cache size 0
+    const actions = c.handleControlMessage(setupWithToken() as never);
+    expect(noClose(actions)).toBe(true);
+    expect(c.state).toBe(SessionState.ESTABLISHED);
+  });
+  it('SERVER processing a client SETUP REGISTER that overflows downgrades', () => {
+    const s = new Session(EndpointRole.SERVER, 18);
+    const actions = s.handleControlMessage(setupWithToken() as never);
+    expect(noClose(actions)).toBe(true);
+    s.completeSetup();
+    expect(s.state).toBe(SessionState.ESTABLISHED);
+  });
+});
+
+describe('draft-18 inbound Full Track Name / Track Namespace validation (§2.4.1)', () => {
+  /** Established draft-18 SERVER session that receives client (even-parity) requests. */
+  function established18Server(): Session {
+    const s = new Session(EndpointRole.SERVER, 18);
+    s.initiateSetup();
+    s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as never);
+    return s;
+  }
+  const NSb = [new Uint8Array([0x61])];
+  const NM = new Uint8Array([0x62]);
+  const EMPTY_FIELD = [new Uint8Array(0)]; // one zero-length field — always invalid
+  const BIG_FIELD = [new Uint8Array(4097)]; // namespace alone > 4096 bytes
+
+  const expectClose = (actions: ReturnType<Session['handleControlMessage']>) => {
+    expect(actions.length).toBeGreaterThanOrEqual(1);
+    expect(actions[0]?.type).toBe('close_connection');
+    expect((actions[0] as CloseConnectionAction).error).toBe(SessionErrorCode.PROTOCOL_VIOLATION);
+  };
+
+  const subMsg = (ns: Uint8Array[]): Subscribe =>
+    ({ type: 'SUBSCRIBE', requestId: varint(0n), trackNamespace: ns, trackName: NM, parameters: new Map() });
+  const pubMsg = (ns: Uint8Array[]): Publish =>
+    ({ type: 'PUBLISH', requestId: varint(0n), trackNamespace: ns, trackName: NM, trackAlias: varint(5n), parameters: new Map() } as Publish);
+  const fetchMsg = (ns: Uint8Array[]): Fetch =>
+    ({ type: 'FETCH', requestId: varint(0n), fetch: { fetchType: 0x1, trackNamespace: ns, trackName: NM, startLocation: { group: varint(0n), object: varint(0n) }, endLocation: { group: varint(10n), object: varint(0n) } } as StandaloneFetch, parameters: new Map() });
+  const tsMsg = (ns: Uint8Array[]): TrackStatus =>
+    ({ type: 'TRACK_STATUS', requestId: varint(0n), trackNamespace: ns, trackName: NM, parameters: new Map() });
+  const pnMsg = (ns: Uint8Array[]): PublishNamespace =>
+    ({ type: 'PUBLISH_NAMESPACE', requestId: varint(0n), trackNamespace: ns, parameters: new Map() });
+
+  it('SUBSCRIBE with an empty namespace field closes PROTOCOL_VIOLATION and creates NO subscription state', () => {
+    const s = established18Server();
+    expectClose(s.handleControlMessage(subMsg(EMPTY_FIELD)));
+    expect(s.getIncomingSubscription(varint(0n))).toBeUndefined();
+  });
+
+  it('SUBSCRIBE with a Full Track Name >4096 closes PROTOCOL_VIOLATION and creates no state', () => {
+    const s = established18Server();
+    expectClose(s.handleControlMessage(subMsg(BIG_FIELD)));
+    expect(s.getIncomingSubscription(varint(0n))).toBeUndefined();
+  });
+
+  it('SUBSCRIBE with a valid EMPTY namespace + track name is accepted (draft-18)', () => {
+    const s = established18Server();
+    const actions = s.handleControlMessage(subMsg([]));
+    expect(actions.some((a) => a.type === 'close_connection')).toBe(false);
+    expect(s.getIncomingSubscription(varint(0n))).toBeDefined();
+  });
+
+  it('PUBLISH with an empty namespace field closes PROTOCOL_VIOLATION; no subscription, no alias registered', () => {
+    const s = established18Server();
+    expectClose(s.handleControlMessage(pubMsg(EMPTY_FIELD)));
+    expect(s.getIncomingSubscription(varint(0n))).toBeUndefined();
+    expect(s.getTrackByAlias(varint(5n))).toBeUndefined();
+  });
+
+  it('PUBLISH with a valid EMPTY namespace registers state + alias (draft-18)', () => {
+    const s = established18Server();
+    const actions = s.handleControlMessage(pubMsg([]));
+    expect(actions.some((a) => a.type === 'close_connection')).toBe(false);
+    expect(s.getIncomingSubscription(varint(0n))).toBeDefined();
+    expect(s.getTrackByAlias(varint(5n))).toBeDefined();
+  });
+
+  it('standalone FETCH with an empty namespace field closes PROTOCOL_VIOLATION and creates no fetch state', () => {
+    const s = established18Server();
+    expectClose(s.handleControlMessage(fetchMsg(EMPTY_FIELD)));
+    expect(s.getIncomingFetch(varint(0n))).toBeUndefined();
+  });
+
+  it('standalone FETCH with a valid EMPTY namespace creates fetch state (draft-18)', () => {
+    const s = established18Server();
+    const actions = s.handleControlMessage(fetchMsg([]));
+    expect(actions.some((a) => a.type === 'close_connection')).toBe(false);
+    expect(s.getIncomingFetch(varint(0n))).toBeDefined();
+  });
+
+  it('TRACK_STATUS with an empty namespace field closes PROTOCOL_VIOLATION; no incomingTrackStatuses entry', () => {
+    const s = established18Server();
+    expectClose(s.handleControlMessage(tsMsg(EMPTY_FIELD)));
+    expect(() => s.acceptTrackStatus(varint(0n))).toThrow(/Unknown incoming TRACK_STATUS/i);
+  });
+
+  it('TRACK_STATUS with a valid EMPTY namespace is recorded (acceptTrackStatus does not throw Unknown)', () => {
+    const s = established18Server();
+    const actions = s.handleControlMessage(tsMsg([]));
+    expect(actions.some((a) => a.type === 'close_connection')).toBe(false);
+    expect(() => s.acceptTrackStatus(varint(0n))).not.toThrow(/Unknown incoming TRACK_STATUS/i);
+  });
+
+  it('PUBLISH_NAMESPACE with a namespace >4096 closes PROTOCOL_VIOLATION with no namespace acceptance', () => {
+    const s = established18Server();
+    const actions = s.handleControlMessage(pnMsg(BIG_FIELD));
+    expectClose(actions);
+    // The success path (REQUEST_OK / notify_namespace) never ran.
+    expect(actions.some((a) => a.type === 'notify_namespace' || a.type === 'send_control')).toBe(false);
+  });
+
+  it('PUBLISH_NAMESPACE with an empty namespace field closes PROTOCOL_VIOLATION', () => {
+    const s = established18Server();
+    expectClose(s.handleControlMessage(pnMsg(EMPTY_FIELD)));
   });
 });

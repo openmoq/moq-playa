@@ -1,0 +1,180 @@
+{
+  "note": "Playa-authored draft-18 golden vectors. Regenerate via GEN_VECTORS=1. See vectors-d18.test.ts.",
+  "vectors": [
+    {
+      "file": "setup.bin",
+      "type": "SETUP",
+      "wire_length": 4,
+      "wire_hex": "af000000",
+      "expected": {}
+    },
+    {
+      "file": "subscribe.bin",
+      "type": "SUBSCRIBE",
+      "wire_length": 15,
+      "wire_hex": "03000c0001046c6976650376696400",
+      "expected": {
+        "request_id": 0
+      }
+    },
+    {
+      "file": "subscribe_ok.bin",
+      "type": "SUBSCRIBE_OK",
+      "wire_length": 5,
+      "wire_hex": "0400020900",
+      "expected": {
+        "track_alias": 9
+      }
+    },
+    {
+      "file": "request_ok.bin",
+      "type": "REQUEST_OK",
+      "wire_length": 4,
+      "wire_hex": "07000100",
+      "expected": {}
+    },
+    {
+      "file": "request_error.bin",
+      "type": "REQUEST_ERROR",
+      "wire_length": 10,
+      "wire_hex": "0500071003046e6f7065",
+      "expected": {
+        "error_code": 16,
+        "retry_interval": 3,
+        "reason": "nope"
+      }
+    },
+    {
+      "file": "request_error_redirect.bin",
+      "type": "REQUEST_ERROR",
+      "wire_length": 45,
+      "wire_hex": "05002a3400056d6f7665641768747470733a2f2f72656c61792e6578616d706c652f3201046c69766503766964",
+      "expected": {
+        "error_code": 52,
+        "redirect": true
+      }
+    },
+    {
+      "file": "publish.bin",
+      "type": "PUBLISH",
+      "wire_length": 16,
+      "wire_hex": "1d000d0001046c697665037669641500",
+      "expected": {
+        "track_alias": 21
+      }
+    },
+    {
+      "file": "fetch.bin",
+      "type": "FETCH",
+      "wire_length": 20,
+      "wire_hex": "160011000101046c697665037669640102090400",
+      "expected": {
+        "request_id": 0
+      }
+    },
+    {
+      "file": "fetch_ok.bin",
+      "type": "FETCH_OK",
+      "wire_length": 7,
+      "wire_hex": "18000400090000",
+      "expected": {
+        "end_group": 9
+      }
+    },
+    {
+      "file": "track_status_ok.bin",
+      "type": "REQUEST_OK",
+      "wire_length": 6,
+      "wire_hex": "070003000e03",
+      "expected": {
+        "track_status_ok": true,
+        "default_publisher_priority": 3
+      }
+    },
+    {
+      "file": "goaway.bin",
+      "type": "GOAWAY",
+      "wire_length": 32,
+      "wire_hex": "10001d1968747470733a2f2f72656c61792e6578616d706c652f6d6f71938800",
+      "expected": {
+        "new_session_uri": "https://relay.example/moq",
+        "timeout": 5000,
+        "request_id": 0
+      }
+    },
+    {
+      "file": "subgroup_header.bin",
+      "type": "SUBGROUP_HEADER",
+      "wire_length": 5,
+      "wire_hex": "14072a0305",
+      "expected": {
+        "track_alias": 7,
+        "group_id": 42,
+        "subgroup_id": 3,
+        "publisher_priority": 5
+      }
+    },
+    {
+      "file": "subgroup_object.bin",
+      "type": "SUBGROUP_OBJECT",
+      "wire_length": 4,
+      "wire_hex": "0502aabb",
+      "expected": {
+        "object_id": 5,
+        "payload_hex": "aabb",
+        "first_object": true
+      }
+    },
+    {
+      "file": "object_datagram.bin",
+      "type": "OBJECT_DATAGRAM",
+      "wire_length": 7,
+      "wire_hex": "00072a03040908",
+      "expected": {
+        "track_alias": 7,
+        "group_id": 42,
+        "object_id": 3,
+        "publisher_priority": 4
+      }
+    },
+    {
+      "file": "fetch_object.bin",
+      "type": "FETCH_DATA",
+      "wire_length": 7,
+      "wire_hex": "1f0a02050701aa",
+      "expected": {
+        "group_id": 10,
+        "subgroup_id": 2,
+        "object_id": 5,
+        "group_order": "ascending",
+        "first_object": true
+      }
+    },
+    {
+      "file": "fetch_empty_object.bin",
+      "type": "FETCH_DATA",
+      "wire_length": 6,
+      "wire_hex": "1f0a02050700",
+      "expected": {
+        "group_id": 10,
+        "subgroup_id": 2,
+        "object_id": 5,
+        "group_order": "ascending",
+        "first_object": true,
+        "payload_hex": ""
+      }
+    },
+    {
+      "file": "fetch_eor.bin",
+      "type": "FETCH_DATA",
+      "wire_length": 5,
+      "wire_hex": "808c050a00",
+      "expected": {
+        "end_of_range": true,
+        "non_existent": true,
+        "group_id": 5,
+        "object_id": 10
+      }
+    }
+  ]
+}

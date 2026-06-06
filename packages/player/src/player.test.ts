@@ -8071,6 +8071,63 @@ describe('MoqtPlayer', () => {
 
       await player.destroy();
     });
+
+    // draft-18 renumbers PUBLISH_DONE: TOO_FAR_BEHIND=0x5, EXPIRED=0x6 (§15.10.3) —
+    // the inverse of draft-16. The player must compare against the negotiated
+    // draft's table, or it both misses real TOO_FAR_BEHIND (0x5) and mis-fires
+    // recovery on EXPIRED (0x6).
+    async function setupVideoSub(adapter: ReturnType<typeof createMockAdapter>) {
+      const player = new MoqtPlayer(createConfig(adapter));
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      ackCatalog(adapter);
+      adapter._triggerObject(0n, {
+        kind: 'data', trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        payload: new TextEncoder().encode(CATALOG_JSON),
+      } as MoqtObject);
+      await new Promise(r => setTimeout(r, 0));
+      const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(BigInt(videoReqId)),
+        trackAlias: varint(BigInt(videoReqId) + 100n), parameters: new Map(), trackExtensions: new Map(),
+      } as any);
+      return { player, videoReqId };
+    }
+
+    it('draft-18: resubscribes on PUBLISH_DONE(TOO_FAR_BEHIND=0x5)', async () => {
+      const adapter = createMockAdapter();
+      (adapter as any).draftVersion = 18;
+      const { player, videoReqId } = await setupVideoSub(adapter);
+      const before = (adapter.subscribe as any).mock.calls.length;
+
+      adapter._triggerMessage({
+        type: 'PUBLISH_DONE', requestId: varint(BigInt(videoReqId)),
+        statusCode: varint(0x05), // draft-18 TOO_FAR_BEHIND
+        streamCount: varint(0), errorReason: 'Subscriber too slow',
+      } as any);
+      await new Promise(r => setTimeout(r, 0));
+
+      expect((adapter.subscribe as any).mock.calls.length).toBeGreaterThan(before); // resubscribed
+      await player.destroy();
+    });
+
+    it('draft-18: does NOT resubscribe on PUBLISH_DONE(EXPIRED=0x6) — 0x6 is EXPIRED, not TOO_FAR_BEHIND', async () => {
+      const adapter = createMockAdapter();
+      (adapter as any).draftVersion = 18;
+      const { player, videoReqId } = await setupVideoSub(adapter);
+      const before = (adapter.subscribe as any).mock.calls.length;
+
+      adapter._triggerMessage({
+        type: 'PUBLISH_DONE', requestId: varint(BigInt(videoReqId)),
+        statusCode: varint(0x06), // draft-18 EXPIRED (the LEGACY TOO_FAR_BEHIND value)
+        streamCount: varint(0), errorReason: 'Expired',
+      } as any);
+      await new Promise(r => setTimeout(r, 0));
+
+      expect((adapter.subscribe as any).mock.calls.length).toBe(before); // NOT mis-fired as TOO_FAR_BEHIND
+      await player.destroy();
+    });
   });
 
   // ─── CMAF ABR ──────────────────────────────────────────────────────

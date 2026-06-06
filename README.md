@@ -260,9 +260,13 @@ const conn = new MoqtConnection(14); // required — CLIENT_SETUP is draft-speci
 
 #### draft-18 known gaps (non-blocking)
 
-draft-18 support is functional for the subscriber and publisher paths. The one deliberately deferred edge is documented as an intentional gap rather than silently dropped:
+draft-18 support is functional for the subscriber and publisher paths. The deliberately deferred edges are documented as intentional gaps rather than silently dropped:
 
 - **Redirect** (`REQUEST_ERROR` code `0x34`) is decoded, context-validated, and surfaced — but automatic redirect-follow is **not** implemented; the application decides whether to reconnect.
+- **GOAWAY** (§10.4) is handled in both forms. On the **control stream** it transitions the session to `DRAINING` (no new local requests). On a **request stream** it is parsed and handled as a per-request **migration** signal — never FIFO-matched as a response and never a session close: the affected request is settled (a pending `subscribeTrack()` rejects with a non-fatal `MoqtConnectionError`) and the GOAWAY is surfaced via `onMessage`. Automatic re-issue/reconnect of that request is **not** implemented; it remains application policy.
+- **`PUBLISH_OK` (`0x1E`)** is intentionally **rejected** on draft-18: the changelog defines `PUBLISH_OK` as a `REQUEST_OK` alias and removed the standalone message, so draft-18 has no `0x1E` control type (the value is a data-stream type) despite a stale registry table entry. Peers that emit a literal `0x1E` control message are non-conformant; respond with `REQUEST_OK`.
+
+Inbound **Track Namespace / Full Track Name** fields are validated per §2.4.1 (0–32 namespace fields, each non-empty; an empty namespace is permitted; Track Namespace and Full Track Name each ≤ 4096 bytes). A violation closes the session with `PROTOCOL_VIOLATION`, enforced both at the wire codec (decode/encode) and defensively in the session before any request/alias state is created.
 
 Track Properties (§2.5) are fully wired in both directions: received on `SUBSCRIBE_OK` / `FETCH_OK` / `TRACK_STATUS_OK` / `PUBLISH`, and sent via the `trackProperties` option on `acceptSubscribe()`, `acceptFetch()`, `acceptTrackStatus()`, and `publish()`. (The send API is draft-18-only; supplying non-empty Track Properties on draft-14/16 throws.)
 

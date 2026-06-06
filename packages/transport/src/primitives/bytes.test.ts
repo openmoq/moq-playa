@@ -13,6 +13,8 @@ import {
   validateTrackNamespacePrefix,
   validateTrackNamespaceSuffix,
   validateFullTrackName,
+  isReservedSessionNamespace,
+  isReservedDotNamespace,
 } from './bytes.js';
 import { varint, writeVarint, varintEncodingLength } from './varint.js';
 import { ProtocolViolationError } from '../errors.js';
@@ -337,5 +339,73 @@ describe('validateFullTrackName()', () => {
     const namespace = Array.from({ length: 3 }, () => new Uint8Array(1000));
     const trackName = new Uint8Array(1096); // 3000 + 1096 = 4096
     expect(() => validateFullTrackName(namespace, trackName)).not.toThrow();
+  });
+
+  // draft-18 §2.4.1: an EMPTY namespace (0 fields) is legal when opted in.
+  it('accepts an empty namespace with allowEmptyNamespace (draft-18 §2.4.1)', () => {
+    expect(() => validateFullTrackName([], new Uint8Array([0x62]), { allowEmptyNamespace: true })).not.toThrow();
+  });
+
+  it('still rejects an empty namespace by default (legacy draft-14/16 behavior)', () => {
+    expect(() => validateFullTrackName([], new Uint8Array([0x62]))).toThrow(/PROTOCOL_VIOLATION|at least 1 field/i);
+  });
+
+  it('rejects an empty FIELD even with allowEmptyNamespace (0-length field ≠ empty namespace)', () => {
+    const namespace = [new Uint8Array([0x61]), new Uint8Array(0)]; // second field length 0
+    expect(() => validateFullTrackName(namespace, new Uint8Array([0x62]), { allowEmptyNamespace: true }))
+      .toThrow(/PROTOCOL_VIOLATION|length 0|at least one byte/i);
+  });
+
+  it('enforces the 4096 limit with an empty namespace (track name alone)', () => {
+    expect(() => validateFullTrackName([], new Uint8Array(4097), { allowEmptyNamespace: true })).toThrow(/4096/i);
+    expect(() => validateFullTrackName([], new Uint8Array(4096), { allowEmptyNamespace: true })).not.toThrow();
+  });
+});
+
+describe('draft-18 Track Namespace rules (§2.4.1, §3.2)', () => {
+  const f = (s: string) => new TextEncoder().encode(s);
+
+  describe('empty full namespace (§2.4.1)', () => {
+    it('rejects a zero-field full namespace by default (draft-14/16)', () => {
+      expect(() => validateTrackNamespace([])).toThrow(ProtocolViolationError);
+    });
+    it('accepts a zero-field full namespace with { allowEmpty: true } (draft-18)', () => {
+      expect(() => validateTrackNamespace([], { allowEmpty: true })).not.toThrow();
+    });
+    it('still rejects a zero-length FIELD even when the namespace may be empty', () => {
+      expect(() => validateTrackNamespace([new Uint8Array(0)], { allowEmpty: true })).toThrow(/length 0/);
+    });
+    it('still enforces the 32-field limit with allowEmpty', () => {
+      const many = Array.from({ length: 33 }, () => new Uint8Array([0x61]));
+      expect(() => validateTrackNamespace(many, { allowEmpty: true })).toThrow(/maximum is 32/);
+    });
+    it('prefix validation permits 0 fields regardless (separate from full namespace)', () => {
+      expect(() => validateTrackNamespacePrefix([])).not.toThrow();
+    });
+  });
+
+  describe('reserved .session namespace detection (§3.2.2)', () => {
+    it('matches a .session first field (exact), with or without further fields', () => {
+      expect(isReservedSessionNamespace([f('.session')])).toBe(true);
+      expect(isReservedSessionNamespace([f('.session'), f('x')])).toBe(true);
+    });
+    it('does not match near-misses or non-first positions', () => {
+      expect(isReservedSessionNamespace([f('.sessionx')])).toBe(false);
+      expect(isReservedSessionNamespace([f('session')])).toBe(false);
+      expect(isReservedSessionNamespace([f('x'), f('.session')])).toBe(false); // only the first field counts
+      expect(isReservedSessionNamespace([])).toBe(false);
+    });
+  });
+
+  describe('reserved single-period namespace detection (§3.2.1)', () => {
+    it('matches an exact single-period first field', () => {
+      expect(isReservedDotNamespace([f('.')])).toBe(true);
+      expect(isReservedDotNamespace([f('.'), f('x')])).toBe(true);
+    });
+    it('does not match multi-char dot fields or .session', () => {
+      expect(isReservedDotNamespace([f('..')])).toBe(false);
+      expect(isReservedDotNamespace([f('.session')])).toBe(false);
+      expect(isReservedDotNamespace([])).toBe(false);
+    });
   });
 });

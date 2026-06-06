@@ -50,4 +50,22 @@ describe('Location', () => {
     expect(value.group).toBe(3n);
     expect(value.object).toBe(7n);
   });
+
+  // ── draft-18 widening: Location fields are bigint (full uint64) ──────
+  describe('full-uint64 fields (draft-18)', () => {
+    it('a Location with group/object above the QUIC range exists semantically', () => {
+      const big = 1n << 63n; // > 2^62-1
+      const loc: Location = { group: big, object: big };
+      expect(loc.group).toBe(big);
+      expect(loc.object).toBe(big);
+    });
+
+    it('the draft-14/16 QUIC-varint helpers reject out-of-range fields', () => {
+      const big = 1n << 63n;
+      const buf = new Uint8Array(32);
+      expect(() => writeLocation({ group: big, object: 0n }, buf, 0)).toThrow(RangeError);
+      expect(() => writeLocation({ group: 0n, object: big }, buf, 0)).toThrow(RangeError);
+      expect(() => locationEncodingLength({ group: big, object: 0n })).toThrow(RangeError);
+    });
+  });
 });

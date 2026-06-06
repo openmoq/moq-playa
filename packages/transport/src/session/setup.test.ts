@@ -7,9 +7,10 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { SetupGate, SetupError } from './setup.js';
 import { SessionState } from './types.js';
 import { varint } from '../primitives/varint.js';
-import type { ClientSetup, ServerSetup, Parameters } from '../control/messages.js';
+import type { ClientSetup, ServerSetup, Parameters, Setup, SetupOptionValue } from '../control/messages.js';
 import { SetupParam } from '../control/parameters.js';
-import { AliasType, encodeAuthorizationToken } from '../control/auth-token.js';
+import { SetupOption18 } from '../control/codes-18.js';
+import { AliasType, encodeAuthorizationToken, encodeAuthorizationToken18, type RegisterToken } from '../control/auth-token.js';
 
 describe('SetupGate', () => {
   describe('client role', () => {
@@ -843,6 +844,36 @@ describe('SetupGate', () => {
       const values = msg.parameters.get(varint(SetupParam.MAX_AUTH_TOKEN_CACHE_SIZE));
       expect(values).toBeDefined();
       expect(values![0]).toBe(4096n);
+    });
+  });
+
+  // ─── draft-18 AUTHORIZATION_TOKEN (vi64 inner Token structure) ─────────
+  describe('draft-18 AUTHORIZATION_TOKEN parsing (§9.2.2.1, vi64 internals)', () => {
+    it('parses a SETUP REGISTER token whose Token Alias / Token Type exceed the QUIC range', () => {
+      // draft-18 encodes the inner Token's Alias/Type as vi64 (full uint64), so a
+      // d18 SETUP must parse the option bytes with the vi64 parser. The semantic
+      // values must survive exactly — 2^63 is above the QUIC-varint ceiling and
+      // could not even be produced by the legacy QUIC-varint encoder.
+      const big = 1n << 63n; // > 2^62-1
+      const gate = new SetupGate('server', 18); // server interprets the peer SETUP
+      const tokenBytes = encodeAuthorizationToken18({
+        aliasType: AliasType.REGISTER,
+        tokenAlias: big,
+        tokenType: big,
+        tokenValue: new Uint8Array([0xab, 0xcd]),
+      });
+      const setupOptions = new Map<bigint, SetupOptionValue[]>([
+        [BigInt(SetupOption18.AUTHORIZATION_TOKEN), [tokenBytes]],
+      ]);
+
+      const result = gate.handleSetup18({ type: 'SETUP', setupOptions } as Setup);
+
+      expect(result.authTokens).toHaveLength(1);
+      const token = result.authTokens![0] as RegisterToken;
+      expect(token.aliasType).toBe(AliasType.REGISTER);
+      expect(token.tokenAlias).toBe(big);
+      expect(token.tokenType).toBe(big);
+      expect(token.tokenValue).toEqual(new Uint8Array([0xab, 0xcd]));
     });
   });
 });

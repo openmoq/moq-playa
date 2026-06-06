@@ -14,6 +14,7 @@ import {
 } from './decoder.js';
 import { varint, writeVarint, varintEncodingLength } from '../primitives/varint.js';
 import { SubgroupFlags, DatagramFlags, DataStreamType } from './codes.js';
+import { ProtocolViolationError } from '../errors.js';
 import type { FetchObject } from './types.js';
 
 /** Helper to build a buffer with varints and raw bytes. */
@@ -589,6 +590,13 @@ interface FetchPriorContext {
 }
 
 describe('decodeFetchObject', () => {
+  it('rejects a non-first object with no prior context (ProtocolViolationError, not a crash)', () => {
+    // Found by parser-crash fuzz: isFirstObject=false + prior=undefined previously
+    // threw `TypeError: Cannot read properties of undefined (reading 'groupId')`.
+    expect(() => decodeFetchObject(Uint8Array.from([0x02]), 0, undefined, false))
+      .toThrow(ProtocolViolationError);
+  });
+
   describe('basic object parsing', () => {
     it('decodes first object with all fields present (flags = 0x3F)', () => {
       // All fields present: EXTENSIONS | PRIORITY | GROUP_ID | OBJECT_ID | SUBGROUP_EXPLICIT(0x03)

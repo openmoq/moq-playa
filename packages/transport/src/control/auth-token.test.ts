@@ -4,11 +4,16 @@ import {
   AliasType,
   parseAuthorizationToken,
   encodeAuthorizationToken,
+  parseAuthorizationToken18,
+  encodeAuthorizationToken18,
   type AuthorizationToken,
+  type AuthorizationToken18,
   type DeleteToken,
   type RegisterToken,
   type UseAliasToken,
   type UseValueToken,
+  type RegisterToken18,
+  type UseValueToken18,
 } from './auth-token.js';
 import { ProtocolViolationError } from '../errors.js';
 
@@ -221,4 +226,66 @@ describe('round-trip encode → decode', () => {
       }
     });
   }
+});
+
+describe('draft-18 Authorization Token (vi64 internals)', () => {
+  // Slice 2: draft-18 encodes Alias Type / Token Alias / Token Type as vi64
+  // (full uint64), not the QUIC varint of draft-14/16. Aliases/types above the
+  // QUIC range (2^62-1) must round-trip unchanged.
+  const big = 1n << 63n; // > 2^62-1
+
+  it('round-trips a DELETE token with a Token Alias above the QUIC range', () => {
+    const token: AuthorizationToken18 = { aliasType: AliasType.DELETE, tokenAlias: big };
+    const decoded = parseAuthorizationToken18(encodeAuthorizationToken18(token));
+    expect(decoded.aliasType).toBe(AliasType.DELETE);
+    expect('tokenAlias' in decoded && decoded.tokenAlias).toBe(big);
+  });
+
+  it('round-trips a REGISTER token with vi64 Token Alias + Token Type', () => {
+    const token: RegisterToken18 = {
+      aliasType: AliasType.REGISTER, tokenAlias: big, tokenType: big + 5n,
+      tokenValue: new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    };
+    const decoded = parseAuthorizationToken18(encodeAuthorizationToken18(token)) as RegisterToken18;
+    expect(decoded.aliasType).toBe(AliasType.REGISTER);
+    expect(decoded.tokenAlias).toBe(big);
+    expect(decoded.tokenType).toBe(big + 5n);
+    expect(decoded.tokenValue).toEqual(token.tokenValue);
+  });
+
+  it('round-trips a USE_VALUE token with a Token Type above the QUIC range', () => {
+    const token: UseValueToken18 = {
+      aliasType: AliasType.USE_VALUE, tokenType: big, tokenValue: new Uint8Array([0x01, 0x02]),
+    };
+    const decoded = parseAuthorizationToken18(encodeAuthorizationToken18(token)) as UseValueToken18;
+    expect(decoded.aliasType).toBe(AliasType.USE_VALUE);
+    expect(decoded.tokenType).toBe(big);
+    expect(decoded.tokenValue).toEqual(token.tokenValue);
+  });
+});
+
+describe('draft-14/16 legacy Authorization Token wire guardrail', () => {
+  // The semantic token shape now carries `bigint` internals (shared with draft-18),
+  // but the legacy QUIC-varint encoder MUST still reject values above the QUIC range
+  // (2^62-1) — draft-14/16 cannot represent them on the wire, so silently widening
+  // would be a conformance regression.
+  const big = 1n << 63n; // > 2^62-1
+
+  it('rejects a REGISTER Token Alias above the QUIC range', () => {
+    expect(() => encodeAuthorizationToken({
+      aliasType: AliasType.REGISTER, tokenAlias: big, tokenType: 1n, tokenValue: new Uint8Array([0x01]),
+    })).toThrow(RangeError);
+  });
+
+  it('rejects a REGISTER Token Type above the QUIC range', () => {
+    expect(() => encodeAuthorizationToken({
+      aliasType: AliasType.REGISTER, tokenAlias: 1n, tokenType: big, tokenValue: new Uint8Array([0x01]),
+    })).toThrow(RangeError);
+  });
+
+  it('rejects a USE_VALUE Token Type above the QUIC range', () => {
+    expect(() => encodeAuthorizationToken({
+      aliasType: AliasType.USE_VALUE, tokenType: big, tokenValue: new Uint8Array([0x01, 0x02]),
+    })).toThrow(RangeError);
+  });
 });

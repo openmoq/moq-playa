@@ -8,6 +8,28 @@ import {
   type Varint,
 } from './varint.js';
 
+describe('range enforcement for raw bigint inputs (Option-A widening guardrail)', () => {
+  // After widening message fields to bigint, the QUIC encoders accept bigint and
+  // MUST reject out-of-QUIC-range values rather than silently truncating, so a
+  // draft-14/16 message can never encode a value > 2^62-1.
+  it('varintEncodingLength throws on values above MAX_VARINT', () => {
+    expect(() => varintEncodingLength((MAX_VARINT + 1n) as bigint)).toThrow(RangeError);
+    expect(() => varintEncodingLength((1n << 63n) as bigint)).toThrow(RangeError);
+  });
+  it('varintEncodingLength throws on negative values', () => {
+    expect(() => varintEncodingLength(-1n as bigint)).toThrow(RangeError);
+  });
+  it('writeVarint throws (no silent truncation) on values above MAX_VARINT', () => {
+    const buf = new Uint8Array(8);
+    expect(() => writeVarint((MAX_VARINT + 1n) as bigint, buf, 0)).toThrow(RangeError);
+  });
+  it('still accepts in-range bigint (Varint subtype) unchanged', () => {
+    expect(varintEncodingLength(MAX_VARINT)).toBe(8);
+    const buf = new Uint8Array(8);
+    expect(writeVarint(MAX_VARINT, buf, 0)).toBe(8);
+  });
+});
+
 describe('varint()', () => {
   it('creates a branded Varint from valid number values', () => {
     expect(varint(0)).toBe(0n);

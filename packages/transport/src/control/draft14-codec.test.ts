@@ -220,6 +220,95 @@ describe('Draft14Codec', () => {
       expect(message.type).toBe('CLIENT_SETUP');
     });
 
+    it('encodes SERVER_SETUP with selected version before params', () => {
+      /**
+       * Draft-14 §9.3:
+       *   SERVER_SETUP { Type=0x21, Length(16),
+       *     Selected Version (i),
+       *     Number of Parameters (i), Setup Parameters (..) ... }
+       * Unlike CLIENT_SETUP, the server echoes a single negotiated version.
+       */
+      const msg: ServerSetup = {
+        type: 'SERVER_SETUP',
+        parameters: new Map([
+          [SetupParam.MAX_REQUEST_ID, [varint(100)]],
+        ]),
+      };
+      const bytes = codec.encode(msg);
+
+      // Byte-exact prefix: Type=0x21, then uint16 length, then Selected Version.
+      expect(bytes[0]).toBe(0x21);
+      const selected = readVarint(bytes, 3); // 0x21 (1) + uint16 length (2)
+      expect(selected.value).toBe(0xff00000en);
+
+      // And it round-trips through the matching decode path.
+      const { message } = codec.decode(bytes, 0);
+      expect(message.type).toBe('SERVER_SETUP');
+      if (message.type === 'SERVER_SETUP') {
+        expect(message.parameters.get(SetupParam.MAX_REQUEST_ID)).toEqual([varint(100)]);
+      }
+    });
+
+    it('encodes a REQUEST_ERROR tagged requestKind=SUBSCRIBE to SUBSCRIBE_ERROR (0x05)', () => {
+      /**
+       * Draft-14 §9.9: SUBSCRIBE_ERROR { Type=0x5, Length(16),
+       *   Request ID (i), Error Code (i), Reason Phrase }.
+       * The session models the unified draft-16 REQUEST_ERROR; the draft-14
+       * codec recovers the specific wire type from the `requestKind` context
+       * the session stamps. Decode stays normalized to REQUEST_ERROR.
+       */
+      const msg: RequestErrorMsg = {
+        type: 'REQUEST_ERROR',
+        requestId: varint(2),
+        errorCode: varint(1),
+        retryInterval: varint(0),
+        errorReason: 'denied',
+        requestKind: 'SUBSCRIBE',
+      };
+      const bytes = codec.encode(msg);
+      expect(bytes[0]).toBe(0x05); // SUBSCRIBE_ERROR wire type, not a generic error
+
+      const { message } = codec.decode(bytes, 0);
+      expect(message.type).toBe('REQUEST_ERROR'); // decode remains normalized
+      if (message.type === 'REQUEST_ERROR') {
+        expect(message.requestId).toBe(2n);
+        expect(message.errorCode).toBe(1n);
+        expect(message.errorReason).toBe('denied');
+      }
+    });
+
+    it('maps every requestKind to its specific draft-14 error wire type', () => {
+      const cases: Array<[RequestErrorMsg['requestKind'], number]> = [
+        ['SUBSCRIBE', 0x05],
+        ['FETCH', 0x19],
+        ['TRACK_STATUS', 0x0f],
+        ['SUBSCRIBE_NAMESPACE', 0x13],
+      ];
+      for (const [kind, wireType] of cases) {
+        const bytes = codec.encode({
+          type: 'REQUEST_ERROR',
+          requestId: varint(2),
+          errorCode: varint(7),
+          retryInterval: varint(0),
+          errorReason: 'x',
+          requestKind: kind,
+        });
+        expect(bytes[0]).toBe(wireType);
+        const { message } = codec.decode(bytes, 0);
+        expect(message.type).toBe('REQUEST_ERROR'); // all normalize back
+      }
+    });
+
+    it('still refuses a REQUEST_ERROR with no requestKind context', () => {
+      expect(() => codec.encode({
+        type: 'REQUEST_ERROR',
+        requestId: varint(2),
+        errorCode: varint(1),
+        retryInterval: varint(0),
+        errorReason: 'denied',
+      })).toThrow(/specific error types/);
+    });
+
     it('encodes SUBSCRIBE with inline fields extracted from parameters', () => {
       /**
        * Draft-14 §9.7:

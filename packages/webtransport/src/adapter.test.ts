@@ -2573,6 +2573,52 @@ describe('MoqtConnection draft-14', () => {
 
       reader.releaseLock();
     });
+
+    it('auto-negotiates draft-18 when transport.protocol is "moqt-18" (no explicit version)', () => {
+      const adapter = new MoqtConnection(); // no explicit version
+      const transport: WebTransportLike = {
+        protocol: 'moqt-18',
+        createBidirectionalStream: async () => ({
+          readable: new ReadableStream({ start() { /* never emit */ } }),
+          writable: new WritableStream(),
+        }),
+        createUnidirectionalStream: async () => new WritableStream(),
+        incomingUnidirectionalStreams: new ReadableStream({ start() { /* never emit */ } }),
+        incomingBidirectionalStreams: new ReadableStream({ start() { /* never emit */ } }),
+        datagrams: { readable: new ReadableStream({ start() { /* never emit */ } }), writable: new WritableStream() },
+        close: () => {},
+        closed: new Promise(() => {}),
+      };
+      // connect() reconfigures to the negotiated draft synchronously — before the
+      // uni-pair SETUP awaits — so draftVersion flips to 18 immediately. The
+      // establish() then hangs against this never-emitting mock; we don't await it.
+      void adapter.connect(transport).catch(() => { /* establish never completes */ });
+      expect(adapter.draftVersion).toBe(18);
+    });
+
+    it('explicit constructor version overrides transport.protocol "moqt-18"', () => {
+      const adapter = new MoqtConnection(16); // force draft-16 despite moqt-18
+
+      const { readable: serverReadable } = new TransformStream<Uint8Array>();
+      const { writable: clientWritable } = new TransformStream<Uint8Array>();
+
+      const transport: WebTransportLike = {
+        protocol: 'moqt-18', // server says 18, but we forced 16
+        createBidirectionalStream: async () => ({
+          readable: serverReadable,
+          writable: clientWritable,
+        }),
+        incomingUnidirectionalStreams: new ReadableStream({ start() { /* never emit */ } }),
+        datagrams: { readable: new ReadableStream({ start() { /* never emit */ } }) },
+        close: () => {},
+        closed: new Promise(() => {}),
+      };
+
+      // Explicit version short-circuits negotiation: stays 16 and takes the legacy
+      // single-bidi-control path (which then waits for SERVER_SETUP; not awaited).
+      void adapter.connect(transport, { maxRequestId: varint(100) }).catch(() => { /* setup never completes */ });
+      expect(adapter.draftVersion).toBe(16);
+    });
   });
 
   // ─── Publisher operations (§9.10, §9.8, §9.15, §10.4.2) ──────────
