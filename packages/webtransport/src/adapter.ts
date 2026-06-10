@@ -297,6 +297,18 @@ export class MoqtConnection {
   ) => void;
 
   /**
+   * Called (draft-18) when an accepted inbound SUBSCRIBE's request stream is closed
+   * or reset by the subscriber — i.e. the subscriber unsubscribed (§3.3.2; draft-18
+   * removed the UNSUBSCRIBE message, so cancellation IS a request-stream teardown).
+   * This is a normal lifecycle end, NOT an error: the session's per-subscription
+   * state is already cleaned and the connection stays open. A publisher (e.g. a relay)
+   * uses it to drop just that subscription — without waiting for the whole connection
+   * to close — which is what ABR quality-switching needs. Mirrors
+   * {@link onSubscribeNamespaceClosed} / {@link onSubscribeTracksClosed}.
+   */
+  onSubscribeClosed?: (requestId: bigint) => void;
+
+  /**
    * Called when a PUBLISH arrives on a new inbound bidi stream (draft-18 §10.10).
    * Set `publish.onObject` to receive the track's objects, then respond via
    * acceptSubscribe(publish.requestId, publish.trackAlias) / rejectSubscribe().
@@ -2375,9 +2387,13 @@ export class MoqtConnection {
       // — clean up the request, do NOT surface it as an error. (Alias routing for
       // an inbound PUBLISH is intentionally left intact for late data streams.)
       const requestId = ctx.requestId;
+      const wasSubscribe = ctx.openerKind === 'subscribe';
       await this.executeActions(this.session.handleInboundRequestClosed(requestId));
       this.inboundRequestContexts.delete(requestId);
       this.inboundFetchGroupOrder.delete(requestId);
+      // §3.3.2: a subscriber resetting its SUBSCRIBE stream IS the draft-18
+      // unsubscribe — surface it so the publisher can drop just that subscription.
+      if (wasSubscribe) this.onSubscribeClosed?.(requestId);
       return;
     }
     // An UNBOUND inbound stream (no valid opener yet) that failed — surface it.

@@ -572,3 +572,31 @@ describe('MoqtConnection(18) loopback — openSubgroup FIRST_OBJECT (§9.4.2)', 
     expect(errors).toEqual([]);
   });
 });
+
+describe('MoqtConnection(18) loopback — onSubscribeClosed (§3.3.2 unsubscribe)', () => {
+  it('fires onSubscribeClosed when the subscriber resets its SUBSCRIBE stream; cleans state, no error/close', async () => {
+    const { client, server, errors } = await connectedPair();
+
+    let subReqId = -1n;
+    server.onSubscribe = (rid) => { subReqId = rid; };
+    let closedReqId = -1n;
+    server.onSubscribeClosed = (rid) => { closedReqId = rid; };
+    let serverClosed = false;
+    server.onClose = () => { serverClosed = true; };
+
+    const subP = client.subscribeTrack(ns('live'), nm('vid'), { onObject: () => {} });
+    await flush();
+    await server.acceptSubscribe(subReqId, 9n);
+    const sub = await subP;
+    expect(server.session.getIncomingSubscription(subReqId)).toBeDefined();
+
+    // draft-18 unsubscribe = reset the SUBSCRIBE request stream.
+    await sub.unsubscribe();
+    for (let i = 0; i < 4; i++) await flush();
+
+    expect(closedReqId).toBe(subReqId);                                   // publisher notified of THIS subscription
+    expect(server.session.getIncomingSubscription(subReqId)).toBeUndefined(); // session state cleaned
+    expect(serverClosed).toBe(false);                                     // connection stays open
+    expect(errors).toEqual([]);                                           // not surfaced as an error
+  });
+});
