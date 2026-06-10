@@ -1,0 +1,31 @@
+{
+  "name": "@moqt/example-node-relay",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Example Node WebTransport MoQT relay demo (NOT production relay support): SETUP, SUBSCRIBE, a tiny object stream, and an optional toy live relay/fanout over real QUIC/HTTP3. Native deps live here, not in core.",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "probe": "tsx src/probe.ts",
+    "gen-cert": "node scripts/gen-cert.mjs",
+    "boot-check": "tsx src/boot-check.ts",
+    "server": "tsx src/server.ts",
+    "client": "tsx src/client.ts",
+    "smoke": "tsx src/smoke.ts",
+    "publisher": "tsx src/publisher.ts",
+    "relay-server": "tsx src/relay-server.ts",
+    "relay-smoke": "tsx src/relay-smoke.ts",
+    "relay-media-smoke": "tsx src/relay-media-smoke.ts"
+  },
+  "dependencies": {
+    "@moqt/transport": "workspace:*",
+    "@moqt/webtransport": "workspace:*",
+    "@fails-components/webtransport": "1.6.3",
+    "@fails-components/webtransport-transport-http3-quiche": "1.6.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

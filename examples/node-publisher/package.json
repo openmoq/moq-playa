@@ -1,0 +1,29 @@
+{
+  "name": "@moqt/example-node-publisher",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Example Node media-origin publisher (NOT a production packager): generates prepared CMAF fixtures from a source MP4 via FFmpeg (prepare-fixture), loads them from disk, and publishes an MSF catalog + media tracks into the node-relay example. Synthetic mode remains as a protocol-only smoke (fake bytes, not browser-playable).",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "probe": "tsx src/probe.ts",
+    "prepare-fixture": "node scripts/prepare-fixture.mjs",
+    "validate-fixture": "tsx src/validate-fixture.ts",
+    "publish-fixture": "tsx src/publish-cli.ts",
+    "smoke": "tsx src/smoke.ts"
+  },
+  "dependencies": {
+    "@moqt/transport": "workspace:*",
+    "@moqt/webtransport": "workspace:*",
+    "@moqt/msf": "workspace:*",
+    "@moqt/loc": "workspace:*",
+    "@moqt/browser": "workspace:*",
+    "@fails-components/webtransport": "1.6.3",
+    "@fails-components/webtransport-transport-http3-quiche": "1.6.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

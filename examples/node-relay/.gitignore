@@ -1,0 +1,9 @@
+# Generated short-lived self-signed certs (never commit private keys)
+certs/
+
+# Native build artifacts (the backend's prebuilt/compiled addon lives in node_modules)
+build/
+*.node
+
+# TS build info
+*.tsbuildinfo

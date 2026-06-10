@@ -1,3 +1,13 @@
 packages:
   - packages/*
   - examples
+  # Isolated Node WebTransport relay example (native deps live ONLY here, not in core or @moqt/examples)
+  - examples/node-relay
+  # Node media-origin publisher example (fixture-based; pairs with node-relay)
+  - examples/node-publisher
+
+# pnpm blocks dependency build scripts by default. Allow ONLY the example's native
+# WebTransport backend to run its install script, so a plain `pnpm install` fetches
+# its prebuilt addon (reproducible bootstrap). Nothing else is allowlisted.
+onlyBuiltDependencies:
+  - '@fails-components/webtransport-transport-http3-quiche'

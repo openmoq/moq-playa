@@ -1,0 +1,6 @@
+# Generated fixtures are local by default (created via prepare-fixture). A fixture
+# we decide to commit gets added explicitly with `git add -f fixtures/<name>`.
+fixtures/*/
+
+# TS build info
+*.tsbuildinfo
