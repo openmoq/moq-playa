@@ -302,7 +302,14 @@ let hideTimer: ReturnType<typeof setTimeout> | null = null;
 // object arrives for LIVENESS_TIMEOUT_MS — or a fatal connection error fires —
 // run the same Stop + fresh-tune-in lifecycle the Stop/Play button uses, with
 // bounded backoff. Intentional Stop disarms everything.
-const LIVENESS_TIMEOUT_MS = 10_000;
+//
+// LAYERING: MoqtPlayer's own liveness ladder fires first (livenessTimeoutMs
+// default 10s) and restarts starved tracks IN-SESSION (REQUEST_UPDATE /
+// resubscribe). This session-level watchdog is the OUTER safety net, so it
+// waits 30s — long enough for the core ladder to recover transient
+// starvation before we tear the whole session down. Fatal connection errors
+// (including the core's MEDIA_STARVED escalation) still reconnect immediately.
+const LIVENESS_TIMEOUT_MS = 30_000;
 const HEALTHY_RESET_MS = 30_000;            // media flowing this long → retry budget resets
 const RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 8000];
 const MAX_RECONNECT_ATTEMPTS = 6;           // per incident (budget resets when healthy)
