@@ -447,6 +447,54 @@ describe('MoqtPlayer', () => {
     await player.destroy();
   });
 
+  it('destroy() is a happy path: an owned connection whose close() surfaces teardown errors emits NO error events', async () => {
+    const adapter = createMockAdapter();
+    // A real adapter's intentional close rejects pending subscriptions / resets
+    // streams, which fires onError/onClose ("The session is closed.") BEFORE the
+    // close promise resolves. Reproduce that teardown shape on the mock.
+    adapter.close = vi.fn(async () => {
+      (adapter as any).onError?.(new Error('The session is closed.'));
+      (adapter as any).onError?.(new Error('The session is closed.'));
+      (adapter as any).onClose?.(0, 'Session closed');
+    }) as any;
+
+    const player = new MoqtPlayer(createConfig(adapter));
+    const errors = vi.fn();
+    const sessionErrors = vi.fn();
+    player.on('error', errors);
+    player.on('session_error', sessionErrors);
+    const loadPromise = player.load();
+    await resolveConnect(adapter);
+    await loadPromise;
+    await player.play();
+
+    await player.destroy();
+    // Stragglers landing async after destroy must also stay silent.
+    (adapter as any).onError?.(new Error('The session is closed.'));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(adapter.close).toHaveBeenCalled();
+    expect(errors).not.toHaveBeenCalled();
+    expect(sessionErrors).not.toHaveBeenCalled();
+  });
+
+  it('an unintentional connection error BEFORE destroy() still emits normally', async () => {
+    const adapter = createMockAdapter();
+    const player = new MoqtPlayer(createConfig(adapter));
+    const errors = vi.fn();
+    player.on('error', errors);
+    const loadPromise = player.load();
+    await resolveConnect(adapter);
+    await loadPromise;
+    await player.play();
+
+    adapter._triggerError(new Error('network blew up'));
+    expect(errors).toHaveBeenCalledTimes(1);
+    expect(errors.mock.calls[0]![0].error.message).toContain('network blew up');
+
+    await player.destroy();
+  });
+
   it('on() returns an unsubscribe function', async () => {
     const adapter = createMockAdapter();
     const player = new MoqtPlayer(createConfig(adapter));

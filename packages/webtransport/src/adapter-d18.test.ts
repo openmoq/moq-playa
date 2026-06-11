@@ -737,3 +737,45 @@ describe('MoqtConnection(18) request-stream GOAWAY (§10.4 — per-request migra
     expect(closeCode).toBe(-1);
   });
 });
+
+describe('MoqtConnection(18) accept-loop failure classification', () => {
+  it('a terminal incoming-UNI accept-loop failure on an ESTABLISHED session emits a FATAL transport error', async () => {
+    const { conn, transport } = await connected();
+    const errors: Array<{ message: string; isFatal?: boolean; errorSource?: string }> = [];
+    conn.onError = (e) => errors.push(e as never);
+
+    transport.errorIncomingUni('simulated WT network error');
+    for (let i = 0; i < 4; i++) await flush();
+
+    expect(errors.length).toBe(1);
+    expect(errors[0]!.message).toContain('simulated WT network error');
+    expect(errors[0]!.isFatal).toBe(true);
+    expect(errors[0]!.errorSource).toBe('transport');
+  });
+
+  it('a terminal incoming-BIDI accept-loop failure on an ESTABLISHED session emits a FATAL transport error', async () => {
+    const { conn, transport } = await connected();
+    const errors: Array<{ message: string; isFatal?: boolean; errorSource?: string }> = [];
+    conn.onError = (e) => errors.push(e as never);
+
+    transport.errorIncomingBidi('simulated WT bidi failure');
+    for (let i = 0; i < 4; i++) await flush();
+
+    expect(errors.length).toBe(1);
+    expect(errors[0]!.message).toContain('simulated WT bidi failure');
+    expect(errors[0]!.isFatal).toBe(true);
+  });
+
+  it('accept-loop failures during/after an intentional close() are SWALLOWED (no error events)', async () => {
+    const { conn, transport } = await connected();
+    const errors: Error[] = [];
+    conn.onError = (e) => errors.push(e);
+
+    await conn.close(); // session → CLOSED before the transport teardown
+    transport.errorIncomingUni('teardown-induced reader failure');
+    transport.errorIncomingBidi('teardown-induced reader failure');
+    for (let i = 0; i < 4; i++) await flush();
+
+    expect(errors).toEqual([]);
+  });
+});

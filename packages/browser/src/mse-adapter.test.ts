@@ -165,8 +165,28 @@ class MockSourceBuffer extends MockEventTarget {
         });
     }
 
-    remove(_start: number, _end: number): void {
-        // Unused in Phase 1 tests.
+    /** Every remove() call, recorded as [start, end]. */
+    readonly removeCalls: Array<[number, number]> = [];
+
+    remove(start: number, end: number): void {
+        this.removeCalls.push([start, end]);
+        // Real MSE semantics: remove() sets updating, fires updateend, and the
+        // removed span disappears from .buffered. Model both so eviction logic
+        // doesn't loop forever against a never-shrinking buffer.
+        this.updating = true;
+        queueMicrotask(() => {
+            const out: [number, number][] = [];
+            for (let i = 0; i < this.buffered.length; i++) {
+                const s = this.buffered.start(i);
+                const e = this.buffered.end(i);
+                if (e <= start || s >= end) { out.push([s, e]); continue; }
+                if (s < start) out.push([s, start]);
+                if (e > end) out.push([end, e]);
+            }
+            this.buffered = makeTimeRanges(out);
+            this.updating = false;
+            this.fire('updateend');
+        });
     }
 
     /** Records every changeType mime so tests can assert the codec pivot. */
@@ -194,9 +214,14 @@ class MockMediaSource extends MockEventTarget {
 class MockVideoElement extends MockEventTarget {
     src = '';
     currentTime = 0;
+    muted = false;
     error: { code: number; message: string } | null = null;
     buffered = makeTimeRanges([]);
-    async play(): Promise<void> { /* no-op */ }
+    /** When true, play() rejects (autoplay blocked) → playTriggered stays false. */
+    rejectPlay = false;
+    async play(): Promise<void> {
+        if (this.rejectPlay) throw new Error('autoplay blocked');
+    }
     load(): void { /* no-op */ }
     removeAttribute(_n: string): void { /* no-op */ }
     /** Trigger the error event, setting .error first. */
@@ -904,5 +929,137 @@ describe('changeType play resume', () => {
         await adapter.changeType('video', 'avc1.64001f', newInit);
 
         expect(playSpy).not.toHaveBeenCalled();
+    });
+});
+
+// ─── Live-buffer management: eviction / behind-live cap / quota recovery ───
+
+describe('MseMediaSource — live-buffer management', () => {
+    /** Ready adapter that has reached playTriggered (post-startup). */
+    async function makePlayingAdapter(): Promise<{
+        adapter: MseMediaSource;
+        video: MockVideoElement;
+        vsb: MockSourceBuffer;
+    }> {
+        const ctx = await makeReadyAdapter();
+        // Reaching playTriggered: drainQueue triggers play() once video.buffered
+        // is non-empty during an idle drain. Seed a buffered range and append.
+        ctx.video.buffered = makeTimeRanges([[0, 1]]);
+        ctx.vsb.buffered = makeTimeRanges([[0, 1]]);
+        ctx.adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 }), 'track1');
+        await flush();
+        await flush(); // play().then(() => playTriggered = true)
+        return ctx;
+    }
+
+    const quotaError = (): Error => {
+        const e = new Error('The SourceBuffer is full, and cannot free space to append additional buffers.');
+        e.name = 'QuotaExceededError';
+        return e;
+    };
+
+    it('evicts played-out back-buffer with a finite range before appending, serialized via updateend', async () => {
+        const { adapter, video, vsb } = await makePlayingAdapter();
+        const appendsBefore = vsb.appendedPayloads.length;
+
+        // 25s played; buffer holds [0, 28]. keepBehind=10 → evict [0, 15).
+        video.currentTime = 25;
+        vsb.buffered = makeTimeRanges([[0, 28]]);
+        adapter.appendChunk('video', makeSegment({ bmd: 28_000, defaultDur: 100, sampleCount: 5 }), 'track1');
+
+        // The remove must be issued FIRST; the append is parked until updateend.
+        expect(vsb.removeCalls).toContainEqual([0, 15]);
+        expect(vsb.appendedPayloads.length).toBe(appendsBefore); // not yet appended
+
+        await flush(); // remove updateend → drain → append dispatch
+        await flush();
+        expect(vsb.appendedPayloads.length).toBe(appendsBefore + 1); // serialized, then appended
+    });
+
+    it('does not evict or chase before playTriggered (startup exempt)', async () => {
+        const { adapter, video, vsb } = await makeReadyAdapter();
+        video.rejectPlay = true; // autoplay blocked → playTriggered stays false
+        video.currentTime = 1;
+        video.buffered = makeTimeRanges([[0, 100]]);
+        vsb.buffered = makeTimeRanges([[0, 100]]);
+
+        adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 }), 'track1');
+        await flush();
+        await flush();
+
+        expect(vsb.removeCalls).toEqual([]);      // no startup eviction
+        expect(video.currentTime).toBe(1);         // no behind-live jump pre-startup
+    });
+
+    it('jumps toward the live edge when buffered-ahead exceeds maxAheadSec (post-startup)', async () => {
+        const { adapter, video, vsb } = await makePlayingAdapter();
+
+        // Inside a buffered range with 28s of data ahead (cap 15) → jump to end-2.
+        video.currentTime = 2;
+        video.buffered = makeTimeRanges([[0, 30]]);
+        vsb.buffered = makeTimeRanges([[0, 30]]);
+        const resyncs: string[] = [];
+        adapter.onLiveEdgeResync = (r) => resyncs.push(r);
+
+        adapter.appendChunk('video', makeSegment({ bmd: 30_000, defaultDur: 100, sampleCount: 5 }), 'track1');
+        await flush();
+        await flush();
+
+        expect(video.currentTime).toBe(28); // 30 - targetAheadSec(2)
+        expect(resyncs).toContain('behind-live');
+    });
+
+    it('QuotaExceededError with played-out media: evicts, retries the SAME chunk once, no error events', async () => {
+        const { adapter, video, vsb } = await makePlayingAdapter();
+        const errors: Error[] = [];
+        adapter.onError = (e) => errors.push(e);
+        const appendsBefore = vsb.appendedPayloads.length;
+
+        video.currentTime = 25;
+        vsb.buffered = makeTimeRanges([[0, 28]]);
+        // currentTime small enough that routine eviction doesn't pre-empt: force
+        // the quota throw on the append itself.
+        video.currentTime = 9; // keepBehind=10 → no routine evict (9-10 < 0)
+        vsb.throwNextAppend = quotaError();
+
+        const seg = makeSegment({ bmd: 28_000, defaultDur: 100, sampleCount: 5 });
+        adapter.appendChunk('video', seg, 'track1');
+        // Stage 1: emergency evict [0, currentTime-1) and park the chunk.
+        expect(vsb.removeCalls).toContainEqual([0, 8]);
+        await flush(); // remove updateend → drain retries the chunk
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(appendsBefore + 1); // retried + accepted
+        expect(errors).toEqual([]); // recovered quota is taxonomy-quiet
+    });
+
+    it('QuotaExceededError with NOTHING evictable: flushes finite ranges, drops backlog, rejoins live', async () => {
+        const { adapter, video, vsb } = await makePlayingAdapter();
+        const errors: Error[] = [];
+        const resyncs: string[] = [];
+        adapter.onError = (e) => errors.push(e);
+        adapter.onLiveEdgeResync = (r) => resyncs.push(r);
+
+        // The reported wedge: everything buffered is AHEAD of the playhead.
+        video.currentTime = 5;
+        vsb.buffered = makeTimeRanges([[5, 60]]);
+        video.buffered = makeTimeRanges([[5, 60]]);
+        vsb.throwNextAppend = quotaError();
+
+        adapter.appendChunk('video', makeSegment({ bmd: 60_000, defaultDur: 100, sampleCount: 5 }), 'track1');
+        // Flush issued with a FINITE range (not remove(0, Infinity)).
+        expect(vsb.removeCalls).toContainEqual([5, 60]);
+        await flush(); // flush updateend
+
+        // Fresh live media arrives after the flush; it commits and playback rejoins.
+        video.buffered = makeTimeRanges([[50, 60]]);
+        vsb.buffered = makeTimeRanges([[50, 60]]);
+        adapter.appendChunk('video', makeSegment({ bmd: 50_000, defaultDur: 100, sampleCount: 5 }), 'track1');
+        await flush();
+        await flush();
+
+        expect(video.currentTime).toBe(50);        // jumped to the new (live) range
+        expect(resyncs).toContain('quota');
+        expect(errors).toEqual([]);                // handled recovery emits no errors
     });
 });

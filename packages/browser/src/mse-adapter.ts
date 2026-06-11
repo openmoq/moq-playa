@@ -119,11 +119,34 @@ function scanMdatNals(segment: Uint8Array): { nalTypes: number[]; mdatHead: stri
 // ─── Adapter ──────────────────────────────────────────────────────────
 
 /**
+ * Live-buffer management knobs for {@link MseMediaSource}. All optional.
+ *
+ * NOTE: the behind-live cap (`maxAheadSec`) is LIVE-specific behavior — it
+ * deliberately skips playback forward to chase the live edge. If CMAF VOD /
+ * time-shift playback becomes a supported mode, it will need an opt-out or
+ * live-aware configuration (e.g. `maxAheadSec: Infinity` disables the jump).
+ */
+export interface MseMediaSourceOptions {
+  /** Seconds of played-out media to keep behind currentTime; older buffered data
+   *  is evicted via SourceBuffer.remove() so the browser quota is never exhausted
+   *  by stale history. Default 10. */
+  readonly keepBehindSec?: number;
+  /** Behind-live cap: if buffered-ahead of currentTime exceeds this, playback
+   *  jumps toward the live edge (post-startup only). Default 15.
+   *  Set Infinity to disable (VOD/time-shift). */
+  readonly maxAheadSec?: number;
+  /** Where a behind-live jump lands: rangeEnd - targetAheadSec. Default 2. */
+  readonly targetAheadSec?: number;
+}
+
+/**
  * Stateless MSE SourceBuffer pipe.
  *
  * The player MUST call initialize() before appendChunk(). Data ordering
  * (init before media, moof+mdat concatenation) is the player's job.
- * MseMediaSource only handles SourceBuffer back-pressure (updateend drain).
+ * MseMediaSource handles SourceBuffer back-pressure (updateend drain) plus
+ * live-buffer hygiene: back-buffer eviction, a behind-live cap, and
+ * QuotaExceededError recovery (evict + retry, escalating to flush-and-rejoin).
  *
  * @see draft-ietf-moq-cmsf-00 §3 (CMAF Packaging)
  */
@@ -153,10 +176,32 @@ export class MseMediaSource implements MediaSourceLike {
   onFirstFrame: (() => void) | null = null;
   onError: ((error: Error) => void) | null = null;
   onStall: ((durationMs: number) => void) | null = null;
+  /** Fired after the adapter repositioned playback toward the live edge —
+   *  'behind-live' (buffered-ahead cap) or 'quota' (flush + rejoin after
+   *  QuotaExceededError). INFORMATIONAL, concrete-class only: it is NOT part of
+   *  MediaSourceLike and MoqtPlayer does not wire it yet — an app holding the
+   *  concrete adapter may use it for logging, or (future work) the player could
+   *  consume it to request fresh keyframe-led media when the publisher doesn't
+   *  keyframe-align chunks. */
+  onLiveEdgeResync: ((reason: 'quota' | 'behind-live') => void) | null = null;
 
   private firstFrameFired = false;
   private playTriggered = false;
   private stallStartTime: number | null = null;
+
+  // ── Live-buffer management (eviction / behind-live cap / quota recovery) ──
+  /** Seconds of played-out media kept behind currentTime; older data is evicted. */
+  private readonly keepBehindSec: number;
+  /** Buffered-ahead cap: beyond this, jump toward the live edge (post-startup only). */
+  private readonly maxAheadSec: number;
+  /** Where a live-edge jump lands: rangeEnd - targetAheadSec. */
+  private readonly targetAheadSec: number;
+  /** One evict+retry is allowed per quota error before escalating to flush. */
+  private readonly quotaRetried: { video: boolean; audio: boolean } = { video: false, audio: false };
+  /** A quota flush happened; the next committed append jumps playback to it. */
+  private chaseAfterFlush = false;
+  /** Guards a flush→quota→flush loop: emit one onError, drop until recovered. */
+  private quotaFlushInFlight = false;
 
   // ── Diagnostic ring buffer (last RING_CAPACITY appends per media type) ──
   private readonly videoRing: AppendRecord[] = [];
@@ -237,8 +282,11 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.debug) console.warn(msg, ...args);
   }
 
-  constructor(videoElement: HTMLVideoElement) {
+  constructor(videoElement: HTMLVideoElement, options: MseMediaSourceOptions = {}) {
     this.video = videoElement;
+    this.keepBehindSec = options.keepBehindSec ?? 10;
+    this.maxAheadSec = options.maxAheadSec ?? 15;
+    this.targetAheadSec = options.targetAheadSec ?? 2;
 
     // Safari iOS (iPhone) only supports ManagedMediaSource, not MediaSource.
     // iPad and desktop Safari support both. Prefer ManagedMediaSource when
@@ -386,6 +434,10 @@ export class MseMediaSource implements MediaSourceLike {
     const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
 
     if (this.changingType[mediaType] || buffer.updating || queue.length > 0) {
+      queue.push(groupId !== undefined ? { data, trackName, groupId } : { data, trackName });
+    } else if (this.maybeEvictBackBuffer(mediaType, buffer)) {
+      // An eviction remove() is now in flight (it sets `updating`); park the
+      // chunk — its updateend re-enters drainQueue and dispatches it.
       queue.push(groupId !== undefined ? { data, trackName, groupId } : { data, trackName });
     } else {
       this.doAppend(mediaType, buffer, data, trackName, groupId);
@@ -620,6 +672,10 @@ export class MseMediaSource implements MediaSourceLike {
     this.videoTrex = undefined;
     this.audioTrex = undefined;
     this.seenDiagnostics.clear();
+    this.quotaRetried.video = false;
+    this.quotaRetried.audio = false;
+    this.chaseAfterFlush = false;
+    this.quotaFlushInFlight = false;
   }
 
   destroy(): void {
@@ -723,8 +779,73 @@ export class MseMediaSource implements MediaSourceLike {
     }
     if (queue.length === 0) return;
 
+    // Back-buffer hygiene before the next append: if played-out media beyond
+    // keepBehindSec exists, evict it first. The remove() sets `updating`; its
+    // updateend re-enters this drain and dispatches the queued chunk.
+    if (this.maybeEvictBackBuffer(mediaType, buffer)) return;
+
     const next = queue.shift()!;
     this.doAppend(mediaType, buffer, next.data, next.trackName, next.groupId);
+  }
+
+  /**
+   * Evict played-out media older than `currentTime - keepBehindSec` from one
+   * SourceBuffer, using a FINITE range. Serialized exactly like an append:
+   * remove() sets `updating` and fires `updateend`, so callers must not issue
+   * another SourceBuffer op until then (both call sites guard on `updating`).
+   * Returns true if a remove() was started. Startup is exempt (pre-playTriggered)
+   * — initial buffering must not be trimmed.
+   */
+  private maybeEvictBackBuffer(mediaType: 'video' | 'audio', buffer: SourceBuffer): boolean {
+    if (!this.playTriggered) return false;
+    const evictBefore = this.video.currentTime - this.keepBehindSec;
+    if (evictBefore <= 0) return false;
+    let start: number;
+    try {
+      if (buffer.buffered.length === 0) return false;
+      start = buffer.buffered.start(0);
+    } catch { return false; /* buffer detached */ }
+    // Hysteresis: only evict once at least 1s of stale media has accumulated,
+    // so we don't churn a remove() per append.
+    if (evictBefore - start < 1) return false;
+    try {
+      buffer.remove(start, evictBefore);
+      this.logDebug('[MSE] evict %s back-buffer [%s, %s)', mediaType, start.toFixed(2), evictBefore.toFixed(2));
+      return true;
+    } catch (err) {
+      this.logWarn('[MSE] back-buffer evict failed (%s): %s', mediaType, (err as Error).message);
+      return false;
+    }
+  }
+
+  /**
+   * Behind-live cap: when playback has fallen more than `maxAheadSec` behind the
+   * buffered data it is inside of (a perpetually-behind live subscriber being
+   * burst-fed by the relay), jump to `rangeEnd - targetAheadSec`. Only acts after
+   * startup (playTriggered) and only within the range CONTAINING currentTime —
+   * never across gaps.
+   */
+  private maybeChaseLiveEdge(): void {
+    if (!this.playTriggered) return;
+    const v = this.video;
+    const ct = v.currentTime;
+    let buffered: TimeRanges;
+    try { buffered = v.buffered; } catch { return; }
+    for (let i = 0; i < buffered.length; i++) {
+      const start = buffered.start(i);
+      const end = buffered.end(i);
+      if (ct < start || ct > end) continue;
+      const ahead = end - ct;
+      if (ahead > this.maxAheadSec) {
+        const target = Math.max(start, end - this.targetAheadSec);
+        if (target > ct) {
+          this.logWarn('[MSE] behind live by %ss — jumping %s -> %s', ahead.toFixed(1), ct.toFixed(2), target.toFixed(2));
+          v.currentTime = target;
+          this.onLiveEdgeResync?.('behind-live');
+        }
+      }
+      return; // containing range handled (or within cap) — done either way
+    }
   }
 
   /**
@@ -820,8 +941,91 @@ export class MseMediaSource implements MediaSourceLike {
         this.pendingAudioRanges = [];
         this.pendingAudioTrackName = null;
       }
+      // QuotaExceededError is RECOVERABLE (evict + retry, escalating to
+      // flush-and-rejoin) — handle it without surfacing an error event.
+      if ((err as Error)?.name === 'QuotaExceededError') {
+        this.handleQuotaExceeded(mediaType, buffer, data, trackName, groupId);
+        return;
+      }
       this.dumpRingOnFailure(`appendBuffer throw on ${mediaType}`, err);
       this.onError?.(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  /**
+   * QuotaExceededError recovery. Two stages, taxonomy-quiet while handled:
+   *
+   *   1. EVICT + RETRY (once per incident): if played-out media exists behind
+   *      currentTime, remove it (finite range, 1s margin) and re-queue the failed
+   *      chunk at the FRONT — its updateend retries the append with space freed.
+   *   2. FLUSH + REJOIN LIVE: nothing evictable (the report's case: the entire
+   *      buffered range is AHEAD of a stalled/behind currentTime — the UA cannot
+   *      free space either). Drop the stale queued backlog AND this chunk, remove
+   *      each buffer's full FINITE buffered span, clear the timeline indexes, and
+   *      let the next committed append pull playback to its (live-edge) position.
+   *
+   * Only if stage 2 itself cannot run (or quota recurs mid-flush) does onError
+   * fire — once.
+   *
+   * Keyframe caveat: MSE-only recovery resumes at the next appended chunk; clean
+   * decode from it requires the publisher to keyframe-lead chunks/groups (true
+   * for CMSF-style publishers and our fixtures). `onLiveEdgeResync('quota')` is an
+   * informational concrete-class hook (NOT player-wired yet) an app could use to
+   * request fresh keyframe-led media when that doesn't hold.
+   */
+  private handleQuotaExceeded(
+    mediaType: 'video' | 'audio',
+    buffer: SourceBuffer,
+    data: Uint8Array,
+    trackName: string,
+    groupId?: bigint,
+  ): void {
+    const ct = this.video.currentTime;
+
+    // ── Stage 1: evict played-out media and retry this chunk once ──────────
+    if (!this.quotaRetried[mediaType]) {
+      let start: number | null = null;
+      try {
+        if (buffer.buffered.length > 0) start = buffer.buffered.start(0);
+      } catch { /* detached */ }
+      const evictBefore = ct - 1; // keep a 1s margin behind the playhead
+      if (start !== null && evictBefore > start) {
+        this.quotaRetried[mediaType] = true;
+        const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
+        queue.unshift(groupId !== undefined ? { data, trackName, groupId } : { data, trackName });
+        try {
+          this.logWarn('[MSE] quota exceeded (%s) — evicting [%s, %s) and retrying', mediaType, start.toFixed(2), evictBefore.toFixed(2));
+          buffer.remove(start, evictBefore); // updateend → drainQueue → retry
+          return;
+        } catch { /* fall through to flush */ }
+      }
+    }
+
+    // ── Stage 2: flush both buffers and rejoin at the next appended media ──
+    if (this.quotaFlushInFlight) {
+      // Flush already in progress and quota STILL exceeded — genuine failure.
+      this.dumpRingOnFailure(`appendBuffer quota on ${mediaType} during flush`, new Error('QuotaExceededError'));
+      this.onError?.(new Error('MSE quota exceeded and flush recovery failed'));
+      return;
+    }
+    this.quotaFlushInFlight = true;
+    this.logWarn('[MSE] quota exceeded (%s) with nothing evictable — flushing buffers and rejoining live', mediaType);
+    this.videoQueue.length = 0;
+    this.audioQueue.length = 0;
+    this.videoTimelines.clear();
+    this.audioTimelines.clear();
+    this.quotaRetried.video = false;
+    this.quotaRetried.audio = false;
+    this.chaseAfterFlush = true;
+    for (const [b, label] of [[this.videoBuffer, 'video'], [this.audioBuffer, 'audio']] as const) {
+      if (!b) continue;
+      try {
+        if (b.updating || b.buffered.length === 0) continue;
+        // FINITE range: first buffered start → last buffered end.
+        b.remove(b.buffered.start(0), b.buffered.end(b.buffered.length - 1));
+      } catch (err) {
+        this.logWarn('[MSE] flush remove failed (%s): %s', label, (err as Error).message);
+      }
     }
   }
 
@@ -856,6 +1060,24 @@ export class MseMediaSource implements MediaSourceLike {
             this.committedGroupFloor.set(floorKey, pendingGroup);
           }
         }
+        // A successful commit clears the per-incident quota retry budget.
+        this.quotaRetried[mediaType] = false;
+        // Post-quota-flush rejoin: pull playback to the newly committed media.
+        // The flush emptied the buffers, so the LAST buffered range of the
+        // element is the fresh (live-edge) data — jump to its start (seconds;
+        // SegmentTimeRange tick values are timescale units, not usable here).
+        if (this.chaseAfterFlush) {
+          let buffered: TimeRanges | null = null;
+          try { buffered = this.video.buffered; } catch { /* detached */ }
+          if (buffered && buffered.length > 0) {
+            this.chaseAfterFlush = false;
+            this.quotaFlushInFlight = false;
+            const target = buffered.start(buffered.length - 1);
+            this.logWarn('[MSE] quota flush recovery: rejoining playback at %ss', target.toFixed(2));
+            this.video.currentTime = target;
+            this.onLiveEdgeResync?.('quota');
+          }
+        }
       }
     }
     if (mediaType === 'video') {
@@ -868,6 +1090,8 @@ export class MseMediaSource implements MediaSourceLike {
       this.pendingAudioGroupId = undefined;
     }
     this.appendErrored[mediaType] = false;
+    // Behind-live cap: act on fresh data arrival (post-startup only).
+    this.maybeChaseLiveEdge();
     this.drainQueue(mediaType);
   }
 

@@ -2231,9 +2231,14 @@ export class MoqtConnection {
         this.processDataStream(stream, streamId);
       }
     } catch (err) {
+      // The ACCEPT loop dying is terminal for media delivery: no future data
+      // stream will ever be accepted, so an established session would starve
+      // silently. Surface it as FATAL — unless the session is already closed
+      // (intentional teardown makes the reader throw; that is not an error).
+      if (this.session.state === SessionState.CLOSED) return;
       this.onError?.(new MoqtConnectionError(
         err instanceof Error ? err.message : String(err),
-        { errorSource: 'transport', ...(err instanceof Error ? { cause: err } : {}) },
+        { errorSource: 'transport', isFatal: true, ...(err instanceof Error ? { cause: err } : {}) },
       ));
     }
   }
@@ -2323,9 +2328,13 @@ export class MoqtConnection {
         void this.handleIncomingBidiStream(stream);
       }
     } catch (err) {
+      // Same as the uni accept loop: terminal accept failure on an ESTABLISHED
+      // session is fatal (inbound requests can never arrive again); during
+      // intentional teardown (session CLOSED) it is expected — swallow.
+      if (this.session.state === SessionState.CLOSED) return;
       this.onError?.(new MoqtConnectionError(
         err instanceof Error ? err.message : String(err),
-        { errorSource: 'transport', ...(err instanceof Error ? { cause: err } : {}) },
+        { errorSource: 'transport', isFatal: true, ...(err instanceof Error ? { cause: err } : {}) },
       ));
     }
   }

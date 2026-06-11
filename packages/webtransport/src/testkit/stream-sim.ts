@@ -172,6 +172,19 @@ export class TransportSim implements WebTransportLike {
     return this;
   }
 
+  /** Error the TOP-LEVEL incoming-uni accept stream (kills the accept loop),
+   *  simulating a transport-layer failure like Safari's WT "network error". */
+  errorIncomingUni(reason = 'simulated transport failure'): this {
+    this.incomingCtrl.error(new Error(reason));
+    return this;
+  }
+
+  /** Error the TOP-LEVEL incoming-bidi accept stream (kills the bidi accept loop). */
+  errorIncomingBidi(reason = 'simulated transport failure'): this {
+    this.incomingBidiCtrl.error(new Error(reason));
+    return this;
+  }
+
   /** Close the datagram readable (ends the datagram loop). */
   closeDatagrams(): this {
     this.datagramCtrl.close();

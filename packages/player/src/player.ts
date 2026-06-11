@@ -2608,7 +2608,11 @@ export class MoqtPlayer {
     this.bandwidthEstimator = null;
     if (this.connection) {
       if (this._adapterOwned) {
-        // Owned adapter: close it (cleans up all subscriptions implicitly)
+        // Owned adapter: detach our callbacks FIRST so the intentional close's
+        // teardown (pending-subscription rejections, stream resets, onClose) is
+        // not surfaced back into the player as fatal/degraded connection errors —
+        // destroy() is a happy path. Then close (cleans up subscriptions implicitly).
+        this.detachConnectionCallbacks(this.connection);
         await this.connection.close();
       } else {
         // Externally owned: explicitly unsubscribe player's tracks, then detach.
@@ -2620,17 +2624,7 @@ export class MoqtPlayer {
         if (this.catalogRequestId !== null) {
           try { await this.connection.unsubscribe(varint(this.catalogRequestId)); } catch { /* ignore */ }
         }
-        // Detach our callbacks to avoid stale references.
-        // Use delete because exactOptionalPropertyTypes forbids assigning undefined.
-        delete this.connection.onMessage;
-        delete this.connection.onObject;
-        delete this.connection.onClose;
-        delete this.connection.onError;
-        delete this.connection.onDataStream;
-        delete this.connection.onStreamClosed;
-        delete this.connection.onDatagram;
-        delete this.connection.onNamespaceMessage;
-        delete this.connection.onQlogEvent;
+        this.detachConnectionCallbacks(this.connection);
       }
       this.connection = null;
     }
@@ -2639,6 +2633,23 @@ export class MoqtPlayer {
       this.transitionState(PlayerState.ENDED);
     }
     this.emitter.removeAllListeners();
+  }
+
+  /**
+   * Detach all player-installed callbacks from a connection so no further
+   * adapter activity is surfaced into this (destroyed/destroying) player.
+   * Use delete because exactOptionalPropertyTypes forbids assigning undefined.
+   */
+  private detachConnectionCallbacks(conn: MoqtConnection): void {
+    delete conn.onMessage;
+    delete conn.onObject;
+    delete conn.onClose;
+    delete conn.onError;
+    delete conn.onDataStream;
+    delete conn.onStreamClosed;
+    delete conn.onDatagram;
+    delete conn.onNamespaceMessage;
+    delete conn.onQlogEvent;
   }
 
   // ─── Subscription hook surface ──────────────────────────
@@ -2679,6 +2690,10 @@ export class MoqtPlayer {
    * 3. Emits legacy `session_error` for backward compatibility
    */
   private emitError(playerError: PlayerError): void {
+    // An intentionally destroyed player emits NO error events: teardown noise
+    // (close/unsubscribe stragglers landing async during/after destroy()) is not
+    // an error. Unintentional failures before destroy() emit normally.
+    if (this._destroyed) return;
     const filtered = this.config.errorFilter
       ? this.config.errorFilter(playerError)
       : playerError;
