@@ -100,8 +100,16 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
   decode(chunk: AudioChunkInit, renderTimeUs: number): void {
     if (!this.lastCodec || !this.decoder || this.decoder.state !== 'configured') return;
 
-    // Backpressure: drop audio frames when decoder queue is too deep.
-    if (this.decoder.decodeQueueSize >= MAX_AUDIO_DECODE_QUEUE_SIZE) return;
+    // Backpressure: a queue this deep means the decoder stopped keeping up
+    // (or stalled outright). Mirror the video decoder: reset — fresh decoder,
+    // empty render-time queue — and surface an error so the pipeline's
+    // recovery/throttle logic sees it. Never drop silently. Audio frames are
+    // independently decodable (LOC §4.1), so playback resumes on the next frame.
+    if (this.decoder.decodeQueueSize >= MAX_AUDIO_DECODE_QUEUE_SIZE) {
+      this.reset();
+      this.onError?.(new Error('audio decode queue overflow — decoder reset'));
+      return;
+    }
 
     let data = chunk.data;
 

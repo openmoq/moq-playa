@@ -117,4 +117,28 @@ describe('WebCodecsAudioDecoder', () => {
 
     expect(received).toEqual([100, 999]);
   });
+
+  it('resets and reports on decode queue overflow instead of dropping silently', () => {
+    const decoder = configuredDecoder();
+    const received: number[] = [];
+    decoder.onData = (_data, renderTimeUs) => received.push(renderTimeUs);
+    const onError = vi.fn();
+    decoder.onError = onError;
+
+    // Decoder stopped draining — queue is at the cap.
+    createdDecoders[0]!.decodeQueueSize = 32;
+    decoder.decode(chunk(1), 100);
+
+    // Overflow must be observable (like the video decoder), not a silent drop.
+    expect(decodeSpy).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledOnce();
+    expect((onError.mock.calls[0]![0] as Error).message).toMatch(/queue overflow/);
+    expect(createdDecoders).toHaveLength(2); // reset → fresh decoder, empty queue
+
+    // Recovery is immediate — the next frame decodes with a fresh render time.
+    decoder.decode(chunk(2), 200);
+    expect(decodeSpy).toHaveBeenCalledOnce();
+    createdDecoders[1]!.output({});
+    expect(received).toEqual([200]);
+  });
 });
