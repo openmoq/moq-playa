@@ -36,6 +36,7 @@ import { parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE } from '@moqt
 import { TypedEmitter } from './emitter.js';
 import { HookChain } from './hooks.js';
 import { WatchdogController } from './watchdog.js';
+import { MediaLivenessMonitor, type LivenessTrack } from './media-liveness.js';
 import { PlayerStateMachine, PlayerState, type PlayerStateValue } from './state.js';
 import type { PlayerEventMap } from './events.js';
 import {
@@ -444,6 +445,31 @@ export class MoqtPlayer {
   >();
 
   /**
+   * Media-liveness: per-track starvation detection + restart ladder.
+   * The gap detector handles gaps BETWEEN arrivals; this handles NO
+   * arrivals (transport stream death, relay restart). null when disabled
+   * (livenessTimeoutMs: 0).
+   */
+  private livenessMonitor: MediaLivenessMonitor | null = null;
+
+  /**
+   * streamId → trackAlias for SUBGROUP data streams only. Lets a stream
+   * reset shorten the owning track's liveness fuse (§10.4.3 resets are
+   * otherwise normal). Fetch streams and datagrams never enter this map.
+   */
+  private readonly subgroupStreamAliases = new Map<bigint, bigint>();
+
+  /**
+   * Restart-ladder state per track, keyed `${mediaType}:${trackName}`
+   * (survives requestId/alias changes across full resubscribes).
+   */
+  private readonly livenessRestarts = new Map<string, {
+    attempts: number;
+    active: boolean;
+    cancelled: boolean;
+  }>();
+
+  /**
    * Media subscriptions pending SUBSCRIBE_OK: requestId → track info.
    * Registration in SubscriptionManager is deferred until SUBSCRIBE_OK
    * provides the server-assigned Track Alias.
@@ -556,6 +582,19 @@ export class MoqtPlayer {
         this.log.info('Watchdog waiting: %s (%dms/%dms)', e.event, e.elapsedMs, e.timeoutMs);
       },
     });
+
+    // Media-liveness monitor: detects per-track delivery starvation while
+    // PLAYING and drives the restart ladder. Complements (does not replace)
+    // the gap detector, which only handles gaps BETWEEN arrivals.
+    if (this.config.livenessTimeoutMs! > 0) {
+      this.livenessMonitor = new MediaLivenessMonitor({
+        livenessTimeoutMs: this.config.livenessTimeoutMs!,
+        resetProbeMs: this.config.livenessResetProbeMs!,
+        onStarved: (track, starvedForMs, healthyForMs) => {
+          void this.handleTrackStarvation(track, starvedForMs, healthyForMs);
+        },
+      });
+    }
   }
 
   // ─── Capability Detection ──────────────────────────────────
@@ -1260,6 +1299,10 @@ export class MoqtPlayer {
 
     // Wire object delivery → media_object events + pipeline routing
     this.subscriptionManager.onObject = (mediaType, trackName, obj, headers) => {
+      // Liveness: ANY object on this track (data, gap, or staged-for-switch)
+      // proves the delivery path is alive — stamp before every early return.
+      this.stampMediaArrival(BigInt(obj.trackAlias));
+
       // Make-before-break track switch: stage new-track objects until a
       // keyframe arrives, keeping the old track playing the entire time.
       // @see draft-ietf-moq-msf-00 §4.2 (seamless switch at group boundaries)
@@ -1358,6 +1401,9 @@ export class MoqtPlayer {
     // Wire CMAF object delivery → MediaSource adapter (pipeline bypass)
     // §3.3: CMAF objects are moof or mdat — concatenate then feed to MSE
     this.subscriptionManager.onCmafObject = (mediaType, trackName, obj) => {
+      // Liveness: stamp before every early return (gates, staging, drops).
+      this.stampMediaArrival(BigInt(obj.trackAlias));
+
       // CMAF switch completion handled at raw onObject level (above)
 
       // Stats
@@ -1863,6 +1909,11 @@ export class MoqtPlayer {
       this.syncController?.reset();
       this.recoveryController?.reset?.();
     }
+
+    // Liveness: drop stale arrival stamps — a pause (no delivery, no ticks)
+    // must not read as starvation on resume. Tracks re-arm on their next
+    // arrival; reconcile re-registers them on the first tick.
+    this.livenessMonitor?.clear();
 
     // Start pipeline tick interval (~60fps for smooth playback)
     this.startTicking();
@@ -2429,6 +2480,11 @@ export class MoqtPlayer {
     // Proactive quality adaptation: if estimated bandwidth is below
     // 1.5× the current track's bitrate, downshift before stalls occur.
     this.checkBandwidthAdaptation();
+
+    // Media liveness: reconcile monitored tracks with the live subscription
+    // map (a handful of entries — cheap at tick rate, and immune to drift
+    // across subscribe/unsubscribe/switch paths), then evaluate starvation.
+    this.syncAndCheckLiveness();
   }
 
   /** Timestamp of last ABR downshift — gates upshift for stability. */
@@ -2570,6 +2626,11 @@ export class MoqtPlayer {
     this.log.info('destroy()');
     this._stats.recordPlayStop();
     this.stopTicking();
+    // Liveness: quiet destroy — cancel any in-flight restart ladder (it must
+    // never emit MEDIA_STARVED for an intentional teardown) and disarm.
+    for (const restart of this.livenessRestarts.values()) restart.cancelled = true;
+    this.livenessMonitor?.clear();
+    this.subgroupStreamAliases.clear();
     this.pendingMediaSubs.clear();
     this.activeFetches.clear();
     this.fetchStreamAliases.clear();
@@ -2861,7 +2922,19 @@ export class MoqtPlayer {
           });
         }
         // §10.4.3: RESET_STREAM is normal (UNSUBSCRIBE, timeout, track switch).
-        // Log at debug level — not an application error.
+        // Log at debug level — not an application error. But a reset on a
+        // DELIVERING track's subgroup stream is a liveness hint: shorten that
+        // track's fuse so a dead delivery path (Safari WT stream death) is
+        // detected in resetProbeMs instead of the full liveness timeout.
+        // A healthy track re-stamps via its successor stream — benign resets
+        // (group end, switch, unsubscribe) stay free.
+        const subgroupAlias = this.subgroupStreamAliases.get(streamId);
+        if (subgroupAlias !== undefined) {
+          this.subgroupStreamAliases.delete(streamId); // map never outlives the stream
+          if (error !== undefined) {
+            this.livenessMonitor?.noteStreamReset(subgroupAlias, performance.now());
+          }
+        }
         if (error !== undefined) {
           this.log.debug('Data stream %s reset with code 0x%s', streamId, error.toString(16));
         }
@@ -2869,6 +2942,14 @@ export class MoqtPlayer {
 
       // §10.4.4: Fetch data stream headers for object routing
       onDataStream: (streamId, header) => {
+        // Liveness: remember which track each SUBGROUP stream belongs to so
+        // a reset can shorten that track's liveness fuse. Subgroup streams
+        // only — fetch streams have their own request lifecycle and must
+        // never touch track liveness (datagrams have no stream at all).
+        if (header.type === 'subgroup') {
+          this.subgroupStreamAliases.set(streamId, BigInt(header.header.trackAlias));
+          return;
+        }
         if (header.type === 'fetch') {
           const reqId = BigInt(header.header.requestId);
           // Catalog-fetch dispatch: map streamId → reqId so the
@@ -3218,7 +3299,7 @@ export class MoqtPlayer {
           this.emitter.emit('recovery_action', {
             type: 'recovery_action',
             action: { type: 'jump_to_live' },
-          } as any);
+          });
           return;
         }
 
@@ -3230,7 +3311,7 @@ export class MoqtPlayer {
           this.emitter.emit('recovery_action', {
             type: 'recovery_action',
             action,
-          } as any);
+          });
           doRecoveryAction(action, 'video', this.qualityController, this.log, {
             onQualityReduced: (newTrack) => {
               // No stats here — deferred to completePendingVideoSwitch.
@@ -3770,6 +3851,265 @@ export class MoqtPlayer {
         ));
       });
     }
+  }
+
+  // ─── Media liveness: starvation detection + restart ladder ──────────
+
+  /**
+   * Reconcile the liveness monitor with the live subscription map, then
+   * evaluate starvation. Called from tick(); a handful of entries, so no
+   * gating needed. Init/catalog/timeline subscriptions are excluded —
+   * they deliver one object (or sparse objects) by design.
+   */
+  private syncAndCheckLiveness(): void {
+    const monitor = this.livenessMonitor;
+    if (!monitor) return;
+    if (this.stateMachine.state !== PlayerState.PLAYING) return;
+    monitor.reconcile(this.collectLivenessTracks());
+    monitor.check(performance.now());
+  }
+
+  /**
+   * Stamp a media-object arrival on the liveness monitor. An object can
+   * race the first tick's reconcile (subscription registered, no tick yet) —
+   * on an unknown alias, reconcile immediately and retry once, so a track
+   * that delivers exactly one object before dying is still armed.
+   */
+  private stampMediaArrival(trackAlias: bigint): void {
+    const monitor = this.livenessMonitor;
+    if (!monitor) return;
+    const nowMs = performance.now();
+    if (!monitor.noteArrival(trackAlias, nowMs)) {
+      monitor.reconcile(this.collectLivenessTracks());
+      monitor.noteArrival(trackAlias, nowMs);
+    }
+  }
+
+  /** Active video/audio media subscriptions eligible for liveness monitoring. */
+  private collectLivenessTracks(): LivenessTrack[] {
+    const initRequestIds = new Set(this.initTrackRequestIds.values());
+    const out: LivenessTrack[] = [];
+    for (const [requestId, sub] of this.activeSubscriptions) {
+      if (sub.mediaType !== 'video' && sub.mediaType !== 'audio') continue;
+      if (requestId === this.catalogRequestId || requestId === this.timelineRequestId) continue;
+      if (initRequestIds.has(requestId)) continue;
+      out.push({
+        requestId,
+        trackAlias: sub.trackAlias,
+        mediaType: sub.mediaType,
+        trackName: sub.trackName,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Restart ladder for a starved track. One incident per track at a time.
+   *
+   * Attempt 1: REQUEST_UPDATE refresh (NextGroupStart) on the existing
+   * subscription — but on draft-18 the request stream may have died WITH
+   * the delivery path (requestUpdate throws), in which case escalate to a
+   * full resubscribe within the same attempt. Attempts ≥2: full
+   * resubscribe directly. Bounded by livenessMaxRestarts with exponential
+   * backoff; the budget resets after livenessHealthyResetMs of health.
+   * Exhausted → fatal MEDIA_STARVED (the application layer reconnects).
+   */
+  private async handleTrackStarvation(
+    track: LivenessTrack,
+    starvedForMs: number,
+    healthyForMs: number,
+  ): Promise<void> {
+    const key = `${track.mediaType}:${track.trackName}`;
+    let restart = this.livenessRestarts.get(key);
+    if (!restart) {
+      restart = { attempts: 0, active: false, cancelled: false };
+      this.livenessRestarts.set(key, restart);
+    }
+    if (restart.active) return;
+
+    // A pending video switch already implies a fresh subscription — let it
+    // finish (it has its own staging timeout). If the track is still starved
+    // afterwards, the monitor fires again.
+    if (track.mediaType === 'video' && this.pendingVideoSwitch) return;
+
+    // Budget reset on REAL health: the monitor reports the uninterrupted
+    // arrival streak that preceded this starvation — not merely time since
+    // the last incident (which would credit a stretch of repeated failures).
+    if (restart.attempts > 0 && healthyForMs >= this.config.livenessHealthyResetMs!) {
+      restart.attempts = 0;
+    }
+
+    restart.active = true;
+    restart.cancelled = false;
+    this.log.warn('Liveness: %s "%s" starved (%dms without objects) — restarting delivery',
+      track.mediaType, track.trackName, Math.round(starvedForMs));
+    try {
+      const maxAttempts = this.config.livenessMaxRestarts!;
+      while (restart.attempts < maxAttempts && this.livenessLadderMayContinue(restart)) {
+        const attempt = restart.attempts + 1;
+        // Backoff before retries (not before the first attempt — the
+        // starvation timeout already waited).
+        if (restart.attempts > 0) {
+          const backoffMs = this.config.livenessRestartBackoffMs! * 2 ** (restart.attempts - 1);
+          await this.livenessSleep(backoffMs, restart);
+          if (!this.livenessLadderMayContinue(restart)) return;
+        }
+        const attemptStartMs = performance.now();
+        restart.attempts++;
+        this.emitter.emit('recovery_action', {
+          type: 'recovery_action',
+          action: {
+            type: 'track_restart',
+            mediaType: track.mediaType,
+            trackName: track.trackName,
+            attempt,
+          },
+        });
+
+        this.flushForLivenessRestart(track);
+        if (attempt === 1 && await this.tryRefreshSubscription(track)) {
+          this.log.info('Liveness: refreshed %s "%s" via REQUEST_UPDATE (attempt %d)',
+            track.mediaType, track.trackName, attempt);
+        } else {
+          // Refresh unavailable/failed or a later attempt — full resubscribe.
+          this.fullResubscribeForLiveness(track);
+        }
+
+        // Probe: did delivery resume? (A full resubscribe registers a new
+        // requestId — the probe matches by track name, not identity.)
+        if (await this.waitForTrackArrival(track, attemptStartMs, this.config.livenessTimeoutMs!, restart)) {
+          this.log.info('Liveness: %s "%s" recovered on attempt %d',
+            track.mediaType, track.trackName, attempt);
+          return;
+        }
+      }
+
+      if (this.livenessLadderMayContinue(restart)) {
+        this.emitError(createPlayerError(
+          'fatal', 'connection', PlayerErrorCode.MEDIA_STARVED,
+          `Media delivery starved: ${track.mediaType} "${track.trackName}" — ` +
+          `${this.config.livenessMaxRestarts} restart attempts failed`,
+          { context: { mediaType: track.mediaType, trackName: track.trackName } },
+        ));
+        if (this.stateMachine.state !== PlayerState.ERROR) {
+          this.transitionState(PlayerState.ERROR);
+        }
+        this.stopTicking();
+      }
+    } finally {
+      restart.active = false;
+    }
+  }
+
+  /** The ladder stops on cancel (stop/destroy), destroy, or leaving PLAYING. */
+  private livenessLadderMayContinue(restart: { cancelled: boolean }): boolean {
+    return !restart.cancelled && !this._destroyed
+      && this.stateMachine.state === PlayerState.PLAYING;
+  }
+
+  /** Cancellation-aware sleep (checks every 250ms). */
+  private async livenessSleep(ms: number, restart: { cancelled: boolean }): Promise<void> {
+    const deadline = performance.now() + ms;
+    while (performance.now() < deadline) {
+      if (!this.livenessLadderMayContinue(restart)) return;
+      const remaining = deadline - performance.now();
+      await new Promise((r) => setTimeout(r, Math.min(250, Math.max(0, remaining))));
+    }
+  }
+
+  /** Poll for a post-restart arrival on the track (by name — identity may change). */
+  private async waitForTrackArrival(
+    track: LivenessTrack,
+    sinceMs: number,
+    timeoutMs: number,
+    restart: { cancelled: boolean },
+  ): Promise<boolean> {
+    const deadline = performance.now() + timeoutMs;
+    const pollMs = Math.min(250, Math.max(10, timeoutMs / 5));
+    // Arrival is checked AFTER each sleep too — an object landing between
+    // the final poll and the deadline must count as recovery.
+    for (;;) {
+      if (!this.livenessLadderMayContinue(restart)) return false;
+      const last = this.livenessMonitor?.lastArrivalForTrack(track.trackName, track.mediaType);
+      if (last !== undefined && last > sinceMs) return true;
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) return false;
+      await new Promise((r) => setTimeout(r, Math.min(pollMs, remaining)));
+    }
+  }
+
+  /**
+   * Flush stale per-path state before a delivery restart, so the restart
+   * never resubscribes against a dirty decoder/assembler (the verified gap
+   * where recovery only flushed if a stall happened to fire first).
+   */
+  private flushForLivenessRestart(track: LivenessTrack): void {
+    const catalogTrack = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === track.trackName);
+    if (catalogTrack?.packaging === 'cmaf') {
+      // CMAF bypasses the LOC pipelines: re-arm the wait-for-keyframe gate
+      // (post-restart mid-group deltas must be dropped, as on init) and drop
+      // any stranded moof half-pair so it can't mispair after the restart.
+      // The MSE buffer itself is NOT flushed — eviction/quota policy governs
+      // it, and the live-edge chase follows the post-restart PTS jump.
+      if (track.mediaType === 'video') this.cmafVideoSynced = false;
+      this.cmafAssembler?.clearPending?.(track.mediaType);
+      return;
+    }
+    // LOC: flush pipeline + sync. Video also gates out stale in-flight
+    // groups (same idiom as the stall path) so pre-restart objects that
+    // straggle in don't replay old content.
+    if (track.mediaType === 'video') {
+      const minFreshGroup = (this.videoPipeline?.currentGroupId ?? -1n) + 1n;
+      this.videoPipeline?.reset(minFreshGroup);
+    } else {
+      this.audioPipeline?.reset();
+    }
+    this.syncController?.reset();
+  }
+
+  /**
+   * Attempt a REQUEST_UPDATE refresh (NextGroupStart) on the track's
+   * existing subscription(s). Returns false when there is nothing to
+   * refresh or the update fails — e.g. draft-18 throws when the
+   * subscription's request stream died with the delivery path (§9.11).
+   */
+  private async tryRefreshSubscription(track: LivenessTrack): Promise<boolean> {
+    if (!this.connection) return false;
+    const matching = [...this.activeSubscriptions.entries()].filter(([, sub]) =>
+      sub.trackName === track.trackName && sub.mediaType === track.mediaType);
+    if (matching.length === 0) return false;
+    try {
+      for (const [requestId] of matching) {
+        await this.connection.requestUpdate(varint(requestId), {
+          subscriptionFilter: { type: 'NextGroupStart' },
+        });
+      }
+      return true;
+    } catch (err) {
+      this.log.warn('Liveness: REQUEST_UPDATE refresh failed for %s "%s" (%s) — escalating to resubscribe',
+        track.mediaType, track.trackName, err instanceof Error ? err.message : String(err));
+      return false;
+    }
+  }
+
+  /**
+   * Tear down the (presumed dead) subscription and create a fresh one.
+   * Reuses the PUBLISH_DONE resubscribe machinery for the new SUBSCRIBE +
+   * pipeline reset; outcome is observed by the caller's arrival probe.
+   */
+  private fullResubscribeForLiveness(track: LivenessTrack): void {
+    if (!this.connection || !this.subscriptionManager) return;
+    for (const [requestId, sub] of [...this.activeSubscriptions.entries()]) {
+      if (sub.trackName !== track.trackName || sub.mediaType !== track.mediaType) continue;
+      this.subscriptionManager.unregisterTrack(sub.trackAlias);
+      // Async — a sync try/catch would let the rejection escape. Best-effort:
+      // the request stream may have died with the delivery path.
+      void this.connection.unsubscribe(varint(requestId)).catch(() => { /* gone */ });
+      this.activeSubscriptions.delete(requestId);
+      this.pendingMediaSubs.delete(requestId);
+      this.pendingObjectsByAlias.delete(sub.trackAlias);
+    }
+    this.resubscribeAfterPublishDone(track.trackName);
   }
 
   /**

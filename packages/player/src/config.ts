@@ -365,6 +365,41 @@ export interface RecoveryConfig {
    * (consecutive count) rather than time-windowed. Kept for backward compat.
    */
   readonly gapEscalationWindowMs?: number;
+
+  /**
+   * Media-liveness starvation threshold: while PLAYING, a track with no
+   * object arrivals for this long triggers the restart ladder.
+   * The gap detector handles gaps BETWEEN arrivals; this handles NO
+   * arrivals (transport stream death, relay restart).
+   * Default: 10_000. Set 0 to disable liveness monitoring entirely.
+   */
+  readonly livenessTimeoutMs?: number;
+
+  /**
+   * Shortened liveness fuse after a data-stream reset on a delivering
+   * track: a healthy track re-stamps via its successor stream within this
+   * window; a dead one starves fast instead of waiting the full timeout.
+   * Default: 2_000.
+   */
+  readonly livenessResetProbeMs?: number;
+
+  /**
+   * Maximum delivery-restart attempts per starvation incident before
+   * escalating to a fatal MEDIA_STARVED error. Default: 3.
+   */
+  readonly livenessMaxRestarts?: number;
+
+  /**
+   * Base backoff before restart attempt N≥2 (doubles per attempt).
+   * Default: 1_000.
+   */
+  readonly livenessRestartBackoffMs?: number;
+
+  /**
+   * Uninterrupted healthy delivery for this long resets the restart
+   * budget. Default: 30_000.
+   */
+  readonly livenessHealthyResetMs?: number;
 }
 
 /** Audio options. */
@@ -581,6 +616,13 @@ export const DEFAULT_PLAYER_CONFIG = {
   maxDecodeErrors: 10,
   gapEscalationWindowMs: 10_000,
 
+  // Media liveness (0 disables)
+  livenessTimeoutMs: 10_000,
+  livenessResetProbeMs: 2_000,
+  livenessMaxRestarts: 3,
+  livenessRestartBackoffMs: 1_000,
+  livenessHealthyResetMs: 30_000,
+
   // Audio
   audioScheduleAheadMs: 200,
 
@@ -627,12 +669,26 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     ['qualitySwitchCooldownMs', config.qualitySwitchCooldownMs],
     ['gapEscalationWindowMs', config.gapEscalationWindowMs],
     ['audioScheduleAheadMs', config.audioScheduleAheadMs],
+    ['livenessResetProbeMs', config.livenessResetProbeMs],
+    ['livenessRestartBackoffMs', config.livenessRestartBackoffMs],
+    ['livenessHealthyResetMs', config.livenessHealthyResetMs],
   ];
 
   for (const [name, value] of msFields) {
     if (value !== undefined && value <= 0) {
       throw new RangeError(`${name} must be > 0, got ${value}`);
     }
+  }
+
+  // livenessTimeoutMs: >= 0 (0 disables the liveness monitor)
+  if (config.livenessTimeoutMs !== undefined && config.livenessTimeoutMs < 0) {
+    throw new RangeError(`livenessTimeoutMs must be >= 0 (0 disables), got ${config.livenessTimeoutMs}`);
+  }
+
+  // livenessMaxRestarts: positive integer
+  if (config.livenessMaxRestarts !== undefined
+      && (config.livenessMaxRestarts <= 0 || !Number.isInteger(config.livenessMaxRestarts))) {
+    throw new RangeError(`livenessMaxRestarts must be a positive integer, got ${config.livenessMaxRestarts}`);
   }
 
   // deliveryTimeoutMs: > 0 if set

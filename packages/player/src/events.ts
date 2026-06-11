@@ -222,6 +222,25 @@ export interface PartialGroupAbandonedEvent {
 // ─── Recovery Events ─────────────────────────────────────────────────
 
 /**
+ * Player-level recovery actions, layered on top of the pipeline's
+ * {@link RecoveryAction} union:
+ *
+ * - `jump_to_live` — persistent stalls flushed the backlog and resubscribed
+ *   from the live edge.
+ * - `track_restart` — the media-liveness ladder restarted a starved track's
+ *   delivery (REQUEST_UPDATE refresh or full resubscribe).
+ */
+export type PlayerRecoveryAction =
+  | RecoveryAction
+  | { readonly type: 'jump_to_live' }
+  | {
+    readonly type: 'track_restart';
+    readonly mediaType: 'video' | 'audio';
+    readonly trackName: string;
+    readonly attempt: number;
+  };
+
+/**
  * Recovery controller recommends an action.
  * @see draft-ietf-moq-transport-16 §7 (Priorities)
  * @see draft-ietf-moq-transport-16 §13.4.3 (TOO_FAR_BEHIND)
@@ -229,7 +248,7 @@ export interface PartialGroupAbandonedEvent {
  */
 export interface RecoveryActionEvent {
   readonly type: 'recovery_action';
-  readonly action: RecoveryAction;
+  readonly action: PlayerRecoveryAction;
 }
 
 // ─── Decoder Command Events ─────────────────────────────────────────

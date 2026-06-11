@@ -218,6 +218,28 @@ describe('CmafAssembler', () => {
     expect(onSegment).not.toHaveBeenCalled();
   });
 
+  it('clearPending drops half-pairs for one media type only (liveness restart)', () => {
+    const onSegment = vi.fn();
+    const assembler = new CmafAssembler({ onSegment });
+
+    // A delivery restart can strand a moof whose mdat never arrived.
+    assembler.push('video', 't1', 5n, buildMoof(90000));
+    assembler.push('audio', 't1', 5n, buildMoof(48000));
+
+    assembler.clearPending('video');
+
+    // The stale video moof must NOT pair with a post-restart mdat…
+    assembler.push('video', 't1', 5n, buildMdat(new Uint8Array([0xCA])));
+    expect(onSegment).not.toHaveBeenCalled();
+
+    // …while the audio half-pair (untouched media type) still completes,
+    // and the audio epoch was not reset.
+    assembler.push('audio', 't1', 5n, buildMdat(new Uint8Array([0xAA])));
+    expect(onSegment).toHaveBeenCalledTimes(1);
+    expect(onSegment.mock.calls[0]![0]).toBe('audio');
+    expect(assembler.getEpoch('audio')).toBe(48000n);
+  });
+
   it('handles interleaved audio and video', () => {
     const onSegment = vi.fn();
     const assembler = new CmafAssembler({ onSegment });

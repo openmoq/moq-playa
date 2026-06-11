@@ -60,6 +60,8 @@ export const PlayerErrorCode = {
   CONNECTION_LOST: 0x1003,
   /** REQUEST_UPDATE failed — forward state change not sent. @see §9.11 */
   REQUEST_UPDATE_FAILED: 0x1004,
+  /** Media delivery starved and the restart ladder was exhausted. */
+  MEDIA_STARVED: 0x1005,
 
   // ── Decoder (0x1100) ──────────────────────────────────────
   /** Video decoder error (WebCodecs). */

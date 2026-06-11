@@ -300,6 +300,20 @@ export class CmafAssembler {
     return mediaType === 'video' ? this.videoEpoch : this.audioEpoch;
   }
 
+  /**
+   * Drop pending half-pairs (moof without mdat) for one media type.
+   *
+   * Used by the player's media-liveness restart: a delivery restart can
+   * strand a moof whose mdat never arrived, and a post-restart mdat for the
+   * same group must not pair against the stale moof. Epochs, bmd history,
+   * and the other media type are untouched — this is NOT a full reset().
+   */
+  clearPending(mediaType: 'video' | 'audio'): void {
+    for (const key of [...this.pendingMoofs.keys()]) {
+      if (key.startsWith(`${mediaType}:`)) this.pendingMoofs.delete(key);
+    }
+  }
+
   /** Clear all pending moofs, epoch state, and parsed init defaults. */
   reset(): void {
     this.pendingMoofs.clear();

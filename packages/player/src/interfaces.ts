@@ -327,6 +327,15 @@ export interface CmafAssemblerLike {
    */
   setInitSegment?(mediaType: 'video' | 'audio', initBytes: Uint8Array): void;
   getEpoch(mediaType: 'video' | 'audio'): bigint | null;
+  /**
+   * Drop pending half-pairs (moof without mdat) for one media type, leaving
+   * epochs and the other media type untouched. Used by the media-liveness
+   * restart so a stale moof can't pair against a post-restart mdat.
+   *
+   * Optional on the interface for back-compat; assemblers without pairing
+   * state may ignore the call.
+   */
+  clearPending?(mediaType: 'video' | 'audio'): void;
   reset(): void;
   destroy(): void;
 }

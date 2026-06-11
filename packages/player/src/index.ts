@@ -44,6 +44,7 @@ export type {
   KeyframeWaitingEvent,
   TrackEndedEvent,
   RecoveryActionEvent,
+  PlayerRecoveryAction,
   FirstFrameEvent,
   StallEvent,
   QualitySwitchedEvent,

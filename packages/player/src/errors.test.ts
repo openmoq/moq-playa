@@ -62,6 +62,15 @@ describe('Error Taxonomy', () => {
     }
   });
 
+  it('error codes are unique', () => {
+    const codes = Object.values(PlayerErrorCode);
+    expect(new Set(codes).size).toBe(codes.length);
+  });
+
+  it('MEDIA_STARVED lives in the connection block', () => {
+    expect(PlayerErrorCode.MEDIA_STARVED).toBe(0x1005);
+  });
+
   it('all severity values are valid', () => {
     const severities = ['transient', 'degraded', 'fatal'] as const;
     for (const severity of severities) {
