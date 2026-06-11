@@ -174,6 +174,11 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
         this.errorCount++;
         this.onError?.(new Error(err.message));
 
+        // Chunks in flight died with the failed decoder — discard their
+        // queued render times. Leaving them would pair every later output
+        // with a stale entry, drifting audio permanently behind (A/V desync).
+        this.renderTimeQueue.length = 0;
+
         // Decoder enters 'closed' state on error — recreate.
         // Each audio frame is independently decodable (LOC §4.1),
         // so we can continue from the next frame.
