@@ -172,6 +172,22 @@ let player: MoqtPlayer | null = null;
 let renderer: CanvasRenderer | null = null;
 let trace: QlogTrace | null = null;
 let statsInterval: ReturnType<typeof setInterval> | null = null;
+/** The `?fetchCatalog=1` external connection — player.destroy() won't close it. */
+let externalConnection: InstanceType<typeof MoqtConnection> | null = null;
+
+// One AudioContext/clock per PAGE (created on first user gesture, reused across
+// stop/play cycles — each fresh player gets a new WebAudioOutput on the same ctx).
+let audioCtx: AudioContext | null = null;
+let audioClock: AudioAlignedClock | null = null;
+function ensureAudio(): { ctx: AudioContext; clock: AudioAlignedClock } {
+    if (!audioCtx || !audioClock) {
+        audioClock = new AudioAlignedClock();
+        audioCtx = new AudioContext();
+        audioClock.attachAudioContext(audioCtx);
+    }
+    if (audioCtx.state === 'suspended') void audioCtx.resume();
+    return { ctx: audioCtx, clock: audioClock };
+}
 
 // ─── Sparkline Data ──────────────────────────────────────────────────
 
@@ -270,8 +286,117 @@ function stopSparklineLoop(): void { clearInterval(sparkIntervalId); }
 
 // ─── Player chrome (auto-hide, click-to-toggle, fullscreen) ─────────
 
-let isPaused = false;
+// LIVE Stop/Play semantics (NOT pause/resume): this is live media, so "pause"
+// via REQUEST_UPDATE forward:0 is wrong for the demo — the <video> element kept
+// draining its buffer, and resume stranded currentTime behind a buffered gap
+// (permanent stall). Stop now tears the player down (unsubscribe + close);
+// Play performs a fresh tune-in (connect → catalog → subscribe → live edge).
+let isPlaying = false;
+let transitioning = false; // double-click guard while start/stop is in flight
 let hideTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ── Live resilience: media-liveness watchdog + fatal-error reconnect ─────────
+// A live player must never sit in "playing" with no media arriving (Safari WT
+// stream death, relay restart). Watchdog: once the FIRST media object of a
+// session arrives (startup is covered by the player's own watchdogs), if no
+// object arrives for LIVENESS_TIMEOUT_MS — or a fatal connection error fires —
+// run the same Stop + fresh-tune-in lifecycle the Stop/Play button uses, with
+// bounded backoff. Intentional Stop disarms everything.
+const LIVENESS_TIMEOUT_MS = 10_000;
+const HEALTHY_RESET_MS = 30_000;            // media flowing this long → retry budget resets
+const RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 8000];
+const MAX_RECONNECT_ATTEMPTS = 6;           // per incident (budget resets when healthy)
+const START_ATTEMPT_TIMEOUT_MS = 15_000;    // a hung tune-in counts as a failed attempt
+
+let lastMediaMs = 0;          // 0 = disarmed (no media yet this session)
+let healthySinceMs = 0;       // start of the current uninterrupted media streak
+let reconnecting = false;     // a reconnect loop is in flight
+let reconnectCancelled = false; // user pressed Stop during a reconnect loop
+let retryCount = 0;
+let playEpoch = 0;            // bumped by every stopPlayback(); a startPlayback()
+                              // that observes a stale epoch must not touch state
+
+/** Called from the media_object listener inside startPlayback(). */
+function noteMediaArrival(): void {
+    const now = performance.now();
+    // A fresh session or a liveness-sized gap starts a new healthy streak.
+    if (lastMediaMs === 0 || now - lastMediaMs > LIVENESS_TIMEOUT_MS) healthySinceMs = now;
+    lastMediaMs = now;
+}
+
+// Dev-console introspection for the resilience state (like window.__player).
+(window as any).__liveness = () => ({
+    lastMediaMs, healthySinceMs, isPlaying, transitioning, reconnecting, retryCount, playEpoch,
+    sinceMediaMs: lastMediaMs === 0 ? null : Math.round(performance.now() - lastMediaMs),
+});
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+    return Promise.race([
+        p,
+        new Promise<T>((_, rej) => setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms)),
+    ]);
+}
+
+/** Tear down and re-tune with bounded backoff. One loop per incident. */
+async function reconnect(reason: string): Promise<void> {
+    if (reconnecting || transitioning || !isPlaying) return;
+    reconnecting = true;
+    reconnectCancelled = false;
+    log(`⚠ ${reason} — reconnecting...`);
+    try {
+        transitioning = true;
+        try { await stopPlayback(); } finally { transitioning = false; }
+
+        while (retryCount < MAX_RECONNECT_ATTEMPTS && !reconnectCancelled) {
+            const delay = RECONNECT_BACKOFF_MS[Math.min(retryCount, RECONNECT_BACKOFF_MS.length - 1)]!;
+            log(`Reconnect attempt ${retryCount + 1}/${MAX_RECONNECT_ATTEMPTS} in ${delay / 1000}s...`);
+            await new Promise((r) => setTimeout(r, delay));
+            if (reconnectCancelled) break;
+            try {
+                transitioning = true;
+                loadingSpinner.style.display = '';
+                await withTimeout(startPlayback(), START_ATTEMPT_TIMEOUT_MS, 'tune-in');
+                if (reconnectCancelled) {
+                    // User pressed Stop while this attempt was in flight — honor it.
+                    try { await stopPlayback(); } catch { /* best effort */ }
+                    return;
+                }
+                log('Reconnected.');
+                return; // success — retry budget resets after sustained healthy media
+            } catch (err) {
+                retryCount++;
+                log(`Reconnect failed: ${(err as Error).message}`);
+                // Clean up any half-started state before the next attempt.
+                try { await stopPlayback(); } catch { /* best effort */ }
+            } finally {
+                transitioning = false;
+                loadingSpinner.style.display = 'none';
+            }
+        }
+        if (!reconnectCancelled) {
+            log(`Gave up after ${MAX_RECONNECT_ATTEMPTS} attempts — press play to retry manually.`);
+            centerPlay.style.display = '';
+        }
+    } finally {
+        reconnecting = false;
+    }
+}
+
+// Liveness tick: 1s cadence, guards make it a no-op unless armed and playing.
+setInterval(() => {
+    const now = performance.now();
+    // 30s of UNINTERRUPTED media after an incident → reset the retry budget.
+    if (retryCount > 0 && healthySinceMs > 0 && lastMediaMs > 0
+        && now - lastMediaMs < LIVENESS_TIMEOUT_MS
+        && now - healthySinceMs > HEALTHY_RESET_MS) {
+        retryCount = 0;
+    }
+    if (!isPlaying || transitioning || reconnecting) return;
+    if (lastMediaMs === 0) return; // not armed: no media yet this session
+    if (now - lastMediaMs > LIVENESS_TIMEOUT_MS) {
+        void reconnect(`No media for ${Math.round((now - lastMediaMs) / 1000)}s`);
+    }
+}, 1000);
 
 function showPlayerControls() {
     controls.classList.remove('hidden');
@@ -280,7 +405,7 @@ function showPlayerControls() {
 }
 
 function hidePlayerControls() {
-    if (!isPaused && player) {
+    if (isPlaying && player) {
         controls.classList.add('hidden');
         playerWrap.classList.add('hide-cursor');
     }
@@ -288,34 +413,86 @@ function hidePlayerControls() {
 
 function resetHideTimer() {
     if (hideTimer) clearTimeout(hideTimer);
-    if (!isPaused && player) hideTimer = setTimeout(hidePlayerControls, 3000);
+    if (isPlaying && player) hideTimer = setTimeout(hidePlayerControls, 3000);
 }
 
-function flashCenter(type: 'play' | 'pause') {
+function flashCenter(type: 'play' | 'stop') {
     flashIcon.innerHTML = type === 'play'
         ? '<svg viewBox="0 0 24 24" fill="white" width="40" height="40"><path d="M8 5.14v14l11-7z"/></svg>'
-        : '<svg viewBox="0 0 24 24" fill="white" width="40" height="40"><path d="M6 4h4v16H6zm8 0h4v16h-4z"/></svg>';
+        : '<svg viewBox="0 0 24 24" fill="white" width="40" height="40"><path d="M6 6h12v12H6z"/></svg>';
     centerFlash.style.display = '';
     setTimeout(() => { centerFlash.style.display = 'none'; }, 500);
 }
 
-function togglePlayPause() {
-    if (!player) return;
-    if (isPaused) {
-        player.play();
-        renderer?.start();
-        isPaused = false;
-        pauseIcon.innerHTML = '<path d="M6 4h4v16H6zm8 0h4v16h-4z"/>';
-        flashCenter('play');
-        resetHideTimer();
-    } else {
-        player.pause();
-        renderer?.stop();
-        isPaused = true;
-        pauseIcon.innerHTML = '<path d="M8 5.14v14l11-7z"/>';
-        flashCenter('pause');
-        showPlayerControls();
-        if (hideTimer) clearTimeout(hideTimer);
+/** Reflect playing/stopped on the control button (square = stop, triangle = play). */
+function setControlIcon(playing: boolean) {
+    pauseIcon.innerHTML = playing ? '<path d="M6 6h12v12H6z"/>' : '<path d="M8 5.14v14l11-7z"/>';
+}
+
+/**
+ * STOP: immediately halt the visible media, then tear the player down.
+ * `player.destroy()` unsubscribes everything and (for player-owned connections)
+ * closes the session; the `?fetchCatalog=1` external connection is closed here.
+ */
+async function stopPlayback(): Promise<void> {
+    // Immediate visual stop FIRST — never let the element drain its buffer.
+    videoEl.pause();
+    renderer?.stop();
+    lastMediaMs = 0; // disarm the liveness watchdog for this session
+    healthySinceMs = 0;
+    playEpoch++;     // invalidate any in-flight startPlayback() attempt
+
+    const p = player;
+    player = null;
+    (window as any).__player = null;
+    isPlaying = false;
+    setControlIcon(false);
+    flashCenter('stop');
+    showPlayerControls();
+    if (hideTimer) clearTimeout(hideTimer);
+
+    try {
+        await p?.destroy(); // unsubscribes; closes player-owned connection; MSE detached
+    } catch (err) {
+        log(`stop: destroy error (ignored): ${(err as Error).message}`);
+    }
+    if (externalConnection) {
+        try { await externalConnection.close(); } catch { /* already closed */ }
+        externalConnection = null;
+    }
+    renderer = null;
+    log('Stopped. Press play to tune back in at the live edge.');
+}
+
+/** Stop ⇄ fresh-tune-in toggle, guarded against double clicks. */
+async function toggleStopPlay(): Promise<void> {
+    // A user action overrides any in-flight auto-reconnect loop — checked BEFORE
+    // the transition guard, because the loop's own stop/start phases set
+    // `transitioning` and a Stop click during them must still cancel.
+    if (reconnecting) {
+        reconnectCancelled = true;
+        log('Auto-reconnect cancelled.');
+        return;
+    }
+    if (transitioning) return;
+    transitioning = true;
+    pauseBtn.disabled = true;
+    try {
+        if (isPlaying) {
+            await stopPlayback();
+        } else {
+            retryCount = 0; // a manual play starts with a fresh retry budget
+            flashCenter('play');
+            loadingSpinner.style.display = '';
+            await startPlayback();
+        }
+    } catch (err) {
+        log(`Fatal: ${(err as Error).message}`);
+        console.error(err);
+        loadingSpinner.style.display = 'none';
+    } finally {
+        transitioning = false;
+        pauseBtn.disabled = false;
     }
 }
 
@@ -325,14 +502,14 @@ playerWrap.addEventListener('click', (e) => {
     if (videoEl.muted) videoEl.muted = false;
     // Don't toggle if clicking controls or center play
     if ((e.target as HTMLElement).closest('.controls, .center-play, .stats-overlay')) return;
-    if (player) togglePlayPause();
+    if (player || isPlaying) void toggleStopPlay();
 });
 playerWrap.addEventListener('dblclick', (e) => {
     if ((e.target as HTMLElement).closest('.controls, .center-play')) return;
     if (!document.fullscreenElement) playerWrap.requestFullscreen();
     else document.exitFullscreen();
 });
-pauseBtn.addEventListener('click', (e) => { e.stopPropagation(); togglePlayPause(); });
+pauseBtn.addEventListener('click', (e) => { e.stopPropagation(); void toggleStopPlay(); });
 fullscreenBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     if (!document.fullscreenElement) playerWrap.requestFullscreen();
@@ -343,15 +520,9 @@ fullscreenBtn.addEventListener('click', (e) => {
 
 startBtn.addEventListener('click', (e) => {
     e.stopPropagation();
+    if (transitioning || isPlaying) return;
     centerPlay.style.display = 'none';
-    loadingSpinner.style.display = '';
-    const audioClock = new AudioAlignedClock();
-    const audioCtx = new AudioContext();
-    audioClock.attachAudioContext(audioCtx);
-    main(audioCtx, audioClock).catch((err) => {
-        log(`Fatal: ${(err as Error).message}`);
-        console.error(err);
-    });
+    void toggleStopPlay();
 });
 
 qlogBtn.addEventListener('click', (e) => {
@@ -635,7 +806,13 @@ async function prefetchCatalogViaFetch(): Promise<{
     return { connection, catalog };
 }
 
-async function main(audioCtx: AudioContext, audioClock: AudioAlignedClock): Promise<void> {
+/** Fresh tune-in: connect → catalog → subscribe → play. Re-invokable after stopPlayback(). */
+async function startPlayback(): Promise<void> {
+    // Stale-attempt token: a reconnect attempt that times out (withTimeout) keeps
+    // running underneath — the loop's cleanup stopPlayback() bumps playEpoch, and
+    // this attempt must then bail without mutating player/UI state.
+    const epoch = playEpoch;
+    const { ctx: audioCtx, clock: audioClock } = ensureAudio();
     log(`Relay: ${relayUrl}`);
     log(`Namespace: ${Array.isArray(namespaceArg) ? `[${namespaceArg.map(f => `"${f}"`).join(', ')}]` : namespaceArg}`);
     if (catalogFromUrl) log(`Catalog: injected (${catalogFromUrl.tracks.length} tracks)`);
@@ -660,6 +837,12 @@ async function main(audioCtx: AudioContext, audioClock: AudioAlignedClock): Prom
     let prefetched: { connection: InstanceType<typeof MoqtConnection>; catalog: { tracks: any[] } } | null = null;
     if (params.get('fetchCatalog') === '1' && !catalogFromUrl) {
         prefetched = await prefetchCatalogViaFetch();
+        if (epoch !== playEpoch) {
+            // Superseded (timeout/stop) while prefetching — leave state alone.
+            try { await prefetched.connection.close(); } catch { /* already closed */ }
+            return;
+        }
+        externalConnection = prefetched.connection; // closed by stopPlayback()
     }
 
     // ?res=720 → quality controller picks the matching track at startup
@@ -701,6 +884,12 @@ async function main(audioCtx: AudioContext, audioClock: AudioAlignedClock): Prom
     player.on('error', (e) => {
         const err = e.error;
         log(`[ErrorTaxonomy] ${err.severity}/${err.source} code=0x${err.code.toString(16)}: ${err.message}`);
+        // Fatal connection loss → same Stop + fresh-tune-in lifecycle as the
+        // liveness watchdog. (Intentional stop emits no errors — destroy() is
+        // quiet and the adapter swallows teardown accept-loop failures.)
+        if (err.severity === 'fatal' && err.source === 'connection') {
+            void reconnect(`Fatal connection error (0x${err.code.toString(16)})`);
+        }
     });
 
     player.on('catalog_received', (e) => {
@@ -758,6 +947,9 @@ async function main(audioCtx: AudioContext, audioClock: AudioAlignedClock): Prom
 
     // Collect jitter + latency for sparkline graphs
     player.on('media_object', (e) => {
+        // Liveness watchdog: ANY media object (audio included) proves the data
+        // path is alive — stamp before the video-only sparkline filter.
+        noteMediaArrival();
         if (e.mediaType !== 'video' || e.kind !== 'data') return;
         const nowMs = performance.now();
 
@@ -784,8 +976,16 @@ async function main(audioCtx: AudioContext, audioClock: AudioAlignedClock): Prom
     // Expose player on window for console inspection (dev only)
     (window as any).__player = player;
 
-    await player.load();
-    player.play();
+    const p = player; // local ref: the global may be swapped while load() is in flight
+    await p.load();
+    if (epoch !== playEpoch) {
+        // This attempt was timed out / cancelled while load() was pending. The
+        // reconnect loop (or a user Stop) has already torn down and moved on —
+        // a late completion must not resurrect old player/UI state.
+        try { await p.destroy(); } catch { /* best effort */ }
+        return;
+    }
+    p.play();
 
     // MSE: ensure <video> element is playing (autoplay may be blocked)
     videoEl.play().catch(() => { /* autoplay blocked — user interaction needed */ });
@@ -793,9 +993,11 @@ async function main(audioCtx: AudioContext, audioClock: AudioAlignedClock): Prom
     // Start the rendering loop (rAF-driven frame presentation)
     renderer.start();
 
-    // Show controls, hide spinner
+    // Show controls, hide spinner; reflect playing state on the Stop/Play control.
     loadingSpinner.style.display = 'none';
     controls.style.display = '';
+    isPlaying = true;
+    setControlIcon(true);
     showPlayerControls();
 }
 
