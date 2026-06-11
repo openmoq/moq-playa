@@ -70,6 +70,11 @@ export class DeferredAudioOutput implements AudioOutputLike {
     return this.real?.currentPlayoutTimeUs ?? 0;
   }
 
+  /** Forward playhead observability to the real output once activated. */
+  playheadCaptureUs(): number | null {
+    return this.real?.playheadCaptureUs?.() ?? null;
+  }
+
   setPlaybackRate(rate: number): void {
     this.pendingRate = rate;
     this.real?.setPlaybackRate?.(rate);

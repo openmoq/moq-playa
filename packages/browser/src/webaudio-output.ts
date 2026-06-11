@@ -45,6 +45,20 @@ export class WebAudioOutput implements AudioOutputLike {
   /** Active source nodes — tracked for flush/destroy. */
   private readonly activeSources: AudioBufferSourceNode[] = [];
 
+  /**
+   * Scheduled-buffer ring for playhead observability: which capture
+   * timestamp is coming out of the speakers right now. One entry per
+   * scheduled buffer; pruned lazily once playout passes a buffer's end.
+   * `captureUs` is the decoded AudioData.timestamp — WebCodecs preserves
+   * the EncodedAudioChunk timestamp, which LOC sets to CaptureTimestamp.
+   */
+  private readonly scheduledRing: Array<{
+    captureUs: number;
+    startSec: number;
+    durSec: number;
+    rate: number;
+  }> = [];
+
   /** Current playback rate for live catch-up. @see draft-ietf-moq-msf-00 §5.1.16 */
   private _playbackRate = 1.0;
 
@@ -107,6 +121,8 @@ export class WebAudioOutput implements AudioOutputLike {
       const dest = buf.getChannelData(ch);
       audioData.copyTo(dest, { planeIndex: ch, format: 'f32-planar' });
     }
+    // Capture timeline position of this buffer — read BEFORE close().
+    const captureUs = audioData.timestamp;
     audioData.close();
 
     const now = this.audioCtx.currentTime;
@@ -142,6 +158,16 @@ export class WebAudioOutput implements AudioOutputLike {
     // Duration at adjusted rate — faster playout means shorter wall-clock time.
     this.nextScheduledTime = startTime + buf.duration / this._playbackRate;
 
+    // Playhead observability (no scheduling effect): record what was
+    // scheduled where, so playheadCaptureUs() can answer "what capture
+    // timestamp is being heard right now."
+    this.scheduledRing.push({
+      captureUs,
+      startSec: startTime,
+      durSec: buf.duration / this._playbackRate,
+      rate: this._playbackRate,
+    });
+
     // Track for flush/destroy cleanup
     this.activeSources.push(source);
     source.onended = () => {
@@ -159,6 +185,36 @@ export class WebAudioOutput implements AudioOutputLike {
     this._playbackRate = rate;
   }
 
+  /**
+   * The capture timestamp (µs) at the AUDIO GRAPH's playhead — i.e. the
+   * position `AudioContext.currentTime` has reached in the scheduled-buffer
+   * ring. NOT literal speaker output: hardware/output latency
+   * (`AudioContext.outputLatency`, typically 10-40ms) is not applied here;
+   * if measured skew shows a consistent offset, that is a later calibration
+   * concern, not noise. Returns null when the graph is silent: nothing
+   * scheduled, playout not yet started (first-anchor delay), or playout has
+   * run past the last scheduled buffer (starvation).
+   *
+   * Observability only — the LOC A/V skew measurement compares this against
+   * the video frame's CaptureTimestamp at render time. Exact across chained
+   * buffers and playbackRate changes (rate recorded per buffer at schedule).
+   */
+  playheadCaptureUs(): number | null {
+    const now = this.audioCtx.currentTime;
+    // Lazy prune: drop buffers whose playout has fully passed.
+    let firstLive = 0;
+    while (firstLive < this.scheduledRing.length
+        && this.scheduledRing[firstLive]!.startSec + this.scheduledRing[firstLive]!.durSec <= now) {
+      firstLive++;
+    }
+    if (firstLive > 0) this.scheduledRing.splice(0, firstLive);
+
+    const playing = this.scheduledRing[0];
+    if (!playing || now < playing.startSec) return null; // silent: starved or not yet started
+    const intoBufferSec = now - playing.startSec;
+    return playing.captureUs + intoBufferSec * playing.rate * 1_000_000;
+  }
+
   /** Cancel all scheduled audio. */
   flush(): void {
     for (const source of this.activeSources) {
@@ -170,6 +226,7 @@ export class WebAudioOutput implements AudioOutputLike {
       }
     }
     this.activeSources.length = 0;
+    this.scheduledRing.length = 0;
     this.nextScheduledTime = 0;
   }
 

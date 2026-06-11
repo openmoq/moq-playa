@@ -124,6 +124,17 @@ export interface PlayerStats {
   // ── Session ─────────────────────────────────────────────────
   /** Number of reconnections (GOAWAY migrations). 0 until reconnection logic. */
   readonly reconnectCount: number;
+
+  // ── A/V sync (LOC observability) ────────────────────────────
+  /**
+   * Last measured A/V skew (ms): video frame CaptureTimestamp minus the
+   * capture timestamp audibly playing at render time. Positive = video
+   * ahead of audio. null until first measurement (CMAF, video-only, or
+   * audio output without playhead support).
+   */
+  readonly avSkewMs: number | null;
+  /** EWMA of measured A/V skew (ms, α=0.1). null until first measurement. */
+  readonly avSkewEwmaMs: number | null;
 }
 
 // ─── StatsAccumulator ────────────────────────────────────────────────
@@ -174,6 +185,10 @@ export class StatsAccumulator {
 
   // ── Session ─────────────────────────────────────────────────
   private _reconnectCount = 0;
+
+  // ── A/V sync observability ──────────────────────────────────
+  private _avSkewMs: number | null = null;
+  private _avSkewEwmaMs: number | null = null;
 
   // ── Latency (Item 8) ──────────────────────────────────────
   private _currentLatencyMs = 0;
@@ -325,6 +340,16 @@ export class StatsAccumulator {
     this._reconnectCount++;
   }
 
+  // ── A/V sync (LOC observability) ──────────────────────────
+
+  /** Record a measured A/V skew sample (ms). */
+  recordAvSkew(ms: number): void {
+    this._avSkewMs = ms;
+    this._avSkewEwmaMs = this._avSkewEwmaMs === null
+      ? ms
+      : this._avSkewEwmaMs * 0.9 + ms * 0.1;
+  }
+
   // ── Latency ──────────────────────────────────────────────
 
   /**
@@ -437,6 +462,10 @@ export class StatsAccumulator {
 
       // Session
       reconnectCount: this._reconnectCount,
+
+      // A/V sync (LOC observability)
+      avSkewMs: this._avSkewMs,
+      avSkewEwmaMs: this._avSkewEwmaMs,
     };
   }
 }

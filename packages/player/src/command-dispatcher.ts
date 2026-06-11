@@ -55,6 +55,14 @@ export interface CommandDispatcherOptions {
   readonly onFirstFrame?: () => void;
   readonly onStall?: (durationMs: number) => void;
   readonly onFrameRendered?: (captureTimestampUs: bigint, actualRenderUs: number) => void;
+  /**
+   * Measured A/V skew at video frame render time:
+   * `skewUs = videoFrameCaptureUs − audioOutput.playheadCaptureUs()`.
+   * Positive = video ahead of audible audio. Only fired when the audio
+   * output exposes a playhead AND audio is currently audible — pure
+   * observability, no effect on scheduling or rendering.
+   */
+  readonly onAvSkew?: (skewUs: number) => void;
   readonly onError?: (mediaType: 'video' | 'audio', error: Error) => void;
 
   /** Feedback callback for pipeline backpressure. @see draft-ietf-moq-transport-16 §7 */
@@ -219,8 +227,18 @@ export class CommandDispatcher {
       }
       // Always wire onFrameRendered when renderer exists — for feedback path.
       // User callback is also fired if provided.
+      const audioOutput = this.audioOutput;
       this.renderer.onFrameRendered = (captureTimestampUs, actualRenderUs) => {
         opts.onFrameRendered?.(captureTimestampUs, actualRenderUs);
+        // A/V skew observability: compare the rendered frame's capture
+        // timestamp against what the speakers are playing RIGHT NOW.
+        // Measurement only — no scheduling/render behavior depends on it.
+        if (opts.onAvSkew && audioOutput?.playheadCaptureUs) {
+          const playheadUs = audioOutput.playheadCaptureUs();
+          if (playheadUs !== null) {
+            opts.onAvSkew(Number(captureTimestampUs) - playheadUs);
+          }
+        }
         this.onFeedback?.({ type: 'frame_rendered', mediaType: 'video', captureTimestampUs, actualRenderUs });
       };
     }

@@ -2487,6 +2487,9 @@ export class MoqtPlayer {
     this.syncAndCheckLiveness();
   }
 
+  /** Throttle for sync_skew diagnostic events (~1/s). */
+  private lastSkewEmitMs = 0;
+
   /** Timestamp of last ABR downshift — gates upshift for stability. */
   private lastAbrDownshiftUs = 0;
   /** Timestamp (µs) of last video stall — gates LOC upshift. */
@@ -3374,6 +3377,20 @@ export class MoqtPlayer {
       onFeedback: (fb) => this.handleFeedback(fb),
       onCommand: (cmd) => this.handlePipelineCommand(cmd),
       onEvent: (mediaType, evt) => this.handlePipelineEvent(mediaType, evt),
+      // A/V skew observability (LOC): record every sample, emit ~1/s.
+      onAvSkew: (skewUs) => {
+        const skewMs = skewUs / 1000;
+        this._stats.recordAvSkew(skewMs);
+        const nowMs = performance.now();
+        if (nowMs - this.lastSkewEmitMs >= 1000) {
+          this.lastSkewEmitMs = nowMs;
+          this.emitter.emit('sync_skew', {
+            type: 'sync_skew',
+            skewMs,
+            ewmaMs: this.stats.avSkewEwmaMs ?? skewMs,
+          });
+        }
+      },
     }, this._handshakeRttMs);
 
     // Store pipeline set in player fields — MUST happen before

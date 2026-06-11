@@ -192,6 +192,20 @@ export interface SyncDriftEvent {
 }
 
 /**
+ * Measured A/V skew (LOC observability, throttled to ~1/s): the rendered
+ * video frame's CaptureTimestamp minus the capture timestamp audibly playing
+ * at that instant. Positive = video ahead of audio. Diagnostic only — unlike
+ * sync_drift (expected-vs-actual video render time), this measures actual
+ * audio playout against actual video render.
+ * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for sync)
+ */
+export interface SyncSkewEvent {
+  readonly type: 'sync_skew';
+  readonly skewMs: number;
+  readonly ewmaMs: number;
+}
+
+/**
  * Waiting for a keyframe after a gap (decoder cannot decode delta frames).
  * @see draft-ietf-moq-loc-01 §2.3.2.2 (VideoFrameMarking)
  */
@@ -576,6 +590,7 @@ export interface PlayerEventMap {
   gap_detected: GapDetectedEvent;
   skip_forward: SkipForwardEvent;
   sync_drift: SyncDriftEvent;
+  sync_skew: SyncSkewEvent;
   keyframe_waiting: KeyframeWaitingEvent;
   track_ended: TrackEndedEvent;
   partial_group_abandoned: PartialGroupAbandonedEvent;

@@ -76,6 +76,8 @@ export interface PipelineCallbacks {
   onFeedback: (fb: DecoderFeedback) => void;
   onCommand: (cmd: DecoderCommand) => void;
   onEvent: (mediaType: 'video' | 'audio', evt: PlaybackEvent) => void;
+  /** Measured A/V skew at video render (µs, positive = video ahead). Optional observability. */
+  onAvSkew?: (skewUs: number) => void;
 }
 
 /** Result of createPipelines — player stores these in its fields. */
@@ -225,6 +227,7 @@ export function createPipelines(
       onError: (mediaType: 'video' | 'audio', error: Error) => callbacks.onDecodeError(mediaType, error),
       onFrameRendered: (captureTimestampUs: number, actualRenderUs: number) => callbacks.onFrameRendered(captureTimestampUs, actualRenderUs),
       onFeedback: (fb: DecoderFeedback) => callbacks.onFeedback(fb),
+      onAvSkew: callbacks.onAvSkew,
       // Recompute video render time at decode OUTPUT using the SyncController.
       // Eliminates startup stutter from async decode latency — render times
       // are fresh relative to the current clock, not stale from pipeline processing.

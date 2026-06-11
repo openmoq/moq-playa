@@ -2497,6 +2497,55 @@ describe('MoqtPlayer', () => {
       expect(createAudioOutput).toHaveBeenCalledOnce();
     });
 
+    it('measures A/V skew from rendered frames vs audio playhead (observability only)', async () => {
+      const adapter = createMockAdapter();
+      const renderer: any = {
+        enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(),
+        onFirstFrame: null, onFrameRendered: null, onStall: null,
+      };
+      const audioOutput = {
+        schedule: vi.fn(), flush: vi.fn(), currentPlayoutTimeUs: 0, destroy: vi.fn(),
+        playheadCaptureUs: vi.fn(() => 5_000_000), // 5.000s of capture audible
+      };
+      const player = await loadWithCatalog(adapter, {
+        ...createPipelineConfig(adapter),
+        createVideoDecoder: () => ({
+          configure: vi.fn(), decode: vi.fn(), flush: vi.fn(() => Promise.resolve()),
+          reset: vi.fn(), queueDepth: 0, onFrame: null, onError: null, destroy: vi.fn(),
+        }),
+        createAudioDecoder: () => ({
+          configure: vi.fn(), decode: vi.fn(), flush: vi.fn(() => Promise.resolve()),
+          reset: vi.fn(), queueDepth: 0, onData: null, onError: null, destroy: vi.fn(),
+        }),
+        createRenderer: () => renderer,
+        createAudioOutput: () => audioOutput,
+      });
+      const skewEvents: any[] = [];
+      player.on('sync_skew', (e) => skewEvents.push(e));
+
+      expect(player.stats.avSkewMs).toBeNull(); // no measurement yet
+
+      // A video frame captured at 5.120s renders while audio plays 5.000s.
+      renderer.onFrameRendered?.(5_120_000n, 1_000_000);
+
+      expect(player.stats.avSkewMs).toBeCloseTo(120, 5); // video 120ms ahead
+      expect(player.stats.avSkewEwmaMs).toBeCloseTo(120, 5);
+      expect(skewEvents).toHaveLength(1);
+      expect(skewEvents[0]).toMatchObject({ type: 'sync_skew', skewMs: 120 });
+
+      // Observability MUST NOT change behavior: nothing scheduled or
+      // enqueued as a side effect of measuring.
+      expect(renderer.enqueue).not.toHaveBeenCalled();
+      expect(audioOutput.schedule).not.toHaveBeenCalled();
+
+      // Throttle: an immediate second render records stats but emits no event.
+      renderer.onFrameRendered?.(5_153_000n, 1_033_000);
+      expect(player.stats.avSkewMs).toBeCloseTo(153, 5);
+      expect(skewEvents).toHaveLength(1);
+
+      await player.destroy();
+    });
+
     it('dispatches decoder commands through CommandDispatcher (LOC §2.1, §4.1)', async () => {
       // When adapter factories are provided, decoder commands from the
       // pipeline should flow through the CommandDispatcher to the adapters.

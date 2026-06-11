@@ -693,6 +693,7 @@ function updateStatsOverlay(): void {
         ${statRow('Decode Errors', `${s.decodeErrorCount}`, s.decodeErrorCount > 0 ? 'bad' : 'good')}
         ${statRow('Gap Events', `${s.gapCount}`, s.gapCount > 0 ? 'warn' : '')}
         ${statRow('Recoveries', `${s.recoveryActionCount}`, s.recoveryActionCount > 0 ? 'warn' : '')}
+        ${s.avSkewMs !== null ? statRow('A/V Skew', `${s.avSkewMs.toFixed(0)}ms (avg ${(s.avSkewEwmaMs ?? 0).toFixed(0)}ms)`, Math.abs(s.avSkewEwmaMs ?? 0) > 80 ? 'warn' : 'good') : ''}
       </div>
       <div class="stats-section">
         <div class="section-label">Session</div>

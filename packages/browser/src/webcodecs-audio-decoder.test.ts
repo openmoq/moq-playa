@@ -118,6 +118,28 @@ describe('WebCodecsAudioDecoder', () => {
     expect(received).toEqual([100, 999]);
   });
 
+  it('preserves the chunk timestamp through decode (CaptureTimestamp fidelity)', () => {
+    // LOC sets EncodedAudioChunk.timestamp = CaptureTimestamp; the playhead
+    // mapping (WebAudioOutput.playheadCaptureUs) depends on that value
+    // surviving decode untouched. Our decoder must (a) pass the chunk
+    // timestamp into the EncodedAudioChunk verbatim and (b) hand the
+    // decoder's AudioData to onData unmodified. (The browser preserving
+    // chunk→AudioData timestamps is WebCodecs-spec behavior, verified
+    // end-to-end in Chrome by the skew harness.)
+    const decoder = configuredDecoder();
+    const received: any[] = [];
+    decoder.onData = (data) => received.push(data);
+
+    decoder.decode({ type: 'key', timestamp: 1_234_567, duration: 20_000, data: new Uint8Array([1]) }, 99);
+
+    const submitted = decodeSpy.mock.calls[0]![0] as { timestamp: number };
+    expect(submitted.timestamp).toBe(1_234_567);
+
+    const fakeAudioData = { timestamp: 1_234_567 };
+    createdDecoders[0]!.output(fakeAudioData);
+    expect(received[0]).toBe(fakeAudioData); // same object, timestamp untouched
+  });
+
   it('resets and reports on decode queue overflow instead of dropping silently', () => {
     const decoder = configuredDecoder();
     const received: number[] = [];

@@ -41,6 +41,7 @@ export type {
   GapDetectedEvent,
   SkipForwardEvent,
   SyncDriftEvent,
+  SyncSkewEvent,
   KeyframeWaitingEvent,
   TrackEndedEvent,
   RecoveryActionEvent,

@@ -105,6 +105,50 @@ function createMockAudioOutput(): AudioOutputLike {
 
 // ─── Tests ────────────────────────────────────────────────────────────
 
+describe('CommandDispatcher A/V skew observability', () => {
+  it('reports skew = videoCaptureUs − audio playheadCaptureUs at frame render', () => {
+    const renderer = createMockRenderer();
+    const audioOutput = { ...createMockAudioOutput(), playheadCaptureUs: vi.fn(() => 5_000_000) };
+    const onAvSkew = vi.fn();
+    const onFrameRendered = vi.fn();
+    new CommandDispatcher({
+      videoDecoder: createMockVideoDecoder(),
+      audioDecoder: createMockAudioDecoder(),
+      renderer, audioOutput, onAvSkew, onFrameRendered,
+    });
+
+    renderer._triggerFrameRendered(5_120_000n, 1_000_000);
+
+    // Behavior-neutral: the existing callback still fires unchanged…
+    expect(onFrameRendered).toHaveBeenCalledWith(5_120_000n, 1_000_000);
+    // …and skew is reported: video frame is 120ms ahead of audible audio.
+    expect(onAvSkew).toHaveBeenCalledWith(120_000);
+  });
+
+  it('reports no skew when audio is silent (playhead null) or unsupported', () => {
+    const renderer = createMockRenderer();
+    const audioOutput = { ...createMockAudioOutput(), playheadCaptureUs: vi.fn(() => null) };
+    const onAvSkew = vi.fn();
+    new CommandDispatcher({
+      videoDecoder: createMockVideoDecoder(),
+      audioDecoder: createMockAudioDecoder(),
+      renderer, audioOutput, onAvSkew,
+    });
+    renderer._triggerFrameRendered(5_120_000n, 1_000_000);
+    expect(onAvSkew).not.toHaveBeenCalled();
+
+    // Output without playheadCaptureUs (back-compat) — also quiet.
+    const renderer2 = createMockRenderer();
+    new CommandDispatcher({
+      videoDecoder: createMockVideoDecoder(),
+      audioDecoder: createMockAudioDecoder(),
+      renderer: renderer2, audioOutput: createMockAudioOutput(), onAvSkew,
+    });
+    renderer2._triggerFrameRendered(5_120_000n, 1_000_000);
+    expect(onAvSkew).not.toHaveBeenCalled();
+  });
+});
+
 describe('CommandDispatcher', () => {
   // ─── Configure dispatch ──────────────────────────────────────
 

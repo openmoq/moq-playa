@@ -174,6 +174,16 @@ export interface AudioOutputLike {
    */
   setPlaybackRate?(rate: number): void;
 
+  /**
+   * The capture timestamp (µs) at the audio graph's playhead, or null when
+   * the graph is silent (not started / starved / video-only). Note this is
+   * graph position, not literal speaker output — hardware output latency is
+   * not applied. Optional — used for A/V skew observability; outputs that
+   * cannot map playout position to the capture timeline simply omit it.
+   * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for sync)
+   */
+  playheadCaptureUs?(): number | null;
+
   /** Release resources. */
   destroy(): void;
 }
