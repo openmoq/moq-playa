@@ -2736,6 +2736,12 @@ export class MoqtPlayer {
 
   // ─── Internal ───────────────────────────────────────────
 
+  /** Whether the player is in a terminal state (no further transitions). */
+  private isTerminalState(): boolean {
+    const state = this.stateMachine.state;
+    return state === PlayerState.ERROR || state === PlayerState.ENDED;
+  }
+
   private transitionState(to: PlayerStateValue): void {
     const from = this.stateMachine.state;
     this.stateMachine.transition(to);
@@ -3335,6 +3341,27 @@ export class MoqtPlayer {
       onDecodeError: (mediaType, error) => {
         if (this.stateMachine.state === PlayerState.ERROR) return;
         this._stats.recordDecodeError();
+
+        // MSE playhead-wedge ladder exhausted (Safari frozen-element class):
+        // the adapter already tried nudge/pulse/seek — the MediaSource must
+        // be rebuilt, which only the application can do (fresh tune-in).
+        // FATAL, unlike ordinary decode errors: this is the public signal
+        // apps reconnect on.
+        if (error.name === 'PlayheadWedgeError') {
+          this.emitError(createPlayerError(
+            'fatal', 'decoder', PlayerErrorCode.MEDIA_ELEMENT_WEDGED, error.message,
+            { cause: error, context: { mediaType } },
+          ));
+          // Re-check across a function boundary (defeats stale narrowing from
+          // the handler's top guard): an emitError listener may have
+          // transitioned re-entrantly (e.g. destroy() → ENDED).
+          if (!this.isTerminalState()) {
+            this.transitionState(PlayerState.ERROR);
+          }
+          this.stopTicking();
+          return;
+        }
+
         if (mediaType === 'video') {
           this.lastLocDecodeErrorUs = this.clock.now();
           this.locHealthyRenderCount = 0;

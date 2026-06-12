@@ -215,12 +215,26 @@ class MockVideoElement extends MockEventTarget {
     src = '';
     currentTime = 0;
     muted = false;
+    paused = false;
+    seeking = false;
+    readyState = 4;
     error: { code: number; message: string } | null = null;
     buffered = makeTimeRanges([]);
     /** When true, play() rejects (autoplay blocked) → playTriggered stays false. */
     rejectPlay = false;
+    playCalls = 0;
+    pauseCalls = 0;
     async play(): Promise<void> {
+        this.playCalls++;
         if (this.rejectPlay) throw new Error('autoplay blocked');
+        this.paused = false;
+    }
+    pause(): void {
+        this.pauseCalls++;
+        this.paused = true;
+    }
+    getVideoPlaybackQuality(): { totalVideoFrames: number; droppedVideoFrames: number } {
+        return { totalVideoFrames: 100, droppedVideoFrames: 2 };
     }
     load(): void { /* no-op */ }
     removeAttribute(_n: string): void { /* no-op */ }
@@ -1061,5 +1075,155 @@ describe('MseMediaSource — live-buffer management', () => {
         expect(video.currentTime).toBe(50);        // jumped to the new (live) range
         expect(resyncs).toContain('quota');
         expect(errors).toEqual([]);                // handled recovery emits no errors
+    });
+});
+
+// ─── Playhead-wedge watchdog (Safari frozen-element recovery) ─────────
+//
+// Safari MSE can wedge: currentTime frozen, readyState 4, buffer growing,
+// NO waiting event, NO error event. The waiting-based stall detector is
+// structurally blind to it. The watchdog detects the frozen playhead and
+// runs an escalating recovery ladder: gentle nudge → pause/play pulse →
+// live-edge seek → onError (app rebuilds). A nudge/seek WE perform must
+// not count as recovery — only the playhead advancing on its own does.
+
+describe('playhead-wedge watchdog', () => {
+    function wedgeSetup() {
+        const video = new MockVideoElement();
+        video.buffered = makeTimeRanges([[5, 25]]);
+        video.currentTime = 10;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        (adapter as any).playTriggered = true;
+        const wedges: any[] = [];
+        const errors: Error[] = [];
+        (adapter as any).onWedge = (info: any) => wedges.push(info);
+        adapter.onError = (e) => errors.push(e);
+        const check = (nowMs: number) => (adapter as any).checkPlayheadWedge(nowMs);
+        return { adapter, video, wedges, errors, check };
+    }
+
+    it('nudges currentTime +0.1 after the playhead is frozen ~2.5s', () => {
+        const { video, wedges, check } = wedgeSetup();
+        check(0);      // baseline observation
+        check(1_000);  // frozen — starts the freeze timer
+        check(2_000);  // still under threshold
+        expect(video.currentTime).toBe(10);
+
+        check(3_600);  // frozen ≥2.5s → rung 1: gentle nudge
+        expect(video.currentTime).toBeCloseTo(10.1, 5);
+        expect(wedges).toHaveLength(1);
+        expect(wedges[0]).toMatchObject({ rung: 1, readyState: 4, paused: false });
+        expect(wedges[0].decodedFrames).toBe(100);
+    });
+
+    it('stays quiet when the playhead is advancing', () => {
+        const { video, wedges, check } = wedgeSetup();
+        check(0);
+        video.currentTime = 10.5;
+        check(1_000);
+        video.currentTime = 11.0;
+        check(3_600);
+        expect(wedges).toHaveLength(0);
+        expect(video.currentTime).toBe(11.0);
+    });
+
+    it('stays quiet when paused, seeking, low readyState, or no buffer ahead', () => {
+        const { video, wedges, check } = wedgeSetup();
+        video.paused = true;
+        check(0); check(1_000); check(3_600);
+        expect(wedges).toHaveLength(0);
+
+        video.paused = false;
+        video.seeking = true;
+        check(4_000); check(5_000); check(7_600);
+        expect(wedges).toHaveLength(0);
+
+        video.seeking = false;
+        video.readyState = 2;
+        check(8_000); check(9_000); check(11_600);
+        expect(wedges).toHaveLength(0);
+
+        video.readyState = 4;
+        video.currentTime = 24.5; // only 0.5s ahead in [5,25] — below the 1s floor
+        check(12_000); check(13_000); check(15_600);
+        expect(wedges).toHaveLength(0);
+    });
+
+    it('escalates: nudge → pause/play pulse → live-edge seek → onError', () => {
+        const { video, wedges, errors, check } = wedgeSetup();
+        check(0);
+        check(1_000);          // freeze timer starts
+        check(3_600);          // rung 1: nudge
+        expect(video.currentTime).toBeCloseTo(10.1, 5);
+
+        // Still frozen (our own nudge must NOT count as recovery).
+        check(4_600);
+        check(6_300);          // rung 2: pause/play pulse
+        expect(video.pauseCalls).toBe(1);
+        expect(video.playCalls).toBe(1);
+
+        check(7_300);
+        check(9_000);          // rung 3: live-edge seek (range end − targetAheadSec 2 → 23)
+        expect(video.currentTime).toBeCloseTo(23, 5);
+
+        check(10_000);
+        check(11_700);         // rung 4: surface error — app rebuilds
+        expect(errors).toHaveLength(1);
+        expect(errors[0]!.message).toMatch(/wedge/i);
+        // The final rung must be DISTINGUISHABLE from ordinary decode errors
+        // so @moqt/player can escalate it to a fatal (the app rebuild path).
+        expect(errors[0]!.name).toBe('PlayheadWedgeError');
+
+        expect(wedges.map((w) => w.rung)).toEqual([1, 2, 3, 4]);
+        // Ladder exhausted — no further actions or duplicate errors.
+        check(12_700); check(14_400);
+        expect(errors).toHaveLength(1);
+    });
+
+    it('organic playhead movement resets the ladder', () => {
+        const { video, wedges, check } = wedgeSetup();
+        check(0);
+        check(1_000);
+        check(3_600);          // rung 1: nudge to 10.1
+        expect(wedges).toHaveLength(1);
+
+        video.currentTime = 12.0; // playback resumed BY ITSELF
+        check(4_600);
+
+        // New wedge episode later starts back at rung 1 (the gentle nudge).
+        check(5_600);          // frozen again — freeze timer restarts
+        check(8_200);
+        expect(wedges).toHaveLength(2);
+        expect(wedges[1].rung).toBe(1);
+        expect(video.currentTime).toBeCloseTo(12.1, 5);
+    });
+
+    it('destroy() stops the watchdog interval', async () => {
+        const { adapter } = wedgeSetup();
+        adapter.destroy();
+        expect((adapter as any).wedgeTimer).toBeNull();
+    });
+
+    it('a behind-live chase seek does not reset the ladder (the slideshow tripwire)', () => {
+        // This exact interaction caused the original symptom: the chase seek
+        // moved currentTime every ~15s, which would read as "organic playhead
+        // movement" and restart the ladder forever — nudge, chase, nudge,
+        // chase — never reaching the rebuild rung.
+        const { adapter, video, wedges, check } = wedgeSetup();
+        video.buffered = makeTimeRanges([[5, 40]]); // 30s ahead → chase-eligible (cap 15)
+        check(0);
+        check(1_000);
+        check(3_600);          // rung 1: nudge → 10.1
+        expect(wedges.map((w) => w.rung)).toEqual([1]);
+
+        // Burst-fed buffer trips the behind-live chase: seek to end − 2 = 38.
+        (adapter as any).maybeChaseLiveEdge();
+        expect(video.currentTime).toBeCloseTo(38, 5);
+
+        // Still frozen at the chase landing — the ladder must CONTINUE.
+        check(4_600);
+        check(6_300);          // rung 2: pause/play pulse (NOT a fresh rung-1 nudge)
+        expect(wedges.map((w) => w.rung)).toEqual([1, 2]);
+        expect(video.pauseCalls).toBe(1);
     });
 });

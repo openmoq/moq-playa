@@ -8531,3 +8531,88 @@ describe('MoqtPlayer', () => {
     });
   });
 });
+
+// ─── MSE playhead-wedge escalation (Safari frozen-element rebuild path) ──
+//
+// The MSE adapter's wedge watchdog surfaces its FINAL rung as an Error named
+// 'PlayheadWedgeError' through mediaSource.onError. Ordinary decode errors
+// are degraded; an unrecoverable wedge means the MediaSource must be
+// rebuilt, so the player must escalate it to a FATAL public error (the
+// signal apps reconnect on) and stop.
+
+describe('MSE playhead-wedge escalation', () => {
+  const CMAF_INLINE_CATALOG = JSON.stringify({
+    version: 1,
+    tracks: [
+      {
+        name: 'video', packaging: 'cmaf', isLive: true, role: 'video',
+        renderGroup: 1, codec: 'avc1.64001f', width: 1920, height: 1080,
+        bitrate: 1_500_000, initData: btoa(String.fromCharCode(1, 2)),
+      },
+      {
+        name: 'audio', packaging: 'cmaf', isLive: true, role: 'audio',
+        renderGroup: 1, codec: 'mp4a.40.2', samplerate: 44100,
+        channelConfig: '2', bitrate: 128_000, initData: btoa(String.fromCharCode(3, 4)),
+      },
+    ],
+  });
+
+  async function cmafPlayer() {
+    const adapter = createMockAdapter();
+    const mockMs: any = {
+      initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(),
+      reset: vi.fn(), mediaElement: null, destroy: vi.fn(),
+      onFirstFrame: null, onError: null, onStall: null,
+    };
+    const player = new MoqtPlayer({
+      ...createConfig(adapter),
+      createMediaSource: () => mockMs,
+      createCmafAssembler: () => ({ push: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn() }),
+    });
+    const catalogReceived = new Promise<void>((r) => player.on('catalog_received', () => r()));
+    const loadPromise = player.load();
+    await resolveConnect(adapter);
+    await loadPromise;
+    ackCatalog(adapter);
+    adapter._triggerObject(0n, {
+      kind: 'data', trackAlias: varint(1),
+      groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(CMAF_INLINE_CATALOG),
+    } as MoqtObject);
+    await catalogReceived;
+    await new Promise((r) => setTimeout(r, 50)); // pipelines + MSE wiring
+    return { player, mockMs };
+  }
+
+  it('escalates an unrecoverable wedge to a FATAL public error + ERROR state', async () => {
+    const { player, mockMs } = await cmafPlayer();
+    const errors: any[] = [];
+    player.on('error', (e) => errors.push(e.error));
+    expect(typeof mockMs.onError).toBe('function'); // player wired the adapter
+
+    mockMs.onError(Object.assign(
+      new Error('playhead wedge unrecoverable: rebuild required'),
+      { name: 'PlayheadWedgeError' },
+    ));
+
+    const wedge = errors.find((e) => e.code === PlayerErrorCode.MEDIA_ELEMENT_WEDGED);
+    expect(wedge).toBeDefined();
+    expect(wedge.severity).toBe('fatal');
+    expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('ordinary MSE errors remain degraded decoder errors (no escalation)', async () => {
+    const { player, mockMs } = await cmafPlayer();
+    const errors: any[] = [];
+    player.on('error', (e) => errors.push(e.error));
+
+    mockMs.onError(new Error('HTMLMediaElement error (code=3)'));
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0].severity).toBe('degraded');
+    expect(errors[0].code).toBe(PlayerErrorCode.VIDEO_DECODE_ERROR);
+    expect(player.state).not.toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+});

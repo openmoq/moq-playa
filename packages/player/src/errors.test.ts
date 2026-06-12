@@ -71,6 +71,10 @@ describe('Error Taxonomy', () => {
     expect(PlayerErrorCode.MEDIA_STARVED).toBe(0x1005);
   });
 
+  it('MEDIA_ELEMENT_WEDGED lives in the decoder block', () => {
+    expect(PlayerErrorCode.MEDIA_ELEMENT_WEDGED).toBe(0x1102);
+  });
+
   it('all severity values are valid', () => {
     const severities = ['transient', 'degraded', 'fatal'] as const;
     for (const severity of severities) {

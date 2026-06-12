@@ -17,7 +17,7 @@
  * @see draft-ietf-moq-loc-01 §4.1 (audio independently decodable)
  */
 
-import { MoqtPlayer } from '@moqt/player';
+import { MoqtPlayer, PlayerErrorCode } from '@moqt/player';
 import { MoqtConnection } from '@moqt/webtransport';
 import { QlogTrace, varint } from '@moqt/transport';
 import { CATALOG_TRACK_NAME } from '@moqt/msf';
@@ -895,8 +895,12 @@ async function startPlayback(): Promise<void> {
         // Fatal connection loss → same Stop + fresh-tune-in lifecycle as the
         // liveness watchdog. (Intentional stop emits no errors — destroy() is
         // quiet and the adapter swallows teardown accept-loop failures.)
-        if (err.severity === 'fatal' && err.source === 'connection') {
-            void reconnect(`Fatal connection error (0x${err.code.toString(16)})`);
+        // MEDIA_ELEMENT_WEDGED (fatal/decoder): Safari froze the <video>
+        // element beyond the MSE adapter's nudge ladder — only a fresh
+        // tune-in rebuilds the MediaSource, so it takes the same path.
+        if (err.severity === 'fatal'
+            && (err.source === 'connection' || err.code === PlayerErrorCode.MEDIA_ELEMENT_WEDGED)) {
+            void reconnect(`Fatal ${err.source} error (0x${err.code.toString(16)})`);
         }
     });
 

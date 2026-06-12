@@ -126,6 +126,23 @@ function scanMdatNals(segment: Uint8Array): { nalTypes: number[]; mdatHead: stri
  * time-shift playback becomes a supported mode, it will need an opt-out or
  * live-aware configuration (e.g. `maxAheadSec: Infinity` disables the jump).
  */
+/**
+ * Diagnostic snapshot emitted by the playhead-wedge watchdog — one per
+ * recovery rung. Mirrors the manual console capture this replaces.
+ */
+export interface PlayheadWedgeInfo {
+  /** Recovery rung: 1 nudge, 2 pause/play pulse, 3 live-edge seek, 4 onError. */
+  readonly rung: number;
+  readonly currentTime: number;
+  readonly readyState: number;
+  readonly paused: boolean;
+  readonly seeking: boolean;
+  /** "start-end|start-end" of the element's buffered ranges. */
+  readonly bufferedRanges: string;
+  readonly decodedFrames?: number;
+  readonly droppedFrames?: number;
+}
+
 export interface MseMediaSourceOptions {
   /** Seconds of played-out media to keep behind currentTime; older buffered data
    *  is evicted via SourceBuffer.remove() so the browser quota is never exhausted
@@ -185,9 +202,32 @@ export class MseMediaSource implements MediaSourceLike {
    *  keyframe-align chunks. */
   onLiveEdgeResync: ((reason: 'quota' | 'behind-live') => void) | null = null;
 
+  /**
+   * Fired when the playhead-wedge watchdog detects or escalates a wedge
+   * (Safari MSE: currentTime frozen, readyState high, buffer growing — no
+   * `waiting` event, no error event, so the stall path is structurally
+   * blind). INFORMATIONAL, concrete-class only — like {@link onLiveEdgeResync},
+   * it is NOT part of MediaSourceLike; apps may wire it for diagnostics.
+   * Recovery itself runs internally (see checkPlayheadWedge), and the final
+   * rung surfaces through the already-wired onError.
+   */
+  onWedge: ((info: PlayheadWedgeInfo) => void) | null = null;
+
   private firstFrameFired = false;
   private playTriggered = false;
   private stallStartTime: number | null = null;
+
+  // ── Playhead-wedge watchdog state ──
+  /** Watchdog cadence; detection threshold per escalation rung. */
+  private static readonly WEDGE_CHECK_INTERVAL_MS = 1_000;
+  private static readonly WEDGE_FROZEN_MS = 2_500;
+  private wedgeTimer: ReturnType<typeof setInterval> | null = null;
+  /** Last observed currentTime; ladder resets only on ORGANIC movement. */
+  private wedgeLastTime: number | null = null;
+  /** When the playhead stopped moving while wedge-eligible. */
+  private wedgeFrozenSinceMs: number | null = null;
+  /** Escalation rung of the current wedge episode (0 = healthy). */
+  private wedgeRung = 0;
 
   // ── Live-buffer management (eviction / behind-live cap / quota recovery) ──
   /** Seconds of played-out media kept behind currentTime; older data is evicted. */
@@ -680,6 +720,11 @@ export class MseMediaSource implements MediaSourceLike {
 
   destroy(): void {
     this.destroyed = true;
+    if (this.wedgeTimer !== null) {
+      clearInterval(this.wedgeTimer);
+      this.wedgeTimer = null;
+    }
+    this.onWedge = null;
     this.video.removeEventListener('playing', this.handlePlaying);
     this.video.removeEventListener('waiting', this.handleWaiting);
     this.video.removeEventListener('timeupdate', this.handleTimeUpdate);
@@ -754,10 +799,12 @@ export class MseMediaSource implements MediaSourceLike {
         // be retried on the next drainQueue cycle.
         this.video.play().then(() => {
           this.playTriggered = true;
+          this.startWedgeWatchdog();
         }).catch(() => {
           this.video.muted = true;
           this.video.play().then(() => {
             this.playTriggered = true;
+            this.startWedgeWatchdog();
           }).catch(() => { /* truly blocked — user must interact */ });
         });
       }
@@ -818,6 +865,141 @@ export class MseMediaSource implements MediaSourceLike {
     }
   }
 
+  // ─── Playhead-wedge watchdog ─────────────────────────────────────
+
+  /** Start the 1s wedge check. Idempotent; cleared in destroy(). */
+  private startWedgeWatchdog(): void {
+    if (this.wedgeTimer !== null || this.destroyed) return;
+    this.wedgeTimer = setInterval(
+      () => this.checkPlayheadWedge(performance.now()),
+      MseMediaSource.WEDGE_CHECK_INTERVAL_MS,
+    );
+  }
+
+  /**
+   * Detect and recover a wedged playhead (Safari MSE failure class:
+   * currentTime frozen while readyState ≥ 3 and buffered media sits ahead
+   * of the playhead — no `waiting` event, no error event, so the
+   * waiting-based stall path never sees it; the only thing that used to
+   * poke it was the behind-live chase, at a 15s period, by accident).
+   *
+   * Escalating recovery ladder, one rung per WEDGE_FROZEN_MS of continued
+   * freeze:
+   *   1. gentle nudge: currentTime += 0.1 (inside the containing range)
+   *   2. pause()/play() pulse
+   *   3. live-edge seek (rangeEnd − targetAheadSec)
+   *   4. onError — the app must rebuild the MediaSource/session
+   *
+   * A seek WE perform must not read as recovery — wedgeLastTime is
+   * re-stamped after each action, so only ORGANIC playhead movement
+   * resets the ladder.
+   */
+  private checkPlayheadWedge(nowMs: number): void {
+    if (this.destroyed || !this.playTriggered) return;
+    const v = this.video;
+    const ct = v.currentTime;
+
+    // Organic movement (or first observation): healthy — reset the ladder.
+    if (this.wedgeLastTime === null || ct !== this.wedgeLastTime) {
+      this.wedgeLastTime = ct;
+      this.wedgeFrozenSinceMs = null;
+      this.wedgeRung = 0;
+      return;
+    }
+
+    // Frozen. Only a wedge if the element CLAIMS it could be playing:
+    // not paused, not seeking, decodable data ready, media ahead of the
+    // playhead within its containing range. Anything else is a normal
+    // pause/buffer/seek state owned by the existing paths.
+    let aheadSec = 0;
+    try {
+      const buffered = v.buffered;
+      for (let i = 0; i < buffered.length; i++) {
+        if (ct >= buffered.start(i) && ct <= buffered.end(i)) {
+          aheadSec = buffered.end(i) - ct;
+          break;
+        }
+      }
+    } catch { /* detached element */ }
+    if (v.paused || v.seeking || (v.readyState ?? 0) < 3 || aheadSec <= 1) {
+      this.wedgeFrozenSinceMs = null;
+      return;
+    }
+
+    if (this.wedgeFrozenSinceMs === null) {
+      this.wedgeFrozenSinceMs = nowMs;
+      return;
+    }
+    if (nowMs - this.wedgeFrozenSinceMs < MseMediaSource.WEDGE_FROZEN_MS) return;
+    if (this.wedgeRung >= 4) return; // exhausted — error already surfaced
+
+    this.wedgeRung++;
+    const rung = this.wedgeRung;
+
+    // Diagnostic snapshot — this is the capture we used to ask humans for.
+    const q = (v as { getVideoPlaybackQuality?: () => VideoPlaybackQuality }).getVideoPlaybackQuality?.();
+    const ranges: string[] = [];
+    try {
+      const b = v.buffered;
+      for (let i = 0; i < b.length; i++) ranges.push(`${b.start(i).toFixed(1)}-${b.end(i).toFixed(1)}`);
+    } catch { /* detached */ }
+    const info: PlayheadWedgeInfo = {
+      rung,
+      currentTime: ct,
+      readyState: v.readyState,
+      paused: v.paused,
+      seeking: v.seeking,
+      bufferedRanges: ranges.join('|'),
+      ...(q ? { decodedFrames: q.totalVideoFrames, droppedFrames: q.droppedVideoFrames } : {}),
+    };
+    this.logWarn('[MSE] playhead wedged at t=%s (rung %d): %s',
+      ct.toFixed(2), rung, JSON.stringify(info));
+    this.onWedge?.(info);
+
+    switch (rung) {
+      case 1: { // gentle nudge inside the containing range (hls.js-classic)
+        const target = Math.min(ct + 0.1, ct + aheadSec - 0.05);
+        if (target > ct) v.currentTime = target;
+        break;
+      }
+      case 2: // pause/play pulse
+        v.pause();
+        void v.play().catch(() => { /* autoplay policy — rung 3 follows */ });
+        break;
+      case 3: { // live-edge seek within the containing range
+        const target = Math.max(ct, ct + aheadSec - this.targetAheadSec);
+        if (target > ct) v.currentTime = target;
+        break;
+      }
+      case 4: {
+        // Named error so @moqt/player can distinguish "rebuild required"
+        // from ordinary (degraded) decode errors and escalate to FATAL.
+        const err = new Error(
+          `playhead wedge unrecoverable: frozen at t=${ct.toFixed(2)} with `
+          + `${aheadSec.toFixed(1)}s buffered ahead (readyState=${v.readyState}) `
+          + `after nudge/pulse/seek — MediaSource rebuild required`,
+        );
+        err.name = 'PlayheadWedgeError';
+        this.onError?.(err);
+        break;
+      }
+    }
+
+    // Our own action must not look like recovery on the next check.
+    this.wedgeLastTime = v.currentTime;
+    this.wedgeFrozenSinceMs = nowMs;
+  }
+
+  /**
+   * Stamp a seek WE performed (behind-live chase, quota rejoin) so the
+   * watchdog doesn't read it as organic playhead movement and reset the
+   * ladder. This exact interaction caused the original slideshow: chase
+   * seeks every ~15s kept "recovering" a wedge that never recovered.
+   */
+  private noteSelfSeek(): void {
+    if (this.wedgeLastTime !== null) this.wedgeLastTime = this.video.currentTime;
+  }
+
   /**
    * Behind-live cap: when playback has fallen more than `maxAheadSec` behind the
    * buffered data it is inside of (a perpetually-behind live subscriber being
@@ -841,6 +1023,7 @@ export class MseMediaSource implements MediaSourceLike {
         if (target > ct) {
           this.logWarn('[MSE] behind live by %ss — jumping %s -> %s', ahead.toFixed(1), ct.toFixed(2), target.toFixed(2));
           v.currentTime = target;
+          this.noteSelfSeek();
           this.onLiveEdgeResync?.('behind-live');
         }
       }
@@ -1075,6 +1258,7 @@ export class MseMediaSource implements MediaSourceLike {
             const target = buffered.start(buffered.length - 1);
             this.logWarn('[MSE] quota flush recovery: rejoining playback at %ss', target.toFixed(2));
             this.video.currentTime = target;
+            this.noteSelfSeek();
             this.onLiveEdgeResync?.('quota');
           }
         }

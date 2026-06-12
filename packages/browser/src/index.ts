@@ -18,7 +18,7 @@ export { CanvasRenderer } from './canvas-renderer.js';
 export { DeferredAudioOutput } from './deferred-audio-output.js';
 export { WebAudioOutput } from './webaudio-output.js';
 export { MseMediaSource } from './mse-adapter.js';
-export type { MseMediaSourceOptions } from './mse-adapter.js';
+export type { MseMediaSourceOptions, PlayheadWedgeInfo } from './mse-adapter.js';
 export { CmafAssembler } from './cmaf-assembler.js';
 export type { CmafAssemblerOptions } from './cmaf-assembler.js';
 export { createWebTransport } from './webtransport-factory.js';

@@ -68,6 +68,12 @@ export const PlayerErrorCode = {
   VIDEO_DECODE_ERROR: 0x1100,
   /** Audio decoder error (WebCodecs). */
   AUDIO_DECODE_ERROR: 0x1101,
+  /**
+   * MSE media element wedged beyond recovery (Safari frozen-playhead class):
+   * the adapter's nudge/pulse/seek ladder was exhausted — the MediaSource
+   * must be rebuilt (fresh tune-in). Fatal.
+   */
+  MEDIA_ELEMENT_WEDGED: 0x1102,
 
   // ── Catalog (0x1200) ──────────────────────────────────────
   /** Initial catalog parse failed — cannot proceed. @see MSF §5.1 */
