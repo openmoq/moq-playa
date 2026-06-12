@@ -877,7 +877,16 @@ async function startPlayback(): Promise<void> {
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
         createRenderer: () => renderer!,
         createAudioOutput: () => new WebAudioOutput(audioCtx, undefined, 200, audioClock),
-        createMediaSource: () => new MseMediaSource(videoEl),
+        createMediaSource: () => {
+            const ms = new MseMediaSource(videoEl);
+            // Playhead-wedge forensics into the PAGE log (the adapter's own
+            // logWarn only reaches the console) — so unattended sessions
+            // self-document which recovery rung fired.
+            ms.onWedge = (w) => log(
+                `[MSE] playhead wedge rung ${w.rung}: t=${w.currentTime.toFixed(2)} `
+                + `ready=${w.readyState} dec=${w.decodedFrames ?? '?'} ranges=${w.bufferedRanges}`);
+            return ms;
+        },
         createCmafAssembler: (opts) => new CmafAssembler(opts),
         onQlogEvent: (e) => trace?.record(e),
     });
