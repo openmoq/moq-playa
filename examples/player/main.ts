@@ -139,6 +139,19 @@ const catalogFromUrl = readCatalogParam();
 
 const canvas = document.getElementById('canvas') as HTMLCanvasElement;
 const videoEl = document.getElementById('video') as HTMLVideoElement;
+
+// ── <video> element lifecycle forensics ──────────────────────────────
+// Safari can pause/stall the element on its own (e.g. autoplay-policy edges
+// around unmute) without any error event. Log the element's own lifecycle
+// into the page log so intermittent episodes self-document which state the
+// element was actually in. (Expected noise: our own Stop pauses the element;
+// the MSE wedge ladder's rung-2 pulse emits a pause+play pair.)
+for (const evt of ['pause', 'play', 'playing', 'waiting', 'stalled', 'volumechange'] as const) {
+    videoEl.addEventListener(evt, () => {
+        const detail = evt === 'volumechange' ? ` muted=${videoEl.muted}` : '';
+        log(`[video] ${evt} t=${videoEl.currentTime.toFixed(2)} ready=${videoEl.readyState}${detail}`);
+    });
+}
 const statsEl = document.getElementById('stats')!;
 const playerWrap = document.getElementById('player-wrap')!;
 const startBtn = document.getElementById('start') as HTMLButtonElement;
@@ -405,6 +418,75 @@ setInterval(() => {
     }
 }, 1000);
 
+// ── Unexpected-pause recovery (intent-aware) ─────────────────────────
+// Safari can pause the <video> element on its own — muted background-tab
+// power saving, autoplay-policy edges around unmute — with no error event.
+// With the adapter no longer chase-seeking paused elements, an unexpected
+// pause would otherwise present as a stuck frame while the app intent is
+// still "playing". Recovery policy (example-level by design):
+//   - visible tab: retry video.play() after a short debounce
+//   - foreground return (visibilitychange/pageshow/focus): retry play()
+//   - if playback does not actually resume, fall back to reconnect()
+// Never fought: manual Stop (intent flags), teardown (playEpoch), and the
+// MSE wedge ladder's deliberate rung-2 pause/play pulse (onWedge signal).
+const PAUSE_RETRY_DEBOUNCE_MS = 350;
+const RESUME_VERIFY_MS = 3_000;
+const WEDGE_PULSE_IGNORE_MS = 1_500;
+let cmafActive = false;        // <video> is the active sink (CMAF mode)
+let lastWedgePulseMs = 0;      // stamped from onWedge rung 2 — that pause is deliberate
+let lastResumeAttemptMs = 0;   // visibilitychange/pageshow/focus arrive in bursts
+let pendingPauseRetry: ReturnType<typeof setTimeout> | null = null;
+
+function playbackIntentActive(): boolean {
+    return cmafActive && isPlaying && !transitioning && !reconnecting;
+}
+
+/** Retry play(); if the element still isn't progressing shortly after, re-tune. */
+function attemptPlaybackResume(reason: string): void {
+    const epoch = playEpoch;
+    lastResumeAttemptMs = performance.now();
+    log(`[video] ${reason} — retrying play()`);
+    videoEl.play().catch((err) => log(`[video] play() retry rejected: ${(err as Error).message}`));
+    const tBefore = videoEl.currentTime;
+    setTimeout(() => {
+        if (epoch !== playEpoch || !playbackIntentActive()) return;
+        if (!videoEl.paused && videoEl.currentTime > tBefore + 0.2) return; // resumed
+        void reconnect(`Playback did not resume after ${reason}`);
+    }, RESUME_VERIFY_MS);
+}
+
+videoEl.addEventListener('pause', () => {
+    if (!playbackIntentActive()) return;  // manual Stop / teardown owns this pause
+    if (performance.now() - lastWedgePulseMs < WEDGE_PULSE_IGNORE_MS) return; // wedge pulse
+    if (document.hidden) return;          // background power saving — recover on return
+    if (pendingPauseRetry) clearTimeout(pendingPauseRetry);
+    const epoch = playEpoch;
+    pendingPauseRetry = setTimeout(() => {
+        pendingPauseRetry = null;
+        if (epoch !== playEpoch || !playbackIntentActive() || !videoEl.paused) return;
+        attemptPlaybackResume('unexpected pause');
+    }, PAUSE_RETRY_DEBOUNCE_MS);
+});
+
+function maybeResumeOnForeground(source: string): void {
+    if (!playbackIntentActive() || !videoEl.paused) return;
+    if (performance.now() - lastResumeAttemptMs < 1_000) return; // coalesce event bursts
+    // If the buffer ran far ahead while paused, the adapter's behind-live
+    // chase rejoins the live edge on the first commit after playback resumes.
+    attemptPlaybackResume(`foreground return (${source})`);
+}
+window.addEventListener('pageshow', () => maybeResumeOnForeground('pageshow'));
+window.addEventListener('focus', () => maybeResumeOnForeground('focus'));
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') maybeResumeOnForeground('visibilitychange');
+});
+
+// Dev-console / harness introspection (like window.__liveness).
+(window as any).__pauseRecovery = {
+    noteWedgePulse: () => { lastWedgePulseMs = performance.now(); },
+    state: () => ({ cmafActive, isPlaying, pendingRetry: pendingPauseRetry !== null }),
+};
+
 function showPlayerControls() {
     controls.classList.remove('hidden');
     playerWrap.classList.remove('hide-cursor');
@@ -447,6 +529,7 @@ async function stopPlayback(): Promise<void> {
     renderer?.stop();
     lastMediaMs = 0; // disarm the liveness watchdog for this session
     healthySinceMs = 0;
+    cmafActive = false; // disarm unexpected-pause recovery for this session
     playEpoch++;     // invalidate any in-flight startPlayback() attempt
 
     const p = player;
@@ -881,10 +964,14 @@ async function startPlayback(): Promise<void> {
             const ms = new MseMediaSource(videoEl);
             // Playhead-wedge forensics into the PAGE log (the adapter's own
             // logWarn only reaches the console) — so unattended sessions
-            // self-document which recovery rung fired.
-            ms.onWedge = (w) => log(
-                `[MSE] playhead wedge rung ${w.rung}: t=${w.currentTime.toFixed(2)} `
-                + `ready=${w.readyState} dec=${w.decodedFrames ?? '?'} ranges=${w.bufferedRanges}`);
+            // self-document which recovery rung fired. Rung 2 is a deliberate
+            // pause/play pulse: stamp it so unexpected-pause recovery does
+            // not fight the ladder (onWedge fires BEFORE the pulse acts).
+            ms.onWedge = (w) => {
+                if (w.rung === 2) lastWedgePulseMs = performance.now();
+                log(`[MSE] playhead wedge rung ${w.rung}: t=${w.currentTime.toFixed(2)} `
+                    + `ready=${w.readyState} dec=${w.decodedFrames ?? '?'} ranges=${w.bufferedRanges}`);
+            };
             return ms;
         },
         createCmafAssembler: (opts) => new CmafAssembler(opts),
@@ -925,6 +1012,7 @@ async function startPlayback(): Promise<void> {
 
         // Detect packaging: CMAF uses <video> element, LOC uses <canvas>
         const hasCmaf = e.catalog.tracks.some(t => t.packaging === 'cmaf');
+        cmafActive = hasCmaf; // gates unexpected-pause recovery to the <video> sink
         if (hasCmaf) {
             canvas.style.display = 'none';
             videoEl.hidden = false;
