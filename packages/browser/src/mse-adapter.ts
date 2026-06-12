@@ -877,11 +877,11 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /**
-   * Detect and recover a wedged playhead (Safari MSE failure class:
-   * currentTime frozen while readyState ≥ 3 and buffered media sits ahead
-   * of the playhead — no `waiting` event, no error event, so the
-   * waiting-based stall path never sees it; the only thing that used to
-   * poke it was the behind-live chase, at a 15s period, by accident).
+   * Detect and recover a wedged playhead: currentTime frozen while
+   * readyState ≥ 3 and buffered media sits ahead of the playhead, with no
+   * `waiting` event and no error event — a failure class observed in
+   * practice (Safari MSE) that the waiting-based stall path is
+   * structurally unable to detect.
    *
    * Escalating recovery ladder, one rung per WEDGE_FROZEN_MS of continued
    * freeze:
@@ -992,9 +992,9 @@ export class MseMediaSource implements MediaSourceLike {
 
   /**
    * Stamp a seek WE performed (behind-live chase, quota rejoin) so the
-   * watchdog doesn't read it as organic playhead movement and reset the
-   * ladder. This exact interaction caused the original slideshow: chase
-   * seeks every ~15s kept "recovering" a wedge that never recovered.
+   * watchdog doesn't read it as organic playhead movement. Without this,
+   * an adapter-initiated seek would reset the recovery ladder mid-episode
+   * and the wedge could persist indefinitely behind periodic seeks.
    */
   private noteSelfSeek(): void {
     if (this.wedgeLastTime !== null) this.wedgeLastTime = this.video.currentTime;
@@ -1010,6 +1010,12 @@ export class MseMediaSource implements MediaSourceLike {
   private maybeChaseLiveEdge(): void {
     if (!this.playTriggered) return;
     const v = this.video;
+    // Never seek a paused element. The UA may pause playback autonomously
+    // (e.g. power saving for muted, non-visible video), and seeking a
+    // paused playhead provides no playback benefit — it only forces decode
+    // work and frame repaints. The chase catches up on the first commit
+    // after playback resumes.
+    if (v.paused) return;
     const ct = v.currentTime;
     let buffered: TimeRanges;
     try { buffered = v.buffered; } catch { return; }

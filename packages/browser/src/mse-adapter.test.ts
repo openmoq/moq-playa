@@ -1204,6 +1204,27 @@ describe('playhead-wedge watchdog', () => {
         expect((adapter as any).wedgeTimer).toBeNull();
     });
 
+    it('the behind-live chase never seeks a PAUSED element', async () => {
+        // Observed in the field: Safari pauses muted background-tab videos;
+        // the chase then seek-dragged the paused playhead for minutes
+        // (t=97 → t=592) — pure churn in the background, and in the
+        // foreground each seek paints one frame: the "slideshow". A paused
+        // element must be left alone; the chase catches up after resume.
+        const video = new MockVideoElement();
+        video.buffered = makeTimeRanges([[5, 40]]);
+        video.currentTime = 10; // 30s behind — far over the 15s cap
+        video.paused = true;
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        (adapter as any).playTriggered = true;
+
+        (adapter as any).maybeChaseLiveEdge();
+        expect(video.currentTime).toBe(10); // untouched while paused
+
+        video.paused = false;
+        (adapter as any).maybeChaseLiveEdge();
+        expect(video.currentTime).toBeCloseTo(38, 5); // resumes → chase works again
+    });
+
     it('a behind-live chase seek does not reset the ladder (the slideshow tripwire)', () => {
         // This exact interaction caused the original symptom: the chase seek
         // moved currentTime every ~15s, which would read as "organic playhead
