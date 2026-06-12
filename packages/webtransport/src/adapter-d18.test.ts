@@ -779,3 +779,37 @@ describe('MoqtConnection(18) accept-loop failure classification', () => {
     expect(errors).toEqual([]);
   });
 });
+
+describe('MoqtConnection(18) teardown on an already failed/closed transport', () => {
+  // WebTransport.close() is specified to return undefined, but on an already
+  // failed or closed session a non-conforming implementation may throw or
+  // return a rejected thenable (observed in practice: Safari 26 rejects with
+  // NetworkError after the session's network path has failed). An
+  // intentional close() must neither reject nor leak an unhandled rejection.
+
+  it('close() does not leak an unhandled rejection when transport.close() returns a rejected thenable', async () => {
+    const { conn, transport } = await connected();
+    (transport as any).close = () =>
+      Promise.reject(new Error('NetworkError: A network error occurred.'));
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      await expect(conn.close()).resolves.toBeUndefined();
+      // Unhandled-rejection notifications fire on a macrotask turn.
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('close() does not throw when transport.close() throws synchronously', async () => {
+    const { conn, transport } = await connected();
+    (transport as any).close = () => { throw new Error('InvalidStateError: session is closed'); };
+
+    await expect(conn.close()).resolves.toBeUndefined();
+  });
+});

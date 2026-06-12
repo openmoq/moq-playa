@@ -478,6 +478,26 @@ describe('MoqtPlayer', () => {
     expect(sessionErrors).not.toHaveBeenCalled();
   });
 
+  it('destroy() resolves quietly when the owned connection close() rejects (failed transport)', async () => {
+    const adapter = createMockAdapter();
+    // Observed in practice on Safari 26: closing a session whose network
+    // path already failed rejects with NetworkError.
+    adapter.close = vi.fn(async () => {
+      throw new Error('NetworkError: A network error occurred.');
+    }) as any;
+    const player = new MoqtPlayer(createConfig(adapter));
+    const errorEvents: unknown[] = [];
+    player.on('error', (e) => errorEvents.push(e));
+    player.load();
+    await resolveConnect(adapter);
+
+    // Quiet-destroy contract: a dead transport rejecting close() must not
+    // make destroy() reject for library consumers without a try/catch.
+    await expect(player.destroy()).resolves.toBeUndefined();
+    expect(errorEvents).toEqual([]);
+    expect(player.state).toBe(PlayerState.ENDED);
+  });
+
   it('an unintentional connection error BEFORE destroy() still emits normally', async () => {
     const adapter = createMockAdapter();
     const player = new MoqtPlayer(createConfig(adapter));

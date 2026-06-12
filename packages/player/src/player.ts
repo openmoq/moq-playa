@@ -2676,8 +2676,10 @@ export class MoqtPlayer {
         // teardown (pending-subscription rejections, stream resets, onClose) is
         // not surfaced back into the player as fatal/degraded connection errors —
         // destroy() is a happy path. Then close (cleans up subscriptions implicitly).
+        // close() itself may reject when the underlying transport has already
+        // failed or closed — destroy() must still resolve quietly.
         this.detachConnectionCallbacks(this.connection);
-        await this.connection.close();
+        try { await this.connection.close(); } catch { /* transport already failed/closed */ }
       } else {
         // Externally owned: explicitly unsubscribe player's tracks, then detach.
         // Don't close — the caller owns the adapter's lifecycle.

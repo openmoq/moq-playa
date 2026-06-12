@@ -2083,10 +2083,18 @@ export class MoqtConnection {
           break;
         }
         case 'close_connection': {
-          this.transport?.close({
-            closeCode: Number(action.error),
-            reason: action.reason,
-          });
+          // WebTransport.close() is specified to return undefined, but on an
+          // already failed or closed session a non-conforming implementation
+          // may throw (InvalidStateError) or return a rejected thenable
+          // (NetworkError). An intentional close must neither reject nor
+          // leak an unhandled rejection — observe both shapes.
+          try {
+            const result = this.transport?.close({
+              closeCode: Number(action.error),
+              reason: action.reason,
+            }) as unknown;
+            void Promise.resolve(result).catch(() => { /* already failed/closed */ });
+          } catch { /* already failed/closed */ }
           break;
         }
         case 'open_namespace_stream': {
