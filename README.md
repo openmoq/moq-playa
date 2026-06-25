@@ -345,4 +345,4 @@ Raymond Lucke and the Red5 Team
 
 ## License
 
-MIT
+Apache 2.0
