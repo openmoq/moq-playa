@@ -1,7 +1,12 @@
 {
   "name": "@moqt/loc",
   "version": "0.5.0",
+  "description": "Low Overhead Media Container (LOC) codec for Media over QUIC (MoQ): parses and builds LOC header extensions and yields WebCodecs-ready media chunks.",
   "license": "Apache-2.0",
+  "author": "OpenMOQ (https://github.com/openmoq)",
+  "contributors": [
+    "Raymond Lucke <ray@raylucke.com>"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,7 +20,33 @@
       "default": "./dist/browser/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "moq",
+    "media-over-quic",
+    "moqt",
+    "quic",
+    "streaming",
+    "low-latency",
+    "live-video",
+    "loc",
+    "container",
+    "webcodecs"
+  ],
+  "homepage": "https://github.com/openmoq/moq-playa/tree/main/packages/loc#readme",
+  "bugs": {
+    "url": "https://github.com/openmoq/moq-playa/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openmoq/moq-playa.git",
+    "directory": "packages/loc"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@moqt/transport": "workspace:*"
   },

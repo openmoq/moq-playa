@@ -1,7 +1,12 @@
 {
   "name": "@moqt/browser",
   "version": "0.5.0",
+  "description": "Browser adapters for @moqt/player: WebCodecs decoding, Canvas and WebAudio rendering, and MSE/CMAF playback, implementing the player's swappable interfaces.",
   "license": "Apache-2.0",
+  "author": "OpenMOQ (https://github.com/openmoq)",
+  "contributors": [
+    "Raymond Lucke <ray@raylucke.com>"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,7 +20,35 @@
       "default": "./dist/browser/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "moq",
+    "media-over-quic",
+    "moqt",
+    "quic",
+    "streaming",
+    "low-latency",
+    "live-video",
+    "browser",
+    "webcodecs",
+    "mse",
+    "cmaf",
+    "adapters"
+  ],
+  "homepage": "https://github.com/openmoq/moq-playa/tree/main/packages/browser#readme",
+  "bugs": {
+    "url": "https://github.com/openmoq/moq-playa/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openmoq/moq-playa.git",
+    "directory": "packages/browser"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@moqt/playback": "workspace:*",
     "@moqt/player": "workspace:*",

@@ -1,7 +1,12 @@
 {
   "name": "@playa/player",
   "version": "0.5.0",
+  "description": "Batteries-included Media over QUIC (MoQ) media player for the browser.",
   "license": "Apache-2.0",
+  "author": "OpenMOQ (https://github.com/openmoq)",
+  "contributors": [
+    "Raymond Lucke <ray@raylucke.com>"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,7 +20,34 @@
       "default": "./dist/browser/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "moq",
+    "media-over-quic",
+    "moqt",
+    "quic",
+    "streaming",
+    "low-latency",
+    "live-video",
+    "player",
+    "browser",
+    "webcodecs",
+    "webtransport"
+  ],
+  "homepage": "https://github.com/openmoq/moq-playa/tree/main/packages/playa#readme",
+  "bugs": {
+    "url": "https://github.com/openmoq/moq-playa/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openmoq/moq-playa.git",
+    "directory": "packages/playa"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@moqt/player": "workspace:*",
     "@moqt/msf": "workspace:*",

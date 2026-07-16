@@ -1,7 +1,12 @@
 {
   "name": "@moqt/playback",
   "version": "0.5.0",
+  "description": "Sans-I/O media playback core for Media over QUIC (MoQ): jitter buffer, A/V sync, gap detection, decoder state machine, and pipeline orchestration.",
   "license": "Apache-2.0",
+  "author": "OpenMOQ (https://github.com/openmoq)",
+  "contributors": [
+    "Raymond Lucke <ray@raylucke.com>"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,7 +20,34 @@
       "default": "./dist/browser/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "moq",
+    "media-over-quic",
+    "moqt",
+    "quic",
+    "streaming",
+    "low-latency",
+    "live-video",
+    "playback",
+    "sans-io",
+    "jitter-buffer",
+    "av-sync"
+  ],
+  "homepage": "https://github.com/openmoq/moq-playa/tree/main/packages/playback#readme",
+  "bugs": {
+    "url": "https://github.com/openmoq/moq-playa/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openmoq/moq-playa.git",
+    "directory": "packages/playback"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@moqt/transport": "workspace:*",
     "@moqt/loc": "workspace:*"

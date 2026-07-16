@@ -1,7 +1,12 @@
 {
   "name": "@moqt/transport",
   "version": "0.5.0",
+  "description": "Sans-I/O protocol core for Media over QUIC Transport (MoQT): wire codec and session state machine for draft-14/16/18, with no I/O.",
   "license": "Apache-2.0",
+  "author": "OpenMOQ (https://github.com/openmoq)",
+  "contributors": [
+    "Raymond Lucke <ray@raylucke.com>"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,7 +20,33 @@
       "default": "./dist/browser/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "moq",
+    "media-over-quic",
+    "moqt",
+    "quic",
+    "streaming",
+    "low-latency",
+    "live-video",
+    "protocol",
+    "sans-io",
+    "wire-codec"
+  ],
+  "homepage": "https://github.com/openmoq/moq-playa/tree/main/packages/transport#readme",
+  "bugs": {
+    "url": "https://github.com/openmoq/moq-playa/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openmoq/moq-playa.git",
+    "directory": "packages/transport"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc && tsup",
     "build:browser": "tsup"
