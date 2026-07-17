@@ -18,6 +18,16 @@
 
 import { FetchState, type FetchStateValue } from './types.js';
 
+/** Joining Fetch fields carried by the state machine (§9.16.2). */
+export interface JoiningFetchState {
+  /** 0x2 = Relative Joining Fetch, 0x3 = Absolute Joining Fetch. */
+  readonly fetchType: 0x2 | 0x3;
+  /** Request ID of the subscription being joined. */
+  readonly joiningRequestId: bigint;
+  /** Relative group count (0x2) or absolute start group (0x3). */
+  readonly joiningStart: bigint;
+}
+
 /**
  * Manages the state machine for a single fetch request.
  */
@@ -26,14 +36,15 @@ export class FetchStateMachine {
   private _errorCode: bigint | undefined;
   private _errorReason: string | undefined;
   private _wasCanceled: boolean = false;
+  private _joining: JoiningFetchState | undefined;
 
   private constructor(
     private readonly _requestId: bigint,
     private readonly _isPublisher: boolean,
-    private readonly _startGroup?: bigint,
-    private readonly _startObject?: bigint,
-    private readonly _endGroup?: bigint,
-    private readonly _endObject?: bigint,
+    private _startGroup?: bigint,
+    private _startObject?: bigint,
+    private _endGroup?: bigint,
+    private _endObject?: bigint,
   ) {}
 
   /**
@@ -74,6 +85,76 @@ export class FetchStateMachine {
       endGroup,
       endObject,
     );
+  }
+
+  /**
+   * Create a fetch state machine for an outgoing Joining Fetch (§9.16.2).
+   *
+   * A Relative Joining Fetch (0x2) stores no range — the publisher computes
+   * it from the subscription's Largest Location, which this subscriber does
+   * not know, so FETCH_OK end/start validation is skipped. An Absolute
+   * Joining Fetch (0x3) has a known start `{joiningStart, 0}` (§9.16.2.1),
+   * stored so the §9.16.3 "End Location MUST specify the same or a larger
+   * Location than Start Location" check applies to its FETCH_OK.
+   */
+  static createAsJoiningFetcher(
+    requestId: bigint,
+    joining: JoiningFetchState,
+  ): FetchStateMachine {
+    const sm = joining.fetchType === 0x3
+      ? new FetchStateMachine(requestId, false, joining.joiningStart, 0n)
+      : new FetchStateMachine(requestId, false);
+    sm._joining = joining;
+    return sm;
+  }
+
+  /**
+   * Create a fetch state machine for an incoming Joining Fetch (§9.16.2).
+   * The range is unknown until the application supplies the subscription's
+   * Largest Location via {@link setResolvedRange}.
+   */
+  static createAsJoiningPublisher(
+    requestId: bigint,
+    joining: JoiningFetchState,
+  ): FetchStateMachine {
+    const sm = new FetchStateMachine(requestId, true);
+    sm._joining = joining;
+    return sm;
+  }
+
+  // ─── Joining Fetch ────────────────────────────────────────────────────
+
+  /** Whether this fetch is a Joining Fetch (0x2/0x3). */
+  get isJoining(): boolean {
+    return this._joining !== undefined;
+  }
+
+  /** Joining Fetch fields, or undefined for a standalone fetch. */
+  get joining(): JoiningFetchState | undefined {
+    return this._joining;
+  }
+
+  /**
+   * Back-fill the publisher-side range once the application has resolved the
+   * Joining Fetch against the subscription's Largest Location (§9.16.2.1).
+   * The absolute start (if any) set at creation is overwritten by the
+   * resolved values.
+   *
+   * @throws {Error} for a standalone fetch (its range came from the message).
+   */
+  setResolvedRange(
+    startGroup: bigint,
+    startObject: bigint,
+    endGroup: bigint,
+    endObject: bigint,
+  ): void {
+    if (this._joining === undefined) {
+      throw new Error('setResolvedRange is only valid for a joining fetch');
+    }
+    this._startGroup = startGroup;
+    this._startObject = startObject;
+    this._endGroup = endGroup;
+    this._endObject = endObject;
   }
 
   // ─── Getters ──────────────────────────────────────────────────────────

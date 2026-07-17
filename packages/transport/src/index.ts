@@ -284,5 +284,7 @@ export { TrackAliasManager } from './session/track-alias.js';
 export type { TrackIdentity } from './session/track-alias.js';
 export { Session } from './session/session.js';
 export { SessionError as SessionProtocolError, SessionDrainingError } from './session/session.js';
-export type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions, RequestResult } from './session/session.js';
+export type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions, RequestResult } from './session/session.js';
+export { resolveJoiningFetchRange, type JoiningFetchFields } from './session/joining.js';
+export { decodeSubscriptionFilter } from './control/subscription-filter.js';
 export type { SubscriptionFilter } from './control/subscription-filter.js';

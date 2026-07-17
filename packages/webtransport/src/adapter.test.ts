@@ -1698,6 +1698,29 @@ describe('MoqtConnection', () => {
       expect(decoded.message.type).toBe('FETCH');
     });
 
+    it('joiningFetch() sends a joining FETCH (0x2) on the control stream referencing our SUBSCRIBE (§9.16.2)', async () => {
+      const mock = createMockTransport();
+      const adapter = await connectAdapter(mock);
+
+      const namespace = [new Uint8Array([0x6c, 0x69, 0x76, 0x65])];
+      const name = new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f]);
+      const subReqId = await adapter.subscribe(namespace, name);
+
+      const requestId = await adapter.joiningFetch({
+        joiningFetchType: 'relative', joiningRequestId: subReqId, joiningStart: 1n,
+      });
+      expect(requestId).not.toBe(subReqId);
+
+      // controlWritten: [0]=CLIENT_SETUP, [1]=SUBSCRIBE, [2]=FETCH
+      const decoded = decodeControlMessage(mock.controlWritten[2]!, 0);
+      expect(decoded.message.type).toBe('FETCH');
+      const f = (decoded.message as import('@moqt/transport').Fetch).fetch;
+      expect(f.fetchType).toBe(0x2);
+      const jf = f as import('@moqt/transport').JoiningFetch;
+      expect(jf.joiningRequestId).toBe(subReqId);
+      expect(jf.joiningStart).toBe(1n);
+    });
+
     it('sends FETCH_CANCEL on control stream', async () => {
       const mock = createMockTransport();
       const adapter = await connectAdapter(mock);

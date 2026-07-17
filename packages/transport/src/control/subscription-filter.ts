@@ -121,6 +121,55 @@ export function encodeSubscriptionFilter(filter: SubscriptionFilter, draftVersio
 }
 
 /**
+ * Decode the inner bytes of a SUBSCRIPTION_FILTER parameter (§5.1.2) into the
+ * semantic {@link SubscriptionFilter}. The third leg beside encode/validate —
+ * the publisher-side session stores the subscriber's decoded filter so the
+ * joining FETCH gate (§9.16.2) can be enforced against it.
+ *
+ * `AbsoluteRange.endGroup` is returned ABSOLUTE on every draft (the draft-18
+ * wire delta is undone here, mirroring the encoder). The deprecated
+ * `LatestObject` alias decodes as `LargestObject` (same wire type 0x2).
+ *
+ * @throws {RangeError} on malformed bytes — validate with
+ *   {@link validateSubscriptionFilter} first when a graceful reason string is
+ *   needed instead of an exception.
+ */
+export function decodeSubscriptionFilter(bytes: Uint8Array, draftVersion: number): SubscriptionFilter {
+  const reason = validateSubscriptionFilter(bytes, draftVersion);
+  if (reason !== undefined) {
+    throw new RangeError(`decodeSubscriptionFilter: ${reason}`);
+  }
+
+  const read = draftVersion === 18
+    ? (pos: number) => readVi64(bytes, pos)
+    : (pos: number) => {
+        const { value, bytesRead } = readVarint(bytes, pos);
+        return { value: value as bigint, bytesRead };
+      };
+
+  let pos = 0;
+  const ft = read(pos);
+  pos += ft.bytesRead;
+
+  if (ft.value === 1n) return { type: 'NextGroupStart' };
+  if (ft.value === 2n) return { type: 'LargestObject' };
+
+  const g = read(pos);
+  pos += g.bytesRead;
+  const o = read(pos);
+  pos += o.bytesRead;
+
+  if (ft.value === 3n) {
+    return { type: 'AbsoluteStart', startGroup: g.value, startObject: o.value };
+  }
+
+  // AbsoluteRange (0x4): draft-18 carries an End Group DELTA, 14/16 the absolute value.
+  const e = read(pos);
+  const endGroup = draftVersion === 18 ? g.value + e.value : e.value;
+  return { type: 'AbsoluteRange', startGroup: g.value, startObject: o.value, endGroup };
+}
+
+/**
  * Validate the inner bytes of a SUBSCRIPTION_FILTER parameter (§5.1.2).
  * @returns a violation reason string if malformed, or `undefined` if valid.
  *   The caller maps a returned reason to a PROTOCOL_VIOLATION close.

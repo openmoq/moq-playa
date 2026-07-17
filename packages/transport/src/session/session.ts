@@ -14,7 +14,8 @@
 
 import { varint, type Varint } from '../primitives/varint.js';
 import { readLocation } from '../primitives/location.js';
-import { encodeSubscriptionFilter, validateSubscriptionFilter, type SubscriptionFilter } from '../control/subscription-filter.js';
+import { encodeSubscriptionFilter, validateSubscriptionFilter, decodeSubscriptionFilter, type SubscriptionFilter } from '../control/subscription-filter.js';
+import { resolveJoiningFetchRange } from './joining.js';
 import { validateTrackNamespace, validateTrackNamespacePrefix, validateFullTrackName, isReservedSessionNamespace, isReservedDotNamespace } from '../primitives/bytes.js';
 import { SessionError as SessionErrorCode, RequestError as RequestErrorCode } from '../errors.js';
 import type {
@@ -32,6 +33,7 @@ import type {
   RequestErrorMsg,
   Fetch,
   StandaloneFetch,
+  JoiningFetch,
   FetchOk,
   FetchCancel,
   PublishDone,
@@ -331,6 +333,29 @@ export interface FetchOptions {
    * parameter (Ascending = 0x1, Descending = 0x2). When omitted, the parameter
    * is not sent and the response is decoded as Ascending per spec.
    */
+  groupOrder?: GroupOrder;
+}
+
+/**
+ * Options for creating a Joining Fetch (§9.16.2 / draft-18 §10.12.2).
+ *
+ * A Joining Fetch carries no namespace, name, or range — the publisher derives
+ * all three from the referenced subscription, computing a range contiguous
+ * with (and never overlapping) the subscription's delivery.
+ */
+export interface JoiningFetchOptions {
+  /** 'relative' = Fetch Type 0x2, 'absolute' = 0x3. */
+  joiningFetchType: 'relative' | 'absolute';
+  /** Request ID of OUR outbound SUBSCRIBE to join (NOT a track alias). */
+  joiningRequestId: bigint;
+  /**
+   * Relative: how many groups before the largest group to start from
+   * (0 = head of the current group). Absolute: the start group itself.
+   * vi64 (full uint64) on draft-18; QUIC-varint-capped on 14/16 (the encoder
+   * throws above that range).
+   */
+  joiningStart: bigint;
+  /** Requested Group Order — GROUP_ORDER (0x22) parameter, as for {@link FetchOptions}. */
   groupOrder?: GroupOrder;
 }
 
@@ -1609,6 +1634,28 @@ export class Session {
       msg.trackNamespace,
       msg.trackName,
     );
+
+    // §9.2.2.5: store the subscriber's filter type — the Joining Fetch gate
+    // (§9.16.2) needs it. An omitted parameter = unfiltered (NOT Largest
+    // Object). Malformed filter bytes were already rejected by the message
+    // parameter validation before this handler runs; a decode failure here is
+    // treated the same as an omitted filter rather than crashing the session.
+    const filterValues = msg.parameters.get(MessageParam.SUBSCRIPTION_FILTER);
+    const filterBytes = filterValues?.[0];
+    if (filterBytes instanceof Uint8Array) {
+      try {
+        sub.setRemoteFilterType(decodeSubscriptionFilter(filterBytes, this._draftVersion).type);
+      } catch { /* malformed — leave unfiltered */ }
+    }
+
+    // §9.2.2.8: FORWARD on the SUBSCRIBE sets the initial forward state
+    // (0 = paused). draft-18 §10.12.2 gates Joining Fetches on this.
+    const forwardValues = msg.parameters.get(MessageParam.FORWARD);
+    const forwardVal = forwardValues?.[0];
+    if (typeof forwardVal === 'bigint') {
+      sub.setInitialForwardState(forwardVal === 0n ? ForwardState.PAUSED : ForwardState.ACTIVE);
+    }
+
     this.incomingSubscriptions.set(msg.requestId as bigint, sub);
 
     return validated.replenish ?? [];
@@ -1670,30 +1717,80 @@ export class Session {
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
 
-    // Extract range from standalone fetch
-    let startGroup: bigint | undefined;
-    let startObject: bigint | undefined;
-    let endGroup: bigint | undefined;
-    let endObject: bigint | undefined;
-    if (msg.fetch.fetchType === 0x1) {
-      const sf = msg.fetch as StandaloneFetch;
-      // §3.2: reserved `.`/`.session` namespace → REQUEST_ERROR DOES_NOT_EXIST.
-      // (Joining FETCH references an existing request and carries no namespace.)
-      const reserved = this.rejectReservedNamespace(sf.trackNamespace, msg.requestId, validated.replenish);
-      if (reserved) return reserved;
-      startGroup = sf.startLocation.group;
-      startObject = sf.startLocation.object;
-      endGroup = sf.endLocation.group;
-      endObject = sf.endLocation.object;
+    // Joining Fetch (0x2/0x3): enforce the MUSTs decidable from protocol state
+    // BEFORE creating any fetch state (§9.16.2 / draft-18 §10.12.2).
+    if (msg.fetch.fetchType !== 0x1) {
+      const jf = msg.fetch as JoiningFetch;
+      const joiningReqId = jf.joiningRequestId as bigint;
+      const sub = this.incomingSubscriptions.get(joiningReqId);
+
+      // §9.16.2: "If a publisher receives a Joining Fetch with a Request ID
+      // that does not correspond to a subscription in the same session in the
+      // Established or Pending (subscriber) states, it MUST return a
+      // REQUEST_ERROR with error code INVALID_JOINING_REQUEST_ID."
+      const eligible = sub !== undefined
+        && (sub.state === SubscriptionState.PENDING || sub.state === SubscriptionState.ESTABLISHED);
+      if (!eligible) {
+        const errorMsg: RequestErrorMsg = {
+          type: 'REQUEST_ERROR',
+          requestId: msg.requestId,
+          errorCode: RequestErrorCode.INVALID_JOINING_REQUEST_ID,
+          retryInterval: varint(0n),
+          errorReason: `Joining Fetch references request ${joiningReqId}, which is not a subscription in PENDING/ESTABLISHED state (§9.16.2)`,
+        };
+        return [this.sendControl(errorMsg), ...(validated.replenish ?? [])];
+      }
+
+      if (this._draftVersion === 18) {
+        // draft-18 §10.12.2: "A Joining Fetch is only permitted when the
+        // associated subscription has Forward State 1; otherwise the publisher
+        // MUST respond with a REQUEST_ERROR with error code INVALID_RANGE."
+        if (sub.forwardState !== ForwardState.ACTIVE) {
+          const errorMsg: RequestErrorMsg = {
+            type: 'REQUEST_ERROR',
+            requestId: msg.requestId,
+            errorCode: RequestErrorCode.INVALID_RANGE,
+            retryInterval: varint(0n),
+            errorReason: `Joining Fetch on subscription ${joiningReqId} with Forward State 0 (§10.12.2)`,
+          };
+          return [this.sendControl(errorMsg), ...(validated.replenish ?? [])];
+        }
+      } else {
+        // §9.16.2: "A Joining Fetch is only permitted when the associated
+        // Subscribe has the Filter Type Largest Object; any other value
+        // results in closing the session with a PROTOCOL_VIOLATION." An
+        // omitted SUBSCRIPTION_FILTER = unfiltered (§9.2.2.5) — not Largest
+        // Object, so it fails this gate too.
+        if (sub.remoteFilterType !== 'LargestObject') {
+          return this.closeWithError(
+            SessionErrorCode.PROTOCOL_VIOLATION,
+            `Joining Fetch on subscription ${joiningReqId} whose filter is ${sub.remoteFilterType ?? 'unfiltered'}, not Largest Object (§9.16.2)`,
+          );
+        }
+      }
+
+      const fetchSm = FetchStateMachine.createAsJoiningPublisher(msg.requestId, {
+        fetchType: msg.fetch.fetchType,
+        joiningRequestId: joiningReqId,
+        joiningStart: jf.joiningStart,
+      });
+      this.incomingFetches.set(msg.requestId as bigint, fetchSm);
+
+      return validated.replenish ?? [];
     }
 
-    // Create publisher-side fetch state machine
+    // Standalone fetch (0x1): the range comes from the message.
+    const sf = msg.fetch as StandaloneFetch;
+    // §3.2: reserved `.`/`.session` namespace → REQUEST_ERROR DOES_NOT_EXIST.
+    const reserved = this.rejectReservedNamespace(sf.trackNamespace, msg.requestId, validated.replenish);
+    if (reserved) return reserved;
+
     const fetchSm = FetchStateMachine.createAsPublisher(
       msg.requestId,
-      startGroup,
-      startObject,
-      endGroup,
-      endObject,
+      sf.startLocation.group,
+      sf.startLocation.object,
+      sf.endLocation.group,
+      sf.endLocation.object,
     );
     this.incomingFetches.set(msg.requestId as bigint, fetchSm);
 
@@ -2388,6 +2485,115 @@ export class Session {
       requestId,
       actions: [this.sendControl(fetchMsg)],
     };
+  }
+
+  /**
+   * Create a Joining Fetch (§9.16.2 / draft-18 §10.12.2) referencing one of
+   * OUR subscriptions in PENDING or ESTABLISHED state.
+   *
+   * The referenced subscription SHOULD use the Largest Object filter: on
+   * draft-14/16 any other filter is a session-fatal PROTOCOL_VIOLATION at the
+   * publisher (§9.16.2); draft-18 gates on Forward State instead (§10.12.2).
+   * Joining a PENDING subscription is legal — draft-18 additionally requires
+   * the publisher to buffer the fetch until the subscription resolves.
+   *
+   * @throws {SessionError} INVALID_STATE if `joiningRequestId` is not one of
+   *   our subscriptions in PENDING/ESTABLISHED — a reference implementation
+   *   never emits a request the peer is required to reject
+   *   (INVALID_JOINING_REQUEST_ID).
+   */
+  joiningFetch(options: JoiningFetchOptions): RequestResult {
+    this.assertEstablishedOrDraining('joiningFetch');
+
+    if (this._state === SessionState.DRAINING) {
+      throw new SessionDrainingError(
+        'Cannot create new fetches after GOAWAY; session is DRAINING',
+        this._newSessionUri ?? '',
+      );
+    }
+
+    const sub = this.subscriptions.get(options.joiningRequestId as bigint);
+    if (!sub || !(sub.state === SubscriptionState.PENDING || sub.state === SubscriptionState.ESTABLISHED)) {
+      throw new SessionError(
+        `joiningFetch: request ${options.joiningRequestId} is not a subscription in PENDING/ESTABLISHED state — §9.16.2`,
+        'INVALID_STATE',
+      );
+    }
+
+    const requestId = this.requestIdAllocator.allocate();
+    const fetchType = options.joiningFetchType === 'absolute' ? 0x3 as const : 0x2 as const;
+
+    const fetchSm = FetchStateMachine.createAsJoiningFetcher(requestId, {
+      fetchType,
+      joiningRequestId: options.joiningRequestId,
+      joiningStart: options.joiningStart,
+    });
+    this.fetches.set(requestId as bigint, fetchSm);
+
+    const joiningFetch: JoiningFetch = {
+      fetchType,
+      joiningRequestId: varint(options.joiningRequestId),
+      joiningStart: options.joiningStart,
+    };
+
+    // §10.2: a requested Group Order travels as the GROUP_ORDER (0x22) parameter.
+    const parameters: Parameters = new Map();
+    if (options.groupOrder !== undefined) {
+      parameters.set(MessageParam.GROUP_ORDER, [varint(options.groupOrder === 'descending' ? 2n : 1n)]);
+    }
+
+    const fetchMsg: Fetch = {
+      type: 'FETCH',
+      requestId,
+      fetch: joiningFetch,
+      parameters,
+    };
+
+    return {
+      requestId,
+      actions: [this.sendControl(fetchMsg)],
+    };
+  }
+
+  /**
+   * Resolve an incoming Joining Fetch against the associated subscription's
+   * Largest Location (§9.16.2.1; draft-18 "Joining Location"), back-filling
+   * the publisher-side fetch state machine's range and returning it.
+   *
+   * The Largest Location is application knowledge — the sans-I/O session
+   * never sees published objects — so the app supplies it and this method
+   * does the joining arithmetic (via {@link resolveJoiningFetchRange}).
+   *
+   * @returns the standalone-equivalent range in the FETCH wire convention
+   *   (`endLocation.object` is one-past the last delivered object).
+   * @throws {SessionError} INVALID_STATE for an unknown request or a
+   *   standalone fetch; {@link RangeError} for an Absolute Joining Fetch
+   *   whose start exceeds the largest group (caller maps to REQUEST_ERROR
+   *   INVALID_RANGE per §9.16.3).
+   */
+  resolveIncomingJoiningFetch(
+    requestId: bigint,
+    largest: { group: bigint; object: bigint },
+  ): { startLocation: { group: bigint; object: bigint }; endLocation: { group: bigint; object: bigint } } {
+    const fetchSm = this.incomingFetches.get(requestId as bigint);
+    if (!fetchSm || !fetchSm.isJoining) {
+      throw new SessionError(
+        `resolveIncomingJoiningFetch: request ${requestId} is not an incoming joining fetch`,
+        'INVALID_STATE',
+      );
+    }
+    const joining = fetchSm.joining!;
+    const range = resolveJoiningFetchRange(
+      { fetchType: joining.fetchType, joiningStart: joining.joiningStart },
+      largest,
+    );
+    fetchSm.setResolvedRange(
+      range.startLocation.group,
+      range.startLocation.object,
+      range.endLocation.group,
+      range.endLocation.object,
+    );
+    return range;
   }
 
   /**

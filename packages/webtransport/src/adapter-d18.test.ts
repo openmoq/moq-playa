@@ -211,6 +211,31 @@ describe('MoqtConnection(18) fetch', () => {
     expect(transport.uniOut[0]!.writtenBytes()[0]).toBe(0xaf);
   });
 
+  it('joiningFetch() opens its own bidi request stream with a joining FETCH (0x2) payload', async () => {
+    const { conn, transport } = await connected();
+    const subReqId = await conn.subscribe(ns('a'), nm('1')); // request stream 0
+    const requestId = await conn.joiningFetch({
+      joiningFetchType: 'relative', joiningRequestId: subReqId, joiningStart: 2n,
+    }); // request stream 1
+    expect(requestId).not.toBe(subReqId);
+    expect(transport.bidi.length).toBe(2);
+
+    const { message } = codec18.decode(transport.bidi[1]!.writtenBytes(), 0);
+    expect(message.type).toBe('FETCH');
+    const jf = (message as Fetch).fetch as Extract<Fetch['fetch'], { fetchType: 0x2 | 0x3 }>;
+    expect(jf.fetchType).toBe(0x2);
+    expect(jf.joiningRequestId).toBe(subReqId);
+    expect(jf.joiningStart).toBe(2n);
+  });
+
+  it('joiningFetch() throws INVALID_STATE for an unknown joiningRequestId (never emitted on the wire)', async () => {
+    const { conn, transport } = await connected();
+    await expect(conn.joiningFetch({
+      joiningFetchType: 'relative', joiningRequestId: 998n, joiningStart: 0n,
+    })).rejects.toThrow(/PENDING\/ESTABLISHED/);
+    expect(transport.bidi.length).toBe(0); // nothing hit the wire
+  });
+
   it('fetch() issues a standalone FETCH with a full-uint64 Location (above the QUIC range)', async () => {
     const { conn, transport } = await connected();
     const big = 1n << 63n;

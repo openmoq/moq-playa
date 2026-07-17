@@ -40,6 +40,7 @@ export interface Location {
 export class SubscriptionStateMachine {
   private _state: SubscriptionStateValue = SubscriptionState.PENDING;
   private _forwardState: ForwardStateValue = ForwardState.ACTIVE;
+  private _remoteFilterType: string | undefined;
   private _trackAlias: bigint | undefined;
   private _errorCode: bigint | undefined;
   private _errorReason: string | undefined;
@@ -113,6 +114,33 @@ export class SubscriptionStateMachine {
     trackName?: Uint8Array,
   ): SubscriptionStateMachine {
     return new SubscriptionStateMachine(requestId, true, trackNamespace, trackName);
+  }
+
+  // ─── Remote Subscribe Properties (publisher side) ─────────────────────
+
+  /**
+   * The subscriber's decoded SUBSCRIPTION_FILTER (§9.2.2.5), stored by the
+   * session when the SUBSCRIBE arrives. `undefined` = the parameter was
+   * omitted, i.e. the subscription is unfiltered — which is NOT the Largest
+   * Object filter, so a draft-14/16 Joining Fetch against it is a protocol
+   * violation (§9.16.2).
+   */
+  get remoteFilterType(): string | undefined {
+    return this._remoteFilterType;
+  }
+
+  /** Record the subscriber's filter type (session-internal, at SUBSCRIBE time). */
+  setRemoteFilterType(filterType: string): void {
+    this._remoteFilterType = filterType;
+  }
+
+  /**
+   * Set the initial forward state from the SUBSCRIBE's FORWARD parameter
+   * (§9.2.2.8). Unlike {@link updateForwardState} (REQUEST_UPDATE, requires
+   * ESTABLISHED) this runs at creation time while the subscription is PENDING.
+   */
+  setInitialForwardState(forward: ForwardStateValue): void {
+    this._forwardState = forward;
   }
 
   /**

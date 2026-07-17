@@ -308,3 +308,38 @@ describe('FetchStateMachine', () => {
     });
   });
 });
+
+describe('joining fetch state (§9.16.2)', () => {
+  it('relative joining fetcher stores joining fields and NO range', () => {
+    const fetch = FetchStateMachine.createAsJoiningFetcher(varint(0n), {
+      fetchType: 0x2, joiningRequestId: 4n, joiningStart: 2n,
+    });
+    expect(fetch.isJoining).toBe(true);
+    expect(fetch.joining).toEqual({ fetchType: 0x2, joiningRequestId: 4n, joiningStart: 2n });
+    expect(fetch.startGroup).toBeUndefined(); // publisher-computed, unknown here
+  });
+
+  it('absolute joining fetcher exposes start {joiningStart, 0} for FETCH_OK validation (§9.16.3)', () => {
+    const fetch = FetchStateMachine.createAsJoiningFetcher(varint(0n), {
+      fetchType: 0x3, joiningRequestId: 4n, joiningStart: 7n,
+    });
+    expect(fetch.startGroup).toBe(7n);
+    expect(fetch.startObject).toBe(0n);
+  });
+
+  it('setResolvedRange back-fills the publisher-side range', () => {
+    const fetch = FetchStateMachine.createAsJoiningPublisher(varint(2n), {
+      fetchType: 0x2, joiningRequestId: 0n, joiningStart: 1n,
+    });
+    fetch.setResolvedRange(9n, 0n, 10n, 8n);
+    expect(fetch.startGroup).toBe(9n);
+    expect(fetch.endGroup).toBe(10n);
+    expect(fetch.endObject).toBe(8n);
+  });
+
+  it('setResolvedRange throws for a standalone fetch (range came from the message)', () => {
+    const fetch = FetchStateMachine.createAsPublisher(varint(2n), 0n, 0n, 1n, 0n);
+    expect(fetch.isJoining).toBe(false);
+    expect(() => fetch.setResolvedRange(0n, 0n, 1n, 0n)).toThrow('joining');
+  });
+});

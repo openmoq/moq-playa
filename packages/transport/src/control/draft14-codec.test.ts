@@ -25,6 +25,7 @@ import type {
   MaxRequestId,
   FetchOk,
   Fetch,
+  JoiningFetch,
   SubscribeNamespace,
   UnsubscribeNamespace,
   PublishNamespaceOk,
@@ -458,6 +459,40 @@ describe('Draft14Codec', () => {
       const bytes = codec.encode(msg);
       const { message } = codec.decode(bytes, 0);
       expect(message.type).toBe('FETCH');
+    });
+
+    it('round-trips a relative joining FETCH (fetchType 0x2, §9.16.2)', () => {
+      const msg: Fetch = {
+        type: 'FETCH',
+        requestId: varint(2),
+        fetch: { fetchType: 0x2, joiningRequestId: varint(0), joiningStart: 3n },
+        parameters: new Map([
+          [MessageParam.SUBSCRIBER_PRIORITY, [varint(128)]],
+          [MessageParam.GROUP_ORDER, [varint(1)]],
+        ]),
+      };
+      const { message } = codec.decode(codec.encode(msg), 0);
+      expect(message.type).toBe('FETCH');
+      const decoded = (message as Fetch).fetch as JoiningFetch;
+      expect(decoded.fetchType).toBe(0x2);
+      expect(decoded.joiningRequestId).toBe(0n);
+      expect(decoded.joiningStart).toBe(3n);
+    });
+
+    it('round-trips an absolute joining FETCH (fetchType 0x3)', () => {
+      const msg: Fetch = {
+        type: 'FETCH',
+        requestId: varint(4),
+        fetch: { fetchType: 0x3, joiningRequestId: varint(2), joiningStart: 7n },
+        parameters: new Map([
+          [MessageParam.SUBSCRIBER_PRIORITY, [varint(128)]],
+          [MessageParam.GROUP_ORDER, [varint(1)]],
+        ]),
+      };
+      const { message } = codec.decode(codec.encode(msg), 0);
+      const decoded = (message as Fetch).fetch as JoiningFetch;
+      expect(decoded.fetchType).toBe(0x3);
+      expect(decoded.joiningStart).toBe(7n);
     });
 
     it('encodes TRACK_STATUS unchanged', () => {

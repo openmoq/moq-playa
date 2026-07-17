@@ -70,7 +70,7 @@ import type {
   Parameters,
   TrackProperties,
 } from '@moqt/transport';
-import type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions } from '@moqt/transport';
+import type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions } from '@moqt/transport';
 import { ControlStreamFramer } from './framer.js';
 import { createBidiControlTopology } from './topology/bidi-control.js';
 import { createUniPairTopology, RequestCancelledError, RequestGoawayError, type UniPairTopology, type RequestStream } from './topology/uni-pair.js';
@@ -1379,6 +1379,47 @@ export class MoqtConnection {
     }
     await this.executeActions(actions);
     return requestId;
+  }
+
+  /**
+   * Create a Joining Fetch (§9.16.2 / draft-18 §10.12.2) referencing one of
+   * our subscriptions in PENDING or ESTABLISHED state. The publisher derives
+   * namespace, name, and range from the referenced subscription's Largest
+   * Location, contiguous with (never overlapping) the live delivery.
+   *
+   * draft-18: opens its own bidi request stream, like {@link fetch}.
+   * draft-14/16: travels on the shared control stream.
+   *
+   * @returns The request ID for this fetch (cancel with {@link fetchCancel}).
+   * @throws {SessionError} INVALID_STATE if `joiningRequestId` is not one of
+   *   our PENDING/ESTABLISHED subscriptions — nothing is emitted on the wire.
+   */
+  async joiningFetch(options: JoiningFetchOptions): Promise<bigint> {
+    const { requestId, actions } = this.session.joiningFetch(options);
+    if (this.session.draftVersion === 18) {
+      this.fetchGroupOrder.set(requestId, options.groupOrder ?? 'ascending');
+      const fetchMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
+      const stream = await this.uniPair!.openRequest(this.transport!, fetchMsg);
+      this.routeRequestResponse(stream);
+      return requestId;
+    }
+    await this.executeActions(actions);
+    return requestId;
+  }
+
+  /**
+   * Resolve an incoming Joining Fetch against this publisher's Largest
+   * Location for the referenced subscription's track (§9.16.2.1). Back-fills
+   * the session's fetch range and returns the standalone-equivalent range in
+   * the FETCH wire convention (endLocation.object is one-past the last
+   * delivered object) — serve exactly `[startLocation, endLocation)` then
+   * {@link acceptFetch} with this `endLocation`.
+   */
+  resolveJoiningFetch(
+    requestId: bigint,
+    largest: { group: bigint; object: bigint },
+  ): { startLocation: { group: bigint; object: bigint }; endLocation: { group: bigint; object: bigint } } {
+    return this.session.resolveIncomingJoiningFetch(requestId, largest);
   }
 
   /**
