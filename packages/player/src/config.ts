@@ -262,6 +262,27 @@ export interface PlaybackTuningConfig {
     readonly startObject?: number;
     readonly endGroup?: number;
   };
+
+  /**
+   * Warm-start the current group at initial tune-in (§5.1.3 "Joining an
+   * Ongoing Track"): live LOC media tracks subscribe with the Largest Object
+   * filter and immediately issue a relative Joining FETCH (Joining Start 0,
+   * §9.16.2 / draft-18 §10.12.2) referencing the SUBSCRIBE, so the current
+   * group's head plays immediately instead of waiting for the next group
+   * boundary. The FETCH and the live subscription are contiguous and
+   * non-overlapping by construction (§9.16.2.1).
+   *
+   * Scope: initial tune-in only (never ABR switches), live LOC tracks only —
+   * CMAF tracks keep their normal boundary start (MSE append ordering is not
+   * warm-start safe yet) and non-live tracks already start from group 0. A
+   * refused FETCH is non-fatal: playback continues live-only from the next
+   * group boundary.
+   *
+   * Default: off. Incompatible with an explicit `subscriptionFilter` other
+   * than `'LargestObject'` — draft-16 §9.16.2 closes the session when a
+   * Joining Fetch references a subscription with any other filter.
+   */
+  readonly warmStartCurrentGroup?: boolean;
 }
 
 /** Latency and catch-up options. */
@@ -717,6 +738,20 @@ export function validateConfig(config: MoqtPlayerConfig): void {
 
   if (config.authority !== undefined && config.authority.trim().length === 0) {
     throw new RangeError('authority must be non-empty when set');
+  }
+
+  // warmStartCurrentGroup requires the Largest Object filter: draft-16
+  // §9.16.2 makes a Joining Fetch on any other filter a session-fatal
+  // PROTOCOL_VIOLATION, so reject the combination at load time.
+  // 'LatestObject' is the deprecated compatibility alias for 'LargestObject'
+  // (same wire filter type 0x2) and is accepted.
+  if (config.warmStartCurrentGroup
+      && config.subscriptionFilter !== undefined
+      && config.subscriptionFilter.type !== 'LargestObject'
+      && config.subscriptionFilter.type !== 'LatestObject') {
+    throw new RangeError(
+      `warmStartCurrentGroup requires the LargestObject subscription filter (§9.16.2), got ${config.subscriptionFilter.type}`,
+    );
   }
 
   // livenessMaxRestarts: positive integer

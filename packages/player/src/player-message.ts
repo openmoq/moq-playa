@@ -81,6 +81,21 @@ export interface ControlMessageContext {
    * callback so player-message.ts doesn't need to import CatalogState.
    */
   onCatalogFetchError?: (requestId: bigint, errorReason: string, errorCode: bigint) => void;
+  /**
+   * Called when REQUEST_ERROR matches an active media FETCH (e.g. a
+   * warm-start joining fetch, §9.16.2). Never fatal: the player logs and
+   * continues live-only. The message layer only reports; the player owns
+   * the activeFetches cleanup.
+   */
+  onMediaFetchError?: (requestId: bigint, errorReason: string, errorCode: bigint) => void;
+  /**
+   * Called when SUBSCRIBE_OK assigns a track alias different from the
+   * request ID (§9.10). Fetch bookkeeping registered under the optimistic
+   * alias (activeFetches, fetchStreamAliases) must follow the remap or a
+   * warm-start fetch's objects are orphaned on relays that do not echo
+   * the request ID as the alias.
+   */
+  onMediaAliasRemapped?: (requestId: bigint, oldAlias: bigint, newAlias: bigint) => void;
 }
 
 /** Known tracks config (subset of MoqtPlayerConfig.knownTracks). */
@@ -186,6 +201,9 @@ export function handleControlMessage(
             // Update stored alias for PUBLISH_DONE cleanup
             const active = ctx.activeSubscriptions.get(okReqId);
             if (active) active.trackAlias = alias;
+            // Follow the remap in fetch bookkeeping (warm-start joining
+            // fetches registered under the optimistic alias).
+            ctx.onMediaAliasRemapped?.(okReqId, okReqId, alias);
           }
         }
         // Replay objects that arrived before this alias was resolved
@@ -277,6 +295,11 @@ export function handleControlMessage(
       // §9.8: REQUEST_ERROR for a fetchCatalog FETCH — dispatch to the
       // pending promise via the player-side callback.
       ctx.onCatalogFetchError?.(errReqId, msg.errorReason, BigInt(msg.errorCode));
+
+      // §9.8: REQUEST_ERROR for an active media FETCH (warm-start joining
+      // fetch or manual media fetch) — non-fatal; the player cleans up its
+      // fetch bookkeeping and continues live-only.
+      ctx.onMediaFetchError?.(errReqId, msg.errorReason, BigInt(msg.errorCode));
       break;
     }
 

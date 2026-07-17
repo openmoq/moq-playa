@@ -508,7 +508,7 @@ export class MoqtPlayer {
    */
   private readonly activeFetches = new Map<
     bigint,
-    { trackName: string; mediaType: 'video' | 'audio'; trackAlias: bigint }
+    { trackName: string; mediaType: 'video' | 'audio'; trackAlias: bigint; warmStart?: boolean }
   >();
 
   /**
@@ -557,6 +557,26 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-transport-16 §10.4.4 (FETCH_HEADER)
    */
   private readonly fetchStreamAliases = new Map<bigint, bigint>();
+
+  /**
+   * Fetch stream → FETCH request ID, so a stream FIN/reset can clean up the
+   * matching {@link activeFetches} entry (a fetch is complete when its single
+   * data stream ends, §9.16.3).
+   */
+  private readonly fetchStreamRequestIds = new Map<bigint, bigint>();
+
+  /**
+   * FETCH data streams whose request ID is not (yet) registered in
+   * {@link activeFetches}. §9.16.3 allows fetch data at any time relative to
+   * FETCH_OK — which can beat the joiningFetch()/fetch() promise continuation
+   * that registers the fetch. Objects buffer here (bounded) and replay
+   * through the normal alias remap once the fetch is registered; they are
+   * NEVER routed under their wire trackAlias 0.
+   */
+  private readonly pendingFetchStreams = new Map<
+    bigint,
+    { requestId: bigint; objects: MoqtObject[] }
+  >();
 
   /**
    * Media timeline state — populated when catalog contains a mediatimeline track.
@@ -2070,6 +2090,8 @@ export class MoqtPlayer {
     // belong to the old adapter and won't match new-session traffic.
     this.activeFetches.clear();
     this.fetchStreamAliases.clear();
+    this.fetchStreamRequestIds.clear();
+    this.pendingFetchStreams.clear();
     this.rejectPendingCatalogFetches('Session migrated — fetchCatalog cancelled');
 
     // Connect to new relay (CLIENT_SETUP → SERVER_SETUP) §3.3
@@ -2126,6 +2148,8 @@ export class MoqtPlayer {
     // belong to the old adapter and won't match new-session traffic.
     this.activeFetches.clear();
     this.fetchStreamAliases.clear();
+    this.fetchStreamRequestIds.clear();
+    this.pendingFetchStreams.clear();
     this.rejectPendingCatalogFetches('Session migrated — fetchCatalog cancelled');
 
     // Connect to new relay — createTransport is guaranteed available (checked by caller)
@@ -2199,9 +2223,42 @@ export class MoqtPlayer {
       }
     }
 
-    this.activeFetches.set(reqIdBigInt, { trackName, mediaType, trackAlias });
+    this.registerMediaFetch(reqIdBigInt, { trackName, mediaType, trackAlias });
 
     return reqId;
+  }
+
+  /**
+   * Register an active media FETCH and resolve any data streams that arrived
+   * before registration (§9.16.3: fetch data may precede FETCH_OK — and the
+   * fetch()/joiningFetch() promise continuation). Buffered objects replay
+   * through the same alias remap as normally-ordered fetch objects.
+   */
+  private registerMediaFetch(
+    fetchReqId: bigint,
+    info: { trackName: string; mediaType: 'video' | 'audio'; trackAlias: bigint; warmStart?: boolean },
+  ): void {
+    this.activeFetches.set(fetchReqId, info);
+    for (const [streamId, pending] of this.pendingFetchStreams) {
+      if (pending.requestId !== fetchReqId) continue;
+      this.pendingFetchStreams.delete(streamId);
+      this.fetchStreamAliases.set(streamId, info.trackAlias);
+      this.fetchStreamRequestIds.set(streamId, fetchReqId);
+      for (const obj of pending.objects) {
+        this.routeFetchObject(streamId, info.trackAlias, obj);
+      }
+    }
+  }
+
+  /**
+   * Route one FETCH data-stream object: remap the wire trackAlias (0 on a
+   * fetch stream, §10.4.4) to the live track's alias and hand it to the
+   * same SubscriptionManager path live objects use.
+   */
+  private routeFetchObject(streamId: bigint, alias: bigint, obj: MoqtObject): void {
+    if (this.subscriptionManager?.getMediaType(alias) === undefined) return;
+    const remapped: MoqtObject = { ...obj, trackAlias: varint(alias) };
+    this.subscriptionManager.routeObject(streamId, remapped);
   }
 
   /**
@@ -2612,6 +2669,8 @@ export class MoqtPlayer {
     this.pendingMediaSubs.clear();
     this.activeFetches.clear();
     this.fetchStreamAliases.clear();
+    this.fetchStreamRequestIds.clear();
+    this.pendingFetchStreams.clear();
     this.pendingObjectsByAlias.clear();
     // Clear make-before-break switch state
     this.pendingVideoSwitch = null;
@@ -2856,9 +2915,17 @@ export class MoqtPlayer {
         // §10.4.4: Fetch stream objects carry trackAlias=0 — remap to correct alias
         const fetchAlias = this.fetchStreamAliases.get(streamId);
         if (fetchAlias !== undefined) {
-          if (this.subscriptionManager?.getMediaType(fetchAlias) !== undefined) {
-            const remapped: MoqtObject = { ...obj, trackAlias: varint(fetchAlias) };
-            this.subscriptionManager.routeObject(streamId, remapped);
+          this.routeFetchObject(streamId, fetchAlias, obj);
+          return;
+        }
+
+        // A fetch stream whose request isn't registered yet (§9.16.3: data
+        // may beat the fetch()/joiningFetch() continuation): buffer per
+        // stream and replay on registration. Never route as wire alias 0.
+        const pendingFetch = this.pendingFetchStreams.get(streamId);
+        if (pendingFetch) {
+          if (pendingFetch.objects.length < MoqtPlayer.MAX_PENDING_PER_ALIAS) {
+            pendingFetch.objects.push(obj);
           }
           return;
         }
@@ -2924,6 +2991,15 @@ export class MoqtPlayer {
             this.livenessMonitor?.noteStreamReset(subgroupAlias, performance.now());
           }
         }
+        // §9.16.3: a fetch's single data stream ending (FIN or reset) ends
+        // the fetch — drop its routing maps and active-fetch bookkeeping.
+        this.pendingFetchStreams.delete(streamId);
+        const fetchReqId = this.fetchStreamRequestIds.get(streamId);
+        if (fetchReqId !== undefined) {
+          this.fetchStreamRequestIds.delete(streamId);
+          this.fetchStreamAliases.delete(streamId);
+          this.activeFetches.delete(fetchReqId);
+        }
         if (error !== undefined) {
           this.log.debug('Data stream %s reset with code 0x%s', streamId, error.toString(16));
         }
@@ -2952,6 +3028,12 @@ export class MoqtPlayer {
           const fetchInfo = this.activeFetches.get(reqId);
           if (fetchInfo) {
             this.fetchStreamAliases.set(streamId, fetchInfo.trackAlias);
+            this.fetchStreamRequestIds.set(streamId, reqId);
+          } else {
+            // §9.16.3: data can precede the fetch()/joiningFetch() promise
+            // continuation that registers the request. Park the stream;
+            // registerMediaFetch() resolves it and replays buffered objects.
+            this.pendingFetchStreams.set(streamId, { requestId: reqId, objects: [] });
           }
         }
       },
@@ -3113,6 +3195,29 @@ export class MoqtPlayer {
             `fetchCatalog failed: ${errorReason} (code=0x${errorCode.toString(16)})`,
           ),
         });
+      },
+      onMediaFetchError: (requestId, errorReason, errorCode) => {
+        const fetchInfo = this.activeFetches.get(requestId);
+        if (!fetchInfo) return;
+        this.activeFetches.delete(requestId);
+        // Non-fatal by design: a refused warm-start (or manual) media fetch
+        // just means no pre-roll — the live subscription is untouched and
+        // playback starts at the next group boundary.
+        this.log.warn('[%s] media FETCH %s for "%s" refused: %s (code=0x%s) — continuing live-only',
+          fetchInfo.warmStart ? 'warm-start' : 'fetch',
+          requestId, fetchInfo.trackName, errorReason, errorCode.toString(16));
+      },
+      onMediaAliasRemapped: (_requestId, oldAlias, newAlias) => {
+        // §9.10: the server assigned a different track alias — fetch
+        // bookkeeping registered under the optimistic alias must follow, or
+        // a warm-start fetch's objects orphan on relays that don't echo the
+        // request ID as the alias.
+        for (const info of this.activeFetches.values()) {
+          if (info.trackAlias === oldAlias) info.trackAlias = newAlias;
+        }
+        for (const [streamId, alias] of this.fetchStreamAliases) {
+          if (alias === oldAlias) this.fetchStreamAliases.set(streamId, newAlias);
+        }
       },
     });
   }
@@ -3780,7 +3885,22 @@ export class MoqtPlayer {
       // Live media defaults to NextGroupStart (start at keyframe boundary).
       // Non-live/VOD defaults to AbsoluteStart {0,0} (start from beginning).
       const track = mediaType === 'video' ? selected.video : selected.audio;
-      const mediaOptions = subscribeOptions ?? defaultMediaSubscriptionFilter(track?.isLive === true);
+
+      // Warm start (§5.1.3): a live LOC track subscribes with the Largest
+      // Object filter so a relative Joining FETCH can prepend the current
+      // group's head (issued below). CMAF is excluded — its MSE append path
+      // is not warm-start safe (see cmafBootstrap notes) — and non-live
+      // tracks already start from group 0. Config validation guarantees any
+      // explicit subscriptionFilter is LargestObject when warm start is on.
+      const warmStart = this.config.warmStartCurrentGroup === true
+        && track?.isLive === true
+        && packaging !== 'cmaf';
+      if (this.config.warmStartCurrentGroup === true && packaging === 'cmaf') {
+        this.log.warn('[warm-start] CMAF track "%s" skipped — LOC only in this slice', name);
+      }
+      const mediaOptions = warmStart
+        ? { subscriptionFilter: { type: 'LargestObject' as const } }
+        : (subscribeOptions ?? defaultMediaSubscriptionFilter(track?.isLive === true));
       const reqId = await this.connection.subscribe(nsBytes, nameBytes, mediaOptions);
       const reqIdBigInt = BigInt(reqId);
 
@@ -3793,6 +3913,30 @@ export class MoqtPlayer {
       // different alias, the registration is updated in handleControlMessage.
       this.subscriptionManager.registerTrack(reqIdBigInt, name, mediaType, packaging);
       this.pendingMediaSubs.set(reqIdBigInt, { trackName: name, mediaType, packaging });
+
+      if (warmStart) {
+        // §9.16.2 / §10.12.2: a Joining Fetch may reference a PENDING
+        // subscription, so this is issued immediately after SUBSCRIBE without
+        // awaiting SUBSCRIBE_OK. Registering the fetch under the LIVE track's
+        // alias routes its objects through the same pipeline as live delivery
+        // (onDataStream → fetchStreamAliases → onObject remap). Failure here
+        // is never fatal — playback continues live-only from the next group.
+        try {
+          const fetchReqId = await this.connection.joiningFetch({
+            joiningFetchType: 'relative',
+            joiningRequestId: reqIdBigInt,
+            joiningStart: 0n,
+          });
+          this.registerMediaFetch(BigInt(fetchReqId), {
+            trackName: name, mediaType, trackAlias: reqIdBigInt, warmStart: true,
+          });
+          this.log.info('[warm-start] joining FETCH requestId=%s for %s "%s" (subscribe %s)',
+            fetchReqId, mediaType, name, reqIdBigInt);
+        } catch (err) {
+          this.log.warn('[warm-start] joining FETCH failed for "%s" — continuing live-only: %s',
+            name, err instanceof Error ? err.message : String(err));
+        }
+      }
 
       this.log.info('Subscribe %s "%s" requestId=%s', mediaType, name, reqIdBigInt);
       this.emitter.emit('track_subscribed', {

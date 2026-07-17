@@ -126,6 +126,36 @@ describe('validateConfig', () => {
     expect(() => validateConfig(minConfig({ cmafBootstrapTimeoutMs: -1 }))).toThrow(RangeError);
   });
 
+  // ── warm start (joining FETCH) ──
+
+  it('accepts warmStartCurrentGroup true/false/undefined', () => {
+    expect(() => validateConfig(minConfig({ warmStartCurrentGroup: true }))).not.toThrow();
+    expect(() => validateConfig(minConfig({ warmStartCurrentGroup: false }))).not.toThrow();
+    expect(() => validateConfig(minConfig({}))).not.toThrow();
+  });
+
+  it('rejects warmStartCurrentGroup with an explicit non-LargestObject subscriptionFilter (d16 §9.16.2 fatality)', () => {
+    expect(() => validateConfig(minConfig({
+      warmStartCurrentGroup: true,
+      subscriptionFilter: { type: 'NextGroupStart' },
+    }))).toThrow(RangeError);
+  });
+
+  it('accepts warmStartCurrentGroup with an explicit LargestObject subscriptionFilter', () => {
+    expect(() => validateConfig(minConfig({
+      warmStartCurrentGroup: true,
+      subscriptionFilter: { type: 'LargestObject' },
+    }))).not.toThrow();
+  });
+
+  it('accepts warmStartCurrentGroup with the deprecated LatestObject compatibility alias', () => {
+    // LatestObject encodes as the same wire filter type (0x2) as LargestObject.
+    expect(() => validateConfig(minConfig({
+      warmStartCurrentGroup: true,
+      subscriptionFilter: { type: 'LatestObject' },
+    }))).not.toThrow();
+  });
+
   // ── connection authority ──
 
   it('accepts non-empty authority', () => {

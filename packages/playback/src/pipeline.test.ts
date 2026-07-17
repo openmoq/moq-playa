@@ -1718,6 +1718,76 @@ describe('PlaybackPipeline', () => {
             // No new decode commands
             expect(commands.length).toBe(commandsBefore);
         });
+
+        it('dedupes a BUFFERED duplicate by identity before decode (warm-start FETCH/SUBSCRIBE overlap)', () => {
+            // Warm-start contract (§9.16.2.1): FETCH pre-roll and live SUBSCRIBE
+            // are contiguous by construction, but a non-compliant publisher may
+            // overlap them. The same (group, object) arriving once via the
+            // FETCH stream and once via live delivery must reach the decoder
+            // exactly once — pinned at the pre-decode buffer, not after.
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const { pipeline, commands, sync } = createPipeline({ mediaType: 'video', clock });
+            sync.setAudioReference(1_000_000_000n);
+
+            pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([0x01, 0x64])));
+            pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_000n, false));
+            // Duplicate of object 1 arrives BEFORE anything is consumed.
+            pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_000n, false));
+            pipeline.tick();
+
+            const decodes = commands.filter((c) => c.type === 'decode_video');
+            expect(decodes.length).toBe(2); // objects 0 and 1, each exactly once
+        });
+
+        it('fetched group head arriving AFTER the live tail (no intervening tick) decodes in order from object 0', () => {
+            // Warm-start ordering: live objects {2,3} can land before the
+            // joining-FETCH head {0,1}. When no tick intervenes, the jitter
+            // buffer inserts by identity and decode starts at the keyframe.
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const { pipeline, commands, sync } = createPipeline({ mediaType: 'video', clock });
+            sync.setAudioReference(1_000_000_000n);
+
+            pipeline.pushObject(makeData(0, 2), videoHeaders(1_000_066_000n, false));
+            pipeline.pushObject(makeData(0, 3), videoHeaders(1_000_100_000n, false));
+            pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([0x01, 0x64])));
+            pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_000n, false));
+            pipeline.tick();
+
+            const decoded = commands.filter((c) => c.type === 'decode_video');
+            expect(decoded.length).toBe(4);
+            // In-order from the keyframe: capture timestamps ascend.
+            const ts = decoded.map((c: any) => c.captureTimestampUs as bigint);
+            expect([...ts].sort((a, b) => Number(a - b))).toEqual(ts);
+        });
+
+        it('DOCUMENTED LIMITATION: a tick between live tail and fetched head discards one tail object per tick', () => {
+            // The reset-sync path (initial join / pause-resume) extracts and
+            // drops the buffer top when it is not a keyframe, one object per
+            // tick, until a keyframe-starting group appears. Under warm start
+            // this means live-tail objects racing ahead of the FETCH head can
+            // be discarded, leaving a gap the existing gap-timeout recovery
+            // must skip. This test pins that exact behavior so any future
+            // keyframe-wait relaxation shows up as a deliberate change.
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const { pipeline, commands, sync } = createPipeline({ mediaType: 'video', clock });
+            sync.setAudioReference(1_000_000_000n);
+
+            pipeline.pushObject(makeData(0, 2), videoHeaders(1_000_066_000n, false));
+            pipeline.pushObject(makeData(0, 3), videoHeaders(1_000_100_000n, false));
+            pipeline.tick(); // discards object 2 (top, not a keyframe)
+
+            pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([0x01, 0x64])));
+            pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_000n, false));
+            pipeline.tick();
+
+            // Head decodes; object 3 is stranded behind the discarded 2 (gap
+            // recovery, not this test's scope, would eventually skip forward).
+            const decoded = commands.filter((c) => c.type === 'decode_video');
+            expect(decoded.length).toBe(2);
+        });
     });
 
     // ─── Recovery reset flush ────────────────────────────────────────
