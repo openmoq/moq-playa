@@ -23,7 +23,7 @@
  * All forwarding uses the public MoqtConnection API — no internals.
  */
 import type { MoqtConnection, IncomingPublish } from '@moqt/webtransport';
-import { RequestError18 } from '@moqt/transport';
+import { RequestError18, type Fetch, type StandaloneFetch } from '@moqt/transport';
 import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, nsStr, hex } from './demo.js';
 
 const log = (...a: unknown[]) => console.log('[relay]', ...a);
@@ -95,8 +95,15 @@ export class Relay {
       track.subscribers.push(sub);
       log(`subscriber joined ${name} (alias=${alias}, requestId=${requestId}); ${track.subscribers.length} now`);
 
-      // Late-join: replay the cached latest group BEFORE any future live object.
-      if (track.cache.length > 0) {
+      // Late-join: replay the cached latest group BEFORE any future live object —
+      // but NOT for a Largest Object subscription (§5.1.2: it starts delivery at
+      // {Largest.Group, Largest.Object + 1}; replaying the cached group would
+      // violate the filter). Such a subscriber warm-starts the current group with
+      // a Joining FETCH instead (§10.12.2, see handleFetch).
+      const remoteFilter = conn.session.getIncomingSubscription(requestId)?.remoteFilterType;
+      if (remoteFilter === 'LargestObject') {
+        log(`Largest Object subscription on ${name} — no cache replay (join the group head via Joining FETCH)`);
+      } else if (track.cache.length > 0) {
         log(`replaying ${track.cache.length} cached object(s) of group ${track.cacheGroupId} to the new ${name} subscriber`);
         for (const c of track.cache) {
           sub.queue = sub.queue.then(() => forwardObject(sub, c.groupId, c.subgroupId, c.objectId, c.payload));
@@ -140,6 +147,83 @@ export class Relay {
     }
   }
 
+  /**
+   * Answer a FETCH from the latest-group live cache (TOY semantics).
+   *
+   * Standalone (§9.16.3): serve `cache ∩ [startLocation, endLocation)` — the
+   * End Location's Object component is one-past ("the end Location, plus 1");
+   * value 0 requests the entire end group. Start beyond the largest cached
+   * object → REQUEST_ERROR INVALID_RANGE. Because only the LATEST group is
+   * retained, a range reaching further back is answered with what exists;
+   * per §9.16.3 gaps in the response stream indicate objects that do not
+   * exist (a real relay would confirm upstream — this toy has no upstream).
+   *
+   * Joining (§9.16.2 / §10.12.2): the session already validated the joining
+   * reference; resolve the range from this track's largest cached object and
+   * serve identically. No cached objects → REQUEST_ERROR INVALID_RANGE
+   * ("If no Objects have been published for the track").
+   */
+  async handleFetch(conn: MoqtConnection, requestId: bigint, fetch: Fetch): Promise<void> {
+    try {
+      if (fetch.fetch.fetchType === 0x1) {
+        const sf = fetch.fetch as StandaloneFetch;
+        if (!isRegisteredTrack(sf.trackNamespace, sf.trackName)) {
+          log(`FETCH ${nsStr(sf.trackNamespace)}/${td(sf.trackName)} — not registered; rejecting`);
+          await conn.rejectFetch(requestId, RequestError18.DOES_NOT_EXIST as bigint, 'unknown track');
+          return;
+        }
+        const track = this.tracks.get(trackKeyOf(sf.trackNamespace, sf.trackName));
+        const largest = latestCached(track);
+        if (!largest) {
+          await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE as bigint, 'no objects published');
+          return;
+        }
+        const start = sf.startLocation;
+        // §9.16.3: "If Start Location is greater than the Largest Object the
+        // publisher MUST return REQUEST_ERROR with error code INVALID_RANGE."
+        if (start.group > largest.groupId
+          || (start.group === largest.groupId && start.object > largest.objectId)) {
+          await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE as bigint,
+            `start (${start.group},${start.object}) beyond largest (${largest.groupId},${largest.objectId})`);
+          return;
+        }
+        await serveFetchFromCache(conn, requestId, track!, start, sf.endLocation);
+        return;
+      }
+
+      // Joining (0x2/0x3): locate the joined subscription's track on THIS conn.
+      const joiningReqId = (fetch.fetch as { joiningRequestId: bigint }).joiningRequestId;
+      const track = this.findSubscriptionTrack(conn, joiningReqId);
+      const largest = latestCached(track);
+      if (!track || !largest) {
+        // §9.16.2: no objects published for the track → INVALID_RANGE.
+        await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE as bigint, 'no objects published');
+        return;
+      }
+      let range;
+      try {
+        range = conn.resolveJoiningFetch(requestId, { group: largest.groupId, object: largest.objectId });
+      } catch {
+        // Absolute joining start beyond the largest group (§9.16.3).
+        await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE as bigint, 'joining start beyond largest');
+        return;
+      }
+      log(`joining FETCH requestId=${requestId} → serving [${range.startLocation.group},${range.startLocation.object}) .. (${range.endLocation.group},${range.endLocation.object})`);
+      await serveFetchFromCache(conn, requestId, track, range.startLocation, range.endLocation);
+    } catch (err) {
+      console.error('[relay] FETCH handling failed:', (err as Error).message);
+      try { await conn.rejectFetch(requestId, RequestError18.INTERNAL_ERROR as bigint, 'relay error'); } catch { /* stream gone */ }
+    }
+  }
+
+  /** Reverse lookup: the track a given (conn, requestId) subscription belongs to. */
+  private findSubscriptionTrack(conn: MoqtConnection, requestId: bigint): Track | undefined {
+    for (const track of this.tracks.values()) {
+      if (track.subscribers.some((s) => s.conn === conn && s.requestId === requestId)) return track;
+    }
+    return undefined;
+  }
+
   /** A single subscription was cancelled (subscriber reset its SUBSCRIBE stream) —
    *  drop ONLY that subscription (ABR quality-switch), keep the connection. */
   removeSubscription(conn: MoqtConnection, requestId: bigint): void {
@@ -165,6 +249,51 @@ export class Relay {
       }
     }
   }
+}
+
+/** Largest cached object of a track (cache holds one group, appended in order). */
+function latestCached(track: Track | undefined): CachedObject | undefined {
+  return track && track.cache.length > 0 ? track.cache[track.cache.length - 1] : undefined;
+}
+
+/**
+ * Serve `cache ∩ [start, end)` on a FETCH data stream, ascending. `end` is in
+ * the wire convention (§9.16.3): Object is one-past; Object 0 requests the
+ * entire end group. FETCH_OK's endLocation uses the same encoding and covers
+ * exactly what was served (the request end capped at largest, per §10.13).
+ */
+async function serveFetchFromCache(
+  conn: MoqtConnection,
+  requestId: bigint,
+  track: Track,
+  start: { group: bigint; object: bigint },
+  end: { group: bigint; object: bigint },
+): Promise<void> {
+  const beforeEnd = (groupId: bigint, objectId: bigint): boolean =>
+    groupId < end.group
+    || (groupId === end.group && (end.object === 0n || objectId < end.object));
+  const atOrAfterStart = (groupId: bigint, objectId: bigint): boolean =>
+    groupId > start.group
+    || (groupId === start.group && objectId >= start.object);
+
+  const servable = track.cache.filter((c) => atOrAfterStart(c.groupId, c.objectId) && beforeEnd(c.groupId, c.objectId));
+  const last = servable[servable.length - 1];
+  const endLocation = last
+    ? { group: last.groupId, object: last.objectId + 1n }
+    : { group: start.group, object: start.object }; // empty range: end == start is legal (§9.16.3)
+
+  await conn.acceptFetch(requestId, { endLocation });
+  const sid = await conn.openFetchStream(requestId);
+  for (const c of servable) {
+    await conn.sendFetchObject(sid, {
+      groupId: c.groupId, subgroupId: c.subgroupId, objectId: c.objectId,
+      publisherPriority: 128, payload: c.payload,
+    });
+  }
+  // §9.16.3: if no objects exist in the range, the stream carries only the
+  // FETCH_HEADER and closes with FIN.
+  await conn.closeFetchStream(sid);
+  log(`FETCH requestId=${requestId}: served ${servable.length} cached object(s)`);
 }
 
 /** Forward ONE object to one subscriber, preserving identity: reuse (or lazily open) an

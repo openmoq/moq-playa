@@ -124,6 +124,8 @@ async function handleSession(
       // ONLY that subscription — the viewer connection stays open.
       conn.onSubscribeClosed = (requestId) => relay.removeSubscription(conn, requestId);
       conn.onPublish = (publish) => { void relay.handlePublish(conn, publish); };
+      // Serve standalone + joining FETCH from the latest-group live cache (§10.12).
+      conn.onFetch = (requestId, fetch) => { void relay.handleFetch(conn, requestId, fetch); };
     } else {
       // Toy-publisher mode: answer a SUBSCRIBE for the demo track with a tiny stream.
       conn.onSubscribe = (requestId, namespace, trackName) => {

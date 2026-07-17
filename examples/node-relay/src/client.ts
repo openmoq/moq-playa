@@ -50,7 +50,7 @@ export interface Subscription {
 export async function beginSubscribe(
   conn: MoqtConnection,
   expected: number,
-  opts: { timeoutMs?: number; label?: string; track?: string } = {},
+  opts: { timeoutMs?: number; label?: string; track?: string; filter?: import('@moqt/transport').SubscriptionFilter } = {},
 ): Promise<Subscription> {
   const timeoutMs = opts.timeoutMs ?? 10_000;
   const trackName = opts.track ?? DEMO_TRACK;
@@ -60,6 +60,7 @@ export async function beginSubscribe(
   const done = new Promise<void>((res) => { resolveDone = res; });
 
   const sub = await conn.subscribeTrack(nsBytes(DEMO_NAMESPACE), te(trackName), {
+    ...(opts.filter ? { filter: opts.filter } : {}),
     onObject: (obj) => {
       if (obj.kind !== 'data') return; // ignore gap signals
       const rec: CollectedObject = {
