@@ -4,10 +4,11 @@
 
 Reference implementation of **Media over QUIC Transport (MoQT)** in TypeScript — the next-generation live media streaming protocol built on WebTransport.
 
-Full stack from WebTransport to viewport, with two integration paths:
+Full stack from WebTransport to viewport, published under two npm scopes so you
+pick the integration path that fits:
 
-- **`@moqt/*`** — Reference implementation toolkit: protocol, playback, browser adapters
-- **`@playa/player`** — Batteries-included drop-in player built on `@moqt/*`
+- **`@moqt/*`** — the reference-implementation building blocks: protocol core, playback, and browser adapters, composed however you need.
+- **`@playa/player`** — the batteries-included, drop-in browser player built on `@moqt/*`.
 
 ---
 
