@@ -68,6 +68,18 @@ describe('buildSetupOptions', () => {
     expect(options.implementation).toBe('proto-moq');
   });
 
+  it('includes authority when configured (§9.3.1.1)', () => {
+    const config = minimalConfig({ authority: 'proto-moq' });
+    const options = buildSetupOptions(config);
+    expect(options.authority).toBe('proto-moq');
+  });
+
+  it('omits authority when not configured', () => {
+    const config = minimalConfig({ authority: undefined });
+    const options = buildSetupOptions(config);
+    expect(options.authority).toBeUndefined();
+  });
+
   it('omits implementation when not configured', () => {
     const config = minimalConfig({ moqtImplementation: undefined });
     const options = buildSetupOptions(config);

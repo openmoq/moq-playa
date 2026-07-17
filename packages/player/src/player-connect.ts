@@ -44,6 +44,10 @@ export function buildSetupOptions(config: MoqtPlayerConfig): SetupOptions {
     options.implementation = config.moqtImplementation;
   }
 
+  if (config.authority) {
+    options.authority = config.authority;
+  }
+
   if (config.authTokens) {
     options.authTokens = config.authTokens;
   }

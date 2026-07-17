@@ -54,7 +54,7 @@ describe('MoqtConnection(18) construction + connect', () => {
     expect(transport.uniOut[0]!.writeClosed).toBe(false); // control stream stays open
   });
 
-  it('forwards setup options into SETUP but strips WebTransport path/authority', async () => {
+  it('forwards setup options into SETUP, strips path, and preserves explicit authority', async () => {
     const conn = new MoqtConnection(18);
     const transport = new TransportSim();
     transport.openIncomingUni().push(setupBytes()); // control stream stays open (§3.3)
@@ -63,7 +63,8 @@ describe('MoqtConnection(18) construction + connect', () => {
     const setup = codec18.decode(transport.uniOut[0]!.writtenBytes(), 0).message as Setup;
     expect(setup.setupOptions.has(BigInt(SetupOption18.MOQT_IMPLEMENTATION))).toBe(true);
     expect(setup.setupOptions.has(BigInt(SetupOption18.PATH))).toBe(false);
-    expect(setup.setupOptions.has(BigInt(SetupOption18.AUTHORITY))).toBe(false);
+    const authority = setup.setupOptions.get(BigInt(SetupOption18.AUTHORITY))?.[0];
+    expect(new TextDecoder().decode(authority as Uint8Array)).toBe('host');
   });
 });
 

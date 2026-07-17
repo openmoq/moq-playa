@@ -126,6 +126,20 @@ describe('validateConfig', () => {
     expect(() => validateConfig(minConfig({ cmafBootstrapTimeoutMs: -1 }))).toThrow(RangeError);
   });
 
+  // ── connection authority ──
+
+  it('accepts non-empty authority', () => {
+    expect(() => validateConfig(minConfig({ authority: 'proto-moq' }))).not.toThrow();
+  });
+
+  it('rejects empty authority', () => {
+    expect(() => validateConfig(minConfig({ authority: '' }))).toThrow(RangeError);
+  });
+
+  it('rejects blank authority', () => {
+    expect(() => validateConfig(minConfig({ authority: '   ' }))).toThrow(RangeError);
+  });
+
   // ── media liveness ──
 
   it('accepts livenessTimeoutMs 0 (disables the liveness monitor)', () => {

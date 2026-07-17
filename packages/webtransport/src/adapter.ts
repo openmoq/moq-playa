@@ -521,10 +521,12 @@ export class MoqtConnection {
       // start those loops here. establish() has already consumed the inbound
       // control stream (#1) and released the lock, so runIncomingStreamLoop
       // picks up data streams (#2+) without contending for the control stream.
-      // WebTransport carries path/authority in the URL — strip them, same as 14/16.
-      const { path, authority, ...cleanOptions } = options;
+      // WebTransport carries the path in the URL, so never put PATH in SETUP.
+      // AUTHORITY over WebTransport is prohibited by draft-16 §9.3.1.1, but
+      // some tenant-routed deployments require it; preserve it only when the
+      // caller explicitly opts into that interop deviation.
+      const { path, ...cleanOptions } = options;
       void path;
-      void authority;
       await this.uniPair!.establish(transport, cleanOptions);
       this.runIncomingStreamLoop(transport);
       this.runDatagramLoop(transport);
@@ -532,9 +534,12 @@ export class MoqtConnection {
       return;
     }
 
-    // §9.3.1.1/§9.3.1.2: PATH and AUTHORITY MUST NOT be used when
-    // WebTransport is used. MoqtConnection is WebTransport-specific — strip them.
-    const { path, authority, ...cleanOptions } = options;
+    // WebTransport carries the path in the URL, so never put PATH in SETUP.
+    // AUTHORITY over WebTransport is prohibited by draft-16 §9.3.1.1, but
+    // some tenant-routed deployments require it; preserve it only when the
+    // caller explicitly opts into that interop deviation.
+    const { path, ...cleanOptions } = options;
+    void path;
 
     // draft-14/16 single-bidi control stream. The role decides who opens it:
     // the client opens it and sends CLIENT_SETUP; the server accepts the client's

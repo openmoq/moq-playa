@@ -446,8 +446,8 @@ describe('MoqtConnection', () => {
       expect(adapter.session.state).toBe(SessionState.ESTABLISHED);
     });
 
-    it('strips path option for WebTransport (§9.3.1.1)', async () => {
-      // §9.3.1.1: "PATH ... MUST NOT be used ... when WebTransport is used."
+    it('strips path option for WebTransport (§9.3.1.2)', async () => {
+      // §9.3.1.2: "PATH ... MUST NOT be used ... when WebTransport is used."
       // MoqtConnection is WebTransport-specific, so it must strip path.
       const mock = createMockTransport();
       const adapter = new MoqtConnection();
@@ -468,10 +468,10 @@ describe('MoqtConnection', () => {
 
       // PATH (0x01) MUST NOT appear in the parameters
       expect(clientSetup.parameters.has(varint(SetupParam.PATH))).toBe(false);
+      expect(clientSetup.parameters.has(varint(SetupParam.AUTHORITY))).toBe(false);
     });
 
-    it('strips authority option for WebTransport (§9.3.1.2)', async () => {
-      // §9.3.1.2: "AUTHORITY ... MUST NOT be used ... when WebTransport is used."
+    it('passes explicit authority option for relay tenant routing', async () => {
       const mock = createMockTransport();
       const adapter = new MoqtConnection();
 
@@ -487,8 +487,8 @@ describe('MoqtConnection', () => {
       const { message } = decodeControlMessage(mock.controlWritten[0]!, 0);
       const clientSetup = message as import('@moqt/transport').ClientSetup;
 
-      // AUTHORITY (0x05) MUST NOT appear in the parameters
-      expect(clientSetup.parameters.has(varint(SetupParam.AUTHORITY))).toBe(false);
+      const authority = clientSetup.parameters.get(varint(SetupParam.AUTHORITY))?.[0];
+      expect(new TextDecoder().decode(authority as Uint8Array)).toBe('example.com');
     });
   });
 

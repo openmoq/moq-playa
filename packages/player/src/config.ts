@@ -137,6 +137,18 @@ export interface ConnectionConfig {
   readonly reconnectBackoff?: 'linear' | 'exponential';
 
   /**
+   * CLIENT_SETUP AUTHORITY parameter.
+   *
+   * Most WebTransport deployments identify the authority in the connection
+   * URL and should leave this unset. Sending AUTHORITY in SETUP over
+   * WebTransport is a deliberate interop override for tenant-routed relays:
+   * a spec-compliant relay MUST close the session with INVALID_AUTHORITY.
+   *
+   * @see draft-ietf-moq-transport-16 §9.3.1.1
+   */
+  readonly authority?: string;
+
+  /**
    * Authorization tokens to include in CLIENT_SETUP.
    * Each Uint8Array is a serialized Token structure (Figure 4).
    * @see draft-ietf-moq-transport-16 §9.3.1.5
@@ -701,6 +713,10 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   // cmafBootstrapTimeoutMs: >= 0 (0 disables the bootstrap deadlines)
   if (config.cmafBootstrapTimeoutMs !== undefined && config.cmafBootstrapTimeoutMs < 0) {
     throw new RangeError(`cmafBootstrapTimeoutMs must be >= 0 (0 disables), got ${config.cmafBootstrapTimeoutMs}`);
+  }
+
+  if (config.authority !== undefined && config.authority.trim().length === 0) {
+    throw new RangeError('authority must be non-empty when set');
   }
 
   // livenessMaxRestarts: positive integer

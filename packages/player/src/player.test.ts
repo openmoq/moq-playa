@@ -4404,6 +4404,22 @@ describe('MoqtPlayer', () => {
       );
     });
 
+    it('passes authority to adapter.connect as setup options (§9.3.1.1)', async () => {
+      const adapter = createMockAdapter();
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        authority: 'proto-moq',
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+
+      expect(adapter.connect).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ authority: 'proto-moq' }),
+      );
+    });
+
     it('passes authTokens to adapter.connect as setup options (§9.3.1.5)', async () => {
       const adapter = createMockAdapter();
       const token = new Uint8Array([1, 2, 3]);
