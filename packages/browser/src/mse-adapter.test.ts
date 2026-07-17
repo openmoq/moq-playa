@@ -200,7 +200,10 @@ class MockMediaSource extends MockEventTarget {
     readyState: 'closed' | 'open' | 'ended' = 'closed';
     readonly videoBuffer = new MockSourceBuffer();
     readonly audioBuffer = new MockSourceBuffer();
+    /** Mime types passed to addSourceBuffer, for created-nothing assertions. */
+    readonly addSourceBufferCalls: string[] = [];
     addSourceBuffer(mimeType: string): MockSourceBuffer {
+        this.addSourceBufferCalls.push(mimeType);
         return mimeType.startsWith('video/') ? this.videoBuffer : this.audioBuffer;
     }
     removeSourceBuffer(_sb: unknown): void { /* no-op */ }
@@ -1246,5 +1249,85 @@ describe('playhead-wedge watchdog', () => {
         check(6_300);          // rung 2: pause/play pulse (NOT a fresh rung-1 nudge)
         expect(wedges.map((w) => w.rung)).toEqual([1, 2]);
         expect(video.pauseCalls).toBe(1);
+    });
+});
+
+// ─── CMAF bootstrap hardening (codec support + init contract) ─────────
+//
+// initialize() must never quietly produce SourceBuffers that cannot work:
+// an unsupported codec string or a zero-byte init entry are loud errors,
+// not silent black screens.
+
+describe('initialize() bootstrap validation (all-or-nothing)', () => {
+    it('rejects an unsupported codec: returns false, named error, NO SourceBuffers created', async () => {
+        (globalThis.MediaSource as any).isTypeSupported =
+            (mime: string) => !mime.includes('avc1.BAD');
+        try {
+            const video = new MockVideoElement();
+            const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+            const errors: Error[] = [];
+            adapter.onError = (e) => errors.push(e);
+            const ok = adapter.initialize({ video: { codec: 'avc1.BAD', initData: makeInit(1, 100) } });
+            currentMs.open();
+            await Promise.resolve(); await Promise.resolve();
+
+            expect(ok).toBe(false);
+            expect(errors.length).toBeGreaterThanOrEqual(1);
+            expect(errors[0]!.name).toBe('CodecUnsupportedError');
+            expect(errors[0]!.message).toContain('avc1.BAD'); // names the exact mime
+            expect(currentMs.addSourceBufferCalls).toHaveLength(0); // nothing created
+        } finally {
+            delete (globalThis.MediaSource as any).isTypeSupported;
+        }
+    });
+
+    it('rejects a zero-byte init entry: returns false, no SourceBuffers, no appends', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const errors: Error[] = [];
+        adapter.onError = (e) => errors.push(e);
+        const ok = adapter.initialize({ video: { codec: 'avc1.42c01e', initData: new Uint8Array(0) } });
+        currentMs.open();
+        await Promise.resolve(); await Promise.resolve();
+
+        expect(ok).toBe(false);
+        expect(errors.length).toBeGreaterThanOrEqual(1);
+        expect(errors[0]!.message).toMatch(/init/i);
+        expect(currentMs.addSourceBufferCalls).toHaveLength(0);
+        expect(currentMs.videoBuffer.appendedPayloads).toHaveLength(0);
+    });
+
+    it('mixed valid video + invalid audio rejects the WHOLE config — no partial video SourceBuffer', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const errors: Error[] = [];
+        adapter.onError = (e) => errors.push(e);
+        const ok = adapter.initialize({
+            video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) },
+            audio: { codec: 'mp4a.40.2', initData: new Uint8Array(0) }, // broken entry
+        });
+        currentMs.open();
+        await Promise.resolve(); await Promise.resolve();
+
+        expect(ok).toBe(false);
+        expect(currentMs.addSourceBufferCalls).toHaveLength(0); // not even the valid track
+        expect(currentMs.videoBuffer.appendedPayloads).toHaveLength(0);
+    });
+
+    it('stays un-latched after rejection: a corrected initialize() then succeeds normally', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.onError = () => { /* swallow the expected rejection error */ };
+        const initData = makeInit(1, 100);
+
+        expect(adapter.initialize({ video: { codec: 'avc1.42c01e', initData: new Uint8Array(0) } }))
+            .toBe(false);
+        // Corrected config on the SAME adapter must succeed (no latch from the failure).
+        expect(adapter.initialize({ video: { codec: 'avc1.42c01e', initData } })).toBe(true);
+        currentMs.open();
+        await Promise.resolve(); await Promise.resolve();
+
+        expect(currentMs.addSourceBufferCalls).toHaveLength(1);
+        expect(currentMs.videoBuffer.appendedPayloads[0]).toEqual(initData); // init appended
     });
 });

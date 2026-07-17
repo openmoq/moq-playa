@@ -79,6 +79,9 @@ export class CmafAssembler {
    */
   private pendingMoofs = new Map<string, Uint8Array>();
 
+  /** Tracks (mediaType:trackName) already warned about non-media drops. */
+  private readonly droppedNonMediaWarned = new Set<string>();
+
   /** First baseMediaDecodeTime seen per media type — used to rebase to zero. */
   private videoEpoch: bigint | null = null;
   private audioEpoch: bigint | null = null;
@@ -166,7 +169,21 @@ export class CmafAssembler {
       moofOffset += s;
     }
 
-    if (moofOffset + 8 > payload.byteLength) return;
+    if (moofOffset + 8 > payload.byteLength) {
+      // No moof/mdat anywhere in the payload — e.g. an in-band ftyp+moov
+      // init segment that should have been consumed by the player layer.
+      // Silently eating it turns a publisher's init into a black screen;
+      // warn once per track so the drop is diagnosable.
+      const warnKey = `${mediaType}:${trackName}`;
+      if (!this.droppedNonMediaWarned.has(warnKey)) {
+        this.droppedNonMediaWarned.add(warnKey);
+        console.warn(
+          `[CMAF] dropped ${mediaType} "${trackName}" object with no moof/mdat `
+          + `(${payload.byteLength}B, first box "${boxType(payload, 0)}") — `
+          + `in-band init segments must be handled before the assembler`);
+      }
+      return;
+    }
     const type = boxType(payload, moofOffset);
     const key = `${mediaType}:${trackName}:${groupId}`;
 

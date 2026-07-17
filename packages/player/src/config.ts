@@ -367,6 +367,16 @@ export interface RecoveryConfig {
   readonly gapEscalationWindowMs?: number;
 
   /**
+   * CMAF bootstrap deadline: once CMAF media objects are arriving, an init
+   * segment must materialize (inline initData, initTrack delivery, or an
+   * in-band ftyp+moov object) — and after MSE initialization, a first frame
+   * must render — within this window, or playback fails with a specific
+   * fatal error instead of a silent black player.
+   * Default: 10_000. Set 0 to disable both bootstrap deadlines.
+   */
+  readonly cmafBootstrapTimeoutMs?: number;
+
+  /**
    * Media-liveness starvation threshold: while PLAYING, a track with no
    * object arrivals for this long triggers the restart ladder.
    * The gap detector handles gaps BETWEEN arrivals; this handles NO
@@ -616,6 +626,9 @@ export const DEFAULT_PLAYER_CONFIG = {
   maxDecodeErrors: 10,
   gapEscalationWindowMs: 10_000,
 
+  // CMAF bootstrap (0 disables)
+  cmafBootstrapTimeoutMs: 10_000,
+
   // Media liveness (0 disables)
   livenessTimeoutMs: 10_000,
   livenessResetProbeMs: 2_000,
@@ -683,6 +696,11 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   // livenessTimeoutMs: >= 0 (0 disables the liveness monitor)
   if (config.livenessTimeoutMs !== undefined && config.livenessTimeoutMs < 0) {
     throw new RangeError(`livenessTimeoutMs must be >= 0 (0 disables), got ${config.livenessTimeoutMs}`);
+  }
+
+  // cmafBootstrapTimeoutMs: >= 0 (0 disables the bootstrap deadlines)
+  if (config.cmafBootstrapTimeoutMs !== undefined && config.cmafBootstrapTimeoutMs < 0) {
+    throw new RangeError(`cmafBootstrapTimeoutMs must be >= 0 (0 disables), got ${config.cmafBootstrapTimeoutMs}`);
   }
 
   // livenessMaxRestarts: positive integer

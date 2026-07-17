@@ -772,3 +772,25 @@ describe('CmafAssembler — HEVC CRA-with-RASL strip', () => {
     expect(onDiscontinuity).toHaveBeenCalledWith('video', 'video-0');
   });
 });
+
+describe('CmafAssembler non-media payload diagnostics', () => {
+  it('warns ONCE per track when dropping a payload with no moof/mdat (e.g. in-band init)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const onSegment = vi.fn();
+      const assembler = new CmafAssembler({ onSegment });
+      // ftyp-only payload: the shape of an in-band ftyp+moov init segment
+      // reaching the assembler (the player layer should have consumed it).
+      const ftyp = new Uint8Array([0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70, 105, 115, 111, 54, 0, 0, 0, 0]);
+      assembler.push('video', 't1', 0n, ftyp);
+      assembler.push('video', 't1', 1n, ftyp); // second drop: same track — no second warn
+      assembler.push('audio', 't1', 0n, ftyp); // different track: warns again
+
+      expect(onSegment).not.toHaveBeenCalled();
+      const dropWarns = warn.mock.calls.filter((c) => /no moof\/mdat/i.test(String(c[0])));
+      expect(dropWarns).toHaveLength(2); // video:t1 once, audio:t1 once
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});

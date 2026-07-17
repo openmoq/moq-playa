@@ -210,18 +210,25 @@ export interface AudioOutputLike {
  */
 export interface MediaSourceLike {
   /**
-   * Initialize with codec strings and init segments from the catalog.
-   * Creates SourceBuffers and appends the initialization segment (ftyp+moov).
+   * Initialize with codec strings and init segment bytes. Creates
+   * SourceBuffers and appends the initialization segments (ftyp+moov).
    * Must be called before appendChunk().
    *
-   * @param config Per-media-type codec string and Base64-decoded initData bytes
+   * ALL-OR-NOTHING: an implementation that rejects any entry (unsupported
+   * codec, empty init bytes) must create NO SourceBuffers, must remain
+   * un-latched (a later corrected call may succeed), and must return
+   * `false` after surfacing the reason via onError. `void`/`true`/
+   * `undefined` mean success (back-compat with implementations that
+   * return nothing).
+   *
+   * @param config Per-media-type codec string and decoded init bytes
    * @see draft-ietf-moq-cmsf-00 §3.1 (initData → ftyp+moov)
    * @see draft-ietf-moq-msf-00 §5.1.24 (codec string)
    */
   initialize(config: {
     video?: { codec: string; initData: Uint8Array };
     audio?: { codec: string; initData: Uint8Array };
-  }): void;
+  }): boolean | void;
 
   /**
    * Append a CMAF object payload (moof+mdat pairs) to the SourceBuffer.

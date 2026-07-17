@@ -75,6 +75,15 @@ describe('Error Taxonomy', () => {
     expect(PlayerErrorCode.MEDIA_ELEMENT_WEDGED).toBe(0x1102);
   });
 
+  it('CODEC_UNSUPPORTED lives in the decoder block', () => {
+    expect(PlayerErrorCode.CODEC_UNSUPPORTED).toBe(0x1103);
+  });
+
+  it('CMAF bootstrap codes live in the catalog block', () => {
+    expect(PlayerErrorCode.CMAF_INIT_INVALID).toBe(0x1202);
+    expect(PlayerErrorCode.CMAF_INIT_TIMEOUT).toBe(0x1203);
+  });
+
   it('all severity values are valid', () => {
     const severities = ['transient', 'degraded', 'fatal'] as const;
     for (const severity of severities) {

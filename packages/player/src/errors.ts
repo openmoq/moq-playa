@@ -74,12 +74,31 @@ export const PlayerErrorCode = {
    * must be rebuilt (fresh tune-in). Fatal.
    */
   MEDIA_ELEMENT_WEDGED: 0x1102,
+  /**
+   * MediaSource.isTypeSupported() rejected a selected track's codec string —
+   * MSE cannot be configured on this UA. Fatal.
+   */
+  CODEC_UNSUPPORTED: 0x1103,
 
   // ── Catalog (0x1200) ──────────────────────────────────────
   /** Initial catalog parse failed — cannot proceed. @see MSF §5.1 */
   CATALOG_PARSE_ERROR: 0x1200,
   /** Delta catalog update failed — degraded. @see MSF §5.2 */
   CATALOG_DELTA_ERROR: 0x1201,
+  /**
+   * A selected CMAF track's bootstrap metadata is invalid: codec string
+   * missing, or inline initData that is not valid base64 / decodes to zero
+   * bytes. Detected BEFORE any media SUBSCRIBE is issued. Fatal.
+   * @see draft-ietf-moq-cmsf-00 §3.1 (Initialization headers)
+   */
+  CMAF_INIT_INVALID: 0x1202,
+  /**
+   * CMAF bootstrap deadline expired: media objects are arriving but no init
+   * segment materialized from initData/initTrack/in-band ftyp+moov within
+   * cmafBootstrapTimeoutMs — or MSE initialized but no frame rendered.
+   * Fatal.
+   */
+  CMAF_INIT_TIMEOUT: 0x1203,
 
   // ── Playback (0x1300) ────────────────────────────────────
   /** Seek failed — timeline lookup or REQUEST_UPDATE error. @see MSF §7 */

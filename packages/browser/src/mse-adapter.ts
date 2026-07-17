@@ -368,8 +368,44 @@ export class MseMediaSource implements MediaSourceLike {
   initialize(config: {
     video?: { codec: string; initData: Uint8Array };
     audio?: { codec: string; initData: Uint8Array };
-  }): void {
-    if (this.initialized) return;
+  }): boolean {
+    if (this.initialized) return true;
+
+    // Bootstrap validation — ALL-OR-NOTHING, BEFORE latching. A partially
+    // initialized MediaSource (one good SourceBuffer, one rejected) would
+    // latch this adapter into a state the player believes is complete;
+    // instead: validate every entry first, and on any rejection create NO
+    // SourceBuffers, stay un-latched (a corrected call may succeed later),
+    // surface each reason via onError, and return false.
+    //   - Unsupported codec (per MediaSource.isTypeSupported, where the UA
+    //     exposes it): named error so the player can escalate to fatal.
+    //   - Zero-byte init entry: the caller's contract is "only initialize
+    //     with real init bytes" — never a silent init-less SourceBuffer.
+    const validateEntry = (
+      mediaType: 'video' | 'audio',
+      entry: { codec: string; initData: Uint8Array },
+    ): Error | null => {
+      const mimeType = `${mediaType}/mp4; codecs="${entry.codec}"`;
+      const MS = (globalThis as { MediaSource?: { isTypeSupported?: (m: string) => boolean } }).MediaSource;
+      if (typeof MS?.isTypeSupported === 'function' && !MS.isTypeSupported(mimeType)) {
+        const err = new Error(`Codec not supported by this UA: ${mimeType}`);
+        err.name = 'CodecUnsupportedError';
+        return err;
+      }
+      if (entry.initData.byteLength === 0) {
+        return new Error(
+          `Empty ${mediaType} init data (codec=${entry.codec}) — refusing to create an init-less SourceBuffer`,
+        );
+      }
+      return null;
+    };
+    const failures: Error[] = [];
+    if (config.video) { const e = validateEntry('video', config.video); if (e) failures.push(e); }
+    if (config.audio) { const e = validateEntry('audio', config.audio); if (e) failures.push(e); }
+    if (failures.length > 0) {
+      for (const e of failures) this.onError?.(e);
+      return false;
+    }
     this.initialized = true;
 
     const doInit = () => {
@@ -440,6 +476,7 @@ export class MseMediaSource implements MediaSourceLike {
     } else {
       this.ms.addEventListener('sourceopen', doInit, { once: true });
     }
+    return true;
   }
 
   /**

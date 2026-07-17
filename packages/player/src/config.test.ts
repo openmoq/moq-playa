@@ -36,6 +36,7 @@ describe('DEFAULT_PLAYER_CONFIG', () => {
     expect(DEFAULT_PLAYER_CONFIG.maxConsecutiveGaps).toBe(5);
     expect(DEFAULT_PLAYER_CONFIG.maxDecodeErrors).toBe(10);
     expect(DEFAULT_PLAYER_CONFIG.gapEscalationWindowMs).toBe(10_000);
+    expect(DEFAULT_PLAYER_CONFIG.cmafBootstrapTimeoutMs).toBe(10_000);
     expect(DEFAULT_PLAYER_CONFIG.livenessTimeoutMs).toBe(10_000);
     expect(DEFAULT_PLAYER_CONFIG.livenessResetProbeMs).toBe(2_000);
     expect(DEFAULT_PLAYER_CONFIG.livenessMaxRestarts).toBe(3);
@@ -113,6 +114,16 @@ describe('validateConfig', () => {
 
   it('accepts reconnectAttempts 0 (disable reconnect)', () => {
     expect(() => validateConfig(minConfig({ reconnectAttempts: 0 }))).not.toThrow();
+  });
+
+  // ── CMAF bootstrap ──
+
+  it('accepts cmafBootstrapTimeoutMs 0 (disables the bootstrap deadlines)', () => {
+    expect(() => validateConfig(minConfig({ cmafBootstrapTimeoutMs: 0 }))).not.toThrow();
+  });
+
+  it('rejects negative cmafBootstrapTimeoutMs', () => {
+    expect(() => validateConfig(minConfig({ cmafBootstrapTimeoutMs: -1 }))).toThrow(RangeError);
   });
 
   // ── media liveness ──

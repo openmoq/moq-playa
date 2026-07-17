@@ -136,40 +136,14 @@ export function createPipelines(
   if (hasCmaf && config.createMediaSource) {
     mediaSource = config.createMediaSource();
 
-    // Defer initialize() when init data comes from a separate track (initTrack).
-    // The player will call mediaSource.initialize() when the init track object arrives.
+    // initialize() is NOT called here. The player owns CMAF initialization
+    // via its init-source state machine (inline initData, initTrack
+    // delivery, or an in-band ftyp+moov object) and calls initialize()
+    // exactly once with the COMPLETE config — never with empty init bytes,
+    // and never per-track (a partial first call would latch the adapter
+    // and orphan the other track's SourceBuffer).
     // @see draft-ietf-moq-cmsf-00 §3.1 (Initialization headers)
     // @see draft-ietf-moq-catalogformat-01 §3.2.16 (initTrack)
-    const needsDeferredInit =
-      (hasCmafVideo && trackInfo.video?.initTrack && !trackInfo.video?.initData) ||
-      (hasCmafAudio && trackInfo.audio?.initTrack && !trackInfo.audio?.initData);
-
-    if (!needsDeferredInit) {
-      // Inline initData — initialize immediately (existing path)
-      const msConfig: {
-        video?: { codec: string; initData: Uint8Array };
-        audio?: { codec: string; initData: Uint8Array };
-      } = {};
-
-      if (hasCmafVideo && trackInfo.video?.codec) {
-        msConfig.video = {
-          codec: trackInfo.video.codec,
-          initData: trackInfo.video.initData
-            ? Uint8Array.from(atob(trackInfo.video.initData), c => c.charCodeAt(0))
-            : new Uint8Array(0),
-        };
-      }
-      if (hasCmafAudio && trackInfo.audio?.codec) {
-        msConfig.audio = {
-          codec: trackInfo.audio.codec,
-          initData: trackInfo.audio.initData
-            ? Uint8Array.from(atob(trackInfo.audio.initData), c => c.charCodeAt(0))
-            : new Uint8Array(0),
-        };
-      }
-
-      mediaSource.initialize(msConfig);
-    }
 
     mediaSource.onFirstFrame = () => callbacks.onFirstFrame();
     mediaSource.onStall = (durationMs) => callbacks.onStall(durationMs);

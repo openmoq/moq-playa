@@ -267,6 +267,25 @@ export class MoqtPlayer {
   /** Whether mediaSource.initialize() has been called. */
   private cmafInitialized = false;
 
+  /**
+   * CMAF init-source state machine: one entry per selected CMAF track,
+   * `bytes` filled by whichever valid source arrives first — inline catalog
+   * initData, an initTrack delivery, or an in-band ftyp+moov object.
+   * initialize() fires exactly ONCE, when EVERY entry has bytes (the
+   * adapter latches on first call, so a partial call would orphan the
+   * other track's SourceBuffer).
+   */
+  private cmafPendingInit: {
+    video?: { codec: string; bytes: Uint8Array | null };
+    audio?: { codec: string; bytes: Uint8Array | null };
+  } | null = null;
+
+  /** Tracks already warned about pre-init media drops (once per track). */
+  private readonly cmafPreInitDropWarned = new Set<string>();
+
+  /** Whether the cmaf_init bootstrap deadline has been armed. */
+  private cmafInitDeadlineArmed = false;
+
   /** Whether we've seen a keyframe (group start) since init — video only. */
   private cmafVideoSynced = false;
 
@@ -571,6 +590,20 @@ export class MoqtPlayer {
     // Fires timeout/warning events when expected lifecycle events don't arrive.
     this.watchdog = new WatchdogController({
       onTimeout: (e) => {
+        // CMAF bootstrap deadlines ESCALATE (fatal); all other
+        // expectations keep the historical diagnostic-only behavior.
+        if (e.event === 'cmaf_init' || e.event === 'cmaf_first_frame') {
+          const detail = e.event === 'cmaf_init'
+            ? 'CMAF media arriving but no init segment materialized (initData / initTrack / in-band ftyp+moov)'
+            : 'CMAF MediaSource initialized but no frame rendered (init/codec mismatch?)';
+          this.emitError(createPlayerError(
+            'fatal', 'catalog', PlayerErrorCode.CMAF_INIT_TIMEOUT,
+            `${detail} within ${e.timeoutMs}ms`,
+          ));
+          if (!this.isTerminalState()) this.transitionState(PlayerState.ERROR);
+          this.stopTicking();
+          return;
+        }
         this.log.warn('Watchdog timeout: %s after %dms', e.event, e.elapsedMs);
         this.emitter.emit('state_changed', {
           type: 'state_changed',
@@ -1435,14 +1468,12 @@ export class MoqtPlayer {
       if (obj.kind !== 'data' || !obj.payload) return;
       if (this.stateMachine.state === PlayerState.PAUSED) return;
 
-      // Gate: don't send data to MSE until initialized (init track delivered)
+      // Gate: media cannot reach MSE before initialization. While init is
+      // pending, an in-band ftyp+moov object is accepted as the init
+      // source; moof/mdat is dropped loudly and arms the bootstrap
+      // deadline (no more silent pre-init drops).
       if (!this.cmafInitialized) {
-        // DEBUG: log first few drops per media type
-        if (mediaType === 'video' && BigInt(obj.objectId) === 0n) {
-          this.log.debug('[CMAF] gate: cmafInitialized=false, dropping %s g=%s o=%s %dB (assembler=%s, mediaSource=%s)',
-            mediaType, String(obj.groupId), String(obj.objectId), obj.payload.byteLength,
-            this.cmafAssembler ? 'exists' : 'null', this.mediaSource ? 'exists' : 'null');
-        }
+        this.handlePreInitCmafObject(mediaType, trackName, obj.payload);
         return;
       }
 
@@ -1603,18 +1634,6 @@ export class MoqtPlayer {
         (t: CatalogTrack) => t.role === 'audio' && t.initTrack === trackName,
       );
 
-      const msConfig: {
-        video?: { codec: string; initData: Uint8Array };
-        audio?: { codec: string; initData: Uint8Array };
-      } = {};
-
-      if (videoTrack?.codec) {
-        msConfig.video = { codec: videoTrack.codec, initData: obj.payload };
-      }
-      if (audioTrack?.codec) {
-        msConfig.audio = { codec: audioTrack.codec, initData: obj.payload };
-      }
-
       // Cache the init bytes so future codec-changing track switches
       // can call mediaSource.changeType() immediately instead of
       // re-fetching. Resolves any pending lazy-subscribe waiter.
@@ -1639,62 +1658,18 @@ export class MoqtPlayer {
         this.connection?.unsubscribe(varint(initReqId)).catch(() => {});
       }
 
-      // mediaSource.initialize() is idempotent on the MseMediaSource
-      // (early-returns once SourceBuffers exist), so re-firing on a
-      // second init-track delivery is safe — but we should NOT re-set
-      // cmafInitialized state machinery if already initialized.
-      const wasInitialized = this.cmafInitialized;
-      if (!wasInitialized) {
-        this.mediaSource.initialize(msConfig);
-        this.cmafInitialized = true;
-        this.cmafVideoSynced = false; // Wait for keyframe after init
-        // Record the codec the SourceBuffer was created with so codec-
-        // changing switches detect the need to call changeType(). Audio
-        // switches don't currently trigger changeType, so audio codec
-        // isn't tracked.
-        if (videoTrack?.codec) this.currentVideoCodec = videoTrack.codec;
-      }
-      // If already initialized, this onInitObject delivery is just
-      // cache-warming for a future codec switch — early-out before the
-      // assembler-recreation block below.
-      if (wasInitialized) return;
+      // Already initialized → this delivery is cache-warming for a future
+      // codec switch only (the cache write above did the work).
+      if (this.cmafInitialized) return;
 
-      // Create assembler: pairs moof+mdat, rebases tfdt to zero, emits segments
-      const ms = this.mediaSource;
-      const timestampOffsetSet = { video: false, audio: false };
-      if (!this.config.createCmafAssembler) {
-        throw new Error('CMAF tracks require createCmafAssembler in MoqtPlayerConfig');
-      }
-      this.cmafAssembler = this.config.createCmafAssembler({
-        onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint) => {
-          if (!timestampOffsetSet[mediaType]) {
-            timestampOffsetSet[mediaType] = true;
-            if ('setTimestampOffset' in ms) {
-              (ms as { setTimestampOffset: (t: string, o: number) => void }).setTimestampOffset(mediaType, 0);
-            }
-          }
-          ms.appendChunk(mediaType, segment, segTrackName, groupId);
-        },
-        onDiscontinuity: (mediaType, trackName) => {
-          if ('clearTimeline' in ms) {
-            (ms as { clearTimeline: (t: string, tn: string) => void }).clearTimeline(mediaType, trackName);
-          }
-        },
-      });
-
-      // Hand the init bytes to the assembler so its strip path can fall
-      // back to trex defaults for streams that don't carry tfhd
-      // sample defaults. Same payload that just initialized the
-      // MediaSource above.
-      if (videoTrack?.codec) {
-        this.cmafAssembler.setInitSegment?.('video', obj.payload);
-      }
-      if (audioTrack?.codec) {
-        this.cmafAssembler.setInitSegment?.('audio', obj.payload);
-      }
-
-      this._stats.recordDecoderConfigured();
-      this.log.info('Init track "%s" received (%d bytes), MediaSource initialized', trackName, obj.payload.byteLength);
+      // Supply the bytes to the init state machine for every selected CMAF
+      // track referencing this init track. initialize() fires once ALL
+      // selected tracks have bytes (collect-then-initialize: split video/
+      // audio init tracks initialize TOGETHER — a partial first call would
+      // latch the adapter and orphan the other SourceBuffer).
+      this.log.info('Init track "%s" received (%d bytes)', trackName, obj.payload.byteLength);
+      if (videoTrack?.codec) this.supplyCmafInitBytes('video', obj.payload);
+      if (audioTrack?.codec) this.supplyCmafInitBytes('audio', obj.payload);
     };
 
     if (this._adapterOwned) {
@@ -2656,6 +2631,9 @@ export class MoqtPlayer {
     this.announcedNamespaces.clear();
     this.commandDispatcher?.destroy();
     this.commandDispatcher = null;
+    this.cmafPendingInit = null;
+    this.cmafPreInitDropWarned.clear();
+    this.cmafInitDeadlineArmed = false;
     this.watchdog.destroy();
     this.cmafAssembler?.destroy();
     this.cmafAssembler = null;
@@ -3275,6 +3253,7 @@ export class MoqtPlayer {
     const pipelines = createPipelines(this.config, this.clock, trackInfo, {
       onFirstFrame: () => {
         this._stats.recordFirstFrameRendered();
+        this.watchdog.fulfill('cmaf_first_frame'); // bootstrap deadline met
         this.log.info('First frame rendered');
         this.emitter.emit('first_frame', { type: 'first_frame' });
       },
@@ -3349,6 +3328,18 @@ export class MoqtPlayer {
         // be rebuilt, which only the application can do (fresh tune-in).
         // FATAL, unlike ordinary decode errors: this is the public signal
         // apps reconnect on.
+        // MediaSource.isTypeSupported rejected the codec string — MSE can
+        // never be configured on this UA. Fatal (adapter names the mime).
+        if (error.name === 'CodecUnsupportedError') {
+          this.emitError(createPlayerError(
+            'fatal', 'decoder', PlayerErrorCode.CODEC_UNSUPPORTED, error.message,
+            { cause: error, context: { mediaType } },
+          ));
+          if (!this.isTerminalState()) this.transitionState(PlayerState.ERROR);
+          this.stopTicking();
+          return;
+        }
+
         if (error.name === 'PlayheadWedgeError') {
           this.emitError(createPlayerError(
             'fatal', 'decoder', PlayerErrorCode.MEDIA_ELEMENT_WEDGED, error.message,
@@ -3465,57 +3456,191 @@ export class MoqtPlayer {
     // @see draft-ietf-moq-loc-01 §2.3.2.1 (Video Config)
     configurePipelines(pipelines, trackInfo);
 
-    // If MSE was initialized inline (initData in catalog, no initTrack),
-    // mark CMAF as ready for media data immediately.
+    // CMAF init-source state machine: register each selected CMAF track.
+    // Inline initData satisfies the entry immediately; initTrack deliveries
+    // and in-band ftyp+moov objects satisfy on arrival. initialize() fires
+    // exactly once, when every selected track has bytes — never with empty
+    // init data. (initData on TrackInfo is base64, CatalogTrack §5.1.20;
+    // selection-time validation already rejected undecodable/empty values.)
     if (this.mediaSource && !this.cmafInitialized) {
-      const needsInitTrack =
-        (trackInfo.video?.initTrack && !trackInfo.video?.initData) ||
-        (trackInfo.audio?.initTrack && !trackInfo.audio?.initData);
-      if (!needsInitTrack) {
-        this.cmafInitialized = true;
-        // Record the codec for change-type detection on future switches.
-        // (Audio codec switches aren't currently exposed in the API.)
-        if (trackInfo.video?.codec) this.currentVideoCodec = trackInfo.video.codec;
-
-        // Create assembler for inline-init path
-        const ms = this.mediaSource;
-        const timestampOffsetSet = { video: false, audio: false };
-        if (!this.config.createCmafAssembler) {
-          throw new Error('CMAF tracks require createCmafAssembler in MoqtPlayerConfig');
-        }
-        this.cmafAssembler = this.config.createCmafAssembler({
-          onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint) => {
-            if (!timestampOffsetSet[mediaType]) {
-              timestampOffsetSet[mediaType] = true;
-              if ('setTimestampOffset' in ms) {
-                (ms as { setTimestampOffset: (t: string, o: number) => void }).setTimestampOffset(mediaType, 0);
-              }
-            }
-            ms.appendChunk(mediaType, segment, segTrackName, groupId);
-          },
-          onDiscontinuity: (mediaType, trackName) => {
-            if (ms && 'clearTimeline' in ms) {
-              (ms as { clearTimeline: (t: string, tn: string) => void }).clearTimeline(mediaType, trackName);
-            }
-          },
-        });
-
-        // Hand inline init bytes to the assembler for trex defaults
-        // (parallel to the initTrack path elsewhere). Required when the
-        // stream relies on trex for sample defaults rather than tfhd.
-        // initData on TrackInfo is base64 (per CatalogTrack §5.1.20).
-        const decodeBase64 = (b64: string): Uint8Array =>
-          Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-        if (trackInfo.video?.initData) {
-          this.cmafAssembler.setInitSegment?.('video', decodeBase64(trackInfo.video.initData));
-        }
-        if (trackInfo.audio?.initData) {
-          this.cmafAssembler.setInitSegment?.('audio', decodeBase64(trackInfo.audio.initData));
-        }
+      const decodeBase64 = (b64: string): Uint8Array =>
+        Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      this.cmafPendingInit = {};
+      if (trackInfo.video?.packaging === 'cmaf' && trackInfo.video.codec) {
+        this.cmafPendingInit.video = {
+          codec: trackInfo.video.codec,
+          bytes: trackInfo.video.initData ? decodeBase64(trackInfo.video.initData) : null,
+        };
       }
+      if (trackInfo.audio?.packaging === 'cmaf' && trackInfo.audio.codec) {
+        this.cmafPendingInit.audio = {
+          codec: trackInfo.audio.codec,
+          bytes: trackInfo.audio.initData ? decodeBase64(trackInfo.audio.initData) : null,
+        };
+      }
+      this.maybeApplyCmafInit();
     }
 
     this.pipelinesCreated = true;
+  }
+
+  // ─── CMAF init-source state machine ─────────────────────────────────
+
+  /**
+   * Record init bytes for a selected CMAF track from any valid source
+   * (initTrack delivery or in-band ftyp+moov). First source wins per
+   * track; initialization happens when all selected tracks are satisfied.
+   */
+  private supplyCmafInitBytes(mediaType: 'video' | 'audio', bytes: Uint8Array): void {
+    if (this.cmafInitialized) return;
+    const entry = this.cmafPendingInit?.[mediaType];
+    if (!entry || entry.bytes) return;
+    entry.bytes = bytes;
+    this.maybeApplyCmafInit();
+  }
+
+  /**
+   * Initialize MSE + assembler once EVERY selected CMAF track has init
+   * bytes. Called from pipeline creation (inline initData), initTrack
+   * delivery, and in-band init detection. The single call site guarantees
+   * the adapter's one-shot initialize() always receives the complete
+   * config (split video/audio init sources initialize together).
+   */
+  private maybeApplyCmafInit(): void {
+    if (this.cmafInitialized || !this.cmafPendingInit || !this.mediaSource) return;
+    const kinds: Array<'video' | 'audio'> = ['video', 'audio'];
+    const entries = kinds
+      .map((mt) => [mt, this.cmafPendingInit![mt]] as const)
+      .filter((pair): pair is readonly [('video' | 'audio'), { codec: string; bytes: Uint8Array | null }] => pair[1] !== undefined);
+    if (entries.length === 0) return;
+    if (entries.some(([, e]) => !e.bytes || e.bytes.byteLength === 0)) return; // still collecting
+
+    const msConfig: {
+      video?: { codec: string; initData: Uint8Array };
+      audio?: { codec: string; initData: Uint8Array };
+    } = {};
+    for (const [mt, e] of entries) msConfig[mt] = { codec: e.codec, initData: e.bytes! };
+
+    // ALL-OR-NOTHING contract: `false` means the adapter rejected the config
+    // (unsupported codec / invalid init), surfaced reasons via onError
+    // (which map to fatal player errors), and stayed un-latched. The player
+    // must NOT mark CMAF initialized or build the assembler on failure —
+    // the bootstrap deadline remains the backstop if no fatal fired.
+    if (this.mediaSource.initialize(msConfig) === false) {
+      this.log.warn('CMAF initialize rejected by the media source adapter — not marking initialized');
+      return;
+    }
+    this.cmafInitialized = true;
+    this.cmafVideoSynced = false; // wait for a keyframe after init
+    // Record the codec for change-type detection on future switches.
+    // (Audio codec switches aren't currently exposed in the API.)
+    if (this.cmafPendingInit.video?.codec) this.currentVideoCodec = this.cmafPendingInit.video.codec;
+
+    this.buildCmafAssembler();
+    // Hand init bytes to the assembler so its strip path can fall back to
+    // trex defaults for streams without tfhd sample defaults.
+    for (const [mt, e] of entries) this.cmafAssembler?.setInitSegment?.(mt, e.bytes!);
+
+    this._stats.recordDecoderConfigured();
+    this.watchdog.fulfill('cmaf_init');
+    if (this.config.cmafBootstrapTimeoutMs! > 0) {
+      // Second bootstrap deadline: initialized but never rendered a frame
+      // (codec/init mismatch class) must not be a silent black player.
+      this.watchdog.expect('cmaf_first_frame', this.config.cmafBootstrapTimeoutMs!);
+    }
+    this.log.info('CMAF MediaSource initialized (%s)',
+      entries.map(([mt, e]) => `${mt}=${e.bytes!.byteLength}B`).join(' '));
+  }
+
+  /** Create the moof+mdat assembler wired to the MediaSource (single site). */
+  private buildCmafAssembler(): void {
+    const ms = this.mediaSource!;
+    const timestampOffsetSet = { video: false, audio: false };
+    if (!this.config.createCmafAssembler) {
+      throw new Error('CMAF tracks require createCmafAssembler in MoqtPlayerConfig');
+    }
+    this.cmafAssembler = this.config.createCmafAssembler({
+      onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint) => {
+        if (!timestampOffsetSet[mediaType]) {
+          timestampOffsetSet[mediaType] = true;
+          if ('setTimestampOffset' in ms) {
+            (ms as { setTimestampOffset: (t: string, o: number) => void }).setTimestampOffset(mediaType, 0);
+          }
+        }
+        ms.appendChunk(mediaType, segment, segTrackName, groupId);
+      },
+      onDiscontinuity: (mediaType, trackName) => {
+        if ('clearTimeline' in ms) {
+          (ms as { clearTimeline: (t: string, tn: string) => void }).clearTimeline(mediaType, trackName);
+        }
+      },
+    });
+  }
+
+  /**
+   * Whether a payload has the shape of an ISO-BMFF initialization segment:
+   * a top-level `moov` box, optionally preceded by non-media boxes (ftyp,
+   * styp, free, ...). Media payloads (moof/mdat before any moov), truncated
+   * boxes, and garbage are rejected — a first-box-only sniff would classify
+   * partial or malformed bytes as init and defer the real failure to the
+   * "no first frame" deadline with a misleading message.
+   */
+  private static looksLikeCmafInitSegment(payload: Uint8Array): boolean {
+    const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    let offset = 0;
+    for (let i = 0; i < 16 && offset + 8 <= payload.byteLength; i++) {
+      const type = String.fromCharCode(
+        payload[offset + 4]!, payload[offset + 5]!, payload[offset + 6]!, payload[offset + 7]!);
+      if (!/^[a-zA-Z0-9 ]{4}$/.test(type)) return false; // not a box structure
+      if (type === 'moof' || type === 'mdat') return false; // media, not init
+      let size = dv.getUint32(offset);
+      if (size === 1) { // 64-bit largesize
+        if (offset + 16 > payload.byteLength) return false;
+        const big = dv.getBigUint64(offset + 8);
+        if (big > BigInt(Number.MAX_SAFE_INTEGER)) return false;
+        size = Number(big);
+      }
+      if (size < 8 || offset + size > payload.byteLength) return false; // truncated/malformed
+      if (type === 'moov') return true; // a COMPLETE top-level moov: init segment
+      offset += size;
+    }
+    return false; // no top-level moov found
+  }
+
+  /**
+   * A CMAF media object arrived before initialization. An in-band init
+   * segment (ftyp+moov) IS a valid init source (common fMP4-over-MoQ
+   * publisher pattern); moof/mdat before init is dropped loudly (once per
+   * track) and arms the bootstrap deadline so a missing init segment can
+   * never present as a silent black player.
+   */
+  private handlePreInitCmafObject(
+    mediaType: 'video' | 'audio',
+    trackName: string,
+    payload: Uint8Array,
+  ): void {
+    if (MoqtPlayer.looksLikeCmafInitSegment(payload)) {
+      this.log.info('[CMAF] in-band init segment on "%s" (%s, %dB)',
+        trackName, mediaType, payload.byteLength);
+      // Cache for codec-changing switches, same as initTrack deliveries.
+      this.initSegmentByTrack.set(trackName, payload);
+      this.supplyCmafInitBytes(mediaType, payload);
+      return;
+    }
+    const firstBox = payload.byteLength >= 8
+      ? String.fromCharCode(payload[4]!, payload[5]!, payload[6]!, payload[7]!)
+      : '(short)';
+    const key = `${mediaType}:${trackName}`;
+    if (!this.cmafPreInitDropWarned.has(key)) {
+      this.cmafPreInitDropWarned.add(key);
+      this.log.warn('[CMAF] dropping %s "%s" media before init (first box "%s") — '
+        + 'waiting for initData/initTrack/in-band init segment',
+        mediaType, trackName, firstBox);
+    }
+    if (!this.cmafInitDeadlineArmed && this.config.cmafBootstrapTimeoutMs! > 0) {
+      this.cmafInitDeadlineArmed = true;
+      this.watchdog.expect('cmaf_init', this.config.cmafBootstrapTimeoutMs!);
+    }
   }
 
   /**
@@ -3539,6 +3664,40 @@ export class MoqtPlayer {
       ...(this.config.disableVideo ? { disableVideo: true } : {}),
       ...(this.config.disableAudio ? { disableAudio: true } : {}),
     }));
+
+    // ── CMAF bootstrap validation: fail BEFORE any media SUBSCRIBE ──
+    // A selected CMAF track with no codec string, or inline initData that
+    // is not valid base64 / decodes to zero bytes, can never configure
+    // MSE — subscribing would produce media with nowhere to go (the old
+    // "clean subscribe, silent black player" failure). Absent init is
+    // FINE: initTrack or an in-band ftyp+moov may still provide it, under
+    // the bootstrap deadline.
+    const cmafSelections: Array<['video' | 'audio', CatalogTrack | undefined]> =
+      [['video', selected.video], ['audio', selected.audio]];
+    for (const [mediaType, track] of cmafSelections) {
+      if (!track || track.packaging !== 'cmaf') continue;
+      let reason: string | null = null;
+      if (!track.codec) {
+        reason = 'no codec string';
+      } else if (track.initData !== undefined) {
+        try {
+          if (Uint8Array.from(atob(track.initData), (c) => c.charCodeAt(0)).byteLength === 0) {
+            reason = 'initData decodes to zero bytes';
+          }
+        } catch {
+          reason = 'initData is not valid base64';
+        }
+      }
+      if (reason) {
+        this.emitError(createPlayerError(
+          'fatal', 'catalog', PlayerErrorCode.CMAF_INIT_INVALID,
+          `CMAF track "${track.name}" (${mediaType}): ${reason} — cannot configure MSE`,
+          { context: { trackName: track.name, mediaType } },
+        ));
+        if (!this.isTerminalState()) this.transitionState(PlayerState.ERROR);
+        return;
+      }
+    }
 
     // Build buffer-based ABR controller from the quality ladder
     const alts = this.qualityController!.alternatives;
