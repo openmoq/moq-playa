@@ -9,7 +9,11 @@
  *   - per-subscription teardown via `onSubscribeClosed` — an ABR quality-switch
  *     resets one SUBSCRIBE stream and the relay drops only that subscription,
  *     WITHOUT closing the viewer connection;
- *   - a tiny per-track LIVE cache (the most-recent group) replayed to a late joiner;
+ *   - a tiny per-track LIVE cache (the most-recent group) replayed to a late joiner
+ *     (except Largest Object subscriptions, which start past the largest object
+ *     per §5.1.2 and backfill the current group via a Joining FETCH instead);
+ *   - standalone + joining FETCH served from the latest-group cache (§9.16 /
+ *     draft-18 §10.12) — see handleFetch;
  *   - forwarding preserves the publisher's groupId/subgroupId/objectId.
  *
  * Deliberately a TOY — see README:

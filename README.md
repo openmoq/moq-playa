@@ -223,6 +223,8 @@ player.on('catch_up_changed', ({ active, rate, latencyMs }) => { ... });
 | `catalog` | `{tracks}` | — | Inject catalog externally, skip catalog subscription |
 | `targetLatencyMs` | number | — | Live catch-up target |
 | `maxCatchUpRate` | number | 1.0 | Max playback rate for catch-up |
+| `authority` | string | — | CLIENT_SETUP AUTHORITY for tenant-routed relays (interop override; spec prohibits it over WebTransport) |
+| `warmStartCurrentGroup` | boolean | false | Join live LOC tracks mid-group via joining FETCH (§9.16.2); non-fatal if the relay refuses |
 | `objectTransform` | function | — | Per-object transform (e.g. decryption) |
 | `extensionParser` | function | — | Custom LOC extension parser |
 | `onQlogEvent` | function | — | qlog event stream |
@@ -311,6 +313,14 @@ Example pages:
 | `/catalog/` | Catalog browser |
 | `/broadcast/` | Publisher example |
 | `/video/` | Video-only player |
+
+The `/player/` page takes URL parameters: `?url=` (relay), `?ns=` / `?nsField=`
+(namespace), `?hash=` (cert hash), `?v=14|16|18` (draft), `?authority=`
+(tenant-routed relays), `?warmStart=1` (join live LOC tracks mid-group via
+joining FETCH — needs `isLive: true` in the catalog and a relay that serves
+joining FETCH; degrades to a normal live join otherwise), `?log=info|debug`
+(player logs on the console), `?catalog=<base64 JSON>` (inject a catalog), and
+`?fetchCatalog=1` (FETCH the catalog instead of subscribing).
 
 ---
 

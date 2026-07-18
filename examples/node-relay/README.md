@@ -54,6 +54,15 @@ connection (one alias each), a tiny latest-group cache replayed to late joiners,
 per-subscription cleanup when a viewer unsubscribes one track (ABR switch) without
 closing the connection.
 
+The relay also answers **FETCH** from the latest-group cache (§9.16 / draft-18
+§10.12): standalone FETCH serves `cache ∩ [start, end)` with proper
+`INVALID_RANGE` / `DOES_NOT_EXIST` rejections, and a **relative joining FETCH**
+resolves its range from the joined subscription's largest cached object — the
+warm-start path a Largest Object subscriber uses to get the current group's
+head immediately. Largest Object subscriptions do **not** get the unconditional
+cache replay (that would violate the filter, §5.1.2); the joining FETCH is the
+way to backfill the current group.
+
 ```bash
 # standalone relay-mode server (what the publisher example connects to):
 PORT=4433 pnpm --filter @moqt/example-node-relay relay-server
@@ -61,6 +70,7 @@ PORT=4433 pnpm --filter @moqt/example-node-relay relay-server
 # self-contained smokes:
 pnpm --filter @moqt/example-node-relay relay-smoke        # 1 publisher → 2 subscribers, IDs preserved
 pnpm --filter @moqt/example-node-relay relay-media-smoke  # multi-track fanout + late join + ABR cleanup
+pnpm --filter @moqt/example-node-relay relay-fetch-smoke  # late viewer gets the current group via joining FETCH
 ```
 
 ## Use with the publisher and browser player
@@ -72,7 +82,9 @@ generate a CMAF fixture from an MP4, publish it (optionally looped) into
 ## Limitations (toy relay, not production)
 
 - **Live, latest-group cache only** — a late joiner gets the most-recent group, not
-  history (no DVR, no init-segment retention policy).
+  history (no DVR, no init-segment retention policy). FETCH is served from the same
+  single-group cache: ranges reaching further back truncate honestly (gaps in the
+  response indicate objects that no longer exist, §9.16.3).
 - **Fixed track registry** — only the names above are routed; a catalog-driven
   registry is a possible follow-up.
 - **Data objects only** — gap/status objects (incl. `END_OF_GROUP`) are not relayed.
