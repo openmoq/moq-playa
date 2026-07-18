@@ -8,6 +8,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
+import { RENDER_CUSHION_MAX_US } from './render-cushion.js';
 import {
   computePlaybackDelayUs,
   createPipelines,
@@ -417,5 +418,54 @@ describe('computePlaybackDelayUs — the ONE shared playout cushion', () => {
   it('no adaptive signal: pure static floor', () => {
     expect(computePlaybackDelayUs(undefined, undefined)).toBe(200_000);
     expect(computePlaybackDelayUs(undefined, 2)).toBe(50_000);
+  });
+});
+
+describe('createPipelines — smoothed render cushion wiring (slice A)', () => {
+  const LOC_AV: TrackInfo = {
+    video: { codec: 'avc1.64001e', width: 1920, height: 1080, packaging: 'loc' },
+    audio: { codec: 'opus', samplerate: 48000, packaging: 'loc' },
+  };
+
+  it('exposes getRenderCushionUs for LOC sessions (the smoothed value, floor at rest)', () => {
+    const result = createPipelines(minimalConfig(), mockClock, LOC_AV, mockCallbacks());
+    expect(result.getRenderCushionUs).toBeDefined();
+    // Fresh session, no jitter: cushion sits at the 200ms static floor.
+    expect(result.getRenderCushionUs!()).toBe(200_000);
+  });
+
+  it('a raw gap-timeout spike reaches the cushion only via the clamp/slew, capped at the render max', () => {
+    const result = createPipelines(minimalConfig(), mockClock, LOC_AV, mockCallbacks());
+    // Force the raw adaptive fuse high (simulates the 2000ms estimator spike).
+    Object.defineProperty(result.videoPipeline, 'effectiveGapTimeoutUs', {
+      get: () => 2_000_000, configurable: true,
+    });
+    // First read snaps to the clamped target: exactly the render cap,
+    // never the raw 2000ms.
+    expect(result.getRenderCushionUs!()).toBe(RENDER_CUSHION_MAX_US);
+  });
+
+  it('SEPARATION PIN: gap detector sees the raw 2000ms while the render cushion stays capped below it', () => {
+    const result = createPipelines(minimalConfig(), mockClock, LOC_AV, mockCallbacks());
+    Object.defineProperty(result.videoPipeline, 'effectiveGapTimeoutUs', {
+      get: () => 2_000_000, configurable: true,
+    });
+    // The smoothed render cushion is capped independently of the fuse…
+    const cushionUs = result.getRenderCushionUs!();
+    expect(cushionUs).toBeLessThanOrEqual(RENDER_CUSHION_MAX_US);
+    expect(cushionUs).toBeLessThan(2_000_000);
+    // …while the pipeline's OWN effective gap timeout — the value the gap
+    // detector consumes — remains the raw adaptive 2000ms, untouched by
+    // the smoother.
+    expect(result.videoPipeline!.effectiveGapTimeoutUs).toBe(2_000_000);
+  });
+
+  it('CMAF sessions expose no LOC render cushion', () => {
+    const cmaf: TrackInfo = {
+      video: { codec: 'avc1.64001e', packaging: 'cmaf' },
+      audio: undefined,
+    };
+    const result = createPipelines(minimalConfig({ createMediaSource: () => ({ initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), mediaElement: null, destroy: vi.fn(), onFirstFrame: null, onError: null, onStall: null }) as any }), mockClock, cmaf, mockCallbacks());
+    expect(result.getRenderCushionUs).toBeUndefined();
   });
 });

@@ -263,6 +263,8 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-cmsf-00 §3 (CMAF Packaging)
    */
   private mediaSource: MediaSourceLike | null = null;
+  /** Smoothed LOC render cushion getter (slice A); null for CMAF sessions. */
+  private getRenderCushionUs: (() => number) | null = null;
 
   /** Whether mediaSource.initialize() has been called. */
   private cmafInitialized = false;
@@ -717,8 +719,8 @@ export class MoqtPlayer {
     // (same formula as recomputeVideoRenderTime — observability only).
     const gapUs = this.videoPipeline?.effectiveGapTimeoutUs;
     const locGauges = gapUs !== undefined ? {
-      videoEffectiveGapTimeoutMs: gapUs / 1000,
-      renderCushionMs: computePlaybackDelayUs(gapUs, this._handshakeRttMs) / 1000,
+      videoEffectiveGapTimeoutMs: gapUs / 1000, // raw adaptive fuse
+      renderCushionMs: (this.getRenderCushionUs?.() ?? computePlaybackDelayUs(gapUs, this._handshakeRttMs)) / 1000,
     } : undefined;
     return Object.freeze(this._stats.snapshot(locGauges));
   }
@@ -3535,6 +3537,7 @@ export class MoqtPlayer {
     this.recoveryController = pipelines.recoveryController;
     this.commandDispatcher = pipelines.commandDispatcher;
     this.mediaSource = pipelines.mediaSource;
+    this.getRenderCushionUs = pipelines.getRenderCushionUs ?? null;
 
     // Wire MSE stall detection to ABR emergency downshift.
     // CMAF has no pipeline-level stall handler — the MseMediaSource

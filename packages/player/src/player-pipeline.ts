@@ -24,6 +24,7 @@ import type { MediaSourceLike } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
 import type { LocDiagnosticKind } from './stats.js';
+import { RenderCushionSmoother } from './render-cushion.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
 
@@ -89,6 +90,12 @@ export interface PipelineSet {
   recoveryController: RecoveryController;
   commandDispatcher: CommandDispatcher | null;
   mediaSource: MediaSourceLike | null;
+  /**
+   * The SMOOTHED render cushion (µs) currently applied to LOC video render
+   * times and audio scheduling — slew-limited and clamped, distinct from
+   * the raw adaptive gap fuse. Absent for CMAF-only sessions.
+   */
+  getRenderCushionUs?: () => number;
 }
 
 /** Context for handlePipelineEvent. */
@@ -212,6 +219,15 @@ export function createPipelines(
 
   let commandDispatcher: CommandDispatcher | null = null;
 
+  // Slice A: the stable render playout target. Smooths the raw adaptive gap
+  // timeout into the cushion used for RENDER scheduling (video recompute +
+  // audio scheduling) — the gap DETECTOR keeps the raw value.
+  const hasLoc = (trackInfo.video !== undefined && !hasCmafVideo)
+    || (trackInfo.audio !== undefined && !hasCmafAudio);
+  const cushionFloorUs = handshakeRttMs !== undefined && handshakeRttMs < 5
+    ? 50_000 : 200_000;
+  const renderCushion = hasLoc ? new RenderCushionSmoother({ floorUs: cushionFloorUs }, clock) : null;
+
   if (videoDecoder || audioDecoder) {
     commandDispatcher = new CommandDispatcher(defined({
       videoDecoder,
@@ -236,10 +252,13 @@ export function createPipelines(
       // Adds a playback delay cushion to absorb network jitter — frames are
       // scheduled slightly into the future so delivery stalls don't cause stutter.
       recomputeVideoRenderTime: (captureTimestampUs: bigint) => {
-        // The shared playout cushion (same value audio receives via
-        // getPlaybackDelayUs) — absorbs network delivery jitter.
-        const playbackDelayUs = computePlaybackDelayUs(
-          videoPipeline?.effectiveGapTimeoutUs, handshakeRttMs);
+        // The SMOOTHED shared playout cushion (the same smoothed value is
+        // passed to audio scheduling via getPlaybackDelayUs; audio adopts it
+        // at anchor/underrun boundaries) — slew-limited so raw gap-fuse
+        // swings cannot step render times (a stepwise collapse froze video
+        // in the field).
+        const playbackDelayUs = renderCushion?.update(videoPipeline?.effectiveGapTimeoutUs)
+          ?? cushionFloorUs;
 
         // Sync reference is guaranteed here — CommandDispatcher holds frames
         // until hasSyncReference() returns true, so this callback only fires
@@ -255,7 +274,7 @@ export function createPipelines(
       },
       hasSyncReference: () => syncController.hasReference,
       getPlaybackDelayUs: () =>
-        computePlaybackDelayUs(videoPipeline?.effectiveGapTimeoutUs, handshakeRttMs),
+        renderCushion?.update(videoPipeline?.effectiveGapTimeoutUs) ?? cushionFloorUs,
     }));
   }
 
@@ -296,6 +315,10 @@ export function createPipelines(
     recoveryController,
     commandDispatcher,
     mediaSource,
+    ...(renderCushion ? {
+      getRenderCushionUs: () =>
+        renderCushion.update(videoPipeline?.effectiveGapTimeoutUs),
+    } : {}),
   };
 }
 

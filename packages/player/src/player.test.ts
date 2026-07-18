@@ -2136,9 +2136,14 @@ describe('MoqtPlayer', () => {
       expect(loc.partialGroupAbandonedCount).toBe(0);
       expect(loc.keyframeWaitingCount).toBe(0);
       expect(loc.syncResetCount).toBe(0);
-      expect(loc.videoEffectiveGapTimeoutMs).toBeGreaterThan(0);
-      expect(loc.renderCushionMs).toBeGreaterThanOrEqual(loc.videoEffectiveGapTimeoutMs!);
-      expect(loc.renderCushionMs).toBeGreaterThanOrEqual(50); // static floor
+      expect(loc.videoEffectiveGapTimeoutMs).toBeGreaterThan(0); // raw fuse gauge
+      // Slice A contract: the render cushion is smoothed and clamped
+      // INDEPENDENTLY of the raw fuse (which may exceed it when spiking) —
+      // bounded by the static floor and the render cap, never compared
+      // against the raw value.
+      expect(loc.renderCushionMs).not.toBeNull();
+      expect(loc.renderCushionMs).toBeGreaterThanOrEqual(50);  // ≥ static floor
+      expect(loc.renderCushionMs).toBeLessThanOrEqual(750);    // ≤ render cap
       await player.destroy();
     });
 
