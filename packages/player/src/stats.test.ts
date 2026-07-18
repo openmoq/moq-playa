@@ -419,3 +419,43 @@ describe('StatsAccumulator', () => {
     });
   });
 });
+
+describe('LOC pipeline diagnostics (stutter observability)', () => {
+  it('starts with zeroed counters and null gauges', () => {
+    const acc = new StatsAccumulator();
+    const s = acc.snapshot();
+    expect(s.loc).toEqual({
+      gapDetectedCount: 0, skipForwardCount: 0, keyframeWaitingCount: 0,
+      partialGroupAbandonedCount: 0, backlogShedCount: 0,
+      recoveryActionCount: 0, syncResetCount: 0,
+      videoEffectiveGapTimeoutMs: null, videoRenderCushionMs: null,
+    });
+  });
+
+  it('accumulates per-kind counters via recordLocDiagnostic', () => {
+    const acc = new StatsAccumulator();
+    acc.recordLocDiagnostic('skip_forward');
+    acc.recordLocDiagnostic('skip_forward');
+    acc.recordLocDiagnostic('backlog_shed');
+    acc.recordLocDiagnostic('partial_group_abandoned');
+    acc.recordLocDiagnostic('keyframe_waiting');
+    acc.recordLocDiagnostic('gap_detected');
+    acc.recordLocDiagnostic('recovery_action');
+    acc.recordLocDiagnostic('sync_reset');
+    const s = acc.snapshot();
+    expect(s.loc.skipForwardCount).toBe(2);
+    expect(s.loc.backlogShedCount).toBe(1);
+    expect(s.loc.partialGroupAbandonedCount).toBe(1);
+    expect(s.loc.keyframeWaitingCount).toBe(1);
+    expect(s.loc.gapDetectedCount).toBe(1);
+    expect(s.loc.recoveryActionCount).toBe(1);
+    expect(s.loc.syncResetCount).toBe(1);
+  });
+
+  it('surfaces the live gap-timeout and render-cushion gauges passed to snapshot', () => {
+    const acc = new StatsAccumulator();
+    const s = acc.snapshot({ videoEffectiveGapTimeoutMs: 120, videoRenderCushionMs: 200 });
+    expect(s.loc.videoEffectiveGapTimeoutMs).toBe(120);
+    expect(s.loc.videoRenderCushionMs).toBe(200);
+  });
+});

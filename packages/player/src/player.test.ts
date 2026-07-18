@@ -2123,6 +2123,25 @@ describe('MoqtPlayer', () => {
       return player;
     }
 
+    it('stats.loc exposes LOC diagnostics: zeroed counters and live timing gauges', async () => {
+      // Slice-1 observability (stutter correlation): counters start at zero,
+      // and the gap-timeout/render-cushion gauges are live once the LOC
+      // video pipeline exists. Behavior-neutral — values only.
+      const adapter = createMockAdapter();
+      const player = await loadWithCatalog(adapter);
+
+      const loc = player.stats.loc;
+      expect(loc.skipForwardCount).toBe(0);
+      expect(loc.backlogShedCount).toBe(0);
+      expect(loc.partialGroupAbandonedCount).toBe(0);
+      expect(loc.keyframeWaitingCount).toBe(0);
+      expect(loc.syncResetCount).toBe(0);
+      expect(loc.videoEffectiveGapTimeoutMs).toBeGreaterThan(0);
+      expect(loc.videoRenderCushionMs).toBeGreaterThanOrEqual(loc.videoEffectiveGapTimeoutMs!);
+      expect(loc.videoRenderCushionMs).toBeGreaterThanOrEqual(50); // static floor
+      await player.destroy();
+    });
+
     it('creates pipelines for video and audio after catalog', async () => {
       // LOC §4.2: Pipeline processes objects in decode order.
       // After catalog triggers track selection, pipelines should exist.

@@ -712,7 +712,18 @@ export class MoqtPlayer {
    * @see draft-jennings-moq-metrics-02 (informational)
    */
   get stats(): Readonly<PlayerStats> {
-    return Object.freeze(this._stats.snapshot());
+    // LOC timing gauges sampled at snapshot time (null on the CMAF path):
+    // the live adaptive gap fuse and the render cushion actually applied
+    // (same formula as recomputeVideoRenderTime — observability only).
+    const gapUs = this.videoPipeline?.effectiveGapTimeoutUs;
+    const locGauges = gapUs !== undefined ? {
+      videoEffectiveGapTimeoutMs: gapUs / 1000,
+      videoRenderCushionMs: Math.max(
+        gapUs,
+        this._handshakeRttMs !== undefined && this._handshakeRttMs < 5 ? 50_000 : 200_000,
+      ) / 1000,
+    } : undefined;
+    return Object.freeze(this._stats.snapshot(locGauges));
   }
 
   /**
@@ -4132,6 +4143,7 @@ export class MoqtPlayer {
       syncController: this.syncController,
       syncResetThisTick: this.syncResetThisTick,
       setSyncResetThisTick: (v) => { this.syncResetThisTick = v; },
+      recordDiagnostic: (kind) => this._stats.recordLocDiagnostic(kind),
       recoveryHook: (action) => {
         const result = this.hooks.onRecovery.run(action);
         if (result) {

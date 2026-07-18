@@ -345,3 +345,55 @@ describe('handleRecoveryAction', () => {
     expect(callbacks.onTerminate).toHaveBeenCalledWith('too many errors');
   });
 });
+
+describe('handlePipelineEvent — LOC diagnostics counting (observability only)', () => {
+  const baseCtx = () => ({
+    emitEvent: vi.fn(), log: mockLog, syncController: null,
+    syncResetThisTick: false, setSyncResetThisTick: vi.fn(),
+    recoveryHook: (a: RecoveryAction) => a,
+    recordDiagnostic: vi.fn(),
+  });
+
+  it.each([
+    ['gap_detected', { type: 'gap_detected', groupId: 5n }],
+    ['keyframe_waiting', { type: 'keyframe_waiting', groupId: 5n }],
+    ['partial_group_abandoned', { type: 'partial_group_abandoned', fromGroupId: 1n, toGroupId: 2n, reason: 'x' }],
+    ['backlog_shed', { type: 'backlog_shed', droppedGroups: 2, remainingGroups: 3, reason: 'x' }],
+  ] as const)('records %s', (kind, evt) => {
+    const ctx = baseCtx();
+    handlePipelineEvent('video', evt as PlaybackEvent, ctx);
+    expect(ctx.recordDiagnostic).toHaveBeenCalledWith(kind);
+  });
+
+  it('records skip_forward AND sync_reset when the reset actually runs', () => {
+    const ctx = { ...baseCtx(), syncController: { reset: vi.fn() } as any };
+    handlePipelineEvent('video', { type: 'skip_forward', fromGroupId: 1n, toGroupId: 2n } as PlaybackEvent, ctx);
+    expect(ctx.recordDiagnostic).toHaveBeenCalledWith('skip_forward');
+    expect(ctx.recordDiagnostic).toHaveBeenCalledWith('sync_reset');
+  });
+
+  it('does NOT record sync_reset when the same-tick guard suppresses the reset', () => {
+    const ctx = { ...baseCtx(), syncController: { reset: vi.fn() } as any, syncResetThisTick: true };
+    handlePipelineEvent('video', { type: 'skip_forward', fromGroupId: 1n, toGroupId: 2n } as PlaybackEvent, ctx);
+    expect(ctx.recordDiagnostic).toHaveBeenCalledWith('skip_forward');
+    expect(ctx.recordDiagnostic).not.toHaveBeenCalledWith('sync_reset');
+  });
+
+  it('records recovery_action only when the hook passes the action through', () => {
+    const ctx = { ...baseCtx(), recoveryHook: () => null };
+    handlePipelineEvent('video', { type: 'recovery', action: { type: 'skip_forward' } } as unknown as PlaybackEvent, ctx);
+    expect(ctx.recordDiagnostic).not.toHaveBeenCalledWith('recovery_action');
+
+    const ctx2 = baseCtx();
+    handlePipelineEvent('video', { type: 'recovery', action: { type: 'reduce_quality' } } as unknown as PlaybackEvent, ctx2);
+    expect(ctx2.recordDiagnostic).toHaveBeenCalledWith('recovery_action');
+  });
+
+  it('is optional: absent recordDiagnostic changes nothing', () => {
+    const { recordDiagnostic: _omit, ...ctx } = baseCtx();
+    expect(() => handlePipelineEvent('video',
+      { type: 'skip_forward', fromGroupId: 1n, toGroupId: 2n } as PlaybackEvent,
+      { ...ctx, syncController: { reset: vi.fn() } as any })).not.toThrow();
+  });
+});
+

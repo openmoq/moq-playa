@@ -135,6 +135,53 @@ export interface PlayerStats {
   readonly avSkewMs: number | null;
   /** EWMA of measured A/V skew (ms, α=0.1). null until first measurement. */
   readonly avSkewEwmaMs: number | null;
+
+  // ── LOC pipeline diagnostics (stutter observability) ────────
+  /**
+   * Cumulative counters and live timing gauges for the LOC pipeline's
+   * disruptive events, so field stutter can be correlated with its cause:
+   * gap-fuse skips vs backlog shedding vs decoder/keyframe waits, and A/V
+   * skew steps with sync resets. Observability only — nothing acts on these.
+   */
+  readonly loc: LocDiagnostics;
+}
+
+/** Kinds of LOC pipeline diagnostic events counted in {@link LocDiagnostics}. */
+export type LocDiagnosticKind =
+  | 'gap_detected'
+  | 'skip_forward'
+  | 'keyframe_waiting'
+  | 'partial_group_abandoned'
+  | 'backlog_shed'
+  | 'recovery_action'
+  | 'sync_reset';
+
+/** LOC pipeline diagnostics block of {@link PlayerStats}. */
+export interface LocDiagnostics {
+  /** Group gaps detected by the pipeline. */
+  readonly gapDetectedCount: number;
+  /** Skip-forwards past a (possibly merely-late) group. */
+  readonly skipForwardCount: number;
+  /** Keyframe waits after a gap/reset (visible freeze while waiting). */
+  readonly keyframeWaitingCount: number;
+  /** Partially-received video GOPs abandoned on intra-group timeout. */
+  readonly partialGroupAbandonedCount: number;
+  /** Backlog sheds (buffered groups dropped after a burst). */
+  readonly backlogShedCount: number;
+  /** Recovery actions that passed the player's recovery hook. */
+  readonly recoveryActionCount: number;
+  /** A/V sync baseline resets actually performed (skip-triggered). */
+  readonly syncResetCount: number;
+  /** Live adaptive gap-timeout of the video pipeline (ms). null without a LOC video pipeline. */
+  readonly videoEffectiveGapTimeoutMs: number | null;
+  /** Video render cushion actually applied: max(adaptive, static floor) (ms). null without a LOC video pipeline. */
+  readonly videoRenderCushionMs: number | null;
+}
+
+/** Live timing gauges supplied by the player at snapshot time. */
+export interface LocTimingGauges {
+  readonly videoEffectiveGapTimeoutMs: number | null;
+  readonly videoRenderCushionMs: number | null;
 }
 
 // ─── StatsAccumulator ────────────────────────────────────────────────
@@ -350,6 +397,22 @@ export class StatsAccumulator {
       : this._avSkewEwmaMs * 0.9 + ms * 0.1;
   }
 
+  // ── LOC pipeline diagnostics ─────────────────────────────
+
+  private readonly _locCounts: Record<LocDiagnosticKind, number> = {
+    gap_detected: 0, skip_forward: 0, keyframe_waiting: 0,
+    partial_group_abandoned: 0, backlog_shed: 0,
+    recovery_action: 0, sync_reset: 0,
+  };
+
+  /**
+   * Count one LOC pipeline diagnostic event. Observability only — called
+   * from the pipeline event handler; never influences behavior.
+   */
+  recordLocDiagnostic(kind: LocDiagnosticKind): void {
+    this._locCounts[kind]++;
+  }
+
   // ── Latency ──────────────────────────────────────────────
 
   /**
@@ -388,7 +451,7 @@ export class StatsAccumulator {
    * Computes relative TTFF, in-progress playback duration, session age,
    * and dropRatio. Returns a plain object (no class instance).
    */
-  snapshot(): PlayerStats {
+  snapshot(locGauges?: LocTimingGauges): PlayerStats {
     const now = Date.now();
     const loadStart = this._loadStartMs;
 
@@ -466,6 +529,19 @@ export class StatsAccumulator {
       // A/V sync (LOC observability)
       avSkewMs: this._avSkewMs,
       avSkewEwmaMs: this._avSkewEwmaMs,
+
+      // LOC pipeline diagnostics
+      loc: {
+        gapDetectedCount: this._locCounts.gap_detected,
+        skipForwardCount: this._locCounts.skip_forward,
+        keyframeWaitingCount: this._locCounts.keyframe_waiting,
+        partialGroupAbandonedCount: this._locCounts.partial_group_abandoned,
+        backlogShedCount: this._locCounts.backlog_shed,
+        recoveryActionCount: this._locCounts.recovery_action,
+        syncResetCount: this._locCounts.sync_reset,
+        videoEffectiveGapTimeoutMs: locGauges?.videoEffectiveGapTimeoutMs ?? null,
+        videoRenderCushionMs: locGauges?.videoRenderCushionMs ?? null,
+      },
     };
   }
 }

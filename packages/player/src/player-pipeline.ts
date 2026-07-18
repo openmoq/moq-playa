@@ -23,6 +23,7 @@ import type { MoqtPlayerConfig } from './config.js';
 import type { MediaSourceLike } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
+import type { LocDiagnosticKind } from './stats.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
 
@@ -98,6 +99,12 @@ export interface PipelineEventContext {
   syncResetThisTick: boolean;
   setSyncResetThisTick: (value: boolean) => void;
   recoveryHook: (action: RecoveryAction) => RecoveryAction | null;
+  /**
+   * Observability-only counter hook for LOC diagnostics (stats.loc).
+   * `sync_reset` is recorded exactly when the reset is actually performed,
+   * not on same-tick suppressed duplicates. Optional — absent = no counting.
+   */
+  recordDiagnostic?: (kind: LocDiagnosticKind) => void;
 }
 
 /** Callbacks for handleRecoveryAction. */
@@ -355,16 +362,19 @@ export function handlePipelineEvent(
 ): void {
   switch (evt.type) {
     case 'gap_detected':
+      ctx.recordDiagnostic?.('gap_detected');
       ctx.log.warn('Gap detected %s group=%s', mediaType, evt.groupId);
       ctx.emitEvent({
         type: 'gap_detected', mediaType, groupId: evt.groupId,
       });
       break;
     case 'skip_forward':
+      ctx.recordDiagnostic?.('skip_forward');
       ctx.log.warn('Skip forward %s group=%s→%s', mediaType, evt.fromGroupId, evt.toGroupId);
       if (!ctx.syncResetThisTick && ctx.syncController) {
         ctx.syncController.reset();
         ctx.setSyncResetThisTick(true);
+        ctx.recordDiagnostic?.('sync_reset');
       }
       ctx.emitEvent({
         type: 'skip_forward', mediaType,
@@ -372,6 +382,7 @@ export function handlePipelineEvent(
       });
       break;
     case 'keyframe_waiting':
+      ctx.recordDiagnostic?.('keyframe_waiting');
       ctx.emitEvent({
         type: 'keyframe_waiting', mediaType, groupId: evt.groupId,
       });
@@ -388,6 +399,7 @@ export function handlePipelineEvent(
     case 'recovery': {
       const action = ctx.recoveryHook(evt.action);
       if (action) {
+        ctx.recordDiagnostic?.('recovery_action');
         ctx.emitEvent({ type: 'recovery_action', action });
       }
       break;
@@ -416,6 +428,7 @@ export function handlePipelineEvent(
       });
       break;
     case 'partial_group_abandoned':
+      ctx.recordDiagnostic?.('partial_group_abandoned');
       ctx.log.warn('Partial group abandoned %s group=%s→%s reason=%s',
         mediaType, evt.fromGroupId, evt.toGroupId, evt.reason);
       ctx.emitEvent({
@@ -427,6 +440,7 @@ export function handlePipelineEvent(
       });
       break;
     case 'backlog_shed':
+      ctx.recordDiagnostic?.('backlog_shed');
       ctx.log.warn('Backlog shed %s: dropped=%d remaining=%d reason=%s',
         mediaType, evt.droppedGroups, evt.remainingGroups, evt.reason);
       ctx.emitEvent({
