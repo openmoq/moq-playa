@@ -129,7 +129,6 @@ export class CommandDispatcher {
   private static readonly MAX_HOLD_QUEUE = 30; // 1 GOP at 30fps
   private readonly _hasSyncReference: (() => boolean) | undefined;
   private readonly _recomputeVideoRenderTime: ((captureTimestampUs: bigint) => number) | undefined;
-  // @ts-expect-error Reserved for future playback delay compensation
   private readonly _getPlaybackDelayUs: (() => number) | undefined;
 
   constructor(opts: CommandDispatcherOptions) {
@@ -192,11 +191,18 @@ export class CommandDispatcher {
       const audioOutput = this.audioOutput;
       const ad = this.audioDecoder;
       this.audioDecoder.onData = (data, renderTimeUs) => {
-        // WebAudioOutput.schedule() already applies its own playback
-        // delay (200ms) on the first-chunk anchor. Adding our
-        // getPlaybackDelayUs here would double-delay audio relative
-        // to video (which gets 200ms via recomputeVideoRenderTime).
-        audioOutput.schedule(data, renderTimeUs);
+        // Delay unification: audio receives THE SAME playout cushion as the
+        // video render-time recompute (getPlaybackDelayUs — adaptive gap
+        // timeout with a static floor), applied here so the cushion arrives
+        // inside renderTimeUs. Integrated audio outputs are constructed with
+        // playbackDelayMs 0 and add no delay of their own. NOTE the adoption
+        // boundary: WebAudioOutput intentionally ignores renderTimeUs while
+        // its chain is healthy, so audio adopts a changed cushion at the
+        // next anchor/underrun — video adopts per-frame. One policy source;
+        // any divergence from a changed cushion persists until the next
+        // audio anchor/underrun/reset (pinned in webaudio-output.test.ts).
+        const cushionUs = this._getPlaybackDelayUs?.() ?? 0;
+        audioOutput.schedule(data, renderTimeUs + cushionUs);
         this.checkQueuePressure('audio', ad);
       };
     }

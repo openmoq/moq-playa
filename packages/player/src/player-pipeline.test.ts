@@ -9,6 +9,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import {
+  computePlaybackDelayUs,
   createPipelines,
   handlePipelineCommand,
   handlePipelineEvent,
@@ -397,3 +398,24 @@ describe('handlePipelineEvent — LOC diagnostics counting (observability only)'
   });
 });
 
+describe('computePlaybackDelayUs — the ONE shared playout cushion', () => {
+  it('normal RTT: max(adaptive, 200ms) for BOTH media types', () => {
+    expect(computePlaybackDelayUs(120_000, undefined)).toBe(200_000);
+    expect(computePlaybackDelayUs(120_000, 40)).toBe(200_000);
+  });
+
+  it('RTT < 5ms: static floor drops to 50ms', () => {
+    expect(computePlaybackDelayUs(0, 2)).toBe(50_000);
+    expect(computePlaybackDelayUs(30_000, 2)).toBe(50_000);
+  });
+
+  it('adaptive gap timeout above the floor wins (propagates to both media)', () => {
+    expect(computePlaybackDelayUs(400_000, 40)).toBe(400_000);
+    expect(computePlaybackDelayUs(400_000, 2)).toBe(400_000);
+  });
+
+  it('no adaptive signal: pure static floor', () => {
+    expect(computePlaybackDelayUs(undefined, undefined)).toBe(200_000);
+    expect(computePlaybackDelayUs(undefined, 2)).toBe(50_000);
+  });
+});

@@ -155,3 +155,51 @@ describe('WebAudioOutput.playheadCaptureUs', () => {
     ]);
   });
 });
+
+describe('unified playout cushion (delay unification)', () => {
+  // With playbackDelayMs = 0, the cushion arrives INSIDE renderTimeUs (the
+  // dispatcher adds the shared pipeline cushion) — the output must anchor at
+  // exactly toAudioCtxTime(renderTimeUs), adding no delay of its own.
+  it('with zero playbackDelayMs the first anchor is exactly the render time', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(audioData(0) as unknown as AudioData, 1_500_000); // render at ctx 1.5s
+    expect(ctx.started[0]!.when).toBeCloseTo(1.5, 5);
+  });
+
+  it('PINNED SEMANTICS: a mid-chain cushion change does NOT retime healthy chained playback', () => {
+    // Audio adopts the shared cushion at anchor/underrun boundaries ONLY.
+    // While the chain is healthy (nextScheduledTime >= now) schedule()
+    // intentionally ignores renderTimeUs — retiming a playing chain would
+    // need an audible gap or rate control (slice-C territory). So a cushion
+    // that grows mid-session reaches audio playout at the NEXT underrun,
+    // not immediately. Video adopts per-frame; transient divergence between
+    // a cushion change and the next audio anchor is expected and bounded.
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(audioData(0) as unknown as AudioData, 1_200_000);      // anchor at 1.2 (cushion 200ms)
+    // Cushion grew to 400ms upstream — next buffer arrives while the chain
+    // is still healthy, carrying renderTime reflecting the LARGER cushion.
+    out.schedule(audioData(20_000) as unknown as AudioData, 1_420_000);
+    // Chained back-to-back at 1.22 — renderTime (1.42) intentionally ignored.
+    expect(ctx.started[1]!.when).toBeCloseTo(1.22, 5);
+  });
+
+  it('the next underrun re-anchor ADOPTS the grown cushion (adoption boundary)', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(audioData(0) as unknown as AudioData, 1_200_000);      // chain ends 1.22
+    ctx.currentTime = 2.0;                                              // underrun
+    out.schedule(audioData(20_000) as unknown as AudioData, 2_400_000); // new 400ms cushion inside renderTime
+    expect(ctx.started[1]!.when).toBeCloseTo(2.4, 5);                   // adopted exactly
+  });
+
+  it('an underrun re-anchor also lands exactly on the (cushion-inclusive) render time', () => {
+    const { ctx, out } = makeOutput(0);
+    ctx.currentTime = 1.0;
+    out.schedule(audioData(0) as unknown as AudioData, 1_100_000); // 20ms buffer → chain ends 1.12
+    ctx.currentTime = 2.0; // chain long dry — underrun
+    out.schedule(audioData(20_000) as unknown as AudioData, 2_300_000);
+    expect(ctx.started[1]!.when).toBeCloseTo(2.3, 5); // no hidden +200ms
+  });
+});

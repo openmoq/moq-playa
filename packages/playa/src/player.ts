@@ -437,7 +437,10 @@ export class Player {
       // to the real output.
       if (!this.deferredAudio.isActive) {
         const dest = this.volumeCtrl?.destinationNode;
-        const real = new WebAudioOutput(this.audioCtx!, dest, 200, this.audioClock);
+        // Delay unification: the shared playout cushion arrives inside
+        // renderTimeUs (CommandDispatcher adds getPlaybackDelayUs) — the
+        // output must not add a second, divergent delay of its own.
+        const real = new WebAudioOutput(this.audioCtx!, dest, 0, this.audioClock);
         this.deferredAudio.activate(real);
       }
     })();
@@ -539,7 +542,10 @@ export class Player {
           // Eager: create AudioContext immediately (backward compat)
           this.ensureAudioContext();
           const dest = this.volumeCtrl?.destinationNode;
-          return new WebAudioOutput(this.audioCtx!, dest, 200, this.audioClock);
+          // Delay unification: the shared playout cushion arrives inside
+          // renderTimeUs (CommandDispatcher adds getPlaybackDelayUs) — the
+          // output must not add a second, divergent delay of its own.
+          return new WebAudioOutput(this.audioCtx!, dest, 0, this.audioClock);
         },
       });
     }

@@ -114,6 +114,27 @@ export interface RecoveryCallbacks {
   onTerminate: (reason: string) => void;
 }
 
+/**
+ * The single playout-cushion POLICY for a LOC session (µs) — the one source
+ * consumed by both the video render-time recompute and audio scheduling
+ * (via the dispatcher's getPlaybackDelayUs hook). Video adopts the value
+ * per-frame; audio adopts it at anchor/underrun boundaries (a healthy audio
+ * chain is never retimed mid-run), so any divergence from a changed cushion
+ * persists until the next audio anchor/underrun/reset.
+ *
+ * `max(adaptive, static)`: the adaptive component is the video pipeline's
+ * effective gap timeout (arrival-jitter EMA); the static floor is 200 ms,
+ * or 50 ms when the WebTransport handshake RTT is under 5 ms (LAN/loopback).
+ */
+export function computePlaybackDelayUs(
+  effectiveGapTimeoutUs: number | undefined,
+  handshakeRttMs: number | undefined,
+): number {
+  const staticDelayUs = handshakeRttMs !== undefined && handshakeRttMs < 5
+    ? 50_000 : 200_000;
+  return Math.max(effectiveGapTimeoutUs ?? 0, staticDelayUs);
+}
+
 // ─── createPipelines ─────────────────────────────────────────────────
 
 /**
@@ -215,11 +236,10 @@ export function createPipelines(
       // Adds a playback delay cushion to absorb network jitter — frames are
       // scheduled slightly into the future so delivery stalls don't cause stutter.
       recomputeVideoRenderTime: (captureTimestampUs: bigint) => {
-        // Adaptive playback delay: absorbs network delivery jitter.
-        const adaptiveDelayUs = videoPipeline?.effectiveGapTimeoutUs ?? 0;
-        const staticDelayUs = (handshakeRttMs !== undefined && handshakeRttMs < 5)
-          ? 50_000 : 200_000;
-        const playbackDelayUs = Math.max(adaptiveDelayUs, staticDelayUs);
+        // The shared playout cushion (same value audio receives via
+        // getPlaybackDelayUs) — absorbs network delivery jitter.
+        const playbackDelayUs = computePlaybackDelayUs(
+          videoPipeline?.effectiveGapTimeoutUs, handshakeRttMs);
 
         // Sync reference is guaranteed here — CommandDispatcher holds frames
         // until hasSyncReference() returns true, so this callback only fires
@@ -234,12 +254,8 @@ export function createPipelines(
         return timing.renderTimeUs + playbackDelayUs;
       },
       hasSyncReference: () => syncController.hasReference,
-      getPlaybackDelayUs: () => {
-        const adaptiveDelayUs = videoPipeline?.effectiveGapTimeoutUs ?? 0;
-        const staticDelayUs = (handshakeRttMs !== undefined && handshakeRttMs < 5)
-          ? 50_000 : 200_000;
-        return Math.max(adaptiveDelayUs, staticDelayUs);
-      },
+      getPlaybackDelayUs: () =>
+        computePlaybackDelayUs(videoPipeline?.effectiveGapTimeoutUs, handshakeRttMs),
     }));
   }
 

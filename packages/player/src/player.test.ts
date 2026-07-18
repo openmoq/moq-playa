@@ -2137,8 +2137,8 @@ describe('MoqtPlayer', () => {
       expect(loc.keyframeWaitingCount).toBe(0);
       expect(loc.syncResetCount).toBe(0);
       expect(loc.videoEffectiveGapTimeoutMs).toBeGreaterThan(0);
-      expect(loc.videoRenderCushionMs).toBeGreaterThanOrEqual(loc.videoEffectiveGapTimeoutMs!);
-      expect(loc.videoRenderCushionMs).toBeGreaterThanOrEqual(50); // static floor
+      expect(loc.renderCushionMs).toBeGreaterThanOrEqual(loc.videoEffectiveGapTimeoutMs!);
+      expect(loc.renderCushionMs).toBeGreaterThanOrEqual(50); // static floor
       await player.destroy();
     });
 

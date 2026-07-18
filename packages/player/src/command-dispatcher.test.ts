@@ -832,3 +832,39 @@ describe('CommandDispatcher', () => {
     });
   });
 });
+
+describe('unified playout cushion — audio consumes the shared pipeline delay', () => {
+  it('adds getPlaybackDelayUs() to audio render times (same cushion as video recompute)', () => {
+    const audioDecoder = createMockAudioDecoder();
+    const audioOutput = createMockAudioOutput();
+    const _d = new CommandDispatcher({
+      audioDecoder, audioOutput,
+      getPlaybackDelayUs: () => 200_000,
+    });
+    audioDecoder._triggerData({ sampleRate: 48000 }, 3000);
+    expect(audioOutput.schedule).toHaveBeenCalledWith({ sampleRate: 48000 }, 203_000);
+  });
+
+  it('adaptive cushion changes reach subsequent audio schedule() arguments (adoption at anchor/underrun is pinned in webaudio-output.test.ts)', () => {
+    const audioDecoder = createMockAudioDecoder();
+    const audioOutput = createMockAudioOutput();
+    let cushion = 200_000;
+    const _d = new CommandDispatcher({
+      audioDecoder, audioOutput,
+      getPlaybackDelayUs: () => cushion,
+    });
+    audioDecoder._triggerData({ sampleRate: 48000 }, 1000);
+    cushion = 400_000; // adaptive gap timeout grew under jitter
+    audioDecoder._triggerData({ sampleRate: 48000 }, 2000);
+    expect(audioOutput.schedule).toHaveBeenNthCalledWith(1, expect.anything(), 201_000);
+    expect(audioOutput.schedule).toHaveBeenNthCalledWith(2, expect.anything(), 402_000);
+  });
+
+  it('without the hook, audio render times pass through unchanged (standalone back-compat)', () => {
+    const audioDecoder = createMockAudioDecoder();
+    const audioOutput = createMockAudioOutput();
+    const _d = new CommandDispatcher({ audioDecoder, audioOutput });
+    audioDecoder._triggerData({ sampleRate: 48000 }, 3000);
+    expect(audioOutput.schedule).toHaveBeenCalledWith(expect.anything(), 3000);
+  });
+});

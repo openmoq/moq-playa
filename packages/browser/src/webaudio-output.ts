@@ -63,10 +63,15 @@ export class WebAudioOutput implements AudioOutputLike {
   private _playbackRate = 1.0;
 
   /**
-   * Playback delay in seconds — matches the video output delay so audio
-   * and video start at the same wall-clock offset. Without this, video
-   * is delayed by up to MAX_OUTPUT_VIDEO_DELAY_US (250ms) for jitter
-   * absorption while audio plays immediately, causing audio-ahead desync.
+   * Local playback delay in seconds, applied at anchor/re-anchor time.
+   *
+   * Delay unification: integrated players pass 0 here — the shared playout
+   * cushion (the same adaptive value the video render-time recompute uses)
+   * arrives INSIDE `renderTimeUs`, applied upstream by the CommandDispatcher.
+   * A non-zero value here is a second, independent delay policy that can
+   * diverge from video's and re-assert that divergence on every underrun
+   * re-anchor (A/V skew). The parameter remains (default 200 ms) only for
+   * standalone use of this class without the dispatcher's cushion.
    */
   private readonly playbackDelaySec: number;
 

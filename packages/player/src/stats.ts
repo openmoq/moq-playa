@@ -174,14 +174,21 @@ export interface LocDiagnostics {
   readonly syncResetCount: number;
   /** Live adaptive gap-timeout of the video pipeline (ms). null without a LOC video pipeline. */
   readonly videoEffectiveGapTimeoutMs: number | null;
-  /** Video render cushion actually applied: max(adaptive, static floor) (ms). null without a LOC video pipeline. */
-  readonly videoRenderCushionMs: number | null;
+  /**
+   * The SHARED playout cushion (ms): max(adaptive gap timeout, static
+   * floor), the single policy source for BOTH media. Video render times
+   * adopt it per-frame; audio adopts it at anchor/underrun boundaries
+   * (a healthy audio chain is never retimed mid-run), so a cushion change
+   * can diverge transiently until the next audio anchor. null without a
+   * LOC video pipeline.
+   */
+  readonly renderCushionMs: number | null;
 }
 
 /** Live timing gauges supplied by the player at snapshot time. */
 export interface LocTimingGauges {
   readonly videoEffectiveGapTimeoutMs: number | null;
-  readonly videoRenderCushionMs: number | null;
+  readonly renderCushionMs: number | null;
 }
 
 // ─── StatsAccumulator ────────────────────────────────────────────────
@@ -540,7 +547,7 @@ export class StatsAccumulator {
         recoveryActionCount: this._locCounts.recovery_action,
         syncResetCount: this._locCounts.sync_reset,
         videoEffectiveGapTimeoutMs: locGauges?.videoEffectiveGapTimeoutMs ?? null,
-        videoRenderCushionMs: locGauges?.videoRenderCushionMs ?? null,
+        renderCushionMs: locGauges?.renderCushionMs ?? null,
       },
     };
   }

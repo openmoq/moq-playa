@@ -975,7 +975,9 @@ async function startPlayback(): Promise<void> {
         createVideoDecoder: () => new WebCodecsVideoDecoder({ preferSoftwareDecoder }),
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
         createRenderer: () => renderer!,
-        createAudioOutput: () => new WebAudioOutput(audioCtx, undefined, 200, audioClock),
+        // Delay 0: the shared playout cushion is applied upstream by the
+        // CommandDispatcher (delay unification) — no independent audio delay.
+        createAudioOutput: () => new WebAudioOutput(audioCtx, undefined, 0, audioClock),
         createMediaSource: () => {
             const ms = new MseMediaSource(videoEl);
             // Playhead-wedge forensics into the PAGE log (the adapter's own

@@ -57,7 +57,7 @@ import { StatsAccumulator } from './stats.js';
 import type { PlayerStats } from './stats.js';
 import type { CmafAssemblerLike } from './interfaces.js';
 import { buildConnectUrl, buildSetupOptions, buildSubscribeOptions } from './player-connect.js';
-import {
+import { computePlaybackDelayUs,
   createPipelines,
   configurePipelines,
   handlePipelineCommand as doPipelineCommand,
@@ -718,10 +718,7 @@ export class MoqtPlayer {
     const gapUs = this.videoPipeline?.effectiveGapTimeoutUs;
     const locGauges = gapUs !== undefined ? {
       videoEffectiveGapTimeoutMs: gapUs / 1000,
-      videoRenderCushionMs: Math.max(
-        gapUs,
-        this._handshakeRttMs !== undefined && this._handshakeRttMs < 5 ? 50_000 : 200_000,
-      ) / 1000,
+      renderCushionMs: computePlaybackDelayUs(gapUs, this._handshakeRttMs) / 1000,
     } : undefined;
     return Object.freeze(this._stats.snapshot(locGauges));
   }
