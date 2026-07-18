@@ -14,6 +14,7 @@
 import { buildCatalog, CATALOG_TRACK_NAME } from '@moqt/msf';
 import type { MoqtConnection } from '@moqt/webtransport';
 import type { LoadedFixture, LoadedTrack } from './fixture.js';
+import { analyzeLoopSpan, rebaseTfdtCopy } from './cmaf-loop-rebase.js';
 
 const log = (...a: unknown[]) => console.log('[publisher]', ...a);
 const te = new TextEncoder();
@@ -137,18 +138,34 @@ export async function publishFixture(
   }
 
   // Loop mode: establish every track ONCE, then advance group IDs together.
+  // CMAF tracks get a CONTINUOUS media timeline: each iteration's chunks are
+  // copies with tfdt rebased by iteration × loopSpan, so the loop presents as
+  // one endless stream instead of replaying timestamps (which wedges MSE
+  // players at the seam — the timeline-overlap dropper discards replays).
   let alias = 11n;
-  const handles: { track: string; alias: bigint; chunks: readonly Uint8Array[] }[] = [];
+  const handles: { track: string; alias: bigint; chunks: readonly Uint8Array[]; spanTicks: bigint | null }[] = [];
   for (const t of fixture.tracks) {
     const a = alias++;
     await establishTrack(conn, ns, t.meta.name, a);
-    handles.push({ track: t.meta.name, alias: a, chunks: t.chunks });
+    const spanTicks = t.meta.packaging === 'cmaf' ? analyzeLoopSpan(t.chunks) : null;
+    if (t.meta.packaging === 'cmaf' && spanTicks === null) {
+      log(`NOTE: ${t.meta.name} chunks are not parseable CMAF (synthetic fixture?) — loop will replay timestamps`);
+    } else if (spanTicks !== null) {
+      log(`${t.meta.name}: loop span ${spanTicks} ticks — tfdt rebased per iteration`);
+    }
+    handles.push({ track: t.meta.name, alias: a, chunks: t.chunks, spanTicks });
   }
   log(`loop mode: ${handles.length} tracks established; sending ${loops === Infinity ? 'endless' : loops} group(s)`);
 
   for (let g = 0; g < loops; g++) {
     // Tracks send each group concurrently so one loop iteration ≈ one group duration.
-    await Promise.all(handles.map((h) => sendGroup(conn, h.alias, BigInt(g), h.chunks, paceMs)));
+    await Promise.all(handles.map((h) => {
+      const chunks = (g === 0 || h.spanTicks === null)
+        ? h.chunks
+        // Always rebase from the ORIGINAL bytes — offsets never compound.
+        : h.chunks.map((c) => rebaseTfdtCopy(c, h.spanTicks! * BigInt(g)));
+      return sendGroup(conn, h.alias, BigInt(g), chunks, paceMs);
+    }));
     log(`group ${g} sent on ${handles.length} track(s)`);
   }
   log('loop publishing finished');

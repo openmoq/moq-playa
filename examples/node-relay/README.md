@@ -89,6 +89,11 @@ generate a CMAF fixture from an MP4, publish it (optionally looped) into
   registry is a possible follow-up.
 - **Data objects only** — gap/status objects (incl. `END_OF_GROUP`) are not relayed.
 - **No route authorization, backpressure/fairness, reconnect/migration, or persistence.**
+- **Uni-stream credit ceiling**: the FAILS WebTransport backend grants roughly a
+  hundred unidirectional streams per connection and does not replenish them, so a
+  subscriber connection exhausts its stream credits after ~100 forwarded subgroups
+  ("No streams available" forward errors; ~50 groups for a 2-track viewer). Long
+  soaks should use fixtures with long groups (e.g. `notld-60s`) or reconnect.
 - The FAILS backend does not echo an application protocol, so endpoints construct
   `MoqtConnection(18)` **explicitly** (draft auto-negotiation would fall back to 16).
 

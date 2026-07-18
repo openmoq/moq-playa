@@ -10,7 +10,8 @@
     "prepare-fixture": "node scripts/prepare-fixture.mjs",
     "validate-fixture": "tsx src/validate-fixture.ts",
     "publish-fixture": "tsx src/publish-cli.ts",
-    "smoke": "tsx src/smoke.ts"
+    "smoke": "tsx src/smoke.ts",
+    "rebase-test": "tsx src/rebase-test.ts"
   },
   "dependencies": {
     "@moqt/transport": "workspace:*",
