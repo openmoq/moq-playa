@@ -19,6 +19,7 @@ import {
   decodeControlMessage,
   createControlCodec,
   SessionState,
+  SessionError,
   EndpointRole,
   varint,
   encodeSubgroupHeader,
@@ -274,6 +275,34 @@ async function connectAdapter(
   await flush();
   mock.pushControlBytes(encodeServerSetup());
   await connectPromise;
+  return adapter;
+}
+
+/**
+ * Connect a publisher-capable adapter AND establish an incoming subscription
+ * bound to `alias`, so publisher data-plane APIs (openSubgroup / sendObject /
+ * sendDatagram) have the alias→subscription association the public API requires
+ * — trackAlias comes from acceptSubscribe(). Publishing on an unassociated alias
+ * is rejected, so encoder tests must associate first (the realistic path).
+ */
+async function connectPublisherWithAlias(
+  mock: MockTransport,
+  alias: bigint,
+): Promise<MoqtConnection> {
+  const adapter = new MoqtConnection();
+  const connectPromise = adapter.connect(mock.transport, { maxRequestId: varint(100) });
+  await flush();
+  mock.pushControlBytes(encodeServerSetup());
+  await connectPromise;
+  mock.pushControlBytes(encodeControlMessage({
+    type: 'SUBSCRIBE',
+    requestId: varint(1n),
+    trackNamespace: [new TextEncoder().encode('live')],
+    trackName: new TextEncoder().encode('video'),
+    parameters: new Map(),
+  } as Subscribe));
+  await flush();
+  await adapter.acceptSubscribe(varint(1n), varint(alias));
   return adapter;
 }
 
@@ -2325,6 +2354,386 @@ describe('MoqtConnection draft-14', () => {
     expect(adapter).toBeDefined();
   });
 
+  // ─── R8d finding 1: legacy SUBSCRIBE_OK validated BEFORE resolve ───
+  // The draft-14/16 control loop must apply the same order as draft-18: a
+  // duplicate-alias SUBSCRIBE_OK closes the session and REJECTS subscribeTrack(),
+  // never resolves it against a closing session.
+  describe('draft-14/16 SUBSCRIBE_OK validation ordering (§10.8 / §11.1)', () => {
+    /** Request ID of the most recent SUBSCRIBE the adapter wrote (draft-specific codec). */
+    function lastSubscribeRequestId(mock: MockTransport, codec: ReturnType<typeof createControlCodec>): bigint {
+      for (let i = mock.controlWritten.length - 1; i >= 0; i--) {
+        const { message } = codec.decode(mock.controlWritten[i]!, 0);
+        if (message.type === 'SUBSCRIBE') return (message as { requestId: bigint }).requestId;
+      }
+      throw new Error('no SUBSCRIBE written');
+    }
+
+    for (const draft of [14, 16] as const) {
+      it(`draft-${draft}: a duplicate-alias SUBSCRIBE_OK rejects subscribeTrack() and closes the session (never resolves)`, async () => {
+        const mock = createMockTransport();
+        const adapter = draft === 14 ? await connectV14Adapter(mock) : await connectAdapter(mock);
+        const codec = createControlCodec(draft);
+        const enc = (s: string) => new TextEncoder().encode(s);
+        const subscribeOk = (requestId: bigint) => codec.encode({
+          type: 'SUBSCRIBE_OK', requestId, trackAlias: varint(42n),
+          parameters: new Map(), trackExtensions: [],
+        } as ControlMessage);
+
+        // First subscription established on alias 42.
+        const p1 = adapter.subscribeTrack([enc('live')], enc('v1'), { onObject: () => { /* live */ } });
+        await deepFlush();
+        mock.pushControlBytes(subscribeOk(lastSubscribeRequestId(mock, codec)));
+        const sub1 = await p1;
+        expect(sub1.trackAlias).toBe(42n);
+
+        // Second subscription; the peer (mis)sends SUBSCRIBE_OK with the SAME alias.
+        let closeCode: number | undefined;
+        adapter.onClose = (code) => { closeCode = code; };
+        // qlog is the RAW channel: it must observe even a SUBSCRIBE_OK that the
+        // session rejects (returns before binding/delivery). Track OKs on qlog.
+        const qlogOks: bigint[] = [];
+        adapter.onQlogEvent = (e) => {
+          const m = (e as { message?: { type: string; requestId?: bigint } }).message;
+          if (m?.type === 'SUBSCRIBE_OK' && m.requestId !== undefined) qlogOks.push(m.requestId);
+        };
+        const p2 = adapter.subscribeTrack([enc('live')], enc('v2'), { onObject: () => { /* dup */ } });
+        await deepFlush();
+        const req2 = lastSubscribeRequestId(mock, codec);
+        mock.pushControlBytes(subscribeOk(req2)); // DUPLICATE alias
+
+        // §11.1: must REJECT (not resolve) and close the session with DUPLICATE_TRACK_ALIAS.
+        await expect(p2).rejects.toThrow();
+        await deepFlush();
+        expect(adapter.session.state).toBe(SessionState.CLOSED);
+        expect(closeCode).toBe(Number(SessionError.DUPLICATE_TRACK_ALIAS));
+        // The rejected SUBSCRIBE_OK was still observed on the raw qlog channel.
+        expect(qlogOks).toContain(req2);
+      });
+
+      // R8e finding 1: a GUARDED-alias reuse must be refused via the DRAFT-SPECIFIC
+      // cancel (draft-14/16 UNSUBSCRIBE) — NOT crash on a null uniPair, and NOT
+      // close the whole session.
+      it(`draft-${draft}: reusing an alias still guarded by a terminating prior sub refuses the subscribe WITHOUT a session close`, async () => {
+        const mock = createMockTransport();
+        const adapter = draft === 14 ? await connectV14Adapter(mock) : await connectAdapter(mock);
+        const codec = createControlCodec(draft);
+        const enc = (s: string) => new TextEncoder().encode(s);
+        const subscribeOk = (requestId: bigint) => codec.encode({
+          type: 'SUBSCRIBE_OK', requestId, trackAlias: varint(42n),
+          parameters: new Map(), trackExtensions: [],
+        } as ControlMessage);
+
+        // sub1 established on alias 42.
+        const p1 = adapter.subscribeTrack([enc('live')], enc('v1'), { onObject: () => { /* live */ } });
+        await deepFlush();
+        const req1 = lastSubscribeRequestId(mock, codec);
+        mock.pushControlBytes(subscribeOk(req1));
+        await p1;
+
+        // Terminate sub1 with an INCOMPLETE Stream Count → arms a strict guard on 42.
+        mock.pushControlBytes(codec.encode({
+          type: 'PUBLISH_DONE', requestId: req1, statusCode: varint(0x0n),
+          streamCount: varint(2n), errorReason: 'done',
+        } as ControlMessage));
+        await deepFlush();
+        const internals = adapter as unknown as { terminatedAliases: Map<bigint, unknown> };
+        expect(internals.terminatedAliases.has(42n)).toBe(true); // guard live
+
+        // sub2 reuses alias 42 while the guard is live → REFUSED, no session close.
+        let closed = false;
+        adapter.onClose = () => { closed = true; };
+        const p2 = adapter.subscribeTrack([enc('live')], enc('v2'), { onObject: () => { /* refused */ } });
+        await deepFlush();
+        mock.pushControlBytes(subscribeOk(lastSubscribeRequestId(mock, codec)));
+
+        await expect(p2).rejects.toThrow(/guarded|reuse/i);
+        await deepFlush();
+        expect(closed).toBe(false); // per-track refusal, NOT a session-fatal close
+        expect(adapter.session.state).not.toBe(SessionState.CLOSED);
+      });
+    }
+  });
+
+  // ─── R8d finding 2: legacy PUBLISH_DONE applies the terminal Stream Count ───
+  it('draft-16: a subscriber-side PUBLISH_DONE tears down alias routing and arms the terminal guard', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock); // draft-16
+    const codec = createControlCodec(16);
+    const enc = (s: string) => new TextEncoder().encode(s);
+
+    const p = adapter.subscribeTrack([enc('live')], enc('vid'), { onObject: () => { /* live */ } });
+    await deepFlush();
+    let reqId = -1n;
+    for (let i = mock.controlWritten.length - 1; i >= 0; i--) {
+      const { message } = codec.decode(mock.controlWritten[i]!, 0);
+      if (message.type === 'SUBSCRIBE') { reqId = (message as { requestId: bigint }).requestId; break; }
+    }
+    mock.pushControlBytes(codec.encode({
+      type: 'SUBSCRIBE_OK', requestId: reqId, trackAlias: varint(42n),
+      parameters: new Map(), trackExtensions: [],
+    } as ControlMessage));
+    await p;
+    const internals = adapter as unknown as {
+      rawAliasMaps: Map<bigint, unknown>; terminatedAliases: Map<bigint, unknown>;
+    };
+    expect(internals.rawAliasMaps.has(42n)).toBe(true); // routing live
+
+    // Subscriber-side PUBLISH_DONE on the control stream (§9.15) — draft-16 legacy.
+    mock.pushControlBytes(codec.encode({
+      type: 'PUBLISH_DONE', requestId: reqId, statusCode: varint(0x0n),
+      streamCount: varint(0n), errorReason: 'done',
+    } as ControlMessage));
+    await deepFlush();
+
+    // §10.11 parity: routing torn down + a terminal guard armed (late streams discarded).
+    expect(internals.rawAliasMaps.has(42n)).toBe(false);
+    expect(internals.terminatedAliases.has(42n)).toBe(true);
+    expect(adapter.session.state).not.toBe(SessionState.CLOSED);
+  });
+
+  // ─── §5.1: onSubscribe admission gate — a SUBSCRIBE reusing a live request ID
+  // is a fatal INVALID_REQUEST_ID whose OLD entry persists; it must NOT re-fire
+  // onSubscribe. Gate on NEW admission (SM identity + not-closed), not existence.
+  it('draft-16: a SUBSCRIBE reusing a live request ID does not fire onSubscribe again', async () => {
+    const mock = createMockTransport();
+    const adapter = new MoqtConnection(16); // draft-16 uses the control read loop
+    const connectP = adapter.connect(mock.transport, { maxRequestId: varint(100) }); // grant the peer credit
+    await flush();
+    mock.pushControlBytes(encodeServerSetup());
+    await connectP;
+
+    const codec = createControlCodec(16);
+    const enc = (s: string) => new TextEncoder().encode(s);
+    let count = 0;
+    adapter.onSubscribe = () => { count += 1; };
+    const subscribe = (requestId: bigint) => codec.encode({
+      type: 'SUBSCRIBE', requestId, trackNamespace: [enc('live')], trackName: enc('vid'),
+      parameters: new Map(),
+    } as ControlMessage);
+
+    // A valid incoming SUBSCRIBE (odd parity for a client) is admitted → fires once.
+    mock.pushControlBytes(subscribe(varint(1n)));
+    await deepFlush();
+    expect(count).toBe(1);
+    expect(adapter.session.getIncomingSubscription(varint(1n))).toBeDefined();
+
+    // A second SUBSCRIBE REUSING the live request ID 1 → fatal INVALID_REQUEST_ID.
+    // The old incoming-subscription entry persists, but onSubscribe must NOT re-fire.
+    mock.pushControlBytes(subscribe(varint(1n)));
+    await deepFlush();
+    expect(count).toBe(1); // NOT surfaced again for the rejected message
+    expect(adapter.session.state).toBe(SessionState.CLOSED);
+  });
+
+  it('draft-16: unsubscribe() clears the rawSubscriptions entry (no leak on churn)', async () => {
+    const mock = createMockTransport();
+    const adapter = new MoqtConnection(16);
+    const connectP = adapter.connect(mock.transport);
+    await flush();
+    mock.pushControlBytes(encodeServerSetup());
+    await connectP;
+
+    const codec = createControlCodec(16);
+    const enc = (s: string) => new TextEncoder().encode(s);
+    const subP = adapter.subscribeTrack([enc('live')], enc('vid'), { onObject: () => { /* live */ } });
+    await deepFlush();
+    let reqId = -1n;
+    for (let i = mock.controlWritten.length - 1; i >= 0; i--) {
+      const { message } = codec.decode(mock.controlWritten[i]!, 0);
+      if (message.type === 'SUBSCRIBE') { reqId = (message as { requestId: bigint }).requestId; break; }
+    }
+    mock.pushControlBytes(codec.encode({
+      type: 'SUBSCRIBE_OK', requestId: reqId, trackAlias: varint(9n),
+      parameters: new Map(), trackExtensions: [],
+    } as ControlMessage));
+    const sub = await subP;
+
+    type Raws = { rawSubscriptions: Map<bigint, unknown> };
+    const raws = (adapter as unknown as Raws).rawSubscriptions;
+    expect(raws.has(reqId)).toBe(true); // present while subscribed
+    await sub.unsubscribe();
+    expect(raws.has(reqId)).toBe(false); // reclaimed on draft-16 unsubscribe (no leak)
+  });
+
+  // ─── §5.1: a SUBSCRIBE_OK crossing a cancellation must be DROPPED before alias
+  // handling / binding / delivery — the local subscription is gone, so it is not a
+  // live response. The old existence-blind path surfaced it via onMessage (and,
+  // with a guarded alias, reached refuseAliasReuse → "Unknown subscription" close).
+  it('draft-16: a SUBSCRIBE_OK crossing a §5.1 cancellation is ignored (not delivered, no session close)', async () => {
+    const mock = createMockTransport();
+    const adapter = new MoqtConnection(16);
+    const connectP = adapter.connect(mock.transport, { maxRequestId: varint(100) }); // grant peer credit
+    await flush();
+    mock.pushControlBytes(encodeServerSetup());
+    await connectP;
+
+    const codec = createControlCodec(16);
+    const enc = (s: string) => new TextEncoder().encode(s);
+    const seenOks: bigint[] = [];
+    adapter.onMessage = (m) => { if (m.type === 'SUBSCRIBE_OK') seenOks.push((m as { requestId: bigint }).requestId); };
+    let closed = false;
+    adapter.onClose = () => { closed = true; };
+
+    // Local SUBSCRIBE (pending) for live/vid.
+    const p = adapter.subscribeTrack([enc('live')], enc('vid'), { onObject: () => { /* none */ } });
+    // Attach the rejection assertion NOW (before acceptSubscribe rejects it) so the
+    // rejection is never momentarily unhandled.
+    const pRejected = expect(p).rejects.toThrow(/superseded/i);
+    await deepFlush();
+    // Recover the request ID the adapter allocated for our SUBSCRIBE (client
+    // even-parity; decode the last SUBSCRIBE it wrote to the control stream).
+    let subReqId = -1n;
+    for (let i = mock.controlWritten.length - 1; i >= 0; i--) {
+      const { message } = codec.decode(mock.controlWritten[i]!, 0);
+      if (message.type === 'SUBSCRIBE') { subReqId = (message as { requestId: bigint }).requestId; break; }
+    }
+
+    // Inbound PUBLISH for the SAME track (server parity) → STAGES the collision.
+    mock.pushControlBytes(codec.encode({
+      type: 'PUBLISH', requestId: varint(1n),
+      trackNamespace: [enc('live')], trackName: enc('vid'),
+      trackAlias: varint(50n), parameters: new Map(), trackExtensions: new Map(),
+    } as ControlMessage));
+    await deepFlush();
+
+    // Accept the PUBLISH → cancels the local SUBSCRIBE (tombstones subReqId, UNSUBSCRIBE).
+    await adapter.acceptSubscribe(varint(1n), varint(50n));
+    await deepFlush();
+    await pRejected;
+
+    // A SUBSCRIBE_OK for subReqId arrives, crossing our UNSUBSCRIBE on the wire.
+    mock.pushControlBytes(codec.encode({
+      type: 'SUBSCRIBE_OK', requestId: subReqId, trackAlias: varint(99n),
+      parameters: new Map(), trackExtensions: [],
+    } as ControlMessage));
+    await deepFlush();
+
+    // Dropped: not surfaced to the application, and NOT a session close.
+    expect(seenOks).not.toContain(subReqId);
+    expect(closed).toBe(false);
+    expect(adapter.session.state).not.toBe(SessionState.CLOSED);
+  });
+
+  // ─── §5.1: consistent crossed-response contract — a crossed REQUEST_ERROR (like
+  // a crossed SUBSCRIBE_OK) is suppressed from the application onMessage but STILL
+  // observed raw on the qlog channel. ──────────────────────────────────────────
+  it('draft-16: a crossed REQUEST_ERROR is suppressed from onMessage but present on qlog', async () => {
+    const mock = createMockTransport();
+    const adapter = new MoqtConnection(16);
+    const connectP = adapter.connect(mock.transport, { maxRequestId: varint(100) });
+    await flush();
+    mock.pushControlBytes(encodeServerSetup());
+    await connectP;
+
+    const codec = createControlCodec(16);
+    const enc = (s: string) => new TextEncoder().encode(s);
+    const appMsgs: string[] = [];
+    adapter.onMessage = (m) => appMsgs.push(m.type);
+    const qlogMsgs: Array<{ type: string; reqId?: bigint }> = [];
+    adapter.onQlogEvent = (e) => {
+      const m = (e as { message?: { type: string; requestId?: bigint } }).message;
+      if (m) qlogMsgs.push({ type: m.type, reqId: m.requestId });
+    };
+
+    const p = adapter.subscribeTrack([enc('live')], enc('vid'), { onObject: () => { /* none */ } });
+    // Attach the rejection assertion NOW so it is never momentarily unhandled.
+    const pRejected = expect(p).rejects.toThrow(/superseded/i);
+    await deepFlush();
+    let subReqId = -1n;
+    for (let i = mock.controlWritten.length - 1; i >= 0; i--) {
+      const { message } = codec.decode(mock.controlWritten[i]!, 0);
+      if (message.type === 'SUBSCRIBE') { subReqId = (message as { requestId: bigint }).requestId; break; }
+    }
+
+    mock.pushControlBytes(codec.encode({
+      type: 'PUBLISH', requestId: varint(1n),
+      trackNamespace: [enc('live')], trackName: enc('vid'),
+      trackAlias: varint(50n), parameters: new Map(), trackExtensions: new Map(),
+    } as ControlMessage));
+    await deepFlush();
+    await adapter.acceptSubscribe(varint(1n), varint(50n)); // cancels + tombstones subReqId
+    await deepFlush();
+    await pRejected;
+    appMsgs.length = 0; qlogMsgs.length = 0; // ignore setup/subscribe traffic
+
+    // A REQUEST_ERROR for subReqId crosses our UNSUBSCRIBE.
+    mock.pushControlBytes(codec.encode({
+      type: 'REQUEST_ERROR', requestId: subReqId, errorCode: varint(0x0n),
+      retryInterval: varint(0n), errorReason: 'crossed', requestKind: 'SUBSCRIBE',
+    } as ControlMessage));
+    await deepFlush();
+
+    // Application onMessage does NOT see it; the raw qlog channel DOES.
+    expect(appMsgs).not.toContain('REQUEST_ERROR');
+    expect(qlogMsgs.some((m) => m.type === 'REQUEST_ERROR' && m.reqId === subReqId)).toBe(true);
+    expect(adapter.session.state).not.toBe(SessionState.CLOSED);
+  });
+
+  // ─── R8e finding 3: a crossed OLD PUBLISH_DONE must not erase a NEW route ───
+  it('draft-16: a delayed PUBLISH_DONE for a superseded request does not delete the reused alias’s new route', async () => {
+    const mock = createMockTransport();
+    // Short guard TTL so the old subscription's unsubscribe guard EXPIRES before
+    // the alias is legitimately reused (the crossed-PUBLISH_DONE scenario).
+    const adapter = new MoqtConnection(16, { terminatedAliasTtlMs: 20 });
+    const connectP = adapter.connect(mock.transport);
+    await flush();
+    mock.pushControlBytes(encodeServerSetup());
+    await connectP;
+    const codec = createControlCodec(16);
+    const enc = (s: string) => new TextEncoder().encode(s);
+    const subscribeOk = (requestId: bigint) => codec.encode({
+      type: 'SUBSCRIBE_OK', requestId, trackAlias: varint(42n),
+      parameters: new Map(), trackExtensions: [],
+    } as ControlMessage);
+    const lastSub = () => {
+      for (let i = mock.controlWritten.length - 1; i >= 0; i--) {
+        const { message } = codec.decode(mock.controlWritten[i]!, 0);
+        if (message.type === 'SUBSCRIBE') return (message as { requestId: bigint }).requestId;
+      }
+      throw new Error('no SUBSCRIBE');
+    };
+
+    // sub1 on alias 42, then unsubscribe (session keeps the terminated sub in
+    // draft-16, still carrying alias 42 — the crossed-PUBLISH_DONE hazard).
+    const p1 = adapter.subscribeTrack([enc('live')], enc('v1'), { onObject: () => { /* old */ } });
+    await deepFlush();
+    const oldReq = lastSub();
+    mock.pushControlBytes(subscribeOk(oldReq));
+    const sub1 = await p1;
+    await sub1.unsubscribe();
+    await deepFlush();
+    // Let the unsubscribe guard EXPIRE so the alias is freely reusable.
+    await new Promise((r) => setTimeout(r, 40));
+
+    // sub2 REUSES alias 42 (guard now expired). Bind sub2.
+    const d2: string[] = [];
+    const p2 = adapter.subscribeTrack([enc('live')], enc('v2'), { onObject: (o) => { d2.push(`${o.groupId}:${o.objectId}`); } });
+    await deepFlush();
+    const newReq = lastSub();
+    mock.pushControlBytes(subscribeOk(newReq));
+    const sub2 = await p2;
+    expect(sub2.trackAlias).toBe(42n);
+    const internals = adapter as unknown as { rawAliasMaps: Map<bigint, { requestId: bigint }> };
+    expect(internals.rawAliasMaps.get(42n)?.requestId).toBe(newReq); // sub2 owns 42
+
+    // A DELAYED PUBLISH_DONE for the OLD (superseded) request arrives. Owner-check
+    // must skip it — the new route (sub2) must survive.
+    mock.pushControlBytes(codec.encode({
+      type: 'PUBLISH_DONE', requestId: oldReq, statusCode: varint(0x0n),
+      streamCount: varint(0n), errorReason: 'late',
+    } as ControlMessage));
+    await deepFlush();
+    expect(internals.rawAliasMaps.get(42n)?.requestId).toBe(newReq); // NOT erased
+
+    // A subgroup on alias 42 still routes to sub2.
+    const header = makeSubgroupHeader({ trackAlias: varint(42n), groupId: varint(5n) });
+    const obj = makeSubgroupObject({ objectId: varint(0), payload: new Uint8Array([0xaa]) });
+    const stream = mock.addIncomingStream();
+    stream.push(concat(encodeSubgroupHeader(header), encodeSubgroupObject(obj, header.hasExtensions, varint(0), true)));
+    await deepFlush();
+    expect(d2).toEqual(['5:0']);
+  });
+
   it('delivers v14 fetch status object with correct status codes', async () => {
     /**
      * Finding 5: Draft-14 fetch status codes must be preserved.
@@ -2797,7 +3206,7 @@ describe('MoqtConnection draft-14', () => {
     describe('data stream publishing (§10.4.2)', () => {
       it('openSubgroup creates a unidirectional stream with SUBGROUP_HEADER', async () => {
         const mock = createMockTransport();
-        const adapter = await connectAdapter(mock);
+        const adapter = await connectPublisherWithAlias(mock, 42n);
 
         const streamId = await adapter.openSubgroup(
           varint(42n),  // trackAlias
@@ -2823,7 +3232,7 @@ describe('MoqtConnection draft-14', () => {
 
       it('sendObject writes encoded object bytes to the stream', async () => {
         const mock = createMockTransport();
-        const adapter = await connectAdapter(mock);
+        const adapter = await connectPublisherWithAlias(mock, 42n);
 
         const streamId = await adapter.openSubgroup(
           varint(42n), varint(0n), varint(0n),
@@ -2850,7 +3259,7 @@ describe('MoqtConnection draft-14', () => {
 
       it('sendObject encodes multiple objects with correct delta IDs', async () => {
         const mock = createMockTransport();
-        const adapter = await connectAdapter(mock);
+        const adapter = await connectPublisherWithAlias(mock, 42n);
 
         const streamId = await adapter.openSubgroup(
           varint(42n), varint(0n), varint(0n),
@@ -2884,7 +3293,7 @@ describe('MoqtConnection draft-14', () => {
 
       it('closeSubgroup sends FIN on the stream', async () => {
         const mock = createMockTransport();
-        const adapter = await connectAdapter(mock);
+        const adapter = await connectPublisherWithAlias(mock, 42n);
 
         const streamId = await adapter.openSubgroup(
           varint(42n), varint(0n), varint(0n),
@@ -2897,7 +3306,7 @@ describe('MoqtConnection draft-14', () => {
 
       it('openSubgroup with extensions flag sets hasExtensions in header', async () => {
         const mock = createMockTransport();
-        const adapter = await connectAdapter(mock);
+        const adapter = await connectPublisherWithAlias(mock, 42n);
 
         await adapter.openSubgroup(
           varint(42n), varint(0n), varint(0n),
@@ -2911,7 +3320,7 @@ describe('MoqtConnection draft-14', () => {
 
       it('sendObject with extensions writes extension data', async () => {
         const mock = createMockTransport();
-        const adapter = await connectAdapter(mock);
+        const adapter = await connectPublisherWithAlias(mock, 42n);
 
         const streamId = await adapter.openSubgroup(
           varint(42n), varint(0n), varint(0n),
@@ -2933,7 +3342,7 @@ describe('MoqtConnection draft-14', () => {
 
       it('openSubgroup with publisherPriority sets priority in header', async () => {
         const mock = createMockTransport();
-        const adapter = await connectAdapter(mock);
+        const adapter = await connectPublisherWithAlias(mock, 42n);
 
         await adapter.openSubgroup(
           varint(42n), varint(0n), varint(0n),
@@ -2947,7 +3356,7 @@ describe('MoqtConnection draft-14', () => {
 
       it('openSubgroup with defaultPriority omits priority byte (§10.4.2)', async () => {
         const mock = createMockTransport();
-        const adapter = await connectAdapter(mock);
+        const adapter = await connectPublisherWithAlias(mock, 42n);
 
         await adapter.openSubgroup(
           varint(42n), varint(0n), varint(0n),
@@ -2964,7 +3373,7 @@ describe('MoqtConnection draft-14', () => {
 
       it('openSubgroup with subgroupIdMode ZERO omits subgroupId field (§10.4.2)', async () => {
         const mock = createMockTransport();
-        const adapter = await connectAdapter(mock);
+        const adapter = await connectPublisherWithAlias(mock, 42n);
 
         await adapter.openSubgroup(
           varint(42n), varint(5n), varint(0n),
@@ -2983,7 +3392,7 @@ describe('MoqtConnection draft-14', () => {
 
       it('closeSubgroup removes stream from internal map', async () => {
         const mock = createMockTransport();
-        const adapter = await connectAdapter(mock);
+        const adapter = await connectPublisherWithAlias(mock, 42n);
 
         const streamId = await adapter.openSubgroup(
           varint(42n), varint(0n), varint(0n),

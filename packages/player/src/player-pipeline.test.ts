@@ -434,23 +434,29 @@ describe('createPipelines — smoothed render cushion wiring (slice A)', () => {
     expect(result.getRenderCushionUs!()).toBe(200_000);
   });
 
-  it('a raw gap-timeout spike reaches the cushion only via the clamp/slew, capped at the render max', () => {
+  it('getRenderCushionUs is a PURE PEEK: polling never advances the smoother (observability contract)', () => {
     const result = createPipelines(minimalConfig(), mockClock, LOC_AV, mockCallbacks());
     // Force the raw adaptive fuse high (simulates the 2000ms estimator spike).
     Object.defineProperty(result.videoPipeline, 'effectiveGapTimeoutUs', {
       get: () => 2_000_000, configurable: true,
     });
-    // First read snaps to the clamped target: exactly the render cap,
-    // never the raw 2000ms.
-    expect(result.getRenderCushionUs!()).toBe(RENDER_CUSHION_MAX_US);
+    // The smoother only moves when SCHEDULING calls update(); the getter must
+    // not adopt the spike no matter how often telemetry polls it.
+    expect(result.getRenderCushionUs!()).toBe(200_000);
+    expect(result.getRenderCushionUs!()).toBe(200_000);
+    expect(result.getRenderCushionUs!()).toBe(200_000);
+    // (Clamp/slew behavior toward the cap is pinned in render-cushion.test.ts;
+    // RENDER_CUSHION_MAX_US bounds any scheduled adoption of this spike.)
+    expect(RENDER_CUSHION_MAX_US).toBeLessThan(2_000_000);
   });
 
-  it('SEPARATION PIN: gap detector sees the raw 2000ms while the render cushion stays capped below it', () => {
+  it('SEPARATION PIN: gap detector sees the raw 2000ms while the render cushion stays below it', () => {
     const result = createPipelines(minimalConfig(), mockClock, LOC_AV, mockCallbacks());
     Object.defineProperty(result.videoPipeline, 'effectiveGapTimeoutUs', {
       get: () => 2_000_000, configurable: true,
     });
-    // The smoothed render cushion is capped independently of the fuse…
+    // The smoothed render cushion never mirrors the fuse: at rest it reads
+    // the floor; even fully adopted it is clamped at RENDER_CUSHION_MAX_US…
     const cushionUs = result.getRenderCushionUs!();
     expect(cushionUs).toBeLessThanOrEqual(RENDER_CUSHION_MAX_US);
     expect(cushionUs).toBeLessThan(2_000_000);

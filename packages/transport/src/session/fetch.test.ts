@@ -96,8 +96,10 @@ describe('FetchStateMachine', () => {
       expect(fetch.state).toBe(FetchState.COMPLETED);
     });
 
-    it('cannot handle FETCH_CANCEL in PENDING state', () => {
-      expect(() => fetch.handleFetchCancel()).toThrow();
+    it('CAN handle FETCH_CANCEL in PENDING state (draft-16 §9.18: cancel before FETCH_OK)', () => {
+      expect(() => fetch.handleFetchCancel()).not.toThrow();
+      expect(fetch.state).toBe(FetchState.COMPLETED);
+      expect(fetch.wasCanceled).toBe(true);
     });
 
     it('cannot send FETCH_OK after already transferring', () => {

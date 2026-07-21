@@ -274,6 +274,21 @@ export interface NotifyNamespaceAction {
 }
 
 /**
+ * Cancel a LOCAL outbound request at the I/O layer: reject its still-pending
+ * subscribeTrack()/request promise, drop adapter routing for it, and (draft-18)
+ * reset its own request stream (§3.3.2). Emitted when the Session terminates a
+ * local request out of band — e.g. a PENDING SUBSCRIBE superseded by a peer
+ * PUBLISH for the same track (§5.1). The Session has ALREADY torn down its own
+ * state and (draft-14/16) emitted UNSUBSCRIBE; this action only drives the
+ * adapter-side cleanup so no caller hangs and no stream leaks.
+ */
+export interface CancelRequestAction {
+  readonly type: 'cancel_request';
+  readonly requestId: bigint;
+  readonly reason: string;
+}
+
+/**
  * All possible outbound actions for the I/O adapter.
  */
 export type SessionOutboundAction =
@@ -285,7 +300,8 @@ export type SessionOutboundAction =
   | StopSendingAction
   | CloseConnectionAction
   | OpenNamespaceStreamAction
-  | NotifyNamespaceAction;
+  | NotifyNamespaceAction
+  | CancelRequestAction;
 
 // ─── Session Events (emitted to application) ──────────────────────────
 

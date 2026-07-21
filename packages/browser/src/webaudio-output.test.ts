@@ -157,6 +157,19 @@ describe('WebAudioOutput.playheadCaptureUs', () => {
 });
 
 describe('unified playout cushion (delay unification)', () => {
+  it('DEFAULT construction adds no delay of its own — the dispatcher owns the cushion', () => {
+    // The documented @moqt/player + @moqt/browser composition wires this
+    // output behind the CommandDispatcher, which already adds the shared
+    // cushion to renderTimeUs. A non-zero default here would double-delay
+    // audio ~200ms behind video after startup or an underrun.
+    const ctx = new MockAudioContext();
+    const clock = { now: () => ctx.currentTime * 1_000_000 };
+    const out = new WebAudioOutput(ctx as unknown as AudioContext, undefined, undefined, clock);
+    ctx.currentTime = 1.0;
+    out.schedule(audioData(0) as unknown as AudioData, 1_500_000);
+    expect(ctx.started[0]!.when).toBeCloseTo(1.5, 5); // exactly the render time
+  });
+
   // With playbackDelayMs = 0, the cushion arrives INSIDE renderTimeUs (the
   // dispatcher adds the shared pipeline cushion) — the output must anchor at
   // exactly toAudioCtxTime(renderTimeUs), adding no delay of its own.

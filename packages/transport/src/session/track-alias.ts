@@ -5,10 +5,12 @@
  * and full track identities (namespace + name). Track aliases are assigned
  * on SUBSCRIBE_OK/PUBLISH_OK and used on data streams for efficiency.
  *
- * Each track can have at most one alias, and each alias maps to exactly one track.
- * Both directions of the mapping must be maintained for efficient lookups.
+ * §11.1: each alias maps to exactly ONE track (reusing an alias for a different
+ * track is DUPLICATE_TRACK_ALIAS), but a track MAY have several aliases at once
+ * (e.g. the §5.1 collision race). Both directions of the mapping are maintained
+ * for efficient lookups; the track→alias direction is therefore one-to-many.
  *
- * @see draft-ietf-moq-transport-16 §10
+ * @see draft-ietf-moq-transport-18 §11.1
  * @module
  */
 
@@ -24,11 +26,28 @@ export interface TrackIdentity {
  * Manages track alias mappings for a session.
  */
 export class TrackAliasManager {
-  /** Alias → Track mapping. */
+  /** Alias → Track mapping. §11.1: one alias MUST map to only one track. */
   private readonly aliasToTrack = new Map<bigint, TrackIdentity>();
 
-  /** Track key → Alias mapping. */
-  private readonly trackToAlias = new Map<string, bigint>();
+  /**
+   * Track key → set of aliases. §11.1 prohibits ONE alias referring to two
+   * different tracks, but NOT multiple aliases for one track — which happens
+   * legitimately during the §5.1 race (an inbound PUBLISH advertising one alias
+   * while a crossed SUBSCRIBE_OK for the same track assigns a different one). So a
+   * track may map to several live aliases at once.
+   */
+  private readonly trackToAliases = new Map<string, Set<bigint>>();
+
+  /**
+   * Alias → set of OWNERS (the request IDs that registered it). Request IDs are
+   * unique for the session lifetime (never reused), so an owner is a generation
+   * token: a cleanup path for one request must not unregister an alias another
+   * request still holds. A single alias→track mapping may legitimately have
+   * MULTIPLE live owners at once — e.g. §5.1 a local SUBSCRIBE and an inbound
+   * PUBLISH for the SAME track both claiming the peer's chosen alias. `unregister`
+   * drops the alias→track mapping only when the LAST owner releases it.
+   */
+  private readonly aliasToOwner = new Map<bigint, Set<bigint>>();
 
   /**
    * Register a track alias mapping.
@@ -36,49 +55,83 @@ export class TrackAliasManager {
    * @param alias - The numeric track alias
    * @param namespace - Track namespace segments
    * @param name - Track name
-   * @throws {Error} If alias is already registered to a different track
-   * @throws {Error} If track is already registered with a different alias
+   * @param owner - The request ID taking ownership of this alias (generation token)
+   * @throws {Error} If the alias is already registered to a DIFFERENT track (§11.1)
    */
-  register(alias: bigint, namespace: Uint8Array[], name: Uint8Array): void {
+  register(alias: bigint, namespace: Uint8Array[], name: Uint8Array, owner?: bigint): void {
     const trackKey = this.computeTrackKey(namespace, name);
     const aliasNum = alias as bigint;
 
-    // Check for duplicate alias pointing to different track
+    // §11.1: the ONLY prohibited case — one alias referring to two different
+    // tracks. Multiple aliases for one track is permitted (§5.1 race), so there
+    // is NO reverse constraint.
     const existingTrack = this.aliasToTrack.get(aliasNum);
     if (existingTrack) {
       const existingKey = this.computeTrackKey(existingTrack.namespace, existingTrack.name);
       if (existingKey !== trackKey) {
         throw new Error(`Alias ${alias} is already registered to a different track`);
       }
-      // Same track, idempotent - no action needed
+      // Same track, idempotent — ADD this owner (do NOT overwrite): multiple live
+      // owners of one same-track mapping are legitimate (§5.1).
+      if (owner !== undefined) this.addOwner(aliasNum, owner);
       return;
     }
 
-    // Check for track already having a different alias
-    const existingAlias = this.trackToAlias.get(trackKey);
-    if (existingAlias !== undefined && existingAlias !== aliasNum) {
-      throw new Error(`Track is already registered with alias ${existingAlias}`);
-    }
-
-    // Register both mappings
+    // Register the mappings (a track may accumulate several aliases).
     this.aliasToTrack.set(aliasNum, { namespace, name });
-    this.trackToAlias.set(trackKey, aliasNum);
+    let aliases = this.trackToAliases.get(trackKey);
+    if (!aliases) {
+      aliases = new Set<bigint>();
+      this.trackToAliases.set(trackKey, aliases);
+    }
+    aliases.add(aliasNum);
+    if (owner !== undefined) this.addOwner(aliasNum, owner);
+  }
+
+  /** Add a request ID to an alias's owner set. */
+  private addOwner(aliasNum: bigint, owner: bigint): void {
+    let owners = this.aliasToOwner.get(aliasNum);
+    if (!owners) {
+      owners = new Set<bigint>();
+      this.aliasToOwner.set(aliasNum, owners);
+    }
+    owners.add(owner);
   }
 
   /**
-   * Remove a track alias mapping.
+   * Remove a track alias mapping — CONDITIONAL on ownership. When `owner` is
+   * given, that request releases its claim; the alias→track mapping is dropped
+   * only when the LAST owner releases it. A release by a request that is not (or
+   * no longer) an owner while others still hold the alias is a no-op — so a
+   * crossed cleanup for an old request whose alias a newer one still owns cannot
+   * drop it. When `owner` is omitted, the alias is removed unconditionally.
    *
    * @param alias - The numeric track alias to remove
+   * @param owner - The request ID releasing its claim (generation token)
    */
-  unregister(alias: bigint): void {
+  unregister(alias: bigint, owner?: bigint): void {
     const aliasNum = alias as bigint;
+    // Generation check: drop the mapping only once every owner has released it.
+    if (owner !== undefined) {
+      const owners = this.aliasToOwner.get(aliasNum);
+      if (owners) {
+        owners.delete(owner);
+        if (owners.size > 0) return; // other live owners remain — keep the mapping
+      }
+      // owners empty, or the alias had no owner tracking → fall through and drop.
+    }
     const track = this.aliasToTrack.get(aliasNum);
 
     if (track) {
       const trackKey = this.computeTrackKey(track.namespace, track.name);
-      this.trackToAlias.delete(trackKey);
+      const aliases = this.trackToAliases.get(trackKey);
+      if (aliases) {
+        aliases.delete(aliasNum);
+        if (aliases.size === 0) this.trackToAliases.delete(trackKey);
+      }
       this.aliasToTrack.delete(aliasNum);
     }
+    this.aliasToOwner.delete(aliasNum);
   }
 
   /**
@@ -100,9 +153,14 @@ export class TrackAliasManager {
    */
   getAliasByTrack(namespace: Uint8Array[], name: Uint8Array): bigint | undefined {
     const trackKey = this.computeTrackKey(namespace, name);
-    // Returns the raw bigint alias: a draft-18 server-assigned alias may exceed
-    // the QUIC-varint range, so it must not be re-branded through varint().
-    return this.trackToAlias.get(trackKey);
+    // A track may hold several aliases (§5.1 race); return the most recently
+    // registered one. Raw bigint: a draft-18 server-assigned alias may exceed the
+    // QUIC-varint range, so it must not be re-branded through varint().
+    const aliases = this.trackToAliases.get(trackKey);
+    if (!aliases || aliases.size === 0) return undefined;
+    let last: bigint | undefined;
+    for (const a of aliases) last = a; // Set preserves insertion order
+    return last;
   }
 
   /**
@@ -124,7 +182,7 @@ export class TrackAliasManager {
    */
   hasTrack(namespace: Uint8Array[], name: Uint8Array): boolean {
     const trackKey = this.computeTrackKey(namespace, name);
-    return this.trackToAlias.has(trackKey);
+    return (this.trackToAliases.get(trackKey)?.size ?? 0) > 0;
   }
 
   /**
@@ -139,7 +197,8 @@ export class TrackAliasManager {
    */
   clear(): void {
     this.aliasToTrack.clear();
-    this.trackToAlias.clear();
+    this.trackToAliases.clear();
+    this.aliasToOwner.clear();
   }
 
   /**

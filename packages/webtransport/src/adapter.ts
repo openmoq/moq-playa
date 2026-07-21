@@ -33,6 +33,8 @@ import {
   hasObjectOnlyTrackProperty,
   hasUnsupportedMandatoryTrackProperty,
   RequestError18,
+  SubscriptionState,
+  ForwardState,
 } from '@moqt/transport';
 import type {
   EndpointRoleValue,
@@ -62,6 +64,7 @@ import type {
   Subscribe,
   Publish,
   Fetch,
+  JoiningFetch,
   TrackStatus,
   PublishNamespace,
   SubscribeNamespace,
@@ -69,6 +72,7 @@ import type {
   Goaway,
   Parameters,
   TrackProperties,
+  SubscriptionStateMachine,
 } from '@moqt/transport';
 import type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions } from '@moqt/transport';
 import { ControlStreamFramer } from './framer.js';
@@ -86,6 +90,13 @@ import type { WebTransportLike, WebTransportBidirectionalStream } from './types.
 export interface TrackSubscribeOptions {
   /** Subscription filter (LargestObject, NextGroupStart, AbsoluteStart, etc.). */
   readonly filter?: SubscribeOptions['subscriptionFilter'];
+  /**
+   * DELIVERY_TIMEOUT (§9.2.2.2), in the encoded unit expected by SUBSCRIBE — the
+   * window during which the publisher may still deliver Objects. The terminal-alias
+   * guard is floored by this so it cannot expire while late old-alias streams are
+   * still legitimately in flight (§10.11).
+   */
+  readonly deliveryTimeout?: SubscribeOptions['deliveryTimeout'];
   /** Called for each object delivered on this subscription (stream-based only; datagrams excluded). */
   onObject?: (obj: MoqtObject) => void;
 }
@@ -213,6 +224,24 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-16 §5.2, §10.4.4
    */
   private fetchStreams = new Map<bigint, bigint>();
+  /**
+   * Fetch request IDs we (the fetcher) recently CANCELLED — a marker so a data stream
+   * the peer already had in flight when our cancellation crossed it is DISCARDED
+   * (STOP_SENDING), whether it is a NEW stream (FETCH_HEADER handler) or ALREADY OPEN
+   * (readFetchObjects18 stops delivering mid-stream). Installed SYNCHRONOUSLY at
+   * cancel (before any await) and CONSUMED one-shot when its stream is handled.
+   *
+   * LOSSLESS — no cap, no eviction: a late data stream may be arbitrarily delayed, so
+   * this is the SOLE provenance distinguishing "a stream for a fetch WE cancelled"
+   * (→ discard) from "a stream for a request that is not a live FETCH" (→ §9.1/§10.12.3
+   * PROTOCOL_VIOLATION: unknown request, wrong request kind, or a second response
+   * stream for a completed fetch). A capped marker would evict a valid cancellation
+   * and either false-close a still-crossing late stream or forgive a genuine
+   * violation. The only cost is memory for a cancellation whose late stream never
+   * arrives — the same lossless trade-off the Session makes for crossed-terminal
+   * shadows; the entry is otherwise reclaimed the instant its one late stream lands.
+   */
+  private recentlyCancelledFetches = new Set<bigint>();
 
   /**
    * Requested Group Order per FETCH request ID (draft-18). The fetch-object
@@ -232,15 +261,48 @@ export class MoqtConnection {
 
   /** Requested Group Order per inbound FETCH Request ID (default ascending). */
   private inboundFetchGroupOrder = new Map<bigint, GroupOrder>();
+
+  /**
+   * draft-18 §10.12.2: Joining Fetches referencing a PENDING subscription are
+   * buffered "until either the Subscription is established or the request
+   * times out." Keyed by the joined subscription's request ID; released on
+   * acceptSubscribe, rejected (INVALID_JOINING_REQUEST_ID) on rejectSubscribe,
+   * and rejected (TIMEOUT) after joiningFetchTimeoutMs. Standalone FETCH is
+   * never buffered.
+   */
+  private readonly pendingJoinFetches = new Map<bigint, Array<{
+    requestId: bigint;
+    fetch: Fetch;
+    timer: ReturnType<typeof setTimeout>;
+  }>>();
+  private readonly joiningFetchTimeoutMs: number;
+
+  /**
+   * §10.8 response ordering: REQUEST_OKs for updates that raced a pending
+   * SUBSCRIBE, deferred until the SUBSCRIBE's own first response is written.
+   * Keyed by the subscription's request ID; flushed FIFO on accept/reject.
+   */
+  private readonly deferredUpdateResponses = new Map<bigint, ControlMessage[]>();
+  /** Bound for deferred update acks per pending subscription (§10.8 flood guard). */
+  private static readonly MAX_DEFERRED_UPDATE_RESPONSES = 4;
   /** Outgoing FETCH response data streams, keyed by synthetic stream ID. */
   private fetchOutgoingStreams = new Map<bigint, {
+    requestId: bigint;
     writer: WritableStreamDefaultWriter<Uint8Array>;
     groupOrder: GroupOrder;
     prior: FetchObjectPrior18 | undefined;
     isFirstObject: boolean;
   }>();
 
-  /** Called for each control message received after setup. */
+  /**
+   * Called for each application-relevant control message received after setup.
+   * This is the APPLICATION channel, not raw wire observability: responses the
+   * connection consumes internally are not surfaced — a SUBSCRIBE_OK that resolves
+   * a subscribeTrack() (delivered via that promise instead), and a response
+   * (SUBSCRIBE_OK / REQUEST_ERROR) crossing a §5.1 cancellation the session ignores.
+   * For the raw, unfiltered message stream use the qlog channel (onQlogEvent),
+   * which observes every parsed control message including the ones suppressed here.
+   */
   onMessage?: (msg: ControlMessage) => void;
 
   /** Called when the control stream or connection closes. */
@@ -259,11 +321,218 @@ export class MoqtConnection {
    */
   private readonly reportedStreamErrors = new WeakSet<Error>();
 
+  /**
+   * True once the single terminal shutdown has run (fatal error, session close,
+   * or transport close). Guards {@link terminate} so shutdown is exactly-once.
+   */
+  private _terminated = false;
+  /** The close report to emit; upgraded from preliminary→authoritative before it fires. */
+  private _terminalReport: { code: number; reason: string; authoritative: boolean } | null = null;
+  /** True once onClose has actually fired (emission is deferred one microtask). */
+  private _closeEmitted = false;
+  /** Fallback timer that emits a preliminary (synthetic) report if no authoritative transport.closed arrives. */
+  private _closeReportTimer: ReturnType<typeof setTimeout> | undefined;
+  /** How long a preliminary read-failure report waits for transport.closed to own it (constructor option). */
+  private readonly closeReportFallbackMs: number;
+
+  /**
+   * THE terminal coordinator. Every terminal path — a session-generated
+   * close_connection ({@link notifyClose}), an adapter-detected fatal violation
+   * (control / request-stream / data-stream / datagram, via
+   * {@link closeSessionFatal}), and the WebTransport `closed` promise settling —
+   * funnels through here. It runs the shutdown EXACTLY ONCE: close the session
+   * if still open, reject every pending public operation, clear all timers and
+   * routing state, then fire onClose a single time. Concurrent causes (e.g. the
+   * control-loop error and `transport.closed` settling together) collapse to one
+   * terminal event.
+   *
+   * The session ALWAYS ends CLOSED, so no operation can allocate state against a
+   * dead transport afterward. `closeSession` chooses HOW: when this endpoint is
+   * declaring a violation (the transport is still alive) it closes the session,
+   * emitting a CONNECTION_CLOSE capsule; otherwise (a remote/failed transport
+   * close) it transitions the session to CLOSED state-only, with no capsule.
+   *
+   * Shutdown is SEPARATE from reporting. The terminal side effects (state,
+   * pending rejection, cleanup) run once, synchronously, on the FIRST cause. The
+   * onClose EMISSION is chosen by the cause's authority:
+   *   - `authoritative` (transport.closed — the peer's real code/reason): emit
+   *     promptly and let it override a not-yet-emitted preliminary report;
+   *   - `preliminary` (a raw stream/control READ FAILURE with only a SYNTHETIC
+   *     code): DON'T emit yet — start a bounded fallback timer so an authoritative
+   *     transport.closed settling in a LATER task still owns the report; the timer
+   *     emits the synthetic report only if none arrives;
+   *   - otherwise (a DECLARED protocol close with a meaningful code): emit on the
+   *     next microtask (prompt), still upgradable by a same-tick authoritative.
+   * onClose fires exactly once regardless.
+   */
+  private terminate(
+    code: number,
+    reason: string,
+    opts: { closeSession?: boolean; authoritative?: boolean; preliminary?: boolean } = {},
+  ): void {
+    if (this._terminated) {
+      // A later AUTHORITATIVE cause overrides a preliminary report not yet emitted.
+      if (!this._closeEmitted && opts.authoritative && this._terminalReport && !this._terminalReport.authoritative) {
+        this._terminalReport = { code, reason, authoritative: true };
+        if (this._closeReportTimer !== undefined) { clearTimeout(this._closeReportTimer); this._closeReportTimer = undefined; }
+        this.emitClose(); // authoritative info arrived — report it now
+      }
+      return;
+    }
+    this._terminated = true;
+    if (this.session.state !== SessionState.CLOSED) {
+      if (opts.closeSession) {
+        void this.executeActions(this.session.close(SessionError.PROTOCOL_VIOLATION, reason));
+      } else {
+        // Remote/failed transport close — move to CLOSED without sending a
+        // capsule on a transport that is already gone. New requests then reject.
+        this.session.handleTransportClosed();
+      }
+    }
+    // Reject any pending subscribeTrack()/request promise so no caller hangs.
+    this.failPendingRawSubscriptions(reason);
+    // Clear every bounded timer + routing map exactly once.
+    this.clearTerminalState();
+    this._terminalReport = { code, reason, authoritative: opts.authoritative ?? false };
+    if (opts.authoritative) {
+      this.emitClose(); // the peer's real reason — report immediately
+    } else if (opts.preliminary) {
+      // Synthetic code from a read failure — give transport.closed a bounded
+      // window to provide the real code/reason before falling back to this.
+      const timer = setTimeout(() => { this._closeReportTimer = undefined; this.emitClose(); }, this.closeReportFallbackMs);
+      (timer as { unref?: () => void }).unref?.();
+      this._closeReportTimer = timer;
+    } else {
+      // A declared protocol close — emit promptly (one microtask, so a same-tick
+      // authoritative transport.closed can still upgrade the code/reason first).
+      queueMicrotask(() => this.emitClose());
+    }
+  }
+
+  /** Fire onClose exactly once with the final (possibly upgraded) close report. */
+  private emitClose(): void {
+    if (this._closeEmitted || !this._terminalReport) return;
+    this._closeEmitted = true;
+    if (this._closeReportTimer !== undefined) { clearTimeout(this._closeReportTimer); this._closeReportTimer = undefined; }
+    this.onClose?.(this._terminalReport.code, this._terminalReport.reason);
+  }
+
+  /**
+   * Cancel every outstanding timer and drop / abort ALL owned state exactly
+   * once: parked-join timers, alias tombstones, publisher accounting, deferred
+   * update responses, inbound-request contexts, publish/fetch routing, data
+   * readers and writers, and the topology's request-stream contexts. Nothing
+   * owned by the connection outlives the terminal shutdown.
+   */
+  private clearTerminalState(): void {
+    // Parked joining-fetch timers.
+    for (const parked of this.pendingJoinFetches.values()) {
+      for (const e of parked) clearTimeout(e.timer);
+    }
+    this.pendingJoinFetches.clear();
+    // Receiver terminal tracker (tombstone TTL timers) + seen counts.
+    for (const alias of [...this.terminatedAliases.keys()]) this.clearTerminatedAlias(alias);
+    this.aliasStreamsSeen.clear();
+    this.aliasDeliveryTimeoutMs.clear();
+    this.aliasPublisherTimeout.clear();
+    this.inboundPublishTimeouts.clear();
+    // Publisher-side accounting.
+    this.publisherAliasRequests.clear();
+    this.retiredPublisherAliases.clear();
+    this.openSubgroupsByRequest.clear();
+    this.pendingPublishOps.clear();
+    this.publisherGeneration.clear();
+    this.incomingSubgroupAliases.clear();
+    this.deferredUpdateResponses.clear();
+    // Inbound request-stream contexts — abort each, then drop. abort() may
+    // reject ASYNCHRONOUSLY, so swallow the promise (a sync try/catch would not
+    // observe it, leaving an unhandled rejection during terminal teardown).
+    const reason = new Error('session terminated');
+    for (const ctx of this.inboundRequestContexts.values()) this.swallow(() => ctx.abort());
+    this.inboundRequestContexts.clear();
+    // Inbound PUBLISH / FETCH routing + group-order state.
+    this.publishAliasMaps.clear();
+    this.fetchGroupOrder.clear();
+    this.inboundFetchGroupOrder.clear();
+    this.fetchServeReserved.clear();
+    this.fetchStreams.clear();
+    this.recentlyCancelledFetches.clear();
+    // Incoming data-stream readers — cancel each, then drop.
+    for (const r of this.dataStreamReaders.values()) this.swallow(() => r.cancel(reason));
+    this.dataStreamReaders.clear();
+    // Outgoing data-stream / fetch / namespace writers — abort each, then drop.
+    for (const st of this.outgoingStreams.values()) this.swallow(() => st.writer.abort(reason));
+    this.outgoingStreams.clear();
+    for (const st of this.fetchOutgoingStreams.values()) this.swallow(() => st.writer.abort(reason));
+    this.fetchOutgoingStreams.clear();
+    for (const w of this.namespaceStreams.values()) this.swallow(() => w.abort(reason));
+    this.namespaceStreams.clear();
+    // Topology request-stream contexts (outbound + continuing).
+    this.uniPair?.shutdown();
+  }
+
+  /**
+   * Run a fire-and-forget teardown thunk, swallowing BOTH a synchronous throw
+   * and an asynchronous rejection — the thunk is invoked INSIDE the try, so a
+   * sync throw from cancel()/abort() cannot escape and abort the terminal
+   * coordinator mid-cleanup.
+   */
+  private swallow(fn: () => Promise<unknown> | undefined): void {
+    try { void Promise.resolve(fn()).catch(() => { /* teardown races are expected */ }); } catch { /* sync throw */ }
+  }
+
+  /**
+   * A fatal violation this endpoint detected (control-stream, request-stream,
+   * data-stream, or datagram). Closes the local session and runs the one-shot
+   * terminal shutdown. Idempotent via {@link terminate}.
+   */
+  private closeSessionFatal(reason: string, code: number = 0x3): void {
+    this.terminate(code, reason, { closeSession: true });
+  }
+
+  /**
+   * Watch the WebTransport `closed` promise for a REMOTE session close (§webtrans).
+   * On fulfillment the real close code/reason are preserved into onClose; on
+   * rejection a fatal transport error is surfaced. Ignores a settle from a
+   * stale/non-current transport (after migration), and collapses with any
+   * concurrent fatal cause through the one-shot {@link terminate}.
+   */
+  private async watchTransportClosed(transport: WebTransportLike): Promise<void> {
+    try {
+      const info = await transport.closed;
+      if (this.transport !== transport) return; // stale/migrated transport — ignore
+      const code = typeof info?.closeCode === 'number' ? info.closeCode : 0;
+      // Authoritative: the peer's real close code/reason override any preliminary
+      // stream/control-failure report that fired first in the same tick.
+      this.terminate(code, info?.reason ?? '', { authoritative: true });
+    } catch (err) {
+      if (this.transport !== transport) return;
+      const message = err instanceof Error ? err.message : String(err);
+      // Surface the transport failure (fatal) before the close notification.
+      if (!this._terminated) {
+        this.onError?.(new MoqtConnectionError(message, {
+          errorSource: 'transport', isFatal: true, ...(err instanceof Error ? { cause: err } : {}),
+        }));
+      }
+      // Authoritative too: a rejected transport.closed is the real transport
+      // failure — it owns the report over any preliminary read-failure guess,
+      // and is never silently suppressed even when it settles later.
+      this.terminate(0x2, message, { authoritative: true });
+    }
+  }
+
   /** Fire `onError` for a request/stream failure at most once per Error instance. */
   private reportStreamError(error: Error): void {
     if (this.reportedStreamErrors.has(error)) return;
     this.reportedStreamErrors.add(error);
     this.onError?.(error);
+    // A protocol violation on an OUTBOUND request stream (e.g. a message after
+    // the terminal PUBLISH_DONE, §10.11) is session-fatal — via the SAME
+    // centralized cleanup as every other fatal path, so unrelated pending
+    // promises are rejected rather than left hanging.
+    if (error instanceof ProtocolViolationError) {
+      this.closeSessionFatal(error.message);
+    }
   }
 
   /** Called when a data stream header is decoded (§10.4). */
@@ -398,10 +667,143 @@ export class MoqtConnection {
     hasExtensions: boolean;
     previousObjectId: bigint;
     isFirstObject: boolean;
+    /** The subscription this stream serves, when its alias is associated. */
+    subscriptionRequestId?: bigint;
   }>();
 
   /** Counter for synthetic outgoing stream IDs. */
   private nextOutgoingStreamId = 0n;
+
+  /**
+   * Publisher-side Track Alias → subscription Request ID for ACTIVE
+   * subscriptions we assigned via acceptSubscribe() / advertised via publish().
+   * Associates the data-plane APIs (openSubgroup / sendDatagram) with their
+   * subscription for §10.11 Stream Count accounting and terminal enforcement.
+   * On termination the entry is RETIRED (moved to {@link retiredPublisherAliases}),
+   * so this map tracks only live subscriptions.
+   */
+  private publisherAliasRequests = new Map<bigint, bigint>();
+
+  /**
+   * BOUNDED LRU of recently-RETIRED publisher alias → request ID. A send on a
+   * just-terminated alias is still refused (terminal enforcement), but the set
+   * is capped so cumulative subscription churn cannot grow unboundedly for the
+   * session lifetime — the oldest retired alias is evicted past the cap.
+   */
+  private retiredPublisherAliases = new Map<bigint, bigint>();
+  private static readonly MAX_RETIRED_PUBLISHER_ALIASES = 256;
+
+  /**
+   * OPEN outgoing subgroup stream IDs per subscription Request ID. §10.11:
+   * PUBLISH_DONE is refused while any of these remain open (its Stream Count
+   * must cover every stream, and the terminal message ends the data plane).
+   */
+  private openSubgroupsByRequest = new Map<bigint, Set<bigint>>();
+
+  /**
+   * Incoming subgroup data streams by Track Alias (streamId → alias). Lets the
+   * PUBLISH_DONE receive path take the explicit early-discard route: it
+   * STOP_SENDINGs every data stream still open for the terminated
+   * subscription instead of merely dropping routing state (§10.11).
+   */
+  private incomingSubgroupAliases = new Map<bigint, bigint>();
+
+  /**
+   * In-flight publisher data-plane operations (subgroup opens / datagram
+   * writes) per subscription Request ID. Reserved SYNCHRONOUSLY before the
+   * first await of the operation and released when it settles, so
+   * publishDone() can refuse atomically: either the terminal message sees the
+   * finished operation in its Stream Count, or the operation is refused —
+   * never a stream/datagram slipping out after the DONE.
+   */
+  private pendingPublishOps = new Map<bigint, number>();
+
+  /**
+   * Publisher-op GENERATION per subscription Request ID. Cancellation /
+   * termination bumps it synchronously; a data-plane operation captures the
+   * generation before its first await and, once the transport stream resolves,
+   * checks it: a bump in the meantime means the subscription was cancelled
+   * mid-open, so the freshly-created stream is aborted and rejected WITHOUT
+   * writing a header, registering, or counting it. This closes the window a
+   * deletion-only scheme leaves open — a stream created after cancellation
+   * escaping onto the wire.
+   */
+  private publisherGeneration = new Map<bigint, number>();
+
+  /**
+   * Receiver-side §10.11 terminal tracker. `aliasStreamsSeen` counts every
+   * subgroup stream observed per Track Alias; when PUBLISH_DONE arrives, the
+   * difference to its Stream Count becomes a BOUNDED tombstone in
+   * `terminatedAliases`: late streams for the alias are early-discarded
+   * (STOP_SENDING) and datagrams dropped, until the announced count has been
+   * observed or `terminatedAliasTtlMs` expires — never retained indefinitely.
+   */
+  private aliasStreamsSeen = new Map<bigint, bigint>();
+  /**
+   * Per-alias tombstone. `remaining` is how many late streams are still expected
+   * (bigint, counted down as they arrive); `null` means the count is UNKNOWN —
+   * the publisher set the 2^62-1 sentinel (§9.15) — so the tombstone relies on
+   * the TTL alone and never auto-clears by counting. A tombstone always carries
+   * a TTL timer so it is bounded even when `remaining` never reaches 0.
+   */
+  private terminatedAliases = new Map<bigint, {
+    remaining: bigint | null;
+    /** Cancels the (possibly chunked) guard-clear timer — see {@link armGuardTimer}. */
+    cancelTimer: () => void;
+    /**
+     * STRICT tombstones come from a PUBLISH_DONE Stream Count; NON-strict ones
+     * are ordinary-unsubscribe / peer-close TTL-only guards. Both REFUSE alias
+     * reuse while live (see {@link aliasReuseSafe}) — §11.1 permits late objects
+     * after cancellation, so reusing an alias with any guard risks misdelivering
+     * an old stream to the new track. The only reuse-safe state is a COMPLETE
+     * strict tombstone (remaining 0: its generation finished). The `strict` flag
+     * distinguishes the two for that check and for count-driven clearing.
+     */
+    strict: boolean;
+  }>();
+  /**
+   * Terminal-alias-guard lifetime (constructor option, default 10s). §10.11: a late
+   * stream should be discarded for at least the effective delivery timeout after
+   * termination. This is the DEFAULT floor; when a subscription's §8 EFFECTIVE
+   * delivery timeout exceeds it, {@link armTerminatedAlias} extends the guard to that
+   * value via {@link aliasDeliveryTimeoutMs} — so a guard cannot expire while the
+   * publisher is still legitimately delivering old-alias streams.
+   */
+  private readonly terminatedAliasTtlMs: number;
+  /**
+   * Alias → §8 EFFECTIVE delivery timeout (ms) for the subscription that owns it —
+   * combining the publisher's OBJECT_DELIVERY_TIMEOUT (0x02) / SUBGROUP_DELIVERY_TIMEOUT
+   * (0x06) Track Properties (both generically decoded) with the subscriber's Message
+   * Parameters, per {@link effectiveDeliveryTimeoutMs}. Populated at SUBSCRIBE_OK bind;
+   * consumed by {@link armTerminatedAlias} to floor the guard TTL, and dropped by
+   * {@link clearTerminatedAlias} when the guard clears.
+   */
+  private aliasDeliveryTimeoutMs = new Map<bigint, number>();
+  /**
+   * Alias → the PUBLISHER's raw OBJECT/SUBGROUP delivery-timeout values (ms), kept so
+   * a later REQUEST_UPDATE carrying a new SUBSCRIBER timeout (§8) can re-derive the
+   * alias's effective guard timeout via {@link combineDeliveryTimeoutMs}. Cleared
+   * with {@link aliasDeliveryTimeoutMs}.
+   */
+  private aliasPublisherTimeout = new Map<bigint, { obj: number; sub: number }>();
+  /**
+   * Inbound-PUBLISH request ID → the publisher's raw OBJECT/SUBGROUP delivery-timeout
+   * Track Properties (ms), captured at bind so acceptSubscribe can COMBINE them with
+   * OUR PUBLISH_OK Message Parameters (§8) into the alias's effective timeout. Dropped
+   * once combined or when the inbound PUBLISH is torn down.
+   */
+  private inboundPublishTimeouts = new Map<bigint, { obj: number; sub: number }>();
+  /**
+   * Inbound-FETCH request IDs that have already opened their ONE response stream
+   * (§11.4.4). Reserved atomically in openFetchStream and RETAINED after the stream
+   * FINs — a request cannot open a second stream, nor reopen after close. Released
+   * only when the inbound FETCH is torn down (reject / cancel / request-stream close).
+   */
+  private fetchServeReserved = new Set<bigint>();
+  /** §9.15 sentinel: publisher could not set an exact Stream Count. */
+  private static readonly STREAM_COUNT_UNKNOWN = (1n << 62n) - 1n;
+  /** setTimeout's safe upper bound (2^31-1 ms); longer durations are chunked. */
+  private static readonly MAX_TIMER_MS = 2_147_483_647;
 
   /** Version explicitly requested in constructor, if any. */
   private readonly _requestedVersion: DraftVersion | undefined;
@@ -424,9 +826,20 @@ export class MoqtConnection {
    *   deployments are clients; `'server'` exists so two endpoints can be paired
    *   in-process (e.g. an in-memory loopback for tests).
    */
-  constructor(version?: DraftVersion, options?: { role?: 'client' | 'server' }) {
+  constructor(
+    version?: DraftVersion,
+    options?: {
+      role?: 'client' | 'server';
+      joiningFetchTimeoutMs?: number;
+      terminatedAliasTtlMs?: number;
+      closeReportFallbackMs?: number;
+    },
+  ) {
     this._requestedVersion = version;
     this._role = options?.role === 'server' ? EndpointRole.SERVER : EndpointRole.CLIENT;
+    this.joiningFetchTimeoutMs = options?.joiningFetchTimeoutMs ?? 10_000;
+    this.terminatedAliasTtlMs = options?.terminatedAliasTtlMs ?? 10_000;
+    this.closeReportFallbackMs = options?.closeReportFallbackMs ?? 2_000;
     // Initialize with the requested version (or default 16). May be reconfigured
     // in connect() if WT protocol negotiation selects a different draft.
     this.configureForVersion(version ?? 16);
@@ -462,7 +875,7 @@ export class MoqtConnection {
         this.handleOutboundPublishPeerUpdate(originalRequestId, message);
       // A peer FIN/reset of an outbound request stream (§11.4.1) terminates that
       // request — clean session AND adapter-owned state for it.
-      this.uniPair.onRequestClosed = (requestId) => this.handleOutboundRequestClosed(requestId);
+      this.uniPair.onRequestClosed = (requestId, disposition) => this.handleOutboundRequestClosed(requestId, disposition);
       // A GOAWAY on a request stream (§10.4) — a per-request migration signal,
       // surfaced for BOTH pending and already-established requests (empty queue).
       this.uniPair.onRequestGoaway = (err) => this.handleRequestStreamGoaway(err);
@@ -499,6 +912,11 @@ export class MoqtConnection {
     options: SetupOptions = {},
   ): Promise<void> {
     this.transport = transport;
+    // Observe the WebTransport session lifetime: a remote close settles this
+    // promise with the real code/reason (preserved into onClose), a transport
+    // failure rejects it (surfaced as a fatal error). Runs through the one-shot
+    // terminal coordinator, ignores a stale transport after migration.
+    void this.watchTransportClosed(transport);
 
     // §3.1: Auto-detect the draft version from the negotiated WT-Available-Protocols
     // BEFORE choosing a connect path. If the constructor was given no explicit
@@ -626,11 +1044,41 @@ export class MoqtConnection {
   private async sendSubscribeActions(actions: SessionOutboundAction[]): Promise<void> {
     if (this.session.draftVersion === 18) {
       const subscribeMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
-      const stream = await this.uniPair!.openRequest(this.transport!, subscribeMsg); // returns after the write
-      this.routeRequestResponse(stream); // always attach a handler (no unhandled rejection)
+      const requestId = (subscribeMsg as { requestId: bigint }).requestId;
+      // The delivery IS the topology's wire-order barrier: the read loop awaits
+      // it before touching the next frame, so a PUBLISH_DONE coalesced behind
+      // the SUBSCRIBE_OK can never reach a still-PENDING subscription.
+      await this.openD18Request(requestId, subscribeMsg);
       return;
     }
     await this.executeActions(actions);
+  }
+
+  /**
+   * Open a draft-18 per-request bidi stream for `message`, write it, and attach the
+   * response handler. On stream-open (or write) FAILURE, roll back the Session's
+   * request state (§11.4.1) plus any adapter-side state (`onRollback`), then
+   * re-throw. Without this a failed open leaves a phantom request that the peer
+   * never learned of — one that could still authorize outbound data (e.g. a fetch's
+   * group-order entry) or leave a caller's promise/subscription pending. The single
+   * transaction boundary for every d18 request opener.
+   */
+  private async openD18Request(
+    requestId: bigint,
+    message: ControlMessage,
+    onRollback?: () => void,
+  ): Promise<void> {
+    try {
+      const stream = await this.uniPair!.openRequest(
+        this.transport!, message,
+        (m) => this.deliverRequestResponse(m, requestId),
+      );
+      this.routeRequestResponse(stream); // always attach a handler (no unhandled rejection)
+    } catch (err) {
+      onRollback?.();
+      await this.executeActions(this.session.handleOutboundRequestClosed(requestId));
+      throw err instanceof Error ? err : new Error(String(err));
+    }
   }
 
   /**
@@ -654,10 +1102,14 @@ export class MoqtConnection {
     options?: { parameters?: Parameters; trackProperties?: TrackProperties },
   ): Promise<bigint> {
     const { requestId, actions } = this.session.publish(namespace, name, trackAlias, options);
+    // Associate the advertised alias with this publish for §10.11 Stream Count
+    // accounting and terminal enforcement on the data-plane APIs.
+    this.publisherAliasRequests.set(trackAlias, requestId);
     if (this.session.draftVersion === 18) {
       const publishMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
-      const stream = await this.uniPair!.openRequest(this.transport!, publishMsg);
-      this.routeRequestResponse(stream);
+      // Roll back the publisher-alias authority too (so openSubgroup can't publish
+      // on an alias the peer never learned) if the request-stream open fails.
+      await this.openD18Request(requestId, publishMsg, () => this.publisherAliasRequests.delete(trackAlias));
       return requestId;
     }
     await this.executeActions(actions);
@@ -680,8 +1132,10 @@ export class MoqtConnection {
 
   private async consumeRequestStream(stream: RequestStream): Promise<void> {
     try {
-      const message = await stream.response;
-      await this.deliverRequestResponse(message, stream.requestId);
+      // Delivery already ran INSIDE the topology's read loop (the wire-order
+      // barrier registered at openRequest/sendUpdate) — here we only await the
+      // settled result so failures are funneled through one catch.
+      await stream.response;
     } catch (err) {
       // A LOCAL cancellation (fetchCancel) tears down the stream on purpose — it
       // is not a failure, so do not reject the caller or fire onError.
@@ -746,6 +1200,73 @@ export class MoqtConnection {
     return m.trackProperties ?? m.trackExtensions ?? new Map();
   }
 
+  /** Read a varint Track Property value (ms), or undefined if absent/non-numeric. */
+  private trackPropMs(props: TrackProperties, type: bigint): number | undefined {
+    const v = props.get(type)?.[0];
+    return typeof v === 'bigint' ? Number(v) : undefined;
+  }
+
+  /** §8 per-type rule: both non-zero → the SMALLER; one zero → the other; both zero → 0. */
+  private static minNonzeroMs(a: number, b: number): number {
+    return a > 0 && b > 0 ? Math.min(a, b) : Math.max(a, b);
+  }
+
+  /**
+   * Combine the §8 delivery timeouts (ms) into the effective value the terminal-alias
+   * guard must outlive. Each of OBJECT_DELIVERY_TIMEOUT (0x02) and
+   * SUBGROUP_DELIVERY_TIMEOUT (0x06) is carried by the PUBLISHER as a Track Property
+   * AND by the SUBSCRIBER as a Message Parameter; the effective value per type is the
+   * smaller non-zero of the two, and the guard must cover the LARGER of the two
+   * effective timeouts (a late Object may arrive within either window).
+   */
+  private combineDeliveryTimeoutMs(pubObj: number, pubSub: number, subObj: number, subSub: number): number {
+    return Math.max(
+      MoqtConnection.minNonzeroMs(pubObj, subObj),
+      MoqtConnection.minNonzeroMs(pubSub, subSub),
+    );
+  }
+
+  /** Read a varint delivery-timeout Message Parameter (ms) from a Parameters map. */
+  private paramTimeoutMs(params: Parameters | undefined, type: bigint): number {
+    const v = params?.get(type)?.[0];
+    return typeof v === 'bigint' ? Number(v) : 0;
+  }
+
+  /**
+   * Effective §8 delivery timeout for a SUBSCRIBE-initiated subscription: the peer's
+   * Track Properties (in the SUBSCRIBE_OK `okMsg`) combined with OUR requested
+   * Message Parameters. Our SUBSCRIBE API exposes only the object timeout
+   * (DELIVERY_TIMEOUT, 0x02); the subscriber subgroup timeout is absent (0).
+   */
+  private effectiveDeliveryTimeoutMs(subObjectMs: number | undefined, okMsg: DecodedControlMessage): number {
+    const props = this.trackPropsOf(okMsg);
+    return this.combineDeliveryTimeoutMs(
+      this.trackPropMs(props, 0x02n) ?? 0, this.trackPropMs(props, 0x06n) ?? 0,
+      subObjectMs ?? 0, 0,
+    );
+  }
+
+  /**
+   * §8: re-derive `alias`'s effective terminal-guard timeout from the subscription's
+   * CURRENTLY-COMMITTED delivery timeouts (a REQUEST_UPDATE commits them on REQUEST_OK,
+   * not at send) combined with the retained publisher Track-Property values. Called
+   * just before the guard is armed at teardown, so it reflects any accepted update.
+   * No-op if the alias's subscription is gone (the last cached value then stands).
+   */
+  private refreshAliasDeliveryTimeout(alias: bigint): void {
+    const reqId = this.rawAliasMaps.get(alias)?.requestId
+      ?? [...this.publishAliasMaps].find(([a]) => a === alias)?.[1]?.requestId;
+    if (reqId === undefined || reqId === null) return;
+    const sub = this.session.getSubscription(reqId) ?? this.session.getIncomingSubscription(reqId);
+    if (!sub) return;
+    const pub = this.aliasPublisherTimeout.get(alias) ?? { obj: 0, sub: 0 };
+    const eff = this.combineDeliveryTimeoutMs(
+      pub.obj, pub.sub, sub.requestedDeliveryTimeoutMs ?? 0, sub.requestedSubgroupDeliveryTimeoutMs ?? 0,
+    );
+    if (eff > 0) this.aliasDeliveryTimeoutMs.set(alias, eff);
+    else this.aliasDeliveryTimeoutMs.delete(alias);
+  }
+
   /**
    * Classify a Track Properties block that this endpoint MUST NOT process/forward:
    * an unsupported Mandatory Track Property (§2.5.1) or a data-Object-only Property
@@ -764,6 +1285,18 @@ export class MoqtConnection {
 
   /** Route a draft-18 request-stream response through the standard pipeline. */
   private async deliverRequestResponse(message: DecodedControlMessage, requestId: bigint): Promise<void> {
+    // Stamp the stream-derived Request ID (codec leaves it absent on responses).
+    const stamped = { ...message, requestId } as ControlMessage;
+    // qlog is the RAW observation channel — emit BEFORE any semantic handling
+    // (track-property fault, session reject, guarded-alias refuse, crossed-response
+    // drop) so every parsed response is observed even when it is not surfaced to
+    // the application via onMessage.
+    this.onQlogEvent?.({
+      type: 'control_message_parsed',
+      stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
+      message: stamped,
+    });
+
     // §2.4.2 / §2.5.1: a SUBSCRIBE_OK / FETCH_OK whose Track Properties carry an
     // unsupported Mandatory Track Property or a data-Object-only Property MUST NOT
     // be processed — cancel ONLY this request (reset its stream); the session is
@@ -776,16 +1309,127 @@ export class MoqtConnection {
       }
     }
 
-    // Stamp the stream-derived Request ID (codec leaves it absent on responses).
-    const stamped = { ...message, requestId } as ControlMessage;
-    this.onQlogEvent?.({
-      type: 'control_message_parsed',
-      stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
-      message: stamped,
-    });
-    const suppress = this.handleRawSubControlMessage(stamped);
+    // SUBSCRIBE_OK binds a Track Alias and resolves the public subscribeTrack()
+    // promise. Ordered handling (§10.8 / §11.1): the SESSION validates FIRST
+    // (unknown request / true simultaneous duplicate alias → session close),
+    // THEN alias-reuse safety is checked and a guarded reuse is refused via the
+    // draft-specific cancel — nothing is bound or resolved until both pass. See
+    // handleSubscribeOkOrdered.
+    if (message.type === 'SUBSCRIBE_OK') {
+      await this.handleSubscribeOkOrdered(message, requestId);
+      return;
+    }
+
+    // §5.1: a response (e.g. REQUEST_ERROR) crossing a cancellation is consumed by
+    // the session as a superseded-request reclaim — suppress it from the application
+    // onMessage for consistency with the crossed-SUBSCRIBE_OK path (qlog above stays raw).
+    const suppress = this.handleRawSubControlMessage(stamped)
+      || this.session.isCancelledRequest(requestId);
     if (!suppress) this.onMessage?.(stamped);
     await this.executeActions(this.session.handleControlMessage(message, { requestId }));
+    // §10.13: a FETCH_OK may complete the fetch (its data stream already FIN'd, in
+    // the object-delivery-before-response order) — close the request bidi so the
+    // fetcher's topology context does not leak.
+    if (message.type === 'FETCH_OK') await this.closeCompletedFetchRequest(requestId);
+  }
+
+  /**
+   * §10.13: once BOTH the FETCH_OK and the data stream are done (the Session has
+   * reclaimed the outgoing fetch), FIN the fetcher's request bidi stream so its
+   * topology context is reclaimed. No-op if the fetch is still in flight (one side
+   * outstanding) or the stream is already gone.
+   */
+  private async closeCompletedFetchRequest(requestId: bigint): Promise<void> {
+    if (this.session.getFetch(requestId) !== undefined) return;
+    if (!this.uniPair?.hasRequestStream(requestId)) return;
+    await this.uniPair.finishRequest(requestId);
+  }
+
+  /**
+   * Ordered SUBSCRIBE_OK handling shared by the draft-18 request-stream path and
+   * the draft-14/16 control loop, so BOTH enforce the same rules (§10.8 / §11.1):
+   *   (1) SESSION validation FIRST — unknown request ID and a TRUE simultaneous
+   *       duplicate alias get their session-level close here (through the terminal
+   *       coordinator); nothing is bound or resolved on rejection;
+   *   (2) alias-reuse policy — if a prior generation's guard is still live,
+   *       refuse binding and cancel via the DRAFT-SPECIFIC mechanism (draft-14/16
+   *       UNSUBSCRIBE, draft-18 request-stream reset), never binding routing;
+   *   (3) only on acceptance: clear a complete guard, bind routing, resolve.
+   */
+  private async handleSubscribeOkOrdered(message: DecodedControlMessage, requestId: bigint): Promise<void> {
+    // (1) Validate in the session first.
+    const actions = this.session.handleControlMessage(message, { requestId });
+    const closeAction = actions.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
+    if (closeAction) {
+      // The session rejected it (e.g. DUPLICATE_TRACK_ALIAS, unknown request) —
+      // do NOT bind or resolve. The terminal coordinator rejects the pending
+      // subscribeTrack().
+      await this.executeActions(actions);
+      this.notifyClose(closeAction, 'SUBSCRIBE_OK rejected');
+      return;
+    }
+    // §5.1: a SUBSCRIBE_OK crossing a cancellation is IGNORED by the session (the
+    // local subscription was already superseded/removed). It is not a live
+    // response — drop it BEFORE alias-reuse checks, guard clearing, binding, and
+    // application (onMessage) delivery. (qlog already observed it raw at the caller;
+    // qlog is the raw channel, onMessage is application-level.) Incidental actions
+    // still run.
+    if (this.session.getSubscription(requestId) === undefined) {
+      await this.executeActions(actions);
+      return;
+    }
+    // (2) The session accepted + registered the alias. If a prior terminal guard
+    // is still live, reusing the alias risks misdelivering an old stream to this
+    // new track — refuse (per-track, non-fatal) via the draft-specific cancel.
+    const alias = BigInt((message as { trackAlias: bigint }).trackAlias);
+    if (!this.aliasReuseSafe(alias)) {
+      await this.refuseAliasReuse(requestId,
+        `track alias ${alias} is still guarded by a terminating prior subscription (§11.1) — reuse refused`);
+      return;
+    }
+    // (3) Accepted — bind routing, resolve, surface, and run replenish actions.
+    const stampedOk = { ...message, requestId } as ControlMessage;
+    // The old generation's complete guard (if any) is safe to clear now.
+    this.clearTerminatedAlias(alias);
+    const suppress = this.handleRawSubControlMessage(stampedOk);
+    if (!suppress) this.onMessage?.(stampedOk);
+    await this.executeActions(actions);
+  }
+
+  /**
+   * Refuse a guarded alias reuse for a just-established subscription: reject its
+   * pending subscribeTrack() promise, terminate the session subscription (which
+   * unregisters the alias), and cancel through the DRAFT-SPECIFIC mechanism —
+   * draft-14/16 emit UNSUBSCRIBE, draft-18 resets the request stream. Never binds
+   * adapter routing. Per-track failure, NOT a session close. `uniPair` is only
+   * touched on draft-18 (it does not exist on draft-14/16).
+   */
+  private async refuseAliasReuse(requestId: bigint, reason: string): Promise<void> {
+    const err = new MoqtConnectionError(reason, { errorSource: 'control', isFatal: false });
+    const raw = this.rawSubscriptions.get(requestId);
+    if (raw) {
+      this.rawSubscriptions.delete(requestId);
+      raw.reject?.(err);
+      raw.resolve = null;
+      raw.reject = null;
+    }
+    // session.unsubscribe: draft-14/16 → UNSUBSCRIBE control action + alias
+    // unregister; draft-18 → no control action + alias unregister.
+    await this.executeActions(this.session.unsubscribe(requestId));
+    if (this.session.draftVersion === 18) await this.uniPair!.cancelRequest(requestId);
+    this.onError?.(err);
+  }
+
+  /**
+   * Whether Track Alias `alias` is safe to (re)bind to a new subscription.
+   * Unsafe while a prior terminal guard is still live and could route a late old
+   * stream to the new track (§11.1): an incomplete or unknown-count STRICT
+   * tombstone, or any NON-strict ordinary-teardown guard. Safe when there is no
+   * tombstone, or a COMPLETE strict one (remaining 0 — its generation finished).
+   */
+  private aliasReuseSafe(alias: bigint): boolean {
+    const t = this.terminatedAliases.get(alias);
+    return !t || (t.strict && t.remaining === 0n);
   }
 
   /**
@@ -845,6 +1489,30 @@ export class MoqtConnection {
     originalRequestId: bigint,
     message: DecodedControlMessage,
   ): Promise<void> {
+    // §10.11: PUBLISH_DONE — the publisher's terminal message on OUR
+    // subscription's request stream. Stamp the subscription's request ID,
+    // let the session terminate the subscription, surface to the app. This
+    // receiver takes the EXPLICIT early-discard path: every data stream still
+    // open for the terminated subscription's alias is STOP_SENDINGed — related
+    // streams are actively stopped, not merely unrouted. The topology FINs our
+    // send direction and drains to the publisher's FIN.
+    if (message.type === 'PUBLISH_DONE') {
+      // Capture the alias BEFORE the session reclaims the subscription.
+      const doneAlias = this.session.getSubscription(originalRequestId)?.trackAlias;
+      const streamCount = (message as { streamCount?: bigint }).streamCount ?? 0n;
+      const stampedDone = { ...message, requestId: originalRequestId } as ControlMessage;
+      this.onMessage?.(stampedDone);
+      // Owner-check + route removal + tombstone install run SYNCHRONOUSLY (the
+      // arm inside applyTerminalStreamCount is before its first await) — started
+      // BEFORE the session-teardown await so no object slips through the window
+      // and no concurrently-binding new subscription's route is deleted.
+      const discard = doneAlias !== undefined
+        ? this.applyTerminalStreamCount(doneAlias, BigInt(streamCount), originalRequestId)
+        : Promise.resolve();
+      await this.executeActions(this.session.handleControlMessage(stampedDone));
+      await discard;
+      return;
+    }
     const updateId = (message as { requestId: bigint }).requestId;
     const stamped = { ...message, existingRequestId: originalRequestId } as ControlMessage;
     this.onMessage?.(stamped);
@@ -868,15 +1536,49 @@ export class MoqtConnection {
    * (§11.4.1: Subscription / Fetch / Track Status / Publish / Publish Namespace).
    * The session drops its state (and unregisters a SUBSCRIBE's Track Alias); here
    * we drop the adapter-owned per-request maps. For a SUBSCRIBE we ALSO drop the
-   * Track-Alias routing entry: the subscription is terminated, so late data on
-   * that alias MUST NOT be delivered (unlike an inbound PUBLISH after PUBLISH_DONE,
-   * where alias routing is deliberately kept for late streams).
+   * Track-Alias routing entry and arm a bounded late-object guard: the
+   * subscription is terminated, so late data on that alias MUST NOT be delivered.
+   * (An inbound PUBLISH that ends is torn down the same bounded way — its routing
+   * is early-discarded, not retained indefinitely; §11.1.)
    */
-  private async handleOutboundRequestClosed(requestId: bigint): Promise<void> {
-    await this.executeActions(this.session.handleOutboundRequestClosed(requestId));
+  private async handleOutboundRequestClosed(requestId: bigint, disposition: 'fin' | 'reset'): Promise<void> {
+    // §5.2 / §10.12: a FETCH's response (FETCH_OK) and its object data ride
+    // INDEPENDENT streams with no cross-stream ordering, so a clean FIN of the request
+    // stream AFTER FETCH_OK does NOT end the fetch — its data stream lives on. RETAIN
+    // the fetch only in that exact case; the data-stream FIN drives reclamation (the
+    // data-FIN finally deletes the group-order entry, reclaims the Session fetch, and
+    // FINs the request stream via closeCompletedFetchRequest — a no-op here since the
+    // stream is already closed; the topology FINned our writable half on the clean FIN).
+    //
+    // Every OTHER close is terminal and must reclaim (fall through), or the fetch would
+    // leak forever:
+    //   - a clean FIN BEFORE FETCH_OK — no response can arrive on a closed stream, so
+    //     the fetch cannot complete (§11.4.1); leaving it PENDING would leak it;
+    //   - a RESET at any point — a terminal stream error (§11.4.1); leaving it after a
+    //     post-FETCH_OK reset would leak it TRANSFERRING.
+    // A locally cancelled/errored fetch is already reclaimed in the Session
+    // (getFetch === undefined) and also falls through.
+    const outgoingFetch = this.session.getFetch(requestId);
+    if (outgoingFetch !== undefined && !outgoingFetch.isFetcherComplete
+        && disposition === 'fin' && outgoingFetch.responseReceived) {
+      return;
+    }
+    // §5.1.1: capture the alias and arm terminal protection SYNCHRONOUSLY —
+    // before the session-teardown await below — via the centralized path, so a
+    // late object cannot slip through to the generic onObject hook. Only if this
+    // request STILL owns the alias routing: a delayed peer-close after the alias
+    // was legitimately reused by a new subscription must not re-tombstone it.
     const raw = this.rawSubscriptions.get(requestId);
+    const teardownAlias = raw && raw.trackAlias !== null && this.rawAliasMaps.get(raw.trackAlias) === raw
+      ? raw.trackAlias : null;
+    if (teardownAlias !== null) this.armSubscriberAliasTeardown(teardownAlias);
+
+    await this.executeActions(this.session.handleOutboundRequestClosed(requestId));
     if (raw) {
-      if (raw.trackAlias !== null) this.rawAliasMaps.delete(raw.trackAlias);
+      if (teardownAlias !== null) {
+        // Tombstone armed above; now early-discard any streams still open.
+        await this.discardOpenStreamsForAlias(teardownAlias);
+      }
       this.rawSubscriptions.delete(requestId);
       // Defensive: a still-pending subscribeTrack() (no SUBSCRIBE_OK yet) must not
       // hang when its request stream closes before the response (peer FIN/reset, or
@@ -887,6 +1589,9 @@ export class MoqtConnection {
         { errorSource: 'control' },
       ));
     }
+    // §5.1.1: if this was an outbound PUBLISH whose subscriber cancelled (peer
+    // reset the PUBLISH request stream), RESET our open data streams for it too.
+    await this.abortPublisherStreamsForRequest(requestId);
     this.fetchGroupOrder.delete(requestId);
   }
 
@@ -915,11 +1620,7 @@ export class MoqtConnection {
    */
   private handleControlStreamViolation(reason: string): void {
     if (this.session.state === SessionState.CLOSED) return;
-    void this.executeActions(this.session.close(SessionError.PROTOCOL_VIOLATION, reason));
-    // A fatal session close must not leave subscribeTrack() callers pending forever
-    // (matches close() and the legacy fatal control-stream path).
-    this.failPendingRawSubscriptions(reason);
-    this.onClose?.(Number(SessionError.PROTOCOL_VIOLATION), reason);
+    this.closeSessionFatal(reason); // centralized: close + reject pending + onClose
   }
 
   /**
@@ -945,6 +1646,9 @@ export class MoqtConnection {
     if (options?.filter) {
       subscribeOpts.subscriptionFilter = options.filter;
     }
+    if (options?.deliveryTimeout !== undefined) {
+      subscribeOpts.deliveryTimeout = options.deliveryTimeout;
+    }
     // Build the SUBSCRIBE synchronously (allocates the Request ID) so the response
     // resolver is registered BEFORE any bytes go out. Otherwise a zero-latency peer
     // (e.g. the §3.2 reserved-namespace auto-reject) could answer with REQUEST_ERROR
@@ -958,8 +1662,9 @@ export class MoqtConnection {
       trackAlias: 0n, // placeholder, updated when SUBSCRIBE_OK arrives
       onObject: options?.onObject ?? null,
       unsubscribe: async () => {
-        this.rawAliasMaps.delete(sub.trackAlias);
-        this.rawSubscriptions.delete(reqIdBigint);
+        // Delegate to the single centralized path: it arms terminal alias
+        // protection synchronously (from the raw entry's real alias — null-safe,
+        // and correct even for a legitimate alias 0) before any await.
         await this.unsubscribe(reqIdBigint);
       },
     };
@@ -971,7 +1676,10 @@ export class MoqtConnection {
     try {
       await this.sendSubscribeActions(actions);
     } catch (err) {
-      // The SUBSCRIBE never went out — drop the pending state and reject the caller.
+      // The SUBSCRIBE never went out (e.g. request-stream creation failed) — drop
+      // BOTH the adapter's pending state AND the session's pending subscription
+      // (§11.4.1), then reject the caller. Otherwise a phantom subscription lingers.
+      await this.executeActions(this.session.handleOutboundRequestClosed(reqIdBigint));
       const raw = this.rawSubscriptions.get(reqIdBigint);
       if (raw) {
         this.rawSubscriptions.delete(reqIdBigint);
@@ -1002,6 +1710,141 @@ export class MoqtConnection {
     return false;
   }
 
+  // ── receiver §10.11 terminal tracker (bounded, Stream-Count-driven) ──
+
+  /** STOP_SENDING one incoming subgroup stream and drop its receiver state. */
+  private async stopIncomingSubgroupStream(streamId: bigint): Promise<void> {
+    this.incomingSubgroupAliases.delete(streamId);
+    const reader = this.dataStreamReaders.get(streamId);
+    if (reader) {
+      try { await reader.cancel(new Error('subscription terminated by PUBLISH_DONE — early discard')); } catch { /* closed */ }
+      this.dataStreamReaders.delete(streamId);
+    }
+  }
+
+  /**
+   * SYNCHRONOUS first step of a subscriber-alias teardown (ordinary unsubscribe /
+   * peer-close): arm a bounded TTL-only tombstone (no Stream Count is known) and
+   * drop the routing entry, in one synchronous step with NO await between. This
+   * closes the window in which a stream/object arriving during a later await
+   * (session teardown, request-stream reset) would find no route and leak to the
+   * generic onObject hook. The async early-discard of already-open streams runs
+   * afterward via {@link discardOpenStreamsForAlias}.
+   */
+  private armSubscriberAliasTeardown(alias: bigint): void {
+    this.refreshAliasDeliveryTimeout(alias); // §8: reflect any accepted REQUEST_UPDATE before arming
+    this.armTerminatedAlias(alias, null, /* strict */ false); // TTL-only; refuses reuse until it expires
+    this.rawAliasMaps.delete(alias);
+  }
+
+  /** Early-discard (STOP_SENDING) every incoming subgroup stream open on `alias`. */
+  private async discardOpenStreamsForAlias(alias: bigint): Promise<void> {
+    for (const [sid, a] of [...this.incomingSubgroupAliases]) {
+      if (a === alias) await this.stopIncomingSubgroupStream(sid);
+    }
+  }
+
+  /** Clear an alias tombstone (cancel its TTL timer) and its seen-count. */
+  private clearTerminatedAlias(alias: bigint): void {
+    const t = this.terminatedAliases.get(alias);
+    if (t) { t.cancelTimer(); this.terminatedAliases.delete(alias); }
+    this.aliasStreamsSeen.delete(alias);
+    this.aliasDeliveryTimeoutMs.delete(alias);
+    this.aliasPublisherTimeout.delete(alias);
+  }
+
+  /**
+   * Schedule `onElapsed` after `totalMs`, re-arming in ≤ {@link MAX_TIMER_MS} chunks
+   * so an effective delivery timeout larger than setTimeout's 32-bit range (e.g. a
+   * 2^62-1 varint) does NOT overflow into an immediate ~1 ms fire (§8 / finding).
+   * `totalMs` is clamped to a safe integer. Returns a cancel function. All timers
+   * are unref'd so they never keep the process alive.
+   */
+  private armGuardTimer(totalMs: number, onElapsed: () => void): () => void {
+    let remaining = Math.max(0, Math.min(totalMs, Number.MAX_SAFE_INTEGER));
+    let handle: ReturnType<typeof setTimeout>;
+    const tick = (): void => {
+      if (remaining <= 0) { onElapsed(); return; }
+      const chunk = Math.min(remaining, MoqtConnection.MAX_TIMER_MS);
+      remaining -= chunk;
+      handle = setTimeout(tick, chunk);
+      (handle as { unref?: () => void }).unref?.();
+    };
+    tick();
+    return () => clearTimeout(handle);
+  }
+
+  /**
+   * Arm (or refresh) a bounded terminal tombstone for `alias`, installed
+   * SYNCHRONOUSLY: the routing is dropped and the tombstone recorded before any
+   * await, so a late stream/datagram racing the STOP_SENDING that follows is
+   * already covered. `remaining` counts expected late streams (bigint), or
+   * `null` when the count is unknown (2^62-1 sentinel) — then only the TTL clears
+   * it. `strict` marks a PUBLISH_DONE Stream-Count tombstone vs an
+   * ordinary-teardown guard; both REFUSE alias reuse while live (only a COMPLETE
+   * strict tombstone is reuse-safe — see {@link aliasReuseSafe}) — the flag only
+   * governs count-driven clearing and the no-downgrade rule below. A tombstone
+   * always carries a TTL so it is bounded regardless.
+   */
+  private armTerminatedAlias(alias: bigint, remaining: bigint | null, strict: boolean): void {
+    // No more objects routed for this alias — drop BOTH routing maps (an alias
+    // lives in one or the other): the inbound-PUBLISH map AND the outbound-
+    // subscribe map (the latter matters for a legacy control-stream PUBLISH_DONE,
+    // where no request-stream close tears rawAliasMaps down separately).
+    this.publishAliasMaps.delete(alias);
+    this.rawAliasMaps.delete(alias);
+    const existing = this.terminatedAliases.get(alias);
+    // Do NOT downgrade a STRICT Stream-Count tombstone (which tracks outstanding
+    // old streams for §11.1) to a non-strict ordinary-teardown guard: the
+    // request-stream FIN that follows a PUBLISH_DONE would otherwise clobber the
+    // count and let a reused alias misdeliver the old stream.
+    if (existing?.strict && !strict) return;
+    if (existing) existing.cancelTimer();
+    // §10.11: the guard must outlive the effective delivery timeout — floor its TTL
+    // by the alias's §8 effective delivery timeout when that exceeds the default.
+    // Chunked so a huge (but valid) timeout cannot overflow setTimeout to ~1 ms.
+    const ttlMs = Math.max(this.terminatedAliasTtlMs, this.aliasDeliveryTimeoutMs.get(alias) ?? 0);
+    const cancelTimer = this.armGuardTimer(ttlMs, () => this.clearTerminatedAlias(alias));
+    this.terminatedAliases.set(alias, { remaining, cancelTimer, strict });
+  }
+
+  /**
+   * Apply a PUBLISH_DONE Stream Count to `alias` on the RECEIVER (§10.11 / §9.15).
+   * The tombstone is installed SYNCHRONOUSLY first (so a stream/datagram arriving
+   * during the STOP_SENDING awaits below is already discarded), THEN every stream
+   * currently open for the alias is early-discarded. Late streams beyond those
+   * already seen are counted down as they arrive; the tombstone clears once the
+   * announced count is met OR the TTL expires. A 2^62-1 Stream Count means the
+   * publisher could not give an exact count — the tombstone then relies on the
+   * TTL alone (never auto-clears by counting). Bounded either way.
+   */
+  private async applyTerminalStreamCount(alias: bigint, streamCount: bigint, owningRequestId: bigint): Promise<void> {
+    // Generation ownership: only tear down / guard the alias when its CURRENT
+    // route still belongs to the terminating request. A crossed OLD PUBLISH_DONE
+    // whose alias was already reused by a newer subscription must NOT erase the
+    // new route (§11.1). `undefined` owner (no live route) is the terminating
+    // request's own already-partly-torn-down subscription — proceed.
+    const owner = this.rawAliasMaps.get(alias)?.requestId
+      ?? this.publishAliasMaps.get(alias)?.requestId;
+    if (owner !== undefined && owner !== owningRequestId) return;
+
+    // 1) Install terminal state synchronously (before any await).
+    // §8: re-derive the effective delivery timeout from the subscription's COMMITTED
+    // state (an accepted REQUEST_UPDATE commits on REQUEST_OK) BEFORE arming — else
+    // the guard uses a stale/default timeout and can expire while late streams for
+    // the updated window are still valid.
+    this.refreshAliasDeliveryTimeout(alias);
+    const seen = this.aliasStreamsSeen.get(alias) ?? 0n;
+    const remaining: bigint | null = streamCount === MoqtConnection.STREAM_COUNT_UNKNOWN
+      ? null // §9.15 sentinel: exact count unknown — rely on the TTL only
+      : (streamCount - seen > 0n ? streamCount - seen : 0n);
+    this.armTerminatedAlias(alias, remaining, /* strict */ true);
+    // 2) Early-discard every stream currently open for the alias.
+    for (const [sid, a] of [...this.incomingSubgroupAliases]) {
+      if (a === alias) await this.stopIncomingSubgroupStream(sid);
+    }
+  }
+
   /**
    * Handle control messages for track subscriptions.
    * Returns true if the message was consumed (suppress onMessage).
@@ -1012,9 +1855,26 @@ export class MoqtConnection {
       const raw = this.rawSubscriptions.get(reqId);
       if (raw) {
         const alias = BigInt((msg as any).trackAlias);
+        // Alias-reuse safety and the complete-guard clear were already handled by
+        // handleSubscribeOkOrdered — AFTER the session validated + registered the
+        // alias, just before this call. Here we only bind routing + resolve.
         raw.trackAlias = alias;
         (raw.sub as { trackAlias: bigint }).trackAlias = alias;
         this.rawAliasMaps.set(alias, raw);
+        // §8/§10.11: record the EFFECTIVE delivery timeout for this alias so a later
+        // teardown's guard outlives the window in which the publisher may still
+        // deliver old-alias streams — combining the publisher's Track Properties
+        // (in this SUBSCRIBE_OK) with the subscriber's requested Message Parameters.
+        // Retain the publisher's raw values so a later REQUEST_UPDATE (§8) can
+        // re-derive the effective timeout with a new subscriber value.
+        const okProps = this.trackPropsOf(msg);
+        this.aliasPublisherTimeout.set(alias, {
+          obj: this.trackPropMs(okProps, 0x02n) ?? 0, sub: this.trackPropMs(okProps, 0x06n) ?? 0,
+        });
+        const eff = this.effectiveDeliveryTimeoutMs(
+          this.session.getSubscription(reqId)?.requestedDeliveryTimeoutMs, msg,
+        );
+        if (eff > 0) this.aliasDeliveryTimeoutMs.set(alias, eff);
         raw.resolve?.(raw.sub);
         raw.resolve = null;
         raw.reject = null;
@@ -1062,9 +1922,31 @@ export class MoqtConnection {
         // REQUEST_ERROR is matched FIFO by the context.
         const { requestId, actions } = this.session.updateIncomingSubscription(existingRequestId, options);
         const updateMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
-        const response = await inboundCtx.sendUpdate(updateMsg);
-        // Apply via the stamped-response pipeline (REQUEST_OK applies the update).
-        await this.deliverRequestResponse(response, requestId);
+        // The delivery runs INSIDE the context's read loop (wire-order barrier)
+        // so a PUBLISH_DONE coalesced behind the REQUEST_OK is applied after it.
+        // On a write failure the peer never received the update — roll back the
+        // pending record (the topology drops its own FIFO slot) so no response is
+        // mis-correlated to an update that never went out.
+        try {
+          await inboundCtx.sendUpdate(updateMsg, (m) => this.deliverRequestResponse(m, requestId));
+        } catch (err) {
+          this.session.rollbackRequestUpdate(requestId);
+          // §11.4.1: the update write failed → the inbound PUBLISH request stream is
+          // dead. Use the SAME owner-checked inbound-PUBLISH teardown as a failed
+          // acceptance: aborting the context alone suppresses onClosed, so we must
+          // ALSO drop publishAliasMaps and arm the terminal-alias guard — otherwise
+          // the route stays live and a late/independent data stream on the alias
+          // would keep reaching the application.
+          const pubAlias = [...this.publishAliasMaps].find(([, p]) => p.requestId === existingRequestId)?.[0];
+          if (pubAlias !== undefined) {
+            await this.rollbackFailedAcceptance(existingRequestId, pubAlias, /* isPublishInitiated */ true);
+          } else {
+            await this.executeActions(this.session.handleInboundRequestClosed(existingRequestId));
+            this.inboundRequestContexts.delete(existingRequestId);
+            try { await inboundCtx.abort(); } catch { /* already torn down */ }
+          }
+          throw err instanceof Error ? err : new Error(String(err));
+        }
         return requestId;
       }
       // draft-18 §10.9.2: an outbound SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS rides
@@ -1074,8 +1956,15 @@ export class MoqtConnection {
       if (this.uniPair!.hasContinuingRequest(existingRequestId)) {
         const { requestId, actions } = this.session.requestUpdate(existingRequestId, options);
         const updateMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
-        const response = await this.uniPair!.sendUpdateOnContinuing(existingRequestId, updateMsg);
-        await this.deliverRequestResponse(response, requestId); // stamps + applies REQUEST_OK
+        try {
+          await this.uniPair!.sendUpdateOnContinuing(
+            existingRequestId, updateMsg,
+            (m) => this.deliverRequestResponse(m, requestId), // stamps + applies REQUEST_OK, in wire order
+          );
+        } catch (err) {
+          this.session.rollbackRequestUpdate(requestId);
+          throw err instanceof Error ? err : new Error(String(err));
+        }
         return requestId;
       }
       // draft-18: the REQUEST_UPDATE is sent on the EXISTING request stream that
@@ -1087,7 +1976,18 @@ export class MoqtConnection {
       const updateMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
       // The response (REQUEST_OK/REQUEST_ERROR) correlates to the UPDATE's own
       // requestId, not the original — routeRequestResponse stamps with handle.requestId.
-      const stream = await this.uniPair!.sendUpdate(existingRequestId, updateMsg);
+      let stream: RequestStream;
+      try {
+        stream = await this.uniPair!.sendUpdate(
+          existingRequestId, updateMsg,
+          (m) => this.deliverRequestResponse(m, requestId),
+        );
+      } catch (err) {
+        // The write failed: the peer never received the update. Roll back the
+        // pending record (the topology already dropped its FIFO slot in send()).
+        this.session.rollbackRequestUpdate(requestId);
+        throw err instanceof Error ? err : new Error(String(err));
+      }
       this.routeRequestResponse(stream);
       return requestId;
     }
@@ -1113,6 +2013,17 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-16 §2.4.2 (Malformed Track), draft-18 §3.3.2
    */
   async unsubscribe(requestId: bigint): Promise<void> {
+    // §5.1.1: arm terminal alias protection SYNCHRONOUSLY — before session
+    // teardown, the request-stream reset, or dropping routing — so a late object
+    // arriving during any of those awaits is discarded, never routed to the
+    // generic onObject hook. Centralized in teardownSubscriberAlias so this
+    // direct API, the TrackSubscription wrapper, and the peer-close path all
+    // arm at the same point and cannot diverge.
+    const raw = this.rawSubscriptions.get(requestId);
+    if (raw && raw.trackAlias !== null && this.rawAliasMaps.get(raw.trackAlias) === raw) {
+      this.armSubscriberAliasTeardown(raw.trackAlias);
+    }
+
     const actions = this.session.unsubscribe(requestId); // draft-18 returns no send_control
     await this.executeActions(actions);
     if (this.session.draftVersion === 18) {
@@ -1120,24 +2031,37 @@ export class MoqtConnection {
       // signal (a LOCAL cancel — the response handler ignores the resulting
       // RequestCancelledError, so it surfaces no onError).
       await this.uniPair!.cancelRequest(requestId);
-      // Drop adapter-owned per-subscription routing so late data on the freed
-      // alias is not delivered (idempotent with TrackSubscription.unsubscribe()).
-      const raw = this.rawSubscriptions.get(requestId);
-      if (raw) {
-        if (raw.trackAlias !== null) this.rawAliasMaps.delete(raw.trackAlias);
-        this.rawSubscriptions.delete(requestId);
+      const current = this.rawSubscriptions.get(requestId) ?? raw;
+      if (current && current.trackAlias !== null) {
+        // Tombstone already armed above; now early-discard open streams.
+        await this.discardOpenStreamsForAlias(current.trackAlias);
       }
     }
+    // Drop the raw subscription for EVERY draft: draft-14/16 has no request-stream
+    // close to reclaim it, so without this the subscription object + its onObject
+    // callback would leak after unsubscribe.
+    this.rawSubscriptions.delete(requestId);
   }
 
   /**
    * Close the session. Sends close_connection to the transport.
+   *
+   * A quiet, intentional local close: it does NOT fire onClose (there is no
+   * remote event to report), but it MARKS the connection terminated so the
+   * ensuing `transport.closed` fulfillment — which our watcher observes when we
+   * close the transport — does not race in a duplicate onClose.
    */
   async close(error?: Varint, reason?: string): Promise<void> {
+    // Mark terminated + emitted FIRST so the transport-close watcher stays quiet
+    // (a quiet local close fires no onClose, and cannot be upgraded into one).
+    this._terminated = true;
+    this._closeEmitted = true;
     const actions = this.session.close(error, reason);
     await this.executeActions(actions);
     // A local close must not leave a caller awaiting subscribeTrack() forever.
     this.failPendingRawSubscriptions(reason ?? 'Session closed');
+    // Drop all timers + publisher/receiver accounting with the session.
+    this.clearTerminalState();
   }
 
   /**
@@ -1212,15 +2136,22 @@ export class MoqtConnection {
       // awaited per message, so the first REQUEST_OK fully transitions the
       // subscription to ACTIVE before any NAMESPACE is processed.
       const action = actions.find((a) => a.type === 'open_namespace_stream') as OpenNamespaceStreamAction;
-      const { closed } = await this.uniPair!.openContinuingRequest(
-        this.transport!,
-        action.message,
-        (rid, msg, kind) => {
-          if (kind === 'first') return this.deliverRequestResponse(msg, rid);
-          this.onNamespaceMessage?.(rid, msg as ControlMessage);
-          return this.executeActions(this.session.handleNamespaceStreamMessage(rid, msg as ControlMessage));
-        },
-      );
+      let closed: Promise<void>;
+      try {
+        ({ closed } = await this.uniPair!.openContinuingRequest(
+          this.transport!,
+          action.message,
+          (rid, msg, kind) => {
+            if (kind === 'first') return this.deliverRequestResponse(msg, rid);
+            this.onNamespaceMessage?.(rid, msg as ControlMessage);
+            return this.executeActions(this.session.handleNamespaceStreamMessage(rid, msg as ControlMessage));
+          },
+        ));
+      } catch (err) {
+        // Request-stream open failed → reclaim the pending namespace subscription.
+        await this.executeActions(this.session.handleNamespaceStreamClosed(requestId));
+        throw err instanceof Error ? err : new Error(String(err));
+      }
       void this.handleNamespaceStreamClosed(requestId, closed);
       return requestId;
     }
@@ -1239,9 +2170,7 @@ export class MoqtConnection {
       await this.executeActions(this.session.handleNamespaceStreamClosed(requestId));
     } catch (err) {
       if (err instanceof ProtocolViolationError) {
-        const actions = this.session.close(SessionError.PROTOCOL_VIOLATION, err.message);
-        await this.executeActions(actions);
-        this.onClose?.(0x3, err.message);
+        this.closeSessionFatal(err.message);
         return;
       }
       this.onError?.(new MoqtConnectionError(
@@ -1265,15 +2194,22 @@ export class MoqtConnection {
   async subscribeTracks(namespacePrefix: Uint8Array[]): Promise<bigint> {
     const { requestId, actions } = this.session.subscribeTracks(namespacePrefix);
     const msg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
-    const { closed } = await this.uniPair!.openContinuingRequest(
-      this.transport!,
-      msg,
-      (rid, m, kind) => {
-        if (kind === 'first') return this.deliverRequestResponse(m, rid);
-        this.onPublishBlocked?.(rid, m as ControlMessage);
-        return this.executeActions(this.session.handleSubscribeTracksStreamMessage(rid, m as ControlMessage));
-      },
-    );
+    let closed: Promise<void>;
+    try {
+      ({ closed } = await this.uniPair!.openContinuingRequest(
+        this.transport!,
+        msg,
+        (rid, m, kind) => {
+          if (kind === 'first') return this.deliverRequestResponse(m, rid);
+          this.onPublishBlocked?.(rid, m as ControlMessage);
+          return this.executeActions(this.session.handleSubscribeTracksStreamMessage(rid, m as ControlMessage));
+        },
+      ));
+    } catch (err) {
+      // Request-stream open failed → reclaim the pending track subscription.
+      await this.executeActions(this.session.handleSubscribeTracksStreamClosed(requestId));
+      throw err instanceof Error ? err : new Error(String(err));
+    }
     void this.handleSubscribeTracksStreamClosed(requestId, closed);
     return requestId;
   }
@@ -1285,9 +2221,7 @@ export class MoqtConnection {
       await this.executeActions(this.session.handleSubscribeTracksStreamClosed(requestId));
     } catch (err) {
       if (err instanceof ProtocolViolationError) {
-        const actions = this.session.close(SessionError.PROTOCOL_VIOLATION, err.message);
-        await this.executeActions(actions);
-        this.onClose?.(0x3, err.message);
+        this.closeSessionFatal(err.message);
         return;
       }
       this.onError?.(new MoqtConnectionError(
@@ -1373,8 +2307,9 @@ export class MoqtConnection {
       // requested Group Order so the fetch-object decoder can read deltas.
       this.fetchGroupOrder.set(requestId, options.groupOrder ?? 'ascending');
       const fetchMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
-      const stream = await this.uniPair!.openRequest(this.transport!, fetchMsg);
-      this.routeRequestResponse(stream);
+      // Roll back the outbound group-order entry on open failure (else a phantom
+      // fetch could shape a later object decode / authorize unsolicited data).
+      await this.openD18Request(requestId, fetchMsg, () => this.fetchGroupOrder.delete(requestId));
       return requestId;
     }
     await this.executeActions(actions);
@@ -1399,8 +2334,7 @@ export class MoqtConnection {
     if (this.session.draftVersion === 18) {
       this.fetchGroupOrder.set(requestId, options.groupOrder ?? 'ascending');
       const fetchMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
-      const stream = await this.uniPair!.openRequest(this.transport!, fetchMsg);
-      this.routeRequestResponse(stream);
+      await this.openD18Request(requestId, fetchMsg, () => this.fetchGroupOrder.delete(requestId));
       return requestId;
     }
     await this.executeActions(actions);
@@ -1441,6 +2375,20 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-16 §5.2, §9.18; draft-ietf-moq-transport-18 §3.3.2
    */
   async fetchCancel(requestId: bigint): Promise<void> {
+    // §5.2: the fetch may already have ended (its data stream FIN'd/reset → reclaimed
+    // by handleFetchStreamFinished, or a REQUEST_ERROR). Cancelling a fetch that is
+    // already gone is a NO-OP, not an error — makes fetchCancel idempotent and safe
+    // to call racing the terminal.
+    if (this.session.getFetch(requestId) === undefined) return;
+    // §10.13: install the late-stream cancellation marker SYNCHRONOUSLY — BEFORE any
+    // await below — so a data stream arriving during the teardown awaits is discarded
+    // (see the FETCH_HEADER handler), never delivered to onObject. The marker is
+    // LOSSLESS (no cap / no eviction): a late data stream may be arbitrarily delayed,
+    // so forgetting a cancellation would turn its late stream into a §9.1 false close.
+    // It is the SOLE provenance for "a stream for a fetch WE cancelled" — a missing
+    // marker means the stream is NOT a cancelled fetch (completed / unknown / wrong
+    // request kind) and is a protocol violation. Consumed one-shot on the late stream.
+    this.recentlyCancelledFetches.add(requestId as bigint);
     // Mark the fetch completed. draft-18 returns no actions (FETCH_CANCEL was
     // removed); draft-14/16 returns a FETCH_CANCEL to send.
     const actions = this.session.fetchCancel(requestId);
@@ -1466,6 +2414,14 @@ export class MoqtConnection {
         this.dataStreamReaders.delete(streamId);
       }
       this.fetchStreams.delete(requestId as bigint);
+      // The known open response stream is torn down HERE, so the marker that guards a
+      // NOT-yet-arrived late stream is redundant for it — CONSUME it. Cancelling a
+      // reader blocked in read() ends the loop via `done` WITHOUT revisiting the
+      // loop-top marker check, and the finalizer does not clear it either, so a
+      // lossless marker would otherwise linger forever. Keep the marker only when NO
+      // response stream has appeared yet (streamId === undefined) — then it is still
+      // needed to discard the eventual late stream.
+      this.recentlyCancelledFetches.delete(requestId as bigint);
     }
     // draft-18 per-request group-order state is no longer needed.
     this.fetchGroupOrder.delete(requestId as bigint);
@@ -1492,8 +2448,7 @@ export class MoqtConnection {
     const { requestId, actions } = this.session.trackStatus(namespace, name);
     if (this.session.draftVersion === 18) {
       const msg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
-      const stream = await this.uniPair!.openRequest(this.transport!, msg);
-      this.routeRequestResponse(stream);
+      await this.openD18Request(requestId, msg);
       return requestId;
     }
     await this.executeActions(actions);
@@ -1537,8 +2492,7 @@ export class MoqtConnection {
     const { requestId, actions } = this.session.publishNamespace(namespace);
     if (this.session.draftVersion === 18) {
       const msg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
-      const stream = await this.uniPair!.openRequest(this.transport!, msg);
-      this.routeRequestResponse(stream);
+      await this.openD18Request(requestId, msg);
       return requestId;
     }
     await this.executeActions(actions);
@@ -1591,9 +2545,132 @@ export class MoqtConnection {
     trackAlias: bigint,
     options?: { parameters?: Parameters; trackProperties?: TrackProperties },
   ): Promise<void> {
+    // Role check: an inbound PUBLISH (publish-initiated) makes US the SUBSCRIBER —
+    // accepting it must NOT authorize us to publish on its alias. Only an inbound
+    // SUBSCRIBE (we are the publisher) grants publisher data-plane authority.
+    const incoming = this.session.getIncomingSubscription(requestId);
+    const isPublishInitiated = incoming?.isPublishInitiated ?? false;
+    // For an inbound PUBLISH the alias is fixed by the publisher on the wire — the
+    // acceptance MUST NOT rebind it to a different value.
+    if (isPublishInitiated && incoming?.trackAlias !== undefined && trackAlias !== incoming.trackAlias) {
+      throw new MoqtConnectionError(
+        `acceptSubscribe alias ${trackAlias} does not match the PUBLISH's advertised alias ${incoming.trackAlias}`,
+        { errorSource: 'control' },
+      );
+    }
     const actions = this.session.acceptSubscribe(requestId, trackAlias, options);
-    if (await this.writeInboundRequestResponse(requestId, actions)) return;
-    await this.executeActions(actions);
+    // §5.1: the acceptance may itself force a session close (e.g. the superseded-set
+    // is at capacity, §5.1). Then there is no acceptance to report — execute the
+    // close, settle parked joins as NOT accepted, and reject rather than resolving
+    // as success.
+    const closeAction = actions.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
+    if (closeAction) {
+      await this.executeActions(actions);
+      this.notifyClose(closeAction, 'acceptSubscribe forced a session close');
+      await this.settleParkedJoins(requestId, false);
+      throw new MoqtConnectionError(
+        `acceptSubscribe closed the session: ${closeAction.reason}`,
+        { errorSource: 'control', isFatal: true },
+      );
+    }
+    // §10.11: authorize publisher data-plane ops (openSubgroup / sendObject /
+    // sendDatagram) on this alias ONLY for an inbound SUBSCRIBE we serve — never for
+    // an inbound PUBLISH, where we are the subscriber.
+    if (!isPublishInitiated) this.publisherAliasRequests.set(trackAlias, requestId);
+    // §8: for an inbound PUBLISH (we are the subscriber), COMPUTE the effective
+    // timeout by combining the publisher's Track-Property timeouts (captured at bind)
+    // with OUR PUBLISH_OK Message Parameters — but DEFER committing it until the
+    // PUBLISH_OK write SUCCEEDS. The provisional (publisher-only) value stays in
+    // aliasDeliveryTimeoutMs meanwhile, so a rollback after a failed write arms the
+    // guard with a value the publisher DID receive, not our unsent subscriber timeout.
+    let commitTimeout: (() => void) | undefined;
+    if (isPublishInitiated) {
+      const pub = this.inboundPublishTimeouts.get(requestId);
+      this.inboundPublishTimeouts.delete(requestId);
+      if (pub) {
+        const subObj = this.paramTimeoutMs(options?.parameters, 0x02n);
+        const subSub = this.paramTimeoutMs(options?.parameters, 0x06n);
+        const eff = this.combineDeliveryTimeoutMs(pub.obj, pub.sub, subObj, subSub);
+        commitTimeout = () => {
+          if (eff > 0) this.aliasDeliveryTimeoutMs.set(trackAlias, eff);
+          else this.aliasDeliveryTimeoutMs.delete(trackAlias);
+        };
+      }
+    }
+    // §5.1: run the NON-response actions (e.g. a cancel_request tearing down a
+    // local SUBSCRIBE this PUBLISH supersedes) BEFORE writing the acceptance. The
+    // session has already deleted that local subscription synchronously, so if the
+    // acceptance write below rejects, the adapter-side teardown (reject the pending
+    // subscribeTrack(), reset its request stream) must still have run — otherwise
+    // its promise and stream leak.
+    const nonResponse = actions.filter((a) => a.type !== 'send_control');
+    if (nonResponse.length > 0) await this.executeActions(nonResponse);
+    // §10.8: the acceptance response (SUBSCRIBE_OK / REQUEST_OK) rides the inbound
+    // request's OWN bidi stream on draft-18. The Session already transitioned the
+    // subscription to ESTABLISHED, so if that write REJECTS the peer never received
+    // acceptance — roll back to avoid a ghost established subscription with live
+    // routing and a publisher-alias association, and PROPAGATE the failure (this
+    // acceptance did not succeed).
+    let handled: boolean;
+    try {
+      handled = await this.writeInboundRequestResponse(requestId, actions);
+    } catch (err) {
+      await this.rollbackFailedAcceptance(requestId, trackAlias, isPublishInitiated);
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+    if (handled) {
+      commitTimeout?.(); // PUBLISH_OK reached the peer — now commit the combined timeout
+      await this.flushDeferredUpdateResponses(requestId);
+      await this.settleParkedJoins(requestId, true);
+      return;
+    }
+    // draft-14/16: the send_control response(s) ride the control stream (the
+    // non-response actions already ran above — do not repeat them). A control-stream
+    // write failure is session-fatal and handled by the control loop, not per-request.
+    await this.executeActions(actions.filter((a) => a.type === 'send_control'));
+    commitTimeout?.(); // control-stream PUBLISH_OK sent — commit the combined timeout
+    await this.flushDeferredUpdateResponses(requestId);
+    await this.settleParkedJoins(requestId, true);
+  }
+
+  /**
+   * Roll back an inbound subscription whose acceptance response failed to write
+   * (§10.8). The peer never received SUBSCRIBE_OK / REQUEST_OK, so no established
+   * subscription, publish routing, or publisher-alias association may survive:
+   * terminate the request in the Session (§11.4.1), drop the publisher-alias
+   * association, remove any inbound PUBLISH route (aborting the context suppresses
+   * the normal onClosed cleanup that would otherwise remove it — without this, late
+   * objects on the alias would keep reaching the application), and reset the stream.
+   * The caller re-throws so the failed acceptance is not reported as success.
+   */
+  private async rollbackFailedAcceptance(requestId: bigint, trackAlias: bigint, isPublishInitiated: boolean): Promise<void> {
+    this.publisherAliasRequests.delete(trackAlias);
+    // For an inbound PUBLISH, tear down its route AND arm a bounded late-object
+    // guard SYNCHRONOUSLY (before the first await), exactly like the inbound-FIN
+    // teardown — a subgroup opened BEFORE the failed PUBLISH_OK and delivered after
+    // would otherwise fall through to the connection-level onObject. Owner-checked
+    // so a reused alias's newer publication is untouched.
+    const ownsRoute = isPublishInitiated
+      && this.publishAliasMaps.get(trackAlias)?.requestId === requestId;
+    if (ownsRoute) this.armTerminatedAlias(trackAlias, null, /* strict */ false); // drops route + installs guard
+    this.inboundPublishTimeouts.delete(requestId);
+    await this.executeActions(this.session.handleInboundRequestClosed(requestId));
+    const ctx = this.inboundRequestContexts.get(requestId);
+    this.inboundRequestContexts.delete(requestId);
+    if (ownsRoute) await this.discardOpenStreamsForAlias(trackAlias);
+    if (ctx) { try { await ctx.abort(); } catch { /* already torn down */ } }
+  }
+
+  /** Write update responses deferred behind the subscribe's first response (§10.8), FIFO. */
+  private async flushDeferredUpdateResponses(subRequestId: bigint): Promise<void> {
+    const queued = this.deferredUpdateResponses.get(subRequestId);
+    if (!queued) return;
+    this.deferredUpdateResponses.delete(subRequestId);
+    const ctx = this.inboundRequestContexts.get(subRequestId);
+    if (!ctx) return; // stream already gone — nothing to write to
+    for (const msg of queued) {
+      try { await ctx.writeMessage(msg); } catch { break; /* stream torn down */ }
+    }
   }
 
   /**
@@ -1615,8 +2692,8 @@ export class MoqtConnection {
     if (!send) return false;
     await ctx.writeMessage(send.message);
     if (finalize) {
-      await ctx.finish(); // FIN our writable — one-shot, nothing more to send
-      ctx.seal();         // any further inbound message is a protocol violation
+      ctx.seal();           // any further inbound message is a protocol violation
+      await ctx.terminate(); // FIN our writable + STOP_SENDING the readable (§3.3.2)
       this.inboundRequestContexts.delete(requestId);
     }
     return true;
@@ -1635,9 +2712,39 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-16 §9.8, draft-ietf-moq-transport-18 §10.6
    */
   async rejectSubscribe(requestId: bigint, errorCode: bigint, reason: string): Promise<void> {
+    // Capture the context BEFORE any await: the subscriber may react to the
+    // REQUEST_ERROR by FINning its side immediately, and that close event
+    // removes the map entry mid-flow — the terminal FIN below must still run.
+    const rejectedCtx = this.inboundRequestContexts.get(requestId);
+    // §10.11: rejecting an inbound PUBLISH we are the subscriber of — tear down its
+    // route AND arm a late-object guard SYNCHRONOUSLY (before session.rejectSubscribe
+    // deletes the state and before the response-write await), so a subgroup object
+    // in flight after the REQUEST_ERROR cannot reach the rejected publication
+    // callback. Owner-checked so a reused alias's newer publication is untouched.
+    const incoming = this.session.getIncomingSubscription(requestId);
+    const pubAlias = incoming?.isPublishInitiated ? incoming.trackAlias : undefined;
+    const ownsRoute = pubAlias !== undefined && this.publishAliasMaps.get(pubAlias)?.requestId === requestId;
+    if (ownsRoute) this.armTerminatedAlias(pubAlias, null, /* strict */ false);
     const actions = this.session.rejectSubscribe(requestId, errorCode, reason);
-    if (await this.writeInboundRequestResponse(requestId, actions)) return;
+    if (await this.writeInboundRequestResponse(requestId, actions)) {
+      // §10.8: REQUEST_ERROR is the subscription's first AND terminal response
+      // — flush deferred update acknowledgements behind it, then close BOTH
+      // directions (FIN our writable, STOP_SENDING the readable): a rejected
+      // request stream must not stay half-open holding context or credit.
+      await this.flushDeferredUpdateResponses(requestId);
+      if (ownsRoute) await this.discardOpenStreamsForAlias(pubAlias);
+      if (rejectedCtx) {
+        rejectedCtx.seal();
+        try { await rejectedCtx.terminate(); } catch { /* peer already tore it down */ }
+        this.inboundRequestContexts.delete(requestId);
+      }
+      await this.settleParkedJoins(requestId, false);
+      return;
+    }
     await this.executeActions(actions);
+    if (ownsRoute) await this.discardOpenStreamsForAlias(pubAlias);
+    await this.flushDeferredUpdateResponses(requestId);
+    await this.settleParkedJoins(requestId, false);
   }
 
   /**
@@ -1653,8 +2760,59 @@ export class MoqtConnection {
    */
   async acceptFetch(requestId: bigint, options?: FetchAcceptOptions): Promise<void> {
     const actions = this.session.acceptFetch(requestId, options);
-    if (await this.writeInboundRequestResponse(requestId, actions)) return;
+    // §10.13: the Session has already transitioned the fetch to TRANSFERRING. On
+    // draft-18 the FETCH_OK rides the fetch's OWN bidi request stream, so if that
+    // write REJECTS the peer never received acceptance — roll back (drop the session
+    // fetch, revoke openFetchStream authorization, abort any response stream already
+    // opened before FETCH_OK) so no ghost accepted fetch survives, then propagate.
+    try {
+      if (await this.writeInboundRequestResponse(requestId, actions)) return;
+    } catch (err) {
+      await this.rollbackFailedFetchAcceptance(requestId);
+      throw err instanceof Error ? err : new Error(String(err));
+    }
     await this.executeActions(actions);
+  }
+
+  /**
+   * Roll back an inbound FETCH whose FETCH_OK failed to write (§10.13). Mirrors
+   * {@link rollbackFailedAcceptance}: the peer never saw acceptance, so revoke the
+   * openFetchStream authorization, abort any response stream already opened (opening
+   * before FETCH_OK is allowed, §10.12), terminate the fetch in the Session
+   * (§11.4.1), and tear the request stream down. The caller re-throws.
+   */
+  private async rollbackFailedFetchAcceptance(requestId: bigint): Promise<void> {
+    this.inboundFetchGroupOrder.delete(requestId);
+    this.fetchServeReserved.delete(requestId);
+    await this.abortFetchStreamsForRequest(requestId, 'fetch acceptance failed');
+    await this.executeActions(this.session.handleInboundRequestClosed(requestId));
+    const ctx = this.inboundRequestContexts.get(requestId);
+    this.inboundRequestContexts.delete(requestId);
+    if (ctx) { try { await ctx.abort(); } catch { /* already torn down */ } }
+  }
+
+  /**
+   * SYNCHRONOUSLY detach every open FETCH response stream serving `requestId` from
+   * the registry and return their writers. After this returns, sendFetchObject() /
+   * closeFetchStream() for those streams find no entry and fail — so a cancellation
+   * takes effect BEFORE any teardown await, closing the window in which a serve call
+   * could still write to a cancelled fetch. The caller aborts the returned writers.
+   */
+  private detachFetchStreamsForRequest(requestId: bigint): WritableStreamDefaultWriter<Uint8Array>[] {
+    const writers: WritableStreamDefaultWriter<Uint8Array>[] = [];
+    for (const [streamId, st] of [...this.fetchOutgoingStreams]) {
+      if (st.requestId !== requestId) continue;
+      this.fetchOutgoingStreams.delete(streamId);
+      writers.push(st.writer);
+    }
+    return writers;
+  }
+
+  /** Detach (synchronously) + abort every open FETCH response stream for `requestId`. */
+  private async abortFetchStreamsForRequest(requestId: bigint, reason: string): Promise<void> {
+    for (const writer of this.detachFetchStreamsForRequest(requestId)) {
+      try { await writer.abort(reason); } catch { /* already torn down */ }
+    }
   }
 
   /**
@@ -1667,7 +2825,18 @@ export class MoqtConnection {
    */
   async rejectFetch(requestId: bigint, errorCode: bigint, reason: string): Promise<void> {
     const actions = this.session.rejectFetch(requestId, errorCode, reason);
-    if (await this.writeInboundRequestResponse(requestId, actions)) return;
+    // §10.13: rejection DEAUTHORIZES the FETCH — drop its group-order entry so a
+    // later openFetchStream() for it is refused, AND abort any response stream the
+    // application already opened. openFetchStream() is explicitly allowed BEFORE
+    // FETCH_OK (§10.12), so a rejection must revoke an in-flight stream too — merely
+    // blocking future opens would leave earlier ones writable and let unsolicited
+    // fetch data reach a peer that received only REQUEST_ERROR.
+    this.inboundFetchGroupOrder.delete(requestId);
+    this.fetchServeReserved.delete(requestId);
+    await this.abortFetchStreamsForRequest(requestId, 'fetch rejected');
+    // finalize: a rejected FETCH's request stream is done — close both
+    // directions rather than leaving the context and reader pending (§3.3.2).
+    if (await this.writeInboundRequestResponse(requestId, actions, /* finalize */ true)) return;
     await this.executeActions(actions);
   }
 
@@ -1820,17 +2989,35 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-16 §9.15
    */
   async publishDone(requestId: bigint, statusCode: Varint, reason: string): Promise<void> {
+    // §10.11: PUBLISH_DONE is the terminal message AND carries the total Stream
+    // Count — it is refused while data streams for this subscription remain
+    // open OR an open/datagram-write operation is still in flight (a
+    // synchronous reservation, so this check cannot race a deferred stream
+    // creation). Close/await them first; their count is already included.
+    const open = this.openSubgroupsByRequest.get(requestId);
+    const inFlight = this.pendingPublishOps.get(requestId) ?? 0;
+    if ((open && open.size > 0) || inFlight > 0) {
+      throw new MoqtConnectionError(
+        `publishDone: ${(open?.size ?? 0)} open + ${inFlight} in-flight data operation(s) for request ${requestId} — finish them before PUBLISH_DONE (§10.11)`,
+        { errorSource: 'control' },
+      );
+    }
     const actions = this.session.publishDone(requestId, statusCode, reason);
+    this.openSubgroupsByRequest.delete(requestId);
+    // Terminal — retire the alias into the bounded LRU (a later send is still
+    // refused) so per-subscription churn does not accumulate for the session.
+    this.retirePublisherRequest(requestId);
     // draft-18 §10.11: PUBLISH_DONE has no wire Request ID — it is written on the
     // subscription's own bidi request stream (an accepted inbound SUBSCRIBE),
-    // then the stream is sealed and FIN'd. Not the uni control stream.
+    // then the stream is sealed and fully closed (FIN + STOP_SENDING). Not the
+    // uni control stream.
     if (this.session.draftVersion === 18) {
       const ctx = this.inboundRequestContexts.get(requestId);
       if (ctx) {
         const send = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
         if (send) await ctx.writeMessage(send.message);
         ctx.seal();
-        await ctx.finish();
+        await ctx.terminate();
         this.inboundRequestContexts.delete(requestId);
         return;
       }
@@ -1843,6 +3030,150 @@ export class MoqtConnection {
       }
     }
     await this.executeActions(actions);
+  }
+
+  /**
+   * Resolve the publisher-side subscription serving `trackAlias`, when the
+   * alias was associated via acceptSubscribe() / publish(). Returns undefined
+   * for an unassociated alias (raw data-plane use with no subscription — the
+   * legacy behavior, unaccounted). A known alias whose subscription is gone or
+   * TERMINATED yields `sub: undefined` — the caller must refuse to send.
+   */
+  private publisherSubscriptionForAlias(
+    trackAlias: bigint,
+  ): { requestId: bigint; sub: SubscriptionStateMachine | undefined } | undefined {
+    const requestId = this.publisherAliasRequests.get(trackAlias);
+    if (requestId === undefined) {
+      // A recently-retired alias: still refuse sends (sub undefined) so a
+      // post-termination open is rejected, until it ages out of the bounded LRU.
+      const retired = this.retiredPublisherAliases.get(trackAlias);
+      if (retired !== undefined) return { requestId: retired, sub: undefined };
+      return undefined; // unassociated (never ours, or aged out) — legacy path
+    }
+    const sub = this.session.getIncomingSubscription(requestId)
+      ?? this.session.getOutgoingPublish(requestId);
+    if (sub && sub.state === SubscriptionState.TERMINATED) return { requestId, sub: undefined };
+    return { requestId, sub };
+  }
+
+  /**
+   * Retire a publisher subscription's alias on termination: move it from the
+   * active map into the bounded retired LRU (still refused), and drop its
+   * generation. Evicts the oldest retired alias past the cap so cumulative
+   * subscription churn stays bounded.
+   */
+  private retirePublisherRequest(requestId: bigint): void {
+    for (const [alias, rid] of this.publisherAliasRequests) {
+      if (rid !== requestId) continue;
+      this.publisherAliasRequests.delete(alias);
+      if (this.retiredPublisherAliases.size >= MoqtConnection.MAX_RETIRED_PUBLISHER_ALIASES) {
+        const oldest = this.retiredPublisherAliases.keys().next().value;
+        if (oldest !== undefined) this.retiredPublisherAliases.delete(oldest);
+      }
+      this.retiredPublisherAliases.set(alias, requestId);
+      break;
+    }
+    // NOTE: publisherGeneration is NOT deleted here — an in-flight openSubgroup
+    // captured before cancellation still checks it. It is bounded separately by
+    // {@link boundPublisherGeneration}, which only evicts entries with no
+    // pending op so an in-flight generation is never lost.
+  }
+
+  /** Cap publisherGeneration: evict the oldest entry that has no pending op. */
+  private boundPublisherGeneration(): void {
+    if (this.publisherGeneration.size <= MoqtConnection.MAX_RETIRED_PUBLISHER_ALIASES) return;
+    for (const rid of this.publisherGeneration.keys()) {
+      if (!this.pendingPublishOps.has(rid)) { this.publisherGeneration.delete(rid); break; }
+    }
+  }
+
+  /**
+   * Begin a publisher data-plane operation on `trackAlias`: refuse if the
+   * subscription is terminated, else SYNCHRONOUSLY reserve the in-flight slot
+   * (so a concurrent publishDone sees it and refuses) and return the
+   * association. Balanced by {@link endPublishOp} in a finally. Returns
+   * undefined for an unassociated alias (legacy unaccounted use).
+   */
+  private beginPublishOp(
+    trackAlias: bigint,
+    what: string,
+  ): { requestId: bigint; sub: SubscriptionStateMachine; generation: number } {
+    const assoc = this.publisherSubscriptionForAlias(trackAlias);
+    // The public API documents trackAlias as coming from acceptSubscribe() /
+    // publish(). An UNKNOWN alias (never associated, or aged out of the retired
+    // LRU) is rejected — never silently published with no accounting.
+    if (!assoc) {
+      throw new MoqtConnectionError(
+        `${what}: unknown track alias ${trackAlias} — not from acceptSubscribe()/publish()`,
+        { errorSource: 'data' },
+      );
+    }
+    if (!assoc.sub) {
+      throw new MoqtConnectionError(
+        `${what}: the subscription for track alias ${trackAlias} is terminated — no further objects (§10.11)`,
+        { errorSource: 'data' },
+      );
+    }
+    this.pendingPublishOps.set(assoc.requestId, (this.pendingPublishOps.get(assoc.requestId) ?? 0) + 1);
+    // Capture the generation now: if it is bumped (cancellation) before the
+    // operation's transport stream resolves, the op invalidates itself.
+    const generation = this.publisherGeneration.get(assoc.requestId) ?? 0;
+    return { requestId: assoc.requestId, sub: assoc.sub, generation };
+  }
+
+  /** Whether the captured op generation is still current (not cancelled). */
+  private publisherOpCurrent(requestId: bigint, generation: number): boolean {
+    return (this.publisherGeneration.get(requestId) ?? 0) === generation;
+  }
+
+  /** Release an in-flight publisher operation reserved by {@link beginPublishOp}. */
+  private endPublishOp(requestId: bigint | undefined): void {
+    if (requestId === undefined) return;
+    const n = (this.pendingPublishOps.get(requestId) ?? 0) - 1;
+    if (n > 0) {
+      this.pendingPublishOps.set(requestId, n);
+    } else {
+      // Last in-flight op released — NOW the generation map may be bounded (its
+      // entry no longer needs preserving to invalidate this op). Deferred here from
+      // abortPublisherStreamsForRequest so a live reservation is never dropped early.
+      this.pendingPublishOps.delete(requestId);
+      this.boundPublisherGeneration();
+    }
+  }
+
+  /**
+   * §5.1.1: the subscriber cancelled a subscription — RESET_STREAM every
+   * publisher subgroup stream still open for it and drop the stream accounting.
+   * The alias→request association is retained so a subsequent openSubgroup /
+   * sendDatagram is refused (terminated), never silently accepted.
+   */
+  private async abortPublisherStreamsForRequest(requestId: bigint): Promise<void> {
+    // Bump the generation FIRST (synchronously): any openSubgroup already past
+    // its beginPublishOp but still awaiting createUnidirectionalStream will, on
+    // resolving, see the stale generation and abort itself instead of emitting
+    // a stream for the cancelled subscription.
+    this.publisherGeneration.set(requestId, (this.publisherGeneration.get(requestId) ?? 0) + 1);
+    const open = this.openSubgroupsByRequest.get(requestId);
+    if (open) {
+      for (const sid of [...open]) {
+        const st = this.outgoingStreams.get(sid);
+        if (st) {
+          try { await st.writer.abort(new Error('subscription cancelled — RESET_STREAM (§5.1.1)')); } catch { /* already gone */ }
+          this.outgoingStreams.delete(sid);
+        }
+      }
+      this.openSubgroupsByRequest.delete(requestId);
+    }
+    // Do NOT delete pendingPublishOps here: an openSubgroup already past its
+    // beginPublishOp but still awaiting createUnidirectionalStream holds a live
+    // reservation. Preserving it keeps boundPublisherGeneration from evicting the
+    // just-bumped generation (which would let the resolving op default to gen 0 and
+    // false-positive as current). The op's own endPublishOp finally releases it and
+    // bounds the map — after it has correctly seen the bumped generation and aborted.
+    // Retire the alias (bounded LRU) so cumulative churn stays bounded, and cap the
+    // generation map (skips any request that still has a pending op).
+    this.retirePublisherRequest(requestId);
+    this.boundPublisherGeneration();
   }
 
   /**
@@ -1890,59 +3221,130 @@ export class MoqtConnection {
         { errorSource: 'transport' },
       );
     }
-
-    let writable: WritableStream<Uint8Array>;
+    // §10.11: no new data streams for a terminated subscription. Reserve the
+    // operation SYNCHRONOUSLY (before any await) so a concurrent publishDone
+    // sees it in flight and refuses — the terminated check and the reservation
+    // are one atomic step, not a pre-await check that a deferred stream
+    // creation could slip past.
+    const assoc = this.beginPublishOp(trackAlias, 'openSubgroup');
     try {
-      writable = await this.transport.createUnidirectionalStream();
-    } catch (err) {
-      // Stream limit exhausted — relay hasn't granted enough MAX_STREAMS
-      // or WT_MAX_STREAMS credit. This is not a protocol error; it means
-      // the peer's flow control window is full.
-      // @see draft-ietf-webtrans-http3-15 §5.3 (session-level stream limits)
-      // @see RFC 9000 §4.6 (QUIC stream limits)
-      throw new MoqtConnectionError(
-        `Failed to open unidirectional stream for group ${groupId}: ${(err as Error).message ?? err}. ` +
-        `The relay may not be granting enough stream credits (MAX_STREAMS / WT_MAX_STREAMS).`,
-        { errorSource: 'transport', isFatal: false, ...(err instanceof Error ? { cause: err } : {}) },
-      );
+      let writable: WritableStream<Uint8Array>;
+      try {
+        writable = await this.transport.createUnidirectionalStream();
+      } catch (err) {
+        // Stream limit exhausted — relay hasn't granted enough MAX_STREAMS
+        // or WT_MAX_STREAMS credit. This is not a protocol error; it means
+        // the peer's flow control window is full.
+        // @see draft-ietf-webtrans-http3-15 §5.3 (session-level stream limits)
+        // @see RFC 9000 §4.6 (QUIC stream limits)
+        throw new MoqtConnectionError(
+          `Failed to open unidirectional stream for group ${groupId}: ${(err as Error).message ?? err}. ` +
+          `The relay may not be granting enough stream credits (MAX_STREAMS / WT_MAX_STREAMS).`,
+          { errorSource: 'transport', isFatal: false, ...(err instanceof Error ? { cause: err } : {}) },
+        );
+      }
+      const writer = writable.getWriter();
+
+      // §5.1.1: if the subscription was cancelled while we awaited the transport
+      // stream, this open is stale — abort the fresh writer and reject WITHOUT
+      // writing a header, registering the stream, or counting it. Nothing for
+      // the cancelled subscription reaches the wire.
+      if (assoc && !this.publisherOpCurrent(assoc.requestId, assoc.generation)) {
+        try { await writer.abort(new Error('subgroup open cancelled before header (§5.1.1)')); } catch { /* already gone */ }
+        throw new MoqtConnectionError(
+          `openSubgroup: subscription for track alias ${trackAlias} was cancelled while opening the stream (§5.1.1)`,
+          { errorSource: 'data' },
+        );
+      }
+
+      // §10.11: the transport stream now exists — count it toward the
+      // subscription's PUBLISH_DONE Stream Count IMMEDIATELY, track it as OPEN,
+      // and REGISTER the writer, all BEFORE writing the header. Registering the
+      // writer first is what lets a cancellation DURING the header write find
+      // and abort it (abortPublisherStreamsForRequest walks outgoingStreams) —
+      // otherwise a stale open would resurrect the stream. If the header write
+      // (or setup) fails or the op was cancelled, the stream is aborted and
+      // removed from the OPEN set, but its Stream Count is retained (§10.11).
+      const streamId = this.nextOutgoingStreamId++;
+      this.outgoingStreams.set(streamId, {
+        writer,
+        hasExtensions: opts?.hasExtensions ?? false,
+        previousObjectId: 0n,
+        isFirstObject: true,
+        ...(assoc ? { subscriptionRequestId: assoc.requestId } : {}),
+      });
+      if (assoc?.sub) {
+        assoc.sub.incrementStreamCount();
+        let open = this.openSubgroupsByRequest.get(assoc.requestId);
+        if (!open) {
+          open = new Set();
+          this.openSubgroupsByRequest.set(assoc.requestId, open);
+        }
+        open.add(streamId);
+      }
+
+      const dropStreamKeepingCount = async (err: unknown): Promise<void> => {
+        try { await writer.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
+        if (assoc) {
+          const open = this.openSubgroupsByRequest.get(assoc.requestId);
+          if (open) {
+            open.delete(streamId);
+            if (open.size === 0) this.openSubgroupsByRequest.delete(assoc.requestId);
+          }
+        }
+        this.outgoingStreams.delete(streamId);
+      };
+
+      try {
+        // Build the type byte from flags. Bit 4 (SUBGROUP_MARKER 0x10) is always set;
+        // bits 1-2 are the subgroup-ID mode. draft-18 renamed EXTENSIONS→PROPERTIES
+        // (bit 0x01) vs draft-14/16 (0x20), so the flag bit differs by version.
+        const mode = opts?.subgroupIdMode ?? SubgroupIdMode.EXPLICIT;
+        const d18 = this.session.draftVersion === 18;
+        let typeByte = SubgroupFlags.SUBGROUP_MARKER | (mode << 1);
+        if (opts?.hasExtensions) typeByte |= d18 ? SubgroupFlags18.PROPERTIES : SubgroupFlags.EXTENSIONS;
+        if (opts?.endOfGroup) typeByte |= d18 ? SubgroupFlags18.END_OF_GROUP : SubgroupFlags.END_OF_GROUP;
+        if (opts?.defaultPriority) typeByte |= d18 ? SubgroupFlags18.DEFAULT_PRIORITY : SubgroupFlags.DEFAULT_PRIORITY;
+        if (opts?.firstObject) typeByte |= SubgroupFlags18.FIRST_OBJECT; // d18-only; validated above
+
+        const header: SubgroupHeader = {
+          typeByte,
+          trackAlias,
+          groupId,
+          subgroupId,
+          // publisherPriority present unless DEFAULT_PRIORITY bit is set
+          publisherPriority: opts?.defaultPriority ? undefined : (opts?.publisherPriority ?? 128),
+          hasExtensions: opts?.hasExtensions ?? false,
+          isEndOfGroup: opts?.endOfGroup ?? false,
+          isFirstObjectInSubgroup: opts?.firstObject ?? false,
+        };
+
+        const headerBytes = d18 ? encodeSubgroupHeader18(header) : encodeSubgroupHeader(header);
+        await writer.write(headerBytes);
+
+        // §5.1.1: a cancellation that raced the header write (bumping the
+        // generation) must NOT leave a live stream for a dead subscription.
+        // Recheck AFTER the write; if stale, abort and reject (count retained).
+        if (assoc && !this.publisherOpCurrent(assoc.requestId, assoc.generation)) {
+          await dropStreamKeepingCount(new Error('subgroup open cancelled during header write (§5.1.1)'));
+          throw new MoqtConnectionError(
+            `openSubgroup: subscription for track alias ${trackAlias} was cancelled while writing the header (§5.1.1)`,
+            { errorSource: 'data' },
+          );
+        }
+        return streamId;
+      } catch (err) {
+        // Header encode/write failed (or the recheck above rejected): abort +
+        // drop from the OPEN set (so PUBLISH_DONE is not blocked), keep the count.
+        // If dropStreamKeepingCount already ran (recheck path), this is idempotent.
+        if (this.outgoingStreams.has(streamId)) await dropStreamKeepingCount(err);
+        throw err;
+      }
+    } finally {
+      // The open is now recorded (open-stream set) or failed — release the
+      // in-flight reservation either way.
+      this.endPublishOp(assoc?.requestId);
     }
-    const writer = writable.getWriter();
-
-    // Build the type byte from flags. Bit 4 (SUBGROUP_MARKER 0x10) is always set;
-    // bits 1-2 are the subgroup-ID mode. draft-18 renamed EXTENSIONS→PROPERTIES
-    // (bit 0x01) vs draft-14/16 (0x20), so the flag bit differs by version.
-    const mode = opts?.subgroupIdMode ?? SubgroupIdMode.EXPLICIT;
-    const d18 = this.session.draftVersion === 18;
-    let typeByte = SubgroupFlags.SUBGROUP_MARKER | (mode << 1);
-    if (opts?.hasExtensions) typeByte |= d18 ? SubgroupFlags18.PROPERTIES : SubgroupFlags.EXTENSIONS;
-    if (opts?.endOfGroup) typeByte |= d18 ? SubgroupFlags18.END_OF_GROUP : SubgroupFlags.END_OF_GROUP;
-    if (opts?.defaultPriority) typeByte |= d18 ? SubgroupFlags18.DEFAULT_PRIORITY : SubgroupFlags.DEFAULT_PRIORITY;
-    if (opts?.firstObject) typeByte |= SubgroupFlags18.FIRST_OBJECT; // d18-only; validated above
-
-    const header: SubgroupHeader = {
-      typeByte,
-      trackAlias,
-      groupId,
-      subgroupId,
-      // publisherPriority present unless DEFAULT_PRIORITY bit is set
-      publisherPriority: opts?.defaultPriority ? undefined : (opts?.publisherPriority ?? 128),
-      hasExtensions: opts?.hasExtensions ?? false,
-      isEndOfGroup: opts?.endOfGroup ?? false,
-      isFirstObjectInSubgroup: opts?.firstObject ?? false,
-    };
-
-    const headerBytes = d18 ? encodeSubgroupHeader18(header) : encodeSubgroupHeader(header);
-    await writer.write(headerBytes);
-
-    const streamId = this.nextOutgoingStreamId++;
-    this.outgoingStreams.set(streamId, {
-      writer,
-      hasExtensions: opts?.hasExtensions ?? false,
-      previousObjectId: 0n,
-      isFirstObject: true,
-    });
-
-    return streamId;
   }
 
   /**
@@ -2007,25 +3409,32 @@ export class MoqtConnection {
     if (!this.transport?.datagrams) {
       throw new MoqtConnectionError('Transport does not support datagrams', { errorSource: 'transport' });
     }
-    const bytes = encodeObjectDatagram18({
-      typeByte: 0x00, // plain OBJECT_DATAGRAM: priority present, no flags
-      trackAlias,
-      groupId,
-      objectId,
-      publisherPriority: opts?.publisherPriority ?? 128,
-      isEndOfGroup: false,
-      extensions: undefined,
-      payload,
-      status: undefined,
-    });
-    const writer = this.transport.datagrams.writable?.getWriter();
-    if (!writer) {
-      throw new MoqtConnectionError('Transport datagrams are not writable', { errorSource: 'transport' });
-    }
+    // §10.11: no datagrams for a terminated subscription; reserve the operation
+    // synchronously so a concurrent publishDone refuses (see openSubgroup).
+    const assoc = this.beginPublishOp(trackAlias, 'sendDatagram');
     try {
-      await writer.write(bytes);
+      const bytes = encodeObjectDatagram18({
+        typeByte: 0x00, // plain OBJECT_DATAGRAM: priority present, no flags
+        trackAlias,
+        groupId,
+        objectId,
+        publisherPriority: opts?.publisherPriority ?? 128,
+        isEndOfGroup: false,
+        extensions: undefined,
+        payload,
+        status: undefined,
+      });
+      const writer = this.transport.datagrams.writable?.getWriter();
+      if (!writer) {
+        throw new MoqtConnectionError('Transport datagrams are not writable', { errorSource: 'transport' });
+      }
+      try {
+        await writer.write(bytes);
+      } finally {
+        writer.releaseLock();
+      }
     } finally {
-      writer.releaseLock();
+      this.endPublishOp(assoc?.requestId);
     }
   }
 
@@ -2045,6 +3454,13 @@ export class MoqtConnection {
       // Stream may already be closed — ignore
     }
     this.outgoingStreams.delete(streamId);
+    if (state.subscriptionRequestId !== undefined) {
+      const open = this.openSubgroupsByRequest.get(state.subscriptionRequestId);
+      if (open) {
+        open.delete(streamId);
+        if (open.size === 0) this.openSubgroupsByRequest.delete(state.subscriptionRequestId);
+      }
+    }
   }
 
   /**
@@ -2071,11 +3487,46 @@ export class MoqtConnection {
     if (!this.transport?.createUnidirectionalStream) {
       throw new MoqtConnectionError('Transport does not support createUnidirectionalStream', { errorSource: 'transport' });
     }
+    // §11.4.4: a FETCH response uses EXACTLY ONE unidirectional stream. Reserve the
+    // request ATOMICALLY (synchronously, before any await) so a concurrent second
+    // open is refused, and the reservation is RETAINED after the stream FINs — a
+    // request whose one stream is done cannot reopen. The reservation is released
+    // only when the inbound FETCH itself is torn down (reject / cancel / close).
+    if (this.fetchServeReserved.has(requestId)) {
+      throw new MoqtConnectionError(`FETCH ${requestId} already has its one response stream (§11.4.4)`, { errorSource: 'data' });
+    }
+    this.fetchServeReserved.add(requestId);
     const writer = (await this.transport.createUnidirectionalStream()).getWriter();
-    await writer.write(encodeFetchHeader18(requestId));
-
+    // §10.13: authorization was validated BEFORE the createUnidirectionalStream
+    // await. A rejectFetch() or a request-stream close during that await
+    // deauthorizes the FETCH SYNCHRONOUSLY (its group-order entry is dropped before
+    // any teardown await). Re-check BEFORE writing the FETCH_HEADER — so a fetch
+    // rejected/cancelled during stream creation transmits NOTHING and does not
+    // RESURRECT itself. Abort the freshly-opened stream and refuse.
+    if (!this.inboundFetchGroupOrder.has(requestId)) {
+      this.fetchServeReserved.delete(requestId); // no stream established — release the reservation
+      try { await writer.abort(new Error('inbound FETCH deauthorized during stream open')); } catch { /* already down */ }
+      throw new MoqtConnectionError(`No admitted inbound FETCH for request ${requestId}`, { errorSource: 'data' });
+    }
+    try {
+      await writer.write(encodeFetchHeader18(requestId));
+    } catch (err) {
+      // The FETCH_HEADER write failed: the stream is unusable — abort it so it is
+      // not left half-open, and surface the failure (do not register a dead writer).
+      this.fetchServeReserved.delete(requestId); // no stream established — release the reservation
+      try { await writer.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already down */ }
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+    // Re-check once more after the header write (single-threaded: no await between
+    // this and the register below, so they are atomic) — a cancellation could have
+    // landed during the header write itself.
+    if (!this.inboundFetchGroupOrder.has(requestId)) {
+      this.fetchServeReserved.delete(requestId);
+      try { await writer.abort(new Error('inbound FETCH deauthorized during stream open')); } catch { /* already down */ }
+      throw new MoqtConnectionError(`No admitted inbound FETCH for request ${requestId}`, { errorSource: 'data' });
+    }
     const streamId = this.nextOutgoingStreamId++;
-    this.fetchOutgoingStreams.set(streamId, { writer, groupOrder, prior: undefined, isFirstObject: true });
+    this.fetchOutgoingStreams.set(streamId, { requestId, writer, groupOrder, prior: undefined, isFirstObject: true });
     return streamId;
   }
 
@@ -2105,6 +3556,22 @@ export class MoqtConnection {
     if (!state) return;
     try { await state.writer.close(); } catch { /* already closed */ }
     this.fetchOutgoingStreams.delete(streamId);
+    // §10.13: the publisher finished serving — RECLAIM the accepted incoming fetch in
+    // the Session so serving-side state is bounded. Do NOT release the one-stream
+    // reservation: §11.4.4 permits EXACTLY ONE response stream per fetch, and that
+    // limit SURVIVES the FIN — a second openFetchStream() must still be refused. The
+    // reservation, the group-order authorization, and the inbound request context are
+    // all released when the inbound FETCH request stream itself is torn down (reject /
+    // cancel / the FETCHER's request-stream FIN — see onInboundStreamClosed).
+    //
+    // The publisher MUST NOT terminate its request-stream context here: §5.2/§10.12
+    // deliver the FETCH_OK and the object data on INDEPENDENT streams with no ordering
+    // between them, so FINning the request stream on completion could reach the
+    // fetcher BEFORE its data stream and make the fetcher discard valid data. The
+    // FETCHER owns final request-stream closure once it has observed BOTH the FETCH_OK
+    // and the data FIN (see closeCompletedFetchRequest); that FIN then drives the
+    // publisher's own context teardown through the normal inbound-close path.
+    this.session.reclaimServedFetch(state.requestId);
   }
 
   // ─── Internal ─────────────────────────────────────────────────
@@ -2171,6 +3638,24 @@ export class MoqtConnection {
           this.onNamespaceMessage?.(action.requestId as bigint, action.message);
           break;
         }
+        case 'cancel_request': {
+          // §5.1: the Session cancelled a local request out of band (a PENDING
+          // SUBSCRIBE superseded by a peer PUBLISH for the same track). Reject its
+          // still-pending subscribeTrack(), drop its routing, and (draft-18) reset
+          // its request stream — the Session already tore down its own state.
+          const raw = this.rawSubscriptions.get(action.requestId);
+          if (raw) {
+            this.rawSubscriptions.delete(action.requestId);
+            raw.reject?.(new MoqtConnectionError(action.reason, { errorSource: 'control', isFatal: false }));
+            raw.resolve = null;
+            raw.reject = null;
+          }
+          for (const [alias, st] of this.rawAliasMaps) {
+            if (st.requestId === action.requestId) this.rawAliasMaps.delete(alias);
+          }
+          if (this.session.draftVersion === 18) await this.uniPair?.cancelRequest(action.requestId);
+          break;
+        }
         case 'close_stream':
         case 'reset_stream':
         case 'open_data_stream':
@@ -2200,14 +3685,9 @@ export class MoqtConnection {
         if (done) {
           // §3.2: "The control stream MUST NOT be closed at the underlying
           // transport layer during the session's lifetime. Doing so results
-          // in the session being closed as a PROTOCOL_VIOLATION."
-          const actions = this.session.close(
-            SessionError.PROTOCOL_VIOLATION,
-            'Control stream closed unexpectedly',
-          );
-          await this.executeActions(actions);
-          this.onClose?.(0x3, 'Control stream closed unexpectedly');
-          this.failPendingRawSubscriptions('Control stream closed unexpectedly');
+          // in the session being closed as a PROTOCOL_VIOLATION." One-shot
+          // terminal coordinator (idempotent with a concurrent transport close).
+          this.closeSessionFatal('Control stream closed unexpectedly');
           break;
         }
 
@@ -2221,13 +3701,7 @@ export class MoqtConnection {
           // Message Payload, the receiver MUST close the session with a
           // PROTOCOL_VIOLATION."
           const drainMsg = drainErr instanceof Error ? drainErr.message : String(drainErr);
-          const actions = this.session.close(
-            SessionError.PROTOCOL_VIOLATION,
-            `Malformed control message: ${drainMsg}`,
-          );
-          await this.executeActions(actions);
-          this.onClose?.(0x3, `Malformed control message: ${drainMsg}`);
-          this.failPendingRawSubscriptions(`Malformed control message: ${drainMsg}`);
+          this.closeSessionFatal(`Malformed control message: ${drainMsg}`);
           return;
         }
         for (const framed of messages) {
@@ -2237,33 +3711,98 @@ export class MoqtConnection {
           // (Slice C); until then this single-bidi-control path only carries
           // draft-14/16, so the narrowing is sound.
           const message = framed.message as ControlMessage;
+          // SUBSCRIBE_OK: same ordered handling as draft-18 (session validation →
+          // terminal-on-close → alias-reuse policy → bind/resolve). Do NOT let the
+          // generic path bind/resolve before the session validates. Emit qlog HERE
+          // (the raw channel) before the ordered handling, since `continue` skips
+          // the generic qlog below and handleSubscribeOkOrdered no longer emits.
+          if (message.type === 'SUBSCRIBE_OK') {
+            this.onQlogEvent?.({
+              type: 'control_message_parsed',
+              stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
+              message,
+            });
+            await this.handleSubscribeOkOrdered(message, (message as { requestId: bigint }).requestId);
+            continue;
+          }
           this.onQlogEvent?.({
             type: 'control_message_parsed',
             stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
             message,
           });
+          // §10.11 / §9.15: a subscriber-side PUBLISH_DONE terminates the
+          // subscription — apply its Stream Count so the alias routing is torn
+          // down and late streams are bounded/discarded (parity with draft-18).
+          // Capture the alias BEFORE the session reclaims the subscription.
+          const doneAlias = message.type === 'PUBLISH_DONE'
+            ? this.session.getSubscription((message as { requestId: bigint }).requestId)?.trackAlias
+            : undefined;
           // Intercept track subscription responses before onMessage.
           // Session still processes them (alias mapping, state machine).
-          const suppressOnMessage = this.handleRawSubControlMessage(message);
+          // §5.1: also suppress a response (e.g. REQUEST_ERROR) crossing a
+          // cancellation — the session consumes it as a tombstone, so it is not an
+          // application event (qlog above stays raw), consistent with SUBSCRIBE_OK.
+          const crossedCancel = 'requestId' in message
+            && this.session.isCancelledRequest((message as { requestId: bigint }).requestId);
+          const suppressOnMessage = this.handleRawSubControlMessage(message) || crossedCancel;
           if (!suppressOnMessage) {
             this.onMessage?.(message);
           }
+          // Arm the terminal guard + remove the route SYNCHRONOUSLY (before the
+          // session-teardown await) so no late object slips through the window.
+          const doneDiscard = message.type === 'PUBLISH_DONE' && doneAlias !== undefined
+            ? this.applyTerminalStreamCount(doneAlias,
+                BigInt((message as { streamCount?: bigint }).streamCount ?? 0n),
+                (message as { requestId: bigint }).requestId)
+            : Promise.resolve();
+          // §9.5: onSubscribe fires only for a request the session ADMITTED as a
+          // NEW subscription. Capture the pre-existing entry (if any) BEFORE
+          // processing: a rejected duplicate creates no state (post === undefined),
+          // and a SUBSCRIBE reusing a live request ID is a fatal INVALID_REQUEST_ID
+          // whose OLD entry persists (post === pre) — neither must fire the callback.
+          const subBefore = message.type === 'SUBSCRIBE'
+            ? this.session.getIncomingSubscription((message as Subscribe).requestId)
+            : undefined;
           const actions = this.session.handleControlMessage(message);
           await this.executeActions(actions);
-          // §9.5: Fire onSubscribe AFTER session processes the SUBSCRIBE
-          // (so incomingSubscriptions is populated when acceptSubscribe is called)
+          await doneDiscard;
+          // Fire AFTER session processing so incomingSubscriptions is populated
+          // when acceptSubscribe is called (§5.1: admission = a NEW SM identity,
+          // and the session did not close on this message).
           if (message.type === 'SUBSCRIBE' && this.onSubscribe) {
             const sub = message as Subscribe;
-            this.onSubscribe(sub.requestId, sub.trackNamespace, sub.trackName, sub.parameters as Map<bigint, any>);
+            const subAfter = this.session.getIncomingSubscription(sub.requestId);
+            if (subAfter !== undefined && subAfter !== subBefore
+                && this.session.state !== SessionState.CLOSED) {
+              this.onSubscribe(sub.requestId, sub.trackNamespace, sub.trackName, sub.parameters as Map<bigint, any>);
+            }
+          }
+          // §5.1.1 (draft-14/16): an inbound UNSUBSCRIBE cancels the
+          // subscription — RESET the publisher's open data streams for it.
+          if (message.type === 'UNSUBSCRIBE') {
+            await this.abortPublisherStreamsForRequest((message as { requestId: bigint }).requestId);
+          }
+          // §9.18 (draft-14/16): an inbound FETCH_CANCEL — the fetcher stopped
+          // (from PENDING or TRANSFERRING). Abort any response stream we opened for
+          // it so we no longer write data for a fetch the peer abandoned.
+          if (message.type === 'FETCH_CANCEL') {
+            await this.abortFetchStreamsForRequest((message as { requestId: bigint }).requestId, 'inbound FETCH_CANCEL');
           }
         }
       }
     } catch (err) {
-      this.onError?.(new MoqtConnectionError(
-        err instanceof Error ? err.message : String(err),
-        { errorSource: 'control', ...(err instanceof Error ? { cause: err } : {}) },
-      ));
-      this.failPendingRawSubscriptions(err instanceof Error ? err.message : String(err));
+      // A control-loop read failure is terminal for the session. The 0x2 code is
+      // SYNTHETIC (the real reason lives in transport.closed) — mark the report
+      // preliminary so an authoritative transport.closed, even one settling in a
+      // later task, owns the reported code/reason (bounded fallback otherwise).
+      const message = err instanceof Error ? err.message : String(err);
+      if (!this._terminated) {
+        this.onError?.(new MoqtConnectionError(
+          message,
+          { errorSource: 'control', ...(err instanceof Error ? { cause: err } : {}) },
+        ));
+      }
+      this.terminate(0x2, message, { preliminary: true });
     }
   }
 
@@ -2318,6 +3857,12 @@ export class MoqtConnection {
             continue;
           }
           const { datagram } = this.dataCodec!.decodeObjectDatagram(bytes, 0);
+          // §10.11 early-discard: a datagram for an alias whose PUBLISH_DONE
+          // already arrived is dropped (datagrams do not count toward the
+          // Stream Count, so the tombstone is not decremented).
+          if (this.terminatedAliases.has(datagram.trackAlias as bigint)) {
+            continue;
+          }
           this.onQlogEvent?.({
             type: 'object_datagram_parsed',
             track_alias: datagram.trackAlias as bigint,
@@ -2337,12 +3882,7 @@ export class MoqtConnection {
           // §10.3.1, §10: Protocol violations (invalid flags, zero-length
           // extensions, extensions on status datagrams) MUST close the session.
           if (err instanceof ProtocolViolationError) {
-            const actions = this.session.close(
-              SessionError.PROTOCOL_VIOLATION,
-              err.message,
-            );
-            await this.executeActions(actions);
-            this.onClose?.(0x3, err.message);
+            this.closeSessionFatal(err.message);
             return;
           }
           // RangeError = truncated/malformed datagram (e.g. stray H3 capsule
@@ -2358,6 +3898,9 @@ export class MoqtConnection {
         }
       }
     } catch (err) {
+      // A real transport close makes this read throw AFTER terminal shutdown —
+      // do not emit a spurious post-close error event.
+      if (this._terminated || this.session.state === SessionState.CLOSED) return;
       this.onError?.(new MoqtConnectionError(
         err instanceof Error ? err.message : String(err),
         { errorSource: 'transport', ...(err instanceof Error ? { cause: err } : {}) },
@@ -2419,6 +3962,7 @@ export class MoqtConnection {
       const requestId = ctx.requestId;
       await this.executeActions(this.session.handleInboundPublishNamespaceClosed(requestId));
       this.inboundRequestContexts.delete(requestId);
+      await ctx.terminate(); // release our half — no half-open stream retained
       this.onPublishNamespaceClosed?.(requestId);
       return; // FIN/reset here is a normal withdrawal, not an error
     }
@@ -2426,6 +3970,7 @@ export class MoqtConnection {
       const requestId = ctx.requestId;
       await this.executeActions(this.session.handleInboundSubscribeNamespaceClosed(requestId));
       this.inboundRequestContexts.delete(requestId);
+      await ctx.terminate(); // release our half — no half-open stream retained
       this.onSubscribeNamespaceClosed?.(requestId);
       return; // FIN/reset here is the §10.18 cancellation, not an error
     }
@@ -2433,6 +3978,7 @@ export class MoqtConnection {
       const requestId = ctx.requestId;
       await this.executeActions(this.session.handleInboundSubscribeTracksClosed(requestId));
       this.inboundRequestContexts.delete(requestId);
+      await ctx.terminate(); // release our half — no half-open stream retained
       this.onSubscribeTracksClosed?.(requestId);
       return; // FIN/reset here is the §10.19 cancellation, not an error
     }
@@ -2447,13 +3993,65 @@ export class MoqtConnection {
     if (ctx.requestId !== null) {
       // §3.3.2: a FIN/reset on any other bound inbound request stream (PUBLISH /
       // SUBSCRIBE / FETCH / TRACK_STATUS) is a normal lifecycle end / cancellation
-      // — clean up the request, do NOT surface it as an error. (Alias routing for
-      // an inbound PUBLISH is intentionally left intact for late data streams.)
+      // — clean up the request, do NOT surface it as an error.
       const requestId = ctx.requestId;
       const wasSubscribe = ctx.openerKind === 'subscribe';
+      // §11.1: an inbound PUBLISH ending must ALSO tear down its adapter routing
+      // and arm a bounded late-object guard (not retain publishAliasMaps forever)
+      // — but only for the route THIS request still owns (found by requestId), so
+      // a reused alias's newer publication is untouched. Captured before the
+      // session teardown below (which unregisters the session alias).
+      const pubAlias = ctx.openerKind === 'publish'
+        ? [...this.publishAliasMaps].find(([, p]) => p.requestId === requestId)?.[0]
+        : undefined;
+      // SYNCHRONOUS route removal + tombstone install + FETCH deauthorization
+      // (before the FIRST await) so nothing can slip through the teardown window:
+      //   - a late object can't route (armTerminatedAlias drops publishAliasMaps);
+      //   - a concurrent openFetchStream() can't open a response stream for the
+      //     cancelled FETCH — its group-order authorization is gone before we await,
+      //     and its post-await re-check now fails (§10.13). Deauthorizing only AFTER
+      //     the session-teardown await left a window in which a new stream opened.
+      if (pubAlias !== undefined) this.armTerminatedAlias(pubAlias, null, /* strict */ false);
+      this.inboundFetchGroupOrder.delete(requestId);
+      this.fetchServeReserved.delete(requestId); // the one-stream reservation is released on teardown
+      this.inboundPublishTimeouts.delete(requestId); // never-accepted inbound PUBLISH
+      // §10.13: DETACH every open FETCH response stream SYNCHRONOUSLY (before the
+      // first await), so sendFetchObject()/closeFetchStream() for this cancelled
+      // fetch fail immediately rather than continuing to write during the teardown
+      // awaits below. The writers are aborted afterward.
+      const fetchWriters = this.detachFetchStreamsForRequest(requestId);
       await this.executeActions(this.session.handleInboundRequestClosed(requestId));
       this.inboundRequestContexts.delete(requestId);
-      this.inboundFetchGroupOrder.delete(requestId);
+      if (pubAlias !== undefined) await this.discardOpenStreamsForAlias(pubAlias);
+      // §5.1.1: the subscriber cancelled — RESET every publisher data stream
+      // still open for this subscription and drop its accounting, so no more
+      // objects can be written for a subscription the peer abandoned.
+      if (wasSubscribe) await this.abortPublisherStreamsForRequest(requestId);
+      // The peer ended its direction; FIN ours too so the stream fully closes
+      // instead of lingering half-open (idempotent if already terminated).
+      await ctx.terminate();
+      // Abort the detached FETCH response writers (already unreachable via the maps).
+      for (const w of fetchWriters) { try { await w.abort('inbound FETCH request stream closed'); } catch { /* already torn down */ } }
+      // A canceled FETCH request stream removes its parked join — otherwise a
+      // later acceptSubscribe would surface a ghost onFetch for a request the
+      // peer already abandoned.
+      if (ctx.openerKind === 'fetch') {
+        for (const [subReqId, parked] of this.pendingJoinFetches) {
+          const idx = parked.findIndex((e) => e.requestId === requestId);
+          if (idx < 0) continue;
+          clearTimeout(parked[idx]!.timer);
+          parked.splice(idx, 1);
+          if (parked.length === 0) this.pendingJoinFetches.delete(subReqId);
+          break;
+        }
+      }
+      // A canceled SUBSCRIBE promptly rejects its parked joins (the
+      // subscription left the Pending/Established states) instead of leaving
+      // them to the timeout.
+      if (wasSubscribe) {
+        this.deferredUpdateResponses.delete(requestId);
+        await this.settleParkedJoins(requestId, false);
+      }
       // §3.3.2: a subscriber resetting its SUBSCRIBE stream IS the draft-18
       // unsubscribe — surface it so the publisher can drop just that subscription.
       if (wasSubscribe) this.onSubscribeClosed?.(requestId);
@@ -2466,9 +4064,7 @@ export class MoqtConnection {
   /** Close the session on a PUBLISH-stream protocol violation; else surface it. */
   private async failInboundRequest(err: Error): Promise<void> {
     if (err instanceof ProtocolViolationError) {
-      const actions = this.session.close(SessionError.PROTOCOL_VIOLATION, err.message);
-      await this.executeActions(actions);
-      this.onClose?.(0x3, err.message);
+      this.closeSessionFatal(err.message); // centralized: also rejects pending promises
       return;
     }
     this.onError?.(new MoqtConnectionError(
@@ -2528,13 +4124,23 @@ export class MoqtConnection {
       if (ctx.openerKind !== 'publish') {
         throw new ProtocolViolationError(`PUBLISH_DONE is not valid on a ${ctx.openerKind} request stream`);
       }
-      // Keep alias routing — late data streams may still arrive after
-      // PUBLISH_DONE. Seal the stream: nothing more may follow.
+      // §10.11: bounded early-discard — capture the published alias, terminate,
+      // then apply the Stream Count so open/late streams are STOP_SENDINGed and
+      // the alias tombstone is cleared once the count is met (or the TTL fires),
+      // rather than retaining the publication's routing indefinitely.
+      const doneAlias = [...this.publishAliasMaps].find(([, p]) => p.requestId === originalId)?.[0];
+      const streamCount = (message as { streamCount?: bigint }).streamCount ?? 0n;
       const stamped = { ...message, requestId: originalId } as ControlMessage;
       this.onMessage?.(stamped);
+      // Arm the terminal guard + remove the route SYNCHRONOUSLY (before the
+      // session-teardown await) so no late object slips through the window.
+      const discard = doneAlias !== undefined
+        ? this.applyTerminalStreamCount(doneAlias, BigInt(streamCount), originalId)
+        : Promise.resolve();
       await this.executeActions(this.session.handleInboundPublishDone(originalId));
       ctx.seal();
       this.inboundRequestContexts.delete(originalId);
+      await discard;
       return;
     }
 
@@ -2564,13 +4170,44 @@ export class MoqtConnection {
         return;
       }
       const send = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
+      // §10.8: SUBSCRIBE_OK is the FIRST response on a successful subscribe
+      // stream. An update racing a still-PENDING subscription is APPLIED
+      // immediately (§10.12.2), but its REQUEST_OK is deferred and flushed —
+      // FIFO — right after SUBSCRIBE_OK / REQUEST_ERROR is written.
+      if (send && ctx.openerKind === 'subscribe'
+          && this.session.getIncomingSubscription(originalId)?.state === SubscriptionState.PENDING) {
+        const queued = this.deferredUpdateResponses.get(originalId) ?? [];
+        // BOUNDED: a peer flooding updates while the application leaves the
+        // SUBSCRIBE pending must not grow this queue without opening streams.
+        // Exceeding the bound rejects the SUBSCRIBE itself with EXCESSIVE_LOAD
+        // (a REQUEST_ERROR is a valid first response) — queued acks flush
+        // behind it and the stream is finished.
+        if (queued.length >= MoqtConnection.MAX_DEFERRED_UPDATE_RESPONSES) {
+          queued.push(send.message);
+          this.deferredUpdateResponses.set(originalId, queued);
+          await this.executeActions(actions.filter((a) => a.type !== 'send_control'));
+          await this.rejectSubscribe(originalId, RequestError18.EXCESSIVE_LOAD as bigint,
+            'too many REQUEST_UPDATEs on a pending subscription');
+          return;
+        }
+        queued.push(send.message);
+        this.deferredUpdateResponses.set(originalId, queued);
+        await this.executeActions(actions.filter((a) => a.type !== 'send_control'));
+        return;
+      }
       if (send) await ctx.writeMessage(send.message);
       await this.executeActions(actions.filter((a) => a.type !== 'send_control'));
-      // §10.9.1: a failed SUBSCRIBE_NAMESPACE prefix update — the responder MUST
-      // close the bidi stream (the subscription is terminated session-side too).
-      if (send?.message.type === 'REQUEST_ERROR' && ctx.openerKind === 'subscribe-namespace') {
+      // §10.9.1: a REQUEST_ERROR to a prefix/namespace update terminates that
+      // request — the responder MUST close BOTH halves of the bidi stream (FIN
+      // our writable AND STOP_SENDING the readable), not just FIN. Applies to the
+      // continuing/persistent request streams: SUBSCRIBE_NAMESPACE (§10.18),
+      // SUBSCRIBE_TRACKS (§10.19), and PUBLISH_NAMESPACE (§10.15).
+      const persistentOpener = ctx.openerKind === 'subscribe-namespace'
+        || ctx.openerKind === 'subscribe-tracks'
+        || ctx.openerKind === 'publish-namespace';
+      if (send?.message.type === 'REQUEST_ERROR' && persistentOpener) {
         ctx.seal();
-        await ctx.finish();
+        await ctx.terminate();
         this.inboundRequestContexts.delete(originalId);
       }
       return;
@@ -2579,9 +4216,14 @@ export class MoqtConnection {
     throw new ProtocolViolationError(`unexpected ${message.type} on inbound request stream`);
   }
 
-  /** Fire onClose for a session-close action using its actual error code. */
+  /**
+   * A session-generated close_connection (a peer protocol violation the session
+   * decided). The action was already executed by the caller, so the session is
+   * closing; route through the one-shot terminal coordinator (which also rejects
+   * pending operations and clears timers — not just fires onClose).
+   */
   private notifyClose(closeAction: CloseConnectionAction, fallbackReason: string): void {
-    this.onClose?.(Number(closeAction.error), closeAction.reason ?? fallbackReason);
+    this.terminate(Number(closeAction.error), closeAction.reason ?? fallbackReason);
   }
 
   /** Validate + bind an inbound PUBLISH (§10.10). */
@@ -2590,12 +4232,17 @@ export class MoqtConnection {
     this.onMessage?.(pub);
     const actions = this.session.handleControlMessage(pub);
     const closeAction = actions.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
-    await this.executeActions(actions);
     if (closeAction) {
+      await this.executeActions(actions);
       await ctx.abort();
       this.notifyClose(closeAction, 'PUBLISH rejected');
       return;
     }
+    // §5.1: the session may reject a duplicate PUBLISH with a per-request
+    // REQUEST_ERROR. draft-18 has no control stream — write it on THIS request's
+    // own bidi stream and seal, WITHOUT binding or surfacing via onPublish.
+    if (await this.autoRejectInboundRequest(actions, ctx)) return;
+    await this.executeActions(actions);
     ctx.bind(requestId, 'publish');
     this.inboundRequestContexts.set(requestId, ctx);
     // §2.5.1 / §2.4.2: a PUBLISH whose Track Properties carry an unsupported
@@ -2605,20 +4252,48 @@ export class MoqtConnection {
     // close (the request, not the connection, failed).
     const fault = this.trackPropertyFault(pub);
     if (fault) {
-      await this.rejectSubscribe(requestId, fault.code, fault.reason); // REQUEST_ERROR on the stream
-      ctx.seal();
-      await ctx.finish(); // FIN after the rejection — the request is done
-      this.inboundRequestContexts.delete(requestId);
+      // REQUEST_ERROR + FIN + seal in ONE finalized write: a publish fault has
+      // no subscription lifecycle (no parked joins, no deferred update
+      // responses), and extra awaits before finish() would race the peer-FIN
+      // cleanup that cancels this context.
+      const actions = this.session.rejectSubscribe(requestId, fault.code, fault.reason);
+      await this.writeInboundRequestResponse(requestId, actions, /* finalize */ true);
       return;
     }
+    // §11.1: refuse an inbound PUBLISH that reuses a Track Alias still guarded by
+    // a terminating prior generation — binding it would risk misdelivering an old
+    // late stream to this new track. Reject with REQUEST_ERROR (not a session
+    // close): the request, not the connection, is at fault.
+    const pubAlias = pub.trackAlias as bigint;
+    if (!this.aliasReuseSafe(pubAlias)) {
+      const actions = this.session.rejectSubscribe(
+        requestId, RequestError18.DUPLICATE_SUBSCRIPTION as bigint,
+        `track alias ${pubAlias} is still guarded by a terminating prior subscription (§11.1)`,
+      );
+      await this.writeInboundRequestResponse(requestId, actions, /* finalize */ true);
+      return;
+    }
+    // The old generation's complete guard (if any) is safe to clear now.
+    this.clearTerminatedAlias(pubAlias);
     const incoming: IncomingPublish = {
       requestId,
       trackNamespace: pub.trackNamespace,
       trackName: pub.trackName,
-      trackAlias: pub.trackAlias as bigint,
+      trackAlias: pubAlias,
       onObject: null,
     };
     this.publishAliasMaps.set(incoming.trackAlias, incoming);
+    // §8 applies to a PUBLISH-initiated subscription too. Capture the publisher's raw
+    // OBJECT/SUBGROUP_DELIVERY_TIMEOUT Track Properties so acceptSubscribe can COMBINE
+    // them with OUR PUBLISH_OK Message Parameters; set a provisional (publisher-only)
+    // guard value now in case we never set subscriber params.
+    const props = this.trackPropsOf(pub);
+    const pubObj = this.trackPropMs(props, 0x02n) ?? 0;
+    const pubSub = this.trackPropMs(props, 0x06n) ?? 0;
+    this.inboundPublishTimeouts.set(requestId, { obj: pubObj, sub: pubSub });
+    this.aliasPublisherTimeout.set(pubAlias, { obj: pubObj, sub: pubSub });
+    const provisional = this.combineDeliveryTimeoutMs(pubObj, pubSub, 0, 0);
+    if (provisional > 0) this.aliasDeliveryTimeoutMs.set(pubAlias, provisional);
     this.onPublish?.(incoming);
   }
 
@@ -2692,7 +4367,71 @@ export class MoqtConnection {
     // §10.2 GROUP_ORDER (0x22): 0x2 = Descending, else (incl. absent) Ascending.
     const order = fetch.parameters.get(0x22n)?.[0];
     this.inboundFetchGroupOrder.set(requestId, order === 2n ? 'descending' : 'ascending');
+
+    // draft-18 §10.12.2: buffer a Joining Fetch whose subscription is still
+    // PENDING; the app sees it via onFetch only once acceptSubscribe runs.
+    if (fetch.fetch.fetchType !== 0x1) {
+      const joiningReqId = (fetch.fetch as JoiningFetch).joiningRequestId as bigint;
+      const sub = this.session.getIncomingSubscription(joiningReqId);
+      if (sub && sub.state === SubscriptionState.PENDING) {
+        const entry = {
+          requestId,
+          fetch,
+          timer: setTimeout(() => { void this.expireParkedJoin(joiningReqId, requestId); }, this.joiningFetchTimeoutMs),
+        };
+        const parked = this.pendingJoinFetches.get(joiningReqId) ?? [];
+        parked.push(entry);
+        this.pendingJoinFetches.set(joiningReqId, parked);
+        return;
+      }
+    }
     this.onFetch?.(requestId, fetch);
+  }
+
+  /** Timeout for a parked Joining Fetch (§10.12.2 "or the request times out"). */
+  private async expireParkedJoin(joiningReqId: bigint, requestId: bigint): Promise<void> {
+    const parked = this.pendingJoinFetches.get(joiningReqId);
+    if (!parked) return;
+    const idx = parked.findIndex((e) => e.requestId === requestId);
+    if (idx < 0) return;
+    parked.splice(idx, 1);
+    if (parked.length === 0) this.pendingJoinFetches.delete(joiningReqId);
+    try {
+      await this.rejectFetch(requestId, RequestError18.TIMEOUT as bigint,
+        'joining fetch timed out waiting for the subscription to establish (§10.12.2)');
+    } catch { /* stream already gone */ }
+  }
+
+  /**
+   * Release (surface) or reject every Joining Fetch parked on `subRequestId`.
+   * Called from acceptSubscribe / rejectSubscribe.
+   */
+  private async settleParkedJoins(subRequestId: bigint, accepted: boolean): Promise<void> {
+    const parked = this.pendingJoinFetches.get(subRequestId);
+    if (!parked) return;
+    this.pendingJoinFetches.delete(subRequestId);
+    for (const entry of parked) {
+      clearTimeout(entry.timer);
+      if (!accepted) {
+        try {
+          await this.rejectFetch(entry.requestId, RequestError18.INVALID_JOINING_REQUEST_ID as bigint,
+            'the joined subscription was rejected (§10.12.2)');
+        } catch { /* stream already gone */ }
+        continue;
+      }
+      // §10.12.2: the Forward-State gate is evaluated NOW — at establish
+      // time, after any REQUEST_UPDATEs that raced establishment have been
+      // applied — never when the join arrived.
+      const sub = this.session.getIncomingSubscription(subRequestId);
+      if (!sub || sub.forwardState !== ForwardState.ACTIVE) {
+        try {
+          await this.rejectFetch(entry.requestId, RequestError18.INVALID_RANGE as bigint,
+            'Joining Fetch on a subscription with Forward State 0 at establish (§10.12.2)');
+        } catch { /* stream already gone */ }
+        continue;
+      }
+      this.onFetch?.(entry.requestId, entry.fetch);
+    }
   }
 
   /**
@@ -2772,8 +4511,11 @@ export class MoqtConnection {
     if (send) {
       await ctx.writeMessage(send.message);
       await this.executeActions(actions.filter((a) => a.type !== 'send_control'));
-      await ctx.finish();
+      // §10.9.1: an immediate REQUEST_ERROR is terminal — close BOTH directions
+      // (FIN writable + STOP_SENDING readable), not just FIN, so the rejected
+      // continuing stream leaves no half-open reader.
       ctx.seal();
+      await ctx.terminate();
       return;
     }
     // Held PENDING — bind and surface to the application for accept/reject.
@@ -2809,8 +4551,11 @@ export class MoqtConnection {
     if (send) {
       await ctx.writeMessage(send.message);
       await this.executeActions(actions.filter((a) => a.type !== 'send_control'));
-      await ctx.finish();
+      // §10.9.1: an immediate REQUEST_ERROR is terminal — close BOTH directions
+      // (FIN writable + STOP_SENDING readable), not just FIN, so the rejected
+      // continuing stream leaves no half-open reader.
       ctx.seal();
+      await ctx.terminate();
       return;
     }
     ctx.bind(requestId, 'subscribe-tracks');
@@ -2861,6 +4606,30 @@ export class MoqtConnection {
 
       if (headerResult.type === 'subgroup') {
         const header = headerResult.header as SubgroupHeader;
+        const subgroupAlias = header.trackAlias as bigint;
+        // §10.11 receiver terminal tracker: a stream for an alias whose
+        // PUBLISH_DONE already arrived is a LATE expected stream — early-discard
+        // it (STOP_SENDING), count it against the announced total, and clear the
+        // tombstone once the whole count is observed. Never delivered.
+        const tombstone = this.terminatedAliases.get(subgroupAlias);
+        if (tombstone) {
+          // Count down only a KNOWN remaining (bigint); a null remaining is the
+          // 2^62-1 sentinel — unknown count, cleared by TTL alone. Clear as soon
+          // as the known count is met so a legitimately reused alias isn't held.
+          if (tombstone.remaining !== null) {
+            tombstone.remaining -= 1n;
+            if (tombstone.remaining <= 0n) this.clearTerminatedAlias(subgroupAlias);
+          }
+          try { await reader.cancel(new Error('late stream on a terminated alias — early discard (§10.11)')); } catch { /* closed */ }
+          this.dataStreamReaders.delete(streamId);
+          this.onStreamClosed?.(streamId);
+          return;
+        }
+        // Count the stream toward this alias's lifetime total (so a later
+        // PUBLISH_DONE knows how many streams are still outstanding) and track
+        // it as open so the terminal message can STOP_SENDING it.
+        this.aliasStreamsSeen.set(subgroupAlias, (this.aliasStreamsSeen.get(subgroupAlias) ?? 0n) + 1n);
+        this.incomingSubgroupAliases.set(streamId, subgroupAlias);
         // Header decoded — route objects below
         this.onQlogEvent?.({
           type: 'stream_type_set',
@@ -2884,8 +4653,30 @@ export class MoqtConnection {
         await this.readSubgroupObjects(reader, buf, streamId, header);
       } else {
         const header = headerResult.header as FetchHeader;
+        const fetchReqId = header.requestId as bigint;
+        // §10.13: a data stream for a fetch WE cancelled may still be in flight. It is
+        // NOT a new fetch nor a §11.4.4 duplicate — DISCARD it (STOP_SENDING via the
+        // finally's reader cleanup) and CONSUME the one-shot marker (a cancellation
+        // has at most one such stream; consuming keeps the marker set from lingering).
+        if (this.recentlyCancelledFetches.has(fetchReqId)) {
+          this.recentlyCancelledFetches.delete(fetchReqId);
+          await reader.cancel(new Error('FETCH cancelled — late data stream discarded')).catch(() => { /* already closed */ });
+          return;
+        }
+        // §11.4.4: a FETCH response uses EXACTLY ONE unidirectional stream. A second
+        // stream for a request that ALREADY has one currently open is a
+        // PROTOCOL_VIOLATION (it would otherwise silently OVERWRITE the mapping). We
+        // scope this to a still-OPEN stream (`fetchStreams`, cleared on FIN/cancel):
+        // a late stream for a gone (cancelled/completed) fetch is not our concern and
+        // must never close the session — so no separate "seen after FIN" set that
+        // could be count-evicted into a false close.
+        if (this.fetchStreams.has(fetchReqId)) {
+          throw new ProtocolViolationError(
+            `second FETCH response stream for request ${fetchReqId} while one is open (§11.4.4: exactly one)`,
+          );
+        }
         // §10.4.4: Track fetch requestId → streamId for STOP_SENDING on cancel
-        this.fetchStreams.set(header.requestId as bigint, streamId);
+        this.fetchStreams.set(fetchReqId, streamId);
         this.onQlogEvent?.({
           type: 'stream_type_set',
           owner: 'remote',
@@ -2913,12 +4704,7 @@ export class MoqtConnection {
       // §10.4, §10.4.2, §10.4.4, §10.2.1.2: Protocol violations on data
       // streams MUST close the session with PROTOCOL_VIOLATION.
       if (err instanceof ProtocolViolationError) {
-        const actions = this.session.close(
-          SessionError.PROTOCOL_VIOLATION,
-          err.message,
-        );
-        await this.executeActions(actions);
-        this.onClose?.(0x3, err.message);
+        this.closeSessionFatal(err.message);
         return;
       }
 
@@ -2929,7 +4715,10 @@ export class MoqtConnection {
       const streamErrorCode = typeof (err as any)?.streamErrorCode === 'number'
         ? (err as any).streamErrorCode as number
         : undefined;
-      if (streamErrorCode === undefined) {
+      // A real transport close makes in-flight data reads throw AFTER terminal
+      // shutdown — do not emit a spurious post-close error event.
+      const terminated = this._terminated || this.session.state === SessionState.CLOSED;
+      if (streamErrorCode === undefined && !terminated) {
         // Not a RESET_STREAM — genuine read error
         this.onError?.(new MoqtConnectionError(
           err instanceof Error ? err.message : String(err),
@@ -2944,11 +4733,22 @@ export class MoqtConnection {
       this.onStreamClosed?.(streamId, streamErrorCode);
     } finally {
       this.dataStreamReaders.delete(streamId);
-      // Clean up fetch stream association (and any draft-18 group-order state)
+      this.incomingSubgroupAliases.delete(streamId);
+      // Clean up fetch stream association (and any draft-18 group-order state), and
+      // RECLAIM the completed outgoing fetch in the Session (§5.2: the fetch ends on
+      // its data-stream FIN/reset). Group-order removal makes a later FETCH_HEADER for
+      // this now-completed request a §10.12.3/§11.4.4 PROTOCOL_VIOLATION (exactly one
+      // response stream per fetch) — a cancelled fetch is instead recognized by its
+      // lossless cancellation marker and its late stream discarded; a completed one
+      // has no marker, so a second stream is correctly rejected.
       for (const [reqId, sid] of this.fetchStreams) {
         if (sid === streamId) {
           this.fetchStreams.delete(reqId);
           this.fetchGroupOrder.delete(reqId);
+          this.session.handleFetchStreamFinished(reqId);
+          // §10.13: if the FETCH_OK also arrived, the fetch is complete — close the
+          // request bidi so the fetcher's topology context does not leak.
+          void this.closeCompletedFetchRequest(reqId);
           break;
         }
       }
@@ -3016,12 +4816,7 @@ export class MoqtConnection {
         // §10.4: FIN with partial header bytes is mid-object
         if (buf.length > 0) {
           // Stream FIN arrived mid-header parse — protocol violation
-          const actions = this.session.close(
-            SessionError.PROTOCOL_VIOLATION,
-            'Stream FIN received mid-header (§10.4)',
-          );
-          await this.executeActions(actions);
-          this.onClose?.(0x3, 'Stream FIN received mid-header');
+          this.closeSessionFatal('Stream FIN received mid-header');
         }
         return undefined;
       }
@@ -3124,12 +4919,7 @@ export class MoqtConnection {
         // Object, the session SHOULD be closed with a PROTOCOL_VIOLATION."
         if (buf.length > 0) {
           // Stream FIN arrived mid-object parse — protocol violation
-          const actions = this.session.close(
-            SessionError.PROTOCOL_VIOLATION,
-            'Stream FIN received mid-object (§10.4)',
-          );
-          await this.executeActions(actions);
-          this.onClose?.(0x3, 'Stream FIN received mid-object');
+          this.closeSessionFatal('Stream FIN received mid-object');
           return;
         }
 
@@ -3242,12 +5032,7 @@ export class MoqtConnection {
       if (done) {
         // §10.4: mid-object FIN → SHOULD close with PROTOCOL_VIOLATION
         if (buf.length > 0) {
-          const actions = this.session.close(
-            SessionError.PROTOCOL_VIOLATION,
-            'Fetch stream FIN received mid-object (§10.4)',
-          );
-          await this.executeActions(actions);
-          this.onClose?.(0x3, 'Fetch stream FIN received mid-object');
+          this.closeSessionFatal('Fetch stream FIN received mid-object');
         }
         return;
       }
@@ -3280,14 +5065,33 @@ export class MoqtConnection {
     // never a silently-defaulted decode.
     const groupOrder = this.fetchGroupOrder.get(header.requestId);
     if (groupOrder === undefined) {
+      // No group-order entry AND no cancellation marker (the marker is checked — and
+      // consumed — at the FETCH_HEADER handler and the loop-top guard BEFORE we reach
+      // here, and it is lossless). So this stream is NOT a cancelled fetch: it is a
+      // FETCH_HEADER for a request that is not a live FETCH — a request we never
+      // issued, a request of a different kind (e.g. a live SUBSCRIBE's id, which
+      // shares the request-id space), or a SECOND response stream for an already
+      // completed fetch. §10.12.3 / §11.4.4 (exactly one response stream) and §9.1
+      // (unknown request) make all of these a PROTOCOL_VIOLATION — never a silent
+      // discard. Cancelled fetches never reach here (their lossless marker discards
+      // the late stream at the header / loop-top guard).
       throw new ProtocolViolationError(
-        `FETCH_HEADER for unknown Request ID ${header.requestId} (no FETCH was issued)`,
+        `FETCH_HEADER for request ${header.requestId} that is not a live FETCH ` +
+        `(unknown, wrong request kind, or a second response stream for a completed fetch)`,
       );
     }
     let prior: FetchObjectPrior18 | undefined;
     let isFirstObject = true;
 
     while (true) {
+      // §10.13: if the fetch is cancelled WHILE this stream is open, stop delivering
+      // immediately — objects buffered mid-flight must not reach onObject after the
+      // cancellation began (the marker is installed synchronously at fetchCancel).
+      if (this.recentlyCancelledFetches.has(header.requestId)) {
+        this.recentlyCancelledFetches.delete(header.requestId); // one-shot: this stream is handled
+        await reader.cancel(new Error('FETCH cancelled — open stream stopped')).catch(() => { /* already closed */ });
+        return;
+      }
       if (buf.length > 0) {
         try {
           const { item, bytesRead, nextPrior } =
@@ -3342,12 +5146,7 @@ export class MoqtConnection {
       const { value, done } = await reader.read();
       if (done) {
         if (buf.length > 0) {
-          const actions = this.session.close(
-            SessionError.PROTOCOL_VIOLATION,
-            'Fetch stream FIN received mid-object (§11.4.4)',
-          );
-          await this.executeActions(actions);
-          this.onClose?.(0x3, 'Fetch stream FIN received mid-object');
+          this.closeSessionFatal('Fetch stream FIN received mid-object');
         }
         return;
       }
@@ -3427,10 +5226,14 @@ export class MoqtConnection {
         }
       }
     } catch (err) {
-      this.onError?.(new MoqtConnectionError(
-        err instanceof Error ? err.message : String(err),
-        { errorSource: 'control', ...(err instanceof Error ? { cause: err } : {}) },
-      ));
+      // A real transport close makes this read throw AFTER terminal shutdown —
+      // suppress the spurious post-close error event.
+      if (!(this._terminated || this.session.state === SessionState.CLOSED)) {
+        this.onError?.(new MoqtConnectionError(
+          err instanceof Error ? err.message : String(err),
+          { errorSource: 'control', ...(err instanceof Error ? { cause: err } : {}) },
+        ));
+      }
     } finally {
       this.namespaceStreams.delete(requestId as bigint);
     }

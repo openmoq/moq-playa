@@ -51,6 +51,13 @@ export interface InboundRequestHandlers {
   onClosed(ctx: InboundRequestStreamContext): void;
 }
 
+/** In-order processing hook awaited before the next frame (wire-order barrier). */
+type ResponseProcessor = (message: DecodedControlMessage) => void | Promise<void>;
+
+interface PendingUpdate extends Deferred<DecodedControlMessage> {
+  readonly process?: ResponseProcessor;
+}
+
 export class InboundRequestStreamContext {
   /** First request's Request ID, set once the owner binds a valid request. */
   requestId: bigint | null = null;
@@ -62,7 +69,7 @@ export class InboundRequestStreamContext {
   private readonly writer: WritableStreamDefaultWriter<Uint8Array>;
   private readonly reader: ReadableStreamDefaultReader<Uint8Array>;
   private readonly framer: ControlStreamFramer;
-  private readonly pendingUpdates: Deferred<DecodedControlMessage>[] = [];
+  private readonly pendingUpdates: PendingUpdate[] = [];
   private aborted = false;
 
   constructor(
@@ -93,9 +100,14 @@ export class InboundRequestStreamContext {
   }
 
   /** Send a LOCAL REQUEST_UPDATE; its REQUEST_OK / REQUEST_ERROR resolves the
-   *  returned promise (matched FIFO against responses on this stream). */
-  async sendUpdate(message: ControlMessage): Promise<DecodedControlMessage> {
-    const d = deferred<DecodedControlMessage>();
+   *  returned promise (matched FIFO against responses on this stream). The read
+   *  loop AWAITS `onResponse` before the next frame, so a response coalesced
+   *  with a following message (e.g. PUBLISH_DONE) is applied in wire order. */
+  async sendUpdate(message: ControlMessage, onResponse: ResponseProcessor): Promise<DecodedControlMessage> {
+    if (typeof onResponse !== 'function') {
+      throw new Error('InboundRequestStreamContext.sendUpdate: an onResponse processor (the wire-order acknowledgement) is required');
+    }
+    const d: PendingUpdate = { ...deferred<DecodedControlMessage>(), process: onResponse };
     this.pendingUpdates.push(d);
     try {
       await this.writer.write(this.codec.encode(message));
@@ -119,12 +131,37 @@ export class InboundRequestStreamContext {
     try { await this.writer.close(); } catch { /* already closed/aborted */ }
   }
 
+  /**
+   * Gracefully terminate after a terminal response (REQUEST_ERROR rejection or
+   * PUBLISH_DONE, §10.11 / §3.3.2): FIN our writable AND STOP_SENDING the
+   * readable, so neither direction stays half-open and the read loop ends
+   * without surfacing the teardown as a failure. Unlike {@link abort} the
+   * response bytes are flushed with a clean FIN, not a RESET.
+   */
+  async terminate(): Promise<void> {
+    if (this.aborted) return;
+    this.aborted = true; // stops the read loop; suppresses onFailure/onClosed
+    this.rejectPendingUpdates(new Error('inbound request stream terminated'));
+    try { await this.writer.close(); } catch { /* already closed/aborted */ }
+    try { await this.reader.cancel(); } catch { /* already closed */ }
+  }
+
   /** Abort the stream (rejected request / session teardown). Suppresses onFailure. */
   async abort(): Promise<void> {
     if (this.aborted) return;
     this.aborted = true;
+    // Setting `aborted` makes the read loop return WITHOUT reaching its catch, so it
+    // will never reject queued REQUEST_UPDATE promises — do it here, else a caller
+    // awaiting an earlier update's response hangs forever (§11.4.1: the request
+    // stream is gone, so no response can ever arrive).
+    this.rejectPendingUpdates(new Error('inbound request stream aborted'));
     try { await this.reader.cancel(); } catch { /* already closed */ }
     try { await this.writer.abort(); } catch { /* already closed */ }
+  }
+
+  /** Reject + drop every queued REQUEST_UPDATE promise (teardown with no response). */
+  private rejectPendingUpdates(reason: Error): void {
+    for (const d of this.pendingUpdates.splice(0)) d.reject(reason);
   }
 
   private async readLoop(): Promise<void> {
@@ -161,10 +198,20 @@ export class InboundRequestStreamContext {
       throw new ProtocolViolationError('message received after the inbound request stream was sealed');
     }
     if (message.type === 'REQUEST_OK' || message.type === 'REQUEST_ERROR') {
-      // Response to a LOCAL REQUEST_UPDATE — match FIFO.
+      // Response to a LOCAL REQUEST_UPDATE — match FIFO. The wire-order barrier:
+      // the owner's processing is AWAITED before the next frame is dispatched.
       const exp = this.pendingUpdates.shift();
       if (!exp) {
         throw new ProtocolViolationError('unsolicited REQUEST_OK/REQUEST_ERROR on inbound request stream');
+      }
+      if (exp.process) {
+        try {
+          await exp.process(message);
+        } catch (err) {
+          const e = err instanceof Error ? err : new Error(String(err));
+          exp.reject(e);
+          throw e;
+        }
       }
       exp.resolve(message);
       return;

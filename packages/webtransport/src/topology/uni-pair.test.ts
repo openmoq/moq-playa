@@ -4,7 +4,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { createUniPairTopology, RequestGoawayError } from './uni-pair.js';
-import { TransportSim, flush } from '../testkit/stream-sim.js';
+import { TransportSim, SimStream, flush } from '../testkit/stream-sim.js';
+import type { WebTransportLike } from '../types.js';
 import {
   Session, EndpointRole, SessionState, SubscriptionState, createControlCodec, varint,
 } from '@moqt/transport';
@@ -78,7 +79,7 @@ describe('UniPairTopology — request streams (SUBSCRIBE)', () => {
     const transport = new TransportSim();
 
     const a = session.subscribe(ns('a'), nm('1'));
-    const handle = await topo.openRequest(transport, reqMessage(a)); // resolves BEFORE any response
+    const handle = await topo.openRequest(transport, reqMessage(a), () => {}); // resolves BEFORE any response
 
     expect(handle.requestId).toBe(a.requestId); // single source of truth
     expect(transport.bidi.length).toBe(1);
@@ -92,7 +93,7 @@ describe('UniPairTopology — request streams (SUBSCRIBE)', () => {
     const transport = new TransportSim();
 
     const a = session.subscribe(ns('a'), nm('1'));
-    const handle = await topo.openRequest(transport, reqMessage(a));
+    const handle = await topo.openRequest(transport, reqMessage(a), () => {});
     transport.bidi[0]!.push(okBytes(10n)).closeReadable();
 
     const response = await handle.response;
@@ -110,8 +111,8 @@ describe('UniPairTopology — request streams (SUBSCRIBE)', () => {
 
     const a = session.subscribe(ns('a'), nm('1')); // requestId 0
     const b = session.subscribe(ns('b'), nm('2')); // requestId 2
-    const hA = await topo.openRequest(transport, reqMessage(a));
-    const hB = await topo.openRequest(transport, reqMessage(b));
+    const hA = await topo.openRequest(transport, reqMessage(a), () => {});
+    const hB = await topo.openRequest(transport, reqMessage(b), () => {});
     expect(transport.bidi.length).toBe(2);
 
     // Respond in REVERSE order: B first, then A.
@@ -131,7 +132,7 @@ describe('UniPairTopology — request streams (SUBSCRIBE)', () => {
     const transport = new TransportSim();
 
     const a = session.subscribe(ns('a'), nm('1'));
-    const handle = await topo.openRequest(transport, reqMessage(a));
+    const handle = await topo.openRequest(transport, reqMessage(a), () => {});
 
     const ok = okBytes(7n);
     transport.bidi[0]!.push(ok.subarray(0, 1)); // first byte only
@@ -150,8 +151,8 @@ describe('UniPairTopology — request streams (SUBSCRIBE)', () => {
 
     const a = session.subscribe(ns('a'), nm('1'));
     const b = session.subscribe(ns('b'), nm('2'));
-    const hA = await topo.openRequest(transport, reqMessage(a));
-    const hB = await topo.openRequest(transport, reqMessage(b));
+    const hA = await topo.openRequest(transport, reqMessage(a), () => {});
+    const hB = await topo.openRequest(transport, reqMessage(b), () => {});
 
     transport.bidi[0]!.push(errBytes()).closeReadable(); // A errors
     transport.bidi[1]!.push(okBytes(20n)).closeReadable(); // B ok
@@ -171,7 +172,7 @@ describe('UniPairTopology — request streams (SUBSCRIBE)', () => {
     const transport = new TransportSim();
 
     const a = session.subscribe(ns('a'), nm('1'));
-    const handle = await topo.openRequest(transport, reqMessage(a));
+    const handle = await topo.openRequest(transport, reqMessage(a), () => {});
     transport.bidi[0]!.push(subBytes()).closeReadable(); // wrong: SUBSCRIBE, not a response
     await expect(handle.response).rejects.toThrow(/expected SUBSCRIBE_OK/i);
   });
@@ -181,7 +182,7 @@ describe('UniPairTopology — request streams (SUBSCRIBE)', () => {
     const topo = createUniPairTopology(session);
     const transport = new TransportSim();
     const a = session.subscribe(ns('a'), nm('1'));
-    const handle = await topo.openRequest(transport, reqMessage(a));
+    const handle = await topo.openRequest(transport, reqMessage(a), () => {});
     transport.bidi[0]!.push(reqOkBytes()).closeReadable(); // REQUEST_OK is not valid for SUBSCRIBE
     await expect(handle.response).rejects.toThrow(/expected SUBSCRIBE_OK/i);
   });
@@ -191,10 +192,10 @@ describe('UniPairTopology — request streams (SUBSCRIBE)', () => {
     const topo = createUniPairTopology(session);
     const transport = new TransportSim();
     const a = session.subscribe(ns('a'), nm('1'));
-    const sh = await topo.openRequest(transport, reqMessage(a));
+    const sh = await topo.openRequest(transport, reqMessage(a), () => {});
     transport.bidi[0]!.push(okBytes(10n)); // resolve the SUBSCRIBE (keep stream open)
     session.handleControlMessage(await sh.response, { requestId: a.requestId }); // establish
-    const uh = await topo.sendUpdate(a.requestId, updateMessage(session, a.requestId));
+    const uh = await topo.sendUpdate(a.requestId, updateMessage(session, a.requestId), () => {});
     transport.bidi[0]!.push(okBytes(20n)).closeReadable(); // SUBSCRIBE_OK is wrong for an update
     await expect(uh.response).rejects.toThrow(/expected REQUEST_OK/i);
   });
@@ -204,17 +205,54 @@ describe('UniPairTopology — request streams (SUBSCRIBE)', () => {
     const topo = createUniPairTopology(session);
     const transport = new TransportSim();
     const a = session.subscribe(ns('a'), nm('1'));
-    const sh = await topo.openRequest(transport, reqMessage(a));
+    const sh = await topo.openRequest(transport, reqMessage(a), () => {});
     transport.bidi[0]!.push(okBytes(10n));
     session.handleControlMessage(await sh.response, { requestId: a.requestId }); // establish
 
-    const u1 = await topo.sendUpdate(a.requestId, updateMessage(session, a.requestId)); // id 2
-    const u2 = await topo.sendUpdate(a.requestId, updateMessage(session, a.requestId)); // id 4
+    const u1 = await topo.sendUpdate(a.requestId, updateMessage(session, a.requestId), () => {}); // id 2
+    const u2 = await topo.sendUpdate(a.requestId, updateMessage(session, a.requestId), () => {}); // id 4
     transport.bidi[0]!.push(reqOkBytes());
     transport.bidi[0]!.push(reqOkBytes()).closeReadable();
     await Promise.all([u1.response, u2.response]); // both REQUEST_OK, resolved FIFO
     expect(u1.requestId).toBe(2n);
     expect(u2.requestId).toBe(4n);
+  });
+
+  it('openRequest write failure reclaims the context — no leaked request stream (rollback)', async () => {
+    const session = established();
+    const topo = createUniPairTopology(session);
+    const a = session.subscribe(ns('a'), nm('1'));
+    // A transport whose bidi stream rejects the FIRST write (the SUBSCRIBE send).
+    const failing = {
+      createBidirectionalStream: async () => { const s = new SimStream(); s.failWrites = true; return s; },
+    } as unknown as WebTransportLike;
+
+    await expect(topo.openRequest(failing, reqMessage(a), () => {})).rejects.toThrow(/write/i);
+    // The context + its FIFO response slot were registered BEFORE the write; on
+    // failure the topology must reclaim them, else a REQUEST_UPDATE or a stray
+    // response could correlate to a request the peer never received.
+    expect(topo.hasRequestStream(a.requestId)).toBe(false);
+  });
+
+  it('a write failure on sendUpdate terminates the request stream + fires onRequestClosed (§11.4.1)', async () => {
+    const session = established();
+    const topo = createUniPairTopology(session);
+    const transport = new TransportSim();
+    const closed: bigint[] = [];
+    topo.onRequestClosed = (rid) => { closed.push(rid); };
+    const a = session.subscribe(ns('a'), nm('1'));
+    const sh = await topo.openRequest(transport, reqMessage(a), () => {});
+    transport.bidi[0]!.push(okBytes(10n));
+    session.handleControlMessage(await sh.response, { requestId: a.requestId }); // establish
+    await flush();
+
+    // The REQUEST_UPDATE write fails: the bidi request stream is dead, so the
+    // UNDERLYING request is terminated — the context is reclaimed (a later update
+    // cannot target a dead writer) and the owner is notified for session cleanup.
+    transport.bidi[0]!.failWrites = true;
+    await expect(topo.sendUpdate(a.requestId, updateMessage(session, a.requestId), () => {})).rejects.toThrow(/write/i);
+    expect(topo.hasRequestStream(a.requestId)).toBe(false);
+    expect(closed).toContain(a.requestId);
   });
 
   it('a stale unsolicited response is surfaced via onStreamError and reclaims the stream', async () => {
@@ -224,7 +262,7 @@ describe('UniPairTopology — request streams (SUBSCRIBE)', () => {
     const errors: Error[] = [];
     topo.onStreamError = (e) => errors.push(e);
     const a = session.subscribe(ns('a'), nm('1'));
-    const sh = await topo.openRequest(transport, reqMessage(a));
+    const sh = await topo.openRequest(transport, reqMessage(a), () => {});
     transport.bidi[0]!.push(okBytes(10n));
     session.handleControlMessage(await sh.response, { requestId: a.requestId }); // establish
     await flush();
@@ -237,14 +275,14 @@ describe('UniPairTopology — request streams (SUBSCRIBE)', () => {
     // so a later update finds no open stream — it never picks up the stale response.
     expect(errors.some((e) => /unsolicited/i.test(e.message))).toBe(true);
     expect(topo.hasRequestStream(a.requestId)).toBe(false);
-    await expect(topo.sendUpdate(a.requestId, updateMessage(session, a.requestId))).rejects.toThrow(/no open request stream/i);
+    await expect(topo.sendUpdate(a.requestId, updateMessage(session, a.requestId), () => {})).rejects.toThrow(/no open request stream/i);
   });
 
   it('rejects a request type that cannot open a stream (e.g. REQUEST_UPDATE)', async () => {
     const topo = createUniPairTopology(established());
     // REQUEST_UPDATE rides an EXISTING stream (sendUpdate), not a new one.
     const update = { type: 'REQUEST_UPDATE', requestId: 0n } as unknown as ControlMessage;
-    await expect(topo.openRequest(new TransportSim(), update)).rejects.toThrow(/SUBSCRIBE\/FETCH/i);
+    await expect(topo.openRequest(new TransportSim(), update, () => {})).rejects.toThrow(/SUBSCRIBE\/FETCH/i);
   });
 });
 
@@ -255,7 +293,7 @@ describe('UniPairTopology — request streams (FETCH)', () => {
     const transport = new TransportSim();
 
     const f = session.fetch(ns('a'), nm('1'), fetchRange);
-    const handle = await topo.openRequest(transport, reqMessage(f));
+    const handle = await topo.openRequest(transport, reqMessage(f), () => {});
     expect(handle.requestId).toBe(f.requestId);
     expect(transport.bidi[0]!.writtenBytes()[0]).toBe(0x16); // FETCH written
 
@@ -274,7 +312,7 @@ describe('UniPairTopology — request streams (FETCH)', () => {
     topo.onStreamError = (e) => errors.push(e);
 
     const f = session.fetch(ns('a'), nm('1'), fetchRange);
-    const handle = await topo.openRequest(transport, reqMessage(f));
+    const handle = await topo.openRequest(transport, reqMessage(f), () => {});
     transport.bidi[0]!.push(okBytes(1n)).closeReadable();
 
     await expect(handle.response).rejects.toThrow(/FETCH_OK\/REQUEST_ERROR/i);
@@ -290,7 +328,7 @@ describe('UniPairTopology — request streams (TRACK_STATUS, §10.14)', () => {
     const transport = new TransportSim();
 
     const t = session.trackStatus(ns('a'), nm('1'));
-    const handle = await topo.openRequest(transport, reqMessage(t));
+    const handle = await topo.openRequest(transport, reqMessage(t), () => {});
     expect(transport.bidi[0]!.writtenBytes()[0]).toBe(0x0d); // TRACK_STATUS written
     expect(transport.bidi[0]!.writeClosed).toBe(true); // one-shot → writable FIN
 
@@ -306,7 +344,7 @@ describe('UniPairTopology — request streams (TRACK_STATUS, §10.14)', () => {
     const transport = new TransportSim();
 
     const t = session.trackStatus(ns('a'), nm('1'));
-    const handle = await topo.openRequest(transport, reqMessage(t));
+    const handle = await topo.openRequest(transport, reqMessage(t), () => {});
     transport.bidi[0]!.push(okBytes(1n)).closeReadable();
 
     await expect(handle.response).rejects.toThrow(/REQUEST_OK\/REQUEST_ERROR/i);
@@ -320,7 +358,7 @@ describe('UniPairTopology — request streams (PUBLISH_NAMESPACE, §10.15)', () 
     const transport = new TransportSim();
 
     const p = session.publishNamespace(ns('a'));
-    const handle = await topo.openRequest(transport, reqMessage(p));
+    const handle = await topo.openRequest(transport, reqMessage(p), () => {});
     expect(transport.bidi[0]!.writtenBytes()[0]).toBe(0x06); // PUBLISH_NAMESPACE
     expect(transport.bidi[0]!.writeClosed).toBe(false); // NOT one-shot → writable stays open
 
@@ -335,7 +373,7 @@ describe('UniPairTopology — request streams (PUBLISH_NAMESPACE, §10.15)', () 
     const transport = new TransportSim();
 
     const p = session.publishNamespace(ns('a'));
-    const handle = await topo.openRequest(transport, reqMessage(p));
+    const handle = await topo.openRequest(transport, reqMessage(p), () => {});
     transport.bidi[0]!.push(reqOkBytes());
     await handle.response;
     await flush();
@@ -349,7 +387,7 @@ describe('UniPairTopology — request streams (PUBLISH_NAMESPACE, §10.15)', () 
     const transport = new TransportSim();
 
     const p = session.publishNamespace(ns('a'));
-    const handle = await topo.openRequest(transport, reqMessage(p));
+    const handle = await topo.openRequest(transport, reqMessage(p), () => {});
     transport.bidi[0]!.push(reqOkBytes());
     await handle.response;
 
@@ -369,7 +407,7 @@ describe('UniPairTopology — cancelRequest (§3.3.2)', () => {
     topo.onStreamError = (e) => errors.push(e);
 
     const f = session.fetch(ns('a'), nm('1'), fetchRange);
-    const handle = await topo.openRequest(transport, reqMessage(f));
+    const handle = await topo.openRequest(transport, reqMessage(f), () => {});
     void handle.response.catch(() => {}); // the owner (adapter) always handles this
     expect(topo.hasRequestStream(handle.requestId)).toBe(true);
 
@@ -388,7 +426,7 @@ describe('UniPairTopology — cancelRequest (§3.3.2)', () => {
     const transport = new TransportSim();
 
     const f = session.fetch(ns('a'), nm('1'), fetchRange);
-    const handle = await topo.openRequest(transport, reqMessage(f));
+    const handle = await topo.openRequest(transport, reqMessage(f), () => {});
     const rejection = expect(handle.response).rejects.toThrow(/cancelled/i);
     await topo.cancelRequest(handle.requestId);
     await rejection;
@@ -412,6 +450,20 @@ describe('UniPairTopology — continuing request stream (SUBSCRIBE_NAMESPACE, §
     });
     return { topo, transport, seen, p, requestId: sn.requestId };
   }
+
+  it('openContinuingRequest initial-write failure reclaims the context (transactional)', async () => {
+    const session = established();
+    const topo = createUniPairTopology(session);
+    const sn = session.subscribeNamespace([new Uint8Array([1])]);
+    // A transport whose bidi stream rejects the SUBSCRIBE_NAMESPACE write.
+    const failing = {
+      createBidirectionalStream: async () => { const s = new SimStream(); s.failWrites = true; return s; },
+    } as unknown as WebTransportLike;
+    await expect(topo.openContinuingRequest(failing, nsRequestMessage(sn), () => {})).rejects.toThrow(/write/i);
+    // The context was inserted BEFORE the write; on failure it must be reclaimed so
+    // hasContinuingRequest is false (no leaked continuing stream).
+    expect(topo.hasContinuingRequest(sn.requestId)).toBe(false);
+  });
 
   it('dispatches the first REQUEST_OK then follow-up NAMESPACE/NAMESPACE_DONE in order', async () => {
     const { topo, transport, seen, p, requestId } = open();
@@ -449,12 +501,17 @@ describe('UniPairTopology — continuing request stream (SUBSCRIBE_NAMESPACE, §
     await expect(handle.closed).rejects.toThrow(/unsolicited REQUEST_OK/i);
   });
 
-  it('a message after REQUEST_ERROR fails the stream', async () => {
+  it('a REQUEST_ERROR first response is terminal: the continuing stream fully closes both directions', async () => {
     const { transport, p } = open();
     const handle = await p;
     transport.bidi[0]!.push(errBytes());
-    transport.bidi[0]!.push(nsBytes('s1')).closeReadable();
-    await expect(handle.closed).rejects.toThrow(/after REQUEST_ERROR/i);
+    await flush();
+    // §10.9.1: REQUEST_ERROR is terminal — we FIN our writable AND STOP_SENDING
+    // the readable (so any trailing peer bytes are discarded, never processed as
+    // an after-error violation), and `closed` resolves cleanly (no half-open).
+    await expect(handle.closed).resolves.toBeUndefined();
+    expect(transport.bidi[0]!.writeClosed).toBe(true);   // our writable FINned
+    expect(transport.bidi[0]!.readCancelled).toBe(true); // readable STOP_SENDINGed
   });
 
   it('closeContinuingRequest FINs our writable and drops the context', async () => {
@@ -478,7 +535,7 @@ describe('UniPairTopology — continuing request stream (SUBSCRIBE_NAMESPACE, §
       type: 'REQUEST_UPDATE', requestId: 2n, existingRequestId: 0n,
       parameters: new Map([[0x34n, [[nm('a'), nm('b')]]]]),
     } as unknown as ControlMessage;
-    const respP = topo.sendUpdateOnContinuing(requestId, updateMsg);
+    const respP = topo.sendUpdateOnContinuing(requestId, updateMsg, () => {});
     await flush();
     transport.bidi[0]!.push(reqOkBytes()); // the update's REQUEST_OK
     const resp = await respP;
@@ -499,10 +556,10 @@ describe('UniPairTopology — continuing request stream (SUBSCRIBE_NAMESPACE, §
     transport.bidi[0]!.push(reqOkBytes());
     await flush();
     const notUpdate = { type: 'REQUEST_OK', requestId: 0n, parameters: new Map() } as ControlMessage;
-    await expect(topo.sendUpdateOnContinuing(requestId, notUpdate)).rejects.toThrow(/expects REQUEST_UPDATE/i);
+    await expect(topo.sendUpdateOnContinuing(requestId, notUpdate, () => {})).rejects.toThrow(/expects REQUEST_UPDATE/i);
   });
 
-  it('a write failure on sendUpdateOnContinuing does not leave a stale pending update', async () => {
+  it('a write failure on sendUpdateOnContinuing terminates the continuing request (§11.4.1)', async () => {
     const { topo, transport, p, requestId } = open();
     const handle = await p;
     transport.bidi[0]!.push(reqOkBytes()); // first response
@@ -513,12 +570,13 @@ describe('UniPairTopology — continuing request stream (SUBSCRIBE_NAMESPACE, §
       type: 'REQUEST_UPDATE', requestId: 2n, existingRequestId: 0n,
       parameters: new Map([[0x34n, [[nm('a')]]]]),
     } as unknown as ControlMessage;
-    await expect(topo.sendUpdateOnContinuing(requestId, updateMsg)).rejects.toThrow();
+    await expect(topo.sendUpdateOnContinuing(requestId, updateMsg, () => {})).rejects.toThrow();
 
-    // A later REQUEST_OK must be treated as UNSOLICITED — proving the failed
-    // update's deferred was removed and cannot mis-correlate a response.
-    transport.bidi[0]!.push(reqOkBytes()).closeReadable();
-    await expect(handle.closed).rejects.toThrow(/unsolicited REQUEST_OK/i);
+    // §11.4.1: the update write failed → the continuing bidi request stream is dead.
+    // The failed update's deferred was removed (no mis-correlation) AND the context
+    // is reclaimed + torn down, so a later update cannot target a dead writer.
+    expect(topo.hasContinuingRequest(requestId)).toBe(false);
+    await handle.closed; // resolves cleanly (torn down) rather than hanging
   });
 });
 
@@ -571,7 +629,7 @@ describe('UniPairTopology — peer REQUEST_UPDATE on an outbound PUBLISH stream 
     topo.onStreamError = (e) => errors.push(e);
     topo.onPeerRequestUpdate = (id, m) => { seen.push({ id, type: m.type }); };
 
-    const handle = await topo.openRequest(transport, reqMessage(session.publish(ns('a'), nm('1'), 5n)));
+    const handle = await topo.openRequest(transport, reqMessage(session.publish(ns('a'), nm('1'), 5n)), () => {});
     transport.bidi[0]!.push(reqOkBytes()); // initial PUBLISH response (PUBLISH_OK shorthand)
     await handle.response;
 
@@ -591,7 +649,7 @@ describe('UniPairTopology — peer REQUEST_UPDATE on an outbound PUBLISH stream 
     topo.onStreamError = (e) => errors.push(e);
     topo.onPeerRequestUpdate = () => { routed++; };
 
-    const handle = await topo.openRequest(transport, reqMessage(session.publish(ns('a'), nm('1'), 5n)));
+    const handle = await topo.openRequest(transport, reqMessage(session.publish(ns('a'), nm('1'), 5n)), () => {});
     void handle.response.catch(() => {});
     transport.bidi[0]!.push(reqUpdateBytes(1n)); // before any REQUEST_OK / REQUEST_ERROR
     await flush();
@@ -610,7 +668,7 @@ describe('UniPairTopology — peer REQUEST_UPDATE on an outbound PUBLISH stream 
     topo.onStreamError = (e) => errors.push(e);
     topo.onPeerRequestUpdate = () => { routed++; };
 
-    const handle = await topo.openRequest(transport, reqMessage(session.subscribe(ns('a'), nm('1'))));
+    const handle = await topo.openRequest(transport, reqMessage(session.subscribe(ns('a'), nm('1'))), () => {});
     void handle.response.catch(() => {});
     transport.bidi[0]!.push(okBytes(7n)); // SUBSCRIBE_OK (initial response)
     await handle.response;
@@ -629,7 +687,7 @@ describe('UniPairTopology — outbound request-stream cleanup (lifecycle)', () =
     const topo = createUniPairTopology(session);
     const transport = new TransportSim();
     const a = session.subscribe(ns('a'), nm('1'));
-    const sh = await topo.openRequest(transport, reqMessage(a));
+    const sh = await topo.openRequest(transport, reqMessage(a), () => {});
     transport.bidi[0]!.push(okBytes(10n));
     await sh.response;
     expect(topo.hasRequestStream(a.requestId)).toBe(true);
@@ -647,7 +705,7 @@ describe('UniPairTopology — outbound request-stream cleanup (lifecycle)', () =
     topo.onRequestClosed = (rid) => closed.push(rid);
 
     const p = session.publish(ns('a'), nm('1'), 5n);
-    const handle = await topo.openRequest(transport, reqMessage(p));
+    const handle = await topo.openRequest(transport, reqMessage(p), () => {});
     transport.bidi[0]!.push(reqOkBytes()); // accept
     await handle.response;
 
@@ -665,7 +723,7 @@ describe('UniPairTopology — outbound request-stream cleanup (lifecycle)', () =
     topo.onRequestClosed = (rid) => closed.push(rid);
 
     const p = session.publish(ns('a'), nm('1'), 5n);
-    const handle = await topo.openRequest(transport, reqMessage(p));
+    const handle = await topo.openRequest(transport, reqMessage(p), () => {});
     transport.bidi[0]!.push(reqOkBytes());
     await handle.response;
 
@@ -753,7 +811,7 @@ describe('UniPairTopology — draft-18 GOAWAY (§10.4)', () => {
     topo.onStreamError = (e) => { streamError = e; };
 
     const a = session.subscribe(ns('live'), nm('vid'));
-    const handle = await topo.openRequest(transport, reqMessage(a));
+    const handle = await topo.openRequest(transport, reqMessage(a), () => {});
     // Request-stream GOAWAY form (no Request ID). It must NOT be matched as the
     // SUBSCRIBE's response — it is a per-request MIGRATION signal: the request fails
     // with a typed RequestGoawayError and the stream is torn down GRACEFULLY (no
@@ -782,7 +840,7 @@ describe('UniPairTopology — draft-18 GOAWAY (§10.4)', () => {
     topo.onRequestGoaway = (e) => { goaway = e; };
 
     const a = session.subscribe(ns('live'), nm('vid'));
-    const handle = await topo.openRequest(transport, reqMessage(a));
+    const handle = await topo.openRequest(transport, reqMessage(a), () => {});
     // First response resolves and DRAINS the FIFO queue; the stream stays open.
     transport.bidi[0]!.push(okBytes(7n));
     const first = await handle.response;
@@ -808,8 +866,8 @@ describe('UniPairTopology — draft-18 GOAWAY (§10.4)', () => {
 
     const a = session.subscribe(ns('a'), nm('1')); // requestId 0 → bidi[0]
     const b = session.subscribe(ns('b'), nm('2')); // requestId 2 → bidi[1]
-    const hA = await topo.openRequest(transport, reqMessage(a));
-    const hB = await topo.openRequest(transport, reqMessage(b));
+    const hA = await topo.openRequest(transport, reqMessage(a), () => {});
+    const hB = await topo.openRequest(transport, reqMessage(b), () => {});
 
     // GOAWAY migrates ONLY request A; request B still resolves normally.
     transport.bidi[0]!.push(codec18.encode({ type: 'GOAWAY', newSessionUri: '', timeout: 0n } as ControlMessage));

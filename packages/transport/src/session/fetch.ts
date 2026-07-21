@@ -37,6 +37,13 @@ export class FetchStateMachine {
   private _errorReason: string | undefined;
   private _wasCanceled: boolean = false;
   private _joining: JoiningFetchState | undefined;
+  // §10.13: FETCH_OK and the data stream are INDEPENDENT — "the FETCH_OK or
+  // REQUEST_ERROR can come at any time relative to object delivery." A fetcher's
+  // fetch is fully done only after BOTH the response (FETCH_OK) AND the data stream
+  // end have been observed, in either order.
+  private _responseReceived = false;
+  private _responseSent = false;
+  private _dataFinished = false;
 
   private constructor(
     private readonly _requestId: bigint,
@@ -229,14 +236,42 @@ export class FetchStateMachine {
   // ─── Fetcher Side Transitions ─────────────────────────────────────────
 
   /**
-   * Handle FETCH_OK received (fetcher side).
-   * Transitions from PENDING to TRANSFERRING.
+   * Handle FETCH_OK received (fetcher side). §10.13: it may arrive before OR after
+   * the data stream. Records that the response was seen; a duplicate is a §5.2
+   * violation. Moves PENDING → TRANSFERRING (unless the data already finished).
    */
   handleFetchOk(): void {
-    this.assertState(FetchState.PENDING, 'handleFetchOk');
     this.assertNotPublisher('handleFetchOk');
+    this.assertNotCompleted('handleFetchOk'); // §5.2: no FETCH_OK after REQUEST_ERROR / cancel
+    if (this._responseReceived) {
+      throw new Error('Cannot handleFetchOk: FETCH_OK already received (§5.2: one response)');
+    }
+    this._responseReceived = true;
+    if (this._state === FetchState.PENDING) this._state = FetchState.TRANSFERRING;
+  }
 
-    this._state = FetchState.TRANSFERRING;
+  /** Fetcher side: the FETCH_OK response has been received. */
+  get responseReceived(): boolean {
+    return this._responseReceived;
+  }
+
+  /** Fetcher side: the FETCH data stream has ended (FIN/reset). */
+  get dataFinished(): boolean {
+    return this._dataFinished;
+  }
+
+  /**
+   * Fetcher side: whether BOTH the FETCH_OK response AND the data-stream end have
+   * been observed (§10.13) — the fetch is then fully complete and reclaimable in
+   * either arrival order.
+   */
+  get isFetcherComplete(): boolean {
+    return this._responseReceived && this._dataFinished;
+  }
+
+  /** Fetcher side: record the FETCH data stream ended (FIN/reset), any order. */
+  markDataFinished(): void {
+    this._dataFinished = true;
   }
 
   /**
@@ -263,7 +298,22 @@ export class FetchStateMachine {
     this.assertState(FetchState.PENDING, 'sendFetchOk');
     this.assertPublisher('sendFetchOk');
 
+    this._responseSent = true;
     this._state = FetchState.TRANSFERRING;
+  }
+
+  /** Publisher side: the FETCH_OK response has been sent. */
+  get responseSent(): boolean {
+    return this._responseSent;
+  }
+
+  /**
+   * Publisher side: whether BOTH the FETCH_OK response AND the response-stream end
+   * have been observed (§10.13) — the served fetch is then reclaimable, in either
+   * order (a publisher may close the data stream before sending FETCH_OK).
+   */
+  get isPublisherComplete(): boolean {
+    return this._responseSent && this._dataFinished;
   }
 
   /**
@@ -281,11 +331,13 @@ export class FetchStateMachine {
   }
 
   /**
-   * Handle FETCH_CANCEL received (publisher side).
-   * Transitions from TRANSFERRING to COMPLETED.
+   * Handle FETCH_CANCEL received (publisher side). draft-16 §9.18 permits the
+   * fetcher to cancel from EITHER state — before FETCH_OK (PENDING) or during
+   * transfer (TRANSFERRING) — so accept both; only a COMPLETED fetch is invalid.
+   * Transitions to COMPLETED.
    */
   handleFetchCancel(): void {
-    this.assertState(FetchState.TRANSFERRING, 'handleFetchCancel');
+    this.assertNotCompleted('handleFetchCancel');
     this.assertPublisher('handleFetchCancel');
 
     this._wasCanceled = true;

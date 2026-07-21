@@ -577,8 +577,26 @@ export class MoqtPlayer {
    */
   private readonly pendingFetchStreams = new Map<
     bigint,
-    { requestId: bigint; objects: MoqtObject[] }
+    { requestId: bigint; objects: MoqtObject[]; finished?: boolean }
   >();
+
+  /**
+   * FETCH request IDs refused by REQUEST_ERROR BEFORE the fetch()/
+   * joiningFetch() continuation registered them (§9.16.3 races). Registration
+   * consults this so a refused request is never resurrected. Bounded FIFO.
+   */
+  private readonly refusedFetchRequests = new Map<bigint, { reason: string; code: bigint }>();
+  private static readonly MAX_REFUSED_FETCHES = 16;
+  /** Entry-count bound for pendingFetchStreams (FIFO eviction of the oldest). */
+  private static readonly MAX_PENDING_FETCH_STREAMS = 8;
+
+  /**
+   * Tombstones for OVERFLOWED unregistered fetch streams: their later objects
+   * must be swallowed (a fetch stream's wire trackAlias is 0, which can
+   * collide with a real alias-0 subscription). Entries clear on FIN/reset,
+   * so the set is bounded by the peer's concurrently-open streams.
+   */
+  private readonly droppedFetchStreams = new Set<bigint>();
 
   /**
    * Media timeline state — populated when catalog contains a mediatimeline track.
@@ -2102,6 +2120,8 @@ export class MoqtPlayer {
     this.fetchStreamAliases.clear();
     this.fetchStreamRequestIds.clear();
     this.pendingFetchStreams.clear();
+    this.refusedFetchRequests.clear();
+    this.droppedFetchStreams.clear();
     this.rejectPendingCatalogFetches('Session migrated — fetchCatalog cancelled');
 
     // Connect to new relay (CLIENT_SETUP → SERVER_SETUP) §3.3
@@ -2160,6 +2180,8 @@ export class MoqtPlayer {
     this.fetchStreamAliases.clear();
     this.fetchStreamRequestIds.clear();
     this.pendingFetchStreams.clear();
+    this.refusedFetchRequests.clear();
+    this.droppedFetchStreams.clear();
     this.rejectPendingCatalogFetches('Session migrated — fetchCatalog cancelled');
 
     // Connect to new relay — createTransport is guaranteed available (checked by caller)
@@ -2205,6 +2227,7 @@ export class MoqtPlayer {
     options: { startGroup: number; startObject: number; endGroup: number; endObject: number },
   ): Promise<bigint> {
     if (!this.connection) throw new Error('Player not loaded');
+    const connAtCall = this.connection;
 
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(trackName);
@@ -2216,7 +2239,7 @@ export class MoqtPlayer {
       endObject: varint(BigInt(options.endObject)),
     };
 
-    const reqId = await this.connection.fetch(nsBytes, nameBytes, fetchOptions);
+    const reqId = await connAtCall.fetch(nsBytes, nameBytes, fetchOptions);
     const reqIdBigInt = BigInt(reqId);
 
     // Find the media type and track alias for this track name
@@ -2233,6 +2256,14 @@ export class MoqtPlayer {
       }
     }
 
+    // Completion crossed destroy()/migration: the request ID belongs to a
+    // dead session — a caller could neither receive objects nor cancel it
+    // (fetchCancel would target the NEW connection). Best-effort cancel on
+    // the captured old connection and reject loudly.
+    if (!this.subscriptionManager || this.connection !== connAtCall) {
+      try { await connAtCall.fetchCancel(reqId); } catch { /* old session gone */ }
+      throw new Error('fetch() aborted: player destroyed or session migrated while the FETCH was in flight');
+    }
     this.registerMediaFetch(reqIdBigInt, { trackName, mediaType, trackAlias });
 
     return reqId;
@@ -2248,14 +2279,45 @@ export class MoqtPlayer {
     fetchReqId: bigint,
     info: { trackName: string; mediaType: 'video' | 'audio'; trackAlias: bigint; warmStart?: boolean },
   ): void {
+    // A REQUEST_ERROR that raced the fetch()/joiningFetch() continuation
+    // already refused this request — honor it instead of resurrecting a
+    // dead fetch (its buffered streams are dropped with it).
+    const refused = this.refusedFetchRequests.get(fetchReqId);
+    if (refused) {
+      this.refusedFetchRequests.delete(fetchReqId);
+      for (const [streamId, pending] of this.pendingFetchStreams) {
+        if (pending.requestId === fetchReqId) this.pendingFetchStreams.delete(streamId);
+      }
+      this.log.warn('[%s] media FETCH %s for "%s" was refused before registration: %s (code=0x%s) — continuing live-only',
+        info.warmStart ? 'warm-start' : 'fetch',
+        fetchReqId, info.trackName, refused.reason, refused.code.toString(16));
+      return;
+    }
+
+    // An alias remap (SUBSCRIBE_OK with a server-assigned alias) may have
+    // landed during the same await window — always register against the
+    // track's CURRENT alias, not the one captured before the await.
+    for (const sub of this.activeSubscriptions.values()) {
+      if (sub.trackName === info.trackName && sub.mediaType === info.mediaType) {
+        info = { ...info, trackAlias: sub.trackAlias };
+        break;
+      }
+    }
+
     this.activeFetches.set(fetchReqId, info);
     for (const [streamId, pending] of this.pendingFetchStreams) {
       if (pending.requestId !== fetchReqId) continue;
       this.pendingFetchStreams.delete(streamId);
-      this.fetchStreamAliases.set(streamId, info.trackAlias);
-      this.fetchStreamRequestIds.set(streamId, fetchReqId);
       for (const obj of pending.objects) {
         this.routeFetchObject(streamId, info.trackAlias, obj);
+      }
+      if (pending.finished) {
+        // The stream already FINned: the pre-roll is complete — no live
+        // routing maps needed, and the fetch bookkeeping ends with it.
+        this.activeFetches.delete(fetchReqId);
+      } else {
+        this.fetchStreamAliases.set(streamId, info.trackAlias);
+        this.fetchStreamRequestIds.set(streamId, fetchReqId);
       }
     }
   }
@@ -2681,6 +2743,8 @@ export class MoqtPlayer {
     this.fetchStreamAliases.clear();
     this.fetchStreamRequestIds.clear();
     this.pendingFetchStreams.clear();
+    this.refusedFetchRequests.clear();
+    this.droppedFetchStreams.clear();
     this.pendingObjectsByAlias.clear();
     // Clear make-before-break switch state
     this.pendingVideoSwitch = null;
@@ -2929,6 +2993,11 @@ export class MoqtPlayer {
           return;
         }
 
+        // An OVERFLOWED fetch stream: still classified as fetch — swallow its
+        // objects rather than letting wire alias 0 fall through to a real
+        // alias-0 subscription.
+        if (this.droppedFetchStreams.has(streamId)) return;
+
         // A fetch stream whose request isn't registered yet (§9.16.3: data
         // may beat the fetch()/joiningFetch() continuation): buffer per
         // stream and replay on registration. Never route as wire alias 0.
@@ -3002,8 +3071,13 @@ export class MoqtPlayer {
           }
         }
         // §9.16.3: a fetch's single data stream ending (FIN or reset) ends
-        // the fetch — drop its routing maps and active-fetch bookkeeping.
-        this.pendingFetchStreams.delete(streamId);
+        // the fetch — drop its routing maps and active-fetch bookkeeping. An
+        // UNREGISTERED stream (data raced the fetch()/joiningFetch()
+        // continuation) keeps its buffered objects and is marked finished:
+        // registration will still replay the completed pre-roll.
+        const pendingFetch = this.pendingFetchStreams.get(streamId);
+        if (pendingFetch) pendingFetch.finished = true;
+        this.droppedFetchStreams.delete(streamId); // tombstone ends with the stream
         const fetchReqId = this.fetchStreamRequestIds.get(streamId);
         if (fetchReqId !== undefined) {
           this.fetchStreamRequestIds.delete(streamId);
@@ -3043,6 +3117,21 @@ export class MoqtPlayer {
             // §9.16.3: data can precede the fetch()/joiningFetch() promise
             // continuation that registers the request. Park the stream;
             // registerMediaFetch() resolves it and replays buffered objects.
+            // BOUNDED: a peer cycling unknown fetch streams must not grow
+            // this for the session lifetime — evict the oldest entry.
+            if (this.pendingFetchStreams.size >= MoqtPlayer.MAX_PENDING_FETCH_STREAMS) {
+              const oldest = this.pendingFetchStreams.keys().next().value;
+              if (oldest !== undefined) {
+                const evicted = this.pendingFetchStreams.get(oldest);
+                this.pendingFetchStreams.delete(oldest);
+                // Keep the CLASSIFICATION for a still-open stream: its later
+                // objects are dropped, never alias-routed. A stream that has
+                // already FINished gets NO tombstone — no close event will
+                // ever clear it, and repeated header→FIN→overflow cycles
+                // would grow the set forever.
+                if (!evicted?.finished) this.droppedFetchStreams.add(oldest);
+              }
+            }
             this.pendingFetchStreams.set(streamId, { requestId: reqId, objects: [] });
           }
         }
@@ -3208,7 +3297,20 @@ export class MoqtPlayer {
       },
       onMediaFetchError: (requestId, errorReason, errorCode) => {
         const fetchInfo = this.activeFetches.get(requestId);
-        if (!fetchInfo) return;
+        if (!fetchInfo) {
+          // Refusal raced the fetch()/joiningFetch() continuation — remember
+          // it (bounded) so registration honors the refusal, and drop any
+          // already-buffered streams for the dead request.
+          if (this.refusedFetchRequests.size >= MoqtPlayer.MAX_REFUSED_FETCHES) {
+            const oldest = this.refusedFetchRequests.keys().next().value;
+            if (oldest !== undefined) this.refusedFetchRequests.delete(oldest);
+          }
+          this.refusedFetchRequests.set(requestId, { reason: errorReason, code: errorCode });
+          for (const [streamId, pending] of this.pendingFetchStreams) {
+            if (pending.requestId === requestId) this.pendingFetchStreams.delete(streamId);
+          }
+          return;
+        }
         this.activeFetches.delete(requestId);
         // Non-fatal by design: a refused warm-start (or manual) media fetch
         // just means no pre-roll — the live subscription is untouched and
@@ -3909,8 +4011,10 @@ export class MoqtPlayer {
       if (this.config.warmStartCurrentGroup === true && packaging === 'cmaf') {
         this.log.warn('[warm-start] CMAF track "%s" skipped — LOC only in this slice', name);
       }
+      // Warm start overrides ONLY the filter — configured subscribe options
+      // (deliveryTimeout, subscriberPriority, groupOrder) are preserved.
       const mediaOptions = warmStart
-        ? { subscriptionFilter: { type: 'LargestObject' as const } }
+        ? { ...(subscribeOptions ?? {}), subscriptionFilter: { type: 'LargestObject' as const } }
         : (subscribeOptions ?? defaultMediaSubscriptionFilter(track?.isLive === true));
       const reqId = await this.connection.subscribe(nsBytes, nameBytes, mediaOptions);
       const reqIdBigInt = BigInt(reqId);
@@ -3933,11 +4037,19 @@ export class MoqtPlayer {
         // (onDataStream → fetchStreamAliases → onObject remap). Failure here
         // is never fatal — playback continues live-only from the next group.
         try {
+          const connAtCall = this.connection;
           const fetchReqId = await this.connection.joiningFetch({
             joiningFetchType: 'relative',
             joiningRequestId: reqIdBigInt,
             joiningStart: 0n,
           });
+          // A late completion can cross destroy() or a session migration —
+          // never register into a destroyed player or a NEW session's maps
+          // with an OLD session's request ID.
+          if (!this.subscriptionManager || this.connection !== connAtCall) {
+            this.log.debug('[warm-start] joining FETCH %s completed after teardown/migration — ignored', fetchReqId);
+            return;
+          }
           this.registerMediaFetch(BigInt(fetchReqId), {
             trackName: name, mediaType, trackAlias: reqIdBigInt, warmStart: true,
           });

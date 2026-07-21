@@ -291,6 +291,11 @@ export interface SubscribeOptions {
   /** §9.2.2.4: Ascending (0x1) or Descending (0x2). */
   groupOrder?: Varint;
   /**
+   * §9.2.2.8: FORWARD parameter on the SUBSCRIBE itself (0 = paused).
+   * If omitted, the subscription starts with Forward State 1 (active).
+   */
+  forward?: ForwardStateValue;
+  /**
    * §9.2.2.5: Subscription filter.
    * If omitted, the subscription is unfiltered (all objects pass).
    */
@@ -307,6 +312,14 @@ export interface RequestUpdateOptions {
   subscriberPriority?: Varint;
   /** §9.2.2.5: SUBSCRIPTION_FILTER MAY appear in REQUEST_UPDATE to change subscription range. */
   subscriptionFilter?: SubscriptionFilter;
+  /**
+   * §8 / §10.2.4: OBJECT_DELIVERY_TIMEOUT (0x02), in ms — MAY appear in REQUEST_UPDATE.
+   * Changing it re-derives the effective delivery timeout the terminal-alias guard
+   * must outlive; omitted leaves the current value unchanged.
+   */
+  objectDeliveryTimeout?: Varint;
+  /** §8 / §10.2.3: SUBGROUP_DELIVERY_TIMEOUT (0x06), in ms — MAY appear in REQUEST_UPDATE (draft-18 only). */
+  subgroupDeliveryTimeout?: Varint;
   /**
    * draft-18 §10.9.2 / §10.2.14: a new Track Namespace Prefix. Valid ONLY when
    * `existingRequestId` is an outbound SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS;
@@ -395,6 +408,26 @@ export interface TrackSubscriptionState {
 }
 
 /**
+ * Phase machine for a locally-cancelled request's crossed peer messages. `kind`
+ * fixes which messages are legal; `phase` tracks §5.1/§5.2's "exactly one OK-or-
+ * error response" plus the terminal:
+ *
+ *   PENDING (no OK yet): SUBSCRIBE_OK/FETCH_OK → ESTABLISHED (kept); REQUEST_ERROR
+ *     → terminal (reclaim); PUBLISH_DONE → terminal (reclaim, subscribe only).
+ *   ESTABLISHED (OK already seen — whether before OR at cancellation, or via a
+ *     crossed OK): PUBLISH_DONE → terminal (reclaim, subscribe only). A SECOND
+ *     OK, or a REQUEST_ERROR after the OK, violates §5.1/§5.2 → §9.1 close.
+ *
+ * A subscription cancelled while already ESTABLISHED starts in `established`, so a
+ * crossed (duplicate) SUBSCRIBE_OK for it is correctly rejected. See {@link
+ * Session}'s `recentlyCancelled`.
+ */
+interface CrossedShadow {
+  readonly kind: 'subscribe' | 'fetch';
+  phase: 'pending' | 'established';
+}
+
+/**
  * Result of subscribe/fetch operations.
  */
 export interface RequestResult {
@@ -423,6 +456,53 @@ export class Session {
   private readonly subscriptions = new Map<bigint, SubscriptionStateMachine>();
   /** Track info for subscriptions (for alias registration). */
   private readonly subscriptionTracks = new Map<bigint, { namespace: Uint8Array[]; name: Uint8Array }>();
+
+  /**
+   * PUBLISH-initiated (incoming) request ID → LOCAL outbound SUBSCRIBE request ID
+   * whose cancellation is STAGED (§5.1). A pending local SUBSCRIBE colliding with
+   * an inbound PUBLISH for the same track is NOT cancelled at receipt: the draft
+   * requires termination only before PUBLISH_OK, and only if the PUBLISH is
+   * actually accepted. Cancellation runs in {@link acceptSubscribe}; a rejected /
+   * malformed / torn-down PUBLISH clears the entry and leaves the SUBSCRIBE alive.
+   */
+  private readonly pendingCollisions = new Map<bigint, bigint>();
+
+  /**
+   * SHADOWS of locally-cancelled requests (UNSUBSCRIBE / §5.1 supersession /
+   * FETCH_CANCEL), keyed by request ID → a small PHASE machine for the crossed
+   * peer messages that may still be in flight. §9.1 would close on any control
+   * message for an unknown request; a peer response the cancellation crossed is the
+   * one legitimate exception, so each shadow tracks how far through the valid crossed
+   * SEQUENCE it is:
+   *
+   *   subscribe: [ SUBSCRIBE_OK? ] → [ PUBLISH_DONE | REQUEST_ERROR ]  (terminal)
+   *   fetch:     one-shot — the FIRST crossed FETCH_OK OR REQUEST_ERROR reclaims it
+   *              (§5.2: after FETCH_OK the terminal is the data-stream FIN, not a
+   *              control message, so no later control response is legal)
+   *
+   * A subscribe's non-terminal SUBSCRIBE_OK is tolerated and KEEPS the shadow (a
+   * PUBLISH_DONE may still follow); the phase guards §5.1/§5.2 (see
+   * {@link CrossedShadow}). A wrong kind, a duplicate OK, an error-after-OK, a second
+   * terminal, or a request WE never cancelled → §9.1 close.
+   *
+   * RECLAMATION is deterministic and TIMER-FREE. A shadow is dropped when (a) its
+   * terminal arrives, or (b) draft-18 tears the request stream down
+   * (`handleOutboundRequestClosed`) — draft-18 responses ride the request's OWN bidi
+   * stream, so draft-18 never accumulates.
+   *
+   * The record is LOSSLESS and NEVER count-evicted: draft-14/16 responses share ONE
+   * control stream with NO cross-request ordering guarantee (the peer MAY process
+   * requests asynchronously, and reverse-direction ordering is independent of request
+   * processing), so a crossing can be arbitrarily delayed — silently forgetting a
+   * shadow would turn a legal crossing into a spurious §9.1 close, and there is no
+   * safe signal (ordering / wall-clock timer) to reclaim on. There is also NO lossy
+   * fallback (a scalar frontier cannot prove a retired id was CANCELLED vs normally
+   * COMPLETED, so it wrongly tolerated duplicate responses). Absence of a shadow
+   * therefore ⇒ §9.1 close. The only cost is memory for draft-14/16 cancellations
+   * whose crossing never arrives (a small `{kind, phase}` record each); draft-18 —
+   * the current draft — reclaims every shadow on its request-stream close.
+   */
+  private readonly recentlyCancelled = new Map<bigint, CrossedShadow>();
 
   /** Outgoing fetches (as fetcher). */
   private readonly fetches = new Map<bigint, FetchStateMachine>();
@@ -465,6 +545,11 @@ export class Session {
     forward?: ForwardStateValue;
     namespacePrefix?: Uint8Array[];
     prefixTarget?: 'namespace' | 'tracks';
+    // §8: STAGED delivery timeouts (ms). Applied to the subscription on REQUEST_OK,
+    // NOT at send time — a REQUEST_ERROR / rollback must not commit them. `undefined`
+    // means the update did not carry that parameter (leave the current value).
+    objectDeliveryTimeoutMs?: number;
+    subgroupDeliveryTimeoutMs?: number;
   }>();
 
   /**
@@ -1223,7 +1308,14 @@ export class Session {
   private handleSubscribeOk(msg: SubscribeOk): SessionOutboundAction[] {
     const sub = this.subscriptions.get(msg.requestId as bigint);
     if (!sub) {
-      // §9.1: Unknown request ID must close with INVALID_REQUEST_ID
+      // §5.1: a SUBSCRIBE_OK crossing OUR cancellation of a PENDING SUBSCRIBE (we
+      // unsubscribed / it was superseded) is a legal crossed message — tolerate it
+      // and KEEP the shadow, because a PUBLISH_DONE terminal may still follow it on
+      // the wire. A duplicate OK (shadow already ESTABLISHED — e.g. we cancelled an
+      // already-established sub), a fetch-kind shadow, or a request we never
+      // cancelled is a §9.1 unknown-request violation → close. (A LIVE subscription's
+      // genuine duplicate SUBSCRIBE_OK is caught by the SM assert.)
+      if (this.toleratesCrossedOk(msg.requestId as bigint, 'subscribe')) return [];
       return this.closeWithError(
         SessionErrorCode.INVALID_REQUEST_ID,
         `Unknown request ID ${msg.requestId} for SUBSCRIBE_OK`,
@@ -1236,7 +1328,7 @@ export class Session {
     const trackInfo = this.subscriptionTracks.get(msg.requestId as bigint);
     if (trackInfo) {
       try {
-        this.trackAliases.register(msg.trackAlias, trackInfo.namespace, trackInfo.name);
+        this.trackAliases.register(msg.trackAlias, trackInfo.namespace, trackInfo.name, msg.requestId as bigint);
       } catch {
         return this.closeWithError(
           SessionErrorCode.DUPLICATE_TRACK_ALIAS,
@@ -1276,12 +1368,21 @@ export class Session {
     const sub = this.subscriptions.get(msg.requestId as bigint);
     if (sub) {
       sub.handleRequestError(msg.errorCode, msg.errorReason);
+      // §5.1: REQUEST_ERROR is terminal for the (pending) subscribe — RECLAIM the
+      // full state (bounded). A second REQUEST_ERROR then takes the unknown-request
+      // path below.
+      if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
+      this.subscriptions.delete(msg.requestId as bigint);
+      this.subscriptionTracks.delete(msg.requestId as bigint);
       return [];
     }
 
     const fetch = this.fetches.get(msg.requestId as bigint);
     if (fetch) {
+      // §5.2: REQUEST_ERROR is terminal for the fetch — RECLAIM the state (bounded).
+      // A second REQUEST_ERROR then takes the unknown-request / crossed-shadow path.
       fetch.handleRequestError(msg.errorCode, msg.errorReason);
+      this.fetches.delete(msg.requestId as bigint);
       return [];
     }
 
@@ -1314,7 +1415,13 @@ export class Session {
       return [];
     }
 
-    // §9.1: Unknown request ID must close with INVALID_REQUEST_ID
+    // §5.1/§5.2: a REQUEST_ERROR crossing OUR cancellation of a still-PENDING request
+    // (SUBSCRIBE or FETCH) is a legal crossed terminal — tolerate it and reclaim the
+    // shadow. A REQUEST_ERROR after the request's OK already crossed (shadow
+    // ESTABLISHED) violates "exactly one OK-or-error" → close.
+    if (this.consumeCrossedTerminal(msg.requestId as bigint, 'request_error', 'subscribe', 'fetch')) return [];
+
+    // §9.1: Unknown request ID must close with INVALID_REQUEST_ID.
     return this.closeWithError(
       SessionErrorCode.INVALID_REQUEST_ID,
       `Unknown request ID ${msg.requestId} for REQUEST_ERROR`,
@@ -1376,6 +1483,11 @@ export class Session {
   private handleFetchOk(msg: FetchOk): SessionOutboundAction[] {
     const fetch = this.fetches.get(msg.requestId as bigint);
     if (!fetch) {
+      // A FETCH_OK crossing OUR FETCH_CANCEL of a PENDING fetch is a legal crossed
+      // message — tolerate it and KEEP the shadow. A duplicate FETCH_OK (shadow
+      // already ESTABLISHED), a subscribe-kind shadow, or a request we never
+      // cancelled is a §9.1 unknown-request violation → close.
+      if (this.toleratesCrossedOk(msg.requestId as bigint, 'fetch')) return [];
       // §9.1: Unknown request ID must close with INVALID_REQUEST_ID
       return this.closeWithError(
         SessionErrorCode.INVALID_REQUEST_ID,
@@ -1403,7 +1515,18 @@ export class Session {
       }
     }
 
+    // §5.2: a duplicate FETCH_OK for a live fetch is a violation → close.
+    if (fetch.responseReceived) {
+      return this.closeWithError(
+        SessionErrorCode.PROTOCOL_VIOLATION,
+        `Duplicate FETCH_OK for request ${msg.requestId}`,
+      );
+    }
     fetch.handleFetchOk();
+    // §10.13: FETCH_OK may arrive AFTER the data stream already ended. Reclaim only
+    // once BOTH are done; if the data has NOT finished, keep the fetch (a later
+    // data-stream FIN reclaims it) — see handleFetchStreamFinished.
+    if (fetch.isFetcherComplete) this.fetches.delete(msg.requestId as bigint);
     return [];
   }
 
@@ -1482,7 +1605,27 @@ export class Session {
         const sub = this.subscriptions.get(pending.existingRequestId)
           ?? this.incomingSubscriptions.get(pending.existingRequestId);
         if (sub) {
-          sub.updateForwardState(pending.forward);
+          // d18: the update may have been sent while the subscription was
+          // still PENDING (§10.12.2 races); use the pre-establish setter then.
+          // A deferred ack can also arrive AFTER the subscription was
+          // terminated by its initial REQUEST_ERROR (§10.8 rejection path):
+          // the ack settles the update, but there is no live subscription to
+          // mutate — applying would throw and close the session.
+          if (sub.state === 'pending') sub.setInitialForwardState(pending.forward);
+          else if (sub.state === 'established') sub.updateForwardState(pending.forward);
+          // terminated: settle without applying.
+        }
+      }
+
+      // §8: COMMIT the staged delivery timeouts now that the update is confirmed
+      // (never at send — see requestUpdate). Omitted parameters leave the current
+      // value unchanged. Applies to the outbound or the PUBLISH-initiated incoming sub.
+      if (pending.objectDeliveryTimeoutMs !== undefined || pending.subgroupDeliveryTimeoutMs !== undefined) {
+        const tsub = this.subscriptions.get(pending.existingRequestId)
+          ?? this.incomingSubscriptions.get(pending.existingRequestId);
+        if (tsub) {
+          if (pending.objectDeliveryTimeoutMs !== undefined) tsub.requestedDeliveryTimeoutMs = pending.objectDeliveryTimeoutMs;
+          if (pending.subgroupDeliveryTimeoutMs !== undefined) tsub.requestedSubgroupDeliveryTimeoutMs = pending.subgroupDeliveryTimeoutMs;
         }
       }
 
@@ -1553,6 +1696,12 @@ export class Session {
 
     const sub = this.subscriptions.get(msg.requestId as bigint);
     if (!sub) {
+      // §5.1.1: a PUBLISH_DONE crossing OUR cancellation of that SUBSCRIBE (from
+      // EITHER phase — with or without a preceding crossed SUBSCRIBE_OK) is the legal
+      // TERMINAL of the crossed sequence — tolerate it and reclaim the shadow. A
+      // PUBLISH_DONE for a request we never cancelled (e.g. a second terminal after a
+      // peer REQUEST_ERROR) or of a non-subscribe kind is a §9.1 violation → close.
+      if (this.consumeCrossedTerminal(msg.requestId as bigint, 'publish_done', 'subscribe')) return [];
       // §9.1: Unknown request ID must close with INVALID_REQUEST_ID
       return this.closeWithError(
         SessionErrorCode.INVALID_REQUEST_ID,
@@ -1560,15 +1709,27 @@ export class Session {
       );
     }
 
+    // §5.1.1 / §11.1: PUBLISH_DONE is the terminal for an ESTABLISHED subscriber
+    // subscription. Apply it, release the Track Alias, and RECLAIM the full state
+    // (bounded — nothing retained). A SECOND PUBLISH_DONE then takes the
+    // unknown-request path above (a crossed PUBLISH_DONE after OUR own unsubscribe
+    // is handled by the ESTABLISHED-phase superseded record, not a retained SM).
     sub.handlePublishDone(msg.statusCode, msg.errorReason);
+    if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
+    this.subscriptions.delete(msg.requestId as bigint);
+    this.subscriptionTracks.delete(msg.requestId as bigint);
     return [];
   }
 
   private handleUnsubscribe(msg: Unsubscribe): SessionOutboundAction[] {
-    // Publisher-side: terminate the subscription
+    // Publisher-side: terminate the subscription and RECLAIM its full state
+    // (bounded — nothing retained). UNSUBSCRIBE is terminal; a second one for the
+    // same request then takes the unknown-request path below.
     const sub = this.incomingSubscriptions.get(msg.requestId as bigint);
     if (sub) {
       sub.handleUnsubscribe();
+      if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
+      this.incomingSubscriptions.delete(msg.requestId as bigint);
       return [];
     }
 
@@ -1635,6 +1796,25 @@ export class Session {
       msg.trackName,
     );
 
+    // §5.1: at most ONE subscription per Track per ROLE (drafts 16/18 only —
+    // draft-14 defines neither this rule nor DUPLICATE_SUBSCRIPTION 0x19). A peer
+    // SUBSCRIBE makes US the publisher; if we already hold a publisher-role
+    // subscription for the same Full Track Name — an inbound SUBSCRIBE (incl. one
+    // Pending) OR a LOCAL outbound PUBLISH — the REQUEST MUST fail with
+    // DUPLICATE_SUBSCRIPTION. Request-level, not a session close.
+    if (this._draftVersion !== 14 && sub.trackKey !== undefined
+        && (this.findLiveIncomingByTrack(sub.trackKey, /* publishInitiated */ false)
+            || this.findLiveOutboundPublishByTrack(sub.trackKey))) {
+      const errorMsg: RequestErrorMsg = {
+        type: 'REQUEST_ERROR',
+        requestId: msg.requestId,
+        errorCode: RequestErrorCode.DUPLICATE_SUBSCRIPTION,
+        retryInterval: varint(0n),
+        errorReason: 'Duplicate subscription: a publisher-role subscription for this track already exists (§5.1)',
+      };
+      return [this.sendControl(errorMsg), ...(validated.replenish ?? [])];
+    }
+
     // §9.2.2.5: store the subscriber's filter type — the Joining Fetch gate
     // (§9.16.2) needs it. An omitted parameter = unfiltered (NOT Largest
     // Object). Malformed filter bytes were already rejected by the message
@@ -1677,12 +1857,49 @@ export class Session {
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
 
+    // Create the subscription state machine flagged as PUBLISH-initiated (this
+    // also computes its track key). NOT stored / alias NOT registered until the
+    // duplicate checks below pass.
+    const sub = SubscriptionStateMachine.createFromPublish(
+      msg.requestId,
+      msg.trackNamespace,
+      msg.trackName,
+      msg.parameters,
+      msg.trackAlias as bigint,
+    );
+
+    // §5.1: an endpoint may hold at most ONE subscription per Track per ROLE
+    // (drafts 16/18 only — draft-14 defines neither this rule nor
+    // DUPLICATE_SUBSCRIPTION 0x19). A PUBLISH makes US the subscriber. Checked
+    // BEFORE touching the alias registry.
+    if (this._draftVersion !== 14 && sub.trackKey !== undefined) {
+      const outboundSub = this.findLiveOutboundSubscribeByTrack(sub.trackKey);
+      // (a) A committed subscriber-role subscription — an earlier PUBLISH we
+      //     accepted, or a local ESTABLISHED SUBSCRIBE — is a duplicate: reject.
+      if (this.findLiveIncomingByTrack(sub.trackKey, /* publishInitiated */ true)
+          || (outboundSub && outboundSub.state === 'established')) {
+        return [this.buildPublishReject(
+          msg.requestId, RequestErrorCode.DUPLICATE_SUBSCRIPTION,
+          'Duplicate subscription: a subscriber-role subscription for this track already exists (§5.1)',
+        ), ...(validated.replenish ?? [])];
+      }
+      // (b) A local PENDING SUBSCRIBE for the same track: §5.1 requires the
+      //     subscription WE initiated to reach Terminated BEFORE we send
+      //     PUBLISH_OK — but ONLY if we accept the PUBLISH. STAGE the cancellation
+      //     (keyed by this PUBLISH's request ID) and accept the PUBLISH into
+      //     Pending state; acceptSubscribe performs it, and a rejected / malformed
+      //     / torn-down PUBLISH clears it, leaving the local SUBSCRIBE alive.
+      if (outboundSub && outboundSub.state === 'pending') {
+        this.pendingCollisions.set(msg.requestId as bigint, outboundSub.requestId as bigint);
+      }
+    }
+
     // Draft-14 §9.13: "The same Track Alias MUST NOT be used to refer to two
     // different Tracks simultaneously. If a subscriber receives a PUBLISH that
     // uses the same Track Alias as a different track with an active subscription,
     // it MUST close the session with error DUPLICATE_TRACK_ALIAS."
     try {
-      this.trackAliases.register(msg.trackAlias, msg.trackNamespace, msg.trackName);
+      this.trackAliases.register(msg.trackAlias, msg.trackNamespace, msg.trackName, msg.requestId as bigint);
     } catch {
       return this.closeWithError(
         SessionErrorCode.DUPLICATE_TRACK_ALIAS,
@@ -1690,18 +1907,173 @@ export class Session {
       );
     }
 
-    // Create subscription state machine flagged as PUBLISH-initiated.
-    // The application response may reuse selected inbound state (for example
-    // draft-14 GROUP_ORDER/FORWARD) when constructing PUBLISH_OK.
-    const sub = SubscriptionStateMachine.createFromPublish(
-      msg.requestId,
-      msg.trackNamespace,
-      msg.trackName,
-      msg.parameters,
-    );
     this.incomingSubscriptions.set(msg.requestId as bigint, sub);
 
     return validated.replenish ?? [];
+  }
+
+  /**
+   * Find a live (non-terminated) incoming subscription for a Full Track Name in
+   * the given ROLE (publisher = peer SUBSCRIBE we serve; subscriber = peer
+   * PUBLISH we receive). Used to enforce §5.1's one-subscription-per-role rule.
+   */
+  private findLiveIncomingByTrack(trackKey: string, publishInitiated: boolean): SubscriptionStateMachine | undefined {
+    for (const sub of this.incomingSubscriptions.values()) {
+      if (sub.trackKey === trackKey && sub.isPublishInitiated === publishInitiated && !sub.isTerminated) {
+        return sub;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Find a live (non-terminated) LOCAL outbound SUBSCRIBE (we are the subscriber)
+   * for a Full Track Name. Part of the §5.1 one-per-role check: a local SUBSCRIBE
+   * and an inbound PUBLISH for the same track both put us in the subscriber role.
+   */
+  private findLiveOutboundSubscribeByTrack(trackKey: string): SubscriptionStateMachine | undefined {
+    for (const sub of this.subscriptions.values()) {
+      if (sub.trackKey === trackKey && !sub.isTerminated) return sub;
+    }
+    return undefined;
+  }
+
+  /**
+   * Find a live (non-terminated) LOCAL outbound PUBLISH (we are the publisher)
+   * for a Full Track Name. Part of the §5.1 one-per-role check: a local PUBLISH
+   * and an inbound SUBSCRIBE for the same track both put us in the publisher role.
+   */
+  private findLiveOutboundPublishByTrack(trackKey: string): SubscriptionStateMachine | undefined {
+    for (const sub of this.outgoingPublishes.values()) {
+      if (sub.trackKey === trackKey && !sub.isTerminated) return sub;
+    }
+    return undefined;
+  }
+
+  /**
+   * §5.1: perform a STAGED cancellation of a local SUBSCRIBE superseded by an
+   * inbound PUBLISH, at the moment we accept that PUBLISH (before PUBLISH_OK). No
+   * staged entry (rejected/torn-down PUBLISH, or no collision) → no actions, so the
+   * local SUBSCRIBE survives. Otherwise terminate it and DELETE its state; a benign
+   * terminal crossing the cancellation is tolerated in O(1) via the allocation
+   * frontier. Returns the cancellation actions to PREPEND before the PUBLISH_OK.
+   */
+  private cancelStagedCollision(publishRequestId: bigint): SessionOutboundAction[] {
+    const localReqId = this.pendingCollisions.get(publishRequestId as bigint);
+    if (localReqId === undefined) return [];
+    this.pendingCollisions.delete(publishRequestId as bigint);
+    const sub = this.subscriptions.get(localReqId);
+    if (!sub || sub.isTerminated) return []; // already gone (app unsubscribed, etc.)
+
+    // Reclaim its full state (delete the SM + track metadata + release its alias).
+    this.terminateLocalSubscriberRequest(sub);
+
+    // Adapter/wire cancellation: a `cancel_request` (reject the pending
+    // subscribeTrack(); draft-18 reset the request stream), preceded on draft-14/16
+    // by an UNSUBSCRIBE on the wire.
+    const cancel: SessionOutboundAction = {
+      type: 'cancel_request',
+      requestId: localReqId,
+      reason: 'local SUBSCRIBE superseded by a peer PUBLISH for the same track (§5.1)',
+    };
+    if (this._draftVersion === 18) return [cancel];
+    return [this.sendControl({ type: 'UNSUBSCRIBE', requestId: localReqId } as Unsubscribe), cancel];
+  }
+
+  /**
+   * Locally terminate a subscriber-side subscription (public UNSUBSCRIBE or §5.1
+   * supersession) and RECLAIM its full state: terminate the SM, release its alias,
+   * and delete the SM + track metadata. Records compact cancellation PROVENANCE
+   * (id → 'subscribe') so exactly one legitimate crossed terminal is tolerated —
+   * bounded, one-shot, never closing the session on churn.
+   */
+  private terminateLocalSubscriberRequest(sub: SubscriptionStateMachine): void {
+    const requestId = sub.requestId;
+    // Capture the phase BEFORE superseding: if it was already ESTABLISHED, no crossed
+    // SUBSCRIBE_OK is legal (§5.1), so the shadow must start ESTABLISHED. (At cancel
+    // time the SM is PENDING or ESTABLISHED — never yet TERMINATED.)
+    const established = !sub.isPending;
+    if (!sub.isTerminated) sub.supersede(); // PENDING or ESTABLISHED → TERMINATED
+    if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, requestId);
+    this.subscriptions.delete(requestId as bigint);
+    this.subscriptionTracks.delete(requestId as bigint);
+    this.recordCancellation(requestId, 'subscribe', established);
+  }
+
+  /**
+   * Record that WE cancelled `requestId` — a shadow that tolerates the crossed peer
+   * SEQUENCE for it (see {@link recentlyCancelled}). `established` sets the starting
+   * phase: an already-established request expects no further OK.
+   */
+  private recordCancellation(requestId: bigint, kind: 'subscribe' | 'fetch', established: boolean): void {
+    // LOSSLESS: no cap, no eviction. A crossing may be arbitrarily delayed on the
+    // shared draft-14/16 control stream, so forgetting a shadow would false-close a
+    // valid session; the record is kept until its crossing consumes it (or, draft-18,
+    // the request-stream close reclaims it). See {@link recentlyCancelled}.
+    this.recentlyCancelled.delete(requestId as bigint); // refresh insertion recency
+    this.recentlyCancelled.set(requestId as bigint, { kind, phase: established ? 'established' : 'pending' });
+  }
+
+  /**
+   * A crossed NON-terminal OK. For a SUBSCRIBE (SUBSCRIBE_OK) it is legal only from
+   * PENDING and transitions the shadow to ESTABLISHED, KEEPING it (a PUBLISH_DONE
+   * terminal may still follow). For a FETCH (FETCH_OK) there is NO legal further
+   * control response (§5.2: the terminal is the data-stream FIN, not a message), so
+   * it is ONE-SHOT — reclaim immediately. Returns false (→ §9.1 close) for the wrong
+   * kind, a request we never cancelled, or a duplicate OK (already ESTABLISHED).
+   */
+  private toleratesCrossedOk(requestId: bigint, kind: 'subscribe' | 'fetch'): boolean {
+    const shadow = this.recentlyCancelled.get(requestId as bigint);
+    if (!shadow || shadow.kind !== kind || shadow.phase !== 'pending') return false;
+    if (kind === 'fetch') this.recentlyCancelled.delete(requestId as bigint); // one-shot
+    else shadow.phase = 'established';
+    return true;
+  }
+
+  /**
+   * A crossed TERMINAL. PUBLISH_DONE (subscribe) is legal from EITHER phase and
+   * reclaims the shadow. REQUEST_ERROR (either kind) is legal ONLY from the PENDING
+   * phase (§5.1/§5.2: no error after an OK) — after an OK it is a violation. Returns
+   * true (reclaimed) if legal; false (→ §9.1 close) otherwise.
+   */
+  private consumeCrossedTerminal(
+    requestId: bigint,
+    terminal: 'publish_done' | 'request_error',
+    ...kinds: ('subscribe' | 'fetch')[]
+  ): boolean {
+    const shadow = this.recentlyCancelled.get(requestId as bigint);
+    if (!shadow || !kinds.includes(shadow.kind)) return false;
+    // A REQUEST_ERROR after the OK-or-error response was already given is illegal.
+    if (terminal === 'request_error' && shadow.phase === 'established') return false;
+    this.recentlyCancelled.delete(requestId as bigint);
+    return true;
+  }
+
+  /**
+   * Whether a control response for `requestId` is a benign crossed message for a
+   * request WE cancelled — it has a live exact shadow. The I/O layer uses this to
+   * keep the application `onMessage` contract consistent — such a response is not
+   * surfaced as an event (qlog still observes it raw). Read-only peek; matches the
+   * tolerate/close decision in the handlers so suppression and tolerance never diverge.
+   */
+  isCancelledRequest(requestId: bigint): boolean {
+    return this.recentlyCancelled.has(requestId as bigint);
+  }
+
+  /** Build the request-level rejection for an incoming PUBLISH. draft-14 uses
+   *  PUBLISH_ERROR; drafts 16/18 use the generic REQUEST_ERROR (PUBLISH_ERROR is a
+   *  draft-14-only type — unencodable on draft-16). On draft-16 the REQUEST_ERROR
+   *  rides the control stream; on draft-18 the adapter writes it on the PUBLISH
+   *  request stream. The draft-14 field is a QUIC Varint — range-guard errorCode. */
+  private buildPublishReject(requestId: bigint, errorCode: bigint, errorReason: string): SessionOutboundAction {
+    if (this._draftVersion === 14) {
+      return this.sendControl({
+        type: 'PUBLISH_ERROR', requestId, errorCode: varint(errorCode), errorReason,
+      } as PublishError);
+    }
+    return this.sendControl({
+      type: 'REQUEST_ERROR', requestId, errorCode, retryInterval: varint(0n), errorReason,
+    } as RequestErrorMsg);
   }
 
   private handleIncomingFetch(msg: Fetch): SessionOutboundAction[] {
@@ -1745,7 +2117,11 @@ export class Session {
         // draft-18 §10.12.2: "A Joining Fetch is only permitted when the
         // associated subscription has Forward State 1; otherwise the publisher
         // MUST respond with a REQUEST_ERROR with error code INVALID_RANGE."
-        if (sub.forwardState !== ForwardState.ACTIVE) {
+        // The gate is evaluated ONLY for an ESTABLISHED subscription: a
+        // PENDING one defers to the buffering layer, which re-evaluates at
+        // establish time — after any pending REQUEST_UPDATEs have applied.
+        if (sub.state === SubscriptionState.ESTABLISHED
+            && sub.forwardState !== ForwardState.ACTIVE) {
           const errorMsg: RequestErrorMsg = {
             type: 'REQUEST_ERROR',
             requestId: msg.requestId,
@@ -1800,7 +2176,12 @@ export class Session {
   private handleFetchCancel(msg: FetchCancel): SessionOutboundAction[] {
     const fetch = this.incomingFetches.get(msg.requestId as bigint);
     if (fetch) {
+      // draft-16 §9.18: the fetcher may cancel from PENDING or TRANSFERRING. Mark it
+      // cancelled and RECLAIM the incoming-fetch state (bounded — a peer cannot grow
+      // incomingFetches with valid unique cancelled requests). The I/O layer aborts
+      // any response stream it had opened for this fetch.
       fetch.handleFetchCancel();
+      this.incomingFetches.delete(msg.requestId as bigint);
       return [];
     }
 
@@ -1869,8 +2250,13 @@ export class Session {
       return [this.sendControl(requestOk), ...(validated.replenish ?? [])];
     }
 
-    // Must be ESTABLISHED to accept updates
-    if (sub && sub.state !== 'established') {
+    // Must be ESTABLISHED to accept updates — except draft-18 SUBSCRIBE, where
+    // updates may race establishment (§10.12.2 "process any pending
+    // REQUEST_UPDATE messages ... before evaluating"). The exception does NOT
+    // cover publish-initiated subscriptions: an update acknowledgement before
+    // PUBLISH_OK has ambiguous correlation on the publish stream.
+    if (sub && sub.state !== 'established'
+        && !(this._draftVersion === 18 && sub.state === 'pending' && !sub.isPublishInitiated)) {
       return this.closeWithError(
         SessionErrorCode.PROTOCOL_VIOLATION,
         `REQUEST_UPDATE for subscription ${msg.existingRequestId} in state ${sub.state}; expected established`,
@@ -1911,8 +2297,33 @@ export class Session {
     if (forwardValues && forwardValues.length > 0 && sub) {
       const forwardVal = forwardValues[0];
       if (typeof forwardVal === 'bigint') {
-        sub.updateForwardState(forwardVal === 0n ? ForwardState.PAUSED : ForwardState.ACTIVE);
+        const next = forwardVal === 0n ? ForwardState.PAUSED : ForwardState.ACTIVE;
+        // PENDING (d18 update racing establishment): the setter that works
+        // pre-establish; ESTABLISHED: the normal transition.
+        if (sub.state === 'pending') sub.setInitialForwardState(next);
+        else sub.updateForwardState(next);
       }
+    }
+
+    // §9.2.2.5: SUBSCRIPTION_FILTER MAY appear in REQUEST_UPDATE — the stored
+    // remote filter must track it, or the Joining Fetch gate (§9.16.2) tests
+    // a stale value: LargestObject→AbsoluteStart would keep permitting joins,
+    // and NextGroupStart→LargestObject would wrongly close the session.
+    // Omitted ⇒ unchanged (per the same section).
+    const updatedFilter = msg.parameters.get(MessageParam.SUBSCRIPTION_FILTER)?.[0];
+    if (updatedFilter instanceof Uint8Array && sub) {
+      try {
+        sub.setRemoteFilterType(decodeSubscriptionFilter(updatedFilter, this._draftVersion).type);
+      } catch { /* malformed bytes were already rejected by parameter validation */ }
+    }
+
+    // §8: OBJECT/SUBGROUP_DELIVERY_TIMEOUT MAY appear in REQUEST_UPDATE — the receiver
+    // records the peer's new value on the subscription (omitted ⇒ unchanged, §9.11).
+    if (sub) {
+      const objTimeout = msg.parameters.get(MessageParam.OBJECT_DELIVERY_TIMEOUT)?.[0];
+      if (typeof objTimeout === 'bigint') sub.requestedDeliveryTimeoutMs = Number(objTimeout);
+      const subgroupTimeout = msg.parameters.get(MessageParam.SUBGROUP_DELIVERY_TIMEOUT)?.[0];
+      if (typeof subgroupTimeout === 'bigint') sub.requestedSubgroupDeliveryTimeoutMs = Number(subgroupTimeout);
     }
 
     // Draft-14 §9.10: "There is no control message in response to a
@@ -2096,6 +2507,10 @@ export class Session {
     const parameters: Parameters = new Map();
     if (options.deliveryTimeout !== undefined) {
       parameters.set(MessageParam.DELIVERY_TIMEOUT, [options.deliveryTimeout]);
+      // Retain the requested value (ms) so the I/O layer can floor its terminal-
+      // alias guard by it (§10.11) — the publisher may keep delivering for this
+      // long after teardown, so the guard must outlive it.
+      sub.requestedDeliveryTimeoutMs = Number(options.deliveryTimeout);
     }
     if (options.subscriberPriority !== undefined) {
       parameters.set(MessageParam.SUBSCRIBER_PRIORITY, [options.subscriberPriority]);
@@ -2104,6 +2519,12 @@ export class Session {
     }
     if (options.groupOrder !== undefined) {
       parameters.set(MessageParam.GROUP_ORDER, [options.groupOrder]);
+    }
+    if (options.forward !== undefined) {
+      // §9.2.2.8: FORWARD MAY appear in SUBSCRIBE — initial forward state.
+      // Both peers must agree: mirror it into OUR state machine too.
+      parameters.set(MessageParam.FORWARD, [varint(BigInt(options.forward))]);
+      sub.setInitialForwardState(options.forward);
     }
     if (options.subscriptionFilter !== undefined) {
       const filterBytes = encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
@@ -2216,34 +2637,33 @@ export class Session {
       );
     }
 
-    // sendUnsubscribe validates ESTABLISHED state + subscriber side
-    sub.sendUnsubscribe();
+    // §5.1: a subscriber may UNSUBSCRIBE from the Pending (Subscriber) OR
+    // Established state. Reclaim the full state; the crossed peer SEQUENCE
+    // (SUBSCRIBE_OK then PUBLISH_DONE / REQUEST_ERROR) is tolerated via the recorded
+    // shadow and reclaimed deterministically (see recentlyCancelled).
+    this.terminateLocalSubscriberRequest(sub);
 
-    // §5.1.1: Subscriber can destroy state after UNSUBSCRIBE.
-    // Unregister the track alias so re-subscribing to the same track
-    // with a new alias doesn't trigger DUPLICATE_TRACK_ALIAS.
-    if (sub.trackAlias !== undefined) {
-      this.trackAliases.unregister(sub.trackAlias);
-    }
-
-    if (this._draftVersion === 18) {
-      // draft-18 removed the UNSUBSCRIBE message; the subscriber cancels by
-      // tearing down the request stream (RESET_STREAM + STOP_SENDING, §3.3.2).
-      // Terminate local subscription state and emit NO control message — the I/O
-      // layer resets the request stream.
-      this.subscriptions.delete(requestId as bigint);
-      return [];
-    }
-
-    const msg: Unsubscribe = {
-      type: 'UNSUBSCRIBE',
-      requestId,
-    };
-
-    return [this.sendControl(msg)];
+    // draft-18 removed the UNSUBSCRIBE message; the subscriber cancels by tearing
+    // down the request stream (RESET_STREAM + STOP_SENDING, §3.3.2) — the I/O layer
+    // does that; emit NO control message. draft-14/16 send UNSUBSCRIBE.
+    if (this._draftVersion === 18) return [];
+    return [this.sendControl({ type: 'UNSUBSCRIBE', requestId } as Unsubscribe)];
   }
 
   // ─── Request Update Operations ─────────────────────────────────────────
+
+  /**
+   * Roll back a REQUEST_UPDATE whose SEND failed before the peer received it. The
+   * update allocated a Request ID and a {@link pendingUpdates} record (drafts
+   * 16/18 defer the state change to REQUEST_OK), which must be dropped so a later
+   * response cannot be mis-applied to an update that never went out — and so the
+   * pending map does not leak on a transport write failure. No-op once resolved.
+   * (draft-14 applies the change inline with no pending record; a draft-14 update
+   * send failure is a control-stream error handled session-fatally.)
+   */
+  rollbackRequestUpdate(requestId: bigint): void {
+    this.pendingUpdates.delete(requestId as bigint);
+  }
 
   /**
    * Send a REQUEST_UPDATE to modify an existing subscription.
@@ -2281,7 +2701,11 @@ export class Session {
       );
     }
 
-    if (sub.state !== 'established') {
+    // draft-18 §10.12.2 contemplates REQUEST_UPDATE racing establishment
+    // ("process any pending REQUEST_UPDATE messages ... before evaluating"),
+    // so a d18 subscriber may update a still-PENDING subscription.
+    const updatableWhilePending = this._draftVersion === 18 && sub.state === 'pending';
+    if (sub.state !== 'established' && !updatableWhilePending) {
       throw new SessionError(
         `Cannot update subscription in state ${sub.state}; expected established`,
         'INVALID_STATE',
@@ -2325,20 +2749,48 @@ export class Session {
       parameters.set(MessageParam.SUBSCRIPTION_FILTER, [sub.currentFilter]);
     }
 
+    // §8 / §10.2.3: SUBGROUP_DELIVERY_TIMEOUT (0x06) is a draft-18-only Message
+    // Parameter — emitting it on draft-14/16 would make a conformant peer close on
+    // the unknown parameter, so reject it locally outside draft-18.
+    if (options.subgroupDeliveryTimeout !== undefined && this._draftVersion !== 18) {
+      throw new SessionError(
+        'subgroupDeliveryTimeout (SUBGROUP_DELIVERY_TIMEOUT, 0x06) is draft-18 only',
+        'INVALID_STATE',
+      );
+    }
+    // §8: OBJECT/SUBGROUP_DELIVERY_TIMEOUT MAY appear in REQUEST_UPDATE. STAGE the new
+    // values on the pending record (drafts 16/18 apply on REQUEST_OK; draft-14 inline
+    // below) so a rejected update / write rollback cannot commit them prematurely. An
+    // omitted parameter leaves the current value unchanged.
+    if (options.objectDeliveryTimeout !== undefined) {
+      parameters.set(MessageParam.OBJECT_DELIVERY_TIMEOUT, [options.objectDeliveryTimeout]);
+    }
+    if (options.subgroupDeliveryTimeout !== undefined) {
+      parameters.set(MessageParam.SUBGROUP_DELIVERY_TIMEOUT, [options.subgroupDeliveryTimeout]);
+    }
+
     if (this._draftVersion === 14) {
       // Draft-14 §9.10: "There is no control message in response to a
       // SUBSCRIBE_UPDATE." Apply state changes immediately.
       if (options.forward !== undefined) {
         sub.updateForwardState(options.forward);
       }
-    } else {
-      // Draft-16: Track pending update — state is applied on REQUEST_OK
-      const pending: { existingRequestId: bigint; forward?: ForwardStateValue } = {
-        existingRequestId: existingRequestId as bigint,
-      };
-      if (options.forward !== undefined) {
-        pending.forward = options.forward;
+      if (options.objectDeliveryTimeout !== undefined) {
+        sub.requestedDeliveryTimeoutMs = Number(options.objectDeliveryTimeout);
       }
+    } else {
+      // Draft-16/18: track pending update — ALL state (forward + timeouts) is applied
+      // on REQUEST_OK, never at send (a rejected update must not commit anything).
+      const pending: {
+        existingRequestId: bigint; forward?: ForwardStateValue;
+        objectDeliveryTimeoutMs?: number; subgroupDeliveryTimeoutMs?: number;
+      } = { existingRequestId: existingRequestId as bigint };
+      if (options.forward !== undefined) {
+        // Normalize: callers pass boolean or ForwardStateValue; state is 0/1.
+        pending.forward = options.forward ? ForwardState.ACTIVE : ForwardState.PAUSED;
+      }
+      if (options.objectDeliveryTimeout !== undefined) pending.objectDeliveryTimeoutMs = Number(options.objectDeliveryTimeout);
+      if (options.subgroupDeliveryTimeout !== undefined) pending.subgroupDeliveryTimeoutMs = Number(options.subgroupDeliveryTimeout);
       this.pendingUpdates.set(requestId as bigint, pending);
     }
 
@@ -2629,14 +3081,23 @@ export class Session {
       );
     }
 
+    // Capture the phase BEFORE sendFetchCancel transitions the SM.
+    const established = fetch.isTransferring;
     fetch.sendFetchCancel();
+
+    // Drop the fetch from tracking. Record a crossed-message shadow ONLY for a
+    // PENDING cancel (round-8t §6): a FETCH already TRANSFERRING has received its
+    // FETCH_OK, so no crossed FETCH_OK is possible and — §5.2 — no REQUEST_ERROR is
+    // legal after the OK, so an established fetch needs no shadow at all. The pending
+    // shadow is ONE-SHOT (the first crossed FETCH_OK / REQUEST_ERROR reclaims it),
+    // sparing the now-COMPLETED state machine an assertion-close on a crossed message.
+    this.fetches.delete(requestId as bigint);
+    if (!established) this.recordCancellation(requestId, 'fetch', false);
 
     if (this._draftVersion === 18) {
       // draft-18 removed the FETCH_CANCEL control message (§3.3.2): cancellation
-      // is STOP_SENDING / RESET_STREAM on the request + data streams, performed
-      // by the I/O layer. The fetch state is marked completed above; no control
-      // message is emitted. Drop the fetch from tracking.
-      this.fetches.delete(requestId as bigint);
+      // is STOP_SENDING / RESET_STREAM on the request + data streams, performed by
+      // the I/O layer. No control message is emitted.
       return [];
     }
 
@@ -2646,6 +3107,37 @@ export class Session {
     };
 
     return [this.sendControl(fetchCancelMsg)];
+  }
+
+  /**
+   * §5.2: the fetcher keeps FETCH state until it sends FETCH_CANCEL, receives
+   * REQUEST_ERROR, or the FETCH data stream FINs/resets. The I/O layer calls this on
+   * that data-stream close to RECLAIM the completed outgoing fetch (bounded — the
+   * fetch is done, no crossed control response is expected after a clean end).
+   * No-op if the fetch is already gone.
+   */
+  handleFetchStreamFinished(requestId: bigint): void {
+    const fetch = this.fetches.get(requestId as bigint);
+    if (!fetch) return;
+    // §10.13: the data stream ended. Reclaim only once the FETCH_OK response has
+    // ALSO been seen; if it has NOT arrived yet, KEEP the fetch so a later FETCH_OK
+    // is matched (not treated as an unknown-request §9.1 close). handleFetchOk
+    // reclaims when it lands after the data.
+    fetch.markDataFinished();
+    if (fetch.isFetcherComplete) this.fetches.delete(requestId as bigint);
+  }
+
+  /**
+   * PUBLISHER side: the response stream for an incoming FETCH has closed (§10.13).
+   * §10.13 lets the data stream close BEFORE FETCH_OK is sent, so RECLAIM only once
+   * BOTH are done; otherwise keep the fetch so a later acceptFetch still finds it.
+   * No-op if already gone.
+   */
+  reclaimServedFetch(requestId: bigint): void {
+    const fetch = this.incomingFetches.get(requestId as bigint);
+    if (!fetch) return;
+    fetch.markDataFinished();
+    if (fetch.isPublisherComplete) this.incomingFetches.delete(requestId as bigint);
   }
 
   // ─── Track Alias Operations ───────────────────────────────────────────
@@ -3509,14 +4001,31 @@ export class Session {
   /**
    * Cancel an inbound PUBLISH / SUBSCRIBE / FETCH on a FIN/reset of its request
    * stream (draft-18 §3.3.2) — a normal lifecycle end, not a protocol error. Drops
-   * the publisher-/subscriber-side request state; no-op if none exists. Track
-   * Alias routing for an inbound PUBLISH is owned by the I/O layer (kept for late
-   * data), so it is not touched here.
+   * the publisher-/subscriber-side request state; no-op if none exists. UNREGISTERS
+   * the request's Track Alias from the session registry so a later request may
+   * reuse it (an inbound PUBLISH registered its publisher-chosen alias at receipt,
+   * §9.13). The I/O layer keeps its own bounded late-object guard — a separate,
+   * adapter-level concern.
    */
   handleInboundRequestClosed(requestId: bigint): SessionOutboundAction[] {
+    const sub = this.incomingSubscriptions.get(requestId as bigint);
+    if (sub?.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
     this.incomingSubscriptions.delete(requestId as bigint);
     this.incomingFetches.delete(requestId as bigint);
+    // §5.1: the PUBLISH went away before acceptance — discard any staged collision
+    // so the local SUBSCRIBE it would have superseded stays alive.
+    this.pendingCollisions.delete(requestId as bigint);
+    // §11.4.1: the request stream is gone — drop any REQUEST_UPDATE still pending
+    // against it, else its record (and REQUEST_OK expectation) leaks forever.
+    this.dropPendingUpdatesFor(requestId);
     return [];
+  }
+
+  /** Drop every pending REQUEST_UPDATE that targets the (now-gone) request `targetId`. */
+  private dropPendingUpdatesFor(targetId: bigint): void {
+    for (const [updateId, pending] of [...this.pendingUpdates]) {
+      if (pending.existingRequestId === (targetId as bigint)) this.pendingUpdates.delete(updateId);
+    }
   }
 
   /**
@@ -3533,7 +4042,7 @@ export class Session {
   handleOutboundRequestClosed(requestId: bigint): SessionOutboundAction[] {
     const sub = this.subscriptions.get(requestId as bigint);
     if (sub) {
-      if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias);
+      if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
       this.subscriptions.delete(requestId as bigint);
       this.subscriptionTracks.delete(requestId as bigint);
     }
@@ -3541,6 +4050,11 @@ export class Session {
     this.pendingTrackStatuses.delete(requestId as bigint);
     this.outgoingPublishes.delete(requestId as bigint);
     this.publishedNamespaces.delete(requestId as bigint);
+    // §11.4.1: drop any REQUEST_UPDATE still pending against this gone request.
+    this.dropPendingUpdatesFor(requestId);
+    // draft-18: the request stream is gone — no crossed terminal can arrive now, so
+    // reclaim any cancellation provenance for it (keeps the bounded map lean).
+    this.recentlyCancelled.delete(requestId as bigint);
     return [];
   }
 
@@ -3803,12 +4317,19 @@ export class Session {
     // PUBLISH-initiated subscriptions respond with a publish-acceptance message
     // (PUBLISH_OK / REQUEST_OK), not SUBSCRIBE_OK.
     if (sub.isPublishInitiated) {
+      // §5.1: if a pending local SUBSCRIBE for this track was superseded by this
+      // PUBLISH, it MUST reach Terminated BEFORE PUBLISH_OK. Perform the staged
+      // cancellation now and emit its actions ahead of the acceptance.
+      const preActions = this.cancelStagedCollision(requestId);
+      // If the cancellation itself forced a session close (superseded-set at
+      // capacity), return ONLY the close — do NOT also append an acceptance.
+      if (preActions.some((a) => a.type === 'close_connection')) return preActions;
       if (this._draftVersion === 18) {
         // draft-18 §10.10: PUBLISH_OK is REQUEST_OK shorthand (wire 0x07, no
         // Request ID); the I/O layer writes it on the inbound PUBLISH request
         // stream, not the control stream.
         const requestOk: RequestOk = { type: 'REQUEST_OK', requestId, parameters: new Map() };
-        return [this.sendControl(requestOk)];
+        return [...preActions, this.sendControl(requestOk)];
       }
       // Draft-14/16 §9.14: respond with PUBLISH_OK. Only carry fields that
       // intentionally define the initial subscription state.
@@ -3818,7 +4339,7 @@ export class Session {
         requestId,
         parameters: params,
       };
-      return [this.sendControl(publishOk)];
+      return [...preActions, this.sendControl(publishOk)];
     }
 
     const subscribeOk: SubscribeOk = {
@@ -3848,25 +4369,29 @@ export class Session {
 
     sub.sendRequestError(errorCode, errorReason);
 
-    // PUBLISH-initiated subscriptions respond with a publish-rejection message.
+    // §5.1: rejecting the PUBLISH discards any staged collision — the local
+    // SUBSCRIBE it would have superseded stays ALIVE (never accepted PUBLISH_OK).
+    this.pendingCollisions.delete(requestId as bigint);
+
+    // Release the Track Alias so a later request may reuse it. An inbound PUBLISH
+    // registered its publisher-chosen alias at receipt (§9.13); rejecting it must
+    // unregister so a subsequent PUBLISH on the same alias is a per-request matter,
+    // not a session-fatal DUPLICATE_TRACK_ALIAS. (No-op for an incoming SUBSCRIBE
+    // rejected before acceptSubscribe assigned an alias.)
+    if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
+
+    // REQUEST_ERROR is the request's first AND terminal response — RECLAIM the
+    // incoming subscription state (bounded; a peer cannot grow the map with valid
+    // unique requests the application rejects). The adapter's stream teardown seals
+    // the context, so its later close callback will not run this cleanup.
+    this.incomingSubscriptions.delete(requestId as bigint);
+
+    // PUBLISH-initiated subscriptions respond with a publish-rejection message:
+    // draft-14 PUBLISH_ERROR, drafts 16/18 REQUEST_ERROR (§10.10). Shared with the
+    // §5.1 duplicate path so both get the draft split right (PUBLISH_ERROR is a
+    // draft-14-only type and is unencodable on draft-16).
     if (sub.isPublishInitiated) {
-      if (this._draftVersion === 18) {
-        // draft-18 §10.10: reject with REQUEST_ERROR (no Request ID on wire),
-        // written on the inbound PUBLISH request stream by the I/O layer.
-        const requestError: RequestErrorMsg = {
-          type: 'REQUEST_ERROR', requestId, errorCode, retryInterval: varint(0n), errorReason,
-        };
-        return [this.sendControl(requestError)];
-      }
-      // Draft-14/16 §9.15: respond with PUBLISH_ERROR. The draft-14 field is a
-      // QUIC Varint — range-guard the (now full-uint64) errorCode at this boundary.
-      const publishError: PublishError = {
-        type: 'PUBLISH_ERROR',
-        requestId,
-        errorCode: varint(errorCode),
-        errorReason,
-      };
-      return [this.sendControl(publishError)];
+      return [this.buildPublishReject(requestId, errorCode, errorReason)];
     }
 
     const requestError: RequestErrorMsg = {
@@ -3883,9 +4408,10 @@ export class Session {
 
   /**
    * Handle PUBLISH_DONE received on an inbound PUBLISH stream (draft-18 §10.11):
-   * terminate the PUBLISH-initiated subscription. Stream/alias teardown is the
-   * I/O layer's concern — late data streams may still arrive, so the caller keeps
-   * alias routing alive until delivery is accounted for.
+   * terminate the PUBLISH-initiated subscription and UNREGISTER its Track Alias
+   * (owner-conditional) so the alias may be reused. The I/O layer removes its
+   * routing immediately and installs a bounded early-discard guard for any late
+   * streams — it does NOT retain routing indefinitely.
    */
   handleInboundPublishDone(requestId: bigint): SessionOutboundAction[] {
     const sub = this.incomingSubscriptions.get(requestId as bigint);
@@ -3895,7 +4421,13 @@ export class Session {
         `Unknown PUBLISH ${requestId} for PUBLISH_DONE`,
       );
     }
+    // Release the publisher-chosen Track Alias from the session registry so a
+    // later PUBLISH may reuse it (the I/O layer keeps its own bounded tombstone
+    // to discard late streams — that is a separate, adapter-level concern).
+    if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
     this.incomingSubscriptions.delete(requestId as bigint);
+    // §5.1: PUBLISH ended before acceptance — discard any staged collision.
+    this.pendingCollisions.delete(requestId as bigint);
     return [];
   }
 
@@ -3932,11 +4464,25 @@ export class Session {
     if (options.subscriberPriority !== undefined) {
       parameters.set(MessageParam.SUBSCRIBER_PRIORITY, [options.subscriberPriority]);
     }
+    // §8: a PUBLISH-initiated subscription can carry delivery-timeout updates too.
+    if (options.objectDeliveryTimeout !== undefined) {
+      parameters.set(MessageParam.OBJECT_DELIVERY_TIMEOUT, [options.objectDeliveryTimeout]);
+    }
+    if (options.subgroupDeliveryTimeout !== undefined) {
+      parameters.set(MessageParam.SUBGROUP_DELIVERY_TIMEOUT, [options.subgroupDeliveryTimeout]);
+    }
 
+    // Stage ALL changes on the pending record — applied on REQUEST_OK, never at send.
     this.pendingUpdates.set(requestId as bigint, {
       existingRequestId,
       ...(options.forward !== undefined
         ? { forward: options.forward ? ForwardState.ACTIVE : ForwardState.PAUSED }
+        : {}),
+      ...(options.objectDeliveryTimeout !== undefined
+        ? { objectDeliveryTimeoutMs: Number(options.objectDeliveryTimeout) }
+        : {}),
+      ...(options.subgroupDeliveryTimeout !== undefined
+        ? { subgroupDeliveryTimeoutMs: Number(options.subgroupDeliveryTimeout) }
         : {}),
     });
 
@@ -3963,7 +4509,10 @@ export class Session {
     }
 
     sub.sendPublishDone(statusCode, errorReason);
+    // §10.11: DONE terminates the subscription — reclaim publisher-side state
+    // (a duplicate publishDone for the same request then throws Unknown).
     this.outgoingPublishes.delete(requestId as bigint);
+    this.incomingSubscriptions.delete(requestId as bigint);
 
     const publishDoneMsg: PublishDone = {
       type: 'PUBLISH_DONE',
@@ -4010,6 +4559,11 @@ export class Session {
       trackProperties,
     };
 
+    // §10.13: the response stream may have closed BEFORE this FETCH_OK. If so, both
+    // are now done — reclaim the served fetch; otherwise keep it (reclaimServedFetch
+    // reclaims when the data stream later closes).
+    if (fetch.isPublisherComplete) this.incomingFetches.delete(requestId as bigint);
+
     return [this.sendControl(fetchOk)];
   }
 
@@ -4028,6 +4582,10 @@ export class Session {
     }
 
     fetch.sendRequestError(errorCode, errorReason);
+    // REQUEST_ERROR is terminal — RECLAIM the incoming fetch state (bounded; a peer
+    // cannot grow incomingFetches with valid unique rejected requests). The adapter
+    // seals the request context, so its close callback will not run this cleanup.
+    this.incomingFetches.delete(requestId as bigint);
 
     const requestError: RequestErrorMsg = {
       type: 'REQUEST_ERROR',
@@ -4063,6 +4621,19 @@ export class Session {
     };
 
     return [closeAction];
+  }
+
+  /**
+   * State-only transition to CLOSED for a TRANSPORT-level close (the underlying
+   * WebTransport session ended remotely or failed). Unlike {@link close} this
+   * emits NO close_connection action — there is no live transport to send a
+   * CONNECTION_CLOSE capsule on. After this, the session refuses new requests
+   * (subscribe/fetch/etc. assert ESTABLISHED), so nothing allocates state
+   * against a dead transport. Idempotent.
+   * @see draft-ietf-moq-transport-18 §3 (session termination)
+   */
+  handleTransportClosed(): void {
+    this._state = SessionState.CLOSED;
   }
 
   /**

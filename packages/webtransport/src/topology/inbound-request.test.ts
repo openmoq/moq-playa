@@ -36,7 +36,7 @@ describe('InboundRequestStreamContext.sendUpdate write-failure cleanup', () => {
     const update = {
       type: 'REQUEST_UPDATE', requestId: 3n, existingRequestId: 1n, parameters: new Map(),
     } as unknown as ControlMessage;
-    await expect(ctx.sendUpdate(update)).rejects.toThrow(/write failure/i);
+    await expect(ctx.sendUpdate(update, () => {})).rejects.toThrow(/write failure/i);
 
     // The failed update left NO pending deferred, so an arriving REQUEST_OK has
     // nothing to match and is treated as a protocol violation (surfaced via
@@ -44,5 +44,35 @@ describe('InboundRequestStreamContext.sendUpdate write-failure cleanup', () => {
     stream.push(reqOkBytes());
     await flush();
     expect(failures.map((e) => e.message).join(' ')).toMatch(/unsolicited REQUEST_OK/i);
+  });
+
+  it('abort() REJECTS an in-flight queued update promise (§11.4.1) — it never hangs', async () => {
+    const { ctx } = setup();
+    // A REQUEST_UPDATE whose write succeeds but whose REQUEST_OK never arrives leaves
+    // a queued deferred. Setting `aborted` makes the read loop return before its
+    // catch, so abort() itself must reject the deferred.
+    const update = {
+      type: 'REQUEST_UPDATE', requestId: 3n, existingRequestId: 1n, parameters: new Map(),
+    } as unknown as ControlMessage;
+    const pending = ctx.sendUpdate(update, () => { /* no response */ });
+    let settled = false;
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    await flush();
+    expect(settled).toBe(false); // still awaiting a response
+
+    await ctx.abort();
+    await flush();
+    await expect(pending).rejects.toThrow(/aborted/i); // rejected, not left hanging
+  });
+
+  it('terminate() also rejects any lingering queued update promise', async () => {
+    const { ctx } = setup();
+    const update = {
+      type: 'REQUEST_UPDATE', requestId: 5n, existingRequestId: 1n, parameters: new Map(),
+    } as unknown as ControlMessage;
+    const pending = ctx.sendUpdate(update, () => { /* no response */ });
+    await flush();
+    await ctx.terminate();
+    await expect(pending).rejects.toThrow(/terminated/i);
   });
 });

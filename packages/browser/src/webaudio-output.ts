@@ -70,15 +70,16 @@ export class WebAudioOutput implements AudioOutputLike {
    * arrives INSIDE `renderTimeUs`, applied upstream by the CommandDispatcher.
    * A non-zero value here is a second, independent delay policy that can
    * diverge from video's and re-assert that divergence on every underrun
-   * re-anchor (A/V skew). The parameter remains (default 200 ms) only for
-   * standalone use of this class without the dispatcher's cushion.
+   * re-anchor (A/V skew) — with the dispatcher composition it double-delays
+   * audio. The default is therefore 0; pass a value only when using this
+   * class standalone, without the dispatcher's cushion.
    */
   private readonly playbackDelaySec: number;
 
   /** Shared clock — when audio-backed, eliminates drift in toAudioCtxTime(). */
   private readonly clock: ClockSource;
 
-  constructor(audioCtx: AudioContext, destination?: AudioNode, playbackDelayMs = 200, clock?: ClockSource) {
+  constructor(audioCtx: AudioContext, destination?: AudioNode, playbackDelayMs = 0, clock?: ClockSource) {
     this.audioCtx = audioCtx;
     this.destination = destination ?? audioCtx.destination;
     this.playbackDelaySec = playbackDelayMs / 1000;

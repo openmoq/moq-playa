@@ -46,6 +46,14 @@ export class SubscriptionStateMachine {
   private _errorReason: string | undefined;
   // PUBLISH_DONE Status Code — vi64 (full uint64) on draft-18, so `bigint`.
   private _terminationCode: bigint | undefined;
+  /**
+   * Why this subscription reached TERMINATED. Distinguishes a LOCAL UNSUBSCRIBE
+   * (after which §5.1.1 lets a crossed PUBLISH_DONE arrive and be ignored) from
+   * termination by PUBLISH_DONE or REQUEST_ERROR (after which any further
+   * terminal message is a protocol violation). `undefined` while not terminated.
+   * @see draft-ietf-moq-transport-16 §5.1.1
+   */
+  private _terminationCause: 'unsubscribed' | 'publish-done' | 'request-error' | 'publisher-unsubscribed' | undefined;
   private _largestLocation: Location | undefined;
   private _trackKey: string | undefined;
   /**
@@ -67,6 +75,15 @@ export class SubscriptionStateMachine {
    * @see draft-ietf-moq-transport-14 §9.10
    */
   private _currentPriority: Varint | undefined;
+  /**
+   * DELIVERY_TIMEOUT (§9.2.2.2) this subscriber requested, in milliseconds — the
+   * window during which the publisher may still be delivering Objects. The I/O
+   * layer floors its terminal-alias guard by this so the guard cannot expire while
+   * the publisher is legitimately still sending old-alias streams (§8 / §10.11).
+   */
+  private _requestedDeliveryTimeoutMs: number | undefined;
+  /** SUBGROUP_DELIVERY_TIMEOUT (§8, draft-18) this subscriber requested, in ms. */
+  private _requestedSubgroupDeliveryTimeoutMs: number | undefined;
   /**
    * Whether this subscription was initiated by a PUBLISH message.
    * Used in draft-14 to determine response type (PUBLISH_OK vs SUBSCRIBE_OK).
@@ -154,12 +171,18 @@ export class SubscriptionStateMachine {
     trackNamespace?: Uint8Array[],
     trackName?: Uint8Array,
     parameters?: Parameters,
+    trackAlias?: bigint,
   ): SubscriptionStateMachine {
     const sm = new SubscriptionStateMachine(requestId, true, trackNamespace, trackName);
     sm._publishInitiated = true;
     if (parameters) {
       sm._publishParameters = parameters;
     }
+    // Record the publisher-chosen Track Alias (from the PUBLISH) so the session
+    // can UNREGISTER it when this inbound publication terminates — otherwise the
+    // alias stays registered and a later PUBLISH reusing it wrongly trips
+    // DUPLICATE_TRACK_ALIAS instead of the intended per-request refusal.
+    if (trackAlias !== undefined) sm._trackAlias = trackAlias;
     return sm;
   }
 
@@ -267,6 +290,26 @@ export class SubscriptionStateMachine {
     this._currentPriority = priority;
   }
 
+  /** Requested DELIVERY_TIMEOUT in milliseconds, or undefined if none was set. */
+  get requestedDeliveryTimeoutMs(): number | undefined {
+    return this._requestedDeliveryTimeoutMs;
+  }
+
+  /** Record the requested DELIVERY_TIMEOUT (§9.2.2.2), in milliseconds. */
+  set requestedDeliveryTimeoutMs(ms: number | undefined) {
+    this._requestedDeliveryTimeoutMs = ms;
+  }
+
+  /** Requested SUBGROUP_DELIVERY_TIMEOUT in ms, or undefined if none was set. */
+  get requestedSubgroupDeliveryTimeoutMs(): number | undefined {
+    return this._requestedSubgroupDeliveryTimeoutMs;
+  }
+
+  /** Record the requested SUBGROUP_DELIVERY_TIMEOUT (§8, draft-18), in milliseconds. */
+  set requestedSubgroupDeliveryTimeoutMs(ms: number | undefined) {
+    this._requestedSubgroupDeliveryTimeoutMs = ms;
+  }
+
   /** Whether this is the publisher side. */
   get isPublisher(): boolean {
     return this._isPublisher;
@@ -290,6 +333,17 @@ export class SubscriptionStateMachine {
   /** Whether subscription is terminated. */
   get isTerminated(): boolean {
     return this._state === SubscriptionState.TERMINATED;
+  }
+
+  /**
+   * Why this subscription terminated (`undefined` while not terminated).
+   * `'unsubscribed'` marks a LOCAL UNSUBSCRIBE — the only cause after which a
+   * crossed PUBLISH_DONE is tolerated (§5.1.1); every other cause keeps a
+   * subsequent terminal message a protocol violation.
+   */
+  get terminationCause():
+    'unsubscribed' | 'publish-done' | 'request-error' | 'publisher-unsubscribed' | undefined {
+    return this._terminationCause;
   }
 
   // ─── Subscriber Side Transitions ──────────────────────────────────────
@@ -317,6 +371,7 @@ export class SubscriptionStateMachine {
     this._errorCode = errorCode;
     this._errorReason = errorReason;
     this._state = SubscriptionState.TERMINATED;
+    this._terminationCause = 'request-error';
   }
 
   /**
@@ -330,6 +385,7 @@ export class SubscriptionStateMachine {
     this._terminationCode = statusCode;
     this._errorReason = errorReason;
     this._state = SubscriptionState.TERMINATED;
+    this._terminationCause = 'publish-done';
   }
 
   // ─── Publisher Side Transitions ───────────────────────────────────────
@@ -394,17 +450,37 @@ export class SubscriptionStateMachine {
     this.assertNotPublisher('sendUnsubscribe');
 
     this._state = SubscriptionState.TERMINATED;
+    this._terminationCause = 'unsubscribed';
   }
 
   /**
-   * Handle UNSUBSCRIBE received (publisher side).
-   * Transitions from ESTABLISHED to TERMINATED.
+   * §5.1: this subscriber-side subscription is SUPERSEDED by a peer PUBLISH for
+   * the same track. Terminate from PENDING or ESTABLISHED with the 'unsubscribed'
+   * cause, so a terminal message crossing our cancellation (SUBSCRIBE_OK /
+   * REQUEST_ERROR / PUBLISH_DONE) is reclaimed as an ordinary crossed terminal
+   * rather than an unknown-request fault. Unlike {@link sendUnsubscribe} this does
+   * not require ESTABLISHED (a pending SUBSCRIBE can be superseded before its OK).
+   */
+  supersede(): void {
+    this.assertNotTerminated('supersede');
+    this.assertNotPublisher('supersede');
+    this._state = SubscriptionState.TERMINATED;
+    this._terminationCause = 'unsubscribed';
+  }
+
+  /**
+   * Handle UNSUBSCRIBE received (publisher side). §5.1: a subscriber may
+   * UNSUBSCRIBE from the Pending (Subscriber) OR Established state — e.g. cancelling
+   * a still-pending SUBSCRIBE superseded by our PUBLISH for the same track — so this
+   * accepts either (only a request already Terminated is a violation).
+   * @see draft-ietf-moq-transport-16 §5.1
    */
   handleUnsubscribe(): void {
-    this.assertState(SubscriptionState.ESTABLISHED, 'handleUnsubscribe');
+    this.assertNotTerminated('handleUnsubscribe');
     this.assertPublisher('handleUnsubscribe');
 
     this._state = SubscriptionState.TERMINATED;
+    this._terminationCause = 'publisher-unsubscribed';
   }
 
   /**
@@ -418,6 +494,7 @@ export class SubscriptionStateMachine {
     this._terminationCode = statusCode;
     this._errorReason = errorReason;
     this._state = SubscriptionState.TERMINATED;
+    this._terminationCause = 'publish-done';
   }
 
   // ─── Forward State ────────────────────────────────────────────────────

@@ -63,15 +63,33 @@ describe('TrackAliasManager', () => {
       expect(() => manager.register(alias, namespace, name2)).toThrow();
     });
 
-    it('throws when registering same track with different alias', () => {
+    it('allows registering a second alias for the same track (§11.1 permits multiple aliases per track)', () => {
+      // draft-18 §11.1 only prohibits ONE alias referring to two different tracks;
+      // multiple aliases for one track is legal (e.g. the §5.1 collision race).
       const namespace = [new Uint8Array([0x6c, 0x69, 0x76, 0x65])];
       const name = new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f]);
       const alias1 = varint(42n);
       const alias2 = varint(43n);
 
       manager.register(alias1, namespace, name);
+      expect(() => manager.register(alias2, namespace, name)).not.toThrow();
 
-      expect(() => manager.register(alias2, namespace, name)).toThrow();
+      // Both aliases resolve to the track; each maps to only that one track.
+      expect(manager.getByAlias(alias1)?.name).toEqual(name);
+      expect(manager.getByAlias(alias2)?.name).toEqual(name);
+      // Removing one leaves the other registered.
+      manager.unregister(alias1);
+      expect(manager.getByAlias(alias1)).toBeUndefined();
+      expect(manager.getByAlias(alias2)?.name).toEqual(name);
+      expect(manager.hasTrack(namespace, name)).toBe(true);
+    });
+
+    it('still throws when registering the same alias for a DIFFERENT track (§11.1)', () => {
+      const ns = [new Uint8Array([0x6c])];
+      const name1 = new Uint8Array([0x76]);
+      const name2 = new Uint8Array([0x77]);
+      manager.register(varint(42n), ns, name1);
+      expect(() => manager.register(varint(42n), ns, name2)).toThrow();
     });
 
     it('allows re-registering same alias with same track', () => {

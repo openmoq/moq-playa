@@ -365,6 +365,285 @@ describe('warm start — alias remap and stream races', () => {
   });
 });
 
+describe('warm start — races against the joiningFetch() await window', () => {
+  const FETCH_REQ = 600n;
+
+  function deferredJoin() {
+    let resolveJoin!: (v: unknown) => void;
+    const mutate = (a: ReturnType<typeof createMockAdapter>) => {
+      a.joiningFetch = vi.fn(() => new Promise((r) => { resolveJoin = r; }));
+    };
+    return { mutate, resolve: () => resolveJoin(varint(FETCH_REQ)) };
+  }
+
+  it('FIN racing registration: a complete early stream still replays its pre-roll once registered', async () => {
+    const routed: Array<{ alias: bigint; objectId: bigint }> = [];
+    const d = deferredJoin();
+    const { player, adapter, reqIdFor } = await bootPlayer(
+      locCatalog([VIDEO_LOC]), {
+        warmStartCurrentGroup: true,
+        objectTransform: (obj) => {
+          if (obj.kind === 'data') routed.push({ alias: BigInt(obj.trackAlias), objectId: BigInt(obj.objectId) });
+          return obj;
+        },
+      }, d.mutate);
+    const videoReqId = (await reqIdFor('video'))!;
+
+    // Fast cached fetch: stream opens, delivers everything, and FINs — all
+    // before the joiningFetch() promise continuation registers the request.
+    const streamId = 88n;
+    adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
+    adapter._triggerObject(streamId, {
+      kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
+      objectId: varint(0n), payload: new Uint8Array([0x01]),
+    } as MoqtObject);
+    adapter._triggerObject(streamId, {
+      kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
+      objectId: varint(1n), payload: new Uint8Array([0x02]),
+    } as MoqtObject);
+    adapter._triggerStreamClosed(streamId); // FIN before registration
+    expect(routed).toEqual([]);
+
+    d.resolve();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(routed).toEqual([
+      { alias: videoReqId, objectId: 0n },
+      { alias: videoReqId, objectId: 1n },
+    ]);
+    await player.destroy();
+  });
+
+  it('REQUEST_ERROR racing registration: the refusal is honored, nothing leaks or routes later', async () => {
+    const routed: Array<{ objectId: bigint }> = [];
+    const d = deferredJoin();
+    const { player, adapter, errors } = await bootPlayer(
+      locCatalog([VIDEO_LOC]), {
+        warmStartCurrentGroup: true,
+        objectTransform: (obj) => {
+          if (obj.kind === 'data') routed.push({ objectId: BigInt(obj.objectId) });
+          return obj;
+        },
+      }, d.mutate);
+
+    // The refusal lands while the request ID is still in flight.
+    adapter._triggerMessage({
+      type: 'REQUEST_ERROR', requestId: varint(FETCH_REQ),
+      errorCode: 0x11n, retryInterval: 0n, errorReason: 'no objects published',
+    } as unknown as ControlMessage);
+
+    d.resolve();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // A later data stream claiming that request ID must NOT route (the fetch
+    // was refused; registering it anyway would resurrect a dead request).
+    const streamId = 89n;
+    adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
+    adapter._triggerObject(streamId, {
+      kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
+      objectId: varint(0n), payload: new Uint8Array([0x01]),
+    } as MoqtObject);
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(routed).toEqual([]);
+    expect(errors.filter((e) => e.severity === 'fatal')).toEqual([]); // non-fatal throughout
+    await player.destroy();
+  });
+
+  it('alias remap racing registration: fetched objects route to the POST-remap alias', async () => {
+    const routed: Array<{ alias: bigint; objectId: bigint }> = [];
+    const d = deferredJoin();
+    const { player, adapter, reqIdFor } = await bootPlayer(
+      locCatalog([VIDEO_LOC]), {
+        warmStartCurrentGroup: true,
+        objectTransform: (obj) => {
+          if (obj.kind === 'data') routed.push({ alias: BigInt(obj.trackAlias), objectId: BigInt(obj.objectId) });
+          return obj;
+        },
+      }, d.mutate);
+    const videoReqId = (await reqIdFor('video'))!;
+    const newAlias = videoReqId + 500n;
+
+    // SUBSCRIBE_OK remaps the alias while joiningFetch() is still in flight.
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(videoReqId), trackAlias: varint(newAlias), parameters: new Map(),
+    } as unknown as ControlMessage);
+    d.resolve();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const streamId = 90n;
+    adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
+    adapter._triggerObject(streamId, {
+      kind: 'data', trackAlias: varint(0n), groupId: varint(2n), subgroupId: varint(0),
+      objectId: varint(0n), payload: new Uint8Array([0x01]),
+    } as MoqtObject);
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(routed).toEqual([{ alias: newAlias, objectId: 0n }]);
+    await player.destroy();
+  });
+});
+
+describe('warm start — lifecycle hardening', () => {
+  it('pendingFetchStreams is BOUNDED: a peer cycling unknown fetch streams cannot grow it forever', async () => {
+    const routed: Array<{ objectId: bigint }> = [];
+    let resolveJoin!: (v: unknown) => void;
+    const { player, adapter } = await bootPlayer(
+      locCatalog([VIDEO_LOC]), {
+        warmStartCurrentGroup: true,
+        objectTransform: (obj) => {
+          if (obj.kind === 'data') routed.push({ objectId: BigInt(obj.objectId) });
+          return obj;
+        },
+      }, (a) => { a.joiningFetch = vi.fn(() => new Promise((r) => { resolveJoin = r; })); });
+
+    // Flood: 40 unknown fetch streams with distinct request IDs, each buffering
+    // one object. The oldest entries must be evicted, not retained for the
+    // session lifetime.
+    for (let i = 0; i < 40; i++) {
+      const sid = 1000n + BigInt(i);
+      adapter._triggerDataStream(sid, { type: 'fetch', header: { requestId: varint(2000n + BigInt(i)) } });
+      adapter._triggerObject(sid, {
+        kind: 'data', trackAlias: varint(0n), groupId: varint(0), subgroupId: varint(0),
+        objectId: varint(BigInt(i)), payload: new Uint8Array([i]),
+      } as MoqtObject);
+    }
+    // The REAL fetch (request 2000, the FIRST/oldest) was evicted by the flood:
+    // registering it must replay nothing.
+    resolveJoin(varint(2000n));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(routed).toEqual([]);
+    // Bounded-map contract, asserted directly: the pending map never exceeds
+    // its bound and the tombstone set only holds still-open evictees.
+    const internals = player as unknown as {
+      droppedFetchStreams: Set<bigint>;
+      pendingFetchStreams: Map<bigint, unknown>;
+    };
+    expect(internals.pendingFetchStreams.size).toBeLessThanOrEqual(8);
+    expect(internals.droppedFetchStreams.size).toBe(40 - internals.pendingFetchStreams.size);
+    await player.destroy();
+  });
+
+  it('objects on an EVICTED fetch stream are swallowed — never routed as wire alias 0', async () => {
+    // A LOC catalog track can plausibly sit at alias 0 (requestId-as-alias);
+    // an overflowed fetch stream's later objects must not fall through the
+    // alias path and misroute into it. The tombstone survives until FIN.
+    const routed: Array<{ alias: bigint }> = [];
+    const { player, adapter } = await bootPlayer(
+      locCatalog([VIDEO_LOC]), {
+        warmStartCurrentGroup: true,
+        objectTransform: (obj) => {
+          if (obj.kind === 'data') routed.push({ alias: BigInt(obj.trackAlias) });
+          return obj;
+        },
+      }, (a) => { a.joiningFetch = vi.fn(() => new Promise(() => { /* never resolves */ })); });
+
+    // Make wire alias 0 a REAL media route: the video track remaps to alias 0
+    // via SUBSCRIBE_OK — exactly the collision that turns fall-through into a
+    // misroute.
+    const videoReqId = 2n; // first media subscribe after catalog (1n)
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(videoReqId), trackAlias: varint(0n), parameters: new Map(),
+    } as unknown as ControlMessage);
+    await new Promise((r) => setTimeout(r, 10));
+    const before = routed.length;
+
+    // Flood past the bound so the first stream is evicted.
+    for (let i = 0; i < 12; i++) {
+      adapter._triggerDataStream(3000n + BigInt(i), { type: 'fetch', header: { requestId: varint(4000n + BigInt(i)) } });
+    }
+    // The evicted (oldest) stream sends another object with wire alias 0 —
+    // without a tombstone it would route INTO the video track.
+    adapter._triggerObject(3000n, {
+      kind: 'data', trackAlias: varint(0n), groupId: varint(0), subgroupId: varint(0),
+      objectId: varint(0n), payload: new Uint8Array([0x01]),
+    } as MoqtObject);
+    expect(routed.length).toBe(before); // swallowed, not misrouted
+    await player.destroy();
+  });
+
+  it('public fetch() REJECTS when completion crosses destroy() (no false success with a dead request ID)', async () => {
+    let resolveFetch!: (v: unknown) => void;
+    const { player, adapter } = await bootPlayer(
+      locCatalog([VIDEO_LOC]), {},
+      (a) => { a.fetch = vi.fn(() => new Promise((r) => { resolveFetch = r; })); });
+
+    const fetchPromise = player.fetch('video', { startGroup: 0, startObject: 0, endGroup: 1, endObject: 0 });
+    await player.destroy();
+    resolveFetch(varint(900n));
+
+    await expect(fetchPromise).rejects.toThrow(/destroyed|migrat|abort/i);
+    expect(adapter.fetchCancel).toHaveBeenCalled(); // best-effort cancel on the old connection
+  });
+
+  it('repeated header→FIN→overflow cycles leave no permanent tombstones (finished evictees skip the set)', async () => {
+    const routed: Array<{ objectId: bigint }> = [];
+    const { player, adapter, reqIdFor } = await bootPlayer(
+      locCatalog([VIDEO_LOC]), {
+        warmStartCurrentGroup: true,
+        objectTransform: (obj) => {
+          if (obj.kind === 'data') routed.push({ objectId: BigInt(obj.objectId) });
+          return obj;
+        },
+      }, (a) => { a.joiningFetch = vi.fn(() => new Promise(() => { /* pending forever */ })); });
+    const videoReqId = (await reqIdFor('video'))!;
+
+    // 50 cycles: unknown fetch stream opens, FINs immediately, then later
+    // overflows out of the pending map. FINished evictees must NOT tombstone.
+    for (let i = 0; i < 50; i++) {
+      const sid = 5000n + BigInt(i);
+      adapter._triggerDataStream(sid, { type: 'fetch', header: { requestId: varint(6000n + BigInt(i)) } });
+      adapter._triggerStreamClosed(sid); // FIN before any eviction
+    }
+    // Direct map contract — alias registration cannot mask a stale tombstone
+    // here: FINished evictees leave ZERO tombstones, and the pending map stays
+    // at its bound regardless of how many cycles ran.
+    const internals = player as unknown as {
+      droppedFetchStreams: Set<bigint>;
+      pendingFetchStreams: Map<bigint, unknown>;
+    };
+    expect(internals.droppedFetchStreams.size).toBe(0);
+    expect(internals.pendingFetchStreams.size).toBeLessThanOrEqual(8);
+    // The maps stay functional: a REAL fetch flow on a reused/new stream id
+    // still registers and routes (nothing clogged, nothing mis-tombstoned).
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(videoReqId), trackAlias: varint(videoReqId), parameters: new Map(),
+    } as unknown as ControlMessage);
+    // Use player.fetch (standalone) for a registered fetch that routes.
+    const p = player.fetch('video', { startGroup: 0, startObject: 0, endGroup: 1, endObject: 0 });
+    const fetchReqId = BigInt(await p);
+    const sid = 5000n; // REUSED id from a FINished cycle — must not be tombstoned
+    adapter._triggerDataStream(sid, { type: 'fetch', header: { requestId: varint(fetchReqId) } });
+    adapter._triggerObject(sid, {
+      kind: 'data', trackAlias: varint(0n), groupId: varint(0), subgroupId: varint(0),
+      objectId: varint(0n), payload: new Uint8Array([0x01]),
+    } as MoqtObject);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(routed).toEqual([{ objectId: 0n }]); // routed — no stale tombstone swallowed it
+    await player.destroy();
+  });
+
+  it('a joiningFetch completing after destroy() does not repopulate the player', async () => {
+    let resolveJoin!: (v: unknown) => void;
+    const { player, adapter } = await bootPlayer(
+      locCatalog([VIDEO_LOC]), { warmStartCurrentGroup: true },
+      (a) => { a.joiningFetch = vi.fn(() => new Promise((r) => { resolveJoin = r; })); });
+
+    await player.destroy();          // clears all fetch state
+    resolveJoin(varint(700n));       // late completion crosses destroy
+    await new Promise((r) => setTimeout(r, 20));
+
+    // A data stream for the late request must not route anywhere (no revived
+    // registration in the destroyed player's maps).
+    expect(() => {
+      adapter._triggerDataStream(44n, { type: 'fetch', header: { requestId: varint(700n) } });
+      adapter._triggerObject(44n, {
+        kind: 'data', trackAlias: varint(0n), groupId: varint(0), subgroupId: varint(0),
+        objectId: varint(0n), payload: new Uint8Array([1]),
+      } as MoqtObject);
+    }).not.toThrow();
+  });
+});
+
 describe('warm start — LatestObject compatibility alias', () => {
   it('warm start with an explicit LatestObject filter is accepted and subscribes as LargestObject', async () => {
     const { player, adapter, subscribeCalls } = await bootPlayer(
@@ -375,6 +654,25 @@ describe('warm start — LatestObject compatibility alias', () => {
     const call = subscribeCalls().find(([n]: [string, unknown]) => n === 'video');
     expect(call![1]?.subscriptionFilter?.type).toBe('LargestObject');
     expect(adapter.joiningFetch).toHaveBeenCalledTimes(1);
+    await player.destroy();
+  });
+});
+
+describe('warm start — configured SUBSCRIBE options are preserved', () => {
+  it('keeps deliveryTimeout, subscriberPriority, and groupOrder while overriding only the filter', async () => {
+    const { player, adapter, subscribeCalls } = await bootPlayer(
+      locCatalog([VIDEO_LOC]), {
+        warmStartCurrentGroup: true,
+        deliveryTimeoutMs: 2_000,
+        subscriberPriority: 64,
+        groupOrder: 'descending',
+      });
+    const call = subscribeCalls().find(([n]: [string, unknown]) => n === 'video');
+    const opts = call![1];
+    expect(opts?.subscriptionFilter?.type).toBe('LargestObject'); // the one override
+    expect(opts?.deliveryTimeout).toBeDefined();                  // preserved
+    expect(opts?.subscriberPriority).toBeDefined();               // preserved
+    expect(opts?.groupOrder).toBeDefined();                       // preserved
     await player.destroy();
   });
 });

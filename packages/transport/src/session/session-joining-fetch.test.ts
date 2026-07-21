@@ -30,11 +30,16 @@ const NAME = new Uint8Array([0x76, 0x69, 0x64]);
 function clientSession(draft: 14 | 16 | 18 = 16): Session {
   const session = new Session(EndpointRole.CLIENT, draft);
   session.initiateSetup({ maxRequestId: varint(100n) });
-  const serverSetup: ServerSetup = {
-    type: 'SERVER_SETUP',
-    parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
-  };
-  session.handleControlMessage(serverSetup);
+  if (draft === 18) {
+    // draft-18 unified SETUP reply (§10.3)
+    session.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as never);
+  } else {
+    const serverSetup: ServerSetup = {
+      type: 'SERVER_SETUP',
+      parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
+    };
+    session.handleControlMessage(serverSetup);
+  }
   return session;
 }
 
@@ -187,6 +192,57 @@ describe('session.joiningFetch (outbound)', () => {
   });
 });
 
+describe('deferred update acks vs terminated subscriptions (§10.8 rejection path)', () => {
+  it('an update REQUEST_OK arriving AFTER the subscribe was rejected settles without closing the session', () => {
+    const session = clientSession(18 as never);
+    const { requestId: subReqId } = session.subscribe(NS, NAME);
+    const { requestId: updateReqId } = session.requestUpdate(subReqId, { forward: 1 as never });
+
+    // Responder rejects the SUBSCRIBE first (its valid first response)…
+    const rejectActions = session.handleControlMessage({
+      type: 'REQUEST_ERROR', requestId: subReqId,
+      errorCode: RequestError.DOES_NOT_EXIST as bigint, retryInterval: 0n, errorReason: 'nope',
+    } as never);
+    expect(rejectActions.every((a) => a.type !== 'close_connection')).toBe(true);
+
+    // …then flushes the deferred update acknowledgement. It must settle
+    // WITHOUT mutating the now-terminated subscription.
+    const ackActions = session.handleControlMessage({
+      type: 'REQUEST_OK', requestId: updateReqId, parameters: new Map(),
+    } as never);
+    expect(ackActions.every((a) => a.type !== 'close_connection')).toBe(true);
+    expect(session.state).toBe(SessionState.ESTABLISHED);
+  });
+});
+
+describe('pending REQUEST_UPDATE scope (§10.12.2 exception is SUBSCRIBE-only)', () => {
+  it('a REQUEST_UPDATE against a PENDING publish-initiated subscription still closes (no ack before PUBLISH_OK)', () => {
+    const session = clientSession(18 as never);
+    // Peer PUBLISH creates a PENDING publish-initiated subscription on us.
+    session.handleControlMessage({
+      type: 'PUBLISH', requestId: varint(1n), trackNamespace: NS, trackName: NAME,
+      trackAlias: varint(9n), parameters: new Map(),
+    } as never);
+    // An update racing PUBLISH_OK has ambiguous response correlation — the
+    // pending exception must NOT cover it.
+    const actions = session.handleControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(3n), existingRequestId: varint(1n),
+      parameters: new Map([[MessageParam.FORWARD, [1n]]]),
+    } as never);
+    const close = actions.find((a) => a.type === 'close_connection') as CloseConnectionAction;
+    expect(close).toBeDefined();
+  });
+});
+
+describe('SubscribeOptions.forward initializes BOTH peers (§9.2.2.8)', () => {
+  it('the subscriber-side state machine starts PAUSED when forward: 0 is sent', () => {
+    const session = clientSession(16);
+    const { requestId } = session.subscribe(NS, NAME, { forward: 0 as never });
+    const sub = session.getSubscription(requestId);
+    expect(sub?.forwardState).toBe(0); // PAUSED locally, matching the wire
+  });
+});
+
 // ─── Inbound (publisher side) ────────────────────────────────────────
 
 describe('incoming joining FETCH validation', () => {
@@ -254,6 +310,21 @@ describe('incoming joining FETCH validation', () => {
     expect(session.state).toBe(SessionState.ESTABLISHED);
   });
 
+  it('d18: joining a PENDING Forward=0 subscription is DEFERRED, not rejected (§10.12.2 buffering)', () => {
+    // The forward-state gate cannot be evaluated while the subscription is
+    // pending: the publisher must buffer the join and "process any pending
+    // REQUEST_UPDATE messages ... before evaluating." The session admits the
+    // fetch (the adapter parks it); the gate runs at establish time.
+    const session = serverSession(18);
+    const params: Parameters = new Map([[MessageParam.FORWARD, [0n]]]);
+    session.handleControlMessage(incomingSubscribe(0n, params));
+    // NOT accepted — subscription stays PENDING.
+
+    const actions = session.handleControlMessage(incomingJoiningFetch(2n, 0n));
+    expect(actions.find((a) => a.type === 'send_control')).toBeUndefined(); // no REQUEST_ERROR
+    expect(session.getIncomingFetch(2n)).toBeDefined();                     // admitted for parking
+  });
+
   it('d18: joining a Forward State 1 subscription is accepted (default forward state)', () => {
     const session = serverSession(18);
     session.handleControlMessage(incomingSubscribe(0n));
@@ -261,6 +332,65 @@ describe('incoming joining FETCH validation', () => {
     const actions = session.handleControlMessage(incomingJoiningFetch(2n, 0n));
     expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
     expect(session.getIncomingFetch(2n)).toBeDefined();
+  });
+});
+
+describe('REQUEST_UPDATE filter changes drive the joining gate (§9.2.2.5)', () => {
+  function updateFilter(session: Session, existingRequestId: bigint, updateReqId: bigint, filter: Parameters extends never ? never : import('../control/subscription-filter.js').SubscriptionFilter): void {
+    const params: Parameters = new Map([[
+      MessageParam.SUBSCRIPTION_FILTER,
+      [encodeSubscriptionFilter(filter, 16)],
+    ]]);
+    session.handleControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(updateReqId),
+      existingRequestId: varint(existingRequestId), parameters: params,
+    } as never);
+  }
+
+  it('NextGroupStart → LargestObject via REQUEST_UPDATE: joining fetch becomes PERMITTED', () => {
+    const session = serverSession(16);
+    const params: Parameters = new Map([[MessageParam.SUBSCRIPTION_FILTER,
+      [encodeSubscriptionFilter({ type: 'NextGroupStart' }, 16)]]]);
+    session.handleControlMessage(incomingSubscribe(0n, params));
+    session.acceptSubscribe(0n, 9n);
+
+    updateFilter(session, 0n, 2n, { type: 'LargestObject' });
+
+    const actions = session.handleControlMessage(incomingJoiningFetch(4n, 0n));
+    expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+    expect(session.getIncomingFetch(4n)).toBeDefined();
+  });
+
+  it('LargestObject → AbsoluteStart via REQUEST_UPDATE: joining fetch now closes with PROTOCOL_VIOLATION', () => {
+    const session = serverSession(16);
+    const params: Parameters = new Map([[MessageParam.SUBSCRIPTION_FILTER,
+      [encodeSubscriptionFilter({ type: 'LargestObject' }, 16)]]]);
+    session.handleControlMessage(incomingSubscribe(0n, params));
+    session.acceptSubscribe(0n, 9n);
+
+    updateFilter(session, 0n, 2n, { type: 'AbsoluteStart', startGroup: 5n, startObject: 0n });
+
+    const actions = session.handleControlMessage(incomingJoiningFetch(4n, 0n));
+    const close = actions.find((a) => a.type === 'close_connection') as CloseConnectionAction;
+    expect(close).toBeDefined();
+    expect(close.error).toBe(SessionErrorCode.PROTOCOL_VIOLATION);
+  });
+
+  it('REQUEST_UPDATE without a filter parameter leaves the stored filter unchanged (§9.2.2.5)', () => {
+    const session = serverSession(16);
+    const params: Parameters = new Map([[MessageParam.SUBSCRIPTION_FILTER,
+      [encodeSubscriptionFilter({ type: 'LargestObject' }, 16)]]]);
+    session.handleControlMessage(incomingSubscribe(0n, params));
+    session.acceptSubscribe(0n, 9n);
+
+    session.handleControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(2n),
+      existingRequestId: varint(0n), parameters: new Map(),
+    } as never);
+
+    const actions = session.handleControlMessage(incomingJoiningFetch(4n, 0n));
+    expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+    expect(session.getIncomingFetch(4n)).toBeDefined();
   });
 });
 

@@ -426,6 +426,146 @@ describe('MoqtConnection(18) FETCH data', () => {
 
     expect(closeCode).toBe(0x3);
   });
+
+  it('an object buffered behind a synchronous fetchCancel is DROPPED mid-stream, not delivered (§10.13)', async () => {
+    const { conn, transport } = await connected();
+    const objs: MoqtObject[] = [];
+    conn.onObject = (_sid, o) => objs.push(o);
+
+    const reqId = await issueFetch(conn);
+    const s = transport.openIncomingUni();
+    s.push(concat(fetchHeader(reqId), firstFetchObj(1n, 0n, 3, [0xaa])));
+    await flush();
+    expect(objs.length).toBe(1); // first object delivered; the stream is admitted + open
+
+    // A SECOND object is already buffered on the open stream when the fetch is
+    // cancelled. fetchCancel installs the marker SYNCHRONOUSLY (before its teardown
+    // awaits) but only STOP_SENDINGs the reader AFTER them — so the buffered read
+    // resolves in between. The loop-top marker check MUST drop it; without that check
+    // the object reaches onObject before the reader cancel lands.
+    s.push(pack(0x0cn, 0n, 7n, 1n, raw(0xbb))); // ascending {2,7}, buffered pre-cancel
+    await conn.fetchCancel(reqId);
+    await flush();
+
+    expect(objs.length).toBe(1);        // buffered post-marker object DROPPED
+    expect(s.readCancelled).toBe(true); // stream STOP_SENDING'd
+  });
+
+  it('a SECOND response stream for a COMPLETED fetch is a PROTOCOL_VIOLATION (§10.12.3: exactly one)', async () => {
+    const { conn, transport } = await connected();
+    let closeCode: number | undefined;
+    conn.onClose = (code) => { closeCode = code; };
+    conn.onObject = () => { /* drain */ };
+
+    const reqId = await issueFetch(conn);
+    // Complete the fetch: header + one object + FIN. This clears the group-order entry
+    // and the open-stream mapping, and — since the fetch was NOT cancelled — adds no
+    // cancellation marker.
+    const s1 = transport.openIncomingUni();
+    s1.push(concat(fetchHeader(reqId), firstFetchObj(1n, 0n, 3, [0xaa])));
+    s1.closeReadable();
+    await flush();
+    expect(closeCode).toBeUndefined(); // clean completion, session open
+
+    // A SECOND response stream for the same (now completed) fetch. §10.12.3 permits
+    // exactly ONE response stream per fetch — with no cancellation marker to excuse it,
+    // this is a protocol violation, NOT a silent discard.
+    transport.openIncomingUni().push(fetchHeader(reqId));
+    await flush();
+
+    expect(closeCode).toBe(0x3);
+  });
+
+  it('a FETCH_HEADER carrying a LIVE SUBSCRIBE\'s request ID is a PROTOCOL_VIOLATION (wrong request kind)', async () => {
+    const { conn, transport } = await connected();
+    let closeCode: number | undefined;
+    conn.onClose = (code) => { closeCode = code; };
+
+    // Request IDs are shared across request types. A live SUBSCRIBE (id 0) is not a
+    // FETCH, so a FETCH_HEADER naming it must be rejected — never silently discarded
+    // just because WE allocated the id.
+    const subP = conn.subscribeTrack(ns('a'), nm('1'), { onObject: () => { /* n/a */ } });
+    subP.catch(() => { /* the violation close rejects the pending subscribe */ });
+    await flush();
+
+    transport.openIncomingUni().push(fetchHeader(0n)); // 0n = our SUBSCRIBE, not a FETCH
+    await flush();
+
+    expect(closeCode).toBe(0x3);
+  });
+
+  it('a FETCH_HEADER for a request we NEVER issued closes the session (§9.1)', async () => {
+    const { conn, transport } = await connected();
+    let closeCode: number | undefined;
+    conn.onClose = (code) => { closeCode = code; };
+
+    // Odd Request ID: peer parity, never allocated by us — a genuinely unknown request.
+    transport.openIncomingUni().push(fetchHeader(7n));
+    await flush();
+
+    expect(closeCode).toBe(0x3);
+  });
+
+  it('a late data stream for a CANCELLED fetch is DISCARDED even behind MANY later cancellations (lossless marker)', async () => {
+    const { conn, transport } = await connected();
+    let closeCode: number | undefined;
+    conn.onClose = (code) => { closeCode = code; };
+
+    const first = await issueFetch(conn);
+    await conn.fetchCancel(first); // marks `first` cancelled (lossless marker)
+    // Thousands... well, hundreds of LATER cancellations. A capped/evicting marker set
+    // would forget `first` and turn its late stream into a §9.1 false close; the marker
+    // is lossless, so `first` is still remembered.
+    for (let i = 0; i < 300; i++) {
+      const rid = await issueFetch(conn);
+      await conn.fetchCancel(rid);
+    }
+
+    // `first`'s long-delayed response stream finally arrives — DISCARDED (STOP_SENDING),
+    // never a session close.
+    const late = transport.openIncomingUni();
+    late.push(fetchHeader(first));
+    await flush();
+
+    expect(late.readCancelled).toBe(true);
+    expect(closeCode).toBeUndefined();
+  });
+
+  it('cancelling a fetch with an ALREADY-OPEN response stream CONSUMES its marker (no lingering marker)', async () => {
+    const { conn, transport } = await connected();
+    conn.onObject = () => { /* drain */ };
+    const markers = (conn as unknown as { recentlyCancelledFetches: Set<bigint> }).recentlyCancelledFetches;
+
+    const reqId = await issueFetch(conn);
+    // Admit a response stream; its read loop then blocks awaiting more bytes.
+    const s = transport.openIncomingUni();
+    s.push(concat(fetchHeader(reqId), firstFetchObj(1n, 0n, 3, [0xaa])));
+    await flush();
+
+    // Cancelling tears down the open stream directly (reader.cancel → the loop ends via
+    // `done`, NOT the loop-top marker check). The marker for this handled stream must be
+    // consumed here — a lossless set would otherwise keep it forever.
+    await conn.fetchCancel(reqId);
+    await flush();
+
+    expect(markers.has(reqId)).toBe(false);
+  });
+
+  it('cancelling a fetch with NO response stream yet KEEPS its marker to discard the late stream', async () => {
+    const { conn, transport } = await connected();
+    const markers = (conn as unknown as { recentlyCancelledFetches: Set<bigint> }).recentlyCancelledFetches;
+
+    const reqId = await issueFetch(conn);
+    await conn.fetchCancel(reqId); // no data stream has appeared yet
+    await flush();
+    expect(markers.has(reqId)).toBe(true); // still needed to guard the eventual late stream
+
+    const late = transport.openIncomingUni();
+    late.push(fetchHeader(reqId));
+    await flush();
+    expect(late.readCancelled).toBe(true);   // discarded via the marker
+    expect(markers.has(reqId)).toBe(false);   // consumed one-shot
+  });
 });
 
 // ─── inbound PUBLISH (§10.10) ───────────────────────────────────────────
@@ -507,6 +647,118 @@ describe('MoqtConnection(18) inbound PUBLISH (§10.10)', () => {
     expect(bidi.writtenBytes()[0]).toBe(0x05); // REQUEST_ERROR wire type
   });
 
+  it('a subgroup object arriving after rejectSubscribe on an inbound PUBLISH is DISCARDED (route torn down + guarded)', async () => {
+    const { conn, transport } = await connected();
+    const objs: MoqtObject[] = [];
+    const generic: MoqtObject[] = [];
+    conn.onPublish = (p) => { p.onObject = (o) => objs.push(o); };
+    conn.onObject = (_sid, o) => generic.push(o);
+
+    transport.pushIncomingBidi().push(publishBytes(1n, 7n, 'vid'));
+    await flush();
+    await conn.rejectSubscribe(1n, varint(0x10n), 'no'); // arms the guard + drops the route
+
+    // A subgroup object on the (now rejected) alias 7 — in flight from the peer —
+    // must reach NEITHER the rejected publication callback nor the connection onObject.
+    transport.pushIncomingUni(concat(subgroupHeader(7n, 42n), subgroupObject(0n, [0xaa])));
+    await flush();
+    expect(objs.length).toBe(0);
+    expect(generic.length).toBe(0);
+  });
+
+  it('rejectFetch deauthorizes openFetchStream (§10.13) — no unsolicited fetch data', async () => {
+    const { conn, transport } = await connected();
+    let fetchReqId = -1n;
+    conn.onFetch = (rid) => { fetchReqId = rid; };
+    transport.pushIncomingBidi().push(fetchReqBytes(1n));
+    await flush();
+    expect(fetchReqId).toBe(1n);
+    await conn.rejectFetch(1n, varint(0x10n), 'no');
+    // The group-order authorization was dropped → serving is refused.
+    await expect(conn.openFetchStream(1n)).rejects.toThrow(/No admitted inbound FETCH/i);
+  });
+
+  it('openFetchStream serves EXACTLY ONE stream per FETCH (§11.4.4) — a second open is refused', async () => {
+    const { conn, transport } = await connected();
+    let fetchReqId = -1n;
+    conn.onFetch = (rid) => { fetchReqId = rid; };
+    transport.pushIncomingBidi().push(fetchReqBytes(1n));
+    await flush();
+    expect(fetchReqId).toBe(1n);
+
+    const sid = await conn.openFetchStream(1n);
+    expect(sid).toBeGreaterThanOrEqual(0n);
+    // §11.4.4: one response stream per fetch — a second open (concurrent or after
+    // FIN) is refused by the atomic reservation.
+    await expect(conn.openFetchStream(1n)).rejects.toThrow(/already has its one response stream/i);
+  });
+
+  it('the one-response-stream reservation SURVIVES the FIN — a reopen after closeFetchStream is refused (§11.4.4)', async () => {
+    const { conn, transport } = await connected();
+    let fetchReqId = -1n;
+    conn.onFetch = (rid) => { fetchReqId = rid; };
+    transport.pushIncomingBidi().push(fetchReqBytes(1n));
+    await flush();
+
+    const sid = await conn.openFetchStream(1n);
+    await conn.closeFetchStream(sid); // FIN the one response stream
+    // §11.4.4: the single-stream limit survives the FIN — a reopen is still refused
+    // (the reservation is released only when the inbound FETCH stream is torn down).
+    await expect(conn.openFetchStream(1n)).rejects.toThrow(/already has its one response stream/i);
+  });
+
+  it('inbound FETCH stream close deauthorizes openFetchStream and aborts an open response stream (§10.13)', async () => {
+    const { conn, transport } = await connected();
+    let fetchReqId = -1n;
+    conn.onFetch = (rid) => { fetchReqId = rid; };
+    const bidi = transport.pushIncomingBidi();
+    bidi.push(fetchReqBytes(1n));
+    await flush();
+    expect(fetchReqId).toBe(1n);
+
+    const sid = await conn.openFetchStream(1n);  // open a response stream before the peer cancels
+    bidi.closeReadable();                          // peer FINs the FETCH request stream
+    await flush();
+
+    // Authorization dropped synchronously on close → a new open is refused, and the
+    // already-open response stream was aborted (no unsolicited fetch data).
+    await expect(conn.openFetchStream(1n)).rejects.toThrow(/No admitted inbound FETCH/i);
+    await expect(conn.sendFetchObject(sid, {
+      groupId: 1n, subgroupId: 0n, objectId: 0n, publisherPriority: 5, payload: new Uint8Array([0xaa]),
+    })).rejects.toThrow();
+  });
+
+  it('openFetchStream does NOT resurrect a FETCH rejected DURING stream setup (§10.13)', async () => {
+    const { conn, transport } = await connected();
+    let fetchReqId = -1n;
+    conn.onFetch = (rid) => { fetchReqId = rid; };
+    transport.pushIncomingBidi().push(fetchReqBytes(1n));
+    await flush();
+    expect(fetchReqId).toBe(1n);
+
+    // Gate stream creation so rejectFetch can run WHILE openFetchStream is mid-open
+    // (authorization was validated before the await). Without the post-await
+    // re-check the writer — registered only after setup — would slip past the
+    // rejection and repopulate the map, resurrecting the rejected FETCH.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const realCreate = transport.createUnidirectionalStream.bind(transport);
+    (transport as unknown as { createUnidirectionalStream: () => Promise<WritableStream<Uint8Array>> })
+      .createUnidirectionalStream = async () => { await gate; return realCreate(); };
+
+    const uniBefore = transport.uniOut.length;
+    const openP = conn.openFetchStream(1n);           // authorized; blocks on the gate
+    await conn.rejectFetch(1n, varint(0x10n), 'no');  // deauthorizes mid-open
+    release();                                         // stream creation now completes
+    await expect(openP).rejects.toThrow(/No admitted inbound FETCH/i); // refused, not resurrected
+    // §10.13 finding: the FETCH_HEADER re-check happens BEFORE the header write, so
+    // the rejected fetch transmits NOTHING — its freshly-opened stream has no bytes.
+    const created = transport.uniOut[uniBefore];
+    expect(created?.writtenBytes().length ?? 0).toBe(0);
+    // Nothing was registered → a later open is also refused (no ghost stream).
+    await expect(conn.openFetchStream(1n)).rejects.toThrow(/No admitted inbound FETCH/i);
+  });
+
   it('peer data for the PUBLISH alias routes to the subscription onObject', async () => {
     const { conn, transport } = await connected();
     const objs: MoqtObject[] = [];
@@ -525,6 +777,33 @@ describe('MoqtConnection(18) inbound PUBLISH (§10.10)', () => {
 
     expect(objs.map((o) => o.objectId)).toEqual([3n]);
     expect(generic.length).toBe(0); // not delivered to the generic onObject
+  });
+
+  it('an object arriving after a FAILED PUBLISH_OK write is DISCARDED, not delivered (§10.11 guard armed on rollback)', async () => {
+    const { conn, transport } = await connected();
+    const objs: MoqtObject[] = [];
+    const generic: MoqtObject[] = [];
+    conn.onPublish = (p) => { p.onObject = (o) => objs.push(o); };
+    conn.onObject = (_sid, o) => generic.push(o);
+    // Force the acceptance write (REQUEST_OK on the PUBLISH request stream) to fail.
+    type Internals = { writeInboundRequestResponse: (...a: unknown[]) => Promise<boolean> };
+    (conn as unknown as Internals).writeInboundRequestResponse = async () => {
+      throw new Error('injected acceptance write failure');
+    };
+
+    transport.pushIncomingBidi().push(publishBytes(1n, 7n, 'vid'));
+    await flush();
+    // Acceptance fails → rollback tears down the route AND arms the alias guard.
+    await expect(conn.acceptSubscribe(1n, 7n)).rejects.toThrow();
+
+    // A subgroup object on the published alias, in flight from the peer, arrives
+    // AFTER the failed acceptance. The armed guard must discard it — it reaches
+    // neither the (torn-down) publication callback nor the connection onObject.
+    transport.pushIncomingUni(concat(subgroupHeader(7n, 42n), subgroupObject(0n, [0xaa])));
+    await flush();
+
+    expect(objs.length).toBe(0);
+    expect(generic.length).toBe(0);
   });
 
   it('a duplicate Track Alias rejects the second PUBLISH: session closes, no second onPublish', async () => {
@@ -609,6 +888,36 @@ async function publishAccepted(): Promise<{ conn: MoqtConnection; transport: Tra
   return { conn, transport, bidi };
 }
 
+describe('MoqtConnection(18) inbound PUBLISH — publisher authority (§10.11)', () => {
+  it('accepting an inbound PUBLISH does NOT authorize us to publish on that alias', async () => {
+    // We are the SUBSCRIBER for an inbound PUBLISH; accepting it must not let us
+    // openSubgroup/sendDatagram on the alias (that is publisher authority).
+    const { conn } = await publishAccepted(); // accepts PUBLISH on alias 42
+    await expect(conn.openSubgroup(42n, 0n, 0n, { publisherPriority: 1 })).rejects.toThrow(/unknown track alias/i);
+    await expect(conn.sendDatagram(42n, 0n, 0n, new Uint8Array([1]))).rejects.toThrow(/unknown track alias/i);
+  });
+
+  it('accepting an inbound PUBLISH with a mismatched alias is rejected (alias fixed by the publisher)', async () => {
+    const { conn, transport } = await connected();
+    transport.pushIncomingBidi().push(publishBytes(1n, 42n, 'vid')); // advertised alias 42
+    await flush();
+    await expect(conn.acceptSubscribe(1n, 99n)).rejects.toThrow(/does not match/i);
+  });
+
+  it('a close-only acceptance (e.g. superseded-set capacity) is surfaced as a failure, not resolved as success (§5.1)', async () => {
+    const { conn, transport } = await connected();
+    conn.onPublish = () => { /* observed */ };
+    transport.pushIncomingBidi().push(publishBytes(1n, 42n, 'vid'));
+    await flush();
+    // Force the session acceptance to return ONLY a close (as it does when the
+    // superseded set is at capacity). The adapter must NOT report success.
+    type SI = { session: { acceptSubscribe: (...a: unknown[]) => unknown } };
+    (conn as unknown as SI).session.acceptSubscribe = () =>
+      [{ type: 'close_connection', error: 0x1n, reason: 'superseded capacity' }];
+    await expect(conn.acceptSubscribe(1n, 42n)).rejects.toThrow(/closed the session/i);
+  });
+});
+
 describe('MoqtConnection(18) inbound PUBLISH lifecycle', () => {
   it('PUBLISH_DONE is stamped with the original Request ID and surfaced to onMessage', async () => {
     const { conn, bidi } = await publishAccepted();
@@ -623,26 +932,81 @@ describe('MoqtConnection(18) inbound PUBLISH lifecycle', () => {
     expect(done!.requestId).toBe(1n); // stamped from stream context
   });
 
-  it('data still routes by alias AFTER PUBLISH_DONE (late streams allowed)', async () => {
+  it('a late stream on the published alias is EARLY-DISCARDED after PUBLISH_DONE, not delivered (§10.11 bounded terminal)', async () => {
     const { conn, transport, bidi } = await publishAccepted();
-    const objs: MoqtObject[] = [];
     conn.onPublish = () => { /* already published */ };
-    // Re-bind onObject via the publishAliasMaps entry from accept: use onObject on the IncomingPublish.
-    // The first onPublish already fired; set onObject through a fresh subscribe is not possible, so we
-    // rely on the alias binding staying alive. Push data and assert it reaches the bound publish.
-    // (Bind onObject by re-publishing is not needed — the original IncomingPublish kept its onObject slot.)
-    void objs;
 
     bidi.push(publishDoneBytes());
     await flush();
 
-    // A late subgroup stream on the published alias still routes (alias kept).
+    // §10.11: after PUBLISH_DONE the receiver takes the bounded early-discard
+    // path — a late subgroup stream on the terminated alias is dropped, NOT
+    // routed to the generic onObject hook (nor to the withdrawn publish route).
     const delivered: MoqtObject[] = [];
     conn.onObject = (_sid, o) => delivered.push(o);
     transport.pushIncomingUni(concat(subgroupHeader(42n, 1n), subgroupObject(0n, [0x09])));
     await flush();
-    // Not delivered to generic onObject because the alias is still claimed by the publish.
+    expect(delivered.length).toBe(0); // discarded, never delivered
+  });
+
+  it('a FIN/reset of the inbound PUBLISH stream tears down its routing and discards late objects (§3.3.2 / §11.1)', async () => {
+    const { conn, transport, bidi } = await publishAccepted();
+    const internals = conn as unknown as { publishAliasMaps: Map<bigint, unknown>; terminatedAliases: Map<bigint, unknown> };
+    expect(internals.publishAliasMaps.has(42n)).toBe(true); // routing live
+
+    // The peer FINs the inbound PUBLISH request stream (§3.3.2).
+    bidi.closeReadable();
+    await flush();
+
+    // Routing torn down + a bounded late-object guard armed (not retained forever).
+    expect(internals.publishAliasMaps.has(42n)).toBe(false);
+    expect(internals.terminatedAliases.has(42n)).toBe(true);
+
+    // A late subgroup on the alias must be discarded, not routed to onObject.
+    const delivered: MoqtObject[] = [];
+    conn.onObject = (_sid, o) => delivered.push(o);
+    transport.pushIncomingUni(concat(subgroupHeader(42n, 1n), subgroupObject(0n, [0x09])));
+    await flush();
     expect(delivered.length).toBe(0);
+  });
+
+  it('an object arriving while the inbound PUBLISH FIN teardown await is HELD is not delivered (no pre-guard window)', async () => {
+    // Capture the IncomingPublish and attach ITS onObject — the stale publish
+    // route would call the publication's own callback, which the connection-level
+    // onObject cannot observe (routeToTrackSubscription claims the object and
+    // returns true even when publication.onObject is null). Watching the
+    // publication callback is what makes a pre-guard-window leak visible.
+    const { conn, transport } = await connected();
+    const toPublish: MoqtObject[] = [];
+    conn.onPublish = (p) => { p.onObject = (o) => toPublish.push(o); };
+    const bidi = transport.pushIncomingBidi();
+    bidi.push(publishBytes(1n, 42n, 'vid'));
+    await flush();
+    await conn.acceptSubscribe(1n, 42n);
+
+    // Deterministically HOLD the FIN teardown's session-action await: gate the
+    // adapter's executeActions so the FIN path parks inside it. A late object
+    // delivered while parked would slip through iff the guard were armed AFTER
+    // this await (the pre-fix bug); the fix arms it BEFORE, so it is discarded.
+    let releaseGate!: () => void;
+    let gateArmed = false;
+    const internals = conn as unknown as { executeActions: (a: unknown) => Promise<void> };
+    const origExec = internals.executeActions.bind(conn);
+    internals.executeActions = async (actions: unknown) => {
+      if (gateArmed) { gateArmed = false; await new Promise<void>((r) => { releaseGate = r; }); }
+      return origExec(actions);
+    };
+
+    gateArmed = true;
+    bidi.closeReadable();        // FIN → onInboundStreamClosed → parks at the gate
+    await flush();
+    // Parked in the teardown await. Deliver a late object NOW.
+    transport.pushIncomingUni(concat(subgroupHeader(42n, 1n), subgroupObject(0n, [0x09])));
+    await flush();
+    releaseGate();               // release the teardown
+    await flush();
+
+    expect(toPublish.length).toBe(0); // never reached the terminated publication
   });
 
   it('a peer REQUEST_UPDATE is stamped with existingRequestId and answered on the same stream', async () => {
@@ -2068,8 +2432,18 @@ describe('MoqtConnection(18) outbound SUBSCRIBE peer-close (§11.4.1)', () => {
 });
 
 describe('MoqtConnection(18) openSubgroup FIRST_OBJECT (§9.4.2)', () => {
-  it('openSubgroup({ firstObject: true }) emits a header the peer decodes as FIRST_OBJECT (0x40 set)', async () => {
+  // Authorize publishing on track alias 7 via an inbound SUBSCRIBE accept — we are
+  // the PUBLISHER for a subscribe (§5.1). (Accepting an inbound PUBLISH would make
+  // us the subscriber and must NOT authorize openSubgroup on that alias.)
+  async function connectedWithAlias7(): Promise<{ conn: MoqtConnection; transport: TransportSim }> {
     const { conn, transport } = await connected();
+    transport.pushIncomingBidi().push(subscribeReqBytes(1n));
+    await flush();
+    await conn.acceptSubscribe(1n, 7n);
+    return { conn, transport };
+  }
+  it('openSubgroup({ firstObject: true }) emits a header the peer decodes as FIRST_OBJECT (0x40 set)', async () => {
+    const { conn, transport } = await connectedWithAlias7();
     await conn.openSubgroup(7n, 42n, 3n, { publisherPriority: 5, firstObject: true });
     const bytes = transport.uniOut[1]!.writtenBytes(); // uniOut[0] = control stream
     expect((bytes[0]! & 0x40)).toBe(0x40); // FIRST_OBJECT bit set on the type byte
@@ -2077,7 +2451,7 @@ describe('MoqtConnection(18) openSubgroup FIRST_OBJECT (§9.4.2)', () => {
     expect(header.isFirstObjectInSubgroup).toBe(true);
   });
   it('openSubgroup without firstObject does NOT set the FIRST_OBJECT bit (default)', async () => {
-    const { conn, transport } = await connected();
+    const { conn, transport } = await connectedWithAlias7();
     await conn.openSubgroup(7n, 42n, 3n, { publisherPriority: 5 });
     const bytes = transport.uniOut[1]!.writtenBytes();
     expect((bytes[0]! & 0x40)).toBe(0);

@@ -91,9 +91,10 @@ export interface PipelineSet {
   commandDispatcher: CommandDispatcher | null;
   mediaSource: MediaSourceLike | null;
   /**
-   * The SMOOTHED render cushion (µs) currently applied to LOC video render
-   * times and audio scheduling — slew-limited and clamped, distinct from
-   * the raw adaptive gap fuse. Absent for CMAF-only sessions.
+   * READ-ONLY view of the SMOOTHED render cushion (µs) last applied to LOC
+   * video render times and audio scheduling — slew-limited and clamped,
+   * distinct from the raw adaptive gap fuse. Peeks without advancing the
+   * smoother (only scheduling does). Absent for CMAF-only sessions.
    */
   getRenderCushionUs?: () => number;
 }
@@ -316,8 +317,10 @@ export function createPipelines(
     commandDispatcher,
     mediaSource,
     ...(renderCushion ? {
-      getRenderCushionUs: () =>
-        renderCushion.update(videoPipeline?.effectiveGapTimeoutUs),
+      // Observability contract: PEEK the smoothed value. Only the scheduling
+      // paths (video recompute, audio getPlaybackDelayUs) advance the
+      // smoother — polling player.stats must never mutate playback timing.
+      getRenderCushionUs: () => renderCushion.currentUs,
     } : {}),
   };
 }

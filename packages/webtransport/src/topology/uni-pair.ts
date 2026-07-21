@@ -132,11 +132,14 @@ export class UniPairTopology {
    *  cleanup still runs through {@link onRequestClosed} as the stream tears down. */
   onRequestGoaway?: (error: RequestGoawayError) => void | Promise<void>;
 
-  /** Called when an open OUTBOUND request stream ends by PEER action (clean FIN or
-   *  reset) — NOT a local cancel/finish (those are driven by the owner). The owner
-   *  cleans any persistent local state (e.g. an outbound PUBLISH / PUBLISH_NAMESPACE)
-   *  for `requestId`. The context is already dropped from the topology. */
-  onRequestClosed?: (requestId: bigint) => void | Promise<void>;
+  /** Called when an open OUTBOUND request stream ends by PEER action — NOT a local
+   *  cancel/finish (those are driven by the owner). `disposition` distinguishes a
+   *  clean FIN (`'fin'`) from a reset/failure (`'reset'`), which the owner needs to
+   *  tell a valid post-response request-stream close (e.g. a FETCH whose data stream
+   *  outlives it, §5.2) from a terminal reset (§11.4.1). The owner cleans any
+   *  persistent local state for `requestId`; the context is already dropped from the
+   *  topology (and our writable half is FINned on a clean FIN — no half-open). */
+  onRequestClosed?: (requestId: bigint, disposition: 'fin' | 'reset') => void | Promise<void>;
 
   constructor(private readonly session: Session) {}
 
@@ -268,7 +271,18 @@ export class UniPairTopology {
    *
    * `requestId` is derived from the message itself (single source of truth).
    */
-  async openRequest(transport: WebTransportLike, message: ControlMessage): Promise<RequestStream> {
+  async openRequest(
+    transport: WebTransportLike,
+    message: ControlMessage,
+    onResponse: ResponseProcessor,
+  ): Promise<RequestStream> {
+    // The response processor is REQUIRED (not optional): it is the wire-order
+    // acknowledgement the read loop awaits before the next frame. Making it
+    // mandatory — in the type AND at runtime — means a direct consumer of this
+    // experimental API cannot silently skip the ordering barrier.
+    if (typeof onResponse !== 'function') {
+      throw new Error('UniPairTopology.openRequest: an onResponse processor (the wire-order acknowledgement) is required');
+    }
     if (!STREAM_OPENING_REQUESTS.has(message.type) || !('requestId' in message)) {
       throw new Error(
         `UniPairTopology: only ${[...STREAM_OPENING_REQUESTS].join('/')} may open a request stream, got ${message.type}`,
@@ -289,18 +303,37 @@ export class UniPairTopology {
     // ALWAYS reclaim the context when the stream ends so it can't leak. A clean FIN
     // resolves `closed`; a failure rejects it — both run the cleanup. If the owner
     // already removed the context (local cancel/finish), skip the peer-close notify.
+    let closedClean = true;
     void ctx.closed
-      .catch((err) => this.onStreamError?.(err instanceof Error ? err : new Error(String(err))))
+      .catch((err) => {
+        closedClean = false; // a reset/failure — NOT a clean FIN
+        this.onStreamError?.(err instanceof Error ? err : new Error(String(err)));
+      })
       .finally(() => {
         if (this.contexts.get(requestId) === ctx) {
           this.contexts.delete(requestId);
-          void this.onRequestClosed?.(requestId); // peer-initiated close → owner cleans local state
+          // peer-initiated close → owner cleans local state, told whether the close
+          // was a clean FIN or a reset (§5.2 vs §11.4.1 — matters for FETCH).
+          void this.onRequestClosed?.(requestId, closedClean ? 'fin' : 'reset');
         }
       });
-    const { response } = await ctx.send(message); // resolves after the WRITE
-    // One-shot requests (TRACK_STATUS) send nothing more — FIN our writable now.
-    if (ONE_SHOT_REQUESTS.has(message.type)) {
-      await ctx.finishSending();
+    let response: Promise<DecodedControlMessage>;
+    try {
+      ({ response } = await ctx.send(message, onResponse)); // resolves after the WRITE
+      // One-shot requests (TRACK_STATUS) send nothing more — FIN our writable now.
+      if (ONE_SHOT_REQUESTS.has(message.type)) {
+        await ctx.finishSending();
+      }
+    } catch (err) {
+      // The open write (or one-shot FIN) failed: the peer never received the
+      // request, so no per-request context may survive in the topology. Reclaim it
+      // and tear the half-open stream down BEFORE rethrowing (matching the owner's
+      // own Session-state rollback). Delete first so the ctx.closed `finally` guard
+      // sees a foreign context and does NOT re-fire onRequestClosed — the caller
+      // owns the request-closed cleanup on this failure path.
+      if (this.contexts.get(requestId) === ctx) this.contexts.delete(requestId);
+      try { await ctx.cancel(StreamResetCode18.CANCELLED); } catch { /* already down */ }
+      throw err instanceof Error ? err : new Error(String(err));
     }
     return { requestId, response };
   }
@@ -312,7 +345,14 @@ export class UniPairTopology {
    * REQUEST_ERROR) correlates to the update — not the original request.
    * @throws if there is no open request stream for `existingRequestId`.
    */
-  async sendUpdate(existingRequestId: bigint, message: ControlMessage): Promise<RequestStream> {
+  async sendUpdate(
+    existingRequestId: bigint,
+    message: ControlMessage,
+    onResponse: ResponseProcessor,
+  ): Promise<RequestStream> {
+    if (typeof onResponse !== 'function') {
+      throw new Error('UniPairTopology.sendUpdate: an onResponse processor (the wire-order acknowledgement) is required');
+    }
     if (message.type !== 'REQUEST_UPDATE') {
       throw new Error(`UniPairTopology.sendUpdate expects REQUEST_UPDATE, got ${message.type}`);
     }
@@ -320,8 +360,34 @@ export class UniPairTopology {
     if (!ctx) {
       throw new Error(`UniPairTopology: no open request stream for request ${existingRequestId}`);
     }
-    const { response } = await ctx.send(message);
+    let response: Promise<DecodedControlMessage>;
+    try {
+      ({ response } = await ctx.send(message, onResponse));
+    } catch (err) {
+      // §11.4.1: the REQUEST_UPDATE write failed, which terminates the bidi request
+      // stream it rode. The UNDERLYING request (SUBSCRIBE / PUBLISH) is therefore
+      // gone — reclaim its context and notify the owner so its session state is
+      // cleaned, else a later update would target an already-dead writer.
+      await this.terminateRequestContext(existingRequestId);
+      throw err instanceof Error ? err : new Error(String(err));
+    }
     return { requestId: message.requestId, response };
+  }
+
+  /**
+   * Terminate an open request-stream context (§11.4.1): drop it from the registry,
+   * tear the stream down, and fire {@link onRequestClosed} so the owner cleans the
+   * request's session state. Deleting BEFORE the cancel means the ctx.closed
+   * `finally` sees a foreign context and does not ALSO fire onRequestClosed — this
+   * fires it exactly once. Used when a write on the stream fails (a REQUEST_UPDATE
+   * send), which the draft treats as terminating the request.
+   */
+  private async terminateRequestContext(requestId: bigint): Promise<void> {
+    const ctx = this.contexts.get(requestId);
+    if (!ctx) return;
+    this.contexts.delete(requestId);
+    try { await ctx.cancel(StreamResetCode18.CANCELLED); } catch { /* already down */ }
+    void this.onRequestClosed?.(requestId, 'reset'); // a write-failure teardown is terminal
   }
 
   /** Whether an open request stream exists for `requestId` (e.g. to send a
@@ -401,7 +467,16 @@ export class UniPairTopology {
     this.continuingContexts.set(requestId, ctx);
     // Clean up the context once the stream ends (either outcome).
     void ctx.closed.then(() => {}, () => {}).finally(() => this.continuingContexts.delete(requestId));
-    await ctx.send(message);
+    try {
+      await ctx.send(message);
+    } catch (err) {
+      // The initial write failed: the peer never received the request, so no
+      // continuing context may survive. Reclaim it and tear the half-open stream
+      // down before rethrowing (matching openRequest's transactional guarantee).
+      if (this.continuingContexts.get(requestId) === ctx) this.continuingContexts.delete(requestId);
+      try { await ctx.close(); } catch { /* already down */ }
+      throw err instanceof Error ? err : new Error(String(err));
+    }
     return { requestId, closed: ctx.closed };
   }
 
@@ -417,7 +492,14 @@ export class UniPairTopology {
    * caller stamps it with the update's own Request ID.
    * @throws if no continuing request stream is open for `existingRequestId`.
    */
-  async sendUpdateOnContinuing(existingRequestId: bigint, message: ControlMessage): Promise<DecodedControlMessage> {
+  async sendUpdateOnContinuing(
+    existingRequestId: bigint,
+    message: ControlMessage,
+    onResponse: ResponseProcessor,
+  ): Promise<DecodedControlMessage> {
+    if (typeof onResponse !== 'function') {
+      throw new Error('UniPairTopology.sendUpdateOnContinuing: an onResponse processor (the wire-order acknowledgement) is required');
+    }
     if (message.type !== 'REQUEST_UPDATE') {
       throw new Error(`UniPairTopology.sendUpdateOnContinuing expects REQUEST_UPDATE, got ${message.type}`);
     }
@@ -425,7 +507,16 @@ export class UniPairTopology {
     if (!ctx) {
       throw new Error(`UniPairTopology.sendUpdateOnContinuing: no continuing request stream for ${existingRequestId}`);
     }
-    return ctx.sendUpdate(message);
+    try {
+      return await ctx.sendUpdate(message, onResponse);
+    } catch (err) {
+      // §11.4.1: the prefix-update write failed → the continuing bidi request
+      // stream is dead. Tear it down; its registered closed-handler then cleans the
+      // session's SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS state. Without this the
+      // continuing context would linger and later updates would target a dead writer.
+      await this.closeContinuingRequest(existingRequestId);
+      throw err instanceof Error ? err : new Error(String(err));
+    }
   }
 
   /**
@@ -438,6 +529,19 @@ export class UniPairTopology {
     if (!ctx) return;
     this.continuingContexts.delete(requestId);
     await ctx.close();
+  }
+
+  /**
+   * Terminal shutdown: cancel every open request-stream context and close every
+   * continuing-request context, then drop them. Used by the owner's one-shot
+   * terminal coordinator so no topology-owned stream context outlives the
+   * session. Fire-and-forget teardown (idempotent; safe if already torn down).
+   */
+  shutdown(): void {
+    for (const [, ctx] of this.contexts) void ctx.cancel(StreamResetCode18.CANCELLED);
+    this.contexts.clear();
+    for (const [, ctx] of this.continuingContexts) void ctx.close();
+    this.continuingContexts.clear();
   }
 }
 
@@ -504,9 +608,20 @@ const CONTINUING_REQUESTS: Record<string, ReadonlySet<string>> = {
   SUBSCRIBE_TRACKS: new Set(['PUBLISH_BLOCKED']),
 };
 
+/**
+ * In-order processing hook for a matched response: the read loop AWAITS it
+ * before decoding the next frame, so coalesced messages from one read are
+ * applied through session state strictly in wire order (e.g. a SUBSCRIBE_OK
+ * must be fully applied before a PUBLISH_DONE in the same receive is handled).
+ * This is an explicit processing acknowledgement — not a microtask delay.
+ */
+export type ResponseProcessor = (message: DecodedControlMessage) => void | Promise<void>;
+
 interface PendingResponse extends Deferred<DecodedControlMessage> {
   /** Response types valid for the request that produced this expectation. */
   readonly allowed: ReadonlySet<string>;
+  /** Awaited by the read loop before the next frame (wire-order barrier). */
+  readonly process?: ResponseProcessor;
 }
 
 /**
@@ -527,6 +642,16 @@ class RequestStreamContext {
   private failure: Error | null = null;
   private cancelled = false;
   private firstResponseSeen = false;
+  /** §10.11: a successful SUBSCRIBE_OK arrived — PUBLISH_DONE becomes legal. */
+  private subscribeEstablished = false;
+  /** §10.11: a terminal PUBLISH_DONE was processed — NOTHING may follow it
+   *  (including further frames in the same receive) except the peer's FIN. */
+  private terminalSeen = false;
+  /** The opener was rejected: the FIRST response was REQUEST_ERROR. Once every
+   *  already-queued update response has settled, our writable is FINned. */
+  private rejectedTerminal = false;
+  /** Our writable has been FINned by the terminal/rejection paths. */
+  private writerFinished = false;
   private readonly closedDeferred = deferred<void>();
 
   /** Invoked for a peer-initiated, stream-scoped request (not a queued response)
@@ -571,18 +696,40 @@ class RequestStreamContext {
    * once the WRITE completes; the returned `response` resolves when the matching
    * reply arrives.
    */
-  async send(message: ControlMessage): Promise<{ response: Promise<DecodedControlMessage> }> {
+  async send(
+    message: ControlMessage,
+    onResponse?: ResponseProcessor,
+  ): Promise<{ response: Promise<DecodedControlMessage> }> {
     if (this.cancelled) throw new RequestCancelledError(StreamResetCode18.CANCELLED);
     if (this.failure) throw this.failure;
     const allowed = ALLOWED_RESPONSES[message.type];
     if (!allowed) {
       throw new Error(`UniPairTopology: no response mapping for request type ${message.type}`);
     }
-    // Register BEFORE writing so a fast reply can't outrun its queue slot.
+    // Register BEFORE writing so a fast reply can't outrun its queue slot. The
+    // read loop AWAITS `process` before touching the next frame — the explicit
+    // wire-order barrier between topology and owner (adapter/session).
     const d = deferred<DecodedControlMessage>();
-    this.queue.push({ ...d, allowed });
+    const entry = { ...d, allowed, ...(onResponse ? { process: onResponse } : {}) };
+    this.queue.push(entry);
     this.startReading();
-    await this.writer.write(this.codec.encode(message));
+    try {
+      await this.writer.write(this.codec.encode(message));
+    } catch (err) {
+      // The write failed: the peer never received this request/update, so no reply
+      // can ever match this FIFO slot. Remove the dangling slot BEFORE rethrowing —
+      // leaving it would mis-correlate the NEXT response to arrive (a REQUEST_UPDATE
+      // whose send failed must not steal the reply meant for an earlier request).
+      const i = this.queue.indexOf(entry);
+      if (i >= 0) this.queue.splice(i, 1);
+      const e = err instanceof Error ? err : new Error(String(err));
+      // Reject the response promise for any holder, but pre-attach a no-op catch:
+      // on the open/send failure path the caller throws BEFORE receiving `response`,
+      // so its rejection would otherwise surface as an unhandled rejection.
+      void d.promise.catch(() => { /* observed; the throw below is the signal */ });
+      d.reject(e);
+      throw e;
+    }
     return { response: d.promise };
   }
 
@@ -638,6 +785,14 @@ class RequestStreamContext {
         const { value, done } = await this.reader.read();
         if (value) this.framer.push(value);
         for (const { message } of this.framer.drain()) {
+          // §10.11: NOTHING follows a terminal PUBLISH_DONE — a duplicate DONE
+          // or any trailing message (even coalesced into the same receive) is a
+          // protocol violation, never silently discarded.
+          if (this.terminalSeen) {
+            throw new ProtocolViolationError(
+              `${message.type} received after the terminal PUBLISH_DONE (§10.11)`,
+            );
+          }
           // A peer-initiated REQUEST_UPDATE is a stream-scoped REQUEST, not a
           // response — it must NOT be FIFO-matched against our local operations.
           // §10.9: only a PUBLISH stream carries one, and only after the initial
@@ -655,6 +810,38 @@ class RequestStreamContext {
             }
             await this.onPeerRequest?.(message);
             continue;
+          }
+          // §10.11: PUBLISH_DONE is the publisher's TERMINAL message on a
+          // subscription's request stream — accepted exactly once, only after
+          // a successful SUBSCRIBE_OK (never after REQUEST_ERROR), and only
+          // once all outstanding local update responses have settled. It is
+          // not a response to any local operation — never FIFO-matched. On
+          // receipt we FIN our own writable and keep READING until the peer's
+          // clean FIN: `closed` resolves only on terminal completion, and any
+          // message after the DONE (same chunk or later) is a violation.
+          if (message.type === 'PUBLISH_DONE') {
+            if (this.openerType !== 'SUBSCRIBE') {
+              throw new ProtocolViolationError(
+                `PUBLISH_DONE not accepted on a ${this.openerType} request stream`,
+              );
+            }
+            if (!this.subscribeEstablished) {
+              throw new ProtocolViolationError(
+                'PUBLISH_DONE without a preceding SUBSCRIBE_OK',
+              );
+            }
+            if (this.queue.length > 0) {
+              throw new ProtocolViolationError(
+                'PUBLISH_DONE while update responses are still outstanding',
+              );
+            }
+            this.terminalSeen = true;
+            await this.onPeerRequest?.(message);
+            if (!this.writerFinished) {
+              this.writerFinished = true;
+              try { await this.writer.close(); } catch { /* already closed */ }
+            }
+            continue; // drain to the peer's clean FIN (or fail on trailing bytes)
           }
           // §10.4: a GOAWAY MAY arrive on a request stream to migrate that ONE
           // request. It is NOT a response, so it must NEVER be FIFO-matched, and it
@@ -691,14 +878,52 @@ class RequestStreamContext {
             exp.reject(err);
             throw err; // wrong-typed reply also fails the stream
           }
+          const isFirstResponse = !this.firstResponseSeen;
           this.firstResponseSeen = true;
+          if (message.type === 'SUBSCRIBE_OK') this.subscribeEstablished = true;
+          // Wire-order barrier: the owner PROCESSES this response (applies it
+          // through session state) before the next frame — even one already
+          // decoded from the same read — is handled. A processing failure fails
+          // the stream; the waiter sees the same error exactly once.
+          if (exp.process) {
+            try {
+              await exp.process(message);
+            } catch (err) {
+              const e = err instanceof Error ? err : new Error(String(err));
+              exp.reject(e);
+              throw e;
+            }
+          }
           exp.resolve(message);
+          // §10.6/§3.3.2: a REQUEST_ERROR to the OPENER rejects the whole
+          // request — the stream is done. Once every already-queued update
+          // response has settled (they are flushed FIFO behind the rejection),
+          // FIN our writable and drain to the peer's FIN, so neither side
+          // retains a half-open stream or its context.
+          if (isFirstResponse && message.type === 'REQUEST_ERROR') this.rejectedTerminal = true;
+          if (this.rejectedTerminal && this.queue.length === 0 && !this.writerFinished) {
+            this.writerFinished = true;
+            try { await this.writer.close(); } catch { /* already closed/aborted */ }
+          }
         }
         if (done) {
           // A local cancel drains the queue and resolves `closed` itself; a
           // peer-side early end with responses still pending is a failure.
           if (!this.cancelled && this.queue.length > 0) {
             throw new Error('UniPairTopology: request stream ended before all responses');
+          }
+          // §3.3.2: on a genuine PEER FIN, FIN OURS too so the bidi fully closes and
+          // no half-open write side lingers. Idempotent if a terminal path
+          // (PUBLISH_DONE / REQUEST_ERROR) already closed it. This matters for a FETCH
+          // whose request stream is FIN'd after FETCH_OK while its data stream lives
+          // on (§5.2): the owner retains the fetch but can no longer reach this
+          // writable, so the topology must close it here. NOT on a local cancel
+          // (`cancelled`) — that path RESETs the writable (writer.abort), and a
+          // reader.cancel there also surfaces as `done`; closing here would race the
+          // abort and downgrade the RESET to a FIN.
+          if (!this.cancelled && !this.writerFinished) {
+            this.writerFinished = true;
+            try { await this.writer.close(); } catch { /* already closed/aborted */ }
           }
           this.closedDeferred.resolve();
           return;
@@ -711,6 +936,16 @@ class RequestStreamContext {
         return;
       }
       this.failure = err instanceof Error ? err : new Error(String(err));
+      // §3.3.2: the stream FAILED (peer reset, early FIN with a pending response, an
+      // unsolicited/wrong-typed reply, or a processing error). RESET our writable half
+      // before settling `closed` — the topology deletes this context immediately after,
+      // so this is the last chance to reach the writer; leaving it open half-closes the
+      // bidi for the life of the connection. Absorb any abort failure (already torn
+      // down). Applies to every outbound request stream, not just FETCH.
+      if (!this.writerFinished) {
+        this.writerFinished = true;
+        try { await this.writer.abort(this.failure); } catch { /* already closed/aborted */ }
+      }
       for (const d of this.queue.splice(0)) d.reject(this.failure);
       this.closedDeferred.reject(this.failure);
     } finally {
@@ -736,9 +971,10 @@ class ContinuingRequestStreamContext {
   /**
    * Pending local REQUEST_UPDATEs (draft-18 §10.9.2 prefix updates) awaiting their
    * REQUEST_OK / REQUEST_ERROR, matched FIFO by send order against responses that
-   * arrive AFTER the first response on this continuing stream.
+   * arrive AFTER the first response on this continuing stream. Each may carry a
+   * processor the read loop awaits before the next frame (wire-order barrier).
    */
-  private readonly pendingUpdates: Deferred<DecodedControlMessage>[] = [];
+  private readonly pendingUpdates: Array<Deferred<DecodedControlMessage> & { process?: ResponseProcessor }> = [];
 
   get closed(): Promise<void> {
     return this.closedDeferred.promise;
@@ -767,8 +1003,8 @@ class ContinuingRequestStreamContext {
    * own Request ID (the caller stamps it); it is matched FIFO so it is never
    * mistaken for a NAMESPACE / PUBLISH_BLOCKED continuation.
    */
-  async sendUpdate(message: ControlMessage): Promise<DecodedControlMessage> {
-    const d = deferred<DecodedControlMessage>();
+  async sendUpdate(message: ControlMessage, onResponse?: ResponseProcessor): Promise<DecodedControlMessage> {
+    const d = { ...deferred<DecodedControlMessage>(), ...(onResponse ? { process: onResponse } : {}) };
     this.pendingUpdates.push(d);
     try {
       await this.writer.write(this.codec.encode(message));
@@ -809,6 +1045,13 @@ class ContinuingRequestStreamContext {
             firstSeen = true;
             errored = message.type === 'REQUEST_ERROR';
             await this.handler(message, 'first');
+            if (errored) {
+              // §10.9.1: a REQUEST_ERROR first response is terminal — the request
+              // is rejected. Close BOTH directions so no half-open stream (an
+              // open request writer + a pending reader) lingers.
+              await this.close();
+              return;
+            }
           } else {
             // After REQUEST_ERROR the stream must FIN — no further messages.
             if (errored) {
@@ -823,6 +1066,17 @@ class ContinuingRequestStreamContext {
                 throw new ProtocolViolationError(
                   `continuing request: unsolicited ${message.type} (no pending REQUEST_UPDATE)`,
                 );
+              }
+              // Wire-order barrier: apply the update response before any
+              // continuation coalesced behind it in the same receive.
+              if (exp.process) {
+                try {
+                  await exp.process(message);
+                } catch (err) {
+                  const e = err instanceof Error ? err : new Error(String(err));
+                  exp.reject(e);
+                  throw e;
+                }
               }
               exp.resolve(message);
               continue; // not a continuation message

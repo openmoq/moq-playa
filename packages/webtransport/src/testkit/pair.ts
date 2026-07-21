@@ -57,11 +57,15 @@ export interface ConnectedPair {
  */
 export async function connectedPair(
   version: DraftVersion = 18,
-  opts: { faults?: { a?: PipeFaults; b?: PipeFaults } } = {},
+  opts: {
+    faults?: { a?: PipeFaults; b?: PipeFaults };
+    serverOptions?: { joiningFetchTimeoutMs?: number; terminatedAliasTtlMs?: number };
+    clientOptions?: { joiningFetchTimeoutMs?: number; terminatedAliasTtlMs?: number };
+  } = {},
 ): Promise<ConnectedPair> {
   const { a, b } = createLoopback(opts.faults ?? {});
-  const client = new MoqtConnection(version);
-  const server = new MoqtConnection(version, { role: 'server' });
+  const client = new MoqtConnection(version, opts.clientOptions);
+  const server = new MoqtConnection(version, { role: 'server', ...(opts.serverOptions ?? {}) });
   const errors: Error[] = [];
   client.onError = (e) => errors.push(e);
   server.onError = (e) => errors.push(e);

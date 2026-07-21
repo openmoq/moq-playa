@@ -47,6 +47,13 @@ export interface PipeFaults {
    * readable (truncated stream end). Models a peer ending a stream mid-frame.
    */
   finAfterBytes?: number;
+  /**
+   * Buffer every delivery (and a FIN) instead of enqueuing it; a later
+   * {@link LoopPipe.releaseHeld} delivers ALL buffered bytes as ONE read chunk.
+   * Models QUIC coalescing: multiple peer writes arriving in a single receive,
+   * so the reader's framer drains several messages from one read().
+   */
+  hold?: boolean;
 }
 
 /** Error shape mirroring a WebTransport RESET_STREAM (the adapter reads `streamErrorCode`). */
@@ -79,6 +86,10 @@ export class LoopPipe {
   /** Bytes delivered to the readable so far (drives resetAfterBytes/finAfterBytes). */
   private delivered = 0;
   private faultFired = false;
+  /** Deliveries buffered while `faults.hold` is armed (flushed by releaseHeld). */
+  private heldChunks: Uint8Array[] = [];
+  /** A writer close() arrived while holding — replayed after the held bytes. */
+  private heldClose = false;
 
   private ctrl!: ReadableStreamDefaultController<Uint8Array>;
   private readClosed = false;
@@ -96,13 +107,21 @@ export class LoopPipe {
       },
       close: () => {
         this.writeClosed = true;
+        if (this.faults.hold) { this.heldClose = true; return; }
         if (!this.readClosed) { this.readClosed = true; this.ctrl.close(); }
       },
-      abort: () => {
+      abort: (reason?: unknown) => {
         this.writeAborted = true;
         if (!this.readClosed) {
           this.readClosed = true;
-          try { this.ctrl.error(new Error('reset')); } catch { /* already closed */ }
+          // A writer.abort() is a RESET_STREAM: the reader must see it as a
+          // reset carrying an application code (streamErrorCode), NOT a generic
+          // read error — the adapter distinguishes the two. Preserve a code from
+          // the reason if present, else default to 0 (a normal reset).
+          const code = typeof (reason as { streamErrorCode?: unknown })?.streamErrorCode === 'number'
+            ? (reason as { streamErrorCode: number }).streamErrorCode
+            : 0;
+          try { this.ctrl.error(new StreamResetError(code)); } catch { /* already closed */ }
         }
       },
     });
@@ -110,6 +129,10 @@ export class LoopPipe {
 
   /** Enqueue a write to the readable, honoring any armed faults. */
   private deliver(chunk: Uint8Array): void {
+    if (this.faults.hold) {
+      this.heldChunks.push(chunk.slice());
+      return;
+    }
     // How many more bytes may be delivered before a byte-count fault trips.
     const limit = this.faults.resetAfterBytes ?? this.faults.finAfterBytes;
     let data = chunk;
@@ -137,6 +160,42 @@ export class LoopPipe {
         try { this.ctrl.close(); } catch { /* closed */ } // truncating FIN
       }
     }
+  }
+
+  /**
+   * Disarm {@link PipeFaults.hold} and deliver everything buffered as ONE read
+   * chunk (a coalesced receive), then replay a deferred FIN if the writer closed
+   * while the hold was armed. No-op with nothing held and no deferred FIN.
+   */
+  releaseHeld(): void {
+    this.faults.hold = false;
+    if (this.heldChunks.length > 0 && !this.readClosed) {
+      const total = this.heldChunks.reduce((n, c) => n + c.length, 0);
+      const merged = new Uint8Array(total);
+      let p = 0;
+      for (const c of this.heldChunks) { merged.set(c, p); p += c.length; }
+      this.heldChunks = [];
+      this.ctrl.enqueue(merged);
+      this.delivered += total;
+    }
+    if (this.heldClose && !this.readClosed) {
+      this.heldClose = false;
+      this.readClosed = true;
+      this.ctrl.close();
+    }
+  }
+
+  /**
+   * Inject raw bytes directly into the readable as one chunk — the reader sees
+   * them as peer bytes that were never actually written by the peer endpoint.
+   * For malformed/misbehaving-peer tests (e.g. a duplicate terminal message the
+   * real adapter API refuses to produce). Honors an armed {@link PipeFaults.hold}.
+   */
+  injectRead(bytes: Uint8Array): void {
+    if (this.readClosed) return;
+    if (this.faults.hold) { this.heldChunks.push(bytes.slice()); return; }
+    this.ctrl.enqueue(bytes.slice());
+    this.delivered += bytes.length;
   }
 
   /**
@@ -173,7 +232,23 @@ export class LoopbackTransport implements WebTransportLike {
 
   closeInfo: WebTransportCloseInfo | undefined;
   private closedResolve!: (info: WebTransportCloseInfo) => void;
-  readonly closed: Promise<WebTransportCloseInfo> = new Promise((res) => { this.closedResolve = res; });
+  private closedReject!: (err: Error) => void;
+  private closedSettled = false;
+  readonly closed: Promise<WebTransportCloseInfo> = new Promise((res, rej) => {
+    this.closedResolve = res;
+    this.closedReject = rej;
+  });
+
+  /**
+   * Test hook: reject the `closed` promise as an abrupt transport failure (a
+   * WebTransport session that errored rather than closing cleanly). No-op once
+   * `closed` has settled.
+   */
+  failClosed(err: Error): void {
+    if (this.closedSettled) return;
+    this.closedSettled = true;
+    this.closedReject(err);
+  }
 
   readonly incomingUnidirectionalStreams: ReadableStream<ReadableStream<Uint8Array>>;
   readonly incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream>;
@@ -205,6 +280,15 @@ export class LoopbackTransport implements WebTransportLike {
     };
   }
 
+  /**
+   * Inject a raw datagram into THIS endpoint's incoming datagram stream, as if
+   * the peer had sent it — for receiver-side tests (e.g. a datagram for a
+   * tombstoned alias) where the real peer API would refuse to produce it.
+   */
+  injectDatagram(bytes: Uint8Array): void {
+    this.datagramInCtrl.enqueue(bytes.slice());
+  }
+
   async createUnidirectionalStream(): Promise<WritableStream<Uint8Array>> {
     const pipe = new LoopPipe({ ...this.streamFaults });
     this.uniOut.push(pipe);
@@ -223,8 +307,9 @@ export class LoopbackTransport implements WebTransportLike {
   }
 
   close(info?: WebTransportCloseInfo): void {
-    if (this.closeInfo) return;
+    if (this.closeInfo || this.closedSettled) return;
     this.closeInfo = info ?? {};
+    this.closedSettled = true;
     this.closedResolve(this.closeInfo);
   }
 }

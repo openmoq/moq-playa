@@ -1,6 +1,6 @@
 {
   "name": "@moqt/webtransport",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Media over QUIC Transport (MoQT) session over WebTransport — the WebTransport binding for @moqt/transport.",
   "license": "Apache-2.0",
   "author": "OpenMOQ (https://github.com/openmoq)",

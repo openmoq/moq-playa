@@ -1,9 +1,9 @@
 /**
  * RenderCushionSmoother — the stable LOC render playout target.
  *
- * Field data (docs/design-loc-av-sync.md, Slice A) showed the raw adaptive
- * gap timeout swinging 50–2000 ms on a mostly-clean network; applying that
- * value stepwise to render scheduling froze video for the length of each
+ * Field data showed the raw adaptive gap timeout swinging 50–2000 ms on a
+ * mostly-clean network; applying that value stepwise to render scheduling
+ * froze video for the length of each
  * collapse: frames already queued under the old larger cushion sat at the
  * queue head and blocked newer, earlier-scheduled frames. The smoother
  * decouples RENDER scheduling from the gap FUSE:

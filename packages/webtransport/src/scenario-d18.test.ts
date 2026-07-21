@@ -44,7 +44,7 @@ describe('draft-18 scenario runner — clean schedules', () => {
 });
 
 describe('draft-18 scenario preludes (hand-authored invariants)', () => {
-  it('late data on a freed alias is not delivered after UNSUBSCRIBE', async () => {
+  it('UNSUBSCRIBE: in-flight bytes may arrive, but the publisher\'s streams are reset and later sends reject (§5.1.1)', async () => {
     const { client, server, errors } = await connectedPair();
     let rid = -1n;
     server.onSubscribe = (r) => { rid = r; };
@@ -62,16 +62,22 @@ describe('draft-18 scenario preludes (hand-authored invariants)', () => {
     await flush();
     expect(delivered).toEqual(['1:0']);
 
-    // After unsubscribe, late data on the SAME alias must NOT reach the subscription.
+    // Bytes written BEFORE cancellation are in flight — they may arrive.
+    sid = await server.openSubgroup(5n, 2n, 0n, { publisherPriority: 1 });
+    await server.sendObject(sid, 0n, new Uint8Array([2]));
+    await flush();
+    expect(delivered).toEqual(['1:0', '2:0']); // pre-cancel object delivered
+
     await sub.unsubscribe();
     await flush();
     expect(client.session.getSubscription(rid)).toBeUndefined(); // draft-18 deletes
     expect(client.session.getTrackByAlias(5n)).toBeUndefined();  // alias freed
-    sid = await server.openSubgroup(5n, 2n, 0n, { publisherPriority: 1 });
-    await server.sendObject(sid, 0n, new Uint8Array([2]));
-    await server.closeSubgroup(sid);
-    await flush();
-    expect(delivered).toEqual(['1:0']); // '2:0' NOT delivered
+
+    // §5.1.1: the publisher's open stream was RESET — a send on it now rejects,
+    // and NEW data streams for the terminated subscription are refused too.
+    await expect(server.sendObject(sid, 1n, new Uint8Array([3]))).rejects.toThrow(/Unknown outgoing stream/);
+    await expect(server.openSubgroup(5n, 3n, 0n, { publisherPriority: 1 })).rejects.toThrow(/terminated/);
+    expect(delivered).toEqual(['1:0', '2:0']); // nothing after cancel
     expect(errors).toEqual([]);
   });
 
@@ -211,19 +217,20 @@ describe('draft-18 fetch preludes (hand-authored invariants)', () => {
     expect(errors).toEqual([]);                                    // local cancel — no onError
     expect(client.session.state).toBe(SessionState.ESTABLISHED);   // session unaffected
 
-    // The publisher tries to send MORE on the already-open fetch data stream. The
-    // server writes to its own stream successfully (it does not throw), but the
-    // client STOP_SENDING'd its reader, so the late object MUST NOT be delivered.
+    // §10.13: the peer's FETCH request-stream reset reached the server, whose
+    // inbound-close path ABORTED its open response stream. A further sendFetchObject
+    // on it now rejects — the publisher can no longer push unsolicited fetch data —
+    // and either way the late object MUST NOT reach the client.
     let sendThrew = false;
     try {
       await server.sendFetchObject(sid, { groupId: 7000n, subgroupId: 0n, objectId: 1n, publisherPriority: 1, payload: new Uint8Array([0xa1]) });
     } catch {
-      sendThrew = true; // acceptable per §3.3.2 if the server observed STOP_SENDING
+      sendThrew = true; // the response stream was aborted by the inbound FETCH close
     }
     await flush();
 
     expect(recv.length).toBe(1);                                   // late fetch data NOT delivered
-    expect(sendThrew).toBe(false);                                 // observed behavior: server write succeeds
+    expect(sendThrew).toBe(true);                                  // server response stream aborted on cancel
     expect(errors).toEqual([]);                                    // still no onError
     expect(client.session.state).toBe(SessionState.ESTABLISHED);   // still no session close
     const cf = client.session.getFetch(requestId);
@@ -306,7 +313,7 @@ describe('draft-18 publish preludes (hand-authored invariants)', () => {
     expect(client.session.state).toBe(SessionState.ESTABLISHED);
   });
 
-  it('draft-18 keeps the peer alias routing after PUBLISH_DONE — a late object still delivers (documented behavior)', async () => {
+  it('PUBLISH_DONE is terminal for the publish alias: refused while a stream is open, and no new streams after (§10.11)', async () => {
     const { client, server, errors } = await connectedPair();
     let pubReqId = -1n;
     const recv: MoqtObject[] = [];
@@ -316,25 +323,20 @@ describe('draft-18 publish preludes (hand-authored invariants)', () => {
     await flush();
     await server.acceptSubscribe(pubReqId, 500003n);
     await flush();
-    let sid = await client.openSubgroup(500003n, 1n, 0n, { publisherPriority: 1 });
+    const sid = await client.openSubgroup(500003n, 1n, 0n, { publisherPriority: 1 });
     await client.sendObject(sid, 0n, new Uint8Array([0x01]));
-    await client.closeSubgroup(sid);
     await flush();
     expect(recv.length).toBe(1);
 
+    // §10.11: the terminal message carries the total Stream Count — it is
+    // refused while this subscription's data streams remain open…
+    await expect(client.publishDone(requestId, varint(0n), 'early')).rejects.toThrow(/open/);
+    await client.closeSubgroup(sid);
     await client.publishDone(requestId, varint(0n), 'done');
     await flush();
-    // §10.11: PUBLISH_DONE ends the PUBLISHER's outgoing state, but the peer keeps
-    // the incoming-publish alias routing, so a late object on the alias STILL
-    // delivers (the publisher may have in-flight / counted streams). Pinned here so
-    // a change in this semantics is caught. (Per-DONE Stream Count enforcement is a
-    // separate concern, out of scope for this slice — the random runner never sends
-    // after PUBLISH_DONE, so it does not depend on this behavior.)
-    sid = await client.openSubgroup(500003n, 2n, 0n, { publisherPriority: 1 });
-    await client.sendObject(sid, 0n, new Uint8Array([0x02]));
-    await client.closeSubgroup(sid);
-    await flush();
-    expect(recv.length).toBe(2); // late object delivered
+    // …and after termination the alias accepts no further data streams.
+    await expect(client.openSubgroup(500003n, 2n, 0n, { publisherPriority: 1 })).rejects.toThrow(/terminated/);
+    expect(recv.length).toBe(1);
     expect(errors).toEqual([]);
     expect(client.session.state).toBe(SessionState.ESTABLISHED);
   });

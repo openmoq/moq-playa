@@ -9,7 +9,7 @@ import { MoqtConnection } from './adapter.js';
 import { TransportSim, flush } from './testkit/stream-sim.js';
 import { createControlCodec, varint, writeVi64, SessionState } from '@moqt/transport';
 import { SetupOption18 } from '@moqt/transport';
-import type { SubscribeOk, RequestErrorMsg, RequestOk, Fetch, FetchOk, ControlMessage, QlogEvent, Setup } from '@moqt/transport';
+import type { SubscribeOk, RequestErrorMsg, RequestOk, Fetch, FetchOk, ControlMessage, QlogEvent, Setup, MoqtObject } from '@moqt/transport';
 
 const codec18 = createControlCodec(18);
 const setupBytes = (): Uint8Array => codec18.encode({ type: 'SETUP', setupOptions: new Map() });
@@ -497,6 +497,23 @@ describe('MoqtConnection(18) fetch cancellation (§3.3.2)', () => {
     p += writeVi64(reqId, out, p);
     return out.subarray(0, p);
   };
+  // A first FETCH object (type 0x1c): group, object, priority, payload-len, payload.
+  const firstFetchObjBytes = (group: bigint, obj: bigint, prio: number, payload: number[]): Uint8Array => {
+    const out = new Uint8Array(64);
+    let p = writeVi64(0x1cn, out, 0);
+    p += writeVi64(group, out, p);
+    p += writeVi64(obj, out, p);
+    out[p++] = prio;
+    p += writeVi64(BigInt(payload.length), out, p);
+    out.set(payload, p); p += payload.length;
+    return out.subarray(0, p);
+  };
+  const concatBytes = (...parts: Uint8Array[]): Uint8Array => {
+    const out = new Uint8Array(parts.reduce((n, a) => n + a.length, 0));
+    let p = 0;
+    for (const a of parts) { out.set(a, p); p += a.length; }
+    return out;
+  };
 
   it('sends no control-stream bytes and no FETCH_CANCEL; cancels the request stream both directions', async () => {
     const { conn, transport } = await connected();
@@ -569,8 +586,27 @@ describe('MoqtConnection(18) fetch cancellation (§3.3.2)', () => {
     await flush();
 
     expect(dataStream.readCancelled).toBe(true); // data stream got STOP_SENDING
-    // A second cancel is a clean no-op (state already cleaned).
-    await expect(conn.fetchCancel(reqId)).rejects.toThrow(/Unknown fetch/i);
+    // A second cancel is a clean no-op — §5.2: the fetch is already reclaimed, so
+    // fetchCancel is idempotent (resolves without throwing), not an error.
+    await expect(conn.fetchCancel(reqId)).resolves.toBeUndefined();
+  });
+
+  it('a data stream arriving AFTER fetchCancel is DISCARDED, not delivered to onDataStream (§10.13)', async () => {
+    const { conn, transport } = await connected();
+    const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
+    const fetchStreams: unknown[] = [];
+    conn.onDataStream = (_sid, h) => { if (h.type === 'fetch') fetchStreams.push(h); };
+
+    await conn.fetchCancel(reqId); // installs the late-stream marker SYNCHRONOUSLY
+    await flush();
+
+    // A response stream the peer already had in flight arrives after the cancel — the
+    // marker must DISCARD it (STOP_SENDING), never surface it as a fetch data stream.
+    const late = transport.openIncomingUni();
+    late.push(fetchHeaderBytes(reqId));
+    await flush();
+    expect(late.readCancelled).toBe(true);
+    expect(fetchStreams.length).toBe(0);
   });
 
   it('cancel with NO data stream yet only tears down the request stream', async () => {
@@ -578,6 +614,97 @@ describe('MoqtConnection(18) fetch cancellation (§3.3.2)', () => {
     const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
     await conn.fetchCancel(reqId); // no fetch data stream was ever opened
     expect(transport.bidi[0]!.readCancelled).toBe(true);
+  });
+
+  it('a SECOND FETCH response stream for the same request is a PROTOCOL_VIOLATION (§11.4.4)', async () => {
+    const { conn, transport } = await connected();
+    const errs: MoqtConnectionError[] = [];
+    conn.onError = (e) => errs.push(e);
+    const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
+
+    transport.openIncomingUni().push(fetchHeaderBytes(reqId));
+    await flush();
+    // A second response stream for the SAME fetch — one is the §11.4.4 maximum.
+    transport.openIncomingUni().push(fetchHeaderBytes(reqId));
+    await flush();
+
+    expect(conn.session.state).toBe(SessionState.CLOSED);
+  });
+
+  it('§5.2: a FETCH data stream arriving AFTER the request-stream FIN is still delivered (independent streams)', async () => {
+    const { conn, transport } = await connected();
+    const objs: MoqtObject[] = [];
+    conn.onObject = (_sid, o) => objs.push(o);
+    let closeCode: number | undefined;
+    conn.onClose = (code) => { closeCode = code; };
+
+    const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC); // request stream 0
+    // FETCH_OK arrives AND the peer FINs the request stream (a publisher that finished
+    // serving on the request stream). §5.2/§10.12: the object data rides an INDEPENDENT
+    // stream with no ordering relative to the request stream, so the fetch MUST survive
+    // the request-stream close — the fetcher owns final closure once it has seen both
+    // FETCH_OK and the data FIN.
+    transport.bidi[0]!.push(fetchOkBytes(9n, 0n)).closeReadable();
+    await flush();
+    expect(conn.session.state).not.toBe(SessionState.CLOSED);
+    // §3.3.2: the peer FIN'd their half, so the topology FINs ours (clean CLOSE, not a
+    // RESET) — no half-open write side lingers even though the owner retains the fetch.
+    expect(transport.bidi[0]!.writeClosed).toBe(true);
+    expect(transport.bidi[0]!.writeAborted).toBe(false);
+    expect(conn.session.getFetch(reqId)).not.toBeUndefined(); // retained until data FIN
+
+    // The object data stream arrives afterward on its own uni stream — delivered, not
+    // discarded as a stale/unknown request.
+    transport.openIncomingUni().push(concatBytes(fetchHeaderBytes(reqId), firstFetchObjBytes(1n, 0n, 3, [0xaa])));
+    await flush();
+
+    expect(objs.map((o) => [o.groupId, o.objectId])).toEqual([[1n, 0n]]);
+    expect(closeCode).toBeUndefined();
+    expect(conn.session.state).not.toBe(SessionState.CLOSED);
+  });
+
+  it('§11.4.1: a clean FIN of the request stream BEFORE FETCH_OK reclaims the fetch (no permanently-pending leak)', async () => {
+    const { conn, transport } = await connected();
+    let closeCode: number | undefined;
+    conn.onClose = (code) => { closeCode = code; };
+
+    const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
+    expect(conn.session.getFetch(reqId)).not.toBeUndefined(); // pending
+
+    // Peer FINs the request stream with no FETCH_OK — no response can arrive on a
+    // closed stream, so the fetch is dead and MUST be reclaimed, not left pending.
+    transport.bidi[0]!.closeReadable();
+    await flush();
+
+    expect(conn.session.getFetch(reqId)).toBeUndefined(); // reclaimed
+    // §3.3.2: an early FIN with the response still pending is a FAILURE — our writable
+    // half is RESET (aborted), not left half-open, before the context is dropped.
+    expect(transport.bidi[0]!.writeAborted).toBe(true);
+    expect(closeCode).toBeUndefined();
+    expect(conn.session.state).not.toBe(SessionState.CLOSED);
+  });
+
+  it('§11.4.1: a RESET of the request stream AFTER FETCH_OK reclaims the fetch (no permanently-transferring leak)', async () => {
+    const { conn, transport } = await connected();
+    conn.onError = () => { /* a peer reset may surface as a stream error — tolerated */ };
+    let closeCode: number | undefined;
+    conn.onClose = (code) => { closeCode = code; };
+
+    const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
+    transport.bidi[0]!.push(fetchOkBytes(9n, 0n));
+    await flush();
+    expect(conn.session.getFetch(reqId)).not.toBeUndefined(); // transferring
+
+    // Peer RESETs the request stream — a terminal stream error. The transferring fetch
+    // MUST be reclaimed, not left forever.
+    transport.bidi[0]!.resetReadable('peer reset');
+    await flush();
+
+    expect(conn.session.getFetch(reqId)).toBeUndefined(); // reclaimed
+    // §3.3.2: a peer RESET is a failure — our writable half is RESET too, not leaked.
+    expect(transport.bidi[0]!.writeAborted).toBe(true);
+    expect(closeCode).toBeUndefined();
+    expect(conn.session.state).not.toBe(SessionState.CLOSED);
   });
 });
 

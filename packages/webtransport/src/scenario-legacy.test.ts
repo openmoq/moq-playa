@@ -69,7 +69,7 @@ for (const version of [16, 14] as const) {
       expect(errors).toEqual([]);
     });
 
-    it('unsubscribe → alias freed → late data not delivered', async () => {
+    it('unsubscribe → in-flight bytes may arrive, publisher streams reset, later sends reject (§5.1.1)', async () => {
       const { client, server, errors } = await connectedPair(version);
       let rid = -1n;
       server.onSubscribe = (r) => { rid = r; };
@@ -87,14 +87,20 @@ for (const version of [16, 14] as const) {
       await flush();
       expect(delivered).toEqual(['1:0']);
 
+      // Written BEFORE cancellation — in flight, may arrive.
+      sid = await server.openSubgroup(6n, 2n, 0n, { publisherPriority: 1 });
+      await server.sendObject(sid, 0n, new Uint8Array([2]));
+      await flush();
+      expect(delivered).toEqual(['1:0', '2:0']);
+
       await sub.unsubscribe(); // draft-14/16: sends UNSUBSCRIBE on the control stream
       await flush();
       expect(client.session.getTrackByAlias(6n)).toBeUndefined(); // alias freed
-      sid = await server.openSubgroup(6n, 2n, 0n, { publisherPriority: 1 });
-      await server.sendObject(sid, 0n, new Uint8Array([2]));
-      await server.closeSubgroup(sid);
-      await flush();
-      expect(delivered).toEqual(['1:0']); // '2:0' NOT delivered to the subscription
+      // §5.1.1: the publisher's open stream was RESET; a later send rejects, and
+      // NEW data streams for the terminated subscription are refused.
+      await expect(server.sendObject(sid, 1n, new Uint8Array([3]))).rejects.toThrow(/Unknown outgoing stream/);
+      await expect(server.openSubgroup(6n, 3n, 0n, { publisherPriority: 1 })).rejects.toThrow(/terminated/);
+      expect(delivered).toEqual(['1:0', '2:0']); // nothing after cancel
       expect(errors).toEqual([]);
     });
 

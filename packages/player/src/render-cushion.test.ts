@@ -1,9 +1,9 @@
 /**
  * RenderCushionSmoother — slew-rate-limited, clamped playout cushion.
  *
- * Field-data-directed (see docs/design-loc-av-sync.md): the raw adaptive
- * gap timeout swings 50–2000 ms and a collapse applied stepwise to render
- * times freezes video for the length of the collapse (queued frames under
+ * Field-data-directed: the raw adaptive gap timeout swings 50–2000 ms and
+ * a collapse applied stepwise to render times freezes video for the length
+ * of the collapse (queued frames under
  * the old cushion block newer earlier-scheduled ones). The smoother turns
  * steps into bounded slews and caps the render range independently of the
  * gap fuse, which keeps consuming the RAW adaptive value.

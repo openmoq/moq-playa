@@ -1,6 +1,6 @@
 {
   "name": "@moqt/browser",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Browser adapters for @moqt/player: WebCodecs decoding, Canvas and WebAudio rendering, and MSE/CMAF playback, implementing the player's swappable interfaces.",
   "license": "Apache-2.0",
   "author": "OpenMOQ (https://github.com/openmoq)",

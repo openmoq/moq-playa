@@ -1,6 +1,6 @@
 {
   "name": "@moqt/msf",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Media over QUIC Streaming Format (MSF) catalog: JSON catalog parsing, validation, track selection and ABR, delta updates, and timeline parsing.",
   "license": "Apache-2.0",
   "author": "OpenMOQ (https://github.com/openmoq)",

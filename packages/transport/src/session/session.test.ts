@@ -8,11 +8,12 @@ import { Session, SessionError as SessionErr } from './session.js';
 import type { SubscriptionFilter } from '../control/subscription-filter.js';
 import { SessionState, EndpointRole, SubscriptionState, FetchState, ForwardState, NamespaceState, type CloseConnectionAction, type OpenNamespaceStreamAction, type SendControlAction } from './types.js';
 import { varint } from '../primitives/varint.js';
+import { createControlCodec } from '../control/codec.js';
 import { writeVi64, MAX_VI64 } from '../primitives/vi64.js';
 import { SetupParam, MessageParam } from '../control/parameters.js';
 import { SetupOption18 } from '../control/codes-18.js';
 import { SessionError as SessionErrorCode, RequestError, PublishDoneCode } from '../errors.js';
-import type { ClientSetup, ServerSetup, Parameters, Setup, Subscribe, SubscribeOk, RequestErrorMsg, RequestUpdate, RequestOk, Publish, PublishOk, PublishError, Fetch, StandaloneFetch, FetchOk, FetchCancel, PublishDone, MaxRequestId, RequestsBlocked, Unsubscribe, TrackStatus, PublishNamespace, PublishNamespaceDone, PublishNamespaceCancel, PublishNamespaceOk, PublishNamespaceError, UnsubscribeNamespace } from '../control/messages.js';
+import type { ClientSetup, ServerSetup, Parameters, Setup, Subscribe, SubscribeOk, RequestErrorMsg, RequestUpdate, RequestOk, Publish, PublishOk, Fetch, StandaloneFetch, FetchOk, FetchCancel, PublishDone, MaxRequestId, RequestsBlocked, Unsubscribe, TrackStatus, PublishNamespace, PublishNamespaceDone, PublishNamespaceCancel, PublishNamespaceOk, PublishNamespaceError, UnsubscribeNamespace } from '../control/messages.js';
 import type { NotifyNamespaceAction } from './types.js';
 import { AliasType, encodeAuthorizationToken, encodeAuthorizationToken18 } from '../control/auth-token.js';
 
@@ -269,9 +270,9 @@ describe('Session', () => {
 
       session.handleControlMessage(requestError);
 
-      const sub = session.getSubscription(requestId);
-      expect(sub?.state).toBe(SubscriptionState.TERMINATED);
-      expect(sub?.errorCode).toBe(0x10n);
+      // §5.1: REQUEST_ERROR is terminal — the subscription state is RECLAIMED
+      // (bounded), not retained. A second REQUEST_ERROR then closes as unknown.
+      expect(session.getSubscription(requestId)).toBeUndefined();
     });
 
     it('registers track alias on SUBSCRIBE_OK', () => {
@@ -314,9 +315,8 @@ describe('Session', () => {
       // Subscriber sends UNSUBSCRIBE
       const actions = session.unsubscribe(requestId);
 
-      expect(actions.length).toBe(1);
-      const sendAction = actions[0] as SendControlAction;
-      expect(sendAction.type).toBe('send_control');
+      const sendAction = actions.find((a) => a.type === 'send_control') as SendControlAction;
+      expect(sendAction).toBeDefined();
       expect(sendAction.message.type).toBe('UNSUBSCRIBE');
       expect((sendAction.message as Unsubscribe).requestId).toBe(requestId);
     });
@@ -336,21 +336,135 @@ describe('Session', () => {
 
       session.unsubscribe(requestId);
 
-      const sub = session.getSubscription(requestId);
-      expect(sub?.state).toBe(SubscriptionState.TERMINATED);
+      // §5.1: UNSUBSCRIBE is terminal — the subscription state is RECLAIMED,
+      // not retained. (A crossed PUBLISH_DONE is absorbed by a bounded record.)
+      expect(session.getSubscription(requestId)).toBeUndefined();
     });
 
     it('unsubscribe() throws for unknown request ID', () => {
       expect(() => session.unsubscribe(varint(999n))).toThrow();
     });
 
-    it('unsubscribe() throws for pending subscription (not yet established)', () => {
+    it('unsubscribe() cancels a PENDING subscription (§5.1: Pending Subscriber → UNSUBSCRIBE)', () => {
       const namespace = [new Uint8Array([0x6c, 0x69, 0x76, 0x65])];
       const name = new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f]);
       const { requestId } = session.subscribe(namespace, name);
 
-      // Still PENDING — not yet ESTABLISHED
-      expect(() => session.unsubscribe(requestId)).toThrow();
+      // Still PENDING — §5.1 permits cancelling it; must NOT throw.
+      const actions = session.unsubscribe(requestId);
+      // draft-16 emits UNSUBSCRIBE on the wire; state is reclaimed either way.
+      expect(actions.some((a) => a.type === 'send_control'
+        && (a as SendControlAction).message.type === 'UNSUBSCRIBE')).toBe(true);
+      expect(session.getSubscription(requestId)).toBeUndefined();
+    });
+
+    it('a crossed SUBSCRIBE_OK after a PENDING unsubscribe is tolerated (§5.1 phase-legal)', () => {
+      const namespace = [new Uint8Array([0x6c, 0x69, 0x76, 0x65])];
+      const name = new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f]);
+      const { requestId } = session.subscribe(namespace, name);
+      session.unsubscribe(requestId); // PENDING cancel → pending-phase record
+
+      // A SUBSCRIBE_OK crossing our UNSUBSCRIBE on the wire is the ONE legal crossed
+      // terminal for the pending phase — tolerated, no session close.
+      const actions = session.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId, trackAlias: varint(88n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(session.state).not.toBe(SessionState.CLOSED);
+    });
+
+    it('N subscribe/unsubscribe cycles retain NO terminated subscription state (bounded, §5.1)', () => {
+      const name = new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f]);
+      for (let i = 0; i < 50; i++) {
+        const ns = [new Uint8Array([0x6c, i & 0xff, (i >> 8) & 0xff])];
+        const { requestId } = session.subscribe(ns, name);
+        session.handleControlMessage({
+          type: 'SUBSCRIBE_OK', requestId, trackAlias: varint(200n + BigInt(i)),
+          parameters: new Map(), trackExtensions: [],
+        } as SubscribeOk);
+        session.unsubscribe(requestId);
+        // Each cycle fully reclaims — no lingering terminated SM.
+        expect(session.getSubscription(requestId)).toBeUndefined();
+      }
+    });
+
+    // ─── §5.1.1: crossed PUBLISH_DONE after local UNSUBSCRIBE ─────────
+    // A subscriber may destroy subscription state as soon as it sends
+    // UNSUBSCRIBE; a PUBLISH_DONE already in flight from the publisher can then
+    // arrive for a locally-terminated subscription (the draft does not define
+    // PUBLISH_DONE as an UNSUBSCRIBE response — it is a terminal message that can
+    // cross UNSUBSCRIBE on the wire). That one crossed terminal message must be
+    // tolerated, NOT close the session.
+
+    function establishedSub(s: Session): bigint {
+      const { requestId } = s.subscribe(
+        [new Uint8Array([0x6c])], new Uint8Array([0x76]),
+      );
+      s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId, trackAlias: varint(42n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      return requestId;
+    }
+
+    for (const draft of [14, 16] as const) {
+      it(`draft-${draft}: a crossed PUBLISH_DONE after local UNSUBSCRIBE is ignored (no session close), then reclaimed`, () => {
+        const s = new Session(EndpointRole.CLIENT, draft);
+        s.initiateSetup({ maxRequestId: varint(100n) });
+        s.handleControlMessage({
+          type: 'SERVER_SETUP',
+          parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
+        });
+        const requestId = establishedSub(s);
+        s.unsubscribe(requestId); // local UNSUBSCRIBE → TERMINATED (cause: unsubscribed)
+
+        // The publisher's crossed PUBLISH_DONE arrives for the just-unsubscribed sub.
+        const actions = s.handleControlMessage({
+          type: 'PUBLISH_DONE', requestId, statusCode: varint(0x0n),
+          streamCount: varint(0n), errorReason: 'track ended',
+        } as PublishDone);
+
+        // Ignored: no close, session stays open, and the state is reclaimed.
+        expect(actions).toEqual([]);
+        expect(s.state).not.toBe(SessionState.CLOSED);
+        expect(s.getSubscription(requestId)).toBeUndefined();
+
+        // The cancellation provenance is ONE-SHOT: a SECOND PUBLISH_DONE for the
+        // same request is no longer an expected crossing → §9.1 close.
+        const dup = s.handleControlMessage({
+          type: 'PUBLISH_DONE', requestId, statusCode: varint(0x0n),
+          streamCount: varint(0n), errorReason: 'again',
+        } as PublishDone);
+        const close = dup.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
+        expect(close?.error).toBe(SessionErrorCode.INVALID_REQUEST_ID);
+      });
+    }
+
+    it('a PUBLISH_DONE for a PENDING subscription still closes the session (§9)', () => {
+      const { requestId } = session.subscribe([new Uint8Array([0x6c])], new Uint8Array([0x76]));
+      const actions = session.handleControlMessage({
+        type: 'PUBLISH_DONE', requestId, statusCode: varint(0x0n),
+        streamCount: varint(0n), errorReason: 'x',
+      } as PublishDone);
+      const close = actions.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
+      expect(close?.error).toBe(SessionErrorCode.PROTOCOL_VIOLATION);
+    });
+
+    it('a PUBLISH_DONE after a PEER REQUEST_ERROR is a violation — not our cancellation, no provenance (§5.1)', () => {
+      const requestId = establishedSub(session);
+      // The PEER terminated via REQUEST_ERROR (we did NOT cancel it) → no
+      // cancellation provenance is recorded.
+      session.handleControlMessage({
+        type: 'REQUEST_ERROR', requestId, errorCode: varint(0x1n), errorReason: 'gone',
+      } as RequestErrorMsg);
+      // A subsequent PUBLISH_DONE is a SECOND peer terminal in order (not a crossing
+      // of our cancellation) → §9.1 unknown-request close, never silently ignored.
+      const late = session.handleControlMessage({
+        type: 'PUBLISH_DONE', requestId, statusCode: varint(0x0n),
+        streamCount: varint(0n), errorReason: 'late',
+      } as PublishDone);
+      expect(late.some((a) => a.type === 'close_connection')).toBe(true);
     });
 
     // ─── Subscription parameters (§9.2.2) ────────────────────────────
@@ -682,8 +796,65 @@ describe('Session', () => {
 
       session.handleControlMessage(requestError);
 
-      const fetch = session.getFetch(requestId);
-      expect(fetch?.state).toBe(FetchState.COMPLETED);
+      // §5.2: REQUEST_ERROR is terminal — the fetch is RECLAIMED (bounded), not
+      // retained COMPLETED.
+      expect(session.getFetch(requestId)).toBeUndefined();
+    });
+
+    it('a DUPLICATE FETCH_OK for a normally-completed FETCH CLOSES even after cancellation churn — no lenient frontier (§6)', () => {
+      const s = new Session(EndpointRole.CLIENT, 16);
+      s.initiateSetup({ maxRequestId: varint(100_000n) });
+      s.handleControlMessage({
+        type: 'SERVER_SETUP',
+        parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100_000n)]]]),
+      });
+      // A FETCH at id 0 that COMPLETES normally (FETCH_OK + data FIN) → reclaimed,
+      // never cancelled.
+      const tns = [new Uint8Array([0x6c])];
+      const tnm = new Uint8Array([0x76]);
+      const { requestId } = s.fetch(tns, tnm, { startGroup: varint(0n), startObject: varint(0n) });
+      s.handleControlMessage({
+        type: 'FETCH_OK', requestId, endOfTrack: 0, endLocation: { group: 0n, object: 0n },
+        parameters: new Map(), trackExtensions: [],
+      } as FetchOk);
+      s.handleFetchStreamFinished(requestId);
+      // Churn 300 cancellations (would advance a scalar retired frontier well past 0).
+      for (let i = 0; i < 300; i++) {
+        const nsX = [new Uint8Array([0x63, i & 0xff, (i >> 8) & 0xff])];
+        const { requestId: rid } = s.subscribe(nsX, tnm);
+        s.unsubscribe(rid);
+      }
+      // A duplicate FETCH_OK for the COMPLETED (never-cancelled) fetch 0 is a §5.2/§9.1
+      // violation → close. A lenient below-the-frontier fallback would wrongly accept
+      // it (it cannot prove the request was cancelled vs completed).
+      const dup = s.handleControlMessage({
+        type: 'FETCH_OK', requestId, endOfTrack: 0, endLocation: { group: 0n, object: 0n },
+        parameters: new Map(), trackExtensions: [],
+      } as FetchOk);
+      expect((dup.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined)?.error)
+        .toBe(SessionErrorCode.INVALID_REQUEST_ID);
+    });
+
+    it('FETCH_OK arriving AFTER the data stream finished does NOT close (§10.13 any order)', () => {
+      const namespace = [new Uint8Array([0x6c])];
+      const name = new Uint8Array([0x76]);
+      const { requestId } = session.fetch(namespace, name, {
+        startGroup: varint(0n), startObject: varint(0n),
+      });
+
+      // Data stream FINishes FIRST (object delivery preceded FETCH_OK) — the fetch is
+      // KEPT (not reclaimed) because the response has not arrived yet.
+      session.handleFetchStreamFinished(requestId);
+      expect(session.getFetch(requestId)).toBeDefined();
+
+      // The FETCH_OK then arrives — tolerated (NOT an unknown-request §9.1 close), and
+      // now that BOTH are done the fetch is reclaimed.
+      const actions = session.handleControlMessage({
+        type: 'FETCH_OK', requestId, endOfTrack: 0, endLocation: { group: 0n, object: 0n },
+        parameters: new Map(), trackExtensions: [],
+      } as FetchOk);
+      expect(actions.some((a) => a.type === 'close_connection')).toBe(false);
+      expect(session.getFetch(requestId)).toBeUndefined();
     });
   });
 
@@ -710,7 +881,7 @@ describe('Session', () => {
       session.handleControlMessage(serverSetup);
     });
 
-    it('sends FETCH_CANCEL and transitions fetch to COMPLETED', () => {
+    it('sends FETCH_CANCEL and DROPS the fetch (tolerating one crossed terminal)', () => {
       const namespace = [new Uint8Array([0x6c, 0x69, 0x76, 0x65])];
       const name = new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f]);
       const { requestId } = session.fetch(namespace, name, {
@@ -722,18 +893,22 @@ describe('Session', () => {
 
       const actions = session.fetchCancel(requestId);
 
-      expect(actions.length).toBe(1);
-      const sendAction = actions[0] as SendControlAction;
-      expect(sendAction.type).toBe('send_control');
+      const sendAction = actions.find((a) => a.type === 'send_control') as SendControlAction;
+      expect(sendAction).toBeDefined();
       expect(sendAction.message.type).toBe('FETCH_CANCEL');
       expect((sendAction.message as FetchCancel).requestId).toBe(requestId);
 
-      const fetch = session.getFetch(requestId);
-      expect(fetch?.state).toBe(FetchState.COMPLETED);
-      expect(fetch?.wasCanceled).toBe(true);
+      // The fetch is reclaimed from tracking (not retained COMPLETED) so a crossed
+      // REQUEST_ERROR cannot assert against a terminal SM and close the session.
+      expect(session.getFetch(requestId)).toBeUndefined();
+      const late = session.handleControlMessage({
+        type: 'REQUEST_ERROR', requestId, errorCode: varint(0x10n),
+        errorReason: 'crossed', retryInterval: varint(0n),
+      } as RequestErrorMsg);
+      expect(late.every((a) => a.type !== 'close_connection')).toBe(true);
     });
 
-    it('can cancel during TRANSFERRING (after FETCH_OK)', () => {
+    it('can cancel during TRANSFERRING (after FETCH_OK) and drops the fetch', () => {
       const namespace = [new Uint8Array([0x6c, 0x69, 0x76, 0x65])];
       const name = new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f]);
       const { requestId } = session.fetch(namespace, name, {
@@ -751,10 +926,11 @@ describe('Session', () => {
       } as FetchOk);
       expect(session.getFetch(requestId)?.state).toBe(FetchState.TRANSFERRING);
 
-      // Now cancel
+      // Now cancel — the fetch is dropped from tracking.
       const actions = session.fetchCancel(requestId);
-      expect(actions.length).toBe(1);
-      expect(session.getFetch(requestId)?.state).toBe(FetchState.COMPLETED);
+      expect(actions.some((a) => a.type === 'send_control'
+        && (a as SendControlAction).message.type === 'FETCH_CANCEL')).toBe(true);
+      expect(session.getFetch(requestId)).toBeUndefined();
     });
 
     it('throws for unknown request ID', () => {
@@ -2733,12 +2909,24 @@ describe('Session', () => {
         expect(msg.requestId).toBe(0n);
         expect(msg.errorCode).toBe(0x10n);
 
-        const sub = session.getIncomingSubscription(varint(0n));
-        expect(sub?.state).toBe(SubscriptionState.TERMINATED);
+        // REQUEST_ERROR is terminal — the incoming-subscription state is RECLAIMED
+        // (bounded), not retained.
+        expect(session.getIncomingSubscription(varint(0n))).toBeUndefined();
       });
 
       it('throws for unknown request ID', () => {
         expect(() => session.rejectSubscribe(varint(999n), varint(0x1n), 'error')).toThrow();
+      });
+
+      it('rejecting many unique inbound SUBSCRIBEs does not grow incomingSubscriptions (bounded)', () => {
+        // A peer cannot accumulate publisher-side state via valid unique requests
+        // the application rejects — each rejection reclaims the incoming state.
+        // Incoming IDs are the peer's parity, in strict sequence (0, 2, 4, …).
+        for (let i = 0n; i < 40n; i += 2n) {
+          session.handleControlMessage(incomingSubscribe(i));
+          session.rejectSubscribe(varint(i), varint(0x10n), 'no');
+          expect(session.getIncomingSubscription(varint(i))).toBeUndefined();
+        }
       });
     });
 
@@ -2755,8 +2943,9 @@ describe('Session', () => {
         } as Unsubscribe);
 
         expect(actions.length).toBe(0);
-        const sub = session.getIncomingSubscription(varint(0n));
-        expect(sub?.state).toBe(SubscriptionState.TERMINATED);
+        // UNSUBSCRIBE is terminal — the publisher-side state is RECLAIMED (bounded),
+        // not retained. A second UNSUBSCRIBE for the same request then closes.
+        expect(session.getIncomingSubscription(varint(0n))).toBeUndefined();
       });
 
       it('closes with INVALID_REQUEST_ID for unknown UNSUBSCRIBE', () => {
@@ -2786,8 +2975,10 @@ describe('Session', () => {
         expect(msg.requestId).toBe(0n);
         expect(msg.statusCode).toBe(0x2n);
 
-        const sub = session.getIncomingSubscription(varint(0n));
-        expect(sub?.state).toBe(SubscriptionState.TERMINATED);
+        // §10.11: DONE terminates AND reclaims publisher-side state — a
+        // duplicate publishDone for the same request throws Unknown.
+        expect(session.getIncomingSubscription(varint(0n))).toBeUndefined();
+        expect(() => session.publishDone(varint(0n), varint(0x2n), 'again')).toThrow(/Unknown/);
       });
 
       it('throws for unknown request ID', () => {
@@ -2913,8 +3104,8 @@ describe('Session', () => {
         expect(msg.requestId).toBe(0n);
         expect(msg.errorCode).toBe(0x11n);
 
-        const fetch = session.getIncomingFetch(varint(0n));
-        expect(fetch?.state).toBe(FetchState.COMPLETED);
+        // REQUEST_ERROR is terminal — the incoming-fetch state is RECLAIMED.
+        expect(session.getIncomingFetch(varint(0n))).toBeUndefined();
       });
 
       it('throws for unknown request ID', () => {
@@ -2925,7 +3116,21 @@ describe('Session', () => {
     // ─── Incoming FETCH_CANCEL (§9.18) ───────────────────────────────────
 
     describe('incoming FETCH_CANCEL (§9.18)', () => {
-      it('terminates transferring fetch', () => {
+      it('cancels a PENDING (not-yet-accepted) fetch WITHOUT closing the session (§9.18: cancel before FETCH_OK)', () => {
+        session.handleControlMessage(incomingFetch(0n)); // PENDING — no acceptFetch/FETCH_OK yet
+
+        const actions = session.handleControlMessage({
+          type: 'FETCH_CANCEL',
+          requestId: varint(0n),
+        } as FetchCancel);
+
+        // Draft-16 permits cancelling before FETCH_OK — this must NOT close the session.
+        expect(actions.some((a) => a.type === 'close_connection')).toBe(false);
+        expect(session.state).not.toBe(SessionState.CLOSED);
+        expect(session.getIncomingFetch(varint(0n))).toBeUndefined(); // reclaimed
+      });
+
+      it('terminates AND reclaims a transferring fetch', () => {
         session.handleControlMessage(incomingFetch(0n));
         session.acceptFetch(varint(0n));
 
@@ -2935,9 +3140,9 @@ describe('Session', () => {
         } as FetchCancel);
 
         expect(actions.length).toBe(0);
-        const fetch = session.getIncomingFetch(varint(0n));
-        expect(fetch?.state).toBe(FetchState.COMPLETED);
-        expect(fetch?.wasCanceled).toBe(true);
+        // §9.18: the fetcher cancelled — the incoming fetch is RECLAIMED (bounded),
+        // not retained COMPLETED.
+        expect(session.getIncomingFetch(varint(0n))).toBeUndefined();
       });
 
       it('closes with INVALID_REQUEST_ID for unknown FETCH_CANCEL', () => {
@@ -3185,8 +3390,10 @@ describe('Session', () => {
         const errorMsg = (rejectActions[0] as SendControlAction).message;
         client.handleControlMessage(errorMsg);
 
-        expect(client.getSubscription(requestId)?.state).toBe(SubscriptionState.TERMINATED);
-        expect(server.getIncomingSubscription(requestId)?.state).toBe(SubscriptionState.TERMINATED);
+        // §5.1: REQUEST_ERROR is terminal on BOTH sides — the subscriber reclaims
+        // its subscription and the publisher reclaims the rejected incoming request.
+        expect(client.getSubscription(requestId)).toBeUndefined();
+        expect(server.getIncomingSubscription(requestId)).toBeUndefined();
       });
     });
 
@@ -3258,8 +3465,11 @@ describe('Session', () => {
         const doneMsg = (doneActions[0] as SendControlAction).message;
         client.handleControlMessage(doneMsg);
 
-        expect(client.getSubscription(requestId)?.state).toBe(SubscriptionState.TERMINATED);
-        expect(server.getIncomingSubscription(requestId)?.state).toBe(SubscriptionState.TERMINATED);
+        // §5.1: PUBLISH_DONE is terminal — the subscriber-side state is RECLAIMED
+        // (a second PUBLISH_DONE then closes as unknown).
+        expect(client.getSubscription(requestId)).toBeUndefined();
+        // Publisher-side state is reclaimed on DONE (duplicate throws Unknown).
+        expect(server.getIncomingSubscription(requestId)).toBeUndefined();
       });
     });
 
@@ -3575,6 +3785,23 @@ describe('Session', () => {
       return s;
     }
 
+    function createEstablishedV16ClientSession(): Session {
+      const s = new Session(EndpointRole.CLIENT, 16);
+      s.initiateSetup({ maxRequestId: varint(100n) });
+      s.handleControlMessage({
+        type: 'SERVER_SETUP',
+        parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
+      });
+      return s;
+    }
+
+    function createEstablishedV18ClientSession(): Session {
+      const s = new Session(EndpointRole.CLIENT, 18);
+      s.initiateSetup();
+      s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as unknown as ControlMessage);
+      return s;
+    }
+
     it('accepts GROUP_ORDER on PUBLISH in draft-14 without PROTOCOL_VIOLATION', () => {
       const s = createEstablishedV14ClientSession();
 
@@ -3593,6 +3820,706 @@ describe('Session', () => {
 
       const actions = s.handleControlMessage(publish);
       expect(actions.every(a => a.type !== 'close_connection')).toBe(true);
+    });
+
+    // ─── §11.1: inbound-PUBLISH alias released on termination (R8d finding 3) ──
+    // Registering an inbound PUBLISH's Track Alias must be UNREGISTERED when it
+    // is rejected / done, so a later PUBLISH reusing the alias is a per-request
+    // matter, not a session-fatal DUPLICATE_TRACK_ALIAS.
+    const publishOn = (requestId: bigint, alias: bigint): Publish => ({
+      type: 'PUBLISH', requestId: varint(requestId),
+      trackNamespace: [new Uint8Array([0x6c])], trackName: new Uint8Array([0x76]),
+      trackAlias: varint(alias), parameters: new Map(), trackExtensions: new Map(),
+    } as Publish);
+
+    it('rejecting an inbound PUBLISH frees its Track Alias — a later PUBLISH on it does not close the session', () => {
+      const s = createEstablishedV14ClientSession();
+      s.handleControlMessage(publishOn(1n, 42n));
+      s.rejectSubscribe(varint(1n), varint(0x1n), 'no'); // unregisters alias 42
+
+      // A new PUBLISH B reuses alias 42 — must NOT be DUPLICATE_TRACK_ALIAS.
+      const actions = s.handleControlMessage(publishOn(3n, 42n));
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.state).not.toBe(SessionState.CLOSED);
+    });
+
+    // §5.1: at most one subscription per Track per role — a second SAME-ROLE
+    // request must fail with DUPLICATE_SUBSCRIPTION (request-level, not a close).
+    // The rule and the 0x19 code are draft-16/18 only.
+    it('draft-14 does NOT enforce one-per-role: a second inbound PUBLISH for the SAME track is accepted', () => {
+      // draft-14 defines neither the one-subscription-per-role rule nor
+      // DUPLICATE_SUBSCRIPTION (0x19). A second PUBLISH for the same Full Track
+      // Name must NOT be rejected with 0x19 (the check is 16/18-only). Reuse the
+      // same Track Alias so the idempotent alias registration doesn't mask the
+      // point with an unrelated same-track/different-alias registry conflict.
+      const s = createEstablishedV14ClientSession();
+      s.handleControlMessage(publishOn(1n, 42n)); // subscriber-role sub, still live
+      const actions = s.handleControlMessage(publishOn(3n, 42n));
+      // No rejection emitted (a MAX_REQUEST_ID replenish send_control is fine).
+      const rejected = actions.some((a) => a.type === 'send_control'
+        && ['REQUEST_ERROR', 'PUBLISH_ERROR', 'SUBSCRIBE_ERROR'].includes(
+          (a as SendControlAction).message.type));
+      expect(rejected).toBe(false);
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.state).not.toBe(SessionState.CLOSED);
+      expect(s.getIncomingSubscription(varint(3n))).toBeDefined(); // second sub IS created
+    });
+
+    it('draft-16: a second inbound PUBLISH for the SAME track fails with DUPLICATE_SUBSCRIPTION (REQUEST_ERROR, not PUBLISH_ERROR)', () => {
+      // §5.1 + finding: PUBLISH_ERROR is unencodable on draft-16, so the rejection
+      // MUST be a generic REQUEST_ERROR on the control stream.
+      const s = createEstablishedV16ClientSession();
+      s.handleControlMessage(publishOn(1n, 42n));
+      const actions = s.handleControlMessage(publishOn(3n, 43n));
+      const err = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
+      expect(err?.message.type).toBe('REQUEST_ERROR');
+      expect((err!.message as RequestErrorMsg).errorCode).toBe(RequestError.DUPLICATE_SUBSCRIPTION);
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.getIncomingSubscription(varint(3n))).toBeUndefined();
+    });
+
+    it('draft-18: a second inbound PUBLISH for the SAME track fails with DUPLICATE_SUBSCRIPTION (REQUEST_ERROR)', () => {
+      const s = new Session(EndpointRole.CLIENT, 18);
+      s.initiateSetup();
+      s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as unknown as ControlMessage);
+      s.handleControlMessage(publishOn(1n, 42n));
+      const actions = s.handleControlMessage(publishOn(3n, 43n));
+      const err = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
+      expect(err?.message.type).toBe('REQUEST_ERROR');
+      expect((err!.message as RequestErrorMsg).errorCode).toBe(RequestError.DUPLICATE_SUBSCRIPTION);
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.getIncomingSubscription(varint(3n))).toBeUndefined();
+    });
+
+    it('a second incoming SUBSCRIBE for the SAME track (publisher role) fails with DUPLICATE_SUBSCRIPTION', () => {
+      const s = new Session(EndpointRole.CLIENT, 18);
+      s.initiateSetup();
+      s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as unknown as ControlMessage);
+      const subscribeOn = (requestId: bigint): Subscribe => ({
+        type: 'SUBSCRIBE', requestId: varint(requestId),
+        trackNamespace: [new Uint8Array([0x6c])], trackName: new Uint8Array([0x76]),
+        parameters: new Map(),
+      } as Subscribe);
+      s.handleControlMessage(subscribeOn(1n)); // publisher-role sub, still Pending
+      const actions = s.handleControlMessage(subscribeOn(3n));
+      const err = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
+      expect(err?.message.type).toBe('REQUEST_ERROR');
+      expect((err!.message as RequestErrorMsg).errorCode).toBe(RequestError.DUPLICATE_SUBSCRIPTION);
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.getIncomingSubscription(varint(3n))).toBeUndefined();
+    });
+
+    // §5.1: the one-per-role check spans LOCALLY-INITIATED requests too — a local
+    // SUBSCRIBE and an inbound PUBLISH for the same track both put US in the
+    // subscriber role; a local PUBLISH and an inbound SUBSCRIBE both make US the
+    // publisher.
+    const trackNs = [new Uint8Array([0x6c])];
+    const trackNm = new Uint8Array([0x76]); // same Full Track Name as publishOn()
+
+    it('a local ESTABLISHED SUBSCRIBE + inbound PUBLISH for the SAME track fails with DUPLICATE_SUBSCRIPTION', () => {
+      const s = createEstablishedV18ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm); // outbound SUBSCRIBE
+      s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: subId, trackAlias: varint(99n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk); // now ESTABLISHED (subscriber role)
+
+      const actions = s.handleControlMessage(publishOn(1n, 100n)); // peer PUBLISH, same track
+      const err = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
+      expect(err?.message.type).toBe('REQUEST_ERROR');
+      expect((err!.message as RequestErrorMsg).errorCode).toBe(RequestError.DUPLICATE_SUBSCRIPTION);
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.getIncomingSubscription(varint(1n))).toBeUndefined(); // PUBLISH not admitted
+    });
+
+    it('draft-18: a local PENDING SUBSCRIBE + inbound PUBLISH STAGES the cancellation; it fires only when the PUBLISH is ACCEPTED (§5.1)', () => {
+      const s = createEstablishedV18ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm); // PENDING (no SUBSCRIBE_OK)
+
+      // Receipt STAGES — it does NOT cancel yet: the PUBLISH is accepted into
+      // Pending state and the local SUBSCRIBE stays alive (§5.1: terminate only
+      // before PUBLISH_OK).
+      const recv = s.handleControlMessage(publishOn(1n, 100n));
+      expect(recv.find((a) => a.type === 'send_control'
+        && (a as SendControlAction).message.type === 'REQUEST_ERROR')).toBeUndefined();
+      expect(recv.some((a) => a.type === 'cancel_request')).toBe(false); // not yet
+      expect(s.getIncomingSubscription(varint(1n))).toBeDefined(); // PUBLISH admitted
+      expect(s.getSubscription(subId)).toBeDefined(); // local SUBSCRIBE still alive
+
+      // Accepting the PUBLISH (PUBLISH_OK) performs the cancellation BEFORE the OK.
+      const accept = s.acceptSubscribe(varint(1n), varint(100n));
+      const cancel = accept.find((a) => a.type === 'cancel_request') as { requestId?: bigint } | undefined;
+      const okIdx = accept.findIndex((a) => a.type === 'send_control');
+      const cancelIdx = accept.findIndex((a) => a.type === 'cancel_request');
+      expect(cancel).toBeDefined();
+      expect(cancel!.requestId).toEqual(subId);
+      expect(cancelIdx).toBeLessThan(okIdx); // cancellation precedes the PUBLISH_OK
+      // §5.1: terminated + its SM DELETED before the OK (bounded — not retained).
+      // A crossed terminal is absorbed via the phase-tagged superseded record.
+      expect(s.getSubscription(subId)).toBeUndefined();
+    });
+
+    it('draft-18: a SUBSCRIBE_OK crossing the §5.1 cancellation is IGNORED, not a fatal unknown-request', () => {
+      const s = createEstablishedV18ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm); // PENDING
+      s.handleControlMessage(publishOn(1n, 100n)); // stages
+      s.acceptSubscribe(varint(1n), varint(100n)); // cancels subId + tombstones
+
+      // The peer had already sent SUBSCRIBE_OK for subId (crossed on the wire).
+      const actions = s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: subId, trackAlias: varint(77n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true); // tolerated
+      expect(s.state).not.toBe(SessionState.CLOSED);
+    });
+
+    it('draft-16: accepting a colliding PUBLISH emits UNSUBSCRIBE (before PUBLISH_OK) then cancel_request (§5.1)', () => {
+      const s = createEstablishedV16ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm); // PENDING
+
+      s.handleControlMessage(publishOn(1n, 100n)); // stages, local SUBSCRIBE alive
+      expect(s.getSubscription(subId)).toBeDefined();
+
+      const actions = s.acceptSubscribe(varint(1n), varint(100n));
+      // draft-16 cancels the local SUBSCRIBE on the wire with UNSUBSCRIBE.
+      const unsub = actions.find((a) => a.type === 'send_control'
+        && (a as SendControlAction).message.type === 'UNSUBSCRIBE') as SendControlAction | undefined;
+      expect(unsub).toBeDefined();
+      expect((unsub!.message as Unsubscribe).requestId).toEqual(subId);
+      expect(actions.some((a) => a.type === 'cancel_request')).toBe(true);
+      // Ordering: UNSUBSCRIBE (terminate our SUBSCRIBE) precedes PUBLISH_OK.
+      const okIdx = actions.findIndex((a) => a.type === 'send_control'
+        && (a as SendControlAction).message.type === 'PUBLISH_OK');
+      const unsubIdx = actions.findIndex((a) => a.type === 'send_control'
+        && (a as SendControlAction).message.type === 'UNSUBSCRIBE');
+      expect(unsubIdx).toBeLessThan(okIdx);
+      // Terminated and DELETED (bounded); a crossed terminal is absorbed via the
+      // phase-tagged superseded record, not a retained SM.
+      expect(s.getSubscription(subId)).toBeUndefined();
+    });
+
+    it('draft-18: REJECTING a colliding PUBLISH leaves the local SUBSCRIBE ALIVE (§5.1 — terminate only on acceptance)', () => {
+      const s = createEstablishedV18ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm); // PENDING
+      s.handleControlMessage(publishOn(1n, 100n)); // stages
+      expect(s.getSubscription(subId)).toBeDefined();
+
+      // The application (or a malformed/guarded PUBLISH) rejects it → NOT accepted.
+      s.rejectSubscribe(varint(1n), varint(0x1n), 'not interested');
+      // The staged collision is discarded; the local SUBSCRIBE survives intact.
+      expect(s.getSubscription(subId)).toBeDefined();
+      expect(s.getSubscription(subId)!.state).toBe('pending');
+    });
+
+    it('draft-18: an inbound-request FIN on a colliding PUBLISH before acceptance leaves the local SUBSCRIBE ALIVE', () => {
+      const s = createEstablishedV18ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm); // PENDING
+      s.handleControlMessage(publishOn(1n, 100n)); // stages
+      s.handleInboundRequestClosed(varint(1n)); // PUBLISH stream torn down before acceptance
+      expect(s.getSubscription(subId)).toBeDefined();
+      expect(s.getSubscription(subId)!.state).toBe('pending');
+    });
+
+    it('draft-18: the FIRST crossed SUBSCRIBE_OK after supersession is tolerated (one-shot); a SECOND closes', () => {
+      const s = createEstablishedV18ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm);
+      s.handleControlMessage(publishOn(1n, 100n));
+      s.acceptSubscribe(varint(1n), varint(100n)); // supersedes + records cancellation provenance
+
+      // The ONE legal crossed SUBSCRIBE_OK is tolerated and consumes the provenance.
+      const first = s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: subId, trackAlias: varint(77n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      expect(first.every((x) => x.type !== 'close_connection')).toBe(true);
+      // A SECOND response for the same request (or a never-cancelled ID) → §9.1 close.
+      const second = s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: subId, trackAlias: varint(78n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      expect((second.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined)?.error)
+        .toBe(SessionErrorCode.INVALID_REQUEST_ID);
+    });
+
+    it('draft-16: a crossed REQUEST_ERROR racing the §5.1 cancellation is IGNORED, not a fatal unknown-request', () => {
+      const s = createEstablishedV16ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm);
+      s.handleControlMessage(publishOn(1n, 100n));
+      s.acceptSubscribe(varint(1n), varint(100n)); // cancels + tombstones subId
+
+      // A REQUEST_ERROR for subId crossing our UNSUBSCRIBE must be tolerated.
+      const actions = s.handleControlMessage({
+        type: 'REQUEST_ERROR', requestId: subId, errorCode: varint(0x0n),
+        retryInterval: varint(0n), errorReason: 'crossed',
+      } as RequestErrorMsg);
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.state).not.toBe(SessionState.CLOSED);
+    });
+
+    // §5.1: the local SUBSCRIBE may ESTABLISH (its SUBSCRIBE_OK crossing the
+    // PUBLISH) before we accept the PUBLISH. Two hazards, both must be handled:
+    it('draft-18: a crossed SUBSCRIBE_OK reusing the PUBLISH alias co-owns it; acceptance keeps the alias for the PUBLISH', () => {
+      const s = createEstablishedV18ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm); // PENDING
+      s.handleControlMessage(publishOn(1n, 100n)); // stages; registers alias 100 owner=PUBLISH
+
+      // Our SUBSCRIBE_OK arrives using the SAME alias 100 → co-owns the mapping
+      // (must NOT overwrite the owner), establishing the local SUBSCRIBE.
+      s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: subId, trackAlias: varint(100n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      expect(s.getTrackByAlias(100n)).toBeDefined();
+      expect(s.getSubscription(subId)!.state).toBe('established');
+
+      // Accepting the PUBLISH cancels the (now established) local SUBSCRIBE, but
+      // releasing only ITS ownership — the PUBLISH still owns alias 100.
+      const accept = s.acceptSubscribe(varint(1n), varint(100n));
+      expect(accept.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.getTrackByAlias(100n)).toBeDefined(); // alias survives for the PUBLISH
+    });
+
+    it('draft-18: a crossed SUBSCRIBE_OK assigning a DIFFERENT alias for the same track is NOT a DUPLICATE_TRACK_ALIAS (§11.1)', () => {
+      // §11.1 prohibits one alias → two tracks, NOT multiple aliases → one track.
+      // In the race the PUBLISH advertises alias 100 and the crossed SUBSCRIBE_OK
+      // assigns alias 101 for the SAME track — this must NOT close the session.
+      const s = createEstablishedV18ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm); // PENDING
+      s.handleControlMessage(publishOn(1n, 100n)); // stages; PUBLISH alias 100
+
+      const ok = s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: subId, trackAlias: varint(101n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      expect(ok.every((a) => a.type !== 'close_connection')).toBe(true); // no DUPLICATE_TRACK_ALIAS
+      expect(s.getTrackByAlias(100n)).toBeDefined(); // PUBLISH alias
+      expect(s.getTrackByAlias(101n)).toBeDefined(); // SUBSCRIBE alias — both coexist
+
+      // Accepting the PUBLISH releases only alias 101 (the SUBSCRIBE's); 100 stays.
+      const accept = s.acceptSubscribe(varint(1n), varint(100n));
+      expect(accept.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.getTrackByAlias(100n)).toBeDefined();
+      expect(s.getTrackByAlias(101n)).toBeUndefined();
+    });
+
+    it('draft-18: a crossed PUBLISH_DONE after an ESTABLISHED collision cancellation is tolerated (not a fatal unknown-request)', () => {
+      const s = createEstablishedV18ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm); // PENDING
+      s.handleControlMessage(publishOn(1n, 100n)); // stages
+      s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: subId, trackAlias: varint(100n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk); // establishes the local SUBSCRIBE
+      s.acceptSubscribe(varint(1n), varint(100n)); // ESTABLISHED branch: sendUnsubscribe, KEEP SM
+
+      // A PUBLISH_DONE for the established-then-unsubscribed local SUBSCRIBE,
+      // crossing our UNSUBSCRIBE, is the ordinary §5.1.1 crossed terminal — ignore.
+      const actions = s.handleControlMessage({
+        type: 'PUBLISH_DONE', requestId: subId, statusCode: varint(0x0n),
+        streamCount: varint(0n), errorReason: 'done',
+      } as PublishDone);
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.state).not.toBe(SessionState.CLOSED);
+    });
+
+    it('draft-18: any crossed terminal for a superseded (allocated-but-gone) request is tolerated (§5.1 frontier)', () => {
+      // The superseded local SUBSCRIBE is reclaimed; a SUBSCRIBE_OK OR a PUBLISH_DONE
+      // crossing the cancellation is a benign terminal for an allocated-but-gone
+      // request — tolerated in O(1) via the allocation frontier (no session close).
+      const mk = () => {
+        const s = createEstablishedV18ClientSession();
+        const { requestId: subId } = s.subscribe(trackNs, trackNm); // PENDING
+        s.handleControlMessage(publishOn(1n, 100n)); // stages
+        s.acceptSubscribe(varint(1n), varint(100n)); // supersession → reclaimed
+        return { s, subId };
+      };
+      const a = mk();
+      expect(a.s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: a.subId, trackAlias: varint(77n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk).every((x) => x.type !== 'close_connection')).toBe(true);
+      const b = mk();
+      expect(b.s.handleControlMessage({
+        type: 'PUBLISH_DONE', requestId: b.subId, statusCode: varint(0x0n),
+        streamCount: varint(0n), errorReason: 'done',
+      } as PublishDone).every((x) => x.type !== 'close_connection')).toBe(true);
+    });
+
+    it('draft-16: after an ESTABLISHED unsubscribe, a crossed PUBLISH_DONE is tolerated but a duplicate OK / error-after-OK closes (§5.1)', () => {
+      const mk = () => {
+        const s = createEstablishedV16ClientSession();
+        const { requestId: subId } = s.subscribe(trackNs, trackNm);
+        s.handleControlMessage({
+          type: 'SUBSCRIBE_OK', requestId: subId, trackAlias: varint(55n),
+          parameters: new Map(), trackExtensions: [],
+        } as SubscribeOk); // established
+        s.unsubscribe(subId); // shadow starts in the ESTABLISHED phase
+        return { s, subId };
+      };
+      // The legal terminal for an established sub — a crossed PUBLISH_DONE — is tolerated.
+      const a = mk();
+      expect(a.s.handleControlMessage({
+        type: 'PUBLISH_DONE', requestId: a.subId, statusCode: varint(0n),
+        streamCount: varint(0n), errorReason: '',
+      } as PublishDone).every((x) => x.type !== 'close_connection')).toBe(true);
+      // A crossed DUPLICATE SUBSCRIBE_OK (a second OK) violates §5.1 → close.
+      const b = mk();
+      expect(b.s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: b.subId, trackAlias: varint(55n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk).some((x) => x.type === 'close_connection')).toBe(true);
+      // A REQUEST_ERROR AFTER the OK was already given violates "one OK-or-error" → close.
+      const c = mk();
+      expect(c.s.handleControlMessage({
+        type: 'REQUEST_ERROR', requestId: c.subId, errorCode: varint(0x0n),
+        retryInterval: varint(0n), errorReason: 'x',
+      } as RequestErrorMsg).some((x) => x.type === 'close_connection')).toBe(true);
+      // A never-allocated request ID also closes (INVALID_REQUEST_ID).
+      const d = mk();
+      expect(d.s.handleControlMessage({
+        type: 'REQUEST_ERROR', requestId: varint(9_999_998n), errorCode: varint(0x0n),
+        retryInterval: varint(0n), errorReason: 'bogus',
+      } as RequestErrorMsg).some((x) => x.type === 'close_connection')).toBe(true);
+    });
+
+    it('draft-16: an inbound UNSUBSCRIBE for a PENDING incoming subscription is accepted, not a protocol close (§5.1)', () => {
+      // §5.1: the subscriber may UNSUBSCRIBE from Pending — our publisher-side
+      // receiver must accept it (a red probe threw "Cannot handleUnsubscribe in
+      // state pending"). Uses the same track as publishOn (namespace/name).
+      const s = createEstablishedV16ClientSession();
+      const subscribeOn = (requestId: bigint): Subscribe => ({
+        type: 'SUBSCRIBE', requestId: varint(requestId),
+        trackNamespace: trackNs, trackName: trackNm, parameters: new Map(),
+      } as Subscribe);
+      s.handleControlMessage(subscribeOn(1n)); // inbound SUBSCRIBE → PENDING incoming sub
+      const actions = s.handleControlMessage({ type: 'UNSUBSCRIBE', requestId: varint(1n) } as Unsubscribe);
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.state).not.toBe(SessionState.CLOSED);
+    });
+
+    const runCollision = (s: Session, i: number, pubId: bigint): SessionOutboundAction[] => {
+      const ns = [new Uint8Array([0x74, i & 0xff, (i >> 8) & 0xff, (i >> 16) & 0xff])];
+      const nm = new Uint8Array([0x76]);
+      s.subscribe(ns, nm); // pending local SUBSCRIBE
+      s.handleControlMessage({
+        type: 'PUBLISH', requestId: varint(pubId),
+        trackNamespace: ns, trackName: nm, trackAlias: varint(1000n + BigInt(i)),
+        parameters: new Map(), trackExtensions: new Map(),
+      } as Publish);
+      return s.acceptSubscribe(varint(pubId), varint(1000n + BigInt(i)));
+    };
+
+    it('far more than 1024 collision cancellations never close the session (churn is benign)', () => {
+      // Each local cancellation records compact one-shot provenance; with no crossed
+      // terminal delivered, churn well past any former cap neither closes a healthy
+      // session nor evicts a still-valid entry (eviction was removed — see the
+      // delayed-crossing test below for why forgetting an entry would be a bug).
+      const s = createEstablishedV18ClientSession();
+      let pubId = 1n;
+      for (let i = 0; i < 3000; i++) {
+        const actions = runCollision(s, i, pubId);
+        expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+        pubId += 2n;
+      }
+      expect(s.state).not.toBe(SessionState.CLOSED);
+    });
+
+    it('draft-16: a crossed SUBSCRIBE_OK delayed behind 1100+ later cancellations is STILL tolerated (no eviction)', () => {
+      // Finding: a bounded evict-oldest cap would silently forget the FIRST
+      // cancellation's provenance once 1024 later cancellations arrived, turning its
+      // eventual (legal, slow-link) crossed terminal into a spurious §9.1 close.
+      // Provenance is NOT count-evicted, so the delayed crossing is tolerated.
+      const s = new Session(EndpointRole.CLIENT, 16);
+      s.initiateSetup({ maxRequestId: varint(10_000n) });
+      s.handleControlMessage({
+        type: 'SERVER_SETUP',
+        parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(10_000n)]]]),
+      });
+      // Cancel the FIRST subscription, then churn 1100 more cancellations past it.
+      const first = s.subscribe([new Uint8Array([0x63, 0, 0])], trackNm);
+      s.unsubscribe(first.requestId);
+      for (let i = 1; i <= 1100; i++) {
+        const ns = [new Uint8Array([0x63, i & 0xff, (i >> 8) & 0xff])];
+        const { requestId } = s.subscribe(ns, trackNm);
+        s.unsubscribe(requestId);
+      }
+      // The FIRST request's crossed SUBSCRIBE_OK finally arrives — tolerated once.
+      const late = s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: first.requestId, trackAlias: varint(4242n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      expect(late.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.state).not.toBe(SessionState.CLOSED);
+    });
+
+    it('draft-16: a crossed SUBSCRIBE_OK THEN PUBLISH_DONE for a cancelled subscribe are BOTH tolerated (phase-aware)', () => {
+      // Finding: the crossed peer SEQUENCE is a phase machine, not a one-shot — a
+      // SUBSCRIBE_OK the cancellation crossed must NOT consume the shadow, because a
+      // legitimate PUBLISH_DONE terminal may still follow it.
+      const s = new Session(EndpointRole.CLIENT, 16);
+      s.initiateSetup({ maxRequestId: varint(100n) });
+      s.handleControlMessage({
+        type: 'SERVER_SETUP',
+        parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
+      });
+      const { requestId } = s.subscribe(trackNs, trackNm); // PENDING
+      s.unsubscribe(requestId); // cancel a PENDING subscribe → shadow
+
+      // Crossed SUBSCRIBE_OK: tolerated, shadow KEPT.
+      const ok = s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId, trackAlias: varint(5n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      expect(ok.every((a) => a.type !== 'close_connection')).toBe(true);
+      // The FOLLOWING PUBLISH_DONE terminal is ALSO tolerated (round-8q one-shot bug
+      // closed here); it reclaims the shadow.
+      const done = s.handleControlMessage({
+        type: 'PUBLISH_DONE', requestId, statusCode: varint(0n), streamCount: varint(0n), errorReason: '',
+      } as PublishDone);
+      expect(done.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.state).not.toBe(SessionState.CLOSED);
+    });
+
+    it('draft-16: a crossed FETCH_OK THEN REQUEST_ERROR for a cancelled fetch CLOSES (§5.2: no error after OK)', () => {
+      const s = new Session(EndpointRole.CLIENT, 16);
+      s.initiateSetup({ maxRequestId: varint(100n) });
+      s.handleControlMessage({
+        type: 'SERVER_SETUP',
+        parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
+      });
+      const { requestId } = s.fetch(trackNs, trackNm, {
+        startGroup: varint(0n), startObject: varint(0n), endGroup: varint(9n), endObject: varint(0n),
+      });
+      s.fetchCancel(requestId); // shadow (PENDING)
+
+      // A crossed FETCH_OK is tolerated (shadow → ESTABLISHED)…
+      const ok = s.handleControlMessage({
+        type: 'FETCH_OK', requestId, endOfTrack: 0, endLocation: { group: 9n, object: 0n },
+        parameters: new Map(), trackExtensions: [],
+      } as FetchOk);
+      expect(ok.every((a) => a.type !== 'close_connection')).toBe(true);
+      // …but a REQUEST_ERROR AFTER the FETCH_OK violates "one OK-or-error" → close.
+      const err = s.handleControlMessage({
+        type: 'REQUEST_ERROR', requestId, errorCode: varint(0x0n),
+        retryInterval: varint(0n), errorReason: 'x',
+      } as RequestErrorMsg);
+      expect((err.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined)?.error)
+        .toBe(SessionErrorCode.INVALID_REQUEST_ID);
+    });
+
+    it('draft-16: subgroupDeliveryTimeout in a REQUEST_UPDATE is REJECTED locally (draft-18-only param)', () => {
+      const s = createEstablishedV16ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm);
+      s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: subId, trackAlias: varint(5n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      // SUBGROUP_DELIVERY_TIMEOUT (0x06) is draft-18-only — emitting it on draft-16
+      // would make a conformant peer close, so reject the option locally.
+      expect(() => s.requestUpdate(subId, { subgroupDeliveryTimeout: varint(45_000n) })).toThrow(/draft-18/i);
+    });
+
+    it('draft-16: a REJECTED delivery-timeout REQUEST_UPDATE does NOT commit the timeout (§10.9)', () => {
+      const s = createEstablishedV16ClientSession();
+      const { requestId: subId } = s.subscribe(trackNs, trackNm);
+      s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: subId, trackAlias: varint(5n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+
+      const { requestId: updId } = s.requestUpdate(subId, { objectDeliveryTimeout: varint(60_000n) });
+      // Staged, NOT committed at send.
+      expect(s.getSubscription(subId)?.requestedDeliveryTimeoutMs).toBeUndefined();
+      // The peer REJECTS the update → the staged timeout is dropped, never committed.
+      s.handleControlMessage({
+        type: 'REQUEST_ERROR', requestId: updId, errorCode: varint(0x1n),
+        retryInterval: varint(0n), errorReason: 'no',
+      } as RequestErrorMsg);
+      expect(s.getSubscription(subId)?.requestedDeliveryTimeoutMs).toBeUndefined();
+    });
+
+    it('retired-shadow leniency requires OUR parity, allocation, and no live owner (§6)', () => {
+      const s = new Session(EndpointRole.CLIENT, 16);
+      s.initiateSetup({ maxRequestId: varint(10_000n) });
+      s.handleControlMessage({
+        type: 'SERVER_SETUP',
+        parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(10_000n)]]]),
+      });
+      // A LIVE outgoing fetch at id 0 (even, ours) — never cancelled.
+      s.fetch(trackNs, trackNm, { startGroup: varint(0n), startObject: varint(0n) });
+      // Churn > 256 subscribe/unsubscribe so the evicted frontier climbs well past 0.
+      for (let i = 0; i < 400; i++) {
+        const nsX = [new Uint8Array([0x63, i & 0xff, (i >> 8) & 0xff])];
+        const { requestId } = s.subscribe(nsX, trackNm);
+        s.unsubscribe(requestId);
+      }
+      // (a) A SUBSCRIBE_OK for the LIVE fetch's id (even, ≤ frontier) is NOT leniently
+      // tolerated — it targets a live request of a different kind → §9.1 close.
+      const live = s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(0n), trackAlias: varint(4242n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      expect(live.some((a) => a.type === 'close_connection')).toBe(true);
+    });
+
+    it('retired-shadow leniency rejects a PEER-parity (odd) request ID (§6)', () => {
+      const s = new Session(EndpointRole.CLIENT, 16);
+      s.initiateSetup({ maxRequestId: varint(10_000n) });
+      s.handleControlMessage({
+        type: 'SERVER_SETUP',
+        parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(10_000n)]]]),
+      });
+      for (let i = 0; i < 400; i++) {
+        const nsX = [new Uint8Array([0x63, i & 0xff, (i >> 8) & 0xff])];
+        const { requestId } = s.subscribe(nsX, trackNm);
+        s.unsubscribe(requestId);
+      }
+      // An ODD request ID (peer parity for a client) below the frontier is NOT ours →
+      // never a retired shadow → §9.1 close.
+      const peer = s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(4243n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      expect(peer.some((a) => a.type === 'close_connection')).toBe(true);
+    });
+
+    it('draft-16: a LATER request response does NOT reclaim an earlier shadow (no ordering guarantee) — its crossing is still tolerated', () => {
+      // Regression: an earlier attempt reclaimed a shadow when a LATER request's
+      // response arrived, assuming ordered responses. draft-16 permits ASYNCHRONOUS
+      // request processing, so a later response can precede an earlier request's
+      // crossed response — reclaiming on it spuriously closes a VALID session. The
+      // shadow must survive until ITS OWN crossing/terminal.
+      const s = new Session(EndpointRole.CLIENT, 16);
+      s.initiateSetup({ maxRequestId: varint(100n) });
+      s.handleControlMessage({
+        type: 'SERVER_SETUP',
+        parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
+      });
+      const first = s.subscribe(trackNs, trackNm);                  // id 0 (PENDING)
+      s.unsubscribe(first.requestId);                               // shadow 0
+      const later = s.subscribe([new Uint8Array([0x6d])], trackNm); // id 2 (later, distinct track)
+
+      // The LATER request's SUBSCRIBE_OK arrives FIRST (async processing) — it must
+      // NOT drop shadow 0.
+      s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: later.requestId, trackAlias: varint(7n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+
+      // Request 0's crossed SUBSCRIBE_OK then arrives — STILL tolerated (no false close).
+      const crossed = s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: first.requestId, trackAlias: varint(8n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      expect(crossed.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.state).not.toBe(SessionState.CLOSED);
+    });
+
+    it('draft-16: a crossing delayed behind MANY later cancellations is LOSSLESSLY tolerated (never a false close)', () => {
+      // The shadow map is LOSSLESS (no cap / no eviction): a crossing may be delayed
+      // arbitrarily on the shared control stream, so the FIRST cancellation's crossed
+      // SUBSCRIBE_OK is still tolerated after thousands of later cancellations — never
+      // silently forgotten into a §9.1 false close.
+      const s = new Session(EndpointRole.CLIENT, 16);
+      s.initiateSetup({ maxRequestId: varint(100_000n) });
+      s.handleControlMessage({
+        type: 'SERVER_SETUP',
+        parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100_000n)]]]),
+      });
+      const first = s.subscribe([new Uint8Array([0x63, 0, 0])], trackNm); // id 0, cancelled first
+      s.unsubscribe(first.requestId);
+      for (let i = 1; i <= 5000; i++) { // thousands of LATER cancellations
+        const ns = [new Uint8Array([0x63, i & 0xff, (i >> 8) & 0xff])];
+        const { requestId } = s.subscribe(ns, trackNm);
+        s.unsubscribe(requestId);
+      }
+      // The FIRST request's long-delayed crossed SUBSCRIBE_OK — still tolerated.
+      const late = s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: first.requestId, trackAlias: varint(9_000n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk);
+      expect(late.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.state).not.toBe(SessionState.CLOSED);
+    });
+
+    it('a local outbound PUBLISH + inbound SUBSCRIBE for the SAME track fails with DUPLICATE_SUBSCRIPTION', () => {
+      const s = createEstablishedV18ClientSession();
+      s.publish(trackNs, trackNm, varint(50n)); // outbound PUBLISH (publisher role)
+      const subscribeOn = (requestId: bigint): Subscribe => ({
+        type: 'SUBSCRIBE', requestId: varint(requestId),
+        trackNamespace: trackNs, trackName: trackNm, parameters: new Map(),
+      } as Subscribe);
+
+      const actions = s.handleControlMessage(subscribeOn(1n)); // peer SUBSCRIBE, same track
+      const err = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
+      expect(err?.message.type).toBe('REQUEST_ERROR');
+      expect((err!.message as RequestErrorMsg).errorCode).toBe(RequestError.DUPLICATE_SUBSCRIPTION);
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.getIncomingSubscription(varint(1n))).toBeUndefined();
+    });
+
+    it('an inbound PUBLISH_DONE frees its Track Alias — a later PUBLISH on it does not close the session', () => {
+      const s = new Session(EndpointRole.CLIENT, 18);
+      s.initiateSetup();
+      s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as unknown as ControlMessage);
+      s.handleControlMessage(publishOn(1n, 42n));
+      s.acceptSubscribe(varint(1n), varint(42n));
+      s.handleInboundPublishDone(varint(1n)); // unregisters alias 42
+
+      const actions = s.handleControlMessage(publishOn(3n, 42n));
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.state).not.toBe(SessionState.CLOSED);
+    });
+
+    it('an inbound PUBLISH stream FIN/reset frees its Track Alias — a later PUBLISH on it does not close the session', () => {
+      const s = new Session(EndpointRole.CLIENT, 18);
+      s.initiateSetup();
+      s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as unknown as ControlMessage);
+      s.handleControlMessage(publishOn(1n, 42n));
+      // The peer resets/FINs the inbound PUBLISH request stream (§3.3.2).
+      s.handleInboundRequestClosed(varint(1n)); // must unregister alias 42
+
+      const actions = s.handleControlMessage(publishOn(3n, 42n));
+      expect(actions.every((a) => a.type !== 'close_connection')).toBe(true);
+      expect(s.state).not.toBe(SessionState.CLOSED);
+    });
+
+    // R8f finding 1: alias unregister is OWNER-conditional — a crossed cleanup
+    // for an OLD request must not drop a NEWER request's alias registration.
+    it('a crossed old-request cleanup does not unregister a CO-OWNER that shares the alias (owner token)', () => {
+      const s = new Session(EndpointRole.CLIENT, 18);
+      s.initiateSetup();
+      s.handleControlMessage({ type: 'SETUP', setupOptions: new Map() } as unknown as ControlMessage);
+      const ns = [new Uint8Array([0x6c])]; // same Full Track Name as publishOn()
+      const nm = new Uint8Array([0x76]);
+
+      // A local SUBSCRIBE (req 0) and an inbound PUBLISH (req 1) for the SAME track,
+      // both on alias 42: the crossed SUBSCRIBE_OK co-owns the mapping (owners {1,0}).
+      const { requestId: subId } = s.subscribe(ns, nm); // req 0
+      s.handleControlMessage(publishOn(1n, 42n)); // registers alias 42 owner=PUBLISH(1)
+      s.handleControlMessage({
+        type: 'SUBSCRIBE_OK', requestId: subId, trackAlias: varint(42n),
+        parameters: new Map(), trackExtensions: [],
+      } as SubscribeOk); // co-owns alias 42 (owner subId added)
+      expect(s.getTrackByAlias(42n)).toBeDefined();
+
+      // The inbound PUBLISH's request stream closes: unregister(42, owner=req 1) must
+      // be a NO-OP because the SUBSCRIBE (req 0) still co-owns alias 42. Without the
+      // owner token this would drop the mapping the SUBSCRIBE still holds.
+      s.handleInboundRequestClosed(varint(1n));
+      expect(s.getTrackByAlias(42n)).toBeDefined(); // co-owner's alias survives
+
+      // And true duplicate-alias enforcement still works: a THIRD PUBLISH on 42
+      // for a DIFFERENT track while req 3 holds it is a session-fatal
+      // DUPLICATE_TRACK_ALIAS (§11.1).
+      const dup = s.handleControlMessage({
+        type: 'PUBLISH', requestId: varint(5n),
+        trackNamespace: [new Uint8Array([0x6c])], trackName: new Uint8Array([0x99]), // different track
+        trackAlias: varint(42n), parameters: new Map(), trackExtensions: new Map(),
+      } as Publish);
+      const close = dup.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
+      expect(close?.error).toBe(SessionErrorCode.DUPLICATE_TRACK_ALIAS);
     });
 
     it('carries GROUP_ORDER from PUBLISH into PUBLISH_OK in draft-14', () => {
@@ -4471,6 +5398,29 @@ describe('Session', () => {
       expect(sendAction.message.type).toBe('PUBLISH_ERROR');
     });
 
+    it('draft-16: rejectSubscribe after PUBLISH sends an encodable REQUEST_ERROR, never PUBLISH_ERROR (§10.10)', () => {
+      // Draft-16 has no PUBLISH_ERROR; the response MUST be a generic REQUEST_ERROR.
+      // Emitting PUBLISH_ERROR throws in the draft-16 encoder — this is that guard.
+      const s = new Session(EndpointRole.CLIENT, 16);
+      s.initiateSetup({ maxRequestId: varint(100n) });
+      s.handleControlMessage({
+        type: 'SERVER_SETUP',
+        parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
+      });
+      s.handleControlMessage({
+        type: 'PUBLISH', requestId: varint(1n),
+        trackNamespace: [new Uint8Array([0x6c])], trackName: new Uint8Array([0x76]),
+        trackAlias: varint(42n), parameters: new Map(), trackExtensions: new Map(),
+      } as Publish);
+
+      const actions = s.rejectSubscribe(varint(1n), varint(0x4n), 'not interested');
+      const send = actions[0] as SendControlAction;
+      expect(send.message.type).toBe('REQUEST_ERROR');
+      // And it actually encodes with the draft-16 codec (PUBLISH_ERROR would throw).
+      const codec = createControlCodec(16);
+      expect(() => codec.encode(send.message)).not.toThrow();
+    });
+
     it('closes session on duplicate track alias in PUBLISH (§9.13)', () => {
       /**
        * Draft-14 §9.13: "The same Track Alias MUST NOT be used to refer
@@ -5129,7 +6079,8 @@ describe('REQUEST_ERROR Redirect semantics (draft-18 §10.6.2)', () => {
     const { requestId } = s.subscribe(NS, NAME);
     const actions = s.handleControlMessage(redirectErr(requestId, sameSessionTrack));
     expect(closeOf(actions)).toBeUndefined();
-    expect(s.getSubscription(requestId)?.isTerminated).toBe(true);
+    // REQUEST_ERROR (Redirect) is terminal — the subscription state is RECLAIMED.
+    expect(s.getSubscription(requestId)).toBeUndefined();
   });
 
   it('accepts REDIRECT for FETCH, TRACK_STATUS, PUBLISH_NAMESPACE, and SUBSCRIBE_NAMESPACE', () => {
