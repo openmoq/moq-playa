@@ -673,6 +673,74 @@ export function readTrexDefaults(initSegment: Uint8Array): Map<number, TrexDefau
 }
 
 /**
+ * Read the media timescale from an init segment's
+ * moov → trak → mdia → mdhd chain.
+ *
+ * CMAF init segments carry one track each, so the first mdhd found is
+ * the track's timescale (video: e.g. 90000; audio: the sample rate).
+ *
+ * @returns The mdhd timescale, or null if no mdhd is present.
+ */
+export function readMdhdTimescale(initSegment: Uint8Array): number | null {
+  let pos = 0;
+  while (pos + 8 <= initSegment.byteLength) {
+    const size = boxSize(initSegment, pos);
+    if (size < 8) break;
+    if (boxType(initSegment, pos) !== 'moov') {
+      pos += size;
+      continue;
+    }
+
+    // Walk moov for trak.
+    const moovEnd = pos + size;
+    let tpos = pos + 8;
+    while (tpos + 8 <= moovEnd) {
+      const tsize = boxSize(initSegment, tpos);
+      if (tsize < 8) break;
+      if (boxType(initSegment, tpos) !== 'trak') {
+        tpos += tsize;
+        continue;
+      }
+
+      // Walk trak for mdia.
+      const trakEnd = tpos + tsize;
+      let mpos = tpos + 8;
+      while (mpos + 8 <= trakEnd) {
+        const msize = boxSize(initSegment, mpos);
+        if (msize < 8) break;
+        if (boxType(initSegment, mpos) !== 'mdia') {
+          mpos += msize;
+          continue;
+        }
+
+        // Walk mdia for mdhd.
+        const mdiaEnd = mpos + msize;
+        let hpos = mpos + 8;
+        while (hpos + 8 <= mdiaEnd) {
+          const hsize = boxSize(initSegment, hpos);
+          if (hsize < 8) break;
+          if (boxType(initSegment, hpos) === 'mdhd') {
+            const version = initSegment[hpos + 8]!;
+            // v0: version+flags(4) + creation(4) + modification(4) → timescale at +20
+            // v1: version+flags(4) + creation(8) + modification(8) → timescale at +28
+            const tsOffset = hpos + (version === 1 ? 28 : 20);
+            if (tsOffset + 4 <= mdiaEnd) {
+              return readU32(initSegment, tsOffset);
+            }
+            return null;
+          }
+          hpos += hsize;
+        }
+        mpos += msize;
+      }
+      tpos += tsize;
+    }
+    pos += size;
+  }
+  return null;
+}
+
+/**
  * Read the baseMediaDecodeTime from a CMAF segment that may have prefix
  * boxes (styp, sidx) before the moof.
  *
