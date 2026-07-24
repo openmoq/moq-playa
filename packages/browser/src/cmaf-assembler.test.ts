@@ -905,6 +905,61 @@ describe('CmafAssembler — shared cross-track epoch (RED5DEV-2315)', () => {
     expect(outBmd(onSegment, 3)).toBe(BigInt(0.75 * VIDEO_TS));   // video keeps its 0.75s lead on the new epoch
   });
 
+  it('advances normally after a restart instead of repeatedly re-anchoring', () => {
+    const onDiscontinuity = vi.fn();
+    const { assembler, onSegment } = assemblerWithInits(onDiscontinuity);
+
+    assembler.push('audio', 'audio0', 0n, concat(buildMoof(105 * AUDIO_TS), buildMdat(new Uint8Array([1]))));
+    assembler.push('video', 'video0', 0n, concat(buildMoof(105.75 * VIDEO_TS), buildMdat(new Uint8Array([2]))));
+    assembler.push('audio', 'audio0', 1n, concat(buildMoof(1 * AUDIO_TS, 2), buildMdat(new Uint8Array([3]))));
+    assembler.push('video', 'video0', 1n, concat(buildMoof(1.75 * VIDEO_TS, 2), buildMdat(new Uint8Array([4]))));
+
+    assembler.push('audio', 'audio0', 2n, concat(buildMoof(2 * AUDIO_TS, 3), buildMdat(new Uint8Array([5]))));
+    assembler.push('video', 'video0', 2n, concat(buildMoof(2.75 * VIDEO_TS, 3), buildMdat(new Uint8Array([6]))));
+
+    expect(onDiscontinuity).toHaveBeenCalledTimes(2);
+    expect(outBmd(onSegment, 4)).toBe(BigInt(AUDIO_TS));
+    expect(outBmd(onSegment, 5)).toBe(BigInt(1.75 * VIDEO_TS));
+  });
+
+  it('treats an mdhd timescale of zero as unknown instead of dividing by zero', () => {
+    const onSegment = vi.fn();
+    const assembler = new CmafAssembler({ onSegment });
+    assembler.setInitSegment('audio', initWithTimescale(0));
+    assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+
+    expect(() => {
+      assembler.push('audio', 'audio0', 0n, concat(buildMoof(1000), buildMdat(new Uint8Array([1]))));
+      assembler.push('video', 'video0', 0n, concat(buildMoof(VIDEO_TS), buildMdat(new Uint8Array([2]))));
+    }).not.toThrow();
+    expect(outBmd(onSegment, 0)).toBe(0n);
+    expect(outBmd(onSegment, 1)).toBe(0n);
+  });
+
+  it('uses the audio mdhd timescale for the one-second reorder window', () => {
+    const highRateDiscontinuity = vi.fn();
+    const highRate = new CmafAssembler({
+      onSegment: vi.fn(),
+      onDiscontinuity: highRateDiscontinuity,
+    });
+    highRate.setInitSegment('audio', initWithTimescale(96000));
+    highRate.push('audio', 'audio0', 0n, concat(buildMoof(200000), buildMdat(new Uint8Array([1]))));
+    highRate.push('audio', 'audio0', 1n, concat(buildMoof(300000), buildMdat(new Uint8Array([2]))));
+    highRate.push('audio', 'audio0', 2n, concat(buildMoof(250000), buildMdat(new Uint8Array([3]))));
+    expect(highRateDiscontinuity).not.toHaveBeenCalled();
+
+    const lowRateDiscontinuity = vi.fn();
+    const lowRate = new CmafAssembler({
+      onSegment: vi.fn(),
+      onDiscontinuity: lowRateDiscontinuity,
+    });
+    lowRate.setInitSegment('audio', initWithTimescale(44100));
+    lowRate.push('audio', 'audio0', 0n, concat(buildMoof(100000), buildMdat(new Uint8Array([1]))));
+    lowRate.push('audio', 'audio0', 1n, concat(buildMoof(150000), buildMdat(new Uint8Array([2]))));
+    lowRate.push('audio', 'audio0', 2n, concat(buildMoof(104000), buildMdat(new Uint8Array([3]))));
+    expect(lowRateDiscontinuity).toHaveBeenCalledTimes(1);
+  });
+
   it('falls back to per-track zero-basing when timescales are unknown (no init segments)', () => {
     const onSegment = vi.fn();
     const assembler = new CmafAssembler({ onSegment });

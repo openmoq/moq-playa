@@ -482,12 +482,13 @@ export class CmafAssembler {
       }
     } else if (lastBmd !== null && bmd < lastBmd) {
       // Same track, bmd went backward.
-      // Audio: small backward jumps (<1s at 48kHz) are late subgroup
-      // stream data arriving after newer subgroup data — not a real
-      // discontinuity. Only large jumps indicate stream restart.
+      // Audio: backward jumps of at most one second in the track's media
+      // timescale are late subgroup data, not a real discontinuity. Use
+      // the historical 48 kHz window when no init segment was available.
       // Video: any backward jump is treated as a discontinuity.
       const jumpBack = lastBmd - bmd;
-      const isSmallAudioReorder = mediaType === 'audio' && jumpBack <= 48000n;
+      const audioReorderWindow = BigInt(this.audioTimescale ?? 48000);
+      const isSmallAudioReorder = mediaType === 'audio' && jumpBack <= audioReorderWindow;
       if (!isSmallAudioReorder) {
         if (this.debug) console.warn('[CMAF] %s discontinuity on "%s": bmd=%s < lastBmd=%s (jump=%s) — re-anchoring',
           mediaType, trackName, bmd, lastBmd, jumpBack);
@@ -500,8 +501,10 @@ export class CmafAssembler {
         const anchored = this.anchorEpoch(mediaType, bmd, trackGen === this.sharedEpochGen);
         if (mediaType === 'video') {
           this.videoEpoch = anchored;
+          this.lastVideoBmd = bmd;
         } else {
           this.audioEpoch = anchored;
+          this.lastAudioBmd = bmd;
         }
       }
     }

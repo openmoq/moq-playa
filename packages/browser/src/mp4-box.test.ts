@@ -548,6 +548,30 @@ describe('readMdhdTimescale', () => {
         expect(readMdhdTimescale(moov([]))).toBeNull();
         expect(readMdhdTimescale(cat(styp()))).toBeNull();
     });
+
+    it('rejects zero and unsupported-version timescales', () => {
+        expect(readMdhdTimescale(initWithMdhd(mdhdV0(0)))).toBeNull();
+        expect(readMdhdTimescale(initWithMdhd(
+            fullBox('mdhd', 2, 0, cat(u32(0), u32(0), u32(48000), u32(0), u32(0))),
+        ))).toBeNull();
+    });
+
+    it('does not read a truncated mdhd value from its following sibling', () => {
+        const truncated = box('mdhd', new Uint8Array(0));
+        const sibling = box('free', cat(new Uint8Array(4), u32(48000)));
+        const init = moov([box('trak', box('mdia', cat(truncated, sibling)))]);
+        expect(readMdhdTimescale(init)).toBeNull();
+    });
+
+    it('rejects boxes that overrun their parent or the input buffer', () => {
+        const overrunMdhd = mdhdV0(48000);
+        new DataView(overrunMdhd.buffer).setUint32(0, overrunMdhd.byteLength + 16);
+        expect(readMdhdTimescale(initWithMdhd(overrunMdhd))).toBeNull();
+
+        const overrunMoov = initWithMdhd(mdhdV0(48000));
+        new DataView(overrunMoov.buffer).setUint32(0, overrunMoov.byteLength + 16);
+        expect(readMdhdTimescale(overrunMoov)).toBeNull();
+    });
 });
 
 // ─── HEVC NAL helpers ────────────────────────────────────────────────

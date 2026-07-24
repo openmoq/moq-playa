@@ -34,6 +34,32 @@ export function boxSize(data: Uint8Array, offset: number): number {
   return readU32(data, offset);
 }
 
+/** A child box discovered by {@link boundedBoxes}. */
+interface BoundedBox {
+  readonly type: string;
+  readonly start: number;
+  readonly size: number;
+  /** Offset of the box body (after the 8-byte header). */
+  readonly bodyStart: number;
+  /** Exclusive end offset (`start + size`). */
+  readonly end: number;
+}
+
+/**
+ * Iterate child boxes fully contained by both their parent and the buffer.
+ * Once a malformed size is encountered, later sibling offsets are untrusted.
+ */
+function* boundedBoxes(data: Uint8Array, start: number, end: number): Generator<BoundedBox> {
+  const limit = Math.min(end, data.byteLength);
+  let pos = start;
+  while (pos >= 0 && pos + 8 <= limit) {
+    const size = boxSize(data, pos);
+    if (size < 8 || pos + size > limit) return;
+    yield { type: boxType(data, pos), start: pos, size, bodyStart: pos + 8, end: pos + size };
+    pos += size;
+  }
+}
+
 /**
  * Find the handler type (hdlr box → handler_type) inside a trak box.
  * Returns 'vide', 'soun', or null.
@@ -682,60 +708,26 @@ export function readTrexDefaults(initSegment: Uint8Array): Map<number, TrexDefau
  * @returns The mdhd timescale, or null if no mdhd is present.
  */
 export function readMdhdTimescale(initSegment: Uint8Array): number | null {
-  let pos = 0;
-  while (pos + 8 <= initSegment.byteLength) {
-    const size = boxSize(initSegment, pos);
-    if (size < 8) break;
-    if (boxType(initSegment, pos) !== 'moov') {
-      pos += size;
-      continue;
-    }
+  for (const moov of boundedBoxes(initSegment, 0, initSegment.byteLength)) {
+    if (moov.type !== 'moov') continue;
+    for (const trak of boundedBoxes(initSegment, moov.bodyStart, moov.end)) {
+      if (trak.type !== 'trak') continue;
+      for (const mdia of boundedBoxes(initSegment, trak.bodyStart, trak.end)) {
+        if (mdia.type !== 'mdia') continue;
+        for (const mdhd of boundedBoxes(initSegment, mdia.bodyStart, mdia.end)) {
+          if (mdhd.type !== 'mdhd') continue;
 
-    // Walk moov for trak.
-    const moovEnd = pos + size;
-    let tpos = pos + 8;
-    while (tpos + 8 <= moovEnd) {
-      const tsize = boxSize(initSegment, tpos);
-      if (tsize < 8) break;
-      if (boxType(initSegment, tpos) !== 'trak') {
-        tpos += tsize;
-        continue;
-      }
+          const version = initSegment[mdhd.bodyStart]!;
+          const minimumSize = version === 0 ? 32 : version === 1 ? 44 : 0;
+          if (minimumSize === 0 || mdhd.size < minimumSize) return null;
 
-      // Walk trak for mdia.
-      const trakEnd = tpos + tsize;
-      let mpos = tpos + 8;
-      while (mpos + 8 <= trakEnd) {
-        const msize = boxSize(initSegment, mpos);
-        if (msize < 8) break;
-        if (boxType(initSegment, mpos) !== 'mdia') {
-          mpos += msize;
-          continue;
+          // v0: version+flags(4) + creation(4) + modification(4) -> +20.
+          // v1: version+flags(4) + creation(8) + modification(8) -> +28.
+          const timescale = readU32(initSegment, mdhd.start + (version === 1 ? 28 : 20));
+          return timescale === 0 ? null : timescale;
         }
-
-        // Walk mdia for mdhd.
-        const mdiaEnd = mpos + msize;
-        let hpos = mpos + 8;
-        while (hpos + 8 <= mdiaEnd) {
-          const hsize = boxSize(initSegment, hpos);
-          if (hsize < 8) break;
-          if (boxType(initSegment, hpos) === 'mdhd') {
-            const version = initSegment[hpos + 8]!;
-            // v0: version+flags(4) + creation(4) + modification(4) → timescale at +20
-            // v1: version+flags(4) + creation(8) + modification(8) → timescale at +28
-            const tsOffset = hpos + (version === 1 ? 28 : 20);
-            if (tsOffset + 4 <= mdiaEnd) {
-              return readU32(initSegment, tsOffset);
-            }
-            return null;
-          }
-          hpos += hsize;
-        }
-        mpos += msize;
       }
-      tpos += tsize;
     }
-    pos += size;
   }
   return null;
 }
