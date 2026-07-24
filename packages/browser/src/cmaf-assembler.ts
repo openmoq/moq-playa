@@ -26,6 +26,7 @@ import {
   firstHevcVclNalType,
   isHevcCraNalType,
   isHevcRaslNalType,
+  readMdhdTimescale,
   readTrexDefaults,
   type TrexDefaults,
   type TrunSample,
@@ -82,9 +83,39 @@ export class CmafAssembler {
   /** Tracks (mediaType:trackName) already warned about non-media drops. */
   private readonly droppedNonMediaWarned = new Set<string>();
 
-  /** First baseMediaDecodeTime seen per media type — used to rebase to zero. */
+  /** Per-track rebase epoch (in that track's timescale units). */
   private videoEpoch: bigint | null = null;
   private audioEpoch: bigint | null = null;
+
+  /** Media timescale per track, parsed from the init segment's mdhd. */
+  private videoTimescale: number | null = null;
+  private audioTimescale: number | null = null;
+
+  /**
+   * Shared cross-track epoch — the decode time (with its timescale) of the
+   * first fragment from whichever track anchored first. Each track's rebase
+   * epoch derives from this single origin so the publisher's A/V alignment
+   * survives the rebase-to-zero. Without it, zero-basing each track at its
+   * own first fragment bakes the audio-vs-video delivery-start gap (audio
+   * joins at the live edge, video at the next GoP boundary) into every
+   * segment as a constant A/V desync (RED5DEV-2315).
+   *
+   * Only established by tracks whose timescale is known (init seen);
+   * tracks without a timescale fall back to per-track zero-basing.
+   */
+  private sharedEpochBmd: bigint | null = null;
+  private sharedEpochTimescale: number | null = null;
+
+  /**
+   * Restart generation of the shared epoch. Bumped when a discontinuity
+   * re-establishes the shared epoch; per-track generations record which
+   * shared epoch a track's rebase derives from, so the second track to
+   * see a publisher restart adopts the re-established epoch instead of
+   * zero-basing independently (which would reintroduce the desync).
+   */
+  private sharedEpochGen = 0;
+  private videoEpochGen = 0;
+  private audioEpochGen = 0;
 
   /** Last raw bmd seen per media type — detects backward jumps (discontinuity). */
   private lastVideoBmd: bigint | null = null;
@@ -126,6 +157,15 @@ export class CmafAssembler {
    * not leak into rewrites of the new stream's fragments.
    */
   setInitSegment(mediaType: 'video' | 'audio', initBytes: Uint8Array): void {
+    // Record the track's media timescale (mdhd) — required to derive this
+    // track's rebase epoch from the shared cross-track epoch. Overwrites on
+    // every init for the same reason as the trex below.
+    const timescale = readMdhdTimescale(initBytes);
+    if (mediaType === 'video') {
+      this.videoTimescale = timescale;
+    } else {
+      this.audioTimescale = timescale;
+    }
     if (mediaType !== 'video') return;
     const trexMap = readTrexDefaults(initBytes);
     this.videoTrex = trexMap.size > 0 ? trexMap.values().next().value! : null;
@@ -341,11 +381,65 @@ export class CmafAssembler {
     this.videoTrackName = null;
     this.audioTrackName = null;
     this.videoTrex = null;
+    this.videoTimescale = null;
+    this.audioTimescale = null;
+    this.sharedEpochBmd = null;
+    this.sharedEpochTimescale = null;
+    this.sharedEpochGen = 0;
+    this.videoEpochGen = 0;
+    this.audioEpochGen = 0;
   }
 
   /** Release all resources. */
   destroy(): void {
     this.reset();
+  }
+
+  /**
+   * Scale the shared epoch into a track's timescale (floor division —
+   * sub-tick error is at most one tick, i.e. microseconds).
+   */
+  private scaledSharedEpoch(timescale: number): bigint | null {
+    if (this.sharedEpochBmd === null || this.sharedEpochTimescale === null) return null;
+    if (this.sharedEpochTimescale === timescale) return this.sharedEpochBmd;
+    return (this.sharedEpochBmd * BigInt(timescale)) / BigInt(this.sharedEpochTimescale);
+  }
+
+  /**
+   * Compute a track's rebase epoch from the shared cross-track epoch,
+   * establishing or re-establishing the shared epoch as needed.
+   *
+   * - No timescale known for this track → per-track zero-basing (legacy).
+   * - Shared epoch unset (or being re-established after a restart this
+   *   track saw first) → this track's bmd becomes the shared epoch.
+   * - Otherwise → adopt the shared epoch scaled to this track's units,
+   *   clamped to the track's own bmd so a track whose content starts
+   *   before the epoch track never rebases negative.
+   */
+  private anchorEpoch(
+    mediaType: 'video' | 'audio',
+    bmd: bigint,
+    reestablish: boolean,
+  ): bigint {
+    const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+    if (timescale === null) return bmd;
+
+    if (reestablish) {
+      this.sharedEpochGen++;
+      this.sharedEpochBmd = bmd;
+      this.sharedEpochTimescale = timescale;
+    } else if (this.sharedEpochBmd === null) {
+      this.sharedEpochBmd = bmd;
+      this.sharedEpochTimescale = timescale;
+    }
+    if (mediaType === 'video') {
+      this.videoEpochGen = this.sharedEpochGen;
+    } else {
+      this.audioEpochGen = this.sharedEpochGen;
+    }
+
+    const shared = this.scaledSharedEpoch(timescale)!;
+    return shared <= bmd ? shared : bmd;
   }
 
   /** Record epoch from first moof, detect discontinuity, rebase tfdt. */
@@ -358,15 +452,31 @@ export class CmafAssembler {
     const lastBmd = mediaType === 'video' ? this.lastVideoBmd : this.lastAudioBmd;
     const epoch = mediaType === 'video' ? this.videoEpoch : this.audioEpoch;
 
-    if (isTrackSwitch || epoch === null) {
-      // New track or first segment — set epoch, no discontinuity signal.
-      // Track switches naturally have different bmd timelines.
+    if (isTrackSwitch) {
+      // Track switch (ABR splice) — re-anchor to this track's own bmd
+      // without touching the shared epoch: variant timelines may be
+      // unrelated to the timeline the shared epoch was anchored on.
       if (mediaType === 'video') {
         this.videoEpoch = bmd;
         this.videoTrackName = trackName;
         this.lastVideoBmd = null;
+        this.videoEpochGen = this.sharedEpochGen;
       } else {
         this.audioEpoch = bmd;
+        this.audioTrackName = trackName;
+        this.lastAudioBmd = null;
+        this.audioEpochGen = this.sharedEpochGen;
+      }
+    } else if (epoch === null) {
+      // First segment — anchor against the shared cross-track epoch so
+      // the publisher's A/V alignment survives the rebase to zero.
+      const anchored = this.anchorEpoch(mediaType, bmd, false);
+      if (mediaType === 'video') {
+        this.videoEpoch = anchored;
+        this.videoTrackName = trackName;
+        this.lastVideoBmd = null;
+      } else {
+        this.audioEpoch = anchored;
         this.audioTrackName = trackName;
         this.lastAudioBmd = null;
       }
@@ -382,10 +492,16 @@ export class CmafAssembler {
         if (this.debug) console.warn('[CMAF] %s discontinuity on "%s": bmd=%s < lastBmd=%s (jump=%s) — re-anchoring',
           mediaType, trackName, bmd, lastBmd, jumpBack);
         this.onDiscontinuity?.(mediaType, trackName);
+        // A restart affects both tracks. The first track to detect it
+        // re-establishes the shared epoch (generation bump); the second
+        // track sees its generation is behind and adopts the new epoch
+        // instead of zero-basing independently.
+        const trackGen = mediaType === 'video' ? this.videoEpochGen : this.audioEpochGen;
+        const anchored = this.anchorEpoch(mediaType, bmd, trackGen === this.sharedEpochGen);
         if (mediaType === 'video') {
-          this.videoEpoch = bmd;
+          this.videoEpoch = anchored;
         } else {
-          this.audioEpoch = bmd;
+          this.audioEpoch = anchored;
         }
       }
     }
