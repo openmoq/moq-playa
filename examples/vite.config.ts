@@ -1,5 +1,22 @@
 import { defineConfig } from 'vite';
 import { resolve } from 'path';
+import { execSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+
+/** Build identity for diagnostics: a run's logs must name the build that produced them. */
+function buildId(): string {
+  let version = 'unknown';
+  try {
+    version = (JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf8')) as { version?: string }).version ?? 'unknown';
+  } catch { /* keep 'unknown' */ }
+  let sha = 'nogit';
+  try {
+    sha = execSync('git rev-parse --short HEAD', { cwd: __dirname, encoding: 'utf8' }).trim();
+    const dirty = execSync('git status --porcelain', { cwd: __dirname, encoding: 'utf8' }).trim().length > 0;
+    if (dirty) sha += '-dirty';
+  } catch { /* keep 'nogit' */ }
+  return `${version}+${sha}`;
+}
 
 /**
  * Vite config for MoQ examples.
@@ -9,6 +26,9 @@ import { resolve } from 'path';
  * source, save, Vite hot-reloads via esbuild.
  */
 export default defineConfig({
+  define: {
+    __PLAYA_BUILD__: JSON.stringify(buildId()),
+  },
   server: {
     // Default: localhost only. For mobile/device testing:
     //   VITE_HOST=0.0.0.0 npm run dev

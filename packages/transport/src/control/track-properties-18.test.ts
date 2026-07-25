@@ -73,6 +73,24 @@ describe('encodeTrackProperties18 ↔ decodeTrackProperties18', () => {
     expect(toPlain(properties).get(0x08n)).toEqual([7n]);
   });
 
+  it('honours `end`: a property block is decoded only within [offset, end)', () => {
+    // A block of two properties followed by a trailing byte that belongs to the
+    // NEXT message field. Decoding with end at the block boundary must stop
+    // exactly there and never consume the trailing byte.
+    const block = encodeTrackProperties18(props(new Map([[0x02n, [5n]], [0x08n, [7n]]])));
+    const buf = new Uint8Array([...block, 0xff]); // 0xff = following field
+    const { properties, bytesRead } = decodeTrackProperties18(buf, 0, block.length);
+    expect(bytesRead).toBe(block.length);
+    expect(properties.size).toBe(2);
+  });
+
+  it('honours `end`: an even value that would cross `end` is a truncated block, not a read-ahead', () => {
+    // 0x02 (id) then a 2-byte vi64 value 128 (0x8080). With end after the id's
+    // first value byte, the value read must NOT reach into buf[2].
+    const buf = new Uint8Array([0x02, 0x80, 0x80]);
+    expect(() => decodeTrackProperties18(buf, 0, 2)).toThrow(RangeError);
+  });
+
   it('preserves duplicate values under one Type (delta 0), in order', () => {
     const p = props(new Map([[0x02n, [5n, 9n]]]));
     const bytes = encodeTrackProperties18(p);

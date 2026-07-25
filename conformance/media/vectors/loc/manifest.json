@@ -1,0 +1,1092 @@
+{
+  "corpusSchema": "moq-media-corpus/1",
+  "domain": "loc",
+  "note": "Read-only. Authored via AUTHOR_CORPUS=1 build-corpus.ts. Normative/interpretation expectations are independently authored; observed Playa output lives only in differential.playa. Regression expectations pin current behavior.",
+  "vectors": [
+    {
+      "id": "loc/sem-all-four",
+      "kind": "loc-semantics",
+      "profile": "loc-01",
+      "scope": "object",
+      "description": "LOC-01 interpretation of all four known properties from a structured PropertyMap.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "42"
+          },
+          {
+            "id": "4",
+            "valueKind": "varint",
+            "value": "32"
+          },
+          {
+            "id": "6",
+            "valueKind": "varint",
+            "value": "127"
+          },
+          {
+            "id": "13",
+            "valueKind": "bytes",
+            "value": "010203"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "42",
+          "videoFrameMarking": {
+            "startOfFrame": false,
+            "endOfFrame": false,
+            "independent": true,
+            "discardable": false,
+            "baseLayerSync": false,
+            "temporalId": 0
+          },
+          "audioLevel": {
+            "voiceActivity": false,
+            "level": 127
+          },
+          "videoConfig": "010203"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/sem-duplicate-last-wins",
+      "kind": "loc-semantics",
+      "profile": "loc-01",
+      "scope": "object",
+      "description": "Duplicate Capture Timestamp: current behavior silently keeps the LAST value (regression pin of the Layer-B policy the resolver must reproduce).",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "100"
+          },
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "200"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "200"
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/sem-unknown-full-width-id",
+      "kind": "loc-semantics",
+      "profile": "loc-01",
+      "scope": "object",
+      "description": "An unknown even property with a near-2^64 id is preserved losslessly. The unknown map is bigint-keyed so the id survives intact (the Layer-B contract).",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "18446744073709551614",
+            "valueKind": "varint",
+            "value": "7"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "unknown": [
+            {
+              "id": "18446744073709551614",
+              "name": null,
+              "value": "7"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/sem-audio-level-high-bits",
+      "kind": "loc-semantics",
+      "profile": "loc-01",
+      "scope": "object",
+      "description": "Audio Level value 0x1FF: current behavior silently masks to the low 8 bits (level 127, voice active) — regression pin.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "6",
+            "valueKind": "varint",
+            "value": "511"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "audioLevel": {
+            "voiceActivity": true,
+            "level": 127
+          }
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-capture-ts-zero",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "Capture Timestamp of 0.",
+      "input": {
+        "file": "props_ts_zero.bin",
+        "byteLength": 2,
+        "sha256": "99be5efb88ca2013bd8e4eb035fd42d5245468fe9afa70d8ba9c1c419a48c4e8",
+        "hex": "0200"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "0"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-capture-ts-above-2p53",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "Capture Timestamp above 2^53-1 (Number-safety probe); kept exact as bigint.",
+      "input": {
+        "file": "props_ts_above_2p53.bin",
+        "byteLength": 9,
+        "sha256": "2c3b3142d80f4215a4129c7bdf2c8205381b9738c16a8491b0ee273ddd0e8c35",
+        "hex": "02c020000000000001"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "9007199254740993"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-capture-ts-max62",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "Capture Timestamp at the QUIC-varint maximum (2^62-1).",
+      "input": {
+        "file": "props_ts_max62.bin",
+        "byteLength": 9,
+        "sha256": "b2cf65b90288fa2b93e532214343121851bb8db63b059aeeb1188ca646b50a51",
+        "hex": "02ffffffffffffffff"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "4611686018427387903"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-vfm-varint",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "Video Frame Marking (RFC 9626) independent-frame bit set.",
+      "input": {
+        "file": "props_vfm.bin",
+        "byteLength": 2,
+        "sha256": "97b546ef5c0a88a4cc8218044975bae50c49e5d9743f28822a587c0dd48f2e24",
+        "hex": "0420"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "videoFrameMarking": {
+            "startOfFrame": false,
+            "endOfFrame": false,
+            "independent": true,
+            "discardable": false,
+            "baseLayerSync": false,
+            "temporalId": 0
+          }
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-audio-level",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "Audio Level (RFC 6464) magnitude 127, no voice activity.",
+      "input": {
+        "file": "props_audio.bin",
+        "byteLength": 3,
+        "sha256": "4db79cd94957a9c01ad42cd47560ba71d8db98a9e33e0bb38c702438b9a55add",
+        "hex": "06407f"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "audioLevel": {
+            "voiceActivity": false,
+            "level": 127
+          }
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-video-config",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "Video Config (odd id 13) length-prefixed codec extradata.",
+      "input": {
+        "file": "props_vconfig.bin",
+        "byteLength": 6,
+        "sha256": "6ae18b6a18f0ed97b25ed4ec93c3340975e06bcc902c6ea5130af0736ffa97a4",
+        "hex": "0d040164001f"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "videoConfig": "0164001f"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-all-four",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "All four known LOC-01 properties in one block.",
+      "input": {
+        "file": "props_all_four.bin",
+        "byteLength": 11,
+        "sha256": "9e01681762cb483ca63a50714b62b8dd5b00ee3a60ac622fc163d5e016203e9d",
+        "hex": "022a022002407f0702aabb"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "42",
+          "videoFrameMarking": {
+            "startOfFrame": false,
+            "endOfFrame": false,
+            "independent": true,
+            "discardable": false,
+            "baseLayerSync": false,
+            "temporalId": 0
+          },
+          "audioLevel": {
+            "voiceActivity": false,
+            "level": 127
+          },
+          "videoConfig": "aabb"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-unknown-even-and-odd-skip",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "An unknown even id (8, varint) and unknown odd id (15, bytes) are preserved in the unknown map (each with an explicit null name).",
+      "input": {
+        "file": "props_unknown.bin",
+        "byteLength": 7,
+        "sha256": "0e7ef5451d5ee872ab5330bca63659374b01fa26616f318c398f183d77277f40",
+        "hex": "0840630702dead"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "unknown": [
+            {
+              "id": "8",
+              "name": null,
+              "value": "99"
+            },
+            {
+              "id": "15",
+              "name": null,
+              "value": "dead"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-err-truncated-varint",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "The value varint (8-byte QUIC form) runs off the end.",
+      "input": {
+        "file": "props_err_truncated.bin",
+        "byteLength": 2,
+        "sha256": "f5e0e61250dc5ca346e045ef9b8830ff510ceebd97829a9047efcaf584db9587",
+        "hex": "02c0"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "decode",
+        "error": {
+          "category": "truncated"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-err-length-overrun",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "An odd-id (Video Config) declares length 10 but only 2 value bytes remain.",
+      "input": {
+        "file": "props_err_overrun.bin",
+        "byteLength": 4,
+        "sha256": "2fa59a4a3345ebdd51b13f0db723fce4a9a5a8d6ca8596d762bae5a184fa5c0a",
+        "hex": "0d0a0102"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "decode",
+        "error": {
+          "category": "length-overrun"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-ts-64-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "DECODE driver: a draft-18 (vi64) Capture Timestamp 64 (>= 64, where vi64 and QUIC diverge) decodes correctly under the d18 profile. An earlier build read it with the QUIC codec and mis-decoded it; the id suffix records that origin.",
+      "input": {
+        "file": "props_d18_ts_64.bin",
+        "byteLength": 2,
+        "sha256": "ba3c702b24e4ef16c111bf92823170f6e81fd37fbafaccbeef52192a1c094380",
+        "hex": "0240"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "64"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-ts-127-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "DECODE driver: a draft-18 (vi64) Capture Timestamp 127 (>= 64, where vi64 and QUIC diverge) decodes correctly under the d18 profile. An earlier build read it with the QUIC codec and mis-decoded it; the id suffix records that origin.",
+      "input": {
+        "file": "props_d18_ts_127.bin",
+        "byteLength": 2,
+        "sha256": "b0ccec045ddc48057ca16bd0669e5c8c9897d7a4844e1963c22652d6aec23de0",
+        "hex": "027f"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "127"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-ts-128-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "DECODE driver: a draft-18 (vi64) Capture Timestamp 128 (>= 64, where vi64 and QUIC diverge) decodes correctly under the d18 profile. An earlier build read it with the QUIC codec and mis-decoded it; the id suffix records that origin.",
+      "input": {
+        "file": "props_d18_ts_128.bin",
+        "byteLength": 3,
+        "sha256": "18b22814bc2f7085f5c5bb7d175a692b7e58b1632b631734b512e096c59915e5",
+        "hex": "028080"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "128"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-ts-16383-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "DECODE driver: a draft-18 (vi64) Capture Timestamp 16383 (>= 64, where vi64 and QUIC diverge) decodes correctly under the d18 profile. An earlier build read it with the QUIC codec and mis-decoded it; the id suffix records that origin.",
+      "input": {
+        "file": "props_d18_ts_16383.bin",
+        "byteLength": 3,
+        "sha256": "44d35ef61b0cb3f62d6469e0c8534959c8c258766aef943f354bc8a61174eef4",
+        "hex": "02bfff"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "16383"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-ts-16384-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "DECODE driver: a draft-18 (vi64) Capture Timestamp 16384 (>= 64, where vi64 and QUIC diverge) decodes correctly under the d18 profile. An earlier build read it with the QUIC codec and mis-decoded it; the id suffix records that origin.",
+      "input": {
+        "file": "props_d18_ts_16384.bin",
+        "byteLength": 4,
+        "sha256": "49fb0960d70a4f6d3651233a90be8a09bcebd4c280d8b85668b6defc7960ad83",
+        "hex": "02c04000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "16384"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-ts-epoch-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "DECODE driver: a draft-18 (vi64) Capture Timestamp 1726000000000000 (>= 64, where vi64 and QUIC diverge) decodes correctly under the d18 profile. An earlier build read it with the QUIC codec and mis-decoded it; the id suffix records that origin.",
+      "input": {
+        "file": "props_d18_ts_epoch.bin",
+        "byteLength": 9,
+        "sha256": "f4a63b8681d20d085885730054476d4ed508038427ca915c5e60af2ae99f1f86",
+        "hex": "02fe0621c9b0e1e000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "1726000000000000"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-ts-max62-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "DECODE driver: a draft-18 (vi64) Capture Timestamp 4611686018427387903 (>= 64, where vi64 and QUIC diverge) decodes correctly under the d18 profile. An earlier build read it with the QUIC codec and mis-decoded it; the id suffix records that origin.",
+      "input": {
+        "file": "props_d18_ts_max62.bin",
+        "byteLength": 10,
+        "sha256": "1f10c44417973ae84052d12da88464cad7ce82ac14c43977a64c49ab901c61ab",
+        "hex": "02ff3fffffffffffffff"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "4611686018427387903"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-ts-pow62-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "DECODE driver: a draft-18 (vi64) Capture Timestamp 4611686018427387904 (>= 64, where vi64 and QUIC diverge) decodes correctly under the d18 profile. An earlier build read it with the QUIC codec and mis-decoded it; the id suffix records that origin.",
+      "input": {
+        "file": "props_d18_ts_pow62.bin",
+        "byteLength": 10,
+        "sha256": "2e642ce527197e9df43f02a208548d64516fa25c2d4353f51cb7f9a5f206d0b0",
+        "hex": "02ff4000000000000000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "4611686018427387904"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-ts-max64-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "DECODE driver: a draft-18 (vi64) Capture Timestamp 18446744073709551615 (>= 64, where vi64 and QUIC diverge) decodes correctly under the d18 profile. An earlier build read it with the QUIC codec and mis-decoded it; the id suffix records that origin.",
+      "input": {
+        "file": "props_d18_ts_max64.bin",
+        "byteLength": 10,
+        "sha256": "138ac4f4577256685b2870b0b95f548fb4d8efc3a8246f83174619dade2aeef6",
+        "hex": "02ffffffffffffffffff"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "captureTimestamp": "18446744073709551615"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-encode-64-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "ENCODE driver: encoding Capture Timestamp 64 for a draft-18 target yields the canonical vi64 block. An earlier build emitted QUIC varints (or threw above 2^62-1); the id suffix records that origin.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "64"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "0240"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-encode-127-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "ENCODE driver: encoding Capture Timestamp 127 for a draft-18 target yields the canonical vi64 block. An earlier build emitted QUIC varints (or threw above 2^62-1); the id suffix records that origin.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "127"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "027f"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-encode-128-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "ENCODE driver: encoding Capture Timestamp 128 for a draft-18 target yields the canonical vi64 block. An earlier build emitted QUIC varints (or threw above 2^62-1); the id suffix records that origin.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "128"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "028080"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-encode-16383-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "ENCODE driver: encoding Capture Timestamp 16383 for a draft-18 target yields the canonical vi64 block. An earlier build emitted QUIC varints (or threw above 2^62-1); the id suffix records that origin.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "16383"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "02bfff"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-encode-16384-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "ENCODE driver: encoding Capture Timestamp 16384 for a draft-18 target yields the canonical vi64 block. An earlier build emitted QUIC varints (or threw above 2^62-1); the id suffix records that origin.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "16384"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "02c04000"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-encode-epoch-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "ENCODE driver: encoding Capture Timestamp 1726000000000000 for a draft-18 target yields the canonical vi64 block. An earlier build emitted QUIC varints (or threw above 2^62-1); the id suffix records that origin.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "1726000000000000"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "02fe0621c9b0e1e000"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-encode-max62-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "ENCODE driver: encoding Capture Timestamp 4611686018427387903 for a draft-18 target yields the canonical vi64 block. An earlier build emitted QUIC varints (or threw above 2^62-1); the id suffix records that origin.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "4611686018427387903"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "02ff3fffffffffffffff"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-encode-pow62-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "ENCODE driver: encoding Capture Timestamp 4611686018427387904 for a draft-18 target yields the canonical vi64 block. An earlier build emitted QUIC varints (or threw above 2^62-1); the id suffix records that origin.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "4611686018427387904"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "02ff4000000000000000"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/props-d18-encode-max64-diverges",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "ENCODE driver: encoding Capture Timestamp 18446744073709551615 for a draft-18 target yields the canonical vi64 block. An earlier build emitted QUIC varints (or threw above 2^62-1); the id suffix records that origin.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "18446744073709551615"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "02ffffffffffffffffff"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-01",
+        "section": "2.3.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    }
+  ]
+}

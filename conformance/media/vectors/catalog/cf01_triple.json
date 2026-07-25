@@ -1,0 +1,1 @@
+{"version":1,"streamingFormat":1,"streamingFormatVersion":"0.2","commonTrackFields":{"packaging":"cmaf","namespace":"ns"},"tracks":[{"name":"1.m4s","selectionParams":{"codec":"avc1.640028","mimeType":"video/mp4","width":1280,"height":720}}]}

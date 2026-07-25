@@ -54,6 +54,58 @@ pnpm --filter @moqt/example-node-publisher publish-fixture --loop https://127.0.
 
 (`fixtures/test-pattern` is generated locally and gitignored — do not commit it.)
 
+## 3b. Modern CMSF-01 / MSF-01 catalog (init-by-reference) + live delta
+
+By default the publisher emits an **MSF-00** catalog (numeric `version: 1`, each
+init segment inline as base64 `initData`). `--catalog-format cmsf-01` (alias
+`--msf01`) instead emits the modern standards shape Playa now consumes end-to-end:
+
+- string `version: "1"`
+- a root `initDataList: [{ id, type: "inline", data }]`
+- per-track `initRef` (**no** per-track inline `initData`)
+- `packaging: "cmaf"`
+
+```bash
+pnpm --filter @moqt/example-node-publisher publish-fixture --loop --catalog-format cmsf-01 \
+  https://127.0.0.1:4433/moq fixtures/test-pattern
+```
+
+`--emit-delta` (or `--delta-after-ms N`, default 2000) additionally publishes one
+**MSF-01 op-array catalog delta** (`deltaUpdate:[{op,tracks}]`) shortly after the
+initial catalog — a `clone` of the primary video into an alternate that reuses the
+same `initRef`. Playa applies it live (a `catalog_updated` event), exercising the
+op-array delta path. It is a catalog-level demo: no media is published for the clone.
+
+```bash
+pnpm --filter @moqt/example-node-publisher publish-fixture --loop --catalog-format cmsf-01 --emit-delta \
+  https://127.0.0.1:4433/moq fixtures/test-pattern
+```
+
+Open Playa exactly as in §4 (local relay ⇒ `?v=18`). **No synthetic catalog or
+injected init-segment workaround is needed** — Playa loads the real wire catalog and
+resolves each track's `initRef` against the root `initDataList`.
+
+### Against a hosted relay (draft-16 moqx)
+
+A public **moqx** relay speaks **draft-16** WebTransport. Playa must be told the
+draft explicitly because moqx does not echo an auto-detectable protocol token — open
+it with **`?v=16`**:
+
+```text
+http://localhost:5173/player/?url=https://test.moqrelay.net:4433/moq-relay&ns=<namespace>&v=16
+```
+
+- **Operational note:** without `?v=16` the player negotiates its default draft and
+  the session fails against moqx.
+- The stream is published by a draft-16-native origin against that relay (e.g. a
+  LibMoQ/moqx publisher). This local demo publisher is pinned to the **local**
+  node-relay (draft-18 + a pinned self-signed cert), so it is not the origin for the
+  hosted flow — that flow demonstrates Playa consuming a real wire catalog +
+  `initRef` + live deltas from moqx with no synthetic workaround.
+- Optional, non-test diagnostics: `curl http://test.moqrelay.net/api/status` (or
+  `/`). **No test or CI lane depends on this public host**, and its availability is
+  best-effort.
+
 ## 4. Browser Playa playback
 
 ```bash

@@ -64,6 +64,15 @@ export {
 export { readKvpList, writeKvpList, kvpListEncodingLength } from './primitives/kvp.js';
 export type { KvpValue } from './primitives/kvp.js';
 
+// Shared ordered property-wire core (draft-14/16/18 KVP + Track Properties).
+export {
+  decodePropertyBlock, encodePropertyBlock, propertyBlockEncodingLength,
+  canonicalOrder, PropertyWireError, MAX_ODD_VALUE_BYTES,
+} from './primitives/property-block.js';
+export type {
+  PropertyEntry, PropertyMap, PropertyValue, PropertyWireProfile, PropertyErrorCategory,
+} from './primitives/property-block.js';
+
 export { readLocation, writeLocation, locationEncodingLength } from './primitives/location.js';
 export type { Location } from './primitives/location.js';
 

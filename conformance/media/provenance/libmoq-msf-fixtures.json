@@ -1,0 +1,176 @@
+{
+  "corpusSchema": "moq-media-corpus/1",
+  "note": "Pinned provenance for the byte-exact LibMoQ MSF fixture import. Machine-checked by corpus-libmoq-import.test.ts. The source audit disproved the planned \"13 executable + 1 MSF-01-shaped\" split (landing at 5 executable + 9 forward-looking); the MSF-01/CMSF-01 parser then promoted the 7 later-era catalogs, and the op-array delta parser promoted the final 2 delta documents — all 14 fixtures are now executable.",
+  "source": {
+    "repo": "openmoq/moq5 (LibMoQ)",
+    "commit": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+    "path": "media/msf/tests/fixtures"
+  },
+  "counts": {
+    "total": 14,
+    "executable": 14,
+    "forwardLooking": 0,
+    "byProfile": {
+      "msf-00": 5,
+      "cmsf-01": 3,
+      "msf-01-delta": 2,
+      "msf-01": 4
+    }
+  },
+  "fixtures": [
+    {
+      "fixture": "av_single.json",
+      "sha256": "f07dd4722601e05bed02b4021a45fdafaa5c423202128700ed5db92b3771a795",
+      "corpusId": "catalog/libmoq-av-single",
+      "corpusFile": "libmoq_av_single.json",
+      "era": "msf-00",
+      "profile": "msf-00",
+      "capability": "executable",
+      "basis": "normative",
+      "section": "draft-ietf-moq-msf-00 §5.1"
+    },
+    {
+      "fixture": "cmsf_clearkey.json",
+      "sha256": "74831a3b1b740ebd67ef7db1681397b8808b01d4a2deda6101850749205ea4ac",
+      "corpusId": "catalog/libmoq-cmsf-clearkey",
+      "corpusFile": "libmoq_cmsf_clearkey.json",
+      "era": "cmsf-01",
+      "profile": "cmsf-01",
+      "capability": "executable",
+      "basis": "interpretation",
+      "section": "draft-ietf-moq-cmsf-01 §4.3"
+    },
+    {
+      "fixture": "cmsf_cmaf_simulcast.json",
+      "sha256": "9d53c32066d044915d5574a60bf8c8b735908d29a62e2a5f27391417533d1cc4",
+      "corpusId": "catalog/libmoq-cmsf-cmaf-simulcast",
+      "corpusFile": "libmoq_cmsf_cmaf_simulcast.json",
+      "era": "cmsf-01",
+      "profile": "cmsf-01",
+      "capability": "executable",
+      "basis": "interpretation",
+      "section": "draft-ietf-moq-cmsf-01 §3.1"
+    },
+    {
+      "fixture": "cmsf_drm_cbcs.json",
+      "sha256": "48b036709de7d7e4ae566c39435537bd658895de3e04803b60cacc7461110cc9",
+      "corpusId": "catalog/libmoq-cmsf-drm-cbcs",
+      "corpusFile": "libmoq_cmsf_drm_cbcs.json",
+      "era": "cmsf-01",
+      "profile": "cmsf-01",
+      "capability": "executable",
+      "basis": "interpretation",
+      "section": "draft-ietf-moq-cmsf-01 §5.2"
+    },
+    {
+      "fixture": "delta_add_clone.json",
+      "sha256": "9b1f6fa8140fb426395bbc24ba179ce01970468e8433aeaa3d3cd6d5f1672f56",
+      "corpusId": "catalog/libmoq-delta-add-clone",
+      "corpusFile": "libmoq_delta_add_clone.json",
+      "era": "msf-01-delta",
+      "profile": "msf-01-delta",
+      "capability": "executable",
+      "basis": "interpretation",
+      "section": "draft-ietf-moq-msf-01 §§5.1.6,5.3,5.6.4"
+    },
+    {
+      "fixture": "delta_remove.json",
+      "sha256": "1cc3b8d80da318d071ae521bd7068b53c26aa91519afdfc1c1d2d32f1332a2c4",
+      "corpusId": "catalog/libmoq-delta-remove",
+      "corpusFile": "libmoq_delta_remove.json",
+      "era": "msf-01-delta",
+      "profile": "msf-01-delta",
+      "capability": "executable",
+      "basis": "interpretation",
+      "section": "draft-ietf-moq-msf-01 §§5.1.6,5.3,5.6.5"
+    },
+    {
+      "fixture": "empty_tracks.json",
+      "sha256": "cc93a54da66ad17da51cbd26aea8a67084dd54b97e525eb1b562e3696a1d242a",
+      "corpusId": "catalog/libmoq-empty-tracks",
+      "corpusFile": "libmoq_empty_tracks.json",
+      "era": "msf-00",
+      "profile": "msf-00",
+      "capability": "executable",
+      "basis": "normative",
+      "section": "draft-ietf-moq-msf-00 §5.1.1"
+    },
+    {
+      "fixture": "mediatimeline.json",
+      "sha256": "b5da1dc96f6ffd59eeb79e8f961ea7f664148c65331315a4580dfe3cc0566633",
+      "corpusId": "catalog/libmoq-mediatimeline",
+      "corpusFile": "libmoq_mediatimeline.json",
+      "era": "msf-01",
+      "profile": "msf-01",
+      "capability": "executable",
+      "basis": "interpretation",
+      "section": "draft-ietf-moq-msf-01 §5.2.14"
+    },
+    {
+      "fixture": "minimal.json",
+      "sha256": "a0bf6eed5a81038492c8ce612698abef5433847511a33f7a8c50005eccbcde06",
+      "corpusId": "catalog/libmoq-minimal",
+      "corpusFile": "libmoq_minimal.json",
+      "era": "msf-00",
+      "profile": "msf-00",
+      "capability": "executable",
+      "basis": "normative",
+      "section": "draft-ietf-moq-msf-00 §5.1"
+    },
+    {
+      "fixture": "template.json",
+      "sha256": "98d6cb8196bce7c7745434d5a5641427430ddc9c783ab47900a221bb25dd09f8",
+      "corpusId": "catalog/libmoq-template",
+      "corpusFile": "libmoq_template.json",
+      "era": "msf-01",
+      "profile": "msf-01",
+      "capability": "executable",
+      "basis": "interpretation",
+      "section": "draft-ietf-moq-msf-01 §5.2.15"
+    },
+    {
+      "fixture": "termination.json",
+      "sha256": "dfdc4e8e565225cb43973fdb648edc76644229f7184fc60a62be680c669998cf",
+      "corpusId": "catalog/libmoq-termination",
+      "corpusFile": "libmoq_termination.json",
+      "era": "msf-01",
+      "profile": "msf-01",
+      "capability": "executable",
+      "basis": "interpretation",
+      "section": "draft-ietf-moq-msf-01 §5.1.3"
+    },
+    {
+      "fixture": "unknown_fields.json",
+      "sha256": "4f3fc0bc4e0e1fbc3d3570d6e2e9981d3632f569b83ad169ab01d72dd740bc37",
+      "corpusId": "catalog/libmoq-unknown-fields",
+      "corpusFile": "libmoq_unknown_fields.json",
+      "era": "msf-00",
+      "profile": "msf-00",
+      "capability": "executable",
+      "basis": "regression",
+      "section": "draft-ietf-moq-msf-00 §5.1"
+    },
+    {
+      "fixture": "vod.json",
+      "sha256": "e377cfa4e892a3b597e34beec0313ba06b219ea7be40a73c0ec8ddc5a6d4404c",
+      "corpusId": "catalog/libmoq-vod",
+      "corpusFile": "libmoq_vod.json",
+      "era": "msf-01",
+      "profile": "msf-01",
+      "capability": "executable",
+      "basis": "interpretation",
+      "section": "draft-ietf-moq-msf-01 §5.2.35"
+    },
+    {
+      "fixture": "with_init_data.json",
+      "sha256": "6c70626f51fe2fda457cdbabc0f3e77ef1edf22161d72027694c8f141975e197",
+      "corpusId": "catalog/libmoq-with-init-data",
+      "corpusFile": "libmoq_with_init_data.json",
+      "era": "msf-00",
+      "profile": "msf-00",
+      "capability": "executable",
+      "basis": "normative",
+      "section": "draft-ietf-moq-msf-00 §5.1.20"
+    }
+  ]
+}

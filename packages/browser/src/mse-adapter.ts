@@ -154,6 +154,153 @@ export interface MseMediaSourceOptions {
   readonly maxAheadSec?: number;
   /** Where a behind-live jump lands: rangeEnd - targetAheadSec. Default 2. */
   readonly targetAheadSec?: number;
+  /**
+   * Which MediaSource implementation to construct.
+   *
+   * - `auto` (default): prefer `ManagedMediaSource` when the browser exposes
+   *   it, else standard `MediaSource`. MMS has better power behavior and is the
+   *   only implementation iPhone-class Safari ships.
+   * - `managed`: explicitly prefer `ManagedMediaSource` (same selection as
+   *   `auto`; states the intent rather than relying on the default).
+   * - `standard`: prefer standard `MediaSource`.
+   *
+   * The explicit preferences exist for investigation. A desktop-Safari A/V
+   * synchronization problem was initially thought to be specific to
+   * ManagedMediaSource, but a later run reproduced it under standard
+   * MediaSource too, so NOTHING here should be read as one implementation
+   * avoiding it.
+   *
+   * Selection is capability-based — there is NO user-agent sniffing. Every
+   * preference FALLS BACK to the other implementation when the requested one is
+   * absent (iPhone Safari ships ManagedMediaSource only; most non-Safari
+   * browsers ship standard MediaSource only), so a preference can never make an
+   * otherwise-playable device unplayable. Construction still throws when
+   * NEITHER exists, exactly as before.
+   */
+  readonly mseImplementation?: MseImplementationPreference;
+  /**
+   * How to attach the MediaSource to the element.
+   *
+   * - `auto` (default): preserves the historical pairing — standard uses an
+   *   object URL, managed uses `srcObject`.
+   * - `object-url` / `src-object`: force that mode for EITHER implementation.
+   *
+   * This exists because implementation and attachment were previously coupled,
+   * so a standard-vs-managed comparison silently varied both. Separating them
+   * makes it possible to tell a ManagedMediaSource problem apart from an
+   * attachment-path problem. An explicit mode is used exactly as requested or
+   * THROWS — a silent fallback would reintroduce the confound it removes.
+   */
+  readonly mseAttachment?: MseAttachmentPreference;
+}
+
+/** Which MediaSource implementation was actually constructed. */
+export type MseImplementation = 'managed' | 'standard';
+
+/** Requested MediaSource implementation. @see MseMediaSourceOptions.mseImplementation */
+export type MseImplementationPreference = 'auto' | 'managed' | 'standard';
+
+/** Requested attachment mode. @see MseMediaSourceOptions.mseAttachment */
+export type MseAttachmentPreference = 'auto' | 'object-url' | 'src-object';
+
+/** How the MediaSource was actually attached to the element. */
+export type MseAttachment = 'object-url' | 'src-object';
+
+/**
+ * Startup lifecycle phase. Positioning is asynchronous, so startup is modelled
+ * explicitly instead of being implied by `playTriggered`.
+ */
+type StartupPhase = 'idle' | 'positioning' | 'play-pending' | 'started';
+
+/**
+ * How far `currentTime` may sit from the requested start position and still
+ * count as positioned there.
+ *
+ * We always seek to the START of a buffered range, which is already a random
+ * access point, so no keyframe snapping is expected — the residual is the
+ * element rounding to the nearest sample. One frame is ~42ms at 24fps and an
+ * audio frame ~21ms at 48kHz, so 100ms covers roughly two frames of rounding
+ * while still rejecting a seek that landed somewhere genuinely different. (The
+ * previous 0.5s was far looser than the rounding it claimed to absorb: it would
+ * have accepted a landing point up to a dozen frames away.)
+ */
+const STARTUP_SEEK_TOLERANCE_SEC = 0.1;
+
+/**
+ * Bounded wait for a startup seek to settle. Not configurable: no consumer
+ * needs to tune it, and an unvalidated public knob accepting NaN/negative/
+ * Infinity would be a worse contract than a considered constant.
+ */
+const STARTUP_SEEK_TIMEOUT_MS = 2000;
+
+/**
+ * How an awaited positioning operation ended. `timeout-accepted` is a timeout
+ * whose postcondition nevertheless held (not seeking, landed at target) — it
+ * releases startup like a settlement, but is reported distinctly because the
+ * `seeked` event never arrived.
+ */
+type PositionOutcome = 'settled' | 'timeout-accepted' | 'cancelled';
+
+/**
+ * Outcomes under which startup SUCCEEDED — positioning completed and play()
+ * started. Exactly one of these accompanies an emitted startup report.
+ */
+export type MseStartupSuccess = 'no-seek-needed' | 'seek-settled' | 'seek-timeout-accepted';
+
+/**
+ * Outcomes under which startup did NOT start playback but WILL be retried by a
+ * later drain or a renewed play intent. These are recorded in `startupReport`
+ * for inspection but are deliberately NOT emitted: a once-only report carrying
+ * a retriable failure would be permanently misleading once a later attempt
+ * succeeds.
+ */
+export type MseStartupRetriable = 'cancelled' | 'autoplay-blocked' | 'seek-timeout-unsettled';
+
+/** How the startup transaction's positioning phase ended. */
+export type MseSeekOutcome = MseStartupSuccess | MseStartupRetriable;
+
+/** Session-scoped, mutable form of the facts an `MseStartupReport` exposes. */
+interface MutableStartupFacts {
+  session: number;
+  startPosition: number | null;
+  seekOutcome: MseSeekOutcome | null;
+  playTimeSec: number | null;
+}
+
+/** Adapter-side startup facts for the joined diagnostic summary. */
+export interface MseStartupReport {
+  readonly implementation: MseImplementation;
+  readonly attachment: MseAttachment;
+  readonly disableRemotePlayback: boolean;
+  /** Session generation these facts belong to (bumped by reset/destroy). */
+  readonly session: number;
+  readonly startPosition: number | null;
+  readonly seekOutcome: MseSeekOutcome | null;
+  readonly playTimeSec: number | null;
+}
+
+/** What app-initiated operation mutated a SourceBuffer. */
+type BufferOpCause = 'append' | 'init-append' | 'back-buffer-remove' | 'quota-remove' | 'quota-flush';
+
+/** Render a TimeRanges as "a-b,c-d" for diagnostics; never throws. */
+function fmtRanges(ranges: TimeRanges | undefined | null): string {
+  if (!ranges) return 'n/a';
+  try {
+    if (ranges.length === 0) return '';
+    return Array.from({ length: ranges.length },
+      (_, i) => `${ranges.start(i).toFixed(2)}-${ranges.end(i).toFixed(2)}`).join(',');
+  } catch {
+    return 'unreadable';
+  }
+}
+
+/** `buffer.buffered` without letting a transient accessor failure throw. */
+function safeBuffered(buffer: SourceBuffer): TimeRanges | null {
+  try {
+    return buffer.buffered;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -171,6 +318,166 @@ export class MseMediaSource implements MediaSourceLike {
   private ms: MediaSource;
   private videoBuffer: SourceBuffer | null = null;
   private audioBuffer: SourceBuffer | null = null;
+
+  /**
+   * Which MediaSource implementation was constructed, and which was asked for.
+   * Readable without debug logging so a harness can assert the selection.
+   */
+  readonly selectedImplementation: MseImplementation;
+  readonly implementationRequested: MseImplementationPreference;
+  /** Attachment actually used, and the mode asked for. */
+  readonly selectedAttachment: MseAttachment;
+  readonly attachmentRequested: MseAttachmentPreference;
+
+  /**
+   * Whether the player has declared playback intent.
+   *
+   * Media arriving is NOT a request to play: without this gate the adapter is a
+   * second owner of startup and can begin playing while the player is still
+   * LOADING or has been paused. Buffering is unaffected — only the startup
+   * positioning/play transaction waits. Defaults to true so an embedder that
+   * never calls setPlaybackIntent keeps the previous behavior.
+   */
+  private playbackIntent = true;
+
+  /**
+   * Declare (or withdraw) playback intent. Withdrawing cancels an in-flight
+   * startup so a late seek/play cannot begin playback afterwards.
+   */
+  setPlaybackIntent(intent: boolean): void {
+    if (this.playbackIntent === intent) return;
+    this.playbackIntent = intent;
+    this.diag('playback-intent %s', String(intent));
+    if (!intent) {
+      // Cancel a startup in flight AND stop playback that already started —
+      // withdrawing intent is a pause, not merely "don't start".
+      this.cancelStartup();
+      if (this.playTriggered && this.video.paused === false) this.video.pause();
+      return;
+    }
+    if (this.destroyed) return;
+    // Already started: this is a resume, not a new startup transaction.
+    if (this.playTriggered) {
+      this.resumeElement();
+      return;
+    }
+    // Intent arrived after media: start now if a common range already exists.
+    void this.requestStartup().catch(() => { /* contained */ });
+  }
+
+  /**
+   * Resume playback after an external stall/pause, through the adapter's own
+   * startup lifecycle. Embedders must call this rather than `video.play()`
+   * directly: a second play owner can race the startup transaction and play
+   * into an unresolved seek. No-op without playback intent.
+   */
+  resumePlayback(): void {
+    if (this.destroyed || !this.playbackIntent) return;
+    if (!this.playTriggered) {
+      void this.requestStartup().catch(() => { /* contained */ });
+      return;
+    }
+    this.resumeElement();
+  }
+
+  /**
+   * Resume an element that has already completed startup, under the same
+   * generation guard as startup itself — so a pause/destroy racing the pending
+   * play promise cannot leave it playing.
+   */
+  private resumeElement(): void {
+    if (!this.video.paused) return;
+    const generation = this.startupGeneration;
+    void this.playElement(generation).catch(() => { /* autoplay policy */ });
+  }
+
+  /**
+   * Startup facts for the joined diagnostic summary. Session-scoped: cleared on
+   * reset()/destroy() so a later session can never report stale facts, and
+   * stamped with `session` so a consumer can refuse to join across sessions.
+   */
+  private startupFacts: MutableStartupFacts =
+    { session: 0, startPosition: null, seekOutcome: null, playTimeSec: null };
+
+  /**
+   * Fired ONCE per session when startup has SUCCEEDED: positioning completed
+   * and play() started, so `startPosition`, `seekOutcome` and `playTimeSec` are
+   * all final. Retriable non-starts (see `MseStartupRetriable`) do not fire —
+   * they remain visible on `startupReport` and a later successful attempt fires
+   * this instead.
+   */
+  onStartupReport: ((report: MseStartupReport) => void) | null = null;
+  private startupReported = false;
+
+  /** Current startup facts (diagnostics only; may be incomplete before terminal). */
+  get startupReport(): MseStartupReport {
+    return {
+      implementation: this.selectedImplementation,
+      attachment: this.selectedAttachment,
+      disableRemotePlayback: (this.video as { disableRemotePlayback?: boolean }).disableRemotePlayback === true,
+      ...this.startupFacts,
+    };
+  }
+
+  /**
+   * Write startup facts into the session they were gathered for.
+   *
+   * A cancelled startup's continuation resumes LATER — possibly after reset()
+   * has installed a fresh facts object for a new session. Taking the target as
+   * a parameter, captured when the attempt began, keeps its outcome where it
+   * belongs: a cancellation that stays within the session (an intent
+   * withdrawal) is still recorded, while one that crosses a reset is DISCARDED
+   * by the identity check rather than contaminating the new session.
+   */
+  private recordStartupFact(
+    facts: MutableStartupFacts,
+    patch: Partial<Omit<MseStartupReport, 'implementation' | 'attachment' | 'disableRemotePlayback' | 'session'>>,
+  ): void {
+    if (facts !== this.startupFacts) return;
+    Object.assign(facts, patch);
+  }
+
+  /** Emit the successful startup report exactly once per session. */
+  private reportStartupSucceeded(outcome: MseStartupSuccess): void {
+    this.startupFacts.seekOutcome = outcome;
+    if (this.startupReported) return;
+    this.startupReported = true;
+    const cb = this.onStartupReport;
+    if (!cb) return;
+    // A diagnostic consumer must never break playback.
+    try { cb(this.startupReport); } catch { /* contained */ }
+  }
+
+  /**
+   * Startup lifecycle. Positioning the playhead is ASYNCHRONOUS — assigning
+   * `currentTime` starts a seek that completes later — so startup is an owned,
+   * cancellable transaction rather than a fire-and-forget pair of statements:
+   *
+   *   idle → positioning → play-pending → started
+   *
+   * `drainQueue` only decides ELIGIBILITY and requests startup; at most one
+   * attempt is ever in flight, however many `updateend` events land while a
+   * seek is outstanding. A rejected autoplay returns the phase to `idle` so a
+   * later drain retries, exactly as before.
+   */
+  private startupPhase: StartupPhase = 'idle';
+
+  /**
+   * Bumped by reset()/destroy() to cancel an in-flight startup. A late `seeked`
+   * or a resolved play() from a superseded generation must never start playback.
+   */
+  private startupGeneration = 0;
+
+  /** Removes the in-flight positioning listener + timer, whatever the outcome. */
+  private startupCleanup: (() => void) | null = null;
+
+  /** Settles the in-flight positioning promise (cancellation path). */
+  private startupSettle: ((outcome: PositionOutcome) => void) | null = null;
+
+  /** How many startup appends per media type carry a debug range log. */
+  private static readonly STARTUP_DIAG_COUNT = 5;
+  private diagVideoAppends = 0;
+  private diagAudioAppends = 0;
 
   /**
    * Back-pressure queues — only for SourceBuffer.updating serialization.
@@ -270,6 +577,28 @@ export class MseMediaSource implements MediaSourceLike {
   private readonly videoTimelines = new Map<string, TimelineIndex>();
   private readonly audioTimelines = new Map<string, TimelineIndex>();
 
+  /**
+   * Diagnostic CHRONOLOGY state — deliberately not ownership.
+   *
+   * MSE queues `bufferedchange` and `updateend` independently, with no
+   * guaranteed relative order (§buffer-append), so deciding which operation
+   * caused a buffered change would encode the very ordering assumption the log
+   * exists to test. Records are emitted append-only with a monotonic sequence
+   * number; `inflight`/`lastDone` appear as chronological context only.
+   */
+  private diagSeq = 0;
+  private opSeq = 0;
+  /** Generation of the current SourceBuffer set; bumped on reset/destroy. */
+  private bufferGen = 0;
+  /** In-flight op per media type — a SourceBuffer serializes to at most one. */
+  private readonly inFlightOp: {
+    video: { id: number; cause: BufferOpCause; errored?: boolean } | null;
+    audio: { id: number; cause: BufferOpCause; errored?: boolean } | null;
+  } = { video: null, audio: null };
+  /** Most recently completed op id per media type, for after-the-fact context. */
+  private readonly lastCompletedOp: { video: number | null; audio: number | null } =
+    { video: null, audio: null };
+
   /** trex defaults from the init segment, per media type. */
   private videoTrex: TrexDefaults | undefined;
   private audioTrex: TrexDefaults | undefined;
@@ -328,24 +657,53 @@ export class MseMediaSource implements MediaSourceLike {
     this.maxAheadSec = options.maxAheadSec ?? 15;
     this.targetAheadSec = options.targetAheadSec ?? 2;
 
-    // Safari iOS (iPhone) only supports ManagedMediaSource, not MediaSource.
-    // iPad and desktop Safari support both. Prefer ManagedMediaSource when
-    // available — it has better battery behavior and is the only option on iPhone.
+    // Capability-based selection, no user-agent sniffing. Safari iOS (iPhone)
+    // exposes only ManagedMediaSource; iPad and desktop Safari expose both;
+    // other browsers typically expose only standard MediaSource.
+    //
+    // Default (`auto`) prefers ManagedMediaSource where available: better power
+    // behavior, and the only implementation iPhone-class Safari ships. The
+    // explicit `standard` / `managed` preferences exist for investigation —
+    // notably to separate the implementation from the attachment path below.
     const MMS = (globalThis as any).ManagedMediaSource as typeof MediaSource | undefined;
     const MS = typeof MediaSource !== 'undefined' ? MediaSource : undefined;
-    const MSConstructor = MMS ?? MS;
+    const preferStandard = options.mseImplementation === 'standard';
+    const MSConstructor = preferStandard ? (MS ?? MMS) : (MMS ?? MS);
     if (!MSConstructor) {
       throw new Error('Neither MediaSource nor ManagedMediaSource is available');
     }
+    // Managed only when the chosen constructor IS the ManagedMediaSource one.
+    const usingManaged = MMS !== undefined && MSConstructor === MMS;
+    this.selectedImplementation = usingManaged ? 'managed' : 'standard';
+    this.implementationRequested = options.mseImplementation ?? 'auto';
     this.ms = new MSConstructor();
 
-    if (MMS) {
-      // ManagedMediaSource: attach via srcObject, require disableRemotePlayback
-      this.video.disableRemotePlayback = true;
+    // Attachment is INDEPENDENT of the implementation. `auto` keeps the
+    // historical pairing (standard → object URL, managed → srcObject); an
+    // explicit mode is honored for either implementation, or throws.
+    this.attachmentRequested = options.mseAttachment ?? 'auto';
+    const attachment: MseAttachment = this.attachmentRequested === 'auto'
+      ? (usingManaged ? 'src-object' : 'object-url')
+      : this.attachmentRequested;
+    this.selectedAttachment = attachment;
+
+    // ManagedMediaSource requires remote playback to be disabled (Safari 17.1
+    // exposes MMS only with an AirPlay alternative or remote playback disabled),
+    // so this holds for BOTH managed attachment modes.
+    if (usingManaged) this.video.disableRemotePlayback = true;
+
+    if (attachment === 'src-object') {
+      if (!('srcObject' in this.video)) {
+        // Never silently fall back: a fallback would make the experiment this
+        // option exists for report a mode it did not actually use.
+        throw new Error('mseAttachment "src-object" requested but HTMLMediaElement.srcObject is unavailable');
+      }
       (this.video as any).srcObject = this.ms;
       this.objectUrl = null;
     } else {
-      // Standard MediaSource: attach via object URL
+      if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
+        throw new Error('mseAttachment "object-url" requested but URL.createObjectURL is unavailable');
+      }
       this.objectUrl = URL.createObjectURL(this.ms);
       this.video.src = this.objectUrl;
     }
@@ -370,6 +728,14 @@ export class MseMediaSource implements MediaSourceLike {
     audio?: { codec: string; initData: Uint8Array };
   }): boolean {
     if (this.initialized) return true;
+
+    // Logged here rather than in the constructor: `debug` is assigned by the
+    // caller after construction, so a constructor-time log would never print.
+    this.logDebug(
+      '[MSE] config: implementation=%s (requested %s) attachment=%s (requested %s) disableRemotePlayback=%s',
+      this.selectedImplementation, this.implementationRequested,
+      this.selectedAttachment, this.attachmentRequested,
+      String((this.video as { disableRemotePlayback?: boolean }).disableRemotePlayback === true));
 
     // Bootstrap validation — ALL-OR-NOTHING, BEFORE latching. A partially
     // initialized MediaSource (one good SourceBuffer, one rejected) would
@@ -415,14 +781,7 @@ export class MseMediaSource implements MediaSourceLike {
           this.logDebug('[MSE] Creating video SourceBuffer:', mimeType);
           this.videoBuffer = this.ms.addSourceBuffer(mimeType);
           this.videoBuffer.mode = 'segments';
-          this.videoBuffer.addEventListener('error', () => {
-            const e = this.video.error;
-            this.appendErrored.video = true;
-            this.pendingVideoRanges = [];
-            this.dumpRingOnFailure('video SourceBuffer error');
-            this.onError?.(new Error(`Video SourceBuffer error (code=${e?.code}, ${e?.message ?? 'unknown'})`));
-          });
-          this.videoBuffer.addEventListener('updateend', () => this.handleUpdateEnd('video'));
+          this.wireBufferLifecycle('video', this.videoBuffer);
           if (config.video.initData.byteLength > 0) {
             const videoInit = filterInitSegment(config.video.initData, 'vide');
             const boxes = describeBoxes(videoInit);
@@ -436,7 +795,8 @@ export class MseMediaSource implements MediaSourceLike {
             const trexMap = readTrexDefaults(videoInit);
             const first = trexMap.values().next();
             if (!first.done) this.videoTrex = first.value;
-            this.videoBuffer.appendBuffer(videoInit.buffer as ArrayBuffer);
+            const vb = this.videoBuffer;
+            this.runMutation('video', 'init-append', () => vb.appendBuffer(videoInit.buffer as ArrayBuffer));
           }
         }
 
@@ -445,14 +805,7 @@ export class MseMediaSource implements MediaSourceLike {
           this.logDebug('[MSE] Creating audio SourceBuffer:', mimeType);
           this.audioBuffer = this.ms.addSourceBuffer(mimeType);
           this.audioBuffer.mode = 'segments';
-          this.audioBuffer.addEventListener('error', () => {
-            const e = this.video.error;
-            this.appendErrored.audio = true;
-            this.pendingAudioRanges = [];
-            this.dumpRingOnFailure('audio SourceBuffer error');
-            this.onError?.(new Error(`Audio SourceBuffer error (code=${e?.code}, ${e?.message ?? 'unknown'})`));
-          });
-          this.audioBuffer.addEventListener('updateend', () => this.handleUpdateEnd('audio'));
+          this.wireBufferLifecycle('audio', this.audioBuffer);
           if (config.audio.initData.byteLength > 0) {
             const audioInit = filterInitSegment(config.audio.initData, 'soun');
             const boxes = describeBoxes(audioInit);
@@ -463,7 +816,8 @@ export class MseMediaSource implements MediaSourceLike {
             const trexMap = readTrexDefaults(audioInit);
             const first = trexMap.values().next();
             if (!first.done) this.audioTrex = first.value;
-            this.audioBuffer.appendBuffer(audioInit.buffer as ArrayBuffer);
+            const ab = this.audioBuffer;
+            this.runMutation('audio', 'init-append', () => ab.appendBuffer(audioInit.buffer as ArrayBuffer));
           }
         }
       } catch (err) {
@@ -594,7 +948,7 @@ export class MseMediaSource implements MediaSourceLike {
       // Append the new init segment and wait for it to commit. Done
       // outside doAppend because init segments carry no tfdt/trun and
       // must skip the timeline-overlap path.
-      buffer.appendBuffer(filtered.buffer as ArrayBuffer);
+      this.runMutation(mediaType, 'init-append', () => buffer.appendBuffer(filtered.buffer as ArrayBuffer));
       await this.waitForBufferEvent(buffer);
 
       // Refresh trex defaults — codec family change generally means a
@@ -632,10 +986,9 @@ export class MseMediaSource implements MediaSourceLike {
     this.drainQueue(mediaType);
 
     // changeType() can pause the video element (browser behavior varies).
-    // Re-trigger play to ensure playback resumes after the codec switch.
-    if (this.playTriggered && this.video.paused) {
-      this.video.play().catch(() => { /* autoplay policy */ });
-    }
+    // Re-trigger play through the owned lifecycle so a late codec switch cannot
+    // restart a player that has been paused (intent withdrawn) or destroyed.
+    this.resumePlayback();
   }
 
   /**
@@ -678,6 +1031,9 @@ export class MseMediaSource implements MediaSourceLike {
 
   endOfStream(): void {
     if (this.ms.readyState === 'open') {
+      // Recorded because endOfStream() mutates the buffered state and can
+      // itself produce a `bufferedchange`.
+      this.diag('endOfStream');
       try { this.ms.endOfStream(); } catch { /* already ended */ }
     }
   }
@@ -720,6 +1076,15 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   reset(): void {
+    // Cancel any in-flight startup FIRST: a late seeked/play from the
+    // superseded generation must not resurrect playback against new buffers.
+    this.cancelStartup();
+    this.diag('reset (buffer generation %d → %d)', this.bufferGen, this.bufferGen + 1);
+    this.bufferGen++;
+    // New session: stale facts must never join a later summary.
+    this.startupFacts = { session: this.bufferGen, startPosition: null, seekOutcome: null, playTimeSec: null };
+    this.startupReported = false;
+    this.cancelBufferOps('reset');
     try {
       if (this.videoBuffer && !this.videoBuffer.updating) {
         this.ms.removeSourceBuffer(this.videoBuffer);
@@ -756,7 +1121,9 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   destroy(): void {
+    this.diag('destroy');
     this.destroyed = true;
+    this.cancelStartup();
     if (this.wedgeTimer !== null) {
       clearInterval(this.wedgeTimer);
       this.wedgeTimer = null;
@@ -813,38 +1180,11 @@ export class MseMediaSource implements MediaSourceLike {
       const triggerHere = hasVideoTrack
         ? mediaType === 'video'
         : mediaType === 'audio';
-      if (
-        triggerHere &&
-        !this.playTriggered &&
-        this.video.buffered.length > 0
-      ) {
-        let bestStart = this.video.buffered.start(0);
-        let bestDuration = this.video.buffered.end(0) - bestStart;
-        for (let i = 1; i < this.video.buffered.length; i++) {
-          const start = this.video.buffered.start(i);
-          const dur = this.video.buffered.end(i) - start;
-          if (dur > bestDuration) {
-            bestStart = start;
-            bestDuration = dur;
-          }
-        }
-        if (this.video.currentTime < bestStart || this.video.currentTime >= bestStart + bestDuration) {
-          this.video.currentTime = bestStart;
-        }
-        // Try unmuted first; if autoplay policy rejects, mute and retry.
-        // Set playTriggered only after play succeeds — rejected play must
-        // be retried on the next drainQueue cycle.
-        this.video.play().then(() => {
-          this.playTriggered = true;
-          this.startWedgeWatchdog();
-        }).catch(() => {
-          this.video.muted = true;
-          this.video.play().then(() => {
-            this.playTriggered = true;
-            this.startWedgeWatchdog();
-          }).catch(() => { /* truly blocked — user must interact */ });
-        });
-      }
+      // Eligibility only — the startup transaction itself is owned by
+      // requestStartup(), which is idempotent and cancellable.
+      // requestStartup() never rejects; the catch is belt-and-braces so a
+      // fire-and-forget call can never surface as an unhandled rejection.
+      if (triggerHere) void this.requestStartup().catch(() => { /* contained */ });
       return;
     }
 
@@ -893,13 +1233,474 @@ export class MseMediaSource implements MediaSourceLike {
     // so we don't churn a remove() per append.
     if (evictBefore - start < 1) return false;
     try {
-      buffer.remove(start, evictBefore);
+      this.runMutation(mediaType, 'back-buffer-remove', () => buffer.remove(start, evictBefore));
       this.logDebug('[MSE] evict %s back-buffer [%s, %s)', mediaType, start.toFixed(2), evictBefore.toFixed(2));
       return true;
     } catch (err) {
       this.logWarn('[MSE] back-buffer evict failed (%s): %s', mediaType, (err as Error).message);
       return false;
     }
+  }
+
+  /** Emit one append-only diagnostic record with a monotonic sequence number. */
+  private diag(msg: string, ...args: unknown[]): void {
+    if (!this.debug) return;
+    this.logDebug(`[MSE] #%d ${msg}`, ++this.diagSeq, ...args);
+  }
+
+  /**
+   * Record the START of an app-initiated mutation. Returns the operation id.
+   * This asserts only that we began the operation — NOT that any particular
+   * later event belongs to it.
+   */
+  private markBufferOp(mediaType: 'video' | 'audio', cause: BufferOpCause): number {
+    const id = ++this.opSeq;
+    this.inFlightOp[mediaType] = { id, cause };
+    this.diag('mutation-start op=%d %s %s', id, mediaType, cause);
+    return id;
+  }
+
+  /**
+   * Run an app-initiated SourceBuffer mutation with chronology bookkeeping.
+   *
+   * Every stamped operation reaches exactly one terminal record:
+   *   - `mutation-sync-failure` when the call throws synchronously (no async
+   *     completion will follow),
+   *   - `mutation-cancelled` when reset()/destroy() supersedes the buffer before
+   *     completion (its late `updateend` is ignored as superseded), or
+   *   - `updateend` otherwise — including a FAILED append, where MSE §5.5.3
+   *     queues `error` and then `updateend`, so the error is an intermediate
+   *     record and `updateend op=N error` is terminal.
+   * The original exception is rethrown so existing recovery paths (quota
+   * evict/retry, error surfacing) behave exactly as before.
+   */
+  private runMutation(
+    mediaType: 'video' | 'audio', cause: BufferOpCause, mutate: () => void,
+  ): number {
+    const id = this.markBufferOp(mediaType, cause);
+    try {
+      mutate();
+    } catch (err) {
+      this.failBufferOp(mediaType, id, err);
+      throw err;
+    }
+    return id;
+  }
+
+  /**
+   * Cancel any in-flight operations, recording each as terminally cancelled.
+   * The buffers they targeted are superseded, so their eventual `updateend`
+   * arrives with no current operation — without this record the chronology
+   * would show an operation that simply stops.
+   */
+  private cancelBufferOps(reason: string): void {
+    for (const mediaType of ['video', 'audio'] as const) {
+      const op = this.inFlightOp[mediaType];
+      if (!op) continue;
+      this.inFlightOp[mediaType] = null;
+      this.diag('mutation-cancelled op=%d %s %s reason=%s', op.id, mediaType, op.cause, reason);
+    }
+  }
+
+  /** Record that a mutation threw synchronously, so no completion will follow. */
+  private failBufferOp(mediaType: 'video' | 'audio', id: number, err: unknown): void {
+    if (this.inFlightOp[mediaType]?.id === id) this.inFlightOp[mediaType] = null;
+    this.diag('mutation-sync-failure op=%d %s: %s', id, mediaType,
+      err instanceof Error ? err.message : String(err));
+  }
+
+  // ─── ManagedSourceBuffer observation (diagnostics only) ──────────
+
+  /**
+   * Report buffer changes. OBSERVATION ONLY — nothing here changes append or
+   * drop behavior.
+   *
+   * `bufferedchange` fires for appendBuffer(), for explicit remove(), AND for
+   * the user agent's own memory cleanup (MSE
+   * §dom-managedsourcebuffer-onbufferedchange), and MSE queues it independently
+   * of `updateend` with no guaranteed relative order. Nothing here decides which
+   * operation caused a change: `inflight` and `lastDone` are CHRONOLOGICAL
+   * CONTEXT only — an operation we started and have not seen complete, and the
+   * most recently completed one. (Standard `SourceBuffer` can also evict coded
+   * frames during an append; what it lacks is MMS's autonomous cleanup and this
+   * event.)
+   *
+   * `BufferedChangeEvent` carries the EXACT `addedRanges` / `removedRanges`, so
+   * both are logged verbatim rather than inferred from aggregate coverage — an
+   * aggregate can hide a removal behind a larger addition in the same event.
+   *
+   * TIMELINE CAVEAT: these ranges are PRESENTATION time in seconds, while the
+   * overlap-drop log reports DECODE time in the track's timescale ticks. Without
+   * the track timescale, the SourceBuffer's timestampOffset, and any composition
+   * offsets, the two are not numerically comparable — do not equate them.
+   * Conclusions drawn from these logs must rest on chronology and on repeated
+   * (mediaType, trackName, groupId) identity, not on matching numbers.
+   *
+   * The open question this exists to answer: when a range leaves the buffer, is
+   * the same object ever delivered again? Playa has NO eviction-triggered
+   * retrieval path — nothing re-requests evicted media — so unless redelivery
+   * happens for some other reason (resubscription, replay), an eviction leaves a
+   * hole that append-side bookkeeping cannot repair. The drop log below shows
+   * whether any redelivered data is being discarded at all.
+   */
+  /**
+   * Wire the completion + observation listeners for a SourceBuffer, capturing
+   * its identity and generation. `reset()` bumps the generation but can leave an
+   * UPDATING old buffer attached, whose late `updateend` would otherwise
+   * complete an operation on, commit pending ranges into, and drain the queue of
+   * the REPLACEMENT buffer. Guarding on identity keeps a superseded buffer's
+   * events observational only.
+   */
+  private wireBufferLifecycle(mediaType: 'video' | 'audio', buffer: SourceBuffer): void {
+    const gen = this.bufferGen;
+    // error, updateend and bufferedchange are wired together so identity and
+    // generation handling cannot drift apart between them.
+    buffer.addEventListener('error', () => {
+      if (this.isSuperseded(mediaType, buffer, gen)) {
+        this.diag('sourcebuffer-error %s SUPERSEDED (gen %d, current %d) — ignored',
+          mediaType, gen, this.bufferGen);
+        return;
+      }
+      // MSE §5.5.3 queues `error` and THEN `updateend` for a failed append, so
+      // the operation is NOT finished here — mark it errored and let updateend
+      // remain its terminal event, carrying the same id.
+      const failing = this.inFlightOp[mediaType];
+      if (failing) failing.errored = true;
+      this.diag('sourcebuffer-error %s op=%s', mediaType, failing ? String(failing.id) : 'none');
+      const e = this.video.error;
+      this.appendErrored[mediaType] = true;
+      if (mediaType === 'video') this.pendingVideoRanges = [];
+      else this.pendingAudioRanges = [];
+      this.dumpRingOnFailure(`${mediaType} SourceBuffer error`);
+      const label = mediaType === 'video' ? 'Video' : 'Audio';
+      this.onError?.(new Error(`${label} SourceBuffer error (code=${e?.code}, ${e?.message ?? 'unknown'})`));
+    });
+    buffer.addEventListener('updateend', () => {
+      if (this.isSuperseded(mediaType, buffer, gen)) {
+        this.diag('updateend %s SUPERSEDED (gen %d, current %d) — ignored', mediaType, gen, this.bufferGen);
+        return;
+      }
+      this.handleUpdateEnd(mediaType);
+    });
+    this.watchBufferedChange(mediaType, buffer, gen);
+  }
+
+  /** Whether an event came from a SourceBuffer that reset()/destroy() replaced. */
+  private isSuperseded(mediaType: 'video' | 'audio', buffer: SourceBuffer, gen: number): boolean {
+    const current = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
+    return gen !== this.bufferGen || buffer !== current;
+  }
+
+  private watchBufferedChange(mediaType: 'video' | 'audio', buffer: SourceBuffer, gen: number): void {
+    buffer.addEventListener('bufferedchange', (event?: Event) => {
+      if (!this.debug || this.destroyed) return;
+      // The range payload is optional defensively: a UA (or a harness) may fire
+      // the event without it, and a diagnostic must never throw.
+      const e = event as (Event & { addedRanges?: TimeRanges; removedRanges?: TimeRanges }) | undefined;
+      // CHRONOLOGICAL CONTEXT ONLY. `inflight` is an operation we started
+      // and have not seen complete; `lastDone` is the most recently completed
+      // one. Which (if either) caused this change is exactly what the log is
+      // meant to reveal, so it is not asserted here.
+      const inflight = this.inFlightOp[mediaType];
+      const superseded = this.isSuperseded(mediaType, buffer, gen);
+      this.diag('bufferedchange %s%s inflight=%s lastDone=%s added=[%s] removed=[%s] now=[%s]',
+        mediaType, superseded ? ' (SUPERSEDED buffer)' : '',
+        inflight ? `${inflight.id}/${inflight.cause}` : 'none',
+        this.lastCompletedOp[mediaType] ?? 'none',
+        fmtRanges(e?.addedRanges), fmtRanges(e?.removedRanges), fmtRanges(safeBuffered(buffer)));
+    });
+  }
+
+  // ─── Startup transaction: position, then play ────────────────────
+  //
+  // Assigning `currentTime` begins an ASYNCHRONOUS seek. Calling play()
+  // on the next statement races that seek — the element can begin playout
+  // while positioning is still unresolved. Modelling startup as an owned,
+  // cancellable transaction removes that race and makes cancellation
+  // well-defined. This is independent positioning/cancellation hardening; it
+  // is NOT a fix for any particular browser's synchronization behavior.
+
+  /**
+   * Pick the start position: the START of the LONGEST buffered range, not
+   * simply `buffered.start(0)`. Tuning in at a CRA-led entry whose leading
+   * RASLs we strip can leave a stub range like [0, 0.07s] separated from the
+   * real content at [1.5s, …]; seeking to 0 would strand playback in the
+   * 2-frame stub. The longest range is also correct for normal streams (one
+   * big range from t=0) and live tune-ins (the latest gap-free run).
+   */
+  private selectStartPosition(): { start: number; duration: number } | null {
+    const buffered = this.video.buffered;
+    if (buffered.length === 0) return null;
+    let start = buffered.start(0);
+    let duration = buffered.end(0) - start;
+    for (let i = 1; i < buffered.length; i++) {
+      const s = buffered.start(i);
+      const d = buffered.end(i) - s;
+      if (d > duration) { start = s; duration = d; }
+    }
+    return { start, duration };
+  }
+
+  /**
+   * Request playback startup. Idempotent: returns immediately unless the
+   * lifecycle is `idle`, so any number of `updateend`-driven drains during an
+   * outstanding seek still produce exactly ONE seek and ONE play attempt.
+   *
+   * NEVER REJECTS — it is invoked fire-and-forget from `drainQueue`, so every
+   * failure path (including a throwing `onError`) is contained here.
+   */
+  private async requestStartup(): Promise<void> {
+    try {
+      // Buffering continues regardless; only STARTUP waits for intent.
+      if (this.destroyed || !this.playbackIntent || this.playTriggered || this.startupPhase !== 'idle') return;
+      const position = this.selectStartPosition();
+      if (position === null) return;
+
+      const generation = this.startupGeneration;
+      // Bind every fact this attempt records to the session it started in.
+      const facts = this.startupFacts;
+      const { start, duration } = position;
+      const needsSeek = this.video.currentTime < start
+        || this.video.currentTime >= start + duration;
+
+      // INVARIANT: never play while the element is still seeking.
+      //
+      // Assigning `currentTime` updates it SYNCHRONOUSLY even though the seek
+      // completes later. So after a seek that timed out unresolved, currentTime
+      // already equals the target and `needsSeek` is false — a later drain would
+      // sail past positioning and play straight into the unresolved seek,
+      // recreating the exact race this transaction exists to remove. Waiting on
+      // `seeking` (without issuing a second seek) closes that door: only a
+      // genuine settlement, or a timeout that proves the element is idle AT the
+      // target, may start playback.
+      const elementSeeking = this.video.seeking === true;
+      if (!needsSeek && !elementSeeking) {
+        this.recordStartupFact(facts, { startPosition: start, seekOutcome: 'no-seek-needed' });
+        this.startupPhase = 'play-pending';
+        await this.attemptPlay(generation, facts);
+        return;
+      }
+
+      this.startupPhase = 'positioning';
+      this.recordStartupFact(facts, { startPosition: start });
+      this.logDebug('[MSE] startup: positioning currentTime=%s → target=%s (seek=%s, seeking=%s)',
+        this.video.currentTime.toFixed(3), start.toFixed(3), String(needsSeek), String(elementSeeking));
+
+      let outcome: PositionOutcome;
+      try {
+        outcome = await this.awaitPositioned(start, generation, needsSeek);
+      } catch (err) {
+        // Positioning never settled. Do NOT play into an unresolved seek —
+        // surface it and return to idle so a later drain can retry (which will
+        // re-await settlement, per the invariant above).
+        if (generation !== this.startupGeneration || this.destroyed) return;
+        this.startupPhase = 'idle';
+        // Retriable: recorded, not emitted (a later attempt may still succeed).
+        this.recordStartupFact(facts, { seekOutcome: 'seek-timeout-unsettled' });
+        this.logWarn('[MSE] startup: %s', (err as Error).message);
+        this.safeOnError(err as Error);
+        return;
+      }
+      // `cancelled` means reset()/destroy() superseded this attempt; the phase
+      // was already returned to idle by cancelStartup().
+      if (outcome === 'cancelled') {
+        this.recordStartupFact(facts, { seekOutcome: 'cancelled' });
+        return;
+      }
+      this.recordStartupFact(facts, {
+        seekOutcome: outcome === 'timeout-accepted' ? 'seek-timeout-accepted' : 'seek-settled',
+      });
+      if (generation !== this.startupGeneration || this.destroyed) return;
+
+      this.startupPhase = 'play-pending';
+      await this.attemptPlay(generation, facts);
+    } catch (err) {
+      // Last-resort containment: this method is called fire-and-forget, so an
+      // unexpected throw (e.g. a failing `buffered` accessor or a throwing
+      // currentTime setter) must not surface as an unhandled rejection. It is
+      // still REPORTED — silently swallowing a startup failure would hide a
+      // player that never starts — with the consumer contained by safeOnError.
+      if (this.startupPhase !== 'started') this.startupPhase = 'idle';
+      const error = err instanceof Error ? err : new Error(String(err));
+      this.logWarn('[MSE] startup: unexpected failure: %s', error.message);
+      this.safeOnError(error);
+    }
+  }
+
+  /** Invoke onError without letting a throwing consumer escape startup. */
+  private safeOnError(err: Error): void {
+    try {
+      this.onError?.(err);
+    } catch {
+      /* a throwing consumer must not break the startup lifecycle */
+    }
+  }
+
+  /**
+   * Wait until the element is positioned at `target`.
+   *
+   * When `assign` is true this issues the seek; when false it only waits for an
+   * already-outstanding seek to settle (the timed-out-retry path — issuing a
+   * second seek there would restart the very operation we are waiting on).
+   *
+   * The `seeked` listener is installed BEFORE `currentTime` is assigned, so a
+   * browser that completes the seek synchronously cannot slip through. The
+   * bounded timeout resolves only when the element is no longer seeking AND
+   * landed within tolerance of the target; otherwise it rejects rather than
+   * letting playback start against an unresolved position. Listener and timer
+   * are removed on every outcome — settlement, timeout, and cancellation.
+   */
+  private awaitPositioned(target: number, generation: number, assign: boolean): Promise<PositionOutcome> {
+    return new Promise<PositionOutcome>((resolve, reject) => {
+      let done = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const cleanup = (): void => {
+        if (done) return;
+        done = true;
+        this.video.removeEventListener('seeked', onSeeked);
+        if (timer !== null) { clearTimeout(timer); timer = null; }
+        if (this.startupCleanup === cleanup) this.startupCleanup = null;
+        if (this.startupSettle === settle) this.startupSettle = null;
+      };
+      const onSeeked = (): void => {
+        if (done) return;
+        // Same postcondition as the timeout path: a `seeked` only releases
+        // startup if it actually left the element idle AT the target. A
+        // superseding seek elsewhere (user scrub, recovery jump) fires `seeked`
+        // too, and must not be mistaken for our positioning completing —
+        // otherwise play() starts at the wrong position. A non-matching event
+        // is IGNORED rather than treated as failure; the bounded timeout
+        // remains the backstop, so this can never wait forever.
+        if (this.video.seeking === true
+          || Math.abs(this.video.currentTime - target) > STARTUP_SEEK_TOLERANCE_SEC) {
+          this.logDebug('[MSE] startup: ignoring seeked at %s (target %s, seeking=%s)',
+            this.video.currentTime.toFixed(3), target.toFixed(3), String(this.video.seeking === true));
+          return;
+        }
+        cleanup();
+        this.logDebug('[MSE] startup: seeked settled at %s (target %s)',
+          this.video.currentTime.toFixed(3), target.toFixed(3));
+        resolve('settled');
+      };
+      /** Cancellation entry point — settles the promise instead of orphaning it. */
+      const settle = (outcome: PositionOutcome): void => {
+        if (done) return;
+        cleanup();
+        resolve(outcome);
+      };
+
+      this.video.addEventListener('seeked', onSeeked);
+      timer = setTimeout(() => {
+        if (done) return;
+        const stillSeeking = this.video.seeking === true;
+        const landed = Math.abs(this.video.currentTime - target) <= STARTUP_SEEK_TOLERANCE_SEC;
+        const superseded = generation !== this.startupGeneration || this.destroyed;
+        cleanup();
+        this.logDebug('[MSE] startup: seek timeout after %dms — seeking=%s currentTime=%s target=%s',
+          STARTUP_SEEK_TIMEOUT_MS, String(stillSeeking), this.video.currentTime.toFixed(3), target.toFixed(3));
+        if (superseded) { resolve('cancelled'); return; }
+        if (!stillSeeking && landed) resolve('timeout-accepted');
+        else reject(new Error(
+          `startup seek to ${target.toFixed(3)} did not settle within ${STARTUP_SEEK_TIMEOUT_MS}ms `
+          + `(seeking=${stillSeeking}, currentTime=${this.video.currentTime.toFixed(3)})`));
+      }, STARTUP_SEEK_TIMEOUT_MS);
+
+      this.startupCleanup = cleanup;
+      this.startupSettle = settle;
+      // Assign LAST: the listener and timeout are already armed. A setter that
+      // throws must not leave them armed behind a rejected promise — clean up
+      // both, clear the transaction hooks, and reject exactly once so the next
+      // drain starts from a clean slate.
+      try {
+        if (assign) this.video.currentTime = target;
+      } catch (err) {
+        cleanup();
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
+  /**
+   * Is the attempt identified by `generation` still the one the adapter wants?
+   *
+   * A superseded generation, a destroyed adapter, and withdrawn playback intent
+   * are all equivalent here: none of them may result in a playing element.
+   */
+  private startupLive(generation: number): boolean {
+    return generation === this.startupGeneration && !this.destroyed && this.playbackIntent;
+  }
+
+  /**
+   * THE single place playback is started on the element.
+   *
+   * `video.play()` resolves asynchronously, and the element is playing by the
+   * time it resolves. So a pause/destroy that happens WHILE the promise is
+   * pending cannot be honored by invalidating internal state alone — that would
+   * leave the element audibly playing with the adapter believing it is not.
+   * Every start therefore re-checks liveness on resolution and pauses the
+   * element when the attempt is no longer wanted.
+   *
+   * Returns true when playback legitimately started; false when the attempt was
+   * superseded (and any playback it caused has been undone). Rejection is left
+   * to the caller so the autoplay ladder can retry muted.
+   */
+  private async playElement(generation: number): Promise<boolean> {
+    await this.video.play();
+    if (this.startupLive(generation)) return true;
+    // Withdrawn/destroyed while the promise was pending: the element started
+    // anyway. Undo it — this is the late-playback hole a generation check alone
+    // cannot close.
+    if (this.video.paused === false) this.video.pause();
+    return false;
+  }
+
+  /**
+   * Play, preserving the established autoplay ladder: unmuted first, muted
+   * retry when policy rejects. A truly blocked attempt returns the lifecycle to
+   * `idle` so the next drain retries — unchanged from the previous behavior.
+   */
+  private async attemptPlay(generation: number, facts: MutableStartupFacts): Promise<void> {
+    const live = (): boolean => this.startupLive(generation);
+    try {
+      if (!await this.playElement(generation)) return;
+    } catch {
+      if (!live()) return;
+      this.video.muted = true;
+      try {
+        if (!await this.playElement(generation)) return;
+      } catch {
+        if (live()) {
+          this.startupPhase = 'idle'; // truly blocked — user must interact
+          this.recordStartupFact(facts, { seekOutcome: 'autoplay-blocked' });
+        }
+        return;
+      }
+    }
+    this.playTriggered = true;
+    this.startupPhase = 'started';
+    this.recordStartupFact(facts, { playTimeSec: this.video.currentTime });
+    this.logDebug('[MSE] startup: play() started at %s', this.video.currentTime.toFixed(3));
+    // Success: positioning AND play have completed, so the facts are final.
+    // The recorded outcome is always a success variant on this path.
+    this.reportStartupSucceeded(
+      (this.startupFacts.seekOutcome as MseStartupSuccess | null) ?? 'seek-settled');
+    this.startWedgeWatchdog();
+  }
+
+  /**
+   * Cancel any in-flight startup. Bumping the generation invalidates a late
+   * `seeked` or a play() that resolves afterwards, and the pending positioning
+   * promise is SETTLED (not orphaned) with a `cancelled` outcome so its awaiter
+   * unwinds instead of hanging forever.
+   */
+  private cancelStartup(): void {
+    this.startupGeneration++;
+    const settle = this.startupSettle;
+    this.startupSettle = null;
+    if (settle) settle('cancelled'); // settles + cleans up
+    else this.startupCleanup?.();
+    this.startupCleanup = null;
+    this.startupPhase = 'idle';
   }
 
   // ─── Playhead-wedge watchdog ─────────────────────────────────────
@@ -1001,7 +1802,10 @@ export class MseMediaSource implements MediaSourceLike {
       }
       case 2: // pause/play pulse
         v.pause();
-        void v.play().catch(() => { /* autoplay policy — rung 3 follows */ });
+        // Through the owned lifecycle, not a bare v.play(): the pulse's play
+        // promise is pending across turns, so a pause/destroy landing in that
+        // window must still leave the element paused.
+        this.resumeElement();
         break;
       case 3: { // live-edge seek within the containing range
         const target = Math.max(ct, ct + aheadSec - this.targetAheadSec);
@@ -1122,10 +1926,15 @@ export class MseMediaSource implements MediaSourceLike {
     if (ranges !== null && ranges.length > 0 && timeline) {
       const overlap = ranges.find((r) => timeline.overlaps(r.startTime, r.endTime));
       if (overlap !== undefined) {
+        // Logged with group id and the exact decode range so an eviction can be
+        // correlated against a later drop of the SAME range — the evidence
+        // needed before any residency/refill policy is designed.
         this.logWarn(
-          `[MSE] drop overlapping ${mediaType} payload on track "${trackName}": ranges=${ranges
+          `[MSE] drop overlapping ${mediaType} payload on track "${trackName}" `
+          + `group=${groupId ?? 'n/a'}: ranges=${ranges
             .map((r) => `[${r.startTime}-${r.endTime})`)
-            .join(',')} timeline=${timeline.toString()}`,
+            .join(',')} overlaps=[${overlap.startTime}-${overlap.endTime}) `
+          + `timeline=${timeline.toString()} buffered=[${fmtRanges(safeBuffered(buffer))}]`,
         );
         return;
       }
@@ -1156,8 +1965,9 @@ export class MseMediaSource implements MediaSourceLike {
     }
 
     try {
-      buffer.appendBuffer(data.buffer as ArrayBuffer);
+      this.runMutation(mediaType, 'append', () => buffer.appendBuffer(data.buffer as ArrayBuffer));
     } catch (err) {
+      // runMutation already recorded mutation-sync-failure.
       // Synchronous throw — the append never happened. Clear pending
       // so updateend (which may or may not fire) doesn't commit it.
       if (mediaType === 'video') {
@@ -1221,7 +2031,8 @@ export class MseMediaSource implements MediaSourceLike {
         queue.unshift(groupId !== undefined ? { data, trackName, groupId } : { data, trackName });
         try {
           this.logWarn('[MSE] quota exceeded (%s) — evicting [%s, %s) and retrying', mediaType, start.toFixed(2), evictBefore.toFixed(2));
-          buffer.remove(start, evictBefore); // updateend → drainQueue → retry
+          // updateend → drainQueue → retry
+          this.runMutation(mediaType, 'quota-remove', () => buffer.remove(start, evictBefore));
           return;
         } catch { /* fall through to flush */ }
       }
@@ -1248,7 +2059,8 @@ export class MseMediaSource implements MediaSourceLike {
       try {
         if (b.updating || b.buffered.length === 0) continue;
         // FINITE range: first buffered start → last buffered end.
-        b.remove(b.buffered.start(0), b.buffered.end(b.buffered.length - 1));
+        this.runMutation(label, 'quota-flush',
+          () => b.remove(b.buffered.start(0), b.buffered.end(b.buffered.length - 1)));
       } catch (err) {
         this.logWarn('[MSE] flush remove failed (%s): %s', label, (err as Error).message);
       }
@@ -1260,6 +2072,40 @@ export class MseMediaSource implements MediaSourceLike {
    * fired for this append, then drains the next queued append.
    */
   private handleUpdateEnd(mediaType: 'video' | 'audio'): void {
+    // Chronology record: which operation just completed. Deliberately does NOT
+    // claim ownership of any bufferedchange — the two events are queued
+    // independently and may arrive in either order.
+    const completing = this.inFlightOp[mediaType];
+    if (completing) {
+      this.inFlightOp[mediaType] = null;
+      this.lastCompletedOp[mediaType] = completing.id;
+    }
+    // `updateend` is the terminal event even for a failed append (MSE §5.5.3
+    // queues error then updateend), so the id survives and the outcome is
+    // recorded alongside it.
+    this.diag('updateend %s op=%s%s', mediaType,
+      completing ? String(completing.id) : 'none', completing?.errored ? ' error' : '');
+    // Startup buffered-range diagnostic (debug-only, first N appends per media
+    // type). The element's own `buffered` is the INTERSECTION of both
+    // SourceBuffers, so per-buffer ranges are the only way to see the two
+    // timelines separately — which is exactly what an A/V skew report needs.
+    if (this.debug) {
+      const seen = mediaType === 'video' ? this.diagVideoAppends : this.diagAudioAppends;
+      if (seen < MseMediaSource.STARTUP_DIAG_COUNT) {
+        if (mediaType === 'video') this.diagVideoAppends++; else this.diagAudioAppends++;
+        const fmt = (sb: SourceBuffer | null): string => {
+          if (!sb) return 'none';
+          try {
+            const b = sb.buffered;
+            return b.length === 0 ? '(empty)' : Array.from({ length: b.length },
+              (_, i) => `${b.start(i).toFixed(2)}-${b.end(i).toFixed(2)}`).join(',');
+          } catch { return '(unreadable)'; }
+        };
+        this.logDebug('[MSE] startup#%d append %s done — video=[%s] audio=[%s] currentTime=%s',
+          seen + 1, mediaType, fmt(this.videoBuffer), fmt(this.audioBuffer), this.video.currentTime.toFixed(2));
+      }
+    }
+
     if (!this.appendErrored[mediaType]) {
       const pending =
         mediaType === 'video' ? this.pendingVideoRanges : this.pendingAudioRanges;

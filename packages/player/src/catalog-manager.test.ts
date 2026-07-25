@@ -272,3 +272,102 @@ describe('CatalogManager', () => {
     expect(mgr.objectCount).toBe(2);
   });
 });
+
+// ─── MSF-01 / CMSF-01 root-field materialization ──────────────────────
+
+const B64_INIT = btoa('\0\0\0\x18ftyp');
+
+/** A CMSF-01 catalog: string version, root initDataList + contentProtections. */
+const CMSF01_JSON = JSON.stringify({
+  version: '1',
+  tracks: [
+    {
+      name: 'video', packaging: 'cmaf', isLive: true, role: 'video',
+      codec: 'avc1.640028', initRef: 'init-video', contentProtectionRefIDs: ['1'],
+    },
+  ],
+  initDataList: [{ id: 'init-video', type: 'inline', data: B64_INIT }],
+  contentProtections: [{
+    refID: '1', defaultKID: ['01234567-89ab-cdef-0123-456789abcdef'], scheme: 'cbcs',
+    drmSystem: { systemID: 'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed', pssh: 'AAAB' },
+  }],
+});
+
+describe('CatalogManager — MSF-01/CMSF-01 root fields survive materialization', () => {
+  it('preserves root initDataList through processCatalogObject (not dropped)', () => {
+    const mgr = new CatalogManager('live/broadcast');
+    const state = mgr.processCatalogObject(new TextEncoder().encode(CMSF01_JSON));
+    expect(state.initDataList).toEqual([{ id: 'init-video', type: 'inline', data: B64_INIT }]);
+    // The per-track initRef survives too, so the player can resolve it.
+    expect(state.tracks[0]!.initRef).toBe('init-video');
+  });
+
+  it('preserves root contentProtections and per-track contentProtectionRefIDs (metadata only)', () => {
+    const mgr = new CatalogManager('live/broadcast');
+    const state = mgr.processCatalogObject(new TextEncoder().encode(CMSF01_JSON));
+    expect(state.contentProtections).toHaveLength(1);
+    expect(state.contentProtections![0]!.refID).toBe('1');
+    expect(state.contentProtections![0]!.drmSystem.systemID).toBe('edef8ba9-79d6-4ace-a3c8-27dcd51d21ed');
+    expect(state.tracks[0]!.contentProtectionRefIDs).toEqual(['1']);
+  });
+
+  it('leaves MSF-00 catalogs without the new root fields (byte/behavior compatible)', () => {
+    const mgr = new CatalogManager('live/broadcast');
+    const state = mgr.processCatalogObject(new TextEncoder().encode(CATALOG_JSON));
+    expect('initDataList' in state).toBe(false);
+    expect('contentProtections' in state).toBe(false);
+    expect('publishTracks' in state).toBe(false);
+  });
+});
+
+// ─── MSF-01 op-array delta application ────────────────────────────────
+
+const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
+
+describe('CatalogManager — MSF-01 op-array delta application', () => {
+  it('applies an op-array add after an MSF-01 catalog: the track appears, root fields survive', () => {
+    const mgr = new CatalogManager('live/broadcast');
+    mgr.processCatalogObject(new TextEncoder().encode(CMSF01_JSON));
+    const state = mgr.processCatalogObject(enc({
+      deltaUpdate: [{ op: 'add', tracks: [{ name: 'video-720', packaging: 'cmaf', isLive: true, role: 'video', codec: 'avc1.640028', initRef: 'init-video' }] }],
+    }));
+    expect(state.tracks.map((t) => t.name)).toContain('video-720');
+    // Root initDataList / contentProtections carried forward, so the delta-added
+    // track's initRef still resolves.
+    expect(state.initDataList).toHaveLength(1);
+    expect(state.contentProtections).toHaveLength(1);
+    expect(state.tracks.find((t) => t.name === 'video-720')!.initRef).toBe('init-video');
+    expect(mgr.objectCount).toBe(2);
+  });
+
+  it('applies an op-array remove without dropping root initDataList / contentProtections', () => {
+    const mgr = new CatalogManager('live/broadcast');
+    mgr.processCatalogObject(new TextEncoder().encode(CMSF01_JSON));
+    const state = mgr.processCatalogObject(enc({ deltaUpdate: [{ op: 'remove', tracks: [{ name: 'video' }] }] }));
+    expect(state.tracks).toHaveLength(0);
+    expect(state.initDataList).toHaveLength(1);
+    expect(state.contentProtections).toHaveLength(1);
+  });
+
+  it('rejects an op-array delta introducing a dangling initRef', () => {
+    const mgr = new CatalogManager('live/broadcast');
+    mgr.processCatalogObject(new TextEncoder().encode(CMSF01_JSON));
+    expect(() => mgr.processCatalogObject(enc({
+      deltaUpdate: [{ op: 'add', tracks: [{ name: 'bad', packaging: 'cmaf', isLive: true, initRef: 'nope' }] }],
+    }))).toThrow(/unknown initDataList/i);
+  });
+
+  it('rejects an op-array delta received before any base catalog (§9.1)', () => {
+    const mgr = new CatalogManager('live/broadcast');
+    expect(() => mgr.processCatalogObject(enc({ deltaUpdate: [{ op: 'add', tracks: [{ name: 'v', packaging: 'loc', isLive: true }] }] })))
+      .toThrow(/before initial catalog/i);
+  });
+
+  it('keeps dialect separation: deltaUpdate:true still routes to the MSF-00 grouped path', () => {
+    const mgr = new CatalogManager('live/broadcast');
+    mgr.processCatalogObject(new TextEncoder().encode(CATALOG_JSON));
+    const state = mgr.processCatalogObject(new TextEncoder().encode(DELTA_ADD_JSON));
+    // MSF-00 grouped add still works and did not go through the op-array path.
+    expect(state.tracks.map((t) => t.name)).toContain('video-low');
+  });
+});

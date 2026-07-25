@@ -1,0 +1,11 @@
+{
+  "extends": "../../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // rootDir is the repo root: bmff-exec deep-imports packages/browser/src/mp4-box.ts
+    // (test infra), which sits outside this package's src.
+    "rootDir": "../../..",
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

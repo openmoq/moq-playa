@@ -46,15 +46,22 @@ interface BoundedBox {
 }
 
 /**
- * Iterate child boxes fully contained by both their parent and the buffer.
- * Once a malformed size is encountered, later sibling offsets are untrusted.
+ * Iterate the child boxes in `data[start, end)`, bounding `end` to the buffer.
+ * Yields ONLY boxes fully contained within `[start, min(end, data.length))` — a
+ * box whose declared size is `< 8`, or overruns the container / buffer, STOPS the
+ * walk (a length that can't be trusted can't be used to find the next box).
+ *
+ * This is the single containment-checked walker every box reader should use, so
+ * no reader can escape its box, its parent, or the buffer into a sibling. Future
+ * fixed-layout readers (e.g. mdhd) MUST descend through this rather than
+ * validating offsets against the backing buffer alone.
  */
 function* boundedBoxes(data: Uint8Array, start: number, end: number): Generator<BoundedBox> {
   const limit = Math.min(end, data.byteLength);
   let pos = start;
   while (pos >= 0 && pos + 8 <= limit) {
     const size = boxSize(data, pos);
-    if (size < 8 || pos + size > limit) return;
+    if (size < 8 || pos + size > limit) return; // malformed / overruns container
     yield { type: boxType(data, pos), start: pos, size, bodyStart: pos + 8, end: pos + size };
     pos += size;
   }
@@ -253,28 +260,27 @@ export function findTfdtOffset(moof: Uint8Array): { offset: number; version: num
   // moof is the entire box including header
   if (moof.byteLength < 8 || boxType(moof, 0) !== 'moof') return null;
 
-  const moofEnd = boxSize(moof, 0);
-  let pos = 8; // skip moof header
-
-  while (pos + 8 <= moofEnd) {
-    const size = boxSize(moof, pos);
-    if (size < 8) break;
-
-    if (boxType(moof, pos) === 'traf') {
-      // Search inside traf for tfdt
-      let trafPos = pos + 8;
-      const trafEnd = pos + size;
-      while (trafPos + 8 <= trafEnd) {
-        const tSize = boxSize(moof, trafPos);
-        if (tSize < 8) break;
-        if (boxType(moof, trafPos) === 'tfdt') {
-          const version = moof[trafPos + 8]!; // version byte
-          return { offset: trafPos, version };
-        }
-        trafPos += tSize;
-      }
+  // The top-level moof must itself be fully present: a moof declaring more bytes
+  // than the buffer holds is truncated, and boundedBoxes would only clamp `end`
+  // to the buffer — so validate the declared size against the buffer here before
+  // trusting any child offset.
+  const moofSize = boxSize(moof, 0);
+  if (moofSize < 8 || moofSize > moof.byteLength) return null;
+  for (const traf of boundedBoxes(moof, 8, moofSize)) {
+    if (traf.type !== 'traf') continue;
+    for (const tfdt of boundedBoxes(moof, traf.bodyStart, traf.end)) {
+      if (tfdt.type !== 'tfdt') continue;
+      // fullbox: version(1) + flags(3) + baseMediaDecodeTime(4 for v0, 8 for v1).
+      // The DECLARED tfdt box must be large enough to hold version + value (v0 ≥16
+      // bytes, v1 ≥20); any other version is rejected. boundedBoxes already
+      // guarantees the whole box is within traf → moof → buffer, so the value read
+      // in readBaseMediaDecodeTime can never spill into the following sibling box.
+      if (tfdt.size < 12) return null; // no version byte
+      const version = moof[tfdt.bodyStart]!;
+      const need = version === 0 ? 16 : version === 1 ? 20 : 0;
+      if (need === 0 || tfdt.size < need) return null;
+      return { offset: tfdt.start, version };
     }
-    pos += size;
   }
   return null;
 }
@@ -291,6 +297,11 @@ export function readBaseMediaDecodeTime(moof: Uint8Array): bigint | null {
   const view = new DataView(moof.buffer, moof.byteOffset, moof.byteLength);
   // tfdt layout: size(4) + type(4) + version(1) + flags(3) + baseMediaDecodeTime(4 or 8)
   const valueOffset = tfdt.offset + 12; // after box header (8) + fullbox header (4)
+
+  // A truncated tfdt (declared size too small to hold the value) must not read
+  // past the buffer — return null instead of throwing, keeping the parse total.
+  const valueBytes = tfdt.version === 0 ? 4 : 8;
+  if (valueOffset + valueBytes > moof.byteLength) return null;
 
   if (tfdt.version === 0) {
     return BigInt(view.getUint32(valueOffset));
@@ -312,6 +323,10 @@ export function patchBaseMediaDecodeTime(moof: Uint8Array, newValue: bigint): vo
 
   const view = new DataView(moof.buffer, moof.byteOffset, moof.byteLength);
   const valueOffset = tfdt.offset + 12;
+  // findTfdtOffset validates the declared box holds the value, but guard the
+  // write defensively so a malformed moof can never overwrite a sibling box.
+  const valueBytes = tfdt.version === 0 ? 4 : 8;
+  if (valueOffset + valueBytes > moof.byteLength) return;
 
   if (tfdt.version === 0) {
     view.setUint32(valueOffset, Number(newValue));
@@ -640,59 +655,35 @@ export function readSegmentTimeRanges(
 export function readTrexDefaults(initSegment: Uint8Array): Map<number, TrexDefaults> {
   const result = new Map<number, TrexDefaults>();
 
-  let pos = 0;
-  while (pos + 8 <= initSegment.byteLength) {
-    const type = boxType(initSegment, pos);
-    const size = boxSize(initSegment, pos);
-    if (size < 8) break;
-    if (type !== 'moov') {
-      pos += size;
-      continue;
-    }
-
-    // Walk moov for mvex.
-    const moovEnd = pos + size;
-    let mpos = pos + 8;
-    while (mpos + 8 <= moovEnd) {
-      const ms = boxSize(initSegment, mpos);
-      if (ms < 8) break;
-      if (boxType(initSegment, mpos) !== 'mvex') {
-        mpos += ms;
-        continue;
+  // Descend moov → mvex → trex through the containment-checked walker, so a trex
+  // declaring a size past its mvex (or the buffer) is never read — it can't
+  // fabricate fields from a following sibling box.
+  for (const moov of boundedBoxes(initSegment, 0, initSegment.byteLength)) {
+    if (moov.type !== 'moov') continue;
+    for (const mvex of boundedBoxes(initSegment, moov.bodyStart, moov.end)) {
+      if (mvex.type !== 'mvex') continue;
+      for (const trex of boundedBoxes(initSegment, mvex.bodyStart, mvex.end)) {
+        // A trex needs 32 bytes for the fixed fields we read. boundedBoxes has
+        // already proven the whole declared box fits mvex → moov → buffer, so the
+        // reads below stay inside the box.
+        if (trex.type !== 'trex' || trex.size < 32) continue;
+        const view = new DataView(initSegment.buffer, initSegment.byteOffset + trex.start, 32);
+        // trex layout (after box header + version+flags):
+        //   track_ID(4) + default_sample_description_index(4)
+        //   + default_sample_duration(4) + default_sample_size(4)
+        //   + default_sample_flags(4)
+        const trackId = view.getUint32(12);
+        const defaultSampleDuration = view.getUint32(20);
+        const defaultSampleSize = view.getUint32(24);
+        const defaultSampleFlags = view.getUint32(28);
+        result.set(trackId, {
+          trackId,
+          defaultSampleDuration,
+          defaultSampleSize,
+          defaultSampleFlags,
+        });
       }
-
-      // Walk mvex for trex.
-      const mvexEnd = mpos + ms;
-      let tpos = mpos + 8;
-      while (tpos + 8 <= mvexEnd) {
-        const ts = boxSize(initSegment, tpos);
-        if (ts < 8) break;
-        if (boxType(initSegment, tpos) === 'trex' && ts >= 32) {
-          const view = new DataView(
-            initSegment.buffer,
-            initSegment.byteOffset + tpos,
-            ts,
-          );
-          // trex layout (after box header + version+flags):
-          //   track_ID(4) + default_sample_description_index(4)
-          //   + default_sample_duration(4) + default_sample_size(4)
-          //   + default_sample_flags(4)
-          const trackId = view.getUint32(12);
-          const defaultSampleDuration = view.getUint32(20);
-          const defaultSampleSize = view.getUint32(24);
-          const defaultSampleFlags = view.getUint32(28);
-          result.set(trackId, {
-            trackId,
-            defaultSampleDuration,
-            defaultSampleSize,
-            defaultSampleFlags,
-          });
-        }
-        tpos += ts;
-      }
-      mpos += ms;
     }
-    pos += size;
   }
 
   return result;

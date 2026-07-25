@@ -16,6 +16,17 @@ import type { MoqtConnection } from '@moqt/webtransport';
 import type { LoadedFixture, LoadedTrack } from './fixture.js';
 import { analyzeLoopSpan, rebaseTfdtCopy } from './cmaf-loop-rebase.js';
 
+/**
+ * Catalog wire shape to emit:
+ *  - `msf-00`  (default): numeric `version: 1`, inline per-track base64 `initData`.
+ *  - `cmsf-01`: string `version: "1"`, a root `initDataList`, and per-track
+ *    `initRef` (the modern MSF-01/CMSF-01 init-by-reference form Playa resolves).
+ */
+export type CatalogFormat = 'msf-00' | 'cmsf-01';
+
+/** Root initDataList entry id for a track (cmsf-01 mode). */
+const initEntryId = (trackName: string) => `${trackName}-init`;
+
 const log = (...a: unknown[]) => console.log('[publisher]', ...a);
 const te = new TextEncoder();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -84,25 +95,59 @@ async function publishObjects(
   log(`published ${track}: ${objects.length} object(s) (alias=${alias})`);
 }
 
-/** Map fixture metadata → MSF catalog bytes (init segments ride as base64 initData). */
-export function buildFixtureCatalog(fixture: LoadedFixture): Uint8Array {
-  return buildCatalog({
-    tracks: fixture.tracks.map((t: LoadedTrack) => ({
-      name: t.meta.name,
-      packaging: t.meta.packaging,
-      isLive: true,
-      role: t.meta.role,
-      codec: t.meta.codec,
-      renderGroup: fixture.manifest.renderGroup,
-      initData: Buffer.from(t.initData).toString('base64'),
-      ...(t.meta.width !== undefined ? { width: t.meta.width } : {}),
-      ...(t.meta.height !== undefined ? { height: t.meta.height } : {}),
-      ...(t.meta.framerate !== undefined ? { framerate: t.meta.framerate } : {}),
-      ...(t.meta.bitrate !== undefined ? { bitrate: t.meta.bitrate } : {}),
-      ...(t.meta.samplerate !== undefined ? { samplerate: t.meta.samplerate } : {}),
-      ...(t.meta.channelConfig !== undefined ? { channelConfig: t.meta.channelConfig } : {}),
-    })),
+/**
+ * Map fixture metadata → MSF catalog bytes. In `msf-00` mode each init segment
+ * rides inline as base64 `initData`; in `cmsf-01` mode the init segments become a
+ * root `initDataList` and tracks reference them by `initRef` (no per-track inline
+ * init). Both are built with the same @moqt/msf `buildCatalog`.
+ */
+export function buildFixtureCatalog(fixture: LoadedFixture, format: CatalogFormat = 'msf-00'): Uint8Array {
+  const common = (t: LoadedTrack) => ({
+    name: t.meta.name,
+    packaging: t.meta.packaging,
+    isLive: true as const,
+    role: t.meta.role,
+    codec: t.meta.codec,
+    renderGroup: fixture.manifest.renderGroup,
+    ...(t.meta.width !== undefined ? { width: t.meta.width } : {}),
+    ...(t.meta.height !== undefined ? { height: t.meta.height } : {}),
+    ...(t.meta.framerate !== undefined ? { framerate: t.meta.framerate } : {}),
+    ...(t.meta.bitrate !== undefined ? { bitrate: t.meta.bitrate } : {}),
+    ...(t.meta.samplerate !== undefined ? { samplerate: t.meta.samplerate } : {}),
+    ...(t.meta.channelConfig !== undefined ? { channelConfig: t.meta.channelConfig } : {}),
   });
+
+  if (format === 'cmsf-01') {
+    return buildCatalog({
+      version: '1',
+      initDataList: fixture.tracks.map((t) => ({
+        id: initEntryId(t.meta.name), type: 'inline', data: Buffer.from(t.initData).toString('base64'),
+      })),
+      tracks: fixture.tracks.map((t) => ({ ...common(t), initRef: initEntryId(t.meta.name) })),
+    });
+  }
+
+  return buildCatalog({
+    tracks: fixture.tracks.map((t) => ({ ...common(t), initData: Buffer.from(t.initData).toString('base64') })),
+  });
+}
+
+/**
+ * Build an MSF-01 op-array catalog delta (§5.3) that clones the primary video
+ * track into an alternate (`<name>-alt`, its own altGroup), reusing the parent's
+ * init source — so it is reference-safe against the already-published catalog and
+ * exercises Playa's live delta application. Returns null if there is no video
+ * track to clone. The clone is a catalog-level demo: no media is published for it.
+ */
+export function buildFixtureDelta(fixture: LoadedFixture): Uint8Array | null {
+  const video = fixture.tracks.find((t) => t.meta.role === 'video');
+  if (!video) return null;
+  const delta = {
+    deltaUpdate: [
+      { op: 'clone', tracks: [{ parentName: video.meta.name, name: `${video.meta.name}-alt`, altGroup: 9 }] },
+    ],
+  };
+  return new TextEncoder().encode(JSON.stringify(delta));
 }
 
 /**
@@ -117,15 +162,31 @@ export function buildFixtureCatalog(fixture: LoadedFixture): Uint8Array {
 export async function publishFixture(
   conn: MoqtConnection,
   fixture: LoadedFixture,
-  opts: { paceMs?: number; loops?: number } = {},
+  opts: { paceMs?: number; loops?: number; catalogFormat?: CatalogFormat; deltaAfterMs?: number } = {},
 ): Promise<void> {
   const paceMs = opts.paceMs ?? 0;
   const loops = opts.loops ?? 1;
+  const catalogFormat = opts.catalogFormat ?? 'msf-00';
   const ns = fixture.manifest.namespace;
+  const deltaBytes = opts.deltaAfterMs !== undefined ? buildFixtureDelta(fixture) : null;
+  if (opts.deltaAfterMs !== undefined && deltaBytes === null) {
+    throw new Error('cannot emit catalog delta: fixture has no video track to clone');
+  }
 
-  const catalogBytes = buildFixtureCatalog(fixture);
-  log(`catalog built: ${catalogBytes.byteLength} bytes, ${fixture.tracks.length} tracks`);
+  const catalogBytes = buildFixtureCatalog(fixture, catalogFormat);
+  log(`catalog built: ${catalogBytes.byteLength} bytes, ${fixture.tracks.length} tracks (${catalogFormat})`);
   await publishObjects(conn, ns, CATALOG_TRACK_NAME, 10n, [catalogBytes], 0);
+
+  // Optional live op-array delta: after `deltaAfterMs`, publish a catalog
+  // delta as a NEW group on the already-established catalog track. Fire-and-await
+  // at the end for finite runs; in an endless loop it fires on its own timer.
+  const deltaTask = deltaBytes
+    ? (async () => {
+        await sleep(opts.deltaAfterMs!);
+        await sendGroup(conn, 10n, 1n, [deltaBytes], 0);
+        log(`published op-array catalog delta after ${opts.deltaAfterMs}ms (catalog group 1)`);
+      })()
+    : null;
 
   if (loops === 1) {
     // One-shot (unchanged behavior): each track established + group 0 sent.
@@ -133,6 +194,7 @@ export async function publishFixture(
     for (const t of fixture.tracks) {
       await publishObjects(conn, ns, t.meta.name, alias++, t.chunks, paceMs);
     }
+    if (deltaTask) await deltaTask; // finite run: don't exit before the delta lands
     log('fixture fully published');
     return;
   }
@@ -168,5 +230,6 @@ export async function publishFixture(
     }));
     log(`group ${g} sent on ${handles.length} track(s)`);
   }
+  if (deltaTask) await deltaTask; // finite loop count: ensure the delta landed
   log('loop publishing finished');
 }

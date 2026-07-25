@@ -10,6 +10,8 @@
  * @module
  */
 
+import { assertFiniteBuilderInput } from './catalog-validate.js';
+
 /** Track definition for catalog construction. */
 export interface CatalogBuilderTrack {
   /** Track name (unique within namespace). @see §5.1.11 */
@@ -36,13 +38,37 @@ export interface CatalogBuilderTrack {
   readonly channelConfig?: string;
   /** Render group for A/V sync. @see §5.1.18 */
   readonly renderGroup?: number;
-  /** Base64-encoded initialization data. @see §5.1.20 */
+  /** Base64-encoded initialization data (MSF-00 inline form). @see §5.1.20 */
   readonly initData?: string;
+  /** Reference to a root {@link BuildCatalogOptions.initDataList} id (MSF-01 init-by-reference). @see draft-ietf-moq-msf-01 §5.2.13 */
+  readonly initRef?: string;
+}
+
+/** A root Initialization Data List entry (MSF-01 §5.1.7). `data` is opaque base64. */
+export interface CatalogBuilderInitDataEntry {
+  readonly id: string;
+  /** This spec revision defines only "inline". @see draft-ietf-moq-msf-01 §5.1.7 */
+  readonly type: string;
+  readonly data: string;
 }
 
 /** Options for buildCatalog. */
 export interface BuildCatalogOptions {
   readonly tracks: readonly CatalogBuilderTrack[];
+  /**
+   * Catalog version to emit. `1` (default) writes the numeric MSF-00 form; the
+   * string `"1"` writes the MSF-01/CMSF-01 form, which a compliant parser reads
+   * identically but which pairs with the init-by-reference fields below.
+   * @see draft-ietf-moq-msf-00 §5.1.1 / draft-ietf-moq-msf-01 §5.1.1
+   */
+  readonly version?: 1 | '1';
+  /**
+   * Root Initialization Data List (MSF-01/CMSF-01). When present it is emitted at
+   * the catalog root and tracks reference entries by `initRef` instead of
+   * carrying inline `initData`.
+   * @see draft-ietf-moq-msf-01 §5.1.7
+   */
+  readonly initDataList?: readonly CatalogBuilderInitDataEntry[];
 }
 
 /**
@@ -54,7 +80,7 @@ export interface BuildCatalogOptions {
  */
 export function buildCatalog(options: BuildCatalogOptions): Uint8Array {
   const catalog: Record<string, unknown> = {
-    version: 1,
+    version: options.version ?? 1,
   };
 
   const tracks: Record<string, unknown>[] = [];
@@ -75,10 +101,21 @@ export function buildCatalog(options: BuildCatalogOptions): Uint8Array {
     if (t.channelConfig !== undefined) track.channelConfig = t.channelConfig;
     if (t.renderGroup !== undefined) track.renderGroup = t.renderGroup;
     if (t.initData !== undefined) track.initData = t.initData;
+    if (t.initRef !== undefined) track.initRef = t.initRef;
     tracks.push(track);
   }
 
   catalog.tracks = tracks;
+
+  // MSF-01/CMSF-01 root Initialization Data List (§5.1.7), emitted after tracks
+  // so verbose init blobs sit toward the end of the document.
+  if (options.initDataList !== undefined) {
+    catalog.initDataList = options.initDataList.map((e) => ({ id: e.id, type: e.type, data: e.data }));
+  }
+
+  // `JSON.stringify(Infinity)` is `"null"`, so a non-finite numeric field would
+  // be silently emitted as `null` in the payload. Reject before serializing.
+  assertFiniteBuilderInput(catalog);
 
   return new TextEncoder().encode(JSON.stringify(catalog));
 }

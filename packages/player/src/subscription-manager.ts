@@ -17,7 +17,7 @@
 
 import type { MoqtObject } from '@moqt/transport';
 import type { LocHeaders, LocHeaderOptions } from '@moqt/loc';
-import { parseLocHeaders } from '@moqt/loc';
+import { parseLocHeaders, locWireProfileForDraft } from '@moqt/loc';
 import type { DraftVersion } from '@moqt/transport';
 
 /**
@@ -49,14 +49,17 @@ export class SubscriptionManager {
   objectTransform: ((obj: MoqtObject) => MoqtObject | null | Promise<MoqtObject | null>) | null = null;
 
   /**
-   * Draft version — controls KVP encoding mode for extension headers.
+   * Draft version — selects the LOC property wire profile for extension headers.
    *
-   * Draft-14 §1.4.2: absolute type IDs.
-   * Draft-16 §1.4.2: delta-encoded type IDs.
+   * Draft-14 §1.4.2: absolute QUIC-varint type IDs.
+   * Draft-16 §1.4.2: delta-encoded QUIC-varint type IDs.
+   * Draft-18 §1.4.1/§1.4.3: delta-encoded vi64 (diverges from QUIC at value 64).
    *
-   * When set, parseLocHeaders() receives `{ deltaEncoded: draftVersion !== 14 }`.
+   * When set, parseLocHeaders() receives the matching `wireProfile`; unset keeps
+   * the draft-16 default.
    * @see draft-ietf-moq-transport-14 §1.4.2
    * @see draft-ietf-moq-transport-16 §1.4.2
+   * @see draft-ietf-moq-transport-18 §1.4.1, §1.4.3
    */
   draftVersion: DraftVersion | undefined;
 
@@ -143,7 +146,10 @@ export class SubscriptionManager {
    * UNSUBSCRIBE any subscription [...] for that Track from that publisher,
    * and SHOULD deliver an error to the application."
    *
-   * Called with (trackAlias, mediaType, trackName, error).
+   * Called with (trackAlias, mediaType, trackName, error, sourceConnection).
+   * `sourceConnection` is the (opaque) connection that delivered the malformed
+   * object, echoed so recovery (UNSUBSCRIBE) targets the SOURCE session — during
+   * a migration `this.connection` already points at the replacement.
    * @see draft-ietf-moq-transport-16 §2.4.2
    */
   onMalformedTrack:
@@ -152,6 +158,7 @@ export class SubscriptionManager {
         mediaType: 'video' | 'audio',
         trackName: string,
         error: Error,
+        sourceConnection?: unknown,
       ) => void)
     | null = null;
 
@@ -215,10 +222,21 @@ export class SubscriptionManager {
    * @see draft-ietf-moq-cmsf-00 §3.3 (CMAF Object Packaging)
    * @see draft-ietf-moq-msf-00 §8 (Event Timeline track)
    */
-  async routeObject(_streamId: bigint, obj: MoqtObject): Promise<void> {
+  async routeObject(_streamId: bigint, obj: MoqtObject, sourceDraft?: DraftVersion, sourceConnection?: unknown): Promise<void> {
     const alias = BigInt(obj.trackAlias);
     const info = this.tracks.get(alias);
     if (!info) return; // Unknown track alias — silently ignore
+
+    // Bind the LOC wire profile to the draft of the SOURCE connection that
+    // delivered this object, captured BEFORE any transform await. A cross-draft
+    // migration mutates the shared this.draftVersion while the old session may
+    // still deliver objects; reading it after the await (or without a per-object
+    // source) would re-profile a late draft-16 object as draft-18. Callers that
+    // only ever route current-session objects omit sourceDraft and fall back to
+    // the manager default. The source connection is captured likewise so a
+    // malformed old-session object recovers against ITS session, not the current.
+    const draft = sourceDraft ?? this.draftVersion;
+    const source = sourceConnection;
 
     try {
       // §7: Mediatimeline objects bypass E2EE transform — metadata is not encrypted.
@@ -264,24 +282,32 @@ export class SubscriptionManager {
       } else {
         // LOC path: parse extension headers and route to PlaybackPipeline
         const extensions = transformed.kind === 'data' ? transformed.extensions : undefined;
-        // Version-aware KVP encoding: draft-14 uses absolute type IDs,
-        // draft-16 uses delta-encoded type IDs.
+        // Draft-aware property wire profile: draft-14 absolute QUIC-varint,
+        // draft-16 delta QUIC-varint, draft-18 delta vi64. draft-18's vi64 codec
+        // diverges from the QUIC varint at value 64, so it MUST be selected
+        // explicitly — deltaEncoded alone cannot express it. Unset draftVersion
+        // keeps today's draft-16 default.
         // @see draft-ietf-moq-transport-14 §1.4.2
         // @see draft-ietf-moq-transport-16 §1.4.2
+        // @see draft-ietf-moq-transport-18 §1.4.1, §1.4.3
         const opts: LocHeaderOptions | undefined =
-          this.draftVersion === 14 ? { deltaEncoded: false } : undefined;
+          draft !== undefined
+            ? { wireProfile: locWireProfileForDraft(draft) }
+            : undefined;
         const parse = this.extensionParser
           ?? ((ext: Uint8Array | undefined) => parseLocHeaders(ext, opts));
         const headers = parse(extensions);
         this.onObject?.(mediaType, info.trackName, transformed, headers);
       }
     } catch (error) {
-      // §2.4.2: Malformed Track — signal to player for UNSUBSCRIBE
+      // §2.4.2: Malformed Track — signal to player for UNSUBSCRIBE, tagged with
+      // the source session so recovery does not cancel a request on another.
       this.onMalformedTrack?.(
         alias,
         info.mediaType as 'video' | 'audio',
         info.trackName,
         error instanceof Error ? error : new Error(String(error)),
+        source,
       );
     }
   }

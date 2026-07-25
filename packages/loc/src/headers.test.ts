@@ -154,7 +154,7 @@ describe('parseLocHeaders', () => {
         ]);
         const headers = parseLocHeaders(bytes);
         expect(headers.unknown).toBeDefined();
-        expect(headers.unknown!.get(8)).toBe(42n);
+        expect(headers.unknown!.get(8n)).toBe(42n);
     });
 
     it('preserves unknown odd extension IDs (§2.3)', () => {
@@ -165,7 +165,7 @@ describe('parseLocHeaders', () => {
         ]);
         const headers = parseLocHeaders(bytes);
         expect(headers.unknown).toBeDefined();
-        expect(headers.unknown!.get(9)).toEqual(data);
+        expect(headers.unknown!.get(9n)).toEqual(data);
     });
 
     it('handles mix of known and unknown extensions (§2.3)', () => {
@@ -176,7 +176,7 @@ describe('parseLocHeaders', () => {
         const headers = parseLocHeaders(bytes);
         expect(headers.captureTimestamp).toBe(1000000n);
         expect(headers.unknown).toBeDefined();
-        expect(headers.unknown!.get(8)).toBe(99n);
+        expect(headers.unknown!.get(8n)).toBe(99n);
     });
 });
 

@@ -6,6 +6,7 @@
  */
 
 import type { CatalogDelta, CatalogState, CatalogTrack, RemoveTrackRef } from './types.js';
+import { assertFiniteCatalogDelta, assertFiniteCatalogNumbers } from './catalog-validate.js';
 
 /** Fields allowed in a removeTracks entry per §5.1.4. */
 const REMOVE_TRACK_ALLOWED_FIELDS = new Set<string>(['name', 'namespace']);
@@ -92,6 +93,11 @@ export function parseDeltaUpdate(
         ...(removeTracks ? { removeTracks } : {}),
         ...(cloneTracks ? { cloneTracks } : {}),
     };
+
+    // §5.1.6/§5.1.28…: a JSON overflow exponent parses to Infinity, which
+    // `typeof === 'number'` accepts. Reject the delta before returning it —
+    // callers use the parsed delta directly, they do not always apply it.
+    assertFiniteCatalogDelta(delta);
 
     return delta;
 }
@@ -183,13 +189,23 @@ export function applyCatalogUpdate(
 
     const generatedAt = delta.generatedAt ?? state.generatedAt;
 
-    return {
+    const next: CatalogState = {
         version: state.version,
         tracks,
         // §5.1.6: generatedAt from delta replaces base if present
         ...(generatedAt !== undefined ? { generatedAt } : {}),
         ...(state.isComplete !== undefined ? { isComplete: state.isComplete } : {}),
+        // MSF-01/CMSF-01 root fields carry forward unchanged: the MSF-00 delta
+        // dialect mutates only the track list, so dropping them here would strand
+        // every initRef / contentProtectionRefID against a now-missing root list.
+        ...(state.initDataList !== undefined ? { initDataList: state.initDataList } : {}),
+        ...(state.contentProtections !== undefined ? { contentProtections: state.contentProtections } : {}),
+        ...(state.publishTracks !== undefined ? { publishTracks: state.publishTracks } : {}),
     };
+    // A delta can introduce tracks / generatedAt with a non-finite number — reject
+    // the applied state on the same contract as a freshly-parsed catalog.
+    assertFiniteCatalogNumbers(next);
+    return next;
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────

@@ -44,6 +44,32 @@ export class TypedEmitter<M> {
     }
   }
 
+  /**
+   * Emit to EVERY listener even if one throws, then rethrow the first
+   * exception.
+   *
+   * `emit()` aborts on the first throwing listener, so the listeners after it
+   * never receive the event. That is acceptable for independent notifications
+   * but not for a sequence a listener must observe completely — one bad
+   * listener would silently censor the others. Callers that need every
+   * listener to see every event use this instead; the first exception still
+   * surfaces, just after delivery rather than instead of it.
+   */
+  emitIsolated<K extends keyof M>(event: K, data: M[K]): void {
+    const set = this.listeners.get(event);
+    if (!set) return;
+    let error: unknown;
+    let failed = false;
+    for (const fn of set) {
+      try {
+        fn(data);
+      } catch (err) {
+        if (!failed) { failed = true; error = err; }
+      }
+    }
+    if (failed) throw error;
+  }
+
   /** Remove all listeners for all events. */
   removeAllListeners(): void {
     this.listeners.clear();

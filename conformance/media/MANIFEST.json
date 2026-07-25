@@ -1,0 +1,10 @@
+{
+  "corpusSchema": "moq-media-corpus/1",
+  "domains": {
+    "bmff": 7,
+    "catalog": 55,
+    "loc": 32,
+    "properties": 33
+  },
+  "totalVectors": 127
+}

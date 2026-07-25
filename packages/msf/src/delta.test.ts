@@ -169,6 +169,43 @@ describe('parseDeltaUpdate', () => {
 
 // ─── applyCatalogUpdate tests ────────────────────────────────────────
 
+describe('applyCatalogUpdate — MSF-01/CMSF-01 root fields survive delta application', () => {
+    // A CMSF-01 catalog carrying root initDataList/contentProtections/publishTracks
+    // followed by an MSF-00 delta MUST keep those root fields — the delta only
+    // mutates the track list, and dropping them would strand every initRef.
+    const cmsfBase = (): CatalogState => ({
+        version: 1,
+        tracks: [{ name: 'video', packaging: 'cmaf', isLive: true, role: 'video', codec: 'avc1.640028', initRef: 'i1' }],
+        initDataList: [{ id: 'i1', type: 'inline', data: 'AAAB' }],
+        contentProtections: [{ refID: '1', defaultKID: ['kid'], scheme: 'cbcs', drmSystem: { systemID: 'sys' } }],
+        publishTracks: [{ name: 'up', packaging: 'loc', isLive: true }],
+    });
+
+    it('preserves initDataList / contentProtections / publishTracks across an addTracks delta', () => {
+        const result = applyCatalogUpdate(cmsfBase(), { deltaUpdate: true, addTracks: [{ name: 'slides', packaging: 'loc', isLive: true, role: 'video' }] });
+        expect(result.initDataList).toEqual([{ id: 'i1', type: 'inline', data: 'AAAB' }]);
+        expect(result.contentProtections).toHaveLength(1);
+        expect(result.contentProtections![0]!.refID).toBe('1');
+        expect(result.publishTracks).toHaveLength(1);
+        // The referenced track and its initRef remain resolvable after the delta.
+        expect(result.tracks.find((t) => t.name === 'video')!.initRef).toBe('i1');
+    });
+
+    it('preserves them across a removeTracks delta too', () => {
+        const result = applyCatalogUpdate(cmsfBase(), { deltaUpdate: true, removeTracks: [{ name: 'video' }] });
+        expect(result.tracks).toHaveLength(0);
+        expect(result.initDataList).toEqual([{ id: 'i1', type: 'inline', data: 'AAAB' }]);
+        expect(result.contentProtections).toHaveLength(1);
+    });
+
+    it('leaves an MSF-00 base state without the new root fields (backward compatible)', () => {
+        const result = applyCatalogUpdate(makeBaseState(), { deltaUpdate: true, addTracks: [{ name: 'x', packaging: 'loc', isLive: true }] }, 'live.example.com/broadcast');
+        expect('initDataList' in result).toBe(false);
+        expect('contentProtections' in result).toBe(false);
+        expect('publishTracks' in result).toBe(false);
+    });
+});
+
 describe('applyCatalogUpdate', () => {
     it('applies addTracks — adds new tracks to state', () => {
         const base = makeBaseState();

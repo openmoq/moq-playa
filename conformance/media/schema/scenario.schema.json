@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moq-playa/conformance/media/schema/scenario.schema.json",
+  "title": "moq-media-scenario/1",
+  "description": "Deterministic, implementation-neutral media scenario. Finalized in Slice -1; its runner lands in Slice 1. Steps are an ordered list; advanceTimeUs is the ONLY way virtual time moves. Traces preserve actual emission order. Wide integers are decimal strings. Every nested structure is exact-keyed (additionalProperties:false).",
+  "type": "object",
+  "required": ["scenarioSchema", "id", "description", "expectationBasis", "provenance", "input", "steps", "expect"],
+  "additionalProperties": false,
+  "$comment": "A non-regression scenario MUST carry shared conformance assertions; a per-implementation golden alone is regression-only evidence.",
+  "allOf": [
+    {
+      "if": { "properties": { "expectationBasis": { "enum": ["normative", "interpretation", "interop"] } } },
+      "then": { "properties": { "expect": { "required": ["assertions"] } } }
+    }
+  ],
+  "properties": {
+    "scenarioSchema": { "const": "moq-media-scenario/1" },
+    "id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)+$" },
+    "description": { "type": "string", "minLength": 1 },
+    "expectationBasis": { "enum": ["normative", "interpretation", "interop", "regression"] },
+    "provenance": { "$ref": "corpus-manifest.schema.json#/$defs/provenance" },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "catalogRef": { "type": "string", "minLength": 1 },
+        "presentation": { "$ref": "#/$defs/presentation" },
+        "subscriptions": { "type": "array", "items": { "$ref": "#/$defs/subscription" } }
+      },
+      "oneOf": [
+        { "required": ["catalogRef"], "not": { "required": ["presentation"] } },
+        { "required": ["presentation"], "not": { "required": ["catalogRef"] } }
+      ]
+    },
+    "steps": { "type": "array", "items": { "$ref": "#/$defs/step" } },
+    "expect": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "assertions": { "$ref": "#/$defs/assertions" },
+        "golden": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string", "minLength": 1 } }
+      }
+    }
+  },
+  "$defs": {
+    "wideInt": { "type": "string", "pattern": "^(?:0|[1-9][0-9]*)$" },
+    "int32": { "type": "integer", "minimum": 0, "maximum": 2147483647, "$comment": "small nonnegative count; larger values are decimal-string wide integers" },
+    "hex": { "type": "string", "pattern": "^(?:[0-9a-f]{2})*$" },
+    "neutralTrack": {
+      "type": "object",
+      "required": ["name", "kind", "packaging"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["audio", "video", "timeline", "metadata"] },
+        "locProfile": { "enum": ["loc-01", "loc-02", "loc-04"] },
+        "packaging": { "enum": ["loc", "cmaf", "m2ts", "mediatimeline", "eventtimeline"] },
+        "codec": { "type": "string" },
+        "timescale": { "$ref": "#/$defs/wideInt" }
+      },
+      "$comment": "locProfile is required for LOC packaging and forbidden otherwise (rejects e.g. packaging:cmaf with locProfile:loc-04).",
+      "if": { "properties": { "packaging": { "const": "loc" } } },
+      "then": { "required": ["locProfile"] },
+      "else": { "not": { "required": ["locProfile"] } }
+    },
+    "presentation": {
+      "type": "object",
+      "required": ["tracks"],
+      "additionalProperties": false,
+      "properties": { "tracks": { "type": "array", "items": { "$ref": "#/$defs/neutralTrack" } } }
+    },
+    "subscription": {
+      "type": "object",
+      "required": ["track"],
+      "additionalProperties": false,
+      "$comment": "No atUs: virtual time moves ONLY via the advanceTimeUs step. A delayed subscription is expressed as an ordered step, not a timestamp.",
+      "properties": { "track": { "type": "string" } }
+    },
+    "locProperty": {
+      "type": "object",
+      "required": ["id", "value"],
+      "additionalProperties": false,
+      "properties": { "id": { "$ref": "#/$defs/wideInt" }, "value": { "type": "string" } }
+    },
+    "payload": {
+      "oneOf": [
+        { "type": "object", "required": ["ref"], "additionalProperties": false, "properties": { "ref": { "type": "string" } } },
+        { "type": "object", "required": ["hex"], "additionalProperties": false, "properties": { "hex": { "$ref": "#/$defs/hex" } } },
+        { "type": "object", "required": ["synthetic"], "additionalProperties": false, "properties": { "synthetic": { "type": "object", "required": ["byteLength"], "additionalProperties": false, "properties": { "byteLength": { "$ref": "#/$defs/int32" }, "fill": { "$ref": "#/$defs/hex" } } } } }
+      ]
+    },
+    "event": {
+      "$comment": "An assertion event matcher: fields are optional (partial match) but exact-keyed per event kind — no arbitrary fields.",
+      "type": "object",
+      "required": ["ev"],
+      "oneOf": [
+        { "additionalProperties": false, "properties": { "ev": { "const": "planResult" }, "accepted": { "type": "boolean" }, "renderGroups": { "$ref": "#/$defs/int32" }, "reason": { "type": ["string", "null"] } } },
+        { "additionalProperties": false, "properties": { "ev": { "const": "streamAnnounce" }, "track": { "type": "string" }, "stream": { "type": "string" }, "kind": { "type": "string" } } },
+        { "additionalProperties": false, "properties": { "ev": { "const": "sinkConfigure" }, "stream": { "type": "string" }, "codec": { "type": "string" }, "descriptionSha256": { "type": ["string", "null"] } } },
+        { "additionalProperties": false, "properties": { "ev": { "const": "sinkDecode" }, "stream": { "type": "string" }, "ticks": { "$ref": "#/$defs/wideInt" }, "timescale": { "$ref": "#/$defs/wideInt" }, "key": { "type": "boolean" }, "byteLength": { "$ref": "#/$defs/int32" }, "payloadSha256": { "type": "string" } } },
+        { "additionalProperties": false, "properties": { "ev": { "const": "sinkInit" }, "mediaType": { "type": "string" } } },
+        { "additionalProperties": false, "properties": { "ev": { "const": "sinkAppend" }, "mediaType": { "type": "string" }, "track": { "type": "string" }, "group": { "$ref": "#/$defs/wideInt" }, "byteLength": { "$ref": "#/$defs/int32" } } },
+        { "additionalProperties": false, "properties": { "ev": { "const": "timingReport" }, "label": { "type": "string" }, "presentedTicks": { "$ref": "#/$defs/wideInt" }, "timescale": { "$ref": "#/$defs/wideInt" }, "lateUs": { "$ref": "#/$defs/wideInt" } } },
+        { "additionalProperties": false, "properties": { "ev": { "const": "warning" }, "category": { "type": "string" } } },
+        { "additionalProperties": false, "properties": { "ev": { "const": "error" }, "category": { "type": "string" } } },
+        { "additionalProperties": false, "properties": { "ev": { "const": "recovery" }, "action": { "type": "string" } } },
+        { "additionalProperties": false, "properties": { "ev": { "const": "gauge" }, "name": { "type": "string" }, "value": { "$ref": "#/$defs/wideInt" } } }
+      ]
+    },
+    "assertions": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "streams": { "type": "object", "additionalProperties": { "type": "object", "required": ["sinkSequence"], "additionalProperties": false, "properties": { "sinkSequence": { "type": "array", "items": { "$ref": "#/$defs/event" } } } } },
+        "events": { "type": "object", "additionalProperties": false, "properties": { "required": { "type": "array", "items": { "$ref": "#/$defs/event" } }, "forbidden": { "type": "array", "items": { "$ref": "#/$defs/event" } } } },
+        "ordering": { "type": "array", "items": { "type": "object", "required": ["before", "after"], "additionalProperties": false, "properties": { "before": { "$ref": "#/$defs/event" }, "after": { "$ref": "#/$defs/event" } } } },
+        "gaugesBounded": { "type": "object", "additionalProperties": { "$ref": "#/$defs/wideInt" } }
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": ["op"],
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "oneOf": [
+            { "type": "object", "required": ["object"], "additionalProperties": false, "properties": { "object": {
+              "type": "object", "required": ["track", "group", "object"], "additionalProperties": false,
+              "properties": {
+                "track": { "type": "string" }, "group": { "$ref": "#/$defs/wideInt" }, "object": { "$ref": "#/$defs/wideInt" },
+                "loc": { "oneOf": [{ "type": "null" }, { "type": "array", "items": { "$ref": "#/$defs/locProperty" } }, { "type": "object", "required": ["rawHex"], "additionalProperties": false, "properties": { "rawHex": { "$ref": "#/$defs/hex" } } }] },
+                "payload": { "$ref": "#/$defs/payload" }, "endOfGroup": { "type": "boolean" }, "endOfTrack": { "type": "boolean" }
+              } } } },
+            { "type": "object", "required": ["advanceTimeUs"], "additionalProperties": false, "properties": { "advanceTimeUs": { "type": "object", "required": ["byUs"], "additionalProperties": false, "properties": { "byUs": { "$ref": "#/$defs/wideInt" } } } } },
+            { "type": "object", "required": ["service"], "additionalProperties": false, "properties": { "service": { "type": "object", "additionalProperties": false } } },
+            { "type": "object", "required": ["fin"], "additionalProperties": false, "properties": { "fin": { "type": "object", "required": ["track"], "additionalProperties": false, "properties": { "track": { "type": "string" } } } } },
+            { "type": "object", "required": ["reset"], "additionalProperties": false, "properties": { "reset": { "type": "object", "required": ["track"], "additionalProperties": false, "properties": { "track": { "type": "string" }, "code": { "$ref": "#/$defs/wideInt" } } } } },
+            { "type": "object", "required": ["trackSwitch"], "additionalProperties": false, "properties": { "trackSwitch": { "type": "object", "required": ["fromTrack", "toTrack"], "additionalProperties": false, "properties": { "fromTrack": { "type": "string" }, "toTrack": { "type": "string" } } } } },
+            { "type": "object", "required": ["pressure"], "additionalProperties": false, "properties": { "pressure": { "type": "object", "required": ["level"], "additionalProperties": false, "properties": { "level": { "enum": ["high", "low"] } } } } },
+            { "type": "object", "required": ["sinkFault"], "additionalProperties": false, "properties": { "sinkFault": { "type": "object", "required": ["track", "kind"], "additionalProperties": false, "properties": { "track": { "type": "string" }, "kind": { "type": "string" } } } } },
+            { "type": "object", "required": ["checkpoint"], "additionalProperties": false, "properties": { "checkpoint": { "type": "object", "required": ["label"], "additionalProperties": false, "properties": { "label": { "type": "string" } } } } }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -17,6 +17,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MoqtPlayer } from './player.js';
 import { PlayerErrorCode } from './errors.js';
+import type { PlayerError } from './errors.js';
 import { QualityController } from './quality-controller.js';
 import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
@@ -25,6 +26,7 @@ import { MoqtConnectionError } from '@moqt/webtransport';
 import type { MoqtConnection } from '@moqt/webtransport';
 import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } from '@moqt/transport';
 import { varint, ObjectStatus } from '@moqt/transport';
+import { encodeLocHeaders } from '@moqt/loc';
 import type { ClockSource } from '@moqt/playback';
 
 // ─── Mock Adapter ────────────────────────────────────────────────────
@@ -49,6 +51,9 @@ function createMockAdapter(): MoqtConnection & {
 } {
   let nextRequestId = 1n;
   const adapter: any = {
+    // Negotiated draft (what conn.draftVersion returns post-connect). Tests that
+    // exercise draft-aware wiring set this before connecting/migrating.
+    draftVersion: 16,
     session: {
       state: 'established',
       subscribe: vi.fn(() => ({
@@ -5140,6 +5145,56 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
+    it('catalog config: preserves root initDataList so injected CMSF-01 initRef initializes CMAF', async () => {
+      const adapter = createMockAdapter();
+      const initBytes = Uint8Array.from([0x00, 0x01, 0x02, 0x03]);
+      const mockMs = {
+        initialize: vi.fn(),
+        appendChunk: vi.fn(),
+        endOfStream: vi.fn(),
+        reset: vi.fn(),
+        destroy: vi.fn(),
+        mediaElement: null,
+        onFirstFrame: null as (() => void) | null,
+        onError: null as ((error: Error) => void) | null,
+        onStall: null as ((durationMs: number) => void) | null,
+      };
+      const assembler = {
+        push: vi.fn(),
+        getEpoch: () => null,
+        reset: vi.fn(),
+        destroy: vi.fn(),
+        setInitSegment: vi.fn(),
+        clearPending: vi.fn(),
+      };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: () => assembler,
+        catalog: {
+          version: 1,
+          tracks: [
+            {
+              name: 'video', packaging: 'cmaf', isLive: true, role: 'video',
+              codec: 'avc1.4D401F', renderGroup: 1, initRef: 'i1',
+            },
+          ],
+          initDataList: [{ id: 'i1', type: 'inline', data: btoa(String.fromCharCode(...initBytes)) }],
+        },
+      });
+
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+
+      expect(adapter.subscribe).toHaveBeenCalledTimes(1); // media only, no catalog subscription
+      expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+      expect(mockMs.initialize.mock.calls[0]![0].video.initData).toEqual(initBytes);
+      expect(assembler.setInitSegment).toHaveBeenCalledWith('video', initBytes);
+
+      await player.destroy();
+    });
+
     it('catalog config: backward compat — knownTracks still works', async () => {
       const adapter = createMockAdapter();
       const player = new MoqtPlayer({
@@ -5850,6 +5905,481 @@ describe('MoqtPlayer', () => {
         }),
       );
 
+      await player.destroy();
+    });
+
+    // ── Playback intent ownership across adapter creation ──────────
+    //
+    // play()/pause() can both happen BEFORE the catalog arrives, so the
+    // adapter created afterwards must inherit the player's CURRENT intent.
+    // A MediaSource that defaults intent to "playing" would otherwise start a
+    // player the embedder had already paused.
+
+    /** Deliver the CMAF catalog so createMediaSource() runs. */
+    async function deliverCmafCatalog(adapter: ReturnType<typeof createMockAdapter>) {
+      const enc = new TextEncoder();
+      ackCatalog(adapter);
+      adapter._triggerObject(0n, {
+        kind: 'data',
+        trackAlias: varint(1),
+        groupId: varint(0),
+        subgroupId: varint(0),
+        objectId: varint(0),
+        publisherPriority: 0,
+        extensions: new Uint8Array(0),
+        payload: enc.encode(CMAF_CATALOG_JSON),
+      });
+      await new Promise(r => setTimeout(r, 10));
+    }
+
+    it('an adapter created AFTER pause() inherits the paused intent', async () => {
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+
+      player.play();
+      player.pause();               // paused BEFORE any MediaSource exists
+      expect(mockMs.setPlaybackIntent).not.toHaveBeenCalled();
+
+      await deliverCmafCatalog(adapter);
+
+      expect(mockMs.setPlaybackIntent).toHaveBeenCalledWith(false);
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(false);
+      await player.destroy();
+    });
+
+    it('an adapter created AFTER play() inherits the playing intent', async () => {
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+
+      player.play();                // playing BEFORE any MediaSource exists
+      await deliverCmafCatalog(adapter);
+
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(true);
+      await player.destroy();
+    });
+
+    it('a player that never declared intent leaves the adapter default alone', async () => {
+      // Backward compatibility: stating `false` here would stop an embedder
+      // that relies on the adapter starting once media arrives.
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+
+      await deliverCmafCatalog(adapter);
+
+      expect(mockMs.setPlaybackIntent).not.toHaveBeenCalled();
+      await player.destroy();
+    });
+
+    it('pause()/play()/destroy() forward intent to an existing adapter', async () => {
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      await deliverCmafCatalog(adapter);
+
+      mockMs.setPlaybackIntent.mockClear();
+      player.play();
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(true);
+      player.pause();
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(false);
+      player.play();
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(true);
+      await player.destroy();
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(false);
+    });
+
+    it('a REJECTED play() does not leave playback intent behind', async () => {
+      // play() from a state that cannot transition throws. If intent were
+      // recorded first, an adapter created by a later successful load() would
+      // inherit "playing" without a successful play() ever having happened.
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+
+      expect(() => player.play()).toThrow(); // IDLE → PLAYING is not a legal transition
+
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      await deliverCmafCatalog(adapter);
+
+      expect(mockMs.setPlaybackIntent).not.toHaveBeenCalled();
+      await player.destroy();
+    });
+
+    it('a state_changed listener that pauses during play() keeps the paused intent', async () => {
+      // transitionState() emits synchronously, so the listener runs INSIDE
+      // play(). Its pause is the newer decision — play() must not overwrite it
+      // on the way out, or the player ends up paused with playback resumed.
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      await deliverCmafCatalog(adapter);
+      mockMs.setPlaybackIntent.mockClear();
+
+      let reentered = false;
+      player.on('state_changed', (e) => {
+        if (e.to === PlayerState.PLAYING && !reentered) { reentered = true; player.pause(); }
+      });
+      player.play();
+
+      expect(reentered).toBe(true);
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(false);
+      expect(player.state).toBe(PlayerState.PAUSED);
+      await player.destroy();
+    });
+
+    it('a state_changed listener that plays during pause() keeps the playing intent', async () => {
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      await deliverCmafCatalog(adapter);
+      player.play();
+      mockMs.setPlaybackIntent.mockClear();
+
+      let reentered = false;
+      player.on('state_changed', (e) => {
+        if (e.to === PlayerState.PAUSED && !reentered) { reentered = true; player.play(); }
+      });
+      player.pause();
+
+      expect(reentered).toBe(true);
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(true);
+      await player.destroy();
+    });
+
+    it('a state_changed listener that destroys during play() is not overridden', async () => {
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      await deliverCmafCatalog(adapter);
+      mockMs.setPlaybackIntent.mockClear();
+
+      let destroying: Promise<void> | null = null;
+      player.on('state_changed', (e) => {
+        if (e.to === PlayerState.PLAYING && !destroying) { destroying = player.destroy(); }
+      });
+      player.play();
+      await destroying;
+
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(false);
+      // The observable damage a destroy-during-play would otherwise cause: the
+      // rest of play() restarting the tick loop on a torn-down player.
+      expect((player as unknown as { tickInterval: unknown }).tickInterval).toBeFalsy();
+    });
+
+    it('a caught INVALID nested play() does not strand the outer play()', async () => {
+      // A listener that calls play() again (invalid: already PLAYING) and
+      // swallows the throw must not cost the outer call its commit — state
+      // would say PLAYING while the adapter stayed paused and ticking never
+      // started.
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      await deliverCmafCatalog(adapter);
+      mockMs.setPlaybackIntent.mockClear();
+
+      let nested = false;
+      player.on('state_changed', (e) => {
+        if (e.to === PlayerState.PLAYING && !nested) {
+          nested = true;
+          try { player.play(); } catch { /* invalid re-entry, swallowed */ }
+        }
+      });
+      player.play();
+
+      expect(nested).toBe(true);
+      expect(player.state).toBe(PlayerState.PLAYING);
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(true);
+      expect((player as unknown as { tickInterval: unknown }).tickInterval).toBeTruthy();
+      await player.destroy();
+    });
+
+    it('a caught INVALID nested pause() does not strand the outer pause()', async () => {
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      await deliverCmafCatalog(adapter);
+      player.play();
+      mockMs.setPlaybackIntent.mockClear();
+
+      let nested = false;
+      player.on('state_changed', (e) => {
+        if (e.to === PlayerState.PAUSED && !nested) {
+          nested = true;
+          try { player.pause(); } catch { /* invalid re-entry, swallowed */ }
+        }
+      });
+      player.pause();
+
+      expect(nested).toBe(true);
+      expect(player.state).toBe(PlayerState.PAUSED);
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(false);
+      expect((player as unknown as { tickInterval: unknown }).tickInterval).toBeFalsy();
+      await player.destroy();
+    });
+
+    it('a THROWING state_changed listener cannot split play() state', async () => {
+      // The transaction is complete before listeners run, so however the
+      // exception is handled afterwards, state/intent/ticking agree.
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      await deliverCmafCatalog(adapter);
+      mockMs.setPlaybackIntent.mockClear();
+
+      player.on('state_changed', (e) => {
+        if (e.to === PlayerState.PLAYING) throw new Error('listener exploded');
+      });
+      try { player.play(); } catch { /* propagation is not what this asserts */ }
+
+      expect(player.state).toBe(PlayerState.PLAYING);
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(true);
+      expect((player as unknown as { tickInterval: unknown }).tickInterval).toBeTruthy();
+      await player.destroy();
+    });
+
+    it('a THROWING state_changed listener cannot split pause() state', async () => {
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      await deliverCmafCatalog(adapter);
+      player.play();
+      mockMs.setPlaybackIntent.mockClear();
+
+      player.on('state_changed', (e) => {
+        if (e.to === PlayerState.PAUSED) throw new Error('listener exploded');
+      });
+      try { player.pause(); } catch { /* propagation is not what this asserts */ }
+
+      expect(player.state).toBe(PlayerState.PAUSED);
+      expect(mockMs.setPlaybackIntent).toHaveBeenLastCalledWith(false);
+      expect((player as unknown as { tickInterval: unknown }).tickInterval).toBeFalsy();
+      await player.destroy();
+    });
+
+    // Re-entrant transitions must not publish out of order. A listener that
+    // pauses during the PLAYING event triggers a nested transition; a later
+    // listener that saw PAUSED before PLAYING would end on a state the player
+    // has already left, leaving a UI stuck showing "playing" while paused.
+
+    /** Player + adapter ready for CMAF, with the MSE adapter created. */
+    async function readyCmafPlayer() {
+      const adapter = createMockAdapter();
+      const mockMs = { ...createMockMediaSource(), setPlaybackIntent: vi.fn() };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs,
+        createCmafAssembler: createCmafAssemblerFactory(),
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      await deliverCmafCatalog(adapter);
+      return { player, mockMs };
+    }
+
+    it('re-entrant pause during play() is published in order to EVERY listener', async () => {
+      const { player } = await readyCmafPlayer();
+      const seenA: string[] = [];
+      const seenB: string[] = [];
+      let nested = false;
+      player.on('state_changed', (e) => {
+        seenA.push(e.to);
+        if (e.to === PlayerState.PLAYING && !nested) { nested = true; player.pause(); }
+      });
+      player.on('state_changed', (e) => { seenB.push(e.to); });
+
+      player.play();
+
+      expect(seenA).toEqual([PlayerState.PLAYING, PlayerState.PAUSED]);
+      expect(seenB).toEqual([PlayerState.PLAYING, PlayerState.PAUSED]);
+      // Every listener's LAST event is the player's actual state.
+      expect(seenA.at(-1)).toBe(player.state);
+      expect(seenB.at(-1)).toBe(player.state);
+      expect(player.state).toBe(PlayerState.PAUSED);
+      await player.destroy();
+    });
+
+    it('re-entrant play during pause() is published in order to EVERY listener', async () => {
+      const { player } = await readyCmafPlayer();
+      player.play();
+      const seenA: string[] = [];
+      const seenB: string[] = [];
+      let nested = false;
+      player.on('state_changed', (e) => {
+        seenA.push(e.to);
+        if (e.to === PlayerState.PAUSED && !nested) { nested = true; player.play(); }
+      });
+      player.on('state_changed', (e) => { seenB.push(e.to); });
+
+      player.pause();
+
+      expect(seenA).toEqual([PlayerState.PAUSED, PlayerState.PLAYING]);
+      expect(seenB).toEqual([PlayerState.PAUSED, PlayerState.PLAYING]);
+      expect(seenA.at(-1)).toBe(player.state);
+      expect(seenB.at(-1)).toBe(player.state);
+      expect(player.state).toBe(PlayerState.PLAYING);
+      await player.destroy();
+    });
+
+    it('re-entrant destroy during play() is published in order to EVERY listener', async () => {
+      const { player } = await readyCmafPlayer();
+      const seenA: string[] = [];
+      const seenB: string[] = [];
+      let destroying: Promise<void> | null = null;
+      player.on('state_changed', (e) => {
+        seenA.push(e.to);
+        if (e.to === PlayerState.PLAYING && !destroying) { destroying = player.destroy(); }
+      });
+      player.on('state_changed', (e) => { seenB.push(e.to); });
+
+      player.play();
+      await destroying;
+
+      // Both listeners saw the same sequence, starting with PLAYING, and both
+      // end on whatever state destroy() left the player in.
+      expect(seenA).toEqual(seenB);
+      expect(seenA[0]).toBe(PlayerState.PLAYING);
+      expect(seenA.at(-1)).toBe(player.state);
+      expect(seenB.at(-1)).toBe(player.state);
+    });
+
+    it('a listener that re-enters and THEN throws cannot censor the sequence', async () => {
+      // The worst case for a shift-then-emit drain: listener A pauses (queuing
+      // PAUSED) and then throws. Listener B must still receive PLAYING and
+      // PAUSED synchronously, and A's exception must still surface.
+      const { player } = await readyCmafPlayer();
+      const seenB: string[] = [];
+      let nested = false;
+      player.on('state_changed', (e) => {
+        if (e.to === PlayerState.PLAYING && !nested) {
+          nested = true;
+          player.pause();
+          throw new Error('listener exploded after re-entering');
+        }
+      });
+      player.on('state_changed', (e) => { seenB.push(e.to); });
+
+      let thrown: unknown;
+      try { player.play(); } catch (err) { thrown = err; }
+
+      expect(seenB).toEqual([PlayerState.PLAYING, PlayerState.PAUSED]);
+      expect(seenB.at(-1)).toBe(player.state);
+      expect(player.state).toBe(PlayerState.PAUSED);
+      expect((thrown as Error | undefined)?.message).toMatch(/exploded after re-entering/);
+      await player.destroy();
+    });
+
+    it('the watchdog state publication goes through the same queue', async () => {
+      // A diagnostic republication is still a state_changed: a listener that
+      // re-enters from it must not reorder the sequence for other listeners.
+      const { player } = await readyCmafPlayer();
+      player.play();
+      const seenA: string[] = [];
+      const seenB: string[] = [];
+      let nested = false;
+      player.on('state_changed', (e) => {
+        seenA.push(e.to);
+        if (!nested) { nested = true; player.pause(); }
+      });
+      player.on('state_changed', (e) => { seenB.push(e.to); });
+
+      // Drive the REAL watchdog timeout handler, not a stand-in for it.
+      const wd = (player as unknown as {
+        watchdog: { config?: unknown };
+      }).watchdog as unknown as { onTimeout?: (e: unknown) => void };
+      const onTimeout = (wd as { onTimeout?: (e: unknown) => void }).onTimeout
+        ?? ((wd as { config?: { onTimeout?: (e: unknown) => void } }).config?.onTimeout);
+      expect(typeof onTimeout).toBe('function');
+      onTimeout!({ event: 'catalog_received', elapsedMs: 10_000, timeoutMs: 10_000 });
+
+      expect(seenA).toEqual(seenB);
+      expect(seenA).toEqual([PlayerState.PLAYING, PlayerState.PAUSED]);
+      expect(seenB.at(-1)).toBe(player.state);
       await player.destroy();
     });
 
@@ -7529,9 +8059,95 @@ describe('MoqtPlayer', () => {
       // Switching to the broken HEVC track must throw with a clear
       // diagnostic, and must NOT issue any new SUBSCRIBE.
       await expect(player.selectVideoTrack('video_hevc')).rejects.toThrow(
-        /no initData or initTrack/i,
+        /no inline init \(initData\/initRef\) or initTrack/i,
       );
       expect((adapter.subscribe as any).mock.calls.length).toBe(subCountBefore);
+
+      await player.destroy();
+    });
+
+    it('selectVideoTrack() rejects CMAF codec change with bad initRef inline bytes before subscribing target', async () => {
+      const BAD_INITREF_CATALOG = JSON.stringify({
+        version: '1',
+        tracks: [
+          {
+            name: 'video_avc',
+            packaging: 'cmaf',
+            isLive: true,
+            role: 'video',
+            renderGroup: 1,
+            altGroup: 1,
+            codec: 'avc1.4D401F',
+            width: 1280,
+            height: 720,
+            bitrate: 800_000,
+            initData: btoa(String.fromCharCode(0x00, 0x01, 0x02, 0x03)),
+          },
+          {
+            name: 'video_hevc',
+            packaging: 'cmaf',
+            isLive: true,
+            role: 'video',
+            renderGroup: 1,
+            altGroup: 1,
+            codec: 'hvc1.1.6.L93.90',
+            width: 1280,
+            height: 720,
+            bitrate: 600_000,
+            initRef: 'bad-init',
+          },
+        ],
+        initDataList: [{ id: 'bad-init', type: 'inline', data: '!!!not-base64!!!' }],
+      });
+
+      const adapter = createMockAdapter();
+      const mockMs = {
+        initialize: vi.fn(),
+        appendChunk: vi.fn(),
+        endOfStream: vi.fn(),
+        reset: vi.fn(),
+        destroy: vi.fn(),
+        mediaElement: null,
+        onFirstFrame: null as (() => void) | null,
+        onError: null as ((error: Error) => void) | null,
+        onStall: null as ((durationMs: number) => void) | null,
+        changeType: vi.fn(() => Promise.resolve()),
+      };
+      const assembler = {
+        push: vi.fn(),
+        getEpoch: () => null,
+        reset: vi.fn(),
+        destroy: vi.fn(),
+        setInitSegment: vi.fn(),
+        clearPending: vi.fn(),
+      };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        startLevel: 0,
+        createMediaSource: () => mockMs,
+        createCmafAssembler: () => assembler,
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+      ackCatalog(adapter);
+      adapter._triggerObject(0n, {
+        kind: 'data',
+        trackAlias: catalogReqId,
+        groupId: varint(0),
+        subgroupId: varint(0),
+        objectId: varint(0),
+        payload: new TextEncoder().encode(BAD_INITREF_CATALOG),
+      } as MoqtObject);
+      await new Promise(r => setTimeout(r, 10));
+
+      const subCountBefore = (adapter.subscribe as any).mock.calls.length;
+      await expect(player.selectVideoTrack('video_hevc')).rejects.toThrow(
+        /inline init data is not valid base64/i,
+      );
+      expect((adapter.subscribe as any).mock.calls.length).toBe(subCountBefore);
+      expect(mockMs.changeType).not.toHaveBeenCalled();
 
       await player.destroy();
     });
@@ -8673,6 +9289,1282 @@ describe('MSE playhead-wedge escalation', () => {
     expect(errors[0].severity).toBe('degraded');
     expect(errors[0].code).toBe(PlayerErrorCode.VIDEO_DECODE_ERROR);
     expect(player.state).not.toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+});
+
+describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not config', () => {
+  // The SubscriptionManager's draftVersion is the integration seam the LOC
+  // wiring depends on: subscription-manager.test.ts proves draftVersion controls
+  // the LOC decode; these prove the player points it at the draft actually
+  // negotiated on the wire (auto-negotiation, config mismatch, migration).
+  const managerDraft = (p: MoqtPlayer): unknown => (p as unknown as { subscriptionManager?: { draftVersion?: number } }).subscriptionManager?.draftVersion;
+
+  it('auto-negotiated draft-18 configures the LOC decoder for draft-18 (config unset)', async () => {
+    const adapter = createMockAdapter();
+    adapter.draftVersion = 16; // pre-negotiation default
+    const player = new MoqtPlayer(createConfig(adapter)); // no config.draftVersion
+    const loadPromise = player.load();
+
+    // The draft is only known AFTER connect resolves — negotiation flips it to 18
+    // as the SETUP completes. A player that copied the draft before negotiation
+    // would read 16 and fail this test.
+    await vi.waitFor(() => expect(adapter.connect).toHaveBeenCalled());
+    adapter.draftVersion = 18;
+    adapter._connectResolve?.();
+    await loadPromise;
+
+    expect(managerDraft(player)).toBe(18);
+    await player.destroy();
+  });
+
+  it('the negotiated draft overrides a mismatched config.draftVersion', async () => {
+    const adapter = createMockAdapter();
+    adapter.draftVersion = 18;
+    const player = new MoqtPlayer({ ...createConfig(adapter), draftVersion: 16 });
+    const loadPromise = player.load();
+    await resolveConnect(adapter);
+    await loadPromise;
+
+    // The wire is draft-18; the config-16 hint must not win.
+    expect(managerDraft(player)).toBe(18);
+    await player.destroy();
+  });
+
+  it('an externally-owned, already-connected draft-18 connection drives the LOC decoder (connect NOT called)', async () => {
+    // External adapter mode: config.connection is a pre-connected adapter — the
+    // player must NOT call connect(), yet must still adopt its negotiated draft.
+    const adapter = createMockAdapter();
+    adapter.draftVersion = 18;
+    const player = new MoqtPlayer({
+      url: 'https://relay.example.com/moq',
+      namespace: 'live/broadcast',
+      connection: adapter as unknown as MoqtConnection,
+    });
+    await player.load();
+
+    expect(adapter.connect).not.toHaveBeenCalled(); // external: no handshake
+    expect(managerDraft(player)).toBe(18);
+    await player.destroy();
+  });
+
+  it('migration re-points the LOC decoder at the replacement session draft (16 → 18)', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+    expect(managerDraft(player)).toBe(16);
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await migratePromise;
+
+    expect(managerDraft(player)).toBe(18);
+    await player.destroy();
+  });
+
+  const TS = 1_726_000_000_000_000n; // realistic epoch-µs, diverges under vi64 vs QUIC
+
+  const locObject = (alias: bigint, streamId: bigint, wireProfile: 'd16-delta-varint' | 'd18-delta-vi64'): MoqtObject => ({
+    kind: 'data',
+    trackAlias: varint(alias),
+    groupId: varint(1),
+    subgroupId: varint(0),
+    objectId: varint(0),
+    extensions: encodeLocHeaders({ captureTimestamp: TS }, { wireProfile }),
+    payload: new Uint8Array([0x00]),
+  } as MoqtObject);
+
+  type TestMgr = {
+    registerTrack: (a: bigint, n: string, t: string) => void;
+    routeObject: (...args: unknown[]) => unknown;
+    onObject: ((mediaType: string, trackName: string, obj: MoqtObject, headers: { captureTimestamp?: bigint }) => void) | null;
+    draftVersion?: number;
+  };
+  const mgrOf = (p: MoqtPlayer): TestMgr => (p as unknown as { subscriptionManager: TestMgr }).subscriptionManager;
+
+  it('migration race (during overlap): a late OLD-session object decodes with the OLD draft', async () => {
+    // Deliver WHILE migrate() is still awaiting the old-session close — the real
+    // overlap window. The old connection is genuinely open, its callbacks live.
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    let releaseClose: (() => void) | null = null;
+    a1.close = vi.fn(() => new Promise<void>((r) => { releaseClose = () => r(); }));
+
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    // Observe the DECODED headers the manager produces.
+    const mgr = mgrOf(player);
+    mgr.registerTrack(77n, 'video', 'video');
+    let decoded: { captureTimestamp?: bigint } | undefined;
+    mgr.onObject = (_mt, _tn, _obj, headers) => { decoded = headers; };
+
+    // Begin migration; hold at the old-session close so both sessions overlap.
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a1.close).toHaveBeenCalled());
+    expect(managerDraft(player)).toBe(18);      // shared manager already migrated
+    expect(releaseClose).not.toBeNull();        // migrate is parked on the close
+
+    // The OLD (draft-16) connection delivers during the overlap.
+    a1._triggerObject(9n, locObject(77n, 9n, 'd16-delta-varint'));
+    await vi.waitFor(() => expect(decoded).toBeDefined());
+
+    // Decoded with the OLD session's draft-16 QUIC profile → the exact timestamp,
+    // NOT the vi64 mis-read the migrated draft-18 default would produce.
+    expect(decoded!.captureTimestamp).toBe(TS);
+
+    releaseClose!();
+    await migratePromise;
+    await player.destroy();
+  });
+
+  it('finding-1: a buffered object replays with ITS OWN source draft, not the mutated manager default', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    // An object arrives on a1 for an UNRESOLVED alias → buffered (source a1/16).
+    a1._triggerObject(7n, locObject(88n, 7n, 'd16-delta-varint'));
+
+    // The shared manager is then mutated to draft-18 (as a migration would).
+    const mgr = mgrOf(player);
+    mgr.draftVersion = 18;
+    mgr.registerTrack(88n, 'video', 'video');
+    const routeSpy = vi.spyOn(mgr, 'routeObject');
+
+    // Alias resolves via a SUBSCRIBE_OK on the SAME session (a1) → replay.
+    (player as unknown as { replayPendingObjects: (a: bigint, c: unknown) => void }).replayPendingObjects(88n, a1);
+
+    // Routed with the buffered entry's OWN draft (16), never the mutated 18.
+    expect(routeSpy).toHaveBeenCalledTimes(1);
+    expect(routeSpy.mock.calls[0]![2]).toBe(16);
+    expect(routeSpy.mock.calls[0]![3]).toBe(a1);
+    await player.destroy();
+  });
+
+  it('finding-1: an OLD-session buffered object is NOT replayed into a reused-alias NEW-session track', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    // a1 buffers an object for an unresolved alias.
+    a1._triggerObject(7n, locObject(88n, 7n, 'd16-delta-varint'));
+
+    // Migrate to a new session, which happens to reuse alias 88 for its OWN track.
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await migratePromise;
+
+    const mgr = mgrOf(player);
+    mgr.registerTrack(88n, 'video', 'video');
+    const routeSpy = vi.spyOn(mgr, 'routeObject');
+
+    // The NEW session (a2) resolves alias 88 → the old-session (a1) entry must
+    // NOT be routed into the new session's track.
+    (player as unknown as { replayPendingObjects: (a: bigint, c: unknown) => void }).replayPendingObjects(88n, a2 as unknown);
+    expect(routeSpy).not.toHaveBeenCalled();
+    await player.destroy();
+  });
+
+  it('finding-1 (crossed ordering): a delayed OLD-session SUBSCRIBE_OK must not consume NEW-session buffered entries', async () => {
+    // New session buffers an object under an alias; then a DELAYED old-session
+    // SUBSCRIBE_OK for the SAME alias arrives. The new object must remain
+    // buffered until the NEW session resolves it — not be replayed or dropped.
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await migratePromise;
+
+    // The NEW session (a2, now current) buffers an object for an unresolved alias.
+    a2._triggerObject(7n, locObject(88n, 7n, 'd18-delta-vi64'));
+
+    const mgr = mgrOf(player);
+    mgr.registerTrack(88n, 'video', 'video');
+    const routeSpy = vi.spyOn(mgr, 'routeObject');
+    const replay = (c: unknown): void =>
+      (player as unknown as { replayPendingObjects: (a: bigint, c: unknown) => void }).replayPendingObjects(88n, c);
+
+    // A delayed OLD-session (a1) SUBSCRIBE_OK resolves alias 88 → must be a no-op
+    // for the new-session entry, which stays buffered.
+    replay(a1);
+    expect(routeSpy).not.toHaveBeenCalled();
+
+    // The new session then resolves it → now it replays (with a2's draft).
+    replay(a2);
+    expect(routeSpy).toHaveBeenCalledTimes(1);
+    expect(routeSpy.mock.calls[0]![2]).toBe(18);
+    expect(routeSpy.mock.calls[0]![3]).toBe(a2);
+    await player.destroy();
+  });
+
+  it('finding-2: a malformed OLD-session object does not UNSUBSCRIBE on the NEW session', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    let releaseClose: (() => void) | null = null;
+    a1.close = vi.fn(() => new Promise<void>((r) => { releaseClose = () => r(); }));
+
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    // A media track + active subscription on the CURRENT session for alias 55.
+    const mgr = mgrOf(player);
+    mgr.registerTrack(55n, 'video', 'video');
+    (player as unknown as { activeSubscriptions: Map<bigint, { trackAlias: bigint; trackName: string; mediaType: string }> })
+      .activeSubscriptions.set(1234n, { trackAlias: 55n, trackName: 'video', mediaType: 'video' });
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a1.close).toHaveBeenCalled());
+    (a2.unsubscribe as ReturnType<typeof vi.fn>).mockClear();
+
+    // The OLD session delivers a MALFORMED object during the overlap.
+    a1._triggerObject(9n, {
+      kind: 'data',
+      trackAlias: varint(55n),
+      groupId: varint(1),
+      subgroupId: varint(0),
+      objectId: varint(0),
+      extensions: new Uint8Array([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+      payload: new Uint8Array([0x00]),
+    } as MoqtObject);
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Recovery must NOT fire against the replacement session.
+    expect(a2.unsubscribe).not.toHaveBeenCalled();
+
+    releaseClose!();
+    await migratePromise;
+    await player.destroy();
+  });
+
+  it('finding-1: a SUBSCRIBE_OK and object arriving BEFORE subscribe() resolves are staged and drained', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    let firedDuringSubscribe = false;
+    a2.subscribe = vi.fn(async () => {
+      // Fast peer: the catalog SUBSCRIBE_OK (reqId 7 → alias 50) arrives DURING
+      // subscribe(), before it resolves — must be staged, not dropped by the guard.
+      a2.onMessage?.({
+        type: 'SUBSCRIBE_OK', requestId: varint(7n), trackAlias: varint(50n), parameters: new Map(),
+      } as unknown as ControlMessage);
+      // A stray media object for a different alias — must be staged and buffered
+      // under the NEW session, not routed through old-session state.
+      a2.onObject?.(9n, {
+        kind: 'data', trackAlias: varint(88n),
+        groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
+        extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
+      } as MoqtObject);
+      firedDuringSubscribe = true;
+      return varint(7n);
+    });
+
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await migratePromise;
+
+    expect(firedDuringSubscribe).toBe(true);
+    // The staged SUBSCRIBE_OK was drained after commit → catalog alias resolved.
+    expect((player as unknown as { catalogTrackAlias: bigint | null }).catalogTrackAlias).toBe(50n);
+    // The staged object was drained under the new session → buffered for its alias.
+    expect((player as unknown as { pendingObjectsByAlias: Map<bigint, unknown[]> }).pendingObjectsByAlias.has(88n)).toBe(true);
+    await player.destroy();
+  });
+
+  it('finding-2: an old-session close() rejection after commit does not fail the migration', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    a1.close = vi.fn(async () => { throw new Error('old close failed'); });
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const migrated = vi.fn();
+    player.on('session_migrated', migrated);
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+
+    // The handoff already committed — an old-session close failure is non-fatal.
+    await expect(migratePromise).resolves.toBeUndefined();
+    expect((player as unknown as { connection: unknown }).connection).toBe(a2);
+    expect(migrated).toHaveBeenCalled();
+    await player.destroy();
+  });
+
+  it('finding-1: migration wires the candidate BEFORE connect() (handlers present when the loops start)', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    let handlersAtConnect = false;
+    a2.connect = vi.fn(async () => {
+      // connect() starts the incoming control/data/datagram loops before it
+      // resolves — the candidate's handlers must already be installed.
+      handlersAtConnect = a2.onMessage !== null && a2.onObject !== null && a2.onClose !== null && a2.onError !== null;
+      // A stray post-SETUP control message during connect must be handled (and
+      // guarded, since the candidate is not yet authoritative), never lost.
+      a2.onMessage?.({
+        type: 'SUBSCRIBE_OK', requestId: varint(999n), trackAlias: varint(1n), parameters: new Map(),
+      } as unknown as ControlMessage);
+    });
+
+    await player.migrate(a2 as unknown as MoqtConnection);
+    expect(handlersAtConnect).toBe(true);
+    await player.destroy();
+  });
+
+  it('finding-2: a catalog-subscribe failure during migrate() keeps the OLD session authoritative', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.connect = vi.fn(async () => { /* candidate connects */ });
+    a2.subscribe = vi.fn(async () => { throw new Error('catalog subscribe refused'); });
+    a2.close = vi.fn(async () => { /* candidate discarded */ });
+
+    await expect(player.migrate(a2 as unknown as MoqtConnection)).rejects.toThrow('catalog subscribe refused');
+
+    // The transaction rolled back: old session still current, candidate closed.
+    expect((player as unknown as { connection: unknown }).connection).toBe(a1);
+    expect(a2.close).toHaveBeenCalled();
+    // And the old session still processes its control messages.
+    const internal = player as unknown as { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null };
+    internal.catalogRequestId = 3n;
+    internal.catalogTrackAlias = null;
+    a1._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(3n), trackAlias: varint(9n), parameters: new Map(),
+    } as unknown as ControlMessage);
+    expect(internal.catalogTrackAlias).toBe(9n);
+    await player.destroy();
+  });
+
+  it('finding-2: a catalog-subscribe failure during migrateToUrl() also keeps the OLD session authoritative', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.connect = vi.fn(async () => { /* candidate connects */ });
+    a2.subscribe = vi.fn(async () => { throw new Error('goaway catalog refused'); });
+    a2.close = vi.fn(async () => { /* candidate discarded */ });
+
+    await expect(
+      (player as unknown as { migrateToUrl: (c: MoqtConnection, u: string) => Promise<void> })
+        .migrateToUrl(a2 as unknown as MoqtConnection, 'https://relay2.example.com/moq'),
+    ).rejects.toThrow('goaway catalog refused');
+
+    expect((player as unknown as { connection: unknown }).connection).toBe(a1);
+    expect(a2.close).toHaveBeenCalled();
+    await player.destroy();
+  });
+
+  it('finding-1: a FAILED migration connect leaves the OLD session authoritative', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    // The replacement's connect() rejects — the candidate never establishes.
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.connect = vi.fn(async () => { throw new Error('replacement connect failed'); });
+
+    await expect(player.migrate(a2 as unknown as MoqtConnection)).rejects.toThrow('replacement connect failed');
+
+    // The old session was never superseded — it is still current and still
+    // processes its control messages.
+    expect((player as unknown as { connection: unknown }).connection).toBe(a1);
+    const internal = player as unknown as { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null };
+    internal.catalogRequestId = 7n;
+    internal.catalogTrackAlias = null;
+    a1._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(7n), trackAlias: varint(55n), parameters: new Map(),
+    } as unknown as ControlMessage);
+    expect(internal.catalogTrackAlias).toBe(55n); // old session STILL authoritative
+    await player.destroy();
+  });
+
+  it('finding-2: a superseded session closing/erroring remotely does not fail the current session', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    let releaseClose: (() => void) | null = null;
+    a1.close = vi.fn(() => new Promise<void>((r) => { releaseClose = () => r(); }));
+
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const sessionClosed = vi.fn();
+    const sessionError = vi.fn();
+    player.on('session_closed', sessionClosed);
+    player.on('session_error', sessionError);
+
+    // Migrate; park at the old-session close so both sessions overlap and a2 is
+    // already the current (authoritative) connection.
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a1.close).toHaveBeenCalled());
+
+    // The OLD relay drops REMOTELY during the overlap (fires onClose + onError).
+    a1._triggerClose(0x1, 'old relay gone');
+    a1._triggerError(new Error('old relay transport error'));
+
+    // The replacement session must not be reported closed or errored.
+    expect(sessionClosed).not.toHaveBeenCalled();
+    expect(sessionError).not.toHaveBeenCalled();
+
+    releaseClose!();
+    await migratePromise;
+    await player.destroy();
+  });
+
+  it('finding-1: a stale old-session SUBSCRIBE_OK (via the real control path) does not mutate current state', async () => {
+    // Driven through a1._triggerMessage → handleControlMessage, not the private
+    // replay method — proving the superseded-session guard, not just replay.
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await migratePromise;
+
+    // Arrange current state so a MATCHING SUBSCRIBE_OK would resolve the catalog
+    // alias — making the mutation observable if the stale message were processed.
+    const internal = player as unknown as { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null };
+    internal.catalogRequestId = 42n;
+    internal.catalogTrackAlias = null;
+
+    // A DELAYED old-session (a1) SUBSCRIBE_OK for that requestId arrives.
+    a1._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(42n), trackAlias: varint(88n), parameters: new Map(),
+    } as unknown as ControlMessage);
+
+    // The superseded session must not set the current catalog alias.
+    expect(internal.catalogTrackAlias).toBeNull();
+    await player.destroy();
+  });
+
+  it('finding-2: a NORMAL migration reclaims the old-session buffer (no onClose fired)', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    // Buffer an object for an unresolved alias on a1.
+    a1._triggerObject(7n, locObject(88n, 7n, 'd16-delta-varint'));
+    const pending = (player as unknown as { pendingObjectsByAlias: Map<bigint, unknown[]> }).pendingObjectsByAlias;
+    expect(pending.size).toBe(1);
+
+    // Migrate normally. The mock close() is a local, no-op close that does NOT
+    // emit onClose — yet the old partition must still be reclaimed.
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    expect(a1.close).not.toHaveBeenCalled();
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await migratePromise;
+
+    expect(a1.close).toHaveBeenCalled();
+    expect(pending.size).toBe(0); // reclaimed by migrate's explicit purge
+    await player.destroy();
+  });
+
+  it('finding-2: closing a session reclaims its buffered objects (releases the adapter)', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    // Buffer objects for two unresolved aliases on a1.
+    a1._triggerObject(7n, locObject(88n, 7n, 'd16-delta-varint'));
+    a1._triggerObject(8n, locObject(99n, 8n, 'd16-delta-varint'));
+    const pending = (player as unknown as { pendingObjectsByAlias: Map<bigint, unknown[]> }).pendingObjectsByAlias;
+    expect(pending.size).toBe(2);
+
+    // The session closes → its buffered entries (and their adapter refs) are gone.
+    a1._triggerClose(undefined, 'gone');
+    expect(pending.size).toBe(0);
+    await player.destroy();
+  });
+
+  it('finding-2: the pending-alias map is bounded — excess distinct aliases are dropped', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const pending = (player as unknown as { pendingObjectsByAlias: Map<bigint, unknown[]> }).pendingObjectsByAlias;
+    const CAP = 1024;
+    // Emit one object per unique unknown alias, past the cap. Bare extensions —
+    // buffered objects are not decoded until replay.
+    for (let i = 0; i < CAP + 50; i++) {
+      a1._triggerObject(BigInt(i), {
+        kind: 'data', trackAlias: varint(BigInt(100000 + i)),
+        groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
+      } as MoqtObject);
+    }
+    expect(pending.size).toBe(CAP); // capped, not unbounded
+    await player.destroy();
+  });
+
+  // ─── Migration lifecycle robustness (round-8 findings) ───────────────
+
+  const holdSubscribe = (a: ReturnType<typeof createMockAdapter>): { release: (r: bigint) => void } => {
+    const box: { release: (r: bigint) => void } = { release: () => {} };
+    a.subscribe = vi.fn(() => new Promise((resolve) => { box.release = (r) => resolve(varint(r)); }));
+    return box;
+  };
+
+  it('lifecycle-1: destroy() during an in-flight migration cancels the candidate (no resurrection)', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const sub = holdSubscribe(a2); // park establishment at catalog subscribe
+
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    await player.destroy(); // cancels the in-flight candidate
+    expect(a2.close).toHaveBeenCalled();
+
+    sub.release(7n); // establishment unblocks, but the candidate must NOT be promoted
+    await expect(migratePromise).rejects.toThrow();
+    expect((player as unknown as { connection: unknown }).connection).toBeNull();
+  });
+
+  it('lifecycle-2: a second migration while one is in flight is rejected (single-flight)', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    const sub = holdSubscribe(a2);
+    const m1 = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    // A concurrent migration is rejected before it touches its candidate.
+    const a3 = createMockAdapter();
+    a3.draftVersion = 18;
+    await expect(player.migrate(a3 as unknown as MoqtConnection)).rejects.toThrow(/already in progress/);
+    expect(a3.connect).not.toHaveBeenCalled();
+
+    // The first migration still completes normally.
+    sub.release(9n);
+    await m1;
+    expect((player as unknown as { connection: unknown }).connection).toBe(a2);
+    await player.destroy();
+  });
+
+  it('lifecycle-3: a candidate that closes before promotion is aborted, not committed', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const sub = holdSubscribe(a2);
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    // The candidate closes remotely BEFORE promotion → the migration aborts.
+    a2._triggerClose(0x1, 'candidate gone');
+    expect(a2.close).toHaveBeenCalled();
+
+    // subscribe then resolves — the aborted candidate must NOT be committed.
+    sub.release(7n);
+    await expect(migratePromise).rejects.toThrow(/no longer valid|aborted/i);
+    expect((player as unknown as { connection: unknown }).connection).toBe(a1);
+    await player.destroy();
+  });
+
+  it('lifecycle-4: staging overflow aborts the migration and closes the candidate', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const sub = holdSubscribe(a2);
+    const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    // The peer floods the candidate with objects while catalog subscribe hangs.
+    // The over-cap event trips the overflow guard, which detaches + closes the
+    // candidate (so the remaining sends become no-ops).
+    for (let i = 0; i < 600; i++) { // > MAX_STAGED_EVENTS (512)
+      a2.onObject?.(BigInt(i), {
+        kind: 'data', trackAlias: varint(BigInt(5000 + i)),
+        groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
+      } as MoqtObject);
+    }
+    expect(a2.close).toHaveBeenCalled();
+
+    sub.release(7n);
+    await expect(migratePromise).rejects.toThrow();
+    expect((player as unknown as { connection: unknown }).connection).toBe(a1);
+    await player.destroy();
+  });
+
+  it('lifecycle-5: an automatic GOAWAY migration failure surfaces via the error channel (no unhandled rejection)', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.connect = vi.fn(async () => { throw new Error('goaway connect failed'); });
+    a2.close = vi.fn(async () => {});
+
+    let call = 0;
+    const player = new MoqtPlayer({
+      url: 'https://relay.example.com/moq',
+      namespace: 'live/broadcast',
+      createTransport: vi.fn(async () => ({}) as unknown as WebTransport),
+      createConnection: () => (call++ === 0 ? a1 : a2) as unknown as MoqtConnection,
+    } as MoqtPlayerConfig);
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const errorFn = vi.fn();
+    player.on('session_error', errorFn);
+
+    // GOAWAY → automatic migration to a2, whose connect() rejects.
+    a1._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://new-relay.example.com/moq' } as unknown as ControlMessage);
+    await vi.waitFor(() => expect(a2.connect).toHaveBeenCalled());
+    await vi.waitFor(() => expect(errorFn).toHaveBeenCalled()); // surfaced, not an unhandled rejection
+
+    // The old session remains authoritative.
+    expect((player as unknown as { connection: unknown }).connection).toBe(a1);
+    await player.destroy();
+  });
+
+  // ─── Migration lifecycle robustness (round-9 refinements) ────────────
+
+  it('refine-1: a staged event throwing during drain does NOT roll back the committed session', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    const errorFn = vi.fn();
+    player.on('session_error', errorFn);
+
+    // Stage an object that will route on drain, and make routing THROW.
+    const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
+    mgr.registerTrack(88n, 'video', 'video');
+    a2.onObject?.(9n, {
+      kind: 'data', trackAlias: varint(88n),
+      groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
+      extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
+    } as MoqtObject);
+    vi.spyOn(mgr, 'routeObject').mockImplementation(() => { throw new Error('staged listener boom'); });
+
+    // Commit + drain: the staged event throws but is isolated per-event — the
+    // now-authoritative session must NOT be rolled back, AND the failure must be
+    // surfaced (not silently swallowed).
+    sub.release(7n);
+    await expect(m).resolves.toBeUndefined();
+    expect((player as unknown as { connection: unknown }).connection).toBe(a2);
+    expect(errorFn).toHaveBeenCalled(); // replay failure routed through the error channel
+    await player.destroy();
+  });
+
+  it('refine-2: a callback captured from an abandoned candidate is permanently inert', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    let rejectSub: (e: Error) => void = () => {};
+    a2.subscribe = vi.fn(() => new Promise((_res, rej) => { rejectSub = rej; }));
+
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    const savedOnObject = a2.onObject; // the wrapped candidate callback
+    expect(savedOnObject).toBeDefined();
+
+    rejectSub(new Error('subscribe failed')); // establishment fails → candidate abandoned
+    await expect(m).rejects.toThrow('subscribe failed');
+
+    // Invoking the SAVED (pre-detach) callback must be inert — never route live.
+    const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
+    mgr.registerTrack(88n, 'video', 'video');
+    const routeSpy = vi.spyOn(mgr, 'routeObject');
+    savedOnObject?.(9n, {
+      kind: 'data', trackAlias: varint(88n),
+      groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
+      extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
+    } as MoqtObject);
+    expect(routeSpy).not.toHaveBeenCalled();
+    expect((player as unknown as { connection: unknown }).connection).toBe(a1);
+    await player.destroy();
+  });
+
+  it('refine-3: a concurrent migration is rejected BEFORE creating a transport', async () => {
+    const createTransport = vi.fn(async () => ({}) as unknown as WebTransport);
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer({
+      url: 'https://relay.example.com/moq', namespace: 'live/broadcast',
+      createTransport, createConnection: () => a1 as unknown as MoqtConnection,
+    } as MoqtPlayerConfig);
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    const sub = holdSubscribe(a2);
+    const m1 = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+    const callsBefore = createTransport.mock.calls.length;
+
+    // A concurrent migration must reject WITHOUT creating another transport.
+    const a3 = createMockAdapter();
+    a3.draftVersion = 18;
+    await expect(player.migrate(a3 as unknown as MoqtConnection)).rejects.toThrow(/already in progress/);
+    expect(createTransport.mock.calls.length).toBe(callsBefore); // no orphaned transport
+    expect(a3.connect).not.toHaveBeenCalled();
+
+    sub.release(9n);
+    await m1;
+    await player.destroy();
+  });
+
+  it('refine-4: a DEGRADED candidate error does not abort the migration', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    const errorFn = vi.fn();
+    player.on('session_error', errorFn);
+
+    // A degraded (data-stream) error on the candidate — e.g. a subgroup reset —
+    // must NOT abort the migration, but IS relevant to the session about to become
+    // current, so it is STAGED (not emitted yet).
+    a2._triggerError(new MoqtConnectionError('subgroup reset during establishment', { errorSource: 'data' }));
+    expect(errorFn).not.toHaveBeenCalled(); // deferred, not emitted during establishment
+
+    sub.release(7n);
+    await expect(m).resolves.toBeUndefined();
+    expect((player as unknown as { connection: unknown }).connection).toBe(a2);
+    expect(errorFn).toHaveBeenCalled(); // the staged diagnostic emits AFTER commit
+    await player.destroy();
+  });
+
+  it('refine-5: staging aborts on the BYTE limit well below the event cap', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    // 512 KiB objects: the 8 MiB byte cap trips after ~16 events — far below the
+    // 512-event cap — proving the byte limit is actually enforced.
+    const bigPayload = new Uint8Array(512 * 1024);
+    let sent = 0;
+    for (let i = 0; i < 512; i++) {
+      if (!a2.onObject) break; // detached once staging overflows
+      a2.onObject(BigInt(i), {
+        kind: 'data', trackAlias: varint(BigInt(7000 + i)),
+        groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        extensions: new Uint8Array(0), payload: bigPayload,
+      } as MoqtObject);
+      sent++;
+    }
+    expect(sent).toBeGreaterThan(0);
+    expect(sent).toBeLessThan(64); // byte cap, not the 512 event cap
+    expect(a2.close).toHaveBeenCalled();
+
+    sub.release(7n);
+    await expect(m).rejects.toThrow();
+    expect((player as unknown as { connection: unknown }).connection).toBe(a1);
+    await player.destroy();
+  });
+
+  it('refine2-1: CONTROL-message parameter bytes count toward the byte limit (below the event cap)', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    // Control messages retaining large parameter byte arrays (no payload at all —
+    // this is what the old flat 1 KiB charge missed): 4 × 64 KiB = 256 KiB each,
+    // so the 8 MiB cap trips after ~32 messages, far below the 512-event cap.
+    // DISTINCT buffers per parameter so the accounting reflects REAL retention,
+    // not a single shared buffer counted many times.
+    let sent = 0;
+    for (let i = 0; i < 512; i++) {
+      if (!a2.onMessage) break; // detached once staging overflows
+      const parameters = new Map<bigint, Uint8Array[]>();
+      for (let p = 0; p < 4; p++) parameters.set(BigInt(p), [new Uint8Array(64 * 1024)]);
+      a2.onMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(BigInt(i)), trackAlias: varint(BigInt(i)), parameters,
+      } as unknown as ControlMessage);
+      sent++;
+    }
+    expect(sent).toBeGreaterThan(0);
+    expect(sent).toBeLessThan(200); // byte cap from parameters, NOT the 512 event cap
+    expect(a2.close).toHaveBeenCalled();
+
+    sub.release(7n);
+    await expect(m).rejects.toThrow();
+    expect((player as unknown as { connection: unknown }).connection).toBe(a1);
+    await player.destroy();
+  });
+
+  it('refine2-2 (finding-1+2): a reentrant close DURING drain terminates without a spurious candidate abort', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    const migrated = vi.fn();
+    player.on('session_migrated', migrated);
+
+    // Stage TWO objects; the FIRST triggers a reentrant close during drain. The
+    // committed candidate must follow current-session close handling (NOT be
+    // aborted/detached as a candidate), the drain must STOP (the second object
+    // must not re-buffer for the closed connection), and migration must NOT be
+    // reported successful.
+    const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
+    mgr.registerTrack(88n, 'video', 'video');
+    const obj = (alias: bigint): MoqtObject => ({
+      kind: 'data', trackAlias: varint(alias),
+      groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
+      extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
+    } as MoqtObject);
+    a2.onObject?.(9n, obj(88n));
+    a2.onObject?.(10n, obj(999n)); // unknown alias — would re-buffer if drain continued
+    let routeCalls = 0;
+    vi.spyOn(mgr, 'routeObject').mockImplementation(() => { routeCalls++; a2._triggerClose(0x1, 'reentrant during drain'); });
+
+    sub.release(7n);
+    // The committed session died during handoff → migration is NOT reported success.
+    await expect(m).rejects.toThrow(/session closed during handoff/);
+    expect(migrated).not.toHaveBeenCalled();
+    // Drain stopped after the close — the second staged object was not replayed.
+    expect(routeCalls).toBe(1);
+    // The committed connection was NOT abortMigration'd (callbacks intact) and the
+    // single-flight lock is released (no permanent "migration in progress").
+    expect(a2.onObject).toBeDefined();
+    const pending = (player as unknown as { pendingObjectsByAlias: Map<bigint, unknown[]> }).pendingObjectsByAlias;
+    expect(pending.has(999n)).toBe(false); // never re-buffered for the closed session
+    await player.destroy();
+  });
+
+  it('refine2-3 (finding-2): a throwing error listener during replay-failure reporting does not strand the migration', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    // A staged event throws on replay; the error listener ALSO throws.
+    const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
+    mgr.registerTrack(88n, 'video', 'video');
+    a2.onObject?.(9n, {
+      kind: 'data', trackAlias: varint(88n),
+      groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
+      extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
+    } as MoqtObject);
+    vi.spyOn(mgr, 'routeObject').mockImplementation(() => { throw new Error('replay boom'); });
+    player.on('session_error', () => { throw new Error('listener boom'); });
+
+    // Neither exception may escape: migration completes and the transaction lock
+    // is released, so a subsequent migration is not permanently blocked.
+    sub.release(7n);
+    await expect(m).resolves.toBeUndefined();
+    expect((player as unknown as { currentMigration: unknown }).currentMigration).toBeNull();
+
+    const a3 = createMockAdapter();
+    a3.draftVersion = 18;
+    const m3 = player.migrate(a3 as unknown as MoqtConnection); // not locked out
+    await resolveConnect(a3);
+    await m3;
+    expect((player as unknown as { connection: unknown }).connection).toBe(a3);
+    await player.destroy();
+  });
+
+  it('refine2-4 (finding-4): a replay failure keeps its live-delivery error source', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    const errors: PlayerError[] = [];
+    player.on('error', (e) => errors.push(e.error));
+
+    // A staged OBJECT (data source) whose replay throws → data-source code, not a
+    // generic CONNECTION_LOST.
+    const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
+    mgr.registerTrack(88n, 'video', 'video');
+    a2.onObject?.(9n, {
+      kind: 'data', trackAlias: varint(88n),
+      groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
+      extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
+    } as MoqtObject);
+    vi.spyOn(mgr, 'routeObject').mockImplementation(() => { throw new Error('data replay boom'); });
+
+    sub.release(7n);
+    await expect(m).resolves.toBeUndefined();
+    expect(errors.some((e) => e.code === PlayerErrorCode.DATA_STREAM_RESET)).toBe(true);
+    await player.destroy();
+  });
+
+  it('refine3-1 (finding-1): a replacement dying DURING old-session retirement is not reported migrated', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    let releaseOldClose: (() => void) | null = null;
+    a1.close = vi.fn(() => new Promise<void>((r) => { releaseOldClose = () => r(); }));
+    const player = new MoqtPlayer(createConfig(a1));
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    // subscribe resolves → commit → drain → retire, which parks on the held a1.close.
+    await vi.waitFor(() => expect(a1.close).toHaveBeenCalled());
+
+    const migrated = vi.fn();
+    player.on('session_migrated', migrated);
+
+    // The REPLACEMENT dies while the old close is still pending — the transaction
+    // is still registered, so this must mark it terminated.
+    a2._triggerClose(0x1, 'replacement died during retirement');
+
+    releaseOldClose!(); // old close completes → migration re-checks termination
+    await expect(m).rejects.toThrow(/session closed during handoff/);
+    expect(migrated).not.toHaveBeenCalled();
+    await player.destroy();
+  });
+
+  it('refine3-2 (finding-2): a throwing logger during replay-failure reporting does not reject the migration', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    // A logger that throws ONLY for the replay-failure diagnostic (so load and the
+    // rest of the migration are unaffected).
+    const throwingLogger = {
+      error: () => {},
+      warn: (msg: string) => { if (msg.includes('replay failure')) throw new Error('logger boom'); },
+      info: () => {},
+      debug: () => {},
+    };
+    const player = new MoqtPlayer({ ...createConfig(a1), logger: throwingLogger, logLevel: 'warn' });
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    // Staged event throws on replay; the error listener ALSO throws (emitError
+    // throws), so drain falls to log.warn — whose custom logger ALSO throws.
+    const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
+    mgr.registerTrack(88n, 'video', 'video');
+    a2.onObject?.(9n, {
+      kind: 'data', trackAlias: varint(88n),
+      groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
+      extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
+    } as MoqtObject);
+    vi.spyOn(mgr, 'routeObject').mockImplementation(() => { throw new Error('replay boom'); });
+    player.on('session_error', () => { throw new Error('listener boom'); });
+
+    // No exception (from the callback, the error listener, or the logger) escapes.
+    sub.release(7n);
+    await expect(m).resolves.toBeUndefined();
+    expect((player as unknown as { connection: unknown }).connection).toBe(a2);
+    await player.destroy();
+  });
+
+  it('refine4-1 (finding): a STAGED GOAWAY replayed during drain re-migrates after the handoff', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const a3 = createMockAdapter();
+    a3.draftVersion = 18;
+    const createTransport = vi.fn(async () => ({}) as unknown as WebTransport);
+    let cc = 0;
+    const createConnection = vi.fn(() => (cc++ === 0 ? a1 : a3) as unknown as MoqtConnection);
+    const player = new MoqtPlayer({
+      url: 'https://relay.example.com/moq', namespace: 'live/broadcast', createTransport, createConnection,
+    } as MoqtPlayerConfig);
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    // A GOAWAY arrives on the candidate DURING establishment → staged as a control
+    // message, replayed during drain (when the slot is still held).
+    a2._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://goaway-target.example.com/moq' } as unknown as ControlMessage);
+
+    sub.release(7n);
+    await m; // first handoff completes → processes the queued GOAWAY
+
+    await resolveConnect(a3);
+    await vi.waitFor(() => expect((player as unknown as { connection: unknown }).connection).toBe(a3));
+    expect(createTransport.mock.calls.some((c) => String(c[0]).includes('goaway-target'))).toBe(true);
+    await player.destroy();
+  });
+
+  it('refine4-2 (finding): a LIVE GOAWAY while the old close is held re-migrates once retirement finishes', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const a3 = createMockAdapter();
+    a3.draftVersion = 18;
+    const createTransport = vi.fn(async () => ({}) as unknown as WebTransport);
+    let cc = 0;
+    const createConnection = vi.fn(() => (cc++ === 0 ? a1 : a3) as unknown as MoqtConnection);
+    const player = new MoqtPlayer({
+      url: 'https://relay.example.com/moq', namespace: 'live/broadcast', createTransport, createConnection,
+    } as MoqtPlayerConfig);
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+
+    let releaseOldClose: (() => void) | null = null;
+    a1.close = vi.fn(() => new Promise<void>((r) => { releaseOldClose = () => r(); }));
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const m = player.migrate(a2 as unknown as MoqtConnection);
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a1.close).toHaveBeenCalled()); // parked in retirement
+
+    // A LIVE GOAWAY from the committed session while the old close is pending.
+    a2._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://goaway-target.example.com/moq' } as unknown as ControlMessage);
+    expect(cc).toBe(1); // NOT acted on yet — no replacement adapter created (no leak)
+
+    releaseOldClose!(); // retirement finishes → the queued GOAWAY is processed
+    await m;
+    await resolveConnect(a3);
+    await vi.waitFor(() => expect((player as unknown as { connection: unknown }).connection).toBe(a3));
+    expect(cc).toBe(2); // a3 created only when the queued GOAWAY was acted on
+    await player.destroy();
+  });
+
+  it('refine4-3 (finding): an OLD-session GOAWAY during establishment is NOT acted on after the caller\'s handoff commits', async () => {
+    const a1 = createMockAdapter();
+    a1.draftVersion = 16;
+    const createTransport = vi.fn(async () => ({}) as unknown as WebTransport);
+    let cc = 0;
+    const createConnection = vi.fn(() => { cc++; return a1 as unknown as MoqtConnection; }); // only a1 is auto-created (load)
+    const player = new MoqtPlayer({
+      url: 'https://relay.example.com/moq', namespace: 'live/broadcast', createTransport, createConnection,
+    } as MoqtPlayerConfig);
+    const loadPromise = player.load();
+    await resolveConnect(a1);
+    await loadPromise;
+    expect(cc).toBe(1);
+
+    const a2 = createMockAdapter();
+    a2.draftVersion = 18;
+    a2.close = vi.fn(async () => {});
+    const sub = holdSubscribe(a2);
+    const m = player.migrate(a2 as unknown as MoqtConnection); // caller's EXPLICIT handoff to a2
+    await resolveConnect(a2);
+    await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
+
+    // The OLD session (a1, still current during a2's establishment) sends GOAWAY —
+    // it passes the ownership guard and is queued, but its source is a1.
+    a1._triggerMessage({ type: 'GOAWAY', newSessionUri: 'https://unwanted-target.example.com/moq' } as unknown as ControlMessage);
+
+    sub.release(7n);
+    await m;
+    expect((player as unknown as { connection: unknown }).connection).toBe(a2); // caller's replacement kept
+
+    // a1's GOAWAY is moot after committing to a2 (source !== current) → discarded:
+    // no third connection, no migration to the unwanted target.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(cc).toBe(1);
+    expect(createTransport.mock.calls.some((c) => String(c[0]).includes('unwanted-target'))).toBe(false);
     await player.destroy();
   });
 });

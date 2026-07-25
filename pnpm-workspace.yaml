@@ -1,5 +1,9 @@
 packages:
   - packages/*
+  # Media conformance corpus runner. Deliberately OUTSIDE packages/* so the
+  # version-sync, pack, and publish tooling (all scoped to packages/*) never
+  # touch it — it is private test infrastructure, never shipped to npm.
+  - conformance/media/runner
   - examples
   # Isolated Node WebTransport relay example (native deps live ONLY here, not in core or @moqt/examples)
   - examples/node-relay

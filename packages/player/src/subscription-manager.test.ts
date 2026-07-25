@@ -177,6 +177,7 @@ describe('SubscriptionManager', () => {
       'video',
       'video',
       expect.any(Error),
+      undefined, // sourceConnection — absent for these direct routeObject calls
     );
     expect(onObject).not.toHaveBeenCalled();
   });
@@ -243,6 +244,7 @@ describe('SubscriptionManager', () => {
       'audio',
       'audio',
       expect.any(Error),
+      undefined, // sourceConnection — absent for these direct routeObject calls
     );
     expect(onObject).not.toHaveBeenCalled();
   });
@@ -305,6 +307,7 @@ describe('SubscriptionManager', () => {
       'audio',
       'audio',
       expect.any(Error),
+      undefined, // sourceConnection — absent for these direct routeObject calls
     );
     expect(onObject).not.toHaveBeenCalled();
   });
@@ -583,6 +586,7 @@ describe('SubscriptionManager', () => {
       'video',
       'video',
       expect.any(Error),
+      undefined, // sourceConnection — absent for these direct routeObject calls
     );
     expect(onCmafObject).not.toHaveBeenCalled();
   });
@@ -658,5 +662,90 @@ describe('SubscriptionManager', () => {
     // as delta=4, resolving to type 2+4=6 (AudioLevel) instead of 4 (VideoFrameMarking)
     expect(headers.videoFrameMarking).toBeUndefined(); // wrong!
     expect(headers.audioLevel).toBeDefined(); // misidentified!
+  });
+
+  // Wiring regression: a draft-18 session must select the vi64 property wire
+  // profile end-to-end, so a realistic (>= 64) Capture Timestamp reaches the
+  // pipeline as the correct bigint — not the value a QUIC-varint decode produces.
+  describe('draft-18 vi64 property wire is actually selected', () => {
+    // Realistic epoch-µs capture timestamp; well above the vi64/QUIC divergence
+    // point (64) and above 2^53, so a mis-decode is unmistakable.
+    const TS = 1_726_000_000_000_000n;
+
+    /** Encode a Capture Timestamp under an explicit wire profile. */
+    const encodeTs = (profile: LocHeaderOptions['wireProfile']): Uint8Array =>
+      encodeLocHeaders({ captureTimestamp: TS }, { wireProfile: profile })!;
+
+    it('draft-18 SubscriptionManager decodes a vi64 Capture Timestamp to the exact bigint', async () => {
+      const mgr = new SubscriptionManager();
+      mgr.draftVersion = 18;
+      const callback = vi.fn();
+      mgr.registerTrack(1n, 'video', 'video');
+      mgr.onObject = callback;
+
+      const extensions = encodeTs('d18-delta-vi64');
+      await mgr.routeObject(0n, createMockObject({ trackAlias: varint(1), extensions }));
+
+      expect(callback).toHaveBeenCalled();
+      const headers: LocHeaders = callback.mock.calls[0]![3];
+      expect(headers.captureTimestamp).toBe(TS);
+    });
+
+    it('the draft-16 (QUIC) decoder would MIS-read the same vi64 bytes (proves the profile matters)', async () => {
+      const mgr = new SubscriptionManager();
+      mgr.draftVersion = 16; // mismatched wiring for a draft-18 stream
+      const callback = vi.fn();
+      mgr.registerTrack(1n, 'video', 'video');
+      mgr.onObject = callback;
+
+      const extensions = encodeTs('d18-delta-vi64');
+      await mgr.routeObject(0n, createMockObject({ trackAlias: varint(1), extensions }));
+
+      const headers: LocHeaders = callback.mock.calls[0]![3];
+      // A QUIC-varint decode of the vi64 bytes does NOT recover TS — that is the
+      // exact defect this wiring prevents; the draft-18 path must not share it.
+      expect(headers.captureTimestamp).not.toBe(TS);
+    });
+
+    it('no regression: draft-16 still round-trips its own (QUIC) Capture Timestamp', async () => {
+      const mgr = new SubscriptionManager();
+      // draftVersion unset → draft-16 default.
+      const callback = vi.fn();
+      mgr.registerTrack(1n, 'video', 'video');
+      mgr.onObject = callback;
+
+      const extensions = encodeTs('d16-delta-varint');
+      await mgr.routeObject(0n, createMockObject({ trackAlias: varint(1), extensions }));
+
+      const headers: LocHeaders = callback.mock.calls[0]![3];
+      expect(headers.captureTimestamp).toBe(TS);
+    });
+
+    it('the per-object source draft overrides this.draftVersion (cross-draft migration race)', async () => {
+      // The shared manager has migrated to draft-18, but a late object from the
+      // OLD draft-16 session is still delivered. Its wire profile must follow the
+      // SOURCE session (16), not the mutated manager default (18).
+      const mgr = new SubscriptionManager();
+      mgr.draftVersion = 18; // migrated
+      const callback = vi.fn();
+      mgr.registerTrack(1n, 'video', 'video');
+      mgr.onObject = callback;
+
+      const extensions = encodeTs('d16-delta-varint'); // old-session QUIC bytes
+      const obj = createMockObject({ trackAlias: varint(1), extensions });
+
+      // Delivered with the old session's negotiated draft as the source.
+      await mgr.routeObject(0n, obj, 16);
+      expect((callback.mock.calls[0]![3] as LocHeaders).captureTimestamp).toBe(TS);
+
+      // Without a source draft it falls back to the migrated default (18): the
+      // QUIC bytes read as vi64 either mis-read the timestamp or fail to decode —
+      // either way NOT the correct value. That is the race the per-object source
+      // prevents.
+      callback.mockClear();
+      await mgr.routeObject(0n, obj);
+      const fallback = callback.mock.calls[0]?.[3] as LocHeaders | undefined;
+      expect(fallback?.captureTimestamp).not.toBe(TS);
+    });
   });
 });

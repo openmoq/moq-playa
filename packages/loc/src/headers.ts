@@ -1,36 +1,32 @@
 /**
  * LOC header extension parsing and encoding.
  *
- * Parses the opaque `extensions: Uint8Array` from MOQ Object Header
- * Extensions into structured LOC headers (CaptureTimestamp, VideoFrameMarking,
- * AudioLevel, VideoConfig). Unknown extensions are preserved.
+ * Bridges the opaque `extensions: Uint8Array` from MOQ Object Header Extensions
+ * and structured {@link LocHeaders}. This module is the compatibility layer over
+ * the two-layer split:
+ *   - Layer A ({@link @moqt/transport}) — the profile-aware property WIRE codec
+ *     (bytes ⇄ ordered `PropertyMap`), shared across draft-14/16/18.
+ *   - Layer B ({@link ./property-map.js}) — LOC semantic resolution (PropertyMap
+ *     ⇄ `LocHeaders`).
  *
- * Wire format: delta-encoded KVP per draft-ietf-moq-transport-16 §1.4.2.
- * Even IDs → varint value. Odd IDs → length-prefixed bytes.
+ * The wire profile is selected explicitly: `deltaEncoded: false` → draft-14
+ * absolute QUIC-varint; the default → draft-16 delta QUIC-varint; an explicit
+ * `wireProfile` → any of the three (draft-18 carries a **vi64** block, whose
+ * integers diverge from the QUIC varint at value 64, so it needs its own
+ * profile — `deltaEncoded` alone cannot express it).
  *
  * @see draft-ietf-moq-loc-01 §2.3
  * @see draft-ietf-moq-transport-16 §2.5 (Extension Headers)
  * @module
  */
 
-import {
-    readVarint,
-    writeVarint,
-    varint,
-    varintEncodingLength,
-    readLengthPrefixedBytes,
-    writeLengthPrefixedBytes,
-    lengthPrefixedBytesEncodingLength,
-} from '@moqt/transport';
-import { LocExtensionId } from './types.js';
+import { decodePropertyBlock, encodePropertyBlock, type PropertyWireProfile } from '@moqt/transport';
 import type {
     LocHeaders,
-    LocExtensionValue,
     VideoChunkInit,
     AudioChunkInit,
 } from './types.js';
-import { parseVideoFrameMarking, encodeVideoFrameMarking } from './video.js';
-import { parseAudioLevel, encodeAudioLevel } from './audio.js';
+import { resolveLocHeaders, locHeadersToPropertyMap } from './property-map.js';
 
 /**
  * Options for LOC header parsing/encoding.
@@ -45,30 +41,59 @@ export interface LocHeaderOptions {
      * Draft-14 §1.4.2: "Type: an unsigned integer, encoded as a varint,
      * identifying the type of the value."
      *
-     * Default: true (draft-16 delta encoding).
+     * Default: true (draft-16 delta encoding). Ignored when {@link wireProfile}
+     * is set.
      *
      * @see draft-ietf-moq-transport-16 §1.4.2
      * @see draft-ietf-moq-transport-14 §1.4.2
      */
     readonly deltaEncoded?: boolean;
+
+    /**
+     * Explicit transport wire profile. Overrides {@link deltaEncoded}. Draft-18
+     * (`d18-delta-vi64`) MUST be selected here — it uses a vi64 integer codec
+     * that diverges from the QUIC varint at value 64, so `deltaEncoded: true`
+     * (which stays on the draft-16 QUIC-varint profile) would mis-encode and
+     * mis-decode every value ≥ 64.
+     *
+     * @see draft-ietf-moq-transport-18 §1.4.1 (vi64), §1.4.3 (property block)
+     */
+    readonly wireProfile?: PropertyWireProfile;
+}
+
+/** Map LOC options to a transport wire profile, preserving legacy defaults. */
+function resolveWireProfile(options?: LocHeaderOptions): PropertyWireProfile {
+    if (options?.wireProfile) return options.wireProfile;
+    return options?.deltaEncoded === false ? 'd14-absolute-varint' : 'd16-delta-varint';
+}
+
+/** The transport wire profile for a negotiated MoQT draft version. */
+export function locWireProfileForDraft(draft: number): PropertyWireProfile {
+    switch (draft) {
+        case 14:
+            return 'd14-absolute-varint';
+        case 18:
+            return 'd18-delta-vi64';
+        default:
+            return 'd16-delta-varint';
+    }
 }
 
 /**
  * Parse LOC header extensions from raw MOQ Object extension bytes.
  *
- * Iterates through KVP entries until all bytes are consumed.
- * Known LOC extension IDs are parsed into structured fields; unknown IDs
- * are collected into the `unknown` map.
+ * Decodes the property block (Layer A) then resolves LOC semantics (Layer B).
+ * Known LOC extension IDs become structured fields; unknown IDs are preserved in
+ * `unknown` under their full-width `bigint` id.
  *
  * Type IDs are delta-encoded by default (draft-16 §1.4.2). Pass
- * `{ deltaEncoded: false }` for draft-14 absolute type IDs.
+ * `{ deltaEncoded: false }` for draft-14 absolute type IDs, or
+ * `{ wireProfile: 'd18-delta-vi64' }` for draft-18.
  *
  * @param extensions Raw extension bytes from `MoqtObjectData.extensions`
- * @param options Parsing options (deltaEncoded defaults to true)
+ * @param options Parsing options (defaults to draft-16 delta)
  * @returns Parsed LOC headers
  * @see draft-ietf-moq-loc-01 §2.3
- * @see draft-ietf-moq-transport-16 §1.4.2 (delta-encoded KVP)
- * @see draft-ietf-moq-transport-14 §1.4.2 (absolute KVP)
  */
 export function parseLocHeaders(
     extensions: Uint8Array | undefined,
@@ -77,158 +102,29 @@ export function parseLocHeaders(
     if (!extensions || extensions.length === 0) {
         return {};
     }
-
-    let captureTimestamp: bigint | undefined;
-    let videoFrameMarking: LocHeaders['videoFrameMarking'];
-    let audioLevel: LocHeaders['audioLevel'];
-    let videoConfig: Uint8Array | undefined;
-    let unknown: Map<number, LocExtensionValue> | undefined;
-
-    const deltaEncoded = options?.deltaEncoded !== false; // default true
-    let pos = 0;
-    let prevType = 0n;
-
-    while (pos < extensions.length) {
-        // Read type ID — delta-encoded (draft-16) or absolute (draft-14)
-        const { value: typeVal, bytesRead: typeBytes } = readVarint(extensions, pos);
-        pos += typeBytes;
-
-        const absType = deltaEncoded ? prevType + typeVal : typeVal;
-        prevType = absType;
-        const id = Number(absType);
-
-        if (absType % 2n === 0n) {
-            // Even type → value is a single varint
-            const { value, bytesRead: valBytes } = readVarint(extensions, pos);
-            pos += valBytes;
-
-            switch (id) {
-                case LocExtensionId.CAPTURE_TIMESTAMP:
-                    captureTimestamp = value;
-                    break;
-                case LocExtensionId.VIDEO_FRAME_MARKING:
-                    videoFrameMarking = parseVideoFrameMarking(value);
-                    break;
-                case LocExtensionId.AUDIO_LEVEL:
-                    audioLevel = parseAudioLevel(value);
-                    break;
-                default: {
-                    if (!unknown) unknown = new Map();
-                    unknown.set(id, value);
-                    break;
-                }
-            }
-        } else {
-            // Odd type → length-prefixed bytes
-            const { value: bytes, bytesRead: valBytes } = readLengthPrefixedBytes(extensions, pos);
-            pos += valBytes;
-
-            switch (id) {
-                case LocExtensionId.VIDEO_CONFIG:
-                    videoConfig = bytes;
-                    break;
-                default: {
-                    if (!unknown) unknown = new Map();
-                    unknown.set(id, bytes);
-                    break;
-                }
-            }
-        }
-    }
-
-    const result: LocHeaders = {};
-    if (captureTimestamp !== undefined) (result as any).captureTimestamp = captureTimestamp;
-    if (videoFrameMarking !== undefined) (result as any).videoFrameMarking = videoFrameMarking;
-    if (audioLevel !== undefined) (result as any).audioLevel = audioLevel;
-    if (videoConfig !== undefined) (result as any).videoConfig = videoConfig;
-    if (unknown !== undefined) (result as any).unknown = unknown;
-
-    return result;
+    const { entries } = decodePropertyBlock(extensions, 0, { profile: resolveWireProfile(options) });
+    return resolveLocHeaders(entries);
 }
 
 /**
  * Encode LOC headers into raw MOQ Object extension bytes.
  *
- * Produces delta-encoded KVP entries in ascending ID order.
- * Returns undefined if no headers are present.
+ * Projects to a PropertyMap (Layer B) then encodes canonically (Layer A):
+ * stable ascending-ID order, minimal integer encodings. Returns undefined if no
+ * headers are present.
  *
  * @param headers Structured LOC headers
- * @param options Encoding options (deltaEncoded defaults to true)
+ * @param options Encoding options (defaults to draft-16 delta)
  * @returns Encoded extension bytes, or undefined if empty
  * @see draft-ietf-moq-loc-01 §2.3
- * @see draft-ietf-moq-transport-16 §1.4.2 (delta-encoded KVP)
- * @see draft-ietf-moq-transport-14 §1.4.2 (absolute KVP)
  */
 export function encodeLocHeaders(
     headers: LocHeaders,
     options?: LocHeaderOptions,
 ): Uint8Array | undefined {
-    // Collect entries as [id, value] pairs
-    const entries: Array<{ id: number; value: bigint | Uint8Array }> = [];
-
-    if (headers.captureTimestamp !== undefined) {
-        entries.push({ id: LocExtensionId.CAPTURE_TIMESTAMP, value: headers.captureTimestamp });
-    }
-    if (headers.videoFrameMarking !== undefined) {
-        entries.push({
-            id: LocExtensionId.VIDEO_FRAME_MARKING,
-            value: encodeVideoFrameMarking(headers.videoFrameMarking),
-        });
-    }
-    if (headers.audioLevel !== undefined) {
-        entries.push({
-            id: LocExtensionId.AUDIO_LEVEL,
-            value: encodeAudioLevel(headers.audioLevel),
-        });
-    }
-    if (headers.videoConfig !== undefined) {
-        entries.push({ id: LocExtensionId.VIDEO_CONFIG, value: headers.videoConfig });
-    }
-    if (headers.unknown) {
-        for (const [id, value] of headers.unknown) {
-            entries.push({ id, value });
-        }
-    }
-
+    const entries = locHeadersToPropertyMap(headers);
     if (entries.length === 0) return undefined;
-
-    const deltaEncoded = options?.deltaEncoded !== false; // default true
-
-    // Sort by ID for ascending order
-    entries.sort((a, b) => a.id - b.id);
-
-    // Compute total size
-    let size = 0;
-    let prevId = 0;
-    for (const entry of entries) {
-        const typeField = deltaEncoded ? entry.id - prevId : entry.id;
-        prevId = entry.id;
-        size += varintEncodingLength(varint(typeField));
-
-        if (entry.id % 2 === 0) {
-            size += varintEncodingLength(varint(entry.value as bigint));
-        } else {
-            size += lengthPrefixedBytesEncodingLength(entry.value as Uint8Array);
-        }
-    }
-
-    // Write
-    const buf = new Uint8Array(size);
-    let pos = 0;
-    prevId = 0;
-    for (const entry of entries) {
-        const typeField = deltaEncoded ? entry.id - prevId : entry.id;
-        prevId = entry.id;
-        pos += writeVarint(varint(typeField), buf, pos);
-
-        if (entry.id % 2 === 0) {
-            pos += writeVarint(varint(entry.value as bigint), buf, pos);
-        } else {
-            pos += writeLengthPrefixedBytes(entry.value as Uint8Array, buf, pos);
-        }
-    }
-
-    return buf;
+    return encodePropertyBlock(entries, resolveWireProfile(options));
 }
 
 /**

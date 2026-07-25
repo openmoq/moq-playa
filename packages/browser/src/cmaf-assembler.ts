@@ -32,6 +32,23 @@ import {
   type TrunSample,
 } from './mp4-box.js';
 
+/**
+ * Startup geometry: what the rebase produced for each track's FIRST fragment,
+ * and the resulting cross-track start gap. `gapSec` is positive when video
+ * starts later than audio (the mid-stream-join shape: audio joins at the live
+ * edge, video waits for the next GoP boundary).
+ */
+export interface CmafStartupGeometry {
+  readonly videoRawBmd: string;
+  readonly audioRawBmd: string;
+  readonly videoTimescale: number | null;
+  readonly audioTimescale: number | null;
+  readonly videoStartSec: number | null;
+  readonly audioStartSec: number | null;
+  readonly gapSec: number | null;
+  readonly epochMode: 'shared' | 'legacy';
+}
+
 /** Options for CmafAssembler construction. */
 export interface CmafAssemblerOptions {
   /**
@@ -54,6 +71,12 @@ export interface CmafAssemblerOptions {
    * so old ranges don't cause overlap drops on the new epoch.
    */
   readonly onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string) => void;
+  /**
+   * DIAGNOSTIC ONLY — rebase epoch mode; see `CmafAssembler.epochMode`.
+   * Construction-time so it cannot change once an epoch is established.
+   * Defaults to `shared` (production behavior).
+   */
+  readonly epochMode?: 'shared' | 'legacy';
 }
 
 /**
@@ -138,9 +161,48 @@ export class CmafAssembler {
   /** Enable diagnostic logging. */
   debug = false;
 
+  /**
+   * DIAGNOSTIC ONLY — which rebase epoch to use. Default `shared` is production
+   * behavior: both tracks derive from one cross-track origin, preserving the
+   * publisher's real A/V offset. `legacy` restores the pre-RED5DEV-2315
+   * per-track zero-basing, which maps BOTH first fragments to 0 and therefore
+   * ERASES that offset.
+   *
+   * This exists so the two startup geometries (0/+gap vs 0/0) can be compared
+   * in the SAME build, isolating the geometry from every other change. `legacy`
+   * is knowingly incorrect — it reintroduces the desync the shared epoch fixed —
+   * and must never be a production default.
+   *
+   * Construction-time and readonly: a mode change after a track has already
+   * established an epoch would rebase later fragments against a different
+   * origin than the earlier ones, producing a geometry that never existed.
+   */
+  readonly epochMode: 'shared' | 'legacy';
+
+  /** First raw + patched decode time per track, for the startup geometry report. */
+  private startupGeometryState: {
+    video?: { rawBmd: bigint; patched: bigint; timescale: number | null };
+    audio?: { rawBmd: bigint; patched: bigint; timescale: number | null };
+  } = {};
+  /**
+   * Fired once BOTH tracks' first fragments are known AND the segment that
+   * completed the pair has been delivered. Delivery order matters: reporting
+   * from inside patchEpoch would announce geometry for a segment the sink has
+   * not yet seen.
+   */
+  onStartupGeometry: ((g: CmafStartupGeometry) => void) | null = null;
+  private startupGeometryReported = false;
+  private pendingStartupGeometry: CmafStartupGeometry | null = null;
+
+  /** How many startup fragments per media type carry a debug timing log. */
+  private static readonly STARTUP_DIAG_COUNT = 5;
+  private diagVideoCount = 0;
+  private diagAudioCount = 0;
+
   constructor(options: CmafAssemblerOptions) {
     this.onSegment = options.onSegment;
     this.onDiscontinuity = options.onDiscontinuity;
+    this.epochMode = options.epochMode ?? 'shared';
   }
 
   /**
@@ -239,12 +301,13 @@ export class CmafAssembler {
         moof.set(payload.subarray(moofOffset, moofEnd));
         const rest = payload.subarray(moofEnd);
 
-        this.patchEpoch(mediaType, trackName, moof);
+        this.patchEpoch(mediaType, trackName, moof, groupId);
 
         const segment = moofOffset > 0
           ? concatBuffers(concatBuffers(payload.subarray(0, moofOffset), moof), rest)
           : concatBuffers(moof, rest);
         this.onSegment(mediaType, this.maybeStripRaslSamples(mediaType, segment), trackName, groupId);
+        this.flushStartupGeometry();
         return;
       }
 
@@ -262,11 +325,12 @@ export class CmafAssembler {
       if (!pending) return; // Orphaned mdat — drop
       this.pendingMoofs.delete(key);
 
-      this.patchEpoch(mediaType, trackName, pending);
+      this.patchEpoch(mediaType, trackName, pending, groupId);
 
       // Concatenate moof + mdat
       const segment = concatBuffers(pending, payload);
       this.onSegment(mediaType, this.maybeStripRaslSamples(mediaType, segment), trackName, groupId);
+      this.flushStartupGeometry();
       return;
     }
 
@@ -386,6 +450,9 @@ export class CmafAssembler {
     this.sharedEpochBmd = null;
     this.sharedEpochTimescale = null;
     this.sharedEpochGen = 0;
+    this.startupGeometryState = {};
+    this.pendingStartupGeometry = null;
+    this.startupGeometryReported = false;
     this.videoEpochGen = 0;
     this.audioEpochGen = 0;
   }
@@ -423,6 +490,8 @@ export class CmafAssembler {
   ): bigint {
     const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
     if (timescale === null) return bmd;
+    // Diagnostic control: per-track zero-basing, ignoring the shared origin.
+    if (this.epochMode === 'legacy') return bmd;
 
     if (reestablish) {
       this.sharedEpochGen++;
@@ -442,8 +511,57 @@ export class CmafAssembler {
     return shared <= bmd ? shared : bmd;
   }
 
+  /**
+   * Capture each track's FIRST raw/patched decode time and, once both are
+   * known, report the resulting cross-track start gap exactly once. This is the
+   * geometry the browser actually receives — the number a startup skew must be
+   * correlated against.
+   */
+  private recordStartupGeometry(mediaType: 'video' | 'audio', rawBmd: bigint, patched: bigint): void {
+    if (this.startupGeometryReported) return;
+    const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+    if (this.startupGeometryState[mediaType] === undefined) {
+      this.startupGeometryState[mediaType] = { rawBmd, patched, timescale };
+    }
+    const v = this.startupGeometryState.video;
+    const a = this.startupGeometryState.audio;
+    if (!v || !a) return; // wait until BOTH first fragments are known
+    this.startupGeometryReported = true;
+    const sec = (t: bigint, ts: number | null): number | null =>
+      ts && ts > 0 ? Number(t) / ts : null;
+    const videoStartSec = sec(v.patched, v.timescale);
+    const audioStartSec = sec(a.patched, a.timescale);
+    const geometry: CmafStartupGeometry = {
+      videoRawBmd: String(v.rawBmd),
+      audioRawBmd: String(a.rawBmd),
+      videoTimescale: v.timescale,
+      audioTimescale: a.timescale,
+      videoStartSec,
+      audioStartSec,
+      gapSec: videoStartSec !== null && audioStartSec !== null
+        ? videoStartSec - audioStartSec : null,
+      epochMode: this.epochMode,
+    };
+    if (this.debug) {
+      console.log('[CMAF] startup-geometry %s', JSON.stringify(geometry));
+    }
+    this.pendingStartupGeometry = geometry;
+  }
+
+  /**
+   * Deliver staged startup geometry, after the segment that completed it has
+   * reached the sink. A throwing diagnostic consumer must never affect media
+   * delivery, so the callback is contained.
+   */
+  private flushStartupGeometry(): void {
+    const geometry = this.pendingStartupGeometry;
+    if (!geometry) return;
+    this.pendingStartupGeometry = null;
+    try { this.onStartupGeometry?.(geometry); } catch { /* contained */ }
+  }
+
   /** Record epoch from first moof, detect discontinuity, rebase tfdt. */
-  private patchEpoch(mediaType: 'video' | 'audio', trackName: string, moof: Uint8Array): void {
+  private patchEpoch(mediaType: 'video' | 'audio', trackName: string, moof: Uint8Array, groupId?: bigint): void {
     const bmd = readBaseMediaDecodeTime(moof);
     if (bmd === null) return;
 
@@ -519,6 +637,31 @@ export class CmafAssembler {
     }
 
     const currentEpoch = mediaType === 'video' ? this.videoEpoch! : this.audioEpoch!;
-    patchBaseMediaDecodeTime(moof, bmd - currentEpoch);
+    const patchedBmd = bmd - currentEpoch;
+    patchBaseMediaDecodeTime(moof, patchedBmd);
+    this.recordStartupGeometry(mediaType, bmd, patchedBmd);
+
+    // Startup timing diagnostic (debug-only, first N fragments per media type).
+    // These numbers describe DECODE-time rebasing only: raw bmd, the chosen
+    // epoch, and the patched result, with the timescale needed to read them as
+    // seconds. Presentation offsets (edit lists, composition offsets) are not
+    // represented here — they are not parsed — so this is the rebasing story,
+    // not a complete account of presentation alignment.
+    if (this.debug) {
+      const seen = mediaType === 'video' ? this.diagVideoCount : this.diagAudioCount;
+      if (seen < CmafAssembler.STARTUP_DIAG_COUNT) {
+        if (mediaType === 'video') this.diagVideoCount++; else this.diagAudioCount++;
+        const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+        const patched = bmd - currentEpoch;
+        const sec = (t: bigint) => (timescale ? `${(Number(t) / timescale).toFixed(3)}s` : 'n/a');
+        console.log(
+          '[CMAF] startup#%d %s "%s" group=%s timescale=%s rawBmd=%s (%s) epoch=%s sharedEpoch=%s/%s patched=%s (%s)',
+          seen + 1, mediaType, trackName, String(groupId ?? 'n/a'), String(timescale ?? 'unknown'),
+          String(bmd), sec(bmd), String(currentEpoch),
+          String(this.sharedEpochBmd ?? 'unset'), String(this.sharedEpochTimescale ?? 'unset'),
+          String(patched), sec(patched),
+        );
+      }
+    }
   }
 }

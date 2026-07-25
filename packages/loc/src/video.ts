@@ -9,7 +9,6 @@
  * @module
  */
 
-import type { Varint } from '@moqt/transport';
 import type { VideoFrameMarking } from './types.js';
 
 /**
@@ -34,12 +33,12 @@ import type { VideoFrameMarking } from './types.js';
  * B flag. RFC 9626 §3.1 uses the RTP extension L field for this; in
  * LOC the varint size serves the same purpose.
  *
- * @param value Varint value from LOC extension ID 4
+ * @param value Integer value (varint/vi64) from LOC extension ID 4
  * @returns Parsed VideoFrameMarking
  * @see draft-ietf-moq-loc-01 §2.3.2.2
  * @see RFC 9626 §3.1
  */
-export function parseVideoFrameMarking(value: Varint): VideoFrameMarking {
+export function parseVideoFrameMarking(value: bigint): VideoFrameMarking {
     const num = Number(value);
 
     // Determine byte count from varint value size.

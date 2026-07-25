@@ -11,6 +11,7 @@
 import fjp from 'fast-json-patch';
 const { applyPatch, validate } = fjp;
 import type { Catalog, CatalogTrack, Packaging } from './types.js';
+import { assertFiniteCatalogNumbers } from './catalog-validate.js';
 
 /**
  * Extended result from cf01 parsing — includes raw document for future JSON Patch deltas.
@@ -178,8 +179,12 @@ function parseCf01Object(
     // Validate initTrack references (§3.2.16)
     validateInitTrackRefs(tracks);
 
+    const catalog: Catalog = { version: 1, tracks };
+    // Reject non-finite numbers (e.g. a 1e999 overflow exponent) on every CF-01
+    // path — direct parse AND patch application both build through here.
+    assertFiniteCatalogNumbers(catalog);
     return {
-        catalog: { version: 1, tracks },
+        catalog,
         supportsDeltaUpdates,
         rawDocument: obj,
     };

@@ -130,9 +130,13 @@ export interface LocHeaders {
     readonly videoConfig?: Uint8Array;
     /**
      * Unknown extension headers, keyed by absolute extension ID.
-     * Even IDs map to bigint (varint value), odd IDs to Uint8Array.
+     *
+     * Keys are `bigint` so a full-width (up to 2^64-1) property ID is preserved
+     * losslessly — a draft-18 property block can carry IDs above `Number`'s safe
+     * range, and narrowing them would silently collide distinct extensions.
+     * Even IDs map to bigint (varint/vi64 value), odd IDs to Uint8Array.
      */
-    readonly unknown?: ReadonlyMap<number, LocExtensionValue>;
+    readonly unknown?: ReadonlyMap<bigint, LocExtensionValue>;
 }
 
 // ─── WebCodecs-compatible chunk init ─────────────────────────────────

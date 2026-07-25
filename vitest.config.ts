@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config';
+import { defineConfig, configDefaults } from 'vitest/config';
 import { resolve } from 'path';
 
 export default defineConfig({
@@ -9,6 +9,14 @@ export default defineConfig({
     },
   },
   test: {
-    include: ['packages/*/src/**/*.test.ts'],
+    include: [
+      'packages/*/src/**/*.test.ts',
+      'conformance/media/runner/src/**/*.test.ts',
+      'examples/node-publisher/src/**/*.test.ts',
+    ],
+    // The external-probe differential lane (`*.diff.test.ts`) requires a built
+    // LibMoQ probe via MOQ_MEDIA_PROBE_BIN; it is opt-in via `test:corpus:diff`
+    // and must NEVER run in the default suite.
+    exclude: [...configDefaults.exclude, '**/*.diff.test.ts'],
   },
 });

@@ -1,0 +1,5 @@
+# Wire vectors are normative BYTES. Marking them binary stops Git from
+# diffing them as text (a vector ending in 0x20 is not "trailing whitespace")
+# and, more importantly, from ever applying EOL normalization — a CRLF rewrite
+# on checkout would silently change the bytes the vector asserts.
+*.bin binary

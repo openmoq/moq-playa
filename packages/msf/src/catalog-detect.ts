@@ -42,9 +42,9 @@ export function parseCatalogAuto(
 
     const obj = raw as Record<string, unknown>;
 
+    // Each parser validates its own normalized output (finite numbers, etc.).
     if ('streamingFormat' in obj) {
         return parseCatalogFormat01(text, catalogNamespace).catalog;
     }
-
     return parseMsfCatalog(text, catalogNamespace);
 }

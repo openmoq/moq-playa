@@ -310,6 +310,26 @@ export interface MediaSourceLike {
   /** Callback: playback stall detected. */
   onStall: ((durationMs: number) => void) | null;
 
+  /**
+   * OPTIONAL playback-intent contract.
+   *
+   * Arrival of media is not a request to play. Without this, an adapter that
+   * starts playback when data lands has a second, implicit owner of startup —
+   * it can begin playing while the player is still LOADING or has been paused.
+   * The player calls `setPlaybackIntent(true)` on play() and `false` on
+   * pause()/destroy(), and re-states the current intent on a media source
+   * created later (a player paused before the catalog arrives must not get an
+   * adapter that starts anyway). An adapter may buffer freely at any time but
+   * must not begin its startup positioning/play sequence until intent is true;
+   * withdrawing intent pauses playback that has already started.
+   *
+   * Optional for backward compatibility: an adapter that does not implement it
+   * keeps its previous behavior. The player only states an intent it has
+   * actually been given — a player whose play()/pause() was never called leaves
+   * the adapter's own default untouched.
+   */
+  setPlaybackIntent?(intent: boolean): void;
+
   /** Release all resources (MediaSource, SourceBuffers, object URLs). */
   destroy(): void;
 }

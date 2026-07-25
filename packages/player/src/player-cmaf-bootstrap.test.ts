@@ -78,6 +78,7 @@ function makeMockMs() {
   return {
     initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(),
     reset: vi.fn(), mediaElement: null, destroy: vi.fn(),
+    changeType: vi.fn(async () => {}),
     onFirstFrame: null as (() => void) | null, onError: null, onStall: null,
   };
 }
@@ -355,6 +356,186 @@ describe('CMAF adapter rejection (initialize() === false)', () => {
       objectId: varint(1), payload: boxPayload(['moof', 24], ['mdat', 32]),
     } as MoqtObject);
     expect(mockMs.appendChunk).not.toHaveBeenCalled();
+    await player.destroy();
+  });
+});
+
+// ─── MSF-01 / CMSF-01 init-by-reference (initRef → root initDataList) ──
+
+/** A CMSF-01 catalog: string version "1", plus optional root fields. */
+function cmsfCatalog(tracks: Array<Record<string, unknown>>, root: Record<string, unknown> = {}): string {
+  return JSON.stringify({ version: '1', ...root, tracks });
+}
+/** base64-encode raw bytes the way a publisher ships inline init data. */
+const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
+
+describe('CMSF-01 init-by-reference (initRef → root initDataList)', () => {
+  it('[red-first] a clear CMAF track with initRef resolves root inline initDataList and initializes MSE', async () => {
+    const initSeg = initSegmentPayload(48); // ftyp+moov
+    const { player, mockMs, assembler, errors, subscribedNames } = await bootPlayer(
+      cmsfCatalog(
+        [{ ...VIDEO_BASE, initRef: 'i1' }],
+        { initDataList: [{ id: 'i1', type: 'inline', data: b64(initSeg) }] },
+      ));
+
+    // Inline init resolved from the root list satisfies bootstrap immediately —
+    // MSE initializes ONCE with the DECODED reference bytes, no injected initData.
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+    const cfg = mockMs.initialize.mock.calls[0]![0];
+    expect(cfg.video.codec).toBe('avc1.4D4028');
+    expect(cfg.video.initData).toEqual(initSeg);
+    expect(assembler.setInitSegment).toHaveBeenCalledWith('video', initSeg);
+    expect(subscribedNames()).toContain('video');
+    expect(errors).toEqual([]);
+    await player.destroy();
+  });
+
+  it('initRef to a NON-inline entry is not treated as inline bytes (defers, no bootstrap init)', async () => {
+    const { player, mockMs, errors, subscribedNames } = await bootPlayer(
+      cmsfCatalog(
+        [{ ...VIDEO_BASE, initRef: 'i1' }],
+        { initDataList: [{ id: 'i1', type: 'external', data: 'https://cdn.example/init.mp4' }] },
+      ),
+      { cmafBootstrapTimeoutMs: 0 });
+    // No inline bytes → nothing to initialize with at bootstrap; the track is
+    // still subscribed (in-band init / timeout is the backstop), no fatal.
+    expect(mockMs.initialize).not.toHaveBeenCalled();
+    expect(subscribedNames()).toContain('video');
+    expect(errors).toEqual([]);
+    await player.destroy();
+  });
+
+  it('resolved inline init that is invalid base64 → fatal CMAF_INIT_INVALID before any media subscribe', async () => {
+    const { player, errors, subscribedNames } = await bootPlayer(
+      cmsfCatalog(
+        [{ ...VIDEO_BASE, initRef: 'i1' }],
+        { initDataList: [{ id: 'i1', type: 'inline', data: '!!!not-base64!!!' }] },
+      ));
+    expect(errors.some((e) => e.code === PlayerErrorCode.CMAF_INIT_INVALID)).toBe(true);
+    expect(subscribedNames()).toEqual(['catalog']); // failed before media hit the wire
+    expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('resolved inline init that decodes to zero bytes → fatal CMAF_INIT_INVALID before subscribe', async () => {
+    const { player, errors, subscribedNames } = await bootPlayer(
+      cmsfCatalog(
+        [{ ...VIDEO_BASE, initRef: 'i1' }],
+        { initDataList: [{ id: 'i1', type: 'inline', data: '' }] },
+      ));
+    expect(errors.some((e) => e.code === PlayerErrorCode.CMAF_INIT_INVALID)).toBe(true);
+    expect(subscribedNames()).toEqual(['catalog']);
+    await player.destroy();
+  });
+
+  it('legacy inline initData WINS over initRef when both are present', async () => {
+    const winning = initSegmentPayload(48);
+    const losing = boxPayload(['moov', 60]);
+    const { player, mockMs, errors } = await bootPlayer(
+      cmsfCatalog(
+        [{ ...VIDEO_BASE, initData: b64(winning), initRef: 'i1' }],
+        { initDataList: [{ id: 'i1', type: 'inline', data: b64(losing) }] },
+      ));
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+    expect(mockMs.initialize.mock.calls[0]![0].video.initData).toEqual(winning);
+    expect(errors).toEqual([]);
+    await player.destroy();
+  });
+
+  it('legacy MSF-00 initTrack auto-subscribe still works (no initRef)', async () => {
+    const { player, subscribedNames, mockMs } = await bootPlayer(
+      cmsfCatalog([{ ...VIDEO_BASE, initTrack: 'init-v' }]));
+    // The init track is lazily subscribed; MSE waits for its delivery.
+    expect(subscribedNames()).toContain('init-v');
+    expect(mockMs.initialize).not.toHaveBeenCalled();
+    await player.destroy();
+  });
+
+  it('dangling initRef is rejected at the MSF parse layer (fatal, zero media subscribes)', async () => {
+    const { player, errors, subscribedNames } = await bootPlayer(
+      cmsfCatalog(
+        [{ ...VIDEO_BASE, initRef: 'missing' }],
+        { initDataList: [{ id: 'i1', type: 'inline', data: b64(initSegmentPayload()) }] },
+      ));
+    expect(errors.some((e) => e.code === PlayerErrorCode.CATALOG_PARSE_ERROR)).toBe(true);
+    expect(subscribedNames()).toEqual(['catalog']);
+    await player.destroy();
+  });
+
+  it('a contentProtectionRefIDs track is metadata-preserved, NOT rejected: clear init still plays', async () => {
+    // Repo policy: content protection is INERT catalog metadata — the player
+    // neither claims protected playback nor blocks on it. A CMSF track carrying
+    // contentProtectionRefIDs + a resolvable clear inline init initializes MSE.
+    const initSeg = initSegmentPayload(48);
+    const { player, mockMs, errors } = await bootPlayer(
+      cmsfCatalog(
+        [{ ...VIDEO_BASE, initRef: 'i1', contentProtectionRefIDs: ['1'] }],
+        {
+          initDataList: [{ id: 'i1', type: 'inline', data: b64(initSeg) }],
+          contentProtections: [{
+            refID: '1', defaultKID: ['01234567-89ab-cdef-0123-456789abcdef'], scheme: 'cbcs',
+            drmSystem: { systemID: 'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed', pssh: 'AAAB' },
+          }],
+        }));
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+    expect(mockMs.initialize.mock.calls[0]![0].video.initData).toEqual(initSeg);
+    // No protected-playback / unsupported error was raised.
+    expect(errors).toEqual([]);
+    await player.destroy();
+  });
+});
+
+// ─── MSF-01 op-array delta applied by the player ──────────────────────
+
+describe('MSF-01 op-array delta reaches the player (delta-added track usable)', () => {
+  it('a delta-added CMAF track with initRef resolves against the preserved root list', async () => {
+    const initSeg = initSegmentPayload(48);
+    const { player, adapter, mockMs, errors, subscribedNames, reqIdFor } = await bootPlayer(
+      cmsfCatalog(
+        [{ ...VIDEO_BASE, name: 'v-avc', altGroup: 1, initRef: 'i1' }],
+        { initDataList: [{ id: 'i1', type: 'inline', data: b64(initSeg) }] },
+      ));
+    // Base track bootstrapped MSE from its initRef.
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+    const catalogReqId = await reqIdFor('catalog');
+
+    // A later op-array delta ADDS an HEVC alternate that reuses the same root
+    // init entry (deltas carry no initDataList of their own).
+    adapter._triggerObject(0n, {
+      kind: 'data', trackAlias: catalogReqId, groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(JSON.stringify({
+        deltaUpdate: [{ op: 'add', tracks: [{ name: 'v-hevc', packaging: 'cmaf', isLive: true, role: 'video', altGroup: 1, codec: 'hvc1.1.6.L93.90', initRef: 'i1' }] }],
+      })),
+    } as MoqtObject);
+    await sleep(10);
+    expect(errors).toEqual([]); // delta applied cleanly (reference resolved)
+
+    // Switching to the delta-added HEVC track resolves its initRef through the
+    // player (a codec change): it must get PAST init validation and SUBSCRIBE,
+    // proving the delta-added track + preserved initDataList are wired in.
+    await player.selectVideoTrack('v-hevc');
+    expect(subscribedNames()).toContain('v-hevc');
+    await player.destroy();
+  });
+
+  it('a delta introducing a dangling initRef surfaces a degraded CATALOG_DELTA_ERROR, base stays', async () => {
+    const initSeg = initSegmentPayload(48);
+    const { player, adapter, errors, reqIdFor } = await bootPlayer(
+      cmsfCatalog(
+        [{ ...VIDEO_BASE, name: 'v-avc', initRef: 'i1' }],
+        { initDataList: [{ id: 'i1', type: 'inline', data: b64(initSeg) }] },
+      ));
+    const catalogReqId = await reqIdFor('catalog');
+    adapter._triggerObject(0n, {
+      kind: 'data', trackAlias: catalogReqId, groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(JSON.stringify({
+        deltaUpdate: [{ op: 'add', tracks: [{ name: 'bad', packaging: 'cmaf', isLive: true, initRef: 'missing' }] }],
+      })),
+    } as MoqtObject);
+    await sleep(10);
+    // Delta rejected → degraded (not fatal); the base catalog keeps playing.
+    expect(errors.some((e) => e.code === PlayerErrorCode.CATALOG_DELTA_ERROR && e.severity === 'degraded')).toBe(true);
+    expect(player.state).not.toBe(PlayerState.ERROR);
     await player.destroy();
   });
 });

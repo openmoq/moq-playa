@@ -23,15 +23,33 @@
  * @module
  */
 
-import { readVi64, writeVi64, vi64EncodingLength, MAX_VI64 } from '../primitives/vi64.js';
+import {
+  decodePropertyBlock,
+  encodePropertyBlock,
+  propertyBlockEncodingLength,
+  PropertyWireError,
+  type PropertyEntry,
+} from '../primitives/property-block.js';
 import { ProtocolViolationError } from '../errors.js';
 import type { TrackExtensions } from './messages.js';
 
-/** Max byte-value length for an odd-Type Property (§12). */
-const MAX_PROPERTY_VALUE_BYTES = 0xffff;
+/** The shared property-wire core carries these draft-18 Properties as vi64. */
+const D18_PROFILE = 'd18-delta-vi64' as const;
 
 /** A single Property's value, by the Type-parity rule (even → bigint, odd → bytes). */
 type PropertyValue = bigint | Uint8Array;
+
+/**
+ * Track Properties are a MUST-close protocol element, so a wire-format violation
+ * surfaced by the generic core (a categorised {@link PropertyWireError}) is
+ * re-raised as a {@link ProtocolViolationError} — the class the session layer
+ * closes on. A plain `RangeError` (a truncated vi64 read) propagates unchanged,
+ * matching the historical behaviour of this codec.
+ */
+function asTrackViolation(err: unknown): never {
+  if (err instanceof PropertyWireError) throw new ProtocolViolationError(err.message);
+  throw err;
+}
 
 /**
  * Properties defined for data OBJECTS only — they MUST NOT apply to Tracks (§2.5).
@@ -104,85 +122,41 @@ function assertTrackPropertySemantics(type: bigint, value: PropertyValue): void 
   }
 }
 
-/** Flatten to ascending-Type, delta-encoded entries (duplicates preserved in order). */
-interface FlatProperty {
-  readonly type: bigint;
-  readonly delta: bigint;
-  readonly value: PropertyValue;
-}
-
-function flatten(props: TrackExtensions): FlatProperty[] {
-  const entries = [...props.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  const out: FlatProperty[] = [];
-  let prev = 0n;
-  for (const [typeKey, values] of entries) {
+/**
+ * Build the ordered entry list the core encodes from, applying the
+ * track-specific value validation the generic core does not (and must not) do:
+ * the per-Type semantic ranges (§2.5) for known Track Properties. Generic parity,
+ * the 2^16-1 odd-value limit, delta-overflow and canonical ordering are the
+ * core's responsibility.
+ */
+function prepareForEncode(props: TrackExtensions): PropertyEntry[] {
+  const out: PropertyEntry[] = [];
+  for (const [typeKey, values] of props.entries()) {
     const type = typeKey as bigint;
-    if (type < 0n || type > MAX_VI64) {
-      throw new ProtocolViolationError(`Track Property Type ${type} out of vi64 range`);
-    }
     for (const value of values as readonly PropertyValue[]) {
-      assertValueMatchesParity(type, value);
       assertTrackPropertySemantics(type, value);
-      out.push({ type, delta: type - prev, value });
-      prev = type;
+      out.push({ id: type, value });
     }
   }
   return out;
 }
 
-/** Even Type ⇒ vi64 value (bigint); odd Type ⇒ length-prefixed bytes (Uint8Array). */
-function assertValueMatchesParity(type: bigint, value: PropertyValue): void {
-  const odd = (type & 1n) === 1n;
-  if (odd) {
-    if (!(value instanceof Uint8Array)) {
-      throw new ProtocolViolationError(`Odd Track Property Type 0x${type.toString(16)} expects a bytes value`);
-    }
-    if (value.length > MAX_PROPERTY_VALUE_BYTES) {
-      throw new ProtocolViolationError(
-        `Track Property value length ${value.length} exceeds maximum ${MAX_PROPERTY_VALUE_BYTES}`,
-      );
-    }
-  } else if (typeof value !== 'bigint') {
-    throw new ProtocolViolationError(`Even Track Property Type 0x${type.toString(16)} expects a varint value`);
-  }
-}
-
-function propertyValueLength(type: bigint, value: PropertyValue): number {
-  if ((type & 1n) === 1n) {
-    const bytes = value as Uint8Array;
-    return vi64EncodingLength(BigInt(bytes.length)) + bytes.length;
-  }
-  return vi64EncodingLength(value as bigint);
-}
-
 /** Wire length of the encoded Track Properties block (0 when empty). */
 export function trackProperties18EncodingLength(props: TrackExtensions): number {
-  let len = 0;
-  for (const { type, delta, value } of flatten(props)) {
-    len += vi64EncodingLength(delta) + propertyValueLength(type, value);
+  try {
+    return propertyBlockEncodingLength(prepareForEncode(props), D18_PROFILE);
+  } catch (err) {
+    asTrackViolation(err);
   }
-  return len;
 }
 
 /** Encode a Track Properties block to its draft-18 wire form (empty → 0 bytes). */
 export function encodeTrackProperties18(props: TrackExtensions): Uint8Array {
-  const flat = flatten(props);
-  const buf = new Uint8Array(
-    flat.reduce((n, { type, delta, value }) => n + vi64EncodingLength(delta) + propertyValueLength(type, value), 0),
-  );
-  let p = 0;
-  for (const { type, delta, value } of flat) {
-    p += writeVi64(delta, buf, p);
-    if ((type & 1n) === 1n) {
-      const bytes = value as Uint8Array;
-      p += writeVi64(BigInt(bytes.length), buf, p);
-      buf.set(bytes, p);
-      p += bytes.length;
-    } else {
-      p += writeVi64(value as bigint, buf, p);
-    }
+  try {
+    return encodePropertyBlock(prepareForEncode(props), D18_PROFILE);
+  } catch (err) {
+    asTrackViolation(err);
   }
-  return buf;
 }
 
 /**
@@ -191,50 +165,29 @@ export function encodeTrackProperties18(props: TrackExtensions): Uint8Array {
  * an empty map. Duplicate Types are preserved (multiple values under one key).
  *
  * @throws {ProtocolViolationError} on a Type above 2^64-1, an over-long byte
- *   value, or a truncated entry.
+ *   value, or an out-of-range known Track Property value.
+ * @throws {RangeError} on a truncated vi64 (an out-of-bounds read).
  */
 export function decodeTrackProperties18(
   buf: Uint8Array,
   offset: number,
   end: number = buf.length,
 ): { properties: TrackExtensions; bytesRead: number } {
+  const decoded = ((): { entries: PropertyEntry[]; bytesRead: number } => {
+    try {
+      return decodePropertyBlock(buf, offset, { profile: D18_PROFILE, end });
+    } catch (err) {
+      asTrackViolation(err);
+    }
+  })();
   const properties = new Map<bigint, PropertyValue[]>();
-  let p = offset;
-  let prevType = 0n;
-  while (p < end) {
-    const delta = readVi64(buf, p);
-    p += delta.bytesRead;
-    const type = prevType + delta.value;
-    if (type > MAX_VI64) {
-      throw new ProtocolViolationError(`Track Property Type ${type} exceeds 2^64-1`);
-    }
-    prevType = type;
-
-    let value: PropertyValue;
-    if ((type & 1n) === 1n) {
-      const len = readVi64(buf, p);
-      p += len.bytesRead;
-      const n = Number(len.value);
-      if (n > MAX_PROPERTY_VALUE_BYTES) {
-        throw new ProtocolViolationError(`Track Property value length ${n} exceeds maximum ${MAX_PROPERTY_VALUE_BYTES}`);
-      }
-      if (p + n > end) {
-        throw new ProtocolViolationError('Track Property bytes value exceeds the Track Properties block');
-      }
-      value = buf.slice(p, p + n);
-      p += n;
-    } else {
-      const v = readVi64(buf, p);
-      p += v.bytesRead;
-      value = v.value;
-    }
+  for (const { id, value } of decoded.entries) {
     // Reject known-but-invalid Track Properties (out-of-range / Object-only);
     // unknown Types pass through and are preserved.
-    assertTrackPropertySemantics(type, value);
-
-    const existing = properties.get(type);
+    assertTrackPropertySemantics(id, value);
+    const existing = properties.get(id);
     if (existing) existing.push(value);
-    else properties.set(type, [value]);
+    else properties.set(id, [value]);
   }
-  return { properties, bytesRead: p - offset };
+  return { properties, bytesRead: decoded.bytesRead };
 }

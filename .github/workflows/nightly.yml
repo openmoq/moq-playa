@@ -1,0 +1,49 @@
+# Scheduled lanes — the expensive checks that must not block PRs or publishing.
+# Only lanes whose implementations exist are wired; the media differential,
+# browser matrix, and corpus fuzz lanes are added by their own slices.
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 9 * * *" # daily, 09:17 UTC (off the top-of-hour rush)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+      - name: Build all packages
+        run: pnpm -r build
+      - name: Scenario soak (draft-18)
+        run: pnpm test:soak
+      - name: Scenario soak (legacy drafts)
+        run: pnpm test:soak:legacy
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+      - name: Build all packages
+        run: pnpm -r build
+      - name: Property/parser-crash fuzz (FC_RUNS=5000)
+        run: pnpm test:soak:fuzz

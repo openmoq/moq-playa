@@ -14,7 +14,7 @@
 
 import type { MoqtConnection, WebTransportLike } from '@moqt/webtransport';
 import type { QlogEvent, MoqtObject, DraftVersion } from '@moqt/transport';
-import type { TrackConstraints, CatalogTrack } from '@moqt/msf';
+import type { TrackConstraints, CatalogTrack, CatalogState } from '@moqt/msf';
 import type { ClockSource, DecoderCommand, RecoveryController } from '@moqt/playback';
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike, MediaSourceLike, CmafAssemblerLike } from './interfaces.js';
 import type { PlayerError } from './errors.js';
@@ -201,9 +201,7 @@ export interface ConnectionConfig {
    *
    * @see draft-ietf-moq-msf-00 §5 (Catalog)
    */
-  readonly catalog?: {
-    readonly tracks: readonly CatalogTrack[];
-  };
+  readonly catalog?: { readonly tracks: readonly CatalogTrack[] } & Partial<Omit<CatalogState, 'tracks'>>;
 }
 
 /** Playback tuning options. */

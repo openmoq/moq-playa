@@ -20,11 +20,11 @@
  * @module
  */
 
-import type { ControlMessage, Parameters } from '@moqt/transport';
+import type { ControlMessage, Parameters, DraftVersion } from '@moqt/transport';
 import { varint, PublishDoneCode, PublishDoneCode18 } from '@moqt/transport';
 import { MoqtConnectionError } from '@moqt/webtransport';
-import type { MoqtConnection } from '@moqt/webtransport';
-import type { MoqtObject } from '@moqt/transport';
+import type { MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@moqt/webtransport';
+import type { MoqtObject, ObjectDatagram } from '@moqt/transport';
 import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@moqt/playback';
 import { BufferBasedController } from '@moqt/playback';
 import type { AbrTrack } from '@moqt/playback';
@@ -195,6 +195,71 @@ export interface QualitySwitchIntent {
   readonly reason: string;
 }
 
+/**
+ * Estimate the bytes a value retains when captured in a staged closure — the
+ * actual sum of its `Uint8Array` byte-lengths and string lengths, recursing
+ * through arrays/maps/objects (bounded depth). Used to charge staged control /
+ * namespace events (which retain parameter byte arrays, track names, and reason
+ * strings) against the migration byte budget, not a flat guess.
+ */
+function estimateRetainedBytes(value: unknown, depth = 0): number {
+  if (value == null || depth > 6) return 0;
+  if (value instanceof Uint8Array) return value.byteLength;
+  if (typeof value === 'string') return value.length * 2; // UTF-16 code units
+  if (typeof value === 'bigint' || typeof value === 'number' || typeof value === 'boolean') return 8;
+  if (Array.isArray(value)) {
+    let sum = 0;
+    for (const el of value) sum += estimateRetainedBytes(el, depth + 1);
+    return sum;
+  }
+  if (value instanceof Map) {
+    let sum = 0;
+    for (const [k, v] of value) sum += estimateRetainedBytes(k, depth + 1) + estimateRetainedBytes(v, depth + 1);
+    return sum;
+  }
+  if (typeof value === 'object') {
+    let sum = 0;
+    for (const v of Object.values(value as Record<string, unknown>)) sum += estimateRetainedBytes(v, depth + 1);
+    return sum;
+  }
+  return 0;
+}
+
+/**
+ * Bytes an Error retains — its (mostly non-enumerable) message, stack, and cause
+ * chain, plus a structured context — which the generic {@link estimateRetainedBytes}
+ * would miss. Used to charge a staged degraded-error diagnostic honestly.
+ */
+function errorRetainedBytes(err: unknown, context: unknown, depth = 0): number {
+  let bytes = estimateRetainedBytes(context);
+  if (err instanceof Error && depth <= 4) {
+    bytes += (err.message?.length ?? 0) * 2;
+    bytes += (err.stack?.length ?? 0) * 2;
+    if (err.cause) bytes += errorRetainedBytes(err.cause, undefined, depth + 1);
+  }
+  return bytes;
+}
+
+/**
+ * One in-flight migration transaction (see {@link MoqtPlayer.currentMigration}).
+ * Owns the candidate connection and its staged events so cleanup, abort, and
+ * commit can prove ownership rather than clobbering a global slot.
+ */
+interface MigrationTxn {
+  readonly conn: MoqtConnection;
+  /** Staged events, each tagged with the live-delivery error source used to
+   *  classify a replay failure the same way live delivery would. */
+  readonly events: Array<{ readonly run: () => void; readonly source: MoqtConnectionErrorSource }>;
+  retainedBytes: number;
+  /** Candidate reached a terminal state (closed/errored) or overflowed staging. */
+  aborted: boolean;
+  /** Candidate has been promoted — staging is closed; further events run live. */
+  committed: boolean;
+  /** The committed session closed/fatally-errored DURING drain — stop replaying
+   *  its events and do not report a successful migration. */
+  terminated: boolean;
+}
+
 // ─── MoqtPlayer ──────────────────────────────────────────────────────
 
 /**
@@ -263,6 +328,16 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-cmsf-00 §3 (CMAF Packaging)
    */
   private mediaSource: MediaSourceLike | null = null;
+  /**
+   * Playback intent as declared through play()/pause()/destroy(), or `null`
+   * when the embedder has never declared one. A media source created later
+   * inherits this rather than its own default, so a player paused before the
+   * catalog arrived cannot get an adapter that starts anyway.
+   */
+  private playbackIntent: boolean | null = null;
+  /** Pending `state_changed` announcements; see announceState(). */
+  private readonly stateAnnouncements: { from: PlayerStateValue; to: PlayerStateValue }[] = [];
+  private announcingState = false;
   /** Smoothed LOC render cushion getter (slice A); null for CMAF sessions. */
   private getRenderCushionUs: (() => number) | null = null;
 
@@ -331,11 +406,45 @@ export class MoqtPlayer {
    * sending immediately after receiving SUBSCRIBE. Objects are keyed by
    * track alias and replayed when SUBSCRIBE_OK maps the alias to a track.
    *
-   * Bounded: max 256 objects per alias, auto-cleared after 10 seconds.
+   * Bounded on two axes so an unresolving peer cannot grow it without limit:
+   * at most {@link MAX_PENDING_PER_ALIAS} objects per alias AND at most
+   * {@link MAX_PENDING_ALIASES} distinct aliases (a new alias beyond the cap is
+   * dropped, not buffered). Entries are reclaimed when their delivering session
+   * closes ({@link purgePendingForConnection}) — which also releases the strong
+   * reference each entry holds to its source connection, so a superseded adapter
+   * is collectable after migration.
    * @see draft-ietf-moq-transport-16 §9.10 (Track Alias in SUBSCRIBE_OK)
    */
-  private readonly pendingObjectsByAlias = new Map<bigint, { streamId: bigint; obj: MoqtObject }[]>();
+  private readonly pendingObjectsByAlias = new Map<bigint, { streamId: bigint; obj: MoqtObject; sourceDraft: DraftVersion | undefined; sourceConnection: MoqtConnection }[]>();
   private static readonly MAX_PENDING_PER_ALIAS = 256;
+  private static readonly MAX_PENDING_ALIASES = 1024;
+
+  /**
+   * The single in-flight migration transaction, or null. Migration is
+   * single-flight: a second attempt while one is running is rejected. The record
+   * owns the candidate connection and its STAGED application events (control,
+   * object, data-stream, datagram, …) captured while the candidate is
+   * established-but-not-promoted — a fast peer can return the catalog
+   * SUBSCRIBE_OK (or objects) before `subscribe()` even resolves, and processing
+   * those against the not-yet-current candidate would drop them (control guard)
+   * or route them through old-session state. They are drained in arrival order
+   * right after the handoff commits. `aborted` records candidate-terminal or
+   * overflow; `committed` stops staging once the candidate is authoritative.
+   */
+  private currentMigration: MigrationTxn | null = null;
+  /** A GOAWAY received from a session WHILE a handoff was in flight — acted on
+   *  once the handoff finishes, but ONLY if its source is still the current
+   *  session (see {@link processPendingGoaway}). The source matters: during
+   *  candidate establishment the OLD session is still current and its GOAWAY would
+   *  otherwise migrate away from the caller's chosen replacement after commit. */
+  private pendingGoaway: { readonly uri: string; readonly sourceConnection: MoqtConnection } | null = null;
+  /** Max staged candidate events before the transaction aborts (bounds closures). */
+  private static readonly MAX_STAGED_EVENTS = 512;
+  /** Max total retained bytes across staged events before aborting. */
+  private static readonly MAX_STAGED_BYTES = 8 * 1024 * 1024;
+  /** Per-event base cost — charges control/namespace/stream events (which retain
+   *  parameter byte arrays and reason strings) so the byte budget covers them. */
+  private static readonly STAGED_EVENT_BASE_BYTES = 1024;
 
 
   /** Tick interval handle for pipeline processing. */
@@ -645,11 +754,9 @@ export class MoqtPlayer {
           return;
         }
         this.log.warn('Watchdog timeout: %s after %dms', e.event, e.elapsedMs);
-        this.emitter.emit('state_changed', {
-          type: 'state_changed',
-          from: this.state,
-          to: this.state, // state doesn't change — diagnostic only
-        });
+        // Through the queue like every other publication: emitting directly
+        // would let a re-entrant listener here reorder state events.
+        this.announceState(this.state, this.state); // state doesn't change — diagnostic only
       },
       onWarning: (e) => {
         this.log.info('Watchdog waiting: %s (%dms/%dms)', e.event, e.elapsedMs, e.timeoutMs);
@@ -800,6 +907,45 @@ export class MoqtPlayer {
   }
 
   /**
+   * Resolve a selected track's effective INLINE CMAF init segment (Base64),
+   * the single source of init-source resolution for every CMAF site.
+   *
+   * Priority:
+   *   1. `track.initData` — the MSF-00 inline init wins, unchanged.
+   *   2. `track.initRef` → a root `initDataList` entry with `type:"inline"` → its
+   *      `data`. This materializes the MSF-01/CMSF-01 init-by-reference form.
+   *   3. otherwise `undefined` — `track.initTrack` subscription or an in-band
+   *      ftyp+moov object supplies the bytes under the bootstrap deadline.
+   *
+   * A non-inline `initRef` target is deliberately NOT treated as inline bytes;
+   * a dangling `initRef` is already rejected by the catalog parser, so the root
+   * lookup here resolves or the reference simply yields no inline data.
+   */
+  private resolveInlineInitData(track: CatalogTrack): string | undefined {
+    if (track.initData !== undefined) return track.initData;
+    if (track.initRef !== undefined) {
+      const entry = this._catalogState?.initDataList?.find((e) => e.id === track.initRef);
+      if (entry?.type === 'inline') return entry.data;
+    }
+    return undefined;
+  }
+
+  private decodeResolvedInlineInitData(track: CatalogTrack): Uint8Array | undefined {
+    const initB64 = this.resolveInlineInitData(track);
+    if (initB64 === undefined) return undefined;
+    let bytes: Uint8Array;
+    try {
+      bytes = Uint8Array.from(atob(initB64), (c) => c.charCodeAt(0));
+    } catch {
+      throw new Error('inline init data is not valid base64');
+    }
+    if (bytes.byteLength === 0) {
+      throw new Error('inline init data decodes to zero bytes');
+    }
+    return bytes;
+  }
+
+  /**
    * Ensure init bytes for `initTrackName` are cached, lazy-subscribing
    * to the init track if necessary.
    *
@@ -912,8 +1058,9 @@ export class MoqtPlayer {
     //
     // Source priority:
     //   1. inline `targetTrack.initData` (catalog ships it)
-    //   2. cached `initSegmentByTrack[targetTrack.initTrack]` (already subscribed)
-    //   3. lazy-subscribe to `targetTrack.initTrack` and await first delivery
+    //   2. inline `targetTrack.initRef` → root initDataList
+    //   3. cached `initSegmentByTrack[targetTrack.initTrack]` (already subscribed)
+    //   4. lazy-subscribe to `targetTrack.initTrack` and await first delivery
     //
     // Validate UP-FRONT (before mutating any state): if the catalog
     // provides neither initData nor initTrack for a codec change, the
@@ -925,15 +1072,25 @@ export class MoqtPlayer {
         && (this.currentVideoCodec === null
             || !codecsCompatible(targetTrack.codec, this.currentVideoCodec));
     if (needsCodecChange) {
-      if (!targetTrack.initData && !targetTrack.initTrack) {
+      // Resolve the inline init once (track.initData or an initRef → root inline
+      // initDataList entry); fall back to an initTrack subscription otherwise.
+      let inlineInit: Uint8Array | undefined;
+      try {
+        inlineInit = this.decodeResolvedInlineInitData(targetTrack);
+      } catch (err) {
         throw new Error(
-          `Cannot switch to "${trackName}": catalog provides no initData or initTrack for codec "${targetTrack.codec}"`,
+          `Cannot switch to "${trackName}": ${err instanceof Error ? err.message : String(err)} for codec "${targetTrack.codec}"`,
+        );
+      }
+      if (!inlineInit && !targetTrack.initTrack) {
+        throw new Error(
+          `Cannot switch to "${trackName}": catalog provides no inline init (initData/initRef) or initTrack for codec "${targetTrack.codec}"`,
         );
       }
       this.log.info('[SWITCH] codec change "%s" → "%s" (codec "%s" → "%s"): prefetching init',
         currentVideoTrackName, trackName,
         this.currentVideoCodec ?? '(unknown)', targetTrack.codec);
-      if (!targetTrack.initData && targetTrack.initTrack) {
+      if (!inlineInit && targetTrack.initTrack) {
         try {
           await this.ensureInitTrack(targetTrack.initTrack);
         } catch (err) {
@@ -1069,11 +1226,17 @@ export class MoqtPlayer {
           || !codecsCompatible(newTrack.codec, this.currentVideoCodec));
 
     if (needsChangeType && newTrack && this.mediaSource?.changeType) {
-      // Inline `initData` is Base64 (CatalogTrack §5.1.20); decode it.
-      // initTrack-delivered cache holds raw Uint8Array.
-      const initData: Uint8Array | undefined = newTrack.initData
-        ? Uint8Array.from(atob(newTrack.initData), c => c.charCodeAt(0))
-        : (newTrack.initTrack ? this.initSegmentByTrack.get(newTrack.initTrack) : undefined);
+      // Inline init (`initData` or an `initRef` → root inline entry) is Base64
+      // (CatalogTrack §5.1.20 / MSF-01 §5.1.7); decode it. initTrack-delivered
+      // cache holds raw Uint8Array.
+      let initData: Uint8Array | undefined;
+      try {
+        initData = this.decodeResolvedInlineInitData(newTrack)
+          ?? (newTrack.initTrack ? this.initSegmentByTrack.get(newTrack.initTrack) : undefined);
+      } catch (err) {
+        this.abortPendingVideoSwitch(sw, err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
       if (!initData) {
         // selectVideoTrack should have pre-fetched this. Hitting here
         // means the catalog has neither inline initData nor an
@@ -1137,7 +1300,7 @@ export class MoqtPlayer {
       const trackInfo: TrackInfo = {
         video: defined({
           codec: newTrack.codec ?? '',
-          initData: newTrack.initData,
+          initData: this.resolveInlineInitData(newTrack),
           width: newTrack.width,
           height: newTrack.height,
         }),
@@ -1587,8 +1750,8 @@ export class MoqtPlayer {
     };
 
     // §2.4.2: Malformed Track — MUST UNSUBSCRIBE, SHOULD deliver error
-    this.subscriptionManager.onMalformedTrack = (trackAlias, _mediaType, trackName, error) => {
-      this.handleMalformedTrack(trackAlias, trackName, error);
+    this.subscriptionManager.onMalformedTrack = (trackAlias, _mediaType, trackName, error, sourceConnection) => {
+      this.handleMalformedTrack(trackAlias, trackName, error, sourceConnection as MoqtConnection | undefined);
     };
 
     // §7: Media timeline object delivery → update timeline state
@@ -1757,6 +1920,13 @@ export class MoqtPlayer {
       this.log.info('Using externally owned adapter (already connected)');
     }
 
+    // The NEGOTIATED draft is authoritative for the LOC property wire profile —
+    // config.draftVersion is only a pre-connect hint. WT protocol negotiation (or
+    // an externally-owned adapter) may land on a different draft (e.g. auto-18),
+    // and decoding LOC with the wrong profile mis-reads every value >= 64.
+    // (Guarded: destroy() may have nulled the manager during the connect await.)
+    if (this.subscriptionManager) this.subscriptionManager.draftVersion = conn.draftVersion;
+
     this._stats.recordTransportConnected();
     this._stats.recordSetupComplete();
     this.emitter.emit('session_established', {
@@ -1786,8 +1956,13 @@ export class MoqtPlayer {
       // the catalog subscription + parse step.
       const injectedCatalog = this.config.catalog;
       const catalogState: CatalogState = {
-        version: 1,
+        version: injectedCatalog.version ?? 1,
         tracks: [...injectedCatalog.tracks] as CatalogTrack[],
+        ...(injectedCatalog.generatedAt !== undefined ? { generatedAt: injectedCatalog.generatedAt } : {}),
+        ...(injectedCatalog.isComplete !== undefined ? { isComplete: injectedCatalog.isComplete } : {}),
+        ...(injectedCatalog.initDataList !== undefined ? { initDataList: injectedCatalog.initDataList } : {}),
+        ...(injectedCatalog.contentProtections !== undefined ? { contentProtections: injectedCatalog.contentProtections } : {}),
+        ...(injectedCatalog.publishTracks !== undefined ? { publishTracks: injectedCatalog.publishTracks } : {}),
       };
 
       // Emit catalog_received so the app knows tracks are available
@@ -1919,8 +2094,18 @@ export class MoqtPlayer {
    */
   play(): void {
     this.log.info('play()');
-    const fromState = this.stateMachine.state;
-    this.transitionState(PlayerState.PLAYING);
+    // ONE transaction. The transition is validated first (an invalid one throws
+    // having changed nothing), then state, playback intent, adapter intent and
+    // ticking are all committed, and only then is the completed transition
+    // announced. Announcing earlier would let a listener observe — or re-enter
+    // against — a half-applied play, and a throwing listener would strand it.
+    const fromState = this.applyState(PlayerState.PLAYING);
+
+    // Playback intent is the player's to declare. The media source may buffer
+    // whenever data arrives, but must not start playing on its own. Recorded so
+    // an adapter created LATER inherits it (see createPipelines wiring).
+    this.playbackIntent = true;
+    this.mediaSource?.setPlaybackIntent?.(true);
     this._stats.recordPlayStart();
 
     // Resuming from pause on a live stream: the media position has moved on.
@@ -1946,6 +2131,10 @@ export class MoqtPlayer {
     if (fromState === PlayerState.PAUSED && this.connection) {
       this.sendForwardUpdate(1);
     }
+
+    // LAST: a listener may now pause/destroy, and its transaction — being
+    // complete in itself — legitimately supersedes this one.
+    this.announceState(fromState, PlayerState.PLAYING);
   }
 
   /**
@@ -1957,7 +2146,11 @@ export class MoqtPlayer {
    */
   pause(): void {
     this.log.info('pause()');
-    this.transitionState(PlayerState.PAUSED);
+    // Same transaction shape as play(): validate, commit everything, announce
+    // last. See play() for why the announcement cannot come earlier.
+    const fromState = this.applyState(PlayerState.PAUSED);
+    this.playbackIntent = false;
+    this.mediaSource?.setPlaybackIntent?.(false);
     this._stats.recordPlayStop();
     this.stopTicking();
 
@@ -1969,6 +2162,8 @@ export class MoqtPlayer {
     if (this.connection) {
       this.sendForwardUpdate(0);
     }
+
+    this.announceState(fromState, PlayerState.PAUSED);
   }
 
   /**
@@ -2102,20 +2297,226 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-transport-16 §8.4.1 (Graceful Subscriber Relay Switchover)
    */
   async migrate(newConnection: MoqtConnection): Promise<void> {
-    const oldConnection = this.connection;
+    if (!this.config.createTransport) {
+      throw new Error('Cannot migrate: createTransport not configured (external adapter mode)');
+    }
+    const createTransport = this.config.createTransport;
+    const setupOptions = buildSetupOptions(this.config);
+    await this.runMigrationTransaction(newConnection, () => createTransport(buildConnectUrl(this.config)), setupOptions);
 
-    // Wire new adapter callbacks
-    this.connection = newConnection;
+    this._stats.recordReconnect();
+    this.log.info('Session migrated');
+    this.emitter.emit('session_migrated', { type: 'session_migrated' });
+  }
+
+  /**
+   * Run one migration as a single-flight transaction. The single-flight slot is
+   * reserved BEFORE the transport is created (so a concurrent migration can't
+   * spin up an orphaned WebTransport). Establishment (transport + connect +
+   * catalog subscribe) runs WITHOUT disturbing the current session and rolls back
+   * completely on failure — including closing an orphaned transport. Only after
+   * the candidate is validated does the handoff commit; POST-commit staged-event
+   * draining is deliberately OUTSIDE the establishment rollback, so a throwing
+   * application listener can never detach/close the already-authoritative session.
+   */
+  private async runMigrationTransaction(
+    newConnection: MoqtConnection,
+    makeTransport: () => Promise<WebTransportLike>,
+    setupOptions: ReturnType<typeof buildSetupOptions>,
+  ): Promise<void> {
+    if (this._destroyed) throw new Error('Cannot migrate: player is destroyed');
+    if (this.currentMigration) throw new Error('Cannot migrate: a migration is already in progress');
+
+    const oldConnection = this.connection;
+    const txn: MigrationTxn = { conn: newConnection, events: [], retainedBytes: 0, aborted: false, committed: false, terminated: false };
+    this.currentMigration = txn; // reserve single-flight BEFORE creating the transport
     this.wireConnection(newConnection);
+
+    let catalogReqId: bigint;
+    let transport: WebTransportLike | undefined;
+    try {
+      transport = await makeTransport();
+      this.assertMigrationLive(txn); // destroyed/aborted during transport creation?
+      await newConnection.connect(transport, setupOptions);
+      this.assertMigrationLive(txn);
+      const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+      const nameBytes = this.enc.encode(catalogTrackName());
+      const reqId = await newConnection.subscribe(nsBytes, nameBytes, {
+        subscriptionFilter: { type: 'AbsoluteStart', startGroup: varint(0n), startObject: varint(0n) },
+      });
+      this.assertMigrationLive(txn); // validate immediately before the atomic commit
+      catalogReqId = BigInt(reqId);
+    } catch (err) {
+      // ESTABLISHMENT rollback — nothing committed, old session untouched. Discard
+      // the candidate and close any orphaned transport (idempotent with the
+      // candidate close, which closes an attached transport).
+      if (this.currentMigration === txn) this.currentMigration = null;
+      this.abandonCandidate(txn);
+      if (transport) { try { transport.close(); } catch { /* already closing/closed */ } }
+      // The old session was never disturbed and is still current — a GOAWAY it
+      // sent while this (failed) handoff held the slot can now be acted on.
+      this.processPendingGoaway();
+      throw err;
+    }
+
+    // ── Point of no return: the candidate is validated. Commit atomically. ──
+    this.commitMigration(txn, newConnection, catalogReqId);
+    // POST-commit: drain staged events, THEN retire the old session — with the
+    // transaction kept REGISTERED (currentMigration === txn) through BOTH, so a
+    // new-session close/fatal-error while the old close() is pending can still
+    // mark txn.terminated. Cleanup runs in `finally` even if something throws — a
+    // stranded transaction would leave a permanent "migration in progress" lock.
+    // (drainStagedCandidate never throws; retireMigratedSession never throws.)
+    try {
+      this.drainStagedCandidate(txn);
+      await this.retireMigratedSession(oldConnection);
+    } finally {
+      if (this.currentMigration === txn) this.currentMigration = null;
+    }
+    // The single-flight slot is now released — a GOAWAY queued during drain or
+    // retirement can be acted on (a fresh migration to its target). Done before
+    // the termination check so a GOAWAY that raced a dying session still drives
+    // recovery to the new relay.
+    this.processPendingGoaway();
+    // The replacement may have died during drain OR during old-session
+    // retirement, or the player was destroyed. In any of these the handoff did
+    // not yield a usable session (session_closed/error was already surfaced), so
+    // do NOT report a successful migration.
+    if (txn.terminated || this._destroyed) throw new Error('Migration session closed during handoff');
+  }
+
+  /**
+   * Throw if the in-flight transaction may no longer commit: the player was
+   * destroyed, the candidate reached a terminal/overflow state, or it was
+   * superseded by another transaction. Called right after each establishment
+   * await, so a deferred candidate cannot resurrect a destroyed player or commit
+   * a dead session.
+   */
+  private assertMigrationLive(txn: MigrationTxn): void {
+    if (this._destroyed) throw new Error('Migration aborted: player destroyed during establishment');
+    if (this.currentMigration !== txn || txn.aborted) throw new Error('Migration aborted: candidate no longer valid');
+  }
+
+  /**
+   * Append a bounded event to a transaction's staged queue. Overflow (event or
+   * byte cap) aborts and closes the candidate rather than silently dropping a
+   * possibly-essential event. Shared by the callback staging wrapper and the
+   * deferred degraded-error diagnostic.
+   */
+  private stageMigrationEvent(txn: MigrationTxn, run: () => void, bytes: number, source: MoqtConnectionErrorSource): void {
+    if (txn.events.length >= MoqtPlayer.MAX_STAGED_EVENTS || txn.retainedBytes + bytes > MoqtPlayer.MAX_STAGED_BYTES) {
+      this.abortMigration(txn);
+      return;
+    }
+    txn.retainedBytes += bytes;
+    txn.events.push({ run, source });
+  }
+
+  /**
+   * Abort an in-flight transaction from an out-of-band signal (candidate close /
+   * error, or staging overflow): mark it terminal, drop its staged events,
+   * DETACH the candidate's callbacks so no racing event runs live, and close it.
+   * The pending connect/subscribe then rejects (or {@link assertMigrationLive}
+   * throws), routing the transaction through its rollback.
+   */
+  private abortMigration(txn: MigrationTxn): void {
+    if (txn.aborted) return;
+    txn.aborted = true;
+    txn.committed = true; // stop staging
+    txn.events.length = 0;
+    txn.retainedBytes = 0;
+    this.detachConnectionCallbacks(txn.conn);
+    void txn.conn.close().catch(() => { /* candidate closing/closed */ });
+  }
+
+  /**
+   * Roll back a failed transaction: detach the candidate's callbacks FIRST (so no
+   * data racing its close runs live against old-session state), drop its staged
+   * events, purge anything it buffered, and close it. Idempotent with a prior
+   * {@link abortMigration}.
+   */
+  private abandonCandidate(txn: MigrationTxn): void {
+    // Mark the transaction terminal so any callback reference captured before
+    // detachment is permanently inert (see the owning-txn check in stageable).
+    txn.aborted = true;
+    txn.committed = true;
+    txn.events.length = 0;
+    txn.retainedBytes = 0;
+    this.detachConnectionCallbacks(txn.conn);
+    this.purgePendingForConnection(txn.conn);
+    void txn.conn.close().catch(() => { /* candidate already dead */ });
+  }
+
+  /**
+   * Replay the transaction's staged events IN ARRIVAL ORDER, now that the
+   * candidate is authoritative. Runs synchronously right after
+   * {@link commitMigration}, so the drained catalog SUBSCRIBE_OK resolves against
+   * the committed `catalogRequestId`. `txn.committed` is already true, so any new
+   * events run live rather than re-staging.
+   */
+  private drainStagedCandidate(txn: MigrationTxn): void {
+    for (const { run, source } of txn.events) {
+      // If the committed session closed/fatally-errored during a prior replayed
+      // event, STOP — the session is dead, and continuing would re-buffer objects
+      // for a closed connection that no future close event will ever purge.
+      if (txn.terminated) break;
+      // Per-event isolation: a staged listener throwing must not stop the drain
+      // or escape to the caller and trip the establishment rollback of an
+      // already-committed session — but it must NOT be silently swallowed either.
+      try {
+        run();
+      } catch (err) {
+        // Route it through the error channel using the SAME classification live
+        // delivery would (by event source). Reporting must not escape (a filter/
+        // listener may throw), so it is itself isolated — otherwise the exception
+        // would strand the transaction (finally-clear + retire never run).
+        try {
+          const e = err instanceof Error ? err : new Error(String(err));
+          const classified = e instanceof MoqtConnectionError
+            ? this.classifyMoqtConnectionError(e)
+            : {
+                severity: (source === 'control' || source === 'transport' ? 'fatal' : 'degraded') as ErrorSeverity,
+                code: this.connectionErrorSourceToCode(source),
+                context: undefined as Record<string, unknown> | undefined,
+              };
+          this.emitError(createPlayerError(
+            classified.severity, 'connection', classified.code,
+            `A migrated session event failed during replay: ${e.message}`,
+            defined({ cause: e, context: classified.context }),
+          ));
+        } catch (reportErr) {
+          // Last resort — even the logger is configurable and may throw, which
+          // must NOT escape and turn a committed migration into a rejection.
+          try {
+            this.log.warn('Error reporting a replay failure threw (ignored): %s',
+              reportErr instanceof Error ? reportErr.message : String(reportErr));
+          } catch { /* logger itself threw — nothing more we can safely do */ }
+        }
+      }
+    }
+    txn.events.length = 0;
+    txn.retainedBytes = 0;
+  }
+
+  /**
+   * Commit the handoff atomically — SYNCHRONOUS, no `await`, so no incoming
+   * message can interleave and observe a half-migrated state. After this returns
+   * `newConnection` is authoritative and its catalog SUBSCRIBE_OK (a later
+   * network event) resolves against a consistent state.
+   */
+  private commitMigration(txn: MigrationTxn, newConnection: MoqtConnection, catalogReqId: bigint): void {
+    txn.committed = true; // staging closed — further candidate events run live on the now-current session
+    this.connection = newConnection;
+    if (this.subscriptionManager) this.subscriptionManager.draftVersion = newConnection.draftVersion;
 
     // Reset catalog state for the new session
     this.catalogReceived = false;
     this.catalogTrackAlias = null;
-    this.catalogRequestId = null;
+    this.catalogRequestId = catalogReqId;
 
-    // Clear fetch state (fetches are per-session) and reject any
-    // in-flight fetchCatalog promises — their request IDs/stream IDs
-    // belong to the old adapter and won't match new-session traffic.
+    // Clear fetch state (fetches are per-session) and reject any in-flight
+    // fetchCatalog promises — their request IDs/stream IDs belong to the old
+    // adapter and won't match new-session traffic.
     this.activeFetches.clear();
     this.fetchStreamAliases.clear();
     this.fetchStreamRequestIds.clear();
@@ -2123,34 +2524,30 @@ export class MoqtPlayer {
     this.refusedFetchRequests.clear();
     this.droppedFetchStreams.clear();
     this.rejectPendingCatalogFetches('Session migrated — fetchCatalog cancelled');
+  }
 
-    // Connect to new relay (CLIENT_SETUP → SERVER_SETUP) §3.3
-    if (!this.config.createTransport) {
-      throw new Error('Cannot migrate: createTransport not configured (external adapter mode)');
-    }
-    const setupOptions = buildSetupOptions(this.config);
-    const transport = await this.config.createTransport(buildConnectUrl(this.config));
-    await newConnection.connect(transport, setupOptions);
-
-    // Subscribe to catalog on new session (MSF §9.1)
-    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(catalogTrackName());
-    const reqId = await newConnection.subscribe(nsBytes, nameBytes, {
-      subscriptionFilter: { type: 'AbsoluteStart', startGroup: varint(0n), startObject: varint(0n) },
-    });
-    this.catalogRequestId = BigInt(reqId);
-
-    // Close old session (§3.5: "RECOMMENDED that the client waits until
-    // there are no more Established subscriptions before closing")
-    if (oldConnection) {
+  /**
+   * Close the superseded session (§3.5) and reclaim its buffered objects. A LOCAL
+   * close does not emit onClose, so the onClose reclamation never runs for a
+   * migration — purge here so the old entries (and the strong adapter reference)
+   * are released instead of consuming the alias cap until player destruction.
+   */
+  private async retireMigratedSession(oldConnection: MoqtConnection | null): Promise<void> {
+    if (!oldConnection) return;
+    try {
       await oldConnection.close();
+    } catch (err) {
+      // The handoff already committed — the replacement is authoritative and
+      // usable, so a failure closing the OLD session is non-fatal. Log and finish
+      // the migration rather than reporting it as failed. The logger is
+      // configurable and may itself throw — that must not escape either.
+      try {
+        this.log.warn('Old session close failed after migration (non-fatal): %s',
+          err instanceof Error ? err.message : String(err));
+      } catch { /* logger threw — swallow, retirement is best-effort */ }
+    } finally {
+      this.purgePendingForConnection(oldConnection);
     }
-
-    this._stats.recordReconnect();
-    this.log.info('Session migrated');
-    this.emitter.emit('session_migrated', {
-      type: 'session_migrated',
-    });
   }
 
   /**
@@ -2161,52 +2558,48 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-transport-16 §3.5 (Migration)
    * @see draft-ietf-moq-transport-16 §8.4.1 (Graceful Subscriber Relay Switchover)
    */
-  private async migrateToUrl(newConnection: MoqtConnection, url: string): Promise<void> {
-    const oldConnection = this.connection;
-
-    // Wire new adapter callbacks
-    this.connection = newConnection;
-    this.wireConnection(newConnection);
-
-    // Reset catalog state for the new session
-    this.catalogReceived = false;
-    this.catalogTrackAlias = null;
-    this.catalogRequestId = null;
-
-    // Clear fetch state (fetches are per-session) and reject any
-    // in-flight fetchCatalog promises — their request IDs/stream IDs
-    // belong to the old adapter and won't match new-session traffic.
-    this.activeFetches.clear();
-    this.fetchStreamAliases.clear();
-    this.fetchStreamRequestIds.clear();
-    this.pendingFetchStreams.clear();
-    this.refusedFetchRequests.clear();
-    this.droppedFetchStreams.clear();
-    this.rejectPendingCatalogFetches('Session migrated — fetchCatalog cancelled');
-
-    // Connect to new relay — createTransport is guaranteed available (checked by caller)
-    const setupOptions = buildSetupOptions(this.config);
-    const transport = await this.config.createTransport!(buildConnectUrl(this.config, url));
-    await newConnection.connect(transport, setupOptions);
-
-    // Subscribe to catalog on new session (MSF §9.1)
-    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(catalogTrackName());
-    const reqId = await newConnection.subscribe(nsBytes, nameBytes, {
-      subscriptionFilter: { type: 'AbsoluteStart', startGroup: varint(0n), startObject: varint(0n) },
+  /**
+   * Start an automatic (GOAWAY-driven) migration to `uri`. Creates the
+   * replacement adapter only here — never before the migration is actually
+   * attempted — so a queued/aborted GOAWAY leaks nothing. Failures are surfaced
+   * through the error channel rather than left as an unhandled rejection.
+   */
+  private startGoawayMigration(uri: string): void {
+    if (this._destroyed || !this.config.createConnection) return;
+    const newConnection = this.config.createConnection();
+    this.migrateToUrl(newConnection, uri).catch((err) => {
+      this.emitError(createPlayerError(
+        'degraded', 'connection', PlayerErrorCode.CONNECTION_LOST,
+        `Automatic GOAWAY migration failed: ${err instanceof Error ? err.message : String(err)}`,
+        defined({ cause: err instanceof Error ? err : undefined }),
+      ));
     });
-    this.catalogRequestId = BigInt(reqId);
+  }
 
-    // Close old session
-    if (oldConnection) {
-      await oldConnection.close();
+  /**
+   * Act on a GOAWAY that arrived while a handoff held the single-flight slot —
+   * but ONLY if its source session is still current. After establishment failure
+   * the old session remains current (its GOAWAY is valid); after a successful
+   * commit only the replacement's own GOAWAY is valid, while a GOAWAY the OLD
+   * session sent during establishment is now moot (we already migrated away from
+   * it) and must be discarded rather than migrating off the caller's replacement.
+   */
+  private processPendingGoaway(): void {
+    const pending = this.pendingGoaway;
+    this.pendingGoaway = null;
+    if (pending !== null && !this._destroyed && !this.currentMigration && pending.sourceConnection === this.connection) {
+      this.startGoawayMigration(pending.uri);
     }
+  }
+
+  private async migrateToUrl(newConnection: MoqtConnection, url: string): Promise<void> {
+    const createTransport = this.config.createTransport!;
+    const setupOptions = buildSetupOptions(this.config);
+    await this.runMigrationTransaction(newConnection, () => createTransport(buildConnectUrl(this.config, url)), setupOptions);
 
     this._stats.recordReconnect();
     this.log.info('Session migrated to %s', url);
-    this.emitter.emit('session_migrated', {
-      type: 'session_migrated',
-    });
+    this.emitter.emit('session_migrated', { type: 'session_migrated' });
   }
 
   /**
@@ -2309,7 +2702,9 @@ export class MoqtPlayer {
       if (pending.requestId !== fetchReqId) continue;
       this.pendingFetchStreams.delete(streamId);
       for (const obj of pending.objects) {
-        this.routeFetchObject(streamId, info.trackAlias, obj);
+        // Fetch state is per-session (cleared on migrate), so the current
+        // connection is the source session here.
+        this.routeFetchObject(streamId, info.trackAlias, obj, this.connection?.draftVersion, this.connection ?? undefined);
       }
       if (pending.finished) {
         // The stream already FINned: the pre-roll is complete — no live
@@ -2327,10 +2722,10 @@ export class MoqtPlayer {
    * fetch stream, §10.4.4) to the live track's alias and hand it to the
    * same SubscriptionManager path live objects use.
    */
-  private routeFetchObject(streamId: bigint, alias: bigint, obj: MoqtObject): void {
+  private routeFetchObject(streamId: bigint, alias: bigint, obj: MoqtObject, sourceDraft?: DraftVersion, sourceConnection?: MoqtConnection): void {
     if (this.subscriptionManager?.getMediaType(alias) === undefined) return;
     const remapped: MoqtObject = { ...obj, trackAlias: varint(alias) };
-    this.subscriptionManager.routeObject(streamId, remapped);
+    this.subscriptionManager.routeObject(streamId, remapped, sourceDraft, sourceConnection);
   }
 
   /**
@@ -2731,6 +3126,24 @@ export class MoqtPlayer {
     if (this._destroyed) return;
     this._destroyed = true;
     this.log.info('destroy()');
+    // Withdraw playback intent first: a late arrival must not start playback
+    // on a player that is going away.
+    this.playbackIntent = false;
+    this.mediaSource?.setPlaybackIntent?.(false);
+    // Cancel any in-flight migration: a deferred candidate connect()/subscribe()
+    // must NOT resurrect this destroyed player by becoming this.connection. The
+    // in-flight transaction sees _destroyed at its next validation and rolls back;
+    // detaching + closing the candidate here stops its callbacks and unblocks it.
+    this.pendingGoaway = null; // never act on a queued GOAWAY after destruction
+    if (this.currentMigration) {
+      const txn = this.currentMigration;
+      this.currentMigration = null;
+      txn.aborted = true;
+      txn.committed = true;
+      txn.events.length = 0;
+      this.detachConnectionCallbacks(txn.conn);
+      try { await txn.conn.close(); } catch { /* candidate transport already gone */ }
+    }
     this._stats.recordPlayStop();
     this.stopTicking();
     // Liveness: quiet destroy — cancel any in-flight restart ladder (it must
@@ -2856,13 +3269,69 @@ export class MoqtPlayer {
   }
 
   private transitionState(to: PlayerStateValue): void {
+    const from = this.applyState(to);
+    this.announceState(from, to);
+  }
+
+  /**
+   * Apply a state transition WITHOUT announcing it, returning the prior state.
+   *
+   * Split from the announcement so a caller with more of the transaction to
+   * commit (play()/pause(): playback intent, adapter intent, ticking) can finish
+   * it BEFORE application listeners run. Throws on an invalid transition, having
+   * changed nothing.
+   */
+  private applyState(to: PlayerStateValue): PlayerStateValue {
     const from = this.stateMachine.state;
     this.stateMachine.transition(to);
-    this.emitter.emit('state_changed', {
-      type: 'state_changed',
-      from,
-      to,
-    });
+    return from;
+  }
+
+  /**
+   * Announce a completed transition. Listeners run SYNCHRONOUSLY and may
+   * re-enter the player (pause/play/destroy) or throw, so this must be the LAST
+   * step of any transaction — everything a re-entrant call could contradict, or
+   * a throwing listener could strand half-done, is already committed.
+   *
+   * Announcements are published by a FIFO drain rather than emitted directly.
+   * A listener that re-enters the player triggers a nested transition whose
+   * event would otherwise be broadcast INSIDE the current one: the listeners
+   * that had not yet been called for the outer event would see the nested state
+   * first and the outer state second, ending on a state the player has already
+   * left. Enqueuing instead means every listener observes the same
+   * chronological order, and every listener's last event is the player's
+   * current state.
+   *
+   * A throwing listener may not censor the sequence either: each event goes to
+   * EVERY listener (emitIsolated), the drain runs to completion, and the first
+   * exception is rethrown afterwards. Otherwise a listener that re-enters the
+   * player and then throws would leave the event it just queued stranded until
+   * some unrelated future transition, with the listeners after it never having
+   * seen the current event at all.
+   */
+  private announceState(from: PlayerStateValue, to: PlayerStateValue): void {
+    this.stateAnnouncements.push({ from, to });
+    if (this.announcingState) return; // the in-progress drain will publish it
+    this.announcingState = true;
+    let error: unknown;
+    let failed = false;
+    try {
+      let next = this.stateAnnouncements.shift();
+      while (next !== undefined) {
+        try {
+          this.emitter.emitIsolated('state_changed',
+            { type: 'state_changed', from: next.from, to: next.to });
+        } catch (err) {
+          // Keep draining: the queue may already hold an event that a
+          // re-entrant listener enqueued before it threw.
+          if (!failed) { failed = true; error = err; }
+        }
+        next = this.stateAnnouncements.shift();
+      }
+    } finally {
+      this.announcingState = false;
+    }
+    if (failed) throw error;
   }
 
   /**
@@ -2948,12 +3417,73 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-transport-16 §6.1 (Namespace discovery)
    */
   private wireConnection(conn: MoqtConnection): void {
+    // While `conn` is an unpromoted migration candidate, capture its application
+    // events instead of dispatching them; they are drained in order after commit
+    // ({@link drainStagedCandidate}). No-op for the current session and for the
+    // old session during a migration (staging targets only THIS transaction's
+    // candidate). The queue is bounded on count and retained bytes — overflow
+    // aborts and closes the candidate rather than silently dropping a possibly
+    // essential control event.
+    // Bind this wiring to the transaction (if any) that owns `conn`. A candidate's
+    // callbacks belong to their transaction for LIFE: once it is abandoned they
+    // are permanently inert — even a reference captured before detachment must
+    // not run live against the old session. `null` for the current session and
+    // for the old session during a migration (both run live).
+    const owningTxn = this.currentMigration?.conn === conn ? this.currentMigration : null;
+    // `cost` receives the raw args array (typed `unknown[]` so it does not drive
+    // A-inference — A is fixed by the wrapped callback's contextual signature).
+    // `source` is the live-delivery error source used to classify a replay failure.
+    const stageable = <A extends unknown[]>(fn: (...a: A) => void, source: MoqtConnectionErrorSource, cost?: (args: unknown[]) => number) => (...args: A): void => {
+      if (owningTxn) {
+        if (owningTxn.aborted) return; // abandoned candidate — permanently dead
+        if (!owningTxn.committed) {
+          // Every staged event carries a base cost (its closure) plus its actual
+          // retained bytes, so the byte budget is enforced for ALL event kinds.
+          const bytes = MoqtPlayer.STAGED_EVENT_BASE_BYTES + (cost ? cost(args) : 0);
+          this.stageMigrationEvent(owningTxn, () => fn(...args), bytes, source);
+          return;
+        }
+        // committed → the candidate is now the current session; run live.
+      }
+      fn(...args);
+    };
+    const objBytes = (a: unknown[]): number => {
+      const obj = a[1] as MoqtObject;
+      return obj.kind === 'data' ? (obj.payload?.byteLength ?? 0) + (obj.extensions?.byteLength ?? 0) : 0;
+    };
+    const dgBytes = (a: unknown[]): number => {
+      const d = a[0] as ObjectDatagram;
+      return (d.payload?.byteLength ?? 0) + (d.extensions?.byteLength ?? 0);
+    };
+    const msgBytes = (a: unknown[]): number => estimateRetainedBytes(a);
     wireConnectionCallbacks(conn, {
-      onControlMessage: (msg) => this.handleControlMessage(msg),
+      onControlMessage: stageable((msg) => this.handleControlMessage(msg, conn), 'control', msgBytes),
 
       onClose: (error, reason) => {
         this.log.info('[SESSION] closed: error=0x%s reason=%s',
           error?.toString(16) ?? 'none', reason ?? 'clean');
+        // A candidate that closes BEFORE promotion must ABORT its migration — it
+        // must never be committed as authoritative.
+        if (this.currentMigration?.conn === conn && !this.currentMigration.committed) {
+          this.abortMigration(this.currentMigration);
+        } else if (this.currentMigration?.conn === conn && this.currentMigration.committed) {
+          // The COMMITTED candidate closed while its migration is still draining:
+          // terminate the transaction so the drain stops and the migration is not
+          // reported successful. Its close still follows the current-session path.
+          this.currentMigration.terminated = true;
+        }
+        // Reclaim any objects still buffered for this (now-dead) session — their
+        // alias can never resolve on it, and holding them pins the adapter. This
+        // is source-owned cleanup and is safe for any connection.
+        this.purgePendingForConnection(conn);
+        // Everything below tears down CURRENT-session operations. A SUPERSEDED
+        // session closing (e.g. the old relay dropping during/after migration)
+        // must not reject the replacement's fetchCatalog promises or report the
+        // active session as closed. Only the current connection may do so.
+        if (conn !== this.connection) {
+          this.log.info('[SESSION] superseded session closed — not affecting the current session');
+          return;
+        }
         // Reject in-flight fetchCatalog promises — their stream IDs
         // belong to the closed session, so the FETCH response can't
         // arrive and the timeout would fire against a dead adapter.
@@ -2969,13 +3499,49 @@ export class MoqtPlayer {
 
       onError: (error) => {
         const classified = this.classifyMoqtConnectionError(error);
+        // The migration candidate (not yet committed): only a FATAL error
+        // (control/transport) aborts establishment. A degraded (data/datagram)
+        // error — e.g. a subgroup reset — is transient and must not kill the
+        // migration, but it IS relevant to the session that is about to become
+        // current: STAGE the diagnostic so it is emitted after commit (and
+        // discarded if establishment fails). Once committed the candidate is the
+        // current session, so its errors fall through to the normal path below.
+        const migTxn = this.currentMigration;
+        if (migTxn?.conn === conn && !migTxn.committed) {
+          if (classified.severity === 'fatal') {
+            this.abortMigration(migTxn);
+          } else {
+            const deferred = createPlayerError(
+              classified.severity, 'connection', classified.code, error.message,
+              defined({ cause: error, context: classified.context }),
+            );
+            // Charge the diagnostic's real retained bytes (message/stack/cause/
+            // context are mostly non-enumerable, so the generic estimator misses
+            // them). Its replay source is the error's own source.
+            const bytes = MoqtPlayer.STAGED_EVENT_BASE_BYTES + errorRetainedBytes(error, classified.context);
+            const errSource: MoqtConnectionErrorSource = error instanceof MoqtConnectionError ? error.errorSource : 'control';
+            this.stageMigrationEvent(migTxn, () => this.emitError(deferred), bytes, errSource);
+          }
+          return;
+        }
+        // The COMMITTED candidate fatally errors while its migration still drains:
+        // terminate the transaction (stop the drain, do not report success).
+        if (migTxn?.conn === conn && migTxn.committed && classified.severity === 'fatal') {
+          migTxn.terminated = true;
+        }
+        // An error on a SUPERSEDED session is not a current-connection failure —
+        // reporting it would surface the old relay's teardown as an active fault.
+        if (conn !== this.connection) {
+          this.log.info('[SESSION] error on a superseded session — ignored: %s', error.message);
+          return;
+        }
         this.emitError(createPlayerError(
           classified.severity, 'connection', classified.code, error.message,
           defined({ cause: error, context: classified.context }),
         ));
       },
 
-      onObject: (streamId, obj) => {
+      onObject: stageable((streamId, obj) => {
         // Catalog-fetch dispatch: route by streamId → reqId. Catalog
         // FETCH objects don't carry a meaningful media alias, so we
         // resolve the pending fetchCatalog promise directly here
@@ -2989,7 +3555,7 @@ export class MoqtPlayer {
         // §10.4.4: Fetch stream objects carry trackAlias=0 — remap to correct alias
         const fetchAlias = this.fetchStreamAliases.get(streamId);
         if (fetchAlias !== undefined) {
-          this.routeFetchObject(streamId, fetchAlias, obj);
+          this.routeFetchObject(streamId, fetchAlias, obj, conn.draftVersion, conn);
           return;
         }
 
@@ -3018,7 +3584,11 @@ export class MoqtPlayer {
         // At replay time, the new track is registered and onObject fires normally.
         if (this.subscriptionManager?.getMediaType(alias) !== undefined) {
           this.watchdog.fulfill('first_media_object');
-          this.subscriptionManager.routeObject(streamId, obj);
+          // Bind the LOC wire profile AND the malformed-recovery target to THIS
+          // connection — a cross-draft migration must not decode a late
+          // old-session object with the new profile, nor UNSUBSCRIBE on the new
+          // session for an old-session object.
+          this.subscriptionManager.routeObject(streamId, obj, conn.draftVersion, conn);
           return;
         }
 
@@ -3032,17 +3602,27 @@ export class MoqtPlayer {
         }
 
         // Buffer unrouted objects — data may arrive before SUBSCRIBE_OK
-        // resolves the alias. Replay when the alias is mapped.
-        const pending = this.pendingObjectsByAlias.get(alias) ?? [];
+        // resolves the alias. Tag each with its SOURCE session (this connection)
+        // so replay uses the delivering session's draft and only replays for an
+        // alias resolved on that same session — never routing an old-session
+        // object into a reused-alias track on the new one.
+        const existingBucket = this.pendingObjectsByAlias.get(alias);
+        // Cap the number of distinct unresolved aliases — a peer must not be able
+        // to pin unbounded memory (and connection references) by emitting one
+        // object per unique unknown alias.
+        if (existingBucket === undefined && this.pendingObjectsByAlias.size >= MoqtPlayer.MAX_PENDING_ALIASES) {
+          return; // drop — too many distinct unresolved aliases already buffered
+        }
+        const pending = existingBucket ?? [];
         if (pending.length < MoqtPlayer.MAX_PENDING_PER_ALIAS) {
-          pending.push({ streamId, obj });
+          pending.push({ streamId, obj, sourceDraft: conn.draftVersion, sourceConnection: conn });
           this.pendingObjectsByAlias.set(alias, pending);
           // Silently buffer — will be replayed when SUBSCRIBE_OK resolves the alias
         }
-      },
+      }, 'data', objBytes),
 
       // §10.4: Stream reset vs FIN
-      onStreamClosed: (streamId, error) => {
+      onStreamClosed: stageable((streamId, error) => {
         // If a pending catalog-fetch's stream closed without delivering
         // an object, reject — otherwise the promise hangs until timeout.
         // (If onObject already settled, the reqId is gone from
@@ -3087,10 +3667,10 @@ export class MoqtPlayer {
         if (error !== undefined) {
           this.log.debug('Data stream %s reset with code 0x%s', streamId, error.toString(16));
         }
-      },
+      }, 'data'),
 
       // §10.4.4: Fetch data stream headers for object routing
-      onDataStream: (streamId, header) => {
+      onDataStream: stageable((streamId, header) => {
         // Liveness: remember which track each SUBGROUP stream belongs to so
         // a reset can shorten that track's liveness fuse. Subgroup streams
         // only — fetch streams have their own request lifecycle and must
@@ -3135,11 +3715,11 @@ export class MoqtPlayer {
             this.pendingFetchStreams.set(streamId, { requestId: reqId, objects: [] });
           }
         }
-      },
+      }, 'data'),
 
       // §6.1: Namespace discovery messages (bidi-stream NAMESPACE / NAMESPACE_DONE)
       // §6.2: Control-stream PUBLISH_NAMESPACE / PUBLISH_NAMESPACE_DONE
-      onNamespaceMessage: (requestId, msg) => {
+      onNamespaceMessage: stageable((requestId, msg) => {
         switch (msg.type) {
           case 'NAMESPACE':
             this.emitter.emit('namespace_discovered', {
@@ -3175,10 +3755,10 @@ export class MoqtPlayer {
             break;
           }
         }
-      },
+      }, 'control', msgBytes),
 
       // §10.3: Datagram objects — convert to MoqtObject for routing
-      onDatagram: (datagram) => {
+      onDatagram: stageable((datagram) => {
         const alias = BigInt(datagram.trackAlias);
         if (this.subscriptionManager?.getMediaType(alias) === undefined) return;
         this.log.debug('Datagram alias=%s group=%s obj=%s', alias, datagram.groupId, datagram.objectId);
@@ -3203,8 +3783,8 @@ export class MoqtPlayer {
               payload: datagram.payload,
             };
 
-        this.subscriptionManager.routeObject(0n, obj);
-      },
+        this.subscriptionManager.routeObject(0n, obj, conn.draftVersion, conn);
+      }, 'datagram', dgBytes),
 
       // §draft-pardue-moq-qlog-moq-events-04: qlog tracing
       ...(this.config.onQlogEvent ? { onQlogEvent: this.config.onQlogEvent } : {}),
@@ -3222,7 +3802,18 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-transport-16 §9.7 (REQUEST_OK)
    * @see draft-ietf-moq-transport-16 §9.8 (REQUEST_ERROR)
    */
-  private handleControlMessage(msg: ControlMessage): void {
+  private handleControlMessage(msg: ControlMessage, conn: MoqtConnection): void {
+    // Ignore control messages from a SUPERSEDED session. After a migration
+    // `this.connection`, `activeSubscriptions`, `pendingMediaSubs`, the track
+    // registrations, and the catalog alias all belong to the NEW session; a
+    // delayed old-session SUBSCRIBE_OK / PUBLISH_DONE / REQUEST_ERROR / GOAWAY
+    // processed against them would remap or unregister a current track, settle a
+    // current request, or send UNSUBSCRIBE/GOAWAY on the replacement adapter. The
+    // old session is closing — its control state is not retained per session.
+    if (conn !== this.connection) {
+      this.log.info('Ignoring control message from a superseded session: %s', msg.type);
+      return;
+    }
     doControlMessage(msg, {
       adapter: this.connection,
       activeSubscriptions: this.activeSubscriptions,
@@ -3235,16 +3826,25 @@ export class MoqtPlayer {
       emitEvent: (event) => this.emitter.emit(event.type as any, event as any),
       setCatalogTrackAlias: (alias) => {
         this.catalogTrackAlias = alias;
-        this.replayPendingObjects(alias);
+        this.replayPendingObjects(alias, conn);
       },
       clearCatalogState: () => { this.catalogTrackAlias = null; this.catalogRequestId = null; },
-      onAliasResolved: (alias) => { this.replayPendingObjects(alias); },
+      onAliasResolved: (alias) => { this.replayPendingObjects(alias, conn); },
       onGoaway: (newSessionUri) => {
-        if (this.config.createConnection) {
-          const uri = newSessionUri || this.config.url;
-          const newConnection = this.config.createConnection();
-          this.migrateToUrl(newConnection, uri);
+        // Ignore a GOAWAY from a superseded session (migration overlap).
+        if (conn !== this.connection) return;
+        if (!this.config.createConnection) return;
+        const uri = newSessionUri || this.config.url;
+        if (this.currentMigration) {
+          // A handoff is in flight (staged-event drain or old-session retirement
+          // still holds the single-flight slot). Starting a migration now would be
+          // rejected and the GOAWAY lost. QUEUE the target WITH its source session
+          // (do NOT create the replacement adapter yet — it would leak); it is
+          // acted on once the handoff finishes, only if `conn` is still current.
+          this.pendingGoaway = { uri, sourceConnection: conn };
+          return;
         }
+        this.startGoawayMigration(uri);
       },
       onPublishDone: (_requestId, trackName, _trackAlias, statusCode, errorReason) => {
         // TOO_FAR_BEHIND means the subscriber fell behind the live edge —
@@ -3351,16 +3951,41 @@ export class MoqtPlayer {
    *
    * @see draft-ietf-moq-transport-16 §9.10 (Track Alias assignment)
    */
-  private replayPendingObjects(alias: bigint): void {
+  /**
+   * Drop every buffered object delivered by `conn` (its session is closing, so
+   * its aliases can never resolve). Empties the alias buckets it owned and, with
+   * them, the strong references to the connection — letting a superseded adapter
+   * be collected after migration.
+   */
+  private purgePendingForConnection(conn: MoqtConnection): void {
+    for (const [alias, bucket] of this.pendingObjectsByAlias) {
+      const kept = bucket.filter((e) => e.sourceConnection !== conn);
+      if (kept.length === 0) this.pendingObjectsByAlias.delete(alias);
+      else if (kept.length !== bucket.length) this.pendingObjectsByAlias.set(alias, kept);
+    }
+  }
+
+  private replayPendingObjects(alias: bigint, resolvingConnection: MoqtConnection): void {
     const pending = this.pendingObjectsByAlias.get(alias);
     if (!pending || pending.length === 0) return;
-    this.pendingObjectsByAlias.delete(alias);
-    for (const { streamId, obj } of pending) {
+
+    // An alias resolution belongs to the session whose SUBSCRIBE_OK carried it.
+    // Only entries delivered by THAT SAME session may be replayed now — entries
+    // buffered by another (e.g. a new session buffering under a reused alias
+    // while a delayed old-session SUBSCRIBE_OK arrives) must stay buffered until
+    // their own session resolves them. So partition, never bulk-delete.
+    const replay = pending.filter((e) => e.sourceConnection === resolvingConnection);
+    const retain = pending.filter((e) => e.sourceConnection !== resolvingConnection);
+    if (retain.length > 0) this.pendingObjectsByAlias.set(alias, retain);
+    else this.pendingObjectsByAlias.delete(alias);
+
+    for (const { streamId, obj, sourceDraft, sourceConnection } of replay) {
       // Re-route through the normal onObject path — alias is now resolved
       const resolvedAlias = BigInt(obj.trackAlias);
 
       if (this.subscriptionManager?.getMediaType(resolvedAlias) !== undefined) {
-        this.subscriptionManager.routeObject(streamId, obj);
+        // Route with the delivering session's own draft + connection.
+        this.subscriptionManager.routeObject(streamId, obj, sourceDraft, sourceConnection);
       } else if (this.catalogTrackAlias !== null && resolvedAlias === this.catalogTrackAlias) {
         this.handleCatalogObject(obj);
       }
@@ -3427,6 +4052,10 @@ export class MoqtPlayer {
           });
         }
       } else {
+        // A delta (or a re-sent independent catalog) changed the catalog —
+        // refresh the cached state so track selection and initRef resolution see
+        // delta-added tracks and the preserved root initDataList / protections.
+        this._catalogState = catalogState;
         this.log.info('Catalog updated');
         this.emitter.emit('catalog_updated', {
           type: 'catalog_updated',
@@ -3639,6 +4268,14 @@ export class MoqtPlayer {
     this.recoveryController = pipelines.recoveryController;
     this.commandDispatcher = pipelines.commandDispatcher;
     this.mediaSource = pipelines.mediaSource;
+    // Re-state playback intent on the newly created adapter. play()/pause() can
+    // both happen before the catalog exists, so the adapter that is created
+    // afterwards must inherit the player's CURRENT intent rather than its own
+    // default. `null` means the embedder has never declared one — leave the
+    // adapter's default alone.
+    if (this.playbackIntent !== null) {
+      this.mediaSource?.setPlaybackIntent?.(this.playbackIntent);
+    }
     this.getRenderCushionUs = pipelines.getRenderCushionUs ?? null;
 
     // Wire MSE stall detection to ABR emergency downshift.
@@ -3897,13 +4534,14 @@ export class MoqtPlayer {
       let reason: string | null = null;
       if (!track.codec) {
         reason = 'no codec string';
-      } else if (track.initData !== undefined) {
+      } else {
+        // Validate the RESOLVED inline init (track.initData or an initRef that
+        // resolves to a root inline initDataList entry) — same CMAF_INIT_INVALID
+        // class for bad base64 / empty bytes from either source.
         try {
-          if (Uint8Array.from(atob(track.initData), (c) => c.charCodeAt(0)).byteLength === 0) {
-            reason = 'initData decodes to zero bytes';
-          }
-        } catch {
-          reason = 'initData is not valid base64';
+          this.decodeResolvedInlineInitData(track);
+        } catch (err) {
+          reason = err instanceof Error ? err.message : String(err);
         }
       }
       if (reason) {
@@ -3962,7 +4600,7 @@ export class MoqtPlayer {
         codec: selected.video.codec,
         width: selected.video.width,
         height: selected.video.height,
-        initData: selected.video.initData,
+        initData: this.resolveInlineInitData(selected.video),
         initTrack: selected.video.initTrack,
         packaging: videoPackaging,
       }) : undefined,
@@ -3970,7 +4608,7 @@ export class MoqtPlayer {
         codec: selected.audio.codec,
         samplerate: selected.audio.samplerate,
         channels: selected.audio.channelConfig ? Number(selected.audio.channelConfig) : undefined,
-        initData: selected.audio.initData,
+        initData: this.resolveInlineInitData(selected.audio),
         initTrack: selected.audio.initTrack,
         packaging: audioPackaging,
       }) : undefined,
@@ -4683,8 +5321,20 @@ export class MoqtPlayer {
    *
    * @see draft-ietf-moq-transport-16 §2.4.2
    */
-  private handleMalformedTrack(trackAlias: bigint, trackName: string, error: Error): void {
+  private handleMalformedTrack(trackAlias: bigint, trackName: string, error: Error, sourceConnection?: MoqtConnection): void {
     this.log.warn('Malformed track "%s": %s', trackName, error.message);
+    // A malformed object from a SUPERSEDED session (migration overlap: not the
+    // current connection) must not drive recovery against the current session.
+    // `this.connection`, `activeSubscriptions`, and the shared track
+    // registrations all belong to the NEW session now — its requestId space is
+    // unrelated, so UNSUBSCRIBE/unregister here would cancel a live new-session
+    // request or drop a valid track. The superseded session is already closing;
+    // let its bad track die with it. Log only.
+    if (sourceConnection !== undefined && sourceConnection !== this.connection) {
+      this.log.info('Ignoring malformed object from a superseded session for track "%s"', trackName);
+      return;
+    }
+
     // Find the requestId for this track alias in activeSubscriptions
     let matchedRequestId: bigint | undefined;
     for (const [requestId, sub] of this.activeSubscriptions) {

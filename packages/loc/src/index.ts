@@ -24,8 +24,12 @@ export { LocExtensionId } from './types.js';
 
 // ─── Header parsing ─────────────────────────────────────────────────
 
-export { parseLocHeaders, encodeLocHeaders, toVideoChunkInit, toAudioChunkInit } from './headers.js';
+export { parseLocHeaders, encodeLocHeaders, toVideoChunkInit, toAudioChunkInit, locWireProfileForDraft } from './headers.js';
 export type { LocHeaderOptions } from './headers.js';
+
+// ─── Layer B — LOC semantic resolution (PropertyMap ⇄ LocHeaders) ────
+
+export { resolveLocHeaders, locHeadersToPropertyMap } from './property-map.js';
 
 // ─── Bit-level parsers ──────────────────────────────────────────────
 

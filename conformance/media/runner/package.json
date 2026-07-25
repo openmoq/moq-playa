@@ -1,0 +1,18 @@
+{
+  "name": "@moqt/media-conformance-runner",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Private, never-published runner for the media conformance corpus (conformance/media/vectors). Consumes the corpus read-only; GEN_CORPUS=1 regenerates only implementation-generated entries.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@moqt/browser": "workspace:*",
+    "@moqt/loc": "workspace:*",
+    "@moqt/msf": "workspace:*",
+    "@moqt/transport": "workspace:*",
+    "ajv": "^8.17.1"
+  }
+}

@@ -1,25 +1,83 @@
 /**
- * Key-Value-Pair encoding per draft-ietf-moq-transport-16 §1.4.2.
+ * Key-Value-Pair encoding per draft-ietf-moq-transport-16 §1.4.2 (delta) and
+ * draft-14 §1.4.2 (absolute).
  *
- * Type values are delta-encoded from previous.
+ * Type values are delta-encoded from previous (draft-16) or absolute (draft-14).
  * If absolute Type is even → Value is a single varint.
  * If absolute Type is odd → Value is Length (varint) + bytes.
  *
- * Note: Parameters are stored as Map<bigint, KvpValue[]> to support
- * multiple values per type (e.g., AUTHORIZATION_TOKEN in setup, §9.3.1.5).
+ * This is a thin adapter over the shared ordered property-wire core
+ * ({@link ./property-block.js}): the wire mechanics (delta accumulation, QUIC
+ * varint coding, odd-value framing, order/duplicate preservation, the 2^16-1
+ * odd-value limit, and range rejection) live there and are shared with the
+ * draft-18 Track Properties codec. This layer only adapts the ordered
+ * `PropertyMap` to the historical `Map<bigint, KvpValue[]>` shape — which groups
+ * by Type to support multiple values per Type (e.g. AUTHORIZATION_TOKEN in
+ * setup, §9.3.1.5) — and back.
  *
  * @module
  */
 
-import { readVarint, writeVarint, varint, varintEncodingLength, type Varint } from './varint.js';
-import { readLengthPrefixedBytes, writeLengthPrefixedBytes, lengthPrefixedBytesEncodingLength } from './bytes.js';
+import { varint, type Varint } from './varint.js';
+import {
+  decodePropertyBlock,
+  encodePropertyBlock,
+  propertyBlockEncodingLength,
+  type PropertyEntry,
+  type PropertyWireProfile,
+} from './property-block.js';
 
 export type KvpValue = Varint | Uint8Array;
 
+/** Group an ordered property list into the historical Map, preserving occurrence
+ *  order within each key's value array; even values are re-branded `Varint`
+ *  (safe: the QUIC-varint profiles cannot decode a value above 2^62-1). */
+function groupEntries(entries: readonly PropertyEntry[]): Map<bigint, KvpValue[]> {
+  const result = new Map<bigint, KvpValue[]>();
+  for (const { id, value } of entries) {
+    const val: KvpValue = typeof value === 'bigint' ? varint(value) : value;
+    const existing = result.get(id);
+    if (existing) existing.push(val);
+    else result.set(id, [val]);
+  }
+  return result;
+}
+
+/** Flatten the historical Map to an ordered property list (the core canonicalises
+ *  the order on encode, so ascending-key order is not required here). */
+function flattenParams(params: Map<bigint, KvpValue[]>): PropertyEntry[] {
+  const out: PropertyEntry[] = [];
+  for (const [id, values] of params) {
+    for (const value of values) out.push({ id, value });
+  }
+  return out;
+}
+
+function readList(
+  buf: Uint8Array,
+  offset: number,
+  count: number,
+  profile: PropertyWireProfile,
+): { value: Map<bigint, KvpValue[]>; bytesRead: number } {
+  const { entries, bytesRead } = decodePropertyBlock(buf, offset, { profile, count });
+  return { value: groupEntries(entries), bytesRead };
+}
+
+function writeList(
+  params: Map<bigint, KvpValue[]>,
+  buf: Uint8Array,
+  offset: number,
+  profile: PropertyWireProfile,
+): number {
+  const bytes = encodePropertyBlock(flattenParams(params), profile);
+  buf.set(bytes, offset);
+  return bytes.length;
+}
+
 /**
- * Read a list of Key-Value-Pairs.
- * Returns a Map where each key maps to an array of values to support
- * duplicate parameter types (e.g., multiple AUTHORIZATION_TOKEN in setup).
+ * Read a list of Key-Value-Pairs (draft-16 delta-encoded Types).
+ * Returns a Map where each key maps to an array of values to support duplicate
+ * parameter Types (e.g. multiple AUTHORIZATION_TOKEN in setup).
  *
  * @see draft-ietf-moq-transport-16 §1.4.2
  */
@@ -28,51 +86,11 @@ export function readKvpList(
   offset: number,
   count: number,
 ): { value: Map<bigint, KvpValue[]>; bytesRead: number } {
-  const result = new Map<bigint, KvpValue[]>();
-  let pos = offset;
-  let prevType = 0n;
-
-  for (let i = 0; i < count; i++) {
-    const { value: delta, bytesRead: deltaBytes } = readVarint(buf, pos);
-    pos += deltaBytes;
-
-    const absType = prevType + delta;
-    prevType = absType;
-    const key = varint(absType);
-
-    let val: KvpValue;
-    if (absType % 2n === 0n) {
-      // Even type → value is a single varint
-      const { value: v, bytesRead: valBytes } = readVarint(buf, pos);
-      pos += valBytes;
-      val = v;
-    } else {
-      // Odd type → value is length-prefixed bytes
-      const { value: v, bytesRead: valBytes } = readLengthPrefixedBytes(buf, pos);
-      if (v.length > 0xffff) {
-        throw new RangeError(
-          `KVP byte value length ${v.length} exceeds maximum 65535 (2^16-1)`,
-        );
-      }
-      pos += valBytes;
-      val = v;
-    }
-
-    // Collect into array (supports duplicates)
-    const existing = result.get(key);
-    if (existing) {
-      existing.push(val);
-    } else {
-      result.set(key, [val]);
-    }
-  }
-
-  return { value: result, bytesRead: pos - offset };
+  return readList(buf, offset, count, 'd16-delta-varint');
 }
 
 /**
- * Write a list of Key-Value-Pairs with delta-encoded types.
- * Params map has keys mapping to arrays of values.
+ * Write a list of Key-Value-Pairs with delta-encoded types (draft-16).
  * @returns bytes written
  */
 export function writeKvpList(
@@ -80,65 +98,12 @@ export function writeKvpList(
   buf: Uint8Array,
   offset: number,
 ): number {
-  let pos = offset;
-  let prevType = 0n;
-
-  // Sort keys to ensure ascending order for delta encoding
-  const sortedKeys = [...params.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-
-  for (const key of sortedKeys) {
-    const values = params.get(key)!;
-
-    for (const val of values) {
-      const delta = varint(key - prevType);
-      prevType = key;
-
-      pos += writeVarint(delta, buf, pos);
-
-      if (key % 2n === 0n) {
-        // Even type → write value as varint
-        pos += writeVarint(val as Varint, buf, pos);
-      } else {
-        // Odd type → write value as length-prefixed bytes
-        const bytes = val as Uint8Array;
-        if (bytes.length > 0xffff) {
-          throw new RangeError(
-            `KVP byte value length ${bytes.length} exceeds maximum 65535 (2^16-1)`,
-          );
-        }
-        pos += writeLengthPrefixedBytes(bytes, buf, pos);
-      }
-    }
-  }
-
-  return pos - offset;
+  return writeList(params, buf, offset, 'd16-delta-varint');
 }
 
-/** Calculate encoding length for a KVP list. */
+/** Calculate encoding length for a delta-encoded KVP list (draft-16). */
 export function kvpListEncodingLength(params: Map<bigint, KvpValue[]>): number {
-  let len = 0;
-  let prevType = 0n;
-
-  const sortedKeys = [...params.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-
-  for (const key of sortedKeys) {
-    const values = params.get(key)!;
-
-    for (const val of values) {
-      const delta = varint(key - prevType);
-      prevType = key;
-
-      len += varintEncodingLength(delta);
-
-      if (key % 2n === 0n) {
-        len += varintEncodingLength(val as Varint);
-      } else {
-        len += lengthPrefixedBytesEncodingLength(val as Uint8Array);
-      }
-    }
-  }
-
-  return len;
+  return propertyBlockEncodingLength(flattenParams(params), 'd16-delta-varint');
 }
 
 /**
@@ -154,40 +119,7 @@ export function readKvpListAbsolute(
   offset: number,
   count: number,
 ): { value: Map<bigint, KvpValue[]>; bytesRead: number } {
-  const result = new Map<bigint, KvpValue[]>();
-  let pos = offset;
-
-  for (let i = 0; i < count; i++) {
-    const { value: absType, bytesRead: typeBytes } = readVarint(buf, pos);
-    pos += typeBytes;
-
-    const key = varint(absType);
-
-    let val: KvpValue;
-    if (absType % 2n === 0n) {
-      const { value: v, bytesRead: valBytes } = readVarint(buf, pos);
-      pos += valBytes;
-      val = v;
-    } else {
-      const { value: v, bytesRead: valBytes } = readLengthPrefixedBytes(buf, pos);
-      if (v.length > 0xffff) {
-        throw new RangeError(
-          `KVP byte value length ${v.length} exceeds maximum 65535 (2^16-1)`,
-        );
-      }
-      pos += valBytes;
-      val = v;
-    }
-
-    const existing = result.get(key);
-    if (existing) {
-      existing.push(val);
-    } else {
-      result.set(key, [val]);
-    }
-  }
-
-  return { value: result, bytesRead: pos - offset };
+  return readList(buf, offset, count, 'd14-absolute-varint');
 }
 
 /**
@@ -201,31 +133,7 @@ export function writeKvpListAbsolute(
   buf: Uint8Array,
   offset: number,
 ): number {
-  let pos = offset;
-
-  const sortedKeys = [...params.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-
-  for (const key of sortedKeys) {
-    const values = params.get(key)!;
-
-    for (const val of values) {
-      pos += writeVarint(key, buf, pos);
-
-      if (key % 2n === 0n) {
-        pos += writeVarint(val as Varint, buf, pos);
-      } else {
-        const bytes = val as Uint8Array;
-        if (bytes.length > 0xffff) {
-          throw new RangeError(
-            `KVP byte value length ${bytes.length} exceeds maximum 65535 (2^16-1)`,
-          );
-        }
-        pos += writeLengthPrefixedBytes(bytes, buf, pos);
-      }
-    }
-  }
-
-  return pos - offset;
+  return writeList(params, buf, offset, 'd14-absolute-varint');
 }
 
 /**
@@ -234,25 +142,7 @@ export function writeKvpListAbsolute(
  * @see draft-ietf-moq-transport-14 §1.4.2
  */
 export function kvpListAbsoluteEncodingLength(params: Map<bigint, KvpValue[]>): number {
-  let len = 0;
-
-  const sortedKeys = [...params.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-
-  for (const key of sortedKeys) {
-    const values = params.get(key)!;
-
-    for (const _val of values) {
-      len += varintEncodingLength(key);
-
-      if (key % 2n === 0n) {
-        len += varintEncodingLength(_val as Varint);
-      } else {
-        len += lengthPrefixedBytesEncodingLength(_val as Uint8Array);
-      }
-    }
-  }
-
-  return len;
+  return propertyBlockEncodingLength(flattenParams(params), 'd14-absolute-varint');
 }
 
 /**

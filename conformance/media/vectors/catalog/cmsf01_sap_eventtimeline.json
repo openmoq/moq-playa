@@ -1,0 +1,1 @@
+{"version":"1","tracks":[{"name":"v","packaging":"cmaf","isLive":true,"initRef":"i1"},{"name":"sap","packaging":"eventtimeline","isLive":true,"eventType":"org.ietf.moq.cmsf.sap","mimeType":"application/json","depends":["v"]}],"initDataList":[{"id":"i1","type":"inline","data":"AAAB"}]}

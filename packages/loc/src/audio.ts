@@ -9,7 +9,6 @@
  * @module
  */
 
-import type { Varint } from '@moqt/transport';
 import type { AudioLevel } from './types.js';
 
 /**
@@ -21,12 +20,12 @@ import type { AudioLevel } from './types.js';
  * Bits 6-0: level — Audio magnitude in -dBov (0 = loudest, 127 = silence)
  * ```
  *
- * @param value Varint value from LOC extension ID 6
+ * @param value Integer value (varint/vi64) from LOC extension ID 6
  * @returns Parsed AudioLevel
  * @see draft-ietf-moq-loc-01 §2.3.3.1
  * @see RFC 6464 §3
  */
-export function parseAudioLevel(value: Varint): AudioLevel {
+export function parseAudioLevel(value: bigint): AudioLevel {
     const byte = Number(value) & 0xFF;
     return {
         voiceActivity: (byte & 0x80) !== 0,

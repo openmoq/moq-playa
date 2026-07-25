@@ -24,6 +24,8 @@ import {
     parseMsfCatalog,
     parseDeltaUpdate,
     applyCatalogUpdate,
+    parseMsf01Delta,
+    applyMsf01Delta,
     parseCatalogFormat01,
     applyCf01Patch,
 } from '@moqt/msf';
@@ -72,9 +74,10 @@ export class CatalogManager {
      *
      * Format detection:
      * - Array → cf01 JSON Patch delta (RFC 6902)
-     * - Object with deltaUpdate: true → MSF-00 delta
+     * - Object with deltaUpdate: true → MSF-00 grouped delta
+     * - Object with deltaUpdate: [ ... ] → MSF-01 op-array delta (§5.3)
      * - Object with streamingFormat → cf01 independent catalog
-     * - Object without streamingFormat → MSF-00 independent catalog
+     * - Object without streamingFormat → MSF-00/MSF-01/CMSF-01 independent catalog
      *
      * @param payload Raw catalog JSON bytes from the catalog track
      * @returns The new materialized CatalogState
@@ -120,6 +123,24 @@ export class CatalogManager {
                 delta,
                 this.catalogNamespace,
             );
+        } else if (
+            typeof raw === 'object' &&
+            raw !== null &&
+            Array.isArray((raw as Record<string, unknown>)['deltaUpdate'])
+        ) {
+            // ── MSF-01 op-array delta (deltaUpdate:[{op,tracks}]) ──────
+            if (!this.state) {
+                throw new Error(
+                    'Delta catalog update received before initial catalog (§9.1: ' +
+                    'publisher MUST publish catalog before media)',
+                );
+            }
+            const delta = parseMsf01Delta(payload);
+            this.state = applyMsf01Delta(
+                this.state,
+                delta,
+                this.catalogNamespace,
+            );
         } else {
             // ── Independent catalog — detect format ────────────────
             const obj = raw as Record<string, unknown>;
@@ -150,6 +171,18 @@ export class CatalogManager {
                         : {}),
                     ...(catalog.isComplete !== undefined
                         ? { isComplete: catalog.isComplete }
+                        : {}),
+                    // MSF-01 / CMSF-01 root fields: materialized so the player
+                    // can resolve per-track initRef against the root initDataList and
+                    // preserve content-protection metadata. Absent on MSF-00 catalogs.
+                    ...(catalog.initDataList !== undefined
+                        ? { initDataList: catalog.initDataList }
+                        : {}),
+                    ...(catalog.contentProtections !== undefined
+                        ? { contentProtections: catalog.contentProtections }
+                        : {}),
+                    ...(catalog.publishTracks !== undefined
+                        ? { publishTracks: catalog.publishTracks }
                         : {}),
                 };
             }

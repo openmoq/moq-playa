@@ -1,0 +1,250 @@
+{
+  "corpusSchema": "moq-media-corpus/1",
+  "domain": "bmff",
+  "note": "Read-only. Authored via AUTHOR_CORPUS=1 build-corpus.ts. Normative/interpretation expectations are independently authored; observed Playa output lives only in differential.playa. Regression expectations pin current behavior.",
+  "vectors": [
+    {
+      "id": "bmff/init-minimal-trex",
+      "kind": "bmff-structure",
+      "profile": "cmaf",
+      "operation": "trex",
+      "description": "Minimal init (moov+mvex+trex): current utilities expose only the trex sample defaults (no codec/timescale/dims extractor exists).",
+      "input": {
+        "file": "init_minimal_trex.bin",
+        "byteLength": 48,
+        "sha256": "eded53d2fca1590db768950042a77afc2c11c89b7cc88ca852410a0aae18a1c0",
+        "hex": "000000306d6f6f76000000286d766578000000207472657800000000000000010000000100000bb80000000000000000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "trex": [
+            {
+              "trackId": "1",
+              "defaultSampleDuration": "3000",
+              "defaultSampleSize": "0",
+              "defaultSampleFlags": "0"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "implementation-generated",
+        "source": "mp4-box test builders (ISO/IEC 14496-12 structure)",
+        "section": "Movie Fragments",
+        "generator": "playa:build-corpus",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "eded53d2fca1590db768950042a77afc2c11c89b7cc88ca852410a0aae18a1c0"
+      }
+    },
+    {
+      "id": "bmff/frag-tfdt-v0",
+      "kind": "bmff-structure",
+      "profile": "cmaf",
+      "operation": "peek",
+      "description": "Fragment with a 32-bit tfdt (baseMediaDecodeTime 1000).",
+      "input": {
+        "file": "frag_tfdt_v0.bin",
+        "byteLength": 86,
+        "sha256": "8d24c3eb12cf0ac0a088509c359c6ad7692046b65d0d7799ba1a241580ecb6a0",
+        "hex": "000000446d6f6f660000003c747261660000001474666864000000080000000100000064000000107466647400000000000003e8000000107472756e0000000000000005000000126d64617400000000000000000000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "bmd": "1000",
+          "mdatSize": "18"
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "implementation-generated",
+        "source": "mp4-box test builders (ISO/IEC 14496-12 structure)",
+        "section": "Movie Fragments",
+        "generator": "playa:build-corpus",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "8d24c3eb12cf0ac0a088509c359c6ad7692046b65d0d7799ba1a241580ecb6a0"
+      }
+    },
+    {
+      "id": "bmff/frag-tfdt-v1-large",
+      "kind": "bmff-structure",
+      "profile": "cmaf",
+      "operation": "peek",
+      "description": "Fragment with a 64-bit tfdt above 2^53-1 (9007199254740993); kept exact as bigint.",
+      "input": {
+        "file": "frag_tfdt_v1_large.bin",
+        "byteLength": 90,
+        "sha256": "7821e097522f6801d205428f1d134ddc9d558775313f180ff3fff13e0e839936",
+        "hex": "000000486d6f6f66000000407472616600000014746668640000000800000001000000640000001474666474010000000020000000000001000000107472756e0000000000000005000000126d64617400000000000000000000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "bmd": "9007199254740993",
+          "mdatSize": "18"
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "implementation-generated",
+        "source": "mp4-box test builders (ISO/IEC 14496-12 structure)",
+        "section": "Movie Fragments",
+        "generator": "playa:build-corpus",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "7821e097522f6801d205428f1d134ddc9d558775313f180ff3fff13e0e839936"
+      }
+    },
+    {
+      "id": "bmff/trex-defaults-time-ranges",
+      "kind": "bmff-structure",
+      "profile": "cmaf",
+      "operation": "timeRanges",
+      "description": "A fragment whose trun omits per-sample durations falls back to the trex default (512) for its time range.",
+      "input": {
+        "file": "trex_defaults_ranges.bin",
+        "byteLength": 128,
+        "sha256": "27391fecc85b791a38415c5829b8f4a7bea99f0e49d64b50e9b4cc0b2c73f000",
+        "hex": "000000306d6f6f76000000286d7665780000002074726578000000000000000100000001000002000000000000000000000000406d6f6f66000000387472616600000010746668640000000000000001000000107466647400000000000007d0000000107472756e0000000000000004000000106d6461740000000000000000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "ranges": [
+            {
+              "startTime": "2000",
+              "endTime": "4048",
+              "sampleCount": "4"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "implementation-generated",
+        "source": "mp4-box test builders (ISO/IEC 14496-12 structure)",
+        "section": "Movie Fragments",
+        "generator": "playa:build-corpus",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "27391fecc85b791a38415c5829b8f4a7bea99f0e49d64b50e9b4cc0b2c73f000"
+      }
+    },
+    {
+      "id": "bmff/multi-moof",
+      "kind": "bmff-structure",
+      "profile": "cmaf",
+      "operation": "timeRanges",
+      "description": "A segment carrying two moof+mdat pairs yields one time range per moof.",
+      "input": {
+        "file": "multi_moof.bin",
+        "byteLength": 172,
+        "sha256": "09beca84d71fc05b71b466c79482a73b702a6a6ad19f1298607aef37a03efca6",
+        "hex": "000000446d6f6f660000003c747261660000001474666864000000080000000100000064000000107466647400000000000003e8000000107472756e0000000000000005000000126d64617400000000000000000000000000446d6f6f660000003c747261660000001474666864000000080000000100000064000000107466647400000000000005dc000000107472756e0000000000000005000000126d64617400000000000000000000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "ranges": [
+            {
+              "startTime": "1000",
+              "endTime": "1500",
+              "sampleCount": "5"
+            },
+            {
+              "startTime": "1500",
+              "endTime": "2000",
+              "sampleCount": "5"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "implementation-generated",
+        "source": "mp4-box test builders (ISO/IEC 14496-12 structure)",
+        "section": "Movie Fragments",
+        "generator": "playa:build-corpus",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "09beca84d71fc05b71b466c79482a73b702a6a6ad19f1298607aef37a03efca6"
+      }
+    },
+    {
+      "id": "bmff/moof-without-mdat",
+      "kind": "bmff-structure",
+      "profile": "cmaf",
+      "operation": "peek",
+      "description": "A moof with no following mdat: the total utility reports the bmd but a null mdatSize (it does not throw).",
+      "input": {
+        "file": "moof_no_mdat.bin",
+        "byteLength": 68,
+        "sha256": "5f9913ec172cc0a534261f963bb22937c38bb4561353fea4c05b3437e1239fd4",
+        "hex": "000000446d6f6f660000003c747261660000001474666864000000080000000100000064000000107466647400000000000003e8000000107472756e0000000000000005"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "bmd": "1000",
+          "mdatSize": null
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "implementation-generated",
+        "source": "mp4-box test builders (ISO/IEC 14496-12 structure)",
+        "section": "Movie Fragments",
+        "generator": "playa:build-corpus",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "5f9913ec172cc0a534261f963bb22937c38bb4561353fea4c05b3437e1239fd4"
+      }
+    },
+    {
+      "id": "bmff/box-overrun",
+      "kind": "bmff-structure",
+      "profile": "cmaf",
+      "operation": "timeRanges",
+      "description": "A leading box size that overruns the buffer: readSegmentTimeRanges returns null (malformed), it does not throw.",
+      "input": {
+        "file": "box_overrun.bin",
+        "byteLength": 86,
+        "sha256": "7f40cef4aaab10800dd3e6bb6ac23a381afc040e812232e27396db78d1e1caa2",
+        "hex": "7f0000446d6f6f660000003c747261660000001474666864000000080000000100000064000000107466647400000000000003e8000000107472756e0000000000000005000000126d64617400000000000000000000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "ranges": [
+            {
+              "startTime": "1000",
+              "endTime": "1500",
+              "sampleCount": "5"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "implementation-generated",
+        "source": "mp4-box test builders (ISO/IEC 14496-12 structure)",
+        "section": "Movie Fragments",
+        "generator": "playa:build-corpus",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "7f40cef4aaab10800dd3e6bb6ac23a381afc040e812232e27396db78d1e1caa2"
+      }
+    }
+  ]
+}

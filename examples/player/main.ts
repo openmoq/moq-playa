@@ -30,6 +30,8 @@ import {
     CanvasRenderer,
     WebAudioOutput,
     MseMediaSource,
+    type MseStartupReport,
+    type CmafStartupGeometry,
     CmafAssembler,
     createWebTransport,
 } from '@moqt/browser';
@@ -37,6 +39,9 @@ import {
 import type { PlayerStats, TTFFBreakdown } from '@moqt/player';
 
 // ─── Settings Modal ──────────────────────────────────────────────────
+
+/** Injected by Vite (`define`): "<version>+<shortSha>[-dirty]". */
+declare const __PLAYA_BUILD__: string;
 
 const params = new URLSearchParams(window.location.search);
 
@@ -189,6 +194,54 @@ const audioTrackLabel = document.getElementById('audio-track-label')!;
 const audioTrackMenu = document.getElementById('audio-track-menu')!;
 
 let player: MoqtPlayer | null = null;
+/** Adapter handle for the current session (diagnostics + playback recovery). */
+let mediaSourceRef: MseMediaSource | null = null;
+/**
+ * Two-source latch for the joined startup summary (diagnostics only).
+ *
+ * The summary is only meaningful when BOTH halves describe the SAME playback
+ * session: the assembler's rebase geometry, and the adapter's startup report
+ * (positioning and play actually settled). Reading a module-global adapter
+ * handle at geometry time reports whatever that adapter happened to know at
+ * that instant, which during startup is nothing.
+ *
+ * ONE latch is created per startPlayback() call and both factories close over
+ * it, so same-session pairing is structural rather than inferred. The adapter's
+ * own `session` stamp is carried into the summary so an in-session adapter
+ * reset is visible in the output.
+ */
+interface StartupLatch {
+    geometry: CmafStartupGeometry | null;
+    report: MseStartupReport | null;
+    emitted: boolean;
+}
+function newStartupLatch(): StartupLatch {
+    return { geometry: null, report: null, emitted: false };
+}
+/** Debug-gate for the joined summary; set from ?msedebug=1 at connect time. */
+let startupSummaryEnabled = false;
+/** Emit the joined summary exactly once, only when both halves have landed. */
+function emitStartupSummary(latch: StartupLatch): void {
+    if (!startupSummaryEnabled || latch.emitted) return;
+    const g = latch.geometry;
+    const r = latch.report;
+    if (!g || !r) return;
+    latch.emitted = true;
+    log('[startup-summary] ' + JSON.stringify({
+        build: __PLAYA_BUILD__,
+        implementation: r.implementation,
+        attachment: r.attachment,
+        disableRemotePlayback: r.disableRemotePlayback,
+        epochMode: g.epochMode,
+        audio: { rawBmd: g.audioRawBmd, timescale: g.audioTimescale, startSec: g.audioStartSec },
+        video: { rawBmd: g.videoRawBmd, timescale: g.videoTimescale, startSec: g.videoStartSec },
+        startGapSec: g.gapSec,
+        session: r.session,
+        mseStartPosition: r.startPosition,
+        seekOutcome: r.seekOutcome,
+        playTimeSec: r.playTimeSec,
+    }));
+}
 let renderer: CanvasRenderer | null = null;
 let trace: QlogTrace | null = null;
 let statsInterval: ReturnType<typeof setInterval> | null = null;
@@ -453,7 +506,9 @@ function attemptPlaybackResume(reason: string): void {
     const epoch = playEpoch;
     lastResumeAttemptMs = performance.now();
     log(`[video] ${reason} — retrying play()`);
-    videoEl.play().catch((err) => log(`[video] play() retry rejected: ${(err as Error).message}`));
+    // Route recovery through the adapter's owned lifecycle rather than calling
+    // videoEl.play() directly, so recovery never becomes a second play owner.
+    mediaSourceRef?.resumePlayback();
     const tBefore = videoEl.currentTime;
     setTimeout(() => {
         if (epoch !== playEpoch || !playbackIntentActive()) return;
@@ -913,6 +968,8 @@ async function startPlayback(): Promise<void> {
     // running underneath — the loop's cleanup stopPlayback() bumps playEpoch, and
     // this attempt must then bail without mutating player/UI state.
     const epoch = playEpoch;
+    // One latch per session; both adapter factories below close over it.
+    const latch = newStartupLatch();
     const { ctx: audioCtx, clock: audioClock } = ensureAudio();
     log(`Relay: ${relayUrl}`);
     log(`Namespace: ${Array.isArray(namespaceArg) ? `[${namespaceArg.map(f => `"${f}"`).join(', ')}]` : namespaceArg}`);
@@ -934,6 +991,38 @@ async function startPlayback(): Promise<void> {
     const lateMs = params.get('late') ? parseInt(params.get('late')!, 10) : undefined;
     const gapMs = params.get('gap') ? parseInt(params.get('gap')!, 10) : undefined;
     const preferSoftwareDecoder = params.get('swdec') === '1';
+    // ?mse=auto|managed|standard — which MediaSource implementation to use.
+    // `auto` (default) and `managed` prefer ManagedMediaSource where the browser
+    // offers both; `standard` prefers plain MediaSource. Every preference FALLS
+    // BACK to the other implementation when the requested one is absent, so a
+    // preference can never make a playable device unplayable — which means a
+    // comparison run can silently end up on the other implementation. The
+    // selected implementation is therefore logged whenever it differs from the
+    // request. (Attachment, below, is the opposite contract: an explicit
+    // ?mseattach= throws rather than falling back.) `?msedebug=1` turns on the
+    // adapter + assembler startup timing logs and the joined startup summary.
+    /** Strictly validate an enum query param; unknown values log and fall back. */
+    function pickParam<T extends string>(name: string, allowed: readonly T[], fallback: T): T {
+        const raw = params.get(name);
+        if (raw === null) return fallback;
+        if ((allowed as readonly string[]).includes(raw)) return raw as T;
+        log(`[MSE] ignoring unknown ?${name}=${raw} (expected ${allowed.join('|')}) — using ${fallback}`);
+        return fallback;
+    }
+    const mseImpl = pickParam('mse', ['auto', 'managed', 'standard'] as const, 'auto');
+    // Attachment is independent of implementation, so the Safari matrix can tell
+    // a ManagedMediaSource problem apart from an attachment-path one.
+    const mseAttach = pickParam('mseattach', ['auto', 'object-url', 'src-object'] as const, 'auto');
+    // Lets a standard/object-url control carry the same disableRemotePlayback
+    // flag that managed always sets, so that flag is not a hidden variable.
+    const mseRemote = pickParam('mseremote', ['auto', 'disabled'] as const, 'auto');
+    // DIAGNOSTIC: `legacy` restores pre-RED5DEV-2315 per-track zero-basing, which
+    // maps both tracks to 0 and erases the publisher's real A/V offset. It is
+    // knowingly incorrect and exists only to compare startup geometry in one
+    // build. Production is always `shared`.
+    const epochMode = pickParam('epoch', ['shared', 'legacy'] as const, 'shared');
+    const mseDebug = params.get('msedebug') === '1';
+    startupSummaryEnabled = mseDebug;
 
     // FETCH-catalog mode: pre-fetch + reuse adapter so the player skips
     // the connect handshake AND the catalog SUBSCRIBE.
@@ -979,7 +1068,28 @@ async function startPlayback(): Promise<void> {
         // CommandDispatcher (delay unification) — no independent audio delay.
         createAudioOutput: () => new WebAudioOutput(audioCtx, undefined, 0, audioClock),
         createMediaSource: () => {
-            const ms = new MseMediaSource(videoEl);
+            // Applied BEFORE construction so a standard/object-url run can carry
+            // the same flag managed sets, isolating it as a variable.
+            if (mseRemote === 'disabled') videoEl.disableRemotePlayback = true;
+            const ms: MseMediaSource = new MseMediaSource(videoEl, {
+                mseImplementation: mseImpl,
+                mseAttachment: mseAttach,
+            });
+            ms.debug = mseDebug;
+            mediaSourceRef = ms;
+            if (mseImpl !== 'auto' && ms.selectedImplementation !== mseImpl) {
+                // Always logged, not msedebug-gated: a matrix run that believes
+                // it tested `standard` while running `managed` is worse than no
+                // result at all.
+                log(`[MSE] ?mse=${mseImpl} unavailable — fell back to `
+                    + `${ms.selectedImplementation}`);
+            }
+            ms.onStartupReport = (r) => { latch.report = r; emitStartupSummary(latch); };
+            if (mseDebug) {
+                log(`[MSE] implementation=${ms.selectedImplementation} (?mse=${mseImpl}) `
+                    + `attachment=${ms.selectedAttachment} (?mseattach=${mseAttach}) `
+                    + `disableRemotePlayback=${videoEl.disableRemotePlayback === true}`);
+            }
             // Playhead-wedge forensics into the PAGE log (the adapter's own
             // logWarn only reaches the console) — so unattended sessions
             // self-document which recovery rung fired. Rung 2 is a deliberate
@@ -992,7 +1102,16 @@ async function startPlayback(): Promise<void> {
             };
             return ms;
         },
-        createCmafAssembler: (opts) => new CmafAssembler(opts),
+        createCmafAssembler: (opts) => {
+            const asm = new CmafAssembler({ ...opts, epochMode });
+            asm.debug = mseDebug;
+            // ONE structured summary, latched from two sources: the assembler's
+            // rebase geometry and the adapter's TERMINAL startup report. It
+            // emits only when both belong to the same session and startup has
+            // actually settled — never from a mid-startup snapshot.
+            asm.onStartupGeometry = (g) => { latch.geometry = g; emitStartupSummary(latch); };
+            return asm;
+        },
         onQlogEvent: (e) => trace?.record(e),
     });
 
@@ -1112,10 +1231,10 @@ async function startPlayback(): Promise<void> {
         try { await p.destroy(); } catch { /* best effort */ }
         return;
     }
+    // play() declares playback intent; the MSE adapter owns the startup
+    // positioning/play sequence from there. A second videoEl.play() here would
+    // be a competing owner that can play into an unresolved startup seek.
     p.play();
-
-    // MSE: ensure <video> element is playing (autoplay may be blocked)
-    videoEl.play().catch(() => { /* autoplay blocked — user interaction needed */ });
 
     // Start the rendering loop (rAF-driven frame presentation)
     renderer.start();

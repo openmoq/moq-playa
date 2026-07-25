@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moq-playa/conformance/media/schema/corpus-manifest.schema.json",
+  "title": "moq-media-corpus/1 domain manifest",
+  "description": "Reviewable mirror of the authoritative TypeScript validator (runner/src/validate.ts). Wide-integer fields are decimal STRINGS, never JSON numbers.",
+  "type": "object",
+  "required": ["corpusSchema", "domain", "vectors"],
+  "additionalProperties": false,
+  "properties": {
+    "corpusSchema": { "const": "moq-media-corpus/1" },
+    "domain": { "type": "string", "minLength": 1 },
+    "note": { "type": "string" },
+    "vectors": { "type": "array", "items": { "$ref": "#/$defs/entry" } }
+  },
+  "$defs": {
+    "wideInt": { "type": "string", "pattern": "^-?(?:0|[1-9][0-9]*)$" },
+    "int32": { "type": "integer", "minimum": 0, "maximum": 2147483647, "$comment": "small nonnegative count; larger values must be decimal-string wide integers" },
+    "hex": { "type": "string", "pattern": "^(?:[0-9a-f]{2})*$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "errorCategory": {
+      "enum": [
+        "malformed-varint", "truncated", "length-overrun", "delta-overflow",
+        "value-out-of-range", "odd-value-too-long", "parity-mismatch",
+        "invalid-version", "invalid-timescale-zero", "dangling-init-ref",
+        "dangling-protection-ref", "missing-required-field", "invalid-packet-size",
+        "payload-size-not-multiple", "sync-byte-invalid", "box-overrun",
+        "missing-mdat", "timestamp-unsafe-number", "mixed-clock-domain",
+        "unsupported-profile", "unsupported-delta", "malformed-json",
+        "duplicate-init-ref", "duplicate-protection-ref",
+        "unknown-delta-op", "illegal-delta-field"
+      ]
+    },
+    "diagnostics": { "type": "array", "items": { "type": "string" } },
+    "errorObject": {
+      "type": "object",
+      "required": ["category"],
+      "additionalProperties": false,
+      "properties": { "category": { "$ref": "#/$defs/errorCategory" }, "note": { "type": "string" } }
+    },
+    "expect": {
+      "oneOf": [
+        {
+          "type": "object", "required": ["status", "stage", "semantics"], "additionalProperties": false,
+          "properties": { "status": { "const": "ok" }, "stage": { "const": "decode" }, "semantics": {}, "canonicalHex": { "$ref": "#/$defs/hex" }, "diagnostics": { "$ref": "#/$defs/diagnostics" } }
+        },
+        {
+          "type": "object", "required": ["status", "stage", "semantics"], "additionalProperties": false,
+          "properties": { "status": { "const": "ok" }, "stage": { "const": "semantic" }, "semantics": {}, "diagnostics": { "$ref": "#/$defs/diagnostics" } }
+        },
+        {
+          "type": "object", "required": ["status", "stage", "bytesHex"], "additionalProperties": false,
+          "properties": { "status": { "const": "ok" }, "stage": { "const": "encode" }, "bytesHex": { "$ref": "#/$defs/hex" }, "diagnostics": { "$ref": "#/$defs/diagnostics" } }
+        },
+        {
+          "type": "object", "required": ["status", "stage", "error"], "additionalProperties": false,
+          "properties": { "status": { "const": "error" }, "stage": { "enum": ["decode", "encode", "semantic"] }, "error": { "$ref": "#/$defs/errorObject" }, "diagnostics": { "$ref": "#/$defs/diagnostics" } }
+        }
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["class", "source", "section", "generator", "generatorVersion", "command", "sourceHash"],
+      "additionalProperties": false,
+      "properties": {
+        "class": { "enum": ["spec-derived", "third-party", "implementation-generated"] },
+        "source": { "type": "string", "minLength": 1 },
+        "section": { "type": "string", "minLength": 1 },
+        "generator": { "type": "string", "minLength": 1 },
+        "generatorVersion": { "type": "string", "minLength": 1 },
+        "command": { "type": "string", "minLength": 1 },
+        "sourceHash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "differentialEntry": {
+      "oneOf": [
+        {
+          "type": "object", "required": ["status", "currentBehavior"], "additionalProperties": false,
+          "properties": { "status": { "enum": ["diverges", "unimplemented"] }, "reason": { "type": "string" }, "currentBehavior": { "$ref": "#/$defs/expect" } }
+        },
+        {
+          "type": "object", "required": ["status"], "additionalProperties": false,
+          "properties": { "status": { "enum": ["pass", "forward-looking"] }, "reason": { "type": "string" } }
+        }
+      ]
+    },
+    "fileInput": {
+      "type": "object",
+      "required": ["file", "byteLength", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "file": { "type": "string", "pattern": "^[^/][^:]*$" },
+        "byteLength": { "$ref": "#/$defs/int32" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "hex": { "$ref": "#/$defs/hex" }
+      }
+    },
+    "propertyMapInput": {
+      "type": "object",
+      "required": ["propertyMap"],
+      "additionalProperties": false,
+      "properties": {
+        "propertyMap": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "valueKind", "value"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "$ref": "#/$defs/wideInt" },
+              "valueKind": { "enum": ["varint", "bytes"] },
+              "value": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "entry": { "oneOf": [{ "$ref": "#/$defs/fullEntry" }, { "$ref": "#/$defs/tombstone" }] },
+    "tombstone": {
+      "type": "object",
+      "required": ["id", "retired"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)+$" },
+        "retired": { "type": "object", "required": ["reason"], "additionalProperties": false, "properties": { "reason": { "type": "string", "minLength": 1 } } }
+      }
+    },
+    "fullEntry": {
+      "type": "object",
+      "required": ["id", "kind", "profile", "description", "input", "expect", "expectationBasis", "provenance"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)+$" },
+        "kind": { "enum": ["property-block-decode", "loc-semantics", "loc-properties", "catalog-parse", "catalog-delta-parse", "bmff-structure", "msfts-validate"] },
+        "profile": { "type": "string", "minLength": 1 },
+        "wireProfile": { "enum": ["d14-absolute-varint", "d16-delta-varint", "d18-delta-vi64"] },
+        "scope": { "enum": ["track", "object"] },
+        "operation": { "enum": ["trex", "peek", "timeRanges"] },
+        "description": { "type": "string", "minLength": 1 },
+        "input": { "oneOf": [{ "$ref": "#/$defs/fileInput" }, { "$ref": "#/$defs/propertyMapInput" }] },
+        "expect": { "$ref": "#/$defs/expect" },
+        "expectationBasis": { "enum": ["normative", "interpretation", "interop", "regression"] },
+        "provenance": { "$ref": "#/$defs/provenance" },
+        "differential": { "type": "object", "additionalProperties": { "$ref": "#/$defs/differentialEntry" } }
+      }
+    }
+  }
+}

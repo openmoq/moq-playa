@@ -16,6 +16,72 @@
 export type Packaging = 'loc' | 'mediatimeline' | 'eventtimeline' | 'cmaf';
 
 /**
+ * MSF-01 media-timeline template (§5.2.15 / §7.4): the inline fixed-duration
+ * timeline on a media track. Carried in its canonical 6-item wire-array shape
+ *   [startMediaMs, deltaMediaMs, [startGroup, startObject],
+ *    [deltaGroup, deltaObject], startWallclockMs, deltaWallclockMs]
+ * (a positional tuple, not a named record) so it projects losslessly with no
+ * shape-reconstruction step. All values are non-negative integer ms / MOQT
+ * Location ids.
+ * @see draft-ietf-moq-msf-01 §5.2.15
+ */
+export type MsfMediaTemplate = readonly [
+    startMediaMs: number,
+    deltaMediaMs: number,
+    startLocation: readonly [group: number, object: number],
+    deltaLocation: readonly [group: number, object: number],
+    startWallclockMs: number,
+    deltaWallclockMs: number,
+];
+
+/**
+ * MSF-01 root Initialization Data List entry (§5.1.7). `data` is carried as an
+ * OPAQUE base64 string, never decoded or validated as a media structure.
+ * @see draft-ietf-moq-msf-01 §5.1.7
+ */
+export interface MsfInitDataEntry {
+    readonly id: string;
+    readonly type: string;
+    readonly data: string;
+}
+
+/**
+ * CMSF-01 URL reference object (laURL/certURL/authorizationURL) — §4.1.1.4.2-.4.
+ * @see draft-ietf-moq-cmsf-01 §4.1.1.4
+ */
+export interface CmsfUrlRef {
+    readonly url: string;
+    readonly type?: string;
+}
+
+/**
+ * CMSF-01 DRM system metadata (§4.1.1.4). Carried as OPAQUE metadata only —
+ * `pssh` is not decoded, and no protected-playback capability is implied.
+ * @see draft-ietf-moq-cmsf-01 §4.1.1.4
+ */
+export interface CmsfDrmSystem {
+    readonly systemID: string;
+    readonly laURL?: CmsfUrlRef;
+    readonly certURL?: CmsfUrlRef;
+    readonly authorizationURL?: CmsfUrlRef;
+    readonly pssh?: string;
+    readonly robustness?: string;
+}
+
+/**
+ * CMSF-01 content-protection entry (§4.1.1). Parse is lenient: string fields are
+ * carried as-is; only required keys and shape are checked. `refID` MUST be
+ * unique across the array (§4.1.1.1).
+ * @see draft-ietf-moq-cmsf-01 §4.1.1
+ */
+export interface CmsfContentProtection {
+    readonly refID: string;
+    readonly defaultKID: readonly string[];
+    readonly scheme: string;
+    readonly drmSystem: CmsfDrmSystem;
+}
+
+/**
  * Reserved track roles.
  * Custom roles are allowed as long as they don't collide with reserved ones.
  * @see draft-ietf-moq-msf-00 §5.1.14 Table 4
@@ -94,6 +160,8 @@ export interface CatalogTrack {
     readonly eventType?: string;
     /** @see draft-ietf-moq-msf-00 §5.1.36 — parent track name for clone operations only */
     readonly parentName?: string;
+    /** @see draft-ietf-moq-msf-01 §5.2 — parent track namespace for clone operations only */
+    readonly parentNamespace?: string;
 
     // ─── CMSF extensions (draft-ietf-moq-cmsf-00 §3.5.2) ─────────
 
@@ -101,6 +169,15 @@ export interface CatalogTrack {
     readonly maxGrpSapStartingType?: number;
     /** @see draft-ietf-moq-cmsf-00 §3.5.2.2 — max SAP type at object start */
     readonly maxObjSapStartingType?: number;
+
+    // ─── MSF-01 / CMSF-01 catalog fields ─────────────────────────
+
+    /** @see draft-ietf-moq-msf-01 §5.2.13 — reference to an initDataList id */
+    readonly initRef?: string;
+    /** @see draft-ietf-moq-msf-01 §5.2.15 — inline media-timeline template */
+    readonly template?: MsfMediaTemplate;
+    /** @see draft-ietf-moq-cmsf-01 §4.1.2 — content-protection refIDs applying to this track */
+    readonly contentProtectionRefIDs?: readonly string[];
 }
 
 /**
@@ -108,7 +185,7 @@ export interface CatalogTrack {
  * @see draft-ietf-moq-msf-00 §5.1
  */
 export interface Catalog {
-    /** @see draft-ietf-moq-msf-00 §5.1.1 — Required; must be 1 for this version */
+    /** @see draft-ietf-moq-msf-00 §5.1.1 — Required; normalized to 1 (accepts "1"/"draft-01") */
     readonly version: number;
     /** @see draft-ietf-moq-msf-00 §5.1.8 — Required */
     readonly tracks: readonly CatalogTrack[];
@@ -116,6 +193,15 @@ export interface Catalog {
     readonly generatedAt?: number;
     /** @see draft-ietf-moq-msf-00 §5.1.7 — MUST NOT be included if false */
     readonly isComplete?: boolean;
+
+    // ─── MSF-01 / CMSF-01 root fields ────────────────────────────
+
+    /** @see draft-ietf-moq-msf-01 §5.1.7 — root Initialization Data List */
+    readonly initDataList?: readonly MsfInitDataEntry[];
+    /** @see draft-ietf-moq-cmsf-01 §4.1.1 — root content protections */
+    readonly contentProtections?: readonly CmsfContentProtection[];
+    /** @see draft-ietf-moq-msf-01 §5.1.5 — publish (reverse-direction) track objects */
+    readonly publishTracks?: readonly CatalogTrack[];
 }
 
 /**
@@ -146,6 +232,38 @@ export interface CatalogDelta {
 }
 
 /**
+ * A single MSF-01 delta operation (§5.3). The operation kind and its ordered
+ * list of (partial) track objects. Unlike the MSF-00 delta — whose grouped
+ * addTracks/removeTracks/cloneTracks fields lose inter-operation ordering — the
+ * MSF-01 op array preserves document order across operations.
+ *
+ * The tracks are PARTIAL: a `remove` entry carries only a name reference, a
+ * `clone` entry carries `parentName`/`parentNamespace` plus overrides, and an
+ * `add` entry may omit fields that the base catalog supplies. This is a
+ * parse-layer projection — no base-catalog application is performed.
+ * @see draft-ietf-moq-msf-01 §5.3
+ */
+export type Msf01DeltaOpKind = 'add' | 'remove' | 'clone';
+export interface Msf01DeltaOp {
+    readonly op: Msf01DeltaOpKind;
+    readonly tracks: readonly Partial<CatalogTrack>[];
+}
+
+/**
+ * MSF-01 op-array delta document (§5.3):
+ *   { "deltaUpdate": [ { "op": "add"|"remove"|"clone", "tracks": [...] }, ... ] }
+ * distinct from the MSF-00 grouped-field {@link CatalogDelta}. Operations apply
+ * in `deltaUpdate` order.
+ * @see draft-ietf-moq-msf-01 §5.3
+ */
+export interface Msf01Delta {
+    /** @see draft-ietf-moq-msf-00 §5.1.6 */
+    readonly generatedAt?: number;
+    /** Ordered operations; document order is significant. */
+    readonly deltaUpdate: readonly Msf01DeltaOp[];
+}
+
+/**
  * Discriminated union: either an independent catalog or a delta update.
  * Use `isDelta()` to discriminate.
  */
@@ -160,6 +278,15 @@ export interface CatalogState {
     readonly tracks: CatalogTrack[];
     readonly generatedAt?: number;
     readonly isComplete?: boolean;
+
+    // ─── MSF-01 / CMSF-01 root fields (preserved through materialization) ──
+
+    /** @see draft-ietf-moq-msf-01 §5.1.7 — root Initialization Data List */
+    readonly initDataList?: readonly MsfInitDataEntry[];
+    /** @see draft-ietf-moq-cmsf-01 §4.1.1 — root content protections (metadata only) */
+    readonly contentProtections?: readonly CmsfContentProtection[];
+    /** @see draft-ietf-moq-msf-01 §5.1.5 — publish (reverse-direction) track objects */
+    readonly publishTracks?: readonly CatalogTrack[];
 }
 
 // ─── Selection types ──────────────────────────────────────────────────

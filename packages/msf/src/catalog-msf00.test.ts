@@ -611,6 +611,8 @@ describe('parseMsfCatalog', () => {
         expect(() => parseMsfCatalog(json)).toThrow(/depends/i);
     });
 
+    // Numeric-version (MSF-00) timeline tracks keep the strict §7.2/§8.2 mimeType
+    // MUST. The MSF-01 (string-version) relaxation lives in catalog-msf01.test.ts.
     it('rejects mediatimeline track without mimeType="application/json" (§7.2)', () => {
         const json = JSON.stringify({
             version: 1,

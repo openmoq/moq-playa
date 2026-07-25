@@ -1,0 +1,1168 @@
+{
+  "corpusSchema": "moq-media-corpus/1",
+  "domain": "properties",
+  "note": "Read-only. Authored via AUTHOR_CORPUS=1 build-corpus.ts. Normative/interpretation expectations are independently authored; observed Playa output lives only in differential.playa. Regression expectations pin current behavior.",
+  "vectors": [
+    {
+      "id": "properties/equiv-63-d16",
+      "kind": "property-block-decode",
+      "profile": "transport-16",
+      "wireProfile": "d16-delta-varint",
+      "description": "Capture Timestamp (id 2, even) value 63 under d16-delta-varint; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_63_d16.bin",
+        "byteLength": 2,
+        "sha256": "4634c4b51a45e6b0eea6846ba9b8e20c32aa108fe67bb9cc0583ecc137e21818",
+        "hex": "023f"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "63"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-16",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18"
+      }
+    },
+    {
+      "id": "properties/equiv-63-d18",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Capture Timestamp (id 2, even) value 63 under d18-delta-vi64; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_63_d18.bin",
+        "byteLength": 2,
+        "sha256": "4634c4b51a45e6b0eea6846ba9b8e20c32aa108fe67bb9cc0583ecc137e21818",
+        "hex": "023f"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "63"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/equiv-64-d16",
+      "kind": "property-block-decode",
+      "profile": "transport-16",
+      "wireProfile": "d16-delta-varint",
+      "description": "Capture Timestamp (id 2, even) value 64 under d16-delta-varint; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_64_d16.bin",
+        "byteLength": 3,
+        "sha256": "11c8d00b459669b3c9911503e72b7cc5d38b2adc41c78e1c872f7be73f8c1f3e",
+        "hex": "024040"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "64"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-16",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18"
+      }
+    },
+    {
+      "id": "properties/equiv-64-d18",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Capture Timestamp (id 2, even) value 64 under d18-delta-vi64; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_64_d18.bin",
+        "byteLength": 2,
+        "sha256": "ba3c702b24e4ef16c111bf92823170f6e81fd37fbafaccbeef52192a1c094380",
+        "hex": "0240"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "64"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/equiv-127-d16",
+      "kind": "property-block-decode",
+      "profile": "transport-16",
+      "wireProfile": "d16-delta-varint",
+      "description": "Capture Timestamp (id 2, even) value 127 under d16-delta-varint; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_127_d16.bin",
+        "byteLength": 3,
+        "sha256": "c777d16160c78feaf8232353394326db240e68ea354af0e306c6a0c6d38388b8",
+        "hex": "02407f"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "127"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-16",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18"
+      }
+    },
+    {
+      "id": "properties/equiv-127-d18",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Capture Timestamp (id 2, even) value 127 under d18-delta-vi64; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_127_d18.bin",
+        "byteLength": 2,
+        "sha256": "b0ccec045ddc48057ca16bd0669e5c8c9897d7a4844e1963c22652d6aec23de0",
+        "hex": "027f"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "127"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/equiv-128-d16",
+      "kind": "property-block-decode",
+      "profile": "transport-16",
+      "wireProfile": "d16-delta-varint",
+      "description": "Capture Timestamp (id 2, even) value 128 under d16-delta-varint; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_128_d16.bin",
+        "byteLength": 3,
+        "sha256": "13e4f3cff99bc20315935cd39c4d20c6281f2f548def12e1d650ecb88ba328ff",
+        "hex": "024080"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "128"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-16",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18"
+      }
+    },
+    {
+      "id": "properties/equiv-128-d18",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Capture Timestamp (id 2, even) value 128 under d18-delta-vi64; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_128_d18.bin",
+        "byteLength": 3,
+        "sha256": "18b22814bc2f7085f5c5bb7d175a692b7e58b1632b631734b512e096c59915e5",
+        "hex": "028080"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "128"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/equiv-16383-d16",
+      "kind": "property-block-decode",
+      "profile": "transport-16",
+      "wireProfile": "d16-delta-varint",
+      "description": "Capture Timestamp (id 2, even) value 16383 under d16-delta-varint; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_16383_d16.bin",
+        "byteLength": 3,
+        "sha256": "8d2b2d97b915467f456cce4f855a69e80219441c4ef45949bf5d7bef47825a31",
+        "hex": "027fff"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "16383"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-16",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18"
+      }
+    },
+    {
+      "id": "properties/equiv-16383-d18",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Capture Timestamp (id 2, even) value 16383 under d18-delta-vi64; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_16383_d18.bin",
+        "byteLength": 3,
+        "sha256": "44d35ef61b0cb3f62d6469e0c8534959c8c258766aef943f354bc8a61174eef4",
+        "hex": "02bfff"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "16383"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/equiv-16384-d16",
+      "kind": "property-block-decode",
+      "profile": "transport-16",
+      "wireProfile": "d16-delta-varint",
+      "description": "Capture Timestamp (id 2, even) value 16384 under d16-delta-varint; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_16384_d16.bin",
+        "byteLength": 5,
+        "sha256": "9614c6660f07b00b9b0337d279b247afd162a7571cc27094e3e25f364f71fd28",
+        "hex": "0280004000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "16384"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-16",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18"
+      }
+    },
+    {
+      "id": "properties/equiv-16384-d18",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Capture Timestamp (id 2, even) value 16384 under d18-delta-vi64; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_16384_d18.bin",
+        "byteLength": 4,
+        "sha256": "49fb0960d70a4f6d3651233a90be8a09bcebd4c280d8b85668b6defc7960ad83",
+        "hex": "02c04000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "16384"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/equiv-epoch-d16",
+      "kind": "property-block-decode",
+      "profile": "transport-16",
+      "wireProfile": "d16-delta-varint",
+      "description": "Capture Timestamp (id 2, even) value 1726000000000000 under d16-delta-varint; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_epoch_d16.bin",
+        "byteLength": 9,
+        "sha256": "ed6702712836ab0a03d0cd4288db0da489fbf363c6b7e497ec6732068443dc1b",
+        "hex": "02c00621c9b0e1e000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "1726000000000000"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-16",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18"
+      }
+    },
+    {
+      "id": "properties/equiv-epoch-d18",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Capture Timestamp (id 2, even) value 1726000000000000 under d18-delta-vi64; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_epoch_d18.bin",
+        "byteLength": 9,
+        "sha256": "f4a63b8681d20d085885730054476d4ed508038427ca915c5e60af2ae99f1f86",
+        "hex": "02fe0621c9b0e1e000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "1726000000000000"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/equiv-max62-d16",
+      "kind": "property-block-decode",
+      "profile": "transport-16",
+      "wireProfile": "d16-delta-varint",
+      "description": "Capture Timestamp (id 2, even) value 4611686018427387903 under d16-delta-varint; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_max62_d16.bin",
+        "byteLength": 9,
+        "sha256": "b2cf65b90288fa2b93e532214343121851bb8db63b059aeeb1188ca646b50a51",
+        "hex": "02ffffffffffffffff"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "4611686018427387903"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-16",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18"
+      }
+    },
+    {
+      "id": "properties/equiv-max62-d18",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Capture Timestamp (id 2, even) value 4611686018427387903 under d18-delta-vi64; decodes to the identical PropertyMap regardless of wire (QUIC↔vi64 divergence begins at 64).",
+      "input": {
+        "file": "equiv_max62_d18.bin",
+        "byteLength": 10,
+        "sha256": "1f10c44417973ae84052d12da88464cad7ce82ac14c43977a64c49ab901c61ab",
+        "hex": "02ff3fffffffffffffff"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "4611686018427387903"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/non-minimal-d18",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Non-minimal vi64 (0x8025 = 37) is valid on read (§1.4.1); canonical encode is minimal (0x25).",
+      "input": {
+        "file": "non_minimal_d18.bin",
+        "byteLength": 3,
+        "sha256": "c25a54d3d2bc14df2bfa59ada4fbee8c68cd325f722bb32e4a0126e163cf5577",
+        "hex": "028025"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "37"
+            }
+          ]
+        },
+        "canonicalHex": "0225"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/non-minimal-d16",
+      "kind": "property-block-decode",
+      "profile": "transport-16",
+      "wireProfile": "d16-delta-varint",
+      "description": "Non-minimal QUIC varint (0x4025 = 37) decodes to 37; canonical encode is minimal (0x25).",
+      "input": {
+        "file": "non_minimal_d16.bin",
+        "byteLength": 3,
+        "sha256": "1fbc6d2468f0f4aecfbdabfff4dac3ef6a989e971e684c7e730aa146873af452",
+        "hex": "024025"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "37"
+            }
+          ]
+        },
+        "canonicalHex": "0225"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-16",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18"
+      }
+    },
+    {
+      "id": "properties/d18-only-pow62",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Value 4611686018427387904 exceeds the QUIC varint range (2^62-1); only a d18 vi64 form exists.",
+      "input": {
+        "file": "d18_only_pow62.bin",
+        "byteLength": 10,
+        "sha256": "2e642ce527197e9df43f02a208548d64516fa25c2d4353f51cb7f9a5f206d0b0",
+        "hex": "02ff4000000000000000"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "4611686018427387904"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/d18-only-max64",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Value 18446744073709551615 exceeds the QUIC varint range (2^62-1); only a d18 vi64 form exists.",
+      "input": {
+        "file": "d18_only_max64.bin",
+        "byteLength": 10,
+        "sha256": "138ac4f4577256685b2870b0b95f548fb4d8efc3a8246f83174619dade2aeef6",
+        "hex": "02ffffffffffffffffff"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "18446744073709551615"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/d18-encode-canonical",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Encoding PropertyMap {id 2, value 100} under d18 produces the canonical minimal vi64 block.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "100"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "0264"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/d16-encode-range-reject",
+      "kind": "property-block-decode",
+      "profile": "transport-16",
+      "wireProfile": "d16-delta-varint",
+      "description": "Encoding a value >= 2^62 under the d16 QUIC-varint profile is a typed range error, never a silent truncation.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "4611686018427387904"
+          }
+        ]
+      },
+      "expect": {
+        "status": "error",
+        "stage": "encode",
+        "error": {
+          "category": "value-out-of-range"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-16",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18"
+      }
+    },
+    {
+      "id": "properties/d16-encode-id-range-reject",
+      "kind": "property-block-decode",
+      "profile": "transport-16",
+      "wireProfile": "d16-delta-varint",
+      "description": "Encoding an id (type field) of 2^62 under d16 exceeds the QUIC-varint range and is a typed value-out-of-range error.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "4611686018427387904",
+            "valueKind": "varint",
+            "value": "0"
+          }
+        ]
+      },
+      "expect": {
+        "status": "error",
+        "stage": "encode",
+        "error": {
+          "category": "value-out-of-range"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-16",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18"
+      }
+    },
+    {
+      "id": "properties/d14-encode-id-range-reject",
+      "kind": "property-block-decode",
+      "profile": "transport-14",
+      "wireProfile": "d14-absolute-varint",
+      "description": "Encoding an absolute id of 2^62 under d14 exceeds the QUIC-varint range and is a typed value-out-of-range error.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "4611686018427387904",
+            "valueKind": "varint",
+            "value": "0"
+          }
+        ]
+      },
+      "expect": {
+        "status": "error",
+        "stage": "encode",
+        "error": {
+          "category": "value-out-of-range"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-14",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "1e6f59bd6d15c8d372932cfbb00dd1c8db7da10771eb57291b9732ea557582b8"
+      }
+    },
+    {
+      "id": "properties/d14-absolute-basic",
+      "kind": "property-block-decode",
+      "profile": "transport-14",
+      "wireProfile": "d14-absolute-varint",
+      "description": "Draft-14 uses ABSOLUTE (non-delta) type IDs; single Capture Timestamp value 42.",
+      "input": {
+        "file": "d14_absolute_basic.bin",
+        "byteLength": 2,
+        "sha256": "2434fdab84f43e54e4b865934d087d41b9b807519d2c3f311d71fe007360f8ae",
+        "hex": "022a"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "42"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-14",
+        "section": "1.4.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "1e6f59bd6d15c8d372932cfbb00dd1c8db7da10771eb57291b9732ea557582b8"
+      }
+    },
+    {
+      "id": "properties/odd-value-65535-accepted",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Odd-id (Video Config, id 13) value of exactly 65535 bytes — the maximum permitted value length (§1.4.3).",
+      "input": {
+        "file": "odd_value_65535.bin",
+        "byteLength": 65539,
+        "sha256": "5c44eaa144451ab3c8bd25a7115cff86920066ba0e5fe12c3774a1bac1d9d5fc"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "13",
+              "valueKind": "bytes",
+              "value": {
+                "sha256": "9f797b60edaf440d5831da53c35f4d4847a2f55adc64cfe887a7bcfcd9eca495",
+                "byteLength": 65535
+              }
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/odd-value-65536-rejected",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "A value length of 65536 exceeds the 2^16-1 maximum; §1.4.3 requires a PROTOCOL_VIOLATION close.",
+      "input": {
+        "file": "odd_value_65536.bin",
+        "byteLength": 65540,
+        "sha256": "dea1c008b3e518009d563a30e09082812d9907bb90045fa72a49296be11e7431"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "decode",
+        "error": {
+          "category": "odd-value-too-long"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/truncated-value",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "The value vi64 (first byte 0xC0 → 3-byte length) runs off the end of the block.",
+      "input": {
+        "file": "truncated_value.bin",
+        "byteLength": 2,
+        "sha256": "f5e0e61250dc5ca346e045ef9b8830ff510ceebd97829a9047efcaf584db9587",
+        "hex": "02c0"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "decode",
+        "error": {
+          "category": "truncated"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/delta-overflow",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "A second id-delta pushes the accumulated type ID past 2^64-1; §1.4.3 requires a PROTOCOL_VIOLATION close.",
+      "input": {
+        "file": "delta_overflow.bin",
+        "byteLength": 12,
+        "sha256": "c898635a73d6d4d05799c0eb94ffd843fd01d3d9697a118746ab3446e6175227",
+        "hex": "ffffffffffffffffff000200"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "decode",
+        "error": {
+          "category": "delta-overflow"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/encode-unsorted-canonical",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Encoding an unsorted PropertyMap [id 6, id 2] yields the canonical ascending-ID block [id 2, id 6]. The wire (§1.4.3) requires non-decreasing ids, but sorting arbitrary caller input is a documented Playa canonicalization policy, not a spec MUST.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "6",
+            "valueKind": "varint",
+            "value": "127"
+          },
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "42"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "022a047f"
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/encode-duplicate-ids",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Encoding duplicate id 2 (values 100 then 200) preserves their relative order in the canonical block (delta 0 for the repeat). Duplicate-order preservation is a documented Playa policy, not a spec MUST.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "100"
+          },
+          {
+            "id": "2",
+            "valueKind": "varint",
+            "value": "200"
+          }
+        ]
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "02640080c8"
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/decode-duplicate-ids",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "Decoding a block with two id-2 entries preserves BOTH in occurrence order. Representing duplicates in a normalized PropertyMap (rather than deduping) is a documented Playa policy; dedup is a Layer-B semantic concern.",
+      "input": {
+        "file": "decode_duplicate_ids.bin",
+        "byteLength": 5,
+        "sha256": "96944d8faca78f3fc733feb54147decdde656f6a2f092ca2e4e0204d034adf01",
+        "hex": "02640080c8"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "decode",
+        "semantics": {
+          "properties": [
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "100"
+            },
+            {
+              "id": "2",
+              "valueKind": "varint",
+              "value": "200"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    },
+    {
+      "id": "properties/encode-parity-mismatch",
+      "kind": "property-block-decode",
+      "profile": "transport-18",
+      "wireProfile": "d18-delta-vi64",
+      "description": "An even id (2) carrying a byte value violates the parity rule (even ⇒ varint, odd ⇒ length-prefixed bytes); the encoder rejects it.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "2",
+            "valueKind": "bytes",
+            "value": "aabb"
+          }
+        ]
+      },
+      "expect": {
+        "status": "error",
+        "stage": "encode",
+        "error": {
+          "category": "parity-mismatch"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-transport-18",
+        "section": "1.4.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6"
+      }
+    }
+  ]
+}

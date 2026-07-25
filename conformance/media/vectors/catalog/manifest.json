@@ -1,0 +1,2420 @@
+{
+  "corpusSchema": "moq-media-corpus/1",
+  "domain": "catalog",
+  "note": "Read-only. Authored via AUTHOR_CORPUS=1 build-corpus.ts. Normative/interpretation expectations are independently authored; observed Playa output lives only in differential.playa. Regression expectations pin current behavior.",
+  "vectors": [
+    {
+      "id": "catalog/msf00-minimal",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "MSF-00 minimal catalog: numeric version, empty tracks.",
+      "input": {
+        "file": "msf00_minimal.json",
+        "byteLength": 25,
+        "sha256": "cc93a54da66ad17da51cbd26aea8a67084dd54b97e525eb1b562e3696a1d242a"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": []
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-00",
+        "section": "5.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f"
+      }
+    },
+    {
+      "id": "catalog/msf00-single-loc-video",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "MSF-00 single LOC video track.",
+      "input": {
+        "file": "msf00_single_loc.json",
+        "byteLength": 110,
+        "sha256": "586310c62aceae0beb33b50feff6a5c3a7b3d7f1bfa1459ac2cf5bb856603849"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "video",
+              "packaging": "loc",
+              "isLive": true,
+              "role": "video",
+              "codec": "avc1.64001f"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-00",
+        "section": "5.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f"
+      }
+    },
+    {
+      "id": "catalog/msf00-rendergroup",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "MSF-00 two tracks sharing renderGroup 1.",
+      "input": {
+        "file": "msf00_rendergroup.json",
+        "byteLength": 176,
+        "sha256": "c3b775e129e4a7f016edf2de7dea405c6452dc23fa08ddc7ee0db3a374b5acc4"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "loc",
+              "isLive": true,
+              "role": "video",
+              "renderGroup": "1"
+            },
+            {
+              "name": "a",
+              "packaging": "loc",
+              "isLive": true,
+              "role": "audio",
+              "renderGroup": "1"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-00",
+        "section": "5.1.18",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f"
+      }
+    },
+    {
+      "id": "catalog/cmsf00-inline-initdata",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "CMSF-00 CMAF track with per-track inline base64 initData (kept as a string, never decoded).",
+      "input": {
+        "file": "cmsf00_initdata.json",
+        "byteLength": 165,
+        "sha256": "933a8ae15446863ade8b01f370af31c29acd94fdc50d70bd563407316cabf54e"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "hd",
+              "packaging": "cmaf",
+              "isLive": true,
+              "role": "video",
+              "codec": "avc1.640028",
+              "width": "1920",
+              "height": "1080",
+              "initData": "AAAAIGZ0eXBpc281"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-cmsf-00",
+        "section": "3.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "8dee5af3d6c028a3be8e808ac2afcf50f4aeaf6074a39f6804b2385814a68a86"
+      }
+    },
+    {
+      "id": "catalog/cf01-triple",
+      "kind": "catalog-parse",
+      "profile": "cf-01",
+      "description": "CF-01 catalog: the version+streamingFormat+streamingFormatVersion triple routes to the CF-01 parser.",
+      "input": {
+        "file": "cf01_triple.json",
+        "byteLength": 241,
+        "sha256": "51b5b407a95bde50785b0e64452f38887a47f8229cace4539ccdc85dddf940c8"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "1.m4s",
+              "packaging": "cmaf",
+              "isLive": true,
+              "namespace": "ns",
+              "role": "video",
+              "codec": "avc1.640028",
+              "mimeType": "video/mp4",
+              "width": "1280",
+              "height": "720"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-catalogformat-01",
+        "section": "3.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "65bb99327880b3de33a233331aa724fb60a5c78eb1ce34ab6b52c3351e72c507"
+      }
+    },
+    {
+      "id": "catalog/msf00-complete-fields",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "Exercises the newly-projected display/scalability fields (displayWidth, displayHeight, depends, temporalId, spatialId); base-layer tracks a and b are declared so the enhancement track's §5.1.21 depends references resolve to real tracks.",
+      "input": {
+        "file": "msf00_complete_fields.json",
+        "byteLength": 484,
+        "sha256": "027da9e9fe04d17317fd3f9a512ddeea6bb3c34fdb06046e75283744b2d11863"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "a",
+              "packaging": "loc",
+              "isLive": true,
+              "role": "video",
+              "codec": "av01.0.08M.10",
+              "temporalId": "0",
+              "spatialId": "0"
+            },
+            {
+              "name": "b",
+              "packaging": "loc",
+              "isLive": true,
+              "role": "video",
+              "codec": "av01.0.08M.10",
+              "temporalId": "0",
+              "spatialId": "1"
+            },
+            {
+              "name": "v",
+              "packaging": "loc",
+              "isLive": true,
+              "role": "video",
+              "codec": "av01.0.08M.10",
+              "framerate": "30",
+              "bitrate": "1000000",
+              "width": "1920",
+              "height": "1080",
+              "displayWidth": "1920",
+              "displayHeight": "1080",
+              "depends": [
+                "a",
+                "b"
+              ],
+              "temporalId": "1",
+              "spatialId": "0"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-00",
+        "section": "5.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f"
+      }
+    },
+    {
+      "id": "catalog/err-version-two",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "MSF-00 unsupported version 2 is rejected.",
+      "input": {
+        "file": "err_version_two.json",
+        "byteLength": 25,
+        "sha256": "4d50e70773278098a63fd244f9ee510ec43b8293e03f8af9f86d391217b94521"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "invalid-version"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-00",
+        "section": "5.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f"
+      }
+    },
+    {
+      "id": "catalog/err-version-string",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "MSF-01 §5.1.1: the string version \"1\" with an empty tracks array is a valid MSF-01 catalog (accepted by the MSF-01 parser; rejected as invalid-version by the MSF-00-only parser that preceded it).",
+      "input": {
+        "file": "err_version_string.json",
+        "byteLength": 27,
+        "sha256": "858cce4a09c40bd4340632b7d736552a1d94d57292904b6e95f488fbe4779ffa"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": []
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/err-malformed-json",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "Malformed JSON is rejected.",
+      "input": {
+        "file": "err_malformed.json",
+        "byteLength": 23,
+        "sha256": "a0b54cbd08876f798e8bc9b8a43feb2c03b5b20dcda2619ec2ad6fc1f85693f0"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "malformed-json"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-00",
+        "section": "5.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f"
+      }
+    },
+    {
+      "id": "catalog/err-cf01-jsonpatch-array",
+      "kind": "catalog-parse",
+      "profile": "cf-01",
+      "description": "A CF-01 JSON-Patch array (§3.3) is not an independent catalog; parseCatalogAuto rejects it (patches go through applyCf01Patch).",
+      "input": {
+        "file": "err_cf01_jsonpatch.json",
+        "byteLength": 54,
+        "sha256": "846f74e6fe6f44eb405ef65bde5fff89554325f3ee1b315d7efdd3985b4d054f"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "unsupported-delta"
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-catalogformat-01",
+        "section": "3.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "65bb99327880b3de33a233331aa724fb60a5c78eb1ce34ab6b52c3351e72c507"
+      }
+    },
+    {
+      "id": "catalog/err-nonfinite-number",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "A numeric field with a JSON overflow exponent (1e999 parses to Infinity) is rejected: a normalized catalog must carry only finite numbers, so it never propagates a non-finite bitrate/generatedAt/width downstream.",
+      "input": {
+        "file": "err_nonfinite.json",
+        "byteLength": 89,
+        "sha256": "1db4b882fcaed6bfda8a5b0dc5cd330f1b7000374414e67052deab0507ffc9f4"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "value-out-of-range"
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-00",
+        "section": "5.1.6",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f"
+      }
+    },
+    {
+      "id": "catalog/msf00-unknown-fields",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "Unknown root and track fields are silently dropped by the current parser (regression pin).",
+      "input": {
+        "file": "msf00_unknown_fields.json",
+        "byteLength": 123,
+        "sha256": "c95f71af04017c8a0b54d86fc7da399ffb358c34de88c692393425c81d766837"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "loc",
+              "isLive": true,
+              "role": "video"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-00",
+        "section": "5.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f"
+      }
+    },
+    {
+      "id": "catalog/msf00-bitrate-above-2p53",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "A bitrate above 2^53-1 as a raw JSON number: JSON.parse silently rounds it (bigint-safety hazard, pinned).",
+      "input": {
+        "file": "msf00_bitrate_big.json",
+        "byteLength": 111,
+        "sha256": "4a797ee975a754a8b14fe1bb3ec16ada7df1097cb138d319bf2323bcfbcda22c"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "loc",
+              "isLive": true,
+              "role": "video",
+              "bitrate": "9007199254740992"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-00",
+        "section": "5.1.28",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f"
+      }
+    },
+    {
+      "id": "catalog/cf01-missing-sfversion",
+      "kind": "catalog-parse",
+      "profile": "cf-01",
+      "description": "CF-01 without streamingFormatVersion: the current (non-strict) parser tolerates it (regression pin; strict mode would reject).",
+      "input": {
+        "file": "cf01_missing_sfversion.json",
+        "byteLength": 161,
+        "sha256": "99d26fcdd4018e6a5045e3b86437041294ef0f5e899facdf033d40e1f0c3cfbc"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "1.m4s",
+              "packaging": "cmaf",
+              "isLive": true,
+              "namespace": "ns",
+              "role": "video",
+              "codec": "avc1.640028"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-catalogformat-01",
+        "section": "3.2.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "65bb99327880b3de33a233331aa724fb60a5c78eb1ce34ab6b52c3351e72c507"
+      }
+    },
+    {
+      "id": "catalog/msf00-delta-object",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "A valid MSF-00 delta update (deltaUpdate:true, NO version field per §5.2) routed through parseCatalogAuto: pins current behavior (the full-catalog parser does not apply deltas — applyCatalogUpdate does).",
+      "input": {
+        "file": "msf00_delta_object.json",
+        "byteLength": 96,
+        "sha256": "d870cca88b33ab210e379c15fa444c3eaafbf38c8a825fa05dcfcb87f5873e9f"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "invalid-version"
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-00",
+        "section": "5.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f"
+      }
+    },
+    {
+      "id": "catalog/libmoq-minimal",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "LibMoQ MSF-00 minimal catalog (numeric version, single LOC track). Executable today.",
+      "input": {
+        "file": "libmoq_minimal.json",
+        "byteLength": 73,
+        "sha256": "a0bf6eed5a81038492c8ce612698abef5433847511a33f7a8c50005eccbcde06"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "video",
+              "packaging": "loc",
+              "isLive": true
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-msf-00 §5.1",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "a0bf6eed5a81038492c8ce612698abef5433847511a33f7a8c50005eccbcde06"
+      }
+    },
+    {
+      "id": "catalog/libmoq-empty-tracks",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "LibMoQ MSF-00 catalog with an empty tracks array (numeric version).",
+      "input": {
+        "file": "libmoq_empty_tracks.json",
+        "byteLength": 25,
+        "sha256": "cc93a54da66ad17da51cbd26aea8a67084dd54b97e525eb1b562e3696a1d242a"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": []
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-msf-00 §5.1.1",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "cc93a54da66ad17da51cbd26aea8a67084dd54b97e525eb1b562e3696a1d242a"
+      }
+    },
+    {
+      "id": "catalog/libmoq-with-init-data",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "LibMoQ MSF-00 LOC track carrying inline base64 initData (kept as a string, never decoded).",
+      "input": {
+        "file": "libmoq_with_init_data.json",
+        "byteLength": 241,
+        "sha256": "6c70626f51fe2fda457cdbabc0f3e77ef1edf22161d72027694c8f141975e197"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "video",
+              "packaging": "loc",
+              "isLive": true,
+              "role": "video",
+              "codec": "avc1.42e01e",
+              "width": "1280",
+              "height": "720",
+              "initData": "AAAB"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-msf-00 §5.1.20",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "6c70626f51fe2fda457cdbabc0f3e77ef1edf22161d72027694c8f141975e197"
+      }
+    },
+    {
+      "id": "catalog/libmoq-av-single",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "LibMoQ MSF-00 conferencing A/V catalog: two render-grouped LOC tracks with targetLatency, codecs, and dimensions.",
+      "input": {
+        "file": "libmoq_av_single.json",
+        "byteLength": 758,
+        "sha256": "f07dd4722601e05bed02b4021a45fdafaa5c423202128700ed5db92b3771a795"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "generatedAt": "1746104606044",
+          "tracks": [
+            {
+              "name": "1080p-video",
+              "packaging": "loc",
+              "isLive": true,
+              "namespace": "conference.example.com/conference123/alice",
+              "role": "video",
+              "codec": "av01.0.08M.10.0.110.09",
+              "renderGroup": "1",
+              "framerate": "30",
+              "bitrate": "1500000",
+              "width": "1920",
+              "height": "1080",
+              "targetLatency": "2000"
+            },
+            {
+              "name": "audio",
+              "packaging": "loc",
+              "isLive": true,
+              "namespace": "conference.example.com/conference123/alice",
+              "role": "audio",
+              "codec": "opus",
+              "renderGroup": "1",
+              "bitrate": "32000",
+              "samplerate": "48000",
+              "channelConfig": "2",
+              "targetLatency": "2000"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-msf-00 §5.1",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "f07dd4722601e05bed02b4021a45fdafaa5c423202128700ed5db92b3771a795"
+      }
+    },
+    {
+      "id": "catalog/libmoq-unknown-fields",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "LibMoQ MSF-00 catalog with unknown root and track fields: the current parser silently drops them (regression pin).",
+      "input": {
+        "file": "libmoq_unknown_fields.json",
+        "byteLength": 213,
+        "sha256": "4f3fc0bc4e0e1fbc3d3570d6e2e9981d3632f569b83ad169ab01d72dd740bc37"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "video",
+              "packaging": "loc",
+              "isLive": true
+            }
+          ]
+        }
+      },
+      "expectationBasis": "regression",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-msf-00 §5.1",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "4f3fc0bc4e0e1fbc3d3570d6e2e9981d3632f569b83ad169ab01d72dd740bc37"
+      }
+    },
+    {
+      "id": "catalog/libmoq-vod",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "LibMoQ MSF-01 VOD catalog (string version \"1\", isLive:false, trackDuration §5.2.35). Intended: accepted by an MSF-01 parser with the full normalized projection; current Playa: invalid-version (no MSF-01 parser).",
+      "input": {
+        "file": "libmoq_vod.json",
+        "byteLength": 714,
+        "sha256": "e377cfa4e892a3b597e34beec0313ba06b219ea7be40a73c0ec8ddc5a6d4404c"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "namespace": "movies.example.com/assets/boy-meets-girl-season3/episode5",
+              "name": "video",
+              "packaging": "loc",
+              "isLive": false,
+              "renderGroup": "1",
+              "codec": "av01.0.08M.10.0.110.09",
+              "framerate": "30",
+              "bitrate": "1500000",
+              "width": "1920",
+              "height": "1080",
+              "trackDuration": "8072340"
+            },
+            {
+              "namespace": "movies.example.com/assets/boy-meets-girl-season3/episode5",
+              "name": "audio",
+              "packaging": "loc",
+              "isLive": false,
+              "renderGroup": "1",
+              "codec": "opus",
+              "bitrate": "32000",
+              "samplerate": "48000",
+              "channelConfig": "2",
+              "trackDuration": "8072340"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-msf-01 §5.2.35",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "e377cfa4e892a3b597e34beec0313ba06b219ea7be40a73c0ec8ddc5a6d4404c"
+      }
+    },
+    {
+      "id": "catalog/libmoq-termination",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "LibMoQ MSF-01 termination catalog (string version, isComplete:true §5.1.3, empty tracks). Intended: accepted; current Playa: invalid-version.",
+      "input": {
+        "file": "libmoq_termination.json",
+        "byteLength": 91,
+        "sha256": "dfdc4e8e565225cb43973fdb648edc76644229f7184fc60a62be680c669998cf"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "generatedAt": "1746104606044",
+          "isComplete": true,
+          "tracks": []
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-msf-01 §5.1.3",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "dfdc4e8e565225cb43973fdb648edc76644229f7184fc60a62be680c669998cf"
+      }
+    },
+    {
+      "id": "catalog/libmoq-mediatimeline",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "LibMoQ MSF-01 catalog with a mediatimeline track depending (§5.2.14) on LOC tracks. Interpretation: the fixture spells the field \"mimetype\" (spec is \"mimeType\" §5.2.19); the canonical interpretation treats it as unknown and drops it — the projected track carries no mimeType. LibMoQ diverges (see differential.libmoq): it accepts the lowercase alias. Current Playa: invalid-version.",
+      "input": {
+        "file": "libmoq_mediatimeline.json",
+        "byteLength": 872,
+        "sha256": "b5da1dc96f6ffd59eeb79e8f961ea7f664148c65331315a4580dfe3cc0566633"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "generatedAt": "1746104606044",
+          "tracks": [
+            {
+              "namespace": "conference.example.com/conference123/alice",
+              "name": "history",
+              "packaging": "mediatimeline",
+              "isLive": true,
+              "depends": [
+                "1080p-video",
+                "audio"
+              ]
+            },
+            {
+              "namespace": "conference.example.com/conference123/alice",
+              "name": "1080p-video",
+              "packaging": "loc",
+              "isLive": true,
+              "role": "video",
+              "codec": "av01.0.08M.10.0.110.09",
+              "bitrate": "1500000",
+              "width": "1920",
+              "height": "1080"
+            },
+            {
+              "namespace": "conference.example.com/conference123/alice",
+              "name": "audio",
+              "packaging": "loc",
+              "isLive": true,
+              "role": "audio",
+              "codec": "opus",
+              "bitrate": "32000",
+              "samplerate": "48000",
+              "channelConfig": "2"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-msf-01 §5.2.14",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "b5da1dc96f6ffd59eeb79e8f961ea7f664148c65331315a4580dfe3cc0566633"
+      },
+      "differential": {
+        "libmoq": {
+          "status": "diverges",
+          "reason": "LibMoQ accepts the non-standard lowercase \"mimetype\" as an alias for mimeType (msf-01 §5.2.19); the canonical interpretation recognizes only \"mimeType\" and drops the misspelling.",
+          "currentBehavior": {
+            "status": "ok",
+            "stage": "semantic",
+            "semantics": {
+              "catalogVersion": "1",
+              "generatedAt": "1746104606044",
+              "tracks": [
+                {
+                  "namespace": "conference.example.com/conference123/alice",
+                  "name": "history",
+                  "packaging": "mediatimeline",
+                  "isLive": true,
+                  "depends": [
+                    "1080p-video",
+                    "audio"
+                  ],
+                  "mimeType": "application/json"
+                },
+                {
+                  "namespace": "conference.example.com/conference123/alice",
+                  "name": "1080p-video",
+                  "packaging": "loc",
+                  "isLive": true,
+                  "role": "video",
+                  "codec": "av01.0.08M.10.0.110.09",
+                  "bitrate": "1500000",
+                  "width": "1920",
+                  "height": "1080"
+                },
+                {
+                  "namespace": "conference.example.com/conference123/alice",
+                  "name": "audio",
+                  "packaging": "loc",
+                  "isLive": true,
+                  "role": "audio",
+                  "codec": "opus",
+                  "bitrate": "32000",
+                  "samplerate": "48000",
+                  "channelConfig": "2"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "catalog/libmoq-template",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "LibMoQ MSF-01 catalog using the per-track template array (§5.2.15). Interpretation: the template is normalized element-wise with numbers as decimal strings (including the wide wallclock anchor), structure preserved. Current Playa: invalid-version.",
+      "input": {
+        "file": "libmoq_template.json",
+        "byteLength": 892,
+        "sha256": "98d6cb8196bce7c7745434d5a5641427430ddc9c783ab47900a221bb25dd09f8"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "generatedAt": "1746104606044",
+          "tracks": [
+            {
+              "namespace": "conference.example.com/conference123/alice",
+              "name": "1080p-video",
+              "packaging": "loc",
+              "isLive": true,
+              "targetLatency": "2000",
+              "role": "video",
+              "renderGroup": "1",
+              "template": [
+                "0",
+                "2002",
+                [
+                  "0",
+                  "0"
+                ],
+                [
+                  "1",
+                  "0"
+                ],
+                "1759924158381",
+                "2002"
+              ],
+              "codec": "av01.0.08M.10.0.110.09",
+              "framerate": "30",
+              "bitrate": "1500000",
+              "width": "1920",
+              "height": "1080"
+            },
+            {
+              "namespace": "conference.example.com/conference123/alice",
+              "name": "audio",
+              "packaging": "loc",
+              "isLive": true,
+              "targetLatency": "2000",
+              "role": "audio",
+              "renderGroup": "1",
+              "template": [
+                "0",
+                "2002",
+                [
+                  "0",
+                  "0"
+                ],
+                [
+                  "1",
+                  "0"
+                ],
+                "1759924158381",
+                "2002"
+              ],
+              "codec": "opus",
+              "bitrate": "32000",
+              "samplerate": "48000",
+              "channelConfig": "2"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-msf-01 §5.2.15",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "98d6cb8196bce7c7745434d5a5641427430ddc9c783ab47900a221bb25dd09f8"
+      }
+    },
+    {
+      "id": "catalog/libmoq-cmsf-clearkey",
+      "kind": "catalog-parse",
+      "profile": "cmsf-01",
+      "description": "LibMoQ CMSF-01 catalog with ClearKey contentProtections (§4.1.1/§4.3) + initDataList (§3.1)/initRef. The projection carries the root contentProtections and initDataList arrays plus the track initRef/contentProtectionRefIDs. Current Playa: invalid-version (no CMSF-01 parser).",
+      "input": {
+        "file": "libmoq_cmsf_clearkey.json",
+        "byteLength": 890,
+        "sha256": "74831a3b1b740ebd67ef7db1681397b8808b01d4a2deda6101850749205ea4ac"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "generatedAt": "1746104606044",
+          "tracks": [
+            {
+              "name": "video",
+              "packaging": "cmaf",
+              "isLive": true,
+              "role": "video",
+              "renderGroup": "1",
+              "initRef": "init-video",
+              "codec": "avc1.640028",
+              "framerate": "30",
+              "bitrate": "5000000",
+              "width": "1920",
+              "height": "1080",
+              "contentProtectionRefIDs": [
+                "1"
+              ]
+            }
+          ],
+          "contentProtections": [
+            {
+              "refID": "1",
+              "defaultKID": [
+                "01234567-89ab-cdef-0123-456789abcdef"
+              ],
+              "scheme": "cenc",
+              "drmSystem": {
+                "systemID": "1077efec-c0b2-4d02-ace3-3c1e52e2fb4b",
+                "pssh": "AAAANHBzc2gBAAAAEHfv7MCyTQKs4",
+                "laURL": {
+                  "url": "https://clearkey-server.example.com/clearkey",
+                  "type": "EME-1.0"
+                }
+              }
+            }
+          ],
+          "initDataList": [
+            {
+              "id": "init-video",
+              "type": "inline",
+              "data": "AAAB"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-cmsf-01 §4.3",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "74831a3b1b740ebd67ef7db1681397b8808b01d4a2deda6101850749205ea4ac"
+      }
+    },
+    {
+      "id": "catalog/libmoq-cmsf-cmaf-simulcast",
+      "kind": "catalog-parse",
+      "profile": "cmsf-01",
+      "description": "LibMoQ CMSF-01 simulcast catalog (altGroup renditions + an eventtimeline SAP track with depends), per-rendition initDataList (§3.1). Complete projection incl. altGroup, codecs, dims, initRef, depends. Current Playa: invalid-version.",
+      "input": {
+        "file": "libmoq_cmsf_cmaf_simulcast.json",
+        "byteLength": 1723,
+        "sha256": "9d53c32066d044915d5574a60bf8c8b735908d29a62e2a5f27391417533d1cc4"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "generatedAt": "1746104606044",
+          "tracks": [
+            {
+              "name": "hd",
+              "packaging": "cmaf",
+              "isLive": true,
+              "role": "video",
+              "renderGroup": "1",
+              "altGroup": "1",
+              "initRef": "init-hd",
+              "codec": "avc1.640028",
+              "framerate": "30",
+              "bitrate": "5000000",
+              "width": "1920",
+              "height": "1080"
+            },
+            {
+              "name": "md",
+              "packaging": "cmaf",
+              "isLive": true,
+              "role": "video",
+              "renderGroup": "1",
+              "altGroup": "1",
+              "initRef": "init-md",
+              "codec": "avc1.64001e",
+              "framerate": "30",
+              "bitrate": "3000000",
+              "width": "720",
+              "height": "640"
+            },
+            {
+              "name": "sd",
+              "packaging": "cmaf",
+              "isLive": true,
+              "role": "video",
+              "renderGroup": "1",
+              "altGroup": "1",
+              "initRef": "init-sd",
+              "codec": "avc1.64000d",
+              "framerate": "30",
+              "bitrate": "500000",
+              "width": "192",
+              "height": "144"
+            },
+            {
+              "name": "audio",
+              "packaging": "cmaf",
+              "isLive": true,
+              "role": "audio",
+              "renderGroup": "1",
+              "initRef": "init-audio",
+              "codec": "mp4a.40.5",
+              "bitrate": "67071",
+              "samplerate": "48000",
+              "channelConfig": "2"
+            },
+            {
+              "name": "sap-timeline",
+              "packaging": "eventtimeline",
+              "eventType": "org.ietf.moq.cmsf.sap",
+              "isLive": true,
+              "depends": [
+                "hd",
+                "md",
+                "sd",
+                "audio"
+              ],
+              "mimeType": "application/json"
+            }
+          ],
+          "initDataList": [
+            {
+              "id": "init-hd",
+              "type": "inline",
+              "data": "AAAB"
+            },
+            {
+              "id": "init-md",
+              "type": "inline",
+              "data": "AAAC"
+            },
+            {
+              "id": "init-sd",
+              "type": "inline",
+              "data": "AAAD"
+            },
+            {
+              "id": "init-audio",
+              "type": "inline",
+              "data": "AAAE"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-cmsf-01 §3.1",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "9d53c32066d044915d5574a60bf8c8b735908d29a62e2a5f27391417533d1cc4"
+      }
+    },
+    {
+      "id": "catalog/libmoq-cmsf-drm-cbcs",
+      "kind": "catalog-parse",
+      "profile": "cmsf-01",
+      "description": "LibMoQ CMSF-01 catalog with three cbcs DRM systems (Widevine/PlayReady/FairPlay) in contentProtections (§4.1.1/§5.2). Complete projection carries all three protection entries and the track contentProtectionRefIDs. Current Playa: invalid-version.",
+      "input": {
+        "file": "libmoq_cmsf_drm_cbcs.json",
+        "byteLength": 1860,
+        "sha256": "48b036709de7d7e4ae566c39435537bd658895de3e04803b60cacc7461110cc9"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "generatedAt": "1746104606044",
+          "tracks": [
+            {
+              "name": "video_protected",
+              "packaging": "cmaf",
+              "isLive": true,
+              "role": "video",
+              "renderGroup": "1",
+              "altGroup": "1",
+              "initRef": "1",
+              "codec": "avc3.4D401F",
+              "framerate": "25",
+              "bitrate": "581905",
+              "width": "1280",
+              "height": "720",
+              "contentProtectionRefIDs": [
+                "1",
+                "2",
+                "3"
+              ]
+            },
+            {
+              "name": "audio",
+              "packaging": "cmaf",
+              "isLive": true,
+              "role": "audio",
+              "renderGroup": "1",
+              "initRef": "2",
+              "codec": "mp4a.40.5",
+              "bitrate": "67071",
+              "samplerate": "48000",
+              "channelConfig": "2"
+            }
+          ],
+          "contentProtections": [
+            {
+              "refID": "1",
+              "defaultKID": [
+                "01234567-89ab-cdef-0123-456789abcdef"
+              ],
+              "scheme": "cbcs",
+              "drmSystem": {
+                "systemID": "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
+                "pssh": "AAAAP3Bzc2gAAAAA7e+LqXnWSs6jyAAA",
+                "laURL": {
+                  "url": "https://widevine-license.example.com/proxy"
+                }
+              }
+            },
+            {
+              "refID": "2",
+              "defaultKID": [
+                "01234567-89ab-cdef-0123-456789abcdef"
+              ],
+              "scheme": "cbcs",
+              "drmSystem": {
+                "systemID": "9a04f079-9840-4286-ab92-e65be0885f95",
+                "pssh": "AAACvnBzc2gAAAAAmgTweZhAQoar",
+                "laURL": {
+                  "url": "https://playready-license.example.com/auth"
+                }
+              }
+            },
+            {
+              "refID": "3",
+              "defaultKID": [
+                "01234567-89ab-cdef-0123-456789abcdef"
+              ],
+              "scheme": "cbcs",
+              "drmSystem": {
+                "systemID": "94ce86fb-07ff-4f43-adb8-93d2fa968ca2",
+                "laURL": {
+                  "url": "https://fps-license.example.com/api/licenses"
+                },
+                "certURL": {
+                  "url": "https://fps-license.example.com/cert"
+                }
+              }
+            }
+          ],
+          "initDataList": [
+            {
+              "id": "1",
+              "type": "inline",
+              "data": "AAAB"
+            },
+            {
+              "id": "2",
+              "type": "inline",
+              "data": "AAAC"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-cmsf-01 §5.2",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "48b036709de7d7e4ae566c39435537bd658895de3e04803b60cacc7461110cc9"
+      }
+    },
+    {
+      "id": "catalog/libmoq-delta-add-clone",
+      "kind": "catalog-delta-parse",
+      "profile": "msf-01-delta",
+      "description": "LibMoQ MSF-01 delta document (§5.6.4): an ordered add + clone operation array (§5.1.6/§5.3) — a successful ordered normalized-operation parse (add then clone), document order preserved.",
+      "input": {
+        "file": "libmoq_delta_add_clone.json",
+        "byteLength": 674,
+        "sha256": "9b1f6fa8140fb426395bbc24ba179ce01970468e8433aeaa3d3cd6d5f1672f56"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "generatedAt": "1746104606044",
+          "deltaUpdate": [
+            {
+              "op": "add",
+              "tracks": [
+                {
+                  "name": "slides",
+                  "isLive": true,
+                  "role": "video",
+                  "renderGroup": "1",
+                  "codec": "av01.0.08M.10.0.110.09",
+                  "framerate": "15",
+                  "bitrate": "750000",
+                  "width": "1920",
+                  "height": "1080"
+                }
+              ]
+            },
+            {
+              "op": "clone",
+              "tracks": [
+                {
+                  "name": "video-720",
+                  "bitrate": "600000",
+                  "width": "1280",
+                  "height": "720",
+                  "parentName": "video-1080",
+                  "parentNamespace": "example.com/custom"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-msf-01 §§5.1.6,5.3,5.6.4",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "9b1f6fa8140fb426395bbc24ba179ce01970468e8433aeaa3d3cd6d5f1672f56"
+      }
+    },
+    {
+      "id": "catalog/libmoq-delta-remove",
+      "kind": "catalog-delta-parse",
+      "profile": "msf-01-delta",
+      "description": "LibMoQ MSF-01 delta document (§5.6.5): a single remove operation naming two tracks (§5.3) — a successful ordered normalized-operation parse.",
+      "input": {
+        "file": "libmoq_delta_remove.json",
+        "byteLength": 149,
+        "sha256": "1cc3b8d80da318d071ae521bd7068b53c26aa91519afdfc1c1d2d32f1332a2c4"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "generatedAt": "1746104606044",
+          "deltaUpdate": [
+            {
+              "op": "remove",
+              "tracks": [
+                {
+                  "name": "video"
+                },
+                {
+                  "name": "slides"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "third-party",
+        "source": "openmoq/moq5 (LibMoQ)@455318cade7445880a294e2ec6e6a5ccb67cb776:media/msf/tests/fixtures",
+        "section": "draft-ietf-moq-msf-01 §§5.1.6,5.3,5.6.5",
+        "generator": "LibMoQ MSF test fixtures (hand-authored)",
+        "generatorVersion": "455318cade7445880a294e2ec6e6a5ccb67cb776",
+        "command": "byte-exact import from media/msf/tests/fixtures",
+        "sourceHash": "1cc3b8d80da318d071ae521bd7068b53c26aa91519afdfc1c1d2d32f1332a2c4"
+      }
+    },
+    {
+      "id": "catalog/msf01-version-string-one",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "MSF-01 §5.1.1: version is the JSON String \"1\"; a compliant MSF-01 subscriber accepts it. Current Playa: invalid-version.",
+      "input": {
+        "file": "msf01_version_one.json",
+        "byteLength": 71,
+        "sha256": "78ed144f03c6e21edd83e86cf8408208128ea28a7fb6ad22e808ea90dad72d7c"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "loc",
+              "isLive": true
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-version-draft",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "MSF-01 §5.1.1 draft convention: \"draft-XX\" names the -XX release; the canonical rule normalizes \"draft-01\" to catalogVersion \"1\" (matching the typed model). Current Playa: invalid-version.",
+      "input": {
+        "file": "msf01_version_draft.json",
+        "byteLength": 78,
+        "sha256": "aaf3bf378c502318dffa291f222185b80fbf8ce0a0a8d217bac0320fe75c6e17"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "loc",
+              "isLive": true
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-version-draft-99",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "Playa MSF-01 profile policy (interpretation of §5.1.1 \"MUST NOT parse a version it does not understand\"): \"draft-99\" is not among the versions this profile understands (\"1\"/\"draft-01\"), so it is rejected — the draft suffix is a draft revision, never decoded to a numeric version. Playa returns the same invalid-version category by ACCIDENT (it rejects all string versions), not by MSF-01 support — forward-looking with no currentBehavior.",
+      "input": {
+        "file": "msf01_version_draft_99.json",
+        "byteLength": 34,
+        "sha256": "ff9fb4e54404924682bdf3c61d29b606a263090bdc70eef9368f4519f308d894"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "invalid-version"
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-version-draft-1",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "Playa MSF-01 profile policy (interpretation of §5.1.1 \"MUST NOT parse a version it does not understand\"): \"draft-1\" is not among the versions this profile understands (\"1\"/\"draft-01\"), so it is rejected — the draft suffix is a draft revision, never decoded to a numeric version. Playa returns the same invalid-version category by ACCIDENT (it rejects all string versions), not by MSF-01 support — forward-looking with no currentBehavior.",
+      "input": {
+        "file": "msf01_version_draft_1.json",
+        "byteLength": 33,
+        "sha256": "a4dbb6b1c63fbd185da4722deb22ddfbd3cfa7a0fc3b746db940d004f3bb7fca"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "invalid-version"
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-version-draft-00",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "Playa MSF-01 profile policy (interpretation of §5.1.1 \"MUST NOT parse a version it does not understand\"): \"draft-00\" is not among the versions this profile understands (\"1\"/\"draft-01\"), so it is rejected — the draft suffix is a draft revision, never decoded to a numeric version. Playa returns the same invalid-version category by ACCIDENT (it rejects all string versions), not by MSF-01 support — forward-looking with no currentBehavior.",
+      "input": {
+        "file": "msf01_version_draft_00.json",
+        "byteLength": 34,
+        "sha256": "ed447e86b8864caeb1347e1952cb472b5a68643679253e236729a9db9a9c6570"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "invalid-version"
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-version-draft-02",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "Playa MSF-01 profile policy (interpretation of §5.1.1 \"MUST NOT parse a version it does not understand\"): \"draft-02\" is not among the versions this profile understands (\"1\"/\"draft-01\"), so it is rejected — the draft suffix is a draft revision, never decoded to a numeric version. Playa returns the same invalid-version category by ACCIDENT (it rejects all string versions), not by MSF-01 support — forward-looking with no currentBehavior.",
+      "input": {
+        "file": "msf01_version_draft_02.json",
+        "byteLength": 34,
+        "sha256": "1f311a3e5d3aa7f86c9281c3a76aca13eb95f11fbef258fe3c9c432490c924aa"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "invalid-version"
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-version-draft-abc",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "Playa MSF-01 profile policy (interpretation of §5.1.1 \"MUST NOT parse a version it does not understand\"): \"draft-abc\" is not among the versions this profile understands (\"1\"/\"draft-01\"), so it is rejected — the draft suffix is a draft revision, never decoded to a numeric version. Playa returns the same invalid-version category by ACCIDENT (it rejects all string versions), not by MSF-01 support — forward-looking with no currentBehavior.",
+      "input": {
+        "file": "msf01_version_draft_abc.json",
+        "byteLength": 35,
+        "sha256": "51884463b138c83706ff9220a044c969a020fb7c65e0d9b1185f9e0738b0781b"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "invalid-version"
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf00-numeric-unchanged",
+      "kind": "catalog-parse",
+      "profile": "msf-00",
+      "description": "Detection boundary: a NUMERIC version selects legacy MSF-00 (draft-ietf-moq-msf-00 §5.1.1) and parses unchanged today (executable). Contrast the identical-shape string-version vector above.",
+      "input": {
+        "file": "msf00_numeric_unchanged.json",
+        "byteLength": 69,
+        "sha256": "43b6ddd792740dc0bb5d387eee52df90bc1a23924a87e52c22a3491318819bc0"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "loc",
+              "isLive": true
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-00",
+        "section": "5.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f"
+      }
+    },
+    {
+      "id": "catalog/msf01-vod-trackduration",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "MSF-01 §5.2.35: trackDuration (integer ms) on a VOD (isLive:false) loc track. Current Playa: invalid-version.",
+      "input": {
+        "file": "msf01_vod_trackduration.json",
+        "byteLength": 96,
+        "sha256": "5e5b6336498f53758ce37a33a25560b4a41020e7f80cc9322aa61ee56e65835c"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "m",
+              "packaging": "loc",
+              "isLive": false,
+              "trackDuration": "8072340"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.2.35",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-depends",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "MSF-01 §5.2.14: depends is an array of track names the track applies to. Self-contained and valid: the mediatimeline track carries mimeType \"application/json\" (§7.2) and depends on the two loc tracks that exist in this catalog. Current Playa: invalid-version.",
+      "input": {
+        "file": "msf01_depends.json",
+        "byteLength": 221,
+        "sha256": "ca10e0824a55a052a49557c42c3e97589ef0b8d5ca82828caff7c354b19aca2b"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "a",
+              "packaging": "loc",
+              "isLive": true
+            },
+            {
+              "name": "b",
+              "packaging": "loc",
+              "isLive": true
+            },
+            {
+              "name": "t",
+              "packaging": "mediatimeline",
+              "isLive": true,
+              "mimeType": "application/json",
+              "depends": [
+                "a",
+                "b"
+              ]
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.2.14",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-template-wide",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "MSF-01 §5.2.15: the template 6-tuple, with the wide wallclock anchor (1759924158381) preserved as a decimal string. Current Playa: invalid-version.",
+      "input": {
+        "file": "msf01_template_wide.json",
+        "byteLength": 122,
+        "sha256": "25ff1964b3361bf4ac5a59a61aaa55f005f08fbb13573136804b48e4a91e99d1"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "loc",
+              "isLive": true,
+              "template": [
+                "0",
+                "2002",
+                [
+                  "0",
+                  "0"
+                ],
+                [
+                  "1",
+                  "0"
+                ],
+                "1759924158381",
+                "2002"
+              ]
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.2.15",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-initdata-initref",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "MSF-01 §5.1.7/§5.2.13: a root initDataList entry with a loc track whose initRef resolves to it. (init data / PSSH are OPAQUE base64 carried verbatim per spec, never decoded or validated — no conforming media structure is claimed). Current Playa: invalid-version.",
+      "input": {
+        "file": "msf01_initdata_initref.json",
+        "byteLength": 145,
+        "sha256": "5ae7b59093f82c739fe2f48b9c6e4b4fdda270a1c86f1fca379392b5e3de50f4"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "initDataList": [
+            {
+              "id": "i1",
+              "type": "inline",
+              "data": "AAAB"
+            }
+          ],
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "loc",
+              "isLive": true,
+              "initRef": "i1"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.1.7",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-dangling-initref",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "MSF-01 §5.2.13: initRef points at an initDataList id. Interpretation (§5.2.13 states no explicit MUST-reject): a dangling reference is treated as an error; the catalog is otherwise valid at the catalog layer. Current Playa: invalid-version (wrong reason — never reaches the check).",
+      "input": {
+        "file": "msf01_dangling_initref.json",
+        "byteLength": 150,
+        "sha256": "142608b817f8f26e458af7d240980d4cb124db7359d3e108d0f659e0cf772b8c"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "dangling-init-ref"
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.2.13",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-duplicate-initid",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "MSF-01 §5.1.7: an initDataList id is \"unique within the scope of the catalog\". Interpretation: a duplicate id is treated as an error; the track and its initRef are otherwise valid at the catalog layer. Current Playa: invalid-version (wrong reason).",
+      "input": {
+        "file": "msf01_duplicate_initid.json",
+        "byteLength": 187,
+        "sha256": "c7c0aa2ace6fb0ceb5742f1ed0a1eb4d0239abae299d0f6aa78dfaa71ddfc7f4"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "duplicate-init-ref"
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.1.7",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-unknown-fields",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "MSF-01 forward-compat: unrecognized root/track fields are dropped, not surfaced. Current Playa: invalid-version.",
+      "input": {
+        "file": "msf01_unknown_fields.json",
+        "byteLength": 105,
+        "sha256": "6a40aedfcc0394ca8bb30fb1d7937e8c008520b0852a611e2fb7953e0646ec14"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "loc",
+              "isLive": true
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-mimetype-canonical",
+      "kind": "catalog-parse",
+      "profile": "msf-01",
+      "description": "MSF-01 §5.2.19: the canonical key is \"mimeType\"; the lowercase \"mimetype\" misspelling is UNKNOWN and dropped. LibMoQ diverges (differential.libmoq): it accepts the lowercase alias, so the trailing \"mimetype\" value wins (mimeType=\"application/json\"). Current Playa: invalid-version.",
+      "input": {
+        "file": "msf01_mimetype_canonical.json",
+        "byteLength": 124,
+        "sha256": "bc1e8fbfc7af4ebc7716dd0e5224c32b81874a576c0fa5bced96ac1070e39212"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "loc",
+              "isLive": true,
+              "mimeType": "video/mp4"
+            }
+          ]
+        }
+      },
+      "differential": {
+        "libmoq": {
+          "status": "diverges",
+          "reason": "LibMoQ accepts the non-standard lowercase \"mimetype\" as an alias for mimeType (msf-01 §5.2.19); with both keys present the later \"mimetype\" value wins, so the projected track carries mimeType \"application/json\" instead of the canonical \"video/mp4\".",
+          "currentBehavior": {
+            "status": "ok",
+            "stage": "semantic",
+            "semantics": {
+              "catalogVersion": "1",
+              "tracks": [
+                {
+                  "name": "v",
+                  "packaging": "loc",
+                  "isLive": true,
+                  "mimeType": "application/json"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.2.19",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/cmsf01-clear-cmaf",
+      "kind": "catalog-parse",
+      "profile": "cmsf-01",
+      "description": "CMSF-01 §3.1: a clear (unprotected) CMAF catalog; the CMAF track carries an initRef resolving to its initDataList header. (init data / PSSH are OPAQUE base64 carried verbatim per spec, never decoded or validated — no conforming media structure is claimed). Current Playa: invalid-version.",
+      "input": {
+        "file": "cmsf01_clear_cmaf.json",
+        "byteLength": 168,
+        "sha256": "279cfb7f3b015c95eb54d38323c334688d0161642fedcd50492d990544612c97"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "initDataList": [
+            {
+              "id": "i1",
+              "type": "inline",
+              "data": "AAAB"
+            }
+          ],
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "cmaf",
+              "isLive": true,
+              "codec": "avc1.640028",
+              "initRef": "i1"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-cmsf-01",
+        "section": "3.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c0ba68d09d6d42540ca0ac7f5df30b66aae7ede11fdc14e8338de977da9cc04d"
+      }
+    },
+    {
+      "id": "catalog/cmsf01-simulcast-altgroup",
+      "kind": "catalog-parse",
+      "profile": "cmsf-01",
+      "description": "CMSF-01 §3.2 (switching sets): two alternate renditions sharing altGroup 1, each with its own CMAF initRef. (init data / PSSH are OPAQUE base64 carried verbatim per spec, never decoded or validated — no conforming media structure is claimed). Current Playa: invalid-version.",
+      "input": {
+        "file": "cmsf01_simulcast_altgroup.json",
+        "byteLength": 277,
+        "sha256": "68432048eba24ffdcdc1d9b3fea95fa8b6b3215b587e69fbc1efa35294432c7f"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "initDataList": [
+            {
+              "id": "i1",
+              "type": "inline",
+              "data": "AAAB"
+            },
+            {
+              "id": "i2",
+              "type": "inline",
+              "data": "AAAC"
+            }
+          ],
+          "tracks": [
+            {
+              "name": "hd",
+              "packaging": "cmaf",
+              "isLive": true,
+              "altGroup": "1",
+              "initRef": "i1"
+            },
+            {
+              "name": "sd",
+              "packaging": "cmaf",
+              "isLive": true,
+              "altGroup": "1",
+              "initRef": "i2"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-cmsf-01",
+        "section": "3.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c0ba68d09d6d42540ca0ac7f5df30b66aae7ede11fdc14e8338de977da9cc04d"
+      }
+    },
+    {
+      "id": "catalog/cmsf01-sap-eventtimeline",
+      "kind": "catalog-parse",
+      "profile": "cmsf-01",
+      "description": "CMSF-01 §3.6.1 (SAP-type timeline): an eventtimeline track carrying the inherited MSF §8.2 requirements (eventType, mimeType \"application/json\", depends); the referenced CMAF track has a valid initRef. (init data / PSSH are OPAQUE base64 carried verbatim per spec, never decoded or validated — no conforming media structure is claimed). Current Playa: invalid-version.",
+      "input": {
+        "file": "cmsf01_sap_eventtimeline.json",
+        "byteLength": 285,
+        "sha256": "e2a5035cf76c77c34a21507687da608e26288f27ddc886721631d9b39bc6e8b1"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "initDataList": [
+            {
+              "id": "i1",
+              "type": "inline",
+              "data": "AAAB"
+            }
+          ],
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "cmaf",
+              "isLive": true,
+              "initRef": "i1"
+            },
+            {
+              "name": "sap",
+              "packaging": "eventtimeline",
+              "isLive": true,
+              "eventType": "org.ietf.moq.cmsf.sap",
+              "mimeType": "application/json",
+              "depends": [
+                "v"
+              ]
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-cmsf-01",
+        "section": "3.6.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c0ba68d09d6d42540ca0ac7f5df30b66aae7ede11fdc14e8338de977da9cc04d"
+      }
+    },
+    {
+      "id": "catalog/cmsf01-content-protection",
+      "kind": "catalog-parse",
+      "profile": "cmsf-01",
+      "description": "CMSF-01 §4.1.1/§4.1.2: content-protection METADATA (refID, defaultKID, scheme, drmSystem) is parsed and preserved as opaque metadata only — NO protected-playback support is claimed. (init data / PSSH are OPAQUE base64 carried verbatim per spec, never decoded or validated — no conforming media structure is claimed). Current Playa: invalid-version.",
+      "input": {
+        "file": "cmsf01_content_protection.json",
+        "byteLength": 402,
+        "sha256": "b5494af2b50a8225c477325237bf672be3a41b9e9ce71ee11d11eff432cf5887"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "contentProtections": [
+            {
+              "refID": "1",
+              "defaultKID": [
+                "01234567-89ab-cdef-0123-456789abcdef"
+              ],
+              "scheme": "cbcs",
+              "drmSystem": {
+                "systemID": "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
+                "laURL": {
+                  "url": "https://la.example/x"
+                },
+                "pssh": "AAAB"
+              }
+            }
+          ],
+          "initDataList": [
+            {
+              "id": "i1",
+              "type": "inline",
+              "data": "AAAB"
+            }
+          ],
+          "tracks": [
+            {
+              "name": "v",
+              "packaging": "cmaf",
+              "isLive": true,
+              "initRef": "i1",
+              "contentProtectionRefIDs": [
+                "1"
+              ]
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-cmsf-01",
+        "section": "4.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c0ba68d09d6d42540ca0ac7f5df30b66aae7ede11fdc14e8338de977da9cc04d"
+      }
+    },
+    {
+      "id": "catalog/cmsf01-dangling-protectionref",
+      "kind": "catalog-parse",
+      "profile": "cmsf-01",
+      "description": "CMSF-01 §4.1.2: contentProtectionRefIDs reference a contentProtections refID. Interpretation: a dangling reference is treated as an error; the catalog is otherwise valid at the catalog layer (valid initRef, one well-formed protection entry). Current Playa: invalid-version (wrong reason).",
+      "input": {
+        "file": "cmsf01_dangling_protectionref.json",
+        "byteLength": 394,
+        "sha256": "0970de7a654d198ff8a8aa46252972239dd433f8bc36b3605792b639a7c5563c"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "dangling-protection-ref"
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-cmsf-01",
+        "section": "4.1.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c0ba68d09d6d42540ca0ac7f5df30b66aae7ede11fdc14e8338de977da9cc04d"
+      }
+    },
+    {
+      "id": "catalog/cmsf01-duplicate-protectionref",
+      "kind": "catalog-parse",
+      "profile": "cmsf-01",
+      "description": "CMSF-01 §4.1.1.1: a content-protection refID is \"a unique identifier\". Interpretation: a duplicate refID is treated as an error; the track/initRef are otherwise valid at the catalog layer. Current Playa: invalid-version (wrong reason).",
+      "input": {
+        "file": "cmsf01_duplicate_protectionref.json",
+        "byteLength": 575,
+        "sha256": "2db2a1ae5c59a17693209b5ff2cb939986a4bc275971383c3952a9c085335d01"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "duplicate-protection-ref"
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-cmsf-01",
+        "section": "4.1.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c0ba68d09d6d42540ca0ac7f5df30b66aae7ede11fdc14e8338de977da9cc04d"
+      }
+    },
+    {
+      "id": "catalog/msf01-delta-add-clone",
+      "kind": "catalog-delta-parse",
+      "profile": "msf-01-delta",
+      "description": "MSF-01 §5.1.6/§5.3: an ordered add→clone delta (the clone parent \"a\" is declared by the preceding add). Operations apply in document order, which production preserves.",
+      "input": {
+        "file": "msf01_delta_add_clone.json",
+        "byteLength": 142,
+        "sha256": "a45b1c18045485e1986b863cb8cd99a5dccdc621dc390ea1dcc5e767c5b20339"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "deltaUpdate": [
+            {
+              "op": "add",
+              "tracks": [
+                {
+                  "name": "a",
+                  "packaging": "loc",
+                  "isLive": true
+                }
+              ]
+            },
+            {
+              "op": "clone",
+              "tracks": [
+                {
+                  "name": "b",
+                  "parentName": "a"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-delta-remove",
+      "kind": "catalog-delta-parse",
+      "profile": "msf-01-delta",
+      "description": "MSF-01 §5.1.6: a remove operation (track objects carry only name[,namespace]). Parsed as an ordered single-operation delta.",
+      "input": {
+        "file": "msf01_delta_remove.json",
+        "byteLength": 57,
+        "sha256": "0464d9adfd96f0b66389b35b76c5ae4b9e04ebd76075545bc4c14c56ecc435aa"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "deltaUpdate": [
+            {
+              "op": "remove",
+              "tracks": [
+                {
+                  "name": "x"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.1.6",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-delta-unknown-op",
+      "kind": "catalog-delta-parse",
+      "profile": "msf-01-delta",
+      "description": "MSF-01 §5.3: a restricted set of operations (add/remove/clone) is allowed. Interpretation: an unknown op (\"replace\") is rejected as unknown-delta-op.",
+      "input": {
+        "file": "msf01_delta_unknown_op.json",
+        "byteLength": 58,
+        "sha256": "d778ca93c153ce9e46d5f4afe38dd0dc431f14d0064678f6fccbf69c8e45f5a7"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "unknown-delta-op"
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf01-delta-illegal-field",
+      "kind": "catalog-delta-parse",
+      "profile": "msf-01-delta",
+      "description": "MSF-01 §5.3: a delta MUST NOT contain an MSF version (or Tracks) field; a delta carrying \"version\" is rejected as illegal-delta-field.",
+      "input": {
+        "file": "msf01_delta_illegal_field.json",
+        "byteLength": 71,
+        "sha256": "3446dadcbd99ea714c4587c9bbd9ff7c470ecf2f35c48edbf5f3c99e90239cfe"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "illegal-delta-field"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-01",
+        "section": "5.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    }
+  ]
+}

@@ -1,0 +1,92 @@
+# PR gate — fast, hermetic checks only. Every step here exists and runs today;
+# expensive lanes (soaks, fuzz, browser, differential) live in nightly.yml and
+# are added only when their implementations land.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the whitespace check can diff the PR's committed range.
+          fetch-depth: 0
+
+      # pnpm version comes from the root package.json "packageManager" field.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build all packages
+        run: pnpm -r build
+
+      - name: Test
+        run: pnpm test
+
+      - name: Typecheck (per package)
+        run: |
+          set -euo pipefail
+          for p in transport webtransport playback loc player browser msf playa; do
+            echo "── tsc: packages/$p"
+            pnpm --dir "packages/$p" exec tsc --noEmit
+          done
+
+      - name: Typecheck + run the media conformance corpus
+        run: |
+          set -euo pipefail
+          pnpm --filter @moqt/media-conformance-runner typecheck
+          pnpm test:corpus
+
+      - name: Examples (player build + node-relay typecheck)
+        run: |
+          set -euo pipefail
+          pnpm --filter @moqt/examples build
+          pnpm --filter @moqt/example-node-relay typecheck
+
+      - name: Whitespace check (committed PR range)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            # push: previous tip when available; first/force pushes fall back to HEAD~1.
+            base="${{ github.event.before }}"
+            if [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$base" 2>/dev/null; then
+              base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+            fi
+          fi
+          echo "Checking whitespace over $base..HEAD"
+          git diff --check "$base"..HEAD
+
+      - name: Post-build dirty-tree check
+        # Build/test must not mutate tracked files: a diff here means generated
+        # output drifted from what is committed (a plain diff --check on a clean
+        # checkout would be vacuous — this is the check that has teeth).
+        run: |
+          set -euo pipefail
+          status="$(git status --porcelain)"
+          if [ -n "$status" ]; then
+            echo "Working tree dirty after build/test:"
+            echo "$status"
+            git diff | head -100
+            exit 1
+          fi

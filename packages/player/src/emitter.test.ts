@@ -85,4 +85,34 @@ describe('TypedEmitter', () => {
     emitter.emit('empty', undefined);
     expect(fn).toHaveBeenCalledWith(undefined);
   });
+
+  describe('emitIsolated', () => {
+    it('delivers to every listener even when one throws, then rethrows the first', () => {
+      const emitter = new TypedEmitter<{ evt: number }>();
+      const seen: string[] = [];
+      emitter.on('evt', () => { seen.push('a'); });
+      emitter.on('evt', () => { seen.push('b'); throw new Error('b exploded'); });
+      emitter.on('evt', () => { seen.push('c'); throw new Error('c exploded'); });
+      emitter.on('evt', () => { seen.push('d'); });
+
+      let thrown: unknown;
+      try { emitter.emitIsolated('evt', 1); } catch (err) { thrown = err; }
+
+      expect(seen).toEqual(['a', 'b', 'c', 'd']); // nobody was censored
+      expect((thrown as Error).message).toBe('b exploded'); // FIRST failure wins
+    });
+
+    it('does not throw when no listener fails', () => {
+      const emitter = new TypedEmitter<{ evt: number }>();
+      const fn = vi.fn();
+      emitter.on('evt', fn);
+      expect(() => emitter.emitIsolated('evt', 7)).not.toThrow();
+      expect(fn).toHaveBeenCalledWith(7);
+    });
+
+    it('is a no-op with no listeners', () => {
+      const emitter = new TypedEmitter<{ evt: number }>();
+      expect(() => emitter.emitIsolated('evt', 1)).not.toThrow();
+    });
+  });
 });

@@ -29,6 +29,14 @@ export type {
     EventIndex,
     EventTimelineRecord,
     SapTimelineEntry,
+    MsfMediaTemplate,
+    MsfInitDataEntry,
+    CmsfUrlRef,
+    CmsfDrmSystem,
+    CmsfContentProtection,
+    Msf01Delta,
+    Msf01DeltaOp,
+    Msf01DeltaOpKind,
 } from './types.js';
 
 export { MSF_VERSION, CATALOG_TRACK_NAME, CMSF_SAP_EVENT_TYPE } from './types.js';
@@ -43,11 +51,13 @@ export { parseCatalogFormat01, applyCf01Patch } from './catalog-cf01.js';
 export type { Cf01ParseResult } from './catalog-cf01.js';
 // Auto-detect dispatcher
 export { parseCatalogAuto } from './catalog-detect.js';
+// MSF-01 op-array delta dialect (draft-ietf-moq-msf-01 §5.3)
+export { parseMsf01Delta, applyMsf01Delta } from './catalog-delta-msf01.js';
 
 // ─── Catalog builder (publisher) ────────────────────────────────────
 
 export { buildCatalog } from './catalog-builder.js';
-export type { CatalogBuilderTrack, BuildCatalogOptions } from './catalog-builder.js';
+export type { CatalogBuilderTrack, CatalogBuilderInitDataEntry, BuildCatalogOptions } from './catalog-builder.js';
 
 // ─── Delta updates ───────────────────────────────────────────────────
 
