@@ -9,7 +9,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { MoqtConnection } from './adapter.js';
 import { createLoopback, flush } from './testkit/loopback.js';
 import { connectedPair, withProtocol, ns, nm } from './testkit/pair.js';
-import { SessionState, ForwardState, varint, SessionError, RequestError18, decodeSubgroupHeader18, createControlCodec, encodeObjectDatagram18, encodeSubgroupHeader18, encodeSubgroupObject18 } from '@moqt/transport';
+import { SessionState, ForwardState, varint, SessionError, RequestError18, decodeSubgroupHeader18, createControlCodec, encodeObjectDatagram18, encodeSubgroupHeader18, encodeSubgroupObject18, writeLocation, locationEncodingLength } from '@moqt/transport';
 
 const codec18 = createControlCodec(18);
 import type { MoqtObject, ControlMessage, Goaway, RequestErrorMsg } from '@moqt/transport';
@@ -442,6 +442,616 @@ describe('MoqtConnection(18) loopback — outbound PUBLISH lifecycle (data + PUB
   });
 });
 
+describe('MoqtConnection(18) loopback — joining FETCH on a PUBLISH-initiated subscription', () => {
+  it('subscriber joins an ACCEPTED inbound PUBLISH — anchored at the PUBLISH-communicated Largest, served end to end', async () => {
+    const { client, server, errors } = await connectedPair();
+    let pubReqId = -1n;
+    server.onPublish = (p) => { pubReqId = p.requestId; };
+    const serverJoins: bigint[] = [];
+    client.onFetch = (rid) => { serverJoins.push(rid); };   // (unused — publisher side is CLIENT)
+    const publisherFetches: bigint[] = [];
+    client.onFetch = (rid) => { publisherFetches.push(rid); };
+
+    // CLIENT publishes with a communicated Largest {4,2}; SERVER (subscriber)
+    // accepts with the LargestObject filter + Forward 1.
+    const requestId = await client.publish(ns('live'), nm('vid'), 33n, {
+      parameters: new Map([
+        [0x09n, [{ group: 4n, object: 2n }]],
+        [0x10n, [1n]],
+      ]) as never,
+    });
+    await flush();
+    expect(pubReqId).toBe(requestId);
+    await server.acceptSubscribe(pubReqId, 33n);
+    await flush();
+
+    // The SUBSCRIBER issues a relative joining FETCH referencing the publish.
+    const joinReqId = await server.joiningFetch({
+      joiningFetchType: 'relative', joiningRequestId: pubReqId, joiningStart: 0n,
+    });
+    await flush();
+    expect(publisherFetches).toContain(joinReqId);          // reached the publisher
+    // …and it resolves from the SAVED PUBLISH-communicated snapshot.
+    const range = client.resolveJoiningFetch(joinReqId);
+    expect(range.startLocation).toEqual({ group: 4n, object: 0n });
+    expect(range.endLocation).toEqual({ group: 4n, object: 3n });
+    await client.acceptFetch(joinReqId, { endLocation: range.endLocation });
+    await flush();
+    const sid = await client.openFetchStream(joinReqId);
+    const recv: MoqtObject[] = [];
+    server.onObject = (_s, o) => recv.push(o);
+    for (let i = 0n; i <= 2n; i++) {
+      await client.sendFetchObject(sid, { groupId: 4n, subgroupId: 0n, objectId: i, publisherPriority: 5, payload: new Uint8Array([Number(i)]) });
+    }
+    await client.closeFetchStream(sid);
+    await flush();
+    expect(recv.filter((o) => o.kind === 'data').map((o) => o.objectId)).toEqual([0n, 1n, 2n]);
+    expect(errors).toEqual([]);
+  });
+
+  it('a join racing the PENDING outbound PUBLISH is REJECTED with INVALID_JOINING_REQUEST_ID — invalid until PUBLISH_OK', async () => {
+    const { client, server, errors } = await connectedPair();
+    let pubReqId = -1n;
+    server.onPublish = (p) => { pubReqId = p.requestId; };
+    const publisherFetches: bigint[] = [];
+    client.onFetch = (rid) => { publisherFetches.push(rid); };
+
+    await client.publish(ns('live'), nm('vid'), 33n, {
+      parameters: new Map([[0x09n, [{ group: 4n, object: 2n }]], [0x10n, [1n]]]) as never,
+    });
+    await flush();
+    // The subscriber attempts the join BEFORE its acceptance: the publish is
+    // still PENDING publisher-initiated — the matrix makes it invalid.
+    await expect(server.joiningFetch({
+      joiningFetchType: 'relative', joiningRequestId: pubReqId, joiningStart: 0n,
+    })).rejects.toThrow(/not a joinable subscription/);
+    // Nothing was parked and nothing reached the publisher's onFetch.
+    await flush();
+    expect(publisherFetches).toEqual([]);
+    // After PUBLISH_OK the SAME reference becomes joinable (matrix success leg).
+    await server.acceptSubscribe(pubReqId, 33n);
+    await flush();
+    const joinReqId = await server.joiningFetch({
+      joiningFetchType: 'relative', joiningRequestId: pubReqId, joiningStart: 0n,
+    });
+    await flush();
+    expect(publisherFetches).toContain(joinReqId);
+    expect(errors).toEqual([]);
+  });
+});
+
+describe('MoqtConnection loopback — failed subscription REQUEST_UPDATE terminates', () => {
+  it('inbound-SUBSCRIBE direction: failed resume → REQUEST_ERROR then PUBLISH_DONE(UPDATE_FAILED) on the subscription stream', async () => {
+    // The publisher (server) has NO Largest Location provider: a Forward 0→1
+    // update on an established subscription cannot meet §5.1 → REQUEST_ERROR,
+    // and the adapter-owned transaction terminates with PUBLISH_DONE(0x8).
+    const { client, server, errors } = await connectedPair();
+    let subReqId = -1n;
+    server.onSubscribe = (rid) => { subReqId = rid; };
+    const clientMsgs: ControlMessage[] = [];
+    client.onMessage = (m) => clientMsgs.push(m);
+
+    const reqId = await client.subscribe(ns('live'), nm('vid'), { forward: 0 } as never);
+    await flush();
+    await server.acceptSubscribe(subReqId, 7n, {
+      parameters: new Map([[0x09n, [{ group: 5n, object: 1n }]]]) as never,
+    });
+    await flush();
+    await client.requestUpdate(reqId, { forward: 1 });
+    await flush();
+
+    const err = clientMsgs.find((m) => m.type === 'REQUEST_ERROR');
+    expect(err).toBeDefined();
+    const done = clientMsgs.find((m) => m.type === 'PUBLISH_DONE') as { statusCode: bigint } | undefined;
+    expect(done).toBeDefined();
+    expect(BigInt(done!.statusCode)).toBe(0x8n);              // UPDATE_FAILED
+    // BOTH ends released the subscription.
+    expect(server.session.getIncomingSubscription(subReqId)).toBeUndefined();
+    expect(client.session.getSubscription(reqId)).toBeUndefined();
+    expect(errors).toEqual([]);
+  });
+
+  it('outbound-PUBLISH direction: failed resume on the publish stream → REQUEST_ERROR then PUBLISH_DONE(UPDATE_FAILED)', async () => {
+    const { client, server, errors } = await connectedPair();
+    let pubReqId = -1n;
+    server.onPublish = (p) => { pubReqId = p.requestId; };
+    const serverMsgs: ControlMessage[] = [];
+    server.onMessage = (m) => serverMsgs.push(m);
+
+    // CLIENT publishes (no provider installed); server accepts PAUSED.
+    await client.publish(ns('live'), nm('vid'), 33n, {
+      parameters: new Map([[0x09n, [{ group: 4n, object: 2n }]]]) as never,
+    });
+    await flush();
+    await server.acceptSubscribe(pubReqId, 33n, {
+      parameters: new Map([[0x10n, [0n]]]) as never,          // FORWARD 0
+    });
+    await flush();
+    // The subscriber resumes; the publisher cannot supply the new Largest.
+    await server.requestUpdate(pubReqId, { forward: 1 });
+    await flush();
+
+    const err = serverMsgs.find((m) => m.type === 'REQUEST_ERROR');
+    expect(err).toBeDefined();
+    const done = serverMsgs.find((m) => m.type === 'PUBLISH_DONE') as { statusCode: bigint } | undefined;
+    expect(done).toBeDefined();
+    expect(BigInt(done!.statusCode)).toBe(0x8n);
+    expect(client.session.getOutgoingPublish(pubReqId)).toBeUndefined();   // publisher side terminated
+    expect(errors).toEqual([]);
+  });
+
+  it('the SUCCESSFUL resume control: with a provider installed the update succeeds and nothing terminates', async () => {
+    const { client, server, errors } = await connectedPair();
+    server.setLargestLocationProvider(() => ({ group: 9n, object: 0n }));
+    let subReqId = -1n;
+    server.onSubscribe = (rid) => { subReqId = rid; };
+    const clientMsgs: ControlMessage[] = [];
+    client.onMessage = (m) => clientMsgs.push(m);
+    const reqId = await client.subscribe(ns('live'), nm('vid'), { forward: 0 } as never);
+    await flush();
+    await server.acceptSubscribe(subReqId, 7n, {
+      parameters: new Map([[0x09n, [{ group: 5n, object: 1n }]]]) as never,
+    });
+    await flush();
+    await client.requestUpdate(reqId, { forward: 1 });
+    await flush();
+    expect(clientMsgs.some((m) => m.type === 'REQUEST_OK')).toBe(true);
+    expect(clientMsgs.some((m) => m.type === 'PUBLISH_DONE')).toBe(false);
+    expect(server.session.getIncomingSubscription(subReqId)).toBeDefined();
+    expect(errors).toEqual([]);
+  });
+});
+
+describe('MoqtConnection(18) loopback — deterministic failed-update termination', () => {
+  /** Establish a paused (FORWARD 0) subscription on a provider-less server. */
+  async function pausedPair() {
+    const pair = await connectedPair();
+    let subReqId = -1n;
+    pair.server.onSubscribe = (rid) => { subReqId = rid; };
+    const clientMsgs: ControlMessage[] = [];
+    pair.client.onMessage = (m) => clientMsgs.push(m);
+    const reqId = await pair.client.subscribe(ns('live'), nm('vid'), { forward: 0 } as never);
+    await flush();
+    await pair.server.acceptSubscribe(subReqId, 7n, {
+      parameters: new Map([[0x09n, [{ group: 5n, object: 1n }]]]) as never,
+    });
+    await flush();
+    return { ...pair, subReqId, reqId, clientMsgs };
+  }
+  const doneMsgs = (msgs: ControlMessage[]) => msgs.filter((m) => m.type === 'PUBLISH_DONE') as Array<{ statusCode: bigint }>;
+
+  it('a HELD createUnidirectionalStream defers the terminal deterministically; release aborts the op and PUBLISH_DONE flows', async () => {
+    const { client, server, b, subReqId, reqId, clientMsgs, errors } = await pausedPair();
+    // Hold the server transport's NEXT uni-stream open indefinitely.
+    const origCreate = b.createUnidirectionalStream.bind(b);
+    let release: (() => void) | null = null;
+    (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
+      () => new Promise((resolve) => { release = () => resolve(origCreate()); });
+    const heldOpen = server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    heldOpen.catch(() => { /* expected: self-invalidated */ });
+    await flush();
+
+    // The failed resume: REQUEST_ERROR flows, but the terminal WAITS on the
+    // reservation barrier (no timers, no arbitrary turn budget).
+    await client.requestUpdate(reqId, { forward: 1 });
+    await flush(); await flush();
+    expect(clientMsgs.some((m) => m.type === 'REQUEST_ERROR')).toBe(true);
+    expect(doneMsgs(clientMsgs)).toHaveLength(0);          // barrier armed
+
+    // NEW publisher operations are refused SYNCHRONOUSLY from entry.
+    await expect(server.openSubgroup(7n, 1n, 0n, { publisherPriority: 1 } as never))
+      .rejects.toThrow(/terminated/);
+
+    // Releasing the hold lets the reserved op settle: it self-invalidates
+    // against the bumped generation, the barrier resolves, the terminal flows.
+    release!();
+    await expect(heldOpen).rejects.toThrow();
+    await flush(); await flush();
+    const dones = doneMsgs(clientMsgs);
+    expect(dones).toHaveLength(1);
+    expect(BigInt(dones[0]!.statusCode)).toBe(0x8n);       // UPDATE_FAILED
+    expect(server.session.getIncomingSubscription(subReqId)).toBeUndefined();
+    expect(errors).toEqual([]);
+  });
+
+  it('an UNPROVEN stream reset fails CLOSED: no PUBLISH_DONE, session terminated (§5.1.1)', async () => {
+    // §5.1.1: "MUST NOT send it until it has closed all related streams." Web
+    // Streams defer abort() behind an in-flight close(), so a hung FIN leaves a
+    // stream we cannot prove was reset. Announcing a clean end anyway would let
+    // the deferred FIN reach the peer AFTER the terminal — so the transaction
+    // must terminate the SESSION instead of sending PUBLISH_DONE.
+    const { client, server, b, subReqId, reqId, clientMsgs } = await pausedPair();
+
+    // The next server subgroup stream accepts its header but its close() and
+    // abort() both hang: the writer becomes unreachable but stays OPEN.
+    const origCreate = b.createUnidirectionalStream.bind(b);
+    (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
+      async () => {
+        await origCreate();
+        return new WritableStream<Uint8Array>({
+          write() { /* accept the header */ },
+          close() { return new Promise<void>(() => { /* hangs */ }); },
+          abort() { return new Promise<void>(() => { /* deferred forever */ }); },
+        });
+      };
+    const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    const hungFin = server.closeSubgroup(sid);
+    hungFin.catch(() => { /* never settles */ });
+    await flush();
+
+    await client.requestUpdate(reqId, { forward: 1 });
+    // Wait past the abort deadline so the transaction reaches its decision.
+    await new Promise((r) => setTimeout(r, 1400));
+    await flush(); await flush();
+
+    // The failure is reported to the peer, but NOT as a clean terminal.
+    expect(clientMsgs.some((m) => m.type === 'REQUEST_ERROR')).toBe(true);
+    expect(doneMsgs(clientMsgs)).toHaveLength(0);            // no PUBLISH_DONE
+    // Fail-closed: the session is gone, which resets the stream at the
+    // transport layer — the only way to honor §5.1.1 here.
+    expect(String(server.session.state).toLowerCase()).not.toBe('established');
+  }, 15_000);
+
+  it('an ORDINARY cancellation whose reset is unproven also fails closed (§5.1.1 applies everywhere)', async () => {
+    // The MUST-reset rule is not specific to the failed-update transaction: a
+    // plain subscription cancellation that cannot reset its streams must close
+    // the session too, or an unreset stream survives silently.
+    const { client, server, b, reqId } = await pausedPair();
+    const origCreate = b.createUnidirectionalStream.bind(b);
+    (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
+      async () => {
+        await origCreate();
+        return new WritableStream<Uint8Array>({
+          write() { /* accept the header */ },
+          abort() { throw new Error('abort refused'); },
+        });
+      };
+    await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    await flush();
+
+    // Ordinary path: the subscriber unsubscribes.
+    await client.unsubscribe(reqId);
+    await flush(); await flush(); await flush();
+
+    expect(String(server.session.state).toLowerCase()).not.toBe('established');
+  }, 15_000);
+
+  it('a fail-closed local reset closes with INTERNAL_ERROR, not PROTOCOL_VIOLATION', async () => {
+    // Our inability to reset our own writer is not peer misconduct — blaming
+    // the peer with PROTOCOL_VIOLATION would misattribute the failure.
+    const { client, server, b, reqId } = await pausedPair();
+    const closes: Array<{ code: number }> = [];
+    const origClose = b.close.bind(b);
+    (b as { close: (i?: { closeCode?: number; reason?: string }) => void }).close = (info) => {
+      if (info?.closeCode !== undefined) closes.push({ code: info.closeCode });
+      return origClose(info);
+    };
+    const origCreate = b.createUnidirectionalStream.bind(b);
+    (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
+      async () => {
+        await origCreate();
+        return new WritableStream<Uint8Array>({
+          write() { /* accept the header */ },
+          abort() { throw new Error('abort refused'); },
+        });
+      };
+    await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    await flush();
+
+    await client.requestUpdate(reqId, { forward: 1 });
+    await flush(); await flush(); await flush();
+
+    expect(closes.length).toBeGreaterThan(0);
+    // 0x1 INTERNAL_ERROR — not 0x3 PROTOCOL_VIOLATION.
+    expect(closes.map((c) => c.code)).toContain(0x1);
+    expect(closes.map((c) => c.code)).not.toContain(0x3);
+  }, 15_000);
+
+  it('a never-settling reserved publisher operation cannot strand the transaction', async () => {
+    // The abort phase is bounded, but so must be the operation barrier: a
+    // reservation that never settles would otherwise hold the transaction
+    // forever, sending neither PUBLISH_DONE nor closing the session.
+    const { client, server, b, reqId, clientMsgs } = await pausedPair();
+    // Hold the server's next uni-stream open forever: the reserved openSubgroup
+    // never settles, so awaitPublisherOpsSettled would never resolve.
+    (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
+      () => new Promise(() => { /* never resolves */ });
+    const heldOpen = server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    heldOpen.catch(() => { /* never settles */ });
+    await flush();
+
+    const start = Date.now();
+    await client.requestUpdate(reqId, { forward: 1 });
+    // Wait past the bound for the transaction to reach a decision.
+    await new Promise((r) => setTimeout(r, 1400));
+    await flush(); await flush();
+
+    expect(Date.now() - start).toBeLessThan(6000);
+    // Bounded to a terminal outcome: no clean terminal, session closed.
+    expect(doneMsgs(clientMsgs)).toHaveLength(0);
+    expect(String(server.session.state).toLowerCase()).not.toBe('established');
+  }, 20_000);
+
+  it('a REJECTED stream reset also fails closed: no PUBLISH_DONE, session terminated (§5.1.1)', async () => {
+    // The reset is unproven whether the abort hangs OR rejects — a writer whose
+    // abort() failed is still an open transport stream.
+    const { client, server, b, reqId, clientMsgs } = await pausedPair();
+    const origCreate = b.createUnidirectionalStream.bind(b);
+    (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
+      async () => {
+        await origCreate();
+        return new WritableStream<Uint8Array>({
+          write() { /* accept the header */ },
+          abort() { throw new Error('abort refused'); },
+        });
+      };
+    await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    await flush();
+
+    await client.requestUpdate(reqId, { forward: 1 });
+    await flush(); await flush(); await flush();
+
+    expect(clientMsgs.some((m) => m.type === 'REQUEST_ERROR')).toBe(true);
+    expect(doneMsgs(clientMsgs)).toHaveLength(0);            // no clean terminal
+    expect(String(server.session.state).toLowerCase()).not.toBe('established');
+  }, 15_000);
+
+  it('a PROVEN stream reset proceeds to exactly one PUBLISH_DONE', async () => {
+    // The positive counterpart: when every abort fulfils, the transaction must
+    // still send exactly one clean terminal and leave the session established.
+    const { client, server, subReqId, reqId, clientMsgs, errors } = await pausedPair();
+    const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    await server.sendObject(sid, 0n, new Uint8Array([1, 2, 3]));
+    await flush();
+
+    await client.requestUpdate(reqId, { forward: 1 });
+    await flush(); await flush(); await flush();
+
+    const dones = doneMsgs(clientMsgs);
+    expect(dones).toHaveLength(1);
+    expect(BigInt(dones[0]!.statusCode)).toBe(0x8n);         // UPDATE_FAILED
+    expect(server.session.getIncomingSubscription(subReqId)).toBeUndefined();
+    expect(String(server.session.state).toLowerCase()).toBe('established');
+    expect(errors).toEqual([]);
+  }, 15_000);
+
+  it('a terminal WRITE failure is surfaced as a session failure — never a silent split-brain', async () => {
+    const { server, client, subReqId, reqId } = await pausedPair();
+    const ctx = (server as unknown as { inboundRequestContexts: Map<bigint, { writeMessage(m: unknown): Promise<void> }> })
+      .inboundRequestContexts.get(subReqId)!;
+    const origWrite = ctx.writeMessage.bind(ctx);
+    let failNext = false;
+    ctx.writeMessage = async (m: unknown) => {
+      if (failNext && (m as { type?: string }).type === 'PUBLISH_DONE') throw new Error('simulated transport write failure');
+      return origWrite(m);
+    };
+    failNext = true;
+    await client.requestUpdate(reqId, { forward: 1 });
+    await flush(); await flush();
+    // The adapter refused to leave the peer split-brain: the session closed.
+    expect(server.session.state).not.toBe(SessionState.ESTABLISHED);
+  });
+
+  it('a terminal write that never SETTLES is bounded: session closes with INTERNAL_ERROR', async () => {
+    // A PUBLISH_DONE that hangs (rather than rejecting) leaves the peer
+    // believing the subscription is established, so not-settling must be
+    // treated exactly like a write failure — bounded, then fail closed.
+    const { server, client, b, subReqId, reqId, clientMsgs, errors } = await pausedPair();
+    const closes: number[] = [];
+    const origClose = b.close.bind(b);
+    (b as { close: (i?: { closeCode?: number; reason?: string }) => void }).close = (info) => {
+      if (info?.closeCode !== undefined) closes.push(info.closeCode);
+      return origClose(info);
+    };
+
+    const ctx = (server as unknown as { inboundRequestContexts: Map<bigint, { writeMessage(m: unknown): Promise<void> }> })
+      .inboundRequestContexts.get(subReqId)!;
+    const origWrite = ctx.writeMessage.bind(ctx);
+    ctx.writeMessage = (m: unknown) => {
+      if ((m as { type?: string }).type === 'PUBLISH_DONE') {
+        return new Promise<void>(() => { /* never settles */ });
+      }
+      return origWrite(m);
+    };
+
+    const start = Date.now();
+    await client.requestUpdate(reqId, { forward: 1 });
+    // Wait past the terminal-write deadline for the transaction to decide.
+    await new Promise((r) => setTimeout(r, 1400));
+    await flush(); await flush();
+
+    expect(Date.now() - start).toBeLessThan(6000);
+    // The terminal never reached the peer, so no clean end was announced...
+    expect(doneMsgs(clientMsgs)).toHaveLength(0);
+    // ...and the session is closed with INTERNAL_ERROR (our failure, not the
+    // peer's), rather than left split-brain.
+    expect(String(server.session.state).toLowerCase()).not.toBe('established');
+    expect(closes).toContain(0x1);
+    expect(closes).not.toContain(0x3);
+    // The transaction settled cleanly — no unhandled rejection escaped it.
+    expect(errors.filter((e) => /unhandled/i.test(String(e)))).toEqual([]);
+  }, 20_000);
+
+  it('a concurrent prior termination is idempotent — exactly one PUBLISH_DONE, no session failure', async () => {
+    const { client, server, subReqId, reqId, clientMsgs, errors } = await pausedPair();
+    await client.requestUpdate(reqId, { forward: 1 });     // fails → terminates
+    await flush(); await flush();
+    expect(doneMsgs(clientMsgs)).toHaveLength(1);
+    expect(server.session.getIncomingSubscription(subReqId)).toBeUndefined();
+    // A racing SECOND invocation of the transaction (e.g. two failure paths
+    // converging) finds the subscription PROVEN terminated: silent, no extra
+    // PUBLISH_DONE, and — critically — no session close.
+    await (server as unknown as { completeFailedSubscriptionUpdate(r: bigint, why: string): Promise<void> })
+      .completeFailedSubscriptionUpdate(subReqId, 'again');
+    await flush();
+    expect(doneMsgs(clientMsgs)).toHaveLength(1);
+    expect(server.session.state).toBe(SessionState.ESTABLISHED);
+    expect(errors).toEqual([]);
+  });
+});
+
+describe('MoqtConnection(18) loopback — publisher terminalization ownership', () => {
+  async function pausedPair22() {
+    const pair = await connectedPair();
+    let subReqId = -1n;
+    pair.server.onSubscribe = (rid) => { subReqId = rid; };
+    const clientMsgs: ControlMessage[] = [];
+    pair.client.onMessage = (m) => clientMsgs.push(m);
+    const reqId = await pair.client.subscribe(ns('live'), nm('vid'), { forward: 0 } as never);
+    await flush();
+    await pair.server.acceptSubscribe(subReqId, 7n, {
+      parameters: new Map([[0x09n, [{ group: 5n, object: 1n }]]]) as never,
+    });
+    await flush();
+    return { ...pair, subReqId, reqId, clientMsgs };
+  }
+  type Internals = {
+    outgoingStreams: Map<bigint, { writer: { abort(e?: unknown): Promise<void>; write(b: unknown): Promise<void> }; subscriptionRequestId?: bigint }>;
+    openSubgroupsByRequest: Map<bigint, Set<bigint>>;
+    pendingPublishOps: Map<bigint, number>;
+    publishOpWaiters: Map<bigint, unknown[]>;
+    completeFailedSubscriptionUpdate(r: bigint, why: string): Promise<void>;
+  };
+  const doneMsgs = (msgs: ControlMessage[]) => msgs.filter((m) => m.type === 'PUBLISH_DONE') as Array<{ statusCode: bigint }>;
+  const relatedStreams = (i: Internals, rid: bigint) => [...i.outgoingStreams.values()].filter((st) => st.subscriptionRequestId === rid);
+
+  it('a HELD writer abort does not reopen the window: a new subgroup during the abort REJECTS and no stream survives DONE', async () => {
+    const { client, server, subReqId, reqId, clientMsgs, errors } = await pausedPair22();
+    const internals = server as unknown as Internals;
+    // One open subgroup whose writer.abort() we hold.
+    const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    const st = internals.outgoingStreams.get(sid)!;
+    const origAbort = st.writer.abort.bind(st.writer);
+    let releaseAbort: (() => void) | null = null;
+    st.writer.abort = (e?: unknown) => new Promise<void>((resolve) => {
+      releaseAbort = () => { void origAbort(e).catch(() => {}); resolve(); };
+    });
+    // Termination begins; the abort is held mid-transaction…
+    const updateP = client.requestUpdate(reqId, { forward: 1 });
+    await flush();
+    // …and a new open attempted DURING that await must reject: the latch,
+    // generation, and alias retirement all installed before the first await.
+    await expect(server.openSubgroup(7n, 1n, 0n, { publisherPriority: 1 } as never))
+      .rejects.toThrow(/terminat/);
+    releaseAbort!();
+    await updateP;
+    await flush(); await flush();
+    const dones = doneMsgs(clientMsgs);
+    expect(dones).toHaveLength(1);
+    expect(BigInt(dones[0]!.statusCode)).toBe(0x8n);
+    // NOTHING related survives the terminal.
+    expect(relatedStreams(internals, subReqId)).toEqual([]);
+    expect(internals.openSubgroupsByRequest.get(subReqId)).toBeUndefined();
+    expect(errors).toEqual([]);
+  });
+
+  it('a held createUnidirectionalStream released AFTER session close: the open rejects and every publisher map stays empty', async () => {
+    const { server, b, subReqId } = await pausedPair22();
+    const internals = server as unknown as Internals;
+    const origCreate = b.createUnidirectionalStream.bind(b);
+    let release: (() => void) | null = null;
+    (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
+      () => new Promise((resolve) => { release = () => resolve(origCreate()); });
+    const heldOpen = server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    heldOpen.catch(() => { /* expected */ });
+    await flush();
+    await server.close();
+    // The stale captured generation must NOT read the cleared map as current.
+    release!();
+    await expect(heldOpen).rejects.toThrow();
+    await flush();
+    expect(relatedStreams(internals, subReqId)).toEqual([]);
+    expect(internals.outgoingStreams.size).toBe(0);
+    expect(internals.openSubgroupsByRequest.size).toBe(0);
+    expect(internals.pendingPublishOps.size).toBe(0);
+  });
+
+  it('a HELD sendObject write on another stream: DONE is sent with no related stream remaining; the late write cannot revive one', async () => {
+    const { client, server, subReqId, reqId, clientMsgs, errors } = await pausedPair22();
+    const internals = server as unknown as Internals;
+    const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    const st = internals.outgoingStreams.get(sid)!;
+    let releaseWrite: (() => void) | null = null;
+    st.writer.write = () => new Promise<void>((resolve) => { releaseWrite = () => resolve(); });
+    const writeP = server.sendObject(sid, 0n, new Uint8Array([1]));
+    writeP.catch(() => { /* may reject on termination */ });
+    await flush();
+    await client.requestUpdate(reqId, { forward: 1 });
+    await flush(); await flush();
+    expect(doneMsgs(clientMsgs)).toHaveLength(1);
+    expect(relatedStreams(internals, subReqId)).toEqual([]);      // detached at entry
+    releaseWrite!();
+    await writeP.catch(() => { /* settled either way */ });
+    await flush();
+    expect(relatedStreams(internals, subReqId)).toEqual([]);      // nothing revived
+    // And a FRESH write on the detached stream id is refused.
+    await expect(server.sendObject(sid, 1n, new Uint8Array([2]))).rejects.toThrow(/Unknown outgoing stream|terminating/);
+    // The sendObject LATCH itself (not just the detach): a stream entry that
+    // somehow survived into the terminating window must still refuse writes.
+    const sid2 = await server.openSubgroup(8n, 0n, 0n, { publisherPriority: 1 } as never).catch(() => null);
+    void sid2;
+    const probeSid = 999_999n;
+    internals.outgoingStreams.set(probeSid, { ...st, subscriptionRequestId: subReqId } as never);
+    await expect(server.sendObject(probeSid, 0n, new Uint8Array([3]))).rejects.toThrow(/terminating/);
+    internals.outgoingStreams.delete(probeSid);
+    expect(errors).toEqual([]);
+  });
+
+  it('two termination transactions racing behind a gate: one PUBLISH_DONE, no duplicate close, no leaked waiter', async () => {
+    const { server, subReqId, reqId, client, clientMsgs, errors } = await pausedPair22();
+    const internals = server as unknown as Internals;
+    // Gate both transactions behind a held writer abort so they overlap.
+    const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
+    const st = internals.outgoingStreams.get(sid)!;
+    const origAbort = st.writer.abort.bind(st.writer);
+    let releaseAbort: (() => void) | null = null;
+    st.writer.abort = (e?: unknown) => new Promise<void>((resolve) => {
+      releaseAbort = () => { void origAbort(e).catch(() => {}); resolve(); };
+    });
+    const t1 = internals.completeFailedSubscriptionUpdate(subReqId, 'first');
+    const t2 = internals.completeFailedSubscriptionUpdate(subReqId, 'second');
+    // SINGLE-FLIGHT contract: the overlapping invocation JOINS the in-flight
+    // transaction rather than starting a second one.
+    expect(t2).toBe(t1);
+    releaseAbort!();
+    await Promise.all([t1, t2]);
+    await flush(); await flush();
+    expect(doneMsgs(clientMsgs)).toHaveLength(1);
+    expect(server.session.state).toBe(SessionState.ESTABLISHED);   // no duplicate close
+    expect(internals.publishOpWaiters.size).toBe(0);               // no leaked waiter
+    expect(errors).toEqual([]);
+    void reqId; void client;
+  });
+});
+
+describe('MoqtConnection(14) loopback — joining FETCH requires an ESTABLISHED subscription', () => {
+  it('pre-SUBSCRIBE_OK the join is refused; post-OK it surfaces to the publisher', async () => {
+    const { client, server, errors } = await connectedPair(14);
+    const fetches: bigint[] = [];
+    server.onFetch = (rid) => { fetches.push(rid); };
+    let subReqId = -1n;
+    server.onSubscribe = (rid) => { subReqId = rid; };
+
+    const reqId = await client.subscribe(ns('live'), nm('vid'), {
+      subscriptionFilter: { type: 'LargestObject' },
+    } as never);
+    await flush();
+    // draft-14 §9.16.2 references an EXISTING subscription: pre-OK is invalid.
+    await expect(client.joiningFetch({
+      joiningFetchType: 'relative', joiningRequestId: reqId, joiningStart: 0n,
+    })).rejects.toThrow(/not a joinable subscription/);
+
+    await server.acceptSubscribe(subReqId, 7n);
+    await flush();
+    const joinReqId = await client.joiningFetch({
+      joiningFetchType: 'relative', joiningRequestId: reqId, joiningStart: 0n,
+    });
+    await flush();
+    expect(fetches).toContain(joinReqId);
+    expect(errors).toEqual([]);
+  });
+});
+
 describe('MoqtConnection(18) loopback — terminal-alias guard delivery timeout (§10.11)', () => {
   it('floors the guard TTL by the requested DELIVERY_TIMEOUT so it outlives a long delivery window', async () => {
     vi.useFakeTimers();
@@ -819,10 +1429,14 @@ describe('MoqtConnection(18) loopback — joining FETCH (§10.12.2)', () => {
     const recv: MoqtObject[] = [];
     client.onObject = (_sid, o) => recv.push(o);
 
-    // Live subscription established first.
+    // Live subscription established first — the SUBSCRIBE_OK communicates
+    // the Largest Location {3, 5}, which the session SAVES as the
+    // subscription's Joining Location (§5.1).
     const subReqId = await client.subscribe(ns('live'), nm('vid'));
     await flush();
-    await server.acceptSubscribe(subReqId, 7n);
+    await server.acceptSubscribe(subReqId, 7n, {
+      parameters: new Map([[0x09n, [{ group: 3n, object: 5n }]]]) as never,
+    });
     await flush();
 
     // Joining fetch for the current group head (relative, joiningStart 0).
@@ -833,8 +1447,8 @@ describe('MoqtConnection(18) loopback — joining FETCH (§10.12.2)', () => {
     expect(joinReqId).toBe(fetchReqId);
     expect(serverFetchMsg?.fetch.fetchType).toBe(0x2);
 
-    // Server resolves against its Largest Location {3, 5} and serves.
-    const range = server.resolveJoiningFetch(joinReqId, { group: 3n, object: 5n });
+    // Server resolves against the SAVED Joining Location and serves.
+    const range = server.resolveJoiningFetch(joinReqId);
     expect(range.startLocation).toEqual({ group: 3n, object: 0n });
     expect(range.endLocation).toEqual({ group: 3n, object: 6n }); // wire one-past: last delivered = 5
 
@@ -880,6 +1494,53 @@ describe('MoqtConnection(18) loopback — joining FETCH (§10.12.2)', () => {
     expect(fetches).toContain(joinReqId);           // released to the app
     expect(clientErrors).toEqual([]);
     expect(errors).toEqual([]);
+  });
+
+  it('draft-16 and draft-14 inbound FETCH reach onFetch from the CONTROL stream — including pending-join parking', async () => {
+    for (const draft of [16, 14] as const) {
+      const { client, server, errors } = await connectedPair(draft);
+      const fetches: bigint[] = [];
+      server.onFetch = (rid) => { fetches.push(rid); };
+      const clientErrors: RequestErrorMsg[] = [];
+      client.onMessage = (m) => { if (m.type === 'REQUEST_ERROR') clientErrors.push(m as RequestErrorMsg); };
+
+      // A join on a PENDING subscription parks (d16; d14 joins post-OK, so
+      // exercise pending parking on 16 only) and a standalone FETCH surfaces
+      // immediately on both.
+      const subReqId = await client.subscribe(ns('live'), nm('vid'), {
+        subscriptionFilter: { type: 'LargestObject' },
+      } as never);
+      if (draft === 16) {
+        const joinReqId = await client.joiningFetch({
+          joiningFetchType: 'relative', joiningRequestId: subReqId, joiningStart: 0n,
+        });
+        await flush();
+        expect(fetches, `d${draft} pending join must park`).not.toContain(joinReqId);
+        const loc = { group: varint(3n), object: varint(5n) };
+        const locBytes = new Uint8Array(locationEncodingLength(loc));
+        writeLocation(loc, locBytes, 0);
+        await server.acceptSubscribe(subReqId, 7n, {
+          parameters: new Map([[0x09n, [locBytes]]]) as never,
+        });
+        await flush();
+        expect(fetches, `d${draft} parked join released at accept`).toContain(joinReqId);
+      } else {
+        await server.acceptSubscribe(subReqId, 7n);
+        await flush();
+        const joinReqId = await client.joiningFetch({
+          joiningFetchType: 'relative', joiningRequestId: subReqId, joiningStart: 0n,
+        });
+        await flush();
+        expect(fetches, `d${draft} established join surfaces`).toContain(joinReqId);
+      }
+      const standaloneReqId = await client.fetch(ns('live'), nm('vid'), {
+        startGroup: varint(0n), startObject: varint(0n), endGroup: varint(1n), endObject: varint(0n),
+      });
+      await flush();
+      expect(fetches, `d${draft} standalone surfaces`).toContain(standaloneReqId);
+      expect(clientErrors).toEqual([]);
+      expect(errors).toEqual([]);
+    }
   });
 
   it('rejectSubscribe rejects the parked joining FETCH with INVALID_JOINING_REQUEST_ID', async () => {
@@ -1207,11 +1868,11 @@ describe('MoqtConnection(18) loopback — joining FETCH (§10.12.2)', () => {
     const { client } = await connectedPair();
     await expect(client.joiningFetch({
       joiningFetchType: 'relative', joiningRequestId: 42n, joiningStart: 0n,
-    })).rejects.toThrow(/PENDING\/ESTABLISHED/);
+    })).rejects.toThrow(/not a joinable subscription/);
   });
 });
 
-describe('MoqtConnection(18) loopback — coalesced reads, terminal PUBLISH_DONE, stream accounting (round 6)', () => {
+describe('MoqtConnection(18) loopback — coalesced reads, terminal PUBLISH_DONE, stream accounting', () => {
   /** Encode a raw draft-18 PUBLISH_DONE frame (no wire Request ID). */
   function rawPublishDone(statusCode: bigint, reason: string): Uint8Array {
     return codec18.encode({
@@ -1427,7 +2088,7 @@ describe('MoqtConnection(18) loopback — coalesced reads, terminal PUBLISH_DONE
   });
 });
 
-describe('MoqtConnection(18) loopback — terminal-lifecycle interleavings (round 7)', () => {
+describe('MoqtConnection(18) loopback — terminal-lifecycle interleavings', () => {
   /** Encode a raw draft-18 PUBLISH_DONE frame with an explicit Stream Count. */
   function rawDone(streamCount: bigint, reason = 'end'): Uint8Array {
     return codec18.encode({
@@ -1660,7 +2321,7 @@ describe('MoqtConnection(18) loopback — terminal-lifecycle interleavings (roun
   });
 });
 
-describe('MoqtConnection(18) loopback — publisher operation lifecycle (round 8)', () => {
+describe('MoqtConnection(18) loopback — publisher operation lifecycle', () => {
   async function acceptedSubscription() {
     const pair = await connectedPair();
     const seen: ControlMessage[] = [];
@@ -1756,7 +2417,7 @@ describe('MoqtConnection(18) loopback — publisher operation lifecycle (round 8
   });
 });
 
-describe('MoqtConnection(18) loopback — receiver terminal/alias lifecycle (round 8)', () => {
+describe('MoqtConnection(18) loopback — receiver terminal/alias lifecycle', () => {
   const STREAM_COUNT_UNKNOWN = (1n << 62n) - 1n; // §9.15 sentinel
   function rawDone(streamCount: bigint): Uint8Array {
     return codec18.encode({
@@ -1871,7 +2532,7 @@ describe('MoqtConnection(18) loopback — receiver terminal/alias lifecycle (rou
   }
 });
 
-describe('MoqtConnection(18) loopback — terminal coordinator + transport.closed (round 8)', () => {
+describe('MoqtConnection(18) loopback — terminal coordinator + transport.closed', () => {
   it('a remote transport close preserves the real closeCode/reason in onClose (fired exactly once)', async () => {
     const { client, a } = await connectedPair();
     const closes: Array<{ code?: number; reason?: string }> = [];
@@ -1954,7 +2615,7 @@ describe('MoqtConnection(18) loopback — terminal coordinator + transport.close
   });
 });
 
-describe('MoqtConnection(18) loopback — round 8 review fixes', () => {
+describe('MoqtConnection(18) loopback — terminal session-state transitions and alias-reuse guards', () => {
   const STREAM_COUNT_UNKNOWN = (1n << 62n) - 1n;
   function rawDone(streamCount: bigint): Uint8Array {
     return codec18.encode({
@@ -2144,7 +2805,7 @@ describe('MoqtConnection(18) loopback — round 8 review fixes', () => {
   });
 });
 
-describe('MoqtConnection(18) loopback — round 8c review fixes', () => {
+describe('MoqtConnection(18) loopback — alias collisions, unknown-alias rejects, shutdown error hygiene', () => {
   // Finding 2: subscribeTrack() must not resolve when the session rejects the
   // SUBSCRIBE_OK — e.g. a DUPLICATE_TRACK_ALIAS. It must reject, session closes.
   it('a SUBSCRIBE_OK that duplicates a live alias closes the session and REJECTS the subscribe (never resolves)', async () => {

@@ -1244,14 +1244,14 @@ describe('Session', () => {
     it('responds NOT_SUPPORTED for unhandled message types with request ID (SHOULD §3.1)', () => {
       // §3.1: "Limited endpoints SHOULD respond to any unsupported messages
       // with the appropriate NOT_SUPPORTED error code, rather than ignoring them."
-      // Use PUBLISH_OK as an example of an unhandled message type with a requestId.
-      const publishOkMsg: PublishOk = {
-        type: 'PUBLISH_OK',
+      // (PUBLISH_OK is handled since round 19 — use an unknown typed message.)
+      const unhandledMsg = {
+        type: 'FUTURE_EXTENSION',
         requestId: varint(0n),
         parameters: new Map(),
       };
 
-      const actions = session.handleControlMessage(publishOkMsg);
+      const actions = session.handleControlMessage(unhandledMsg as never);
 
       // Should send REQUEST_ERROR with NOT_SUPPORTED
       expect(actions.length).toBe(1);

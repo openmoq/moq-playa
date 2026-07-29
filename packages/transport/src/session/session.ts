@@ -14,6 +14,11 @@
 
 import { varint, type Varint } from '../primitives/varint.js';
 import { readLocation } from '../primitives/location.js';
+
+/** vi64 ceiling (2^64 − 1) — the widest Location component any draft can
+ *  encode; resume-provider results above it are unencodable, so they fail
+ *  closed (kept local: the sans-I/O session imports no wire modules). */
+const MAX_VI64 = 18446744073709551615n;
 import { encodeSubscriptionFilter, validateSubscriptionFilter, decodeSubscriptionFilter, type SubscriptionFilter } from '../control/subscription-filter.js';
 import { resolveJoiningFetchRange } from './joining.js';
 import { validateTrackNamespace, validateTrackNamespacePrefix, validateFullTrackName, isReservedSessionNamespace, isReservedDotNamespace } from '../primitives/bytes.js';
@@ -807,6 +812,8 @@ export class Session {
           return this.handleFetchOk(msg);
         case 'REQUEST_OK':
           return this.handleRequestOk(msg);
+        case 'PUBLISH_OK':
+          return this.handleInboundPublishOk(msg as PublishOk);
         case 'PUBLISH_DONE':
           return this.handlePublishDone(msg);
         case 'UNSUBSCRIBE':
@@ -1412,6 +1419,7 @@ export class Session {
     const outPubErr = this.outgoingPublishes.get(msg.requestId as bigint);
     if (outPubErr) {
       this.outgoingPublishes.delete(msg.requestId as bigint);
+    this.incomingJoiningLocations.delete(msg.requestId as bigint);
       return [];
     }
 
@@ -1672,16 +1680,53 @@ export class Session {
     }
 
     // draft-18 §10.10: our outbound PUBLISH accepted (REQUEST_OK = PUBLISH_OK
-    // shorthand). Establish the publisher-side subscription; keep the stream.
+    // shorthand). Establish the publisher-side subscription and APPLY the
+    // subscriber's response parameters — the subscriber sets the Forward
+    // State and filter in its acceptance (§5.1 / §9.2.2), and the joining
+    // gates consult exactly this state.
     const outPub = this.outgoingPublishes.get(msg.requestId as bigint);
     if (outPub && outPub.state === SubscriptionState.PENDING) {
       outPub.acceptOutboundPublish();
+      this.applyPublishAcceptanceParams(outPub, msg.parameters);
       return [];
     }
 
     return this.closeWithError(
       SessionErrorCode.INVALID_REQUEST_ID,
       `Unknown request ID ${msg.requestId} for REQUEST_OK`,
+    );
+  }
+
+  /** Apply a publish-acceptance's response parameters (PUBLISH_OK / d18
+   *  REQUEST_OK) to our outbound publish: FORWARD, SUBSCRIPTION_FILTER, and
+   *  delivery timeouts — the subscriber's choices govern this subscription. */
+  private applyPublishAcceptanceParams(sub: SubscriptionStateMachine, parameters: Parameters | undefined): void {
+    const fwd = parameters?.get(MessageParam.FORWARD)?.[0];
+    if (typeof fwd === 'bigint') {
+      sub.updateForwardState(fwd === 0n ? ForwardState.PAUSED : ForwardState.ACTIVE);
+    }
+    const filter = parameters?.get(MessageParam.SUBSCRIPTION_FILTER)?.[0];
+    if (filter instanceof Uint8Array) {
+      try { sub.setRemoteFilterType(decodeSubscriptionFilter(filter, this._draftVersion).type); }
+      catch { /* malformed bytes rejected by parameter validation */ }
+    }
+    const objTimeout = parameters?.get(MessageParam.OBJECT_DELIVERY_TIMEOUT)?.[0];
+    if (typeof objTimeout === 'bigint') sub.requestedDeliveryTimeoutMs = Number(objTimeout);
+    const subgroupTimeout = parameters?.get(MessageParam.SUBGROUP_DELIVERY_TIMEOUT)?.[0];
+    if (typeof subgroupTimeout === 'bigint') sub.requestedSubgroupDeliveryTimeoutMs = Number(subgroupTimeout);
+  }
+
+  /** draft-14/16 §9.14: an inbound PUBLISH_OK accepting OUR outbound PUBLISH. */
+  private handleInboundPublishOk(msg: PublishOk): SessionOutboundAction[] {
+    const outPub = this.outgoingPublishes.get(msg.requestId as bigint);
+    if (outPub && outPub.state === SubscriptionState.PENDING) {
+      outPub.acceptOutboundPublish();
+      this.applyPublishAcceptanceParams(outPub, msg.parameters);
+      return [];
+    }
+    return this.closeWithError(
+      SessionErrorCode.INVALID_REQUEST_ID,
+      `Unknown request ID ${msg.requestId} for PUBLISH_OK`,
     );
   }
 
@@ -1730,6 +1775,7 @@ export class Session {
       sub.handleUnsubscribe();
       if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
       this.incomingSubscriptions.delete(msg.requestId as bigint);
+    this.incomingJoiningLocations.delete(msg.requestId as bigint);
       return [];
     }
 
@@ -1867,6 +1913,13 @@ export class Session {
       msg.parameters,
       msg.trackAlias as bigint,
     );
+    // §10.10 / §5.1: the initiator sets the initial Forward State in PUBLISH —
+    // apply it BEFORE the subscription is stored, so both endpoints agree
+    // (the subscriber's acceptance may still override it).
+    const publishForward = msg.parameters.get(MessageParam.FORWARD)?.[0];
+    if (typeof publishForward === 'bigint') {
+      sub.setInitialForwardState(publishForward === 0n ? ForwardState.PAUSED : ForwardState.ACTIVE);
+    }
 
     // §5.1: an endpoint may hold at most ONE subscription per Track per ROLE
     // (drafts 16/18 only — draft-14 defines neither this rule nor
@@ -2094,21 +2147,39 @@ export class Session {
     if (msg.fetch.fetchType !== 0x1) {
       const jf = msg.fetch as JoiningFetch;
       const joiningReqId = jf.joiningRequestId as bigint;
+      // A subscription this publisher serves may have been created by the
+      // peer's SUBSCRIBE (incomingSubscriptions) OR by our own outbound
+      // PUBLISH (outgoingPublishes) — d18 §5.1 saves the PUBLISH-communicated
+      // largest precisely so joins against it can resolve.
       const sub = this.incomingSubscriptions.get(joiningReqId);
+      const pubSub = sub === undefined ? this.outgoingPublishes.get(joiningReqId) : undefined;
+      const joined = sub ?? pubSub;
 
-      // §9.16.2: "If a publisher receives a Joining Fetch with a Request ID
-      // that does not correspond to a subscription in the same session in the
-      // Established or Pending (subscriber) states, it MUST return a
-      // REQUEST_ERROR with error code INVALID_JOINING_REQUEST_ID."
-      const eligible = sub !== undefined
-        && (sub.state === SubscriptionState.PENDING || sub.state === SubscriptionState.ESTABLISHED);
+      // Eligibility matrix (§9.16.2 / d18 §10.12.2):
+      //  - draft-14: an EXISTING (established) subscription only;
+      //  - drafts 16/18: Established, or Pending SUBSCRIBER-initiated (a
+      //    peer SUBSCRIBE we serve) — a PENDING publisher-initiated PUBLISH
+      //    is invalid until PUBLISH_OK;
+      //  - an inbound PUBLISH we consume is never joinable BY the peer.
+      const eligible = (() => {
+        if (joined === undefined) return false;
+        if (sub !== undefined && sub.isPublishInitiated) return false; // we are the subscriber there
+        if (joined.state === SubscriptionState.ESTABLISHED) return true;
+        if (this._draftVersion === 14) return false;                  // d14: established only
+        // Pending: subscriber-initiated only (peer SUBSCRIBE, never our PUBLISH).
+        return joined.state === SubscriptionState.PENDING && sub !== undefined;
+      })();
       if (!eligible) {
         const errorMsg: RequestErrorMsg = {
           type: 'REQUEST_ERROR',
           requestId: msg.requestId,
-          errorCode: RequestErrorCode.INVALID_JOINING_REQUEST_ID,
+          // draft-14 has no generic REQUEST_ERROR: this encodes as
+          // FETCH_ERROR (0x19) with the d14 code INVALID_JOINING_REQUEST_ID
+          // (0x7, §9.18); drafts 16/18 use the common-table 0x32.
+          errorCode: this._draftVersion === 14 ? varint(0x7n) : RequestErrorCode.INVALID_JOINING_REQUEST_ID,
           retryInterval: varint(0n),
           errorReason: `Joining Fetch references request ${joiningReqId}, which is not a subscription in PENDING/ESTABLISHED state (§9.16.2)`,
+          requestKind: 'FETCH', // draft-14 → FETCH_ERROR; ignored by 16/18
         };
         return [this.sendControl(errorMsg), ...(validated.replenish ?? [])];
       }
@@ -2120,14 +2191,15 @@ export class Session {
         // The gate is evaluated ONLY for an ESTABLISHED subscription: a
         // PENDING one defers to the buffering layer, which re-evaluates at
         // establish time — after any pending REQUEST_UPDATEs have applied.
-        if (sub.state === SubscriptionState.ESTABLISHED
-            && sub.forwardState !== ForwardState.ACTIVE) {
+        if (joined!.state === SubscriptionState.ESTABLISHED
+            && joined!.forwardState !== ForwardState.ACTIVE) {
           const errorMsg: RequestErrorMsg = {
             type: 'REQUEST_ERROR',
             requestId: msg.requestId,
             errorCode: RequestErrorCode.INVALID_RANGE,
             retryInterval: varint(0n),
             errorReason: `Joining Fetch on subscription ${joiningReqId} with Forward State 0 (§10.12.2)`,
+            requestKind: 'FETCH', // draft-18-only branch; kind stamped for uniformity
           };
           return [this.sendControl(errorMsg), ...(validated.replenish ?? [])];
         }
@@ -2137,10 +2209,14 @@ export class Session {
         // results in closing the session with a PROTOCOL_VIOLATION." An
         // omitted SUBSCRIPTION_FILTER = unfiltered (§9.2.2.5) — not Largest
         // Object, so it fails this gate too.
-        if (sub.remoteFilterType !== 'LargestObject') {
+        // §9.16.2's Largest Object FILTER rule binds regardless of who
+        // initiated the subscription: a SUBSCRIBE communicates the filter in
+        // its request; a PUBLISH-initiated subscription gets it from the
+        // subscriber's PUBLISH_OK (§9.2.2.5). Unfiltered fails the gate.
+        if (joined!.remoteFilterType !== 'LargestObject') {
           return this.closeWithError(
             SessionErrorCode.PROTOCOL_VIOLATION,
-            `Joining Fetch on subscription ${joiningReqId} whose filter is ${sub.remoteFilterType ?? 'unfiltered'}, not Largest Object (§9.16.2)`,
+            `Joining Fetch on subscription ${joiningReqId} whose filter is ${joined!.remoteFilterType ?? 'unfiltered'}, not Largest Object (§9.16.2)`,
           );
         }
       }
@@ -2171,6 +2247,45 @@ export class Session {
     this.incomingFetches.set(msg.requestId as bigint, fetchSm);
 
     return validated.replenish ?? [];
+  }
+
+  /**
+   * The saved Joining Location per incoming subscription (§5.1): the Largest
+   * Location this publisher communicated in SUBSCRIBE_OK (or, on draft-18, in
+   * a REQUEST_UPDATE_OK that changed the Forward State 0→1). Authoritative
+   * for Joining-FETCH range arithmetic; reclaimed with the subscription.
+   */
+  private readonly incomingJoiningLocations = new Map<bigint, { group: bigint; object: bigint }>();
+
+  /**
+   * Application hook supplying the publisher's CURRENT Largest Location for a
+   * track (the session never sees published objects). draft-18 §5.1 requires
+   * a REQUEST_UPDATE_OK that flips Forward 0→1 to communicate — and this
+   * publisher to save — the current head as the new Joining Location; without
+   * this hook a paused track that advanced would resume with a stale one.
+   */
+  private largestLocationProvider: ((subscriptionRequestId: bigint) => { group: bigint; object: bigint } | null) | null = null;
+
+  setLargestLocationProvider(provider: (subscriptionRequestId: bigint) => { group: bigint; object: bigint } | null): void {
+    this.largestLocationProvider = provider;
+  }
+
+  /** Parse a LARGEST_OBJECT parameter value: d14/16 Location byte blob, or a
+   *  d18 typed {group, object}. Null when absent/malformed. */
+  private extractLargestObjectParam(parameters: Parameters | undefined): { group: bigint; object: bigint } | null {
+    const raw = parameters?.get(MessageParam.LARGEST_OBJECT as bigint)?.[0];
+    if (raw instanceof Uint8Array) {
+      try {
+        const { value } = readLocation(raw, 0);
+        return { group: BigInt(value.group), object: BigInt(value.object) };
+      } catch { return null; }
+    }
+    if (raw !== null && raw !== undefined && typeof raw === 'object'
+        && 'group' in (raw as object) && 'object' in (raw as object)) {
+      const loc = raw as { group: bigint | number; object: bigint | number };
+      return { group: BigInt(loc.group), object: BigInt(loc.object) };
+    }
+    return null;
   }
 
   private handleFetchCancel(msg: FetchCancel): SessionOutboundAction[] {
@@ -2292,8 +2407,75 @@ export class Session {
 
     // §9.11: "If a parameter previously set on the request is not present
     // in REQUEST_UPDATE, its value remains unchanged."
-    // Apply FORWARD parameter if present
+    const prevForwardState = sub?.forwardState;
     const forwardValues = msg.parameters.get(MessageParam.FORWARD);
+    // draft-18 §5.1: a REQUEST_UPDATE_OK that flips Forward 0→1 MUST
+    // communicate (and this publisher save) the CURRENT Largest Location.
+    // The lookup completes BEFORE any Forward mutation, and every
+    // can't-comply shape fails CLOSED (REQUEST_ERROR, Forward unchanged):
+    //   - no provider installed  → the publisher cannot meet the MUST;
+    //   - provider throws        → likewise;
+    //   - invalid result shape   → likewise;
+    //   - provider returns null  → compliant: the track has no objects, the
+    //     OK carries no LARGEST_OBJECT and any STALE saved Joining Location
+    //     is cleared (a later join is INVALID_RANGE, never anchored stale).
+    let resumeLocation: { group: bigint; object: bigint } | null = null;
+    let resumeClearsStale = false;
+    const isSubscriptionScope = sub !== undefined && !fetch
+      && (this.incomingSubscriptions.has(msg.existingRequestId as bigint)
+        || this.outgoingPublishes.has(msg.existingRequestId as bigint));
+    // Scope: an ESTABLISHED subscription resuming. §5.1's clause is
+    // unqualified, but for a PENDING subscription no Joining Location has
+    // been communicated yet and the acknowledgement that will (SUBSCRIBE_OK)
+    // is still outstanding — d18 §10.12.2 explicitly orders pending
+    // REQUEST_UPDATEs BEFORE establishment evaluation, so the SUBSCRIBE_OK
+    // emitted after them carries the current largest and satisfies the save
+    // requirement for the resumed state. Failing such an update closed here
+    // would reject the very races §10.12.2 requires publishers to tolerate.
+    const wantsResume = this._draftVersion === 18 && isSubscriptionScope
+      && sub!.state === 'established'
+      && prevForwardState === ForwardState.PAUSED
+      && forwardValues !== undefined && forwardValues.length > 0
+      && typeof forwardValues[0] === 'bigint' && forwardValues[0] !== 0n;
+    if (wantsResume) {
+      // d18 §10.11: "PUBLISH_DONE ... UPDATE_FAILED": an unsuccessful
+      // subscription update terminates the subscription. The SESSION emits
+      // only the REQUEST_ERROR here — the I/O layer owns the termination
+      // transaction (it must close in-flight publisher operations, report a
+      // truthful Stream Count, retire the alias, and seal the request
+      // stream, none of which bare Session actions can do). The adapter
+      // detects the REQUEST_ERROR update response and runs its publishDone.
+      const failClosed = (why: string): SessionOutboundAction[] => {
+        const reason = `cannot resume subscription ${msg.existingRequestId}: ${why} (§5.1 requires the REQUEST_UPDATE_OK to carry the current Largest Location)`;
+        return [this.sendControl({
+          type: 'REQUEST_ERROR',
+          requestId: msg.requestId,
+          errorCode: varint(0x0n), // INTERNAL_ERROR
+          retryInterval: varint(0n),
+          errorReason: reason,
+        } as RequestErrorMsg), ...(validated.replenish ?? [])];
+      };
+      if (!this.largestLocationProvider) {
+        return failClosed('no Largest Location provider is installed');
+      }
+      let provided: { group: bigint; object: bigint } | null;
+      try {
+        provided = this.largestLocationProvider(msg.existingRequestId as bigint);
+      } catch (err) {
+        return failClosed(`the Largest Location provider threw (${err instanceof Error ? err.message : String(err)})`);
+      }
+      if (provided === null) {
+        resumeClearsStale = true;
+      } else if (typeof provided === 'object' && provided !== null
+          && typeof provided.group === 'bigint' && typeof provided.object === 'bigint'
+          && provided.group >= 0n && provided.object >= 0n
+          && provided.group <= MAX_VI64 && provided.object <= MAX_VI64) {
+        resumeLocation = { group: provided.group, object: provided.object };
+      } else {
+        return failClosed('the Largest Location provider returned an invalid value');
+      }
+    }
+    // Apply FORWARD parameter if present
     if (forwardValues && forwardValues.length > 0 && sub) {
       const forwardVal = forwardValues[0];
       if (typeof forwardVal === 'bigint') {
@@ -2332,11 +2514,20 @@ export class Session {
       return validated.replenish ?? [];
     }
 
+    // Communicate + SAVE the pre-validated resume location (see above).
+    const requestOkParams: Parameters = new Map();
+    if (resumeLocation) {
+      requestOkParams.set(MessageParam.LARGEST_OBJECT as bigint, [resumeLocation]);
+      this.incomingJoiningLocations.set(msg.existingRequestId as bigint, resumeLocation);
+    } else if (resumeClearsStale) {
+      this.incomingJoiningLocations.delete(msg.existingRequestId as bigint);
+    }
+
     // Draft-16 §9.11: Respond with REQUEST_OK
     const requestOk: RequestOk = {
       type: 'REQUEST_OK',
       requestId: msg.requestId,
-      parameters: new Map(),
+      parameters: requestOkParams,
     };
 
     return [this.sendControl(requestOk), ...(validated.replenish ?? [])];
@@ -2585,6 +2776,17 @@ export class Session {
 
     const sub = SubscriptionStateMachine.createAsPublisher(requestId, namespace, name);
     sub.setOutboundPublishAlias(trackAlias);
+    // §5.1 (d18:1948): "A publisher MUST save the Largest Location
+    // communicated in ... PUBLISH" — it is this subscription's Joining
+    // Location, exactly as with SUBSCRIBE_OK.
+    const communicated = this.extractLargestObjectParam(options.parameters);
+    if (communicated) this.incomingJoiningLocations.set(requestId as bigint, communicated);
+    // The PUBLISH's FORWARD parameter sets the subscription's initial Forward
+    // State (§10.10) — the d18 joining-fetch gate consults it at establish.
+    const initialForward = options.parameters?.get(MessageParam.FORWARD)?.[0];
+    if (typeof initialForward === 'bigint') {
+      sub.setInitialForwardState(initialForward === 0n ? ForwardState.PAUSED : ForwardState.ACTIVE);
+    }
     this.outgoingPublishes.set(requestId as bigint, sub);
 
     const publishMsg: Publish = {
@@ -2964,10 +3166,23 @@ export class Session {
       );
     }
 
-    const sub = this.subscriptions.get(options.joiningRequestId as bigint);
-    if (!sub || !(sub.state === SubscriptionState.PENDING || sub.state === SubscriptionState.ESTABLISHED)) {
+    // A subscription WE consume may be our outbound SUBSCRIBE or an inbound
+    // PUBLISH we accepted (we are the subscriber for both) — a join may
+    // reference either (§9.16.2 / d18 §10.12.2). Peer SUBSCRIBEs we SERVE are
+    // not joinable by us. The eligibility matrix mirrors the publisher side:
+    // draft-14 requires the subscription ESTABLISHED; 16/18 additionally
+    // allow a PENDING outbound SUBSCRIBE (never a pending inbound PUBLISH —
+    // it is invalid until our PUBLISH_OK establishes it).
+    const inbound = this.incomingSubscriptions.get(options.joiningRequestId as bigint);
+    const outbound = this.subscriptions.get(options.joiningRequestId as bigint);
+    const sub = outbound ?? (inbound?.isPublishInitiated ? inbound : undefined);
+    const joinable = sub !== undefined && (
+      sub.state === SubscriptionState.ESTABLISHED
+      || (this._draftVersion !== 14 && sub.state === SubscriptionState.PENDING && sub === outbound)
+    );
+    if (!joinable) {
       throw new SessionError(
-        `joiningFetch: request ${options.joiningRequestId} is not a subscription in PENDING/ESTABLISHED state — §9.16.2`,
+        `joiningFetch: request ${options.joiningRequestId} is not a joinable subscription (draft-14: established only; 16/18: established or pending SUBSCRIBE) — §9.16.2`,
         'INVALID_STATE',
       );
     }
@@ -2982,9 +3197,12 @@ export class Session {
     });
     this.fetches.set(requestId as bigint, fetchSm);
 
+    // No width narrowing here: the field is vi64 on draft-18 (a peer-allocated
+    // PUBLISH Request ID may exceed the QUIC-varint range), and the selected
+    // draft codec enforces its own width on encode (d14/16 reject out-of-range).
     const joiningFetch: JoiningFetch = {
       fetchType,
-      joiningRequestId: varint(options.joiningRequestId),
+      joiningRequestId: options.joiningRequestId,
       joiningStart: options.joiningStart,
     };
 
@@ -3009,23 +3227,24 @@ export class Session {
 
   /**
    * Resolve an incoming Joining Fetch against the associated subscription's
-   * Largest Location (§9.16.2.1; draft-18 "Joining Location"), back-filling
-   * the publisher-side fetch state machine's range and returning it.
-   *
-   * The Largest Location is application knowledge — the sans-I/O session
-   * never sees published objects — so the app supplies it and this method
-   * does the joining arithmetic (via {@link resolveJoiningFetchRange}).
+   * SAVED Joining Location (§9.16.2.1; draft-18 §5.1) — the Largest Location
+   * this publisher communicated in SUBSCRIBE_OK / PUBLISH / a Forward-0→1
+   * REQUEST_UPDATE_OK — back-filling the publisher-side fetch state
+   * machine's range and returning it. There is no app-supplied anchor and no
+   * fallback: a subscription with no saved snapshot cannot be joined, and
+   * the method throws so the caller rejects with REQUEST_ERROR INVALID_RANGE.
    *
    * @returns the standalone-equivalent range in the FETCH wire convention
-   *   (`endLocation.object` is one-past the last delivered object).
-   * @throws {SessionError} INVALID_STATE for an unknown request or a
-   *   standalone fetch; {@link RangeError} for an Absolute Joining Fetch
-   *   whose start exceeds the largest group (caller maps to REQUEST_ERROR
-   *   INVALID_RANGE per §9.16.3).
+   *   (`endLocation.object` is one-past the last delivered object), computed
+   *   from the saved anchor via {@link resolveJoiningFetchRange}.
+   * @throws {SessionError} INVALID_STATE for an unknown request, a
+   *   standalone fetch, or a subscription with no saved Joining Location
+   *   (caller maps the last to REQUEST_ERROR INVALID_RANGE);
+   *   {@link RangeError} for an Absolute Joining Fetch whose start exceeds
+   *   the largest group (same INVALID_RANGE mapping per §9.16.3).
    */
   resolveIncomingJoiningFetch(
     requestId: bigint,
-    largest: { group: bigint; object: bigint },
   ): { startLocation: { group: bigint; object: bigint }; endLocation: { group: bigint; object: bigint } } {
     const fetchSm = this.incomingFetches.get(requestId as bigint);
     if (!fetchSm || !fetchSm.isJoining) {
@@ -3035,9 +3254,24 @@ export class Session {
       );
     }
     const joining = fetchSm.joining!;
+    // §5.1 (d16:1381 / d18:1948): the SAVED Joining Location — the Largest
+    // Location this publisher communicated in SUBSCRIBE_OK (or a d18 Forward
+    // 0→1 REQUEST_UPDATE_OK) — is the ONLY valid join anchor. There is
+    // deliberately no caller-supplied fallback: a later head can gap or
+    // overlap the subscription's delivery boundary, and a subscription whose
+    // SUBSCRIBE_OK communicated no Largest has no Joining Location at all —
+    // the compliant response to its join is REQUEST_ERROR INVALID_RANGE
+    // (which this throw lets the caller map to).
+    const anchor = this.incomingJoiningLocations.get(joining.joiningRequestId as bigint);
+    if (!anchor) {
+      throw new SessionError(
+        `resolveIncomingJoiningFetch: subscription ${joining.joiningRequestId} has no saved Joining Location (no LARGEST_OBJECT was communicated) — reject the join with INVALID_RANGE`,
+        'INVALID_STATE',
+      );
+    }
     const range = resolveJoiningFetchRange(
       { fetchType: joining.fetchType, joiningStart: joining.joiningStart },
-      largest,
+      anchor,
     );
     fetchSm.setResolvedRange(
       range.startLocation.group,
@@ -4011,6 +4245,7 @@ export class Session {
     const sub = this.incomingSubscriptions.get(requestId as bigint);
     if (sub?.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
     this.incomingSubscriptions.delete(requestId as bigint);
+    this.incomingJoiningLocations.delete(requestId as bigint);
     this.incomingFetches.delete(requestId as bigint);
     // §5.1: the PUBLISH went away before acceptance — discard any staged collision
     // so the local SUBSCRIBE it would have superseded stays alive.
@@ -4039,6 +4274,43 @@ export class Session {
    *
    * @see draft-ietf-moq-transport-18 §11.4.1
    */
+  /**
+   * Roll back an OUTBOUND request that failed before/at emission.
+   *
+   * Two distinct failure classes require different provenance handling:
+   * - Ordinary rollback (default): the request's bytes never left this endpoint
+   *   (e.g. a pre-send ownership callback threw). No response can ever arrive,
+   *   so all state — including any cancellation shadow — is dropped.
+   * - `retainCancellationProvenance`: the send FAILED AMBIGUOUSLY — bytes may
+   *   have reached the peer, so a response may still cross. The request's kind
+   *   and phase are recorded in `recentlyCancelled` BEFORE cleanup, so a crossed
+   *   SUBSCRIBE_OK / FETCH_OK / REQUEST_ERROR / PUBLISH_DONE is tolerated as
+   *   known-cancelled instead of closing the session as unknown-request.
+   */
+  rollbackRequest(
+    requestId: bigint,
+    options?: { retainCancellationProvenance?: boolean },
+  ): void {
+    const retain = options?.retainCancellationProvenance === true;
+    const sub = this.subscriptions.get(requestId as bigint);
+    if (retain) {
+      if (sub) this.recordCancellation(requestId, 'subscribe', !sub.isPending);
+      else if (this.fetches.has(requestId as bigint)) this.recordCancellation(requestId, 'fetch', false);
+    }
+    if (sub) {
+      if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
+      this.subscriptions.delete(requestId as bigint);
+      this.subscriptionTracks.delete(requestId as bigint);
+    }
+    this.fetches.delete(requestId as bigint);
+    this.pendingTrackStatuses.delete(requestId as bigint);
+    this.outgoingPublishes.delete(requestId as bigint);
+    this.incomingJoiningLocations.delete(requestId as bigint);
+    this.publishedNamespaces.delete(requestId as bigint);
+    this.dropPendingUpdatesFor(requestId);
+    if (!retain) this.recentlyCancelled.delete(requestId as bigint);
+  }
+
   handleOutboundRequestClosed(requestId: bigint): SessionOutboundAction[] {
     const sub = this.subscriptions.get(requestId as bigint);
     if (sub) {
@@ -4049,6 +4321,7 @@ export class Session {
     this.fetches.delete(requestId as bigint);
     this.pendingTrackStatuses.delete(requestId as bigint);
     this.outgoingPublishes.delete(requestId as bigint);
+    this.incomingJoiningLocations.delete(requestId as bigint);
     this.publishedNamespaces.delete(requestId as bigint);
     // §11.4.1: drop any REQUEST_UPDATE still pending against this gone request.
     this.dropPendingUpdatesFor(requestId);
@@ -4324,16 +4597,26 @@ export class Session {
       // If the cancellation itself forced a session close (superseded-set at
       // capacity), return ONLY the close — do NOT also append an acceptance.
       if (preActions.some((a) => a.type === 'close_connection')) return preActions;
+      // WE are the subscriber accepting this PUBLISH: our response parameters
+      // (FORWARD, SUBSCRIPTION_FILTER, priorities, timeouts) define the
+      // subscription state on BOTH ends — apply FORWARD locally too, so the
+      // joining gates here agree with what the acceptance communicates.
+      const acceptFwd = options.parameters?.get(MessageParam.FORWARD)?.[0];
+      if (typeof acceptFwd === 'bigint') {
+        sub.updateForwardState(acceptFwd === 0n ? ForwardState.PAUSED : ForwardState.ACTIVE);
+      }
       if (this._draftVersion === 18) {
         // draft-18 §10.10: PUBLISH_OK is REQUEST_OK shorthand (wire 0x07, no
         // Request ID); the I/O layer writes it on the inbound PUBLISH request
-        // stream, not the control stream.
-        const requestOk: RequestOk = { type: 'REQUEST_OK', requestId, parameters: new Map() };
+        // stream, not the control stream. Caller-supplied response parameters
+        // ride it verbatim.
+        const requestOk: RequestOk = { type: 'REQUEST_OK', requestId, parameters: options.parameters ?? new Map() };
         return [...preActions, this.sendControl(requestOk)];
       }
-      // Draft-14/16 §9.14: respond with PUBLISH_OK. Only carry fields that
-      // intentionally define the initial subscription state.
+      // Draft-14/16 §9.14: respond with PUBLISH_OK — derived initial-state
+      // fields first, caller-supplied response parameters taking precedence.
       const params = this.buildPublishOkParamsFromPublish(sub.publishParameters);
+      for (const [k, v] of options.parameters ?? new Map()) params.set(k, v);
       const publishOk: PublishOk = {
         type: 'PUBLISH_OK',
         requestId,
@@ -4341,6 +4624,12 @@ export class Session {
       };
       return [...preActions, this.sendControl(publishOk)];
     }
+
+    // §5.1: SAVE the Largest Location communicated in this SUBSCRIBE_OK — it
+    // becomes the subscription's Joining Location, the mandatory anchor for
+    // any Joining FETCH while the subscription is active.
+    const communicated = this.extractLargestObjectParam(options.parameters);
+    if (communicated) this.incomingJoiningLocations.set(requestId as bigint, communicated);
 
     const subscribeOk: SubscribeOk = {
       type: 'SUBSCRIBE_OK',
@@ -4385,6 +4674,7 @@ export class Session {
     // unique requests the application rejects). The adapter's stream teardown seals
     // the context, so its later close callback will not run this cleanup.
     this.incomingSubscriptions.delete(requestId as bigint);
+    this.incomingJoiningLocations.delete(requestId as bigint);
 
     // PUBLISH-initiated subscriptions respond with a publish-rejection message:
     // draft-14 PUBLISH_ERROR, drafts 16/18 REQUEST_ERROR (§10.10). Shared with the
@@ -4426,6 +4716,7 @@ export class Session {
     // to discard late streams — that is a separate, adapter-level concern).
     if (sub.trackAlias !== undefined) this.trackAliases.unregister(sub.trackAlias, sub.requestId);
     this.incomingSubscriptions.delete(requestId as bigint);
+    this.incomingJoiningLocations.delete(requestId as bigint);
     // §5.1: PUBLISH ended before acceptance — discard any staged collision.
     this.pendingCollisions.delete(requestId as bigint);
     return [];
@@ -4513,6 +4804,7 @@ export class Session {
     // (a duplicate publishDone for the same request then throws Unknown).
     this.outgoingPublishes.delete(requestId as bigint);
     this.incomingSubscriptions.delete(requestId as bigint);
+    this.incomingJoiningLocations.delete(requestId as bigint);
 
     const publishDoneMsg: PublishDone = {
       type: 'PUBLISH_DONE',

@@ -126,6 +126,9 @@ async function handleSession(
       conn.onPublish = (publish) => { void relay.handlePublish(conn, publish); };
       // Serve standalone + joining FETCH from the latest-group live cache (§10.12).
       conn.onFetch = (requestId, fetch) => { void relay.handleFetch(conn, requestId, fetch); };
+      // §5.1: a Forward 0→1 REQUEST_UPDATE_OK must communicate the CURRENT
+      // Largest Location — supply it from the live cache per subscription.
+      conn.setLargestLocationProvider((subReqId) => relay.currentLargestFor(conn, subReqId));
     } else {
       // Toy-publisher mode: answer a SUBSCRIBE for the demo track with a tiny stream.
       conn.onSubscribe = (requestId, namespace, trackName) => {

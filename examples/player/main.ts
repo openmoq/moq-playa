@@ -22,7 +22,7 @@ import { MoqtConnection } from '@moqt/webtransport';
 import { QlogTrace, varint } from '@moqt/transport';
 import { CATALOG_TRACK_NAME } from '@moqt/msf';
 import { log } from '../shared/log.js';
-import { relayUrl, namespace, namespaceArg, authority, warmStart, certHash, draftVersion } from '../shared/cert.js';
+import { relayUrl, namespace, namespaceArg, authority, warmStart, certHash, draftVersion, catalogBootstrap } from '../shared/cert.js';
 import {
     AudioAlignedClock,
     WebCodecsVideoDecoder,
@@ -1050,6 +1050,7 @@ async function startPlayback(): Promise<void> {
         namespace: namespaceArg,
         ...(authority ? { authority } : {}),
         ...(warmStart ? { warmStartCurrentGroup: true } : {}),
+        ...(catalogBootstrap ? { catalogBootstrap } : {}),
         // ?log=debug|info|warn|error — surface player-internal logs on the console.
         ...(params.get('log') ? { logLevel: params.get('log') as 'debug' | 'info' | 'warn' | 'error' } : {}),
         ...(draftVersion ? { draftVersion } : {}),

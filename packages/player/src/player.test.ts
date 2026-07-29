@@ -153,6 +153,9 @@ function createConfig(
     namespace: 'live/broadcast',
     createTransport: vi.fn(async () => ({}) as any),
     createConnection: () => adapter as unknown as MoqtConnection,
+    // These suites pin the pre-bootstrap catalog behavior — the explicit
+    // legacy escape hatch keeps them byte-identical under the 'auto' default.
+    catalogBootstrap: 'subscribe',
   };
 }
 
@@ -3310,6 +3313,7 @@ describe('MoqtPlayer', () => {
         namespace: 'live/broadcast',
         createConnection,
         createTransport,
+        catalogBootstrap: 'subscribe',
       });
       const loadPromise = player.load();
       await resolveConnect(oldAdapter);
@@ -3395,6 +3399,170 @@ describe('MoqtPlayer', () => {
       expect(createTransport.mock.calls.length).toBeGreaterThanOrEqual(2);
       const fallbackUrl = createTransport.mock.calls[createTransport.mock.calls.length - 1][0];
       expect(fallbackUrl).toContain('relay.example.com');
+    });
+
+    /**
+     * The New Session URI is peer-controlled text (a misbehaving relay has
+     * been observed placing its own error string in the field). It must be
+     * validated BEFORE any candidate connection or transport is created —
+     * and a non-empty invalid URI must NOT silently fall back to the current
+     * URL: that would reconnect to a relay that just declared itself
+     * unusable while hiding the peer's defect.
+     */
+    async function loadWithFactories() {
+      const oldAdapter = createMockAdapter();
+      const newAdapter = createMockAdapter();
+      const createTransport = vi.fn(async () => ({} as any));
+      let adapterCallCount = 0;
+      const createConnection = vi.fn(() => {
+        adapterCallCount++;
+        return (adapterCallCount === 1 ? oldAdapter : newAdapter) as unknown as MoqtConnection;
+      });
+      const player = new MoqtPlayer({
+        url: 'https://relay.example.com/moq',
+        namespace: 'live/broadcast',
+        createConnection,
+        createTransport,
+        catalogBootstrap: 'subscribe',
+      });
+      const loadPromise = player.load();
+      await resolveConnect(oldAdapter);
+      await loadPromise;
+      const catalogReqId = await (oldAdapter.subscribe as any).mock.results[0]?.value;
+      ackCatalog(oldAdapter);
+      oldAdapter._triggerObject(0n, {
+        kind: 'data',
+        trackAlias: catalogReqId,
+        groupId: varint(0),
+        subgroupId: varint(0),
+        objectId: varint(0),
+        payload: new TextEncoder().encode(CATALOG_JSON),
+      } as MoqtObject);
+      // load() itself consumed one createConnection + one createTransport.
+      const baseConnections = createConnection.mock.calls.length;
+      const baseTransports = createTransport.mock.calls.length;
+      return { player, oldAdapter, newAdapter, createConnection, createTransport, catalogReqId, baseConnections, baseTransports };
+    }
+
+    it('GOAWAY with a malformed (non-URL) URI creates no candidate and emits one degraded diagnostic', async () => {
+      const { player, oldAdapter, createConnection, createTransport, baseConnections, baseTransports } = await loadWithFactories();
+      const errors: any[] = [];
+      player.on('error', (e) => errors.push(e));
+
+      // Observed in the field: a relay putting its parser-error text in the field.
+      oldAdapter._triggerMessage({
+        type: 'GOAWAY',
+        newSessionUri: 'Protocol violation: Invalid parameter delta 0 after first parameter',
+      } as ControlMessage);
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(createConnection.mock.calls.length).toBe(baseConnections); // no candidate
+      expect(createTransport.mock.calls.length).toBe(baseTransports);
+      const migrationErrors = errors.filter((e) => e.error?.code === PlayerErrorCode.CONNECTION_LOST);
+      expect(migrationErrors).toHaveLength(1);
+      expect(migrationErrors[0].error.severity).toBe('degraded');
+      expect(migrationErrors[0].error.message).toMatch(/New Session URI/i);
+    });
+
+    it('GOAWAY with an unsupported scheme creates no candidate and does not reuse the current URL', async () => {
+      const { player, oldAdapter, createConnection, createTransport, baseConnections, baseTransports } = await loadWithFactories();
+      const errors: any[] = [];
+      player.on('error', (e) => errors.push(e));
+
+      oldAdapter._triggerMessage({
+        type: 'GOAWAY',
+        newSessionUri: 'http://insecure.example.com/moq', // WebTransport requires https
+      } as ControlMessage);
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(createConnection.mock.calls.length).toBe(baseConnections);
+      expect(createTransport.mock.calls.length).toBe(baseTransports); // no silent config.url fallback
+      const migrationErrors = errors.filter((e) => e.error?.code === PlayerErrorCode.CONNECTION_LOST);
+      expect(migrationErrors).toHaveLength(1);
+      expect(migrationErrors[0].error.message).toMatch(/scheme|https/i);
+    });
+
+    it.each(['https://new-relay.example.com/moq#fragment', 'https://new-relay.example.com/moq#'])(
+      'GOAWAY URI with a fragment (%s) creates no candidate — WebTransport rejects fragments', async (uri) => {
+        // W3C WebTransport constructor step: a URL whose fragment is non-null
+        // fails — including an empty trailing '#'. Validation must catch it
+        // BEFORE a candidate connection exists.
+        const { player, oldAdapter, createConnection, createTransport, baseConnections, baseTransports } = await loadWithFactories();
+        const errors: any[] = [];
+        player.on('error', (e) => errors.push(e));
+
+        oldAdapter._triggerMessage({ type: 'GOAWAY', newSessionUri: uri } as ControlMessage);
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(createConnection.mock.calls.length).toBe(baseConnections);
+        expect(createTransport.mock.calls.length).toBe(baseTransports);
+        const migrationErrors = errors.filter((e) => e.error?.code === PlayerErrorCode.CONNECTION_LOST);
+        expect(migrationErrors).toHaveLength(1);
+        expect(migrationErrors[0].error.message).toMatch(/fragment/i);
+      });
+
+    it('GOAWAY quarantine survives a rejected migration URI: late old-session catalog data stays inert', async () => {
+      const { player, oldAdapter, catalogReqId } = await loadWithFactories();
+      const updated = vi.fn();
+      player.on('catalog_updated', updated);
+
+      oldAdapter._triggerMessage({
+        type: 'GOAWAY',
+        newSessionUri: 'not a uri at all',
+      } as ControlMessage);
+      await new Promise((r) => setTimeout(r, 0));
+
+      // A parseable catalog object arriving on the GOAWAY'd session must not
+      // mutate catalog state — the rejected migration does not lift quarantine.
+      oldAdapter._triggerObject(1n, {
+        kind: 'data',
+        trackAlias: catalogReqId,
+        groupId: varint(1),
+        subgroupId: varint(0),
+        objectId: varint(0),
+        payload: new TextEncoder().encode(CATALOG_JSON),
+      } as MoqtObject);
+      expect(updated).not.toHaveBeenCalled();
+    });
+
+    it('a queued GOAWAY with an invalid URI is validated when processed (no candidate, one diagnostic)', async () => {
+      const { player, oldAdapter, newAdapter, createConnection, createTransport, baseConnections, baseTransports } = await loadWithFactories();
+      const errors: any[] = [];
+      player.on('error', (e) => errors.push(e));
+
+      // Hold the single-flight slot with a MANUAL migration whose candidate
+      // connect stays pending under our control. (A second GOAWAY from the
+      // same session would be a protocol violation — the queue is exercised
+      // with exactly ONE GOAWAY, from the still-current old session.)
+      let rejectConnect!: (err: Error) => void;
+      (newAdapter.connect as any).mockImplementationOnce(
+        () => new Promise((_res, rej) => { rejectConnect = rej; }),
+      );
+      const migratePromise = player.migrate(newAdapter as unknown as MoqtConnection);
+      await new Promise((r) => setTimeout(r, 0));
+
+      // The old session (still current until commit) sends its one GOAWAY,
+      // carrying garbage — it is queued, not acted on.
+      oldAdapter._triggerMessage({
+        type: 'GOAWAY',
+        newSessionUri: 'definitely not a webtransport url',
+      } as ControlMessage);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(createConnection.mock.calls.length).toBe(baseConnections); // nothing created for the GOAWAY
+
+      // The manual migration fails → the old session stays current → the
+      // queued GOAWAY is processed and must be REJECTED by validation.
+      rejectConnect(new Error('candidate connect failed'));
+      await expect(migratePromise).rejects.toThrow('candidate connect failed');
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(createConnection.mock.calls.length).toBe(baseConnections); // still no candidate for the garbage URI
+      // The manual migration consumed one transport; the rejected URI none.
+      expect(createTransport.mock.calls.length).toBe(baseTransports + 1);
+      const uriErrors = errors.filter(
+        (e) => e.error?.code === PlayerErrorCode.CONNECTION_LOST && /New Session URI/i.test(e.error.message),
+      );
+      expect(uriErrors).toHaveLength(1);
     });
   });
 
@@ -8170,6 +8338,7 @@ describe('MoqtPlayer', () => {
         namespace: 'live/broadcast',
         connection: adapter as unknown as MoqtConnection,
         createTransport: vi.fn(async () => ({}) as any),
+        catalogBootstrap: 'subscribe',
       });
 
       const loadPromise = player.load();
@@ -8210,6 +8379,7 @@ describe('MoqtPlayer', () => {
         namespace: 'live/broadcast',
         connection: adapter as unknown as MoqtConnection,
         createTransport: vi.fn(async () => ({}) as any),
+        catalogBootstrap: 'subscribe',
       });
 
       const loadPromise = player.load();
@@ -8246,6 +8416,7 @@ describe('MoqtPlayer', () => {
         namespace: 'live/broadcast',
         connection: adapter as unknown as MoqtConnection,
         createTransport: vi.fn(async () => ({}) as any),
+        catalogBootstrap: 'subscribe',
       });
 
       const loadPromise = player.load();
@@ -8348,6 +8519,7 @@ describe('MoqtPlayer', () => {
         namespace: 'live/broadcast',
         createTransport: vi.fn(async () => ({}) as any),
         createConnection: () => adapter as unknown as MoqtConnection,
+        catalogBootstrap: 'subscribe',
         clock: mockClock,
         qualitySwitchCooldownMs: 1,
         createVideoDecoder: () => decoder,
@@ -8959,6 +9131,7 @@ describe('MoqtPlayer', () => {
         namespace: 'live/broadcast',
         createTransport: vi.fn(async () => ({}) as any),
         createConnection: () => adapter as unknown as MoqtConnection,
+        catalogBootstrap: 'subscribe',
         createMediaSource: () => ms as any,
         createCmafAssembler: (opts: any) => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn() }),
         qualitySwitchCooldownMs: 1,
@@ -8998,6 +9171,7 @@ describe('MoqtPlayer', () => {
         namespace: 'live/broadcast',
         createTransport: vi.fn(async () => ({}) as any),
         createConnection: () => adapter as unknown as MoqtConnection,
+        catalogBootstrap: 'subscribe',
         createMediaSource: () => ms as any,
         createCmafAssembler: (opts: any) => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn() }),
         qualitySwitchCooldownMs: 1,
@@ -9043,6 +9217,7 @@ describe('MoqtPlayer', () => {
         namespace: 'live/broadcast',
         createTransport: vi.fn(async () => ({}) as any),
         createConnection: () => adapter as unknown as MoqtConnection,
+        catalogBootstrap: 'subscribe',
         createMediaSource: () => ms as any,
         createCmafAssembler: (opts: any) => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn() }),
         qualitySwitchCooldownMs: 1,
@@ -9114,6 +9289,7 @@ describe('MoqtPlayer', () => {
         namespace: 'live/broadcast',
         createTransport: vi.fn(async () => ({}) as any),
         createConnection: () => adapter as unknown as MoqtConnection,
+        catalogBootstrap: 'subscribe',
         createMediaSource: () => ms as any,
         createCmafAssembler: (opts: any) => ({ push: vi.fn(), setInitSegment: vi.fn(), destroy: vi.fn() }),
         qualitySwitchCooldownMs: 1,
@@ -9428,7 +9604,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-1: a buffered object replays with ITS OWN source draft, not the mutated manager default', async () => {
+  it('a buffered object replays with ITS OWN source draft, not the mutated manager default', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -9455,7 +9631,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-1: an OLD-session buffered object is NOT replayed into a reused-alias NEW-session track', async () => {
+  it('an OLD-session buffered object is NOT replayed into a reused-alias NEW-session track', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -9523,7 +9699,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-2: a malformed OLD-session object does not UNSUBSCRIBE on the NEW session', async () => {
+  it('a malformed OLD-session object does not UNSUBSCRIBE on the NEW session', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     let releaseClose: (() => void) | null = null;
@@ -9567,7 +9743,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-1: a SUBSCRIBE_OK and object arriving BEFORE subscribe() resolves are staged and drained', async () => {
+  it('a SUBSCRIBE_OK and object arriving BEFORE subscribe() resolves are staged and drained', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -9602,12 +9778,14 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     expect(firedDuringSubscribe).toBe(true);
     // The staged SUBSCRIBE_OK was drained after commit → catalog alias resolved.
     expect((player as unknown as { catalogTrackAlias: bigint | null }).catalogTrackAlias).toBe(50n);
-    // The staged object was drained under the new session → buffered for its alias.
-    expect((player as unknown as { pendingObjectsByAlias: Map<bigint, unknown[]> }).pendingObjectsByAlias.has(88n)).toBe(true);
+    // The staged object was drained under the NEW session — where no request
+    // is outstanding for it, so per request/generation ownership it is
+    // DROPPED (unownable), never routed through old-session state.
+    expect((player as unknown as { pendingObjectsByAlias: Map<bigint, unknown[]> }).pendingObjectsByAlias.has(88n)).toBe(false);
     await player.destroy();
   });
 
-  it('finding-2: an old-session close() rejection after commit does not fail the migration', async () => {
+  it('an old-session close() rejection after commit does not fail the migration', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     a1.close = vi.fn(async () => { throw new Error('old close failed'); });
@@ -9631,7 +9809,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-1: migration wires the candidate BEFORE connect() (handlers present when the loops start)', async () => {
+  it('migration wires the candidate BEFORE connect() (handlers present when the loops start)', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -9658,7 +9836,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-2: a catalog-subscribe failure during migrate() keeps the OLD session authoritative', async () => {
+  it('a catalog-subscribe failure during migrate() keeps the OLD session authoritative', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -9688,7 +9866,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-2: a catalog-subscribe failure during migrateToUrl() also keeps the OLD session authoritative', async () => {
+  it('a catalog-subscribe failure during migrateToUrl() also keeps the OLD session authoritative', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -9712,7 +9890,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-1: a FAILED migration connect leaves the OLD session authoritative', async () => {
+  it('a FAILED migration connect leaves the OLD session authoritative', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -9740,7 +9918,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-2: a superseded session closing/erroring remotely does not fail the current session', async () => {
+  it('a superseded session closing/erroring remotely does not fail the current session', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     let releaseClose: (() => void) | null = null;
@@ -9777,7 +9955,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-1: a stale old-session SUBSCRIBE_OK (via the real control path) does not mutate current state', async () => {
+  it('a stale old-session SUBSCRIBE_OK (via the real control path) does not mutate current state', async () => {
     // Driven through a1._triggerMessage → handleControlMessage, not the private
     // replay method — proving the superseded-session guard, not just replay.
     const a1 = createMockAdapter();
@@ -9809,7 +9987,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-2: a NORMAL migration reclaims the old-session buffer (no onClose fired)', async () => {
+  it('a NORMAL migration reclaims the old-session buffer (no onClose fired)', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -9836,7 +10014,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-2: closing a session reclaims its buffered objects (releases the adapter)', async () => {
+  it('closing a session reclaims its buffered objects (releases the adapter)', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -9856,7 +10034,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-2: the pending-alias map is bounded — excess distinct aliases are dropped', async () => {
+  it('the pending-alias map is bounded — excess distinct aliases are dropped', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -9864,7 +10042,21 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await resolveConnect(a1);
     await loadPromise;
 
+    // Resolve the catalog first (SUBSCRIBE_OK + first object) so the flood is
+    // MEDIA-owned pre-roll with no catalog transaction in flight — a flood
+    // during a pending catalog subscribe now fails the load closed instead
+    // (a dropped entry could be a load-bearing catalog delta).
+    a1._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n), parameters: new Map(),
+    } as unknown as ControlMessage);
+    a1._triggerObject(1n, {
+      kind: 'data', trackAlias: varint(1n), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+      extensions: new Uint8Array(0), payload: new TextEncoder().encode(CATALOG_JSON),
+    } as MoqtObject);
+    await new Promise((r) => setTimeout(r, 0));
+
     const pending = (player as unknown as { pendingObjectsByAlias: Map<bigint, unknown[]> }).pendingObjectsByAlias;
+    pending.clear();   // discard any pre-resolution buffering; measure the flood alone
     const CAP = 1024;
     // Emit one object per unique unknown alias, past the cap. Bare extensions —
     // buffered objects are not decoded until replay.

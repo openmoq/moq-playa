@@ -10,7 +10,7 @@
  * @see draft-ietf-moq-transport-16 §3, §9, §10
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MoqtConnection } from './adapter.js';
 import { MoqtConnectionError } from './adapter-error.js';
 import type { WebTransportLike } from './types.js';
@@ -96,6 +96,8 @@ interface MockTransport {
   closeControlReadable: () => void;
   /** All byte chunks written to the control stream writable. */
   controlWritten: Uint8Array[];
+  /** Make the NEXT control-stream write reject with the given error. */
+  failNextControlWrite: (err: Error) => void;
   /** Mock for transport.close(). */
   closeFn: ReturnType<typeof vi.fn>;
   /** Add an incoming unidirectional stream, returns push/close controls. */
@@ -120,8 +122,14 @@ function createMockTransport(): MockTransport {
     },
   });
 
+  let nextControlWriteError: Error | null = null;
   const controlWritable = new WritableStream<Uint8Array>({
     write(chunk) {
+      if (nextControlWriteError) {
+        const err = nextControlWriteError;
+        nextControlWriteError = null;
+        throw err;
+      }
       controlWritten.push(new Uint8Array(chunk));
     },
   });
@@ -239,6 +247,7 @@ function createMockTransport(): MockTransport {
     pushControlBytes,
     closeControlReadable,
     controlWritten,
+    failNextControlWrite: (err: Error) => { nextControlWriteError = err; },
     closeFn,
     addIncomingStream,
     pushDatagram,
@@ -3230,6 +3239,271 @@ describe('MoqtConnection draft-14', () => {
         expect(header.subgroupId).toBe(varint(0n));
       });
 
+      it('the fail-closed session close happens BEFORE the awaitable rollback (a hung rollback cannot keep it open)', async () => {
+        // rollbackFailedAcceptance awaits stream cancellation (for an inbound
+        // PUBLISH it resets the request stream). If that hangs, a session we
+        // already know is unrecoverable must not remain open waiting for it —
+        // so the close must be issued synchronously, before the rollback await.
+        const mock = createMockTransport();
+        const adapter = new MoqtConnection();
+        const connectPromise = adapter.connect(mock.transport, { maxRequestId: varint(100) });
+        await flush();
+        mock.pushControlBytes(encodeServerSetup());
+        await connectPromise;
+        mock.pushControlBytes(encodeControlMessage({
+          type: 'SUBSCRIBE',
+          requestId: varint(1n),
+          trackNamespace: [new TextEncoder().encode('live')],
+          trackName: new TextEncoder().encode('video'),
+          parameters: new Map(),
+        } as Subscribe));
+        await flush();
+
+        // Rollback hangs, and records the session state at the moment it starts.
+        let stateAtRollback: string | undefined;
+        (adapter as unknown as { rollbackFailedAcceptance: () => Promise<void> })
+          .rollbackFailedAcceptance = () => {
+            stateAtRollback = String(adapter.session.state).toLowerCase();
+            return new Promise<void>(() => { /* never settles */ });
+          };
+
+        mock.failNextControlWrite(new Error('control stream broken'));
+        const accepting = adapter.acceptSubscribe(varint(1n), varint(42n));
+        accepting.catch(() => { /* never settles while rollback hangs */ });
+        await deepFlush();
+
+        expect(stateAtRollback).toBeDefined();
+        expect(stateAtRollback).not.toBe('established'); // already closed
+      });
+
+      it('a draft-14/16 acceptance whose control write FAILS is fail-closed (rolled back + session closed)', async () => {
+        // The Session has already transitioned the subscription to ESTABLISHED
+        // and installed alias authority before the SUBSCRIBE_OK is written. If
+        // that write fails the peer never learned of the acceptance, and the
+        // control stream cannot carry a correction — so the acceptance must not
+        // be reported as success, and no ghost established subscription with
+        // live routing may survive.
+        const mock = createMockTransport();
+        const adapter = new MoqtConnection();
+        const connectPromise = adapter.connect(mock.transport, { maxRequestId: varint(100) });
+        await flush();
+        mock.pushControlBytes(encodeServerSetup());
+        await connectPromise;
+        mock.pushControlBytes(encodeControlMessage({
+          type: 'SUBSCRIBE',
+          requestId: varint(1n),
+          trackNamespace: [new TextEncoder().encode('live')],
+          trackName: new TextEncoder().encode('video'),
+          parameters: new Map(),
+        } as Subscribe));
+        await flush();
+
+        mock.failNextControlWrite(new Error('control stream broken'));
+        await expect(adapter.acceptSubscribe(varint(1n), varint(42n))).rejects.toThrow(/control stream broken/);
+        await deepFlush();
+
+        // Session torn down rather than left inconsistent with the peer.
+        expect(String(adapter.session.state).toLowerCase()).not.toBe('established');
+        // No surviving publisher authority for the alias: publishing rejects.
+        await expect(adapter.openSubgroup(varint(42n), varint(0n), varint(0n))).rejects.toThrow();
+      });
+
+      it('resetting streams for a request is BOUNDED even when abort() is deferred forever', async () => {
+        // Web Streams defer abort() behind an in-flight close(), so a hung FIN
+        // makes writer.abort() hang too. The reset pass must still return —
+        // reporting that the reset was NOT proven, so its caller can fail
+        // closed. (The protocol consequence — no PUBLISH_DONE, session
+        // terminated — is covered end to end in the d18 loopback suite.)
+        const mock = createMockTransport();
+        (mock.transport.createUnidirectionalStream as unknown as { mockImplementation: (f: () => Promise<WritableStream>) => void })
+          .mockImplementation(async () => new WritableStream<Uint8Array>({
+            write() { /* accept the header */ },
+            close() { return new Promise<void>(() => {}); },
+            abort() { return new Promise<void>(() => {}); },
+          }));
+        const adapter = await connectPublisherWithAlias(mock, 42n);
+        const streamId = await adapter.openSubgroup(varint(42n), varint(0n), varint(0n));
+        const hungFin = adapter.closeSubgroup(streamId);
+        hungFin.catch(() => { /* never settles */ });
+        await flush();
+
+        const internals = adapter as unknown as {
+          abortPublisherStreamsForRequest(requestId: bigint): Promise<boolean>;
+          outgoingStreams: Map<bigint, unknown>;
+          openSubgroupsByRequest: Map<bigint, Set<bigint>>;
+        };
+        const start = Date.now();
+        const allReset = await internals.abortPublisherStreamsForRequest(1n);
+        expect(Date.now() - start).toBeLessThan(4000);
+        // The reset could NOT be proven — the caller must not send PUBLISH_DONE.
+        expect(allReset).toBe(false);
+        // Ownership transfer still happened synchronously.
+        expect(internals.outgoingStreams.has(streamId)).toBe(false);
+        expect(internals.openSubgroupsByRequest.has(1n)).toBe(false);
+      }, 15_000);
+
+      it('a subgroup whose FIN is still IN FLIGHT keeps the §10.11 publishDone gate closed', async () => {
+        // A stream whose close() has not settled is not yet closed: its Stream
+        // Count is not final, so PUBLISH_DONE must still be refused.
+        const mock = createMockTransport();
+        let releaseClose!: () => void;
+        (mock.transport.createUnidirectionalStream as unknown as { mockImplementation: (f: () => Promise<WritableStream>) => void })
+          .mockImplementation(async () => new WritableStream<Uint8Array>({
+            write() { /* accept the header */ },
+            close() { return new Promise<void>((resolve) => { releaseClose = () => resolve(); }); },
+          }));
+        const adapter = await connectPublisherWithAlias(mock, 42n);
+        const streamId = await adapter.openSubgroup(varint(42n), varint(0n), varint(0n));
+
+        const closing = adapter.closeSubgroup(streamId);
+        await flush();
+        // FIN pending → still an open data stream for the subscription.
+        await expect(adapter.publishDone(varint(1n), varint(0x2n), 'ended'))
+          .rejects.toThrow(/open \+ .* in-flight data operation/);
+
+        releaseClose();
+        await closing;
+        // FIN settled → the gate opens.
+        await expect(adapter.publishDone(varint(1n), varint(0x2n), 'ended')).resolves.toBeUndefined();
+      });
+
+      it('a stream whose FIN hangs stays REACHABLE by terminal teardown until it settles', async () => {
+        // Teardown (clearTerminalState / abortPublisherStreamsForRequest) finds
+        // writers through outgoingStreams + openSubgroupsByRequest. If a closing
+        // stream were deregistered before its FIN settled, a hung writer would be
+        // invisible to teardown — unreachable and unreleasable.
+        //
+        // (Note: the Streams spec will not deliver abort() to a sink while its
+        // close() is in flight, so the transport close is what ultimately frees
+        // such a writer. What must hold here is that teardown can still SEE it.)
+        const mock = createMockTransport();
+        let releaseClose!: () => void;
+        (mock.transport.createUnidirectionalStream as unknown as { mockImplementation: (f: () => Promise<WritableStream>) => void })
+          .mockImplementation(async () => new WritableStream<Uint8Array>({
+            write() { /* accept the header */ },
+            close() { return new Promise<void>((resolve) => { releaseClose = () => resolve(); }); },
+          }));
+        const adapter = await connectPublisherWithAlias(mock, 42n);
+        const streamId = await adapter.openSubgroup(varint(42n), varint(0n), varint(0n));
+
+        const closing = adapter.closeSubgroup(streamId);
+        await flush();
+
+        const internals = adapter as unknown as {
+          outgoingStreams: Map<bigint, unknown>;
+          openSubgroupsByRequest: Map<bigint, Set<bigint>>;
+        };
+        expect(internals.outgoingStreams.has(streamId)).toBe(true);
+        expect(internals.openSubgroupsByRequest.get(1n)?.has(streamId)).toBe(true);
+
+        releaseClose();
+        await closing;
+        // Settled → both registries release it (no phantom open subgroup).
+        expect(internals.outgoingStreams.has(streamId)).toBe(false);
+        expect(internals.openSubgroupsByRequest.get(1n)?.has(streamId) ?? false).toBe(false);
+      });
+
+      it('sendObject is refused once a FIN has been initiated on the stream', async () => {
+        const mock = createMockTransport();
+        let releaseClose!: () => void;
+        (mock.transport.createUnidirectionalStream as unknown as { mockImplementation: (f: () => Promise<WritableStream>) => void })
+          .mockImplementation(async () => new WritableStream<Uint8Array>({
+            write() { /* accept */ },
+            close() { return new Promise<void>((resolve) => { releaseClose = () => resolve(); }); },
+          }));
+        const adapter = await connectPublisherWithAlias(mock, 42n);
+        const streamId = await adapter.openSubgroup(varint(42n), varint(0n), varint(0n));
+        const closing = adapter.closeSubgroup(streamId);
+        await flush();
+
+        await expect(adapter.sendObject(streamId, varint(0n), new Uint8Array([1])))
+          .rejects.toThrow(/closing/);
+
+        releaseClose();
+        await closing;
+      });
+
+      it('concurrent closeSubgroup callers SHARE the in-flight FIN: both stay pending, both see success', async () => {
+        const mock = createMockTransport();
+        let closeCalls = 0;
+        let releaseClose!: () => void;
+        (mock.transport.createUnidirectionalStream as unknown as { mockImplementation: (f: () => Promise<WritableStream>) => void })
+          .mockImplementation(async () => new WritableStream<Uint8Array>({
+            write() { /* accept */ },
+            close() { closeCalls++; return new Promise<void>((resolve) => { releaseClose = () => resolve(); }); },
+          }));
+        const adapter = await connectPublisherWithAlias(mock, 42n);
+        const streamId = await adapter.openSubgroup(varint(42n), varint(0n), varint(0n));
+
+        let firstDone = false;
+        let secondDone = false;
+        const first = adapter.closeSubgroup(streamId).then(() => { firstDone = true; });
+        await flush();
+        const second = adapter.closeSubgroup(streamId).then(() => { secondDone = true; });
+        await flush();
+
+        // The writer is closed ONCE, and neither caller may claim the group was
+        // delivered while its FIN is still pending.
+        expect(closeCalls).toBe(1);
+        expect(firstDone).toBe(false);
+        expect(secondDone).toBe(false);
+
+        releaseClose();
+        await Promise.all([first, second]);
+        expect(firstDone).toBe(true);
+        expect(secondDone).toBe(true);
+      });
+
+      it('concurrent closeSubgroup callers both observe a FIN FAILURE', async () => {
+        const mock = createMockTransport();
+        let rejectClose!: (e: Error) => void;
+        (mock.transport.createUnidirectionalStream as unknown as { mockImplementation: (f: () => Promise<WritableStream>) => void })
+          .mockImplementation(async () => new WritableStream<Uint8Array>({
+            write() { /* accept */ },
+            close() { return new Promise<void>((_res, rej) => { rejectClose = rej; }); },
+          }));
+        const adapter = await connectPublisherWithAlias(mock, 42n);
+        const streamId = await adapter.openSubgroup(varint(42n), varint(0n), varint(0n));
+
+        const first = adapter.closeSubgroup(streamId);
+        await flush();
+        const second = adapter.closeSubgroup(streamId);
+        const firstSettled = expect(first).rejects.toThrow(/FIN blew up/);
+        const secondSettled = expect(second).rejects.toThrow(/FIN blew up/);
+        rejectClose(new Error('FIN blew up'));
+        await Promise.all([firstSettled, secondSettled]);
+      });
+
+      it('closeSubgroup PROPAGATES a failed FIN and still releases the stream slot', async () => {
+        // A caller whose success criterion is "the group reached the peer" —
+        // catalog publication announcing readiness — must be able to observe a
+        // FIN that failed. Suppressing it lets the app report success for a
+        // group the receiver can only see as truncated.
+        const mock = createMockTransport();
+        (mock.transport.createUnidirectionalStream as unknown as { mockImplementation: (f: () => Promise<WritableStream>) => void })
+          .mockImplementation(async () => new WritableStream<Uint8Array>({
+            write() { /* accept the header */ },
+            close() { throw new Error('FIN failed: stream reset'); },
+          }));
+        const adapter = await connectPublisherWithAlias(mock, 42n);
+
+        const streamId = await adapter.openSubgroup(varint(42n), varint(0n), varint(0n));
+        await expect(adapter.closeSubgroup(streamId)).rejects.toThrow(/FIN failed/);
+
+        // The slot is released regardless, so a retry is a clean no-op rather
+        // than a second (also failing) close of a phantom stream.
+        await expect(adapter.closeSubgroup(streamId)).resolves.toBeUndefined();
+      });
+
+      it('closeSubgroup on an unknown/already-closed stream stays an idempotent no-op', async () => {
+        const mock = createMockTransport();
+        const adapter = await connectPublisherWithAlias(mock, 42n);
+        const streamId = await adapter.openSubgroup(varint(42n), varint(0n), varint(0n));
+        await expect(adapter.closeSubgroup(streamId)).resolves.toBeUndefined();
+        await expect(adapter.closeSubgroup(streamId)).resolves.toBeUndefined();
+        await expect(adapter.closeSubgroup(9999n)).resolves.toBeUndefined();
+      });
+
       it('sendObject writes encoded object bytes to the stream', async () => {
         const mock = createMockTransport();
         const adapter = await connectPublisherWithAlias(mock, 42n);
@@ -3476,5 +3750,508 @@ describe('MoqtConnection draft-14', () => {
         expect((message as any).requestId).toBeUndefined();
       });
     });
+  });
+});
+
+// ─── Pre-send request ownership (onRequestId) ────────────────────────
+//
+// A response can legally arrive before the caller's `await subscribe()`
+// continuation runs, so the caller must be able to register ownership BEFORE
+// any bytes are emitted. `onRequestId` is invoked synchronously between
+// request-ID allocation and wire emission, and is stripped before Session.
+
+describe('onRequestId — pre-send ownership', () => {
+  it('fires with the request ID BEFORE any bytes are emitted (subscribe)', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const before = mock.controlWritten.length;
+    let seenId: bigint | null = null;
+    let bytesAtCallback = -1;
+    const reqId = await adapter.subscribe(
+      [new TextEncoder().encode('live')], new TextEncoder().encode('catalog'),
+      { onRequestId: (id: bigint) => { seenId = id; bytesAtCallback = mock.controlWritten.length; } } as never,
+    );
+    expect(seenId).toBe(reqId);
+    expect(bytesAtCallback).toBe(before);            // nothing emitted yet at callback time
+    expect(mock.controlWritten.length).toBeGreaterThan(before); // emitted after
+  });
+
+  it('fires pre-emission for fetch() and joiningFetch()', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const ns = [new TextEncoder().encode('live')];
+    const name = new TextEncoder().encode('catalog');
+
+    let fetchId: bigint | null = null;
+    const fid = await adapter.fetch(ns, name, {
+      startGroup: varint(0n), startObject: varint(0n),
+      endGroup: varint(0n), endObject: varint(0n),
+      onRequestId: (id: bigint) => { fetchId = id; },
+    } as never);
+    expect(fetchId).toBe(fid);
+
+    const subId = await adapter.subscribe(ns, name, {
+      subscriptionFilter: { type: 'LargestObject' },
+    });
+    let joinId: bigint | null = null;
+    const jid = await adapter.joiningFetch({
+      joiningFetchType: 'relative', joiningRequestId: subId, joiningStart: 0n,
+      onRequestId: (id: bigint) => { joinId = id; },
+    } as never);
+    expect(joinId).toBe(jid);
+  });
+
+  it('a throwing callback rolls back the session request and emits nothing', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const before = mock.controlWritten.length;
+    await expect(adapter.subscribe(
+      [new TextEncoder().encode('live')], new TextEncoder().encode('catalog'),
+      { onRequestId: () => { throw new Error('owner registration failed'); } } as never,
+    )).rejects.toThrow('owner registration failed');
+    expect(mock.controlWritten.length).toBe(before);       // no bytes
+    // The rolled-back request ID is reusable state: a subsequent subscribe works
+    // and the session did not retain a phantom subscription.
+    const reqId = await adapter.subscribe(
+      [new TextEncoder().encode('live')], new TextEncoder().encode('catalog'));
+    expect(reqId).toBeDefined();
+  });
+
+  it('is never passed through to Session options', async () => {
+    // If the callback leaked into Session, parameter validation/encoding
+    // could observe an unknown field. Assert the encoded SUBSCRIBE decodes
+    // cleanly and the subscription is fully functional.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const before = mock.controlWritten.length;
+    await adapter.subscribe(
+      [new TextEncoder().encode('live')], new TextEncoder().encode('x'),
+      { onRequestId: () => { /* noop */ } } as never,
+    );
+    const { message } = decodeControlMessage(mock.controlWritten[before]!, 0);
+    expect(message.type).toBe('SUBSCRIBE');
+  });
+});
+
+describe('session rollbackRequest provenance (ambiguous send failure)', () => {
+  it('control-stream write failure closes the session (d14/16 fatality)', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    mock.failNextControlWrite(new Error('socket burst'));
+    await expect(adapter.subscribe(
+      [new TextEncoder().encode('live')], new TextEncoder().encode('catalog'),
+    )).rejects.toThrow();
+    // A broken MOQT control stream is unrecoverable: the session must be closed
+    // so "the failed transport cannot deliver a response" holds by construction.
+    expect(adapter.session.state).not.toBe(SessionState.ESTABLISHED);
+  });
+});
+
+// ─── Terminal drain (terminalDelivery: 'drain') ──────────────────────
+//
+// PUBLISH_DONE is not a delivery barrier: it will likely precede late objects
+// or even late-opening streams (§9.15/§10.11 retention guidance). An opted
+// subscription keeps its routing alive for the effective delivery timeout and
+// only then reports `onDrained` — so a one-shot catalog's final delta arriving
+// after DONE is delivered, not discarded.
+
+describe('parked-join settlement is draft-aware', () => {
+  /** White-box: park a join, stub the session view, settle as accepted. */
+  async function settleWithForwardZero(draft: 14 | 16 | 18): Promise<{ surfaced: bigint[]; rejected: bigint[] }> {
+    const adapter = new MoqtConnection(draft);
+    const surfaced: bigint[] = [];
+    adapter.onFetch = (rid) => { surfaced.push(rid); };
+    const rejected: bigint[] = [];
+    const internals = adapter as unknown as {
+      session: { getIncomingSubscription(id: bigint): unknown };
+      pendingJoinFetches: Map<bigint, Array<{ requestId: bigint; fetch: unknown; timer: ReturnType<typeof setTimeout> }>>;
+      settleParkedJoins(subRequestId: bigint, accepted: boolean): Promise<void>;
+      rejectFetch(requestId: bigint, code: bigint, reason: string): Promise<void>;
+    };
+    internals.rejectFetch = async (rid: bigint) => { rejected.push(rid); };
+    // The joined subscription established with Forward State 0 (paused).
+    vi.spyOn(internals.session as never, 'getIncomingSubscription' as never)
+      .mockReturnValue({ forwardState: 0 } as never);   // ForwardState.PAUSED
+    internals.pendingJoinFetches.set(1n, [{
+      requestId: 5n, fetch: { requestId: varint(5n) },
+      timer: setTimeout(() => { /* never */ }, 60_000),
+    }]);
+    await internals.settleParkedJoins(1n, true);
+    return { surfaced, rejected };
+  }
+
+  it('d16: a Forward-0 subscription RELEASES its parked join at accept — no Forward gate outside draft 18 (§9.16.2)', async () => {
+    const { surfaced, rejected } = await settleWithForwardZero(16);
+    expect(surfaced).toContain(5n);
+    expect(rejected).toEqual([]);
+  });
+
+  it('d18: the Forward-0 gate applies at establish (§10.12.2) — the parked join is rejected', async () => {
+    const { surfaced, rejected } = await settleWithForwardZero(18);
+    expect(surfaced).toEqual([]);
+    expect(rejected).toContain(5n);
+  });
+});
+
+describe('terminal drain (terminalDelivery)', () => {
+  const enc = (s: string) => new TextEncoder().encode(s);
+  const codec16 = () => createControlCodec(16);
+  /** deepFlush that works under fake timers (advances the 0-ms flush timers). */
+  const tflush = async () => { for (let i = 0; i < 4; i++) await vi.advanceTimersByTimeAsync(1); };
+  afterEach(() => { vi.useRealTimers(); });
+
+  /** Subscribe with drain, deliver SUBSCRIBE_OK for `alias`, return reqId. */
+  async function drainSubscribe(
+    mock: ReturnType<typeof createMockTransport>,
+    adapter: MoqtConnection,
+    alias: bigint,
+    onDrained: (id: bigint) => void,
+    extra?: object,
+  ): Promise<bigint> {
+    const reqId = await adapter.subscribe([enc('live')], enc('catalog'), {
+      subscriptionFilter: { type: 'LargestObject' },
+      terminalDelivery: 'drain', onDrained, ...(extra ?? {}),
+    } as never);
+    mock.pushControlBytes(codec16().encode({
+      type: 'SUBSCRIBE_OK', requestId: reqId, trackAlias: varint(alias),
+      parameters: new Map(), trackExtensions: [],
+    } as ControlMessage));
+    await tflush();
+    return reqId;
+  }
+
+  function pushDone(mock: ReturnType<typeof createMockTransport>, reqId: bigint, streamCount: bigint): void {
+    mock.pushControlBytes(codec16().encode({
+      type: 'PUBLISH_DONE', requestId: reqId, statusCode: varint(0x0n),
+      streamCount: varint(streamCount), errorReason: 'done',
+    } as ControlMessage));
+  }
+
+  /** Push one subgroup stream carrying a single object on `alias`. */
+  function pushSubgroupObject(mock: ReturnType<typeof createMockTransport>, alias: bigint, groupId: bigint, objectId: bigint, payload: Uint8Array): void {
+    const header = makeSubgroupHeader({ trackAlias: varint(alias), groupId: varint(groupId) });
+    const obj = makeSubgroupObject({ objectId: varint(objectId), payload });
+    const stream = mock.addIncomingStream();
+    stream.push(concat(encodeSubgroupHeader(header), encodeSubgroupObject(obj, header.hasExtensions, varint(0), true)));
+    stream.close();
+  }
+
+  it('an ordinary REQUEST_ERROR reclaims the drain opt-in (no session-lifetime leak)', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const errors: unknown[] = [];
+    adapter.onError = (e) => errors.push(e);
+    const subPromise = adapter.subscribe([enc('live')], enc('catalog'), {
+      subscriptionFilter: { type: 'LargestObject' },
+      terminalDelivery: 'drain', onDrained: () => { /* never */ },
+    } as never).catch(() => 0n);
+    await deepFlush();
+    const internals = adapter as unknown as { drainConfigs: Map<bigint, unknown> };
+    expect(internals.drainConfigs.size).toBe(1);
+    const reqId = [...internals.drainConfigs.keys()][0]!;
+    // A normal refusal — the request can never PUBLISH_DONE, so the entry
+    // must not persist for the session.
+    mock.pushControlBytes(codec16().encode({
+      type: 'REQUEST_ERROR', requestId: varint(reqId), errorCode: varint(0x1n),
+      retryInterval: varint(0n), errorReason: 'unauthorized',
+    } as ControlMessage));
+    await deepFlush();
+    expect(internals.drainConfigs.size).toBe(0);
+    await subPromise;
+    expect(errors.length).toBeGreaterThanOrEqual(0);
+  });
+
+  it('21h/21i3a: late stream delivered during drain; onDrained once at timeout; post-drain same-alias stream PASSES THROUGH for alias reuse', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    vi.useFakeTimers();
+    try {
+      const objects: bigint[] = [];
+      const drained: bigint[] = [];
+      adapter.onObject = (_sid, obj) => { if (obj.kind === 'data') objects.push(obj.objectId); };
+      const reqId = await drainSubscribe(mock, adapter, 42n, (id) => drained.push(id));
+
+      pushDone(mock, reqId, 1n);           // DONE first…
+      await tflush();
+      pushSubgroupObject(mock, 42n, 0n, 5n, enc('late-delta'));  // …then the already-sent stream
+      await tflush();
+      expect(objects).toEqual([5n]);        // delivered, not discarded
+      expect(drained).toEqual([]);          // not drained yet
+
+      await vi.advanceTimersByTimeAsync(10_001); // default effective timeout (TTL floor 10 s)
+      await tflush();
+      expect(drained).toEqual([reqId]);     // exactly once, with identity
+
+      // 21i3a: after the drain the alias is FREE — a same-alias stream may be
+      // the REUSED alias's first data racing its SUBSCRIBE_OK. The adapter
+      // passes it through to the application (which parks/binds it); silently
+      // discarding here would lose the new subscription's first objects.
+      pushSubgroupObject(mock, 42n, 0n, 6n, enc('reused-alias-first-data'));
+      await tflush();
+      expect(objects).toEqual([5n, 6n]);    // delivered, application decides
+      await vi.runOnlyPendingTimersAsync();
+      expect(drained).toEqual([reqId]);     // still exactly once
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('21h2: Stream Count limits acceptance but never completes the drain early', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    vi.useFakeTimers();
+    try {
+      const objects: bigint[] = [];
+      const drained: bigint[] = [];
+      adapter.onObject = (_sid, obj) => { if (obj.kind === 'data') objects.push(obj.objectId); };
+      const reqId = await drainSubscribe(mock, adapter, 42n, (id) => drained.push(id));
+
+      pushDone(mock, reqId, 1n);            // exactly ONE late stream announced
+      await tflush();
+      pushSubgroupObject(mock, 42n, 0n, 1n, enc('announced'));
+      await tflush();
+      expect(objects).toEqual([1n]);
+      expect(drained).toEqual([]);          // Nth stream done ≠ drain complete
+      pushSubgroupObject(mock, 42n, 0n, 2n, enc('beyond-count'));
+      await tflush();
+      expect(objects).toEqual([1n]);        // (N+1)th not accepted
+
+      await vi.advanceTimersByTimeAsync(10_001);
+      await tflush();
+      expect(drained).toEqual([reqId]);     // completion is timeout-only
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('21h7: an overstated Stream Count completes at the timeout', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    vi.useFakeTimers();
+    try {
+      const drained: bigint[] = [];
+      const reqId = await drainSubscribe(mock, adapter, 42n, (id) => drained.push(id));
+      pushDone(mock, reqId, 5n);            // announces 5; nothing ever arrives
+      await tflush();
+      await vi.advanceTimersByTimeAsync(10_001);
+      await tflush();
+      expect(drained).toEqual([reqId]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('21h8: drain window = max(terminatedAliasTtlMs, effective delivery timeout)', async () => {
+    // Absent effective timeout → the TTL floor (10 s) applies (proven by 21h/21h9
+    // timing). Here: a LONGER effective delivery timeout extends the window, and a
+    // SHORTER one does not shrink it below the floor.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    vi.useFakeTimers();
+    try {
+      const drained: bigint[] = [];
+      const reqId = await drainSubscribe(mock, adapter, 42n, (id) => drained.push(id));
+      // Longer-than-floor: effective per-alias delivery timeout of 20 s.
+      (adapter as unknown as { aliasDeliveryTimeoutMs: Map<bigint, number> })
+        .aliasDeliveryTimeoutMs.set(42n, 20_000);
+      pushDone(mock, reqId, 0n);
+      await tflush();
+      await vi.advanceTimersByTimeAsync(10_001);
+      await tflush();
+      expect(drained).toEqual([]);          // floor alone is not enough
+      await vi.advanceTimersByTimeAsync(10_001);
+      await tflush();
+      expect(drained).toEqual([reqId]);     // 20 s effective timeout wins
+    } finally { vi.useRealTimers(); }
+
+    // Shorter-than-floor: 1 s effective timeout must NOT shrink the window.
+    const mock2 = createMockTransport();
+    const adapter2 = await connectAdapter(mock2);
+    vi.useFakeTimers();
+    try {
+      const drained2: bigint[] = [];
+      const req2 = await drainSubscribe(mock2, adapter2, 43n, (id) => drained2.push(id));
+      (adapter2 as unknown as { aliasDeliveryTimeoutMs: Map<bigint, number> })
+        .aliasDeliveryTimeoutMs.set(43n, 1_000);
+      pushDone(mock2, req2, 0n);
+      await tflush();
+      await vi.advanceTimersByTimeAsync(1_100);
+      await tflush();
+      expect(drained2).toEqual([]);         // below the floor does not shorten
+      await vi.advanceTimersByTimeAsync(9_001);
+      await tflush();
+      expect(drained2).toEqual([req2]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('21h9: PUBLISH_DONE is observed by the application before onDrained', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      adapter.onMessage = (m) => { if (m.type === 'PUBLISH_DONE') order.push('done'); };
+      const reqId = await drainSubscribe(mock, adapter, 42n, () => order.push('drained'));
+      pushDone(mock, reqId, 0n);            // zero announced — still no early completion
+      await tflush();
+      await vi.advanceTimersByTimeAsync(10_001);
+      await tflush();
+      expect(order).toEqual(['done', 'drained']);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('21h11: a late datagram delivers during the drain window', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    vi.useFakeTimers();
+    try {
+      const datagrams: bigint[] = [];
+      const drained: bigint[] = [];
+      adapter.onDatagram = (d) => datagrams.push(d.objectId as bigint);
+      const reqId = await drainSubscribe(mock, adapter, 42n, (id) => drained.push(id));
+      pushDone(mock, reqId, 0n);            // datagram-only delivery legitimately reports 0
+      await tflush();
+      mock.pushDatagram(encodeObjectDatagram({
+        typeByte: 0x00, trackAlias: varint(42n), groupId: varint(0n), objectId: varint(7n),
+        publisherPriority: 200, isEndOfGroup: false, extensions: undefined,
+        payload: enc('dg'), status: undefined,
+      }));
+      await tflush();
+      expect(datagrams).toEqual([7n]);      // delivered before onDrained
+      expect(drained).toEqual([]);
+      await vi.advanceTimersByTimeAsync(10_001);
+      await tflush();
+      expect(drained).toEqual([reqId]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('4b: onDrained without terminalDelivery throws before allocation or emission', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const before = mock.controlWritten.length;
+    await expect(adapter.subscribe([enc('live')], enc('catalog'), {
+      onDrained: () => { /* invalid without the opt-in */ },
+    } as never)).rejects.toThrow(/terminalDelivery/);
+    expect(mock.controlWritten.length).toBe(before);  // nothing emitted
+    // The next request ID is unaffected (nothing was allocated).
+    const reqId = await adapter.subscribe([enc('live')], enc('catalog'));
+    expect(reqId).toBe(0n);
+  });
+
+  it('4b2: terminalDelivery without onDrained is valid (drain runs unobserved)', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const reqId = await adapter.subscribe([enc('live')], enc('catalog'), {
+      terminalDelivery: 'drain',
+    } as never);
+    expect(reqId).toBeDefined();
+  });
+});
+
+describe('terminal drain — review findings (alias reuse, completion race, shutdown)', () => {
+  const enc2 = (s: string) => new TextEncoder().encode(s);
+  const tflush2 = async () => { for (let i = 0; i < 4; i++) await vi.advanceTimersByTimeAsync(1); };
+  afterEach(() => { vi.useRealTimers(); });
+
+  async function drainSetup() {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    vi.useFakeTimers();
+    const drained: bigint[] = [];
+    const reqId = await adapter.subscribe([enc2('live')], enc2('catalog'), {
+      subscriptionFilter: { type: 'LargestObject' },
+      terminalDelivery: 'drain', onDrained: (id: bigint) => drained.push(id),
+    } as never);
+    mock.pushControlBytes(createControlCodec(16).encode({
+      type: 'SUBSCRIBE_OK', requestId: reqId, trackAlias: varint(42n),
+      parameters: new Map(), trackExtensions: [],
+    } as ControlMessage));
+    await tflush2();
+    return { mock, adapter, drained, reqId };
+  }
+
+  function pushDone2(mock: ReturnType<typeof createMockTransport>, reqId: bigint, count: bigint): void {
+    mock.pushControlBytes(createControlCodec(16).encode({
+      type: 'PUBLISH_DONE', requestId: reqId, statusCode: varint(0x0n),
+      streamCount: varint(count), errorReason: 'done',
+    } as ControlMessage));
+  }
+
+  it('the alias is REUSABLE immediately after onDrained (drain completion IS the guard boundary)', async () => {
+    const { mock, adapter, drained, reqId } = await drainSetup();
+    pushDone2(mock, reqId, 0n);
+    await tflush2();
+    const internals = adapter as unknown as { aliasReuseSafe(a: bigint): boolean };
+    expect(internals.aliasReuseSafe(42n)).toBe(false);   // blocked during the drain
+    await vi.advanceTimersByTimeAsync(10_001);
+    await tflush2();
+    expect(drained).toEqual([reqId]);
+    expect(internals.aliasReuseSafe(42n)).toBe(true);    // reusable at completion
+  });
+
+  it('a stream arriving DURING the completion sweep is discarded, not delivered', async () => {
+    const { mock, adapter, drained, reqId } = await drainSetup();
+    const objects: bigint[] = [];
+    adapter.onObject = (_sid, obj) => { if (obj.kind === 'data') objects.push(obj.objectId); };
+    pushDone2(mock, reqId, 0n);
+    await tflush2();
+    // Hold a stream open so the sweep has something to await…
+    const held = mock.addIncomingStream();
+    held.push(encodeSubgroupHeader(makeSubgroupHeader({ trackAlias: varint(42n), groupId: varint(0n) })));
+    await tflush2();
+    // …fire the timeout; while cleanup awaits, a NEW stream arrives.
+    const advance = vi.advanceTimersByTimeAsync(10_001);
+    const late = mock.addIncomingStream();
+    late.push(concat(
+      encodeSubgroupHeader(makeSubgroupHeader({ trackAlias: varint(42n), groupId: varint(1n) })),
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(9n), payload: enc2('escapee') }), false, varint(0), true),
+    ));
+    late.close();
+    await advance;
+    await tflush2();
+    expect(drained).toEqual([reqId]);
+    expect(objects).not.toContain(9n);                   // no escape through the sweep window
+  });
+
+  it('terminal shutdown cancels drain timers and a throwing onDrained cannot reject unhandled', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    vi.useFakeTimers();
+    const reqId = await adapter.subscribe([enc2('live')], enc2('catalog'), {
+      subscriptionFilter: { type: 'LargestObject' },
+      terminalDelivery: 'drain', onDrained: () => { throw new Error('consumer exploded'); },
+    } as never);
+    mock.pushControlBytes(createControlCodec(16).encode({
+      type: 'SUBSCRIBE_OK', requestId: reqId, trackAlias: varint(43n),
+      parameters: new Map(), trackExtensions: [],
+    } as ControlMessage));
+    await tflush2();
+    mock.pushControlBytes(createControlCodec(16).encode({
+      type: 'PUBLISH_DONE', requestId: reqId, statusCode: varint(0x0n),
+      streamCount: varint(0n), errorReason: 'done',
+    } as ControlMessage));
+    await tflush2();
+    // Session closes mid-drain: the timer must be cancelled with the rest of
+    // the terminal state (no callbacks after closure).
+    const internals = adapter as unknown as {
+      clearTerminalState(): void;
+      drainingAliases: Map<bigint, unknown>; drainConfigs: Map<bigint, unknown>;
+    };
+    internals.clearTerminalState();
+    expect(internals.drainingAliases.size).toBe(0);
+    expect(internals.drainConfigs.size).toBe(0);
+    await vi.advanceTimersByTimeAsync(20_001);           // nothing fires
+
+    // And a THROWING onDrained on a live drain is contained (no unhandled).
+    const reqId2 = await adapter.subscribe([enc2('live')], enc2('catalog2'), {
+      subscriptionFilter: { type: 'LargestObject' },
+      terminalDelivery: 'drain', onDrained: () => { throw new Error('boom'); },
+    } as never);
+    mock.pushControlBytes(createControlCodec(16).encode({
+      type: 'SUBSCRIBE_OK', requestId: reqId2, trackAlias: varint(44n),
+      parameters: new Map(), trackExtensions: [],
+    } as ControlMessage));
+    await tflush2();
+    mock.pushControlBytes(createControlCodec(16).encode({
+      type: 'PUBLISH_DONE', requestId: reqId2, statusCode: varint(0x0n),
+      streamCount: varint(0n), errorReason: 'done',
+    } as ControlMessage));
+    await tflush2();
+    await vi.advanceTimersByTimeAsync(10_001);
+    await tflush2();                                     // would surface unhandled rejection if not contained
   });
 });

@@ -49,6 +49,13 @@ export const authority: string | undefined = (() => {
 /** `?warmStart=1`: joining-FETCH warm start of the current group (live LOC tracks). */
 export const warmStart: boolean = params.get('warmStart') === '1';
 
+/** Catalog retrieval mode override (?catalogBootstrap=auto|joining-fetch|strict|subscribe).
+ *  For manual relay verification of the MSF-01 §5 bootstrap; unset = player default. */
+export const catalogBootstrap: 'auto' | 'joining-fetch' | 'strict' | 'subscribe' | undefined = (() => {
+  const v = params.get('catalogBootstrap');
+  return v === 'auto' || v === 'joining-fetch' || v === 'strict' || v === 'subscribe' ? v : undefined;
+})();
+
 /** Draft version override (e.g. ?v=14 for draft-14 relays, ?v=18 for draft-18). */
 export const draftVersion: 14 | 16 | 18 | undefined = (() => {
   const v = params.get('v');

@@ -52,6 +52,19 @@ export class CatalogManager {
     /** Raw document for cf01 JSON Patch base. */
     private lastRawDocument: Record<string, unknown> | null = null;
 
+    /** Exact locations already applied via {@link processCatalogObjectAt}.
+     *  Pruned only via {@link pruneLocationsBefore} — never by age: an evicted
+     *  location would let a replayed CF-01 patch re-apply positionally and
+     *  corrupt the document. Fail-closed capacity — see processCatalogObjectAt. */
+    private readonly appliedLocations = new Set<string>();
+    private static readonly MAX_APPLIED_LOCATIONS = 65_536;
+
+    /** Highest group with an applied object (location-aware path only). */
+    private _latestGroup: bigint | null = null;
+
+    /** Last applied location (location-aware path only). */
+    private _lastApplied: { group: bigint; object: bigint } | null = null;
+
     constructor(catalogNamespace: string) {
         this.catalogNamespace = catalogNamespace;
     }
@@ -64,6 +77,110 @@ export class CatalogManager {
     /** Number of catalog objects processed. */
     get objectCount(): number {
         return this._objectCount;
+    }
+
+    /** Highest group with an applied object (location-aware path only). */
+    get latestGroup(): bigint | null {
+        return this._latestGroup;
+    }
+
+    /** Last applied location (location-aware path only). */
+    get lastApplied(): { group: bigint; object: bigint } | null {
+        return this._lastApplied;
+    }
+
+    /**
+     * Full reset: materialized state, cf01 patch context, location dedup and
+     * trackers, object count. Used per bootstrap generation (and on migration)
+     * so a later session can never apply a delta against a stale base — the
+     * cf01 JSON Patch path in particular is stateful over `lastRawDocument`
+     * and silently corrupts if replayed against pre-reset state.
+     */
+    reset(): void {
+        this.state = null;
+        this._objectCount = 0;
+        this.cf01DeltaSupport = false;
+        this.lastRawDocument = null;
+        this.appliedLocations.clear();
+        this._latestGroup = null;
+        this._lastApplied = null;
+    }
+
+    /**
+     * Location-aware apply with EXACT-LOCATION dedup — and nothing more.
+     *
+     * A duplicate `(group, object)` is a no-op (`'duplicate'`), never a throw:
+     * with a fetch prefix and a live suffix converging, the same object can
+     * legally be seen twice, and a replayed delta must not be misread as a
+     * conflict (nor a cf01 patch re-applied, which corrupts positionally).
+     *
+     * Deliberately profile-neutral: ordering, group-head rules and the MSF
+     * latest-group rule are the CatalogBootstrap coordinator's responsibility —
+     * imposing MSF grouping here would break CF-01, whose patches may cross
+     * group boundaries.
+     *
+     * @throws Only on parse/apply errors of an object it accepted.
+     */
+    processCatalogObjectAt(
+        location: { group: bigint; object: bigint },
+        payload: Uint8Array,
+        opts?: { pruneBeforeOnSuccess?: bigint },
+    ): { outcome: 'applied'; state: CatalogState } | { outcome: 'duplicate' } {
+        const key = `${location.group}:${location.object}`;
+        if (this.appliedLocations.has(key)) return { outcome: 'duplicate' };
+        // FAIL-CLOSED capacity: duplicate knowledge cannot be evicted by age
+        // (a forgotten location would let a replayed CF-01 patch re-apply
+        // positionally), so at capacity the manager REFUSES new applications.
+        // The one path through is an independent head carrying
+        // `pruneBeforeOnSuccess`: its prune frees capacity — but ONLY after
+        // the head has successfully applied (a failed replacement must leave
+        // the old catalog's replay protection fully intact).
+        if (this.appliedLocations.size >= CatalogManager.MAX_APPLIED_LOCATIONS) {
+            // An independent head passes ONLY if its prune would actually
+            // restore capacity — checked BEFORE applying (transactional):
+            // repeated same-group heads must not creep the set past the cap.
+            const freed = opts?.pruneBeforeOnSuccess !== undefined
+                ? this.countLocationsBefore(opts.pruneBeforeOnSuccess) : 0;
+            if (this.appliedLocations.size - freed >= CatalogManager.MAX_APPLIED_LOCATIONS) {
+                throw new Error('catalog location-dedup capacity exhausted — refusing updates until a fresh independent base');
+            }
+        }
+        const state = this.processCatalogObject(payload);
+        if (opts?.pruneBeforeOnSuccess !== undefined) {
+            this.pruneLocationsBefore(opts.pruneBeforeOnSuccess);
+        }
+        this.appliedLocations.add(key);
+        if (this._latestGroup === null || location.group > this._latestGroup) {
+            this._latestGroup = location.group;
+        }
+        this._lastApplied = { group: location.group, object: location.object };
+        return { outcome: 'applied', state };
+    }
+
+    /**
+     * Prune dedup entries for locations with `group < beforeGroup`.
+     *
+     * Called by the coordinator ONLY when those locations are provably
+     * obsolete — an MSF independent head at `beforeGroup` applied, so every
+     * older group is dropped upstream by the latest-group rule and a replay
+     * can never reach {@link processCatalogObjectAt}. This is what bounds the
+     * dedup set over a session's lifetime without risking positional
+     * re-application (CF-01 bases never prune).
+     */
+    /** How many dedup entries {@link pruneLocationsBefore} would remove. */
+    private countLocationsBefore(beforeGroup: bigint): number {
+        let n = 0;
+        for (const key of this.appliedLocations) {
+            if (BigInt(key.slice(0, key.indexOf(':'))) < beforeGroup) n += 1;
+        }
+        return n;
+    }
+
+    pruneLocationsBefore(beforeGroup: bigint): void {
+        for (const key of this.appliedLocations) {
+            const group = BigInt(key.slice(0, key.indexOf(':')));
+            if (group < beforeGroup) this.appliedLocations.delete(key);
+        }
     }
 
     /**

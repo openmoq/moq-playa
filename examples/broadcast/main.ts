@@ -14,10 +14,11 @@
  */
 
 import { MoqtConnection } from '@moqt/webtransport';
-import { varint, SubgroupIdMode, PublishDoneCode } from '@moqt/transport';
-import { encodeLocHeaders } from '@moqt/loc';
-import { buildCatalog } from '@moqt/msf';
-import type { Varint } from '@moqt/transport';
+import { varint } from '@moqt/transport';
+import { BroadcastSession } from './broadcast-session.js';
+import type { BroadcastSessionConnection } from './broadcast-session.js';
+import { BroadcastAttempt } from './broadcast-attempt.js';
+import type { AttemptResources } from './broadcast-attempt.js';
 import { log } from '../shared/log.js';
 import { relayUrl, namespace, certHash, draftVersion } from '../shared/cert.js';
 import {
@@ -101,23 +102,15 @@ const startCameraBtn = document.getElementById('start-camera') as HTMLButtonElem
 const startScreenBtn = document.getElementById('start-screen') as HTMLButtonElement;
 const stopBtn = document.getElementById('stop') as HTMLButtonElement;
 
-let connection: MoqtConnection | null = null;
-let capture: MediaCapture | null = null;
-let videoEncoder: WebCodecsVideoEncoder | null = null;
-let audioEncoder: WebCodecsAudioEncoder | null = null;
-
-// MoQ state
-let videoGroupId = BigInt(Date.now());
-let videoObjectId = 0n;
-let audioGroupId = BigInt(Date.now()) + 1_000_000n; // offset to avoid collision
-let videoStreamId: bigint | null = null;
-let videoTrackAlias = 0n;
-let audioTrackAlias = 0n;
-let nextAlias = 1n;
-let audioSampleRate = 48000;
-let audioChannels = 1;
-let frameCount = 0;
-let audioChunkCount = 0;
+// MoQ state. Everything a broadcast touches — capture, encoders, connection,
+// media publisher, alias allocator, audio settings — is owned by the
+// per-broadcast startup TRANSACTION (BroadcastAttempt) and its
+// BroadcastSession. There are no mutable resource globals: stopping attempt
+// A and starting attempt B lets A's late continuations clean up only A's
+// own resources, never B's — and lifecycle callbacks are identity-guarded
+// in the session, so a delayed old-session onClose/onSubscribe cannot stop
+// or mutate a replacement.
+let currentAttempt: BroadcastAttempt | null = null;
 
 // ─── Share modal ─────────────────────────────────────────────────────
 
@@ -153,326 +146,250 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   stopBtn.disabled = false;
   statusEl.textContent = 'Connecting...';
 
-  try {
-    // 1. Start capture
-    capture = new MediaCapture();
-    const stream = source === 'camera'
-      ? await capture.startCamera({ width: 1280, height: 720, frameRate: 30 })
-      : await capture.startScreen({ video: true, audio: false });
+  // Attempt-local state threaded between steps (never module globals).
+  let capture: MediaCapture | null = null;
+  let videoEncoder: WebCodecsVideoEncoder | null = null;
+  let audioEncoder: WebCodecsAudioEncoder | null = null;
+  let connection: MoqtConnection | null = null;
+  let audio: { sampleRate: number; channels: number } | undefined;
+  let width = 1280;
+  let height = 720;
+  let fps = 30;
 
-    preview.srcObject = stream;
-    log(`Capture started: ${source}`);
+  const attempt: BroadcastAttempt = new BroadcastAttempt({
+    // 1. Start capture — audio settings are ATTEMPT-LOCAL, derived from the
+    // actual tracks (a screen capture without audio yields none).
+    startCapture: async (ctx: AttemptResources) => {
+      // Adopted BEFORE the start resolves: a rejected getUserMedia (or a
+      // cancellation mid-prompt) must still stop the handle.
+      const cap = ctx.adopt(new MediaCapture(), (c) => { c.stop(); });
+      // Capture retires SYNCHRONOUSLY when Stop is pressed — camera/mic tracks
+      // are released immediately, not after the session's bounded shutdown.
+      ctx.onCancel(() => { try { cap.stop(); } catch { /* not started */ } });
+      capture = cap;
+      const stream = source === 'camera'
+        ? await cap.startCamera({ width: 1280, height: 720, frameRate: 30 })
+        : await cap.startScreen({ video: true, audio: false });
+      // The tracks only become real HERE — MediaCapture.stop() before this
+      // point cannot stop a stream it does not yet hold. Re-adopt the ACQUIRED
+      // capture so a permission prompt that resolved AFTER Stop still has its
+      // camera released (the adoption disposes immediately when cancelled).
+      ctx.adopt(cap, (c) => { c.stop(); });
+      ctx.throwIfCancelled();
+      preview.srcObject = stream;
+      log(`Capture started: ${source}`);
 
-    const settings = capture.videoSettings;
-    const width = settings?.width ?? 1280;
-    const height = settings?.height ?? 720;
-    const fps = settings?.frameRate ?? 30;
-    log(`Video: ${width}x${height} @ ${fps}fps`);
+      const settings = cap.videoSettings;
+      width = settings?.width ?? 1280;
+      height = settings?.height ?? 720;
+      fps = settings?.frameRate ?? 30;
+      log(`Video: ${width}x${height} @ ${fps}fps`);
+
+      const audioTrack = stream.getAudioTracks()[0];
+      if (audioTrack) {
+        const audioSettings = audioTrack.getSettings();
+        audio = {
+          sampleRate: audioSettings.sampleRate ?? 48000,
+          channels: audioSettings.channelCount ?? 1,
+        };
+      } else {
+        log('Audio: no audio track in this capture');
+      }
+      return { stop: () => cap.stop() };
+    },
 
     // 2. Configure encoders
-    videoEncoder = new WebCodecsVideoEncoder();
-    videoEncoder.configure(videoCodec, width, height, {
-      bitrate: videoBitrate,
-      framerate: fps,
-      keyframeInterval,
-      latencyMode: 'realtime',
-    });
-    log(`Video encoder: ${videoCodec} @ ${videoBitrate / 1000}kbps`);
-
-    // Configure audio encoder from actual mic settings
-    const audioTrack = stream.getAudioTracks()[0];
-    if (audioTrack) {
-      const audioSettings = audioTrack.getSettings();
-      audioSampleRate = audioSettings.sampleRate ?? 48000;
-      audioChannels = audioSettings.channelCount ?? 1;
-      audioEncoder = new WebCodecsAudioEncoder();
-      audioEncoder.configure('opus', audioSampleRate, audioChannels, { bitrate: 128_000 });
-      log(`Audio encoder: opus @ 128kbps (${audioSampleRate}Hz, ${audioChannels}ch)`);
-    } else {
-      log('Audio: no mic available');
-    }
-
-    // 3. Connect to relay
-    log(`Connecting to ${relayUrl}...`);
-    const transportFactory = createWebTransport({ ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) });
-    const transport = await transportFactory(relayUrl);
-    connection = new MoqtConnection(draftVersion);
-
-    connection.onClose = (error, reason) => {
-      log(`Session closed: error=${error ?? 'none'} reason=${reason ?? 'clean'}`);
-      // Check WebTransport close info
-      transport.closed.then((info: any) => {
-        log(`WebTransport closed: code=${info?.closeCode ?? 'N/A'} reason=${info?.reason ?? 'N/A'}`);
-      }).catch(() => {});
-      stopBroadcast();
-    };
-
-    connection.onError = (err) => {
-      log(`Session error: ${err.message}`);
-    };
-
-    connection.onMessage = (msg) => {
-      log(`[CTRL] ${msg.type}${('requestId' in msg) ? ` reqId=${(msg as any).requestId}` : ''}`);
-    };
-
-    // Handle incoming SUBSCRIBE from relay
-    connection.onSubscribe = (requestId, _ns, trackName) => {
-      const name = new TextDecoder().decode(trackName);
-      const alias = nextAlias++;
-      log(`Relay subscribed to "${name}" (reqId=${requestId}, alias=${alias})`);
-
-      if (name === 'catalog') {
-        handleCatalogSubscribe(requestId, alias, width, height, fps);
-      } else if (name === 'video') {
-        videoTrackAlias = alias;
-        connection!.acceptSubscribe(varint(requestId), varint(alias));
-        log(`Accepted video subscription`);
-      } else if (name === 'audio') {
-        audioTrackAlias = alias;
-        connection!.acceptSubscribe(varint(requestId), varint(alias));
-        log(`Accepted audio subscription`);
-      } else {
-        connection!.rejectSubscribe(varint(requestId), varint(0), `Unknown track: ${name}`);
+    createEncoders: (ctx: AttemptResources) => {
+      // Each encoder is adopted at construction, so a throw while configuring
+      // the SECOND one still destroys the first.
+      const ve = ctx.adopt(new WebCodecsVideoEncoder(), (e) => { e.destroy(); });
+      // Encoders also retire synchronously at Stop: no further frames are
+      // encoded while the session drains.
+      ctx.onCancel(() => { try { ve.destroy(); } catch { /* already destroyed */ } });
+      videoEncoder = ve;
+      ve.configure(videoCodec, width, height, {
+        bitrate: videoBitrate,
+        framerate: fps,
+        keyframeInterval,
+        latencyMode: 'realtime',
+      });
+      log(`Video encoder: ${videoCodec} @ ${videoBitrate / 1000}kbps`);
+      if (audio) {
+        const ae = ctx.adopt(new WebCodecsAudioEncoder(), (e) => { e.destroy(); });
+        ctx.onCancel(() => { try { ae.destroy(); } catch { /* already destroyed */ } });
+        audioEncoder = ae;
+        ae.configure('opus', audio.sampleRate, audio.channels, { bitrate: 128_000 });
+        log(`Audio encoder: opus @ 128kbps (${audio.sampleRate}Hz, ${audio.channels}ch)`);
       }
-    };
+      // Disposal is handled per-encoder by the adoptions above.
+      return { destroy: () => { /* owned by the attempt registry */ } };
+    },
 
-    await connection.connect(transport, { maxRequestId: varint(100) });
-    log('Session established.');
+    // 3. Transport + connection + session, wired. The session's wire
+    // behavior binds to the NEGOTIATED draft (connection.draftVersion after
+    // connect), not the configured preference.
+    openSession: async (ctx: AttemptResources) => {
+      log(`Connecting to ${relayUrl}...`);
+      const transportFactory = createWebTransport({ ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) });
+      // Each resource is adopted the moment it exists — a cancellation or a
+      // handshake failure between these awaits must not leak the transport or
+      // the connection.
+      const transport = ctx.adopt(await transportFactory(relayUrl), (t) => {
+        try { (t as unknown as { close(): void }).close(); } catch { /* already closed */ }
+      });
+      ctx.throwIfCancelled();
+      const conn = ctx.adopt(new MoqtConnection(draftVersion), (c) => c.close());
+      connection = conn;
 
-    // Listen for WebTransport close reason
-    (transport as any).closed?.then?.((info: any) => {
-      log(`[WT] closed: code=${info?.closeCode} reason=${info?.reason}`);
-    }).catch?.((err: any) => {
-      log(`[WT] closed with error: ${err?.message ?? err}`);
-    });
+      conn.onError = (err) => { log(`Session error: ${err.message}`); };
+      conn.onMessage = (msg) => {
+        log(`[CTRL] ${msg.type}${('requestId' in msg) ? ` reqId=${(msg as any).requestId}` : ''}`);
+      };
+
+      // Cancellation must REACH the in-progress handshake: closing the
+      // transport makes a pending connect() settle instead of hanging.
+      ctx.onCancel(() => {
+        try { (transport as unknown as { close(): void }).close(); } catch { /* already closed */ }
+      });
+      await conn.connect(transport, { maxRequestId: varint(100) });
+      ctx.throwIfCancelled();
+      const negotiatedDraft = conn.draftVersion;
+      log(`Session established (draft-${negotiatedDraft}).`);
+
+      const session = ctx.adopt(new BroadcastSession(conn as unknown as BroadcastSessionConnection, {
+        catalog: {
+          videoCodec,
+          width,
+          height,
+          fps,
+          videoBitrate,
+          ...(audio ? { audio } : {}),
+        },
+        publisher: {
+          wrapInt: (n) => varint(n),
+          draft: negotiatedDraft,
+          onError: (context, err) => log(`Failed ${context}: ${(err as Error)?.message ?? err}`),
+          onCounts: (videoFrames, audioChunks) => {
+            if (videoFrames % 30 === 0) {
+              statFrames.textContent = String(videoFrames);
+              statAudio.textContent = String(audioChunks);
+            }
+          },
+        },
+        log,
+        onCatalogPublished: () => {
+          statusEl.textContent = 'Broadcasting';
+          liveBadge.classList.add('visible');
+        },
+        // Only the CURRENT attempt's session may drive the global stop.
+        onSessionClosed: () => { if (currentAttempt === attempt) void stopBroadcast(); },
+      }), (sess) => sess.shutdown());
+
+      // No await between connect resolution and these assignments — nothing
+      // can be missed. Handlers reference only this attempt's session.
+      conn.onClose = (error, reason) => {
+        log(`Session closed: error=${error ?? 'none'} reason=${reason ?? 'clean'}`);
+        transport.closed.then((info: any) => {
+          log(`WebTransport closed: code=${info?.closeCode ?? 'N/A'} reason=${info?.reason ?? 'N/A'}`);
+        }).catch(() => {});
+        session.handleClose(error, reason);
+      };
+      conn.onSubscribe = (requestId, _ns, trackName) => {
+        session.handleSubscribe(requestId, new TextDecoder().decode(trackName));
+      };
+      return session;
+    },
 
     // 4. Announce namespace
-    const enc = new TextEncoder();
-    const nsBytes = namespace.split('/').map(s => enc.encode(s));
-    log(`Sending PUBLISH_NAMESPACE for [${namespace}]...`);
-    await connection.publishNamespace(nsBytes);
-    log(`PUBLISH_NAMESPACE sent, waiting for relay response...`);
+    publishNamespace: async (ctx: AttemptResources) => {
+      const enc = new TextEncoder();
+      const nsBytes = namespace.split('/').map(p => enc.encode(p));
+      log(`Sending PUBLISH_NAMESPACE for [${namespace}]...`);
+      await connection!.publishNamespace(nsBytes);
+      ctx.throwIfCancelled();
+      log(`PUBLISH_NAMESPACE sent, waiting for relay response...`);
+    },
 
-    statusEl.textContent = 'Waiting for relay to subscribe...';
+    // 5. Wire encoder output → MoQ publish. WebCodecs chunk callbacks are
+    // synchronous and void — publication is a synchronous ENQUEUE into this
+    // generation's serialized publisher, which builds the LOC extensions
+    // under the negotiated draft's wire profile.
+    wirePublication: (session) => {
+      const mediaPublisher = session.publisher;
+      const ve = videoEncoder!;
+      ve.onChunk = (data, isKeyframe, timestamp, _duration, description) => {
+        const videoConfig = description ?? ve.description;
+        mediaPublisher.publishVideo(data, {
+          isKeyframe,
+          timestampUs: timestamp,
+          ...(videoConfig ? { videoConfig } : {}),
+        });
+      };
+      ve.onError = (err) => log(`[VideoEncoder ERROR] ${err.message}`);
+      capture!.onError = (err) => log(`[Capture ERROR] ${err.message}`);
+      if (audioEncoder) {
+        const ae = audioEncoder;
+        ae.onChunk = (data, timestamp) => {
+          mediaPublisher.publishAudio(data, { timestampUs: timestamp });
+        };
+        ae.onError = (err) => log(`[AudioEncoder ERROR] ${err.message}`);
+      }
 
-    // 5. Wire encoder output → MoQ publish
-    videoEncoder.onChunk = handleVideoChunk;
-    videoEncoder.onError = (err) => log(`[VideoEncoder ERROR] ${err.message}`);
-    capture.onError = (err) => log(`[Capture ERROR] ${err.message}`);
-    if (audioEncoder) {
-      audioEncoder.onChunk = handleAudioChunk;
-      audioEncoder.onError = (err) => log(`[AudioEncoder ERROR] ${err.message}`);
-    }
+      // 6. Wire capture → encoder
+      capture!.onVideoFrame = (frame) => {
+        ve.encode(frame);
+        frame.close();
+      };
+      capture!.onAudioData = (data) => {
+        audioEncoder?.encode(data);
+        data.close();
+      };
 
-    // 6. Wire capture → encoder
-    capture.onVideoFrame = (frame) => {
-      videoEncoder?.encode(frame);
-      frame.close();
-    };
-
-    capture.onAudioData = (data) => {
-      audioEncoder?.encode(data);
-      data.close();
-    };
-
-    // Show viewer URL + resolution
-    const viewerBase = window.location.origin + '/player/';
-    const viewerParams = new URLSearchParams();
-    viewerParams.set('url', relayUrl);
-    viewerParams.set('ns', namespace);
-    if (draftVersion) viewerParams.set('v', String(draftVersion));
-    const viewerLink = `${viewerBase}?${viewerParams.toString()}`;
-    currentViewerLink = viewerLink;
-    viewerCard.style.display = 'block';
-    statRes.textContent = `${width}x${height}`;
-    statResContainer.style.display = '';
-
-  } catch (err) {
-    log(`Fatal: ${(err as Error).message}`);
-    console.error(err);
-    stopBroadcast();
-  }
-}
-
-// ─── Catalog ─────────────────────────────────────────────────────────
-
-async function handleCatalogSubscribe(
-  requestId: bigint,
-  alias: bigint,
-  width: number,
-  height: number,
-  fps: number,
-): Promise<void> {
-  await connection!.acceptSubscribe(varint(requestId), varint(alias));
-
-  const catalogPayload = buildCatalog({
-    tracks: [
-      {
-        name: 'video',
-        packaging: 'loc',
-        isLive: true,
-        role: 'video',
-        codec: videoCodec,
-        width,
-        height,
-        framerate: fps,
-        bitrate: videoBitrate,
-        renderGroup: 1,
-      },
-      {
-        name: 'audio',
-        packaging: 'loc',
-        isLive: true,
-        role: 'audio',
-        codec: 'opus',
-        samplerate: audioSampleRate,
-        channelConfig: String(audioChannels),
-        bitrate: 128_000,
-        renderGroup: 1,
-      },
-    ],
+      // Show viewer URL + resolution
+      const viewerBase = window.location.origin + '/player/';
+      const viewerParams = new URLSearchParams();
+      viewerParams.set('url', relayUrl);
+      viewerParams.set('ns', namespace);
+      if (draftVersion) viewerParams.set('v', String(draftVersion));
+      currentViewerLink = `${viewerBase}?${viewerParams.toString()}`;
+      viewerCard.style.display = 'block';
+      statRes.textContent = `${width}x${height}`;
+      statResContainer.style.display = '';
+      statusEl.textContent = 'Waiting for relay to subscribe...';
+    },
   });
 
-  // Publish catalog with timestamp-based group ID (matches mojito pattern).
-  // Close the stream after writing (mojito does `defer stream.Close()`).
-  // Wire format matches mojito: SubgroupIDZero, DefaultPriority, EndOfGroup.
-  const catalogGroupId = varint(BigInt(Date.now()));
-  const streamId = await connection!.openSubgroup(
-    varint(alias), catalogGroupId, varint(0),
-    {
-      hasExtensions: false,
-      endOfGroup: true,
-      defaultPriority: true,
-      subgroupIdMode: SubgroupIdMode.ZERO,
-    },
-  );
-  await connection!.sendObject(streamId, varint(0), catalogPayload);
-  await connection!.closeSubgroup(streamId);
-
-  // §9.15: PUBLISH_DONE signals the catalog subscription is complete.
-  // Some relays require this to cache and replay the catalog to subsequent
-  // viewers. Trade-off: terminates the subscription, so catalog delta updates
-  // would require a new SUBSCRIBE from the relay. Acceptable for this example.
-  await connection!.publishDone(varint(requestId), PublishDoneCode.TRACK_ENDED, '');
-
-  log(`Catalog published (${catalogPayload.byteLength} bytes)`);
-  statusEl.textContent = 'Broadcasting';
-  liveBadge.classList.add('visible');
-}
-
-// ─── Video chunks → MoQ objects ──────────────────────────────────────
-
-async function handleVideoChunk(
-  data: Uint8Array,
-  isKeyframe: boolean,
-  timestamp: number,
-  _duration: number,
-  description: Uint8Array | undefined,
-): Promise<void> {
-  if (!connection || videoTrackAlias === 0n) return;
-
-  // New group on keyframe
-  if (isKeyframe) {
-    // Close previous stream in background (don't await — delta frames may still be writing)
-    if (videoStreamId !== null) {
-      const oldStreamId = videoStreamId;
-      connection.closeSubgroup(oldStreamId).catch(() => { /* stream may already be closed */ });
-    }
-
-    videoGroupId++;
-    videoObjectId = 0n;
-
-    // endOfGroup: true — required for one-subgroup-per-GOP LOC video.
-    // Without this, receivers cannot distinguish normal group completion
-    // from an incomplete group and will wait for the intra-group timeout.
-    videoStreamId = await connection.openSubgroup(
-      varint(videoTrackAlias), varint(videoGroupId), varint(0),
-      { hasExtensions: true, endOfGroup: true, publisherPriority: 128 },
-    );
-  }
-
-  if (videoStreamId === null) return; // No stream yet (waiting for first keyframe)
-
-  // Build LOC extensions
-  const extensions = encodeLocHeaders({
-    captureTimestamp: BigInt(Math.round(timestamp)),
-    videoFrameMarking: {
-      independent: isKeyframe,
-      discardable: !isKeyframe,
-      baseLayerSync: false,
-      startOfFrame: true,
-      endOfFrame: true,
-      temporalId: 0,
-    },
-    ...(description || videoEncoder?.description ? { videoConfig: description ?? videoEncoder!.description! } : {}),
-  }, { deltaEncoded: draftVersion !== 14 });
-
+  currentAttempt = attempt;
   try {
-    await connection.sendObject(
-      videoStreamId,
-      varint(videoObjectId),
-      data,
-      extensions,
-    );
-  } catch {
-    // Stream may have been closed by a keyframe race — silently skip
-    return;
+    const result = await attempt.run();
+    if (result === 'cancelled') return; // superseded — the UI belongs to the replacement
+  } catch (err) {
+    // Only the CURRENT attempt's failure is the user's failure; a stale
+    // attempt has already been quiet-cancelled inside run().
+    log(`Fatal: ${(err as Error).message}`);
+    console.error(err);
+    if (currentAttempt === attempt) {
+      currentAttempt = null;
+      resetBroadcastUi();
+    }
   }
-
-  videoObjectId++;
-  frameCount++;
-
-  // Update status every 30 frames
-  if (frameCount % 30 === 0) {
-    statFrames.textContent = String(frameCount);
-    statAudio.textContent = String(audioChunkCount);
-  }
-}
-
-// ─── Audio chunks → MoQ objects ──────────────────────────────────────
-
-async function handleAudioChunk(
-  data: Uint8Array,
-  timestamp: number,
-  _duration: number,
-): Promise<void> {
-  if (!connection || audioTrackAlias === 0n) return;
-
-  audioGroupId++;
-
-  // Audio: one object per group (independently decodable, LOC §4.1)
-  const extensions = encodeLocHeaders({
-    captureTimestamp: BigInt(Math.round(timestamp)),
-  }, { deltaEncoded: draftVersion !== 14 });
-
-  const streamId = await connection.openSubgroup(
-    varint(audioTrackAlias), varint(audioGroupId), varint(0),
-    { hasExtensions: true, endOfGroup: true, publisherPriority: 64 }, // audio higher priority
-  );
-  await connection.sendObject(streamId, varint(0), data, extensions);
-  await connection.closeSubgroup(streamId);
-
-  audioChunkCount++;
 }
 
 // ─── Stop ────────────────────────────────────────────────────────────
 
 async function stopBroadcast(): Promise<void> {
-  capture?.stop();
-  capture = null;
-  videoEncoder?.destroy();
-  videoEncoder = null;
-  audioEncoder?.destroy();
-  audioEncoder = null;
+  // Cancel the pending/current attempt SYNCHRONOUSLY (its continuations go
+  // inert at their next gate), then await its teardown: capture, encoders,
+  // and a graceful bounded session shutdown.
+  const attempt = currentAttempt;
+  currentAttempt = null;
+  await attempt?.cancel();
+  // If a new broadcast started while we awaited, the UI belongs to it.
+  if (currentAttempt === null) resetBroadcastUi();
+  log('Broadcast stopped.');
+}
 
-  if (videoStreamId !== null && connection) {
-    try { await connection.closeSubgroup(videoStreamId); } catch { /* ignore */ }
-    videoStreamId = null;
-  }
-
-  try { await connection?.close(); } catch { /* ignore */ }
-  connection = null;
-
+function resetBroadcastUi(): void {
   preview.srcObject = null;
   statusEl.textContent = 'Ready';
   liveBadge.classList.remove('visible');
@@ -483,8 +400,4 @@ async function stopBroadcast(): Promise<void> {
   startCameraBtn.disabled = false;
   startScreenBtn.disabled = false;
   stopBtn.disabled = true;
-  frameCount = 0;
-  audioChunkCount = 0;
-
-  log('Broadcast stopped.');
 }

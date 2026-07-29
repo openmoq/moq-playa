@@ -232,7 +232,7 @@ describe('MoqtConnection(18) fetch', () => {
     const { conn, transport } = await connected();
     await expect(conn.joiningFetch({
       joiningFetchType: 'relative', joiningRequestId: 998n, joiningStart: 0n,
-    })).rejects.toThrow(/PENDING\/ESTABLISHED/);
+    })).rejects.toThrow(/not a joinable subscription/);
     expect(transport.bidi.length).toBe(0); // nothing hit the wire
   });
 

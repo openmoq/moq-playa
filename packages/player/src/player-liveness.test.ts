@@ -88,6 +88,8 @@ function createConfig(
     namespace: 'live/broadcast',
     createTransport: vi.fn(async () => ({}) as any),
     createConnection: () => adapter as unknown as MoqtConnection,
+    // Liveness suites pin pre-bootstrap catalog behavior (legacy escape hatch).
+    catalogBootstrap: 'subscribe',
     ...FAST_LIVENESS,
     ...overrides,
   };

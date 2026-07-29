@@ -82,6 +82,9 @@ async function bootPlayer(
     namespace: 'live/broadcast',
     createTransport: vi.fn(async () => ({}) as any),
     createConnection: () => adapter as unknown as MoqtConnection,
+    // Media warm start is under test — the catalog keeps the legacy mode so
+    // the joining-fetch assertions count MEDIA joins only.
+    catalogBootstrap: 'subscribe',
     ...cfg,
   });
   const errors: any[] = [];

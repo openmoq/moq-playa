@@ -94,6 +94,8 @@ async function bootPlayer(catalogJson: string, cfg?: Partial<MoqtPlayerConfig>) 
     createConnection: () => adapter as unknown as MoqtConnection,
     createMediaSource: () => mockMs,
     createCmafAssembler: () => assembler,
+    // Pin pre-bootstrap catalog behavior (legacy escape hatch).
+    catalogBootstrap: 'subscribe',
     ...cfg,
   });
   const errors: any[] = [];

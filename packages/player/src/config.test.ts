@@ -327,3 +327,21 @@ describe('validateConfig', () => {
     expect(config.draftVersion).toBeUndefined();
   });
 });
+
+describe('catalogBootstrap option', () => {
+  it('accepts the three modes and undefined (default auto is applied at use)', () => {
+    for (const mode of ['auto', 'joining-fetch', 'subscribe', undefined] as const) {
+      expect(() => validateConfig({
+        url: 'https://relay.example', namespace: 'live/test',
+        ...(mode !== undefined ? { catalogBootstrap: mode } : {}),
+      } as MoqtPlayerConfig)).not.toThrow();
+    }
+  });
+
+  it('rejects unknown values', () => {
+    expect(() => validateConfig({
+      url: 'https://relay.example', namespace: 'live/test',
+      catalogBootstrap: 'bogus',
+    } as unknown as MoqtPlayerConfig)).toThrow(/catalogBootstrap/);
+  });
+});

@@ -13,7 +13,7 @@
  */
 
 import type { ControlMessage, Parameters } from '@moqt/transport';
-import { varint } from '@moqt/transport';
+import { varint, readLocation, MessageParam } from '@moqt/transport';
 import type { CatalogState, CatalogTrack } from '@moqt/msf';
 import type { LoggerLike } from './logger.js';
 import type { TrackPackaging } from './subscription-manager.js';
@@ -53,7 +53,45 @@ export interface MessageSubscriptionManager {
 }
 
 /** Context for handleControlMessage. */
+/**
+ * Extract the LARGEST_OBJECT Location from SUBSCRIBE_OK parameters.
+ * d14/16 encode it as a raw Location byte blob (§9.2.2.7); the d18 codec
+ * decodes location-kind parameters into a typed {group, object}. Absent or
+ * malformed = null (track empty at subscribe time).
+ */
+function extractLargestLocation(parameters: Parameters | undefined): { group: bigint; object: bigint } | null {
+  const raw = parameters?.get(MessageParam.LARGEST_OBJECT)?.[0];
+  if (raw instanceof Uint8Array) {
+    try {
+      const { value } = readLocation(raw, 0);
+      return { group: BigInt(value.group), object: BigInt(value.object) };
+    } catch { return null; }
+  }
+  if (raw !== undefined && raw !== null && typeof raw === 'object'
+      && 'group' in (raw as object) && 'object' in (raw as object)) {
+    const loc = raw as { group: bigint | number; object: bigint | number };
+    return { group: BigInt(loc.group), object: BigInt(loc.object) };
+  }
+  return null;
+}
+
 export interface ControlMessageContext {
+  /** Catalog bootstrap: SUBSCRIBE_OK largest for the catalog subscription
+   *  (null = SUBSCRIBE_OK carried no LARGEST_OBJECT → track empty). */
+  onCatalogSubscribeOk?: (largest: { group: bigint; object: bigint } | null) => void;
+  /** Staged recovery: SUBSCRIBE_OK for the CANDIDATE catalog subscription.
+   *  Returns true when consumed (transaction-local — never the main slot). */
+  onRecoveryCatalogSubscribeOk?: (reqId: bigint, alias: bigint, largest: { group: bigint; object: bigint } | null) => boolean;
+  /** Staged recovery: PUBLISH_DONE for the CANDIDATE subscription. */
+  onRecoveryCatalogPublishDone?: (reqId: bigint, statusCode: bigint) => boolean;
+  /** Staged recovery: REQUEST_ERROR for the CANDIDATE subscription. */
+  onRecoveryCatalogRequestError?: (reqId: bigint) => boolean;
+  /** Catalog bootstrap: FETCH_OK for the bootstrap fetch. */
+  onCatalogBootstrapFetchOk?: (requestId: bigint, endLocation: { group: bigint; object: bigint }, endOfTrack: boolean) => void;
+  /** Catalog bootstrap: REQUEST_ERROR for the bootstrap fetch. */
+  onCatalogBootstrapFetchError?: (requestId: bigint, errorCode: bigint) => void;
+  /** Catalog bootstrap: PUBLISH_DONE on the catalog subscription (raw status). */
+  onCatalogPublishDone?: (statusCode: bigint) => void;
   adapter: MessageAdapter | null;
   activeSubscriptions: Map<bigint, ActiveSubscription>;
   pendingMediaSubs: Map<bigint, PendingMediaSub>;
@@ -161,8 +199,23 @@ export function handleControlMessage(
       const alias = BigInt(msg.trackAlias);
       ctx.log.debug('SUBSCRIBE_OK reqId=%s alias=%s', okReqId, alias);
 
+      // Staged recovery candidate: transaction-local — consumed here, never
+      // touching the main catalog slot.
+      if (ctx.onRecoveryCatalogSubscribeOk?.(okReqId, alias, extractLargestLocation(msg.parameters as Parameters | undefined))) {
+        break;
+      }
+
       // Catalog subscription: store the track alias for catalog routing
       if (ctx.catalogRequestId !== null && okReqId === ctx.catalogRequestId) {
+        // Catalog bootstrap: the LARGEST_OBJECT location (§9.2.2.7 / d18
+        // largest) anchors the joined group and the rung-1 emulation range —
+        // it MUST be installed BEFORE the alias bind below, because binding
+        // replays parked objects and an older parked independent judged
+        // against largest === null could wrongly supersede the Joining FETCH.
+        // Absent parameter = track empty at subscribe time.
+        if (ctx.onCatalogSubscribeOk) {
+          ctx.onCatalogSubscribeOk(extractLargestLocation(msg.parameters as Parameters | undefined));
+        }
         ctx.setCatalogTrackAlias(alias);
 
         // Evict optimistic media registration if it collides with the catalog alias.
@@ -217,10 +270,38 @@ export function handleControlMessage(
       break;
     }
 
+    case 'FETCH_OK': {
+      // §9.16/§10.12: only the catalog bootstrap consumes FETCH_OK today (it
+      // fixes the prefix's exclusive end; completion still requires the data
+      // FIN). Media fetches rely on the stream FIN alone, as before.
+      const okId = BigInt((msg as { requestId: bigint }).requestId);
+      const end = (msg as { endLocation?: { group: bigint; object: bigint } }).endLocation;
+      if (end !== undefined) {
+        ctx.onCatalogBootstrapFetchOk?.(okId,
+          { group: BigInt(end.group), object: BigInt(end.object) },
+          Boolean((msg as { endOfTrack?: number }).endOfTrack));
+      }
+      break;
+    }
+
     case 'PUBLISH_DONE': {
       // §9.15: Publisher is done publishing objects for this subscription.
       // Clean up active subscription state and notify the application.
       const doneReqId = BigInt(msg.requestId);
+
+      // Staged recovery candidate: transaction-local.
+      if (ctx.onRecoveryCatalogPublishDone?.(doneReqId, BigInt(msg.statusCode))) {
+        break;
+      }
+
+      // Catalog subscription: status-aware handling is the bootstrap
+      // coordinator's (normalized per-draft player-side). PUBLISH_DONE is NOT
+      // a delivery barrier — the adapter's terminal drain keeps delivering
+      // late objects; drained finalizes.
+      if (ctx.catalogRequestId !== null && doneReqId === ctx.catalogRequestId) {
+        ctx.onCatalogPublishDone?.(BigInt(msg.statusCode));
+        break;
+      }
       const sub = ctx.activeSubscriptions.get(doneReqId);
       ctx.log.debug('PUBLISH_DONE reqId=%s sub=%s', doneReqId, sub ? sub.trackName : '(none)');
       if (sub) {
@@ -259,6 +340,12 @@ export function handleControlMessage(
     case 'REQUEST_ERROR': {
       const errReqId = BigInt(msg.requestId);
 
+      // Staged recovery candidate SUBSCRIBE refused → candidate fails
+      // (transaction-local; the active catalog is untouched).
+      if (ctx.onRecoveryCatalogRequestError?.(errReqId)) {
+        break;
+      }
+
       // If the catalog subscription was rejected, clear catalogTrackAlias to
       // prevent track alias collision where media data with the same alias
       // gets misrouted to the catalog handler.
@@ -291,6 +378,10 @@ export function handleControlMessage(
         ctx.onMediaSubscribeError?.(errReqId, pendingMedia.trackName, pendingMedia.mediaType,
           msg.errorReason ?? '', BigInt(msg.errorCode));
       }
+
+      // Catalog-bootstrap fetch: INVALID_RANGE (empty track) vs any other
+      // refusal — the coordinator's ladder decides.
+      ctx.onCatalogBootstrapFetchError?.(errReqId, BigInt(msg.errorCode));
 
       // §9.8: REQUEST_ERROR for a fetchCatalog FETCH — dispatch to the
       // pending promise via the player-side callback.

@@ -30,6 +30,33 @@ export function buildConnectUrl(config: MoqtPlayerConfig, urlOverride?: string):
 }
 
 /**
+ * Why a GOAWAY New Session URI cannot be used as a migration target, or null
+ * if it can. The field is peer-controlled text (a misbehaving relay has been
+ * observed placing its own error string there), so it must be validated
+ * before any candidate connection or transport is created. WebTransport
+ * targets are https-only.
+ */
+export function invalidGoawayUriReason(uri: string): string | null {
+  const shown = uri.length > 120 ? `${uri.slice(0, 120)}…` : uri;
+  let parsed: URL;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return `GOAWAY New Session URI is not a valid URL: "${shown}"`;
+  }
+  if (parsed.protocol !== 'https:') {
+    return `GOAWAY New Session URI has unsupported scheme "${parsed.protocol}" (WebTransport requires https): "${shown}"`;
+  }
+  // The W3C WebTransport constructor fails on any URL whose fragment is
+  // non-null — which includes a bare trailing '#' (URL.hash is '' for it, so
+  // check the raw text too).
+  if (parsed.hash !== '' || uri.includes('#')) {
+    return `GOAWAY New Session URI contains a fragment (WebTransport forbids fragments): "${shown}"`;
+  }
+  return null;
+}
+
+/**
  * Build SetupOptions from player config for CLIENT_SETUP.
  *
  * @see draft-ietf-moq-transport-16 §9.3.1 (Setup Parameters)

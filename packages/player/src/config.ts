@@ -202,6 +202,34 @@ export interface ConnectionConfig {
    * @see draft-ietf-moq-msf-00 §5 (Catalog)
    */
   readonly catalog?: { readonly tracks: readonly CatalogTrack[] } & Partial<Omit<CatalogState, 'tracks'>>;
+
+  /**
+   * How the catalog track is retrieved at tune-in.
+   *
+   * - `'auto'` (default) — the MSF-01 §5 mandated pattern on EVERY draft:
+   *   SUBSCRIBE with a relative Joining FETCH (offset 0), so the latest
+   *   independent catalog and its deltas arrive via the fetch and the live
+   *   tail via the subscription. On draft 14 the fetch is issued after
+   *   SUBSCRIBE_OK (§9.16.2 references an existing subscription there).
+   *   Relay refusal degrades through a diagnosed fallback ladder
+   *   (standalone-FETCH emulation first, legacy resubscribe last) — but a
+   *   catalog that classifies as MSF-01/CMSF-01 is REJECTED when acquired
+   *   through a fallback rung (its spec makes the joining fetch
+   *   unconditional); accepting such content requires the explicit
+   *   `'subscribe'` compatibility option.
+   * - `'joining-fetch'` — same retrieval as `'auto'`, stated explicitly.
+   * - `'strict'` — standards mode: any fallback off the joining path is a
+   *   fatal load error (no emulation, no legacy resubscribe).
+   * - `'subscribe'` — the explicitly named COMPATIBILITY escape hatch:
+   *   legacy wire behavior (`AbsoluteStart{0,0}` subscription, no fetch),
+   *   accepting any catalog profile. Forever reachable.
+   *
+   * Ignored when {@link catalog} is injected (no catalog subscription exists).
+   *
+   * @see draft-ietf-moq-msf-01 §5
+   * @see draft-ietf-moq-transport-16 §9.16.2, draft-ietf-moq-transport-18 §10.12.2
+   */
+  readonly catalogBootstrap?: 'auto' | 'joining-fetch' | 'strict' | 'subscribe';
 }
 
 /** Playback tuning options. */
@@ -749,6 +777,13 @@ export function validateConfig(config: MoqtPlayerConfig): void {
       && config.subscriptionFilter.type !== 'LatestObject') {
     throw new RangeError(
       `warmStartCurrentGroup requires the LargestObject subscription filter (§9.16.2), got ${config.subscriptionFilter.type}`,
+    );
+  }
+
+  if (config.catalogBootstrap !== undefined
+      && !['auto', 'joining-fetch', 'strict', 'subscribe'].includes(config.catalogBootstrap)) {
+    throw new RangeError(
+      `catalogBootstrap must be 'auto' | 'joining-fetch' | 'strict' | 'subscribe', got ${String(config.catalogBootstrap)}`,
     );
   }
 
