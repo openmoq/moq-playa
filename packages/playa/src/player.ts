@@ -79,7 +79,7 @@ export class Player {
   // ─── Static ──────────────────────────────────────────────────────
 
   /** Player version (set at build time). */
-  static readonly version = '0.5.3';
+  static readonly version = '0.5.4';
 
   /** Check if the current browser supports MoQ playback. */
   static isSupported(): boolean {
