@@ -2623,6 +2623,55 @@ describe('MoqtConnection draft-14', () => {
     expect(adapter.session.state).not.toBe(SessionState.CLOSED);
   });
 
+  // ─── §10.4: control and data streams are not ordered relative to each other.
+  // A publisher may deliver a subscription's objects before the subscriber has
+  // processed its own SUBSCRIBE_OK and bound the track alias. Without buffering,
+  // routeToTrackSubscription finds no route yet and the object is lost forever —
+  // fatal for tracks whose entire content is one object at group 0 (catalogs,
+  // CMAF init segments). ──────────────────────────────────────────────────────
+  it('draft-16: an object arriving before its SUBSCRIBE_OK binds the alias is buffered and delivered once bound', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const enc = (s: string) => new TextEncoder().encode(s);
+    const onObject = vi.fn();
+
+    const subP = adapter.subscribeTrack([enc('live')], enc('vid'), { onObject });
+    await deepFlush();
+
+    const codec = createControlCodec(16);
+    let subReqId = -1n;
+    for (let i = mock.controlWritten.length - 1; i >= 0; i--) {
+      const { message } = codec.decode(mock.controlWritten[i]!, 0);
+      if (message.type === 'SUBSCRIBE') { subReqId = (message as { requestId: bigint }).requestId; break; }
+    }
+    expect(subReqId).not.toBe(-1n);
+
+    const alias = 42n;
+    const header = makeSubgroupHeader({ trackAlias: varint(alias) });
+    const obj = makeSubgroupObject({ objectId: varint(0), payload: new Uint8Array([0xAB]) });
+
+    // The object arrives on the data plane before SUBSCRIBE_OK is processed.
+    const stream = mock.addIncomingStream();
+    stream.push(concat(
+      encodeSubgroupHeader(header),
+      encodeSubgroupObject(obj, header.hasExtensions, varint(0), true),
+    ));
+    await deepFlush();
+
+    expect(onObject).not.toHaveBeenCalled(); // buffered, not yet routable
+
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'SUBSCRIBE_OK', requestId: subReqId, trackAlias: varint(alias),
+      parameters: new Map(), trackExtensions: [],
+    } as ControlMessage));
+    await deepFlush();
+
+    const sub = await subP;
+    expect(sub.trackAlias).toBe(alias);
+    expect(onObject).toHaveBeenCalledOnce();
+    expect(onObject.mock.calls[0]![0].payload).toEqual(obj.payload);
+  });
+
   // ─── §5.1: consistent crossed-response contract — a crossed REQUEST_ERROR (like
   // a crossed SUBSCRIBE_OK) is suppressed from the application onMessage but STILL
   // observed raw on the qlog channel. ──────────────────────────────────────────

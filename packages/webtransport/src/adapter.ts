@@ -99,6 +99,12 @@ export interface TrackSubscribeOptions {
   readonly deliveryTimeout?: SubscribeOptions['deliveryTimeout'];
   /** Called for each object delivered on this subscription (stream-based only; datagrams excluded). */
   onObject?: (obj: MoqtObject) => void;
+  /**
+   * Called when a subgroup data stream of this subscription ends gracefully
+   * (FIN). This is the only reliable end-of-subgroup signal when the
+   * publisher does not set the subgroup header's END_OF_GROUP flag.
+   */
+  onSubgroupClosed?: (header: SubgroupHeader) => void;
 }
 
 /**
@@ -114,6 +120,8 @@ export interface TrackSubscription {
   readonly trackAlias: bigint;
   /** Called for each object — mutable, read live on each delivery. */
   onObject: ((obj: MoqtObject) => void) | null;
+  /** Called on graceful FIN of a subgroup data stream — mutable, read live. */
+  onSubgroupClosed: ((header: SubgroupHeader) => void) | null;
   /** Unsubscribe and clean up. */
   unsubscribe(): Promise<void>;
 }
@@ -323,6 +331,17 @@ export class MoqtConnection {
   private rawSubscriptions = new Map<bigint, RawSubState>();
   /** Track subscriptions by trackAlias (active, alias resolved). */
   private rawAliasMaps = new Map<bigint, RawSubState>();
+  /**
+   * Objects that arrived on a data stream before the SUBSCRIBE_OK that binds
+   * their track alias (control and data streams are not ordered relative to
+   * each other, so a fast publisher can deliver before the subscriber has
+   * processed its own SUBSCRIBE_OK). Buffered while ANY subscribeTrack() is
+   * still pending, replayed once the matching alias binds.
+   */
+  private pendingAliasObjects = new Map<bigint, MoqtObject[]>();
+  private static readonly MAX_PENDING_OBJECTS_PER_ALIAS = 256;
+  /** Subgroup stream FINs racing SUBSCRIBE_OK, replayed after the buffered objects. */
+  private pendingAliasCloses = new Map<bigint, SubgroupHeader[]>();
 
   /** Inbound PUBLISH (draft-18 §10.10) stream contexts, keyed by Request ID. */
   private inboundRequestContexts = new Map<bigint, InboundRequestStreamContext>();
@@ -1730,6 +1749,8 @@ export class MoqtConnection {
     }
     this.rawSubscriptions.clear();
     this.rawAliasMaps.clear();
+    this.pendingAliasObjects.clear();
+    this.pendingAliasCloses.clear();
   }
 
   /**
@@ -1929,6 +1950,7 @@ export class MoqtConnection {
       requestId: reqIdBigint,
       trackAlias: 0n, // placeholder, updated when SUBSCRIBE_OK arrives
       onObject: options?.onObject ?? null,
+      onSubgroupClosed: options?.onSubgroupClosed ?? null,
       unsubscribe: async () => {
         // Delegate to the single centralized path: it arms terminal alias
         // protection synchronously (from the raw entry's real alias — null-safe,
@@ -1951,6 +1973,10 @@ export class MoqtConnection {
       const raw = this.rawSubscriptions.get(reqIdBigint);
       if (raw) {
         this.rawSubscriptions.delete(reqIdBigint);
+        if (!this.hasPendingRawSubscription()) {
+          this.pendingAliasObjects.clear();
+          this.pendingAliasCloses.clear();
+        }
         raw.reject?.(err instanceof Error ? err : new Error(String(err)));
       }
     }
@@ -1975,7 +2001,46 @@ export class MoqtConnection {
       pub.onObject?.(obj);
       return true;
     }
+    // The publisher may deliver objects before its SUBSCRIBE_OK is processed
+    // (control and data streams are not ordered relative to each other, §10.4);
+    // dropping them would permanently starve the subscription of anything it
+    // published up front (init segments, catalogs). We cannot yet know WHICH
+    // pending subscribeTrack() this alias belongs to, so buffer tentatively
+    // while any is pending and replay once the alias binds (or is cleared once
+    // no subscription is left pending to claim it).
+    if (this.hasPendingRawSubscription()) {
+      const pending = this.pendingAliasObjects.get(alias) ?? [];
+      if (pending.length < MoqtConnection.MAX_PENDING_OBJECTS_PER_ALIAS) {
+        pending.push(obj);
+        this.pendingAliasObjects.set(alias, pending);
+      }
+      return true;
+    }
     return false;
+  }
+
+  private hasPendingRawSubscription(): boolean {
+    for (const raw of this.rawSubscriptions.values()) {
+      if (raw.resolve !== null) return true;
+    }
+    return false;
+  }
+
+  /** Notify the owning subscription that one of its subgroup streams ended gracefully. */
+  private routeSubgroupClosed(header: SubgroupHeader): void {
+    const alias = BigInt(header.trackAlias);
+    const rawSub = this.rawAliasMaps.get(alias);
+    if (rawSub) {
+      rawSub.sub.onSubgroupClosed?.(header);
+      return;
+    }
+    if (this.hasPendingRawSubscription()) {
+      const pending = this.pendingAliasCloses.get(alias) ?? [];
+      if (pending.length < MoqtConnection.MAX_PENDING_OBJECTS_PER_ALIAS) {
+        pending.push(header);
+        this.pendingAliasCloses.set(alias, pending);
+      }
+    }
   }
 
   // ── receiver §10.11 terminal tracker (bounded, Stream-Count-driven) ──
@@ -2196,6 +2261,16 @@ export class MoqtConnection {
         raw.trackAlias = alias;
         (raw.sub as { trackAlias: bigint }).trackAlias = alias;
         this.rawAliasMaps.set(alias, raw);
+        const buffered = this.pendingAliasObjects.get(alias);
+        if (buffered) {
+          this.pendingAliasObjects.delete(alias);
+          for (const obj of buffered) raw.sub.onObject?.(obj);
+        }
+        const bufferedCloses = this.pendingAliasCloses.get(alias);
+        if (bufferedCloses) {
+          this.pendingAliasCloses.delete(alias);
+          for (const closedHeader of bufferedCloses) raw.sub.onSubgroupClosed?.(closedHeader);
+        }
         // §8/§10.11: record the EFFECTIVE delivery timeout for this alias so a later
         // teardown's guard outlives the window in which the publisher may still
         // deliver old-alias streams — combining the publisher's Track Properties
@@ -2225,6 +2300,10 @@ export class MoqtConnection {
         raw.resolve = null;
         raw.reject = null;
         this.rawSubscriptions.delete(reqId);
+        if (!this.hasPendingRawSubscription()) {
+          this.pendingAliasObjects.clear();
+          this.pendingAliasCloses.clear();
+        }
         return true;
       }
     }
@@ -5630,6 +5709,7 @@ export class MoqtConnection {
             this.onObject?.(streamId, eogGap);
           }
         }
+        this.routeSubgroupClosed(header);
         return;
       }
       buf = this.appendBuffer(buf, value);
