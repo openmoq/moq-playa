@@ -4287,9 +4287,9 @@ export class MoqtConnection {
         for (const framed of messages) {
           // draft-14/16: the decoder always yields a fully-correlated
           // ControlMessage (Request IDs are on the wire). draft-18 response
-          // correlation will be stamped by the topology before this point
-          // (Slice C); until then this single-bidi-control path only carries
-          // draft-14/16, so the narrowing is sound.
+          // correlation is stamped by the topology before this point. This
+          // single-bidi-control path only carries draft-14/16, so the narrowing
+          // is sound.
           const message = framed.message as ControlMessage;
           // SUBSCRIBE_OK: same ordered handling as draft-18 (session validation →
           // terminal-on-close → alias-reuse policy → bind/resolve). Do NOT let the
@@ -5906,7 +5906,7 @@ export class MoqtConnection {
         const messages = framer.drain();
         for (const framed of messages) {
           // draft-16 namespace bidi stream carries fully-correlated messages;
-          // draft-18 correlation is a topology concern (Slice C).
+          // Draft-18 correlation is handled by its request-stream topology.
           const message = framed.message as ControlMessage;
           this.onNamespaceMessage?.(requestId as bigint, message);
           const actions = this.session.handleNamespaceStreamMessage(

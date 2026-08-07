@@ -1244,7 +1244,7 @@ describe('Session', () => {
     it('responds NOT_SUPPORTED for unhandled message types with request ID (SHOULD §3.1)', () => {
       // §3.1: "Limited endpoints SHOULD respond to any unsupported messages
       // with the appropriate NOT_SUPPORTED error code, rather than ignoring them."
-      // (PUBLISH_OK is handled since round 19 — use an unknown typed message.)
+      // PUBLISH_OK is handled, so use an unknown typed message.
       const unhandledMsg = {
         type: 'FUTURE_EXTENSION',
         requestId: varint(0n),
@@ -3822,7 +3822,7 @@ describe('Session', () => {
       expect(actions.every(a => a.type !== 'close_connection')).toBe(true);
     });
 
-    // ─── §11.1: inbound-PUBLISH alias released on termination (R8d finding 3) ──
+    // ─── §11.1: inbound-PUBLISH alias released on termination ───────────
     // Registering an inbound PUBLISH's Track Alias must be UNREGISTERED when it
     // is rejected / done, so a later PUBLISH reusing the alias is a per-request
     // matter, not a session-fatal DUPLICATE_TRACK_ALIAS.
@@ -4272,8 +4272,8 @@ describe('Session', () => {
         parameters: new Map(), trackExtensions: [],
       } as SubscribeOk);
       expect(ok.every((a) => a.type !== 'close_connection')).toBe(true);
-      // The FOLLOWING PUBLISH_DONE terminal is ALSO tolerated (round-8q one-shot bug
-      // closed here); it reclaims the shadow.
+      // The following PUBLISH_DONE terminal is also tolerated and reclaims the
+      // shadow.
       const done = s.handleControlMessage({
         type: 'PUBLISH_DONE', requestId, statusCode: varint(0n), streamCount: varint(0n), errorReason: '',
       } as PublishDone);
@@ -4485,8 +4485,8 @@ describe('Session', () => {
       expect(s.state).not.toBe(SessionState.CLOSED);
     });
 
-    // R8f finding 1: alias unregister is OWNER-conditional — a crossed cleanup
-    // for an OLD request must not drop a NEWER request's alias registration.
+    // Alias unregister is owner-conditional: crossed cleanup for an old request
+    // must not drop a newer request's alias registration.
     it('a crossed old-request cleanup does not unregister a CO-OWNER that shares the alias (owner token)', () => {
       const s = new Session(EndpointRole.CLIENT, 18);
       s.initiateSetup();
@@ -5535,7 +5535,7 @@ describe('Session', () => {
 
     it('replays forward state on REQUEST_UPDATE when not specified (§9.10)', () => {
       /**
-       * Finding 3: When only filter is updated, Forward should not reset to 1.
+       * Updating only the filter must not reset Forward to 1.
        * "If a parameter included in SUBSCRIBE is not present in
        * SUBSCRIBE_UPDATE, its value remains unchanged."
        */
@@ -5580,7 +5580,7 @@ describe('Session', () => {
 
     it('replays priority on REQUEST_UPDATE when not specified (§9.10)', () => {
       /**
-       * Finding 3: When only forward is changed, priority should not reset to 128.
+       * Updating only Forward must not reset priority to 128.
        */
       const s = createEstablishedV14Session();
       const result = s.subscribe(
@@ -5606,7 +5606,7 @@ describe('Session', () => {
 
     it('applies draft-14 REQUEST_UPDATE immediately without pending leak (§9.10)', () => {
       /**
-       * Finding 4: Draft-14 SUBSCRIBE_UPDATE has no response (no REQUEST_OK).
+       * Draft-14 SUBSCRIBE_UPDATE has no response (no REQUEST_OK).
        * The session must apply state changes immediately and not accumulate
        * pending updates.
        */

@@ -1,7 +1,7 @@
 /**
- * RequestEndpoint correlation seam on Session.handleControlMessage.
+ * RequestEndpoint correlation in Session.handleControlMessage.
  *
- * Slice A: the optional `endpoint` argument is additive and inert for draft-14/16
+ * The optional `endpoint` argument is additive and inert for draft-14/16
  * (responses carry their Request ID on the wire). These tests prove two things:
  *   1. Passing an endpoint does not change draft-16 behavior (backward compatible).
  *   2. The seam genuinely works: a response whose Request ID is *absent* (as a
@@ -81,7 +81,7 @@ describe('handleControlMessage(msg, endpoint?)', () => {
     expect(session.getSubscription(requestId)?.state).toBe(SubscriptionState.ESTABLISHED);
   });
 
-  it('carries a full-uint64 endpoint requestId without re-branding through varint() (Codex)', () => {
+  it('carries a full-uint64 endpoint requestId without re-branding through varint()', () => {
     const big = 1n << 63n; // > 2^62-1: would throw if passed through varint()
     const okNoId = {
       type: 'SUBSCRIBE_OK',
@@ -114,7 +114,7 @@ describe('handleControlMessage(msg, endpoint?)', () => {
   });
 });
 
-describe('handleControlMessage — REQUEST_UPDATE endpoint context (Codex note #3)', () => {
+describe('handleControlMessage — REQUEST_UPDATE endpoint context', () => {
   function establishedServer(): Session {
     const s = new Session(EndpointRole.SERVER);
     const clientSetup: ClientSetup = { type: 'CLIENT_SETUP', parameters: new Map() };

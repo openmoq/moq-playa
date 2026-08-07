@@ -15,8 +15,10 @@ export { CanvasRenderer } from './canvas-renderer.js';
 export { WebAudioOutput } from './webaudio-output.js';
 export { MseMediaSource } from './mse-adapter.js';
 export { CmafAssembler } from '@moqt/browser';
-export { createWebTransport } from './webtransport-factory.js';
-export type { WebTransportFactoryOptions } from './webtransport-factory.js';
+// Re-export the package factory so examples use the same protocol negotiation
+// and fallback behavior as applications.
+export { createWebTransport } from '@moqt/browser';
+export type { WebTransportFactoryOptions } from '@moqt/browser';
 
 // ─── Publisher adapters ─────────────────────────────────────────────
 

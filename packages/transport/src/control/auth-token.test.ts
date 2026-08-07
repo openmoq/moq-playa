@@ -229,7 +229,7 @@ describe('round-trip encode → decode', () => {
 });
 
 describe('draft-18 Authorization Token (vi64 internals)', () => {
-  // Slice 2: draft-18 encodes Alias Type / Token Alias / Token Type as vi64
+  // Draft-18 encodes Alias Type / Token Alias / Token Type as vi64
   // (full uint64), not the QUIC varint of draft-14/16. Aliases/types above the
   // QUIC range (2^62-1) must round-trip unchanged.
   const big = 1n << 63n; // > 2^62-1

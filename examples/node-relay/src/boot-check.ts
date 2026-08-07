@@ -1,6 +1,6 @@
 /**
- * Slice A2 boot check: prove the FAILS native backend can actually BIND on this
- * machine with a real cert — still WITHOUT any MoQT behavior. Requires:
+ * Verify the FAILS native backend can bind on this machine with a real
+ * certificate, without exercising MoQT behavior. Requires:
  *   1. the native addon built (see README "Native backend"), and
  *   2. `pnpm gen-cert` to have produced ./certs/{cert,key}.pem.
  *
@@ -43,7 +43,7 @@ async function main(): Promise<number> {
     console.log('BIND OK — Http3Server is listening:', JSON.stringify(addr));
     const s = server.sessionStream('/moq');
     console.log('sessionStream("/moq"):', s?.constructor?.name, '— has getReader:', typeof s?.getReader === 'function');
-    console.log('RESULT: native backend binds. Slice B can proceed.');
+    console.log('RESULT: native backend binds.');
     return 0;
   } catch (err) {
     console.error('BIND FAILED:', (err as Error).message);

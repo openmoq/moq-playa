@@ -20,7 +20,8 @@ import type { BroadcastSessionConnection } from './broadcast-session.js';
 import { BroadcastAttempt } from './broadcast-attempt.js';
 import type { AttemptResources } from './broadcast-attempt.js';
 import { log } from '../shared/log.js';
-import { relayUrl, namespace, certHash, draftVersion } from '../shared/cert.js';
+import { namespace, certHash, draftVersion } from '../shared/cert.js';
+import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
 import {
   WebCodecsVideoEncoder,
   WebCodecsAudioEncoder,
@@ -50,8 +51,26 @@ const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
   const applyBtn = document.getElementById('settings-apply')!;
   const cancelBtn = document.getElementById('settings-cancel')!;
 
+  // Modal-scoped lazy discovery: opening settings with no explicit ?url= and
+  // no cached result starts its own discovery consumer, aborted on
+  // close/Apply. Independent of the Go Live flow's consumer — neither can
+  // block the other (Stop never waits on this, and vice versa).
+  let modalDiscovery: AbortController | undefined;
+
+  function abortModalDiscovery() {
+    modalDiscovery?.abort(new Error('settings closed'));
+    modalDiscovery = undefined;
+  }
+
   function populateFields() {
-    sUrl.value = params.get('url') ?? 'https://localhost:4443';
+    sUrl.value = params.get('url') ?? discoveredRelayUrl() ?? '';
+    if (!sUrl.value && !modalDiscovery) {
+      modalDiscovery = new AbortController();
+      void resolveRelayEndpoint({ signal: modalDiscovery.signal }).then(
+        (url) => { if (!sUrl.value) sUrl.value = url; },
+        () => { /* aborted or failed — the field stays editable */ },
+      );
+    }
     sNs.value = params.get('ns') ?? 'live';
     sHash.value = params.get('hash') ?? '';
     sVersion.value = params.get('v') ?? '';
@@ -61,14 +80,17 @@ const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
   }
 
   settingsBtn.addEventListener('click', () => { populateFields(); backdrop.classList.add('visible'); });
-  cancelBtn.addEventListener('click', () => backdrop.classList.remove('visible'));
-  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.classList.remove('visible'); });
+  cancelBtn.addEventListener('click', () => { abortModalDiscovery(); backdrop.classList.remove('visible'); });
+  backdrop.addEventListener('click', (e) => {
+    if (e.target === backdrop) { abortModalDiscovery(); backdrop.classList.remove('visible'); }
+  });
 
   applyBtn.addEventListener('click', () => {
+    abortModalDiscovery();
     const np = new URLSearchParams();
     const url = sUrl.value.trim();
     const ns = sNs.value.trim();
-    if (url && url !== 'https://localhost:4443') np.set('url', url);
+    if (url) np.set('url', url);
     if (ns && ns !== 'live') np.set('ns', ns);
     if (sHash.value.trim()) np.set('hash', sHash.value.trim());
     if (sVersion.value) np.set('v', sVersion.value);
@@ -151,6 +173,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
   let videoEncoder: WebCodecsVideoEncoder | null = null;
   let audioEncoder: WebCodecsAudioEncoder | null = null;
   let connection: MoqtConnection | null = null;
+  let resolvedRelayUrl = '';   // set by openSession; feeds the viewer link
   let audio: { sampleRate: number; channels: number } | undefined;
   let width = 1280;
   let height = 720;
@@ -229,6 +252,17 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
     // behavior binds to the NEGOTIATED draft (connection.draftVersion after
     // connect), not the configured preference.
     openSession: async (ctx: AttemptResources) => {
+      // Resolve the relay endpoint (explicit ?url= as-is, discovery
+      // otherwise). The consumer aborts with the attempt: Stop during
+      // probing closes the connecting probe transport once no other
+      // consumer remains — it never hangs the cancellation.
+      const discoveryAbort = new AbortController();
+      ctx.onCancel(() => discoveryAbort.abort(new Error('broadcast stopped')));
+      log('Discovering relay endpoint...');
+      const relayUrl = await resolveRelayEndpoint({ signal: discoveryAbort.signal });
+      ctx.throwIfCancelled();
+      resolvedRelayUrl = relayUrl;
+
       log(`Connecting to ${relayUrl}...`);
       const transportFactory = createWebTransport({ ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) });
       // Each resource is adopted the moment it exists — a cancellation or a
@@ -345,12 +379,14 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         data.close();
       };
 
-      // Show viewer URL + resolution
+      // Carry the resolved endpoint and certificate hash into the viewer link.
       const viewerBase = window.location.origin + '/player/';
       const viewerParams = new URLSearchParams();
-      viewerParams.set('url', relayUrl);
+      viewerParams.set('url', resolvedRelayUrl);
       viewerParams.set('ns', namespace);
       if (draftVersion) viewerParams.set('v', String(draftVersion));
+      const hashParam = params.get('hash');
+      if (hashParam) viewerParams.set('hash', hashParam);
       currentViewerLink = `${viewerBase}?${viewerParams.toString()}`;
       viewerCard.style.display = 'block';
       statRes.textContent = `${width}x${height}`;

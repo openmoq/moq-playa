@@ -1,6 +1,6 @@
 /**
  * Draft18Codec — wire codec increment for SUBSCRIBE (request) and SUBSCRIBE_OK
- * (response). Scope is deliberately narrow (Codex): framing + these two
+ * (response). Scope is deliberately narrow: framing plus these two
  * messages. Other message types throw an explicit "not implemented".
  *
  * Guardrails verified here:
@@ -141,7 +141,7 @@ describe('SUBSCRIBE_OK round-trip (response omits Request ID)', () => {
   });
 });
 
-describe('codec fixes (Codex round)', () => {
+describe('draft-18 codec validation and wide values', () => {
   it('rejects a SUBSCRIBE with trailing payload bytes', () => {
     const sub: Subscribe = {
       type: 'SUBSCRIBE', requestId: 1n, trackNamespace: NS, trackName: NAME, parameters: new Map(),
@@ -164,7 +164,7 @@ describe('codec fixes (Codex round)', () => {
   });
 
   it('round-trips a non-Location varint param above the QUIC range (EXPIRES) — vi64, not QUIC varint', () => {
-    // Slice 2: the draft18 codec's parameter bridge must NOT re-fold message
+    // The draft-18 codec's parameter bridge must not re-fold message
     // varints through the QUIC-Varint guard. EXPIRES (kind 'varint') carries the
     // full vi64 range, so 2^63 survives encode→decode unchanged.
     const big = 1n << 63n; // > 2^62-1
@@ -837,7 +837,7 @@ describe('PUBLISH_DONE round-trip (response on PUBLISH stream, §10.11)', () => 
   });
 
   it('round-trips Status Code + Stream Count above the QUIC range (vi64) byte-identically', () => {
-    // Slice 2: draft-18 PUBLISH_DONE Status Code and Stream Count are vi64, so a
+    // Draft-18 PUBLISH_DONE Status Code and Stream Count are vi64, so a
     // value above 2^62-1 must survive encode→decode and re-encode byte-identically.
     const big = 1n << 63n; // > 2^62-1
     const pd: PublishDone = {

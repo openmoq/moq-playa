@@ -322,6 +322,16 @@ joining FETCH; degrades to a normal live join otherwise), `?log=info|debug`
 (player logs on the console), `?catalog=<base64 JSON>` (inject a catalog), and
 `?fetchCatalog=1` (FETCH the catalog instead of subscribing).
 
+`?url=` is the complete WebTransport endpoint, including its deployment-specific
+path. For example, use `?url=https%3A%2F%2Frelay.example.com%3A4433%2Fmoq-relay`
+when a relay is mounted at `/moq-relay`. When omitted, the browser examples
+discover the endpoint by probing `https://<page-host>:4433` at `/moq`,
+`/moq-relay`, then `/` and selecting the first successful path in that order.
+`/moq` and `/moq-relay` are deployment conventions, not
+MOQT-standard paths (a relay that accepts any path simply matches on `/moq`).
+Discovery is a convenience for these examples: a deployed application knows its
+relay endpoint and should configure the complete URL.
+
 ---
 
 ## Testing

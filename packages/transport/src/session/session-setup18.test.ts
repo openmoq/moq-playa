@@ -1,5 +1,5 @@
 /**
- * draft-18 unified SETUP interpretation in the Session (Slice C, skeletal).
+ * Draft-18 unified SETUP interpretation in the Session.
  *
  * The codec produces a role-neutral SETUP; the session interprets it by role.
  * draft-18 does not require or emit MAX_REQUEST_ID, and draft-14/16 behavior is

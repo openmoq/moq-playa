@@ -1,5 +1,5 @@
 /**
- * Typed Location parameter validation (Codex gap fix).
+ * Typed Location parameter validation.
  *
  * A draft-18 typed `Location` parameter value is only defined for LARGEST_OBJECT.
  * Supplied for any other parameter (e.g. SUBSCRIPTION_FILTER, FORWARD) it must be

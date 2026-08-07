@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://moq-playa/conformance/media/schema/scenario.schema.json",
   "title": "moq-media-scenario/1",
-  "description": "Deterministic, implementation-neutral media scenario. Finalized in Slice -1; its runner lands in Slice 1. Steps are an ordered list; advanceTimeUs is the ONLY way virtual time moves. Traces preserve actual emission order. Wide integers are decimal strings. Every nested structure is exact-keyed (additionalProperties:false).",
+  "description": "Deterministic, implementation-neutral media scenario. Steps are an ordered list; advanceTimeUs is the only way virtual time moves. Traces preserve actual emission order. Wide integers are decimal strings. Every nested structure is exact-keyed (additionalProperties:false).",
   "type": "object",
   "required": ["scenarioSchema", "id", "description", "expectationBasis", "provenance", "input", "steps", "expect"],
   "additionalProperties": false,

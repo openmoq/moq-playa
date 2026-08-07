@@ -1,9 +1,8 @@
 /**
- * Slice A — Node WebTransport API probe.
+ * Node WebTransport API probe.
  *
- * Goal: discover and document the @fails-components/webtransport SERVER API at
- * runtime WITHOUT implementing any MoQT behavior. It answers the questions Slice B
- * depends on:
+ * Discover and document the @fails-components/webtransport server API at
+ * runtime without implementing MoQT behavior. It reports:
  *   - Does the package import on this platform/Node (native binding loads)?
  *   - Is `Http3Server` present and constructible?
  *   - Which methods exist (startServer/stopServer/address/sessionStream/ready/closed)?
@@ -31,7 +30,7 @@ function shapeOf(v: any): string {
 }
 
 async function main(): Promise<number> {
-  console.log('=== @fails-components/webtransport — Slice A API probe ===\n');
+  console.log('=== @fails-components/webtransport API probe ===\n');
 
   // ── 1. Import the package (native binding may fail to load here) ───────────
   let wt: any;
@@ -81,7 +80,7 @@ async function main(): Promise<number> {
       row('generateWebTransportCertificate()', 'THREW: ' + (err as Error).message);
     }
   } else {
-    row('cert helper', 'NOT exported by this version — Slice B must source a cert another way');
+    row('cert helper', 'not exported by this version; source a certificate separately');
   }
 
   // ── 4. Construct + introspect Http3Server (bind on :0 if a cert was obtained) ─
@@ -129,8 +128,8 @@ async function main(): Promise<number> {
 
   console.log('\n=== probe complete ===');
   console.log(apiDiscovered
-    ? 'RESULT: API discovery SUCCEEDED (Http3Server present). See output above for Slice B.'
-    : 'RESULT: API discovery INCOMPLETE — Http3Server not found; record in README.');
+    ? 'RESULT: API discovery succeeded (Http3Server present).'
+    : 'RESULT: API discovery incomplete: Http3Server not found; record this in the README.');
   return apiDiscovered ? 0 : 1;
 }
 

@@ -22,7 +22,8 @@ import { MoqtConnection } from '@moqt/webtransport';
 import { QlogTrace, varint } from '@moqt/transport';
 import { CATALOG_TRACK_NAME } from '@moqt/msf';
 import { log } from '../shared/log.js';
-import { relayUrl, namespace, namespaceArg, authority, warmStart, certHash, draftVersion, catalogBootstrap } from '../shared/cert.js';
+import { namespace, namespaceArg, authority, warmStart, certHash, draftVersion, catalogBootstrap } from '../shared/cert.js';
+import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
 import {
     AudioAlignedClock,
     WebCodecsVideoDecoder,
@@ -77,9 +78,30 @@ const catalogFromUrl = readCatalogParam();
     const applyBtn = document.getElementById('settings-apply')!;
     const cancelBtn = document.getElementById('settings-cancel')!;
 
+    // Modal-scoped lazy discovery: opening settings with no explicit ?url=
+    // and no cached result starts its own discovery consumer, aborted on
+    // close/Apply. Independent of the playback flow's consumer — neither
+    // can block the other.
+    let modalDiscovery: AbortController | undefined;
+
+    function abortModalDiscovery() {
+        modalDiscovery?.abort(new Error('settings closed'));
+        modalDiscovery = undefined;
+    }
+
+    function prefillUrlField() {
+        sUrl.value = params.get('url') ?? discoveredRelayUrl() ?? '';
+        if (sUrl.value || modalDiscovery) return;
+        modalDiscovery = new AbortController();
+        void resolveRelayEndpoint({ signal: modalDiscovery.signal }).then(
+            (url) => { if (!sUrl.value) sUrl.value = url; },
+            () => { /* aborted or failed — the field stays editable */ },
+        );
+    }
+
     // Populate from current URL params
     function populateFields() {
-        sUrl.value = params.get('url') ?? 'https://localhost:4443';
+        prefillUrlField();
         sNs.value = params.get('ns') ?? 'live';
         sAuthority.value = params.get('authority') ?? '';
         sWarmStart.checked = params.get('warmStart') === '1';
@@ -103,14 +125,19 @@ const catalogFromUrl = readCatalogParam();
     });
 
     cancelBtn.addEventListener('click', () => {
+        abortModalDiscovery();
         backdrop.classList.remove('visible');
     });
 
     backdrop.addEventListener('click', (e) => {
-        if (e.target === backdrop) backdrop.classList.remove('visible');
+        if (e.target === backdrop) {
+            abortModalDiscovery();
+            backdrop.classList.remove('visible');
+        }
     });
 
     applyBtn.addEventListener('click', () => {
+        abortModalDiscovery();
         const newParams = new URLSearchParams();
         const url = sUrl.value.trim();
         const ns = sNs.value.trim();
@@ -121,7 +148,7 @@ const catalogFromUrl = readCatalogParam();
         const gap = sGap.value.trim();
         const catalogJson = sCatalog.value.trim();
 
-        if (url && url !== 'https://localhost:4443') newParams.set('url', url);
+        if (url) newParams.set('url', url);
         if (ns && ns !== 'live') newParams.set('ns', ns);
         if (authorityValue) newParams.set('authority', authorityValue);
         if (sWarmStart.checked) newParams.set('warmStart', '1');
@@ -393,6 +420,7 @@ let healthySinceMs = 0;       // start of the current uninterrupted media streak
 let reconnecting = false;     // a reconnect loop is in flight
 let reconnectCancelled = false; // user pressed Stop during a reconnect loop
 let retryCount = 0;
+let startupDiscovery: AbortController | null = null; // aborts endpoint discovery on Stop
 let playEpoch = 0;            // bumped by every stopPlayback(); a startPlayback()
                               // that observes a stale epoch must not touch state
 
@@ -593,6 +621,8 @@ async function stopPlayback(): Promise<void> {
     healthySinceMs = 0;
     cmafActive = false; // disarm unexpected-pause recovery for this session
     playEpoch++;     // invalidate any in-flight startPlayback() attempt
+    startupDiscovery?.abort(new Error('playback stopped'));
+    startupDiscovery = null;
 
     const p = player;
     player = null;
@@ -918,7 +948,7 @@ function renderPipelineBar(s: PlayerStats): string {
  * Demo-quality: assumes JSON (MSF) catalog; would need parseCatalogAuto
  * for CF01-encoded catalogs.
  */
-async function prefetchCatalogViaFetch(): Promise<{
+async function prefetchCatalogViaFetch(relayUrl: string): Promise<{
     connection: InstanceType<typeof MoqtConnection>;
     catalog: { tracks: any[] };
 }> {
@@ -971,6 +1001,30 @@ async function startPlayback(): Promise<void> {
     // One latch per session; both adapter factories below close over it.
     const latch = newStartupLatch();
     const { ctx: audioCtx, clock: audioClock } = ensureAudio();
+
+    // Resolve the relay endpoint. Explicit ?url= is used as-is; otherwise
+    // the shared discovery probes the page host's common endpoint paths.
+    // The consumer is tied to this startup attempt: Stop aborts it (which
+    // closes any connecting probe transport once no consumer remains).
+    const discovery = new AbortController();
+    startupDiscovery = discovery;
+    let relayUrl: string;
+    try {
+        log('Discovering relay endpoint...');
+        relayUrl = await resolveRelayEndpoint({ signal: discovery.signal });
+    } catch (err) {
+        if (epoch !== playEpoch) return;         // superseded by Stop
+        log(`Endpoint discovery failed: ${(err as Error).message}`);
+        isPlaying = false;
+        setControlIcon(false);
+        return;
+    } finally {
+        // Identity-safe: a stale attempt must not clear a successor's
+        // controller (Stop nulls the slot itself when it aborts).
+        if (startupDiscovery === discovery) startupDiscovery = null;
+    }
+    if (epoch !== playEpoch) return;             // superseded while discovering
+
     log(`Relay: ${relayUrl}`);
     log(`Namespace: ${Array.isArray(namespaceArg) ? `[${namespaceArg.map(f => `"${f}"`).join(', ')}]` : namespaceArg}`);
     if (authority) log(`Authority: ${authority}`);
@@ -1028,7 +1082,7 @@ async function startPlayback(): Promise<void> {
     // the connect handshake AND the catalog SUBSCRIBE.
     let prefetched: { connection: InstanceType<typeof MoqtConnection>; catalog: { tracks: any[] } } | null = null;
     if (params.get('fetchCatalog') === '1' && !catalogFromUrl) {
-        prefetched = await prefetchCatalogViaFetch();
+        prefetched = await prefetchCatalogViaFetch(relayUrl);
         if (epoch !== playEpoch) {
             // Superseded (timeout/stop) while prefetching — leave state alone.
             try { await prefetched.connection.close(); } catch { /* already closed */ }

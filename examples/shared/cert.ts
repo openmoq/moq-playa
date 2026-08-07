@@ -1,19 +1,22 @@
 /**
- * Parse relay URL and certificate hash from URL query parameters.
+ * Parse example configuration from URL query parameters.
  *
- * Usage: http://localhost:5173/connect/?hash=abc123&url=https://localhost:4443
+ * Usage: http://localhost:5173/connect/?hash=abc123&url=https://localhost:4433/moq
  *
- * The relay prints its self-signed certificate hash on startup.
+ * The relay URL is NOT exported here: a non-empty `?url=` is authoritative,
+ * and without one the endpoint is discovered asynchronously — use
+ * `resolveRelayEndpoint()` from relay-endpoint.ts.
+ *
+ * The relay's cert generator prints its self-signed certificate hash;
  * serverCertificateHashes is the standard WebTransport mechanism
  * for local development TLS.
  *
  * @see draft-ietf-moq-transport-16 §3.1 (WebTransport requires TLS)
  */
 
-const params = new URLSearchParams(window.location.search);
+import { parseCertHashHex } from './relay-url.js';
 
-/** Relay URL (default: https://localhost:4443). */
-export const relayUrl: string = params.get('url') ?? `${window.location.origin}:4433`;
+const params = new URLSearchParams(window.location.search);
 
 /** Namespace as a display string (`?ns=`, default "live"). */
 export const namespace: string = params.get('ns') ?? 'live';
@@ -71,14 +74,5 @@ export const draftVersion: 14 | 16 | 18 | undefined = (() => {
  */
 export const certHash: ArrayBuffer | undefined = (() => {
   const hex = params.get('hash');
-  if (!hex) return undefined;
-  const clean = hex.replace(/[^0-9a-fA-F]/g, '');
-  if (clean.length % 2 !== 0) {
-    throw new Error(`Invalid cert hash: odd number of hex chars (${clean.length})`);
-  }
-  const bytes = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes.buffer;
+  return hex ? parseCertHashHex(hex) : undefined;
 })();

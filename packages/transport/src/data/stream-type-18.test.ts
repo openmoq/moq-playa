@@ -1,5 +1,5 @@
 /**
- * draft-18 stream-type classification (Codex note #2): the stream type is a
+ * Draft-18 stream-type classification: the stream type is a
  * vi64 VALUE, so multi-byte types (SETUP 0x2F00, PADDING 0x132B3E28) must be
  * decoded as a full vi64 — not classified by peeking the first byte.
  */

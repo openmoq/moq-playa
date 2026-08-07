@@ -6,7 +6,8 @@
  */
 
 import { Player } from '@playa/player';
-import { relayUrl, namespace, certHash, draftVersion } from '../shared/cert.js';
+import { namespace, certHash, draftVersion } from '../shared/cert.js';
+import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
 
 // ─── DOM refs & helpers ─────────────────────────────────────────────
 
@@ -33,85 +34,106 @@ function formatTime(ms: number): string {
   return `${m}:${String(s % 60).padStart(2, '0')}`;
 }
 
-// ─── Create Player ──────────────────────────────────────────────────
+// ─── Main ───────────────────────────────────────────────────────────
+// Explicit ?url= is used as-is; otherwise the shared discovery probes the
+// page host's common endpoint paths. Total failure renders the diagnostic
+// and stops — no rethrow, no unhandled page error.
 
-const player = new Player(playerContainer, {
-  url: relayUrl,
-  namespace,
-  ...(certHash ? { certHash } : {}),
-  ...(draftVersion ? { draftVersion } : {})
-});
-
-// ─── Wire Events ────────────────────────────────────────────────────
-
-player.on('statechange', ({ state }) => {
-  stateBadge.textContent = state;
-  stateBadge.className = `state-badge ${state}`;
-});
-
-player.on('ready', ({ levels }) => {
-  log(`Ready: ${levels.length} quality level(s)`);
-  playBtn.disabled = false;
-  muteBtn.disabled = false;
-  qualitySelect.disabled = false;
-  qualitySelect.innerHTML = '<option value="auto">Auto</option>';
-  for (const level of levels) {
-    const opt = document.createElement('option');
-    opt.value = String(level.index);
-    opt.textContent = `${level.label} (${Math.round(level.bitrate / 1000)}k)`;
-    qualitySelect.appendChild(opt);
+async function main(): Promise<void> {
+  log('Discovering relay endpoint...');
+  onDiscoveryAttempt((url, outcome) => log(`  probe ${url}: ${outcome}`));
+  let relayUrl: string;
+  try {
+    relayUrl = await resolveRelayEndpoint();
+  } catch (err) {
+    log(`Fatal: ${(err as Error).message}`);
+    stateBadge.textContent = 'error';
+    stateBadge.className = 'state-badge error';
+    return;
   }
-});
 
-player.on('playing', () => log('First frame rendered'));
+  // ── Create Player ─────────────────────────────────────────────────
 
-player.on('timeupdate', ({ currentTime }) => {
-  timeDisplay.textContent = formatTime(currentTime);
-  if (player.duration) {
-    seekBar.max = String(player.duration);
-    seekBar.value = String(currentTime);
-    seekBar.disabled = !player.seekable;
-  }
-});
+  const player = new Player(playerContainer, {
+    url: relayUrl,
+    namespace,
+    ...(certHash ? { certHash } : {}),
+    ...(draftVersion ? { draftVersion } : {})
+  });
 
-player.on('durationchange', ({ duration }) => log(`Duration: ${formatTime(duration)}`));
-player.on('qualitychange', ({ level, auto }) => log(`Quality: ${level.label} (${auto ? 'ABR' : 'manual'})`));
-player.on('stall', ({ durationMs }) => log(`Stall: ${durationMs}ms`));
-player.on('error', ({ severity, message }) => log(`[${severity}] ${message}`));
+  // ── Wire Events ───────────────────────────────────────────────────
 
-player.on('stats', (s) => {
-  statsDiv.innerHTML = [
-    `<span>${s.framesRendered}</span> frames`,
-    s.resolution ? `<span>${s.resolution.width}x${s.resolution.height}</span>` : '',
-    s.videoCodec ? `<span>${s.videoCodec}</span>` : '',
-    s.timeToFirstFrameMs !== null ? `TTFF <span>${s.timeToFirstFrameMs.toFixed(0)}ms</span>` : '',
-    s.stallCount > 0 ? `stalls <span>${s.stallCount}</span>` : '',
-  ].filter(Boolean).join(' &middot; ');
-});
+  player.on('statechange', ({ state }) => {
+    stateBadge.textContent = state;
+    stateBadge.className = `state-badge ${state}`;
+  });
 
-// ─── Controls ───────────────────────────────────────────────────────
+  player.on('ready', ({ levels }) => {
+    log(`Ready: ${levels.length} quality level(s)`);
+    playBtn.disabled = false;
+    muteBtn.disabled = false;
+    qualitySelect.disabled = false;
+    qualitySelect.innerHTML = '<option value="auto">Auto</option>';
+    for (const level of levels) {
+      const opt = document.createElement('option');
+      opt.value = String(level.index);
+      opt.textContent = `${level.label} (${Math.round(level.bitrate / 1000)}k)`;
+      qualitySelect.appendChild(opt);
+    }
+  });
 
-playBtn.addEventListener('click', () => {
-  if (player.state === 'playing') player.pause();
-  else player.play();
-});
+  player.on('playing', () => log('First frame rendered'));
 
-player.on('play', () => { playBtn.textContent = 'Pause'; });
-player.on('pause', () => { playBtn.textContent = 'Play'; });
+  player.on('timeupdate', ({ currentTime }) => {
+    timeDisplay.textContent = formatTime(currentTime);
+    if (player.duration) {
+      seekBar.max = String(player.duration);
+      seekBar.value = String(currentTime);
+      seekBar.disabled = !player.seekable;
+    }
+  });
 
-seekBar.addEventListener('input', () => player.seek(Number(seekBar.value)));
-volumeBar.addEventListener('input', () => player.setVolume(Number(volumeBar.value) / 100));
-muteBtn.addEventListener('click', () => player.toggleMute());
-player.on('volumechange', ({ muted }) => { muteBtn.textContent = muted ? 'Unmute' : 'Mute'; });
+  player.on('durationchange', ({ duration }) => log(`Duration: ${formatTime(duration)}`));
+  player.on('qualitychange', ({ level, auto }) => log(`Quality: ${level.label} (${auto ? 'ABR' : 'manual'})`));
+  player.on('stall', ({ durationMs }) => log(`Stall: ${durationMs}ms`));
+  player.on('error', ({ severity, message }) => log(`[${severity}] ${message}`));
 
-qualitySelect.addEventListener('change', () => {
-  const val = qualitySelect.value;
-  void player.setQuality(val === 'auto' ? 'auto' : Number(val))
-    .catch((err: unknown) => log(`Quality switch failed: ${(err as Error).message}`));
-});
+  player.on('stats', (s) => {
+    statsDiv.innerHTML = [
+      `<span>${s.framesRendered}</span> frames`,
+      s.resolution ? `<span>${s.resolution.width}x${s.resolution.height}</span>` : '',
+      s.videoCodec ? `<span>${s.videoCodec}</span>` : '',
+      s.timeToFirstFrameMs !== null ? `TTFF <span>${s.timeToFirstFrameMs.toFixed(0)}ms</span>` : '',
+      s.stallCount > 0 ? `stalls <span>${s.stallCount}</span>` : '',
+    ].filter(Boolean).join(' &middot; ');
+  });
 
-// ─── Load ───────────────────────────────────────────────────────────
+  // ── Controls ──────────────────────────────────────────────────────
 
-log(`Relay: ${relayUrl}`);
-log(`Namespace: ${namespace}`);
-player.load().catch((err) => log(`Fatal: ${(err as Error).message}`));
+  playBtn.addEventListener('click', () => {
+    if (player.state === 'playing') player.pause();
+    else player.play();
+  });
+
+  player.on('play', () => { playBtn.textContent = 'Pause'; });
+  player.on('pause', () => { playBtn.textContent = 'Play'; });
+
+  seekBar.addEventListener('input', () => player.seek(Number(seekBar.value)));
+  volumeBar.addEventListener('input', () => player.setVolume(Number(volumeBar.value) / 100));
+  muteBtn.addEventListener('click', () => player.toggleMute());
+  player.on('volumechange', ({ muted }) => { muteBtn.textContent = muted ? 'Unmute' : 'Mute'; });
+
+  qualitySelect.addEventListener('change', () => {
+    const val = qualitySelect.value;
+    void player.setQuality(val === 'auto' ? 'auto' : Number(val))
+      .catch((err: unknown) => log(`Quality switch failed: ${(err as Error).message}`));
+  });
+
+  // ── Load ──────────────────────────────────────────────────────────
+
+  log(`Relay: ${relayUrl}`);
+  log(`Namespace: ${namespace}`);
+  player.load().catch((err) => log(`Fatal: ${(err as Error).message}`));
+}
+
+void main();

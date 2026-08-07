@@ -3320,7 +3320,7 @@ export class Session {
     fetch.sendFetchCancel();
 
     // Drop the fetch from tracking. Record a crossed-message shadow ONLY for a
-    // PENDING cancel (round-8t §6): a FETCH already TRANSFERRING has received its
+    // Pending FETCH cancellation: a transferring FETCH has received its
     // FETCH_OK, so no crossed FETCH_OK is possible and — §5.2 — no REQUEST_ERROR is
     // legal after the OK, so an established fetch needs no shadow at all. The pending
     // shadow is ONE-SHOT (the first crossed FETCH_OK / REQUEST_ERROR reclaims it),

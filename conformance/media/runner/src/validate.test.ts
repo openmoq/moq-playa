@@ -63,7 +63,7 @@ describe('validateEntry — discriminating failures', () => {
   }
 });
 
-describe('validateEntry — strictness (the cases Codex exercised)', () => {
+describe('validateEntry — strictness', () => {
   const encEntry = (pm: unknown): CorpusEntry => ({
     ...validDecodeEntry(), id: 'properties/strict',
     input: { propertyMap: pm } as never,

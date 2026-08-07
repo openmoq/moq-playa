@@ -15,6 +15,10 @@
 import { MoqtConnection } from '@moqt/webtransport';
 import { varint } from '@moqt/transport';
 import { createWebTransport } from '../shared/browser/index.js';
+import { resolveRelayEndpoint } from '../shared/relay-endpoint.js';
+import { parseCertHashHex, relayCandidates } from '../shared/relay-url.js';
+import { discoverEndpoint } from '../shared/discover-endpoint.js';
+import { probeTransport } from '../shared/probe-transport.js';
 import {
   CATALOG_TRACK_NAME,
   applyCatalogUpdate,
@@ -146,6 +150,17 @@ class CatalogAccumulator {
 
 let activeRun = 0;
 let activeConnection: InstanceType<typeof MoqtConnection> | null = null;
+// Keep at most one discovery flight active. A submission replaces the page
+// prefill or an earlier blank-URL discovery and closes its probes.
+let prefillAbort: AbortController | null = null;
+let manualDiscoveryAbort: AbortController | null = null;
+
+function abortDiscoveryFlights(reason: string): void {
+  prefillAbort?.abort(new Error(reason));
+  prefillAbort = null;
+  manualDiscoveryAbort?.abort(new Error(reason));
+  manualDiscoveryAbort = null;
+}
 
 form.addEventListener('submit', (e) => {
   e.preventDefault();
@@ -159,13 +174,54 @@ if (!('WebTransport' in window)) {
 
 async function run(): Promise<void> {
   const runId = ++activeRun;
-  const url = (document.getElementById('relay-url') as HTMLInputElement).value.trim();
+  // Every submission supersedes any in-flight discovery (prefill or a
+  // previous blank-URL run) — their probes are aborted and closed.
+  abortDiscoveryFlights('superseded by run');
+  const urlInput = document.getElementById('relay-url') as HTMLInputElement;
+  let url = urlInput.value.trim();
   const ns = (document.getElementById('namespace') as HTMLInputElement).value.trim();
   const vRaw = (document.getElementById('draft-version') as HTMLSelectElement).value;
   const hashHex = (document.getElementById('cert-hash') as HTMLInputElement).value.trim();
   const v: 14 | 16 | 18 | undefined = vRaw === '14' ? 14 : vRaw === '16' ? 16 : vRaw === '18' ? 18 : undefined;
 
-  if (!url || !ns) { setStatus('URL and namespace required.', 'error'); return; }
+  if (!ns) { setStatus('Namespace required.', 'error'); return; }
+  if (!url) {
+    // Use the current form values for a fresh discovery. This bypasses the
+    // page-query singleton so a newly entered hash or draft cannot share an
+    // incompatible probe.
+    if (!('WebTransport' in window)) {
+      setStatus('WebTransport not available. Use Chrome 97+.', 'error');
+      return;
+    }
+    setStatus('Discovering relay endpoint…');
+    const discoveryController = new AbortController();
+    manualDiscoveryAbort = discoveryController;
+    try {
+      const certHashBuf = hashHex ? parseCertHashHex(hashHex) : undefined;
+      url = await discoverEndpoint({
+        candidates: relayCandidates(window.location.hostname),
+        connect: (candidate, signal) => probeTransport(candidate, {
+          ...(certHashBuf ? { certHash: certHashBuf } : {}),
+          ...(v ? { draftVersion: v } : {}),
+          signal,
+        }),
+        signal: discoveryController.signal,
+        onAttempt: (candidate, outcome) => {
+          if (runId === activeRun) log(`probe ${candidate}: ${outcome}`);
+        },
+      });
+    } catch (err) {
+      if (runId === activeRun && !discoveryController.signal.aborted) {
+        setStatus((err as Error).message, 'error');
+      }
+      return;
+    } finally {
+      // Identity-safe: a superseding run owns the slot by now.
+      if (manualDiscoveryAbort === discoveryController) manualDiscoveryAbort = null;
+    }
+    if (runId !== activeRun) return;   // superseded while discovering
+    urlInput.value = url;
+  }
 
   const method = (document.getElementById('read-method') as HTMLSelectElement).value as 'subscribe' | 'fetch';
   const groupId = BigInt((document.getElementById('fetch-group') as HTMLInputElement).value || '0');
@@ -186,12 +242,7 @@ async function run(): Promise<void> {
 
   try {
     // WebTransport — use shared factory for protocol negotiation
-    const certHashBuf = hashHex ? (() => {
-      const clean = hashHex.replace(/[^0-9a-fA-F]/g, '');
-      const bytes = new Uint8Array(clean.length / 2);
-      for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
-      return bytes.buffer as ArrayBuffer;
-    })() : undefined;
+    const certHashBuf = hashHex ? parseCertHashHex(hashHex) : undefined;
     const transportFactory = createWebTransport({ ...(certHashBuf ? { certHash: certHashBuf } : {}), ...(v ? { draftVersion: v } : {}) });
     const transport = await transportFactory(url);
     log(`WebTransport connected${(transport as any).protocol ? ` (${(transport as any).protocol})` : ''}`);
@@ -449,8 +500,39 @@ function setStatus(msg: string, type: 'info' | 'error' | 'success' = 'info'): vo
 
 function seedForm(): void {
   const p = new URLSearchParams(window.location.search);
-  (document.getElementById('relay-url') as HTMLInputElement).value =
-    p.get('url') ?? `${window.location.origin.replace(/\/$/, '')}:4433`;
+  const urlInput = document.getElementById('relay-url') as HTMLInputElement;
+  const explicit = p.get('url');
+  if (explicit) {
+    urlInput.value = explicit;
+  } else if (!('WebTransport' in window)) {
+    // No discovery without the API — and never overwrite the capability
+    // diagnostic with a "no endpoint found" message.
+    urlInput.placeholder = 'https://relay.example.com:4433/moq';
+  } else {
+    // Prefill asynchronously from the shared discovery. The user can type
+    // while it runs — a typed value always wins over the discovered one —
+    // and a run started meanwhile owns the status bar AND aborts this
+    // flight (identity-safe controller; a late failure of a superseded
+    // prefill must not overwrite an active run's status).
+    const prefillRun = activeRun;
+    const controller = new AbortController();
+    prefillAbort = controller;
+    urlInput.placeholder = 'discovering…';
+    void resolveRelayEndpoint({ signal: controller.signal }).then(
+      (url) => {
+        if (prefillAbort === controller) prefillAbort = null;
+        if (!urlInput.value) urlInput.value = url;
+        urlInput.placeholder = 'https://relay.example.com:4433/moq';
+      },
+      (err: unknown) => {
+        if (prefillAbort === controller) prefillAbort = null;
+        urlInput.placeholder = 'https://relay.example.com:4433/moq';
+        if (activeRun === prefillRun && !controller.signal.aborted) {
+          setStatus((err as Error).message, 'error');
+        }
+      },
+    );
+  }
   (document.getElementById('namespace') as HTMLInputElement).value = p.get('ns') ?? 'live';
   (document.getElementById('draft-version') as HTMLSelectElement).value = p.get('v') ?? '';
   (document.getElementById('cert-hash') as HTMLInputElement).value = p.get('hash') ?? '';

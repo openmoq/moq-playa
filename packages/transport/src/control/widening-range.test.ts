@@ -1,5 +1,5 @@
 /**
- * Option-A widening guardrail (Codex #4/#6, encode half): message `requestId`
+ * Legacy request-ID range enforcement: message `requestId`
  * is now `bigint` so draft-18 can carry the full uint64 range, but the draft-14
  * and draft-16 encoders MUST still reject a value outside the QUIC-varint range
  * rather than silently truncating it. (The decode-flows-for-d18 half lands with

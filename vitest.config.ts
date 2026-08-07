@@ -14,6 +14,7 @@ export default defineConfig({
       'conformance/media/runner/src/**/*.test.ts',
       'examples/node-publisher/src/**/*.test.ts',
       'examples/broadcast/**/*.test.ts',
+      'examples/shared/**/*.test.ts',
     ],
     // The external-probe differential lane (`*.diff.test.ts`) requires a built
     // LibMoQ probe via MOQ_MEDIA_PROBE_BIN; it is opt-in via `test:corpus:diff`

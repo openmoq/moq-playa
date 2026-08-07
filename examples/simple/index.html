@@ -132,7 +132,10 @@
     <h1>Playa — Simple Example</h1>
     <p class="subtitle">
       The entire player in <code>~30 lines</code> of TypeScript.
-      Pass <code>?url=</code>, <code>&ns=</code>, and optionally <code>&hash=</code> / <code>&v=14</code>.
+      Pass <code>?url=</code> (the complete relay endpoint), <code>&ns=</code>, and optionally
+      <code>&hash=</code> / <code>&v=14</code>. Without <code>?url=</code> the page discovers the
+      endpoint by probing <code>https://&lt;page-host&gt;:4433</code> at <code>/moq</code>,
+      <code>/moq-relay</code>, then <code>/</code>.
     </p>
 
     <div id="player-container"></div>

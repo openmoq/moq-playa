@@ -2145,10 +2145,9 @@ describe('MoqtPlayer', () => {
       expect(loc.keyframeWaitingCount).toBe(0);
       expect(loc.syncResetCount).toBe(0);
       expect(loc.videoEffectiveGapTimeoutMs).toBeGreaterThan(0); // raw fuse gauge
-      // Slice A contract: the render cushion is smoothed and clamped
-      // INDEPENDENTLY of the raw fuse (which may exceed it when spiking) —
-      // bounded by the static floor and the render cap, never compared
-      // against the raw value.
+      // The render cushion is smoothed and clamped independently of the raw
+      // fuse, which may exceed it when spiking. It remains bounded by the
+      // static floor and render cap and is never compared against the raw value.
       expect(loc.renderCushionMs).not.toBeNull();
       expect(loc.renderCushionMs).toBeGreaterThanOrEqual(50);  // ≥ static floor
       expect(loc.renderCushionMs).toBeLessThanOrEqual(750);    // ≤ render cap
@@ -9660,7 +9659,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('finding-1 (crossed ordering): a delayed OLD-session SUBSCRIBE_OK must not consume NEW-session buffered entries', async () => {
+  it('a delayed old-session SUBSCRIBE_OK does not consume new-session buffered entries', async () => {
     // New session buffers an object under an alias; then a DELAYED old-session
     // SUBSCRIBE_OK for the SAME alias arrives. The new object must remain
     // buffered until the NEW session resolves it — not be replayed or dropped.
@@ -10071,7 +10070,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  // ─── Migration lifecycle robustness (round-8 findings) ───────────────
+  // ─── Migration lifecycle robustness ─────────────────────────────────
 
   const holdSubscribe = (a: ReturnType<typeof createMockAdapter>): { release: (r: bigint) => void } => {
     const box: { release: (r: bigint) => void } = { release: () => {} };
@@ -10225,9 +10224,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  // ─── Migration lifecycle robustness (round-9 refinements) ────────────
+  // ─── Migration replay and retirement robustness ─────────────────────
 
-  it('refine-1: a staged event throwing during drain does NOT roll back the committed session', async () => {
+  it('a staged event throwing during drain does not roll back the committed session', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -10266,7 +10265,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine-2: a callback captured from an abandoned candidate is permanently inert', async () => {
+  it('a callback captured from an abandoned candidate is permanently inert', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -10304,7 +10303,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine-3: a concurrent migration is rejected BEFORE creating a transport', async () => {
+  it('a concurrent migration is rejected before creating a transport', async () => {
     const createTransport = vi.fn(async () => ({}) as unknown as WebTransport);
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
@@ -10336,7 +10335,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine-4: a DEGRADED candidate error does not abort the migration', async () => {
+  it('a degraded candidate error does not abort the migration', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -10367,7 +10366,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine-5: staging aborts on the BYTE limit well below the event cap', async () => {
+  it('staging aborts on the byte limit well below the event cap', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -10406,7 +10405,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine2-1: CONTROL-message parameter bytes count toward the byte limit (below the event cap)', async () => {
+  it('control-message parameter bytes count toward the byte limit below the event cap', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -10447,7 +10446,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine2-2 (finding-1+2): a reentrant close DURING drain terminates without a spurious candidate abort', async () => {
+  it('a reentrant close during drain terminates without a spurious candidate abort', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -10497,7 +10496,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine2-3 (finding-2): a throwing error listener during replay-failure reporting does not strand the migration', async () => {
+  it('a throwing error listener during replay-failure reporting does not strand the migration', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -10539,7 +10538,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine2-4 (finding-4): a replay failure keeps its live-delivery error source', async () => {
+  it('a replay failure keeps its live-delivery error source', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -10575,7 +10574,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine3-1 (finding-1): a replacement dying DURING old-session retirement is not reported migrated', async () => {
+  it('a replacement dying during old-session retirement is not reported migrated', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     let releaseOldClose: (() => void) | null = null;
@@ -10606,7 +10605,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine3-2 (finding-2): a throwing logger during replay-failure reporting does not reject the migration', async () => {
+  it('a throwing logger during replay-failure reporting does not reject the migration', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     // A logger that throws ONLY for the replay-failure diagnostic (so load and the
@@ -10649,7 +10648,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine4-1 (finding): a STAGED GOAWAY replayed during drain re-migrates after the handoff', async () => {
+  it('a staged GOAWAY replayed during drain re-migrates after the handoff', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const a3 = createMockAdapter();
@@ -10685,7 +10684,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine4-2 (finding): a LIVE GOAWAY while the old close is held re-migrates once retirement finishes', async () => {
+  it('a live GOAWAY while the old close is held re-migrates once retirement finishes', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const a3 = createMockAdapter();
@@ -10722,7 +10721,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('refine4-3 (finding): an OLD-session GOAWAY during establishment is NOT acted on after the caller\'s handoff commits', async () => {
+  it('an old-session GOAWAY during establishment is ignored after the caller\'s handoff commits', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const createTransport = vi.fn(async () => ({}) as unknown as WebTransport);

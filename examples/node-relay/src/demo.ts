@@ -1,5 +1,5 @@
 /**
- * Shared demo constants + tiny helpers for the Slice C object-stream example.
+ * Shared constants and helpers for the object-stream example.
  * One fixed track; three small text payloads. Nothing here is protocol logic.
  */
 export const DEMO_NAMESPACE = (process.env.DEMO_NAMESPACE ?? 'demo').split('/');

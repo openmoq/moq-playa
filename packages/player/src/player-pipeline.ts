@@ -220,9 +220,8 @@ export function createPipelines(
 
   let commandDispatcher: CommandDispatcher | null = null;
 
-  // Slice A: the stable render playout target. Smooths the raw adaptive gap
-  // timeout into the cushion used for RENDER scheduling (video recompute +
-  // audio scheduling) — the gap DETECTOR keeps the raw value.
+  // Smooth the raw adaptive gap timeout into the stable cushion used for render
+  // scheduling. Gap detection continues to use the raw value.
   const hasLoc = (trackInfo.video !== undefined && !hasCmafVideo)
     || (trackInfo.audio !== undefined && !hasCmafAudio);
   const cushionFloorUs = handshakeRttMs !== undefined && handshakeRttMs < 5

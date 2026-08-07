@@ -8,7 +8,7 @@ import {
   type Varint,
 } from './varint.js';
 
-describe('range enforcement for raw bigint inputs (Option-A widening guardrail)', () => {
+describe('range enforcement for raw bigint inputs', () => {
   // After widening message fields to bigint, the QUIC encoders accept bigint and
   // MUST reject out-of-QUIC-range values rather than silently truncating, so a
   // draft-14/16 message can never encode a value > 2^62-1.

@@ -2363,7 +2363,7 @@ describe('MoqtConnection draft-14', () => {
     expect(adapter).toBeDefined();
   });
 
-  // ─── R8d finding 1: legacy SUBSCRIBE_OK validated BEFORE resolve ───
+  // ─── Legacy SUBSCRIBE_OK validation precedes resolution ────────────
   // The draft-14/16 control loop must apply the same order as draft-18: a
   // duplicate-alias SUBSCRIBE_OK closes the session and REJECTS subscribeTrack(),
   // never resolves it against a closing session.
@@ -2419,9 +2419,9 @@ describe('MoqtConnection draft-14', () => {
         expect(qlogOks).toContain(req2);
       });
 
-      // R8e finding 1: a GUARDED-alias reuse must be refused via the DRAFT-SPECIFIC
-      // cancel (draft-14/16 UNSUBSCRIBE) — NOT crash on a null uniPair, and NOT
-      // close the whole session.
+      // A guarded-alias reuse must be refused through the draft-specific cancel
+      // (draft-14/16 UNSUBSCRIBE), without crashing on a null uniPair or closing
+      // the whole session.
       it(`draft-${draft}: reusing an alias still guarded by a terminating prior sub refuses the subscribe WITHOUT a session close`, async () => {
         const mock = createMockTransport();
         const adapter = draft === 14 ? await connectV14Adapter(mock) : await connectAdapter(mock);
@@ -2463,7 +2463,7 @@ describe('MoqtConnection draft-14', () => {
     }
   });
 
-  // ─── R8d finding 2: legacy PUBLISH_DONE applies the terminal Stream Count ───
+  // ─── Legacy PUBLISH_DONE applies the terminal Stream Count ─────────
   it('draft-16: a subscriber-side PUBLISH_DONE tears down alias routing and arms the terminal guard', async () => {
     const mock = createMockTransport();
     const adapter = await connectAdapter(mock); // draft-16
@@ -2678,7 +2678,7 @@ describe('MoqtConnection draft-14', () => {
     expect(adapter.session.state).not.toBe(SessionState.CLOSED);
   });
 
-  // ─── R8e finding 3: a crossed OLD PUBLISH_DONE must not erase a NEW route ───
+  // ─── A crossed old PUBLISH_DONE must not erase a new route ─────────
   it('draft-16: a delayed PUBLISH_DONE for a superseded request does not delete the reused alias’s new route', async () => {
     const mock = createMockTransport();
     // Short guard TTL so the old subscription's unsubscribe guard EXPIRES before
@@ -2745,7 +2745,7 @@ describe('MoqtConnection draft-14', () => {
 
   it('delivers v14 fetch status object with correct status codes', async () => {
     /**
-     * Finding 5: Draft-14 fetch status codes must be preserved.
+     * Draft-14 fetch status codes must be preserved.
      * Wire status 0x1 (OBJECT_DOES_NOT_EXIST) → emitted status 0x1
      * Wire status 0x3 (END_OF_GROUP) → emitted status 0x3
      * Wire status 0x4 (END_OF_TRACK) → emitted status 0x4
@@ -2833,7 +2833,7 @@ describe('MoqtConnection draft-14', () => {
 
   it('applies REQUEST_UPDATE state immediately without waiting for REQUEST_OK', async () => {
     /**
-     * Finding 4: Draft-14 has no REQUEST_OK for SUBSCRIBE_UPDATE.
+     * Draft-14 has no REQUEST_OK for SUBSCRIBE_UPDATE.
      * State changes must be applied immediately.
      *
      * @see draft-ietf-moq-transport-14 §9.10

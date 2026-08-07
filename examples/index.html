@@ -15,7 +15,11 @@
   <p>Each example demonstrates one aspect of the MoQ client stack.</p>
   <p>
     Pass <code>?hash=&lt;hex&gt;</code> with the relay's certificate hash
-    and optionally <code>&amp;url=&lt;relay-url&gt;</code> (default: <code>https://localhost:4443</code>).
+    and optionally <code>&amp;url=&lt;full-relay-url&gt;</code> including the relay's
+    endpoint path. Without <code>?url=</code>, the examples probe
+    <code>https://&lt;page-host&gt;:4433</code> at <code>/moq</code>, <code>/moq-relay</code>,
+    then <code>/</code> and select the first successful endpoint in that order
+    (these paths are deployment conventions, not MOQT-standard).
   </p>
   <ul>
     <li>

@@ -32,7 +32,9 @@ import { parseCatalog } from '@moqt/msf';
 import type { Catalog, CatalogTrack } from '@moqt/msf';
 import { parseLocHeaders, toVideoChunkInit } from '@moqt/loc';
 import { log } from '../shared/log.js';
-import { relayUrl, namespace, certHash } from '../shared/cert.js';
+import { namespace, certHash, draftVersion } from '../shared/cert.js';
+import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
+import { createWebTransport } from '../shared/browser/index.js';
 
 // ─── Capability checks ──────────────────────────────────────────────
 
@@ -204,6 +206,54 @@ function createAudioDecoder(config: AudioDecoderConfig): void {
 
 // ─── Main ────────────────────────────────────────────────────────────
 
+// Register discovery progress once for the page lifetime.
+onDiscoveryAttempt((url, outcome) => log(`  probe ${url}: ${outcome}`));
+
+// Resources owned by the current startup attempt. Failed attempts are retired
+// before Start is enabled again.
+let activeAttempt: {
+    transport: { close(info?: { closeCode?: number; reason?: string }): void } | null;
+    connection: MoqtConnection | null;
+} | null = null;
+
+// Generation counter: teardown bumps it, so late callbacks from a
+// torn-down connection are inert instead of mutating the next attempt's
+// decoder/session state.
+let attemptEpoch = 0;
+
+function teardownAttempt(): void {
+    attemptEpoch++;   // invalidate the old attempt's connection callbacks
+    const attempt = activeAttempt;
+    activeAttempt = null;
+    try { void attempt?.connection?.close()?.catch?.(() => {}); } catch { /* not connected */ }
+    try { attempt?.transport?.close(); } catch { /* already closed */ }
+    // Reset session state before allowing another attempt.
+    try { videoDecoder?.close(); } catch { /* never configured */ }
+    videoDecoder = null;
+    videoConfigured = false;
+    needsKeyframe = true;
+    videoTrackAlias = null;
+    frameCount = 0;
+    videoCodec = '';
+    videoWidth = 0;
+    videoHeight = 0;
+    videoInitData = undefined;
+    try { audioDecoder?.close(); } catch { /* never configured */ }
+    audioDecoder = null;
+    audioTrackAlias = null;
+    audioCodec = '';
+    audioSampleRate = 0;
+    audioChannels = 0;
+    audioSampleCount = 0;
+    audioSubmitCount = 0;
+    audioErrorCount = 0;
+    firstAudioTimestamp = null;
+    lastAudioFrameInfo = '';
+    nextAudioPlayTime = 0;
+    void audioCtx?.close().catch(() => {});
+    audioCtx = null;
+}
+
 // AudioContext requires a user gesture (Chrome autoplay policy).
 // We gate the entire flow on the Start button click.
 startBtn.addEventListener('click', () => {
@@ -214,44 +264,62 @@ startBtn.addEventListener('click', () => {
     main().catch((err) => {
         log(`Fatal: ${(err as Error).message}`);
         console.error(err);
+        // Retire the failed attempt before allowing another click.
+        teardownAttempt();
+        startBtn.disabled = false;
+        startBtn.textContent = 'Start';
     });
 });
 
 async function main(): Promise<void> {
+    // This attempt's generation: teardownAttempt() bumps the counter, so
+    // any callback closing over a stale epoch becomes inert.
+    const epoch = ++attemptEpoch;
+
+    // Explicit ?url= is used as-is; otherwise the shared discovery probes
+    // the page host's common endpoint paths.
+    log('Discovering relay endpoint...');
+    const relayUrl = await resolveRelayEndpoint();
+
     log(`Relay: ${relayUrl}`);
     log(`Namespace: ${namespace}`);
     log('');
 
     // ── 1. WebTransport connection ──────────────────────────────────
+    // Shared factory: cert-hash pinning + WT-Available-Protocols offer with
+    // the strict-UA no-protocols fallback. relayUrl is the complete
+    // WebTransport endpoint. The namespace is carried by SUBSCRIBE and must
+    // not alter a deployment-specific endpoint path.
     // @see draft-ietf-moq-transport-16 §3.1
     log('Creating WebTransport connection...');
-    const transportOptions: WebTransportOptions = {};
-    if (certHash) {
-        transportOptions.serverCertificateHashes = [{
-            algorithm: 'sha-256',
-            value: certHash,
-        }];
-    }
-    const connectUrl = `${relayUrl}/?ns=${encodeURIComponent(namespace)}`;
-    const transport = new WebTransport(connectUrl, transportOptions);
-    await transport.ready;
+    const transport = await createWebTransport({
+        ...(certHash ? { certHash } : {}),
+        ...(draftVersion ? { draftVersion } : {}),
+    })(relayUrl);
+    activeAttempt = { transport, connection: null };
     log('WebTransport connected.');
 
     // ── 2. MoqtConnection ─────────────────────────────────────────────
+    // Same draft on both halves: the factory's WT protocols offer and the
+    // MOQT session's CLIENT_SETUP version list must agree.
     // @see draft-ietf-moq-transport-16 §3
-    const connection = new MoqtConnection();
+    const connection = new MoqtConnection(draftVersion);
+    if (activeAttempt) activeAttempt.connection = connection;
 
     // ── 3. Wire callbacks ──────────────────────────────────────────
 
     connection.onMessage = (msg) => {
+        if (epoch !== attemptEpoch) return;   // torn-down attempt
         log(`Control: ${msg.type}`);
     };
 
     connection.onClose = (error, reason) => {
+        if (epoch !== attemptEpoch) return;
         log(`Session closed: error=${error ?? 'none'} reason=${reason ?? ''}`);
     };
 
     connection.onError = (error) => {
+        if (epoch !== attemptEpoch) return;
         log(`Session error: ${error.message}`);
     };
 
@@ -260,6 +328,7 @@ async function main(): Promise<void> {
     // @see draft-ietf-moq-transport-16 §9.2.2.2 (DELIVERY_TIMEOUT)
     // @see draft-ietf-moq-transport-16 §13.4.4 (error code 0x2)
     connection.onStreamClosed = (_streamId, error) => {
+        if (epoch !== attemptEpoch) return;
         if (error !== undefined) {
             log(`Stream reset: error=0x${error.toString(16)}`);
             needsKeyframe = true;
@@ -273,6 +342,7 @@ async function main(): Promise<void> {
     });
 
     connection.onObject = (_streamId, obj) => {
+        if (epoch !== attemptEpoch) return;   // torn-down attempt
         // Route by track alias
         if (videoTrackAlias !== null && BigInt(obj.trackAlias) === BigInt(videoTrackAlias)) {
             handleVideoObject(obj);
@@ -329,13 +399,12 @@ async function main(): Promise<void> {
     const videoTrack: CatalogTrack | undefined = catalog.tracks.find(
         (t) => t.role === 'video' && t.packaging === 'loc',
     );
+    // Route unplayable catalogs through the normal teardown path.
     if (!videoTrack) {
-        log('No LOC video track found in catalog.');
-        return;
+        throw new Error('No LOC video track found in catalog.');
     }
     if (!videoTrack.codec) {
-        log(`Video track "${videoTrack.name}" has no codec field.`);
-        return;
+        throw new Error(`Video track "${videoTrack.name}" has no codec field.`);
     }
 
     videoCodec = videoTrack.codec;

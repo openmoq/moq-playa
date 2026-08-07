@@ -20,7 +20,9 @@ import { varint } from '@moqt/transport';
 import { parseCatalogAuto } from '@moqt/msf';
 import type { CatalogTrack } from '@moqt/msf';
 import { log } from '../shared/log.js';
-import { relayUrl, namespace, certHash, draftVersion } from '../shared/cert.js';
+import { namespace, certHash, draftVersion } from '../shared/cert.js';
+import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
+import { createWebTransport } from '../shared/browser/index.js';
 
 // ─── Capability check ────────────────────────────────────────────────
 
@@ -34,32 +36,27 @@ if (!('WebTransport' in window)) {
 const enc = new TextEncoder();
 
 async function main(): Promise<void> {
+  // Resolve the relay endpoint: explicit ?url= is used as-is; otherwise the
+  // shared discovery probes the page host's common endpoint paths.
+  log('Discovering relay endpoint...');
+  onDiscoveryAttempt((url, outcome) => log(`  probe ${url}: ${outcome}`));
+  const relayUrl = await resolveRelayEndpoint();
+
   log(`Relay: ${relayUrl}`);
   log(`Namespace: ${namespace}`);
   log(`Cert hash: ${certHash ? 'provided' : 'none (using system trust)'}`);
   log('');
 
-  // 1. Create WebTransport connection
-  //    serverCertificateHashes pins the relay's self-signed cert.
+  // 1. Create WebTransport connection via the shared factory (cert-hash
+  //    pinning + WT-Available-Protocols offer with strict-UA fallback).
+  //    Connect to the relay URL as-is: the namespace is communicated via
+  //    SUBSCRIBE, never appended to a deployment-specific endpoint path.
   //    @see draft-ietf-moq-transport-16 §3.1
   log('Creating WebTransport connection...');
-  const transportOptions: WebTransportOptions = {};
-  if (certHash) {
-    transportOptions.serverCertificateHashes = [{
-      algorithm: 'sha-256',
-      value: certHash,
-    }];
-  }
-  // §3.1: WT-Available-Protocols for MOQT version negotiation
-  if (draftVersion) {
-    (transportOptions as any).protocols = [`moqt-${draftVersion}`];
-  }
-  // Connect to relay URL as-is. Namespace is communicated via SUBSCRIBE,
-  // not the connection URL. Some relays (moquito) accept ?ns= but others
-  // (Red5) reject unrecognized URL paths.
-  const connectUrl = relayUrl;
-  const transport = new WebTransport(connectUrl, transportOptions);
-  await transport.ready;
+  const transport = await createWebTransport({
+    ...(certHash ? { certHash } : {}),
+    ...(draftVersion ? { draftVersion } : {}),
+  })(relayUrl);
   log('WebTransport connected.');
 
   // 2. Create MoqtConnection — internally creates Session(EndpointRole.CLIENT)

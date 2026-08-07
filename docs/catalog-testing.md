@@ -71,7 +71,11 @@ You can also prefill the harness with query parameters:
 Supported parameters:
 
 - `url`
-  - Full WebTransport relay URL
+  - Full WebTransport relay URL, including its endpoint path (for example,
+    `https://relay.example.com:4433/moq-relay` — the path is
+    deployment-specific; `/moq` and `/moq-relay` are conventions, not
+    MOQT-standard paths). When omitted, the form prefills from endpoint
+    discovery against the page host.
 - `ns`
   - Broadcast namespace
 - `v`

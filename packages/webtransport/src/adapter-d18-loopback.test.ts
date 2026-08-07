@@ -2635,7 +2635,7 @@ describe('MoqtConnection(18) loopback — terminal session-state transitions and
     return { pipe, w };
   }
 
-  // Finding 1: remote/rejected transport close must move the Session to CLOSED.
+  // A remote or rejected transport close must move the Session to CLOSED.
   it('a remote transport close moves the Session to CLOSED and subsequent APIs reject', async () => {
     const { client, a } = await connectedPair();
     expect(client.session.state).toBe(SessionState.ESTABLISHED);
@@ -2653,7 +2653,7 @@ describe('MoqtConnection(18) loopback — terminal session-state transitions and
     await expect(client.subscribe(ns('live'), nm('vid'))).rejects.toThrow();
   });
 
-  // Finding 2: alias reuse must NOT deliver an outstanding old stream to the new track.
+  // Alias reuse must not deliver an outstanding old stream to the new track.
   for (const kind of ['remaining=1', 'sentinel'] as const) {
     it(`alias reuse while an incomplete old generation (${kind}) is still guarded is REFUSED — never bound, never misdelivered`, async () => {
       const { client, server, a, b, errors } = await connectedPair(18, { clientOptions: { terminatedAliasTtlMs: 10_000 } });
@@ -2695,7 +2695,7 @@ describe('MoqtConnection(18) loopback — terminal session-state transitions and
     });
   }
 
-  // Finding 3: cancellation DURING the header write must not resurrect the stream.
+  // Cancellation during the header write must not resurrect the stream.
   it('cancellation while the subgroup HEADER WRITE is held aborts the writer and rejects; the stream is still counted', async () => {
     const { client, server, subReqId } = await (async () => {
       const pair = await connectedPair();
@@ -2729,7 +2729,7 @@ describe('MoqtConnection(18) loopback — terminal session-state transitions and
     expect(aborted).toBe(true); // the writer was aborted, not left live
   });
 
-  // Finding 4: terminal alias protection must be armed synchronously — an object
+  // Terminal alias protection must be armed synchronously: an object
   // arriving during the held cancelRequest must not reach generic onObject.
   it('an object arriving during a held cancelRequest is discarded, not routed to generic onObject', async () => {
     const { client, server, b } = await connectedPair();
@@ -2760,7 +2760,7 @@ describe('MoqtConnection(18) loopback — terminal session-state transitions and
     await unsubP;
   });
 
-  // Finding 5: an authoritative transport.closed wins the reported code/reason
+  // An authoritative transport.closed wins the reported code and reason
   // over a preliminary stream/control failure in the same tick.
   it('transport.closed code/reason take precedence over a concurrent preliminary control-stream failure', async () => {
     const { client, a, b } = await connectedPair();
@@ -2778,7 +2778,7 @@ describe('MoqtConnection(18) loopback — terminal session-state transitions and
     expect(closes[0]!.reason).toBe('real peer reason');
   });
 
-  // Finding 6: terminal cleanup empties the owned maps + topology contexts.
+  // Terminal cleanup empties the owned maps and topology contexts.
   it('terminal shutdown clears owned state and topology contexts (no leaks)', async () => {
     const { client, server, a } = await connectedPair();
     const rid = await client.subscribe(ns('live'), nm('vid'));
@@ -2806,7 +2806,7 @@ describe('MoqtConnection(18) loopback — terminal session-state transitions and
 });
 
 describe('MoqtConnection(18) loopback — alias collisions, unknown-alias rejects, shutdown error hygiene', () => {
-  // Finding 2: subscribeTrack() must not resolve when the session rejects the
+  // subscribeTrack() must not resolve when the session rejects the
   // SUBSCRIBE_OK — e.g. a DUPLICATE_TRACK_ALIAS. It must reject, session closes.
   it('a SUBSCRIBE_OK that duplicates a live alias closes the session and REJECTS the subscribe (never resolves)', async () => {
     const { client, server } = await connectedPair();
@@ -2835,14 +2835,14 @@ describe('MoqtConnection(18) loopback — alias collisions, unknown-alias reject
     expect(closes[0]!.code).toBe(Number(SessionError.DUPLICATE_TRACK_ALIAS));
   });
 
-  // Finding 3: publishing on an unknown alias (never associated) is rejected.
+  // Publishing on an unknown alias that was never associated is rejected.
   it('openSubgroup / sendDatagram on an unknown track alias reject (not silently published)', async () => {
     const { server } = await connectedPair();
     await expect(server.openSubgroup(999n, 0n, 0n, { publisherPriority: 1 })).rejects.toThrow(/unknown track alias/i);
     await expect(server.sendDatagram(999n, 0n, 0n, new Uint8Array([1]))).rejects.toThrow(/unknown track alias/i);
   });
 
-  // Finding 4: after terminal shutdown, a real transport close produces NO
+  // After terminal shutdown, a real transport close produces no
   // post-close error events from the read loops, and the open data stream that
   // errors as the transport dies stays quiet too.
   it('a transport close after an established subscription emits no post-shutdown error events', async () => {
@@ -2874,7 +2874,7 @@ describe('MoqtConnection(18) loopback — alias collisions, unknown-alias reject
     expect(errs).toEqual([]); // no spurious post-close error events
   });
 
-  // Finding 5: a preliminary read-failure's synthetic code must not pre-empt an
+  // A preliminary read failure's synthetic code must not preempt an
   // authoritative transport.closed that settles in a LATER task.
   it('a control-loop read failure yields to a transport.closed that settles later (real code/reason win)', async () => {
     // draft-14/16 uses the single bidi control read loop (runControlReadLoop),

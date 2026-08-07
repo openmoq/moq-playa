@@ -152,8 +152,8 @@ describe('Catalog crash fuzz — parseCatalogAuto', () => {
 
     const proj = catalogProjection(cat) as { tracks: Record<string, unknown>[] };
     const t = proj.tracks[0]!;
-    // The projected key set must be EXACTLY the CatalogTrack field set — no field
-    // silently dropped (finding 2), none accidentally added.
+    // The projected key set must exactly match the CatalogTrack field set, with
+    // no fields silently dropped or accidentally added.
     expect(Object.keys(t).sort()).toEqual(Object.keys(track).sort());
     // A spot-check of the string-rendered numerics and the array field.
     expect(t['displayWidth']).toBe('1920');

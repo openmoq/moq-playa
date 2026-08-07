@@ -26,7 +26,7 @@ describe('createBidiControlTopology', () => {
     expect(topo.control.peekFrameSize(frame)).toBe(3);
   });
 
-  it('throws for draft-18 (uni-pair topology lands in Slice C)', () => {
+  it('throws for draft-18, which uses the uni-pair topology', () => {
     expect(() => createBidiControlTopology(18)).toThrow(/draft-18|not.*implement/i);
   });
 });
