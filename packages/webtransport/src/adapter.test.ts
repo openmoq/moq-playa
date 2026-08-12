@@ -3802,6 +3802,235 @@ describe('MoqtConnection draft-14', () => {
   });
 });
 
+// ─── Pending-alias buffer rework (review response) ───────────────────
+//
+// Follow-up to the buffering fix above: the buffer must never claim an alias
+// still guarded by another (torn-down) subscription's terminal tombstone,
+// must fail closed (not silently discard while claiming the object) once any
+// limit is hit, must clear on every settlement/cancellation path via one
+// centralized helper, and must defer replay past the point where the caller
+// could have swapped its "mutable, read live" onObject/onSubgroupClosed.
+
+describe('pending-alias buffer rework (review response)', () => {
+  const enc = (s: string) => new TextEncoder().encode(s);
+
+  function findRequestId(mock: ReturnType<typeof createMockTransport>, type: string): bigint {
+    const codec = createControlCodec(16);
+    for (let i = mock.controlWritten.length - 1; i >= 0; i--) {
+      const { message } = codec.decode(mock.controlWritten[i]!, 0);
+      if (message.type === type) return (message as { requestId: bigint }).requestId;
+    }
+    throw new Error(`no ${type} found on the control stream`);
+  }
+
+  function pushSubscribeOk(mock: ReturnType<typeof createMockTransport>, requestId: bigint, alias: bigint): void {
+    mock.pushControlBytes(createControlCodec(16).encode({
+      type: 'SUBSCRIBE_OK', requestId, trackAlias: varint(alias),
+      parameters: new Map(), trackExtensions: [],
+    } as ControlMessage));
+  }
+
+  function pushObjectStream(mock: ReturnType<typeof createMockTransport>, alias: bigint, payload: Uint8Array): void {
+    const stream = mock.addIncomingStream();
+    stream.push(concat(
+      encodeSubgroupHeader(makeSubgroupHeader({ trackAlias: varint(alias) })),
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0), payload }), false, varint(0), true),
+    ));
+  }
+
+  it('the buffer refuses an alias still guarded by another subscription\'s terminal tombstone', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+
+    // Establish and tear down track A on alias 42n — unsubscribe() arms a
+    // terminal tombstone synchronously (see TrackSubscription.unsubscribe).
+    // Every CURRENT caller of bufferPendingAlias (subgroup-stream and datagram
+    // handling) already pre-filters a tombstoned alias before ever reaching
+    // it — early-discarding the whole stream/datagram at the protocol layer
+    // (§10.11), so this can't be observed end-to-end through a live stream.
+    // The guarantee this test verifies is a property of the buffer itself:
+    // it must never claim a tombstoned alias regardless of what any caller
+    // (present or future) already filters upstream.
+    const subAP = adapter.subscribeTrack([enc('live')], enc('a'), { onObject: () => undefined });
+    await deepFlush();
+    pushSubscribeOk(mock, findRequestId(mock, 'SUBSCRIBE'), 42n);
+    const subA = await subAP;
+    await subA.unsubscribe();
+
+    // A second, unrelated subscription is pending throughout — the buffer's
+    // gate on "is anything pending at all" alone would happily buffer for it.
+    const subBP = adapter.subscribeTrack([enc('live')], enc('b'), { onObject: () => undefined });
+    await deepFlush();
+
+    type Internals = {
+      bufferPendingAlias(alias: bigint, obj: unknown, closeHeader: unknown): boolean;
+      terminatedAliases: Map<bigint, unknown>;
+      pendingAliasTimers: Map<bigint, unknown>;
+    };
+    const internals = adapter as unknown as Internals;
+    expect(internals.terminatedAliases.has(42n)).toBe(true); // tombstone is live
+
+    const straggler = {
+      kind: 'data', trackAlias: 42n, groupId: 0n, subgroupId: 0n, objectId: 0n,
+      publisherPriority: 128, payload: new Uint8Array([0xAB]),
+    };
+    expect(internals.bufferPendingAlias(42n, straggler, undefined)).toBe(false);
+    expect(internals.pendingAliasTimers.has(42n)).toBe(false); // no bucket ever created for it
+    void subBP; // deliberately left pending — never resolved/rejected in this test
+  });
+
+  it('replay is deferred past resolve() so a caller can swap onObject before buffered data arrives', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const initialOnObject = vi.fn();
+
+    const subP = adapter.subscribeTrack([enc('live')], enc('vid'), { onObject: initialOnObject });
+    await deepFlush();
+    const reqId = findRequestId(mock, 'SUBSCRIBE');
+
+    pushObjectStream(mock, 7n, new Uint8Array([0x01]));
+    await deepFlush();
+
+    pushSubscribeOk(mock, reqId, 7n);
+    // Mirrors the documented "mutable, read live" contract: swap the handler
+    // in the very continuation that observes the resolved subscription.
+    const sub = await subP;
+    const realOnObject = vi.fn();
+    sub.onObject = realOnObject;
+    await deepFlush();
+
+    expect(initialOnObject).not.toHaveBeenCalled();
+    expect(realOnObject).toHaveBeenCalledOnce();
+  });
+
+  it('fails closed on the per-alias object cap instead of silently claiming the overflow object', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const unrouted: unknown[] = [];
+    adapter.onObject = (_sid, obj) => unrouted.push(obj);
+
+    const subP = adapter.subscribeTrack([enc('live')], enc('vid'), { onObject: () => undefined });
+    await deepFlush();
+
+    for (let i = 0; i < 257; i++) pushObjectStream(mock, 5n, new Uint8Array([i]));
+    await deepFlush();
+
+    expect(unrouted).toHaveLength(1); // only the 257th (over the 256 cap) fell through
+
+    pushSubscribeOk(mock, findRequestId(mock, 'SUBSCRIBE'), 5n);
+    const sub = await subP;
+    const delivered: number[] = [];
+    sub.onObject = (obj) => { if (obj.kind === 'data') delivered.push(obj.payload[0]!); };
+    await deepFlush();
+    expect(delivered).toEqual(Array.from({ length: 256 }, (_, i) => i)); // the first 256, in order
+  });
+
+  it('fails closed on the global distinct-alias cap and the global byte cap', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const subP = adapter.subscribeTrack([enc('live')], enc('vid'), { onObject: () => undefined });
+    await deepFlush();
+
+    type Internals = {
+      bufferPendingAlias(alias: bigint, obj: unknown, closeHeader: unknown): boolean;
+      pendingAliasTimers: Map<bigint, unknown>;
+      pendingAliasTotalBytes: number;
+    };
+    const internals = adapter as unknown as Internals;
+    const dataObject = (alias: bigint, bytes: number) => ({
+      kind: 'data', trackAlias: alias, groupId: 0n, subgroupId: 0n, objectId: 0n,
+      publisherPriority: 128, payload: new Uint8Array(bytes),
+    });
+
+    // MAX_PENDING_ALIASES (64): the 65th distinct alias is refused outright.
+    for (let alias = 1n; alias <= 64n; alias++) {
+      expect(internals.bufferPendingAlias(alias, dataObject(alias, 1), undefined)).toBe(true);
+    }
+    expect(internals.bufferPendingAlias(65n, dataObject(65n, 1), undefined)).toBe(false);
+    expect(internals.pendingAliasTimers.size).toBe(64); // the refused 65th never got a bucket
+
+    // MAX_PENDING_TOTAL_BYTES (8 MiB): reuse one already-buffered alias so we're
+    // only exercising the GLOBAL byte cap, not the per-alias/per-count ones.
+    const totalBefore = internals.pendingAliasTotalBytes;
+    const remaining = 8 * 1024 * 1024 - totalBefore;
+    expect(internals.bufferPendingAlias(1n, dataObject(1n, remaining), undefined)).toBe(true);
+    expect(internals.bufferPendingAlias(1n, dataObject(1n, 1), undefined)).toBe(false); // one byte over → refused
+
+    void subP; // deliberately left pending — never resolved/rejected in this test
+  });
+
+  it('a buffered alias with no claiming SUBSCRIBE_OK expires via TTL and is not later replayed', async () => {
+    try {
+      const mock = createMockTransport();
+      const adapter = await connectAdapter(mock);
+      vi.useFakeTimers(); // enabled AFTER connect — connectAdapter's own flush() relies on real timers
+      const unrouted: unknown[] = [];
+      adapter.onObject = (_sid, obj) => unrouted.push(obj);
+
+      const subP = adapter.subscribeTrack([enc('live')], enc('vid'), { onObject: () => undefined });
+      await vi.advanceTimersByTimeAsync(0);
+
+      pushObjectStream(mock, 11n, new Uint8Array([0x9]));
+      await vi.advanceTimersByTimeAsync(0);
+
+      type Internals = { pendingAliasTimers: Map<bigint, unknown> };
+      expect((adapter as unknown as Internals).pendingAliasTimers.has(11n)).toBe(true);
+
+      // joiningFetchTimeoutMs default (10s) — the same TTL expireParkedJoin uses
+      // for the analogous Joining-Fetch parking structure.
+      await vi.advanceTimersByTimeAsync(10_001);
+      expect((adapter as unknown as Internals).pendingAliasTimers.has(11n)).toBe(false);
+
+      // A SUBSCRIBE_OK arriving AFTER expiry binds cleanly but replays nothing.
+      pushSubscribeOk(mock, findRequestId(mock, 'SUBSCRIBE'), 11n);
+      const sub = await subP;
+      expect(sub.trackAlias).toBe(11n);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(unrouted).toHaveLength(0); // the stale object was dropped at expiry, not replayed late
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('centralizes cleanup on REQUEST_ERROR: a rejected subscription cannot leak its buffered alias to a later, unrelated one', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const onObjectLater = vi.fn();
+
+    const subAP = adapter.subscribeTrack([enc('live')], enc('a'), { onObject: () => undefined });
+    subAP.catch(() => undefined); // attach a handler now — it rejects mid-test, before the `.rejects` assertion below
+    await deepFlush();
+    const reqIdA = findRequestId(mock, 'SUBSCRIBE');
+
+    // An object races ahead for the alias the relay is ABOUT to (but never
+    // does) assign to A.
+    pushObjectStream(mock, 99n, new Uint8Array([0x7]));
+    await deepFlush();
+
+    type Internals = { pendingAliasTimers: Map<bigint, unknown> };
+    expect((adapter as unknown as Internals).pendingAliasTimers.has(99n)).toBe(true);
+
+    mock.pushControlBytes(createControlCodec(16).encode({
+      type: 'REQUEST_ERROR', requestId: reqIdA, errorCode: varint(0x0n),
+      retryInterval: varint(0n), errorReason: 'rejected', requestKind: 'SUBSCRIBE',
+    } as ControlMessage));
+    await deepFlush();
+    await expect(subAP).rejects.toThrow();
+
+    // The buffer (and its TTL timer) is gone — nothing left pending at all.
+    expect((adapter as unknown as Internals).pendingAliasTimers.has(99n)).toBe(false);
+
+    // A brand new, unrelated subscription later reuses alias 99n legitimately.
+    const subBP = adapter.subscribeTrack([enc('live')], enc('b'), { onObject: onObjectLater });
+    await deepFlush();
+    pushSubscribeOk(mock, findRequestId(mock, 'SUBSCRIBE'), 99n);
+    await deepFlush();
+    await subBP;
+
+    expect(onObjectLater).not.toHaveBeenCalled(); // no leaked straggler from A's rejected attempt
+  });
+});
+
 // ─── Pre-send request ownership (onRequestId) ────────────────────────
 //
 // A response can legally arrive before the caller's `await subscribe()`

@@ -336,12 +336,24 @@ export class MoqtConnection {
    * their track alias (control and data streams are not ordered relative to
    * each other, so a fast publisher can deliver before the subscriber has
    * processed its own SUBSCRIBE_OK). Buffered while ANY subscribeTrack() is
-   * still pending, replayed once the matching alias binds.
+   * still pending, replayed once the matching alias binds — see
+   * {@link bufferPendingAlias} for the ownership/limit/staleness rules and
+   * {@link clearPendingAlias} for the single centralized cleanup path.
    */
   private pendingAliasObjects = new Map<bigint, MoqtObject[]>();
-  private static readonly MAX_PENDING_OBJECTS_PER_ALIAS = 256;
   /** Subgroup stream FINs racing SUBSCRIBE_OK, replayed after the buffered objects. */
   private pendingAliasCloses = new Map<bigint, SubgroupHeader[]>();
+  /** Running payload-byte total per buffered alias (objects only; closes carry none). */
+  private pendingAliasBytes = new Map<bigint, number>();
+  /** Per-alias TTL: clears the whole bucket if no SUBSCRIBE_OK claims it in time (mirrors {@link expireParkedJoin}). */
+  private pendingAliasTimers = new Map<bigint, ReturnType<typeof setTimeout>>();
+  /** Running total across every buffered alias — the global counterpart to the per-alias cap below. */
+  private pendingAliasTotalBytes = 0;
+  private static readonly MAX_PENDING_OBJECTS_PER_ALIAS = 256;
+  /** Caps how many distinct not-yet-bound aliases can be buffering at once. */
+  private static readonly MAX_PENDING_ALIASES = 64;
+  /** Caps total buffered payload bytes across all pending aliases (peer-controlled data — must fail closed, not grow unbounded). */
+  private static readonly MAX_PENDING_TOTAL_BYTES = 8 * 1024 * 1024;
 
   /** Inbound PUBLISH (draft-18 §10.10) stream contexts, keyed by Request ID. */
   private inboundRequestContexts = new Map<bigint, InboundRequestStreamContext>();
@@ -1749,8 +1761,7 @@ export class MoqtConnection {
     }
     this.rawSubscriptions.clear();
     this.rawAliasMaps.clear();
-    this.pendingAliasObjects.clear();
-    this.pendingAliasCloses.clear();
+    this.clearAllPendingAliases();
   }
 
   /**
@@ -1973,10 +1984,7 @@ export class MoqtConnection {
       const raw = this.rawSubscriptions.get(reqIdBigint);
       if (raw) {
         this.rawSubscriptions.delete(reqIdBigint);
-        if (!this.hasPendingRawSubscription()) {
-          this.pendingAliasObjects.clear();
-          this.pendingAliasCloses.clear();
-        }
+        if (!this.hasPendingRawSubscription()) this.clearAllPendingAliases();
         raw.reject?.(err instanceof Error ? err : new Error(String(err)));
       }
     }
@@ -2006,16 +2014,10 @@ export class MoqtConnection {
     // dropping them would permanently starve the subscription of anything it
     // published up front (init segments, catalogs). We cannot yet know WHICH
     // pending subscribeTrack() this alias belongs to, so buffer tentatively
-    // while any is pending and replay once the alias binds (or is cleared once
-    // no subscription is left pending to claim it).
-    if (this.hasPendingRawSubscription()) {
-      const pending = this.pendingAliasObjects.get(alias) ?? [];
-      if (pending.length < MoqtConnection.MAX_PENDING_OBJECTS_PER_ALIAS) {
-        pending.push(obj);
-        this.pendingAliasObjects.set(alias, pending);
-      }
-      return true;
-    }
+    // while any is pending and replay once the alias binds — see
+    // {@link bufferPendingAlias} for why this refuses aliases already claimed
+    // by a torn-down subscription (§11.1) and fails closed on any limit.
+    if (this.bufferPendingAlias(alias, obj, undefined)) return true;
     return false;
   }
 
@@ -2034,13 +2036,92 @@ export class MoqtConnection {
       rawSub.sub.onSubgroupClosed?.(header);
       return;
     }
-    if (this.hasPendingRawSubscription()) {
-      const pending = this.pendingAliasCloses.get(alias) ?? [];
-      if (pending.length < MoqtConnection.MAX_PENDING_OBJECTS_PER_ALIAS) {
-        pending.push(header);
-        this.pendingAliasCloses.set(alias, pending);
-      }
+    this.bufferPendingAlias(alias, undefined, header);
+  }
+
+  /**
+   * Tentatively buffer one object or graceful subgroup-close FIN for `alias`
+   * while a SUBSCRIBE_OK that could bind it is still outstanding. Refuses
+   * (returns false — caller falls through to the generic unrouted-object
+   * path, never silently drops while pretending to have handled it) when:
+   *  - no subscribeTrack() is currently pending at all (nothing could ever
+   *    claim this alias, buffering it would just leak);
+   *  - a terminal tombstone (`terminatedAliases`) is currently live for this
+   *    alias — §11.1 explicitly permits late objects after a subscription
+   *    tears down, so this is a known straggler from THAT subscription, not
+   *    fresh data for whichever one eventually reuses the alias next. The
+   *    tombstone is only ever armed for an alias that was previously bound
+   *    (see every armTerminatedAlias call site), so this can never
+   *    false-positive on a genuinely new, never-before-seen alias;
+   *  - any global or per-alias limit (distinct aliases, total bytes,
+   *    per-alias object count) would be exceeded — fails closed rather than
+   *    growing unbounded on peer-controlled data.
+   * Starts (or refreshes) a per-alias TTL that clears the whole bucket via
+   * {@link clearPendingAlias} if no SUBSCRIBE_OK claims it in time, mirroring
+   * {@link expireParkedJoin}'s per-entry TTL for the analogous Joining-Fetch
+   * parking structure.
+   */
+  private bufferPendingAlias(alias: bigint, obj: MoqtObject | undefined, closeHeader: SubgroupHeader | undefined): boolean {
+    if (!this.hasPendingRawSubscription()) return false;
+    if (this.terminatedAliases.has(alias)) return false;
+
+    const isNewAlias = !this.pendingAliasTimers.has(alias);
+    const objectBytes = obj !== undefined && obj.kind === 'data' ? obj.payload.byteLength : 0;
+    const currentAliasBytes = this.pendingAliasBytes.get(alias) ?? 0;
+    const currentAliasObjectCount = this.pendingAliasObjects.get(alias)?.length ?? 0;
+
+    if (isNewAlias && this.pendingAliasTimers.size >= MoqtConnection.MAX_PENDING_ALIASES) return false;
+    if (this.pendingAliasTotalBytes + objectBytes > MoqtConnection.MAX_PENDING_TOTAL_BYTES) return false;
+    if (obj !== undefined && currentAliasObjectCount >= MoqtConnection.MAX_PENDING_OBJECTS_PER_ALIAS) return false;
+
+    if (isNewAlias) {
+      this.pendingAliasTimers.set(alias, setTimeout(() => this.clearPendingAlias(alias), this.joiningFetchTimeoutMs));
     }
+    if (obj !== undefined) {
+      const pending = this.pendingAliasObjects.get(alias) ?? [];
+      pending.push(obj);
+      this.pendingAliasObjects.set(alias, pending);
+      this.pendingAliasBytes.set(alias, currentAliasBytes + objectBytes);
+      this.pendingAliasTotalBytes += objectBytes;
+    }
+    if (closeHeader !== undefined) {
+      const pending = this.pendingAliasCloses.get(alias) ?? [];
+      pending.push(closeHeader);
+      this.pendingAliasCloses.set(alias, pending);
+    }
+    return true;
+  }
+
+  /**
+   * Single centralized cleanup for one buffered alias's pending objects/closes,
+   * TTL timer, and byte accounting — called from every settlement and
+   * cancellation path (SUBSCRIBE_OK bind, REQUEST_ERROR, subscribeTrack() send
+   * failure, session teardown, and this bucket's own TTL expiry) instead of
+   * each path clearing state ad hoc. Returns what was buffered (for the bind
+   * path to replay) or undefined if nothing was buffered for this alias.
+   */
+  private clearPendingAlias(alias: bigint): { objects: MoqtObject[]; closes: SubgroupHeader[] } | undefined {
+    const timer = this.pendingAliasTimers.get(alias);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.pendingAliasTimers.delete(alias);
+    }
+    const objects = this.pendingAliasObjects.get(alias);
+    const closes = this.pendingAliasCloses.get(alias);
+    this.pendingAliasObjects.delete(alias);
+    this.pendingAliasCloses.delete(alias);
+    const bytes = this.pendingAliasBytes.get(alias);
+    if (bytes !== undefined) {
+      this.pendingAliasTotalBytes -= bytes;
+      this.pendingAliasBytes.delete(alias);
+    }
+    if (objects === undefined && closes === undefined) return undefined;
+    return { objects: objects ?? [], closes: closes ?? [] };
+  }
+
+  /** Clears every currently-buffered pending alias (session teardown, or the last pending subscribeTrack() settling). */
+  private clearAllPendingAliases(): void {
+    for (const alias of [...this.pendingAliasTimers.keys()]) this.clearPendingAlias(alias);
   }
 
   // ── receiver §10.11 terminal tracker (bounded, Stream-Count-driven) ──
@@ -2261,16 +2342,16 @@ export class MoqtConnection {
         raw.trackAlias = alias;
         (raw.sub as { trackAlias: bigint }).trackAlias = alias;
         this.rawAliasMaps.set(alias, raw);
-        const buffered = this.pendingAliasObjects.get(alias);
-        if (buffered) {
-          this.pendingAliasObjects.delete(alias);
-          for (const obj of buffered) raw.sub.onObject?.(obj);
-        }
-        const bufferedCloses = this.pendingAliasCloses.get(alias);
-        if (bufferedCloses) {
-          this.pendingAliasCloses.delete(alias);
-          for (const closedHeader of bufferedCloses) raw.sub.onSubgroupClosed?.(closedHeader);
-        }
+        // Take-and-clear the buffer NOW (synchronously, alongside binding) so nothing
+        // buffered for this alias can be double-claimed or leak past this settlement -
+        // but defer actually INVOKING the callbacks until after raw.resolve() below.
+        // onObject/onSubgroupClosed are documented "mutable, read live on each delivery":
+        // resolve() only settles the promise, it does not run the caller's own
+        // `await subscribeTrack()` continuation synchronously (that's a later microtask) -
+        // replaying inline here, before that continuation has had a chance to swap in
+        // its real handler, would deliver buffered data into whatever onObject was at
+        // call time, not the "live" one the contract promises.
+        const cleared = this.clearPendingAlias(alias);
         // §8/§10.11: record the EFFECTIVE delivery timeout for this alias so a later
         // teardown's guard outlives the window in which the publisher may still
         // deliver old-alias streams — combining the publisher's Track Properties
@@ -2288,6 +2369,20 @@ export class MoqtConnection {
         raw.resolve?.(raw.sub);
         raw.resolve = null;
         raw.reject = null;
+        if (cleared) {
+          // A plain queueMicrotask is NOT enough of a delay here: subscribeTrack()
+          // is itself an async function, so the promise it returns to the caller
+          // settles ONE MORE microtask tick after raw.resolve() above (the
+          // engine's own thenable-unwrap of `return result`) - a microtask
+          // scheduled right here would still run before that caller ever
+          // observes the resolved subscription. A macrotask reliably runs after
+          // every currently-queued microtask, however many hops that unwrap
+          // takes, so the caller has always had its chance to swap onObject.
+          setTimeout(() => {
+            for (const obj of cleared.objects) raw.sub.onObject?.(obj);
+            for (const closedHeader of cleared.closes) raw.sub.onSubgroupClosed?.(closedHeader);
+          }, 0);
+        }
         return true; // suppress onMessage
       }
     }
@@ -2300,10 +2395,7 @@ export class MoqtConnection {
         raw.resolve = null;
         raw.reject = null;
         this.rawSubscriptions.delete(reqId);
-        if (!this.hasPendingRawSubscription()) {
-          this.pendingAliasObjects.clear();
-          this.pendingAliasCloses.clear();
-        }
+        if (!this.hasPendingRawSubscription()) this.clearAllPendingAliases();
         return true;
       }
     }
