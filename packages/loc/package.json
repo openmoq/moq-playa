@@ -1,6 +1,6 @@
 {
   "name": "@moqt/loc",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "description": "Low Overhead Media Container (LOC) codec for Media over QUIC (MoQ): parses and builds LOC header extensions and yields WebCodecs-ready media chunks.",
   "license": "Apache-2.0",
   "author": "OpenMOQ (https://github.com/openmoq)",
