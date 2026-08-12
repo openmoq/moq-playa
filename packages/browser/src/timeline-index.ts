@@ -19,9 +19,11 @@
  *
  * Scope
  * ─────
- * Phase 1 — used only by MseMediaSource for overlap detection before
- * appendBuffer. Future phases extend it for eviction policy, target
- * latency accounting, and seek handling.
+ * Phase 1 — used only by MseMediaSource for containment-based replay
+ * suppression before appendBuffer (a payload whose every decoded range
+ * is already recorded is treated as a replay and dropped; anything
+ * extending the record appends). Future phases extend it for eviction
+ * policy, target latency accounting, and seek handling.
  *
  * @module
  */
@@ -51,17 +53,17 @@ export class TimelineIndex {
   }
 
   /**
-   * True if `[start, end)` intersects any existing range.
+   * True if `[start, end)` lies entirely within a single recorded range.
    *
-   * Uses strict half-open semantics — touching ranges (end == start)
-   * do NOT count as overlap. Degenerate empty ranges (start == end)
-   * are never considered overlapping.
+   * Because the index keeps ranges merged and non-adjacent, a range that
+   * would only be covered by the UNION of two recorded ranges necessarily
+   * spans an unrecorded hole — and is therefore not contained. Degenerate
+   * empty ranges (start >= end) are never contained.
    */
-  overlaps(start: bigint, end: bigint): boolean {
+  containsRange(start: bigint, end: bigint): boolean {
     if (start >= end) return false;
     for (const r of this.ranges) {
-      // Two half-open intervals [a, b) and [c, d) overlap iff a < d && c < b.
-      if (start < r.end && r.start < end) return true;
+      if (r.start <= start && end <= r.end) return true;
     }
     return false;
   }

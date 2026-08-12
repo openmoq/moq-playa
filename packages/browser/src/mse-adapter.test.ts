@@ -395,14 +395,14 @@ describe('MseMediaSource — timeline-owned append integration', () => {
         expect(vsb.appendedPayloads.length).toBe(initCount + 2);
     });
 
-    it('overlapping second segment is dropped before append', async () => {
+    it('fully-contained duplicate segment is dropped before append', async () => {
         const { adapter, vsb } = await makeReadyAdapter();
         const initCount = vsb.appendedPayloads.length;
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
         const seg1 = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });
-        // bmd=200 is inside seg1's range [0, 500)
-        const seg2 = makeSegment({ bmd: 200, defaultDur: 100, sampleCount: 5 });
+        // [200, 400) is fully inside seg1's recorded [0, 500) — treated as a replay.
+        const seg2 = makeSegment({ bmd: 200, defaultDur: 100, sampleCount: 2 });
 
         adapter.appendChunk('video', seg1, 'track1');
         await flush();
@@ -411,7 +411,7 @@ describe('MseMediaSource — timeline-owned append integration', () => {
 
         expect(vsb.appendedPayloads.length).toBe(initCount + 1);
         expect(warn).toHaveBeenCalledWith(
-            expect.stringContaining('drop overlapping video payload'),
+            expect.stringContaining('drop contained replay candidate: video payload'),
         );
 
         warn.mockRestore();
@@ -437,13 +437,13 @@ describe('MseMediaSource — timeline-owned append integration', () => {
 
         expect(vsb.appendedPayloads.length).toBe(initCount + 2);
         expect(warn).not.toHaveBeenCalledWith(
-            expect.stringContaining('drop overlapping video payload'),
+            expect.stringContaining('drop contained replay candidate: video payload'),
         );
 
         warn.mockRestore();
     });
 
-    it('overlap on the same track is still dropped after a switch', async () => {
+    it('contained duplicate on the same track is still dropped after a switch', async () => {
         // Per-track timelines must still catch within-track duplicates
         // (e.g., a relay publishing both IDR-GOP and CRA-entry segments
         // under one track-name).
@@ -452,7 +452,7 @@ describe('MseMediaSource — timeline-owned append integration', () => {
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
         const seg1 = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });
-        const seg2 = makeSegment({ bmd: 200, defaultDur: 100, sampleCount: 5 });
+        const seg2 = makeSegment({ bmd: 200, defaultDur: 100, sampleCount: 2 }); // [200,400) inside [0,500)
 
         adapter.appendChunk('video', seg1, 'cmsf/clear:video_main');
         await flush();
@@ -468,7 +468,7 @@ describe('MseMediaSource — timeline-owned append integration', () => {
         // initCount + seg1 + segOther — seg2 dropped (overlap on video_main).
         expect(vsb.appendedPayloads.length).toBe(initCount + 2);
         expect(warn).toHaveBeenCalledWith(
-            expect.stringContaining('drop overlapping video payload on track "cmsf/clear:video_main"'),
+            expect.stringContaining('drop contained replay candidate: video payload on track "cmsf/clear:video_main"'),
         );
 
         warn.mockRestore();
@@ -527,7 +527,7 @@ describe('MseMediaSource — timeline-owned append integration', () => {
         // Segment with NO tfhd default and NO per-sample trun duration,
         // but trex provided dur=100 via init.
         const segA = makeSegment({ bmd: 0, sampleCount: 3 });   // duration 300 via trex
-        const segB = makeSegment({ bmd: 200, sampleCount: 3 }); // inside segA's [0, 300)
+        const segB = makeSegment({ bmd: 100, sampleCount: 2 }); // [100, 300) inside segA's [0, 300)
 
         adapter.appendChunk('video', segA, 'track1');
         await flush();
@@ -535,10 +535,10 @@ describe('MseMediaSource — timeline-owned append integration', () => {
         await flush();
 
         // segA appended; segB dropped because trex default scored it
-        // as overlapping.
+        // as a contained duplicate.
         expect(vsb.appendedPayloads.length).toBe(initCount + 1);
         expect(warn).toHaveBeenCalledWith(
-            expect.stringContaining('drop overlapping video payload'),
+            expect.stringContaining('drop contained replay candidate: video payload'),
         );
 
         warn.mockRestore();
@@ -555,6 +555,151 @@ describe('MseMediaSource — timeline-owned append integration', () => {
         expect(vsb.appendedPayloads.length).toBe(initCount + 1);
     });
 
+    // ─── Containment policy: drop ONLY when every decoded range is fully
+    // contained in the track's timeline; anything extending it appends. MSE's
+    // coded-frame replacement handles small overlaps natively — dropping a
+    // whole fragment over a few-tick seam manufactures holes and stalls
+    // playback (observed live as fragment-sized buffered holes). ───────────
+
+    it('seam overlap appends: next fragment starts ticks before the recorded end but extends past it', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const seg1 = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });   // [0, 500)
+        const seg2 = makeSegment({ bmd: 497, defaultDur: 100, sampleCount: 5 }); // [497, 997) — 3-tick seam
+
+        adapter.appendChunk('video', seg1, 'track1');
+        await flush();
+        adapter.appendChunk('video', seg2, 'track1');
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(initCount + 2);
+        expect(warn).not.toHaveBeenCalledWith(
+            expect.stringContaining('drop contained replay candidate: video payload'),
+        );
+        warn.mockRestore();
+    });
+
+    it('exact-boundary fragment appends without any drop diagnostic', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const seg1 = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });   // [0, 500)
+        const seg2 = makeSegment({ bmd: 500, defaultDur: 100, sampleCount: 5 }); // [500, 1000) — touching
+
+        adapter.appendChunk('video', seg1, 'track1');
+        await flush();
+        adapter.appendChunk('video', seg2, 'track1');
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(initCount + 2);
+        expect(warn).not.toHaveBeenCalledWith(
+            expect.stringContaining('drop contained replay candidate: video payload'),
+        );
+        warn.mockRestore();
+    });
+
+    it('exact full replay is dropped', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const seg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });    // [0, 500)
+
+        adapter.appendChunk('video', seg, 'track1');
+        await flush();
+        adapter.appendChunk('video', seg, 'track1');                              // relay replay
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(initCount + 1);
+        expect(warn).toHaveBeenCalledWith(
+            expect.stringContaining('drop contained replay candidate: video payload'),
+        );
+        warn.mockRestore();
+    });
+
+    it('partial containment extending backwards appends (start-side extension)', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const seg1 = makeSegment({ bmd: 100, defaultDur: 100, sampleCount: 1 }); // [100, 200)
+        const seg2 = makeSegment({ bmd: 50, defaultDur: 100, sampleCount: 1 });  // [50, 150) — extends before
+
+        adapter.appendChunk('video', seg1, 'track1');
+        await flush();
+        adapter.appendChunk('video', seg2, 'track1');
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(initCount + 2);
+        expect(warn).not.toHaveBeenCalledWith(
+            expect.stringContaining('drop contained replay candidate: video payload'),
+        );
+        warn.mockRestore();
+    });
+
+    it('superset payload appends (covers and extends the recorded range)', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+
+        const seg1 = makeSegment({ bmd: 100, defaultDur: 100, sampleCount: 2 }); // [100, 300)
+        const seg2 = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });   // [0, 500) — superset
+
+        adapter.appendChunk('video', seg1, 'track1');
+        await flush();
+        adapter.appendChunk('video', seg2, 'track1');
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(initCount + 2);
+    });
+
+    it('multi-moof payload with one contained and one extending moof appends', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 }), 'track1'); // [0, 500)
+        await flush();
+
+        const payload = cat(
+            makeSegment({ bmd: 200, defaultDur: 100, sampleCount: 2 }),  // [200, 400) — contained
+            makeSegment({ bmd: 500, defaultDur: 100, sampleCount: 3 }),  // [500, 800) — extends
+        );
+        adapter.appendChunk('video', payload, 'track1');
+        await flush();
+
+        // Not EVERY range is contained → the payload extends the timeline → append.
+        expect(vsb.appendedPayloads.length).toBe(initCount + 2);
+        expect(warn).not.toHaveBeenCalledWith(
+            expect.stringContaining('drop contained replay candidate: video payload'),
+        );
+        warn.mockRestore();
+    });
+
+    it('multi-moof payload with every moof contained is dropped', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const initCount = vsb.appendedPayloads.length;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 6 }), 'track1'); // [0, 600)
+        await flush();
+
+        const payload = cat(
+            makeSegment({ bmd: 100, defaultDur: 100, sampleCount: 1 }),  // [100, 200) — contained
+            makeSegment({ bmd: 350, defaultDur: 100, sampleCount: 1 }),  // [350, 450) — contained
+        );
+        adapter.appendChunk('video', payload, 'track1');
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(initCount + 1);
+        expect(warn).toHaveBeenCalledWith(
+            expect.stringContaining('drop contained replay candidate: video payload'),
+        );
+        warn.mockRestore();
+    });
+
     it('multi-moof payload appends once, timeline picks up both ranges', async () => {
         const { adapter, vsb } = await makeReadyAdapter();
         const initCount = vsb.appendedPayloads.length;
@@ -567,14 +712,14 @@ describe('MseMediaSource — timeline-owned append integration', () => {
         await flush();
         expect(vsb.appendedPayloads.length).toBe(initCount + 1);
 
-        // Next segment at bmd=200 overlaps the first moof's range — should drop.
+        // Next segment [200, 400) is contained in the merged [0, 600) — drop.
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         const seg2 = makeSegment({ bmd: 200, defaultDur: 100, sampleCount: 2 });
         adapter.appendChunk('video', seg2, 'track1');
         await flush();
         expect(vsb.appendedPayloads.length).toBe(initCount + 1);
         expect(warn).toHaveBeenCalledWith(
-            expect.stringContaining('drop overlapping video payload'),
+            expect.stringContaining('drop contained replay candidate: video payload'),
         );
         warn.mockRestore();
     });

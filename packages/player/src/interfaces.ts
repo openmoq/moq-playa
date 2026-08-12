@@ -238,9 +238,10 @@ export interface MediaSourceLike {
    * @param mediaType Which SourceBuffer to append to
    * @param data Raw MOQT object payload (one or more moof+mdat pairs)
    * @param trackName Source MoQ track name. Adapters that maintain
-   *                  per-track state (e.g. timeline-overlap detection)
-   *                  rely on this to distinguish across-track splices
-   *                  (ABR switch) from same-track duplicates.
+   *                  per-track state (e.g. timeline containment-based
+   *                  replay suppression) rely on this to distinguish
+   *                  across-track splices (ABR switch) from same-track
+   *                  replays.
    * @see draft-ietf-moq-cmsf-00 §3.3 (Object Packaging)
    */
   appendChunk(

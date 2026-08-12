@@ -244,7 +244,7 @@ export class CmafAssembler {
    * @param trackName Source MoQ track name — propagates to onSegment so
    *                  downstream consumers can distinguish overlapping
    *                  ranges from different tracks (ABR splice) vs the
-   *                  same track (true duplicates).
+   *                  same track (contained replay candidates).
    * @param groupId MoQ group ID — ensures moof+mdat from different groups
    *                don't cross-contaminate when streams interleave
    * @param payload Raw MoQ object payload (a single MP4 box: moof or mdat)

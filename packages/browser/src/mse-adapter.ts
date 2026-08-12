@@ -1880,13 +1880,16 @@ export class MseMediaSource implements MediaSourceLike {
 
   /**
    * Append a segment to a SourceBuffer with diagnostic recording and
-   * timeline-owned overlap protection.
+   * timeline-owned replay suppression.
    *
    * Pipeline:
    *   1. Parse the payload's time ranges (tri-state: null / [] / ranges).
-   *   2. If null — unscorable moof in the payload — drop with a warn.
+   *   2. If null — unscorable moof in the payload — append anyway (fail
+   *      open, with a warn).
    *   3. If [] — no moofs, fail open.
-   *   4. If ranges — check against the timeline; drop on overlap.
+   *   4. If ranges — drop ONLY when every range is fully contained in the
+   *      track's timeline (contained payload treated as a replay); any
+   *      range extending the timeline appends.
    *   5. Record a ring entry; mark pending; call appendBuffer.
    *   6. On `updateend` without a preceding error, commit pending.
    *
@@ -1921,19 +1924,28 @@ export class MseMediaSource implements MediaSourceLike {
     }
 
     // ranges is an array (possibly empty) or null (fail-open).
+    //
+    // Containment policy: drop ONLY when EVERY decoded range in the payload
+    // is fully contained in this track's timeline — a contained payload is
+    // treated as a replay (relay group redelivery). Anything extending the
+    // timeline appends: MSE's coded-frame replacement natively absorbs seam
+    // overlaps, and live encoders routinely emit fragments whose decode
+    // range starts a few ticks before the previous fragment's end. Dropping
+    // those wholesale manufactures fragment-sized buffered holes and stalls
+    // playback at the first hole.
     const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
     const timeline = timelines.get(trackName);
     if (ranges !== null && ranges.length > 0 && timeline) {
-      const overlap = ranges.find((r) => timeline.overlaps(r.startTime, r.endTime));
-      if (overlap !== undefined) {
+      const allContained = ranges.every((r) => timeline.containsRange(r.startTime, r.endTime));
+      if (allContained) {
         // Logged with group id and the exact decode range so an eviction can be
         // correlated against a later drop of the SAME range — the evidence
         // needed before any residency/refill policy is designed.
         this.logWarn(
-          `[MSE] drop overlapping ${mediaType} payload on track "${trackName}" `
+          `[MSE] drop contained replay candidate: ${mediaType} payload on track "${trackName}" `
           + `group=${groupId ?? 'n/a'}: ranges=${ranges
             .map((r) => `[${r.startTime}-${r.endTime})`)
-            .join(',')} overlaps=[${overlap.startTime}-${overlap.endTime}) `
+            .join(',')} all contained in `
           + `timeline=${timeline.toString()} buffered=[${fmtRanges(safeBuffered(buffer))}]`,
         );
         return;

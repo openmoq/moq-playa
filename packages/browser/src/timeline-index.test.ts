@@ -2,8 +2,8 @@
  * Tests for TimelineIndex.
  *
  * Uses half-open interval semantics [start, end). Touching ranges
- * (end == start) are NOT overlapping but SHOULD merge on insert so
- * adjacent appends collapse into a single indexed range.
+ * (end == start) are disjoint for containment queries but SHOULD merge
+ * on insert so adjacent appends collapse into a single indexed range.
  *
  * @module
  */
@@ -19,11 +19,6 @@ describe('TimelineIndex — empty state', () => {
         expect(t.getRanges()).toEqual([]);
     });
 
-    it('overlaps returns false for any query', () => {
-        const t = new TimelineIndex();
-        expect(t.overlaps(0n, 1n)).toBe(false);
-        expect(t.overlaps(1000n, 2000n)).toBe(false);
-    });
 
     it('toString returns "empty"', () => {
         const t = new TimelineIndex();
@@ -39,65 +34,13 @@ describe('TimelineIndex — single insert', () => {
         expect(t.extent).toEqual({ start: 100n, end: 200n });
     });
 
-    it('overlaps detects exact match', () => {
+    it('touching ranges are disjoint for containment but merge on insert', () => {
         const t = new TimelineIndex();
         t.insert(100n, 200n);
-        expect(t.overlaps(100n, 200n)).toBe(true);
-    });
-
-    it('overlaps detects strict subset', () => {
-        const t = new TimelineIndex();
-        t.insert(100n, 200n);
-        expect(t.overlaps(120n, 180n)).toBe(true);
-    });
-
-    it('overlaps detects strict superset', () => {
-        const t = new TimelineIndex();
-        t.insert(100n, 200n);
-        expect(t.overlaps(50n, 250n)).toBe(true);
-    });
-
-    it('overlaps detects left-partial', () => {
-        const t = new TimelineIndex();
-        t.insert(100n, 200n);
-        expect(t.overlaps(50n, 150n)).toBe(true);
-    });
-
-    it('overlaps detects right-partial', () => {
-        const t = new TimelineIndex();
-        t.insert(100n, 200n);
-        expect(t.overlaps(150n, 250n)).toBe(true);
-    });
-
-    it('overlaps returns false for fully-left disjoint range', () => {
-        const t = new TimelineIndex();
-        t.insert(100n, 200n);
-        expect(t.overlaps(0n, 50n)).toBe(false);
-    });
-
-    it('overlaps returns false for fully-right disjoint range', () => {
-        const t = new TimelineIndex();
-        t.insert(100n, 200n);
-        expect(t.overlaps(300n, 400n)).toBe(false);
-    });
-
-    it('touching-left (end == start) does NOT overlap', () => {
-        const t = new TimelineIndex();
-        t.insert(100n, 200n);
-        expect(t.overlaps(50n, 100n)).toBe(false);
-    });
-
-    it('touching-right (start == end) does NOT overlap', () => {
-        const t = new TimelineIndex();
-        t.insert(100n, 200n);
-        expect(t.overlaps(200n, 300n)).toBe(false);
-    });
-
-    it('degenerate query (start >= end) never overlaps', () => {
-        const t = new TimelineIndex();
-        t.insert(100n, 200n);
-        expect(t.overlaps(150n, 150n)).toBe(false);
-        expect(t.overlaps(180n, 120n)).toBe(false);
+        expect(t.containsRange(50n, 100n)).toBe(false);
+        expect(t.containsRange(200n, 300n)).toBe(false);
+        t.insert(200n, 300n);
+        expect(t.containsRange(150n, 250n)).toBe(true); // merged [100, 300)
     });
 
     it('degenerate insert (start >= end) is a no-op', () => {
@@ -192,8 +135,8 @@ describe('TimelineIndex — BigInt boundaries', () => {
         const start = 2n ** 53n;
         const end = 2n ** 53n + 1000n;
         t.insert(start, end);
-        expect(t.overlaps(start, end)).toBe(true);
-        expect(t.overlaps(start + 500n, start + 500n + 100n)).toBe(true);
+        expect(t.containsRange(start, end)).toBe(true);
+        expect(t.containsRange(start + 500n, start + 500n + 100n)).toBe(true);
     });
 
     it('handles values near uint64 max', () => {
@@ -206,7 +149,62 @@ describe('TimelineIndex — BigInt boundaries', () => {
     it('zero is a valid boundary', () => {
         const t = new TimelineIndex();
         t.insert(0n, 100n);
-        expect(t.overlaps(0n, 50n)).toBe(true);
-        expect(t.overlaps(100n, 200n)).toBe(false);
+        expect(t.containsRange(0n, 50n)).toBe(true);
+        expect(t.containsRange(100n, 200n)).toBe(false);
+    });
+
+    describe('containsRange', () => {
+        it('empty index contains nothing', () => {
+            const t = new TimelineIndex();
+            expect(t.containsRange(0n, 1n)).toBe(false);
+        });
+
+        it('exact match is contained', () => {
+            const t = new TimelineIndex();
+            t.insert(100n, 200n);
+            expect(t.containsRange(100n, 200n)).toBe(true);
+        });
+
+        it('strict subset is contained', () => {
+            const t = new TimelineIndex();
+            t.insert(100n, 200n);
+            expect(t.containsRange(120n, 180n)).toBe(true);
+        });
+
+        it('a range extending past the recorded end is NOT contained (seam overlap)', () => {
+            // The customer-stream shape: the next fragment starts a few ticks
+            // before the previous end but extends a full fragment beyond it.
+            const t = new TimelineIndex();
+            t.insert(0n, 225280n);
+            expect(t.containsRange(225264n, 239568n)).toBe(false);
+        });
+
+        it('a range starting before the recorded start is NOT contained', () => {
+            const t = new TimelineIndex();
+            t.insert(100n, 200n);
+            expect(t.containsRange(50n, 150n)).toBe(false);
+        });
+
+        it('a superset is NOT contained', () => {
+            const t = new TimelineIndex();
+            t.insert(100n, 200n);
+            expect(t.containsRange(50n, 250n)).toBe(false);
+        });
+
+        it('containment cannot span a hole between two ranges', () => {
+            const t = new TimelineIndex();
+            t.insert(0n, 100n);
+            t.insert(200n, 300n);
+            // [50, 250) touches both ranges but the hole [100, 200) is not recorded.
+            expect(t.containsRange(50n, 250n)).toBe(false);
+            expect(t.containsRange(0n, 300n)).toBe(false);
+            expect(t.containsRange(210n, 290n)).toBe(true);
+        });
+
+        it('degenerate empty range is never contained', () => {
+            const t = new TimelineIndex();
+            t.insert(0n, 100n);
+            expect(t.containsRange(50n, 50n)).toBe(false);
+        });
     });
 });
