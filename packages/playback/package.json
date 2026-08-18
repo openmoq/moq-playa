@@ -1,6 +1,6 @@
 {
   "name": "@moqt/playback",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "description": "Sans-I/O media playback core for Media over QUIC (MoQ): jitter buffer, A/V sync, gap detection, decoder state machine, and pipeline orchestration.",
   "license": "Apache-2.0",
   "author": "OpenMOQ (https://github.com/openmoq)",

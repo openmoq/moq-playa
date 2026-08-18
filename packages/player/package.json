@@ -1,6 +1,6 @@
 {
   "name": "@moqt/player",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "description": "Convenience facade for Media over QUIC (MoQ) playback: wires the sans-I/O core packages into a simple load()/play()/pause()/destroy() API.",
   "license": "Apache-2.0",
   "author": "OpenMOQ (https://github.com/openmoq)",
