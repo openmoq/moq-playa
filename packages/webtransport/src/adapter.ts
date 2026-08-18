@@ -135,6 +135,25 @@ interface RawSubState {
   reject: ((err: Error) => void) | null;
 }
 
+type PendingAliasEvent = {
+  readonly kind: 'object';
+  readonly streamId: bigint;
+  readonly object: MoqtObject;
+  readonly ownerGeneration: bigint;
+} | {
+  readonly kind: 'close';
+  readonly header: SubgroupHeader;
+  readonly ownerGeneration: bigint;
+};
+
+interface PendingAliasReplay {
+  readonly requestId: bigint;
+  readonly raw: RawSubState | null;
+  readonly events: PendingAliasEvent[];
+  timer: ReturnType<typeof setTimeout> | undefined;
+  bytes: number;
+}
+
 /**
  * A PUBLISH received from a peer publisher on a new inbound bidi stream
  * (draft-18 §10.10). Set `onObject` to receive the track's objects (delivered
@@ -331,25 +350,31 @@ export class MoqtConnection {
   private rawSubscriptions = new Map<bigint, RawSubState>();
   /** Track subscriptions by trackAlias (active, alias resolved). */
   private rawAliasMaps = new Map<bigint, RawSubState>();
+  /** Generic subscribe() requests awaiting SUBSCRIBE_OK / REQUEST_ERROR. */
+  private pendingGenericSubscriptions = new Set<bigint>();
+  /** Local monotonic ownership generation for every unanswered SUBSCRIBE. */
+  private pendingSubscriptionGenerations = new Map<bigint, bigint>();
+  private nextPendingSubscriptionGeneration = 0n;
   /**
-   * Objects that arrived on a data stream before the SUBSCRIBE_OK that binds
+   * Data events that arrived before the SUBSCRIBE_OK that binds
    * their track alias (control and data streams are not ordered relative to
    * each other, so a fast publisher can deliver before the subscriber has
-   * processed its own SUBSCRIBE_OK). Buffered while ANY subscribeTrack() is
-   * still pending, replayed once the matching alias binds — see
+   * processed its own SUBSCRIBE_OK). Each event snapshots the latest local
+   * subscription generation that could own it, so a request created afterward
+   * can never inherit it. See
    * {@link bufferPendingAlias} for the ownership/limit/staleness rules and
    * {@link clearPendingAlias} for the single centralized cleanup path.
    */
-  private pendingAliasObjects = new Map<bigint, MoqtObject[]>();
-  /** Subgroup stream FINs racing SUBSCRIBE_OK, replayed after the buffered objects. */
-  private pendingAliasCloses = new Map<bigint, SubgroupHeader[]>();
-  /** Running payload-byte total per buffered alias (objects only; closes carry none). */
+  private pendingAliasEvents = new Map<bigint, PendingAliasEvent[]>();
+  /** Running payload-byte total per buffered alias (FIN events carry none). */
   private pendingAliasBytes = new Map<bigint, number>();
   /** Per-alias TTL: clears the whole bucket if no SUBSCRIBE_OK claims it in time (mirrors {@link expireParkedJoin}). */
   private pendingAliasTimers = new Map<bigint, ReturnType<typeof setTimeout>>();
+  /** Deferred FIFO replay gates, kept live until the subscriber can install mutable callbacks. */
+  private pendingAliasReplays = new Map<bigint, PendingAliasReplay>();
   /** Running total across every buffered alias — the global counterpart to the per-alias cap below. */
   private pendingAliasTotalBytes = 0;
-  private static readonly MAX_PENDING_OBJECTS_PER_ALIAS = 256;
+  private static readonly MAX_PENDING_EVENTS_PER_ALIAS = 256;
   /** Caps how many distinct not-yet-bound aliases can be buffering at once. */
   private static readonly MAX_PENDING_ALIASES = 64;
   /** Caps total buffered payload bytes across all pending aliases (peer-controlled data — must fail closed, not grow unbounded). */
@@ -535,6 +560,9 @@ export class MoqtConnection {
    * owned by the connection outlives the terminal shutdown.
    */
   private clearTerminalState(): void {
+    this.pendingGenericSubscriptions.clear();
+    this.pendingSubscriptionGenerations.clear();
+    this.clearAllPendingAliases();
     // Terminal-drain timers/callbacks must not survive connection closure.
     for (const drain of this.drainingAliases.values()) drain.cancelTimer();
     this.drainingAliases.clear();
@@ -1265,6 +1293,8 @@ export class MoqtConnection {
     const { terminalDelivery, onDrained, ...restSession } =
       (sessionOptions ?? {}) as SubscribeOptions & TerminalDeliveryOptions;
     const { requestId, actions } = this.session.subscribe(namespace, name, restSession as SubscribeOptions);
+    this.pendingGenericSubscriptions.add(requestId);
+    this.registerPendingSubscription(requestId);
     if (terminalDelivery === 'drain') {
       this.drainConfigs.set(requestId, { onDrained: onDrained ?? null });
     }
@@ -1273,6 +1303,8 @@ export class MoqtConnection {
       await this.emitRequestOrRollback(requestId, () => this.sendSubscribeActions(actions));
     } catch (err) {
       this.drainConfigs.delete(requestId);
+      this.pendingGenericSubscriptions.delete(requestId);
+      this.settlePendingAliasOwnership(requestId);
       throw err;
     }
     return requestId;
@@ -1432,12 +1464,15 @@ export class MoqtConnection {
       // Reject a still-pending subscribeTrack for this request (no-op if already
       // resolved), then surface the error.
       const raw = this.rawSubscriptions.get(stream.requestId);
+      this.cancelPendingAliasReplaysForRequest(stream.requestId);
       if (raw?.reject) {
         raw.reject(error);
         raw.resolve = null;
         raw.reject = null;
-        this.rawSubscriptions.delete(stream.requestId);
+        this.removeRawSubscription(raw);
       }
+      this.pendingGenericSubscriptions.delete(stream.requestId);
+      this.settlePendingAliasOwnership(stream.requestId);
       // De-duped: the topology's onStreamError path carries the same Error.
       this.reportStreamError(error);
     }
@@ -1462,6 +1497,7 @@ export class MoqtConnection {
    */
   private handleRequestStreamGoaway(err: RequestGoawayError): void {
     const raw = this.rawSubscriptions.get(err.requestId);
+    this.cancelPendingAliasReplaysForRequest(err.requestId);
     if (raw?.reject) {
       raw.reject(new MoqtConnectionError(
         `Request ${err.requestId} received GOAWAY on its request stream; re-issue is application policy (automatic reissue not implemented)`,
@@ -1469,8 +1505,10 @@ export class MoqtConnection {
       ));
       raw.resolve = null;
       raw.reject = null;
-      this.rawSubscriptions.delete(err.requestId);
+      this.removeRawSubscription(raw);
     }
+    this.pendingGenericSubscriptions.delete(err.requestId);
+    this.settlePendingAliasOwnership(err.requestId);
     // Surface the GOAWAY to the application (same channel as control-stream GOAWAY).
     this.onMessage?.(err.goaway as ControlMessage);
   }
@@ -1586,7 +1624,10 @@ export class MoqtConnection {
     if (message.type === 'SUBSCRIBE_OK' || message.type === 'FETCH_OK') {
       const fault = this.trackPropertyFault(message);
       if (fault) {
-        await this.failRejectedTrack(message.type, requestId, fault.reason);
+        const alias = message.type === 'SUBSCRIBE_OK'
+          ? BigInt((message as { trackAlias: bigint }).trackAlias)
+          : undefined;
+        await this.failRejectedTrack(message.type, requestId, fault.reason, alias);
         return;
       }
     }
@@ -1657,6 +1698,8 @@ export class MoqtConnection {
     // qlog is the raw channel, onMessage is application-level.) Incidental actions
     // still run.
     if (this.session.getSubscription(requestId) === undefined) {
+      this.pendingGenericSubscriptions.delete(requestId);
+      this.settlePendingAliasOwnership(requestId);
       await this.executeActions(actions);
       return;
     }
@@ -1665,7 +1708,7 @@ export class MoqtConnection {
     // new track — refuse (per-track, non-fatal) via the draft-specific cancel.
     const alias = BigInt((message as { trackAlias: bigint }).trackAlias);
     if (!this.aliasReuseSafe(alias)) {
-      await this.refuseAliasReuse(requestId,
+      await this.refuseAliasReuse(requestId, alias,
         `track alias ${alias} is still guarded by a terminating prior subscription (§11.1) — reuse refused`);
       return;
     }
@@ -1674,7 +1717,12 @@ export class MoqtConnection {
     // The old generation's complete guard (if any) is safe to clear now.
     this.clearTerminatedAlias(alias);
     const suppress = this.handleRawSubControlMessage(stampedOk);
-    if (!suppress) this.onMessage?.(stampedOk);
+    if (!suppress) {
+      this.pendingGenericSubscriptions.delete(requestId);
+      const replay = this.settlePendingAliasOwnership(requestId, alias);
+      this.beginPendingAliasReplay(alias, requestId, null, replay);
+      this.onMessage?.(stampedOk);
+    }
     await this.executeActions(actions);
   }
 
@@ -1686,15 +1734,17 @@ export class MoqtConnection {
    * adapter routing. Per-track failure, NOT a session close. `uniPair` is only
    * touched on draft-18 (it does not exist on draft-14/16).
    */
-  private async refuseAliasReuse(requestId: bigint, reason: string): Promise<void> {
+  private async refuseAliasReuse(requestId: bigint, alias: bigint, reason: string): Promise<void> {
     const err = new MoqtConnectionError(reason, { errorSource: 'control', isFatal: false });
     const raw = this.rawSubscriptions.get(requestId);
     if (raw) {
-      this.rawSubscriptions.delete(requestId);
+      this.removeRawSubscription(raw);
       raw.reject?.(err);
       raw.resolve = null;
       raw.reject = null;
     }
+    this.pendingGenericSubscriptions.delete(requestId);
+    this.settlePendingAliasOwnership(requestId, alias);
     // A refused/failed subscription can never PUBLISH_DONE — reclaim its
     // drain opt-in so the config map cannot leak.
     this.drainConfigs.delete(requestId);
@@ -1725,7 +1775,12 @@ export class MoqtConnection {
    * subscribeTrack (if any), terminate local request state, and RESET the request's
    * own bidi stream (§3.3.2). Surfaced via onError as a per-track failure.
    */
-  private async failRejectedTrack(type: 'SUBSCRIBE_OK' | 'FETCH_OK', requestId: bigint, reason: string): Promise<void> {
+  private async failRejectedTrack(
+    type: 'SUBSCRIBE_OK' | 'FETCH_OK',
+    requestId: bigint,
+    reason: string,
+    alias?: bigint,
+  ): Promise<void> {
     const err = new MoqtConnectionError(
       `Track rejected: ${type} carried ${reason} — request reset`,
       { errorSource: 'control', isFatal: false },
@@ -1736,8 +1791,10 @@ export class MoqtConnection {
       raw.reject(err);
       raw.resolve = null;
       raw.reject = null;
-      this.rawSubscriptions.delete(requestId);
+      this.removeRawSubscription(raw);
     }
+    this.pendingGenericSubscriptions.delete(requestId);
+    this.settlePendingAliasOwnership(requestId, alias);
     await this.executeActions(this.session.handleMalformedTrack(requestId)); // terminate state (no establish)
     await this.uniPair!.cancelRequest(requestId); // §2.4.2: RESET the request stream
     this.onError?.(err);
@@ -1761,6 +1818,8 @@ export class MoqtConnection {
     }
     this.rawSubscriptions.clear();
     this.rawAliasMaps.clear();
+    this.pendingGenericSubscriptions.clear();
+    this.pendingSubscriptionGenerations.clear();
     this.clearAllPendingAliases();
   }
 
@@ -1872,6 +1931,7 @@ export class MoqtConnection {
     const teardownAlias = raw && raw.trackAlias !== null && this.rawAliasMaps.get(raw.trackAlias) === raw
       ? raw.trackAlias : null;
     if (teardownAlias !== null) this.armSubscriberAliasTeardown(teardownAlias);
+    this.cancelPendingAliasReplaysForRequest(requestId);
 
     await this.executeActions(this.session.handleOutboundRequestClosed(requestId));
     if (raw) {
@@ -1879,7 +1939,7 @@ export class MoqtConnection {
         // Tombstone armed above; now early-discard any streams still open.
         await this.discardOpenStreamsForAlias(teardownAlias);
       }
-      this.rawSubscriptions.delete(requestId);
+      this.removeRawSubscription(raw);
       // Defensive: a still-pending subscribeTrack() (no SUBSCRIBE_OK yet) must not
       // hang when its request stream closes before the response (peer FIN/reset, or
       // a request-stream GOAWAY whose handler raced this cleanup). No-op once the
@@ -1889,6 +1949,8 @@ export class MoqtConnection {
         { errorSource: 'control' },
       ));
     }
+    this.pendingGenericSubscriptions.delete(requestId);
+    this.settlePendingAliasOwnership(requestId);
     // §5.1.1: if this was an outbound PUBLISH whose subscriber cancelled (peer
     // reset the PUBLISH request stream), RESET our open data streams for it too.
     await this.resetPublisherStreamsOrFail(requestId, 'peer stream close');
@@ -1955,6 +2017,7 @@ export class MoqtConnection {
     // before rawSubscriptions held an entry, and the promise would never settle.
     const { requestId, actions } = this.session.subscribe(namespace, name, subscribeOpts);
     const reqIdBigint = BigInt(requestId);
+    this.registerPendingSubscription(reqIdBigint);
 
     // Create the subscription object — connection reads sub.onObject live.
     const sub: TrackSubscription = {
@@ -1983,8 +2046,8 @@ export class MoqtConnection {
       await this.executeActions(this.session.handleOutboundRequestClosed(reqIdBigint));
       const raw = this.rawSubscriptions.get(reqIdBigint);
       if (raw) {
-        this.rawSubscriptions.delete(reqIdBigint);
-        if (!this.hasPendingRawSubscription()) this.clearAllPendingAliases();
+        this.removeRawSubscription(raw);
+        this.settlePendingAliasOwnership(reqIdBigint);
         raw.reject?.(err instanceof Error ? err : new Error(String(err)));
       }
     }
@@ -1996,8 +2059,14 @@ export class MoqtConnection {
    * Returns true if the object was claimed by a track subscription.
    * Called from data stream handlers before this.onObject.
    */
-  private routeToTrackSubscription(obj: MoqtObject): boolean {
+  private routeToTrackSubscription(streamId: bigint, obj: MoqtObject): boolean {
     const alias = BigInt(obj.trackAlias);
+    const replay = this.pendingAliasReplays.get(alias);
+    if (replay) {
+      return this.appendPendingAliasReplay(replay, {
+        kind: 'object', streamId, object: obj, ownerGeneration: 0n,
+      });
+    }
     const rawSub = this.rawAliasMaps.get(alias);
     if (rawSub) {
       rawSub.sub.onObject?.(obj);
@@ -2009,6 +2078,9 @@ export class MoqtConnection {
       pub.onObject?.(obj);
       return true;
     }
+    // An established generic subscribe() intentionally uses the connection-wide
+    // onObject callback. A pending raw subscription elsewhere must not steal it.
+    if (this.session.getTrackByAlias(varint(alias)) !== undefined) return false;
     // The publisher may deliver objects before its SUBSCRIBE_OK is processed
     // (control and data streams are not ordered relative to each other, §10.4);
     // dropping them would permanently starve the subscription of anything it
@@ -2017,7 +2089,7 @@ export class MoqtConnection {
     // while any is pending and replay once the alias binds — see
     // {@link bufferPendingAlias} for why this refuses aliases already claimed
     // by a torn-down subscription (§11.1) and fails closed on any limit.
-    if (this.bufferPendingAlias(alias, obj, undefined)) return true;
+    if (this.bufferPendingAlias(alias, obj, undefined, streamId)) return true;
     return false;
   }
 
@@ -2031,12 +2103,40 @@ export class MoqtConnection {
   /** Notify the owning subscription that one of its subgroup streams ended gracefully. */
   private routeSubgroupClosed(header: SubgroupHeader): void {
     const alias = BigInt(header.trackAlias);
+    const replay = this.pendingAliasReplays.get(alias);
+    if (replay) {
+      this.appendPendingAliasReplay(replay, {
+        kind: 'close', header, ownerGeneration: 0n,
+      });
+      return;
+    }
     const rawSub = this.rawAliasMaps.get(alias);
     if (rawSub) {
       rawSub.sub.onSubgroupClosed?.(header);
       return;
     }
+    if (this.publishAliasMaps.has(alias)) return;
+    if (this.session.getTrackByAlias(varint(alias)) !== undefined) return;
     this.bufferPendingAlias(alias, undefined, header);
+  }
+
+  private registerPendingSubscription(requestId: bigint): void {
+    this.nextPendingSubscriptionGeneration += 1n;
+    this.pendingSubscriptionGenerations.set(requestId, this.nextPendingSubscriptionGeneration);
+  }
+
+  private latestPendingSubscriptionGeneration(): bigint | undefined {
+    let latest: bigint | undefined;
+    for (const generation of this.pendingSubscriptionGenerations.values()) {
+      if (latest === undefined || generation > latest) latest = generation;
+    }
+    return latest;
+  }
+
+  private pendingAliasEventBytes(event: PendingAliasEvent): number {
+    return event.kind === 'object' && event.object.kind === 'data'
+      ? event.object.payload.byteLength
+      : 0;
   }
 
   /**
@@ -2054,41 +2154,72 @@ export class MoqtConnection {
    *    (see every armTerminatedAlias call site), so this can never
    *    false-positive on a genuinely new, never-before-seen alias;
    *  - any global or per-alias limit (distinct aliases, total bytes,
-   *    per-alias object count) would be exceeded — fails closed rather than
+   *    per-alias event count) would be exceeded — fails closed rather than
    *    growing unbounded on peer-controlled data.
-   * Starts (or refreshes) a per-alias TTL that clears the whole bucket via
+   * Starts a per-alias TTL that clears the whole bucket via
    * {@link clearPendingAlias} if no SUBSCRIBE_OK claims it in time, mirroring
    * {@link expireParkedJoin}'s per-entry TTL for the analogous Joining-Fetch
    * parking structure.
    */
-  private bufferPendingAlias(alias: bigint, obj: MoqtObject | undefined, closeHeader: SubgroupHeader | undefined): boolean {
+  private bufferPendingAlias(
+    alias: bigint,
+    obj: MoqtObject | undefined,
+    closeHeader: SubgroupHeader | undefined,
+    streamId: bigint = 0n,
+  ): boolean {
+    const replay = this.pendingAliasReplays.get(alias);
+    if (replay) {
+      const event: PendingAliasEvent = obj !== undefined
+        ? { kind: 'object', streamId, object: obj, ownerGeneration: 0n }
+        : { kind: 'close', header: closeHeader!, ownerGeneration: 0n };
+      return this.appendPendingAliasReplay(replay, event);
+    }
     if (!this.hasPendingRawSubscription()) return false;
     if (this.terminatedAliases.has(alias)) return false;
+    if (this.publishAliasMaps.has(alias)) return false;
+    if (this.session.getTrackByAlias(varint(alias)) !== undefined) return false;
+
+    const ownerGeneration = this.latestPendingSubscriptionGeneration();
+    if (ownerGeneration === undefined) return false;
 
     const isNewAlias = !this.pendingAliasTimers.has(alias);
     const objectBytes = obj !== undefined && obj.kind === 'data' ? obj.payload.byteLength : 0;
     const currentAliasBytes = this.pendingAliasBytes.get(alias) ?? 0;
-    const currentAliasObjectCount = this.pendingAliasObjects.get(alias)?.length ?? 0;
+    const currentAliasEventCount = this.pendingAliasEvents.get(alias)?.length ?? 0;
 
-    if (isNewAlias && this.pendingAliasTimers.size >= MoqtConnection.MAX_PENDING_ALIASES) return false;
+    if (isNewAlias
+        && this.pendingAliasTimers.size + this.pendingAliasReplays.size >= MoqtConnection.MAX_PENDING_ALIASES) return false;
     if (this.pendingAliasTotalBytes + objectBytes > MoqtConnection.MAX_PENDING_TOTAL_BYTES) return false;
-    if (obj !== undefined && currentAliasObjectCount >= MoqtConnection.MAX_PENDING_OBJECTS_PER_ALIAS) return false;
+    if (currentAliasEventCount >= MoqtConnection.MAX_PENDING_EVENTS_PER_ALIAS) return false;
 
     if (isNewAlias) {
-      this.pendingAliasTimers.set(alias, setTimeout(() => this.clearPendingAlias(alias), this.joiningFetchTimeoutMs));
+      const timer = setTimeout(() => this.clearPendingAlias(alias), this.joiningFetchTimeoutMs);
+      (timer as { unref?: () => void }).unref?.();
+      this.pendingAliasTimers.set(alias, timer);
     }
-    if (obj !== undefined) {
-      const pending = this.pendingAliasObjects.get(alias) ?? [];
-      pending.push(obj);
-      this.pendingAliasObjects.set(alias, pending);
-      this.pendingAliasBytes.set(alias, currentAliasBytes + objectBytes);
-      this.pendingAliasTotalBytes += objectBytes;
+    const pending = this.pendingAliasEvents.get(alias) ?? [];
+    pending.push(obj !== undefined
+      ? { kind: 'object', streamId, object: obj, ownerGeneration }
+      : { kind: 'close', header: closeHeader!, ownerGeneration });
+    this.pendingAliasEvents.set(alias, pending);
+    this.pendingAliasBytes.set(alias, currentAliasBytes + objectBytes);
+    this.pendingAliasTotalBytes += objectBytes;
+    return true;
+  }
+
+  private appendPendingAliasReplay(replay: PendingAliasReplay, event: PendingAliasEvent): boolean {
+    const bytes = this.pendingAliasEventBytes(event);
+    if (replay.events.length >= MoqtConnection.MAX_PENDING_EVENTS_PER_ALIAS
+        || this.pendingAliasTotalBytes + bytes > MoqtConnection.MAX_PENDING_TOTAL_BYTES) {
+      this.cancelPendingAliasReplay(BigInt(
+        event.kind === 'object' ? event.object.trackAlias : event.header.trackAlias,
+      ));
+      this.closeSessionFatal('Pending alias replay exceeded its bounded event or byte limit');
+      return true;
     }
-    if (closeHeader !== undefined) {
-      const pending = this.pendingAliasCloses.get(alias) ?? [];
-      pending.push(closeHeader);
-      this.pendingAliasCloses.set(alias, pending);
-    }
+    replay.events.push(event);
+    replay.bytes += bytes;
+    this.pendingAliasTotalBytes += bytes;
     return true;
   }
 
@@ -2100,28 +2231,147 @@ export class MoqtConnection {
    * each path clearing state ad hoc. Returns what was buffered (for the bind
    * path to replay) or undefined if nothing was buffered for this alias.
    */
-  private clearPendingAlias(alias: bigint): { objects: MoqtObject[]; closes: SubgroupHeader[] } | undefined {
+  private clearPendingAlias(alias: bigint): PendingAliasEvent[] | undefined {
     const timer = this.pendingAliasTimers.get(alias);
     if (timer !== undefined) {
       clearTimeout(timer);
       this.pendingAliasTimers.delete(alias);
     }
-    const objects = this.pendingAliasObjects.get(alias);
-    const closes = this.pendingAliasCloses.get(alias);
-    this.pendingAliasObjects.delete(alias);
-    this.pendingAliasCloses.delete(alias);
+    const events = this.pendingAliasEvents.get(alias);
+    this.pendingAliasEvents.delete(alias);
     const bytes = this.pendingAliasBytes.get(alias);
     if (bytes !== undefined) {
       this.pendingAliasTotalBytes -= bytes;
       this.pendingAliasBytes.delete(alias);
     }
-    if (objects === undefined && closes === undefined) return undefined;
-    return { objects: objects ?? [], closes: closes ?? [] };
+    return events;
+  }
+
+  private replacePendingAliasEvents(alias: bigint, events: PendingAliasEvent[]): void {
+    if (events.length === 0) {
+      this.clearPendingAlias(alias);
+      return;
+    }
+    const oldBytes = this.pendingAliasBytes.get(alias) ?? 0;
+    const newBytes = events.reduce((total, event) => total + this.pendingAliasEventBytes(event), 0);
+    this.pendingAliasEvents.set(alias, events);
+    this.pendingAliasBytes.set(alias, newBytes);
+    this.pendingAliasTotalBytes += newBytes - oldBytes;
+  }
+
+  /**
+   * Settle one subscription request's claim on every parked event. A bound alias
+   * receives only events whose generation includes this request; events that
+   * predate it can never leak into it. Events with no remaining candidate are
+   * discarded.
+   */
+  private settlePendingAliasOwnership(requestId: bigint, boundAlias?: bigint): PendingAliasEvent[] {
+    const requestGeneration = this.pendingSubscriptionGenerations.get(requestId);
+    if (requestGeneration === undefined) return [];
+    this.pendingSubscriptionGenerations.delete(requestId);
+    let oldestPendingGeneration: bigint | undefined;
+    for (const generation of this.pendingSubscriptionGenerations.values()) {
+      if (oldestPendingGeneration === undefined || generation < oldestPendingGeneration) {
+        oldestPendingGeneration = generation;
+      }
+    }
+    let claimed: PendingAliasEvent[] = [];
+    for (const alias of [...this.pendingAliasTimers.keys()]) {
+      const events = this.pendingAliasEvents.get(alias) ?? [];
+      if (boundAlias !== undefined && alias === boundAlias) {
+        this.clearPendingAlias(alias);
+        claimed = events.filter((event) => requestGeneration <= event.ownerGeneration);
+        continue;
+      }
+      const retained = oldestPendingGeneration === undefined
+        ? []
+        : events.filter((event) => oldestPendingGeneration! <= event.ownerGeneration);
+      this.replacePendingAliasEvents(alias, retained);
+    }
+    return claimed;
+  }
+
+  private beginPendingAliasReplay(
+    alias: bigint,
+    requestId: bigint,
+    raw: RawSubState | null,
+    events: PendingAliasEvent[],
+  ): void {
+    if (events.length === 0) return;
+    this.cancelPendingAliasReplay(alias);
+    const bytes = events.reduce((total, event) => total + this.pendingAliasEventBytes(event), 0);
+    const replay: PendingAliasReplay = { requestId, raw, events, timer: undefined, bytes };
+    this.pendingAliasTotalBytes += bytes;
+    this.pendingAliasReplays.set(alias, replay);
+    replay.timer = setTimeout(() => this.drainPendingAliasReplay(alias, replay), 0);
+    (replay.timer as { unref?: () => void }).unref?.();
+  }
+
+  private drainPendingAliasReplay(alias: bigint, replay: PendingAliasReplay): void {
+    if (this.pendingAliasReplays.get(alias) !== replay) return;
+    try {
+      while (replay.events.length > 0 && this.pendingAliasReplays.get(alias) === replay) {
+        if (replay.raw !== null
+            && (this.rawSubscriptions.get(replay.requestId) !== replay.raw
+              || this.rawAliasMaps.get(alias) !== replay.raw)) {
+          break;
+        }
+        if (replay.raw === null
+            && this.session.getSubscription(replay.requestId)?.trackAlias !== alias) {
+          break;
+        }
+        const event = replay.events.shift()!;
+        const bytes = this.pendingAliasEventBytes(event);
+        replay.bytes -= bytes;
+        this.pendingAliasTotalBytes -= bytes;
+        if (event.kind === 'object') {
+          if (replay.raw) replay.raw.sub.onObject?.(event.object);
+          else this.onObject?.(event.streamId, event.object);
+        } else if (replay.raw) {
+          replay.raw.sub.onSubgroupClosed?.(event.header);
+        }
+      }
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      try { this.reportStreamError(error); } catch { /* application error handlers are isolated from the replay task */ }
+    } finally {
+      if (this.pendingAliasReplays.get(alias) === replay) {
+        this.pendingAliasReplays.delete(alias);
+        if (replay.timer !== undefined) clearTimeout(replay.timer);
+        this.pendingAliasTotalBytes -= replay.bytes;
+        replay.bytes = 0;
+      }
+    }
+  }
+
+  private cancelPendingAliasReplay(alias: bigint, requestId?: bigint): void {
+    const replay = this.pendingAliasReplays.get(alias);
+    if (!replay || (requestId !== undefined && replay.requestId !== requestId)) return;
+    this.pendingAliasReplays.delete(alias);
+    if (replay.timer !== undefined) clearTimeout(replay.timer);
+    this.pendingAliasTotalBytes -= replay.bytes;
+    replay.bytes = 0;
+    replay.events.length = 0;
+  }
+
+  private cancelPendingAliasReplaysForRequest(requestId: bigint): void {
+    for (const [alias, replay] of this.pendingAliasReplays) {
+      if (replay.requestId === requestId) this.cancelPendingAliasReplay(alias, requestId);
+    }
+  }
+
+  private removeRawSubscription(raw: RawSubState): void {
+    if (this.rawSubscriptions.get(raw.requestId) === raw) this.rawSubscriptions.delete(raw.requestId);
+    if (raw.trackAlias !== null && this.rawAliasMaps.get(raw.trackAlias) === raw) {
+      this.rawAliasMaps.delete(raw.trackAlias);
+    }
+    this.cancelPendingAliasReplaysForRequest(raw.requestId);
   }
 
   /** Clears every currently-buffered pending alias (session teardown, or the last pending subscribeTrack() settling). */
   private clearAllPendingAliases(): void {
     for (const alias of [...this.pendingAliasTimers.keys()]) this.clearPendingAlias(alias);
+    for (const alias of [...this.pendingAliasReplays.keys()]) this.cancelPendingAliasReplay(alias);
   }
 
   // ── receiver §10.11 terminal tracker (bounded, Stream-Count-driven) ──
@@ -2207,6 +2457,7 @@ export class MoqtConnection {
     // where no request-stream close tears rawAliasMaps down separately).
     this.publishAliasMaps.delete(alias);
     this.rawAliasMaps.delete(alias);
+    this.cancelPendingAliasReplay(alias);
     const existing = this.terminatedAliases.get(alias);
     // Do NOT downgrade a STRICT Stream-Count tombstone (which tracks outstanding
     // old streams for §11.1) to a non-strict ordinary-teardown guard: the
@@ -2342,16 +2593,15 @@ export class MoqtConnection {
         raw.trackAlias = alias;
         (raw.sub as { trackAlias: bigint }).trackAlias = alias;
         this.rawAliasMaps.set(alias, raw);
-        // Take-and-clear the buffer NOW (synchronously, alongside binding) so nothing
-        // buffered for this alias can be double-claimed or leak past this settlement -
-        // but defer actually INVOKING the callbacks until after raw.resolve() below.
+        // Claim only events that named this exact request while it was pending.
+        // Callback delivery remains deferred until after raw.resolve() below.
         // onObject/onSubgroupClosed are documented "mutable, read live on each delivery":
         // resolve() only settles the promise, it does not run the caller's own
         // `await subscribeTrack()` continuation synchronously (that's a later microtask) -
         // replaying inline here, before that continuation has had a chance to swap in
         // its real handler, would deliver buffered data into whatever onObject was at
         // call time, not the "live" one the contract promises.
-        const cleared = this.clearPendingAlias(alias);
+        const replay = this.settlePendingAliasOwnership(reqId, alias);
         // §8/§10.11: record the EFFECTIVE delivery timeout for this alias so a later
         // teardown's guard outlives the window in which the publisher may still
         // deliver old-alias streams — combining the publisher's Track Properties
@@ -2369,20 +2619,11 @@ export class MoqtConnection {
         raw.resolve?.(raw.sub);
         raw.resolve = null;
         raw.reject = null;
-        if (cleared) {
-          // A plain queueMicrotask is NOT enough of a delay here: subscribeTrack()
-          // is itself an async function, so the promise it returns to the caller
-          // settles ONE MORE microtask tick after raw.resolve() above (the
-          // engine's own thenable-unwrap of `return result`) - a microtask
-          // scheduled right here would still run before that caller ever
-          // observes the resolved subscription. A macrotask reliably runs after
-          // every currently-queued microtask, however many hops that unwrap
-          // takes, so the caller has always had its chance to swap onObject.
-          setTimeout(() => {
-            for (const obj of cleared.objects) raw.sub.onObject?.(obj);
-            for (const closedHeader of cleared.closes) raw.sub.onSubgroupClosed?.(closedHeader);
-          }, 0);
-        }
+        // A macrotask is required: subscribeTrack() adds another promise-unwrapping
+        // microtask after raw.resolve(), and callers may install their live callback
+        // only in that continuation. The replay gate also queues any data arriving
+        // after binding, so it cannot overtake these parked events.
+        this.beginPendingAliasReplay(alias, reqId, raw, replay);
         return true; // suppress onMessage
       }
     }
@@ -2394,10 +2635,13 @@ export class MoqtConnection {
         raw.reject?.(new Error(`Subscribe failed: ${errMsg.errorReason} (${errMsg.errorCode})`));
         raw.resolve = null;
         raw.reject = null;
-        this.rawSubscriptions.delete(reqId);
-        if (!this.hasPendingRawSubscription()) this.clearAllPendingAliases();
+        this.removeRawSubscription(raw);
+        this.pendingGenericSubscriptions.delete(reqId);
+        this.settlePendingAliasOwnership(reqId);
         return true;
       }
+      this.pendingGenericSubscriptions.delete(reqId);
+      this.settlePendingAliasOwnership(reqId);
     }
     return false;
   }
@@ -2522,6 +2766,9 @@ export class MoqtConnection {
     // An unsubscribed subscription can never PUBLISH_DONE — reclaim its
     // terminal-drain opt-in so the config map cannot leak.
     this.drainConfigs.delete(requestId);
+    this.pendingGenericSubscriptions.delete(requestId);
+    this.settlePendingAliasOwnership(requestId);
+    this.cancelPendingAliasReplaysForRequest(requestId);
     // §5.1.1: arm terminal alias protection SYNCHRONOUSLY — before session
     // teardown, the request-stream reset, or dropping routing — so a late object
     // arriving during any of those awaits is discarded, never routed to the
@@ -2549,7 +2796,7 @@ export class MoqtConnection {
     // Drop the raw subscription for EVERY draft: draft-14/16 has no request-stream
     // close to reclaim it, so without this the subscription object + its onObject
     // callback would leak after unsubscribe.
-    this.rawSubscriptions.delete(requestId);
+    if (raw) this.removeRawSubscription(raw);
   }
 
   /**
@@ -4396,14 +4643,13 @@ export class MoqtConnection {
           // its request stream — the Session already tore down its own state.
           const raw = this.rawSubscriptions.get(action.requestId);
           if (raw) {
-            this.rawSubscriptions.delete(action.requestId);
+            this.removeRawSubscription(raw);
             raw.reject?.(new MoqtConnectionError(action.reason, { errorSource: 'control', isFatal: false }));
             raw.resolve = null;
             raw.reject = null;
           }
-          for (const [alias, st] of this.rawAliasMaps) {
-            if (st.requestId === action.requestId) this.rawAliasMaps.delete(alias);
-          }
+          this.pendingGenericSubscriptions.delete(action.requestId);
+          this.settlePendingAliasOwnership(action.requestId);
           if (this.session.draftVersion === 18) await this.uniPair?.cancelRequest(action.requestId);
           break;
         }
@@ -5762,7 +6008,7 @@ export class MoqtConnection {
               ? { extension_headers: [] } : {}), // TODO: parse extension headers for qlog
             ...(object.status !== undefined ? { object_status: object.status as bigint } : {}),
           });
-          if (!this.routeToTrackSubscription(delivered)) {
+          if (!this.routeToTrackSubscription(streamId, delivered)) {
             this.onObject?.(streamId, delivered);
           }
           previousObjectId = object.objectId;
@@ -5797,7 +6043,7 @@ export class MoqtConnection {
             objectId: previousObjectId + 1n, // raw bigint — object IDs are semantic now
             status: ObjectStatus.END_OF_GROUP,
           };
-          if (!this.routeToTrackSubscription(eogGap)) {
+          if (!this.routeToTrackSubscription(streamId, eogGap)) {
             this.onObject?.(streamId, eogGap);
           }
         }
@@ -5854,9 +6100,9 @@ export class MoqtConnection {
               properties: item.extensions,
               payload: item.payload,
             };
-            if (!this.routeToTrackSubscription(delivered)) {
-              this.onObject?.(streamId, delivered);
-            }
+            // FETCH objects have no Track Alias. Alias 0 here is synthetic and
+            // must never be confused with a subgroup racing SUBSCRIBE_OK.
+            this.onObject?.(streamId, delivered);
 
             // Update prior context for next object's inheritance
             prior = {
@@ -5879,9 +6125,7 @@ export class MoqtConnection {
               objectId: item.objectId,
               status: gapStatus,
             };
-            if (!this.routeToTrackSubscription(delivered)) {
-              this.onObject?.(streamId, delivered);
-            }
+            this.onObject?.(streamId, delivered);
           }
 
           isFirstObject = false;

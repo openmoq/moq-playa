@@ -3802,7 +3802,7 @@ describe('MoqtConnection draft-14', () => {
   });
 });
 
-// ─── Pending-alias buffer rework (review response) ───────────────────
+// ─── Pre-SUBSCRIBE_OK alias parking ─────────────────────────────────
 //
 // Follow-up to the buffering fix above: the buffer must never claim an alias
 // still guarded by another (torn-down) subscription's terminal tombstone,
@@ -3811,7 +3811,7 @@ describe('MoqtConnection draft-14', () => {
 // centralized helper, and must defer replay past the point where the caller
 // could have swapped its "mutable, read live" onObject/onSubgroupClosed.
 
-describe('pending-alias buffer rework (review response)', () => {
+describe('pre-SUBSCRIBE_OK alias parking', () => {
   const enc = (s: string) => new TextEncoder().encode(s);
 
   function findRequestId(mock: ReturnType<typeof createMockTransport>, type: string): bigint {
@@ -3830,13 +3830,269 @@ describe('pending-alias buffer rework (review response)', () => {
     } as ControlMessage));
   }
 
-  function pushObjectStream(mock: ReturnType<typeof createMockTransport>, alias: bigint, payload: Uint8Array): void {
+  function pushObjectStream(
+    mock: ReturnType<typeof createMockTransport>,
+    alias: bigint,
+    payload: Uint8Array,
+  ): MockDataStream {
     const stream = mock.addIncomingStream();
     stream.push(concat(
       encodeSubgroupHeader(makeSubgroupHeader({ trackAlias: varint(alias) })),
       encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0), payload }), false, varint(0), true),
     ));
+    return stream;
   }
+
+  it('does not claim an established generic subscription alias while a raw subscription is pending', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const onObject = vi.fn();
+    adapter.onObject = onObject;
+
+    const genericRequestId = await adapter.subscribe([enc('live')], enc('generic'));
+    pushSubscribeOk(mock, genericRequestId, 42n);
+    await deepFlush();
+
+    void adapter.subscribeTrack([enc('live')], enc('raw'), { onObject: vi.fn() });
+    await deepFlush();
+    pushObjectStream(mock, 42n, new Uint8Array([0x42]));
+    await deepFlush();
+
+    expect(onObject).toHaveBeenCalledOnce();
+    expect(onObject.mock.calls[0]![1].trackAlias).toBe(42n);
+  });
+
+  it('releases a parked object when the matching pending generic subscription binds first', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    vi.useFakeTimers();
+    try {
+      const onObject = vi.fn();
+      adapter.onObject = onObject;
+      const genericRequestId = await adapter.subscribe([enc('live')], enc('generic'));
+      void adapter.subscribeTrack([enc('live')], enc('raw'), { onObject: vi.fn() });
+      await vi.advanceTimersByTimeAsync(0);
+
+      pushObjectStream(mock, 42n, new Uint8Array([0x42]));
+      await vi.advanceTimersByTimeAsync(0);
+      pushSubscribeOk(mock, genericRequestId, 42n);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(onObject).toHaveBeenCalledOnce();
+      expect(onObject.mock.calls[0]![1].trackAlias).toBe(42n);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not park legacy FETCH objects under the synthetic alias zero', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const onObject = vi.fn();
+    adapter.onObject = onObject;
+
+    void adapter.subscribeTrack([enc('live')], enc('raw'), { onObject: vi.fn() });
+    await deepFlush();
+
+    const fetchObject: FetchObject = {
+      flags: varint(0x1c),
+      groupId: varint(0),
+      subgroupId: varint(0),
+      objectId: varint(0),
+      publisherPriority: 128,
+      isDatagram: false,
+      extensions: undefined,
+      payload: new Uint8Array([0xBE, 0xEF]),
+    };
+    const stream = mock.addIncomingStream();
+    stream.push(concat(
+      encodeFetchHeader({ requestId: varint(2) }),
+      encodeFetchObject(fetchObject),
+    ));
+    await deepFlush();
+
+    expect(onObject).toHaveBeenCalledOnce();
+    expect(onObject.mock.calls[0]![1].payload).toEqual(fetchObject.payload);
+  });
+
+  it('preserves parked objects ahead of objects arriving after the alias binds', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    vi.useFakeTimers();
+    try {
+      const seen: number[] = [];
+      const subP = adapter.subscribeTrack([enc('live')], enc('raw'), { onObject: vi.fn() });
+      await vi.advanceTimersByTimeAsync(0);
+      const requestId = findRequestId(mock, 'SUBSCRIBE');
+
+      pushObjectStream(mock, 7n, new Uint8Array([1]));
+      await vi.advanceTimersByTimeAsync(0);
+      pushSubscribeOk(mock, requestId, 7n);
+      const sub = await subP;
+      sub.onObject = (object) => {
+        if (object.kind === 'data') seen.push(object.payload[0]!);
+      };
+
+      // The deferred replay has not run yet. This live object must queue behind
+      // the object that arrived before SUBSCRIBE_OK rather than overtaking it.
+      pushObjectStream(mock, 7n, new Uint8Array([2]));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(seen).toEqual([1, 2]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('replays a graceful subgroup FIN after its parked objects using live callbacks', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const initialObject = vi.fn();
+    const initialClose = vi.fn();
+    const subP = adapter.subscribeTrack([enc('live')], enc('raw'), {
+      onObject: initialObject,
+      onSubgroupClosed: initialClose,
+    });
+    await deepFlush();
+
+    const stream = pushObjectStream(mock, 7n, new Uint8Array([1]));
+    stream.close();
+    await deepFlush();
+    pushSubscribeOk(mock, findRequestId(mock, 'SUBSCRIBE'), 7n);
+    const sub = await subP;
+    const seen: string[] = [];
+    sub.onObject = () => seen.push('object');
+    sub.onSubgroupClosed = () => seen.push('close');
+    await deepFlush();
+
+    expect(initialObject).not.toHaveBeenCalled();
+    expect(initialClose).not.toHaveBeenCalled();
+    expect(seen).toEqual(['object', 'close']);
+  });
+
+  it('bounds objects and graceful FINs with one per-alias event limit', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    void adapter.subscribeTrack([enc('live')], enc('raw'), { onObject: vi.fn() });
+    await deepFlush();
+
+    type Internals = {
+      bufferPendingAlias(alias: bigint, obj: unknown, closeHeader: unknown): boolean;
+    };
+    const internals = adapter as unknown as Internals;
+    const header = makeSubgroupHeader({ trackAlias: varint(7n) });
+    for (let i = 0; i < 256; i++) {
+      expect(internals.bufferPendingAlias(7n, undefined, header)).toBe(true);
+    }
+    expect(internals.bufferPendingAlias(7n, undefined, header)).toBe(false);
+  });
+
+  it('does not let a later request inherit data parked before that request existed', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const globalObjects = vi.fn();
+    const laterObjects = vi.fn();
+    adapter.onObject = globalObjects;
+
+    const firstP = adapter.subscribeTrack([enc('live')], enc('first'), { onObject: vi.fn() });
+    firstP.catch(() => undefined);
+    await deepFlush();
+    const firstRequestId = findRequestId(mock, 'SUBSCRIBE');
+    pushObjectStream(mock, 99n, new Uint8Array([0x99]));
+    await deepFlush();
+
+    const laterP = adapter.subscribeTrack([enc('live')], enc('later'), { onObject: laterObjects });
+    await deepFlush();
+    const laterRequestId = findRequestId(mock, 'SUBSCRIBE');
+
+    mock.pushControlBytes(createControlCodec(16).encode({
+      type: 'REQUEST_ERROR', requestId: firstRequestId, errorCode: varint(0),
+      retryInterval: varint(0), errorReason: 'rejected', requestKind: 'SUBSCRIBE',
+    } as ControlMessage));
+    await deepFlush();
+    await expect(firstP).rejects.toThrow();
+
+    pushSubscribeOk(mock, laterRequestId, 99n);
+    await laterP;
+    await deepFlush();
+
+    expect(laterObjects).not.toHaveBeenCalled();
+    expect(globalObjects).not.toHaveBeenCalled();
+  });
+
+  it('retains parked data for another request that was already pending when it arrived', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const firstP = adapter.subscribeTrack([enc('live')], enc('first'), { onObject: vi.fn() });
+    await deepFlush();
+    const firstRequestId = findRequestId(mock, 'SUBSCRIBE');
+    const secondObjects = vi.fn();
+    const secondP = adapter.subscribeTrack([enc('live')], enc('second'), { onObject: secondObjects });
+    await deepFlush();
+    const secondRequestId = findRequestId(mock, 'SUBSCRIBE');
+
+    pushObjectStream(mock, 99n, new Uint8Array([0x99]));
+    await deepFlush();
+    pushSubscribeOk(mock, firstRequestId, 42n);
+    await firstP;
+    pushSubscribeOk(mock, secondRequestId, 99n);
+    await secondP;
+    await deepFlush();
+
+    expect(secondObjects).toHaveBeenCalledOnce();
+  });
+
+  it('cancels deferred replay when the subscription is removed', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    vi.useFakeTimers();
+    try {
+      const onObject = vi.fn();
+      const subP = adapter.subscribeTrack([enc('live')], enc('raw'), { onObject });
+      await vi.advanceTimersByTimeAsync(0);
+      pushObjectStream(mock, 7n, new Uint8Array([1]));
+      await vi.advanceTimersByTimeAsync(0);
+      pushSubscribeOk(mock, findRequestId(mock, 'SUBSCRIBE'), 7n);
+      const sub = await subP;
+
+      const unsubscribeP = sub.unsubscribe();
+      await vi.advanceTimersByTimeAsync(0);
+      await unsubscribeP;
+
+      expect(onObject).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears parked ownership when guarded alias reuse refuses the subscription', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+
+    const oldP = adapter.subscribeTrack([enc('live')], enc('old'), { onObject: vi.fn() });
+    await deepFlush();
+    pushSubscribeOk(mock, findRequestId(mock, 'SUBSCRIBE'), 42n);
+    const old = await oldP;
+    await old.unsubscribe();
+
+    const refusedP = adapter.subscribeTrack([enc('live')], enc('refused'), { onObject: vi.fn() });
+    refusedP.catch(() => undefined);
+    await deepFlush();
+    const refusedRequestId = findRequestId(mock, 'SUBSCRIBE');
+    pushObjectStream(mock, 99n, new Uint8Array([0x99]));
+    await deepFlush();
+    pushSubscribeOk(mock, refusedRequestId, 42n);
+    await expect(refusedP).rejects.toThrow(/reuse refused/);
+
+    const laterObjects = vi.fn();
+    const laterP = adapter.subscribeTrack([enc('live')], enc('later'), { onObject: laterObjects });
+    await deepFlush();
+    pushSubscribeOk(mock, findRequestId(mock, 'SUBSCRIBE'), 99n);
+    await laterP;
+    await deepFlush();
+
+    expect(laterObjects).not.toHaveBeenCalled();
+  });
 
   it('the buffer refuses an alias still guarded by another subscription\'s terminal tombstone', async () => {
     const mock = createMockTransport();
