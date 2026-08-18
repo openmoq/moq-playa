@@ -5953,6 +5953,47 @@ export class MoqtPlayer {
           return;
         }
 
+        if (error.name === 'MediaGapUnrecoverableError') {
+          // Buffered-gap recovery was unrecoverable: either a hole exceeded
+          // the bounded-skip policy, or a bounded skip's landing never
+          // resumed playback. Only a MediaSource rebuild (fresh tune-in)
+          // recovers.
+          //
+          // Terminal transaction FIRST, publications LAST: the adapter
+          // spends its once-only fatal before calling onError, so no
+          // externally supplied code (config.errorFilter, `error` or
+          // `state_changed` listeners) may run until state AND ticking are
+          // committed — a throwing listener must neither strand live
+          // ticking behind a public ERROR state nor censor the other
+          // publication. Same applyState/announceState split play()/pause()
+          // use; first listener failure rethrows after both attempts.
+          const doTransition = !this.isTerminalState();
+          const from = this.state;
+          if (doTransition) this.applyState(PlayerState.ERROR);
+          this.stopTicking();
+          let publishFailed = false;
+          let publishError: unknown;
+          try {
+            this.emitError(createPlayerError(
+              'fatal', 'decoder', PlayerErrorCode.MEDIA_GAP_UNRECOVERABLE, error.message,
+              { cause: error, context: { mediaType } },
+            ));
+          } catch (publishErr) {
+            // Boolean sentinel, payload verbatim: `throw undefined`/`null`
+            // are legal and must neither be swallowed nor displaced.
+            if (!publishFailed) { publishFailed = true; publishError = publishErr; }
+          }
+          if (doTransition) {
+            try {
+              this.announceState(from, PlayerState.ERROR);
+            } catch (publishErr) {
+              if (!publishFailed) { publishFailed = true; publishError = publishErr; }
+            }
+          }
+          if (publishFailed) throw publishError;
+          return;
+        }
+
         if (error.name === 'PlayheadWedgeError') {
           this.emitError(createPlayerError(
             'fatal', 'decoder', PlayerErrorCode.MEDIA_ELEMENT_WEDGED, error.message,
@@ -6049,9 +6090,13 @@ export class MoqtPlayer {
     // CMAF has no pipeline-level stall handler — the MseMediaSource
     // detects stalls directly from the <video> element.
     if (this.mediaSource) {
-      this.mediaSource.onStall = (durationMs) => {
+      this.mediaSource.onStall = (durationMs, cause) => {
         this._stats.recordStall(durationMs);
-        this.emitter.emit('stall', { type: 'stall', durationMs });
+        this.emitter.emit('stall', { type: 'stall', durationMs, ...(cause ? { cause } : {}) });
+
+        // A media-gap stall is missing SOURCE media the adapter already
+        // skipped — not a bandwidth signal. Count it, never downshift on it.
+        if (cause === 'media-gap') return;
 
         // Don't cascade downshifts while a switch is already in flight.
         // Each switch needs time for the relay to deliver the new track's
@@ -6071,6 +6116,21 @@ export class MoqtPlayer {
             });
           }
         }
+      };
+
+      // Buffered-hole gap-jump: the adapter skipped missing source media.
+      // Surface it as stats + a typed public event (apps subscribe to the
+      // player event; the adapter slot has exactly one owner — this one).
+      this.mediaSource.onGapJump = (info) => {
+        this._stats.recordGapJump();
+        this.log.warn(
+          'MSE gap-jump: skipped %ss hole %ss -> %ss (waited %sms)',
+          info.holeSec.toFixed(2), info.from.toFixed(2), info.to.toFixed(2), info.waitedMs.toFixed(0),
+        );
+        this.emitter.emit('gap_jump', {
+          type: 'gap_jump',
+          from: info.from, to: info.to, holeSec: info.holeSec, waitedMs: info.waitedMs,
+        });
       };
     }
 

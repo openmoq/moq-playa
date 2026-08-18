@@ -2995,3 +2995,452 @@ describe('MseMediaSource — terminal startup report', () => {
         expect(currentMs.videoBuffer.appendedPayloads.length).toBe(3); // init + 2
     });
 });
+
+// ─── Buffered-hole gap-jump (defensive recovery for source holes) ──────
+//
+// Real live chains deliver streams with HOLES: media time missing either
+// from the content (packager/ingest loss) or from delivery (relay drop).
+// Nothing else crosses a buffered hole: the wedge ladder computes ahead
+// only within the containing range, the live-edge chase never seeks
+// across gaps, and the stall detector reports only when the playhead
+// moves again. The gap-jump monitor arms when the playhead is frozen at
+// a containing range's end with a bounded hole and another range ahead,
+// waits gapJumpMs, then seeks just past the hole — committing state
+// before publishing diagnostics. Holes wider than the bound never jump;
+// if one persists, the adapter escalates exactly once through onError
+// with name 'MediaGapUnrecoverableError' (the same name-based fatal
+// channel as the wedge ladder's final rung).
+
+describe('buffered-hole gap-jump', () => {
+    function gapSetup(opts?: { gapJumpMs?: number; ranges?: [number, number][]; ct?: number }) {
+        const video = new MockVideoElement();
+        video.buffered = makeTimeRanges(opts?.ranges ?? [[5, 19.27], [19.78, 25]]);
+        video.currentTime = opts?.ct ?? 19.25;
+        const adapter = new MseMediaSource(
+            video as unknown as HTMLVideoElement,
+            opts?.gapJumpMs !== undefined ? { gapJumpMs: opts.gapJumpMs } : undefined,
+        );
+        (adapter as any).playTriggered = true;
+        adapter.debug = true;  // gap diagnostics route through logWarn
+        const jumps: any[] = [];
+        const stalls: Array<{ durationMs: number; cause?: string }> = [];
+        const errors: Error[] = [];
+        (adapter as any).onGapJump = (info: any) => jumps.push(info);
+        adapter.onStall = (durationMs: number, cause?: 'media-gap') => stalls.push({ durationMs, ...(cause ? { cause } : {}) });
+        adapter.onError = (e) => errors.push(e);
+        const check = (nowMs: number) => (adapter as any).checkGapJump(nowMs);
+        video.seekCount = 0;   // ignore the harness's own setup assignment
+        return { adapter, video, jumps, stalls, errors, check };
+    }
+
+    it('jumps across a bounded hole after gapJumpMs, landing just inside the next range', () => {
+        const { video, jumps, stalls, check } = gapSetup();
+        check(0);          // arms (frozen at 19.25, range end 19.27, hole to 19.78)
+        check(1_000);      // still waiting
+        expect(video.seekCount).toBe(0);
+
+        check(2_100);      // wait (2000ms default) elapsed → jump
+        expect(video.seekCount).toBe(1);
+        expect(video.currentTime).toBeCloseTo(19.79, 5); // 19.78 + 0.01
+        expect(jumps).toHaveLength(1);
+        expect(jumps[0].from).toBeCloseTo(19.25, 5);
+        expect(jumps[0].to).toBeCloseTo(19.79, 5);
+        expect(jumps[0].holeSec).toBeCloseTo(0.51, 2);
+        expect(jumps[0].waitedMs).toBeGreaterThanOrEqual(2_000);
+        // Exactly one stall record, adapter-emitted, cause-tagged.
+        expect(stalls).toHaveLength(1);
+        expect(stalls[0].cause).toBe('media-gap');
+        expect(stalls[0].durationMs).toBeGreaterThanOrEqual(2_000);
+    });
+
+    it('commit-before-publish: a throwing onStall listener does not prevent the seek or onGapJump', () => {
+        const { adapter, video, jumps, check } = gapSetup();
+        adapter.onStall = () => { throw new Error('listener bug'); };
+        check(0);
+        expect(() => check(2_100)).not.toThrow();
+        expect(video.seekCount).toBe(1);
+        expect(jumps).toHaveLength(1);
+        // Re-entrancy: armed state was cleared before publish — a re-check
+        // in the same tick window cannot double-jump.
+        check(2_100);
+        expect(video.seekCount).toBe(1);
+    });
+
+    it('episode: post-jump waiting/timeupdate churn cannot double-count the stall', () => {
+        const { adapter, video, stalls, check } = gapSetup();
+        check(0);
+        check(2_100);
+        expect(stalls).toHaveLength(1);
+        // The jump's own churn:
+        (adapter as any).handleWaiting();
+        (adapter as any).handleTimeUpdate();
+        expect(stalls).toHaveLength(1);
+        // First real progress past the landing clears the episode…
+        video.currentTime = 20.0;
+        (adapter as any).handleTimeUpdate();
+        // …after which a genuine stall reports normally.
+        (adapter as any).handleWaiting();
+        video.currentTime = 20.5;
+        (adapter as any).handleTimeUpdate();
+        expect(stalls).toHaveLength(2);
+        expect(stalls[1].cause).toBeUndefined();
+    });
+
+    it('a growing next range does not restart the wait (nextRangeEnd excluded from identity)', () => {
+        const { video, check } = gapSetup();
+        check(0);
+        video.buffered = makeTimeRanges([[5, 19.27], [19.78, 26]]);   // tail grew
+        check(1_000);
+        video.buffered = makeTimeRanges([[5, 19.27], [19.78, 27.5]]); // and again
+        check(2_100);
+        expect(video.seekCount).toBe(1);
+    });
+
+    it('candidate drift (nextRangeStart moves) restarts the wait', () => {
+        const { video, check } = gapSetup();
+        check(0);
+        video.buffered = makeTimeRanges([[5, 19.27], [19.60, 25]]);   // hole shrank: new candidate
+        check(1_500);
+        check(2_600);                                                  // only 1.1s since drift
+        expect(video.seekCount).toBe(0);
+        check(3_600);                                                  // 2.1s since drift
+        expect(video.seekCount).toBe(1);
+        expect(video.currentTime).toBeCloseTo(19.61, 5);
+    });
+
+    it('movement disarms; a filled hole disarms', () => {
+        const { video, check } = gapSetup();
+        check(0);
+        video.currentTime = 19.6;                                      // moved (well past tolerance)
+        check(1_000);
+        video.currentTime = 19.25;
+        video.seekCount = 0;                                           // manual moves aren't adapter seeks
+        check(2_100);                                                  // re-armed only at 1_000+… not elapsed
+        expect(video.seekCount).toBe(0);
+
+        // Filled hole: single continuous range → disarm, never jump.
+        video.buffered = makeTimeRanges([[5, 25]]);
+        check(3_200); check(4_300); check(5_400);
+        expect(video.seekCount).toBe(0);
+    });
+
+    it('paused, seeking, element error, or intent-pause disarms synchronously', () => {
+        const { adapter, video, check } = gapSetup();
+        check(0);
+        video.paused = true;
+        check(2_100);
+        expect(video.seekCount).toBe(0);
+        video.paused = false;
+
+        check(3_000);                                                  // re-arm
+        adapter.setPlaybackIntent(false);                              // synchronous disarm
+        adapter.setPlaybackIntent(true);
+        check(5_200);                                                  // 2.2s after re-arm but state was cleared
+        expect(video.seekCount).toBe(0);
+
+        check(6_000);
+        video.setError(3, 'decode');
+        check(8_200);
+        expect(video.seekCount).toBe(0);
+    });
+
+    it('never arms when the playhead is outside every buffered range (this slice)', () => {
+        const { video, check } = gapSetup({ ranges: [[5, 15], [19.78, 25]], ct: 17 });
+        check(0); check(1_000); check(2_100); check(3_200);
+        expect(video.seekCount).toBe(0);
+    });
+
+    it('wide hole: no jump, one gap-too-wide warn, exactly one MediaGapUnrecoverableError after 10s', () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const { video, errors, check } = gapSetup({ ranges: [[5, 19.27], [21.29, 25]] }); // hole 2.02
+        for (let t = 0; t <= 9_000; t += 1_000) check(t);
+        expect(video.seekCount).toBe(0);
+        expect(errors).toHaveLength(0);
+        const wideWarns = warn.mock.calls.filter((c) => String(c[0]).includes('gap-too-wide'));
+        expect(wideWarns).toHaveLength(1);
+
+        check(10_100);
+        expect(errors).toHaveLength(1);
+        expect(errors[0].name).toBe('MediaGapUnrecoverableError');
+        check(11_200); check(12_300);
+        expect(errors).toHaveLength(1);                                // spent — never re-emits
+        warn.mockRestore();
+    });
+
+    it('a throwing onError listener still yields exactly one escalation (spent before publish)', () => {
+        const { adapter, errors, check } = gapSetup({ ranges: [[5, 19.27], [21.29, 25]] });
+        let thrown = 0;
+        adapter.onError = (e) => { errors.push(e); thrown++; throw new Error('listener bug'); };
+        for (let t = 0; t <= 10_100; t += 1_000) expect(() => check(t)).not.toThrow();
+        check(11_200);
+        expect(errors).toHaveLength(1);
+        expect(thrown).toBe(1);
+    });
+
+    it('boundary: hole of exactly 2.000s still jumps', () => {
+        const { video, check } = gapSetup({ ranges: [[5, 19], [21, 25]], ct: 18.95 });
+        check(0);
+        check(2_100);
+        expect(video.seekCount).toBe(1);
+        expect(video.currentTime).toBeCloseTo(21.01, 5);
+    });
+
+    it('boundary: a hole of 2.001s is refused (identity tolerance must not widen the policy bound)', () => {
+        const { video, errors, check } = gapSetup({ ranges: [[5, 19], [21.001, 25]], ct: 18.95 });
+        for (let t = 0; t <= 9_000; t += 1_000) check(t);
+        expect(video.seekCount).toBe(0);
+        check(10_100);                                                 // wide-hole escalation applies
+        expect(errors).toHaveLength(1);
+        expect(errors[0].name).toBe('MediaGapUnrecoverableError');
+    });
+
+    it('suppressed-waiting evidence survives the episode fallback (no second waiting required)', () => {
+        const { adapter, video, stalls, check } = gapSetup();
+        check(0);
+        check(2_100);                                                  // jump; episode armed
+        expect(stalls).toHaveLength(1);
+        (adapter as any).handleWaiting();                              // the ONLY waiting (seek-generated)
+        check(3_100);
+        check(4_100);                                                  // fallback expiry restores the evidence
+        // No further waiting ever fires. When the playhead finally moves,
+        // the frozen span still reports as a genuine stall.
+        video.currentTime = 19.9;
+        video.seekCount = 1;                                           // manual move isn't an adapter seek
+        (adapter as any).handleTimeUpdate();
+        expect(stalls).toHaveLength(2);
+        expect(stalls[1].cause).toBeUndefined();
+    });
+
+    it('a failed landing with a single suppressed waiting reaches a bounded fatal (no wedge eligibility needed)', () => {
+        const { adapter, video, stalls, errors, check } = gapSetup();
+        check(0);
+        check(2_100);                                                  // jump to 19.79
+        (adapter as any).handleWaiting();                              // seek-generated waiting; suppressed
+        // Landing never decodes: no playing, no timeupdate, no second
+        // waiting, readyState low — the wedge ladder would decline this
+        // state forever. The landing watchdog must not.
+        video.readyState = 2;
+        for (let t = 3_100; t <= 11_900; t += 1_000) check(t);
+        expect(errors).toHaveLength(0);                                // still inside the bound
+        check(12_200);                                                 // ≥10s after the jump
+        expect(errors).toHaveLength(1);
+        expect(errors[0].name).toBe('MediaGapUnrecoverableError');
+        check(13_300); check(14_400);
+        expect(errors).toHaveLength(1);                                // spent — never re-emits
+        expect(stalls.filter((st) => st.cause === 'media-gap')).toHaveLength(1);
+    });
+
+    it('intent-pause retires the landing watch; resume does not resurrect the old deadline', () => {
+        const { adapter, errors, check } = gapSetup();
+        check(0);
+        check(2_100);                                                  // jump; landing armed
+        (adapter as any).handleWaiting();                              // suppressed waiting recorded
+        adapter.setPlaybackIntent(false);                              // user pause BEFORE any progress
+        adapter.setPlaybackIntent(true);                               // and resume, between ticks
+        for (let t = 3_100; t <= 15_400; t += 1_000) check(t);         // far past the 10s deadline
+        expect(errors).toHaveLength(0);                                // no fatal for an intentional pause
+    });
+
+    it('element paused or user-seeking retires the landing watch (no fatal against a paused player)', () => {
+        for (const put of [
+            (v: MockVideoElement) => { v.paused = true; },
+            // A USER seek moves the playhead away from the landing target;
+            // bare `seeking` at the target is the adapter's own pending
+            // seek and must keep the landing watched (see the dedicated
+            // self-seek discriminator above).
+            (v: MockVideoElement) => { v.seeking = true; (v as any)._currentTime = 5; },
+        ]) {
+            const { adapter, video, errors, check } = gapSetup();
+            check(0);
+            check(2_100);                                              // jump; landing armed
+            put(video);                                                // user pause / user seek
+            for (let t = 3_100; t <= 15_400; t += 1_000) check(t);
+            expect(errors).toHaveLength(0);
+            adapter.destroy();
+        }
+    });
+
+    it("the adapter's own unsettled landing seek keeps the landing watched (bounded fatal still fires)", () => {
+        const { adapter, video, errors, check } = gapSetup();
+        video.modelSeekLifecycle = true;                               // real element: assignment latches seeking
+        video.autoFireSeeked = false;                                  // …and this seek NEVER settles
+        check(0);
+        check(2_100);                                                  // jump → our own seek pending
+        expect(video.seeking).toBe(true);                              // latched by the jump itself
+        for (let t = 3_100; t <= 11_900; t += 1_000) check(t);
+        expect(errors).toHaveLength(0);
+        check(12_200);                                                 // ≥10s after the jump
+        expect(errors).toHaveLength(1);                                // exactly one landing fatal
+        expect(errors[0].name).toBe('MediaGapUnrecoverableError');
+        check(13_300);
+        expect(errors).toHaveLength(1);
+    });
+
+    it('a USER seek to a different position retires the landing (no fatal)', () => {
+        const { adapter, video, errors, check } = gapSetup();
+        video.modelSeekLifecycle = true;
+        video.autoFireSeeked = false;
+        check(0);
+        check(2_100);                                                  // jump; landing armed at ~19.79
+        video.currentTime = 5;                                         // user seeks elsewhere (still seeking)
+        for (let t = 3_100; t <= 15_400; t += 1_000) check(t);
+        expect(errors).toHaveLength(0);                                // user intent wins; no fatal
+        adapter.destroy();
+    });
+
+    it('retiring a landing also retires its transferred waiting evidence (no phantom bandwidth stall)', () => {
+        const { adapter, video, stalls, check } = gapSetup();
+        check(0);
+        check(2_100);                                                  // jump
+        (adapter as any).handleWaiting();                              // the one suppressed waiting
+        check(3_100);
+        check(4_100);                                                  // fallback transfers the evidence
+        adapter.setPlaybackIntent(false);                              // user pauses
+        adapter.setPlaybackIntent(true);                               // and resumes
+        video.currentTime = 20.5;                                      // playback proceeds
+        video.seekCount = 1;
+        (adapter as any).handleTimeUpdate();
+        // The paused span must NOT report as an ordinary bandwidth stall.
+        expect(stalls).toHaveLength(1);
+        expect(stalls[0].cause).toBe('media-gap');
+    });
+
+    it('cancellation during the fallback window prevents the evidence transfer entirely', () => {
+        const { adapter, video, stalls, check } = gapSetup();
+        check(0);
+        check(2_100);                                                  // jump
+        (adapter as any).handleWaiting();
+        check(3_100);                                                  // one fallback tick
+        video.paused = true;                                           // pause BEFORE the transfer tick
+        check(4_100);                                                  // cancellation must run before transfer
+        video.paused = false;
+        video.currentTime = 20.5;
+        video.seekCount = 1;
+        (adapter as any).handleTimeUpdate();
+        expect(stalls).toHaveLength(1);
+        expect(stalls[0].cause).toBe('media-gap');
+    });
+
+    it('a user seek that SETTLES between ticks still retires the landing (no fatal on user intent)', async () => {
+        const { adapter, video, errors, check } = gapSetup();
+        video.modelSeekLifecycle = true;                               // real element lifecycle,
+        video.autoFireSeeked = true;                                   // …seeks settle promptly
+        check(0);
+        check(2_100);                                                  // jump; landing armed at ~19.79
+        video.currentTime = 5;                                         // user scrubs backward…
+        await Promise.resolve();                                       // …and the seek completes
+        await Promise.resolve();
+        expect(video.seeking).toBe(false);                             // settled before the next tick
+        for (let t = 3_100; t <= 15_400; t += 1_000) check(t);
+        expect(errors).toHaveLength(0);                                // user intent wins
+        adapter.destroy();
+    });
+
+    it('a successful landing clears the landing watchdog (no delayed fatal)', () => {
+        const { adapter, video, errors, check } = gapSetup();
+        check(0);
+        check(2_100);                                                  // jump
+        video.currentTime = 20.4;                                      // organic progress past the landing
+        video.seekCount = 1;
+        (adapter as any).handleTimeUpdate();
+        for (let t = 3_100; t <= 14_400; t += 1_000) check(t);
+        expect(errors).toHaveLength(0);
+    });
+
+    it('degenerate next range at jump time aborts the jump and disarms', () => {
+        const { video, check } = gapSetup();
+        check(0);
+        check(1_000);
+        // Next range collapses to a point before the deadline tick.
+        video.buffered = makeTimeRanges([[5, 19.27], [19.78, 19.78]]);
+        check(2_100);
+        expect(video.seekCount).toBe(0);
+    });
+
+    it('pre-jump freeze time does not carry into the wedge ladder (self-seek restamps)', () => {
+        const { adapter, video, check } = gapSetup();
+        const wedges: any[] = [];
+        (adapter as any).onWedge = (info: any) => wedges.push(info);
+        (adapter as any).checkPlayheadWedge(0);                        // baseline
+        check(0);
+        (adapter as any).checkPlayheadWedge(1_000);                    // frozen 1.0s pre-jump
+        check(1_000);
+        (adapter as any).checkPlayheadWedge(2_000);                    // frozen 2.0s pre-jump (no rung yet)
+        check(2_100);                                                  // jump (noteSelfSeek restamps)
+        expect(video.seekCount).toBe(1);
+        // If the pre-jump 2.1s of freeze carried over, rung 1 would fire
+        // at 2.6s total; the restamp means the ladder starts over at the
+        // landing, so 2.0s post-jump is still quiet.
+        (adapter as any).checkPlayheadWedge(2_100);
+        (adapter as any).checkPlayheadWedge(3_100);
+        (adapter as any).checkPlayheadWedge(4_100);
+        expect(wedges).toHaveLength(0);
+        // A landing that STAYS frozen is then the wedge ladder's business —
+        // by 2.5s+ post-jump it fires normally (division of labor pinned).
+        (adapter as any).checkPlayheadWedge(4_700);
+        expect(wedges).toHaveLength(1);
+    });
+
+    it('rate limit: consecutive holes jump at least GAP_JUMP_MIN_INTERVAL_MS apart', () => {
+        const { video, check } = gapSetup();
+        check(0);
+        check(2_100);                                                  // jump #1 at 2.1s
+        expect(video.seekCount).toBe(1);
+        // Immediately a new hole at the landing.
+        video.currentTime = 19.79;
+        video.seekCount = 1;                                           // manual move isn't an adapter seek
+        video.buffered = makeTimeRanges([[5, 19.80], [20.31, 30]]);
+        check(3_100);                                                  // arms
+        check(5_200);                                                  // wait elapsed but rate limit (2.1+5=7.1s) not
+        expect(video.seekCount).toBe(1);
+        check(7_300);                                                  // past both → jump #2
+        expect(video.seekCount).toBe(2);
+        expect(video.currentTime).toBeCloseTo(20.32, 5);
+    });
+
+    it('gapJumpMs: 0 disables; constructor rejects NaN, Infinity, and negatives', () => {
+        const { video, check } = gapSetup({ gapJumpMs: 0 });
+        for (let t = 0; t <= 8_000; t += 1_000) check(t);
+        expect(video.seekCount).toBe(0);
+
+        const el = new MockVideoElement() as unknown as HTMLVideoElement;
+        expect(() => new MseMediaSource(el, { gapJumpMs: Number.NaN })).toThrow(/gapJumpMs/);
+        expect(() => new MseMediaSource(el, { gapJumpMs: Number.POSITIVE_INFINITY })).toThrow(/gapJumpMs/);
+        expect(() => new MseMediaSource(el, { gapJumpMs: -1 })).toThrow(/gapJumpMs/);
+    });
+
+    it('reset() clears armed candidate, episode, and rate-limit state; destroy() nulls onGapJump', () => {
+        const { adapter, video, check } = gapSetup();
+        check(0);
+        check(1_000);
+        adapter.reset();
+        check(2_100);                                                  // old deadline dead
+        expect(video.seekCount).toBe(0);
+        check(3_200); check(4_300);                                    // fresh arm at 2_100 → jump at 4_300
+        expect(video.seekCount).toBe(1);
+
+        adapter.destroy();
+        expect((adapter as any).onGapJump).toBeNull();
+    });
+});
+
+describe('seam-overlap default visibility (non-silent accountability)', () => {
+    it('the first seam per track is surfaced even with debug DISABLED', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        adapter.debug = false;                                          // default consumer configuration
+        const initCount = vsb.appendedPayloads.length;
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 }), 'track1');
+        await flush();
+        adapter.appendChunk('video', makeSegment({ bmd: 497, defaultDur: 100, sampleCount: 5 }), 'track1');
+        await flush();
+        adapter.appendChunk('video', makeSegment({ bmd: 995, defaultDur: 100, sampleCount: 5 }), 'track1');
+        await flush();
+
+        expect(vsb.appendedPayloads.length).toBe(initCount + 3);        // all appended
+        const seamWarns = warn.mock.calls.filter((c) => String(c[0]).includes('seam overlap on track'));
+        expect(seamWarns).toHaveLength(1);                              // first is unconditional; later are debug-only
+        warn.mockRestore();
+    });
+});

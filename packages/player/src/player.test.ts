@@ -10759,3 +10759,200 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 });
+
+// ─── MSE buffered-hole gap-jump: player-side wiring ─────────────────────
+//
+// The adapter jumps bounded holes and reports via onGapJump +
+// onStall(d, 'media-gap'); unjumpable holes escalate through onError with
+// name 'MediaGapUnrecoverableError'. The player must: wire onGapJump into
+// stats + a typed gap_jump event; exempt media-gap stalls from the ABR
+// emergency downshift (a content hole is not bandwidth) while still
+// counting them; and promote the named error to a FATAL public error.
+
+describe('MSE gap-jump escalation and wiring', () => {
+  const CMAF_INLINE_CATALOG = JSON.stringify({
+    version: 1,
+    tracks: [
+      {
+        name: 'video', packaging: 'cmaf', isLive: true, role: 'video',
+        renderGroup: 1, codec: 'avc1.64001f', width: 1920, height: 1080,
+        bitrate: 1_500_000, initData: btoa(String.fromCharCode(1, 2)),
+      },
+      {
+        name: 'audio', packaging: 'cmaf', isLive: true, role: 'audio',
+        renderGroup: 1, codec: 'mp4a.40.2', samplerate: 44100,
+        channelConfig: '2', bitrate: 128_000, initData: btoa(String.fromCharCode(3, 4)),
+      },
+    ],
+  });
+
+  async function cmafPlayer(extraConfig: Record<string, unknown> = {}) {
+    const adapter = createMockAdapter();
+    const mockMs: any = {
+      initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(),
+      reset: vi.fn(), mediaElement: null, destroy: vi.fn(),
+      onFirstFrame: null, onError: null, onStall: null, onGapJump: null,
+    };
+    const player = new MoqtPlayer({
+      ...createConfig(adapter),
+      createMediaSource: () => mockMs,
+      createCmafAssembler: () => ({ push: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn() }),
+      ...extraConfig,
+    } as any);
+    const catalogReceived = new Promise<void>((r) => player.on('catalog_received', () => r()));
+    const loadPromise = player.load();
+    await resolveConnect(adapter);
+    await loadPromise;
+    ackCatalog(adapter);
+    adapter._triggerObject(0n, {
+      kind: 'data', trackAlias: varint(1),
+      groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(CMAF_INLINE_CATALOG),
+    } as MoqtObject);
+    await catalogReceived;
+    await new Promise((r) => setTimeout(r, 50)); // pipelines + MSE wiring
+    return { player, mockMs };
+  }
+
+  it('wires onGapJump: gap_jump event emitted and gapJumpCount incremented', async () => {
+    const { player, mockMs } = await cmafPlayer();
+    expect(typeof mockMs.onGapJump).toBe('function');
+
+    const events: any[] = [];
+    player.on('gap_jump', (e: any) => events.push(e));
+    mockMs.onGapJump({ from: 19.25, to: 19.79, holeSec: 0.51, waitedMs: 2100 });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: 'gap_jump', from: 19.25, to: 19.79, holeSec: 0.51, waitedMs: 2100 });
+    expect(player.stats.gapJumpCount).toBe(1);
+    await player.destroy();
+  });
+
+  it('media-gap stalls are counted but exempt from the ABR emergency downshift', async () => {
+    const { player, mockMs } = await cmafPlayer();
+    const peek = vi.fn(() => null);
+    (player as any).qualityController = { peekLowerVideoQuality: peek };
+    (player as any).bufferAbrController = {};
+
+    const stallEvents: any[] = [];
+    player.on('stall', (e: any) => stallEvents.push(e));
+
+    mockMs.onStall(2100, 'media-gap');
+    expect(peek).not.toHaveBeenCalled();               // exempt
+    expect(stallEvents).toHaveLength(1);
+    expect(stallEvents[0].cause).toBe('media-gap');    // public cause
+    expect(player.stats.stallCount).toBe(1);           // still counted
+
+    mockMs.onStall(300);                               // plain bandwidth stall
+    expect(peek).toHaveBeenCalledTimes(1);             // downshift path still live
+    expect(stallEvents).toHaveLength(2);
+    expect(stallEvents[1].cause).toBeUndefined();
+    await player.destroy();
+  });
+
+  it('a throwing state_changed listener cannot strand live ticking or censor the error publication', async () => {
+    const { player, mockMs } = await cmafPlayer();
+    expect(player.state).not.toBe(PlayerState.ERROR);    // non-terminal precondition
+    (player as any).startTicking();
+    expect((player as any).tickInterval).not.toBeNull();
+
+    const seen: Array<{ state: unknown; tickNull: boolean }> = [];
+    const errorEvents: unknown[] = [];
+    player.on('error', (e) => errorEvents.push(e));
+    let listenerThrew = false;   // one-shot: destroy()'s own transition must not re-trip it
+    player.on('state_changed', () => {
+      if (!listenerThrew) { listenerThrew = true; throw new Error('state listener bug'); }
+    });
+    player.on('state_changed', () => {
+      seen.push({ state: player.state, tickNull: (player as any).tickInterval === null });
+    });
+
+    try {
+      mockMs.onError(Object.assign(
+        new Error('unrecoverable buffered hole'), { name: 'MediaGapUnrecoverableError' },
+      ));
+    } catch { /* first listener failure may propagate after the transaction committed */ }
+
+    expect(player.state).toBe(PlayerState.ERROR);
+    expect((player as any).tickInterval).toBeNull();
+    // Every state observer saw ERROR with ticking already stopped.
+    expect(seen.length).toBeGreaterThan(0);
+    for (const observation of seen) {
+      expect(observation.state).toBe(PlayerState.ERROR);
+      expect(observation.tickNull).toBe(true);
+    }
+    // The error publication was still attempted exactly once — a throwing
+    // state listener must not censor it (nor vice versa).
+    expect(errorEvents).toHaveLength(1);
+    await player.destroy();
+  });
+
+  it('a throwing errorFilter cannot strand the player outside ERROR (state commits first)', async () => {
+    const { player, mockMs } = await cmafPlayer({
+      errorFilter: () => { throw new Error('filter bug'); },
+    });
+    (player as any).startTicking();
+    expect((player as any).tickInterval).not.toBeNull();
+    try {
+      mockMs.onError(Object.assign(
+        new Error('unrecoverable buffered hole'), { name: 'MediaGapUnrecoverableError' },
+      ));
+    } catch { /* the filter's throw may propagate — state must already be committed */ }
+
+    expect(player.state).toBe(PlayerState.ERROR);
+    expect((player as any).tickInterval).toBeNull();
+    await player.destroy();
+  });
+
+  it('a throwing error listener cannot strand the player outside ERROR (state commits first)', async () => {
+    const { player, mockMs } = await cmafPlayer();
+    (player as any).startTicking();
+    expect((player as any).tickInterval).not.toBeNull();
+    player.on('error', () => { throw new Error('listener bug'); });
+    try {
+      mockMs.onError(Object.assign(
+        new Error('unrecoverable buffered hole'), { name: 'MediaGapUnrecoverableError' },
+      ));
+    } catch { /* listener throw may propagate — state must already be committed */ }
+
+    expect(player.state).toBe(PlayerState.ERROR);
+    expect((player as any).tickInterval).toBeNull();
+    await player.destroy();
+  });
+
+  it('a listener throwing undefined is still propagated (sentinel is not the payload)', async () => {
+    const { player, mockMs } = await cmafPlayer({
+      // eslint-disable-next-line no-throw-literal
+      errorFilter: () => { throw undefined; },
+    });
+    (player as any).startTicking();
+    let propagated = false;
+    try {
+      mockMs.onError(Object.assign(
+        new Error('unrecoverable buffered hole'), { name: 'MediaGapUnrecoverableError' },
+      ));
+    } catch { propagated = true; }
+
+    expect(propagated).toBe(true);                 // throw undefined must not be swallowed
+    expect(player.state).toBe(PlayerState.ERROR);
+    expect((player as any).tickInterval).toBeNull();
+    await player.destroy();
+  });
+
+  it('escalates MediaGapUnrecoverableError to a FATAL public error + ERROR state', async () => {
+    const { player, mockMs } = await cmafPlayer();
+    const errors: any[] = [];
+    player.on('error', (e) => errors.push(e.error));
+
+    mockMs.onError(Object.assign(
+      new Error('unrecoverable buffered hole (2.5s) at t=19.3s — rebuild required'),
+      { name: 'MediaGapUnrecoverableError' },
+    ));
+
+    const fatal = errors.filter((e) => e.code === PlayerErrorCode.MEDIA_GAP_UNRECOVERABLE);
+    expect(fatal).toHaveLength(1);
+    expect(fatal[0].severity).toBe('fatal');
+    expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+});

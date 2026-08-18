@@ -12,6 +12,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { TypedEmitter } from './emitter.js';
 import type { PlayerEventMap, PlayerEvent } from './events.js';
+import type { GapJumpEvent as RootGapJumpEvent } from './index.js';
 
 describe('PlayerEventMap', () => {
   it('TypedEmitter<PlayerEventMap> can emit session events', () => {
@@ -69,5 +70,14 @@ describe('PlayerEventMap', () => {
       type: 'recovery_action',
       action: { type: 'skip_forward' },
     });
+  });
+});
+
+describe('public surface — gap-jump types', () => {
+  it('GapJumpEvent is exported from the package root', () => {
+    // Compile-gated by the package tsc: removing the barrel export breaks
+    // this import. The runtime assertion just keeps the test observable.
+    const e: RootGapJumpEvent = { type: 'gap_jump', from: 1, to: 2, holeSec: 0.5, waitedMs: 2000 };
+    expect(e.type).toBe('gap_jump');
   });
 });

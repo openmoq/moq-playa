@@ -1126,9 +1126,13 @@ async function startPlayback(): Promise<void> {
             // Applied BEFORE construction so a standard/object-url run can carry
             // the same flag managed sets, isolating it as a variable.
             if (mseRemote === 'disabled') videoEl.disableRemotePlayback = true;
+            // ?gapjump=<ms> overrides the buffered-hole gap-jump wait
+            // (0 disables) for A/B against hole-carrying streams.
+            const gapJumpParam = params.get('gapjump');
             const ms: MseMediaSource = new MseMediaSource(videoEl, {
                 mseImplementation: mseImpl,
                 mseAttachment: mseAttach,
+                ...(gapJumpParam !== null ? { gapJumpMs: Number(gapJumpParam) } : {}),
             });
             ms.debug = mseDebug;
             mediaSourceRef = ms;
@@ -1231,7 +1235,9 @@ async function startPlayback(): Promise<void> {
 
     // Rendering lifecycle events from the CanvasRenderer
     player.on('first_frame', () => log('First video frame rendered!'));
-    player.on('stall', (e) => log(`Stall detected: ${e.durationMs.toFixed(0)}ms`));
+    player.on('stall', (e) => log(`Stall detected: ${e.durationMs.toFixed(0)}ms${e.cause ? ` (${e.cause})` : ''}`));
+    player.on('gap_jump', (e) => log(
+        `Gap-jump: skipped ${e.holeSec.toFixed(2)}s hole ${e.from.toFixed(2)}s -> ${e.to.toFixed(2)}s (waited ${e.waitedMs.toFixed(0)}ms)`));
 
     // Playback events from the pipeline
     player.on('gap_detected', (e) => log(`Gap: ${e.mediaType} group=${e.groupId}`));

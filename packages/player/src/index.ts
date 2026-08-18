@@ -48,6 +48,7 @@ export type {
   PlayerRecoveryAction,
   FirstFrameEvent,
   StallEvent,
+  GapJumpEvent,
   QualitySwitchedEvent,
   CatchUpChangedEvent,
   StateChangedEvent,

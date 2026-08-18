@@ -143,6 +143,20 @@ export interface PlayheadWedgeInfo {
   readonly droppedFrames?: number;
 }
 
+/** Diagnostics for one buffered-hole gap-jump (see onGapJump). */
+export interface GapJumpInfo {
+  /** Playhead position before the jump (seconds). */
+  readonly from: number;
+  /** Landing position just inside the next buffered range (seconds). */
+  readonly to: number;
+  /** Width of the skipped hole (seconds). */
+  readonly holeSec: number;
+  /** How long the hole persisted before the jump (ms). */
+  readonly waitedMs: number;
+  /** "start-end|start-end" of the element's buffered ranges at jump time. */
+  readonly bufferedRanges: string;
+}
+
 export interface MseMediaSourceOptions {
   /** Seconds of played-out media to keep behind currentTime; older buffered data
    *  is evicted via SourceBuffer.remove() so the browser quota is never exhausted
@@ -154,6 +168,16 @@ export interface MseMediaSourceOptions {
   readonly maxAheadSec?: number;
   /** Where a behind-live jump lands: rangeEnd - targetAheadSec. Default 2. */
   readonly targetAheadSec?: number;
+  /**
+   * Buffered-hole gap-jump: when the playhead is frozen at the end of a
+   * buffered range with a bounded hole (≤ 2 s) and more buffered media
+   * ahead, wait this long, then seek just past the hole. Live streams from
+   * real-world chains carry such holes (content loss at the packager,
+   * delivery loss at a relay); nothing else in the element or adapter will
+   * ever cross one. `0` disables. Default 2000. Detection runs on the 1 Hz
+   * watchdog, so effective resolution is ±1 s. Must be finite and >= 0.
+   */
+  readonly gapJumpMs?: number;
   /**
    * Which MediaSource implementation to construct.
    *
@@ -351,6 +375,13 @@ export class MseMediaSource implements MediaSourceLike {
     if (!intent) {
       // Cancel a startup in flight AND stop playback that already started —
       // withdrawing intent is a pause, not merely "don't start".
+      // Also drop any armed gap candidate AND the post-jump landing watch
+      // synchronously: a pause/resume entirely between watchdog ticks must
+      // not preserve an old deadline, and an intentional pause must never
+      // ripen into a landing-failure fatal.
+      this.disarmGap();
+      this.gapStallEpisode = false;
+      this.retireGapLanding();
       this.cancelStartup();
       if (this.playTriggered && this.video.paused === false) this.video.pause();
       return;
@@ -499,7 +530,10 @@ export class MseMediaSource implements MediaSourceLike {
 
   onFirstFrame: (() => void) | null = null;
   onError: ((error: Error) => void) | null = null;
-  onStall: ((durationMs: number) => void) | null = null;
+  /** `cause` is set for stalls the adapter itself resolved by a gap-jump
+   *  (a source hole, not bandwidth) — consumers may exempt those from
+   *  bandwidth-driven reactions while still counting them. */
+  onStall: ((durationMs: number, cause?: 'media-gap') => void) | null = null;
   /** Fired after the adapter repositioned playback toward the live edge —
    *  'behind-live' (buffered-ahead cap) or 'quota' (flush + rejoin after
    *  QuotaExceededError). INFORMATIONAL, concrete-class only: it is NOT part of
@@ -520,6 +554,14 @@ export class MseMediaSource implements MediaSourceLike {
    */
   onWedge: ((info: PlayheadWedgeInfo) => void) | null = null;
 
+  /**
+   * Fired after the adapter jumped the playhead across a bounded buffered
+   * hole (see MseMediaSourceOptions.gapJumpMs). Wired by MoqtPlayer into
+   * stats + the public `gap_jump` event; applications should subscribe to
+   * the player event, not this slot.
+   */
+  onGapJump: ((info: GapJumpInfo) => void) | null = null;
+
   private firstFrameFired = false;
   private playTriggered = false;
   private stallStartTime: number | null = null;
@@ -535,6 +577,47 @@ export class MseMediaSource implements MediaSourceLike {
   private wedgeFrozenSinceMs: number | null = null;
   /** Escalation rung of the current wedge episode (0 = healthy). */
   private wedgeRung = 0;
+
+  // ── Buffered-hole gap-jump state (fully separate from wedge state) ──
+  /** Holes wider than this are never jumped (escalate instead). */
+  private static readonly GAP_JUMP_MAX_HOLE_SEC = 2.0;
+  /** Minimum spacing between jumps (swiss-cheese streams keep jumping, bounded). */
+  private static readonly GAP_JUMP_MIN_INTERVAL_MS = 5_000;
+  /** A persistent unjumpable hole escalates to a fatal error after this long. */
+  private static readonly GAP_WIDE_HOLE_FATAL_MS = 10_000;
+  /** Playhead must be this close to its range's end to count as "at the hole". */
+  private static readonly GAP_EDGE_WINDOW_SEC = 0.5;
+  /** Playhead movement below this is "stuck" (gap detection only). */
+  private static readonly GAP_MOVE_TOLERANCE_SEC = 0.05;
+  /** Candidate identity comparison tolerance (never float equality). */
+  private static readonly GAP_IDENTITY_TOLERANCE_SEC = 0.01;
+  /** Per-attempt wait before jumping; 0 disables. */
+  private readonly gapJumpMs: number;
+  /** Armed hole candidate; identity is {curEnd, nextStart} ONLY (the next
+   *  range's tail grows under live append and must not restart the wait). */
+  private gapCandidate: {
+    curEnd: number; nextStart: number; armedAtMs: number;
+    wideWarned: boolean; spent: boolean;
+  } | null = null;
+  /** Own last-observed playhead — never reads or writes wedgeLastTime. */
+  private gapLastPlayheadTime: number | null = null;
+  private lastGapJumpAtMs = Number.NEGATIVE_INFINITY;
+  /** Suppresses ONE seek-generated waiting/timeupdate episode after a jump. */
+  private gapStallEpisode = false;
+  /** Watchdog-tick fallback so an undecodable landing can't mute stalls forever. */
+  private gapEpisodeTicks = 0;
+  /** Post-jump landing watch: cleared on organic progress past `to`; a
+   *  landing with no progress escalates to a bounded fatal — even when the
+   *  wedge ladder's eligibility conditions never become true. Preserves the
+   *  single seek-generated `waiting` timestamp so the frozen span can still
+   *  report as a stall after the suppression episode ends. */
+  private gapLanding: {
+    to: number; jumpedAtMs: number; waitingAtMs: number | null; spent: boolean;
+  } | null = null;
+  /** True while stallStartTime holds evidence TRANSFERRED from the landing
+   *  transaction — retired together with the landing so an intentional
+   *  pause can never report as an ordinary bandwidth stall. */
+  private gapStallFromLanding = false;
 
   // ── Live-buffer management (eviction / behind-live cap / quota recovery) ──
   /** Seconds of played-out media kept behind currentTime; older data is evicted. */
@@ -656,6 +739,11 @@ export class MseMediaSource implements MediaSourceLike {
     this.keepBehindSec = options.keepBehindSec ?? 10;
     this.maxAheadSec = options.maxAheadSec ?? 15;
     this.targetAheadSec = options.targetAheadSec ?? 2;
+    const gapJumpMs = options.gapJumpMs ?? 2_000;
+    if (!Number.isFinite(gapJumpMs) || gapJumpMs < 0) {
+      throw new Error(`gapJumpMs must be finite and >= 0 (got ${String(options.gapJumpMs)})`);
+    }
+    this.gapJumpMs = gapJumpMs;
 
     // Capability-based selection, no user-agent sniffing. Safari iOS (iPhone)
     // exposes only ManagedMediaSource; iPad and desktop Safari expose both;
@@ -1118,6 +1206,13 @@ export class MseMediaSource implements MediaSourceLike {
     this.quotaRetried.audio = false;
     this.chaseAfterFlush = false;
     this.quotaFlushInFlight = false;
+    // Gap-jump state: quality switches / MediaSource reconstruction must
+    // clear the armed candidate, episode, and rate-limit history.
+    this.disarmGap();
+    this.gapStallEpisode = false;
+    this.gapEpisodeTicks = 0;
+    this.retireGapLanding();
+    this.lastGapJumpAtMs = Number.NEGATIVE_INFINITY;
   }
 
   destroy(): void {
@@ -1129,6 +1224,7 @@ export class MseMediaSource implements MediaSourceLike {
       this.wedgeTimer = null;
     }
     this.onWedge = null;
+    this.onGapJump = null;
     this.video.removeEventListener('playing', this.handlePlaying);
     this.video.removeEventListener('waiting', this.handleWaiting);
     this.video.removeEventListener('timeupdate', this.handleTimeUpdate);
@@ -1709,8 +1805,243 @@ export class MseMediaSource implements MediaSourceLike {
   private startWedgeWatchdog(): void {
     if (this.wedgeTimer !== null || this.destroyed) return;
     this.wedgeTimer = setInterval(
-      () => this.checkPlayheadWedge(performance.now()),
+      () => {
+        const nowMs = performance.now();
+        // Gap-jump first: the wedge detector structurally ignores the
+        // at-a-hole case (aheadSec is computed only within the containing
+        // range), so the two never race for the same playhead state.
+        this.checkGapJump(nowMs);
+        this.checkPlayheadWedge(nowMs);
+      },
       MseMediaSource.WEDGE_CHECK_INTERVAL_MS,
+    );
+  }
+
+  // ─── Buffered-hole gap-jump ──────────────────────────────────────
+
+  /** Drop the armed hole candidate (wait restarts on the next sighting). */
+  private disarmGap(): void {
+    this.gapCandidate = null;
+    this.gapLastPlayheadTime = null;
+  }
+
+  /** Retire the post-jump landing transaction INCLUDING any stall evidence
+   *  it transferred — intentional pause/seek must leave nothing armed. */
+  private retireGapLanding(): void {
+    if (this.gapStallFromLanding) {
+      this.stallStartTime = null;
+      this.gapStallFromLanding = false;
+    }
+    this.gapLanding = null;
+  }
+
+  /**
+   * Detect a playhead frozen at a buffered hole and, after a bounded wait,
+   * seek just past it. Holes wider than GAP_JUMP_MAX_HOLE_SEC never jump;
+   * if one persists GAP_WIDE_HOLE_FATAL_MS it escalates exactly once via
+   * onError with name 'MediaGapUnrecoverableError' (the same name-based
+   * fatal channel as the wedge ladder's final rung — the app rebuilds).
+   *
+   * Commit-before-publish discipline throughout: state is finalized before
+   * any callback runs, so throwing or re-entrant listeners cannot skip the
+   * seek, double-jump, or re-emit the escalation.
+   */
+  private checkGapJump(nowMs: number): void {
+    // Landing cancellation FIRST — before the episode fallback can transfer
+    // any landing-owned evidence. Pause / element-error / withdrawn intent
+    // retire the transaction; `seeking` retires it ONLY when the seek is
+    // not our own: the adapter's landing seek reports currentTime at the
+    // landing target while pending, so a seek away from the target is a
+    // user seek (user intent wins), while our own never-settling seek is
+    // precisely the failure the landing deadline exists to bound.
+    if (this.gapLanding !== null) {
+      // Seek ownership must survive the transient `seeking` flag: a normal
+      // user seek settles well inside the 1 s cadence, so the POSITION is
+      // the durable signal. A playhead materially BEHIND the landing target
+      // is a superseding user seek whether or not `seeking` is still true
+      // (our own pending seek reports currentTime AT the target; forward
+      // movement past the target resolves as success below).
+      const behindTarget = this.video.currentTime
+        < this.gapLanding.to - MseMediaSource.GAP_MOVE_TOLERANCE_SEC;
+      const seekIsOurs = this.video.seeking
+        && Math.abs(this.video.currentTime - this.gapLanding.to)
+           <= MseMediaSource.GAP_MOVE_TOLERANCE_SEC;
+      if (this.video.paused || this.video.error !== null || !this.playbackIntent
+          || behindTarget || (this.video.seeking && !seekIsOurs)) {
+        this.retireGapLanding();
+      }
+    }
+
+    // Episode-tick fallback: an undecodable landing must not mute stall
+    // reporting forever — two ticks after a jump the episode ends
+    // unconditionally and freezes belong to the normal machinery. The
+    // suppressed seek-generated `waiting` (browsers need not emit another
+    // for the same uninterrupted freeze) is the only stall evidence; hand
+    // it back to the stall detector when the episode expires — evidence
+    // stays OWNED by the landing (gapStallFromLanding) so retirement can
+    // reclaim it.
+    if (this.gapStallEpisode && ++this.gapEpisodeTicks >= 2) {
+      this.gapStallEpisode = false;
+      if (this.gapLanding !== null && this.gapLanding.waitingAtMs !== null
+          && this.stallStartTime === null) {
+        this.stallStartTime = this.gapLanding.waitingAtMs;
+        this.gapStallFromLanding = true;
+      }
+    }
+
+    // Landing watch: independent of wedge eligibility, a jump whose landing
+    // never produces organic progress reaches a bounded fatal outcome.
+    if (this.gapLanding !== null && !this.gapLanding.spent) {
+      if (this.video.currentTime > this.gapLanding.to + MseMediaSource.GAP_MOVE_TOLERANCE_SEC) {
+        this.gapLanding = null;                                        // landed successfully
+      } else if (nowMs - this.gapLanding.jumpedAtMs >= MseMediaSource.GAP_WIDE_HOLE_FATAL_MS) {
+        this.gapLanding.spent = true;                                  // committed BEFORE publish
+        const err = new Error(
+          `[MSE] gap-jump landing failed: no playback progress past `
+          + `t=${this.gapLanding.to.toFixed(2)}s since the jump — MediaSource rebuild required`,
+        );
+        err.name = 'MediaGapUnrecoverableError';
+        try {
+          this.onError?.(err);
+        } catch {
+          // Listener bugs must not corrupt adapter state.
+        }
+      }
+    }
+
+    if (this.destroyed || !this.playTriggered || this.gapJumpMs <= 0) return;
+    const v = this.video;
+    if (v.paused || v.seeking || v.error !== null || !this.playbackIntent) {
+      this.disarmGap();
+      return;
+    }
+
+    const ct = v.currentTime;
+    // Locate the containing range and the next range ahead.
+    let curEnd: number | null = null;
+    let nextStart: number | null = null;
+    let nextEnd: number | null = null;
+    let buffered: TimeRanges;
+    try {
+      buffered = v.buffered;
+    } catch {
+      return;
+    }
+    for (let i = 0; i < buffered.length; i++) {
+      if (ct >= buffered.start(i) && ct <= buffered.end(i)) {
+        curEnd = buffered.end(i);
+        if (i + 1 < buffered.length) {
+          nextStart = buffered.start(i + 1);
+          nextEnd = buffered.end(i + 1);
+        }
+        break;
+      }
+    }
+
+    // Only the proven shape arms: inside a range, near its end, with a hole
+    // and more buffered media ahead. (Outside-every-range states also match
+    // startup/reset/eviction/user seeks — deliberately excluded.)
+    const tol = MseMediaSource.GAP_IDENTITY_TOLERANCE_SEC;
+    const holeSec = curEnd !== null && nextStart !== null ? nextStart - curEnd : 0;
+    const atHole = curEnd !== null && nextStart !== null
+      && curEnd - ct < MseMediaSource.GAP_EDGE_WINDOW_SEC
+      && holeSec > tol;
+    if (!atHole) {
+      this.disarmGap();
+      return;
+    }
+
+    // Stuck check (own state — never wedgeLastTime).
+    const moved = this.gapLastPlayheadTime !== null
+      && Math.abs(ct - this.gapLastPlayheadTime) > MseMediaSource.GAP_MOVE_TOLERANCE_SEC;
+    this.gapLastPlayheadTime = ct;
+    if (moved) {
+      this.gapCandidate = null;
+      return;
+    }
+
+    // Candidate identity: {curEnd, nextStart} only — a growing next-range
+    // tail must not restart the wait; any real drift must.
+    const c = this.gapCandidate;
+    if (c === null || Math.abs(c.curEnd - curEnd!) > tol || Math.abs(c.nextStart - nextStart!) > tol) {
+      this.gapCandidate = {
+        curEnd: curEnd!, nextStart: nextStart!, armedAtMs: nowMs,
+        wideWarned: false, spent: false,
+      };
+      return;
+    }
+    if (c.spent) return;
+
+    // Unjumpable width: warn once; escalate once if it persists.
+    // Strictly the advertised bound; 1e-9 guards float subtraction noise
+    // only — the 10ms identity tolerance must never widen the policy.
+    if (holeSec > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9) {
+      if (!c.wideWarned) {
+        c.wideWarned = true;
+        this.logWarn(
+          `[MSE] gap-too-wide: ${holeSec.toFixed(2)}s buffered hole at t=${ct.toFixed(2)}s `
+          + `exceeds the ${MseMediaSource.GAP_JUMP_MAX_HOLE_SEC}s jump bound — not skipping`,
+        );
+      }
+      if (nowMs - c.armedAtMs >= MseMediaSource.GAP_WIDE_HOLE_FATAL_MS) {
+        c.spent = true;                                    // committed BEFORE publish
+        const err = new Error(
+          `[MSE] unrecoverable buffered hole (${holeSec.toFixed(2)}s) at `
+          + `t=${ct.toFixed(2)}s — MediaSource rebuild required`,
+        );
+        err.name = 'MediaGapUnrecoverableError';
+        try {
+          this.onError?.(err);
+        } catch {
+          // Listener bugs must not corrupt adapter state.
+        }
+      }
+      return;
+    }
+
+    // Jumpable: wait + rate limit.
+    if (nowMs - c.armedAtMs < this.gapJumpMs) return;
+    if (nowMs - this.lastGapJumpAtMs < MseMediaSource.GAP_JUMP_MIN_INTERVAL_MS) return;
+
+    // Re-validate the landing at jump time (the tail may have grown; the
+    // range must be nonempty).
+    if (nextEnd === null || nextEnd - nextStart! <= tol) {
+      this.disarmGap();
+      return;
+    }
+    const to = nextStart! + Math.min(0.01, (nextEnd - nextStart!) / 2);
+    const info: GapJumpInfo = {
+      from: ct,
+      to,
+      holeSec,
+      waitedMs: nowMs - c.armedAtMs,
+      bufferedRanges: fmtRanges(buffered),
+    };
+    const stallDur = nowMs - (this.stallStartTime ?? c.armedAtMs);
+
+    // Commit first…
+    this.gapCandidate = null;
+    this.gapLastPlayheadTime = null;
+    this.lastGapJumpAtMs = nowMs;
+    this.stallStartTime = null;
+    this.gapStallEpisode = true;
+    this.gapEpisodeTicks = 0;
+    this.gapLanding = { to, jumpedAtMs: nowMs, waitingAtMs: null, spent: false };
+
+    // …seek…
+    v.currentTime = to;
+    this.noteSelfSeek();
+
+    // …publish last (no adapter work after these).
+    try {
+      this.onStall?.(stallDur, 'media-gap');
+    } catch { /* listener bug — state already committed */ }
+    try {
+      this.onGapJump?.(info);
+    } catch { /* listener bug */ }
+    this.logWarn(
+      `[MSE] gap-jump: skipped ${holeSec.toFixed(2)}s hole `
+      + `${info.from.toFixed(2)}s -> ${info.to.toFixed(2)}s after ${info.waitedMs.toFixed(0)}ms`,
     );
   }
 
@@ -1949,6 +2280,37 @@ export class MseMediaSource implements MediaSourceLike {
           + `timeline=${timeline.toString()} buffered=[${fmtRanges(safeBuffered(buffer))}]`,
         );
         return;
+      }
+
+      // Upstream-accountability diagnostic: an appended payload whose range
+      // STARTS inside recorded media but extends past it is a seam overlap —
+      // the producer's fragments are not contiguous in decode time (e.g. an
+      // ms-quantized ingest clock). MSE absorbs it via coded-frame
+      // replacement, but absorbing it SILENTLY would erase the evidence
+      // trail, so it is named once per track (per-occurrence detail rides
+      // the debug channel).
+      const seam = ranges.find((r) =>
+        !timeline.containsRange(r.startTime, r.endTime)
+        && timeline.containsRange(r.startTime, r.startTime + 1n));
+      if (seam !== undefined) {
+        const key = `${mediaType}:seam:${trackName}`;
+        if (!this.seenDiagnostics.has(key)) {
+          this.seenDiagnostics.add(key);
+          // Unconditional (not debug-gated): accountability for source
+          // defects must survive default configuration. Exactly once per
+          // track; per-occurrence detail rides the debug channel.
+          console.warn(
+            `[MSE] seam overlap on track "${trackName}": ${mediaType} fragment `
+            + `[${seam.startTime}-${seam.endTime}) starts inside already-recorded media — `
+            + `incoming fragments are not contiguous in decode time (appending; MSE replaces `
+            + `the overlapped frames; further occurrences logged at debug level)`,
+          );
+        } else {
+          this.diag(
+            '[MSE] seam overlap %s track %s group %s range [%s-%s)',
+            mediaType, trackName, String(groupId ?? 'n/a'), String(seam.startTime), String(seam.endTime),
+          );
+        }
       }
     }
 
@@ -2284,6 +2646,7 @@ export class MseMediaSource implements MediaSourceLike {
   // ─── Event handlers ────────────────────────────────────────────
 
   private handlePlaying = (): void => {
+    this.gapStallEpisode = false;                 // post-jump churn episode over
     if (this.stallStartTime !== null) this.stallStartTime = null;
     if (!this.firstFrameFired) {
       this.firstFrameFired = true;
@@ -2292,6 +2655,19 @@ export class MseMediaSource implements MediaSourceLike {
   };
 
   private handleWaiting = (): void => {
+    // A gap-jump's own seek emits a waiting; the adapter already reported
+    // that stall itself (cause 'media-gap') — don't arm a duplicate. The
+    // episode ends on the first playing/timeupdate or, unconditionally,
+    // two watchdog ticks after the jump (no persistent 'seeked' listener:
+    // the startup-positioning machinery owns transient seeked listeners,
+    // and playing/timeupdate always accompany a successful landing).
+    if (this.gapStallEpisode) {
+      // Do not lose the only stall evidence: browsers need not re-emit
+      // `waiting` for the same uninterrupted freeze.
+      if (this.gapLanding !== null) this.gapLanding.waitingAtMs ??= performance.now();
+      return;
+    }
+    this.gapStallFromLanding = false;   // fresh evidence, not landing-owned
     this.stallStartTime = performance.now();
   };
 
@@ -2300,9 +2676,16 @@ export class MseMediaSource implements MediaSourceLike {
       this.firstFrameFired = true;
       this.onFirstFrame?.();
     }
+    if (this.gapStallEpisode) {
+      // First post-jump progress signal ends the suppression episode; the
+      // jump's stall was already reported by the adapter.
+      this.gapStallEpisode = false;
+      return;
+    }
     if (this.stallStartTime !== null) {
       const durationMs = performance.now() - this.stallStartTime;
       this.stallStartTime = null;
+      this.gapStallFromLanding = false;
       this.onStall?.(durationMs);
     }
   };

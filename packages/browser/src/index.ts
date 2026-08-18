@@ -18,7 +18,7 @@ export { CanvasRenderer } from './canvas-renderer.js';
 export { DeferredAudioOutput } from './deferred-audio-output.js';
 export { WebAudioOutput } from './webaudio-output.js';
 export { MseMediaSource } from './mse-adapter.js';
-export type { MseMediaSourceOptions, MseImplementation, MseImplementationPreference, MseAttachment, MseAttachmentPreference, PlayheadWedgeInfo, MseSeekOutcome, MseStartupSuccess, MseStartupRetriable, MseStartupReport } from './mse-adapter.js';
+export type { MseMediaSourceOptions, MseImplementation, MseImplementationPreference, MseAttachment, MseAttachmentPreference, PlayheadWedgeInfo, GapJumpInfo, MseSeekOutcome, MseStartupSuccess, MseStartupRetriable, MseStartupReport } from './mse-adapter.js';
 export { CmafAssembler } from './cmaf-assembler.js';
 export type { CmafAssemblerOptions, CmafStartupGeometry } from './cmaf-assembler.js';
 export { createWebTransport } from './webtransport-factory.js';

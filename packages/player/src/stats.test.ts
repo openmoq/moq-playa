@@ -459,3 +459,13 @@ describe('LOC pipeline diagnostics (stutter observability)', () => {
     expect(s.loc.renderCushionMs).toBe(200);
   });
 });
+
+describe('gap-jump stats', () => {
+  it('recordGapJump increments gapJumpCount in the snapshot', () => {
+    const stats = new StatsAccumulator();
+    expect(stats.snapshot().gapJumpCount).toBe(0);
+    stats.recordGapJump();
+    stats.recordGapJump();
+    expect(stats.snapshot().gapJumpCount).toBe(2);
+  });
+});

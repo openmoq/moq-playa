@@ -319,6 +319,27 @@ export interface FirstFrameEvent {
 export interface StallEvent {
   readonly type: 'stall';
   readonly durationMs: number;
+  /** Set when the stall was caused by missing source media that the MSE
+   *  adapter resolved by a gap-jump — NOT a bandwidth signal. */
+  readonly cause?: 'media-gap';
+}
+
+/**
+ * The MSE adapter jumped the playhead across a bounded buffered hole —
+ * source media was missing (content or delivery loss upstream) and
+ * playback skipped it rather than freezing. The skipped span is gone;
+ * QoE dashboards should count these alongside stalls.
+ */
+export interface GapJumpEvent {
+  readonly type: 'gap_jump';
+  /** Playhead position before the jump (seconds). */
+  readonly from: number;
+  /** Landing position just inside the next buffered range (seconds). */
+  readonly to: number;
+  /** Width of the skipped hole (seconds). */
+  readonly holeSec: number;
+  /** How long the hole persisted before the jump (ms). */
+  readonly waitedMs: number;
 }
 
 /**
@@ -601,6 +622,7 @@ export interface PlayerEventMap {
   // Rendering
   first_frame: FirstFrameEvent;
   stall: StallEvent;
+  gap_jump: GapJumpEvent;
   quality_switching: QualitySwitchingEvent;
   quality_switched: QualitySwitchedEvent;
   quality_switch_failed: QualitySwitchFailedEvent;

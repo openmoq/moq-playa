@@ -114,6 +114,9 @@ export interface PlayerStats {
   readonly gapCount: number;
   /** Number of playback stalls. */
   readonly stallCount: number;
+  /** Bounded buffered-hole gap-jumps performed by the MSE adapter (source
+   *  media missing and skipped; distinct from the LOC-pipeline gapCount). */
+  readonly gapJumpCount: number;
   /** Total stall duration (ms). */
   readonly totalStallDurationMs: number;
   /** Number of decode errors. */
@@ -233,6 +236,7 @@ export class StatsAccumulator {
   // ── Errors ──────────────────────────────────────────────────
   private _gapCount = 0;
   private _stallCount = 0;
+  private _gapJumpCount = 0;
   private _totalStallDurationMs = 0;
   private _decodeErrorCount = 0;
   private _recoveryActionCount = 0;
@@ -369,6 +373,11 @@ export class StatsAccumulator {
   /** Record a gap detected by the pipeline. */
   recordGapDetected(): void {
     this._gapCount++;
+  }
+
+  /** One MSE buffered-hole gap-jump performed. */
+  recordGapJump(): void {
+    this._gapJumpCount++;
   }
 
   /** Record a playback stall. */
@@ -526,6 +535,7 @@ export class StatsAccumulator {
       // Errors
       gapCount: this._gapCount,
       stallCount: this._stallCount,
+      gapJumpCount: this._gapJumpCount,
       totalStallDurationMs: this._totalStallDurationMs,
       decodeErrorCount: this._decodeErrorCount,
       recoveryActionCount: this._recoveryActionCount,

@@ -75,6 +75,15 @@ export const PlayerErrorCode = {
    */
   MEDIA_ELEMENT_WEDGED: 0x1102,
   /**
+   * Buffered-gap recovery was unrecoverable. Two conditions share this
+   * code (the error message distinguishes them): a buffered hole exceeded
+   * the MSE adapter's bounded-skip policy and persisted at the playhead,
+   * or a bounded skip was performed but its landing never resumed
+   * playback. Either way the stream cannot proceed; the MediaSource must
+   * be rebuilt (fresh tune-in). Fatal.
+   */
+  MEDIA_GAP_UNRECOVERABLE: 0x1104,
+  /**
    * MediaSource.isTypeSupported() rejected a selected track's codec string —
    * MSE cannot be configured on this UA. Fatal.
    */

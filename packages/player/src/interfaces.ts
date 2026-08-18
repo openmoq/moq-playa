@@ -308,8 +308,20 @@ export interface MediaSourceLike {
   /** Callback: SourceBuffer error. */
   onError: ((error: Error) => void) | null;
 
-  /** Callback: playback stall detected. */
-  onStall: ((durationMs: number) => void) | null;
+  /** Callback: playback stall detected. `cause` is set when the adapter
+   *  itself resolved the stall by jumping a source hole ('media-gap') —
+   *  such stalls are not bandwidth signals. */
+  onStall: ((durationMs: number, cause?: 'media-gap') => void) | null;
+
+  /**
+   * OPTIONAL callback: the adapter jumped the playhead across a bounded
+   * buffered hole (source media missing). Informational; the player wires
+   * it into stats and the public `gap_jump` event.
+   */
+  onGapJump?: ((info: {
+    from: number; to: number; holeSec: number; waitedMs: number;
+    bufferedRanges: string;
+  }) => void) | null;
 
   /**
    * OPTIONAL playback-intent contract.
