@@ -274,6 +274,9 @@ interface MigrationTxn {
  * @see draft-ietf-moq-msf-00 §5 (Catalog)
  */
 export class MoqtPlayer {
+  /** Player version (set at build time). */
+  static readonly version = '0.5.7';
+
   private readonly config: MoqtPlayerConfig;
   private readonly emitter = new TypedEmitter<PlayerEventMap>();
   private readonly stateMachine = new PlayerStateMachine();

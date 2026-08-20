@@ -40,19 +40,24 @@ for (const name of readdirSync(packagesDir)) {
   }
 }
 
-// Update Player.version static in @playa/player source
-const playerSrc = join(packagesDir, 'playa', 'src', 'player.ts');
-try {
-  let src = readFileSync(playerSrc, 'utf-8');
-  const replaced = src.replace(
-    /static readonly version = '[^']+'/,
-    `static readonly version = '${version}'`,
-  );
-  if (replaced !== src) {
-    writeFileSync(playerSrc, replaced);
-    console.log(`  @playa/player Player.version → '${version}'`);
-    updated++;
-  }
-} catch { /* @playa/player not found — skip */ }
+// Update the `static readonly version` literal in player class sources
+const versionStatics = [
+  ['@playa/playa Player.version', join(packagesDir, 'playa', 'src', 'player.ts')],
+  ['@moqt/player MoqtPlayer.version', join(packagesDir, 'player', 'src', 'player.ts')],
+];
+for (const [label, srcPath] of versionStatics) {
+  try {
+    const src = readFileSync(srcPath, 'utf-8');
+    const replaced = src.replace(
+      /static readonly version = '[^']+'/,
+      `static readonly version = '${version}'`,
+    );
+    if (replaced !== src) {
+      writeFileSync(srcPath, replaced);
+      console.log(`  ${label} → '${version}'`);
+      updated++;
+    }
+  } catch { /* package not found — skip */ }
+}
 
 console.log(`\nSynced ${updated} package(s) to v${version}`);
