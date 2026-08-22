@@ -49,10 +49,10 @@ pnpm --filter @moqt/example-node-relay client https://127.0.0.1:4433/moq
 Relay mode forwards objects from **one publisher** to **many subscribers** over a
 registered track set (a toy ABR ladder: `catalog`, `video-1080/720/360`,
 `audio-en/es`, plus the demo track), preserving each object's
-`groupId`/`subgroupId`/`objectId`. It supports multiple subscriptions per viewer
-connection (one alias each), a tiny latest-group cache replayed to late joiners, and
-per-subscription cleanup when a viewer unsubscribes one track (ABR switch) without
-closing the connection.
+`groupId`/`subgroupId`/`objectId` and mirroring each graceful subgroup FIN. It
+supports multiple subscriptions per viewer connection (one alias each), a tiny
+latest-group cache replayed to late joiners, and per-subscription cleanup when a
+viewer unsubscribes one track (ABR switch) without closing the connection.
 
 The relay also answers **FETCH** from the latest-group cache (§9.16 / draft-18
 §10.12): standalone FETCH serves `cache ∩ [start, end)` with proper
@@ -87,13 +87,9 @@ generate a CMAF fixture from an MP4, publish it (optionally looped) into
   response indicate objects that no longer exist, §9.16.3).
 - **Fixed track registry** — only the names above are routed; a catalog-driven
   registry is a possible follow-up.
-- **Data objects only** — gap/status objects (incl. `END_OF_GROUP`) are not relayed.
+- **Data objects only** — gap/status objects (incl. `END_OF_GROUP`) are not relayed;
+  graceful subgroup FIN is mirrored so downstream stream credit is returned.
 - **No route authorization, backpressure/fairness, reconnect/migration, or persistence.**
-- **Uni-stream credit ceiling**: the FAILS WebTransport backend grants roughly a
-  hundred unidirectional streams per connection and does not replenish them, so a
-  subscriber connection exhausts its stream credits after ~100 forwarded subgroups
-  ("No streams available" forward errors; ~50 groups for a 2-track viewer). Long
-  soaks should use fixtures with long groups (e.g. `notld-60s`) or reconnect.
 - The FAILS backend does not echo an application protocol, so endpoints construct
   `MoqtConnection(18)` **explicitly** (draft auto-negotiation would fall back to 16).
 

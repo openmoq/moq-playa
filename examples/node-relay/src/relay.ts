@@ -14,7 +14,8 @@
  *     per §5.1.2 and backfill the current group via a Joining FETCH instead);
  *   - standalone + joining FETCH served from the latest-group cache (§9.16 /
  *     draft-18 §10.12) — see handleFetch;
- *   - forwarding preserves the publisher's groupId/subgroupId/objectId.
+ *   - forwarding preserves the publisher's groupId/subgroupId/objectId and
+ *     mirrors graceful subgroup FIN so downstream stream credit is returned.
  *
  * Deliberately a TOY — see README:
  *   - LIVE only: the cache holds just the latest group, so a late joiner gets that
@@ -57,6 +58,8 @@ interface Track {
   /** Latest group seen (for late-join replay), and that group's objects. */
   cacheGroupId: bigint | null;
   cache: CachedObject[];
+  /** Subgroups in the cached group whose publisher stream ended gracefully. */
+  cacheClosedSubgroups: Set<string>;
 }
 
 /** ASCII-safe route-table key (hex of each namespace field + the track name). */
@@ -72,7 +75,15 @@ export class Relay {
 
   private getTrack(key: string): Track {
     let track = this.tracks.get(key);
-    if (!track) { track = { subscribers: [], cacheGroupId: null, cache: [] }; this.tracks.set(key, track); }
+    if (!track) {
+      track = {
+        subscribers: [],
+        cacheGroupId: null,
+        cache: [],
+        cacheClosedSubgroups: new Set(),
+      };
+      this.tracks.set(key, track);
+    }
     return track;
   }
 
@@ -129,6 +140,9 @@ export class Relay {
         for (const c of track.cache) {
           sub.queue = sub.queue.then(() => forwardObject(sub, c.groupId, c.subgroupId, c.objectId, c.payload));
         }
+        for (const skey of track.cacheClosedSubgroups) {
+          sub.queue = sub.queue.then(() => closeSubscriberSubgroup(sub, skey));
+        }
       }
     } catch (err) {
       console.error('[relay] SUBSCRIBE handling failed:', (err as Error).message);
@@ -155,12 +169,28 @@ export class Relay {
       publish.onObject = (obj) => {
         if (obj.kind !== 'data') return; // §see README: gap/status objects are not relayed
         // Maintain the latest-group cache for late joiners.
-        if (track.cacheGroupId !== obj.groupId) { track.cacheGroupId = obj.groupId; track.cache = []; }
+        if (track.cacheGroupId !== obj.groupId) {
+          track.cacheGroupId = obj.groupId;
+          track.cache = [];
+          track.cacheClosedSubgroups.clear();
+        }
         track.cache.push({ groupId: obj.groupId, subgroupId: obj.subgroupId, objectId: obj.objectId, payload: obj.payload });
         // Live fanout (identity preserved), serialized per subscriber.
         const { groupId, subgroupId, objectId, payload } = obj;
         for (const sub of track.subscribers) {
           sub.queue = sub.queue.then(() => forwardObject(sub, groupId, subgroupId, objectId, payload));
+        }
+      };
+      publish.onSubgroupClosed = (header) => {
+        const skey = subgroupKey(header.groupId, header.subgroupId);
+        if (track.cacheGroupId === header.groupId) {
+          track.cacheClosedSubgroups.add(skey);
+        }
+        // onSubgroupClosed follows the final onObject from this incoming stream.
+        // Append the close to each subscriber's queue so every corresponding
+        // downstream send settles before its FIN is written.
+        for (const sub of track.subscribers) {
+          sub.queue = sub.queue.then(() => closeSubscriberSubgroup(sub, skey));
         }
       };
     } catch (err) {
@@ -343,7 +373,7 @@ async function forwardObject(
   payload: Uint8Array,
 ): Promise<void> {
   try {
-    const skey = `${groupId}/${subgroupId}`;
+    const skey = subgroupKey(groupId, subgroupId);
     let sid = sub.subgroups.get(skey);
     if (sid === undefined) {
       sid = await sub.conn.openSubgroup(sub.alias, groupId, subgroupId, { publisherPriority: 128, firstObject: objectId === 0n });
@@ -352,6 +382,21 @@ async function forwardObject(
     await sub.conn.sendObject(sid, objectId, payload);
   } catch (err) {
     console.error('[relay] FORWARD ERROR (object dropped):', (err as Error).message);
+  }
+}
+
+const subgroupKey = (groupId: bigint, subgroupId: bigint): string =>
+  `${groupId}/${subgroupId}`;
+
+/** Close one outgoing subgroup after its queued objects have settled. */
+async function closeSubscriberSubgroup(sub: Subscriber, skey: string): Promise<void> {
+  const sid = sub.subgroups.get(skey);
+  if (sid === undefined) return;
+  sub.subgroups.delete(skey);
+  try {
+    await sub.conn.closeSubgroup(sid);
+  } catch (err) {
+    console.error('[relay] SUBGROUP CLOSE ERROR:', (err as Error).message);
   }
 }
 

@@ -414,6 +414,34 @@ describe('MoqtConnection(18) loopback — §5.1 pending SUBSCRIBE superseded by 
 });
 
 describe('MoqtConnection(18) loopback — outbound PUBLISH lifecycle (data + PUBLISH_DONE)', () => {
+  it('delivers subgroup FIN to the inbound PUBLISH after its objects', async () => {
+    const { client, server, errors } = await connectedPair();
+    let pubReqId = -1n;
+    const events: string[] = [];
+
+    server.onPublish = (publish) => {
+      pubReqId = publish.requestId;
+      publish.onObject = (object) => events.push(`object:${object.objectId}`);
+      publish.onSubgroupClosed = (header) => {
+        events.push(`close:${header.groupId}/${header.subgroupId}`);
+      };
+    };
+
+    await client.publish(ns('live'), nm('vid'), 33n);
+    await flush();
+    await server.acceptSubscribe(pubReqId, 33n);
+    await flush();
+
+    const sid = await client.openSubgroup(33n, 7n, 2n, { publisherPriority: 4 });
+    await client.sendObject(sid, 0n, new Uint8Array([0x01]));
+    await client.sendObject(sid, 1n, new Uint8Array([0x02]));
+    await client.closeSubgroup(sid);
+    await flush();
+
+    expect(events).toEqual(['object:0', 'object:1', 'close:7/2']);
+    expect(errors).toEqual([]);
+  });
+
   it('publish → accept → object delivered to the peer → PUBLISH_DONE seen by the peer; no onError', async () => {
     const { client, server, errors } = await connectedPair();
     let pubReqId = -1n;

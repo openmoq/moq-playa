@@ -12,6 +12,7 @@ export default defineConfig({
     include: [
       'packages/*/src/**/*.test.ts',
       'conformance/media/runner/src/**/*.test.ts',
+      'examples/node-relay/src/**/*.test.ts',
       'examples/node-publisher/src/**/*.test.ts',
       'examples/broadcast/**/*.test.ts',
       'examples/shared/**/*.test.ts',

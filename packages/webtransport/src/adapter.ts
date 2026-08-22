@@ -156,8 +156,9 @@ interface PendingAliasReplay {
 
 /**
  * A PUBLISH received from a peer publisher on a new inbound bidi stream
- * (draft-18 §10.10). Set `onObject` to receive the track's objects (delivered
- * via the bound Track Alias), then accept/reject via the connection.
+ * (draft-18 §10.10). Set `onObject` and `onSubgroupClosed` to receive the
+ * track's data-plane lifecycle (delivered via the bound Track Alias), then
+ * accept/reject via the connection.
  */
 export interface IncomingPublish {
   readonly requestId: bigint;
@@ -166,6 +167,8 @@ export interface IncomingPublish {
   readonly trackAlias: bigint;
   /** Called for each object on the published track — mutable, read live. */
   onObject: ((obj: MoqtObject) => void) | null;
+  /** Called when a subgroup data stream ends gracefully — mutable, read live. */
+  onSubgroupClosed: ((header: SubgroupHeader) => void) | null;
 }
 
 /**
@@ -2115,7 +2118,11 @@ export class MoqtConnection {
       rawSub.sub.onSubgroupClosed?.(header);
       return;
     }
-    if (this.publishAliasMaps.has(alias)) return;
+    const pub = this.publishAliasMaps.get(alias);
+    if (pub) {
+      pub.onSubgroupClosed?.(header);
+      return;
+    }
     if (this.session.getTrackByAlias(varint(alias)) !== undefined) return;
     this.bufferPendingAlias(alias, undefined, header);
   }
@@ -4796,6 +4803,7 @@ export class MoqtConnection {
                 trackName: pub.trackName,
                 trackAlias: pub.trackAlias as bigint,
                 onObject: null,
+                onSubgroupClosed: null,
               };
               this.publishAliasMaps.set(incoming.trackAlias, incoming);
               this.onPublish(incoming);
@@ -5354,6 +5362,7 @@ export class MoqtConnection {
       trackName: pub.trackName,
       trackAlias: pubAlias,
       onObject: null,
+      onSubgroupClosed: null,
     };
     this.publishAliasMaps.set(incoming.trackAlias, incoming);
     // §8 applies to a PUBLISH-initiated subscription too. Capture the publisher's raw
