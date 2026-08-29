@@ -183,8 +183,9 @@ export interface SkipForwardEvent {
 }
 
 /**
- * A/V sync drift detected.
- * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp)
+ * Video presentation-schedule drift: the renderer missed the exact time a
+ * frame was scheduled to present. Measured as `actual - scheduled` on the local
+ * clock. For actual audio/video skew see `sync_skew`.
  */
 export interface SyncDriftEvent {
   readonly type: 'sync_drift';

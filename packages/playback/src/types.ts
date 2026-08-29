@@ -134,7 +134,11 @@ export interface SkipForwardEvent {
     readonly toGroupId: bigint;
 }
 
-/** A/V sync drift detected. @see draft-ietf-moq-loc-01 §2.3.1.1 */
+/**
+ * Video PRESENTATION SCHEDULE drift: the renderer presented a frame later (or
+ * earlier) than the exact time it was queued to present. This is NOT audio/video
+ * skew — see `sync_skew` for that.
+ */
 export interface SyncDriftEvent {
     readonly type: 'sync_drift';
     readonly driftUs: number;
@@ -224,6 +228,12 @@ export interface FrameRenderedFeedback {
     readonly mediaType: 'video';
     readonly captureTimestampUs: bigint;
     readonly actualRenderUs: number;
+    /**
+     * The exact time this frame was scheduled to present. Absent when the
+     * renderer cannot report it, in which case presentation-schedule drift is
+     * suppressed rather than fabricated.
+     */
+    readonly scheduledRenderUs?: number;
 }
 
 /** Flush completed (forward compatibility — currently a no-op). */
@@ -240,7 +250,7 @@ export interface FlushCompleteFeedback {
 export interface PlaybackConfig {
     /** Maximum wait time in microseconds for a missing group before skip-forward. */
     readonly gapTimeoutUs: number;
-    /** A/V sync drift threshold in microseconds before resync. */
+    /** Video presentation-schedule drift threshold in microseconds. */
     readonly driftThresholdUs: number;
     /** Maximum number of objects in the jitter buffer. */
     readonly maxBufferDepth: number;

@@ -142,7 +142,12 @@ export interface VideoRendererLike {
   onFirstFrame: (() => void) | null;
 
   /** Callback: frame was rendered (for sync feedback). */
-  onFrameRendered: ((captureTimestampUs: bigint, actualRenderUs: number) => void) | null;
+  /**
+   * Presentation report. `scheduledRenderUs` is optional at this swappable
+   * boundary: a custom renderer that cannot report the schedule causes the
+   * presentation-drift diagnostic to be suppressed rather than fabricated.
+   */
+  onFrameRendered: ((captureTimestampUs: bigint, actualRenderUs: number, scheduledRenderUs?: number) => void) | null;
 
   /** Callback: no frames rendered for longer than stall threshold. */
   onStall: ((durationMs: number) => void) | null;

@@ -65,7 +65,12 @@ export class CanvasRenderer implements VideoRendererLike {
   // ─── Callbacks ──────────────────────────────────────────────────
 
   onFirstFrame: (() => void) | null = null;
-  onFrameRendered: ((captureTimestampUs: bigint, actualRenderUs: number) => void) | null = null;
+  /**
+   * Presentation report. `scheduledRenderUs` is the EXACT time this frame was
+   * queued to present at, which is the authority for presentation-schedule
+   * drift — it already includes the playout cushion applied to this frame.
+   */
+  onFrameRendered: ((captureTimestampUs: bigint, actualRenderUs: number, scheduledRenderUs?: number) => void) | null = null;
   onStall: ((durationMs: number) => void) | null = null;
 
   constructor(
@@ -144,7 +149,7 @@ export class CanvasRenderer implements VideoRendererLike {
           this.onFirstFrame?.();
         }
 
-        this.onFrameRendered?.(captureTimestampUs, nowUs);
+        this.onFrameRendered?.(captureTimestampUs, nowUs, entry.renderTimeUs);
         // Render-timing diagnostic: logs every 30th frame's scheduling
         // jitter (scheduled vs actual render time, inter-frame delta).
         // Enable via ?debug=render in the URL.

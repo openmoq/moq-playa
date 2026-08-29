@@ -234,7 +234,7 @@ export class CommandDispatcher {
       // Always wire onFrameRendered when renderer exists — for feedback path.
       // User callback is also fired if provided.
       const audioOutput = this.audioOutput;
-      this.renderer.onFrameRendered = (captureTimestampUs, actualRenderUs) => {
+      this.renderer.onFrameRendered = (captureTimestampUs, actualRenderUs, scheduledRenderUs) => {
         opts.onFrameRendered?.(captureTimestampUs, actualRenderUs);
         // A/V skew observability: compare the rendered frame's capture
         // timestamp against what the speakers are playing RIGHT NOW.
@@ -245,7 +245,10 @@ export class CommandDispatcher {
             opts.onAvSkew(Number(captureTimestampUs) - playheadUs);
           }
         }
-        this.onFeedback?.({ type: 'frame_rendered', mediaType: 'video', captureTimestampUs, actualRenderUs });
+        this.onFeedback?.({
+          type: 'frame_rendered', mediaType: 'video', captureTimestampUs, actualRenderUs,
+          ...(scheduledRenderUs !== undefined ? { scheduledRenderUs } : {}),
+        });
       };
     }
   }

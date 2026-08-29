@@ -15,6 +15,7 @@
     "test:soak": "SCENARIO_SEEDS=2000 SCENARIO_STEPS=200 vitest run scenario-d18.test.ts",
     "test:soak:legacy": "SCENARIO_SEEDS=300 SCENARIO_STEPS=120 vitest run scenario-legacy.test.ts",
     "test:soak:fuzz": "FC_RUNS=5000 vitest run packages/transport/src/primitives/codec-properties.test.ts packages/transport/src/control/message-params-18.properties.test.ts packages/transport/src/control/draft18-codec.properties.test.ts packages/transport/src/control/legacy-codec.properties.test.ts packages/transport/src/data/draft18-data.properties.test.ts packages/transport/src/control/parser-crash.properties.test.ts packages/transport/src/data/parser-crash.properties.test.ts conformance/media/runner/src/fuzz/loc-fuzz.properties.test.ts conformance/media/runner/src/fuzz/catalog-fuzz.properties.test.ts conformance/media/runner/src/fuzz/bmff-fuzz.properties.test.ts",
+    "typecheck:tests": "tsc --noEmit -p tsconfig.test.json",
     "version:sync": "node scripts/sync-versions.mjs",
     "smoke:exports": "node scripts/smoke-exports.mjs",
     "release": "node scripts/release.mjs",

@@ -50,6 +50,16 @@ jobs:
             pnpm --dir "packages/$p" exec tsc --noEmit
           done
 
+      - name: Typecheck (simulation suites + test-support)
+        run: pnpm typecheck:tests
+
+      # The Vitest config aliases workspace packages to src, so the test suite
+      # deliberately never loads the built `exports` map. This is the only PR
+      # gate covering that boundary — without it a source-green change could
+      # ship a broken bundle.
+      - name: Package export smoke (built bundles)
+        run: pnpm smoke:exports
+
       - name: Typecheck + run the media conformance corpus
         run: |
           set -euo pipefail

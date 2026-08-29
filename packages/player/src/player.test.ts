@@ -5100,7 +5100,7 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
-    it('frame rendered feeds SyncController drift detection', async () => {
+    it('wires the renderer frame-rendered callback into the feedback path', async () => {
       const adapter = createMockAdapter();
       const mockRenderer = {
         enqueue: vi.fn(),
@@ -5136,8 +5136,8 @@ describe('MoqtPlayer', () => {
 
       // Trigger a frame_rendered with large drift — this goes through:
       // renderer.onFrameRendered → CommandDispatcher.onFeedback
-      // → player.handleFeedback → pipeline.handleFeedback → sync.reportActualRenderTime
-      // → needsResync → sync_drift event
+      // → player.handleFeedback → pipeline.handleFeedback → sync.reportPresentationTiming
+      // → presentationDriftExceeded → sync_drift event
       // (Only fires if sync reference is established, which requires audio pipeline activity)
 
       await player.destroy();

@@ -14,7 +14,7 @@
 
 import type { MoqtObject, MoqtObjectData } from '@moqt/transport';
 import { ObjectStatus } from '@moqt/transport';
-import type { LocHeaders } from '@moqt/loc';
+import type { LocHeaders, VideoFrameMarking } from '@moqt/loc';
 import { toVideoChunkInit, toAudioChunkInit } from '@moqt/loc';
 
 import { isKeyframePayload } from './keyframe-validator.js';
@@ -82,23 +82,23 @@ export class PlaybackPipeline {
     private activeGroupWaitStartUs: number | null = null;
 
     /**
-     * Minimum group ID accepted by pushObject().
-     * Set after SKIP_FORWARD to reject stale objects from pre-skip groups
-     * that arrive late due to async QUIC stream delivery.
-     */
+ * Minimum group ID accepted by pushObject().
+ * Set after SKIP_FORWARD to reject stale objects from pre-skip groups
+ * that arrive late due to async QUIC stream delivery.
+ */
     private minAcceptGroupId = -1n;
 
     /** Last group for which keyframe_waiting was emitted (dedup). */
     private lastKeyframeWaitingGroupId = -1n;
 
     /**
-     * When true, the first tick syncs to whatever group is available
-     * without gap detection — avoids cascading recovery on initial
-     * live join or after pause→resume on a live stream.
-     *
-     * Starts `true` so the first arriving group is accepted as the
-     * starting point (joining mid-broadcast is not a gap).
-     */
+ * When true, the first tick syncs to whatever group is available
+ * without gap detection — avoids cascading recovery on initial
+ * live join or after pause→resume on a live stream.
+ *
+ * Starts `true` so the first arriving group is accepted as the
+ * starting point (joining mid-broadcast is not a gap).
+ */
     private resetPending = true;
 
     /** True once track_ended has been emitted — prevents re-emission on every tick. */
@@ -108,10 +108,10 @@ export class PlaybackPipeline {
     private _lastEmittedRate = 1.0;
 
     /**
-     * Throttle flag — set by decoder feedback when queue depth is high.
-     * While true, tick() evaluates gaps but does NOT drain the buffer.
-     * Objects still enter the jitter buffer (needed for gap detection).
-     */
+ * Throttle flag — set by decoder feedback when queue depth is high.
+ * While true, tick() evaluates gaps but does NOT drain the buffer.
+ * Objects still enter the jitter buffer (needed for gap detection).
+ */
     private _throttled = false;
 
     /** Adaptive jitter tolerance controller (null if disabled). */
@@ -162,20 +162,20 @@ export class PlaybackPipeline {
     }
 
     /**
-     * Set the video codec string for keyframe payload validation.
-     *
-     * @param codec Codec string from catalog (e.g., 'avc1.42c01f', 'hvc1', 'av01.0.08M.10')
-     * @see draft-ietf-moq-loc-01 §4.2 (decode order)
-     */
+ * Set the video codec string for keyframe payload validation.
+ *
+ * @param codec Codec string from catalog (e.g., 'avc1.42c01f', 'hvc1', 'av01.0.08M.10')
+ * @see draft-ietf-moq-loc-01 §4.2 (decode order)
+ */
     setCodec(codec: string): void {
         this._videoCodec = codec;
     }
 
     /**
-     * Current effective gap timeout in microseconds.
-     * When adaptive tolerance is enabled, this is auto-calibrated from jitter.
-     * Otherwise, returns the fixed configured value.
-     */
+ * Current effective gap timeout in microseconds.
+ * When adaptive tolerance is enabled, this is auto-calibrated from jitter.
+ * Otherwise, returns the fixed configured value.
+ */
     get effectiveGapTimeoutUs(): number {
         if (this.adaptiveTolerance) {
             return this.adaptiveTolerance.effectiveGapTimeoutMs * 1000;
@@ -199,10 +199,10 @@ export class PlaybackPipeline {
     }
 
     /**
-     * Handle feedback from browser adapters (decoder queue, errors, drift).
-     *
-     * @see draft-ietf-moq-loc-01 §2.3.1.1 (drift detection)
-     */
+ * Handle feedback from browser adapters (decoder queue, errors, drift).
+ *
+ * @see draft-ietf-moq-loc-01 §2.3.1.1 (drift detection)
+ */
     handleFeedback(fb: DecoderFeedback): void {
         switch (fb.type) {
             case 'queue_pressure':
@@ -234,16 +234,20 @@ export class PlaybackPipeline {
                 break;
 
             case 'frame_rendered':
-                // Guard: only report drift when a real capture timestamp is provided.
-                // Renderers that don't track capture timestamps pass 0n (e.g., CanvasRenderer),
-                // which would produce absurd drift values (trillions of µs).
-                if (fb.captureTimestampUs > 0n) {
-                    this.sync.reportActualRenderTime(fb.captureTimestampUs, fb.actualRenderUs);
-                    // Guard: suppress drift reporting when audio/video CaptureTimestamps
-                    // are on different epochs (>5s drift). This is an epoch mismatch,
-                    // not real sync drift — reporting it would flood the event log.
+                // PRESENTATION SCHEDULE drift: actual minus the exact time this
+                // frame was queued to present. Both are on the SAME local clock,
+                // so the old PTS-era guards no longer apply and are deliberately
+                // gone: a capture timestamp is not required, an active video-join
+                // offset is already represented in the schedule, and there is no
+                // cross-epoch case to hide.
+                //
+                // Without a schedule the whole measurement/event transaction is
+                // suppressed — returning BEFORE reading drift, so a stale value
+                // from an earlier frame cannot be re-emitted as a new event.
+                if (fb.scheduledRenderUs !== undefined) {
+                    this.sync.reportPresentationTiming(fb.scheduledRenderUs, fb.actualRenderUs);
                     const drift = this.sync.currentDriftUs;
-                    if (this.sync.needsResync && Math.abs(drift) < 5_000_000) {
+                    if (this.sync.presentationDriftExceeded) {
                         this.onEvent({ type: 'sync_drift', driftUs: drift });
                     }
                 }
@@ -256,14 +260,14 @@ export class PlaybackPipeline {
     }
 
     /**
-     * Provide codec configuration (from catalog or initial headers).
-     *
-     * For video, this is also triggered automatically when a videoConfig
-     * LOC extension is encountered. For audio, this must be called
-     * externally since audio config comes from the MSF catalog.
-     *
-     * @param config Codec-specific configuration bytes
-     */
+ * Provide codec configuration (from catalog or initial headers).
+ *
+ * For video, this is also triggered automatically when a videoConfig
+ * LOC extension is encountered. For audio, this must be called
+ * externally since audio config comes from the MSF catalog.
+ *
+ * @param config Codec-specific configuration bytes
+ */
     configure(config: Uint8Array): void {
         const decision = this.decoderState.configure(config);
         if (decision.action === 'configure') {
@@ -276,13 +280,13 @@ export class PlaybackPipeline {
     }
 
     /**
-     * Push an object into the pipeline.
-     *
-     * Data objects are buffered. Gap objects notify the gap detector.
-     *
-     * @param obj The MoqtObject (data or gap)
-     * @param headers Parsed LocHeaders (only meaningful for data objects)
-     */
+ * Push an object into the pipeline.
+ *
+ * Data objects are buffered. Gap objects notify the gap detector.
+ *
+ * @param obj The MoqtObject (data or gap)
+ * @param headers Parsed LocHeaders (only meaningful for data objects)
+ */
     pushObject(obj: MoqtObject, headers?: LocHeaders): void {
         if (obj.kind === 'gap') {
             // Gap signals — notify gap detector
@@ -341,34 +345,34 @@ export class PlaybackPipeline {
     }
 
     /**
-     * Reset pipeline state for pause→resume or seek.
-     *
-     * Clears the jitter buffer, gap detector, and decoder FSM so the first
-     * arriving group after resume is accepted cleanly without cascading
-     * gap-recovery escalation from the stale pre-pause position.
-     *
-     * Emits a decoder 'reset' command so the WebCodecs decoder clears its
-     * queue and waits for the next keyframe (video) or resumes immediately
-     * (audio — Opus/AAC-LC frames are independently decodable).
-     *
-     * @param targetGroupId When seeking, set this to the target group ID.
-     *   Objects from groups before this ID are rejected — prevents stale
-     *   in-flight objects from corrupting the post-seek decoder state.
-     *   @see draft-ietf-moq-transport-16 §9.11.1 — "it might still receive
-     *   Objects outside the new range if the publisher sent them before the
-     *   update was processed."
-     */
+ * Reset pipeline state for pause→resume or seek.
+ *
+ * Clears the jitter buffer, gap detector, and decoder FSM so the first
+ * arriving group after resume is accepted cleanly without cascading
+ * gap-recovery escalation from the stale pre-pause position.
+ *
+ * Emits a decoder 'reset' command so the WebCodecs decoder clears its
+ * queue and waits for the next keyframe (video) or resumes immediately
+ * (audio — Opus/AAC-LC frames are independently decodable).
+ *
+ * @param targetGroupId When seeking, set this to the target group ID.
+ *   Objects from groups before this ID are rejected — prevents stale
+ *   in-flight objects from corrupting the post-seek decoder state.
+ *   @see draft-ietf-moq-transport-16 §9.11.1 — "it might still receive
+ *   Objects outside the new range if the publisher sent them before the
+ *   update was processed."
+ */
     /**
-     * Reset for a track switch — clears jitter buffer (old-track objects
-     * use the same groupIds as new-track per altGroup alignment), resets
-     * gap detector and group tracking. Does NOT reset decoder state or
-     * emit flush/reset commands — already-decoded frames in the renderer
-     * queue play out naturally for seamless visual transition.
-     *
-     * @param firstGroupId The first group ID from the new track — sets
-     *   lastConsumedGroupId to firstGroupId-1 so the gap detector doesn't
-     *   see a gap and trigger skip_forward (which would reset sync).
-     */
+ * Reset for a track switch — clears jitter buffer (old-track objects
+ * use the same groupIds as new-track per altGroup alignment), resets
+ * gap detector and group tracking. Does NOT reset decoder state or
+ * emit flush/reset commands — already-decoded frames in the renderer
+ * queue play out naturally for seamless visual transition.
+ *
+ * @param firstGroupId The first group ID from the new track — sets
+ *   lastConsumedGroupId to firstGroupId-1 so the gap detector doesn't
+ *   see a gap and trigger skip_forward (which would reset sync).
+ */
     resetForTrackSwitch(firstGroupId: bigint): void {
         // Clear the jitter buffer — old-track encoded objects must not
         // survive into the new decoder configuration. Without this,
@@ -411,10 +415,10 @@ export class PlaybackPipeline {
     }
 
     /**
-     * Process buffered objects: evaluate gaps, feed decoder FSM, emit commands.
-     *
-     * Call this on a regular interval (e.g., requestAnimationFrame or timer).
-     */
+ * Process buffered objects: evaluate gaps, feed decoder FSM, emit commands.
+ *
+ * Call this on a regular interval (e.g., requestAnimationFrame or timer).
+ */
     tick(): void {
         // Update adaptive tolerance → push auto-calibrated thresholds to gap detector and sync
         if (this.adaptiveTolerance) {
@@ -641,10 +645,10 @@ export class PlaybackPipeline {
     // ─── Internal ───────────────────────────────────────────────────
 
     /**
-     * Drop oldest whole groups when backlog exceeds maxBacklogGroups.
-     * Keeps the newest maxBacklogGroups groups, discards the rest.
-     * After shedding, notifies decoder that a gap occurred (needs keyframe).
-     */
+ * Drop oldest whole groups when backlog exceeds maxBacklogGroups.
+ * Keeps the newest maxBacklogGroups groups, discards the rest.
+ * After shedding, notifies decoder that a gap occurred (needs keyframe).
+ */
     private shedBacklog(): void {
         const groupIds = [...this.bufferedGroupCounts.keys()].sort((a, b) =>
             a < b ? -1 : a > b ? 1 : 0,
@@ -684,10 +688,32 @@ export class PlaybackPipeline {
     }
 
     /**
-     * Attempt to evict a lower-importance object to make room.
-     * @returns true if the incoming object was inserted.
-     * @see draft-ietf-moq-transport-16 §7 (Priority-based dropping)
-     */
+ * Whether late encoded VIDEO may be discarded before it reaches the decoder.
+ *
+ * Only explicitly discardable, non-independent frames may be. Everything
+ * else is NOT PROVEN SAFE TO DISCARD and is therefore preserved
+ * conservatively: RFC 9626 §3.1 defines D=1 as the sender asserting the
+ * frame can be removed while the stream stays decodable, so D=0 does not
+ * prove the frame is a reference — it means the receiver has no assurance
+ * that discarding it is safe. Absent marking is treated the same way, and
+ * an independent frame is preserved even if it also claims to be
+ * discardable.
+ *
+ * Lateness of decoded OUTPUT remains the output stage's decision.
+ *
+ * @see draft-ietf-moq-loc-01 §2.3.2.2 (Video Frame Marking)
+ */
+    private isPreDecodeDroppable(marking: VideoFrameMarking | undefined): boolean {
+        if (marking === undefined) return false;   // unknown dependencies — keep
+        if (marking.independent) return false;      // reference anchor — keep
+        return marking.discardable === true;        // sender said it is safe
+    }
+
+    /**
+ * Attempt to evict a lower-importance object to make room.
+ * @returns true if the incoming object was inserted.
+ * @see draft-ietf-moq-transport-16 §7 (Priority-based dropping)
+ */
     private tryEvictAndInsert(obj: MoqtObjectData, headers?: LocHeaders): boolean {
         const evicted = this.buffer.evictLowestImportance();
         if (!evicted) return false; // No evictable candidate
@@ -741,6 +767,16 @@ export class PlaybackPipeline {
 
         // 3. Compute render time.
         //    Returns null when no reference — CommandDispatcher holds the frame.
+        // Video dependency marking, resolved BEFORE the lateness decision so the
+        // drop policy and DecoderStateMachine see the same marking.
+        const videoMarking = this.mediaType === 'video'
+            ? (headers.videoFrameMarking
+                ?? (obj.objectId === 0n
+                    ? { independent: true, startOfFrame: true, endOfFrame: true,
+                        discardable: false, baseLayerSync: false, temporalId: 0 }
+                    : undefined))
+            : undefined;
+
         let renderTimeUs: number;
         if (headers.captureTimestamp !== undefined) {
             const timing = this.mediaType === 'video'
@@ -754,8 +790,17 @@ export class PlaybackPipeline {
             } else if (timing.shouldDrop) {
                 if (timing.offsetUs < -5_000_000) {
                     renderTimeUs = this.clock.now();
+                } else if (this.mediaType === 'video' && !this.isPreDecodeDroppable(videoMarking)) {
+                    // Late, but the sender has not asserted this frame can be
+                    // removed with the stream still decodable, so discarding it
+                    // here risks every frame that may depend on it — a far
+                    // larger cost than one late picture. Decode it and let the
+                    // OUTPUT stage decide what to present: the dispatcher
+                    // recomputes timing at decoder output and CanvasRenderer
+                    // drops sufficiently late frames while keeping the newest.
+                    renderTimeUs = this.clock.now();
                 } else {
-                    return; // Genuinely late — skip
+                    return; // Genuinely late and safe to discard — skip
                 }
             } else if (timing.offsetUs > 5_000_000) {
                 renderTimeUs = this.clock.now();
@@ -780,14 +825,9 @@ export class PlaybackPipeline {
 
         // 4. Create chunk init and feed through decoder FSM
         if (this.mediaType === 'video') {
-            // Infer keyframe from group structure when VideoFrameMarking is absent.
-            // MoQ data model: Group = GOP, objectId 0 = keyframe (LOC §4.2).
-            // Some publishers omit VideoFrameMarking — fall back to position.
-            const marking = headers.videoFrameMarking
-                ?? (obj.objectId === 0n
-                    ? { independent: true, startOfFrame: true, endOfFrame: true,
-                        discardable: false, baseLayerSync: false, temporalId: 0 }
-                    : undefined);
+            // Resolved above, before the lateness decision, so the drop policy
+            // and the decoder FSM cannot disagree about the same object.
+            const marking = videoMarking;
             // Keyframe payload validation: verify bitstream actually starts with a keyframe
             // when the LOC header claims independent. Catches broken publishers.
             // Only check payloads > 5 bytes (too short = can't determine).
