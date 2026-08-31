@@ -12,7 +12,7 @@
  * @module
  */
 
-import type { ControlMessage, ObjectDatagram, DataStreamHeader, QlogEvent } from '@moqt/transport';
+import type { ControlMessage, ObjectDatagram, DataStreamHeader, QlogEvent, SubgroupHeader } from '@moqt/transport';
 import type { MoqtObject } from '@moqt/transport';
 import type { MoqtConnection } from '@moqt/webtransport';
 
@@ -26,6 +26,8 @@ export interface ConnectionHandlers {
   onObject: (streamId: bigint, obj: MoqtObject) => void;
   onStreamClosed: (streamId: bigint, error?: number) => void;
   onDataStream: (streamId: bigint, header: DataStreamHeader) => void;
+  /** Graceful subgroup FIN — the adapter alone can distinguish it from a read failure. */
+  onSubgroupFin?: (streamId: bigint, header: SubgroupHeader) => void;
   onNamespaceMessage: (requestId: bigint, msg: ControlMessage) => void;
   onDatagram: (datagram: ObjectDatagram) => void;
   onQlogEvent?: (event: QlogEvent) => void;
@@ -83,6 +85,9 @@ export function wireConnectionCallbacks(
     handlers.onDatagram(datagram);
   };
 
+  if (handlers.onSubgroupFin) {
+    conn.onSubgroupFin = handlers.onSubgroupFin;
+  }
   if (handlers.onQlogEvent) {
     conn.onQlogEvent = handlers.onQlogEvent;
   }

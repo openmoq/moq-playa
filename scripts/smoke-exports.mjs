@@ -143,6 +143,13 @@ testImport('parseCatalog',       `import { parseCatalog } from '@moqt/msf'; if (
 testImport('PlaybackPipeline',   `import { PlaybackPipeline } from '@moqt/playback'; if (!PlaybackPipeline) throw 1;`);
 testImport('parseLocHeaders',    `import { parseLocHeaders } from '@moqt/loc'; if (!parseLocHeaders) throw 1;`);
 
+// ── Trace recorder exports (docs/playout-trace.md) ───────────────
+
+console.log('\nTrace recorder public surface:');
+
+testImport('TraceRecorder constructs and dumps', `import { TraceRecorder, DEFAULT_TRACE_LIMITS, PLAYA_EVENT_SCHEMA, LOGLEVEL_EVENT_SCHEMA, formatLogMessage } from '@moqt/player'; if (typeof TraceRecorder !== 'function') throw 1; if (typeof formatLogMessage !== 'function') throw 1; if (typeof DEFAULT_TRACE_LIMITS?.denseMaxAgeMs !== 'number') throw 1; if (PLAYA_EVENT_SCHEMA !== 'https://openmoq.org/082026/playa') throw 1; if (LOGLEVEL_EVENT_SCHEMA !== 'urn:ietf:params:qlog:events:loglevel') throw 1; const r = new TraceRecorder({ clock: { clock_id: 'smoke', clock_type: 'monotonic', now: () => 0 }, runId: 'smoke', eventSchemas: ['urn:ietf:params:qlog:events:moqt-06'], enabled: true }); r.record('moqt:a', {}); if (!r.dump().includes('playa:trace_window')) throw 1;`);
+testImport('assertEventName', `import { assertEventName } from '@moqt/transport'; if (typeof assertEventName !== 'function') throw 1; assertEventName('moqt:stream_type_set'); let threw = false; try { assertEventName('unnamespaced'); } catch { threw = true; } if (!threw) throw 1;`);
+
 // ── Deep imports (must FAIL) ─────────────────────────────────────────
 
 console.log('\nDeep imports (must be blocked by exports maps):');

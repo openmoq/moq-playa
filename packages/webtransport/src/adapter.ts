@@ -761,6 +761,22 @@ export class MoqtConnection {
   /** Called when a data stream closes (FIN or error). */
   onStreamClosed?: (streamId: bigint, error?: number) => void;
 
+  /**
+   * Called when a subgroup stream ends by **graceful FIN**, with the header as
+   * finally resolved (FIRST_OBJECT subgroup IDs included).
+   *
+   * Connection-level and diagnostic; distinct from the per-subscription
+   * `onSubgroupClosed`, which fires for a subscription's own streams.
+   *
+   * `onStreamClosed` cannot express this: it reports a generic read failure
+   * with the same absent error code as a clean FIN, so a consumer cannot tell
+   * them apart. Only the adapter knows the stream drained to `done` with no
+   * partial object, which is what completes an END_OF_GROUP-bearing subgroup.
+   *
+   * @see draft-ietf-moq-transport-16 §10.4.2
+   */
+  onSubgroupFin?: (streamId: bigint, header: SubgroupHeader) => void;
+
   /** Called for each decoded datagram (§10.3). */
   onDatagram?: (datagram: ObjectDatagram) => void;
 
@@ -862,7 +878,7 @@ export class MoqtConnection {
    * protocol observation point. When null/undefined, zero overhead —
    * no event objects are allocated.
    *
-   * @see draft-pardue-moq-qlog-moq-events-04
+   * @see draft-pardue-moq-qlog-moq-events-06
    */
   onQlogEvent?: (event: QlogEvent) => void;
 
@@ -6057,6 +6073,8 @@ export class MoqtConnection {
           }
         }
         this.routeSubgroupClosed(header);
+        // Graceful FIN with no partial object — the only place this is known.
+        this.onSubgroupFin?.(streamId, header);
         return;
       }
       buf = this.appendBuffer(buf, value);

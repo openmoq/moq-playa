@@ -3,7 +3,7 @@
  *
  * Human-readable console output for development; pluggable interface
  * for production telemetry. Complementary to qlog (machine-readable
- * protocol tracing per draft-pardue-moq-qlog-moq-events-04).
+ * protocol tracing per draft-pardue-moq-qlog-moq-events-06).
  *
  * @see DESIGN-production-readiness.md §6 (Debug Logging)
  * @module

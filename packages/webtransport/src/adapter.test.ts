@@ -68,6 +68,8 @@ interface MockDataStream {
   close: () => void;
   /** Reset the stream with an error code (simulates RESET_STREAM). */
   reset: (errorCode: number) => void;
+  /** Fail the read with NO stream error code — a generic failure, not a RESET. */
+  fail: (error: Error) => void;
 }
 
 /** Controls for a mock bidirectional stream. */
@@ -235,6 +237,8 @@ function createMockTransport(): MockTransport {
         (err as any).streamErrorCode = errorCode;
         streamController.error(err);
       },
+      /** A read failure carrying NO stream error code — not a RESET_STREAM. */
+      fail: (err: Error) => streamController.error(err),
     };
   }
 
@@ -846,6 +850,106 @@ describe('MoqtConnection', () => {
 
         // Stream lifecycle signal must also fire after synthesis
         expect(onStreamClosed).toHaveBeenCalledOnce();
+      });
+
+      it('invokes onSubgroupFin exactly once on graceful FIN, with the header', async () => {
+        // onStreamClosed reports a generic read failure with the same absent
+        // error code as a clean FIN, so only this hook proves the stream
+        // actually drained — the fact that completes an EOG-bearing subgroup.
+        const mock = createMockTransport();
+        const adapter = await connectAdapter(mock);
+        const onSubgroupFin = vi.fn();
+        adapter.onSubgroupFin = onSubgroupFin;
+
+        const header = makeSubgroupHeader({ typeByte: 0x18, isEndOfGroup: true });
+        const stream = mock.addIncomingStream();
+        stream.push(concat(
+          encodeSubgroupHeader(header),
+          encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+        ));
+        await deepFlush();
+        expect(onSubgroupFin).not.toHaveBeenCalled();
+
+        stream.close();
+        await deepFlush();
+
+        expect(onSubgroupFin).toHaveBeenCalledOnce();
+        expect(onSubgroupFin.mock.calls[0]![1].groupId).toBe(header.groupId);
+        expect(onSubgroupFin.mock.calls[0]![1].isEndOfGroup).toBe(true);
+      });
+
+      it('does NOT invoke onSubgroupFin on RESET_STREAM', async () => {
+        const mock = createMockTransport();
+        const adapter = await connectAdapter(mock);
+        const onSubgroupFin = vi.fn();
+        const onStreamClosed = vi.fn();
+        adapter.onSubgroupFin = onSubgroupFin;
+        adapter.onStreamClosed = onStreamClosed;
+
+        const header = makeSubgroupHeader({ typeByte: 0x18, isEndOfGroup: true });
+        const stream = mock.addIncomingStream();
+        stream.push(concat(
+          encodeSubgroupHeader(header),
+          encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+        ));
+        await deepFlush();
+
+        stream.reset(0x2a);
+        await deepFlush();
+
+        expect(onSubgroupFin).not.toHaveBeenCalled();
+        expect(onStreamClosed).toHaveBeenCalledWith(expect.anything(), 0x2a);
+      });
+
+      it('does NOT invoke onSubgroupFin on a generic read failure', async () => {
+        // The failure that made this hook necessary: no numeric code, so
+        // onStreamClosed is indistinguishable from a clean FIN.
+        const mock = createMockTransport();
+        const adapter = await connectAdapter(mock);
+        const onSubgroupFin = vi.fn();
+        const onStreamClosed = vi.fn();
+        adapter.onSubgroupFin = onSubgroupFin;
+        adapter.onStreamClosed = onStreamClosed;
+
+        const header = makeSubgroupHeader({ typeByte: 0x18, isEndOfGroup: true });
+        const stream = mock.addIncomingStream();
+        stream.push(concat(
+          encodeSubgroupHeader(header),
+          encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+        ));
+        await deepFlush();
+
+        stream.fail(new Error('read failed'));
+        await deepFlush();
+
+        expect(onSubgroupFin).not.toHaveBeenCalled();
+        expect(onStreamClosed).toHaveBeenCalledWith(expect.anything(), undefined);
+      });
+
+      it('passes the resolved FIRST_OBJECT subgroup id to onSubgroupFin', async () => {
+        // §10.4.2: in FIRST_OBJECT mode the header's subgroup id is a decoder
+        // placeholder until the first object is decoded. The hook must hand
+        // back the resolved header, not the placeholder.
+        const mock = createMockTransport();
+        const adapter = await connectAdapter(mock);
+        const onSubgroupFin = vi.fn();
+        adapter.onSubgroupFin = onSubgroupFin;
+
+        const header = makeSubgroupHeader({
+          typeByte: 0x1a, // SUBGROUP_MARKER | FIRST_OBJECT | END_OF_GROUP
+          isEndOfGroup: true,
+        });
+        const stream = mock.addIncomingStream();
+        stream.push(concat(
+          encodeSubgroupHeader(header),
+          encodeSubgroupObject(makeSubgroupObject({ objectId: varint(7) }), false, varint(7), true),
+        ));
+        await deepFlush();
+        stream.close();
+        await deepFlush();
+
+        expect(onSubgroupFin).toHaveBeenCalledOnce();
+        expect(onSubgroupFin.mock.calls[0]![1].subgroupId).toBe(7n);
       });
 
       it('does NOT synthesize END_OF_GROUP on FIN when header lacks endOfGroup flag', async () => {
@@ -1907,7 +2011,7 @@ describe('MoqtConnection', () => {
     });
   });
 
-  // ─── qlog events (draft-pardue-moq-qlog-moq-events-04) ────────
+  // ─── qlog events (draft-pardue-moq-qlog-moq-events-06) ────────
 
   describe('qlog events', () => {
     it('onQlogEvent not called when callback is null (no crash)', async () => {

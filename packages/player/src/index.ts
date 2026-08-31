@@ -151,3 +151,13 @@ export { SubscriptionManager } from './subscription-manager.js';
 export { WatchdogController } from './watchdog.js';
 /** @experimental Advanced API — may change between minor versions. */
 export type { WatchdogOptions, WatchdogTimeout, WatchdogWarning } from './watchdog.js';
+
+// ─── Trace recorder (docs/playout-trace.md) ─────────────────────────
+export {
+  TraceRecorder,
+  DEFAULT_TRACE_LIMITS,
+  PLAYA_EVENT_SCHEMA,
+  LOGLEVEL_EVENT_SCHEMA,
+  formatLogMessage,
+} from './trace-recorder.js';
+export type { TraceLimits, TraceLane, TraceRecorderOptions } from './trace-recorder.js';

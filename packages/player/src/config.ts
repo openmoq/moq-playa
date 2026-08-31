@@ -587,7 +587,7 @@ export interface TransformConfig {
 export interface DebugConfig {
   /**
    * qlog event callback.
-   * @see draft-pardue-moq-qlog-moq-events-04
+   * @see draft-pardue-moq-qlog-moq-events-06
    */
   readonly onQlogEvent?: (event: QlogEvent) => void;
 

@@ -26,7 +26,8 @@ import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import { MoqtConnectionError } from '@moqt/webtransport';
 import type { MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@moqt/webtransport';
-import type { MoqtObject, ObjectDatagram } from '@moqt/transport';
+import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@moqt/transport';
+import { getSubgroupIdMode, SubgroupIdMode } from '@moqt/transport';
 import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@moqt/playback';
 import { BufferBasedController } from '@moqt/playback';
 import type { AbrTrack } from '@moqt/playback';
@@ -47,7 +48,7 @@ import {
   type MoqtPlayerConfig,
 } from './config.js';
 import { createPlayerError, PlayerErrorCode, type PlayerError, type ErrorSeverity, type PlayerErrorCodeValue } from './errors.js';
-import { createLogger, type LoggerLike } from './logger.js';
+import { createLogger, LOG_LEVELS, type LoggerLike } from './logger.js';
 import { checkSupport as detectSupport } from './support.js';
 import type { SupportReport } from './support.js';
 import { CatalogManager } from './catalog-manager.js';
@@ -423,6 +424,22 @@ export class MoqtPlayer {
    * is collectable after migration.
    * @see draft-ietf-moq-transport-16 §9.10 (Track Alias in SUBSCRIBE_OK)
    */
+  /**
+   * Per-connection subgroup lifecycle witness state.
+   *
+   * Keyed by connection, so a migration's reused stream ids and aliases cannot
+   * collide with the previous connection's entries. A WeakMap also means a
+   * discarded candidate's state is collectable without explicit teardown.
+   */
+  /** True when an info-level message can reach a sink. @see constructor */
+  private readonly infoLoggingEnabled: boolean;
+
+  private readonly subgroupWitness = new WeakMap<MoqtConnection, Map<bigint, {
+    groupId: bigint;
+    endOfGroup: boolean;
+    subgroupId: bigint | undefined;
+  }>>();
+
   private readonly pendingObjectsByAlias = new Map<bigint, { streamId: bigint; obj: MoqtObject; sourceDraft: DraftVersion | undefined; sourceConnection: MoqtConnection; owners?: bigint[] }[]>();
   private static readonly MAX_PENDING_PER_ALIAS = 256;
   private static readonly MAX_PENDING_ALIASES = 1024;
@@ -865,6 +882,12 @@ export class MoqtPlayer {
       ...(this.config.logLevel !== undefined ? { logLevel: this.config.logLevel } : {}),
       ...(this.config.logger !== undefined ? { logger: this.config.logger } : {}),
     });
+    // Whether an info-level message can reach anything. A custom logger does
+    // its own filtering, so it always can; otherwise `createLogger` returns
+    // NULL_LOGGER below 'info' and the message would be built and discarded.
+    // Diagnostics that serialize their payload check this first.
+    this.infoLoggingEnabled = this.config.logger !== undefined
+      || LOG_LEVELS[this.config.logLevel ?? 'none'] >= LOG_LEVELS.info;
 
     // Watchdog: detect "nothing happened" scenarios.
     // Fires timeout/warning events when expected lifecycle events don't arrive.
@@ -4581,6 +4604,9 @@ export class MoqtPlayer {
     delete conn.onDatagram;
     delete conn.onNamespaceMessage;
     delete conn.onQlogEvent;
+    delete conn.onSubgroupFin;
+    // Deterministic purge — do not rely on the WeakMap being collected.
+    this.subgroupWitness.delete(conn);
   }
 
   // ─── Subscription hook surface ──────────────────────────
@@ -4758,6 +4784,60 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-transport-16 §6.1 (Namespace discovery)
    */
   private wireConnection(conn: MoqtConnection): void {
+    // Diagnostic witness for video group completion. A subgroup carrying
+    // END_OF_GROUP completes its group only when the stream FINs, so the
+    // terminal disposition is evidence the qlog cannot supply — it defines no
+    // stream-terminal event. Kept connection-local so a migration's reused
+    // stream IDs cannot collide with the previous connection's entries.
+    const subgroupLifecycle = new Map<bigint, {
+      groupId: bigint;
+      endOfGroup: boolean;
+      /**
+       * Authoritative for ZERO and EXPLICIT modes from the header; undefined
+       * for FIRST_OBJECT until an object supplies it (§10.4.2).
+       */
+      subgroupId: bigint | undefined;
+    }>();
+    this.subgroupWitness.set(conn, subgroupLifecycle);
+
+    /**
+     * One preformatted record per video subgroup terminal.
+     *
+     * Video only: LOC audio commonly uses one stream per group, so emitting
+     * for every track would approach one line per audio packet and bury the
+     * video boundary this exists to show. One record per video subgroup
+     * terminal — MOQT does not require one subgroup per group, so this is not
+     * a promise of one line per GOP. Emitted at info so an info-level capture
+     * retains it, and self-contained so it needs no cross-artifact
+     * correlation.
+     */
+    const emitSubgroupLifecycle = (
+      entry: { groupId: bigint; endOfGroup: boolean },
+      streamId: bigint,
+      subgroupId: bigint | undefined,
+      terminal: Record<string, unknown>,
+    ): void => {
+      // Serializing the record costs a JSON per video subgroup terminal, so
+      // skip it entirely when nothing would receive the line.
+      if (!this.infoLoggingEnabled) return;
+      try {
+        this.log.info(`[subgroup_lifecycle:v1] ${JSON.stringify({
+          stream_id: streamId.toString(),
+          group_id: entry.groupId.toString(),
+          // Null rather than wrong: a FIRST_OBJECT subgroup id is unknown until
+          // its first object is decoded, which may never happen on a reset.
+          ...(subgroupId !== undefined
+            ? { subgroup_id: subgroupId.toString() }
+            : { subgroup_id: null }),
+          contains_end_of_group: entry.endOfGroup,
+          ...terminal,
+        })}`);
+      } catch {
+        // A diagnostic must never turn a clean adapter FIN into a synthetic
+        // read failure by throwing back through onSubgroupFin.
+      }
+    };
+
     // While `conn` is an unpromoted migration candidate, capture its application
     // events instead of dispatching them; they are drained in order after commit
     // ({@link drainStagedCandidate}). No-op for the current session and for the
@@ -4883,6 +4963,12 @@ export class MoqtPlayer {
       },
 
       onObject: stageable((streamId, obj) => {
+        // §10.4.2 FIRST_OBJECT: the subgroup id is the first object's id, known
+        // only here. Record it so a later reset still reports a real value.
+        const pendingSubgroup = subgroupLifecycle.get(streamId);
+        if (pendingSubgroup !== undefined && pendingSubgroup.subgroupId === undefined) {
+          pendingSubgroup.subgroupId = obj.subgroupId;
+        }
         // Catalog-fetch dispatch: route by streamId → reqId. Catalog
         // FETCH objects don't carry a meaningful media alias, so we
         // resolve the pending fetchCatalog promise directly here
@@ -5191,9 +5277,32 @@ export class MoqtPlayer {
         if (error !== undefined) {
           this.log.debug('Data stream %s reset with code 0x%s', streamId, error.toString(16));
         }
+        // Consume the entry on every terminal so the map cannot grow. Only a
+        // numeric code proves RESET; an absent code covers clean FIN *and*
+        // generic read failure alike, so FIN is claimed only from the
+        // adapter's `onSubgroupFin`, which alone knows the stream drained.
+        const lifecycle = subgroupLifecycle.get(streamId);
+        if (lifecycle !== undefined) {
+          subgroupLifecycle.delete(streamId);
+          if (error !== undefined) {
+            emitSubgroupLifecycle(lifecycle, streamId, lifecycle.subgroupId, {
+              terminal: 'reset',
+              reset_code: `0x${error.toString(16)}`,
+            });
+          }
+        }
       }, 'data'),
 
       // §10.4.4: Fetch data stream headers for object routing
+      onSubgroupFin: stageable((streamId: bigint, header: SubgroupHeader) => {
+        const lifecycle = subgroupLifecycle.get(streamId);
+        if (lifecycle === undefined) return;
+        subgroupLifecycle.delete(streamId);
+        // The header handed back here has its FIRST_OBJECT subgroup id
+        // resolved; the one captured at open may still be a placeholder.
+        emitSubgroupLifecycle(lifecycle, streamId, header.subgroupId, { terminal: 'fin' });
+      }, 'data'),
+
       onDataStream: stageable((streamId, header) => {
         // Liveness: remember which track each SUBGROUP stream belongs to so
         // a reset can shorten that track's liveness fuse. Subgroup streams
@@ -5203,7 +5312,34 @@ export class MoqtPlayer {
           // Liveness bookkeeping is a CURRENT-session concern; a superseded
           // session's header must not overwrite a colliding current stream id.
           if (conn !== this.connection) return;
-          this.subgroupStreamAliases.set(streamId, BigInt(header.header.trackAlias));
+          const sub = header.header;
+          this.subgroupStreamAliases.set(streamId, BigInt(sub.trackAlias));
+          const alias = BigInt(sub.trackAlias);
+          // Only FIRST_OBJECT defers its subgroup id; ZERO and EXPLICIT are
+          // authoritative from the header, so reporting them as unknown would
+          // discard a fact we already have.
+          const mode = getSubgroupIdMode(sub.typeByte);
+          // Track a stream only when its alias is a CONFIRMED video track.
+          //
+          // A subscription is registered optimistically under its request ID
+          // before SUBSCRIBE_OK, because many relays echo the request ID as the
+          // track alias — but the two are separate spaces. Trusting that guess
+          // could label an audio subgroup, whose real alias happens to equal a
+          // pending video request ID, as video. This record exists to settle a
+          // root-cause dispute, so it must never classify from a guess.
+          //
+          // Classification is made once and never revised: a stream opened
+          // against an unconfirmed alias is simply never reported, which also
+          // means no state is retained for it.
+          const confirmed = this.pendingMediaSubs.has(alias)
+            ? undefined
+            : this.subscriptionManager?.getMediaType(alias);
+          if (confirmed !== 'video') return;
+          subgroupLifecycle.set(streamId, {
+            groupId: sub.groupId,
+            endOfGroup: sub.isEndOfGroup,
+            subgroupId: mode === SubgroupIdMode.FIRST_OBJECT ? undefined : sub.subgroupId,
+          });
           return;
         }
         if (header.type === 'fetch') {
@@ -5343,7 +5479,7 @@ export class MoqtPlayer {
         this.subscriptionManager.routeObject(0n, obj, conn.draftVersion, conn);
       }, 'datagram', dgBytes),
 
-      // §draft-pardue-moq-qlog-moq-events-04: qlog tracing
+      // §draft-pardue-moq-qlog-moq-events-06: qlog tracing
       ...(this.config.onQlogEvent ? { onQlogEvent: this.config.onQlogEvent } : {}),
     });
   }
