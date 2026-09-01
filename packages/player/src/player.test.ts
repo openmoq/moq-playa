@@ -1185,6 +1185,245 @@ describe('MoqtPlayer', () => {
       );
     });
 
+    // TOO_FAR_BEHIND means the subscriber fell behind the live edge. The
+    // player replaces the subscription rather than ending the track, so
+    // `track_unsubscribed` would be wrong: the app's logical track is still
+    // selected. Without a distinct action the app cannot tell that its stream
+    // was restarted, or why.
+    describe('TOO_FAR_BEHIND resubscribe (§13.4.3 / §15.10.3)', () => {
+      it('emits track_resubscribe with its trigger on draft-16 0x06', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('recovery_action', fn);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        const before = (adapter.subscribe as any).mock.calls.length;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(fn).toHaveBeenCalledTimes(1);
+        expect(fn.mock.calls[0]![0]).toEqual({
+          type: 'recovery_action',
+          action: {
+            type: 'track_resubscribe',
+            trigger: 'too_far_behind',
+            trackName: 'video',
+            mediaType: 'video',
+          },
+        });
+        expect((adapter.subscribe as any).mock.calls.length).toBe(before + 1);
+      });
+
+      it('emits nothing for draft-18 EXPIRED, which reuses 0x06', async () => {
+        // The tables are swapped: 0x06 is TOO_FAR_BEHIND on draft-14/16 and
+        // EXPIRED on draft-18. Comparing against the wrong one both misses the
+        // real signal and mis-fires recovery.
+        const adapter = createMockAdapter();
+        adapter.draftVersion = 18;
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('recovery_action', fn);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        const before = (adapter.subscribe as any).mock.calls.length;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'expired',
+        } as ControlMessage);
+
+        expect(fn).not.toHaveBeenCalled();
+        expect((adapter.subscribe as any).mock.calls.length).toBe(before);
+      });
+
+      it('emits track_resubscribe on draft-18 0x05', async () => {
+        const adapter = createMockAdapter();
+        adapter.draftVersion = 18;
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('recovery_action', fn);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x5),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(fn).toHaveBeenCalledTimes(1);
+        expect((fn.mock.calls[0]![0] as any).action.trigger).toBe('too_far_behind');
+      });
+
+      it('emits nothing for a PUBLISH_DONE on an unknown request', async () => {
+        // Never reaches the helper at all; the catalog gate is covered below.
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('recovery_action', fn);
+        const before = (adapter.subscribe as any).mock.calls.length;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: varint(9999),
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(fn).not.toHaveBeenCalled();
+        expect((adapter.subscribe as any).mock.calls.length).toBe(before);
+      });
+
+      it('emits nothing when the active track is absent from the catalog', async () => {
+        // Exercises the helper's own catalog lookup gate.
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('recovery_action', fn);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        (player as any)._catalogState = { tracks: [] };
+        const before = (adapter.subscribe as any).mock.calls.length;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(fn).not.toHaveBeenCalled();
+        expect((adapter.subscribe as any).mock.calls.length).toBe(before);
+      });
+
+      it('emits nothing while a video switch is pending', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('recovery_action', fn);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        (player as any).pendingVideoSwitch = {
+          oldTrackName: 'video', newTrackName: 'video-hi',
+        };
+        const before = (adapter.subscribe as any).mock.calls.length;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(fn).not.toHaveBeenCalled();
+        expect((adapter.subscribe as any).mock.calls.length).toBe(before);
+      });
+
+      it('publishes only after the replacement subscribe has started', async () => {
+        // The event's contract is "a replacement was started", so the call must
+        // already exist when a listener observes it. Publishing first would
+        // also let a listener tear the player down mid-flight.
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        const before = (adapter.subscribe as any).mock.calls.length;
+        let callsAtEvent = -1;
+        player.on('recovery_action', () => {
+          callsAtEvent = (adapter.subscribe as any).mock.calls.length;
+        });
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(callsAtEvent).toBe(before + 1);
+      });
+
+      it('survives a listener that tears the player down reentrantly', async () => {
+        // The action is published synchronously from the PUBLISH_DONE handler,
+        // so a listener can destroy the player before the subscribe settles.
+        // Because the replacement is started and observed first, that teardown
+        // cannot orphan the promise or throw back into the message handler.
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        const before = (adapter.subscribe as any).mock.calls.length;
+        player.on('recovery_action', () => { void player.destroy(); });
+
+        expect(() => adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage)).not.toThrow();
+
+        expect((adapter.subscribe as any).mock.calls.length).toBe(before + 1);
+        await new Promise((r) => setTimeout(r, 0));
+      });
+
+      it('reports failure after the started action, never a false success', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const actions = vi.fn();
+        const subscribed = vi.fn();
+        const unsubscribed = vi.fn();
+        player.on('recovery_action', actions);
+        player.on('track_subscribed', subscribed);
+        player.on('track_unsubscribed', unsubscribed);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        (adapter.subscribe as any).mockRejectedValueOnce(new Error('relay refused'));
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(actions).toHaveBeenCalledTimes(1);
+        expect(subscribed).not.toHaveBeenCalled();
+        expect(unsubscribed).toHaveBeenCalledWith(expect.objectContaining({
+          reason: expect.stringContaining('too_far_behind resubscribe failed'),
+        }));
+      });
+
+      it('does not emit track_unsubscribed for TOO_FAR_BEHIND', async () => {
+        // The logical track is still selected; only its subscription changed.
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('track_unsubscribed', fn);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(fn).not.toHaveBeenCalled();
+      });
+    });
+
     it('removes subscription from active set — no REQUEST_UPDATE after PUBLISH_DONE', async () => {
       // After PUBLISH_DONE for video, pause() should only send
       // REQUEST_UPDATE for audio (the remaining active subscription).

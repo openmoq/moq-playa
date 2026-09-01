@@ -244,6 +244,10 @@ export interface PartialGroupAbandonedEvent {
  *   from the live edge.
  * - `track_restart` — the media-liveness ladder restarted a starved track's
  *   delivery (REQUEST_UPDATE refresh or full resubscribe).
+ * - `track_resubscribe` — the publisher ended the subscription for a reason
+ *   the player recovers from by replacing it. The logical track stays
+ *   selected, so this is NOT a `track_unsubscribed`; `trigger` names the
+ *   reason so an application can tell backpressure from anything else.
  */
 export type PlayerRecoveryAction =
   | RecoveryAction
@@ -253,6 +257,17 @@ export type PlayerRecoveryAction =
     readonly mediaType: 'video' | 'audio';
     readonly trackName: string;
     readonly attempt: number;
+  }
+  | {
+    /**
+     * A replacement subscription was started after PUBLISH_DONE.
+     * @see draft-ietf-moq-transport-16 §13.4.3 (TOO_FAR_BEHIND)
+     * @see draft-ietf-moq-transport-18 §15.10.3 (renumbered)
+     */
+    readonly type: 'track_resubscribe';
+    readonly trigger: 'too_far_behind';
+    readonly trackName: string;
+    readonly mediaType: 'video' | 'audio';
   };
 
 /**

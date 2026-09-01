@@ -283,6 +283,29 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await player.destroy();
   });
 
+  it('a liveness resubscribe is never attributed to peer backpressure', async () => {
+    // The liveness ladder and the PUBLISH_DONE path share one replacement
+    // helper. A local starvation incident must not publish
+    // `track_resubscribe { trigger: 'too_far_behind' }`, which would tell the
+    // application the peer signalled backpressure when it did not.
+    const adapter = createMockAdapter();
+    adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
+    const { player } = await startPlaying(adapter);
+    const recoveries: any[] = [];
+    player.on('recovery_action', (e) => recoveries.push(e.action));
+
+    feedVideo(adapter);
+    await vi.waitFor(() => {
+      expect(recoveries.some((a) => a.type === 'track_restart')).toBe(true);
+    }, { timeout: 2_000 });
+    // Let the ladder escalate to a full resubscribe.
+    await sleep(300);
+
+    expect(recoveries.filter((a) => a.type === 'track_resubscribe')).toHaveLength(0);
+    expect(recoveries.some((a) => a.trigger === 'too_far_behind')).toBe(false);
+    await player.destroy();
+  });
+
   it('destroy() during a starvation incident stays quiet — no MEDIA_STARVED', async () => {
     const adapter = createMockAdapter();
     adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));

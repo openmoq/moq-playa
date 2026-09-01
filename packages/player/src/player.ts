@@ -5565,7 +5565,7 @@ export class MoqtPlayer {
           : PublishDoneCode.TOO_FAR_BEHIND;
         if (statusCode === BigInt(tooFarBehind)) {
           this.log.warn('PUBLISH_DONE(TOO_FAR_BEHIND) "%s": resubscribing from live edge', trackName);
-          this.resubscribeAfterPublishDone(trackName);
+          this.replaceSubscription(trackName, 'too_far_behind');
           return;
         }
 
@@ -7258,23 +7258,33 @@ export class MoqtPlayer {
       this.pendingMediaSubs.delete(requestId);
       this.pendingObjectsByAlias.delete(sub.trackAlias);
     }
-    this.resubscribeAfterPublishDone(track.trackName);
+    this.replaceSubscription(track.trackName, 'liveness');
   }
 
   /**
-   * Resubscribe to a track after PUBLISH_DONE with a retriable status.
-   * Creates a fresh subscription (the old one is terminated by the session layer).
+   * Replace a track's subscription with a fresh one.
+   *
+   * Shared by two unrelated causes, which must stay distinguishable to an
+   * application: a publisher-signalled PUBLISH_DONE with a retriable status,
+   * and a locally-detected liveness incident. Only the former publishes
+   * `track_resubscribe`; the liveness ladder publishes its own
+   * `track_restart`, and attributing a local incident to peer backpressure
+   * would defeat the point of the event.
+   *
    * @see draft-ietf-moq-transport-16 §9.15, §13.4.3
    */
-  private resubscribeAfterPublishDone(trackName: string): void {
+  private replaceSubscription(
+    trackName: string,
+    cause: 'too_far_behind' | 'liveness',
+  ): void {
     if (!this.connection || !this.subscriptionManager || !this._catalogState) return;
 
     // Don't resurrect the OLD track during a make-before-break switch —
     // that would fight the switch by resubscribing to a track we're
     // intentionally abandoning.
     if (this.pendingVideoSwitch?.oldTrackName === trackName) {
-      this.log.info('Ignoring TOO_FAR_BEHIND for "%s" — pending switch to "%s"',
-        trackName, this.pendingVideoSwitch.newTrackName);
+      this.log.info('Ignoring %s replacement for "%s" — pending switch to "%s"',
+        cause, trackName, this.pendingVideoSwitch.newTrackName);
       return;
     }
 
@@ -7316,14 +7326,19 @@ export class MoqtPlayer {
       this.subscriptionManager.registerTrack(id, trackName, mediaType, packaging);
       this.pendingMediaSubs.set(id, { trackName, mediaType, packaging });
     };
-    this.connection.subscribe(nsBytes, nameBytes,
+    // Start through the CAPTURED connection and attach both observers before
+    // publishing: a recovery listener may synchronously destroy or migrate the
+    // player, and `this.connection` is mutable. Announcing afterwards also
+    // makes the event's contract true — the replacement has really started.
+    const pending = resubConn.subscribe(nsBytes, nameBytes,
       { ...(filter ?? {}), onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
     ).then((reqId) => {
       const reqIdBigInt = BigInt(reqId);
       if (!this.subscriptionManager) return;
       registerResub(reqIdBigInt);
 
-      this.log.info('Resubscribed %s "%s" requestId=%s after PUBLISH_DONE', mediaType, trackName, reqIdBigInt);
+      this.log.info('Resubscribed %s "%s" requestId=%s after %s',
+        mediaType, trackName, reqIdBigInt, cause);
       this.emitter.emit('track_subscribed', {
         type: 'track_subscribed',
         trackName,
@@ -7337,19 +7352,28 @@ export class MoqtPlayer {
         this.subscriptionManager?.unregisterTrack(resubRegisteredId);
         this.pendingMediaSubs.delete(resubRegisteredId);
       }
-      const cause = err instanceof Error ? err : new Error(String(err));
-      this.log.warn('Resubscribe "%s" failed: %s', trackName, cause.message);
+      const failure = err instanceof Error ? err : new Error(String(err));
+      this.log.warn('Resubscribe "%s" failed: %s', trackName, failure.message);
       this.emitError(createPlayerError(
         'degraded', 'connection', PlayerErrorCode.CONNECTION_LOST,
-        `Resubscribe after TOO_FAR_BEHIND failed: ${cause.message}`,
-        { cause, context: { trackName, mediaType } },
+        `Resubscribe after ${cause} failed: ${failure.message}`,
+        { cause: failure, context: { trackName, mediaType, cause } },
       ));
       this.emitter.emit('track_unsubscribed', {
         type: 'track_unsubscribed',
         trackName,
-        reason: `TOO_FAR_BEHIND resubscribe failed: ${cause.message}`,
+        reason: `${cause} resubscribe failed: ${failure.message}`,
       });
     });
+
+    // Now that the replacement exists and its outcome is observed, announce it.
+    if (cause === 'too_far_behind') {
+      this.emitter.emit('recovery_action', {
+        type: 'recovery_action',
+        action: { type: 'track_resubscribe', trigger: 'too_far_behind', trackName, mediaType },
+      });
+    }
+    void pending;
   }
 
   /** Start pipeline tick interval (~60fps). */
