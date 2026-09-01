@@ -1,11 +1,20 @@
 #!/usr/bin/env node
 /**
- * Release workflow — build, verify, tag, and optionally publish.
+ * Release workflow — build, verify, pack, and (with --publish) tag.
+ *
+ * npm publish lives in .github/workflows/publish.yml (Trusted Publisher).
+ * This script never uploads; pushing the vMAJOR.MINOR.PATCH tag does.
  *
  * Usage:
  *   node scripts/release.mjs              # verify current version, dry-run
  *   node scripts/release.mjs 0.6.0        # bump to 0.6.0, verify, pack
- *   node scripts/release.mjs --publish    # verify + tag + publish to npm
+ *   node scripts/release.mjs --publish    # verify + tag v{version}
+ *
+ * Typical cut:
+ *   1. node scripts/release.mjs 0.6.0
+ *   2. commit the version bump (tree must be clean before tagging)
+ *   3. node scripts/release.mjs --publish
+ *   4. git push origin HEAD && git push origin v0.6.0
  *
  * Steps:
  *   1. Sync version across all packages (from root or CLI arg)
@@ -14,12 +23,11 @@
  *   4. pnpm test
  *   5. package README check + smoke-exports (boundary verification)
  *   6. Pack the PUBLISHABLE packages only (packages/*) into ./release
- *   7. If --publish: git tag v{version} + pnpm publish --access public
+ *   7. If --publish: git tag v{version} (do not npm publish)
  *
- * Publishing requires a clean working tree (asserted up front), so the
- * tarballs in ./release/ — which cover exactly the packages that publish —
- * are the exact artifacts sent to npm. The tag is created only on publish,
- * so a dry run never leaves a tag with no corresponding release.
+ * --publish requires a clean working tree so the tag points at the commit
+ * that the GitHub Action will check out and publish. The tag is created
+ * only on --publish, so a dry run never leaves a tag with no release.
  */
 
 import { execSync } from 'child_process';
@@ -41,13 +49,13 @@ function runCapture(cmd) {
   return execSync(cmd, { cwd: ROOT, encoding: 'utf-8' }).trim();
 }
 
-// ── Guard: never publish from a dirty tree ───────────────────────────
-// Publishing packs from the working tree; a dirty tree would ship artifacts
-// the git tag does not represent. Require a clean, committed state up front.
+// ── Guard: never tag from a dirty tree ───────────────────────────────
+// The GitHub Action publishes whatever the tag points at. A dirty tree
+// would tag a commit that does not include the files about to ship.
 if (shouldPublish) {
   const dirty = runCapture('git status --porcelain');
   if (dirty) {
-    console.error('\n✗ Refusing to publish from a dirty working tree — commit or stash first:\n');
+    console.error('\n✗ Refusing to tag from a dirty working tree — commit or stash first:\n');
     console.error(dirty + '\n');
     process.exit(1);
   }
@@ -108,9 +116,9 @@ const tarballs = runCapture(`ls -lh "${releaseDir}"/*.tgz`);
 console.log('\nTarballs:');
 console.log(tarballs);
 
-// ── Step 7: Tag + Publish (opt-in) ───────────────────────────────────
-// Tag only when actually publishing (the clean-tree guard above ran), so a
-// dry run never leaves a tag with no corresponding release.
+// ── Step 7: Tag (opt-in) ─────────────────────────────────────────────
+// Tag only on --publish (the clean-tree guard above ran), so a dry run
+// never leaves a tag with no corresponding GitHub Action run.
 
 const tag = `v${version}`;
 
@@ -121,12 +129,11 @@ if (shouldPublish) {
     console.log(`\n🏷  Tagging ${tag}`);
     execSync(`git tag -a ${tag} -m "Release ${tag}"`, { cwd: ROOT });
   }
-  console.log('\n🚀 Publishing to npm...');
-  run('pnpm --filter "./packages/*" publish --access public --no-git-checks');
-  console.log(`\n✅ Published v${version} to npm`);
-  console.log(`   Push the tag: git push origin ${tag}`);
+  console.log(`\n✅ Tagged ${tag}`);
+  console.log('   npm publish runs in CI when this tag reaches origin:');
+  console.log(`   git push origin HEAD && git push origin ${tag}`);
 } else {
   console.log(`\n✅ Release v${version} verified`);
-  console.log('   Tarballs in ./release/ are exactly what would publish.');
-  console.log('   To publish (from a clean tree): node scripts/release.mjs --publish');
+  console.log('   Tarballs in ./release/ are exactly what CI would publish.');
+  console.log('   To tag (from a clean tree): node scripts/release.mjs --publish');
 }
