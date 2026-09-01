@@ -965,4 +965,44 @@ describe('MoqtConnection(18) teardown on an already failed/closed transport', ()
 
     await expect(conn.close()).resolves.toBeUndefined();
   });
+
+  it('close() owns the terminal transport close exactly once across repeated calls', async () => {
+    const { conn, transport } = await connected();
+    const close = transport.close.bind(transport);
+    let closeCalls = 0;
+    transport.close = (info) => {
+      closeCalls++;
+      close(info);
+    };
+
+    await conn.close();
+    await conn.close();
+
+    expect(closeCalls).toBe(1);
+  });
+
+  it('close() does not repeat a transport close already caused by a fatal response', async () => {
+    const { conn, transport } = await connected();
+    const close = transport.close.bind(transport);
+    let closeCalls = 0;
+    transport.close = (info) => {
+      closeCalls++;
+      close(info);
+    };
+
+    await conn.subscribe(ns('a'), nm('1'));
+    const invalid = codec18.encode({
+      type: 'SUBSCRIBE_OK',
+      requestId: 0n,
+      trackAlias: 10n,
+      parameters: new Map([[0x22n, [2n]]]),
+      trackExtensions: new Map(),
+    } as SubscribeOk);
+    transport.bidi[0]!.push(invalid);
+    await flush(16);
+
+    expect(closeCalls).toBe(1);
+    await conn.close();
+    expect(closeCalls).toBe(1);
+  });
 });

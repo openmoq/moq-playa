@@ -2831,6 +2831,10 @@ export class MoqtConnection {
    * close the transport — does not race in a duplicate onClose.
    */
   async close(error?: Varint, reason?: string): Promise<void> {
+    // A fatal path may already have closed the transport before application
+    // teardown calls close(). Keep one owner for the terminal transport close;
+    // concurrent/repeated callers leave that already-owned shutdown untouched.
+    if (this._terminated) return;
     // Mark terminated + emitted FIRST so the transport-close watcher stays quiet
     // (a quiet local close fires no onClose, and cannot be upgraded into one).
     this._terminated = true;
