@@ -2787,6 +2787,61 @@ describe('MoqtPlayer', () => {
       expect(createAudioOutput).toHaveBeenCalledOnce();
     });
 
+    // The stall metric only means something if the player actually wires both
+    // phases. Driving the renderer callbacks directly keeps that wiring
+    // load-bearing rather than assumed.
+    describe('stall lifecycle wiring', () => {
+      async function playerWithRenderer(adapter: ReturnType<typeof createMockAdapter>) {
+        const renderer: any = {
+          enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(),
+          onFirstFrame: null, onFrameRendered: null, onStall: null,
+          onStallRecovered: null, cancelStallEpisode: vi.fn(),
+        };
+        const player = await loadWithCatalog(adapter, {
+          ...createPipelineConfig(adapter),
+          createVideoDecoder: vi.fn(() => ({
+            configure: vi.fn(), decode: vi.fn(), flush: vi.fn(() => Promise.resolve()),
+            reset: vi.fn(), queueDepth: 0, onFrame: null, onError: null, destroy: vi.fn(),
+          })),
+          createAudioDecoder: vi.fn(() => ({
+            configure: vi.fn(), decode: vi.fn(), flush: vi.fn(() => Promise.resolve()),
+            reset: vi.fn(), queueDepth: 0, onData: null, onError: null, destroy: vi.fn(),
+          })),
+          createRenderer: vi.fn(() => renderer),
+          createAudioOutput: vi.fn(() => ({
+            schedule: vi.fn(), flush: vi.fn(), currentPlayoutTimeUs: 0, destroy: vi.fn(),
+          })),
+        });
+        return { player, renderer };
+      }
+
+      it('publishes detection and completion, and totals only the completion', async () => {
+        const adapter = createMockAdapter();
+        const { player, renderer } = await playerWithRenderer(adapter);
+        const detected: number[] = [];
+        const recovered: number[] = [];
+        player.on('stall', (e) => detected.push(e.durationMs));
+        player.on('stall_recovered', (e) => recovered.push(e.durationMs));
+
+        renderer.onStall(250);
+        renderer.onStallRecovered(43_360);
+
+        expect(detected).toEqual([250]);
+        expect(recovered).toEqual([43_360]);
+        expect(player.stats.stallCount).toBe(1);
+        // The 43s outage, not the 250ms detection latency.
+        expect(player.stats.totalStallDurationMs).toBe(43_360);
+      });
+
+      it('counts a detected stall that never recovers, without duration', async () => {
+        const adapter = createMockAdapter();
+        const { player, renderer } = await playerWithRenderer(adapter);
+        renderer.onStall(250);
+        expect(player.stats.stallCount).toBe(1);
+        expect(player.stats.totalStallDurationMs).toBe(0);
+      });
+    });
+
     it('measures A/V skew from rendered frames vs audio playhead (observability only)', async () => {
       const adapter = createMockAdapter();
       const renderer: any = {
@@ -11086,6 +11141,76 @@ describe('MSE gap-jump escalation and wiring', () => {
     expect(peek).toHaveBeenCalledTimes(1);             // downshift path still live
     expect(stallEvents).toHaveLength(2);
     expect(stallEvents[1].cause).toBeUndefined();
+    await player.destroy();
+  });
+
+  it('a media-gap interval still contributes to the aggregate exactly once', async () => {
+    // Separating detection from completion moved ordinary duration onto the
+    // recovery event. The gap-jump path reports an interval that has already
+    // elapsed and is never followed by a recovery, so it must keep its own
+    // contribution rather than silently dropping to zero.
+    const { player, mockMs } = await cmafPlayer();
+    const recovered: any[] = [];
+    player.on('stall_recovered', (e: any) => recovered.push(e));
+
+    mockMs.onStall(2100, 'media-gap');
+
+    expect(player.stats.stallCount).toBe(1);
+    expect(player.stats.totalStallDurationMs).toBe(2100);
+    // The jump is an attempt, not proof the landing recovered.
+    expect(recovered).toEqual([]);
+    await player.destroy();
+  });
+
+  it('a committed seek cancels the episode, before the pipeline resets', async () => {
+    // Cancellation belongs at the commit boundary: every guard has passed and
+    // `seeking` has been published, so the seek really does supersede playback.
+    const { player, mockMs } = await cmafPlayer();
+    const order: string[] = [];
+    (mockMs as any).cancelStallEpisode = () => order.push('cancel');
+    (player as any).videoPipeline = {
+      reset: () => order.push('reset'), tick: () => {}, destroy: () => {},
+    };
+    (player as any).timelineState = {
+      entries: [{ mediaPts: 0, location: [0, 0] as const, wallclockTime: 0 }],
+    };
+    player.play();
+
+    mockMs.onStall(250);
+    await player.seek(1_000).catch(() => { /* downstream update is not under test */ });
+
+    expect(order[0]).toBe('cancel');
+    expect(order).toContain('reset');
+    await player.destroy();
+  });
+
+  it('a rejected seek does not censor a live stall', async () => {
+    // A seek that changes no playback state must leave a running outage alone.
+    const { player, mockMs } = await cmafPlayer();
+    const cancel = vi.fn();
+    (mockMs as any).cancelStallEpisode = cancel;
+    player.play();
+    (player as any).timelineState = { entries: [] };   // seek will reject
+
+    mockMs.onStall(250);
+    await expect(player.seek(1_000)).rejects.toThrow(/timeline/);
+
+    expect(cancel).not.toHaveBeenCalled();
+    // The episode is still live, so its eventual recovery still reports.
+    mockMs.onStallRecovered(43_360);
+    expect(player.stats.totalStallDurationMs).toBe(43_360);
+    await player.destroy();
+  });
+
+  it('an ordinary detection contributes no duration until it recovers', async () => {
+    const { player, mockMs } = await cmafPlayer();
+    mockMs.onStall(250);
+    expect(player.stats.stallCount).toBe(1);
+    expect(player.stats.totalStallDurationMs).toBe(0);
+
+    mockMs.onStallRecovered(43_360);
+    expect(player.stats.stallCount).toBe(1);
+    expect(player.stats.totalStallDurationMs).toBe(43_360);
     await player.destroy();
   });
 

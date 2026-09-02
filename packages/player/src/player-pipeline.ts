@@ -73,6 +73,12 @@ export interface TrackInfo {
 export interface PipelineCallbacks {
   onFirstFrame: () => void;
   onStall: (durationMs: number) => void;
+  /**
+   * A detected stall ended with genuine recovery. Full outage length.
+   *
+   * Optional: a caller that only wants detection stays source-compatible.
+   */
+  onStallRecovered?: (durationMs: number) => void;
   onDecodeError: (mediaType: 'video' | 'audio', error: Error) => void;
   onFrameRendered: (captureTimestampUs: number, actualRenderUs: number) => void;
   onFeedback: (fb: DecoderFeedback) => void;
@@ -183,6 +189,7 @@ export function createPipelines(
 
     mediaSource.onFirstFrame = () => callbacks.onFirstFrame();
     mediaSource.onStall = (durationMs) => callbacks.onStall(durationMs);
+    mediaSource.onStallRecovered = (durationMs) => callbacks.onStallRecovered?.(durationMs);
     mediaSource.onError = (error) => callbacks.onDecodeError('video', error);
   }
 
@@ -242,6 +249,7 @@ export function createPipelines(
       audioChannels: trackInfo.audio?.channels,
       onFirstFrame: () => callbacks.onFirstFrame(),
       onStall: (durationMs: number) => callbacks.onStall(durationMs),
+      onStallRecovered: (durationMs: number) => callbacks.onStallRecovered?.(durationMs),
       onError: (mediaType: 'video' | 'audio', error: Error) => callbacks.onDecodeError(mediaType, error),
       onFrameRendered: (captureTimestampUs: number, actualRenderUs: number) => callbacks.onFrameRendered(captureTimestampUs, actualRenderUs),
       onFeedback: (fb: DecoderFeedback) => callbacks.onFeedback(fb),

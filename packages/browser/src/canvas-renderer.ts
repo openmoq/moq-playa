@@ -19,6 +19,7 @@
 
 import type { VideoRendererLike } from '@moqt/player';
 import type { ClockSource } from '@moqt/playback';
+import { validateStallThresholdMs } from './mse-adapter.js';
 
 /** A queued frame awaiting presentation. */
 interface QueuedFrame {
@@ -52,7 +53,16 @@ export class CanvasRenderer implements VideoRendererLike {
   private readonly clock: ClockSource;
   private firstFrameRendered = false;
   private lastRenderTimeMs = 0;
-  private stallReported = false;
+  /**
+   * The in-flight stall episode, if any.
+   *
+   * `startedMs` is when rendering actually stopped, so a completion reports the
+   * whole outage rather than the detection latency. Survives a flush, because
+   * the player's own stall recovery resets the pipeline and flushes this
+   * renderer: dropping the episode there would make automatic recovery
+   * permanently unable to report a completed stall.
+   */
+  private stallEpisode: { startedMs: number; detected: boolean } | null = null;
   private renderDiagCount = 0;
   private lastActualRenderUs = 0;
   private renderDiagEnabled = typeof location !== 'undefined'
@@ -73,12 +83,21 @@ export class CanvasRenderer implements VideoRendererLike {
   onFrameRendered: ((captureTimestampUs: bigint, actualRenderUs: number, scheduledRenderUs?: number) => void) | null = null;
   onStall: ((durationMs: number) => void) | null = null;
 
+  /**
+   * A detected stall ended with a rendered frame. Carries the full outage.
+   */
+  onStallRecovered: ((durationMs: number) => void) | null = null;
+
   constructor(
     canvas: HTMLCanvasElement,
     options?: { stallThresholdMs?: number; clock?: ClockSource },
   ) {
+    // Validate before acquiring any browser state, so an invalid option
+    // cannot leave a half-constructed renderer holding a 2d context.
+    this.stallThresholdMs = options?.stallThresholdMs === undefined
+      ? DEFAULT_STALL_THRESHOLD_MS
+      : validateStallThresholdMs(options.stallThresholdMs);
     this.ctx = canvas.getContext('2d')!;
-    this.stallThresholdMs = options?.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS;
     this.clock = options?.clock ?? { now: () => performance.now() * 1000 };
   }
 
@@ -141,7 +160,17 @@ export class CanvasRenderer implements VideoRendererLike {
         entry.frame.close();
 
         rendered = true;
-        this.stallReported = false;
+        // A genuinely rendered frame is the only thing that completes an
+        // episode. Capture it here but publish only after every piece of frame
+        // state below is committed: emit() propagates listener exceptions, and
+        // a throwing listener must not leave this frame half-recorded or stop
+        // the next one being scheduled.
+        let recoveredMs: number | null = null;
+        if (this.stallEpisode !== null) {
+          const episode = this.stallEpisode;
+          this.stallEpisode = null;
+          if (episode.detected) recoveredMs = performance.now() - episode.startedMs;
+        }
 
         // First frame lifecycle
         if (!this.firstFrameRendered) {
@@ -167,20 +196,25 @@ export class CanvasRenderer implements VideoRendererLike {
         }
         this.lastActualRenderUs = nowUs;
         this.lastRenderTimeMs = performance.now();
+        // All frame state committed — safe to publish.
+        if (recoveredMs !== null) this.onStallRecovered?.(recoveredMs);
       } else {
         // Future frame — stop processing
         break;
       }
     }
 
-    // Stall detection: fires once per stall event (reset when a frame renders).
-    // Suppressed when page is hidden — throttled ticks always exceed threshold.
-    if (!rendered && this.firstFrameRendered && !this.stallReported
+    // Stall detection: once per episode. Suppressed when the page is hidden —
+    // throttled ticks always exceed the threshold.
+    if (!rendered && this.firstFrameRendered
         && this.lastRenderTimeMs > 0 && !document.hidden) {
-      const stallMs = performance.now() - this.lastRenderTimeMs;
-      if (stallMs > this.stallThresholdMs) {
-        this.stallReported = true;
-        this.onStall?.(stallMs);
+      this.stallEpisode ??= { startedMs: this.lastRenderTimeMs, detected: false };
+      if (!this.stallEpisode.detected) {
+        const stallMs = performance.now() - this.stallEpisode.startedMs;
+        if (stallMs > this.stallThresholdMs) {
+          this.stallEpisode.detected = true;
+          this.onStall?.(stallMs);
+        }
       }
     }
   }
@@ -213,20 +247,38 @@ export class CanvasRenderer implements VideoRendererLike {
       entry.frame.close();
     }
     this.queue.length = 0;
-    // Reset stall tracking — after flush, stall detection is suppressed until
-    // the next frame renders. This prevents false stalls during pause.
+    // Suppress *new* detection until the next frame renders, so a pause does
+    // not read as a stall. An already-detected episode is deliberately kept:
+    // the player's stall recovery flushes this renderer, and discarding it here
+    // would mean an automatically-recovered stall could never be completed.
+    // Callers that genuinely supersede playback call cancelStallEpisode().
     this.lastRenderTimeMs = 0;
-    this.stallReported = false;
+    if (this.stallEpisode !== null && !this.stallEpisode.detected) {
+      this.stallEpisode = null;
+    }
+  }
+
+  /**
+   * Abandon any in-flight stall episode without completing it.
+   *
+   * For pause, user seek, and destroy: playback is superseded rather than
+   * recovered, so no completion is published and nothing is contributed to
+   * aggregate stall time.
+   */
+  cancelStallEpisode(): void {
+    this.stallEpisode = null;
   }
 
   /** Release resources. MUST close() all held frames. */
   destroy(): void {
+    this.cancelStallEpisode();
     this.destroyed = true;
     this.stop();
     this.flush();
     this.onFirstFrame = null;
     this.onFrameRendered = null;
     this.onStall = null;
+    this.onStallRecovered = null;
   }
 
   // ─── Internal ──────────────────────────────────────────────────
@@ -241,14 +293,27 @@ export class CanvasRenderer implements VideoRendererLike {
     if (document.hidden) {
       // Page is hidden — rAF won't fire. Use setInterval fallback.
       this.intervalId = setInterval(() => {
+        // No guard needed: setInterval re-fires regardless of a thrown
+        // callback, so a listener exception cannot end this loop. Catching it
+        // would only diverge from the rAF path, which propagates by contract.
         this.renderTick(this.clock.now());
       }, FALLBACK_INTERVAL_MS);
     } else {
       // Page is visible — use rAF for smooth rendering.
       const loop = (): void => {
         if (!this.running || this.destroyed) return;
-        this.renderTick(this.clock.now());
-        this.rafId = requestAnimationFrame(loop);
+        try {
+          this.renderTick(this.clock.now());
+        } finally {
+          // renderTick publishes to application listeners, and the emitter
+          // propagates their exceptions by design. Rescheduling in `finally`
+          // keeps one bad listener from silently ending playback — but only
+          // while still running, so stop()/destroy() from inside a listener
+          // still terminates the loop.
+          if (this.running && !this.destroyed) {
+            this.rafId = requestAnimationFrame(loop);
+          }
+        }
       };
       this.rafId = requestAnimationFrame(loop);
     }

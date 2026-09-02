@@ -2453,6 +2453,14 @@ export class MoqtPlayer {
       targetTimeMs: timeMs,
     });
 
+    // The seek is committed here: every guard passed and `seeking` has been
+    // published. Only now does it supersede playback, so a rejected seek — bad
+    // state, no timeline, target before the start — leaves a live stall alone
+    // rather than censoring an outage that is still running. The LOC path is
+    // cancelled inside CommandDispatcher.flush() below; CMAF needs its own
+    // call, and it must land before the resets.
+    this.mediaSource?.cancelStallEpisode?.();
+
     // Reset playback pipelines — flush jitter buffer, decoder state, sync reference.
     // §9.11.1: "it might still receive Objects outside the new range if the
     // publisher sent them before the update was processed."
@@ -6009,6 +6017,10 @@ export class MoqtPlayer {
         this.log.info('First frame rendered');
         this.emitter.emit('first_frame', { type: 'first_frame' });
       },
+      onStallRecovered: (durationMs) => {
+        this._stats.recordStallRecovered(durationMs);
+        this.emitter.emit('stall_recovered', { type: 'stall_recovered', durationMs });
+      },
       onStall: (durationMs) => {
         this._stats.recordStall(durationMs);
         this.emitter.emit('stall', { type: 'stall', durationMs });
@@ -6229,8 +6241,15 @@ export class MoqtPlayer {
     // CMAF has no pipeline-level stall handler — the MseMediaSource
     // detects stalls directly from the <video> element.
     if (this.mediaSource) {
+      this.mediaSource.onStallRecovered = (durationMs) => {
+        this._stats.recordStallRecovered(durationMs);
+        this.emitter.emit('stall_recovered', { type: 'stall_recovered', durationMs });
+      };
       this.mediaSource.onStall = (durationMs, cause) => {
-        this._stats.recordStall(durationMs);
+        // A media-gap report is an already-elapsed interval, not a detection
+        // latency, and nothing will later complete it.
+        if (cause === 'media-gap') this._stats.recordResolvedStall(durationMs);
+        else this._stats.recordStall(durationMs);
         this.emitter.emit('stall', { type: 'stall', durationMs, ...(cause ? { cause } : {}) });
 
         // A media-gap stall is missing SOURCE media the adapter already

@@ -330,7 +330,12 @@ export interface FirstFrameEvent {
 }
 
 /**
- * Playback stalled — no frames rendered for longer than threshold.
+ * Playback stall **detected** — nothing rendered for longer than the
+ * threshold.
+ *
+ * `durationMs` is the elapsed time when detection fired, not the length of the
+ * outage: the episode is still in progress. Wait for {@link StallRecoveredEvent}
+ * for the completed duration.
  */
 export interface StallEvent {
   readonly type: 'stall';
@@ -338,6 +343,18 @@ export interface StallEvent {
   /** Set when the stall was caused by missing source media that the MSE
    *  adapter resolved by a gap-jump — NOT a bandwidth signal. */
   readonly cause?: 'media-gap';
+}
+
+/**
+ * A detected stall ended with genuine playback recovery.
+ *
+ * Emitted once per detected episode, carrying the **full** outage length.
+ * An episode cancelled by pause, seek, or destroy never emits this.
+ */
+export interface StallRecoveredEvent {
+  readonly type: 'stall_recovered';
+  /** Full outage length, from stall onset to recovery. */
+  readonly durationMs: number;
 }
 
 /**
@@ -638,6 +655,7 @@ export interface PlayerEventMap {
   // Rendering
   first_frame: FirstFrameEvent;
   stall: StallEvent;
+  stall_recovered: StallRecoveredEvent;
   gap_jump: GapJumpEvent;
   quality_switching: QualitySwitchingEvent;
   quality_switched: QualitySwitchedEvent;

@@ -286,7 +286,7 @@ describe('StatsAccumulator', () => {
       expect(stats.snapshot().gapCount).toBe(3);
     });
 
-    it('tracks stallCount and totalStallDurationMs', () => {
+    it('counts stalls at detection', () => {
       const stats = new StatsAccumulator();
       stats.recordStall(100);
       stats.recordStall(250);
@@ -294,7 +294,22 @@ describe('StatsAccumulator', () => {
 
       const snap = stats.snapshot();
       expect(snap.stallCount).toBe(3);
-      expect(snap.totalStallDurationMs).toBe(400);
+      // Detection reports elapsed-at-threshold, a fixed latency rather than
+      // the outage, so it contributes nothing to the total.
+      expect(snap.totalStallDurationMs).toBe(0);
+    });
+
+    it('accumulates duration only from completed stalls', () => {
+      const stats = new StatsAccumulator();
+      stats.recordStall(250);            // detected
+      stats.recordStallRecovered(43_360); // and recovered 43s later
+      stats.recordStall(250);            // detected, never recovered
+
+      const snap = stats.snapshot();
+      expect(snap.stallCount).toBe(2);
+      // The completed episode contributes its real length; the censored one
+      // contributes nothing rather than its detection latency.
+      expect(snap.totalStallDurationMs).toBe(43_360);
     });
 
     it('increments decodeErrorCount', () => {

@@ -151,6 +151,10 @@ export interface VideoRendererLike {
 
   /** Callback: no frames rendered for longer than stall threshold. */
   onStall: ((durationMs: number) => void) | null;
+  /** A detected stall ended with a genuinely rendered frame. Full duration. */
+  onStallRecovered?: ((durationMs: number) => void) | null;
+  /** Cancel an in-flight stall episode without completing it (pause/seek/destroy). */
+  cancelStallEpisode?: (() => void) | null;
 }
 
 /**
@@ -317,6 +321,16 @@ export interface MediaSourceLike {
    *  itself resolved the stall by jumping a source hole ('media-gap') —
    *  such stalls are not bandwidth signals. */
   onStall: ((durationMs: number, cause?: 'media-gap') => void) | null;
+  /**
+   * A detected stall ended with genuine playback resumption. Full duration.
+   *
+   * No cause parameter: the only causal variant, `media-gap`, is resolved at
+   * report time and never completes, so advertising one would describe a
+   * lifecycle no producer can emit.
+   */
+  onStallRecovered?: ((durationMs: number) => void) | null;
+  /** Abandon an in-flight stall episode — playback superseded, not recovered. */
+  cancelStallEpisode?: () => void;
 
   /**
    * OPTIONAL callback: the adapter jumped the playhead across a bounded

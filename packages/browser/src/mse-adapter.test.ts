@@ -3078,12 +3078,17 @@ describe('buffered-hole gap-jump', () => {
         // First real progress past the landing clears the episode…
         video.currentTime = 20.0;
         (adapter as any).handleTimeUpdate();
-        // …after which a genuine stall reports normally.
-        (adapter as any).handleWaiting();
-        video.currentTime = 20.5;
-        (adapter as any).handleTimeUpdate();
-        expect(stalls).toHaveLength(2);
-        expect(stalls[1].cause).toBeUndefined();
+        // …after which a genuine stall reports normally. Detection is the
+        // explicit threshold now; a `timeupdate` is not a stall signal.
+        vi.useFakeTimers();
+        try {
+          (adapter as any).handleWaiting();
+          vi.advanceTimersByTime(300);
+          expect(stalls).toHaveLength(2);
+          expect(stalls[1].cause).toBeUndefined();
+        } finally {
+          vi.useRealTimers();
+        }
     });
 
     it('a growing next range does not restart the wait (nextRangeEnd excluded from identity)', () => {
@@ -3202,13 +3207,20 @@ describe('buffered-hole gap-jump', () => {
         (adapter as any).handleWaiting();                              // the ONLY waiting (seek-generated)
         check(3_100);
         check(4_100);                                                  // fallback expiry restores the evidence
-        // No further waiting ever fires. When the playhead finally moves,
-        // the frozen span still reports as a genuine stall.
+        // No further waiting ever fires. The single suppressed waiting still
+        // owns an episode, so the explicit threshold reports it as a genuine
+        // stall without needing a second waiting.
         video.currentTime = 19.9;
         video.seekCount = 1;                                           // manual move isn't an adapter seek
-        (adapter as any).handleTimeUpdate();
-        expect(stalls).toHaveLength(2);
-        expect(stalls[1].cause).toBeUndefined();
+        vi.useFakeTimers();
+        try {
+          (adapter as any).armStallDetection();
+          vi.advanceTimersByTime(300);
+          expect(stalls).toHaveLength(2);
+          expect(stalls[1].cause).toBeUndefined();
+        } finally {
+          vi.useRealTimers();
+        }
     });
 
     it('a failed landing with a single suppressed waiting reaches a bounded fatal (no wedge eligibility needed)', () => {
