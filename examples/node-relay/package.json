@@ -15,6 +15,7 @@
     "publisher": "tsx src/publisher.ts",
     "relay-server": "tsx src/relay-server.ts",
     "relay-smoke": "tsx src/relay-smoke.ts",
+    "relay-load-smoke": "tsx src/relay-load-smoke.ts",
     "relay-media-smoke": "tsx src/relay-media-smoke.ts",
     "relay-fetch-smoke": "tsx src/relay-fetch-smoke.ts"
   },

@@ -10,7 +10,7 @@
 import { fileURLToPath } from 'node:url';
 import type { MoqtConnection } from '@moqt/webtransport';
 import { connectClient } from './client.js';
-import { DEMO_NAMESPACE, DEMO_TRACK, DEMO_PAYLOADS, nsBytes, te } from './demo.js';
+import { DEMO_EXTENSIONS, DEMO_NAMESPACE, DEMO_TRACK, DEMO_PAYLOADS, nsBytes, te } from './demo.js';
 
 const log = (...a: unknown[]) => console.log('[publisher]', ...a);
 
@@ -46,15 +46,18 @@ export async function publishTrack(
   trackName: string,
   alias: bigint,
   payloads: string[],
-  opts: { endOfGroup?: boolean } = {},
+  opts: { endOfGroup?: boolean; extensions?: Uint8Array } = {},
 ): Promise<void> {
   const requestId = await conn.publish(nsBytes(DEMO_NAMESPACE), te(trackName), alias);
   await waitForPublishAccept(conn, requestId);
   const sid = await conn.openSubgroup(alias, 0n, 0n, {
-    publisherPriority: 128, firstObject: true, endOfGroup: opts.endOfGroup ?? false,
+    publisherPriority: 128,
+    firstObject: true,
+    endOfGroup: opts.endOfGroup ?? false,
+    hasExtensions: opts.extensions !== undefined,
   });
   for (let i = 0; i < payloads.length; i++) {
-    await conn.sendObject(sid, BigInt(i), te(payloads[i]!));
+    await conn.sendObject(sid, BigInt(i), te(payloads[i]!), opts.extensions);
   }
   await conn.closeSubgroup(sid);
   log(`published ${payloads.length} objects to ${trackName} (alias=${alias})`);
@@ -78,7 +81,9 @@ export async function publishGroupObjects(
 /** Publish the simple demo track (used by the publisher CLI and relay-smoke). */
 export async function publishDemo(conn: MoqtConnection): Promise<void> {
   log(`publishing ${DEMO_NAMESPACE.join('/')}/${DEMO_TRACK}`);
-  await publishTrack(conn, DEMO_TRACK, PUB_ALIAS, [...DEMO_PAYLOADS]);
+  await publishTrack(conn, DEMO_TRACK, PUB_ALIAS, [...DEMO_PAYLOADS], {
+    extensions: DEMO_EXTENSIONS,
+  });
 }
 
 // ── CLI entrypoint ──────────────────────────────────────────────────────────

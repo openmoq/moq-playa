@@ -14,13 +14,15 @@
  *     per §5.1.2 and backfill the current group via a Joining FETCH instead);
  *   - standalone + joining FETCH served from the latest-group cache (§9.16 /
  *     draft-18 §10.12) — see handleFetch;
- *   - forwarding preserves the publisher's groupId/subgroupId/objectId and
- *     mirrors graceful subgroup FIN so downstream stream credit is returned.
+ *   - forwarding preserves the publisher's groupId/subgroupId/objectId and raw
+ *     Object Properties/Extensions, and mirrors graceful subgroup FIN so
+ *     downstream stream credit is returned.
  *
  * Deliberately a TOY — see README:
  *   - LIVE only: the cache holds just the latest group, so a late joiner gets that
  *     group, not full history (no DVR / no real init-segment retention policy).
- *   - NO route authorization, NO backpressure/fairness, NO reconnect/migration.
+ *   - NO route authorization, fairness, reconnect/migration, or persistence.
+ *     A bounded per-subscription forwarder sheds a subscriber that cannot keep up.
  *   - Forwards DATA objects ONLY. Gap/status objects (incl. END_OF_GROUP) are NOT
  *     relayed: a live relay can't reproduce them with the public API — per-object
  *     status has no `sendObject` field, and the END_OF_GROUP header bit is set at
@@ -28,8 +30,9 @@
  * All forwarding uses the public MoqtConnection API — no internals.
  */
 import type { MoqtConnection, IncomingPublish } from '@moqt/webtransport';
-import { MessageParam, RequestError18, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@moqt/transport';
+import { MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@moqt/transport';
 import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, nsStr, hex } from './demo.js';
+import { SubgroupForwarder, type ForwardLimits } from './subgroup-forwarder.js';
 
 const log = (...a: unknown[]) => console.log('[relay]', ...a);
 
@@ -41,17 +44,58 @@ interface CachedObject {
   readonly subgroupId: bigint;
   readonly objectId: bigint;
   readonly payload: Uint8Array;
+  /** Raw draft-18 Object Properties / draft-14/16 Extensions. */
+  readonly extensions: Uint8Array | undefined;
 }
 
-interface Subscriber {
-  readonly conn: MoqtConnection;
-  readonly requestId: bigint;
-  readonly alias: bigint;
-  /** Per-subscriber promise chain: serializes forwards so objects keep their order. */
-  queue: Promise<void>;
-  /** Outgoing subgroup streams keyed by the publisher's "groupId/subgroupId". */
-  readonly subgroups: Map<string, bigint>;
+interface SubscriberSubgroup {
+  readonly streamId: bigint;
+  /** Fixed by the subgroup header before its first object is sent. */
+  readonly hasExtensions: boolean;
 }
+
+interface ForwardObjectFields {
+  readonly groupId: bigint;
+  readonly subgroupId: bigint;
+  readonly objectId: bigint;
+  readonly payload: Uint8Array;
+  readonly extensions: Uint8Array | undefined;
+}
+
+class Subscriber {
+  readonly subgroups = new Map<string, SubscriberSubgroup>();
+  readonly forwarder: SubgroupForwarder<ForwardObjectFields>;
+
+  constructor(
+    readonly conn: MoqtConnection,
+    readonly requestId: bigint,
+    readonly alias: bigint,
+    limits: ForwardLimits,
+  ) {
+    this.forwarder = new SubgroupForwarder(limits, {
+      forward: (fields) => forwardObject(this, fields),
+      close: (skey) => closeSubscriberSubgroup(this, skey),
+      reportError: (err) => {
+        console.error('[relay] FORWARD SCHEDULER ERROR:', (err as Error).message);
+      },
+    });
+  }
+}
+
+export interface RelayOptions {
+  /** Maximum downstream subgroup streams held open by one subscription. */
+  readonly maxConcurrentSubgroupsPerSubscription?: number;
+  /** Disconnect a subscriber rather than retain more queued objects than this. */
+  readonly maxPendingObjectsPerSubscription?: number;
+  /** Disconnect a subscriber rather than retain more queued payload bytes than this. */
+  readonly maxPendingBytesPerSubscription?: number;
+}
+
+const DEFAULT_FORWARD_LIMITS: ForwardLimits = {
+  maxConcurrentSubgroups: 8,
+  maxPendingObjects: 256,
+  maxPendingBytes: 4 * 1024 * 1024,
+};
 
 interface Track {
   subscribers: Subscriber[];
@@ -72,6 +116,24 @@ const isRegisteredTrack = (namespace: Uint8Array[], trackName: Uint8Array): bool
 export class Relay {
   private readonly tracks = new Map<string, Track>();
   private nextAlias = 100n;
+  private readonly forwardLimits: ForwardLimits;
+
+  constructor(options: RelayOptions = {}) {
+    this.forwardLimits = {
+      maxConcurrentSubgroups: positiveInteger(
+        'maxConcurrentSubgroupsPerSubscription',
+        options.maxConcurrentSubgroupsPerSubscription ?? DEFAULT_FORWARD_LIMITS.maxConcurrentSubgroups,
+      ),
+      maxPendingObjects: positiveInteger(
+        'maxPendingObjectsPerSubscription',
+        options.maxPendingObjectsPerSubscription ?? DEFAULT_FORWARD_LIMITS.maxPendingObjects,
+      ),
+      maxPendingBytes: positiveInteger(
+        'maxPendingBytesPerSubscription',
+        options.maxPendingBytesPerSubscription ?? DEFAULT_FORWARD_LIMITS.maxPendingBytes,
+      ),
+    };
+  }
 
   private getTrack(key: string): Track {
     let track = this.tracks.get(key);
@@ -123,7 +185,7 @@ export class Relay {
       await conn.acceptSubscribe(requestId, alias, acceptParams ? { parameters: acceptParams } : undefined);
 
       const track = this.getTrack(key);
-      const sub: Subscriber = { conn, requestId, alias, queue: Promise.resolve(), subgroups: new Map() };
+      const sub = new Subscriber(conn, requestId, alias, this.forwardLimits);
       track.subscribers.push(sub);
       log(`subscriber joined ${name} (alias=${alias}, requestId=${requestId}); ${track.subscribers.length} now`);
 
@@ -138,10 +200,10 @@ export class Relay {
       } else if (track.cache.length > 0) {
         log(`replaying ${track.cache.length} cached object(s) of group ${track.cacheGroupId} to the new ${name} subscriber`);
         for (const c of track.cache) {
-          sub.queue = sub.queue.then(() => forwardObject(sub, c.groupId, c.subgroupId, c.objectId, c.payload));
+          this.enqueueObject(track, sub, c);
         }
         for (const skey of track.cacheClosedSubgroups) {
-          sub.queue = sub.queue.then(() => closeSubscriberSubgroup(sub, skey));
+          sub.forwarder.enqueueClose(skey);
         }
       }
     } catch (err) {
@@ -174,11 +236,21 @@ export class Relay {
           track.cache = [];
           track.cacheClosedSubgroups.clear();
         }
-        track.cache.push({ groupId: obj.groupId, subgroupId: obj.subgroupId, objectId: obj.objectId, payload: obj.payload });
-        // Live fanout (identity preserved), serialized per subscriber.
+        const extensions = obj.properties ?? obj.extensions;
+        track.cache.push({
+          groupId: obj.groupId,
+          subgroupId: obj.subgroupId,
+          objectId: obj.objectId,
+          payload: obj.payload,
+          extensions,
+        });
+        // Live fanout (identity preserved), ordered per subgroup. Independent
+        // subgroup streams may advance concurrently up to the configured bound.
         const { groupId, subgroupId, objectId, payload } = obj;
-        for (const sub of track.subscribers) {
-          sub.queue = sub.queue.then(() => forwardObject(sub, groupId, subgroupId, objectId, payload));
+        for (const sub of [...track.subscribers]) {
+          this.enqueueObject(track, sub, {
+            groupId, subgroupId, objectId, payload, extensions,
+          });
         }
       };
       publish.onSubgroupClosed = (header) => {
@@ -187,10 +259,9 @@ export class Relay {
           track.cacheClosedSubgroups.add(skey);
         }
         // onSubgroupClosed follows the final onObject from this incoming stream.
-        // Append the close to each subscriber's queue so every corresponding
-        // downstream send settles before its FIN is written.
-        for (const sub of track.subscribers) {
-          sub.queue = sub.queue.then(() => closeSubscriberSubgroup(sub, skey));
+        // Its lane keeps FIN behind that subgroup's final downstream send.
+        for (const sub of [...track.subscribers]) {
+          sub.forwarder.enqueueClose(skey);
         }
       };
     } catch (err) {
@@ -290,6 +361,22 @@ export class Relay {
     return undefined;
   }
 
+  private enqueueObject(track: Track, sub: Subscriber, fields: ForwardObjectFields): void {
+    const skey = subgroupKey(fields.groupId, fields.subgroupId);
+    const retainedBytes = fields.payload.byteLength + (fields.extensions?.byteLength ?? 0);
+    const result = sub.forwarder.enqueueObject(skey, fields, retainedBytes);
+    if (result.status !== 'overloaded') return;
+    const reason = `subscriber requestId=${sub.requestId} cannot keep up: ${result.reason}`;
+    log(`${reason}; closing its connection`);
+    // A WebTransport connection may own several track subscriptions. Once one
+    // subscription has exceeded its bounded backlog, stop all work for that
+    // connection before initiating the asynchronous session close.
+    this.removeConn(sub.conn);
+    void sub.conn.close(SessionError.INTERNAL_ERROR, reason).catch((err) => {
+      console.error('[relay] SLOW SUBSCRIBER CLOSE ERROR:', (err as Error).message);
+    });
+  }
+
   /** A single subscription was cancelled (subscriber reset its SUBSCRIBE stream) —
    *  drop ONLY that subscription (ABR quality-switch), keep the connection. */
   removeSubscription(conn: MoqtConnection, requestId: bigint): void {
@@ -297,8 +384,8 @@ export class Relay {
       const i = track.subscribers.findIndex((s) => s.conn === conn && s.requestId === requestId);
       if (i < 0) continue;
       const [sub] = track.subscribers.splice(i, 1);
-      // Close the subgroups AFTER any queued forwards drain (chain, don't race).
-      sub!.queue = sub!.queue.then(() => closeAllSubgroups(sub!));
+      // Finish already-queued forwards in subgroup order, then FIN each stream.
+      void sub!.forwarder.retire();
       log(`subscription requestId=${requestId} unsubscribed; ${track.subscribers.length} subscriber(s) remain on this track`);
       return; // (conn, requestId) is unique to one subscription
     }
@@ -307,11 +394,12 @@ export class Relay {
   /** Drop every subscription belonging to a closed/lost connection. */
   removeConn(conn: MoqtConnection): void {
     for (const track of this.tracks.values()) {
-      const before = track.subscribers.length;
-      const kept = track.subscribers.filter((s) => s.conn !== conn);
-      if (kept.length !== before) {
+      const removed = track.subscribers.filter((s) => s.conn === conn);
+      if (removed.length > 0) {
+        for (const sub of removed) sub.forwarder.abort();
+        const kept = track.subscribers.filter((s) => s.conn !== conn);
         track.subscribers = kept;
-        log(`removed ${before - kept.length} subscriber(s) on close; ${kept.length} remain on this track`);
+        log(`removed ${removed.length} subscriber(s) on close; ${kept.length} remain on this track`);
       }
     }
   }
@@ -353,7 +441,7 @@ async function serveFetchFromCache(
   for (const c of servable) {
     await conn.sendFetchObject(sid, {
       groupId: c.groupId, subgroupId: c.subgroupId, objectId: c.objectId,
-      publisherPriority: 128, payload: c.payload,
+      publisherPriority: 128, extensions: c.extensions, payload: c.payload,
     });
   }
   // §9.16.3: if no objects exist in the range, the stream carries only the
@@ -364,22 +452,33 @@ async function serveFetchFromCache(
 
 /** Forward ONE object to one subscriber, preserving identity: reuse (or lazily open) an
  *  outgoing subgroup for this `(groupId, subgroupId)` and send at the original objectId.
+ *  The first object fixes whether the outgoing subgroup carries Properties/Extensions.
+ *  Later property-free objects are representable as empty blocks; properties cannot
+ *  first appear after a property-free subgroup header is already on the wire.
  *  Errors are logged loudly (never hidden) — a short subscriber fails the smoke. */
 async function forwardObject(
   sub: Subscriber,
-  groupId: bigint,
-  subgroupId: bigint,
-  objectId: bigint,
-  payload: Uint8Array,
+  fields: ForwardObjectFields,
 ): Promise<void> {
   try {
+    const { groupId, subgroupId, objectId, payload, extensions } = fields;
     const skey = subgroupKey(groupId, subgroupId);
-    let sid = sub.subgroups.get(skey);
-    if (sid === undefined) {
-      sid = await sub.conn.openSubgroup(sub.alias, groupId, subgroupId, { publisherPriority: 128, firstObject: objectId === 0n });
-      sub.subgroups.set(skey, sid);
+    let subgroup = sub.subgroups.get(skey);
+    if (subgroup === undefined) {
+      const hasExtensions = extensions !== undefined;
+      const streamId = await sub.conn.openSubgroup(sub.alias, groupId, subgroupId, {
+        publisherPriority: 128,
+        firstObject: objectId === 0n,
+        hasExtensions,
+      });
+      subgroup = { streamId, hasExtensions };
+      sub.subgroups.set(skey, subgroup);
+    } else if (!subgroup.hasExtensions && extensions !== undefined) {
+      throw new Error(
+        `subgroup ${skey} opened without Properties/Extensions, but object ${objectId} carries them`,
+      );
     }
-    await sub.conn.sendObject(sid, objectId, payload);
+    await sub.conn.sendObject(subgroup.streamId, objectId, payload, extensions);
   } catch (err) {
     console.error('[relay] FORWARD ERROR (object dropped):', (err as Error).message);
   }
@@ -390,21 +489,19 @@ const subgroupKey = (groupId: bigint, subgroupId: bigint): string =>
 
 /** Close one outgoing subgroup after its queued objects have settled. */
 async function closeSubscriberSubgroup(sub: Subscriber, skey: string): Promise<void> {
-  const sid = sub.subgroups.get(skey);
-  if (sid === undefined) return;
+  const subgroup = sub.subgroups.get(skey);
+  if (subgroup === undefined) return;
   sub.subgroups.delete(skey);
   try {
-    await sub.conn.closeSubgroup(sid);
+    await sub.conn.closeSubgroup(subgroup.streamId);
   } catch (err) {
     console.error('[relay] SUBGROUP CLOSE ERROR:', (err as Error).message);
   }
 }
 
-/** Close all of a subscriber's open outgoing subgroups (on unsubscribe). */
-async function closeAllSubgroups(sub: Subscriber): Promise<void> {
-  const ids = [...sub.subgroups.values()];
-  sub.subgroups.clear();
-  for (const sid of ids) {
-    try { await sub.conn.closeSubgroup(sid); } catch { /* already gone */ }
+function positiveInteger(name: string, value: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new RangeError(`${name} must be a positive safe integer`);
   }
+  return value;
 }
