@@ -2399,13 +2399,28 @@ export class MoqtConnection {
 
   // ── receiver §10.11 terminal tracker (bounded, Stream-Count-driven) ──
 
+  /**
+   * True when a read on `reader` settled as done because THIS adapter cancelled it
+   * (PUBLISH_DONE early discard, FETCH cancel, session teardown). Every cancel site
+   * drops the reader from `dataStreamReaders` first, so a reader that is no longer
+   * registered under its stream id ended by our hand, not by a peer FIN: the bytes it
+   * had buffered mid-object are simply discarded. Without this, the object loop's
+   * pending read resolved `{done: true}` and was reported as a mid-object FIN — the
+   * session closed itself with PROTOCOL_VIOLATION on every TOO_FAR_BEHIND cut.
+   */
+  private readerWasDiscarded(streamId: bigint, reader: ReadableStreamDefaultReader<Uint8Array>): boolean {
+    return this.dataStreamReaders.get(streamId) !== reader;
+  }
+
   /** STOP_SENDING one incoming subgroup stream and drop its receiver state. */
   private async stopIncomingSubgroupStream(streamId: bigint): Promise<void> {
     this.incomingSubgroupAliases.delete(streamId);
     const reader = this.dataStreamReaders.get(streamId);
     if (reader) {
-      try { await reader.cancel(new Error('subscription terminated by PUBLISH_DONE — early discard')); } catch { /* closed */ }
+      // Drop the registration BEFORE cancelling: the object loop's pending read settles
+      // during the cancel, and readerWasDiscarded() is how it tells our discard from a FIN.
       this.dataStreamReaders.delete(streamId);
+      try { await reader.cancel(new Error('subscription terminated by PUBLISH_DONE — early discard')); } catch { /* closed */ }
     }
   }
 
@@ -3202,12 +3217,13 @@ export class MoqtConnection {
     if (streamId !== undefined) {
       const reader = this.dataStreamReaders.get(streamId);
       if (reader) {
+        // Unregister before cancelling (see readerWasDiscarded).
+        this.dataStreamReaders.delete(streamId);
         try {
           await reader.cancel(new Error('FETCH cancelled'));
         } catch {
           // Stream may already be closed
         }
-        this.dataStreamReaders.delete(streamId);
       }
       this.fetchStreams.delete(requestId as bigint);
       // The known open response stream is torn down HERE, so the marker that guards a
@@ -4648,12 +4664,13 @@ export class MoqtConnection {
           // In WebTransport, reader.cancel() sends STOP_SENDING.
           const reader = this.dataStreamReaders.get(action.streamId);
           if (reader) {
+            // Unregister before cancelling (see readerWasDiscarded).
+            this.dataStreamReaders.delete(action.streamId);
             try {
               await reader.cancel(new Error(`STOP_SENDING: ${action.error}`));
             } catch {
               // Stream may already be closed — ignore
             }
-            this.dataStreamReaders.delete(action.streamId);
           }
           break;
         }
@@ -5698,7 +5715,7 @@ export class MoqtConnection {
 
     try {
       // Phase 1: Accumulate bytes and decode the stream header
-      const headerResult = await this.readStreamHeader(reader, buf);
+      const headerResult = await this.readStreamHeader(reader, buf, streamId);
       if (!headerResult) {
         // Stream closed before header could be decoded
         // Stream closed before header could be decoded — non-fatal
@@ -5899,6 +5916,7 @@ export class MoqtConnection {
   private async readStreamHeader(
     reader: ReadableStreamDefaultReader<Uint8Array>,
     buf: Uint8Array,
+    streamId: bigint,
   ): Promise<
     | { type: 'subgroup' | 'fetch'; header: SubgroupHeader | FetchHeader; remaining: Uint8Array }
     | { type: 'discard' }
@@ -5951,7 +5969,7 @@ export class MoqtConnection {
       const { value, done } = await reader.read();
       if (done) {
         // §10.4: FIN with partial header bytes is mid-object
-        if (buf.length > 0) {
+        if (buf.length > 0 && !this.readerWasDiscarded(streamId, reader)) {
           // Stream FIN arrived mid-header parse — protocol violation
           this.closeSessionFatal('Stream FIN received mid-header');
         }
@@ -6054,6 +6072,10 @@ export class MoqtConnection {
       if (done) {
         // §10.4: "If a stream ends gracefully in the middle of a serialized
         // Object, the session SHOULD be closed with a PROTOCOL_VIOLATION."
+        // A read that settled because we cancelled the reader is not a FIN.
+        if (buf.length > 0 && this.readerWasDiscarded(streamId, reader)) {
+          return;
+        }
         if (buf.length > 0) {
           // Stream FIN arrived mid-object parse — protocol violation
           this.closeSessionFatal('Stream FIN received mid-object');
@@ -6169,7 +6191,7 @@ export class MoqtConnection {
       const { value, done } = await reader.read();
       if (done) {
         // §10.4: mid-object FIN → SHOULD close with PROTOCOL_VIOLATION
-        if (buf.length > 0) {
+        if (buf.length > 0 && !this.readerWasDiscarded(streamId, reader)) {
           this.closeSessionFatal('Fetch stream FIN received mid-object');
         }
         return;
@@ -6283,7 +6305,7 @@ export class MoqtConnection {
 
       const { value, done } = await reader.read();
       if (done) {
-        if (buf.length > 0) {
+        if (buf.length > 0 && !this.readerWasDiscarded(streamId, reader)) {
           this.closeSessionFatal('Fetch stream FIN received mid-object');
         }
         return;
