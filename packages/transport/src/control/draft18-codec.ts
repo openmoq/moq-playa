@@ -61,6 +61,7 @@ import type {
 import type { Location } from '../primitives/location.js';
 import { readVi64, writeVi64, vi64EncodingLength, MAX_VI64 } from '../primitives/vi64.js';
 import { ControlMessageType18, SetupOption18 } from './codes-18.js';
+import { MessageParam } from './parameters.js';
 import {
   encodeMessageParams18,
   decodeMessageParams18,
@@ -319,7 +320,16 @@ function toTypedParam(type: bigint, v: ParameterValue): MessageParamValue {
 
 function paramsToTyped(params: Parameters): MessageParams18 {
   const out = new Map<bigint, MessageParamValue[]>();
-  for (const [type, values] of params) out.set(type, values.map((v) => toTypedParam(type, v)));
+  for (const [type, values] of params) {
+    if (type === MessageParam.FORWARD) {
+      const value = values[0];
+      if (values.length !== 1 || typeof value !== 'bigint'
+          || (value !== 0n && value !== 1n)) {
+        throw new ProtocolViolationError('FORWARD must be exactly one value, 0 or 1');
+      }
+    }
+    out.set(type, values.map((v) => toTypedParam(type, v)));
+  }
   return out;
 }
 

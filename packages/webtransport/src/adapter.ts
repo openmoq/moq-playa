@@ -477,6 +477,22 @@ export class MoqtConnection {
    */
   onMessage?: (msg: ControlMessage) => void;
 
+  /**
+   * Called after the Forward State of one of our live outbound PUBLISHes changes
+   * through PUBLISH_OK / d18 REQUEST_OK or a peer REQUEST_UPDATE. A pause is
+   * reported immediately after the state changes, before any awaited response
+   * write, so the application can stop producing Objects promptly. A resume is
+   * reported only after any required acknowledgement is written. Use
+   * {@link getPublishForwardState} to read the current state.
+   *
+   * Exceptions from this observer are reported to `onError` and contained; they
+   * never interrupt protocol processing.
+   */
+  onPublishForwardStateChange?: (
+    requestId: bigint,
+    forward: boolean,
+  ) => void | Promise<void>;
+
   /** Called when the control stream or connection closes. */
   onClose?: (error?: number, reason?: string) => void;
 
@@ -1427,6 +1443,55 @@ export class MoqtConnection {
   }
 
   /**
+   * Emit a draft-14/16 PUBLISH as a two-phase transaction. Encoding happens
+   * before the control writer is touched, so a local encode failure can roll
+   * back without closing an otherwise healthy session. Once write() begins the
+   * outcome is ambiguous; retain cancellation provenance and fail closed because
+   * those drafts share one mandatory control stream.
+   */
+  private async emitLegacyPublishOrRollback(
+    requestId: bigint,
+    trackAlias: bigint,
+    actions: SessionOutboundAction[],
+  ): Promise<void> {
+    let bytes: Uint8Array;
+    try {
+      const send = actions.length === 1 && actions[0]?.type === 'send_control'
+        ? actions[0] as SendControlAction
+        : undefined;
+      if (!send || send.message.type !== 'PUBLISH') {
+        throw new Error('PUBLISH produced an unexpected outbound action');
+      }
+      bytes = this.codec.encode(send.message);
+      this.onQlogEvent?.({
+        type: 'control_message_created',
+        stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
+        length: bytes.byteLength,
+        message: send.message,
+      });
+    } catch (err) {
+      this.publisherAliasRequests.delete(trackAlias);
+      if (!this.session.rollbackUnsentPublish(requestId)) {
+        this.closeSessionFatal(
+          `could not preserve the request sequence after PUBLISH ${requestId} failed before emission`,
+        );
+      }
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+
+    try {
+      await this.controlWriter!.write(bytes);
+    } catch (err) {
+      this.publisherAliasRequests.delete(trackAlias);
+      this.session.rollbackRequest(requestId, { retainCancellationProvenance: true });
+      this.closeSessionFatal(
+        `control-stream write failed while publishing request ${requestId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  /**
    * Send the outbound SUBSCRIBE produced by `session.subscribe()`. draft-18 opens
    * the SUBSCRIBE's own bidi request stream (response correlates by it); draft-14/16
    * write it on the shared control stream. Split out so {@link subscribeTrack} can
@@ -1474,17 +1539,18 @@ export class MoqtConnection {
   }
 
   /**
-   * Initiate an outbound PUBLISH (draft-18 §10.10): push a track to the peer. We
-   * are the publisher — this opens a NEW bidi request stream, writes PUBLISH, and
-   * keeps the stream open for the REQUEST_OK / REQUEST_ERROR response, a local
-   * PUBLISH_DONE, and object data (sent via openSubgroup / sendObject / sendDatagram
-   * keyed by `trackAlias`). Objects MAY be sent before REQUEST_OK arrives.
+   * Initiate an outbound PUBLISH: push a track to the peer. Draft 14/16 write the
+   * request on the control stream; draft 18 opens a bidi request stream and keeps
+   * it open for the response and PUBLISH_DONE. Object data is sent through
+   * openSubgroup / sendObject / sendDatagram keyed by `trackAlias`.
    *
    * @param namespace Track namespace tuple
    * @param name Track name bytes
    * @param trackAlias Track Alias to advertise (full uint64-capable bigint)
    * @param options Optional PUBLISH parameters
    * @returns The request ID for this publish
+   * @see draft-ietf-moq-transport-14 §9.13
+   * @see draft-ietf-moq-transport-16 §9.13
    * @see draft-ietf-moq-transport-18 §10.10
    */
   async publish(
@@ -1504,7 +1570,7 @@ export class MoqtConnection {
       await this.openD18Request(requestId, publishMsg, () => this.publisherAliasRequests.delete(trackAlias));
       return requestId;
     }
-    await this.executeActions(actions);
+    await this.emitLegacyPublishOrRollback(requestId, trackAlias, actions);
     return requestId;
   }
 
@@ -1681,7 +1747,68 @@ export class MoqtConnection {
     return null;
   }
 
-  /** Route a draft-18 request-stream response through the standard pipeline. */
+  /**
+   * Current Forward State of one of our outbound PUBLISHes: `true` when the
+   * subscriber wants Objects, `false` when it set Forward State 0, `undefined`
+   * when `requestId` is not a live outbound PUBLISH.
+   */
+  getPublishForwardState(requestId: bigint): boolean | undefined {
+    const pub = this.session.getOutgoingPublish(requestId);
+    return pub === undefined ? undefined : pub.forwardState === ForwardState.ACTIVE;
+  }
+
+  /**
+   * The outbound PUBLISH whose Forward State `message` may change, or undefined:
+   * a PUBLISH_OK / REQUEST_OK names it by requestId, a REQUEST_UPDATE by
+   * existingRequestId (already stamped on draft-18 by the request stream).
+   */
+  private outboundPublishForwardTarget(message: {
+    type: string;
+    requestId?: bigint;
+    existingRequestId?: bigint;
+  }): bigint | undefined {
+    const target = message.type === 'REQUEST_UPDATE'
+      ? message.existingRequestId
+      : (message.type === 'PUBLISH_OK' || message.type === 'REQUEST_OK') ? message.requestId : undefined;
+    if (target === undefined || this.session.getOutgoingPublish(target) === undefined) {
+      return undefined;
+    }
+    return target;
+  }
+
+  /** Return the new Forward State when it moved from `before`. */
+  private changedPublishForwardState(
+    requestId: bigint | undefined,
+    before: boolean | undefined,
+  ): boolean | undefined {
+    if (requestId === undefined || before === undefined) return;
+    const after = this.getPublishForwardState(requestId);
+    return after !== undefined && after !== before ? after : undefined;
+  }
+
+  /** Report a Forward-State observer failure without letting `onError` escape. */
+  private reportPublishForwardObserverError(err: unknown): void {
+    try {
+      this.onError?.(err instanceof Error ? err : new Error(String(err)));
+    } catch { /* application observers cannot interrupt protocol processing */ }
+  }
+
+  /** Deliver a Forward-State transition without letting observers poison I/O. */
+  private notifyPublishForwardChange(requestId: bigint, forward: boolean): void {
+    const observer = this.onPublishForwardStateChange;
+    if (!observer) return;
+    try {
+      const result = observer(requestId, forward);
+      if (result) {
+        void Promise.resolve(result).catch((err) => {
+          this.reportPublishForwardObserverError(err);
+        });
+      }
+    } catch (err) {
+      this.reportPublishForwardObserverError(err);
+    }
+  }
+
   private async deliverRequestResponse(message: DecodedControlMessage, requestId: bigint): Promise<void> {
     // Stamp the stream-derived Request ID (codec leaves it absent on responses).
     const stamped = { ...message, requestId } as ControlMessage;
@@ -1727,7 +1854,13 @@ export class MoqtConnection {
     const suppress = this.handleRawSubControlMessage(stamped)
       || this.session.isCancelledRequest(requestId);
     if (!suppress) this.onMessage?.(stamped);
+    const fwdTarget = this.outboundPublishForwardTarget(stamped as { type: string; requestId?: bigint });
+    const fwdBefore = fwdTarget === undefined ? undefined : this.getPublishForwardState(fwdTarget);
     await this.executeActions(this.session.handleControlMessage(message, { requestId }));
+    const fwdAfter = this.changedPublishForwardState(fwdTarget, fwdBefore);
+    if (fwdTarget !== undefined && fwdAfter !== undefined) {
+      this.notifyPublishForwardChange(fwdTarget, fwdAfter);
+    }
     // §10.13: a FETCH_OK may complete the fetch (its data stream already FIN'd, in
     // the object-delivery-before-response order) — close the request bidi so the
     // fetcher's topology context does not leak.
@@ -1944,10 +2077,12 @@ export class MoqtConnection {
     const updateId = (message as { requestId: bigint }).requestId;
     const stamped = { ...message, existingRequestId: originalRequestId } as ControlMessage;
     this.onMessage?.(stamped);
+    const fwdBefore = this.getPublishForwardState(originalRequestId);
     const actions = this.session.handleControlMessage(stamped, {
       requestId: updateId,
       existingRequestId: originalRequestId,
     });
+    const fwdAfter = this.changedPublishForwardState(originalRequestId, fwdBefore);
     const closeAction = actions.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
     if (closeAction) {
       await this.executeActions(actions);
@@ -1955,8 +2090,21 @@ export class MoqtConnection {
       return;
     }
     const send = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
-    if (send) await this.uniPair!.writeOnRequest(originalRequestId, send.message);
+    // Queue the response before invoking application code. A reentrant observer
+    // may send PUBLISH_DONE, which must remain behind this update response on
+    // the request stream. Do not await yet: Forward=0 must still be reported
+    // promptly when the transport write is blocked.
+    const responseWrite = send
+      ? this.uniPair!.writeOnRequest(originalRequestId, send.message)
+      : Promise.resolve();
+    if (fwdAfter === false) this.notifyPublishForwardChange(originalRequestId, false);
+    await responseWrite;
     await this.executeActions(actions.filter((a) => a.type !== 'send_control'));
+    // A resume is exposed only after REQUEST_OK is on the wire. A rejected
+    // update leaves the Forward State unchanged and produces no transition.
+    if (send?.message.type !== 'REQUEST_ERROR' && fwdAfter === true) {
+      this.notifyPublishForwardChange(originalRequestId, true);
+    }
     // d18 §10.11: a FAILED subscription update terminates the subscription —
     // the adapter-owned transaction sends PUBLISH_DONE(UPDATE_FAILED) on this
     // same publish request stream and seals it.
@@ -4038,10 +4186,15 @@ export class MoqtConnection {
       if (retired !== undefined) return { requestId: retired, sub: undefined };
       return undefined; // unassociated (never ours, or aged out) — legacy path
     }
-    const sub = this.session.getIncomingSubscription(requestId)
-      ?? this.session.getOutgoingPublish(requestId);
+    const sub = this.publisherSubscriptionForRequest(requestId);
     if (sub && sub.state === SubscriptionState.TERMINATED) return { requestId, sub: undefined };
     return { requestId, sub };
+  }
+
+  /** Publisher-side subscription state for an adapter-owned request ID. */
+  private publisherSubscriptionForRequest(requestId: bigint): SubscriptionStateMachine | undefined {
+    return this.session.getIncomingSubscription(requestId)
+      ?? this.session.getOutgoingPublish(requestId);
   }
 
   /**
@@ -4077,10 +4230,10 @@ export class MoqtConnection {
 
   /**
    * Begin a publisher data-plane operation on `trackAlias`: refuse if the
-   * subscription is terminated, else SYNCHRONOUSLY reserve the in-flight slot
-   * (so a concurrent publishDone sees it and refuses) and return the
-   * association. Balanced by {@link endPublishOp} in a finally. Returns
-   * undefined for an unassociated alias (legacy unaccounted use).
+   * subscription is terminated, terminating, or has Forward State 0, else
+   * SYNCHRONOUSLY reserve the in-flight slot (so a concurrent publishDone sees
+   * it and refuses) and return the association. Balanced by
+   * {@link endPublishOp} in a finally.
    */
   private beginPublishOp(
     trackAlias: bigint,
@@ -4108,6 +4261,12 @@ export class MoqtConnection {
         { errorSource: 'data' },
       );
     }
+    if (assoc.sub.forwardState !== ForwardState.ACTIVE) {
+      throw new MoqtConnectionError(
+        `${what}: the subscription for track alias ${trackAlias} has Forward State 0 — no Objects may be sent (§5.1)`,
+        { errorSource: 'data' },
+      );
+    }
     this.pendingPublishOps.set(assoc.requestId, (this.pendingPublishOps.get(assoc.requestId) ?? 0) + 1);
     // Capture the generation now — and SEED the entry so that a later missing
     // entry is unambiguous: it can only mean terminal teardown cleared the
@@ -4117,14 +4276,20 @@ export class MoqtConnection {
     return { requestId: assoc.requestId, sub: assoc.sub, generation };
   }
 
-  /** Whether the captured op generation is still current (not cancelled).
+  /** Whether the captured op is still current and permitted to send Objects.
    *  A missing entry means terminal teardown cleared the map — STALE, never
-   *  the default generation — and a terminal connection is never current. */
+   *  the default generation. A Forward=0 transition while an async open is
+   *  pending also invalidates it before any Object data can be emitted. */
   private publisherOpCurrent(requestId: bigint, generation: number): boolean {
     if (this.publisherOpsTerminal) return false;
     const current = this.publisherGeneration.get(requestId);
     if (current === undefined) return false;
-    return current === generation;
+    const sub = this.publisherSubscriptionForRequest(requestId);
+    return current === generation
+      && !this.terminatingPublisherRequests.has(requestId)
+      && sub !== undefined
+      && sub.state !== SubscriptionState.TERMINATED
+      && sub.forwardState === ForwardState.ACTIVE;
   }
 
   /** Release an in-flight publisher operation reserved by {@link beginPublishOp}. */
@@ -4299,14 +4464,16 @@ export class MoqtConnection {
       }
       const writer = writable.getWriter();
 
-      // §5.1.1: if the subscription was cancelled while we awaited the transport
-      // stream, this open is stale — abort the fresh writer and reject WITHOUT
-      // writing a header, registering the stream, or counting it. Nothing for
-      // the cancelled subscription reaches the wire.
+      // A cancellation or Forward=0 transition while the transport open was
+      // pending makes this operation stale. Abort the fresh writer and reject
+      // WITHOUT writing a header, registering the stream, or counting it.
       if (assoc && !this.publisherOpCurrent(assoc.requestId, assoc.generation)) {
-        try { await writer.abort(new Error('subgroup open cancelled before header (§5.1.1)')); } catch { /* already gone */ }
+        const paused = this.publisherSubscriptionForRequest(assoc.requestId)?.forwardState === ForwardState.PAUSED;
+        try { await writer.abort(new Error('subgroup open no longer permitted before header (§5.1)')); } catch { /* already gone */ }
         throw new MoqtConnectionError(
-          `openSubgroup: subscription for track alias ${trackAlias} was cancelled while opening the stream (§5.1.1)`,
+          paused
+            ? `openSubgroup: subscription for track alias ${trackAlias} changed to Forward State 0 while opening the stream (§5.1)`
+            : `openSubgroup: subscription for track alias ${trackAlias} was cancelled while opening the stream (§5.1.1)`,
           { errorSource: 'data' },
         );
       }
@@ -4376,13 +4543,16 @@ export class MoqtConnection {
         const headerBytes = d18 ? encodeSubgroupHeader18(header) : encodeSubgroupHeader(header);
         await writer.write(headerBytes);
 
-        // §5.1.1: a cancellation that raced the header write (bumping the
-        // generation) must NOT leave a live stream for a dead subscription.
-        // Recheck AFTER the write; if stale, abort and reject (count retained).
+        // A cancellation or pause racing the header write must not leave a live
+        // stream authorized to carry Objects. Recheck AFTER the write; if stale,
+        // abort and reject (the Stream Count remains retained).
         if (assoc && !this.publisherOpCurrent(assoc.requestId, assoc.generation)) {
-          await dropStreamKeepingCount(new Error('subgroup open cancelled during header write (§5.1.1)'));
+          const paused = this.publisherSubscriptionForRequest(assoc.requestId)?.forwardState === ForwardState.PAUSED;
+          await dropStreamKeepingCount(new Error('subgroup open no longer permitted during header write (§5.1)'));
           throw new MoqtConnectionError(
-            `openSubgroup: subscription for track alias ${trackAlias} was cancelled while writing the header (§5.1.1)`,
+            paused
+              ? `openSubgroup: subscription for track alias ${trackAlias} changed to Forward State 0 while writing the header (§5.1)`
+              : `openSubgroup: subscription for track alias ${trackAlias} was cancelled while writing the header (§5.1.1)`,
             { errorSource: 'data' },
           );
         }
@@ -4445,6 +4615,21 @@ export class MoqtConnection {
         `sendObject: stream ${streamId} belongs to a terminating subscription — no further objects (§10.11)`,
         { errorSource: 'data' },
       );
+    }
+    if (state.subscriptionRequestId !== undefined) {
+      const sub = this.publisherSubscriptionForRequest(state.subscriptionRequestId);
+      if (!sub || sub.state === SubscriptionState.TERMINATED) {
+        throw new MoqtConnectionError(
+          `sendObject: stream ${streamId} belongs to a terminated subscription — no further Objects (§10.11)`,
+          { errorSource: 'data' },
+        );
+      }
+      if (sub.forwardState !== ForwardState.ACTIVE) {
+        throw new MoqtConnectionError(
+          `sendObject: stream ${streamId} belongs to a subscription with Forward State 0 — no Objects may be sent (§5.1)`,
+          { errorSource: 'data' },
+        );
+      }
     }
 
     const obj = { objectId, extensions, payload, status: undefined };
@@ -4867,9 +5052,29 @@ export class MoqtConnection {
           const subBefore = message.type === 'SUBSCRIBE'
             ? this.session.getIncomingSubscription((message as Subscribe).requestId)
             : undefined;
+          // Forward State of our outbound PUBLISH before the subscriber's
+          // PUBLISH_OK / REQUEST_UPDATE is applied, so a change can be reported.
+          const fwdTarget = this.outboundPublishForwardTarget(message as {
+            type: string;
+            requestId?: bigint;
+            existingRequestId?: bigint;
+          });
+          const fwdBefore = fwdTarget === undefined ? undefined : this.getPublishForwardState(fwdTarget);
           const actions = this.session.handleControlMessage(message);
-          await this.executeActions(actions);
+          const fwdAfter = this.changedPublishForwardState(fwdTarget, fwdBefore);
+          // Start protocol output before invoking application code. A pause
+          // observer may terminalize the PUBLISH reentrantly; queuing the update
+          // response first preserves control-message order while still exposing
+          // Forward=0 before a blocked write settles.
+          const actionExecution = this.executeActions(actions);
+          if (fwdTarget !== undefined && fwdAfter === false) {
+            this.notifyPublishForwardChange(fwdTarget, false);
+          }
+          await actionExecution;
           await doneDiscard;
+          if (fwdTarget !== undefined && fwdAfter === true) {
+            this.notifyPublishForwardChange(fwdTarget, true);
+          }
           // Fire AFTER session processing so incomingSubscriptions is populated
           // when acceptSubscribe is called (§5.1: admission = a NEW SM identity,
           // and the session did not close on this message).

@@ -1697,14 +1697,20 @@ export class Session {
     );
   }
 
-  /** Apply a publish-acceptance's response parameters (PUBLISH_OK / d18
-   *  REQUEST_OK) to our outbound publish: FORWARD, SUBSCRIPTION_FILTER, and
-   *  delivery timeouts — the subscriber's choices govern this subscription. */
+  /**
+   * Apply a publish acceptance's parameters to our outbound publish. FORWARD
+   * defaults to 1 when omitted from PUBLISH_OK / d18 REQUEST_OK; filter and
+   * delivery-timeout parameters apply only when present.
+   */
   private applyPublishAcceptanceParams(sub: SubscriptionStateMachine, parameters: Parameters | undefined): void {
     const fwd = parameters?.get(MessageParam.FORWARD)?.[0];
-    if (typeof fwd === 'bigint') {
-      sub.updateForwardState(fwd === 0n ? ForwardState.PAUSED : ForwardState.ACTIVE);
-    }
+    // FORWARD omitted from an acceptance defaults to 1. Only omission from a
+    // REQUEST_UPDATE preserves the existing state (§9.2.2.8 / d18 §10.2.12).
+    sub.updateForwardState(
+      typeof fwd === 'bigint' && fwd === 0n
+        ? ForwardState.PAUSED
+        : ForwardState.ACTIVE,
+    );
     const filter = parameters?.get(MessageParam.SUBSCRIPTION_FILTER)?.[0];
     if (filter instanceof Uint8Array) {
       try { sub.setRemoteFilterType(decodeSubscriptionFilter(filter, this._draftVersion).type); }
@@ -2688,6 +2694,8 @@ export class Session {
       );
     }
 
+    const requestedForward = this.normalizeLocalForwardState(options.forward, 'SUBSCRIBE');
+
     const requestId = this.requestIdAllocator.allocate();
 
     const sub = SubscriptionStateMachine.createAsSubscriber(requestId, namespace, name);
@@ -2711,11 +2719,11 @@ export class Session {
     if (options.groupOrder !== undefined) {
       parameters.set(MessageParam.GROUP_ORDER, [options.groupOrder]);
     }
-    if (options.forward !== undefined) {
+    if (requestedForward !== undefined) {
       // §9.2.2.8: FORWARD MAY appear in SUBSCRIBE — initial forward state.
       // Both peers must agree: mirror it into OUR state machine too.
-      parameters.set(MessageParam.FORWARD, [varint(BigInt(options.forward))]);
-      sub.setInitialForwardState(options.forward);
+      parameters.set(MessageParam.FORWARD, [varint(BigInt(requestedForward))]);
+      sub.setInitialForwardState(requestedForward);
     }
     if (options.subscriptionFilter !== undefined) {
       const filterBytes = encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
@@ -2739,10 +2747,11 @@ export class Session {
   }
 
   /**
-   * Initiate an outbound PUBLISH (draft-18 §10.10). We are the publisher: this
+   * Initiate an outbound PUBLISH. We are the publisher: this
    * allocates a Request ID, records publisher-side subscription state with the
    * advertised Track Alias (PENDING until the peer's REQUEST_OK), and produces a
-   * PUBLISH control message. The I/O layer opens a dedicated bidi request stream.
+   * PUBLISH control message. Draft 14/16 use the control stream; draft 18 opens
+   * a dedicated bidi request stream.
    *
    * `trackAlias` is a full uint64-capable bigint; the draft-18 encoder accepts the
    * whole range, while draft-14/16 encoders still range-check it.
@@ -2752,6 +2761,8 @@ export class Session {
    * @param trackAlias The Track Alias the publisher advertises for this track
    * @param options Optional PUBLISH `parameters` and draft-18 `trackProperties`
    *   (§2.5; non-empty Track Properties on draft-14/16 throw).
+   * @see draft-ietf-moq-transport-14 §9.13
+   * @see draft-ietf-moq-transport-16 §9.13
    * @see draft-ietf-moq-transport-18 §10.10
    */
   publish(
@@ -2769,6 +2780,13 @@ export class Session {
         this._newSessionUri ?? '',
       );
     }
+
+    // Sender-side API validation must precede request-ID allocation and every
+    // state mutation. The wire value is binary in every supported draft;
+    // treating an arbitrary non-zero value as ACTIVE would emit a malformed
+    // PUBLISH and leave a locally-authorized subscription behind if encoding
+    // later rejected it.
+    this.assertLocalForwardParameter(options.parameters, 'PUBLISH');
 
     const trackProperties = this.resolveTrackProperties(options.trackProperties, 'PUBLISH');
 
@@ -2877,6 +2895,7 @@ export class Session {
     options: RequestUpdateOptions = {},
   ): RequestResult {
     this.assertEstablishedOrDraining('requestUpdate');
+    const requestedForward = this.normalizeLocalForwardState(options.forward, 'REQUEST_UPDATE');
 
     // draft-18 §10.9.2: a prefix update targets an outbound SUBSCRIBE_NAMESPACE /
     // SUBSCRIBE_TRACKS request (tracked in separate maps, not `subscriptions`).
@@ -2920,8 +2939,8 @@ export class Session {
     const parameters: Parameters = new Map();
 
     // FORWARD parameter
-    if (options.forward !== undefined) {
-      parameters.set(MessageParam.FORWARD, [varint(BigInt(options.forward))]);
+    if (requestedForward !== undefined) {
+      parameters.set(MessageParam.FORWARD, [varint(BigInt(requestedForward))]);
     } else if (this._draftVersion === 14) {
       // Draft-14 §9.10: Forward is a mandatory inline field.
       // Replay current value to avoid unintentional state change.
@@ -2974,8 +2993,8 @@ export class Session {
     if (this._draftVersion === 14) {
       // Draft-14 §9.10: "There is no control message in response to a
       // SUBSCRIBE_UPDATE." Apply state changes immediately.
-      if (options.forward !== undefined) {
-        sub.updateForwardState(options.forward);
+      if (requestedForward !== undefined) {
+        sub.updateForwardState(requestedForward);
       }
       if (options.objectDeliveryTimeout !== undefined) {
         sub.requestedDeliveryTimeoutMs = Number(options.objectDeliveryTimeout);
@@ -2987,9 +3006,8 @@ export class Session {
         existingRequestId: bigint; forward?: ForwardStateValue;
         objectDeliveryTimeoutMs?: number; subgroupDeliveryTimeoutMs?: number;
       } = { existingRequestId: existingRequestId as bigint };
-      if (options.forward !== undefined) {
-        // Normalize: callers pass boolean or ForwardStateValue; state is 0/1.
-        pending.forward = options.forward ? ForwardState.ACTIVE : ForwardState.PAUSED;
+      if (requestedForward !== undefined) {
+        pending.forward = requestedForward;
       }
       if (options.objectDeliveryTimeout !== undefined) pending.objectDeliveryTimeoutMs = Number(options.objectDeliveryTimeout);
       if (options.subgroupDeliveryTimeout !== undefined) pending.subgroupDeliveryTimeoutMs = Number(options.subgroupDeliveryTimeout);
@@ -4311,6 +4329,17 @@ export class Session {
     if (!retain) this.recentlyCancelled.delete(requestId as bigint);
   }
 
+  /**
+   * Roll back an outbound PUBLISH whose bytes were proven not to leave this
+   * endpoint. Legacy drafts require gap-free Request IDs, so the allocation is
+   * reusable only when no later request was allocated reentrantly.
+   */
+  rollbackUnsentPublish(requestId: bigint): boolean {
+    if (!this.outgoingPublishes.has(requestId as bigint)) return false;
+    this.rollbackRequest(requestId);
+    return this.requestIdAllocator.releaseUnsent(requestId);
+  }
+
   handleOutboundRequestClosed(requestId: bigint): SessionOutboundAction[] {
     const sub = this.subscriptions.get(requestId as bigint);
     if (sub) {
@@ -4572,6 +4601,13 @@ export class Session {
       );
     }
 
+    if (sub.isPublishInitiated) {
+      // PUBLISH_OK / REQUEST_OK is the subscriber's Forward-State authority.
+      // Reject local misuse before sendSubscribeOk() establishes the state
+      // machine or installs any alias authority.
+      this.assertLocalForwardParameter(options.parameters, 'PUBLISH acceptance');
+    }
+
     // Validate ALL misuse up-front, BEFORE any state mutation: draft-14/16 Track
     // Properties, and Track Properties on a PUBLISH acceptance (which is a
     // REQUEST_OK / PUBLISH_OK, not a SUBSCRIBE_OK — §10.10). sendSubscribeOk()
@@ -4597,30 +4633,43 @@ export class Session {
       // If the cancellation itself forced a session close (superseded-set at
       // capacity), return ONLY the close — do NOT also append an acceptance.
       if (preActions.some((a) => a.type === 'close_connection')) return preActions;
-      // WE are the subscriber accepting this PUBLISH: our response parameters
-      // (FORWARD, SUBSCRIPTION_FILTER, priorities, timeouts) define the
-      // subscription state on BOTH ends — apply FORWARD locally too, so the
-      // joining gates here agree with what the acceptance communicates.
-      const acceptFwd = options.parameters?.get(MessageParam.FORWARD)?.[0];
-      if (typeof acceptFwd === 'bigint') {
-        sub.updateForwardState(acceptFwd === 0n ? ForwardState.PAUSED : ForwardState.ACTIVE);
+      let responseParameters: Parameters;
+      if (this._draftVersion === 18) {
+        responseParameters = options.parameters ?? new Map();
+      } else {
+        // Draft-14/16 §9.14: derived initial-state fields first, with caller-
+        // supplied response parameters taking precedence.
+        responseParameters = this.buildPublishOkParamsFromPublish(sub.publishParameters);
+        for (const [key, values] of options.parameters ?? new Map()) {
+          responseParameters.set(key, values);
+        }
       }
+
+      // Apply the exact value communicated on the wire, including the default
+      // of 1 when FORWARD is absent, so the two endpoints cannot disagree.
+      const acceptFwd = responseParameters.get(MessageParam.FORWARD)?.[0];
+      sub.updateForwardState(
+        typeof acceptFwd === 'bigint' && acceptFwd === 0n
+          ? ForwardState.PAUSED
+          : ForwardState.ACTIVE,
+      );
+
       if (this._draftVersion === 18) {
         // draft-18 §10.10: PUBLISH_OK is REQUEST_OK shorthand (wire 0x07, no
         // Request ID); the I/O layer writes it on the inbound PUBLISH request
         // stream, not the control stream. Caller-supplied response parameters
         // ride it verbatim.
-        const requestOk: RequestOk = { type: 'REQUEST_OK', requestId, parameters: options.parameters ?? new Map() };
+        const requestOk: RequestOk = {
+          type: 'REQUEST_OK',
+          requestId,
+          parameters: responseParameters,
+        };
         return [...preActions, this.sendControl(requestOk)];
       }
-      // Draft-14/16 §9.14: respond with PUBLISH_OK — derived initial-state
-      // fields first, caller-supplied response parameters taking precedence.
-      const params = this.buildPublishOkParamsFromPublish(sub.publishParameters);
-      for (const [k, v] of options.parameters ?? new Map()) params.set(k, v);
       const publishOk: PublishOk = {
         type: 'PUBLISH_OK',
         requestId,
-        parameters: params,
+        parameters: responseParameters,
       };
       return [...preActions, this.sendControl(publishOk)];
     }
@@ -4747,10 +4796,12 @@ export class Session {
       );
     }
 
+    const requestedForward = this.normalizeLocalForwardState(options.forward, 'REQUEST_UPDATE');
+
     const requestId = this.requestIdAllocator.allocate();
     const parameters: Parameters = new Map();
-    if (options.forward !== undefined) {
-      parameters.set(MessageParam.FORWARD, [varint(BigInt(options.forward))]);
+    if (requestedForward !== undefined) {
+      parameters.set(MessageParam.FORWARD, [varint(BigInt(requestedForward))]);
     }
     if (options.subscriberPriority !== undefined) {
       parameters.set(MessageParam.SUBSCRIBER_PRIORITY, [options.subscriberPriority]);
@@ -4766,8 +4817,8 @@ export class Session {
     // Stage ALL changes on the pending record — applied on REQUEST_OK, never at send.
     this.pendingUpdates.set(requestId as bigint, {
       existingRequestId,
-      ...(options.forward !== undefined
-        ? { forward: options.forward ? ForwardState.ACTIVE : ForwardState.PAUSED }
+      ...(requestedForward !== undefined
+        ? { forward: requestedForward }
         : {}),
       ...(options.objectDeliveryTimeout !== undefined
         ? { objectDeliveryTimeoutMs: Number(options.objectDeliveryTimeout) }
@@ -5119,6 +5170,33 @@ export class Session {
       }
     }
     return undefined;
+  }
+
+  /** Validate a locally-authored binary FORWARD parameter before side effects. */
+  private assertLocalForwardParameter(params: Parameters | undefined, context: string): void {
+    const values = params?.get(MessageParam.FORWARD);
+    if (values === undefined) return;
+    if (values.length !== 1 || typeof values[0] !== 'bigint'
+        || (values[0] !== 0n && values[0] !== 1n)) {
+      throw new SessionError(
+        `${context}: FORWARD must be exactly one value, 0 or 1`,
+        'INVALID_STATE',
+      );
+    }
+  }
+
+  /** Normalize a locally-authored Forward State before allocating request state. */
+  private normalizeLocalForwardState(
+    forward: unknown,
+    context: string,
+  ): ForwardStateValue | undefined {
+    if (forward === undefined) return undefined;
+    if (forward === false || forward === ForwardState.PAUSED) return ForwardState.PAUSED;
+    if (forward === true || forward === ForwardState.ACTIVE) return ForwardState.ACTIVE;
+    throw new SessionError(
+      `${context}: Forward State must be 0 or 1`,
+      'INVALID_STATE',
+    );
   }
 
   /**

@@ -31,6 +31,7 @@ import type {
 import { varint } from '../primitives/varint.js';
 import { readVarint } from '../primitives/varint.js';
 import { MessageType } from './codes.js';
+import { MessageParam } from './parameters.js';
 import { ProtocolViolationError } from '../errors.js';
 
 /**
@@ -502,6 +503,19 @@ describe('encoder: bounds checks', () => {
 });
 
 describe('encoder: sender-side duplicate validation', () => {
+  it('rejects a non-binary FORWARD value before writing wire bytes', () => {
+    const msg: Publish = {
+      type: 'PUBLISH',
+      requestId: varint(0),
+      trackNamespace: [new Uint8Array([0x6c, 0x69, 0x76, 0x65])],
+      trackName: new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f]),
+      trackAlias: varint(1),
+      parameters: new Map([[MessageParam.FORWARD, [varint(2n)]]]),
+      trackExtensions: new Map(),
+    };
+    expect(() => encodeControlMessage(msg)).toThrow(/FORWARD.*0 or 1/);
+  });
+
   it('throws if DELIVERY_TIMEOUT appears multiple times', () => {
     const params = new Map();
     params.set(varint(0x02), [varint(500), varint(600)]); // DELIVERY_TIMEOUT duplicated

@@ -591,11 +591,16 @@ describe('joining fetch against an outbound PUBLISH subscription', () => {
     expect(range.endLocation).toEqual({ group: 4n, object: 3n });
   });
 
-  it('applies the PUBLISH FORWARD parameter — an established Forward-0 publish rejects the join with INVALID_RANGE (§10.12.2)', () => {
+  it('applies the acceptance FORWARD — an established Forward-0 publish rejects the join with INVALID_RANGE (§10.12.2)', () => {
     const session = serverSession(18);
     const { requestId } = session.publish(NS, NAME, 77n, { parameters: pubParams(0n) });
-    // The peer accepts: REQUEST_OK establishes the publish-initiated subscription.
-    session.handleControlMessage({ type: 'REQUEST_OK', requestId: varint(requestId as bigint), parameters: new Map() } as never);
+    // The subscriber explicitly keeps the publish paused. An omitted acceptance
+    // FORWARD would instead apply the protocol default of 1.
+    session.handleControlMessage({
+      type: 'REQUEST_OK',
+      requestId: varint(requestId as bigint),
+      parameters: new Map([[MessageParam.FORWARD, [varint(0n)]]]),
+    } as never);
     const actions = session.handleControlMessage(incomingJoiningFetch(0n, requestId as bigint, 0x2));
     const err = actions.find((a) => a.type === 'send_control'
       && (a as SendControlAction).message.type === 'REQUEST_ERROR') as SendControlAction | undefined;
@@ -665,6 +670,26 @@ describe('Forward 0→1 resume provider semantics', () => {
 });
 
 describe('publish-acceptance parameter application', () => {
+  for (const draft of [16, 18] as const) {
+    it(`d${draft}: an omitted PUBLISH_OK FORWARD applies the protocol default of ACTIVE`, () => {
+      const session = serverSession(draft);
+      const { requestId } = session.publish(NS, NAME, 77n, {
+        parameters: new Map([[MessageParam.FORWARD as bigint, [0n]]]) as Parameters,
+      });
+      expect(session.getOutgoingPublish(requestId as bigint)?.forwardState).toBe(0);
+
+      session.handleControlMessage({
+        type: draft === 18 ? 'REQUEST_OK' : 'PUBLISH_OK',
+        requestId: varint(requestId as bigint),
+        parameters: new Map(),
+      } as never);
+
+      // FORWARD omitted from PUBLISH_OK defaults to 1. Only omission from a
+      // REQUEST_UPDATE leaves the current state unchanged (§9.2.2.8 / §10.2.12).
+      expect(session.getOutgoingPublish(requestId as bigint)?.forwardState).toBe(1);
+    });
+  }
+
   it('d18 REQUEST_OK applies FORWARD to the outbound publish — a Forward-0 acceptance pauses it', () => {
     const session = serverSession(18);
     const { requestId } = session.publish(NS, NAME, 77n, {
@@ -765,14 +790,49 @@ describe('inbound PUBLISH initial Forward State', () => {
     expect(session.getIncomingSubscription(0n)?.forwardState).toBe(1);   // override applied
   });
 
-  it('with NO acceptance override the PUBLISH state persists through acceptance', () => {
+  it('d18 PUBLISH_OK without FORWARD applies the ACTIVE default locally', () => {
     const session = serverSession(18);
     session.handleControlMessage({
       type: 'PUBLISH', requestId: varint(0n), trackNamespace: NS, trackName: NAME,
       trackAlias: varint(50n), parameters: new Map([[MessageParam.FORWARD as bigint, [0n]]]), trackProperties: new Map(),
     } as never);
-    session.acceptSubscribe(0n, 50n);
-    expect(session.getIncomingSubscription(0n)?.forwardState).toBe(0);   // still PAUSED
+    const actions = session.acceptSubscribe(0n, 50n);
+    const ok = (actions.find((a) => a.type === 'send_control') as SendControlAction).message as {
+      type: string;
+      parameters: Parameters;
+    };
+    expect(ok.type).toBe('REQUEST_OK');
+    expect(ok.parameters.has(MessageParam.FORWARD as bigint)).toBe(false);
+    expect(session.getIncomingSubscription(0n)?.forwardState).toBe(1);
+  });
+
+  it('rejects invalid local PUBLISH Forward values before allocating request state', () => {
+    const invalidValues: Array<Array<bigint | Uint8Array>> = [
+      [2n],
+      [new Uint8Array([0])],
+      [0n, 1n],
+    ];
+    for (const values of invalidValues) {
+      const session = clientSession(16);
+      expect(() => session.publish(NS, NAME, 77n, {
+        parameters: new Map([[MessageParam.FORWARD as bigint, values]]) as Parameters,
+      })).toThrow(/FORWARD must be exactly one value, 0 or 1/);
+      expect(session.getOutgoingPublish(0n)).toBeUndefined();
+      expect(session.publish(NS, NAME, 77n).requestId).toBe(0n);
+    }
+  });
+
+  it('rejects an invalid local PUBLISH acceptance before establishing it', () => {
+    const session = serverSession(18);
+    session.handleControlMessage({
+      type: 'PUBLISH', requestId: varint(0n), trackNamespace: NS, trackName: NAME,
+      trackAlias: varint(50n), parameters: new Map(), trackProperties: new Map(),
+    } as never);
+
+    expect(() => session.acceptSubscribe(0n, 50n, {
+      parameters: new Map([[MessageParam.FORWARD as bigint, [2n]]]) as Parameters,
+    })).toThrow(/FORWARD must be exactly one value, 0 or 1/);
+    expect(session.getIncomingSubscription(0n)?.state).toBe('pending');
   });
 });
 

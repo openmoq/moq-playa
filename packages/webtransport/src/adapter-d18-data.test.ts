@@ -9,7 +9,7 @@
  * via the same vi64 `pack` helper used by the decoder unit tests; the publisher
  * send path uses the real d18 encoders and is verified by decoding the bytes.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { MoqtConnection } from './adapter.js';
 import { TransportSim, flush } from './testkit/stream-sim.js';
 import {
@@ -17,6 +17,7 @@ import {
   writeVi64,
   vi64EncodingLength,
   varint,
+  MessageParam,
   StreamType18,
   PADDING_DATAGRAM_TYPE,
   DatagramFlags18,
@@ -2012,6 +2013,135 @@ describe('MoqtConnection(18) outbound PUBLISH (§10.10)', () => {
     const { message } = codec18.decode(transport.bidi[0]!.writtenBytes(), 0) as { message: { type: string; trackProperties?: Map<bigint, unknown> } };
     expect(message.type).toBe('PUBLISH');
     expect(message.trackProperties).toEqual(trackProperties);
+  });
+
+  it('REQUEST_OK Forward State 0 then a peer REQUEST_UPDATE FORWARD=1 report pause and resume (§5.1 / §9.5)', async () => {
+    const { conn, transport } = await connected();
+    const changes: [bigint, boolean][] = [];
+    let resumeWriteOffset: number | undefined;
+    let ackVisibleAtCallback = false;
+    conn.onPublishForwardStateChange = (id, fwd) => {
+      changes.push([id, fwd]);
+      if (fwd && resumeWriteOffset !== undefined) {
+        ackVisibleAtCallback = transport.bidi[0]!.writtenBytes()[resumeWriteOffset] === 0x07;
+      }
+    };
+    // d18 §5.1: resuming 0→1 makes the REQUEST_OK carry the current Largest Location.
+    conn.setLargestLocationProvider(() => ({ group: 0n, object: 0n }));
+    const forwardParams = (forward: bigint) => new Map([[MessageParam.FORWARD, [varint(forward)]]]);
+
+    const requestId = await conn.publish(ns('a'), nm('vid'), 42n);
+    expect(conn.getPublishForwardState(requestId)).toBe(true);
+    transport.bidi[0]!.push(codec18.encode({ type: 'REQUEST_OK', requestId: 0n, parameters: forwardParams(0n) } as RequestOk));
+    await flush();
+    expect(changes).toEqual([[requestId, false]]);
+    expect(conn.getPublishForwardState(requestId)).toBe(false);
+
+    resumeWriteOffset = transport.bidi[0]!.writtenBytes().length;
+    transport.bidi[0]!.push(codec18.encode({ type: 'REQUEST_UPDATE', requestId: 3n, parameters: forwardParams(1n) } as never));
+    await flush();
+    expect(changes).toEqual([[requestId, false], [requestId, true]]);
+    expect(conn.getPublishForwardState(requestId)).toBe(true);
+    expect(ackVisibleAtCallback).toBe(true);
+  });
+
+  it('an omitted PUBLISH_OK FORWARD resumes an initially paused publish', async () => {
+    const { conn, transport } = await connected();
+    const changes: [bigint, boolean][] = [];
+    conn.onPublishForwardStateChange = (id, forward) => changes.push([id, forward]);
+
+    const requestId = await conn.publish(ns('a'), nm('vid'), 42n, {
+      parameters: new Map([[MessageParam.FORWARD, [varint(0n)]]]),
+    });
+    expect(conn.getPublishForwardState(requestId)).toBe(false);
+
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'REQUEST_OK', requestId: 0n, parameters: new Map(),
+    } as RequestOk));
+    await flush();
+
+    expect(changes).toEqual([[requestId, true]]);
+    expect(conn.getPublishForwardState(requestId)).toBe(true);
+  });
+
+  it('refuses datagrams while Forward State is 0 and permits them after acceptance resumes', async () => {
+    const { conn, transport } = await connected();
+    const requestId = await conn.publish(ns('a'), nm('vid'), 42n, {
+      parameters: new Map([[MessageParam.FORWARD, [varint(0n)]]]),
+    });
+
+    await expect(conn.sendDatagram(42n, 0n, 0n, new Uint8Array([0x01])))
+      .rejects.toThrow(/Forward State 0/);
+    expect(transport.sentDatagrams).toEqual([]);
+
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'REQUEST_OK', requestId: 0n, parameters: new Map(),
+    } as RequestOk));
+    await flush();
+    await conn.sendDatagram(42n, 0n, 0n, new Uint8Array([0x02]));
+    expect(transport.sentDatagrams).toHaveLength(1);
+    expect(conn.getPublishForwardState(requestId)).toBe(true);
+  });
+
+  it('reports a pause before waiting for the request-stream REQUEST_OK write', async () => {
+    const { conn, transport } = await connected();
+    const requestId = await conn.publish(ns('a'), nm('vid'), 42n);
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'REQUEST_OK', requestId: 0n, parameters: new Map(),
+    } as RequestOk));
+    await flush();
+
+    const internal = conn as unknown as {
+      uniPair: { writeOnRequest(requestId: bigint, message: unknown): Promise<void> };
+    };
+    const original = internal.uniPair.writeOnRequest.bind(internal.uniPair);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    vi.spyOn(internal.uniPair, 'writeOnRequest').mockImplementation(async (id, message) => {
+      await gate;
+      await original(id, message);
+    });
+    const changes: boolean[] = [];
+    conn.onPublishForwardStateChange = (_id, forward) => changes.push(forward);
+
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'REQUEST_UPDATE', requestId: 3n,
+      parameters: new Map([[MessageParam.FORWARD, [varint(0n)]]]),
+    } as never));
+    await flush();
+
+    expect(conn.getPublishForwardState(requestId)).toBe(false);
+    expect(changes).toEqual([false]);
+    release();
+    await flush();
+    expect(changes).toEqual([false]);
+  });
+
+  it('queues REQUEST_OK before a pause observer terminalizes the publish', async () => {
+    const { conn, transport } = await connected();
+    const requestId = await conn.publish(ns('a'), nm('vid'), 42n);
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'REQUEST_OK', requestId: 0n, parameters: new Map(),
+    } as RequestOk));
+    await flush();
+
+    const writeOffset = transport.bidi[0]!.writtenBytes().length;
+    let terminal: Promise<void> | undefined;
+    conn.onPublishForwardStateChange = (_id, forward) => {
+      if (!forward) terminal = conn.publishDone(requestId, varint(0n), 'paused');
+    };
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'REQUEST_UPDATE', requestId: 3n,
+      parameters: new Map([[MessageParam.FORWARD, [varint(0n)]]]),
+    } as never));
+    await flush();
+    await terminal;
+
+    const responseBytes = transport.bidi[0]!.writtenBytes().slice(writeOffset);
+    const first = codec18.decode(responseBytes, 0);
+    const second = codec18.decode(responseBytes, first.bytesRead);
+    expect([first.message.type, second.message.type]).toEqual(['REQUEST_OK', 'PUBLISH_DONE']);
+    expect(first.bytesRead + second.bytesRead).toBe(responseBytes.length);
   });
 
   it('REQUEST_OK on the PUBLISH stream is stamped to the publish requestId and keeps the stream open', async () => {

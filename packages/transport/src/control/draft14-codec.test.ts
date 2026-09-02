@@ -826,6 +826,28 @@ describe('Draft14Codec', () => {
       }
     });
 
+    it('decodes a hand-built PUBLISH with Content Exists and preserves its Largest Location', () => {
+      const largest = loc(7n, 11n);
+      const payload = concat(
+        vi(1),
+        tuple([enc.encode('live')]),
+        lpb(enc.encode('video')),
+        vi(42),
+        new Uint8Array([0x02]),       // Group Order = descending
+        new Uint8Array([0x01]),       // Content Exists = 1
+        largest,
+        new Uint8Array([0x00]),       // Forward = 0
+        buildParams(new Map()),
+      );
+
+      const { message } = codec.decode(frameVarint(0x1d, payload), 0);
+      expect(message.type).toBe('PUBLISH');
+      const publish = message as Publish;
+      expect(publish.parameters.get(MessageParam.GROUP_ORDER)).toEqual([2n]);
+      expect(publish.parameters.get(MessageParam.FORWARD)).toEqual([0n]);
+      expect(publish.parameters.get(MessageParam.LARGEST_OBJECT)).toEqual([largest]);
+    });
+
     it('rejects PUBLISH with invalid Content Exists value (§9.13)', () => {
       const params = new Map<Varint, KvpValue[]>();
       const payload = concat(
@@ -1185,6 +1207,103 @@ describe('Draft14Codec', () => {
     });
   });
 
+  describe('PUBLISH encoding (§9.13)', () => {
+    it('round-trips inline state and preserves Largest Location', () => {
+      const largest: Location = { group: varint(7n), object: varint(11n) };
+      const largestBytes = new Uint8Array(locationEncodingLength(largest));
+      writeLocation(largest, largestBytes, 0);
+      const msg: Publish = {
+        type: 'PUBLISH',
+        requestId: varint(5n),
+        trackNamespace: [enc.encode('live')],
+        trackName: enc.encode('video'),
+        trackAlias: varint(42n),
+        parameters: new Map([
+          [MessageParam.GROUP_ORDER, [varint(2n)]],
+          [MessageParam.LARGEST_OBJECT, [largestBytes]],
+          [MessageParam.FORWARD, [varint(0n)]],
+        ]),
+        trackExtensions: new Map(),
+      };
+
+      const bytes = codec.encode(msg);
+      expect(readVarint(bytes, 0).value).toBe(0x1dn);
+      const { message } = codec.decode(bytes, 0);
+      expect(message.type).toBe('PUBLISH');
+      const publish = message as Publish;
+      expect(publish.requestId).toBe(5n);
+      expect(publish.trackNamespace).toEqual([enc.encode('live')]);
+      expect(publish.trackName).toEqual(enc.encode('video'));
+      expect(publish.trackAlias).toBe(42n);
+      expect(publish.parameters.get(MessageParam.GROUP_ORDER)).toEqual([2n]);
+      expect(publish.parameters.get(MessageParam.FORWARD)).toEqual([0n]);
+      expect(publish.parameters.get(MessageParam.LARGEST_OBJECT)).toEqual([largestBytes]);
+    });
+
+    it('uses compliant inline defaults when optional normalized parameters are absent', () => {
+      const msg: Publish = {
+        type: 'PUBLISH',
+        requestId: varint(1n),
+        trackNamespace: [enc.encode('live')],
+        trackName: enc.encode('video'),
+        trackAlias: varint(2n),
+        parameters: new Map(),
+        trackExtensions: new Map(),
+      };
+
+      const { message } = codec.decode(codec.encode(msg), 0);
+      expect(message.type).toBe('PUBLISH');
+      const publish = message as Publish;
+      expect(publish.parameters.get(MessageParam.GROUP_ORDER)).toEqual([1n]);
+      expect(publish.parameters.get(MessageParam.FORWARD)).toEqual([1n]);
+      expect(publish.parameters.has(MessageParam.LARGEST_OBJECT)).toBe(false);
+    });
+
+    it('rejects invalid inline Forward and Group Order values', () => {
+      const publish = (parameters: Publish['parameters']): Publish => ({
+        type: 'PUBLISH',
+        requestId: varint(1n),
+        trackNamespace: [enc.encode('live')],
+        trackName: enc.encode('video'),
+        trackAlias: varint(2n),
+        parameters,
+        trackExtensions: new Map(),
+      });
+
+      expect(() => codec.encode(publish(new Map([
+        [MessageParam.FORWARD, [varint(2n)]],
+      ])))).toThrow(/FORWARD must be 0 or 1/);
+      expect(() => codec.encode(publish(new Map([
+        [MessageParam.GROUP_ORDER, [varint(0n)]],
+      ])))).toThrow(/GROUP_ORDER must be Ascending.*or Descending/);
+      expect(() => codec.encode(publish(new Map([
+        [MessageParam.GROUP_ORDER, [varint(3n)]],
+      ])))).toThrow(/GROUP_ORDER must be Ascending.*or Descending/);
+      expect(() => codec.encode(publish(new Map([
+        [MessageParam.FORWARD, [varint(1n), varint(0n)]],
+      ])))).toThrow(/FORWARD must contain exactly one integer/);
+      expect(() => codec.encode(publish(new Map([
+        [MessageParam.GROUP_ORDER, [new Uint8Array([1])]],
+      ])))).toThrow(/GROUP_ORDER must contain exactly one integer/);
+    });
+
+    it('rejects a malformed Largest Location value', () => {
+      const msg: Publish = {
+        type: 'PUBLISH',
+        requestId: varint(1n),
+        trackNamespace: [enc.encode('live')],
+        trackName: enc.encode('video'),
+        trackAlias: varint(2n),
+        parameters: new Map([
+          [MessageParam.LARGEST_OBJECT, [new Uint8Array([0x00])]],
+        ]),
+        trackExtensions: new Map(),
+      };
+
+      expect(() => codec.encode(msg)).toThrow(/LARGEST_OBJECT must contain exactly one Location/);
+    });
+  });
+
   describe('PUBLISH_OK encoding (§9.14)', () => {
     it('encodes PUBLISH_OK with inline fields', () => {
       /**
@@ -1279,6 +1398,35 @@ describe('Draft14Codec', () => {
       pos++;
       // Group Order (8) — must be 0x1 (Ascending), not 0x0
       expect(bytes[pos]).toBe(1);
+    });
+
+    it('rejects invalid mandatory Forward and Group Order values', () => {
+      const publishOk = (key: bigint, value: bigint): PublishOk => ({
+        type: 'PUBLISH_OK',
+        requestId: varint(1n),
+        parameters: new Map([[key, [varint(value)]]]),
+      });
+
+      expect(() => codec.encode(publishOk(MessageParam.FORWARD, 2n)))
+        .toThrow(/FORWARD must be 0 or 1/);
+      expect(() => codec.encode(publishOk(MessageParam.GROUP_ORDER, 0n)))
+        .toThrow(/GROUP_ORDER must be Ascending.*or Descending/);
+      expect(() => codec.encode(publishOk(MessageParam.GROUP_ORDER, 3n)))
+        .toThrow(/GROUP_ORDER must be Ascending.*or Descending/);
+      expect(() => codec.encode({
+        type: 'PUBLISH_OK',
+        requestId: varint(1n),
+        parameters: new Map([
+          [MessageParam.FORWARD, [varint(0n), varint(1n)]],
+        ]),
+      })).toThrow(/FORWARD must contain exactly one integer/);
+      expect(() => codec.encode({
+        type: 'PUBLISH_OK',
+        requestId: varint(1n),
+        parameters: new Map([
+          [MessageParam.SUBSCRIBER_PRIORITY, [new Uint8Array([128])]],
+        ]),
+      })).toThrow(/SUBSCRIBER_PRIORITY must contain exactly one integer/);
     });
   });
 

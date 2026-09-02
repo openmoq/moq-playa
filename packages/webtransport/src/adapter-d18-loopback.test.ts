@@ -631,14 +631,14 @@ describe('MoqtConnection loopback — failed subscription REQUEST_UPDATE termina
 });
 
 describe('MoqtConnection(18) loopback — deterministic failed-update termination', () => {
-  /** Establish a paused (FORWARD 0) subscription on a provider-less server. */
-  async function pausedPair() {
+  /** Establish an active subscription on a provider-less server. */
+  async function activePair() {
     const pair = await connectedPair();
     let subReqId = -1n;
     pair.server.onSubscribe = (rid) => { subReqId = rid; };
     const clientMsgs: ControlMessage[] = [];
     pair.client.onMessage = (m) => clientMsgs.push(m);
-    const reqId = await pair.client.subscribe(ns('live'), nm('vid'), { forward: 0 } as never);
+    const reqId = await pair.client.subscribe(ns('live'), nm('vid'), { forward: 1 } as never);
     await flush();
     await pair.server.acceptSubscribe(subReqId, 7n, {
       parameters: new Map([[0x09n, [{ group: 5n, object: 1n }]]]) as never,
@@ -646,10 +646,15 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     await flush();
     return { ...pair, subReqId, reqId, clientMsgs };
   }
+  async function pausePair(pair: Awaited<ReturnType<typeof activePair>>): Promise<void> {
+    await pair.client.requestUpdate(pair.reqId, { forward: 0 });
+    await flush();
+  }
   const doneMsgs = (msgs: ControlMessage[]) => msgs.filter((m) => m.type === 'PUBLISH_DONE') as Array<{ statusCode: bigint }>;
 
   it('a HELD createUnidirectionalStream defers the terminal deterministically; release aborts the op and PUBLISH_DONE flows', async () => {
-    const { client, server, b, subReqId, reqId, clientMsgs, errors } = await pausedPair();
+    const pair = await activePair();
+    const { client, server, b, subReqId, reqId, clientMsgs, errors } = pair;
     // Hold the server transport's NEXT uni-stream open indefinitely.
     const origCreate = b.createUnidirectionalStream.bind(b);
     let release: (() => void) | null = null;
@@ -658,6 +663,7 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     const heldOpen = server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
     heldOpen.catch(() => { /* expected: self-invalidated */ });
     await flush();
+    await pausePair(pair);
 
     // The failed resume: REQUEST_ERROR flows, but the terminal WAITS on the
     // reservation barrier (no timers, no arbitrary turn budget).
@@ -688,7 +694,8 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     // stream we cannot prove was reset. Announcing a clean end anyway would let
     // the deferred FIN reach the peer AFTER the terminal — so the transaction
     // must terminate the SESSION instead of sending PUBLISH_DONE.
-    const { client, server, b, subReqId, reqId, clientMsgs } = await pausedPair();
+    const pair = await activePair();
+    const { client, server, b, subReqId, reqId, clientMsgs } = pair;
 
     // The next server subgroup stream accepts its header but its close() and
     // abort() both hang: the writer becomes unreachable but stays OPEN.
@@ -706,6 +713,7 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     const hungFin = server.closeSubgroup(sid);
     hungFin.catch(() => { /* never settles */ });
     await flush();
+    await pausePair(pair);
 
     await client.requestUpdate(reqId, { forward: 1 });
     // Wait past the abort deadline so the transaction reaches its decision.
@@ -724,7 +732,7 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     // The MUST-reset rule is not specific to the failed-update transaction: a
     // plain subscription cancellation that cannot reset its streams must close
     // the session too, or an unreset stream survives silently.
-    const { client, server, b, reqId } = await pausedPair();
+    const { client, server, b, reqId } = await activePair();
     const origCreate = b.createUnidirectionalStream.bind(b);
     (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
       async () => {
@@ -747,7 +755,8 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
   it('a fail-closed local reset closes with INTERNAL_ERROR, not PROTOCOL_VIOLATION', async () => {
     // Our inability to reset our own writer is not peer misconduct — blaming
     // the peer with PROTOCOL_VIOLATION would misattribute the failure.
-    const { client, server, b, reqId } = await pausedPair();
+    const pair = await activePair();
+    const { client, server, b, reqId } = pair;
     const closes: Array<{ code: number }> = [];
     const origClose = b.close.bind(b);
     (b as { close: (i?: { closeCode?: number; reason?: string }) => void }).close = (info) => {
@@ -765,6 +774,7 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
       };
     await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
     await flush();
+    await pausePair(pair);
 
     await client.requestUpdate(reqId, { forward: 1 });
     await flush(); await flush(); await flush();
@@ -779,7 +789,8 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     // The abort phase is bounded, but so must be the operation barrier: a
     // reservation that never settles would otherwise hold the transaction
     // forever, sending neither PUBLISH_DONE nor closing the session.
-    const { client, server, b, reqId, clientMsgs } = await pausedPair();
+    const pair = await activePair();
+    const { client, server, b, reqId, clientMsgs } = pair;
     // Hold the server's next uni-stream open forever: the reserved openSubgroup
     // never settles, so awaitPublisherOpsSettled would never resolve.
     (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
@@ -787,6 +798,7 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     const heldOpen = server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
     heldOpen.catch(() => { /* never settles */ });
     await flush();
+    await pausePair(pair);
 
     const start = Date.now();
     await client.requestUpdate(reqId, { forward: 1 });
@@ -803,7 +815,8 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
   it('a REJECTED stream reset also fails closed: no PUBLISH_DONE, session terminated (§5.1.1)', async () => {
     // The reset is unproven whether the abort hangs OR rejects — a writer whose
     // abort() failed is still an open transport stream.
-    const { client, server, b, reqId, clientMsgs } = await pausedPair();
+    const pair = await activePair();
+    const { client, server, b, reqId, clientMsgs } = pair;
     const origCreate = b.createUnidirectionalStream.bind(b);
     (b as { createUnidirectionalStream: () => Promise<unknown> }).createUnidirectionalStream =
       async () => {
@@ -815,6 +828,7 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
       };
     await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
     await flush();
+    await pausePair(pair);
 
     await client.requestUpdate(reqId, { forward: 1 });
     await flush(); await flush(); await flush();
@@ -827,10 +841,12 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
   it('a PROVEN stream reset proceeds to exactly one PUBLISH_DONE', async () => {
     // The positive counterpart: when every abort fulfils, the transaction must
     // still send exactly one clean terminal and leave the session established.
-    const { client, server, subReqId, reqId, clientMsgs, errors } = await pausedPair();
+    const pair = await activePair();
+    const { client, server, subReqId, reqId, clientMsgs, errors } = pair;
     const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
     await server.sendObject(sid, 0n, new Uint8Array([1, 2, 3]));
     await flush();
+    await pausePair(pair);
 
     await client.requestUpdate(reqId, { forward: 1 });
     await flush(); await flush(); await flush();
@@ -844,7 +860,9 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
   }, 15_000);
 
   it('a terminal WRITE failure is surfaced as a session failure — never a silent split-brain', async () => {
-    const { server, client, subReqId, reqId } = await pausedPair();
+    const pair = await activePair();
+    const { server, client, subReqId, reqId } = pair;
+    await pausePair(pair);
     const ctx = (server as unknown as { inboundRequestContexts: Map<bigint, { writeMessage(m: unknown): Promise<void> }> })
       .inboundRequestContexts.get(subReqId)!;
     const origWrite = ctx.writeMessage.bind(ctx);
@@ -864,7 +882,9 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     // A PUBLISH_DONE that hangs (rather than rejecting) leaves the peer
     // believing the subscription is established, so not-settling must be
     // treated exactly like a write failure — bounded, then fail closed.
-    const { server, client, b, subReqId, reqId, clientMsgs, errors } = await pausedPair();
+    const pair = await activePair();
+    const { server, client, b, subReqId, reqId, clientMsgs, errors } = pair;
+    await pausePair(pair);
     const closes: number[] = [];
     const origClose = b.close.bind(b);
     (b as { close: (i?: { closeCode?: number; reason?: string }) => void }).close = (info) => {
@@ -901,7 +921,9 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
   }, 20_000);
 
   it('a concurrent prior termination is idempotent — exactly one PUBLISH_DONE, no session failure', async () => {
-    const { client, server, subReqId, reqId, clientMsgs, errors } = await pausedPair();
+    const pair = await activePair();
+    const { client, server, subReqId, reqId, clientMsgs, errors } = pair;
+    await pausePair(pair);
     await client.requestUpdate(reqId, { forward: 1 });     // fails → terminates
     await flush(); await flush();
     expect(doneMsgs(clientMsgs)).toHaveLength(1);
@@ -919,19 +941,23 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
 });
 
 describe('MoqtConnection(18) loopback — publisher terminalization ownership', () => {
-  async function pausedPair22() {
+  async function activePair22() {
     const pair = await connectedPair();
     let subReqId = -1n;
     pair.server.onSubscribe = (rid) => { subReqId = rid; };
     const clientMsgs: ControlMessage[] = [];
     pair.client.onMessage = (m) => clientMsgs.push(m);
-    const reqId = await pair.client.subscribe(ns('live'), nm('vid'), { forward: 0 } as never);
+    const reqId = await pair.client.subscribe(ns('live'), nm('vid'), { forward: 1 } as never);
     await flush();
     await pair.server.acceptSubscribe(subReqId, 7n, {
       parameters: new Map([[0x09n, [{ group: 5n, object: 1n }]]]) as never,
     });
     await flush();
     return { ...pair, subReqId, reqId, clientMsgs };
+  }
+  async function pausePair22(pair: Awaited<ReturnType<typeof activePair22>>): Promise<void> {
+    await pair.client.requestUpdate(pair.reqId, { forward: 0 });
+    await flush();
   }
   type Internals = {
     outgoingStreams: Map<bigint, { writer: { abort(e?: unknown): Promise<void>; write(b: unknown): Promise<void> }; subscriptionRequestId?: bigint }>;
@@ -944,7 +970,8 @@ describe('MoqtConnection(18) loopback — publisher terminalization ownership', 
   const relatedStreams = (i: Internals, rid: bigint) => [...i.outgoingStreams.values()].filter((st) => st.subscriptionRequestId === rid);
 
   it('a HELD writer abort does not reopen the window: a new subgroup during the abort REJECTS and no stream survives DONE', async () => {
-    const { client, server, subReqId, reqId, clientMsgs, errors } = await pausedPair22();
+    const pair = await activePair22();
+    const { client, server, subReqId, reqId, clientMsgs, errors } = pair;
     const internals = server as unknown as Internals;
     // One open subgroup whose writer.abort() we hold.
     const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
@@ -954,6 +981,7 @@ describe('MoqtConnection(18) loopback — publisher terminalization ownership', 
     st.writer.abort = (e?: unknown) => new Promise<void>((resolve) => {
       releaseAbort = () => { void origAbort(e).catch(() => {}); resolve(); };
     });
+    await pausePair22(pair);
     // Termination begins; the abort is held mid-transaction…
     const updateP = client.requestUpdate(reqId, { forward: 1 });
     await flush();
@@ -974,7 +1002,7 @@ describe('MoqtConnection(18) loopback — publisher terminalization ownership', 
   });
 
   it('a held createUnidirectionalStream released AFTER session close: the open rejects and every publisher map stays empty', async () => {
-    const { server, b, subReqId } = await pausedPair22();
+    const { server, b, subReqId } = await activePair22();
     const internals = server as unknown as Internals;
     const origCreate = b.createUnidirectionalStream.bind(b);
     let release: (() => void) | null = null;
@@ -995,7 +1023,8 @@ describe('MoqtConnection(18) loopback — publisher terminalization ownership', 
   });
 
   it('a HELD sendObject write on another stream: DONE is sent with no related stream remaining; the late write cannot revive one', async () => {
-    const { client, server, subReqId, reqId, clientMsgs, errors } = await pausedPair22();
+    const pair = await activePair22();
+    const { client, server, subReqId, reqId, clientMsgs, errors } = pair;
     const internals = server as unknown as Internals;
     const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);
     const st = internals.outgoingStreams.get(sid)!;
@@ -1004,6 +1033,7 @@ describe('MoqtConnection(18) loopback — publisher terminalization ownership', 
     const writeP = server.sendObject(sid, 0n, new Uint8Array([1]));
     writeP.catch(() => { /* may reject on termination */ });
     await flush();
+    await pausePair22(pair);
     await client.requestUpdate(reqId, { forward: 1 });
     await flush(); await flush();
     expect(doneMsgs(clientMsgs)).toHaveLength(1);
@@ -1026,7 +1056,7 @@ describe('MoqtConnection(18) loopback — publisher terminalization ownership', 
   });
 
   it('two termination transactions racing behind a gate: one PUBLISH_DONE, no duplicate close, no leaked waiter', async () => {
-    const { server, subReqId, reqId, client, clientMsgs, errors } = await pausedPair22();
+    const { server, subReqId, reqId, client, clientMsgs, errors } = await activePair22();
     const internals = server as unknown as Internals;
     // Gate both transactions behind a held writer abort so they overlap.
     const sid = await server.openSubgroup(7n, 0n, 0n, { publisherPriority: 1 } as never);

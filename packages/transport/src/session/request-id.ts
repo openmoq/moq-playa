@@ -237,6 +237,20 @@ export class RequestIdAllocator {
   }
 
   /**
+   * Release the most recently allocated ID when its request was proven not to
+   * have reached the wire. Returns false if another allocation has already
+   * followed it, since rewinding in that case would reuse an exposed ID.
+   */
+  releaseUnsent(requestId: bigint): boolean {
+    if (requestId < 0n) return false;
+    if (this.nextOutgoingId !== requestId + 2n) return false;
+    if ((requestId & 1n) !== this.parityBit) return false;
+    this.nextOutgoingId = requestId;
+    this.blocked = false;
+    return true;
+  }
+
+  /**
    * Validate an incoming request ID from peer.
    *
    * Rules per §9.1:

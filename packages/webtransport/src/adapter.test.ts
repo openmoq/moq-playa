@@ -23,6 +23,7 @@ import {
   SessionError,
   EndpointRole,
   varint,
+  MessageParam,
   encodeSubgroupHeader,
   encodeSubgroupObject,
   decodeSubgroupHeader,
@@ -115,6 +116,8 @@ interface MockTransport {
   controlWritten: Uint8Array[];
   /** Make the NEXT control-stream write reject with the given error. */
   failNextControlWrite: (err: Error) => void;
+  /** Hold the NEXT control-stream write until the returned release function runs. */
+  holdNextControlWrite: () => () => void;
   /** Mock for transport.close(). */
   closeFn: ReturnType<typeof vi.fn>;
   /** Add an incoming unidirectional stream, returns push/close controls. */
@@ -140,8 +143,12 @@ function createMockTransport(): MockTransport {
   });
 
   let nextControlWriteError: Error | null = null;
+  let nextControlWriteGate: Promise<void> | null = null;
   const controlWritable = new WritableStream<Uint8Array>({
-    write(chunk) {
+    async write(chunk) {
+      const gate = nextControlWriteGate;
+      nextControlWriteGate = null;
+      if (gate) await gate;
       if (nextControlWriteError) {
         const err = nextControlWriteError;
         nextControlWriteError = null;
@@ -298,6 +305,11 @@ function createMockTransport(): MockTransport {
     closeControlReadable,
     controlWritten,
     failNextControlWrite: (err: Error) => { nextControlWriteError = err; },
+    holdNextControlWrite: () => {
+      let release!: () => void;
+      nextControlWriteGate = new Promise<void>((resolve) => { release = resolve; });
+      return release;
+    },
     closeFn,
     addIncomingStream,
     pushDatagram,
@@ -2501,7 +2513,7 @@ describe('MoqtConnection draft-14', () => {
   /** Helper: connect a draft-14 adapter and complete the setup handshake. */
   async function connectV14Adapter(mock: MockTransport): Promise<MoqtConnection> {
     const adapter = new MoqtConnection(14);
-    const connectPromise = adapter.connect(mock.transport);
+    const connectPromise = adapter.connect(mock.transport, { maxRequestId: varint(100n) });
     await flush();
     mock.pushControlBytes(encodeServerSetupV14());
     await connectPromise;
@@ -2512,6 +2524,134 @@ describe('MoqtConnection draft-14', () => {
     const mock = createMockTransport();
     const adapter = await connectV14Adapter(mock);
     expect(adapter).toBeDefined();
+  });
+
+  it('reports PUBLISH_OK and SUBSCRIBE_UPDATE Forward State changes', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectV14Adapter(mock);
+    const codec = createControlCodec(14);
+    const changes: [bigint, boolean][] = [];
+    adapter.onPublishForwardStateChange = (requestId, forward) => {
+      changes.push([requestId, forward]);
+    };
+    adapter.onClose = (code, reason) => {
+      throw new Error(`session closed: ${code} ${reason}`);
+    };
+
+    const requestId = await adapter.publish(
+      [new TextEncoder().encode('media')],
+      new TextEncoder().encode('video'),
+      42n,
+    );
+    mock.pushControlBytes(codec.encode({
+      type: 'PUBLISH_OK',
+      requestId: varint(requestId),
+      parameters: new Map([[MessageParam.FORWARD, [varint(0n)]]]),
+    } as ControlMessage));
+    await deepFlush();
+
+    expect(changes).toEqual([[requestId, false]]);
+    expect(adapter.getPublishForwardState(requestId)).toBe(false);
+
+    const writesBeforeUpdate = mock.controlWritten.length;
+    mock.pushControlBytes(codec.encode({
+      type: 'REQUEST_UPDATE',
+      requestId: varint(1n),
+      existingRequestId: varint(requestId),
+      parameters: new Map([[MessageParam.FORWARD, [varint(1n)]]]),
+    } as ControlMessage));
+    await deepFlush();
+
+    // Draft 14 applies SUBSCRIBE_UPDATE without an acknowledgement (§9.10).
+    expect(mock.controlWritten).toHaveLength(writesBeforeUpdate);
+    expect(changes).toEqual([[requestId, false], [requestId, true]]);
+    expect(adapter.getPublishForwardState(requestId)).toBe(true);
+  });
+
+  it.each([14, 16] as const)(
+    'draft-%i reuses the Request ID after PUBLISH encoding fails before emission',
+    async (draft) => {
+      const mock = createMockTransport();
+      const adapter = draft === 14
+        ? await connectV14Adapter(mock)
+        : await connectAdapter(mock);
+      const internal = adapter as unknown as {
+        codec: { encode(message: ControlMessage): Uint8Array };
+      };
+      const encode = vi.spyOn(internal.codec, 'encode')
+        .mockImplementationOnce(() => { throw new Error('injected PUBLISH encode failure'); });
+      const writesBefore = mock.controlWritten.length;
+
+      await expect(adapter.publish(
+        [new TextEncoder().encode('media')],
+        new TextEncoder().encode('video'),
+        42n,
+      )).rejects.toThrow(/injected PUBLISH encode failure/);
+
+      expect(mock.controlWritten).toHaveLength(writesBefore);
+      expect(adapter.session.getOutgoingPublish(0n)).toBeUndefined();
+      expect(adapter.session.state).toBe(SessionState.ESTABLISHED);
+      await expect(adapter.openSubgroup(42n, 0n, 0n)).rejects.toThrow(/unknown track alias/);
+      encode.mockRestore();
+
+      const nextRequestId = await adapter.publish(
+        [new TextEncoder().encode('media')],
+        new TextEncoder().encode('video'),
+        42n,
+      );
+      expect(nextRequestId).toBe(0n);
+      expect(mock.controlWritten).toHaveLength(writesBefore + 1);
+      expect(adapter.session.getOutgoingPublish(nextRequestId)).toBeDefined();
+    },
+  );
+
+  it('fails closed when reentrant allocation prevents an unsent PUBLISH rollback', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    let reentrantPublish: Promise<bigint> | undefined;
+    adapter.onQlogEvent = (event) => {
+      if (event.type !== 'control_message_created'
+          || event.message.type !== 'PUBLISH') return;
+      adapter.onQlogEvent = undefined;
+      reentrantPublish = adapter.publish(
+        [new TextEncoder().encode('media')],
+        new TextEncoder().encode('backup'),
+        43n,
+      );
+      throw new Error('injected qlog failure after reentrant allocation');
+    };
+
+    await expect(adapter.publish(
+      [new TextEncoder().encode('media')],
+      new TextEncoder().encode('video'),
+      42n,
+    )).rejects.toThrow(/injected qlog failure/);
+    await reentrantPublish?.catch(() => undefined);
+
+    expect(adapter.session.state).toBe(SessionState.CLOSED);
+    expect(adapter.session.getOutgoingPublish(0n)).toBeUndefined();
+    const internal = adapter as unknown as {
+      publisherAliasRequests: Map<bigint, bigint>;
+    };
+    expect(internal.publisherAliasRequests.size).toBe(0);
+    await expect(adapter.openSubgroup(42n, 0n, 0n)).rejects.toThrow();
+    await expect(adapter.openSubgroup(43n, 0n, 0n)).rejects.toThrow();
+  });
+
+  it('fails closed and revokes alias authority when a draft-14 PUBLISH write is ambiguous', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectV14Adapter(mock);
+    mock.failNextControlWrite(new Error('injected PUBLISH write failure'));
+
+    await expect(adapter.publish(
+      [new TextEncoder().encode('media')],
+      new TextEncoder().encode('video'),
+      42n,
+    )).rejects.toThrow(/injected PUBLISH write failure/);
+
+    expect(adapter.session.getOutgoingPublish(0n)).toBeUndefined();
+    expect(adapter.session.state).not.toBe(SessionState.ESTABLISHED);
+    await expect(adapter.openSubgroup(42n, 0n, 0n)).rejects.toThrow();
   });
 
   // ─── Legacy SUBSCRIBE_OK validation precedes resolution ────────────
@@ -6126,5 +6266,264 @@ describe('terminal drain — review findings (alias reuse, completion race, shut
     await tflush2();
     await vi.advanceTimersByTimeAsync(10_001);
     await tflush2();                                     // would surface unhandled rejection if not contained
+  });
+});
+
+// ─── Outbound PUBLISH Forward State (§5.1 / §8.5) ──────────────────────────
+
+describe('outbound PUBLISH forward state (draft-16)', () => {
+  const enc = (s: string) => new TextEncoder().encode(s);
+  const forwardParams = (forward: bigint) => new Map([[MessageParam.FORWARD, [varint(forward)]]]);
+
+  async function publishedWithChanges(initialForward?: bigint): Promise<{
+    adapter: MoqtConnection; mock: MockTransport; requestId: bigint; changes: [bigint, boolean][];
+  }> {
+    const mock = createMockTransport();
+    // Advertise a request-ID budget so the relay's own REQUEST_UPDATE (id 1, 3) is in range.
+    const adapter = new MoqtConnection();
+    const connectPromise = adapter.connect(mock.transport, { maxRequestId: varint(100) });
+    await flush();
+    mock.pushControlBytes(encodeServerSetup());
+    await connectPromise;
+    const changes: [bigint, boolean][] = [];
+    adapter.onPublishForwardStateChange = (id, fwd) => changes.push([id, fwd]);
+    adapter.onClose = (code, reason) => { throw new Error(`session closed: ${code} ${reason}`); };
+    const requestId = await adapter.publish(
+      [enc('media'), enc('avn')],
+      enc('catalog'),
+      0n,
+      initialForward === undefined ? undefined : { parameters: forwardParams(initialForward) },
+    );
+    await flush();
+    return { adapter, mock, requestId, changes };
+  }
+
+  it('a PUBLISH_OK with Forward State 0 reports the pause and is readable', async () => {
+    const { adapter, mock, requestId, changes } = await publishedWithChanges();
+    expect(adapter.getPublishForwardState(requestId)).toBe(true); // §5.1 initial state from PUBLISH
+
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'PUBLISH_OK', requestId: varint(requestId), parameters: forwardParams(0n),
+    } as ControlMessage));
+    await deepFlush();
+
+    expect(changes).toEqual([[requestId, false]]);
+    expect(adapter.getPublishForwardState(requestId)).toBe(false);
+  });
+
+  it('an omitted PUBLISH_OK FORWARD resumes an initially paused publish', async () => {
+    const { adapter, mock, requestId, changes } = await publishedWithChanges(0n);
+    expect(adapter.getPublishForwardState(requestId)).toBe(false);
+
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
+    } as ControlMessage));
+    await deepFlush();
+
+    expect(changes).toEqual([[requestId, true]]);
+    expect(adapter.getPublishForwardState(requestId)).toBe(true);
+  });
+
+  it('a later peer REQUEST_UPDATE with FORWARD=1 reports the resume (§8.5: relay had no subscriber at PUBLISH time)', async () => {
+    const { adapter, mock, requestId, changes } = await publishedWithChanges();
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'PUBLISH_OK', requestId: varint(requestId), parameters: forwardParams(0n),
+    } as ControlMessage));
+    await deepFlush();
+
+    const writesBeforeUpdate = mock.controlWritten.length;
+    let ackVisibleAtCallback = false;
+    adapter.onPublishForwardStateChange = (id, fwd) => {
+      changes.push([id, fwd]);
+      if (fwd) {
+        ackVisibleAtCallback = mock.controlWritten.slice(writesBeforeUpdate).some((bytes) =>
+          decodeControlMessage(bytes, 0).message.type === 'REQUEST_OK');
+      }
+    };
+
+    // The relay's own update: server-initiated request IDs are odd.
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(1n), existingRequestId: varint(requestId), parameters: forwardParams(1n),
+    } as ControlMessage));
+    await deepFlush();
+
+    expect(changes).toEqual([[requestId, false], [requestId, true]]);
+    expect(ackVisibleAtCallback).toBe(true);
+    expect(adapter.getPublishForwardState(requestId)).toBe(true);
+  });
+
+  it('a REQUEST_UPDATE that does not change Forward State, or repeats it, is silent', async () => {
+    const { adapter, mock, requestId, changes } = await publishedWithChanges();
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(1n), existingRequestId: varint(requestId), parameters: new Map(),
+    } as ControlMessage));
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(3n), existingRequestId: varint(requestId), parameters: forwardParams(1n),
+    } as ControlMessage));
+    await deepFlush();
+
+    expect(changes).toEqual([]);
+    expect(adapter.getPublishForwardState(requestId)).toBe(true);
+    expect(adapter.getPublishForwardState(999n)).toBeUndefined();
+  });
+
+  it('refuses new subgroups and writes on an existing subgroup while Forward State is 0', async () => {
+    const { adapter, mock, requestId } = await publishedWithChanges();
+    const streamId = await adapter.openSubgroup(0n, 0n, 0n);
+    await adapter.sendObject(streamId, 0n, new Uint8Array([0x01]));
+
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'PUBLISH_OK', requestId: varint(requestId), parameters: forwardParams(0n),
+    } as ControlMessage));
+    await deepFlush();
+
+    await expect(adapter.openSubgroup(0n, 1n, 0n)).rejects.toThrow(/Forward State 0/);
+    await expect(adapter.sendObject(streamId, 1n, new Uint8Array([0x02])))
+      .rejects.toThrow(/Forward State 0/);
+    expect(mock.outgoingStreams).toHaveLength(1);
+
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(1n), existingRequestId: varint(requestId),
+      parameters: forwardParams(1n),
+    } as ControlMessage));
+    await deepFlush();
+    await expect(adapter.sendObject(streamId, 1n, new Uint8Array([0x03]))).resolves.toBeUndefined();
+  });
+
+  it('aborts a subgroup open that crosses a transition to Forward State 0', async () => {
+    const { adapter, mock, requestId } = await publishedWithChanges();
+    let release!: (stream: WritableStream<Uint8Array>) => void;
+    const created = new Promise<WritableStream<Uint8Array>>((resolve) => { release = resolve; });
+    (mock.transport.createUnidirectionalStream as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => created);
+    const written: Uint8Array[] = [];
+    let aborted = false;
+    const opening = adapter.openSubgroup(0n, 0n, 0n);
+
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'PUBLISH_OK', requestId: varint(requestId), parameters: forwardParams(0n),
+    } as ControlMessage));
+    await deepFlush();
+    release(new WritableStream<Uint8Array>({
+      write: (chunk) => { written.push(chunk.slice()); },
+      abort: () => { aborted = true; },
+    }));
+
+    await expect(opening).rejects.toThrow(/Forward State 0/);
+    expect(written).toEqual([]);
+    expect(aborted).toBe(true);
+  });
+
+  it('reports a pause before waiting for the REQUEST_OK write', async () => {
+    const { adapter, mock, requestId, changes } = await publishedWithChanges();
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
+    } as ControlMessage));
+    await deepFlush();
+
+    const release = mock.holdNextControlWrite();
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(1n), existingRequestId: varint(requestId),
+      parameters: forwardParams(0n),
+    } as ControlMessage));
+    await deepFlush();
+
+    expect(adapter.getPublishForwardState(requestId)).toBe(false);
+    expect(changes).toEqual([[requestId, false]]);
+    release();
+    await deepFlush();
+    expect(changes).toEqual([[requestId, false]]);
+  });
+
+  it('queues REQUEST_OK before a pause observer terminalizes the publish', async () => {
+    const { adapter, mock, requestId } = await publishedWithChanges();
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
+    } as ControlMessage));
+    await deepFlush();
+
+    const writesBeforeUpdate = mock.controlWritten.length;
+    let terminal: Promise<void> | undefined;
+    adapter.onPublishForwardStateChange = (_id, forward) => {
+      if (!forward) terminal = adapter.publishDone(requestId, varint(0n), 'paused');
+    };
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(1n), existingRequestId: varint(requestId),
+      parameters: forwardParams(0n),
+    } as ControlMessage));
+    await deepFlush();
+    await terminal;
+
+    const messageTypes = mock.controlWritten.slice(writesBeforeUpdate).map((bytes) =>
+      decodeControlMessage(bytes, 0).message.type);
+    expect(messageTypes).toEqual(['REQUEST_OK', 'PUBLISH_DONE']);
+  });
+
+  it('contains a throwing Forward State observer and keeps processing updates', async () => {
+    const { adapter, mock, requestId } = await publishedWithChanges();
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
+    } as ControlMessage));
+    await deepFlush();
+
+    adapter.onError = () => { throw new Error('throwing error observer'); };
+    adapter.onPublishForwardStateChange = () => { throw new Error('throwing Forward observer'); };
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(1n), existingRequestId: varint(requestId),
+      parameters: forwardParams(0n),
+    } as ControlMessage));
+    await deepFlush();
+    expect(adapter.session.state).toBe(SessionState.ESTABLISHED);
+    expect(adapter.getPublishForwardState(requestId)).toBe(false);
+
+    const resumed: boolean[] = [];
+    adapter.onPublishForwardStateChange = (_id, forward) => resumed.push(forward);
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(3n), existingRequestId: varint(requestId),
+      parameters: forwardParams(1n),
+    } as ControlMessage));
+    await deepFlush();
+    expect(resumed).toEqual([true]);
+    expect(adapter.session.state).toBe(SessionState.ESTABLISHED);
+  });
+
+  it('reports and contains a rejected async Forward State observer', async () => {
+    const { adapter, mock, requestId } = await publishedWithChanges();
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
+    } as ControlMessage));
+    await deepFlush();
+
+    const errors: Error[] = [];
+    adapter.onError = (err) => errors.push(err);
+    adapter.onPublishForwardStateChange = async () => {
+      await Promise.resolve();
+      throw new Error('async Forward observer failed');
+    };
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(1n), existingRequestId: varint(requestId),
+      parameters: forwardParams(0n),
+    } as ControlMessage));
+    await deepFlush();
+
+    expect(errors.map((err) => err.message)).toEqual(['async Forward observer failed']);
+    expect(adapter.session.state).toBe(SessionState.ESTABLISHED);
+    expect(adapter.getPublishForwardState(requestId)).toBe(false);
+  });
+
+  it('rejects an invalid local Forward value before allocating or emitting PUBLISH', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const writesBefore = mock.controlWritten.length;
+
+    await expect(adapter.publish(
+      [enc('media')], enc('video'), 42n,
+      { parameters: forwardParams(2n) },
+    )).rejects.toThrow(/FORWARD.*0 or 1/);
+
+    expect(mock.controlWritten).toHaveLength(writesBefore);
+    expect(adapter.session.getOutgoingPublish(0n)).toBeUndefined();
+    const requestId = await adapter.publish([enc('media')], enc('video'), 42n);
+    expect(requestId).toBe(0n);
   });
 });

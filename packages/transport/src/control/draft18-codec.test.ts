@@ -763,6 +763,14 @@ describe('SUBSCRIBE_TRACKS + PUBLISH_BLOCKED (§10.19–10.20)', () => {
 });
 
 describe('PUBLISH round-trip (request keeps Request ID, §10.10)', () => {
+  it('rejects a non-binary FORWARD value before writing wire bytes', () => {
+    const pub: Publish = {
+      type: 'PUBLISH', requestId: 1n, trackNamespace: NS, trackName: NAME, trackAlias: 1n,
+      parameters: new Map([[MessageParam.FORWARD, [2n]]]), trackProperties: new Map(),
+    };
+    expect(() => codec18.encode(pub)).toThrow(/FORWARD.*0 or 1/);
+  });
+
   it('round-trips Request ID + namespace + name + Track Alias + params (type 0x1D)', () => {
     const pub: Publish = {
       type: 'PUBLISH', requestId: 7n, trackNamespace: NS, trackName: NAME, trackAlias: 42n,
