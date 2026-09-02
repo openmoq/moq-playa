@@ -17,6 +17,7 @@ import {
   writeVi64,
   vi64EncodingLength,
   varint,
+  MessageParam,
   StreamType18,
   PADDING_DATAGRAM_TYPE,
   DatagramFlags18,
@@ -2012,6 +2013,30 @@ describe('MoqtConnection(18) outbound PUBLISH (§10.10)', () => {
     const { message } = codec18.decode(transport.bidi[0]!.writtenBytes(), 0) as { message: { type: string; trackProperties?: Map<bigint, unknown> } };
     expect(message.type).toBe('PUBLISH');
     expect(message.trackProperties).toEqual(trackProperties);
+  });
+
+  it('REQUEST_OK Forward State 0 then a peer REQUEST_UPDATE FORWARD=1 report pause and resume (§5.1 / §9.5)', async () => {
+    const { conn, transport } = await connected();
+    const changes: [bigint, boolean][] = [];
+    conn.onPublishForwardStateChange = (id, fwd) => changes.push([id, fwd]);
+    // d18 §5.1: resuming 0→1 makes the REQUEST_OK carry the current Largest Location.
+    conn.setLargestLocationProvider(() => ({ group: 0n, object: 0n }));
+    const forwardParams = (forward: bigint) => new Map([[MessageParam.FORWARD, [varint(forward)]]]);
+
+    const requestId = await conn.publish(ns('a'), nm('vid'), 42n);
+    expect(conn.getPublishForwardState(requestId)).toBe(true);
+    transport.bidi[0]!.push(codec18.encode({ type: 'REQUEST_OK', requestId: 0n, parameters: forwardParams(0n) } as RequestOk));
+    await flush();
+    expect(changes).toEqual([[requestId, false]]);
+    expect(conn.getPublishForwardState(requestId)).toBe(false);
+
+    const writtenBefore = transport.bidi[0]!.writtenBytes().length;
+    transport.bidi[0]!.push(codec18.encode({ type: 'REQUEST_UPDATE', requestId: 3n, parameters: forwardParams(1n) } as never));
+    await flush();
+    expect(changes).toEqual([[requestId, false], [requestId, true]]);
+    expect(conn.getPublishForwardState(requestId)).toBe(true);
+    // The resume was acknowledged on the PUBLISH stream (REQUEST_OK, 0x07) before the callback fired.
+    expect(transport.bidi[0]!.writtenBytes()[writtenBefore]).toBe(0x07);
   });
 
   it('REQUEST_OK on the PUBLISH stream is stamped to the publish requestId and keeps the stream open', async () => {

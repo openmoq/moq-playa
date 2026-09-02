@@ -23,6 +23,7 @@ import {
   SessionError,
   EndpointRole,
   varint,
+  MessageParam,
   encodeSubgroupHeader,
   encodeSubgroupObject,
   decodeSubgroupHeader,
@@ -6126,5 +6127,75 @@ describe('terminal drain — review findings (alias reuse, completion race, shut
     await tflush2();
     await vi.advanceTimersByTimeAsync(10_001);
     await tflush2();                                     // would surface unhandled rejection if not contained
+  });
+});
+
+// ─── Outbound PUBLISH Forward State (§5.1 / §8.5) ──────────────────────────
+
+describe('outbound PUBLISH forward state (draft-16)', () => {
+  const enc = (s: string) => new TextEncoder().encode(s);
+  const forwardParams = (forward: bigint) => new Map([[MessageParam.FORWARD, [varint(forward)]]]);
+
+  async function publishedWithChanges(): Promise<{
+    adapter: MoqtConnection; mock: MockTransport; requestId: bigint; changes: [bigint, boolean][];
+  }> {
+    const mock = createMockTransport();
+    // Advertise a request-ID budget so the relay's own REQUEST_UPDATE (id 1, 3) is in range.
+    const adapter = new MoqtConnection();
+    const connectPromise = adapter.connect(mock.transport, { maxRequestId: varint(100) });
+    await flush();
+    mock.pushControlBytes(encodeServerSetup());
+    await connectPromise;
+    const changes: [bigint, boolean][] = [];
+    adapter.onPublishForwardStateChange = (id, fwd) => changes.push([id, fwd]);
+    adapter.onClose = (code, reason) => { throw new Error(`session closed: ${code} ${reason}`); };
+    const requestId = await adapter.publish([enc('media'), enc('avn')], enc('catalog'), 0n);
+    await flush();
+    return { adapter, mock, requestId, changes };
+  }
+
+  it('a PUBLISH_OK with Forward State 0 reports the pause and is readable', async () => {
+    const { adapter, mock, requestId, changes } = await publishedWithChanges();
+    expect(adapter.getPublishForwardState(requestId)).toBe(true); // §5.1 initial state from PUBLISH
+
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'PUBLISH_OK', requestId: varint(requestId), parameters: forwardParams(0n),
+    } as ControlMessage));
+    await deepFlush();
+
+    expect(changes).toEqual([[requestId, false]]);
+    expect(adapter.getPublishForwardState(requestId)).toBe(false);
+  });
+
+  it('a later peer REQUEST_UPDATE with FORWARD=1 reports the resume (§8.5: relay had no subscriber at PUBLISH time)', async () => {
+    const { adapter, mock, requestId, changes } = await publishedWithChanges();
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'PUBLISH_OK', requestId: varint(requestId), parameters: forwardParams(0n),
+    } as ControlMessage));
+    await deepFlush();
+
+    // The relay's own update: server-initiated request IDs are odd.
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(1n), existingRequestId: varint(requestId), parameters: forwardParams(1n),
+    } as ControlMessage));
+    await deepFlush();
+
+    expect(changes).toEqual([[requestId, false], [requestId, true]]);
+    expect(adapter.getPublishForwardState(requestId)).toBe(true);
+  });
+
+  it('a REQUEST_UPDATE that does not change Forward State, or repeats it, is silent', async () => {
+    const { adapter, mock, requestId, changes } = await publishedWithChanges();
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(1n), existingRequestId: varint(requestId), parameters: new Map(),
+    } as ControlMessage));
+    mock.pushControlBytes(encodeControlMessage({
+      type: 'REQUEST_UPDATE', requestId: varint(3n), existingRequestId: varint(requestId), parameters: forwardParams(1n),
+    } as ControlMessage));
+    await deepFlush();
+
+    expect(changes).toEqual([]);
+    expect(adapter.getPublishForwardState(requestId)).toBe(true);
+    expect(adapter.getPublishForwardState(999n)).toBeUndefined();
   });
 });

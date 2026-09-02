@@ -477,6 +477,20 @@ export class MoqtConnection {
    */
   onMessage?: (msg: ControlMessage) => void;
 
+  /**
+   * Called when the Forward State of one of OUR outbound PUBLISHes changes: the
+   * subscriber's acceptance (PUBLISH_OK on draft-14/16, REQUEST_OK on draft-18) or
+   * a later peer REQUEST_UPDATE carried a FORWARD that differs from the current
+   * state. §5.1: "The publisher does not send Objects if the Forward State is 0,
+   * and does send them if the Forward State is 1." A relay MAY accept a PUBLISH
+   * with Forward State 0 until it has a subscriber (§8.5) and then raises it with
+   * REQUEST_UPDATE (§8.5; d18 §9.5), so a publisher that reads Forward only from
+   * the acceptance never starts sending on a relay that had no viewer yet. Fires
+   * after the session applied the change (and, on draft-18, after the REQUEST_OK
+   * was written); `getPublishForwardState` reads the current value at any time.
+   */
+  onPublishForwardStateChange?: (requestId: bigint, forward: boolean) => void;
+
   /** Called when the control stream or connection closes. */
   onClose?: (error?: number, reason?: string) => void;
 
@@ -1682,6 +1696,36 @@ export class MoqtConnection {
   }
 
   /** Route a draft-18 request-stream response through the standard pipeline. */
+  /**
+   * Current Forward State of one of OUR outbound PUBLISHes: `true` when the
+   * subscriber wants Objects, `false` when it set Forward State 0, `undefined`
+   * when `requestId` is not a live outbound PUBLISH.
+   */
+  getPublishForwardState(requestId: bigint): boolean | undefined {
+    const pub = this.session.getOutgoingPublish(requestId);
+    return pub === undefined ? undefined : pub.forwardState === ForwardState.ACTIVE;
+  }
+
+  /**
+   * The outbound PUBLISH whose Forward State `message` may change, or undefined:
+   * a PUBLISH_OK / REQUEST_OK names it by requestId, a REQUEST_UPDATE by
+   * existingRequestId (already stamped on draft-18 by the request stream).
+   */
+  private outboundPublishForwardTarget(message: { type: string; requestId?: bigint; existingRequestId?: bigint }): bigint | undefined {
+    const target = message.type === 'REQUEST_UPDATE'
+      ? message.existingRequestId
+      : (message.type === 'PUBLISH_OK' || message.type === 'REQUEST_OK') ? message.requestId : undefined;
+    if (target === undefined || this.session.getOutgoingPublish(target) === undefined) return undefined;
+    return target;
+  }
+
+  /** Fire onPublishForwardStateChange when the state moved from `before`. */
+  private notifyPublishForwardChange(requestId: bigint | undefined, before: boolean | undefined): void {
+    if (requestId === undefined || before === undefined) return;
+    const after = this.getPublishForwardState(requestId);
+    if (after !== undefined && after !== before) this.onPublishForwardStateChange?.(requestId, after);
+  }
+
   private async deliverRequestResponse(message: DecodedControlMessage, requestId: bigint): Promise<void> {
     // Stamp the stream-derived Request ID (codec leaves it absent on responses).
     const stamped = { ...message, requestId } as ControlMessage;
@@ -1727,7 +1771,10 @@ export class MoqtConnection {
     const suppress = this.handleRawSubControlMessage(stamped)
       || this.session.isCancelledRequest(requestId);
     if (!suppress) this.onMessage?.(stamped);
+    const fwdTarget = this.outboundPublishForwardTarget(stamped as { type: string; requestId?: bigint });
+    const fwdBefore = fwdTarget === undefined ? undefined : this.getPublishForwardState(fwdTarget);
     await this.executeActions(this.session.handleControlMessage(message, { requestId }));
+    this.notifyPublishForwardChange(fwdTarget, fwdBefore);
     // §10.13: a FETCH_OK may complete the fetch (its data stream already FIN'd, in
     // the object-delivery-before-response order) — close the request bidi so the
     // fetcher's topology context does not leak.
@@ -1944,6 +1991,7 @@ export class MoqtConnection {
     const updateId = (message as { requestId: bigint }).requestId;
     const stamped = { ...message, existingRequestId: originalRequestId } as ControlMessage;
     this.onMessage?.(stamped);
+    const fwdBefore = this.getPublishForwardState(originalRequestId);
     const actions = this.session.handleControlMessage(stamped, {
       requestId: updateId,
       existingRequestId: originalRequestId,
@@ -1957,6 +2005,9 @@ export class MoqtConnection {
     const send = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
     if (send) await this.uniPair!.writeOnRequest(originalRequestId, send.message);
     await this.executeActions(actions.filter((a) => a.type !== 'send_control'));
+    // The REQUEST_OK is on the wire; now tell the application it may (or must
+    // stop) sending. A rejected update (REQUEST_ERROR) leaves the state as it was.
+    if (send?.message.type !== 'REQUEST_ERROR') this.notifyPublishForwardChange(originalRequestId, fwdBefore);
     // d18 §10.11: a FAILED subscription update terminates the subscription —
     // the adapter-owned transaction sends PUBLISH_DONE(UPDATE_FAILED) on this
     // same publish request stream and seals it.
@@ -4867,9 +4918,14 @@ export class MoqtConnection {
           const subBefore = message.type === 'SUBSCRIBE'
             ? this.session.getIncomingSubscription((message as Subscribe).requestId)
             : undefined;
+          // Forward State of OUR outbound PUBLISH before the subscriber's
+          // PUBLISH_OK / REQUEST_UPDATE is applied, so a change can be reported.
+          const fwdTarget = this.outboundPublishForwardTarget(message as { type: string; requestId?: bigint; existingRequestId?: bigint });
+          const fwdBefore = fwdTarget === undefined ? undefined : this.getPublishForwardState(fwdTarget);
           const actions = this.session.handleControlMessage(message);
           await this.executeActions(actions);
           await doneDiscard;
+          this.notifyPublishForwardChange(fwdTarget, fwdBefore);
           // Fire AFTER session processing so incomingSubscriptions is populated
           // when acceptSubscribe is called (§5.1: admission = a NEW SM identity,
           // and the session did not close on this message).
