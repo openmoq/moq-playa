@@ -1,0 +1,61 @@
+name: Publish moq-playa-interop-client to GHCR
+
+# Builds the MoQ interop test client (tools/moq-interop-client) and publishes it
+# to ghcr.io/openmoq/moq-playa-interop-client, so the moq-interop-runner can
+# pull it directly, the same way openmoq/moqx and openmoq/moq5 publish theirs.
+#
+# Tags pushed: :latest and :<short-sha> (so the runner can pin a build).
+#
+# One-time setup: after the first successful run, set the package
+# ghcr.io/openmoq/moq-playa-interop-client to Public in the openmoq org's
+# package settings so the runner (and anyone) can pull it without
+# authentication.
+
+on:
+  # Every push to main rebuilds and republishes. No paths filter on purpose: a
+  # squash/force-push rewrites history and a paths-filtered push workflow often
+  # will not re-run in that case, which silently stales the published image.
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/openmoq/moq-playa-interop-client
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute tags
+        id: tags
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The image build runs the client's own teardown and case discriminators
+      # as a mandatory stage, so a failing test fails this publish.
+      - name: Build interop client image
+        run: |
+          docker build \
+            -f tools/moq-interop-client/Dockerfile.client \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${{ steps.tags.outputs.short_sha }}" \
+            tools/moq-interop-client
+
+      - name: Push tags
+        run: |
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${{ steps.tags.outputs.short_sha }}"
+          echo "Published ${IMAGE}:latest and :${{ steps.tags.outputs.short_sha }}"

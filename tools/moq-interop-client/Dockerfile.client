@@ -1,0 +1,53 @@
+# moq-playa interop test client — headless Node.
+#
+# Node 24 (trixie: the prebuilt quiche binding needs GLIBC 2.38, bookworm has 2.36)
+# + @fails-components/webtransport, NOT bun: playa selects its MoQT draft
+# through WebTransport subprotocol negotiation, and the bun polyfill
+# (@moq/web-transport 0.1.1) ignores the `protocols` option and leaves
+# session.protocol null, so negotiation-dependent relays cannot be driven.
+#
+# Not Chromium either, for the same reason and measured here: Chrome 133 and
+# Chrome 141 expose no `protocol` attribute on WebTransport.prototype at all,
+# so the `protocols` offer is accepted silently and the negotiated draft is
+# unobservable. Headless Node keeps negotiation provable; no case needs a DOM.
+FROM node:24-trixie-slim AS builder
+WORKDIR /app
+# Reproducible install: both manifests are copied and `npm ci` installs the
+# exact locked graph. `npm install` without a lockfile would let the resolved
+# dependency drift away from the versions the discriminators ran against.
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY tsconfig.json ./
+COPY src ./src
+RUN npx tsc -p tsconfig.json
+
+# Test stage. Test-only sources live in test/ and are compiled by a SEPARATE
+# tsconfig, so deliberately-broken control code (the teardown neuter) can never
+# reach dist/ or the runtime image. The final stage copies this stage's marker,
+# which makes the tests a mandatory gate on every ordinary build: if they fail,
+# the image does not build, so a stale image cannot be run by accident.
+FROM builder AS test
+COPY tsconfig.test.json ./
+COPY test ./test
+RUN npx tsc -p tsconfig.test.json
+RUN node dist-test/test/teardown.test.js \
+ && node dist-test/test/cases.test.js \
+ && touch /app/.tests-passed
+
+FROM node:24-trixie-slim
+# Links the published GHCR package to this repository. Without it the first
+# workflow publication creates a package with no repo association, which also
+# makes the one-time visibility change harder to find.
+LABEL org.opencontainers.image.source="https://github.com/openmoq/moq-playa"
+LABEL org.opencontainers.image.description="moq-playa MoQT interop test client (draft-18)"
+LABEL org.opencontainers.image.licenses="MIT"
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+COPY --from=test /app/.tests-passed ./.tests-passed
+COPY package.json ./
+COPY entrypoint-client.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && mkdir -p /mlog
+ENTRYPOINT ["/app/entrypoint.sh"]
