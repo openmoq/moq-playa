@@ -12,6 +12,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MoqtConnection } from './adapter.js';
+import type { DataStreamTerminal } from './adapter.js';
 import { MoqtConnectionError } from './adapter-error.js';
 import type { WebTransportLike } from './types.js';
 import {
@@ -72,6 +73,20 @@ interface MockDataStream {
   fail: (error: Error) => void;
 }
 
+/**
+ * How a mock reader's `cancel()` misbehaves.
+ *
+ * Real backends do both: WebTransport implementations have thrown
+ * synchronously from `cancel()` on an already-failed stream, and they settle a
+ * locally cancelled read by REJECTION carrying a stream error code. Neither
+ * may escape our teardown paths or overwrite our own provenance.
+ */
+type CancelBehavior =
+  | { kind: 'throws-sync'; error: Error }
+  | { kind: 'rejects'; error: Error }
+  | { kind: 'rejects-read-with-code'; code: number }
+  | { kind: 'rejects-read-no-code'; error: Error };
+
 /** Controls for a mock bidirectional stream. */
 interface MockBidiStream {
   /** Push bytes to the readable side (simulates peer writing). */
@@ -103,7 +118,7 @@ interface MockTransport {
   /** Mock for transport.close(). */
   closeFn: ReturnType<typeof vi.fn>;
   /** Add an incoming unidirectional stream, returns push/close controls. */
-  addIncomingStream: () => MockDataStream;
+  addIncomingStream: (cancelBehavior?: CancelBehavior) => MockDataStream;
   /** Push a datagram. */
   pushDatagram: (bytes: Uint8Array) => void;
   /** All bidirectional streams created (index 0 = control stream). */
@@ -220,14 +235,45 @@ function createMockTransport(): MockTransport {
     closed: new Promise<never>(() => {}), // Never resolves in tests
   };
 
-  function addIncomingStream(): MockDataStream {
+  function addIncomingStream(cancelBehavior?: CancelBehavior): MockDataStream {
     let streamController!: ReadableStreamDefaultController<Uint8Array>;
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         streamController = controller;
       },
     });
-    incomingUniController.enqueue(stream);
+    // The adapter takes exactly one reader per stream; intercept `getReader`
+    // so the misbehavior sits on the reader the adapter actually holds.
+    const delivered = cancelBehavior === undefined ? stream : {
+      getReader: () => {
+        const reader = stream.getReader();
+        return new Proxy(reader, {
+          get(target, prop, recv) {
+            if (prop !== 'cancel') {
+              const v = Reflect.get(target, prop, recv);
+              return typeof v === 'function' ? v.bind(target) : v;
+            }
+            return (reason?: unknown) => {
+              if (cancelBehavior.kind === 'throws-sync') throw cancelBehavior.error;
+              if (cancelBehavior.kind === 'rejects') return Promise.reject(cancelBehavior.error);
+              if (cancelBehavior.kind === 'rejects-read-no-code') {
+                // The parked read fails with NO stream code — the shape that
+                // must not surface as a connection error when WE cancelled.
+                streamController.error(cancelBehavior.error);
+                return target.cancel(reason);
+              }
+              // Settle the PARKED read by rejection, carrying a stream code —
+              // the shape that must not overwrite local provenance.
+              const err = new Error(`Stream reset with code ${cancelBehavior.code}`);
+              (err as any).streamErrorCode = cancelBehavior.code;
+              streamController.error(err);
+              return target.cancel(reason);
+            };
+          },
+        });
+      },
+    } as unknown as ReadableStream<Uint8Array>;
+    incomingUniController.enqueue(delivered);
     return {
       push: (bytes) => streamController.enqueue(bytes),
       close: () => streamController.close(),
@@ -853,9 +899,9 @@ describe('MoqtConnection', () => {
       });
 
       it('invokes onSubgroupFin exactly once on graceful FIN, with the header', async () => {
-        // onStreamClosed reports a generic read failure with the same absent
-        // error code as a clean FIN, so only this hook proves the stream
-        // actually drained — the fact that completes an EOG-bearing subgroup.
+        // onStreamClosed classifies its own terminal, but carries no header.
+        // Only this hook pairs the graceful drain with the RESOLVED header —
+        // the fact that completes an EOG-bearing subgroup.
         const mock = createMockTransport();
         const adapter = await connectAdapter(mock);
         const onSubgroupFin = vi.fn();
@@ -898,12 +944,13 @@ describe('MoqtConnection', () => {
         await deepFlush();
 
         expect(onSubgroupFin).not.toHaveBeenCalled();
-        expect(onStreamClosed).toHaveBeenCalledWith(expect.anything(), 0x2a);
+        expect(onStreamClosed).toHaveBeenCalledWith(expect.anything(), 0x2a, 'reset');
       });
 
       it('does NOT invoke onSubgroupFin on a generic read failure', async () => {
-        // The failure that made this hook necessary: no numeric code, so
-        // onStreamClosed is indistinguishable from a clean FIN.
+        // onStreamClosed now classifies this as 'error' rather than leaving it
+        // indistinguishable from a FIN, but it carries no header — this hook is
+        // still the only subgroup-specific graceful-FIN signal.
         const mock = createMockTransport();
         const adapter = await connectAdapter(mock);
         const onSubgroupFin = vi.fn();
@@ -923,7 +970,7 @@ describe('MoqtConnection', () => {
         await deepFlush();
 
         expect(onSubgroupFin).not.toHaveBeenCalled();
-        expect(onStreamClosed).toHaveBeenCalledWith(expect.anything(), undefined);
+        expect(onStreamClosed).toHaveBeenCalledWith(expect.anything(), undefined, 'error');
       });
 
       it('passes the resolved FIRST_OBJECT subgroup id to onSubgroupFin', async () => {
@@ -1207,7 +1254,7 @@ describe('MoqtConnection', () => {
 
       // Should NOT close session — clean boundary
       expect(mock.closeFn).not.toHaveBeenCalled();
-      expect(onStreamClosed).toHaveBeenCalledWith(0n);
+      expect(onStreamClosed).toHaveBeenCalledWith(0n, undefined, 'fin');
     });
 
     it('closes session on unknown data stream type (§10.4)', async () => {
@@ -2565,6 +2612,1194 @@ describe('MoqtConnection draft-14', () => {
         expect(adapter.session.state).not.toBe(SessionState.CLOSED);
       });
     }
+  });
+
+  // ─── Local discard is not a peer terminal ─────────────────────────
+  //
+  // `reader.cancel()` settles an already-pending `read()` as `{done:true}`,
+  // which is exactly what a peer FIN looks like to the consuming loop. Our own
+  // early discard was therefore reported as a mid-object FIN (fatal) or, one
+  // branch over, as a graceful FIN — synthesizing END_OF_GROUP and publishing
+  // clean-close evidence the player treats as proof of completion.
+  //
+  // Diagnosis by Paul Gregoire (openmoq/moq-playa#7).
+
+  /** Subscribe, ack with `alias`, and return the request id. */
+  async function subscribeWithAlias(
+    mock: ReturnType<typeof createMockTransport>,
+    adapter: MoqtConnection,
+    alias: bigint,
+    sink?: unknown[],
+    onObject?: (obj: unknown) => void,
+  ): Promise<bigint> {
+    const codec = createControlCodec(16);
+    const enc = (str: string) => new TextEncoder().encode(str);
+    const p = adapter.subscribeTrack([enc('live')], enc('vid'), {
+      onObject: (obj: unknown) => { sink?.push(obj); onObject?.(obj); },
+    });
+    await deepFlush();
+    let reqId: bigint | undefined;
+    for (let i = mock.controlWritten.length - 1; i >= 0; i--) {
+      const { message } = codec.decode(mock.controlWritten[i]!, 0);
+      if (message.type === 'SUBSCRIBE') { reqId = (message as { requestId: bigint }).requestId; break; }
+    }
+    if (reqId === undefined) throw new Error('harness: no SUBSCRIBE was written');
+    mock.pushControlBytes(codec.encode({
+      type: 'SUBSCRIBE_OK', requestId: reqId, trackAlias: varint(alias),
+      parameters: new Map(), trackExtensions: [],
+    } as ControlMessage));
+    await p;
+    return reqId;
+  }
+
+  /** PUBLISH_DONE for `reqId` — the real trigger Paul reported. */
+  function publishDone(
+    mock: ReturnType<typeof createMockTransport>,
+    reqId: bigint,
+    streamCount = 1n,
+  ): void {
+    const codec = createControlCodec(16);
+    mock.pushControlBytes(codec.encode({
+      type: 'PUBLISH_DONE', requestId: reqId, statusCode: varint(0x0n),
+      streamCount: varint(streamCount), errorReason: 'done',
+    } as ControlMessage));
+  }
+
+  /** Terminal kinds seen on `onStreamClosed`, in order. */
+  function captureTerminals(adapter: MoqtConnection): DataStreamTerminal[] {
+    const seen: DataStreamTerminal[] = [];
+    adapter.onStreamClosed = (_sid, _err, terminal) => seen.push(terminal);
+    return seen;
+  }
+
+  /** Park a subgroup read loop between objects on a live route. */
+  async function parkedSubgroup(
+    mock: ReturnType<typeof createMockTransport>,
+    adapter: MoqtConnection,
+    alias: bigint,
+    cancelBehavior?: Parameters<typeof mock.addIncomingStream>[0],
+  ): Promise<{ reqId: bigint; streamId: bigint }> {
+    const reqId = await subscribeWithAlias(mock, adapter, alias);
+    const headers: bigint[] = [];
+    adapter.onDataStream = (sid) => headers.push(sid);
+    const stream = mock.addIncomingStream(cancelBehavior);
+    stream.push(concat(
+      encodeSubgroupHeader(
+        makeSubgroupHeader({ trackAlias: varint(alias), typeByte: 0x18, isEndOfGroup: true }),
+      ),
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+    ));
+    await deepFlush();
+    return { reqId, streamId: headers[0]! };
+  }
+
+  it('a synchronously throwing reader.cancel() does not escape a PUBLISH_DONE teardown', async () => {
+    // A backend may throw straight out of cancel() on an already-failed stream.
+    // The old try/catch at each call site swallowed that; the centralized
+    // primitive must too, or terminal processing aborts mid-teardown.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const boom = new Error('cancel() exploded synchronously');
+    const { reqId } = await parkedSubgroup(mock, adapter, 60n, { kind: 'throws-sync', error: boom });
+
+    const errors: Error[] = [];
+    adapter.onError = (e) => errors.push(e);
+    publishDone(mock, reqId);
+    await deepFlush();
+
+    expect(errors.map((e) => e.message)).not.toContain(boom.message);
+    expect(adapter.session.state).not.toBe(SessionState.CLOSED);
+  });
+
+  it('a rejecting reader.cancel() does not reject public stopSending()', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const boom = new Error('cancel() rejected');
+    const { streamId } = await parkedSubgroup(mock, adapter, 61n, { kind: 'rejects', error: boom });
+
+    // stopSending() reaches the same primitive through the action path.
+    await expect(adapter.stopSending(streamId, varint(0x1))).resolves.toBeUndefined();
+  });
+
+  it('a local discard whose read fails without a code emits no connection error', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const boom = new Error('read failed during our own cancellation');
+    const { reqId } = await parkedSubgroup(
+      mock, adapter, 63n, { kind: 'rejects-read-no-code', error: boom },
+    );
+
+    const errors: Error[] = [];
+    adapter.onError = (e) => errors.push(e);
+    const closes: Array<[number | undefined, DataStreamTerminal]> = [];
+    adapter.onStreamClosed = (_sid, err, terminal) => closes.push([err, terminal]);
+    publishDone(mock, reqId);
+    await deepFlush();
+
+    // We ended this stream; a failure on the way out is not a connection fault.
+    expect(errors).toEqual([]);
+    expect(closes).toEqual([[undefined, 'local-discard']]);
+  });
+
+  it('a peer read failure with no code still surfaces as a connection error', async () => {
+    // The control for the case above: nothing local about this one.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    await subscribeWithAlias(mock, adapter, 64n);
+    const stream = mock.addIncomingStream();
+    stream.push(encodeSubgroupHeader(
+      makeSubgroupHeader({ trackAlias: varint(64n), typeByte: 0x18, isEndOfGroup: true }),
+    ));
+    await deepFlush();
+
+    const errors: Error[] = [];
+    adapter.onError = (e) => errors.push(e);
+    const closes: Array<[number | undefined, DataStreamTerminal]> = [];
+    adapter.onStreamClosed = (_sid, err, terminal) => closes.push([err, terminal]);
+    stream.fail(new Error('peer read failure'));
+    await deepFlush();
+
+    expect(errors).toHaveLength(1);
+    expect(closes).toEqual([[undefined, 'error']]);
+  });
+
+  it('a peer RESET_STREAM carries its code alongside the reset terminal', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    await subscribeWithAlias(mock, adapter, 65n);
+    const stream = mock.addIncomingStream();
+    stream.push(encodeSubgroupHeader(
+      makeSubgroupHeader({ trackAlias: varint(65n), typeByte: 0x18, isEndOfGroup: true }),
+    ));
+    await deepFlush();
+
+    const closes: Array<[number | undefined, DataStreamTerminal]> = [];
+    adapter.onStreamClosed = (_sid, err, terminal) => closes.push([err, terminal]);
+    stream.reset(0x2a);
+    await deepFlush();
+
+    expect(closes).toEqual([[0x2a, 'reset']]);
+  });
+
+  it('local provenance survives a read rejection that carries a stream error code', async () => {
+    // Cancelling locally can settle the parked read by REJECTION with a numeric
+    // code attached. The code is the peer's vocabulary; the provenance is ours,
+    // and ours is the one that says who ended the stream.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const { reqId } = await parkedSubgroup(
+      mock, adapter, 62n, { kind: 'rejects-read-with-code', code: 0x2a },
+    );
+
+    const errors: Error[] = [];
+    adapter.onError = (e) => errors.push(e);
+    const closes: Array<[number | undefined, DataStreamTerminal]> = [];
+    adapter.onStreamClosed = (_sid, err, terminal) => closes.push([err, terminal]);
+    publishDone(mock, reqId);
+    await deepFlush();
+
+    // Only a peer RESET carries a code. Passing the peer's code through here
+    // would let a legacy two-argument listener read our own cancellation as one.
+    expect(errors).toEqual([]);
+    expect(closes).toEqual([[undefined, 'local-discard']]);
+  });
+
+  it('PUBLISH_DONE discard mid-object does not close the session', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const reqId = await subscribeWithAlias(mock, adapter, 42n);
+
+    const header = makeSubgroupHeader({ trackAlias: varint(42n), typeByte: 0x18, isEndOfGroup: true });
+    const stream = mock.addIncomingStream();
+    const full = encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true);
+    // Header plus a DELIBERATELY partial object: the loop is mid-object when
+    // our discard cancels its pending read.
+    stream.push(concat(encodeSubgroupHeader(header), full.subarray(0, full.length - 2)));
+    await deepFlush();
+
+    const terminals = captureTerminals(adapter);
+    publishDone(mock, reqId);
+    await deepFlush();
+
+    expect(adapter.session.state).not.toBe(SessionState.CLOSED);
+    expect(terminals).toEqual(['local-discard']);
+  });
+
+  it('PUBLISH_DONE discard between objects emits no clean-FIN evidence', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const reqId = await subscribeWithAlias(mock, adapter, 42n);
+
+    const objects: unknown[] = [];
+    const fins: bigint[] = [];
+    adapter.onObject = (_sid, obj) => objects.push(obj);
+    adapter.onSubgroupFin = (sid) => fins.push(sid);
+    const terminals = captureTerminals(adapter);
+
+    const header = makeSubgroupHeader({ trackAlias: varint(42n), typeByte: 0x18, isEndOfGroup: true });
+    const stream = mock.addIncomingStream();
+    // A COMPLETE object: the loop parks on an empty buffer awaiting the next.
+    stream.push(concat(
+      encodeSubgroupHeader(header),
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+    ));
+    await deepFlush();
+    objects.length = 0;   // ignore the delivered data object
+
+    publishDone(mock, reqId);
+    await deepFlush();
+
+    // Our own discard must not look like the publisher finishing the group.
+    // The close callback is still published for cleanup, but classified: a
+    // consumer must never read it as positive completion evidence.
+    expect(objects.filter((o) => (o as { kind: string }).kind === 'gap')).toEqual([]);
+    expect(fins).toEqual([]);
+    expect(terminals).toEqual(['local-discard']);
+  });
+
+  it('a genuine FIN after a complete object still completes the group', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const delivered0: unknown[] = [];
+    await subscribeWithAlias(mock, adapter, 43n, delivered0);
+
+    const fins: bigint[] = [];
+    adapter.onSubgroupFin = (sid) => fins.push(sid);
+
+    const header = makeSubgroupHeader({ trackAlias: varint(43n), typeByte: 0x18, isEndOfGroup: true });
+    const stream = mock.addIncomingStream();
+    stream.push(concat(
+      encodeSubgroupHeader(header),
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+    ));
+    await deepFlush();
+    stream.close();
+    await deepFlush();
+
+    // With routing live the synthesized EOG reaches the SUBSCRIPTION, not the
+    // adapter-level onObject fallback.
+    expect(delivered0.filter((o) => (o as { kind: string }).kind === 'gap')).toHaveLength(1);
+    expect(fins).toHaveLength(1);
+  });
+
+  it('a genuine peer FIN mid-object is still protocol-fatal', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    await subscribeWithAlias(mock, adapter, 44n);
+
+    const header = makeSubgroupHeader({ trackAlias: varint(44n), typeByte: 0x18, isEndOfGroup: true });
+    const stream = mock.addIncomingStream();
+    const full = encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true);
+    stream.push(concat(encodeSubgroupHeader(header), full.subarray(0, full.length - 2)));
+    await deepFlush();
+    const terminals = captureTerminals(adapter);
+    stream.close();   // the PEER ends mid-object
+    await deepFlush();
+
+    expect(adapter.session.state).toBe(SessionState.CLOSED);
+    // A protocol-fatal close must publish no normal terminal at all.
+    expect(terminals).toEqual([]);
+  });
+
+  it('classifies each terminal kind distinctly', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    await subscribeWithAlias(mock, adapter, 45n);
+    const seen: DataStreamTerminal[] = [];
+    adapter.onStreamClosed = (_sid, _err, terminal) => seen.push(terminal);
+
+    const header = makeSubgroupHeader({ trackAlias: varint(45n), typeByte: 0x10 });
+    const clean = mock.addIncomingStream();
+    clean.push(encodeSubgroupHeader(header));
+    await deepFlush();
+    clean.close();
+    await deepFlush();
+
+    const resetStream = mock.addIncomingStream();
+    resetStream.push(encodeSubgroupHeader(header));
+    await deepFlush();
+    resetStream.reset(0x2a);
+    await deepFlush();
+
+    const failStream = mock.addIncomingStream();
+    failStream.push(encodeSubgroupHeader(header));
+    await deepFlush();
+    failStream.fail(new Error('read failed'));
+    await deepFlush();
+
+    expect(seen).toEqual(['fin', 'reset', 'error']);
+  });
+
+  it('a partial-header local discard is non-fatal and classified', async () => {
+    // The loop is parked inside readStreamHeader, a different `done` branch
+    // from the object loop. PUBLISH_DONE cannot reach this stream — with no
+    // decoded header it has no alias attribution — so teardown is the local
+    // cancel that does.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    await subscribeWithAlias(mock, adapter, 46n);
+
+    const stream = mock.addIncomingStream();
+    const header = encodeSubgroupHeader(
+      makeSubgroupHeader({ trackAlias: varint(46n), typeByte: 0x18, isEndOfGroup: true }),
+    );
+    stream.push(header.subarray(0, 1));   // header deliberately incomplete
+    await deepFlush();
+
+    const terminals = captureTerminals(adapter);
+    await adapter.close();
+    await deepFlush();
+
+    expect(terminals).toEqual(['local-discard']);
+  });
+
+  it('a partial-header peer FIN is still fatal and publishes no fin', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    await subscribeWithAlias(mock, adapter, 47n);
+
+    const stream = mock.addIncomingStream();
+    const header = encodeSubgroupHeader(
+      makeSubgroupHeader({ trackAlias: varint(47n), typeByte: 0x18, isEndOfGroup: true }),
+    );
+    stream.push(header.subarray(0, 1));
+    await deepFlush();
+
+    const terminals = captureTerminals(adapter);
+    stream.close();
+    await deepFlush();
+
+    expect(adapter.session.state).toBe(SessionState.CLOSED);
+    // A protocol-fatal close must publish no normal terminal at all.
+    expect(terminals).toEqual([]);
+  });
+
+  it('stop_sending between objects on a LIVE route emits no completion evidence', async () => {
+    // PUBLISH_DONE cannot observe this branch: it tears routing down first, so
+    // the false EOG lands on the unrouted fallback instead of a subscriber.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const delivered: unknown[] = [];
+    await subscribeWithAlias(mock, adapter, 48n, delivered);
+
+    const fins: bigint[] = [];
+    adapter.onSubgroupFin = (sid) => fins.push(sid);
+
+    let openStreamId: bigint | undefined;
+    adapter.onDataStream = (sid) => { openStreamId = sid; };
+
+    const stream = mock.addIncomingStream();
+    stream.push(concat(
+      encodeSubgroupHeader(
+        makeSubgroupHeader({ trackAlias: varint(48n), typeByte: 0x18, isEndOfGroup: true }),
+      ),
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+    ));
+    await deepFlush();
+    expect(openStreamId).toBeDefined();
+    delivered.length = 0;   // ignore the real data object
+
+    const terminals = captureTerminals(adapter);
+    await adapter.stopSending(openStreamId!, varint(0x1));
+    await deepFlush();
+
+    // The subscription is still routed, so a false EOG would reach a real
+    // subscriber and mark its group complete.
+    expect(delivered.filter((o) => (o as { kind: string }).kind === 'gap')).toEqual([]);
+    expect(fins).toEqual([]);
+    expect(terminals).toEqual(['local-discard']);
+  });
+
+  it('fetchCancel is non-fatal and publishes no clean completion (draft-16)', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const requestId = await adapter.fetch(
+      [new TextEncoder().encode('live')], new TextEncoder().encode('vid'),
+      { startGroup: varint(0n), startObject: varint(0n), endGroup: varint(10n), endObject: varint(0n) },
+    );
+
+    const stream = mock.addIncomingStream();
+    stream.push(encodeFetchHeader({ requestId } as FetchHeader));
+    await deepFlush();
+
+    const terminals = captureTerminals(adapter);
+    await adapter.fetchCancel(requestId);
+    await deepFlush();
+
+    expect(adapter.session.state).not.toBe(SessionState.CLOSED);
+    expect(terminals).toEqual(['local-discard']);
+  });
+
+  /** A fetch response stream parked PART-WAY through its first object. */
+  async function parkedPartialFetch(
+    mock: ReturnType<typeof createMockTransport>,
+    adapter: MoqtConnection,
+  ): Promise<{ requestId: bigint; stream: MockDataStream }> {
+    const requestId = await adapter.fetch(
+      [new TextEncoder().encode('live')], new TextEncoder().encode('vid'),
+      { startGroup: varint(0n), startObject: varint(0n), endGroup: varint(10n), endObject: varint(0n) },
+    );
+    const fetchObj: FetchObject = {
+      flags: varint(0x1c), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+      publisherPriority: 128, isDatagram: false, extensions: undefined,
+      payload: new Uint8Array([0xbe, 0xef]),
+    };
+    const objBytes = encodeFetchObject(fetchObj);
+    const stream = mock.addIncomingStream();
+    stream.push(concat(
+      encodeFetchHeader({ requestId } as FetchHeader),
+      objBytes.subarray(0, objBytes.length - 1),   // one payload byte short
+    ));
+    await deepFlush();
+    return { requestId, stream };
+  }
+
+  it('a partial-object fetchCancel is non-fatal and publishes no clean completion (draft-16)', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const { requestId } = await parkedPartialFetch(mock, adapter);
+
+    const terminals = captureTerminals(adapter);
+    await adapter.fetchCancel(requestId);
+    await deepFlush();
+
+    // Buffered bytes remain — the peer-FIN control below is fatal on exactly
+    // this state, so only the provenance separates them.
+    expect(adapter.session.state).not.toBe(SessionState.CLOSED);
+    expect(terminals).toEqual(['local-discard']);
+  });
+
+  it('a partial-object peer FIN is fatal and publishes no terminal (draft-16)', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const { stream } = await parkedPartialFetch(mock, adapter);
+
+    const terminals = captureTerminals(adapter);
+    stream.close();          // the PEER ends mid-object
+    await deepFlush();
+
+    expect(adapter.session.state).toBe(SessionState.CLOSED);
+    expect(terminals).toEqual([]);
+  });
+
+  // Provenance must GATE delivery, not merely label the terminal. When
+  // cancel() fails the reader stays usable, so a peer that keeps writing can
+  // still drive the decoder unless every loop boundary consults it.
+  for (const failure of ['throws-sync', 'rejects'] as const) {
+    it(`no subgroup byte is delivered after a local discard whose cancel ${failure}`, async () => {
+      const mock = createMockTransport();
+      const adapter = await connectAdapter(mock);
+      const boom = new Error(`cancel ${failure}`);
+      const routed: unknown[] = [];
+      await subscribeWithAlias(mock, adapter, 70n, routed);
+
+      const headers: bigint[] = [];
+      adapter.onDataStream = (sid) => headers.push(sid);
+      const header = makeSubgroupHeader({
+        trackAlias: varint(70n), typeByte: 0x18, isEndOfGroup: true,
+      });
+      const stream = mock.addIncomingStream({ kind: failure, error: boom });
+      stream.push(concat(
+        encodeSubgroupHeader(header),
+        encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+      ));
+      await deepFlush();
+
+      const objects: unknown[] = [];
+      const fins: bigint[] = [];
+      adapter.onObject = (_sid, o) => objects.push(o);
+      adapter.onSubgroupFin = (sid) => fins.push(sid);
+      const terminals = captureTerminals(adapter);
+      const routedBefore = routed.length;
+
+      await adapter.stopSending(headers[0]!, varint(0x1));
+      // The subscription is still live and the peer keeps writing.
+      stream.push(encodeSubgroupObject(makeSubgroupObject({ objectId: varint(1) }), false, varint(0), false));
+      stream.close();
+      await deepFlush();
+
+      // Nothing more reaches the subscription, the global fallback, or the
+      // FIN/EOG synthesis — the routing maps alone do not gate any of these.
+      expect(routed).toHaveLength(routedBefore);
+      expect(objects).toEqual([]);
+      expect(fins).toEqual([]);
+      expect(terminals).toEqual(['local-discard']);
+    });
+
+    it(`no fetch object is delivered after a local discard whose cancel ${failure}`, async () => {
+      // The fetch path bypasses alias routing and reaches onObject directly,
+      // so detaching the routing maps does not gate it.
+      const mock = createMockTransport();
+      const adapter = await connectAdapter(mock);
+      const requestId = await adapter.fetch(
+        [new TextEncoder().encode('live')], new TextEncoder().encode('vid'),
+        { startGroup: varint(0n), startObject: varint(0n), endGroup: varint(10n), endObject: varint(0n) },
+      );
+      const stream = mock.addIncomingStream({ kind: failure, error: new Error(`cancel ${failure}`) });
+      stream.push(encodeFetchHeader({ requestId } as FetchHeader));
+      await deepFlush();
+
+      const objects: unknown[] = [];
+      adapter.onObject = (_sid, o) => objects.push(o);
+      const terminals = captureTerminals(adapter);
+
+      await adapter.fetchCancel(requestId);
+      stream.push(encodeFetchObject({
+        flags: varint(0x1c), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        publisherPriority: 128, isDatagram: false, extensions: undefined,
+        payload: new Uint8Array([0xbe, 0xef]),
+      }));
+      stream.close();
+      await deepFlush();
+
+      expect(objects).toEqual([]);
+      expect(terminals).toEqual(['local-discard']);
+    });
+  }
+
+  // `onQlogEvent` is application code, and it runs BETWEEN the decode and the
+  // delivery. A stop issued from there installs provenance synchronously, so
+  // the gate has to be re-checked after every external callback — a gate at the
+  // loop boundary alone is one callback too early.
+  it('an object is not delivered when onQlogEvent cancels the stream', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const routed: unknown[] = [];
+    await subscribeWithAlias(mock, adapter, 73n, routed);
+
+    const objects: unknown[] = [];
+    adapter.onObject = (_sid, o) => objects.push(o);
+    adapter.onQlogEvent = (e: { type: string; stream_id?: bigint }) => {
+      if (e.type === 'subgroup_object_parsed') {
+        void adapter.stopSending(e.stream_id!, varint(0x1));
+      }
+    };
+
+    const stream = mock.addIncomingStream({ kind: 'rejects', error: new Error('cancel rejected') });
+    stream.push(concat(
+      encodeSubgroupHeader(
+        makeSubgroupHeader({ trackAlias: varint(73n), typeByte: 0x18, isEndOfGroup: true }),
+      ),
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+    ));
+    await deepFlush();
+
+    expect(routed).toEqual([]);
+    expect(objects).toEqual([]);
+  });
+
+  it('no data-stream callback fires when the parsed-header qlog event cancels', async () => {
+    // The SECOND header qlog event, not the first: only the gate immediately
+    // before onDataStream can stop this one.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    await subscribeWithAlias(mock, adapter, 78n);
+
+    const headers: bigint[] = [];
+    adapter.onDataStream = (sid) => headers.push(sid);
+    adapter.onQlogEvent = (e: { type: string; stream_id?: bigint }) => {
+      if (e.type === 'subgroup_header_parsed') {
+        void adapter.stopSending(e.stream_id!, varint(0x1));
+      }
+    };
+
+    const stream = mock.addIncomingStream({ kind: 'rejects', error: new Error('cancel rejected') });
+    stream.push(encodeSubgroupHeader(
+      makeSubgroupHeader({ trackAlias: varint(78n), typeByte: 0x18, isEndOfGroup: true }),
+    ));
+    await deepFlush();
+
+    expect(headers).toEqual([]);
+  });
+
+  for (const at of ['stream_type_set', 'fetch_header_parsed'] as const) {
+    it(`no fetch data-stream callback fires when the ${at} qlog event cancels`, async () => {
+      const mock = createMockTransport();
+      const adapter = await connectAdapter(mock);
+      const requestId = await adapter.fetch(
+        [new TextEncoder().encode('live')], new TextEncoder().encode('vid'),
+        { startGroup: varint(0n), startObject: varint(0n), endGroup: varint(10n), endObject: varint(0n) },
+      );
+
+      const headers: bigint[] = [];
+      const qlog: string[] = [];
+      adapter.onDataStream = (sid) => headers.push(sid);
+      adapter.onQlogEvent = (e: { type: string; stream_id?: bigint }) => {
+        qlog.push(e.type);
+        if (e.type === at) void adapter.stopSending(e.stream_id!, varint(0x1));
+      };
+
+      const stream = mock.addIncomingStream({ kind: 'rejects', error: new Error('cancel rejected') });
+      stream.push(encodeFetchHeader({ requestId } as FetchHeader));
+      await deepFlush();
+
+      expect(headers).toEqual([]);
+      if (at === 'stream_type_set') expect(qlog).not.toContain('fetch_header_parsed');
+    });
+  }
+
+  it('malformed bytes after a local discard do not close the session', async () => {
+    // The loop-boundary gate's own job, distinct from the post-callback ones:
+    // stop DECODING, not merely stop delivering. Without it a later malformed
+    // object would raise a protocol violation for a stream we already gave up.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const routed: unknown[] = [];
+    const streamIds: bigint[] = [];
+    let cancelled = false;
+    await subscribeWithAlias(mock, adapter, 79n, routed, () => {
+      if (cancelled) return;
+      cancelled = true;
+      void adapter.stopSending(streamIds[0]!, varint(0x1));
+    });
+    adapter.onDataStream = (sid) => streamIds.push(sid);
+
+    const stream = mock.addIncomingStream({ kind: 'rejects', error: new Error('cancel rejected') });
+    stream.push(encodeSubgroupHeader(
+      makeSubgroupHeader({ trackAlias: varint(79n), typeByte: 0x18, isEndOfGroup: true }),
+    ));
+    await deepFlush();
+
+    // One valid object (its callback cancels), then a COMPLETE object whose
+    // status code is invalid — a protocol violation if it is ever decoded.
+    stream.push(concat(
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+      new Uint8Array([0x01, 0x00, 0x3f]),   // objectId delta, zero payload, bogus status
+    ));
+    await deepFlush();
+
+    expect(cancelled).toBe(true);
+    expect(adapter.session.state).not.toBe(SessionState.CLOSED);
+  });
+
+  it('a second buffered legacy fetch object is never decoded after a discard', async () => {
+    // Same invariant on the fetch loop: after a discard the decoder must stop
+    // entirely, not merely withhold the decoded object from the consumer.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const requestId = await adapter.fetch(
+      [new TextEncoder().encode('live')], new TextEncoder().encode('vid'),
+      { startGroup: varint(0n), startObject: varint(0n), endGroup: varint(10n), endObject: varint(0n) },
+    );
+
+    let cancelled = false;
+    adapter.onObject = (sid) => {
+      if (cancelled) return;
+      cancelled = true;
+      void adapter.stopSending(sid, varint(0x1));
+    };
+    const qlog: string[] = [];
+    adapter.onQlogEvent = (e: { type: string }) => qlog.push(e.type);
+
+    const stream = mock.addIncomingStream({ kind: 'rejects', error: new Error('cancel rejected') });
+    stream.push(encodeFetchHeader({ requestId } as FetchHeader));
+    await deepFlush();
+
+    stream.push(concat(
+      encodeFetchObject({
+        flags: varint(0x1c), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        publisherPriority: 128, isDatagram: false, extensions: undefined,
+        payload: new Uint8Array([0xbe, 0xef]),
+      }),
+      // A COMPLETE second object, already buffered.
+      encodeFetchObject({
+        flags: varint(0x1c), groupId: varint(0), subgroupId: varint(0), objectId: varint(1),
+        publisherPriority: 128, isDatagram: false, extensions: undefined,
+        payload: new Uint8Array([0xca, 0xfe]),
+      }),
+    ));
+    await deepFlush();
+
+    expect(cancelled).toBe(true);
+    // The loop guard stops the DECODE, not just the delivery: the second object
+    // must never be observed at all, so no qlog event describes it.
+    expect(qlog.filter((t) => t === 'fetch_object_parsed')).toHaveLength(1);
+    expect(adapter.session.state).not.toBe(SessionState.CLOSED);
+  });
+
+  // Datagrams run their own loop with the same shape: tombstone check, qlog
+  // callback, delivery. The callback is application code and can enter terminal
+  // state between the two.
+  function datagramBytes(alias: bigint, objectId: bigint): Uint8Array {
+    return encodeObjectDatagram({
+      typeByte: 0x00, trackAlias: varint(alias), groupId: varint(5),
+      objectId: varint(objectId), publisherPriority: 200, isEndOfGroup: false,
+      extensions: undefined, payload: new Uint8Array([0xde, 0xad]), status: undefined,
+    } as ObjectDatagram);
+  }
+
+  it('a datagram is not delivered when its qlog event closes the connection', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const seen: unknown[] = [];
+    adapter.onDatagram = (d) => seen.push(d);
+    adapter.onQlogEvent = (e: { type: string }) => {
+      if (e.type === 'object_datagram_parsed') void adapter.close();
+    };
+
+    mock.pushDatagram(datagramBytes(82n, 3n));
+    await deepFlush();
+
+    expect(seen).toEqual([]);
+  });
+
+  it('a datagram is not delivered when its qlog event tombstones the alias', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const reqId = await subscribeWithAlias(mock, adapter, 83n);
+    const seen: unknown[] = [];
+    adapter.onDatagram = (d) => seen.push(d);
+    adapter.onQlogEvent = (e: { type: string }) => {
+      if (e.type === 'object_datagram_parsed') void adapter.unsubscribe(reqId);
+    };
+
+    mock.pushDatagram(datagramBytes(83n, 3n));
+    await deepFlush();
+
+    expect(seen).toEqual([]);
+  });
+
+  it('no further transport read is started once delivery closed the connection', async () => {
+    // Not decoding the next datagram is only half of it: the loop must not
+    // issue another read at all. A backend whose readable does not settle on
+    // close would otherwise park the background task forever, holding the
+    // reader and the connection.
+    let reads = 0;
+    let releaseFirst!: (v: { value?: Uint8Array; done: boolean }) => void;
+    const gated = new Promise<{ value?: Uint8Array; done: boolean }>((r) => { releaseFirst = r; });
+    const countingReader = {
+      read: () => {
+        reads += 1;
+        return reads === 1 ? gated : new Promise(() => { /* never settles */ });
+      },
+      cancel: async () => { /* nothing to cancel */ },
+      releaseLock: () => { /* not used */ },
+    };
+
+    const mock = createMockTransport();
+    const transport: WebTransportLike = {
+      ...mock.transport,
+      datagrams: {
+        readable: { getReader: () => countingReader } as unknown as ReadableStream<Uint8Array>,
+      },
+    };
+    const adapter = new MoqtConnection();
+    const connectPromise = adapter.connect(transport);
+    await flush();
+    mock.pushControlBytes(encodeServerSetup());
+    await connectPromise;
+
+    const seen: unknown[] = [];
+    adapter.onDatagram = (d) => { seen.push(d); void adapter.close(); };
+
+    releaseFirst({ value: datagramBytes(84n, 3n), done: false });
+    await deepFlush();
+
+    expect(seen).toHaveLength(1);
+    expect(reads).toBe(1);   // the loop noticed terminal entry before reading again
+  });
+
+  it('a datagram released after terminal entry is never decoded', async () => {
+    // The other side of the same await: the connection goes terminal from
+    // elsewhere while a read is already outstanding. The later gate would stop
+    // the DELIVERY, so the qlog event is what proves the bytes were never
+    // classified and decoded in the first place.
+    let releaseFirst!: (v: { value?: Uint8Array; done: boolean }) => void;
+    const gated = new Promise<{ value?: Uint8Array; done: boolean }>((r) => { releaseFirst = r; });
+    let reads = 0;
+    const gatedReader = {
+      read: () => {
+        reads += 1;
+        return reads === 1 ? gated : new Promise(() => { /* never settles */ });
+      },
+      cancel: async () => { /* nothing to cancel */ },
+      releaseLock: () => { /* not used */ },
+    };
+
+    const mock = createMockTransport();
+    const transport: WebTransportLike = {
+      ...mock.transport,
+      datagrams: {
+        readable: { getReader: () => gatedReader } as unknown as ReadableStream<Uint8Array>,
+      },
+    };
+    const adapter = new MoqtConnection();
+    const connectPromise = adapter.connect(transport);
+    await flush();
+    mock.pushControlBytes(encodeServerSetup());
+    await connectPromise;
+
+    const seen: unknown[] = [];
+    const qlog: string[] = [];
+    adapter.onDatagram = (d) => seen.push(d);
+    adapter.onQlogEvent = (e: { type: string }) => qlog.push(e.type);
+
+    await adapter.close();                                  // terminal, read still pending
+    releaseFirst({ value: datagramBytes(88n, 3n), done: false });
+    await deepFlush();
+
+    expect(seen).toEqual([]);
+    expect(qlog.filter((t) => t === 'object_datagram_parsed')).toEqual([]);
+  });
+
+  it('a second queued datagram is not decoded once delivery closed the connection', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const seen: unknown[] = [];
+    const qlog: string[] = [];
+    adapter.onQlogEvent = (e: { type: string }) => qlog.push(e.type);
+    adapter.onDatagram = (d) => {
+      seen.push(d);
+      if (seen.length === 1) void adapter.close();
+    };
+
+    mock.pushDatagram(datagramBytes(84n, 3n));
+    mock.pushDatagram(datagramBytes(84n, 4n));
+    await deepFlush();
+
+    expect(seen).toHaveLength(1);
+    expect(qlog.filter((t) => t === 'object_datagram_parsed')).toHaveLength(1);
+  });
+
+  it('a live tombstone outranks the Session alias fallback (routing invariant)', async () => {
+    // White-box invariant, not a stream schedule: while a tombstone is live for
+    // an alias the Session still owns, routing must CLAIM the object rather
+    // than fall through to the connection-wide callback. Checked in the other
+    // order the Session fallback wins and returns false.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const codec = createControlCodec(16);
+    const reqId = await adapter.subscribe(
+      [new TextEncoder().encode('live')], new TextEncoder().encode('video'),
+    );
+    mock.pushControlBytes(codec.encode({
+      type: 'SUBSCRIBE_OK', requestId: reqId, trackAlias: varint(86n),
+      parameters: new Map(), trackExtensions: [],
+    } as ControlMessage));
+    await deepFlush();
+
+    const internals = adapter as unknown as {
+      armSubscriberAliasTeardown: (alias: bigint) => void;
+      routeToTrackSubscription: (streamId: bigint, obj: MoqtObject) => boolean;
+      session: { getTrackByAlias: (a: Varint) => unknown };
+    };
+    // Precondition: the Session still owns this alias.
+    expect(internals.session.getTrackByAlias(varint(86n))).toBeDefined();
+
+    internals.armSubscriberAliasTeardown(86n);
+    const claimed = internals.routeToTrackSubscription(9n, {
+      kind: 'data', trackAlias: varint(86n), groupId: varint(0n), subgroupId: varint(0n),
+      objectId: varint(0n), publisherPriority: 128, extensions: undefined,
+      payload: new Uint8Array([0x01]),
+    } as unknown as MoqtObject);
+
+    expect(claimed).toBe(true);
+  });
+
+  it('PUBLISH_DONE does not recreate receiver state after onMessage closes', async () => {
+    // The non-drained terminal application must start BEFORE the application
+    // callback: its arm runs ahead of the first await, so a reentrant close()
+    // clears it. Run afterwards, the arm would reinstall a tombstone and timer
+    // that clearTerminalState() had just removed.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const reqId = await subscribeWithAlias(mock, adapter, 85n);
+
+    adapter.onMessage = (m: ControlMessage) => {
+      if (m.type === 'PUBLISH_DONE') void adapter.close();
+    };
+    publishDone(mock, reqId, 0n);
+    await deepFlush();
+
+    const maps = adapter as unknown as {
+      terminatedAliases: Map<bigint, unknown>;
+      rawAliasMaps: Map<bigint, unknown>;
+      drainingAliases: Map<bigint, unknown>;
+    };
+    expect(maps.terminatedAliases.size).toBe(0);
+    expect(maps.rawAliasMaps.size).toBe(0);
+    expect(maps.drainingAliases.size).toBe(0);
+  });
+
+  it('an ALREADY-OPEN stream delivers nothing once its alias is tombstoned', async () => {
+    // armSubscriberAliasTeardown() drops the raw route synchronously, and on
+    // draft-14/16 unsubscribe() performs NO local reader cancellation: the open
+    // reader runs until the peer FINs it. The tombstone is therefore the only
+    // thing standing between a decoded object and the connection-wide callback.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const routed: unknown[] = [];
+    const reqId = await subscribeWithAlias(mock, adapter, 81n, routed);
+
+    const stream = mock.addIncomingStream();
+    stream.push(concat(
+      encodeSubgroupHeader(
+        makeSubgroupHeader({ trackAlias: varint(81n), typeByte: 0x18, isEndOfGroup: true }),
+      ),
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+    ));
+    await deepFlush();
+    expect(routed).toHaveLength(1);   // the stream is live and delivering
+
+    const objects: unknown[] = [];
+    adapter.onObject = (_sid, o) => objects.push(o);
+    const fins: bigint[] = [];
+    adapter.onSubgroupFin = (sid) => fins.push(sid);
+
+    // Begin legacy teardown: the tombstone is armed synchronously; the reader
+    // remains open until the peer FINs it.
+    const unsubscribing = adapter.unsubscribe(reqId);
+    stream.push(encodeSubgroupObject(makeSubgroupObject({ objectId: varint(1) }), false, varint(0), false));
+    stream.close();
+    await deepFlush();
+    await unsubscribing;
+    await deepFlush();
+
+    expect(routed).toHaveLength(1);   // the old subscription is done
+    // Nothing leaked to the global route: not the late object, and not the
+    // synthesized END_OF_GROUP, which travels the same routing path.
+    expect(objects).toEqual([]);
+    // onSubgroupFin still fires: the peer really did FIN this stream, and it is
+    // a connection-level fact with no subscription attached. Suppressing it
+    // would hide a real peer event rather than prevent a delivery.
+    expect(fins).toHaveLength(1);
+  });
+
+  it('an object is not delivered when onQlogEvent closes the connection', async () => {
+    // close() now transfers reader ownership before its first await, so the
+    // provenance is installed by the time the qlog callback returns. Without
+    // that, the object the callback just described would still be delivered.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const routed: unknown[] = [];
+    await subscribeWithAlias(mock, adapter, 80n, routed);
+
+    const objects: unknown[] = [];
+    adapter.onObject = (_sid, o) => objects.push(o);
+    adapter.onQlogEvent = (e: { type: string }) => {
+      if (e.type === 'subgroup_object_parsed') void adapter.close();
+    };
+
+    const stream = mock.addIncomingStream();
+    stream.push(concat(
+      encodeSubgroupHeader(
+        makeSubgroupHeader({ trackAlias: varint(80n), typeByte: 0x18, isEndOfGroup: true }),
+      ),
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+    ));
+    await deepFlush();
+
+    expect(routed).toEqual([]);
+    expect(objects).toEqual([]);
+  });
+
+  it('a fetch object is not delivered when onQlogEvent cancels the stream', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    const requestId = await adapter.fetch(
+      [new TextEncoder().encode('live')], new TextEncoder().encode('vid'),
+      { startGroup: varint(0n), startObject: varint(0n), endGroup: varint(10n), endObject: varint(0n) },
+    );
+
+    const objects: unknown[] = [];
+    adapter.onObject = (_sid, o) => objects.push(o);
+    adapter.onQlogEvent = (e: { type: string; stream_id?: bigint }) => {
+      if (e.type === 'fetch_object_parsed') {
+        void adapter.stopSending(e.stream_id!, varint(0x1));
+      }
+    };
+
+    const stream = mock.addIncomingStream({ kind: 'rejects', error: new Error('cancel rejected') });
+    stream.push(concat(
+      encodeFetchHeader({ requestId } as FetchHeader),
+      encodeFetchObject({
+        flags: varint(0x1c), groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        publisherPriority: 128, isDatagram: false, extensions: undefined,
+        payload: new Uint8Array([0xbe, 0xef]),
+      }),
+    ));
+    await deepFlush();
+
+    expect(objects).toEqual([]);
+  });
+
+  it('no header callback fires when the first header qlog event cancels the stream', async () => {
+    // The header path has the same shape: stream_type_set, then the parsed
+    // header event, then onDataStream — three callbacks, no check between.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    await subscribeWithAlias(mock, adapter, 74n);
+
+    const headers: bigint[] = [];
+    adapter.onDataStream = (sid) => headers.push(sid);
+    const qlog: string[] = [];
+    adapter.onQlogEvent = (e: { type: string; stream_id?: bigint }) => {
+      qlog.push(e.type);
+      if (e.type === 'stream_type_set') {
+        void adapter.stopSending(e.stream_id!, varint(0x1));
+      }
+    };
+
+    const stream = mock.addIncomingStream({ kind: 'rejects', error: new Error('cancel rejected') });
+    stream.push(encodeSubgroupHeader(
+      makeSubgroupHeader({ trackAlias: varint(74n), typeByte: 0x18, isEndOfGroup: true }),
+    ));
+    await deepFlush();
+
+    expect(headers).toEqual([]);
+    expect(qlog).not.toContain('subgroup_header_parsed');
+  });
+
+  it('a discarded partial-header read does not park on another read', async () => {
+    // The loop-boundary gate's own job: with a still-incomplete header the
+    // decoder must return promptly on the next wake-up rather than issuing
+    // another read and parking for bytes that will never matter.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    await subscribeWithAlias(mock, adapter, 76n);
+
+    const headerBytes = encodeSubgroupHeader(
+      makeSubgroupHeader({ trackAlias: varint(76n), typeByte: 0x18, isEndOfGroup: true }),
+    );
+    const stream = mock.addIncomingStream({ kind: 'rejects', error: new Error('cancel rejected') });
+    stream.push(headerBytes.subarray(0, 1));
+    await deepFlush();
+
+    const terminals = captureTerminals(adapter);
+    await adapter.close();
+    stream.push(headerBytes.subarray(1, 2));   // STILL incomplete
+    await deepFlush();
+
+    expect(terminals).toEqual(['local-discard']);
+  });
+
+  it('a header resolved before a teardown emits no header callback', async () => {
+    // The post-header gate's own job: the await seam between readStreamHeader
+    // resolving and processDataStream resuming. Hold the resolved result,
+    // tear down, then release it.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    await subscribeWithAlias(mock, adapter, 77n);
+
+    const headers: bigint[] = [];
+    adapter.onDataStream = (sid) => headers.push(sid);
+
+    const internals = adapter as unknown as {
+      readStreamHeader: (...a: unknown[]) => Promise<unknown>;
+    };
+    const realHeaderRead = internals.readStreamHeader.bind(adapter);
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    internals.readStreamHeader = async (...a: unknown[]) => {
+      const result = await realHeaderRead(...a);
+      await held;              // the seam: resolved, but not yet returned
+      return result;
+    };
+
+    const stream = mock.addIncomingStream({ kind: 'rejects', error: new Error('cancel rejected') });
+    stream.push(encodeSubgroupHeader(
+      makeSubgroupHeader({ trackAlias: varint(77n), typeByte: 0x18, isEndOfGroup: true }),
+    ));
+    await deepFlush();
+    expect(headers).toEqual([]);   // still held
+
+    const terminals = captureTerminals(adapter);
+    await adapter.close();         // teardown lands INSIDE the seam
+    release();
+    await deepFlush();
+
+    expect(headers).toEqual([]);
+    expect(terminals).toEqual(['local-discard']);
+    // The later qlog gates would also suppress the callbacks, but the subgroup
+    // branch runs its accounting FIRST: without this guard it repopulates the
+    // per-alias maps that clearTerminalState() just emptied.
+    const maps = adapter as unknown as {
+      aliasStreamsSeen: Map<bigint, bigint>;
+      incomingSubgroupAliases: Map<bigint, bigint>;
+    };
+    expect(maps.aliasStreamsSeen.size).toBe(0);
+    expect(maps.incomingSubgroupAliases.size).toBe(0);
+  });
+
+  it('a header completed AFTER a local discard is never decoded', async () => {
+    // The header loop has its own boundary: a PARTIAL header is buffered, we
+    // tear down, cancel fails, and the peer then supplies the rest. Without a
+    // gate the header decodes and onDataStream fires for a discarded stream.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    await subscribeWithAlias(mock, adapter, 72n);
+
+    const headers: bigint[] = [];
+    adapter.onDataStream = (sid) => headers.push(sid);
+    const headerBytes = encodeSubgroupHeader(
+      makeSubgroupHeader({ trackAlias: varint(72n), typeByte: 0x18, isEndOfGroup: true }),
+    );
+    const stream = mock.addIncomingStream({ kind: 'rejects', error: new Error('cancel rejected') });
+    stream.push(headerBytes.subarray(0, 1));   // incomplete
+    await deepFlush();
+    expect(headers).toEqual([]);
+
+    const terminals = captureTerminals(adapter);
+    await adapter.close();                      // our own teardown
+    stream.push(headerBytes.subarray(1));       // the peer completes it anyway
+    await deepFlush();
+
+    expect(headers).toEqual([]);
+    expect(terminals).toEqual(['local-discard']);
+  });
+
+  it('a second object in the SAME chunk is not delivered after a callback cancels', async () => {
+    // Both objects arrive in one read, so the decode loop never re-enters
+    // `read()` between them. Only the loop-top gate can stop the second one.
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    // Cancel synchronously from the FIRST object's delivery callback.
+    const routed: unknown[] = [];
+    const streamIds: bigint[] = [];
+    let cancelled = false;
+    await subscribeWithAlias(mock, adapter, 75n, routed, () => {
+      if (cancelled) return;
+      cancelled = true;
+      void adapter.stopSending(streamIds[0]!, varint(0x1));
+    });
+
+    adapter.onDataStream = (sid) => streamIds.push(sid);
+    const stream = mock.addIncomingStream({ kind: 'rejects', error: new Error('cancel rejected') });
+    stream.push(encodeSubgroupHeader(
+      makeSubgroupHeader({ trackAlias: varint(75n), typeByte: 0x18, isEndOfGroup: true }),
+    ));
+    await deepFlush();
+
+    stream.push(concat(
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(1) }), false, varint(0), false),
+    ));
+    await deepFlush();
+
+    expect(cancelled).toBe(true);
+    expect(routed).toHaveLength(1);   // only the object that triggered the stop
+  });
+
+  it('terminal teardown marks a pending data read as locally discarded', async () => {
+    const mock = createMockTransport();
+    const adapter = await connectAdapter(mock);
+    await subscribeWithAlias(mock, adapter, 49n);
+
+    const stream = mock.addIncomingStream();
+    stream.push(concat(
+      encodeSubgroupHeader(
+        makeSubgroupHeader({ trackAlias: varint(49n), typeByte: 0x18, isEndOfGroup: true }),
+      ),
+      encodeSubgroupObject(makeSubgroupObject({ objectId: varint(0) }), false, varint(0), true),
+    ));
+    await deepFlush();
+
+    const terminals = captureTerminals(adapter);
+    await adapter.close();
+    await deepFlush();
+
+    // Session shutdown is our own teardown, not a peer terminal.
+    expect(terminals).toEqual(['local-discard']);
   });
 
   // ─── Legacy PUBLISH_DONE applies the terminal Stream Count ─────────

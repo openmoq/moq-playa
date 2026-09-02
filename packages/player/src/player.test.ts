@@ -28,6 +28,7 @@ import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } fro
 import { varint, ObjectStatus } from '@moqt/transport';
 import { encodeLocHeaders } from '@moqt/loc';
 import type { ClockSource } from '@moqt/playback';
+import type { DataStreamTerminal } from '@moqt/webtransport';
 
 // ─── Mock Adapter ────────────────────────────────────────────────────
 
@@ -37,7 +38,7 @@ function createMockAdapter(): MoqtConnection & {
   _triggerObject: (streamId: bigint, obj: MoqtObject) => void;
   _triggerDatagram: (datagram: ObjectDatagram) => void;
   _triggerDataStream: (streamId: bigint, header: DataStreamHeader) => void;
-  _triggerStreamClosed: (streamId: bigint, error?: number) => void;
+  _triggerStreamClosed: (streamId: bigint, error?: number, terminal?: DataStreamTerminal) => void;
   _triggerClose: (error?: number, reason?: string) => void;
   _triggerError: (err: Error) => void;
   _triggerNamespaceMessage: (requestId: bigint, msg: ControlMessage) => void;
@@ -67,7 +68,7 @@ function createMockAdapter(): MoqtConnection & {
     onError: null as ((error: Error) => void) | null,
     onDataStream: null,
     onObject: null as ((streamId: bigint, obj: MoqtObject) => void) | null,
-    onStreamClosed: null as ((streamId: bigint, error?: number) => void) | null,
+    onStreamClosed: null as ((streamId: bigint, error: number | undefined, terminal: DataStreamTerminal) => void) | null,
     onDatagram: null as ((datagram: ObjectDatagram) => void) | null,
     onNamespaceMessage: null as ((requestId: bigint, msg: ControlMessage) => void) | null,
     onQlogEvent: null as ((event: any) => void) | null,
@@ -99,8 +100,14 @@ function createMockAdapter(): MoqtConnection & {
     _triggerDataStream(streamId: bigint, header: DataStreamHeader) {
       adapter.onDataStream?.(streamId, header);
     },
-    _triggerStreamClosed(streamId: bigint, error?: number) {
-      adapter.onStreamClosed?.(streamId, error);
+  /**
+   * Ordinary calls default to the terminal their error code implies: no error
+   * means a peer FIN, a numeric error means a peer reset. Ambiguity tests pass
+   * the kind explicitly — the player accepts only 'fin' as completion evidence,
+   * so an unclassified call would silently stop being a clean FIN.
+   */
+    _triggerStreamClosed(streamId: bigint, error?: number, terminal?: DataStreamTerminal) {
+      adapter.onStreamClosed?.(streamId, error, terminal ?? (error === undefined ? 'fin' : 'reset'));
     },
     _triggerClose(error?: number, reason?: string) {
       adapter.onClose?.(error, reason);

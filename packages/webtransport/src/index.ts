@@ -5,6 +5,7 @@
 
 export { MoqtConnection } from './adapter.js';
 export type { TrackSubscription, TrackSubscribeOptions, IncomingPublish } from './adapter.js';
+export type { DataStreamTerminal } from './adapter.js';
 export type {
   WebTransportLike,
   WebTransportBidirectionalStream,

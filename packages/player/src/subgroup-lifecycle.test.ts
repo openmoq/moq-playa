@@ -18,6 +18,7 @@ import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@moqt/webtransport';
 import type { ControlMessage, DataStreamHeader, MoqtObject } from '@moqt/transport';
 import { varint } from '@moqt/transport';
+import type { DataStreamTerminal } from '@moqt/webtransport';
 
 const VIDEO_ALIAS = 50n;
 const AUDIO_ALIAS = 51n;
@@ -58,9 +59,18 @@ function createMockAdapter() {
     _triggerObject: (streamId: bigint, obj: MoqtObject) => adapter.onObject?.(streamId, obj),
     _triggerDataStream: (streamId: bigint, header: DataStreamHeader) =>
       adapter.onDataStream?.(streamId, header),
-    _triggerStreamClosed: (streamId: bigint, error?: number) =>
-      adapter.onStreamClosed?.(streamId, error),
-    /** Graceful FIN — the adapter alone can distinguish this from a read failure. */
+    /**
+     * Ordinary calls default to the terminal their error code implies: no error
+     * means a peer FIN, a numeric error means a peer reset. Ambiguity tests pass
+     * the kind explicitly — the player accepts only 'fin' as completion evidence,
+     * so an unclassified call would silently stop being a clean FIN.
+     */
+    _triggerStreamClosed: (streamId: bigint, error?: number, terminal?: DataStreamTerminal) =>
+      adapter.onStreamClosed?.(streamId, error, terminal ?? (error === undefined ? 'fin' : 'reset')),
+    /**
+     * Graceful subgroup FIN. `onStreamClosed` now classifies its terminal too,
+     * but only this callback carries the finally resolved header.
+     */
     _triggerSubgroupFin: (streamId: bigint, header: any) =>
       adapter.onSubgroupFin?.(streamId, header.header ?? header),
   };
@@ -183,12 +193,26 @@ describe('subgroup lifecycle witness', () => {
     }]);
   });
 
-  it('does NOT claim FIN for a close with no error code', () => {
-    // `onStreamClosed(id, undefined)` covers a generic read failure as well as
-    // a clean FIN. Only the adapter's graceful-FIN hook proves the difference,
-    // and a false FIN would send the investigation the wrong way.
+  it('does NOT claim FIN from onStreamClosed alone, even when it says fin', () => {
+    // Only the graceful-FIN hook carries the RESOLVED header this record needs,
+    // so a FIN terminal on its own is still not enough to emit one.
     adapter._triggerDataStream(35n, subgroupHeader(VIDEO_ALIAS, 400n, true));
     adapter._triggerStreamClosed(35n);
+    expect(lifecycleLines()).toEqual([]);
+  });
+
+  it('does NOT report a local discard as a reset, even carrying a code', () => {
+    // Guards the player at its public callback boundary: the adapter now holds
+    // a code back on a local discard, but the player must not re-derive the
+    // cause from the code if one ever arrives anyway.
+    adapter._triggerDataStream(36n, subgroupHeader(VIDEO_ALIAS, 401n, true));
+    adapter._triggerStreamClosed(36n, 0x2a, 'local-discard');
+    expect(lifecycleLines()).toEqual([]);
+  });
+
+  it('does NOT report a generic read failure as a reset', () => {
+    adapter._triggerDataStream(37n, subgroupHeader(VIDEO_ALIAS, 402n, true));
+    adapter._triggerStreamClosed(37n, undefined, 'error');
     expect(lifecycleLines()).toEqual([]);
   });
 

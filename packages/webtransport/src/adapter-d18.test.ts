@@ -6,6 +6,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { MoqtConnection } from './adapter.js';
+import type { DataStreamTerminal } from './adapter.js';
 import { TransportSim, flush } from './testkit/stream-sim.js';
 import { createControlCodec, varint, writeVi64, SessionState } from '@moqt/transport';
 import { SetupOption18 } from '@moqt/transport';
@@ -90,6 +91,33 @@ describe('MoqtConnection(18) subscribe', () => {
     expect(sub.trackAlias).toBe(42n);
     // SUBSCRIBE_OK was consumed by raw subscription resolution → suppressed from onMessage.
     expect(seen).not.toContain('SUBSCRIBE_OK');
+  });
+
+  it('PUBLISH_DONE does not recreate receiver state after onMessage closes', async () => {
+    // The outbound-subscription response stream is the third copy of the
+    // terminal application; it must also run before the application callback.
+    const { conn, transport } = await connected();
+    const sub = await (async () => {
+      const p = conn.subscribeTrack(ns('a'), nm('1'));
+      await flush();
+      transport.bidi[0]!.push(okBytes(87n));
+      return p;
+    })();
+    expect(sub.trackAlias).toBe(87n);
+
+    conn.onMessage = (m) => { if (m.type === 'PUBLISH_DONE') void conn.close(); };
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'PUBLISH_DONE', requestId: 0n, statusCode: varint(0n),
+      streamCount: varint(0n), errorReason: 'done',
+    } as never));
+    await flush();
+
+    const maps = conn as unknown as {
+      terminatedAliases: Map<bigint, unknown>;
+      rawAliasMaps: Map<bigint, unknown>;
+    };
+    expect(maps.terminatedAliases.size).toBe(0);
+    expect(maps.rawAliasMaps.size).toBe(0);
   });
 
   it('plain subscribe() routes SUBSCRIBE_OK to onMessage + qlog with a stamped requestId', async () => {
@@ -591,6 +619,69 @@ describe('MoqtConnection(18) fetch cancellation (§3.3.2)', () => {
     await expect(conn.fetchCancel(reqId)).resolves.toBeUndefined();
   });
 
+  // ─── Local discard is not a peer terminal (draft-18 decoder branch) ──
+  //
+  // `reader.cancel()` settles an already-pending `read()` as `{done:true}`,
+  // which is what a peer FIN looks like to the fetch object loop. Diagnosis by
+  // Paul Gregoire (openmoq/moq-playa#7); the draft-18 loop is a separate branch
+  // from the legacy one, so it needs its own proof.
+
+  /** Terminal kinds seen on `onStreamClosed`, in order. */
+  function terminalsOf(conn: MoqtConnection): DataStreamTerminal[] {
+    const seen: DataStreamTerminal[] = [];
+    conn.onStreamClosed = (_sid, _err, terminal) => seen.push(terminal);
+    return seen;
+  }
+
+  it('fetchCancel mid-object is non-fatal and classified local-discard', async () => {
+    const { conn, transport } = await connected();
+    const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
+    const dataStream = transport.openIncomingUni();
+    const obj = firstFetchObjBytes(1n, 0n, 3, [0xaa, 0xbb, 0xcc]);
+    // Truncated object: the loop is mid-object when our cancel lands.
+    dataStream.push(concatBytes(fetchHeaderBytes(reqId), obj.subarray(0, obj.length - 2)));
+    await flush();
+
+    const terminals = terminalsOf(conn);
+    await conn.fetchCancel(reqId);
+    await flush();
+
+    expect(conn.session.state).not.toBe(SessionState.CLOSED);
+    expect(terminals).toEqual(['local-discard']);
+  });
+
+  it('fetchCancel at an empty buffer publishes no clean completion', async () => {
+    const { conn, transport } = await connected();
+    const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
+    const dataStream = transport.openIncomingUni();
+    // Header only: the object loop parks on an empty buffer.
+    dataStream.push(fetchHeaderBytes(reqId));
+    await flush();
+
+    const terminals = terminalsOf(conn);
+    await conn.fetchCancel(reqId);
+    await flush();
+
+    expect(conn.session.state).not.toBe(SessionState.CLOSED);
+    expect(terminals).toEqual(['local-discard']);
+  });
+
+  it('a peer FIN mid-object is still fatal and publishes no normal terminal', async () => {
+    const { conn, transport } = await connected();
+    const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
+    const dataStream = transport.openIncomingUni();
+    const obj = firstFetchObjBytes(1n, 0n, 3, [0xaa, 0xbb, 0xcc]);
+    dataStream.push(concatBytes(fetchHeaderBytes(reqId), obj.subarray(0, obj.length - 2)));
+    await flush();
+
+    const terminals = terminalsOf(conn);
+    dataStream.closeReadable();   // the PEER ends mid-object
+    await flush();
+
+    expect(conn.session.state).toBe(SessionState.CLOSED);
+    expect(terminals).toEqual([]);
+  });
+
   it('a data stream arriving AFTER fetchCancel is DISCARDED, not delivered to onDataStream (§10.13)', async () => {
     const { conn, transport } = await connected();
     const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
@@ -607,6 +698,133 @@ describe('MoqtConnection(18) fetch cancellation (§3.3.2)', () => {
     await flush();
     expect(late.readCancelled).toBe(true);
     expect(fetchStreams.length).toBe(0);
+  });
+
+  for (const failure of ['throws-sync', 'rejects'] as const) {
+    it(`no draft-18 fetch object is delivered after a discard whose cancel ${failure}`, async () => {
+      // When cancel() fails the reader stays usable. The draft-18 fetch loop
+      // must gate on provenance, not just on the cancellation marker it
+      // consumes one-shot.
+      const { conn, transport } = await connected();
+      const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
+      const dataStream = transport.openIncomingUni();
+      dataStream.failCancel = failure;
+      dataStream.push(fetchHeaderBytes(reqId));
+      await flush();
+
+      const objects: MoqtObject[] = [];
+      conn.onObject = (_sid, o) => objects.push(o);
+      const terminals = terminalsOf(conn);
+
+      await conn.fetchCancel(reqId);
+      // The peer keeps writing after our teardown returned.
+      dataStream.push(firstFetchObjBytes(1n, 0n, 3, [0xaa, 0xbb, 0xcc]));
+      dataStream.closeReadable();
+      await flush();
+
+      expect(objects).toEqual([]);
+      expect(terminals).toEqual(['local-discard']);
+      expect(conn.session.state).not.toBe(SessionState.CLOSED);
+    });
+  }
+
+  it('no draft-18 fetch object is delivered when its qlog event cancels', async () => {
+    // The draft-18 decoder has its own delivery point; a stop issued from the
+    // qlog callback must reach it, not just the loop boundary above.
+    const { conn, transport } = await connected();
+    const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
+    const dataStream = transport.openIncomingUni();
+    dataStream.failCancel = 'rejects';
+    dataStream.push(fetchHeaderBytes(reqId));
+    await flush();
+
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, o) => objects.push(o);
+    conn.onQlogEvent = (e: { type: string; stream_id?: bigint }) => {
+      if (e.type === 'fetch_object_parsed') void conn.stopSending(e.stream_id!, varint(0x1));
+    };
+
+    dataStream.push(firstFetchObjBytes(1n, 0n, 3, [0xaa, 0xbb, 0xcc]));
+    await flush();
+
+    expect(objects).toEqual([]);
+  });
+
+  it('a second buffered draft-18 fetch object is never decoded after a discard', async () => {
+    // The loop guard's own job: stop DECODING. Both objects arrive in one
+    // chunk, so only a check at the loop boundary can prevent the second from
+    // being parsed and observed.
+    const { conn, transport } = await connected();
+    const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
+    const dataStream = transport.openIncomingUni();
+    dataStream.failCancel = 'rejects';
+    dataStream.push(fetchHeaderBytes(reqId));
+    await flush();
+
+    const qlog: string[] = [];
+    let cancelled = false;
+    conn.onQlogEvent = (e: { type: string }) => qlog.push(e.type);
+    conn.onObject = (sid) => {
+      if (cancelled) return;
+      cancelled = true;
+      void conn.stopSending(sid, varint(0x1));
+    };
+
+    dataStream.push(concatBytes(
+      firstFetchObjBytes(1n, 0n, 3, [0xaa, 0xbb, 0xcc]),
+      firstFetchObjBytes(1n, 1n, 3, [0xdd, 0xee, 0xff]),
+    ));
+    await flush();
+
+    expect(cancelled).toBe(true);
+    expect(qlog.filter((t) => t === 'fetch_object_parsed')).toHaveLength(1);
+    expect(conn.session.state).not.toBe(SessionState.CLOSED);
+  });
+
+  it('a late stream discarded at its FETCH_HEADER publishes no clean completion', async () => {
+    // The header decodes, the cancellation marker fires, and we cancel the
+    // reader. That local teardown must not reach the outer terminal decision
+    // as a peer FIN — it would settle a fetch the peer never finished.
+    const { conn, transport } = await connected();
+    const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
+    await conn.fetchCancel(reqId);
+    await flush();
+
+    const terminals = terminalsOf(conn);
+    transport.openIncomingUni().push(fetchHeaderBytes(reqId));
+    await flush();
+
+    expect(terminals).toEqual(['local-discard']);
+    expect(conn.session.state).not.toBe(SessionState.CLOSED);
+  });
+
+  it('a fetch cancelled while its object loop is parked publishes no clean completion', async () => {
+    // The loop-top guard: the stream is already OPEN and decoding objects when
+    // the cancel lands, so the discard happens inside readFetchObjects18 —
+    // a different branch from the FETCH_HEADER marker above.
+    const { conn, transport } = await connected();
+    const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
+    const dataStream = transport.openIncomingUni();
+    dataStream.push(fetchHeaderBytes(reqId));
+    await flush();
+
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, o) => objects.push(o);
+    const terminals = terminalsOf(conn);
+    // The marker is installed SYNCHRONOUSLY by fetchCancel; delivering a chunk
+    // before its teardown awaits complete wakes the parked read, so the loop
+    // re-enters its top and takes the guard rather than the `done` branch.
+    const cancelling = conn.fetchCancel(reqId);
+    dataStream.push(firstFetchObjBytes(1n, 0n, 3, [0xaa, 0xbb, 0xcc]));
+    await cancelling;
+    await flush();
+
+    // The point of the guard is that this object never reaches the consumer.
+    // Asserting only the terminal would also pass with the guard deleted: the
+    // later reader cancellation produces the same terminal either way.
+    expect(objects).toEqual([]);
+    expect(terminals).toEqual(['local-discard']);
+    expect(conn.session.state).not.toBe(SessionState.CLOSED);
   });
 
   it('cancel with NO data stream yet only tears down the request stream', async () => {

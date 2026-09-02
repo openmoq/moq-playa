@@ -232,6 +232,25 @@ describe('MoqtConnection(18) padding stream + invalid types', () => {
     expect(closedSession).toBe(false);
   });
 
+  it('a padding drain stops on local discard even when cancel fails', async () => {
+    // Without a gate at the drain boundary the loop keeps consuming whatever
+    // the peer writes and never reaches `done`, so no terminal is ever
+    // published for a stream we already tore down.
+    const { conn, transport } = await connected();
+    const s = transport.openIncomingUni();
+    s.failCancel = 'rejects';
+    s.push(concat(pack(BigInt(StreamType18.PADDING)), new Uint8Array([0x00, 0x11])));
+    await flush();
+
+    const terminals: string[] = [];
+    conn.onStreamClosed = (_sid, _err, terminal) => terminals.push(terminal);
+    await conn.close();
+    s.push(new Uint8Array([0x22, 0x33]));   // the peer keeps padding
+    await flush();
+
+    expect(terminals).toEqual(['local-discard']);
+  });
+
   it('raises a protocol violation on an unknown stream type', async () => {
     const { conn, transport } = await connected();
     let closeCode: number | undefined;
@@ -930,6 +949,24 @@ describe('MoqtConnection(18) inbound PUBLISH lifecycle', () => {
     const done = seen.find((m) => m.type === 'PUBLISH_DONE') as { requestId?: bigint } | undefined;
     expect(done).toBeDefined();
     expect(done!.requestId).toBe(1n); // stamped from stream context
+  });
+
+  it('PUBLISH_DONE does not recreate receiver state after onMessage closes', async () => {
+    // The inbound-PUBLISH path duplicates the terminal application; it must
+    // also run before the application callback, so a reentrant close() clears
+    // state rather than having its cleanup undone by a later arm.
+    const { conn, bidi } = await publishAccepted();
+    conn.onMessage = (m) => { if (m.type === 'PUBLISH_DONE') void conn.close(); };
+
+    bidi.push(publishDoneBytes());
+    await flush();
+
+    const maps = conn as unknown as {
+      terminatedAliases: Map<bigint, unknown>;
+      publishAliasMaps: Map<bigint, unknown>;
+    };
+    expect(maps.terminatedAliases.size).toBe(0);
+    expect(maps.publishAliasMaps.size).toBe(0);
   });
 
   it('a late stream on the published alias is EARLY-DISCARDED after PUBLISH_DONE, not delivered (§10.11 bounded terminal)', async () => {

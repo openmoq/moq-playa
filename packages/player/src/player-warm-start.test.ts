@@ -24,6 +24,7 @@ import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@moqt/webtransport';
 import type { ControlMessage, MoqtObject } from '@moqt/transport';
 import { varint } from '@moqt/transport';
+import type { DataStreamTerminal } from '@moqt/webtransport';
 
 // ─── Mock adapter (thin copy of the player.test.ts harness) ──────────
 
@@ -49,7 +50,14 @@ function createMockAdapter() {
     _triggerMessage: (msg: ControlMessage) => adapter.onMessage?.(msg),
     _triggerObject: (streamId: bigint, obj: MoqtObject) => adapter.onObject?.(streamId, obj),
     _triggerDataStream: (streamId: bigint, header: unknown) => adapter.onDataStream?.(streamId, header),
-    _triggerStreamClosed: (streamId: bigint, error?: number) => adapter.onStreamClosed?.(streamId, error),
+    /**
+     * Ordinary calls default to the terminal their error code implies: no error
+     * means a peer FIN, a numeric error means a peer reset. Ambiguity tests pass
+     * the kind explicitly — the player accepts only 'fin' as completion evidence,
+     * so an unclassified call would silently stop being a clean FIN.
+     */
+    _triggerStreamClosed: (streamId: bigint, error?: number, terminal?: DataStreamTerminal) =>
+      adapter.onStreamClosed?.(streamId, error, terminal ?? (error === undefined ? 'fin' : 'reset')),
   };
   return adapter;
 }

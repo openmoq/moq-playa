@@ -25,7 +25,7 @@ import { varint, PublishDoneCode, PublishDoneCode18 } from '@moqt/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import { MoqtConnectionError } from '@moqt/webtransport';
-import type { MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@moqt/webtransport';
+import type { DataStreamTerminal, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@moqt/webtransport';
 import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@moqt/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@moqt/transport';
 import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@moqt/playback';
@@ -558,7 +558,7 @@ export class MoqtPlayer {
     retiredAlias: bigint | null;
     parked: Array<{ streamId: bigint; obj: MoqtObject }>;
     parkedBytes: number;
-    parkedEvents: Map<bigint, 'fin' | 'reset'>;
+    parkedEvents: Map<bigint, DataStreamTerminal>;
     /** Candidate readiness held until the alias is BOUND: the joining fetch
      *  can legally complete on a Pending subscription, and adopting before
      *  SUBSCRIBE_OK would discard the transaction-local parked traffic. */
@@ -583,7 +583,8 @@ export class MoqtPlayer {
    * closed — the chain is treated as not-clean, never as clean). Bounded FIFO:
    * eviction only removes positive evidence, which is also fail-closed.
    */
-  private readonly pendingStreamEvents = new Map<MoqtConnection, Map<bigint, { error: number | undefined }>>();
+  private readonly pendingStreamEvents =
+    new Map<MoqtConnection, Map<bigint, { error: number | undefined; terminal: DataStreamTerminal }>>();
   private static readonly MAX_PENDING_STREAM_EVENTS = 64;
 
   private pendingStreamEventCount(): number {
@@ -811,7 +812,7 @@ export class MoqtPlayer {
    */
   private readonly pendingFetchStreams = new Map<
     bigint,
-    { requestId: bigint; objects: MoqtObject[]; finished?: boolean }
+    { requestId: bigint; objects: MoqtObject[]; terminal?: DataStreamTerminal }
   >();
 
   /**
@@ -840,7 +841,7 @@ export class MoqtPlayer {
     for (const [streamId, pending] of this.pendingFetchStreams) {
       if (pending.requestId === reqId) {
         this.pendingFetchStreams.delete(streamId);
-        if (!pending.finished) this.droppedFetchStreams.add(streamId);
+        if (pending.terminal === undefined) this.droppedFetchStreams.add(streamId);
       }
     }
   }
@@ -3038,9 +3039,10 @@ export class MoqtPlayer {
         // connection is the source session here.
         this.routeFetchObject(streamId, info.trackAlias, obj, this.connection?.draftVersion, this.connection ?? undefined);
       }
-      if (pending.finished) {
-        // The stream already FINned: the pre-roll is complete — no live
-        // routing maps needed, and the fetch bookkeeping ends with it.
+      if (pending.terminal !== undefined) {
+        // The stream already ended — however it ended, no live routing maps
+        // are needed and the fetch bookkeeping ends with it. Only the
+        // BOOTSTRAP path below needs the terminal to be a peer FIN.
         this.activeFetches.delete(fetchReqId);
       } else {
         this.fetchStreamAliases.set(streamId, info.trackAlias);
@@ -3486,8 +3488,9 @@ export class MoqtPlayer {
   private registerBootstrapFetch(conn: MoqtConnection, reqId: bigint, attempt: number, gen: number): void {
     if (gen !== this.bootstrapGeneration) return;
     this.bootstrapFetch = { conn, reqId, attempt, gen };
-    // Claim parked fetch streams that raced this registration (the FETCH
-    // header can arrive before the fetch() continuation resolves).
+    // Claim any stream parked by the defensive fallback at the onDataStream
+    // site — a FETCH header whose request had no owner yet. Registration is
+    // pre-send and synchronous, so this should find nothing.
     for (const [streamId, parked] of [...this.pendingFetchStreams]) {
       if (parked.requestId === reqId) {
         this.pendingFetchStreams.delete(streamId);
@@ -3496,11 +3499,11 @@ export class MoqtPlayer {
           this.emitCatalogRaw(obj);
           this.catalogBootstrapCoord?.onFetchObject(attempt, this.toCatalogEvent(obj));
         }
-        if (parked.finished) {
-          // Parked-stream machinery only records clean completion; a reset
-          // would have gone through onStreamClosed with an error and never
-          // parked as `finished`.
-          this.catalogBootstrapCoord?.onFetchStreamClosed(attempt, true);
+        if (parked.terminal !== undefined) {
+          // The stream ended before registration. Only a peer FIN completes the
+          // attempt — a reset, our own discard, and a read failure are all
+          // recorded here too, and none of them finished the fetch.
+          this.catalogBootstrapCoord?.onFetchStreamClosed(attempt, parked.terminal === 'fin');
         }
       }
     }
@@ -5163,7 +5166,7 @@ export class MoqtPlayer {
       }, 'data', objBytes),
 
       // §10.4: Stream reset vs FIN
-      onStreamClosed: stageable((streamId, error) => {
+      onStreamClosed: stageable((streamId, error, terminal) => {
         // If a pending catalog-fetch's stream closed without delivering
         // an object, reject — otherwise the promise hangs until timeout.
         // (If onObject already settled, the reqId is gone from
@@ -5173,12 +5176,12 @@ export class MoqtPlayer {
           const rAttempt = recoveryClose.fetchStreams.get(streamId);
           if (rAttempt !== undefined) {
             recoveryClose.fetchStreams.delete(streamId);
-            recoveryClose.coord.onFetchStreamClosed(rAttempt, error === undefined);
+            recoveryClose.coord.onFetchStreamClosed(rAttempt, terminal === 'fin');
           }
           // Lifecycle evidence for PARKED retired-alias streams (fail-closed
           // bound: overflow aborts the candidate rather than dropping).
           if (recoveryClose.parked.some((e) => e.streamId === streamId)) {
-            recoveryClose.parkedEvents.set(streamId, error === undefined ? 'fin' : 'reset');
+            recoveryClose.parkedEvents.set(streamId, terminal);
             if (!this.catalogParkingWithinBounds(conn)) {
               this.onCatalogParkingOverflow(conn);
             }
@@ -5187,14 +5190,14 @@ export class MoqtPlayer {
         const bootstrapEntry2 = this.bootstrapFetchStreams.get(streamId);
         if (bootstrapEntry2 !== undefined && bootstrapEntry2.conn === conn) {
           this.bootstrapFetchStreams.delete(streamId);
-          this.catalogBootstrapCoord?.onFetchStreamClosed(bootstrapEntry2.attempt, error === undefined);
+          this.catalogBootstrapCoord?.onFetchStreamClosed(bootstrapEntry2.attempt, terminal === 'fin');
         }
         // Live catalog stream lifecycle → retained-chain clean-FIN tracking,
         // dispatched to the OWNING coordinator (main or candidate).
         const liveEntry = this.catalogLiveStreams.get(streamId);
         if (liveEntry !== undefined && liveEntry.conn === conn) {
           this.catalogLiveStreams.delete(streamId);
-          liveEntry.coord.onLiveStreamEvent(streamId, error === undefined ? 'fin' : 'reset');
+          liveEntry.coord.onLiveStreamEvent(streamId, terminal);
         }
         // The legacy fetch registries below are keyed by BARE stream ID and are
         // authoritative only for the current connection (see onObject) — a
@@ -5205,8 +5208,8 @@ export class MoqtPlayer {
         if (catalogReqId !== undefined) {
           this.settleCatalogFetch(catalogReqId, {
             ok: false,
-            error: new Error(error !== undefined
-              ? `fetchCatalog: stream reset (code 0x${error.toString(16)})`
+            error: new Error(terminal === 'reset'
+              ? `fetchCatalog: stream reset (code 0x${error!.toString(16)})`
               : 'fetchCatalog: stream closed without object'),
           });
         }
@@ -5253,8 +5256,9 @@ export class MoqtPlayer {
                 if (!catalogOwned) return;
               }
             }
-            const perConn = this.pendingStreamEvents.get(conn) ?? new Map<bigint, { error: number | undefined }>();
-            perConn.set(streamId, { error });
+            const perConn = this.pendingStreamEvents.get(conn)
+              ?? new Map<bigint, { error: number | undefined; terminal: DataStreamTerminal }>();
+            perConn.set(streamId, { error, terminal });
             this.pendingStreamEvents.set(conn, perConn);
           }
         }
@@ -5262,18 +5266,18 @@ export class MoqtPlayer {
         const subgroupAlias = closeMapsAuthoritative ? this.subgroupStreamAliases.get(streamId) : undefined;
         if (subgroupAlias !== undefined) {
           this.subgroupStreamAliases.delete(streamId); // map never outlives the stream
-          if (error !== undefined) {
+          if (terminal === 'reset') {
             this.livenessMonitor?.noteStreamReset(subgroupAlias, performance.now());
           }
         }
-        // §9.16.3: a fetch's single data stream ending (FIN or reset) ends
+        // §9.16.3: a fetch's single data stream ending (however it ended) ends
         // the fetch — drop its routing maps and active-fetch bookkeeping. An
-        // UNREGISTERED stream (data raced the fetch()/joiningFetch()
-        // continuation) keeps its buffered objects and is marked finished:
-        // registration will still replay the completed pre-roll.
+        // UNREGISTERED stream keeps its buffered objects and RECORDS ITS
+        // TERMINAL: registration replays the pre-roll, and only a peer FIN
+        // there counts as completion.
         if (closeMapsAuthoritative) {
           const pendingFetch = this.pendingFetchStreams.get(streamId);
-          if (pendingFetch) pendingFetch.finished = true;
+          if (pendingFetch) pendingFetch.terminal = terminal;
           this.droppedFetchStreams.delete(streamId); // tombstone ends with the stream
           const fetchReqId = this.fetchStreamRequestIds.get(streamId);
           if (fetchReqId !== undefined) {
@@ -5282,20 +5286,20 @@ export class MoqtPlayer {
             this.activeFetches.delete(fetchReqId);
           }
         }
-        if (error !== undefined) {
-          this.log.debug('Data stream %s reset with code 0x%s', streamId, error.toString(16));
+        if (terminal === 'reset') {
+          this.log.debug('Data stream %s reset with code 0x%s', streamId, error!.toString(16));
         }
-        // Consume the entry on every terminal so the map cannot grow. Only a
-        // numeric code proves RESET; an absent code covers clean FIN *and*
-        // generic read failure alike, so FIN is claimed only from the
-        // adapter's `onSubgroupFin`, which alone knows the stream drained.
+        // Consume the entry on every terminal so the map cannot grow. RESET is
+        // claimed from the adapter's classification, never from a present code —
+        // and FIN only from `onSubgroupFin`, which alone carries the resolved
+        // header this record needs.
         const lifecycle = subgroupLifecycle.get(streamId);
         if (lifecycle !== undefined) {
           subgroupLifecycle.delete(streamId);
-          if (error !== undefined) {
+          if (terminal === 'reset') {
             emitSubgroupLifecycle(lifecycle, streamId, lifecycle.subgroupId, {
               terminal: 'reset',
-              reset_code: `0x${error.toString(16)}`,
+              reset_code: `0x${error!.toString(16)}`,
             });
           }
         }
@@ -5395,9 +5399,10 @@ export class MoqtPlayer {
             this.fetchStreamAliases.set(streamId, fetchInfo.trackAlias);
             this.fetchStreamRequestIds.set(streamId, reqId);
           } else {
-            // §9.16.3: data can precede the fetch()/joiningFetch() promise
-            // continuation that registers the request. Park the stream;
-            // registerMediaFetch() resolves it and replays buffered objects.
+            // §9.16.3 defensive fallback: a stream whose request has no owner
+            // yet. Registration is pre-send and synchronous today, so this
+            // should not happen — park the stream rather than drop it, and
+            // registerMediaFetch() replays the buffered objects if it does.
             // BOUNDED: a peer cycling unknown fetch streams must not grow
             // this for the session lifetime — evict the oldest entry.
             if (this.pendingFetchStreams.size >= MoqtPlayer.MAX_PENDING_FETCH_STREAMS) {
@@ -5407,10 +5412,10 @@ export class MoqtPlayer {
                 this.pendingFetchStreams.delete(oldest);
                 // Keep the CLASSIFICATION for a still-open stream: its later
                 // objects are dropped, never alias-routed. A stream that has
-                // already FINished gets NO tombstone — no close event will
-                // ever clear it, and repeated header→FIN→overflow cycles
+                // ALREADY ENDED gets NO tombstone — no close event will ever
+                // clear it, and repeated header→terminal→overflow cycles
                 // would grow the set forever.
-                if (!evicted?.finished) this.droppedFetchStreams.add(oldest);
+                if (evicted?.terminal === undefined) this.droppedFetchStreams.add(oldest);
               }
             }
             this.pendingFetchStreams.set(streamId, { requestId: reqId, objects: [] });
@@ -5899,7 +5904,7 @@ export class MoqtPlayer {
         perConn.delete(streamId);
         if (coord) {
           this.catalogLiveStreams.delete(streamId);
-          coord.onLiveStreamEvent(streamId, closed.error === undefined ? 'fin' : 'reset');
+          coord.onLiveStreamEvent(streamId, closed.terminal);
         }
       }
       if (perConn.size === 0) this.pendingStreamEvents.delete(resolvingConnection);

@@ -21,6 +21,7 @@ import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@moqt/webtransport';
 import type { ControlMessage, DataStreamHeader, MoqtObject } from '@moqt/transport';
 import { varint } from '@moqt/transport';
+import type { DataStreamTerminal } from '@moqt/webtransport';
 
 // ─── Mock adapter (thin copy of the player.test.ts harness) ──────────
 
@@ -51,7 +52,14 @@ function createMockAdapter() {
     _triggerMessage: (msg: ControlMessage) => adapter.onMessage?.(msg),
     _triggerObject: (streamId: bigint, obj: MoqtObject) => adapter.onObject?.(streamId, obj),
     _triggerDataStream: (streamId: bigint, header: DataStreamHeader) => adapter.onDataStream?.(streamId, header),
-    _triggerStreamClosed: (streamId: bigint, error?: number) => adapter.onStreamClosed?.(streamId, error),
+    /**
+     * Ordinary calls default to the terminal their error code implies: no error
+     * means a peer FIN, a numeric error means a peer reset. Ambiguity tests pass
+     * the kind explicitly — the player accepts only 'fin' as completion evidence,
+     * so an unclassified call would silently stop being a clean FIN.
+     */
+    _triggerStreamClosed: (streamId: bigint, error?: number, terminal?: DataStreamTerminal) =>
+      adapter.onStreamClosed?.(streamId, error, terminal ?? (error === undefined ? 'fin' : 'reset')),
   };
   return adapter;
 }
@@ -245,6 +253,27 @@ describe('media liveness (starvation detection + restart ladder)', () => {
       expect(recoveries.some((a) => a.type === 'track_restart')).toBe(true);
     }, { timeout: 2_000 });
     feedVideo(adapter); // recover
+    await player.destroy();
+  });
+
+  it('OUR OWN discard does not shorten the fuse — only a peer reset does', async () => {
+    // The reset fuse exists because a peer reset means objects were lost. We
+    // cancel streams routinely (PUBLISH_DONE teardown, STOP_SENDING, track
+    // switches); treating that as evidence of loss restarts a healthy track.
+    const adapter = createMockAdapter();
+    const { player } = await startPlaying(adapter, { livenessTimeoutMs: 5_000 });
+    const recoveries: any[] = [];
+    player.on('recovery_action', (e) => recoveries.push(e.action));
+
+    adapter._triggerDataStream(7n, subgroupHeader(VIDEO_ALIAS));
+    feedVideo(adapter, 7n); // arm
+    // A numeric value alongside a local discard: the adapter holds the code
+    // back today, so this pins the player at its own callback boundary.
+    adapter._triggerStreamClosed(7n, 0x1, 'local-discard');
+
+    // The reset fuse is 40ms and the full timeout is 5s — well clear.
+    await sleep(300);
+    expect(recoveries.filter((a) => a.type === 'track_restart')).toHaveLength(0);
     await player.destroy();
   });
 

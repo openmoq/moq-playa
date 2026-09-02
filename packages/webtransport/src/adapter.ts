@@ -86,6 +86,35 @@ import type { WebTransportLike, WebTransportBidirectionalStream } from './types.
 
 // ─── Track Subscription Types ─────────────────────────────────────────
 
+/**
+ * How an incoming data stream ended.
+ *
+ * - `'fin'`: the peer finished the stream gracefully. The ONLY positive
+ *   completion evidence.
+ * - `'reset'`: the peer reset it; the callback's `error` carries the code.
+ * - `'local-discard'`: WE cancelled the reader.
+ * - `'error'`: the read or its processing failed with no stream error code.
+ *
+ * Only `'reset'` carries a numeric code, so an ABSENT code spans three
+ * outcomes and can never be read as completion (§10.4, §10.4.3).
+ */
+export type DataStreamTerminal =
+  | 'fin'
+  | 'reset'
+  | 'local-discard'
+  | 'error';
+
+/**
+ * How a data-stream read loop ended, as seen from inside the loop. A protocol
+ * violation throws instead, so no terminal is published for it.
+ */
+type DataStreamReadTerminal = 'peer-fin' | 'local-discard';
+
+/** Widen a read-loop outcome into the public terminal classification. */
+function terminalKind(terminal: DataStreamReadTerminal): DataStreamTerminal {
+  return terminal === 'peer-fin' ? 'fin' : 'local-discard';
+}
+
 /** Options for connection.subscribeTrack(). */
 export interface TrackSubscribeOptions {
   /** Subscription filter (LargestObject, NextGroupStart, AbsoluteStart, etc.). */
@@ -313,6 +342,20 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-16 §10.4.3
    */
   private dataStreamReaders = new Map<bigint, ReadableStreamDefaultReader<Uint8Array>>();
+  /**
+   * Readers WE cancelled. A pending `read()` settles as `{ done: true }`
+   * before `reader.cancel()` resolves, so a local discard is otherwise
+   * indistinguishable from a peer FIN. Keyed by the reader itself, this cannot
+   * be confused by a later stream-id reuse. Only `discardLocalReader()` adds.
+   *
+   * Membership is a DELIVERY GATE, not just a terminal label: `cancel()` can
+   * fail and leave the reader usable, and application callbacks (`onQlogEvent`,
+   * object delivery) can tear the stream down re-entrantly. Every decoder
+   * therefore re-checks this at each loop boundary and after each external
+   * callback, before the next decode or delivery. Once a reader is in here, no
+   * further byte from it reaches a consumer.
+   */
+  private locallyDiscardedReaders = new WeakSet<ReadableStreamDefaultReader<Uint8Array>>();
 
   /**
    * Map from fetch requestId → data stream ID, for STOP_SENDING on cancel.
@@ -612,8 +655,13 @@ export class MoqtConnection {
     this.fetchServeReserved.clear();
     this.fetchStreams.clear();
     this.recentlyCancelledFetches.clear();
-    // Incoming data-stream readers — cancel each, then drop.
-    for (const r of this.dataStreamReaders.values()) this.swallow(() => r.cancel(reason));
+    // Incoming data-stream readers — cancel each, then drop. This is a LOCAL
+    // teardown: route it through the ownership primitive so a read parked in
+    // `read()` cannot report its `done` as a peer FIN. The helper marks and
+    // unregisters before its first await, so not awaiting here is safe.
+    for (const [streamId, r] of [...this.dataStreamReaders]) {
+      this.swallow(() => this.discardLocalReader(streamId, r, reason));
+    }
     this.dataStreamReaders.clear();
     // Outgoing data-stream / fetch / namespace writers — abort each, then drop.
     for (const st of this.outgoingStreams.values()) this.swallow(() => st.writer.abort(reason));
@@ -758,8 +806,19 @@ export class MoqtConnection {
   /** Called for each object decoded from a data stream (§10.4.2, §10.4.4). */
   onObject?: (streamId: bigint, object: MoqtObject) => void;
 
-  /** Called when a data stream closes (FIN or error). */
-  onStreamClosed?: (streamId: bigint, error?: number) => void;
+  /**
+   * Called when a data stream closes.
+   *
+   * `error` alone cannot distinguish a peer FIN from our own cancellation or a
+   * generic failure — all three leave it undefined — so `terminal` is required
+   * at every emission site. Only `'fin'` is evidence the peer finished the
+   * stream.
+   */
+  onStreamClosed?: (
+    streamId: bigint,
+    error: number | undefined,
+    terminal: DataStreamTerminal,
+  ) => void;
 
   /**
    * Called when a subgroup stream ends by **graceful FIN**, with the header as
@@ -768,10 +827,10 @@ export class MoqtConnection {
    * Connection-level and diagnostic; distinct from the per-subscription
    * `onSubgroupClosed`, which fires for a subscription's own streams.
    *
-   * `onStreamClosed` cannot express this: it reports a generic read failure
-   * with the same absent error code as a clean FIN, so a consumer cannot tell
-   * them apart. Only the adapter knows the stream drained to `done` with no
-   * partial object, which is what completes an END_OF_GROUP-bearing subgroup.
+   * `onStreamClosed` now classifies its own terminal, so it CAN be told apart
+   * from a read failure. This hook remains the subgroup-specific one, and the
+   * only place the resolved header is available — which is what completes an
+   * END_OF_GROUP-bearing subgroup.
    *
    * @see draft-ietf-moq-transport-16 §10.4.2
    */
@@ -1870,15 +1929,14 @@ export class MoqtConnection {
       // no callback may observe a DONE'd subscription without the drain pending.
       const draining = this.drainConfigs.has(originalRequestId) && doneAlias !== undefined;
       if (draining) this.applyTerminalDrain(doneAlias!, BigInt(streamCount), originalRequestId);
-      this.onMessage?.(stampedDone);
-      // Non-drained: owner-check + route removal + tombstone install run
-      // SYNCHRONOUSLY (the arm inside applyTerminalStreamCount is before its
-      // first await) — started BEFORE the session-teardown await so no object
-      // slips through the window and no concurrently-binding new subscription's
-      // route is deleted.
+      // Non-drained terminal application starts BEFORE the callback, like the
+      // drain above: its arm runs before the first await, so a reentrant
+      // close() inside the callback CLEARS the terminal state instead of having
+      // its cleanup undone by an arm that follows it.
       const discard = !draining && doneAlias !== undefined
         ? this.applyTerminalStreamCount(doneAlias, BigInt(streamCount), originalRequestId)
         : Promise.resolve();
+      this.onMessage?.(stampedDone);
       await this.executeActions(this.session.handleControlMessage(stampedDone));
       await discard;
       return;
@@ -2097,6 +2155,14 @@ export class MoqtConnection {
       pub.onObject?.(obj);
       return true;
     }
+    // §11.1: the alias is tombstoned — its route was torn down synchronously,
+    // but streams already open on it keep producing until their readers are
+    // cancelled. CLAIM those objects and drop them; falling through would hand
+    // a dead subscription's data to the connection-wide callback.
+    //
+    // Ahead of the Session fallback below: a live tombstone is authoritative,
+    // and a legitimately reused alias has already cleared it before binding.
+    if (this.terminatedAliases.has(alias)) return true;
     // An established generic subscribe() intentionally uses the connection-wide
     // onObject callback. A pending raw subscription elsewhere must not steal it.
     if (this.session.getTrackByAlias(varint(alias)) !== undefined) return false;
@@ -2170,12 +2236,14 @@ export class MoqtConnection {
    *  - no subscribeTrack() is currently pending at all (nothing could ever
    *    claim this alias, buffering it would just leak);
    *  - a terminal tombstone (`terminatedAliases`) is currently live for this
-   *    alias — §11.1 explicitly permits late objects after a subscription
-   *    tears down, so this is a known straggler from THAT subscription, not
-   *    fresh data for whichever one eventually reuses the alias next. The
-   *    tombstone is only ever armed for an alias that was previously bound
-   *    (see every armTerminatedAlias call site), so this can never
-   *    false-positive on a genuinely new, never-before-seen alias;
+   *    alias. Objects reaching {@link routeToTrackSubscription} are already
+   *    claimed and dropped by the tombstone before this helper is consulted;
+   *    this arm covers the other callers. §11.1 explicitly permits late
+   *    objects after a subscription tears down, so such an object is a known
+   *    straggler from THAT subscription, not fresh data for whichever one
+   *    eventually reuses the alias next. The tombstone is only ever armed for
+   *    an alias that was previously bound (see every armTerminatedAlias call
+   *    site), so this can never false-positive on a genuinely new alias;
    *  - any global or per-alias limit (distinct aliases, total bytes,
    *    per-alias event count) would be exceeded — fails closed rather than
    *    growing unbounded on peer-controlled data.
@@ -2404,8 +2472,9 @@ export class MoqtConnection {
     this.incomingSubgroupAliases.delete(streamId);
     const reader = this.dataStreamReaders.get(streamId);
     if (reader) {
-      try { await reader.cancel(new Error('subscription terminated by PUBLISH_DONE — early discard')); } catch { /* closed */ }
-      this.dataStreamReaders.delete(streamId);
+      await this.discardLocalReader(
+        streamId, reader, new Error('subscription terminated by PUBLISH_DONE — early discard'),
+      );
     }
   }
 
@@ -2415,8 +2484,14 @@ export class MoqtConnection {
    * drop the routing entry, in one synchronous step with NO await between. This
    * closes the window in which a stream/object arriving during a later await
    * (session teardown, request-stream reset) would find no route and leak to the
-   * generic onObject hook. The async early-discard of already-open streams runs
-   * afterward via {@link discardOpenStreamsForAlias}.
+   * generic onObject hook — {@link routeToTrackSubscription} claims and drops
+   * objects for a live tombstone.
+   *
+   * Already-open readers are NOT cancelled here, and on draft-14/16 unsubscribe()
+   * never cancels them: they run until the peer FINs or resets. The tombstone,
+   * not reader teardown, is what keeps their objects from being delivered. The
+   * request-stream paths that DO early-discard open streams use
+   * {@link discardOpenStreamsForAlias} afterward.
    */
   private armSubscriberAliasTeardown(alias: bigint): void {
     this.refreshAliasDeliveryTimeout(alias); // §8: reflect any accepted REQUEST_UPDATE before arming
@@ -2795,7 +2870,7 @@ export class MoqtConnection {
     // §5.1.1: arm terminal alias protection SYNCHRONOUSLY — before session
     // teardown, the request-stream reset, or dropping routing — so a late object
     // arriving during any of those awaits is discarded, never routed to the
-    // generic onObject hook. Centralized in teardownSubscriberAlias so this
+    // generic onObject hook. Centralized in armSubscriberAliasTeardown so this
     // direct API, the TrackSubscription wrapper, and the peer-close path all
     // arm at the same point and cannot diverge.
     const raw = this.rawSubscriptions.get(requestId);
@@ -2840,11 +2915,13 @@ export class MoqtConnection {
     this._terminated = true;
     this._closeEmitted = true;
     const actions = this.session.close(error, reason);
-    await this.executeActions(actions);
-    // A local close must not leave a caller awaiting subscribeTrack() forever.
+    // Reader ownership transfers BEFORE the first await. `executeActions()`
+    // yields even when its actions are synchronous, and an application callback
+    // running inside a decoder can reach here — a stream must not deliver
+    // another object across that gap. §10.4 accounting goes with it.
     this.failPendingRawSubscriptions(reason ?? 'Session closed');
-    // Drop all timers + publisher/receiver accounting with the session.
     this.clearTerminalState();
+    await this.executeActions(actions);
   }
 
   /**
@@ -3202,12 +3279,7 @@ export class MoqtConnection {
     if (streamId !== undefined) {
       const reader = this.dataStreamReaders.get(streamId);
       if (reader) {
-        try {
-          await reader.cancel(new Error('FETCH cancelled'));
-        } catch {
-          // Stream may already be closed
-        }
-        this.dataStreamReaders.delete(streamId);
+        await this.discardLocalReader(streamId, reader, new Error('FETCH cancelled'));
       }
       this.fetchStreams.delete(requestId as bigint);
       // The known open response stream is torn down HERE, so the marker that guards a
@@ -4648,12 +4720,9 @@ export class MoqtConnection {
           // In WebTransport, reader.cancel() sends STOP_SENDING.
           const reader = this.dataStreamReaders.get(action.streamId);
           if (reader) {
-            try {
-              await reader.cancel(new Error(`STOP_SENDING: ${action.error}`));
-            } catch {
-              // Stream may already be closed — ignore
-            }
-            this.dataStreamReaders.delete(action.streamId);
+            await this.discardLocalReader(
+              action.streamId, reader, new Error(`STOP_SENDING: ${action.error}`),
+            );
           }
           break;
         }
@@ -4778,16 +4847,18 @@ export class MoqtConnection {
             this.applyTerminalDrain(doneAlias!,
               BigInt((message as { streamCount?: bigint }).streamCount ?? 0n), doneReqId!);
           }
-          if (!suppressOnMessage) {
-            this.onMessage?.(message);
-          }
-          // Arm the terminal guard + remove the route SYNCHRONOUSLY (before the
-          // session-teardown await) so no late object slips through the window.
+          // Non-drained terminal application starts BEFORE the callback, like the
+          // drain above: its arm runs before the first await, so a reentrant
+          // close() inside the callback CLEARS the terminal state instead of having
+          // its cleanup undone by an arm that follows it.
           const doneDiscard = !doneDraining && message.type === 'PUBLISH_DONE' && doneAlias !== undefined
             ? this.applyTerminalStreamCount(doneAlias,
                 BigInt((message as { streamCount?: bigint }).streamCount ?? 0n),
                 (message as { requestId: bigint }).requestId)
             : Promise.resolve();
+          if (!suppressOnMessage) {
+            this.onMessage?.(message);
+          }
           // §9.5: onSubscribe fires only for a request the session ADMITTED as a
           // NEW subscription. Capture the pre-existing entry (if any) BEFORE
           // processing: a rejected duplicate creates no state (post === undefined),
@@ -4935,9 +5006,14 @@ export class MoqtConnection {
   ): Promise<void> {
     try {
       const reader = transport.datagrams.readable.getReader();
-      while (true) {
+      // Both sides of the await matter. The loop condition catches terminal
+      // entry caused by delivering the PREVIOUS datagram, so no further read is
+      // issued — a readable that never settles on close would otherwise park
+      // this task forever. The post-read check catches termination that happens
+      // while a read is already pending.
+      while (!this._terminated) {
         const { value: bytes, done } = await reader.read();
-        if (done) break;
+        if (done || this._terminated) break;
         try {
           // Classify by the (vi64 in draft-18) datagram type first. Padding
           // datagrams (draft-18 §11.5.2, type 0x132B3E29) are discarded rather
@@ -4967,6 +5043,11 @@ export class MoqtConnection {
               : {}),
             end_of_group: datagram.isEndOfGroup,
           });
+          // The qlog callback is application code: it can close the connection
+          // or unsubscribe (arming the tombstone synchronously) between the
+          // checks above and this delivery.
+          if (this._terminated) break;
+          if (this.terminatedAliases.has(datagram.trackAlias as bigint)) continue;
           this.onDatagram?.(datagram);
         } catch (err) {
           // §10.3.1, §10: Protocol violations (invalid flags, zero-length
@@ -5223,12 +5304,14 @@ export class MoqtConnection {
       const stamped = { ...message, requestId: originalId } as ControlMessage;
       const pubDraining = this.drainConfigs.has(originalId) && doneAlias !== undefined;
       if (pubDraining) this.applyTerminalDrain(doneAlias!, BigInt(streamCount), originalId);
-      this.onMessage?.(stamped);
-      // Arm the terminal guard + remove the route SYNCHRONOUSLY (before the
-      // session-teardown await) so no late object slips through the window.
+      // Non-drained terminal application starts BEFORE the callback, like the
+      // drain above: its arm runs before the first await, so a reentrant
+      // close() inside the callback CLEARS the terminal state instead of having
+      // its cleanup undone by an arm that follows it.
       const discard = !pubDraining && doneAlias !== undefined
         ? this.applyTerminalStreamCount(doneAlias, BigInt(streamCount), originalId)
         : Promise.resolve();
+      this.onMessage?.(stamped);
       await this.executeActions(this.session.handleInboundPublishDone(originalId));
       ctx.seal();
       this.inboundRequestContexts.delete(originalId);
@@ -5695,26 +5778,40 @@ export class MoqtConnection {
     // Track the reader so STOP_SENDING can be sent later (§10.4.3)
     this.dataStreamReaders.set(streamId, reader);
     let buf: Uint8Array = new Uint8Array(0);
+    let readTerminal: DataStreamReadTerminal = 'peer-fin';
 
     try {
       // Phase 1: Accumulate bytes and decode the stream header
       const headerResult = await this.readStreamHeader(reader, buf);
-      if (!headerResult) {
-        // Stream closed before header could be decoded
-        // Stream closed before header could be decoded — non-fatal
-        this.onStreamClosed?.(streamId);
+      if (headerResult.type === 'terminal') {
+        // Stream ended before a header could be decoded — non-fatal either
+        // way, but only a peer FIN may be reported as one.
+        this.onStreamClosed?.(streamId, undefined, terminalKind(headerResult.terminal));
         return;
       }
       if (headerResult.type === 'discard') {
         // draft-18 padding stream — drain and drop the remaining bytes.
+        let paddingDiscarded = false;
         while (true) {
+          if (this.locallyDiscardedReaders.has(reader)) { paddingDiscarded = true; break; }
           const { done } = await reader.read();
           if (done) break;
         }
-        this.onStreamClosed?.(streamId);
+        this.onStreamClosed?.(
+          streamId,
+          undefined,
+          paddingDiscarded || this.locallyDiscardedReaders.has(reader) ? 'local-discard' : 'fin',
+        );
         return;
       }
       buf = headerResult.remaining;
+      // Covers the await seam above: a teardown between `readStreamHeader`
+      // resolving and this frame resuming must emit no header callback and
+      // must not reinstall the ownership the primitive detached.
+      if (this.locallyDiscardedReaders.has(reader)) {
+        this.onStreamClosed?.(streamId, undefined, 'local-discard');
+        return;
+      }
 
       if (headerResult.type === 'subgroup') {
         const header = headerResult.header as SubgroupHeader;
@@ -5732,16 +5829,14 @@ export class MoqtConnection {
           // closing the race between `drained` flipping and the tombstone
           // being installed after the sweep's awaits.
           if (drainState.drained) {
-            try { await reader.cancel(new Error('stream during terminal-drain completion — discarded')); } catch { /* closed */ }
-            this.dataStreamReaders.delete(streamId);
-            this.onStreamClosed?.(streamId);
+            await this.discardLocalReader(streamId, reader, new Error('stream during terminal-drain completion — discarded'));
+            this.onStreamClosed?.(streamId, undefined, 'local-discard');
             return;
           }
           if (drainState.acceptRemaining !== null) {
             if (drainState.acceptRemaining <= 0n) {
-              try { await reader.cancel(new Error('stream beyond the announced Stream Count during terminal drain — discarded')); } catch { /* closed */ }
-              this.dataStreamReaders.delete(streamId);
-              this.onStreamClosed?.(streamId);
+              await this.discardLocalReader(streamId, reader, new Error('stream beyond the announced Stream Count during terminal drain — discarded'));
+              this.onStreamClosed?.(streamId, undefined, 'local-discard');
               return;
             }
             drainState.acceptRemaining -= 1n;
@@ -5757,9 +5852,8 @@ export class MoqtConnection {
             tombstone.remaining -= 1n;
             if (tombstone.remaining <= 0n) this.clearTerminatedAlias(subgroupAlias);
           }
-          try { await reader.cancel(new Error('late stream on a terminated alias — early discard (§10.11)')); } catch { /* closed */ }
-          this.dataStreamReaders.delete(streamId);
-          this.onStreamClosed?.(streamId);
+          await this.discardLocalReader(streamId, reader, new Error('late stream on a terminated alias — early discard (§10.11)'));
+          this.onStreamClosed?.(streamId, undefined, 'local-discard');
           return;
         }
         // Count the stream toward this alias's lifetime total (so a later
@@ -5774,6 +5868,11 @@ export class MoqtConnection {
           stream_id: streamId,
           stream_type: 'subgroup_header',
         });
+        // Gate: the callback above may have torn this stream down.
+        if (this.locallyDiscardedReaders.has(reader)) {
+          this.onStreamClosed?.(streamId, undefined, 'local-discard');
+          return;
+        }
         this.onQlogEvent?.({
           type: 'subgroup_header_parsed',
           stream_id: streamId,
@@ -5785,9 +5884,14 @@ export class MoqtConnection {
           contains_end_of_group: header.isEndOfGroup,
           extensions_present: header.hasExtensions,
         });
+        // Gate: the callback above may have torn this stream down.
+        if (this.locallyDiscardedReaders.has(reader)) {
+          this.onStreamClosed?.(streamId, undefined, 'local-discard');
+          return;
+        }
         this.onDataStream?.(streamId, { type: 'subgroup', header });
         // Phase 2: Decode subgroup objects
-        await this.readSubgroupObjects(reader, buf, streamId, header);
+        readTerminal = await this.readSubgroupObjects(reader, buf, streamId, header);
       } else {
         const header = headerResult.header as FetchHeader;
         const fetchReqId = header.requestId as bigint;
@@ -5797,7 +5901,10 @@ export class MoqtConnection {
         // has at most one such stream; consuming keeps the marker set from lingering).
         if (this.recentlyCancelledFetches.has(fetchReqId)) {
           this.recentlyCancelledFetches.delete(fetchReqId);
-          await reader.cancel(new Error('FETCH cancelled — late data stream discarded')).catch(() => { /* already closed */ });
+          await this.discardLocalReader(
+            streamId, reader, new Error('FETCH cancelled — late data stream discarded'),
+          );
+          this.onStreamClosed?.(streamId, undefined, 'local-discard');
           return;
         }
         // §11.4.4: a FETCH response uses EXACTLY ONE unidirectional stream. A second
@@ -5820,23 +5927,31 @@ export class MoqtConnection {
           stream_id: streamId,
           stream_type: 'fetch_header',
         });
+        // Gate: the callback above may have torn this stream down.
+        if (this.locallyDiscardedReaders.has(reader)) {
+          this.onStreamClosed?.(streamId, undefined, 'local-discard');
+          return;
+        }
         this.onQlogEvent?.({
           type: 'fetch_header_parsed',
           stream_id: streamId,
           request_id: header.requestId as bigint,
         });
+        // Gate: the callback above may have torn this stream down.
+        if (this.locallyDiscardedReaders.has(reader)) {
+          this.onStreamClosed?.(streamId, undefined, 'local-discard');
+          return;
+        }
         this.onDataStream?.(streamId, { type: 'fetch', header });
         // Phase 2: Decode fetch objects. draft-18 has its own object format
         // (group-order-aware deltas, End-of-Range prior rules) and correlates by
         // FETCH_HEADER.requestId — not by a (fabricated) track alias.
-        if (this.dataCodec!.version === 18) {
-          await this.readFetchObjects18(reader, buf, streamId, header);
-        } else {
-          await this.readFetchObjects(reader, buf, streamId);
-        }
+        readTerminal = this.dataCodec!.version === 18
+          ? await this.readFetchObjects18(reader, buf, streamId, header)
+          : await this.readFetchObjects(reader, buf, streamId);
       }
 
-      this.onStreamClosed?.(streamId);
+      this.onStreamClosed?.(streamId, undefined, terminalKind(readTerminal));
     } catch (err) {
       // §10.4, §10.4.2, §10.4.4, §10.2.1.2: Protocol violations on data
       // streams MUST close the session with PROTOCOL_VIOLATION.
@@ -5855,8 +5970,16 @@ export class MoqtConnection {
       // A real transport close makes in-flight data reads throw AFTER terminal
       // shutdown — do not emit a spurious post-close error event.
       const terminated = this._terminated || this.session.state === SessionState.CLOSED;
-      if (streamErrorCode === undefined && !terminated) {
-        // Not a RESET_STREAM — genuine read error
+      // Provenance decides BOTH the terminal and whether this is a fault at
+      // all. Cancelling can settle the parked read by rejection, with or
+      // without a code attached; either way we ended the stream, so it is not
+      // a connection error and the peer's code is not ours to report.
+      const locallyDiscarded = this.locallyDiscardedReaders.has(reader);
+      const terminal: DataStreamTerminal = locallyDiscarded
+        ? 'local-discard'
+        : streamErrorCode !== undefined ? 'reset' : 'error';
+      if (terminal === 'error' && !terminated) {
+        // Not a RESET_STREAM and not our own teardown — a genuine failure.
         this.onError?.(new MoqtConnectionError(
           err instanceof Error ? err.message : String(err),
           {
@@ -5866,8 +5989,13 @@ export class MoqtConnection {
           },
         ));
       }
-      // Always notify stream closed — player can inspect the code if needed
-      this.onStreamClosed?.(streamId, streamErrorCode);
+      // ONLY a peer reset carries a code. Holding that invariant keeps a legacy
+      // two-argument listener from reading our own cancellation as a reset.
+      this.onStreamClosed?.(
+        streamId,
+        terminal === 'reset' ? streamErrorCode : undefined,
+        terminal,
+      );
     } finally {
       this.dataStreamReaders.delete(streamId);
       this.incomingSubgroupAliases.delete(streamId);
@@ -5893,6 +6021,31 @@ export class MoqtConnection {
   }
 
   /**
+   * Cancel an incoming data-stream reader that WE are giving up on.
+   *
+   * Marks provenance, unregisters ownership, and detaches the alias BEFORE the
+   * first await, so a read loop resuming inside `cancel()` cannot mistake its
+   * `{ done: true }` for a peer FIN. Every local cancellation of an incoming
+   * data reader must go through here.
+   */
+  private async discardLocalReader(
+    streamId: bigint,
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    reason: Error,
+  ): Promise<void> {
+    this.locallyDiscardedReaders.add(reader);
+    if (this.dataStreamReaders.get(streamId) === reader) this.dataStreamReaders.delete(streamId);
+    this.incomingSubgroupAliases.delete(streamId);
+    try {
+      await reader.cancel(reason);
+    } catch {
+      // Already closed or failed. A backend may throw SYNCHRONOUSLY here as
+      // well as reject; neither may escape into terminal processing or out of
+      // a public teardown method.
+    }
+  }
+
+  /**
    * Read and decode the stream header (subgroup or fetch).
    * Accumulates bytes until the header can be decoded.
    */
@@ -5902,9 +6055,11 @@ export class MoqtConnection {
   ): Promise<
     | { type: 'subgroup' | 'fetch'; header: SubgroupHeader | FetchHeader; remaining: Uint8Array }
     | { type: 'discard' }
-    | undefined
+    | { type: 'terminal'; terminal: DataStreamReadTerminal }
   > {
     while (true) {
+      // Gate: see `locallyDiscardedReaders`.
+      if (this.locallyDiscardedReaders.has(reader)) return { type: 'terminal', terminal: 'local-discard' };
       // Try to decode if we have any bytes
       if (buf.length > 0) {
         const firstByte = buf[0]!;
@@ -5950,12 +6105,18 @@ export class MoqtConnection {
       // Read more bytes from the stream
       const { value, done } = await reader.read();
       if (done) {
-        // §10.4: FIN with partial header bytes is mid-object
-        if (buf.length > 0) {
-          // Stream FIN arrived mid-header parse — protocol violation
-          this.closeSessionFatal('Stream FIN received mid-header');
+        // A local discard settles a pending read as `done` too — that is our
+        // own teardown, never a peer FIN and never a violation.
+        if (this.locallyDiscardedReaders.has(reader)) {
+          return { type: 'terminal', terminal: 'local-discard' };
         }
-        return undefined;
+        // §10.4: FIN with partial header bytes is mid-object. Throw so the
+        // centralized catch closes the session AND no normal terminal is
+        // published on the way out.
+        if (buf.length > 0) {
+          throw new ProtocolViolationError('Stream FIN received mid-header');
+        }
+        return { type: 'terminal', terminal: 'peer-fin' };
       }
       buf = this.appendBuffer(buf, value);
     }
@@ -5970,11 +6131,13 @@ export class MoqtConnection {
     buf: Uint8Array,
     streamId: bigint,
     header: SubgroupHeader,
-  ): Promise<void> {
+  ): Promise<DataStreamReadTerminal> {
     let previousObjectId: bigint = 0n;
     let isFirstObject = true;
 
     while (true) {
+      // Gate: see `locallyDiscardedReaders`.
+      if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
       // Try to decode an object from the buffer
       if (buf.length > 0) {
         try {
@@ -6037,6 +6200,8 @@ export class MoqtConnection {
               ? { extension_headers: [] } : {}), // TODO: parse extension headers for qlog
             ...(object.status !== undefined ? { object_status: object.status as bigint } : {}),
           });
+          // Gate: the qlog callback above may have torn this stream down.
+          if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
           if (!this.routeToTrackSubscription(streamId, delivered)) {
             this.onObject?.(streamId, delivered);
           }
@@ -6052,12 +6217,14 @@ export class MoqtConnection {
       // Read more bytes from the stream
       const { value, done } = await reader.read();
       if (done) {
+        // Our own cancellation also settles a pending read as `done`. It is
+        // not a peer FIN: no synthesized END_OF_GROUP, no subscription close,
+        // no FIN callback.
+        if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
         // §10.4: "If a stream ends gracefully in the middle of a serialized
         // Object, the session SHOULD be closed with a PROTOCOL_VIOLATION."
         if (buf.length > 0) {
-          // Stream FIN arrived mid-object parse — protocol violation
-          this.closeSessionFatal('Stream FIN received mid-object');
-          return;
+          throw new ProtocolViolationError('Stream FIN received mid-object');
         }
 
         // §10.4.2: Subgroup header's END_OF_GROUP flag means this subgroup
@@ -6079,7 +6246,7 @@ export class MoqtConnection {
         this.routeSubgroupClosed(header);
         // Graceful FIN with no partial object — the only place this is known.
         this.onSubgroupFin?.(streamId, header);
-        return;
+        return 'peer-fin';
       }
       buf = this.appendBuffer(buf, value);
     }
@@ -6093,11 +6260,13 @@ export class MoqtConnection {
     reader: ReadableStreamDefaultReader<Uint8Array>,
     buf: Uint8Array,
     streamId: bigint,
-  ): Promise<void> {
+  ): Promise<DataStreamReadTerminal> {
     let prior: FetchPriorContext | undefined;
     let isFirstObject = true;
 
     while (true) {
+      // Gate: see `locallyDiscardedReaders`.
+      if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
       if (buf.length > 0) {
         try {
           const { item, bytesRead } = this.dataCodec!.decodeFetchObject(buf, 0, prior, isFirstObject);
@@ -6133,6 +6302,7 @@ export class MoqtConnection {
             };
             // FETCH objects have no Track Alias. Alias 0 here is synthetic and
             // must never be confused with a subgroup racing SUBSCRIBE_OK.
+            if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
             this.onObject?.(streamId, delivered);
 
             // Update prior context for next object's inheritance
@@ -6168,11 +6338,14 @@ export class MoqtConnection {
 
       const { value, done } = await reader.read();
       if (done) {
+        // A local discard settles the pending read as `done` first — never a
+        // clean fetch completion.
+        if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
         // §10.4: mid-object FIN → SHOULD close with PROTOCOL_VIOLATION
         if (buf.length > 0) {
-          this.closeSessionFatal('Fetch stream FIN received mid-object');
+          throw new ProtocolViolationError('Fetch stream FIN received mid-object');
         }
-        return;
+        return 'peer-fin';
       }
       buf = this.appendBuffer(buf, value);
     }
@@ -6196,7 +6369,7 @@ export class MoqtConnection {
     buf: Uint8Array,
     streamId: bigint,
     header: FetchHeader,
-  ): Promise<void> {
+  ): Promise<DataStreamReadTerminal> {
     // A FETCH_HEADER must name a Request ID we actually issued a FETCH for. The
     // group-order map is recorded for every fetch() (Ascending by default), so a
     // missing entry means an unknown/unrequested fetch — a PROTOCOL_VIOLATION,
@@ -6222,13 +6395,17 @@ export class MoqtConnection {
     let isFirstObject = true;
 
     while (true) {
+      // Gate: see `locallyDiscardedReaders`.
+      if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
       // §10.13: if the fetch is cancelled WHILE this stream is open, stop delivering
       // immediately — objects buffered mid-flight must not reach onObject after the
       // cancellation began (the marker is installed synchronously at fetchCancel).
       if (this.recentlyCancelledFetches.has(header.requestId)) {
         this.recentlyCancelledFetches.delete(header.requestId); // one-shot: this stream is handled
-        await reader.cancel(new Error('FETCH cancelled — open stream stopped')).catch(() => { /* already closed */ });
-        return;
+        await this.discardLocalReader(
+          streamId, reader, new Error('FETCH cancelled — open stream stopped'),
+        );
+        return 'local-discard';
       }
       if (buf.length > 0) {
         try {
@@ -6263,6 +6440,7 @@ export class MoqtConnection {
               properties: item.extensions,
               payload: item.payload,
             };
+            if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
             this.onObject?.(streamId, delivered); // no alias routing for fetch
           } else {
             const delivered: MoqtObjectGap = {
@@ -6283,10 +6461,11 @@ export class MoqtConnection {
 
       const { value, done } = await reader.read();
       if (done) {
+        if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
         if (buf.length > 0) {
-          this.closeSessionFatal('Fetch stream FIN received mid-object');
+          throw new ProtocolViolationError('Fetch stream FIN received mid-object');
         }
-        return;
+        return 'peer-fin';
       }
       buf = this.appendBuffer(buf, value);
     }
