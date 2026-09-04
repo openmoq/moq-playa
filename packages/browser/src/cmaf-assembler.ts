@@ -143,6 +143,7 @@ export class CmafAssembler {
   /** Last raw bmd seen per media type — detects backward jumps (discontinuity). */
   private lastVideoBmd: bigint | null = null;
   private lastAudioBmd: bigint | null = null;
+  private lastVideoGroup: bigint | null = null;
 
   /** Track name associated with the current epoch, for scoped timeline clear. */
   private videoTrackName: string | null = null;
@@ -442,6 +443,7 @@ export class CmafAssembler {
     this.audioEpoch = null;
     this.lastVideoBmd = null;
     this.lastAudioBmd = null;
+    this.lastVideoGroup = null;
     this.videoTrackName = null;
     this.audioTrackName = null;
     this.videoTrex = null;
@@ -578,6 +580,7 @@ export class CmafAssembler {
         this.videoEpoch = bmd;
         this.videoTrackName = trackName;
         this.lastVideoBmd = null;
+        this.lastVideoGroup = null;
         this.videoEpochGen = this.sharedEpochGen;
       } else {
         this.audioEpoch = bmd;
@@ -593,21 +596,24 @@ export class CmafAssembler {
         this.videoEpoch = anchored;
         this.videoTrackName = trackName;
         this.lastVideoBmd = null;
+        this.lastVideoGroup = null;
       } else {
         this.audioEpoch = anchored;
         this.audioTrackName = trackName;
         this.lastAudioBmd = null;
       }
     } else if (lastBmd !== null && bmd < lastBmd) {
-      // Same track, bmd went backward.
-      // Audio: backward jumps of at most one second in the track's media
-      // timescale are late subgroup data, not a real discontinuity. Use
-      // the historical 48 kHz window when no init segment was available.
-      // Video: any backward jump is treated as a discontinuity.
+      // Same track, bmd went backward. Adjacent groups arrive on separate streams in
+      // either order, so a jump of at most one second is late subgroup data, not a
+      // discontinuity; video also requires the group to be the current or previous one.
       const jumpBack = lastBmd - bmd;
-      const audioReorderWindow = BigInt(this.audioTimescale ?? 48000);
-      const isSmallAudioReorder = mediaType === 'audio' && jumpBack <= audioReorderWindow;
-      if (!isSmallAudioReorder) {
+      const timescale = mediaType === 'video' ? (this.videoTimescale ?? 90000) : (this.audioTimescale ?? 48000);
+      const reorderWindow = BigInt(timescale);
+      const lastGroup = this.lastVideoGroup;
+      const groupIsRecent = mediaType === 'audio' || groupId === undefined || lastGroup === null
+        || (groupId <= lastGroup && lastGroup - groupId <= 1n);
+      const isLateSubgroupData = groupIsRecent && jumpBack <= reorderWindow;
+      if (!isLateSubgroupData) {
         if (this.debug) console.warn('[CMAF] %s discontinuity on "%s": bmd=%s < lastBmd=%s (jump=%s) — re-anchoring',
           mediaType, trackName, bmd, lastBmd, jumpBack);
         this.onDiscontinuity?.(mediaType, trackName);
@@ -620,6 +626,7 @@ export class CmafAssembler {
         if (mediaType === 'video') {
           this.videoEpoch = anchored;
           this.lastVideoBmd = bmd;
+          this.lastVideoGroup = groupId ?? null;
         } else {
           this.audioEpoch = anchored;
           this.lastAudioBmd = bmd;
@@ -632,6 +639,7 @@ export class CmafAssembler {
     // to look like a forward jump past the reordered one.
     if (mediaType === 'video') {
       if (this.lastVideoBmd === null || bmd > this.lastVideoBmd) this.lastVideoBmd = bmd;
+      if (groupId !== undefined && (this.lastVideoGroup === null || groupId > this.lastVideoGroup)) this.lastVideoGroup = groupId;
     } else {
       if (this.lastAudioBmd === null || bmd > this.lastAudioBmd) this.lastAudioBmd = bmd;
     }
