@@ -8153,6 +8153,7 @@ describe('MoqtPlayer', () => {
         // new codec isn't supported (or any other MSE-level failure).
         changeType: vi.fn(() => Promise.reject(new Error('mock changeType rejected'))),
       };
+      const selectCmafTrack = vi.fn();
       const cmafAssemblerFactory = (
         options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void },
       ) => {
@@ -8176,6 +8177,7 @@ describe('MoqtPlayer', () => {
               }
             }
           },
+          selectTrack: selectCmafTrack,
           getEpoch(_mt: 'video' | 'audio') { return null; },
           reset() { pending.clear(); },
           destroy() { pending.clear(); },
@@ -8228,6 +8230,7 @@ describe('MoqtPlayer', () => {
       expect((adapter.subscribe as any).mock.calls.length).toBe(subscribesBefore + 1);
       expect(switchingFn).toHaveBeenCalledTimes(1);
       expect(switchedFn).not.toHaveBeenCalled();
+      expect(selectCmafTrack).not.toHaveBeenCalled();
 
       // Ack the new subscription with a DIFFERENT trackAlias so the
       // SUBSCRIBE_OK handler registers the track with the
@@ -8270,6 +8273,7 @@ describe('MoqtPlayer', () => {
       });
       // No "switched" event ever fires for the failed switch.
       expect(switchedFn).not.toHaveBeenCalled();
+      expect(selectCmafTrack).not.toHaveBeenCalled();
       // An `error` event also surfaces (PlayerErrorCode.VIDEO_DECODE_ERROR).
       expect(errorFn).toHaveBeenCalled();
 
@@ -8341,6 +8345,7 @@ describe('MoqtPlayer', () => {
         // changeType resolves successfully — the happy path.
         changeType: vi.fn(() => Promise.resolve()),
       };
+      const selectCmafTrack = vi.fn();
       const cmafAssemblerFactory = (
         options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void },
       ) => {
@@ -8364,6 +8369,7 @@ describe('MoqtPlayer', () => {
               }
             }
           },
+          selectTrack: selectCmafTrack,
           getEpoch(_mt: 'video' | 'audio') { return null; },
           reset() { pending.clear(); },
           destroy() { pending.clear(); },
@@ -8439,6 +8445,7 @@ describe('MoqtPlayer', () => {
       expect(ctCodec).toBe('hvc1.1.6.L93.90');
       expect(ctInit).toBeInstanceOf(Uint8Array);
       expect(Array.from(ctInit as Uint8Array)).toEqual([0x10, 0x11, 0x12, 0x13]);
+      expect(selectCmafTrack).toHaveBeenCalledWith('video', 'video_hevc');
 
       // Commit-time event fired exactly once with the right payload.
       expect(switchedFn).toHaveBeenCalledTimes(1);

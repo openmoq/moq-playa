@@ -375,7 +375,7 @@ export interface MediaSourceLike {
  * baseMediaDecodeTime to zero-based, and emits via onSegment.
  * The concrete implementation lives in @moqt/browser.
  *
- * @see draft-ietf-moq-cmsf-00 §3.3 (Object Packaging — moof+mdat)
+ * @see draft-ietf-moq-cmsf-01 §3.3 (Object Packaging — moof+mdat)
  */
 export interface CmafAssemblerLike {
   push(
@@ -395,6 +395,13 @@ export interface CmafAssemblerLike {
    * sample-table surgery may ignore the call.
    */
   setInitSegment?(mediaType: 'video' | 'audio', initBytes: Uint8Array): void;
+  /**
+   * Commit the track that may feed one media type after a successful switch.
+   * Implementations may use this to discard late objects from the retired
+   * track. Optional for compatibility with assemblers that do not retain
+   * cross-object track state.
+   */
+  selectTrack?(mediaType: 'video' | 'audio', trackName: string): void;
   getEpoch(mediaType: 'video' | 'audio'): bigint | null;
   /**
    * Drop pending half-pairs (moof without mdat) for one media type, leaving

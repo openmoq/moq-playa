@@ -1545,6 +1545,10 @@ export class MoqtPlayer {
   private flushCmafStagedBuffer(
     sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>,
   ): void {
+    // The replacement is now authoritative. Pin it before replaying staged
+    // bytes so a late object from the retired stream cannot switch the
+    // assembler back after this commit.
+    this.cmafAssembler?.selectTrack?.('video', sw.newTrackName);
     const cmafStaged = this.cmafSwitchStagingBuffer;
     this.cmafSwitchStagingBuffer = [];
     for (const { trackName: stagedTrack, mediaType: stagedMt, groupId, payload } of cmafStaged) {
