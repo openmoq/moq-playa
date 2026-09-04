@@ -757,7 +757,7 @@ describe('CmafAssembler — HEVC CRA-with-RASL strip', () => {
     expect(onDiscontinuity).toHaveBeenCalledWith('audio', 'audio-0');
   });
 
-  it('any backward video bmd triggers discontinuity', () => {
+  it('backward video bmd on a NEW group triggers discontinuity', () => {
     const onSegment = vi.fn();
     const onDiscontinuity = vi.fn();
     const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
@@ -766,8 +766,59 @@ describe('CmafAssembler — HEVC CRA-with-RASL strip', () => {
     assembler.push('video', 'video-0', 0n, combinedSeg(1000));
     assembler.push('video', 'video-0', 1n, combinedSeg(2000));
 
-    // Even small backward jump on video triggers discontinuity
+    // A backward jump on a group newer than any seen is a discontinuity
     assembler.push('video', 'video-0', 2n, combinedSeg(1500));
+
+    expect(onDiscontinuity).toHaveBeenCalledWith('video', 'video-0');
+  });
+
+  it('late trailing video object from the previous group is NOT a discontinuity', () => {
+    const onSegment = vi.fn();
+    const onDiscontinuity = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+    const internals = assembler as unknown as { videoEpoch: bigint | null };
+
+    assembler.push('video', 'video-0', 5n, combinedSeg(90000));
+    const epochAfterFirst = internals.videoEpoch;
+    assembler.push('video', 'video-0', 5n, combinedSeg(93000));
+    assembler.push('video', 'video-0', 5n, combinedSeg(96000));
+
+    // Group 6's first object is read before group 5's last one
+    assembler.push('video', 'video-0', 6n, combinedSeg(180000));
+    assembler.push('video', 'video-0', 5n, combinedSeg(177000));
+
+    expect(onDiscontinuity).not.toHaveBeenCalled();
+    expect(onSegment).toHaveBeenCalledTimes(5);
+    expect(internals.videoEpoch).toBe(epochAfterFirst);
+
+    const group6: Uint8Array = onSegment.mock.calls[3]![1];
+    const lateGroup5: Uint8Array = onSegment.mock.calls[4]![1];
+    expect(readBaseMediaDecodeTime(lateGroup5)!).toBeLessThan(readBaseMediaDecodeTime(group6)!);
+  });
+
+  it('video group id back by two with a large bmd jump is still a discontinuity', () => {
+    const onSegment = vi.fn();
+    const onDiscontinuity = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+
+    assembler.push('video', 'video-0', 5n, combinedSeg(900000));
+    assembler.push('video', 'video-0', 6n, combinedSeg(990000));
+
+    assembler.push('video', 'video-0', 4n, combinedSeg(1000));
+
+    expect(onDiscontinuity).toHaveBeenCalledWith('video', 'video-0');
+  });
+
+  it('video restart within the first two groups is still a discontinuity', () => {
+    const onSegment = vi.fn();
+    const onDiscontinuity = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+
+    assembler.push('video', 'video-0', 0n, combinedSeg(90000));
+    assembler.push('video', 'video-0', 1n, combinedSeg(180000));
+
+    // Publisher restart: group 0 again, one group behind, but bmd back by the whole session
+    assembler.push('video', 'video-0', 0n, combinedSeg(0));
 
     expect(onDiscontinuity).toHaveBeenCalledWith('video', 'video-0');
   });
