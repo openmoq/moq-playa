@@ -1,0 +1,167 @@
+# Publish every packages/* tarball to npm when a vMAJOR.MINOR.PATCH tag is pushed.
+#
+# Auth is npm Trusted Publisher (OIDC) - no NPM_TOKEN. Each package on
+# npmjs.com must authorize this file for this repo:
+#   Organization or user : the GitHub org/user that owns the repo
+#   Repository            : the repo name (not owner/name)
+#   Workflow filename     : publish.yml
+#   Environment           : leave empty unless you add `environment:` below
+#   Allowed actions       : npm publish
+#
+name: publish
+
+on:
+  push:
+    tags:
+      # Glob (not regex). The job still requires exact vMAJOR.MINOR.PATCH.
+      - 'v*.*.*'
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NPM_CLI_VERSION: 11.19.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Install npm CLI with trusted publishing support
+        run: npm install --global "npm@${NPM_CLI_VERSION}"
+
+      - name: Verify npm CLI version
+        run: |
+          set -euo pipefail
+          ver="$(npm --version)"
+          echo "npm ${ver}"
+          test "$ver" = "$NPM_CLI_VERSION"
+
+      - name: Verify tag commit belongs to main
+        run: |
+          set -euo pipefail
+          tagged_commit="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$tagged_commit" origin/main; then
+            echo "Tag commit ${tagged_commit} is not part of origin/main"
+            exit 1
+          fi
+
+      - name: Verify tag matches package versions
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must be vMAJOR.MINOR.PATCH (got ${tag})"
+            exit 1
+          fi
+          expected="${tag#v}"
+          EXPECTED_VERSION="$expected" node <<'NODE'
+            const { readFileSync, readdirSync, existsSync } = require("fs");
+            const { join } = require("path");
+            const expected = process.env.EXPECTED_VERSION;
+            const root = JSON.parse(readFileSync("package.json", "utf8"));
+            if (root.version !== expected) {
+              console.error(`Root package.json version ${root.version} !== tag ${expected}`);
+              process.exit(1);
+            }
+            let n = 0;
+            for (const dir of readdirSync("packages")) {
+              const pf = join("packages", dir, "package.json");
+              if (!existsSync(pf)) continue;
+              const pkg = JSON.parse(readFileSync(pf, "utf8"));
+              if (pkg.private) continue;
+              if (pkg.version !== expected) {
+                console.error(`${pkg.name}: ${pkg.version} !== tag ${expected}`);
+                process.exit(1);
+              }
+              console.log(`  ${pkg.name}@${pkg.version}`);
+              n++;
+            }
+            if (n === 0) {
+              console.error("No publishable packages under packages/");
+              process.exit(1);
+            }
+            console.log(`Tag v${expected} matches ${n} package(s)`);
+          NODE
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build all packages
+        run: pnpm -r build
+
+      - name: Test
+        run: pnpm test
+
+      - name: Package README check
+        run: node scripts/generate-package-readmes.mjs --check
+
+      - name: Package export smoke (built bundles)
+        run: pnpm smoke:exports
+
+      - name: Pack publishable packages
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          pnpm --filter "./packages/*" pack --pack-destination "${PWD}/release"
+          ls -lh release/*.tgz
+
+      - name: Verify every package is bootstrapped on npm
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(release/*.tgz)
+          if [ ${#tarballs[@]} -eq 0 ]; then
+            echo "No tarballs in release/"
+            exit 1
+          fi
+          for tgz in "${tarballs[@]}"; do
+            meta="$(tar -xOzf "$tgz" package/package.json)"
+            name="$(printf '%s' "$meta" | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).name")"
+            if ! npm view "$name" name >/dev/null; then
+              echo "${name} must be published once before Trusted Publisher can manage it"
+              exit 1
+            fi
+          done
+
+      - name: Publish to npm
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(release/*.tgz)
+          if [ ${#tarballs[@]} -eq 0 ]; then
+            echo "No tarballs in release/"
+            exit 1
+          fi
+          for tgz in "${tarballs[@]}"; do
+            meta="$(tar -xOzf "$tgz" package/package.json)"
+            name="$(printf '%s' "$meta" | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).name")"
+            version="$(printf '%s' "$meta" | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")"
+            versions="$(npm view "$name" versions --json)"
+            if VERSIONS_JSON="$versions" TARGET_VERSION="$version" node <<'NODE'
+              const value = JSON.parse(process.env.VERSIONS_JSON);
+              const versions = Array.isArray(value) ? value : [value];
+              process.exit(versions.includes(process.env.TARGET_VERSION) ? 0 : 1);
+          NODE
+            then
+              echo "Already on npm: ${name}@${version} - skipping"
+              continue
+            fi
+            echo "Publishing ${name}@${version} from ${tgz}"
+            npm publish "$tgz" --access public
+          done
