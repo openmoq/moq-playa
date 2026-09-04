@@ -680,7 +680,9 @@ describe('MoqtConnection(18) loopback — deterministic failed-update terminatio
     // against the bumped generation, the barrier resolves, the terminal flows.
     release!();
     await expect(heldOpen).rejects.toThrow();
-    await flush(); await flush();
+    // Incoming streams are classified before delivery, so observe the
+    // terminal rather than assuming a fixed number of microtask turns.
+    for (let i = 0; i < 8 && doneMsgs(clientMsgs).length === 0; i++) await flush();
     const dones = doneMsgs(clientMsgs);
     expect(dones).toHaveLength(1);
     expect(BigInt(dones[0]!.statusCode)).toBe(0x8n);       // UPDATE_FAILED

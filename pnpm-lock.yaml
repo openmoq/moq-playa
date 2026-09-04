@@ -201,6 +201,12 @@ importers:
         specifier: workspace:*
         version: link:../webtransport
 
+  packages/quic:
+    dependencies:
+      '@moqt/webtransport':
+        specifier: workspace:*
+        version: link:../webtransport
+
   packages/transport: {}
 
   packages/webtransport:

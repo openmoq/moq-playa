@@ -1,53 +1,106 @@
-# moq-playa interop test client — headless Node.
+# Headless MoQT interop client with both WebTransport and native QUIC.
 #
-# Node 24 (trixie: the prebuilt quiche binding needs GLIBC 2.38, bookworm has 2.36)
-# + @fails-components/webtransport, NOT bun: playa selects its MoQT draft
-# through WebTransport subprotocol negotiation, and the bun polyfill
-# (@moq/web-transport 0.1.1) ignores the `protocols` option and leaves
-# session.protocol null, so negotiation-dependent relays cannot be driven.
-#
-# Not Chromium either, for the same reason and measured here: Chrome 133 and
-# Chrome 141 expose no `protocol` attribute on WebTransport.prototype at all,
-# so the `protocols` offer is accepted silently and the negotiated draft is
-# unobservable. Headless Node keeps negotiation provable; no case needs a DOM.
-FROM node:24-trixie-slim AS builder
+# Node's QUIC API is build-time experimental. Pinning only a Node version is
+# insufficient because official binaries omit it, so this image verifies the
+# source archive and compiles that exact source with --experimental-quic.
+FROM debian:trixie-slim AS node-quic-build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl xz-utils python3 g++ make ninja-build pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+ARG NODE_VERSION=26.8.1
+ARG NODE_SHA256=d1698832a1a10f050cdda044a3e3d6a748246811e2e7bc89ba9a8bd693dc45f2
+RUN curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.tar.xz" \
+ && echo "${NODE_SHA256}  node-v${NODE_VERSION}.tar.xz" | sha256sum -c - \
+ && tar -xJf "node-v${NODE_VERSION}.tar.xz" && rm "node-v${NODE_VERSION}.tar.xz"
+WORKDIR /src/node-v${NODE_VERSION}
+# Keep the default suitable for low-memory builders. Larger builders can opt
+# into more parallelism without editing the reproducible build recipe.
+ARG NODE_BUILD_JOBS=2
+RUN case "${NODE_BUILD_JOBS}" in ''|0*|*[!0-9]*) \
+      echo "NODE_BUILD_JOBS must be a positive integer" >&2; exit 2 ;; \
+    esac \
+ && ./configure --experimental-quic --ninja --prefix=/opt/node-quic \
+ && ninja -C out/Release -j"${NODE_BUILD_JOBS}" node \
+ && ./tools/install.py install --dest-dir / --prefix /opt/node-quic
+RUN /opt/node-quic/bin/node --experimental-quic -e \
+  "if (process.features.quic !== true) process.exit(1); import('node:quic').catch(() => process.exit(1))"
+
+FROM debian:trixie-slim AS node-quic
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=node-quic-build /opt/node-quic /opt/node-quic
+ENV PATH="/opt/node-quic/bin:${PATH}"
+RUN node --experimental-quic -e \
+  "if (process.features.quic !== true) process.exit(1); import('node:quic').catch(() => process.exit(1))"
+
+FROM node-quic AS builder
 WORKDIR /app
-# Reproducible install: both manifests are copied and `npm ci` installs the
-# exact locked graph. `npm install` without a lockfile would let the resolved
-# dependency drift away from the versions the discriminators ran against.
-COPY package.json package-lock.json ./
+COPY tools/moq-interop-client/package.json tools/moq-interop-client/package-lock.json ./
 RUN npm ci --no-audit --no-fund
-COPY tsconfig.json ./
-COPY src ./src
+
+# Build the transport-neutral adapter and native binding from this checkout.
+# The interop image therefore tests the source revision that produced it, not
+# whichever package version happens to be newest on npm.
+COPY tsconfig.json /local/tsconfig.json
+COPY packages/transport/package.json packages/transport/tsconfig.json /local/packages/transport/
+COPY packages/transport/src /local/packages/transport/src
+COPY packages/webtransport/package.json packages/webtransport/tsconfig.json /local/packages/webtransport/
+COPY packages/webtransport/src /local/packages/webtransport/src
+COPY packages/quic/package.json packages/quic/tsconfig.json /local/packages/quic/
+COPY packages/quic/src /local/packages/quic/src
+RUN ln -s /app/node_modules /local/node_modules \
+ && /app/node_modules/.bin/tsc -p /local/packages/transport/tsconfig.json \
+ && rm -rf /app/node_modules/@moqt/transport \
+ && mkdir -p /app/node_modules/@moqt/transport \
+ && cp /local/packages/transport/package.json /app/node_modules/@moqt/transport/ \
+ && cp -a /local/packages/transport/dist /app/node_modules/@moqt/transport/ \
+ && /app/node_modules/.bin/tsc -p /local/packages/webtransport/tsconfig.json \
+ && rm -rf /app/node_modules/@moqt/webtransport \
+ && mkdir -p /app/node_modules/@moqt/webtransport \
+ && cp /local/packages/webtransport/package.json /app/node_modules/@moqt/webtransport/ \
+ && cp -a /local/packages/webtransport/dist /app/node_modules/@moqt/webtransport/ \
+ && /app/node_modules/.bin/tsc -p /local/packages/quic/tsconfig.json \
+ && mkdir -p /app/node_modules/@moqt/quic \
+ && cp /local/packages/quic/package.json /app/node_modules/@moqt/quic/ \
+ && cp -a /local/packages/quic/dist /app/node_modules/@moqt/quic/
+
+COPY tools/moq-interop-client/tsconfig.json ./
+COPY tools/moq-interop-client/src ./src
 RUN npx tsc -p tsconfig.json
 
-# Test stage. Test-only sources live in test/ and are compiled by a SEPARATE
-# tsconfig, so deliberately-broken control code (the teardown neuter) can never
-# reach dist/ or the runtime image. The final stage copies this stage's marker,
-# which makes the tests a mandatory gate on every ordinary build: if they fail,
-# the image does not build, so a stale image cannot be run by accident.
+# Tests use a separate output tree. The final stage copies their marker, which
+# makes them a mandatory image-build gate without shipping test-only code.
 FROM builder AS test
-COPY tsconfig.test.json ./
-COPY test ./test
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl \
+ && rm -rf /var/lib/apt/lists/*
+COPY tools/moq-interop-client/tsconfig.test.json ./
+COPY tools/moq-interop-client/test ./test
+COPY packages/quic/test/native-smoke.mjs /local/packages/quic/test/native-smoke.mjs
 RUN npx tsc -p tsconfig.test.json
 RUN node dist-test/test/teardown.test.js \
  && node dist-test/test/cases.test.js \
+ && node dist-test/test/transport-factory.test.js \
+ && mkdir -p /tmp/native-quic-smoke \
+ && openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+      -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+      -keyout /tmp/native-quic-smoke/key.pem -out /tmp/native-quic-smoke/cert.pem \
+      >/dev/null 2>&1 \
+ && node --experimental-quic --no-warnings /local/packages/quic/test/native-smoke.mjs \
+      /tmp/native-quic-smoke/key.pem /tmp/native-quic-smoke/cert.pem \
  && touch /app/.tests-passed
 
-FROM node:24-trixie-slim
-# Links the published GHCR package to this repository. Without it the first
-# workflow publication creates a package with no repo association, which also
-# makes the one-time visibility change harder to find.
+FROM node-quic
 LABEL org.opencontainers.image.source="https://github.com/openmoq/moq-playa"
 LABEL org.opencontainers.image.description="moq-playa MoQT interop test client (draft-18)"
-LABEL org.opencontainers.image.licenses="MIT"
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 WORKDIR /app
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=test /app/.tests-passed ./.tests-passed
-COPY package.json ./
-COPY entrypoint-client.sh /app/entrypoint.sh
+COPY tools/moq-interop-client/package.json ./
+COPY tools/moq-interop-client/entrypoint-client.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh && mkdir -p /mlog
 ENTRYPOINT ["/app/entrypoint.sh"]

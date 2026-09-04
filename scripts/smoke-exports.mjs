@@ -32,6 +32,7 @@ mkdirSync(consumerDir);
 const packages = [
   ['transport',    '@moqt/transport'],
   ['webtransport', '@moqt/webtransport'],
+  ['quic',          '@moqt/quic'],
   ['loc',          '@moqt/loc'],
   ['msf',          '@moqt/msf'],
   ['playback',     '@moqt/playback'],
@@ -121,6 +122,7 @@ console.log('Root imports (must succeed):');
 
 testImport('@moqt/transport',       `import '@moqt/transport'`);
 testImport('@moqt/webtransport',    `import '@moqt/webtransport'`);
+testImport('@moqt/quic',            `import '@moqt/quic'`);
 testImport('@moqt/loc',             `import '@moqt/loc'`);
 testImport('@moqt/msf',             `import '@moqt/msf'`);
 testImport('@moqt/playback',        `import '@moqt/playback'`);
@@ -134,6 +136,7 @@ console.log('\nNamed exports from roots (must succeed):');
 
 testImport('MoqtConnection',     `import { MoqtConnection } from '@moqt/webtransport'; if (!MoqtConnection) throw 1;`);
 testImport('MoqtConnectionError', `import { MoqtConnectionError } from '@moqt/webtransport'; if (!MoqtConnectionError) throw 1;`);
+testImport('connectQuic',         `import { connectQuic, parseMoqtUri } from '@moqt/quic'; if (typeof connectQuic !== 'function') throw 1; if (parseMoqtUri('moqt://example.com/moq').setup.path !== '/moq') throw 1;`);
 testImport('MoqtPlayer',         `import { MoqtPlayer } from '@moqt/player'; if (!MoqtPlayer) throw 1;`);
 testImport('checkSupport',       `import { checkSupport } from '@moqt/player'; if (!checkSupport) throw 1;`);
 testImport('PlayerErrorCode',    `import { PlayerErrorCode } from '@moqt/player'; if (!PlayerErrorCode) throw 1;`);
@@ -157,6 +160,7 @@ console.log('\nDeep imports (must be blocked by exports maps):');
 testImport('@moqt/browser/dist/mse-adapter.js',          `import '@moqt/browser/dist/mse-adapter.js'`, false);
 testImport('@moqt/player/dist/player.js',                `import '@moqt/player/dist/player.js'`, false);
 testImport('@moqt/webtransport/dist/adapter.js',         `import '@moqt/webtransport/dist/adapter.js'`, false);
+testImport('@moqt/quic/dist/connect.js',                  `import '@moqt/quic/dist/connect.js'`, false);
 testImport('@moqt/transport/dist/session/session.js',    `import '@moqt/transport/dist/session/session.js'`, false);
 testImport('@moqt/browser/dist/codec-strategy-h264.js',  `import '@moqt/browser/dist/codec-strategy-h264.js'`, false);
 testImport('@moqt/playback/dist/pipeline.js',            `import '@moqt/playback/dist/pipeline.js'`, false);

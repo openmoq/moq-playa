@@ -55,6 +55,53 @@ describe('MoqtConnection(18) construction + connect', () => {
     expect(transport.uniOut[0]!.writeClosed).toBe(false); // control stream stays open
   });
 
+  it('close() cancels the accepted peer control stream', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = new TransportSim();
+    const control = transport.openIncomingUni();
+    control.push(setupBytes());
+    await conn.connect(transport);
+
+    await conn.close();
+    await flush();
+
+    expect(control.readCancelled).toBe(true);
+  });
+
+  it('lets the exact transport passed to connect settle its caller-held closed promise', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = new TransportSim();
+    const control = transport.openIncomingUni();
+    control.push(setupBytes());
+    await conn.connect(transport);
+
+    const close = transport.close.bind(transport);
+    let backendClose!: Promise<void>;
+    transport.close = (info) => {
+      // Model a backend that closes its aggregate stream controller from a later
+      // onClose callback. Cancelling that source first makes the callback throw
+      // before it can resolve transport.closed.
+      backendClose = new Promise<void>((resolve, reject) => setTimeout(() => {
+        try {
+          transport.closeIncomingSources();
+          close(info);
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      }, 0));
+    };
+    const callerHeldClosed = transport.closed;
+
+    await conn.close();
+
+    await expect(backendClose).resolves.toBeUndefined();
+    await expect(callerHeldClosed).resolves.toBeDefined();
+    expect(transport.incomingUniSourceCancelled).toBe(false);
+    expect(control.readCancelled).toBe(true);
+    expect(transport.uniOut[0]!.writeAborted).toBe(true);
+  });
+
   it('forwards setup options into SETUP, strips path, and preserves explicit authority', async () => {
     const conn = new MoqtConnection(18);
     const transport = new TransportSim();
@@ -66,6 +113,156 @@ describe('MoqtConnection(18) construction + connect', () => {
     expect(setup.setupOptions.has(BigInt(SetupOption18.PATH))).toBe(false);
     const authority = setup.setupOptions.get(BigInt(SetupOption18.AUTHORITY))?.[0];
     expect(new TextDecoder().decode(authority as Uint8Array)).toBe('host');
+  });
+
+  it('native QUIC preserves PATH and AUTHORITY in SETUP', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = Object.assign(new TransportSim(), {
+      kind: 'quic' as const,
+      protocol: 'moqt-18',
+      maxDatagramSize: 1200,
+      setupOptions: { path: '/live?a=1', authority: 'relay.example:443' },
+    });
+    transport.openIncomingUni().push(setupBytes());
+
+    await conn.connect(transport);
+
+    const setup = codec18.decode(transport.uniOut[0]!.writtenBytes(), 0).message as Setup;
+    const path = setup.setupOptions.get(BigInt(SetupOption18.PATH))?.[0];
+    const authority = setup.setupOptions.get(BigInt(SetupOption18.AUTHORITY))?.[0];
+    expect(new TextDecoder().decode(path as Uint8Array)).toBe('/live?a=1');
+    expect(new TextDecoder().decode(authority as Uint8Array)).toBe('relay.example:443');
+  });
+
+  it('native QUIC uses the routing identity carried by the transport', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = Object.assign(new TransportSim(), {
+      kind: 'quic' as const,
+      protocol: 'moqt-18',
+      maxDatagramSize: 1200,
+      setupOptions: { path: '/live?token=x', authority: 'relay.example:4443' },
+    });
+    transport.openIncomingUni().push(setupBytes());
+
+    await conn.connect(transport, { implementation: 'test-client' });
+
+    const setup = codec18.decode(transport.uniOut[0]!.writtenBytes(), 0).message as Setup;
+    const path = setup.setupOptions.get(BigInt(SetupOption18.PATH))?.[0];
+    const authority = setup.setupOptions.get(BigInt(SetupOption18.AUTHORITY))?.[0];
+    expect(new TextDecoder().decode(path as Uint8Array)).toBe('/live?token=x');
+    expect(new TextDecoder().decode(authority as Uint8Array)).toBe('relay.example:4443');
+    expect(setup.setupOptions.has(BigInt(SetupOption18.MOQT_IMPLEMENTATION))).toBe(true);
+  });
+
+  it('native QUIC rejects missing or conflicting transport routing before SETUP', async () => {
+    for (const setupOptions of [
+      undefined,
+      { path: '/wire', authority: 'relay.example:443' },
+    ]) {
+      const conn = new MoqtConnection(18);
+      const transport = Object.assign(new TransportSim(), {
+        kind: 'quic' as const,
+        protocol: 'moqt-18',
+        maxDatagramSize: 1200,
+        ...(setupOptions === undefined ? {} : { setupOptions }),
+      });
+      const options = setupOptions === undefined ? {} : { path: '/caller' };
+
+      await expect(conn.connect(transport, options)).rejects.toThrow(/routing|conflict/i);
+      expect(transport.uniOut).toEqual([]);
+      await conn.close();
+      expect(transport.closeInfo).toBeDefined();
+    }
+  });
+
+  it('native QUIC rejects a missing or mismatched ALPN before opening SETUP', async () => {
+    for (const protocol of [undefined, 'moqt-16']) {
+      const conn = new MoqtConnection(18);
+      const transport = Object.assign(new TransportSim(), {
+        kind: 'quic' as const,
+        protocol,
+        maxDatagramSize: 1200,
+      });
+
+      await expect(conn.connect(transport)).rejects.toThrow(/ALPN.*moqt-18/i);
+      expect(transport.uniOut).toEqual([]);
+      await conn.close();
+      expect(transport.closeInfo).toBeDefined();
+    }
+  });
+
+  it('native QUIC requires negotiated datagram support before opening SETUP', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = Object.assign(new TransportSim(), {
+      kind: 'quic' as const,
+      protocol: 'moqt-18',
+      maxDatagramSize: 0,
+    });
+
+    await expect(conn.connect(transport)).rejects.toThrow(/datagram/i);
+    expect(transport.uniOut).toEqual([]);
+    await conn.close();
+    expect(transport.closeInfo).toBeDefined();
+  });
+
+  it('closes with the exact session error when peer SETUP is invalid', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = new TransportSim();
+    const realCreate = transport.createUnidirectionalStream.bind(transport);
+    let releaseLocalSetup!: () => void;
+    const localSetupGate = new Promise<void>((resolve) => { releaseLocalSetup = resolve; });
+    transport.createUnidirectionalStream = async () => {
+      await localSetupGate;
+      return realCreate();
+    };
+    const closes: Array<{ code?: number; reason?: string }> = [];
+    conn.onClose = (code, reason) => closes.push({ code, reason });
+    const invalidSetup = codec18.encode({
+      type: 'SETUP',
+      setupOptions: new Map([[BigInt(SetupOption18.PATH), [new TextEncoder().encode('/forbidden')]]]),
+    } as Setup);
+    transport.openIncomingUni().push(invalidSetup);
+
+    await expect(conn.connect(transport)).rejects.toThrow(/PATH MUST NOT/i);
+    releaseLocalSetup();
+    await flush();
+
+    expect(transport.closeInfo?.closeCode).toBe(0x8);
+    expect(closes).toEqual([{ code: 0x8, reason: expect.stringMatching(/PATH MUST NOT/i) }]);
+    expect(transport.uniOut).toHaveLength(1);
+    expect(transport.uniOut[0]!.written).toEqual([]);
+    expect(transport.uniOut[0]!.writeAborted).toBe(true);
+  });
+
+  it('keeps a local SETUP-stream failure out of the peer-violation path', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = new TransportSim();
+    const failure = new Error('local control stream failed');
+    const closes: Array<{ code?: number; reason?: string }> = [];
+    conn.onClose = (code, reason) => closes.push({ code, reason });
+    transport.createUnidirectionalStream = async () => { throw failure; };
+    transport.openIncomingUni().push(setupBytes());
+
+    await expect(conn.connect(transport)).rejects.toBe(failure);
+    await flush();
+
+    expect(transport.closeInfo?.closeCode).toBe(0x1);
+    expect(closes).toEqual([{ code: 0x1, reason: expect.stringMatching(/local control stream failed/i) }]);
+  });
+
+  it('rejects an unsupported native QUIC server binding before opening SETUP', async () => {
+    const conn = new MoqtConnection(18, { role: 'server' });
+    const transport = Object.assign(new TransportSim(), {
+      kind: 'quic' as const,
+      protocol: 'moqt-18',
+      maxDatagramSize: 1200,
+      setupOptions: { path: '/live', authority: 'relay.example:443' },
+    });
+
+    await expect(conn.connect(transport)).rejects.toThrow(/server binding is not supported/i);
+    expect(transport.uniOut).toEqual([]);
+    await conn.close();
+    expect(transport.closeInfo).toBeDefined();
   });
 });
 

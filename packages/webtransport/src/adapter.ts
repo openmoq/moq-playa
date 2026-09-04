@@ -1,5 +1,5 @@
 /**
- * MoqtConnection — bridges WebTransport to the sans-I/O Session state machine.
+ * MoqtConnection — bridges stream/datagram transports to the sans-I/O Session.
  *
  * Manages the control stream lifecycle, framing, setup handshake,
  * control message routing, data stream processing, and datagram decoding.
@@ -77,10 +77,11 @@ import type {
 import type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions } from '@moqt/transport';
 import { ControlStreamFramer } from './framer.js';
 import { createBidiControlTopology } from './topology/bidi-control.js';
-import { createUniPairTopology, RequestCancelledError, RequestGoawayError, type UniPairTopology, type RequestStream } from './topology/uni-pair.js';
+import { createUniPairTopology, PeerSetupRejectedError, RequestCancelledError, RequestGoawayError, type UniPairTopology, type RequestStream } from './topology/uni-pair.js';
+import { IncomingUniRouter, type RoutedIncomingUniStream } from './topology/incoming-uni.js';
 import { InboundRequestStreamContext } from './topology/inbound-request.js';
 import { MoqtConnectionError } from './adapter-error.js';
-import type { WebTransportLike, WebTransportBidirectionalStream } from './types.js';
+import type { WebTransportLike, WebTransportBidirectionalStream, MoqtSetupRouting } from './types.js';
 
 
 
@@ -201,7 +202,7 @@ export interface IncomingPublish {
 }
 
 /**
- * MoQT connection over WebTransport I/O to the MOQT Session state machine.
+ * MoQT connection over WebTransport or native-QUIC I/O.
  *
  * Handles control stream, incoming data streams (§10.4), and datagrams (§10.3).
  *
@@ -320,10 +321,14 @@ export class MoqtConnection {
 
   /** draft-18 control/request stream topology. Null for draft-14/16. */
   private uniPair: UniPairTopology | null = null;
+  /** draft-18 owner of the shared incoming unidirectional stream source. */
+  private incomingUniRouter: IncomingUniRouter | null = null;
 
   private framer!: ControlStreamFramer;
   private controlWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private transport: WebTransportLike | null = null;
+  /** Omitted `kind` remains WebTransport for API compatibility. */
+  private transportKind: 'webtransport' | 'quic' = 'webtransport';
   private nextStreamId = 0n;
 
   /**
@@ -527,7 +532,7 @@ export class MoqtConnection {
    * THE terminal coordinator. Every terminal path — a session-generated
    * close_connection ({@link notifyClose}), an adapter-detected fatal violation
    * (control / request-stream / data-stream / datagram, via
-   * {@link closeSessionFatal}), and the WebTransport `closed` promise settling —
+   * {@link closeSessionFatal}), and the transport `closed` promise settling —
    * funnels through here. It runs the shutdown EXACTLY ONCE: close the session
    * if still open, reject every pending public operation, clear all timers and
    * routing state, then fire onClose a single time. Concurrent causes (e.g. the
@@ -622,6 +627,12 @@ export class MoqtConnection {
    * owned by the connection outlives the terminal shutdown.
    */
   private clearTerminalState(): void {
+    const incomingUniRouter = this.incomingUniRouter;
+    this.incomingUniRouter = null;
+    // The transport owns the aggregate incoming-stream readable's terminal
+    // transition. Retire our classifier and child readers, but leave that source
+    // for transport.close(); some backends close its controller from onClose.
+    incomingUniRouter?.retire(new Error('session terminated'));
     this.pendingGenericSubscriptions.clear();
     this.pendingSubscriptionGenerations.clear();
     this.clearAllPendingAliases();
@@ -687,7 +698,7 @@ export class MoqtConnection {
     for (const w of this.namespaceStreams.values()) this.swallow(() => w.abort(reason));
     this.namespaceStreams.clear();
     // Topology request-stream contexts (outbound + continuing).
-    this.uniPair?.shutdown();
+    this.uniPair?.shutdown({ transportClosing: true });
   }
 
   /**
@@ -772,7 +783,7 @@ export class MoqtConnection {
   }
 
   /**
-   * Watch the WebTransport `closed` promise for a REMOTE session close (§webtrans).
+   * Watch the transport `closed` promise for a remote session close.
    * On fulfillment the real close code/reason are preserved into onClose; on
    * rejection a fatal transport error is surfaced. Ignores a settle from a
    * stale/non-current transport (after migration), and collapses with any
@@ -1207,10 +1218,17 @@ export class MoqtConnection {
    *   flows on incoming uni streams + datagrams (draft-18 vi64 data codec).
    * - draft-14/16: a single bidi control stream (BidiControlTopology); no uniPair.
    */
-  private configureForVersion(version: DraftVersion): void {
-    // This adapter is always WebTransport, so PATH/AUTHORITY in SETUP are illegal
-    // (§10.3.1.1/§10.3.1.2 → INVALID_PATH / INVALID_AUTHORITY on receive).
-    this.session = new Session(this._role, version, { webtransport: true });
+  private configureForVersion(
+    version: DraftVersion,
+    transportKind: 'webtransport' | 'quic' = this.transportKind,
+  ): void {
+    this.incomingUniRouter?.abort(new Error('connection reconfigured'));
+    this.incomingUniRouter = null;
+    this.transportKind = transportKind;
+    this.uniPair = null;
+    // PATH/AUTHORITY are forbidden over WebTransport but carry native-QUIC
+    // routing information. The sans-I/O gate enforces the selected binding.
+    this.session = new Session(this._role, version, { webtransport: transportKind === 'webtransport' });
     if (version === 18) {
       this.codec = createControlCodec(18);
       this.framer = new ControlStreamFramer(this.codec);
@@ -1231,8 +1249,9 @@ export class MoqtConnection {
       // A later control-stream message (draft-18 GOAWAY, §10.4): feed it to the
       // session (→ DRAINING, or close on a violation) and surface it to the app.
       this.uniPair.onControlMessage = (message) => this.handleControlStreamMessage(message);
-      // A post-SETUP control-stream lifecycle violation (non-GOAWAY message, decode
-      // failure, or FIN, §3.3/§10.4) is fatal — close with PROTOCOL_VIOLATION.
+      // A post-SETUP control-stream lifecycle violation (wrong-stream message,
+      // decode failure, or FIN, §3.3 and §10 Table 5) is fatal: close with
+      // PROTOCOL_VIOLATION.
       this.uniPair.onControlStreamViolation = (reason) => this.handleControlStreamViolation(reason);
     } else {
       const topology = createBidiControlTopology(version);
@@ -1244,15 +1263,15 @@ export class MoqtConnection {
   }
 
   /**
-   * Connect to a MOQT server via WebTransport.
+   * Connect to a MOQT server over WebTransport or native QUIC.
    *
-   * Opens the control bidirectional stream, sends CLIENT_SETUP,
-   * waits for SERVER_SETUP, then starts background loops for:
+   * Opens the control topology for the selected draft and transport binding,
+   * exchanges SETUP, then starts background loops for:
    * - Control stream reading
    * - Incoming unidirectional data streams
    * - Incoming datagrams
    *
-   * @param transport WebTransport session (real or mock)
+   * @param transport WebTransport session, native QUIC facade, or mock
    * @param options Setup parameters (path, maxRequestId, etc.)
    * @see draft-ietf-moq-transport-16 §3.3
    */
@@ -1260,42 +1279,108 @@ export class MoqtConnection {
     transport: WebTransportLike,
     options: SetupOptions = {},
   ): Promise<void> {
+    // connect() owns the supplied transport from entry, including preflight
+    // failures. A caller can always tear it down through close().
     this.transport = transport;
-    // Observe the WebTransport session lifetime: a remote close settles this
+    const transportKind = transport.kind ?? 'webtransport';
+    let selectedVersion = this.session.draftVersion;
+    let nativeRouting: MoqtSetupRouting | undefined;
+
+    if (transportKind === 'quic') {
+      if (this._role !== EndpointRole.CLIENT) {
+        throw new Error('native QUIC server binding is not supported');
+      }
+      // Native QUIC support starts at draft 18. Unlike the historical
+      // WebTransport fallback, ALPN is mandatory and must identify the exact
+      // wire draft before any MOQT stream is opened.
+      if (transport.protocol !== 'moqt-18') {
+        throw new ProtocolViolationError(
+          `native QUIC negotiated ALPN ${JSON.stringify(transport.protocol ?? '')}; expected "moqt-18"`,
+        );
+      }
+      if (this._requestedVersion !== undefined && this._requestedVersion !== 18) {
+        throw new Error(`native QUIC supports draft 18 only, not draft ${this._requestedVersion}`);
+      }
+      if (!Number.isSafeInteger(transport.maxDatagramSize) || transport.maxDatagramSize! <= 0) {
+        throw new Error('native QUIC requires negotiated QUIC datagram support');
+      }
+      const routing = transport.setupOptions;
+      if (!routing || typeof routing.authority !== 'string' || routing.authority.length === 0
+          || typeof routing.path !== 'string') {
+        throw new Error('native QUIC transport is missing its URI-derived SETUP routing');
+      }
+      if ((options.authority !== undefined && options.authority !== routing.authority)
+          || (options.path !== undefined && options.path !== routing.path)) {
+        throw new Error('native QUIC SETUP routing conflicts with the transport URI');
+      }
+      nativeRouting = routing;
+      selectedVersion = 18;
+    } else if (transportKind !== 'webtransport') {
+      throw new Error(`unsupported transport kind: ${String(transportKind)}`);
+    } else if (this._requestedVersion === undefined && transport.protocol) {
+      selectedVersion = protocolToDraftVersion(transport.protocol) ?? selectedVersion;
+    }
+
+    if (selectedVersion !== this.session.draftVersion || transportKind !== this.transportKind) {
+      this.configureForVersion(selectedVersion, transportKind);
+    }
+
+    // Observe the transport session lifetime: a remote close settles this
     // promise with the real code/reason (preserved into onClose), a transport
     // failure rejects it (surfaced as a fatal error). Runs through the one-shot
     // terminal coordinator, ignores a stale transport after migration.
     void this.watchTransportClosed(transport);
 
-    // §3.1: Auto-detect the draft version from the negotiated WT-Available-Protocols
-    // BEFORE choosing a connect path. If the constructor was given no explicit
-    // version and the server picked a supported protocol, reconfigure to it — this
-    // is what lets an auto-negotiated 'moqt-18' enter the uni-pair path below
-    // instead of the legacy single-bidi path. An explicit constructor version
-    // (`_requestedVersion !== undefined`) always wins over `transport.protocol`.
-    if (this._requestedVersion === undefined && transport.protocol) {
-      const negotiated = protocolToDraftVersion(transport.protocol);
-      if (negotiated !== undefined && negotiated !== this.session.draftVersion) {
-        this.configureForVersion(negotiated);
-      }
-    }
-
     if (this.session.draftVersion === 18) {
       // draft-18: open the uni control-stream pair and exchange SETUP. Request
       // responses arrive on their own bidi streams (see subscribe()), so no
-      // shared control read loop is started. Data, however, flows the same way
-      // as 14/16 — incoming uni (subgroup/fetch) streams and datagrams — so we
-      // start those loops here. establish() has already consumed the inbound
-      // control stream (#1) and released the lock, so runIncomingStreamLoop
-      // picks up data streams (#2+) without contending for the control stream.
+      // shared control read loop is started. SETUP, subgroup, FETCH, and
+      // PADDING can arrive on independent unidirectional streams in any order,
+      // so one classifier owns the stream source and parks data until SETUP is
+      // accepted.
       // WebTransport carries the path in the URL, so never put PATH in SETUP.
-      // AUTHORITY over WebTransport is prohibited by draft-16 §9.3.1.1, but
+      // AUTHORITY over WebTransport is prohibited by draft-18 §10.3.1.1, but
       // some tenant-routed deployments require it; preserve it only when the
       // caller explicitly opts into that interop deviation.
-      const { path, ...cleanOptions } = options;
-      void path;
-      await this.uniPair!.establish(transport, cleanOptions);
-      this.runIncomingStreamLoop(transport);
+      let setupOptions = nativeRouting === undefined
+        ? options
+        : { ...options, authority: nativeRouting.authority, path: nativeRouting.path };
+      if (transportKind === 'webtransport') {
+        const { path, ...withoutPath } = options;
+        void path;
+        setupOptions = withoutPath;
+      }
+      let localSetupFailure: unknown;
+      const localSetup = this.uniPair!.openControlStream(transport, setupOptions).catch((error) => {
+        localSetupFailure = error;
+        throw error;
+      });
+      const router = new IncomingUniRouter({
+        onSetup: (stream) => this.uniPair!.acceptControlStream(stream),
+        onData: (stream) => {
+          const streamId = this.nextStreamId++;
+          void this.processRoutedDataStream(stream, streamId);
+        },
+        onViolation: (reason, error) => this.handleIncomingUniViolation(reason, error),
+        onTransportError: (error) => this.handleIncomingUniTransportError(error),
+      });
+      this.incomingUniRouter = router;
+      try {
+        await Promise.all([
+          localSetup,
+          router.start(transport.incomingUnidirectionalStreams),
+        ]);
+        router.releaseData();
+      } catch (error) {
+        router.retire(error);
+        if (this.incomingUniRouter === router) this.incomingUniRouter = null;
+        if (error === localSetupFailure && !this._terminated) {
+          this.closeSessionInternalError(
+            `local SETUP failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        throw error;
+      }
       this.runDatagramLoop(transport);
       this.runIncomingBidiLoop(transport);
       return;
@@ -1311,7 +1396,7 @@ export class MoqtConnection {
     // draft-14/16 single-bidi control stream. The role decides who opens it:
     // the client opens it and sends CLIENT_SETUP; the server accepts the client's
     // stream and replies SERVER_SETUP. (draft-18's server path is the uni-pair
-    // establish() above; this is the legacy equivalent.)
+    // classifier above; this is the legacy equivalent.)
     let reader: ReadableStreamDefaultReader<Uint8Array>;
     if (this._role === EndpointRole.SERVER) {
       const incoming = transport.incomingBidirectionalStreams;
@@ -2199,11 +2284,11 @@ export class MoqtConnection {
   }
 
   /**
-   * A draft-18 control-stream lifecycle violation AFTER setup (§3.3/§10.4): a
-   * non-GOAWAY message, a decode failure, or a FIN of the control stream. This is
-   * fatal — close the session with PROTOCOL_VIOLATION and fire onClose. No-op if
-   * the session is already closed (e.g. a local close FIN'd the stream first), so
-   * we never double-close.
+   * A draft-18 control-stream lifecycle violation AFTER setup (§3.3 and §10
+   * Table 5): a wrong-stream message, a decode failure, or a FIN of the control
+   * stream. This is fatal — close the session with PROTOCOL_VIOLATION and fire
+   * onClose. No-op if the session is already closed (e.g. a local close FIN'd
+   * the stream first), so we never double-close.
    */
   private handleControlStreamViolation(reason: string): void {
     if (this.session.state === SessionState.CLOSED) return;
@@ -3063,13 +3148,12 @@ export class MoqtConnection {
     this._terminated = true;
     this._closeEmitted = true;
     const actions = this.session.close(error, reason);
-    // Reader ownership transfers BEFORE the first await. `executeActions()`
-    // yields even when its actions are synchronous, and an application callback
-    // running inside a decoder can reach here — a stream must not deliver
-    // another object across that gap. §10.4 accounting goes with it.
     this.failPendingRawSubscriptions(reason ?? 'Session closed');
+    // Start transport shutdown before retiring local I/O, while still making
+    // every reader and publisher inert before this method first yields.
+    const transportClose = this.executeActions(actions);
     this.clearTerminalState();
-    await this.executeActions(actions);
+    await transportClose;
   }
 
   /**
@@ -5202,6 +5286,25 @@ export class MoqtConnection {
     }
   }
 
+  /** Preserve the established-session behavior of the legacy accept loop. */
+  private handleIncomingUniTransportError(error: Error): void {
+    if (this.session.state === SessionState.CLOSED) return;
+    this.onError?.(new MoqtConnectionError(
+      error.message,
+      { errorSource: 'transport', isFatal: true, cause: error },
+    ));
+  }
+
+  /** Preserve an exact Session-selected SETUP close; classify other failures normally. */
+  private handleIncomingUniViolation(reason: string, error: Error): void {
+    if (error instanceof PeerSetupRejectedError) {
+      this.swallow(() => this.executeActions([error.closeAction]));
+      this.notifyClose(error.closeAction, 'peer SETUP rejected');
+      return;
+    }
+    this.handleControlStreamViolation(reason);
+  }
+
   /**
    * Background loop: listen for incoming datagrams, decode each one.
    * @see draft-ietf-moq-transport-16 §10.3
@@ -5979,10 +6082,25 @@ export class MoqtConnection {
     stream: ReadableStream<Uint8Array>,
     streamId: bigint,
   ): Promise<void> {
-    const reader = stream.getReader();
+    await this.processDataStreamReader(stream.getReader(), streamId, new Uint8Array(0));
+  }
+
+  /** Continue decoding a stream whose draft-18 type prefix was already read. */
+  private async processRoutedDataStream(
+    stream: RoutedIncomingUniStream,
+    streamId: bigint,
+  ): Promise<void> {
+    await this.processDataStreamReader(stream.reader, streamId, stream.prefix);
+  }
+
+  private async processDataStreamReader(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    streamId: bigint,
+    initial: Uint8Array,
+  ): Promise<void> {
     // Track the reader so STOP_SENDING can be sent later (§10.4.3)
     this.dataStreamReaders.set(streamId, reader);
-    let buf: Uint8Array = new Uint8Array(0);
+    let buf: Uint8Array = initial;
     let readTerminal: DataStreamReadTerminal = 'peer-fin';
 
     try {

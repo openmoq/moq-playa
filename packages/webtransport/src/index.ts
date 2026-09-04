@@ -1,5 +1,5 @@
 /**
- * @moqt/webtransport — MoQT connection over WebTransport.
+ * @moqt/webtransport — MoQT connection adapter and WebTransport binding.
  * @module
  */
 
@@ -10,6 +10,7 @@ export type {
   WebTransportLike,
   WebTransportBidirectionalStream,
   WebTransportCloseInfo,
+  MoqtSetupRouting,
 } from './types.js';
 export { MoqtConnectionError } from './adapter-error.js';
 export type { MoqtConnectionErrorSource, MoqtConnectionErrorOptions } from './adapter-error.js';

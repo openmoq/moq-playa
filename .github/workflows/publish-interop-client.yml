@@ -44,18 +44,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: docker/setup-buildx-action@v3
+
       # The image build runs the client's own teardown and case discriminators
       # as a mandatory stage, so a failing test fails this publish.
       - name: Build interop client image
-        run: |
-          docker build \
-            -f tools/moq-interop-client/Dockerfile.client \
-            -t "${IMAGE}:latest" \
-            -t "${IMAGE}:${{ steps.tags.outputs.short_sha }}" \
-            tools/moq-interop-client
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tools/moq-interop-client/Dockerfile.client
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.tags.outputs.short_sha }}
+          build-args: NODE_BUILD_JOBS=4
+          cache-from: type=gha,scope=moq-playa-interop-client
+          cache-to: type=gha,mode=max,scope=moq-playa-interop-client
 
-      - name: Push tags
+      - name: Summarize publication
         run: |
-          docker push "${IMAGE}:latest"
-          docker push "${IMAGE}:${{ steps.tags.outputs.short_sha }}"
           echo "Published ${IMAGE}:latest and :${{ steps.tags.outputs.short_sha }}"

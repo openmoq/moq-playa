@@ -1,6 +1,6 @@
-# PR gate — fast, hermetic checks only. Every step here exists and runs today;
-# expensive lanes (soaks, fuzz, browser, differential) live in nightly.yml and
-# are added only when their implementations land.
+# PR gate. The main package checks are hermetic; the separate native QUIC image
+# job compiles the pinned experimental Node runtime and runs its native smoke.
+# Soaks, fuzz, browser, and differential lanes live in nightly.yml.
 name: ci
 
 on:
@@ -45,7 +45,7 @@ jobs:
       - name: Typecheck (per package)
         run: |
           set -euo pipefail
-          for p in transport webtransport playback loc player browser msf playa; do
+          for p in transport webtransport quic playback loc player browser msf playa; do
             echo "── tsc: packages/$p"
             pnpm --dir "packages/$p" exec tsc --noEmit
           done
@@ -100,3 +100,35 @@ jobs:
             git diff | head -100
             exit 1
           fi
+
+  native-quic-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Node's QUIC API is compile-time experimental. Building the real image
+      # here proves both the pinned linux/x64 runtime and the native smoke test
+      # before the same Dockerfile can be published.
+      - name: Build native QUIC interop image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tools/moq-interop-client/Dockerfile.client
+          load: true
+          tags: moq-playa-interop-client:ci
+          build-args: NODE_BUILD_JOBS=4
+          cache-from: type=gha,scope=moq-playa-interop-client
+          cache-to: type=gha,mode=max,scope=moq-playa-interop-client
+
+      - name: Verify final image runtime and test gate
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /bin/sh moq-playa-interop-client:ci -ceu '
+            test -f /app/.tests-passed
+            test "$(node --version)" = "v26.8.1"
+            node --experimental-quic --input-type=module -e \
+              "if (process.features.quic !== true) process.exit(1); await import(\"node:quic\")"
+          '

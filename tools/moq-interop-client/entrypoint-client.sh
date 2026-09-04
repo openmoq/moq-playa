@@ -7,4 +7,4 @@
 # client default. The client fails closed on an unsupported value rather than
 # defaulting a non-empty one.
 set -euo pipefail
-exec node /app/dist/main.js
+exec node --experimental-quic /app/dist/main.js

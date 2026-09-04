@@ -1,8 +1,8 @@
 /**
- * Minimal WebTransport type interfaces for testability.
+ * Minimal byte-transport interfaces for testability.
  *
- * These mirror the browser WebTransport API but are defined locally
- * so the adapter can be tested without a real browser environment.
+ * These mirror the browser WebTransport API. A native QUIC binding can expose
+ * the same byte-stream surface while identifying its transport kind.
  *
  * @see https://www.w3.org/TR/webtransport/
  * @module
@@ -20,17 +20,29 @@ export interface WebTransportCloseInfo {
   reason?: string;
 }
 
+/** URI identity copied into native-QUIC MOQT SETUP. */
+export interface MoqtSetupRouting {
+  readonly authority: string;
+  readonly path: string;
+}
+
 /**
- * Minimal subset of the WebTransport API used by MoqtConnection.
+ * Minimal transport surface used by MoqtConnection.
  *
- * Implementations can supply the real browser WebTransport object
- * or a mock for testing.
+ * Implementations can supply browser WebTransport, a native QUIC adapter, or
+ * a mock for testing. The historical name is retained for API compatibility.
  */
 export interface WebTransportLike {
   /**
-   * Negotiated application protocol from WT-Available-Protocols.
+   * Transport binding. Omitted preserves the historical WebTransport behavior;
+   * native QUIC adapters must identify themselves explicitly.
+   */
+  readonly kind?: 'webtransport' | 'quic';
+
+  /**
+   * Negotiated application protocol from WT-Available-Protocols or ALPN.
    * Empty string if no protocol was negotiated.
-   * @see draft-ietf-moq-transport-16 §3.1
+   * @see draft-ietf-moq-transport-18 §3.1
    * @see W3C WebTransport §3.3
    */
   readonly protocol?: string;
@@ -40,6 +52,17 @@ export interface WebTransportLike {
    * Used by the startup buffer to classify network conditions.
    */
   readonly handshakeRttMs?: number;
+
+  /** Maximum peer-accepted QUIC datagram payload. Required and non-zero for
+   * native QUIC, where MOQT negotiates datagrams at the QUIC layer. */
+  readonly maxDatagramSize?: number;
+
+  /**
+   * URI-derived MOQT routing fields for native QUIC. Native adapters must
+   * provide these so callers cannot accidentally omit or alter the AUTHORITY
+   * and PATH carried in SETUP. WebTransport implementations omit this field.
+   */
+  readonly setupOptions?: MoqtSetupRouting;
 
   /** Open a new client-initiated bidirectional stream. */
   createBidirectionalStream(): Promise<WebTransportBidirectionalStream>;

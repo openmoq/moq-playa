@@ -153,7 +153,19 @@ export class TransportSim implements WebTransportLike {
     this.closedResolve(this.closeInfo);
   }
 
+  /**
+   * Model the backend side of a session close. Double-closing an aggregate
+   * source intentionally throws, matching Web Streams controller semantics.
+   */
+  closeIncomingSources(): void {
+    this.incomingBidiCtrl.close();
+    this.incomingCtrl.close();
+    this.datagramCtrl.close();
+  }
+
   private incomingCtrl!: ReadableStreamDefaultController<ReadableStream<Uint8Array>>;
+  /** Whether a consumer cancelled the transport-owned incoming-uni source. */
+  incomingUniSourceCancelled = false;
   readonly incomingUnidirectionalStreams: ReadableStream<ReadableStream<Uint8Array>>;
 
   private incomingBidiCtrl!: ReadableStreamDefaultController<SimStream>;
@@ -168,6 +180,9 @@ export class TransportSim implements WebTransportLike {
     this.incomingUnidirectionalStreams = new ReadableStream<ReadableStream<Uint8Array>>({
       start: (c) => {
         this.incomingCtrl = c;
+      },
+      cancel: () => {
+        this.incomingUniSourceCancelled = true;
       },
     });
     this.incomingBidirectionalStreams = new ReadableStream<SimStream>({

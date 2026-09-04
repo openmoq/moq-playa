@@ -7,7 +7,8 @@ import { createUniPairTopology, RequestGoawayError } from './uni-pair.js';
 import { TransportSim, SimStream, flush } from '../testkit/stream-sim.js';
 import type { WebTransportLike } from '../types.js';
 import {
-  Session, EndpointRole, SessionState, SubscriptionState, createControlCodec, varint,
+  Session, EndpointRole, SessionError as SessionErrorCode, SessionState, SubscriptionState,
+  SetupOption18, createControlCodec, varint,
 } from '@moqt/transport';
 import type { Setup, SubscribeOk, RequestOk, RequestErrorMsg, Subscribe, FetchOk, Namespace, NamespaceDone, Goaway, ControlMessage, DecodedControlMessage, SendControlAction, OpenNamespaceStreamAction, RequestResult } from '@moqt/transport';
 
@@ -63,12 +64,265 @@ describe('UniPairTopology — control handshake', () => {
     expect(transport.uniOut[0]!.writeClosed).toBe(false); // control stream stays open
   });
 
-  it('rejects a non-SETUP first message on the control stream', async () => {
+  it('shutdown cancels the peer control reader without reporting a peer FIN', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const violations: string[] = [];
+    topo.onControlStreamViolation = (reason) => violations.push(reason);
+    const control = transport.openIncomingUni();
+    control.push(setupBytes());
+    await topo.establish(transport);
+
+    topo.shutdown();
+    await flush();
+
+    expect(control.readCancelled).toBe(true);
+    expect(transport.incomingUniSourceCancelled).toBe(true);
+    expect(violations).toEqual([]);
+  });
+
+  it('leaves the aggregate source to a transport-closing owner', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const control = transport.openIncomingUni();
+    control.push(setupBytes());
+    await topo.establish(transport);
+
+    topo.shutdown({ transportClosing: true });
+    await flush();
+
+    expect(control.readCancelled).toBe(true);
+    expect(transport.incomingUniSourceCancelled).toBe(false);
+    expect(() => transport.closeIncomingSources()).not.toThrow();
+  });
+
+  it('classifies an Object stream that arrives before SETUP without stealing the control stream', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const routed: Uint8Array[] = [];
+    topo.onIncomingDataStream = (stream) => { routed.push(stream.prefix); };
+
+    transport.openIncomingUni().push(new Uint8Array([0x10, 0x01]));
+    transport.openIncomingUni().push(setupBytes());
+    await topo.establish(transport);
+
+    expect(client.state).toBe(SessionState.ESTABLISHED);
+    expect(routed).toEqual([new Uint8Array([0x10, 0x01])]);
+  });
+
+  it('reports a throwing incoming-data handler as a local stream error', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const errors: Error[] = [];
+    const violations: string[] = [];
+    topo.onIncomingDataStream = () => { throw new Error('application handler failed'); };
+    topo.onStreamError = (error) => errors.push(error);
+    topo.onControlStreamViolation = (reason) => violations.push(reason);
+
+    transport.openIncomingUni().push(setupBytes());
+    await topo.establish(transport);
+    const data = transport.openIncomingUni();
+    data.push(new Uint8Array([0x10, 0x01]));
+    await flush();
+
+    expect(errors.map((error) => error.message)).toEqual(['application handler failed']);
+    expect(violations).toEqual([]);
+    expect(data.readCancelled).toBe(true);
+    expect(client.state).toBe(SessionState.ESTABLISHED);
+  });
+
+  it('reports a rejected incoming-data handler as a local stream error', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const errors: Error[] = [];
+    const violations: string[] = [];
+    const rejection = Promise.reject(new Error('async application handler failed'));
+    void rejection.catch(() => {});
+    topo.onIncomingDataStream = () => rejection;
+    topo.onStreamError = (error) => errors.push(error);
+    topo.onControlStreamViolation = (reason) => violations.push(reason);
+
+    transport.openIncomingUni().push(setupBytes());
+    await topo.establish(transport);
+    const data = transport.openIncomingUni();
+    data.push(new Uint8Array([0x10, 0x01]));
+    await flush();
+
+    expect(errors.map((error) => error.message)).toEqual(['async application handler failed']);
+    expect(violations).toEqual([]);
+    expect(data.readCancelled).toBe(true);
+    expect(client.state).toBe(SessionState.ESTABLISHED);
+  });
+
+  it('holds early Object streams until both control-stream SETUP messages complete', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const realCreate = transport.createUnidirectionalStream.bind(transport);
+    let releaseLocalSetup!: () => void;
+    const localSetupGate = new Promise<void>((resolve) => { releaseLocalSetup = resolve; });
+    (transport as unknown as {
+      createUnidirectionalStream: () => Promise<WritableStream<Uint8Array>>;
+    }).createUnidirectionalStream = async () => {
+      await localSetupGate;
+      return realCreate();
+    };
+    const routed: Uint8Array[] = [];
+    topo.onIncomingDataStream = (stream) => { routed.push(stream.prefix); };
+
+    transport.openIncomingUni().push(new Uint8Array([0x10, 0x01]));
+    transport.openIncomingUni().push(setupBytes());
+    const establishing = topo.establish(transport);
+    await flush();
+    await flush();
+
+    expect(client.state).toBe(SessionState.ESTABLISHED);
+    expect(routed).toEqual([]);
+
+    releaseLocalSetup();
+    await establishing;
+    expect(routed).toEqual([new Uint8Array([0x10, 0x01])]);
+  });
+
+  it('executes an invalid peer SETUP close action instead of accepting the session', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18, { webtransport: true });
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const invalidSetup = codec18.encode({
+      type: 'SETUP',
+      setupOptions: new Map([[BigInt(SetupOption18.PATH), [new TextEncoder().encode('/forbidden')]]]),
+    } as Setup);
+    transport.openIncomingUni().push(invalidSetup);
+
+    await expect(topo.establish(transport)).rejects.toThrow(/PATH MUST NOT/i);
+
+    expect(client.state).toBe(SessionState.CLOSED);
+    expect(transport.closeInfo?.closeCode).toBe(Number(SessionErrorCode.INVALID_PATH));
+  });
+
+  it('invalidates a delayed local control stream after peer SETUP rejection', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18, { webtransport: true });
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const realCreate = transport.createUnidirectionalStream.bind(transport);
+    let releaseLocalSetup!: () => void;
+    const localSetupGate = new Promise<void>((resolve) => { releaseLocalSetup = resolve; });
+    transport.createUnidirectionalStream = async () => {
+      await localSetupGate;
+      return realCreate();
+    };
+    const invalidSetup = codec18.encode({
+      type: 'SETUP',
+      setupOptions: new Map([[BigInt(SetupOption18.PATH), [new TextEncoder().encode('/forbidden')]]]),
+    } as Setup);
+    transport.openIncomingUni().push(invalidSetup);
+
+    await expect(topo.establish(transport)).rejects.toThrow(/PATH MUST NOT/i);
+    releaseLocalSetup();
+    await flush();
+
+    expect(transport.uniOut).toHaveLength(1);
+    expect(transport.uniOut[0]!.written).toEqual([]);
+    expect(transport.uniOut[0]!.writeAborted).toBe(true);
+    await expect(topo.sendControl({ type: 'GOAWAY', newSessionUri: '' } as never))
+      .rejects.toThrow(/not established/i);
+  });
+
+  it('retires an in-flight local SETUP writer when peer SETUP is rejected', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18, { webtransport: true });
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    let markWriteStarted!: () => void;
+    const writeStarted = new Promise<void>((resolve) => { markWriteStarted = resolve; });
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const writes: Uint8Array[] = [];
+    let aborts = 0;
+    const writable = new WritableStream<Uint8Array>({
+      write(chunk) {
+        writes.push(chunk.slice());
+        markWriteStarted();
+        return writeGate;
+      },
+      abort() { aborts++; },
+    });
+    transport.createUnidirectionalStream = async () => writable;
+    const control = transport.openIncomingUni();
+    const establishing = topo.establish(transport);
+    await writeStarted;
+
+    const invalidSetup = codec18.encode({
+      type: 'SETUP',
+      setupOptions: new Map([[BigInt(SetupOption18.PATH), [new TextEncoder().encode('/forbidden')]]]),
+    } as Setup);
+    control.push(invalidSetup);
+    await expect(establishing).rejects.toThrow(/PATH MUST NOT/i);
+
+    const lateSend = topo.sendControl({ type: 'GOAWAY', newSessionUri: '' } as never);
+    releaseWrite();
+    await expect(lateSend).rejects.toThrow();
+    await flush();
+
+    expect(writes).toHaveLength(1);
+    expect(aborts).toBe(1);
+  });
+
+  it('does not report a local SETUP-stream failure as a peer violation', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const failure = new Error('local control stream failed');
+    const violations: string[] = [];
+    let rejectLocalSetup!: (reason: Error) => void;
+    const localSetup = new Promise<WritableStream<Uint8Array>>((_, reject) => {
+      rejectLocalSetup = reject;
+    });
+    topo.onControlStreamViolation = (reason) => violations.push(reason);
+    transport.createUnidirectionalStream = () => localSetup;
+    transport.openIncomingUni().push(setupBytes());
+
+    const establishing = topo.establish(transport);
+    await flush();
+    await flush();
+    expect(client.state).toBe(SessionState.ESTABLISHED);
+
+    rejectLocalSetup(failure);
+    await expect(establishing).rejects.toBe(failure);
+    await flush();
+
+    expect(violations).toEqual([]);
+    expect(transport.closeInfo?.closeCode).toBe(Number(SessionErrorCode.INTERNAL_ERROR));
+  });
+
+  it('shutdown cancels a stream whose type classification is still pending', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const routed: Uint8Array[] = [];
+    topo.onIncomingDataStream = (stream) => { routed.push(stream.prefix); };
+    transport.openIncomingUni().push(setupBytes());
+    await topo.establish(transport);
+
+    const pending = transport.openIncomingUni();
+    await flush();
+    topo.shutdown();
+    await flush();
+
+    expect(routed).toEqual([]);
+    expect(pending.readCancelled).toBe(true);
+  });
+
+  it('rejects a control message where a unidirectional stream type is required', async () => {
     const client = new Session(EndpointRole.CLIENT, 18);
     const topo = createUniPairTopology(client);
     const transport = new TransportSim();
     transport.pushIncomingUni(subBytes());
-    await expect(topo.establish(transport)).rejects.toThrow(/expected SETUP/i);
+    await expect(topo.establish(transport)).rejects.toThrow(/unknown.*stream type/i);
   });
 });
 
@@ -786,7 +1040,7 @@ describe('UniPairTopology — draft-18 GOAWAY (§10.4)', () => {
     await flush();
     expect(received).toEqual([]);            // never handed to the owner
     expect(violations).toHaveLength(1);
-    expect(violations[0]).toMatch(/SUBSCRIBE.*only GOAWAY/i);
+    expect(violations[0]).toMatch(/SUBSCRIBE.*§3\.3.*§10 Table 5/i);
   });
 
   it('malformed post-SETUP control bytes are a violation (decode failure)', async () => {

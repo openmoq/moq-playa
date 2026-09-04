@@ -8,7 +8,7 @@
  * only shows green runs cannot tell a working verdict from a vacuous one.
  */
 import {
-  CaseScope, Inbox, __setConnect, __setBoundScale,
+  CaseScope, Inbox, __setConnect, __setBoundScale, connectPeer,
   caseSubscribeError, caseAnnounceSubscribe, caseSubscribeBeforeAnnounce,
   casePublishNamespaceDone,
 } from "../src/main.js";
@@ -158,6 +158,56 @@ async function main() {
   // -- 8. synchronous response during request emission is still matched
   check("inbox retains a response delivered synchronously during subscribe()",
     (await run(caseSubscribeError, { subscribeReply: "REQUEST_ERROR", replyDuringEmit: true })) === null);
+
+  // -- connection ownership: a SETUP failure still leaves a peer to tear down
+  {
+    const failure = new Error("induced SETUP failure");
+    let closeCalls = 0;
+    let resolveClosed!: () => void;
+    const transport = {
+      protocol: "moqt-18",
+      closed: new Promise<void>((resolve) => { resolveClosed = resolve; }),
+    };
+    const conn: any = {
+      async connect() { throw failure; },
+      async close() { closeCalls++; resolveClosed(); },
+    };
+    const scope = new CaseScope();
+    const result = await connectPeer(18, "failed-setup", scope, {
+      makeTransport: async () => transport,
+      makeConnection: () => conn,
+    }).then(() => null, (error) => error);
+    check("failed SETUP preserves the original failure", result === failure);
+    const cleanup = await scope.teardownAll();
+    check("failed SETUP tears down the adopted connection",
+      cleanup.length === 0 && closeCalls === 1,
+      `cleanup=${cleanup.join(";")} closeCalls=${closeCalls}`);
+  }
+
+  // connectPeer adopts successful peers before returning; case bodies may
+  // track the returned peer again without creating a second close owner.
+  {
+    let closeCalls = 0;
+    let resolveClosed!: () => void;
+    const transport = {
+      protocol: "moqt-18",
+      closed: new Promise<void>((resolve) => { resolveClosed = resolve; }),
+    };
+    const conn: any = {
+      async connect() {},
+      async close() { closeCalls++; resolveClosed(); },
+    };
+    const scope = new CaseScope();
+    const peer = await connectPeer(18, "successful-setup", scope, {
+      makeTransport: async () => transport,
+      makeConnection: () => conn,
+    });
+    scope.track(peer);
+    const cleanup = await scope.teardownAll();
+    check("successful SETUP has one teardown owner",
+      cleanup.length === 0 && closeCalls === 1,
+      `cleanup=${cleanup.join(";")} closeCalls=${closeCalls}`);
+  }
 
   console.log(failures === 0 ? "# all case discriminators passed" : `# ${failures} FAILED`);
   process.exit(failures === 0 ? 0 : 1);

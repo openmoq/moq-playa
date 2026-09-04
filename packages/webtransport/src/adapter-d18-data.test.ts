@@ -18,6 +18,7 @@ import {
   vi64EncodingLength,
   varint,
   MessageParam,
+  SetupOption18,
   StreamType18,
   PADDING_DATAGRAM_TYPE,
   DatagramFlags18,
@@ -84,6 +85,101 @@ async function connected(): Promise<{ conn: MoqtConnection; transport: Transport
 }
 
 describe('MoqtConnection(18) subgroup stream delivery', () => {
+  it('accepts an Object stream before SETUP and delivers it after setup completes', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = new TransportSim();
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, object) => objects.push(object);
+
+    transport.pushIncomingUni(concat(
+      subgroupHeader(7n, 42n),
+      subgroupObject(3n, [0xaa, 0xbb]),
+    ));
+    const control = transport.openIncomingUni();
+
+    const connecting = conn.connect(transport);
+    await flush();
+    expect(objects).toEqual([]);
+
+    control.push(setupBytes());
+    await connecting;
+    await flush();
+
+    expect(objects).toHaveLength(1);
+    expect(objects[0]!.trackAlias).toBe(7n);
+    expect(objects[0]!.groupId).toBe(42n);
+  });
+
+  it('does not deliver an early Object before its outbound SETUP is sent', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = new TransportSim();
+    const realCreate = transport.createUnidirectionalStream.bind(transport);
+    let releaseLocalSetup!: () => void;
+    const localSetupGate = new Promise<void>((resolve) => { releaseLocalSetup = resolve; });
+    (transport as unknown as {
+      createUnidirectionalStream: () => Promise<WritableStream<Uint8Array>>;
+    }).createUnidirectionalStream = async () => {
+      await localSetupGate;
+      return realCreate();
+    };
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, object) => objects.push(object);
+
+    transport.pushIncomingUni(concat(
+      subgroupHeader(7n, 42n),
+      subgroupObject(3n, [0xaa, 0xbb]),
+    ));
+    transport.openIncomingUni().push(setupBytes());
+    const connecting = conn.connect(transport);
+    await flush();
+    await flush();
+
+    expect(objects).toEqual([]);
+
+    releaseLocalSetup();
+    await connecting;
+    await flush();
+    expect(objects).toHaveLength(1);
+    expect(objects[0]!.groupId).toBe(42n);
+  });
+
+  it('discards an early Object when peer SETUP is rejected', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = new TransportSim();
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, object) => objects.push(object);
+    const invalidSetup = codec18.encode({
+      type: 'SETUP',
+      setupOptions: new Map([[BigInt(SetupOption18.PATH), [new TextEncoder().encode('/forbidden')]]]),
+    });
+
+    transport.pushIncomingUni(concat(
+      subgroupHeader(7n, 42n),
+      subgroupObject(3n, [0xaa, 0xbb]),
+    ));
+    transport.openIncomingUni().push(invalidSetup);
+
+    await expect(conn.connect(transport)).rejects.toThrow(/PATH MUST NOT/i);
+    await flush();
+
+    expect(objects).toEqual([]);
+    expect(transport.closeInfo?.closeCode).toBe(0x8);
+  });
+
+  it('cancels a stream whose type is still pending when the connection closes', async () => {
+    const { conn, transport } = await connected();
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, object) => objects.push(object);
+    const pending = transport.openIncomingUni();
+    await flush();
+
+    await conn.close();
+    await flush();
+
+    expect(objects).toEqual([]);
+    expect(pending.readCancelled).toBe(true);
+  });
+
   it('delivers a subgroup object to onObject (unknown alias → raw onObject)', async () => {
     const { conn, transport } = await connected();
     const objects: MoqtObject[] = [];
@@ -848,15 +944,18 @@ describe('MoqtConnection(18) inbound PUBLISH (§10.10)', () => {
     conn.onPublish = (p) => { published++; p.onObject = (o) => objs.push(o); };
     conn.onObject = () => { /* generic */ };
 
+    // This stream is already accepted by the transport but has not exposed its
+    // type. A fatal PUBLISH must retire it along with the stream accept loop.
+    const pendingData = transport.openIncomingUni();
+    await flush();
+
     // requestId 2n is EVEN = our (client) parity, not the peer's — invalid.
     transport.pushIncomingBidi().push(publishBytes(2n, 50n, 'vid'));
     await flush();
 
     expect(published).toBe(0);
     expect(transport.closeInfo).toBeDefined();
-    // No alias binding happened: data on alias 50 does not reach a publish onObject.
-    transport.pushIncomingUni(concat(subgroupHeader(50n, 1n), subgroupObject(0n, [0x01])));
-    await flush();
+    expect(pendingData.readCancelled).toBe(true);
     expect(objs.length).toBe(0);
   });
 

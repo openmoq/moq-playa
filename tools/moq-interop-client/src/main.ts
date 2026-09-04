@@ -11,13 +11,16 @@
  *   - every async callback outcome is folded into the verdict; nothing rests
  *     on a bare sleep.
  */
-import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { MoqtConnection } from "@moqt/webtransport";
 import type { ControlMessage } from "@moqt/transport";
 import { teardown as teardownPeer } from "./teardown.js";
 import { pathToFileURL } from "node:url";
 import { varint } from "@moqt/transport";
+import {
+  connectInteropWebTransport,
+  selectRelayTransport,
+  transportSecurityDiagnostic,
+} from "./transport-factory.js";
 
 // ---------------------------------------------------------------- environment
 const RELAY_URL = process.env.RELAY_URL ?? "";
@@ -76,29 +79,21 @@ const diag = (m: string) => { if (VERBOSE) process.stderr.write(`# ${m}\n`); };
 
 // ------------------------------------------------------------------ transport
 async function makeTransport(url: string, draft: number): Promise<any> {
-  const wt = await import("@fails-components/webtransport");
-  if ((wt as any).quicheLoaded) await (wt as any).quicheLoaded;
-  const opts: Record<string, unknown> = {};
-  const protocols = protocolsFor(draft);
-  if (protocols) opts.protocols = protocols;
-  if (TLS_DISABLE_VERIFY) {
-    // Pin the mounted self-signed leaf. If pinning was requested we must not
-    // silently fall back to ordinary verification, and must never install a
-    // verifier bypass.
-    let pem: string;
-    try { pem = readFileSync(CERT_PATH, "utf8"); }
-    catch (e) { throw new Error(`TLS_DISABLE_VERIFY=1 but ${CERT_PATH} is unreadable: ${e}`); }
-    const b64 = pem.replace(/-----(BEGIN|END) CERTIFICATE-----/g, "").replace(/\s+/g, "");
-    if (!b64) throw new Error(`TLS_DISABLE_VERIFY=1 but ${CERT_PATH} holds no certificate`);
-    const der = Buffer.from(b64, "base64");
-    if (der.length === 0) throw new Error(`TLS_DISABLE_VERIFY=1 but ${CERT_PATH} is malformed`);
-    opts.serverCertificateHashes = [
-      { algorithm: "sha-256", value: new Uint8Array(createHash("sha256").update(der).digest()) },
-    ];
-  }
-  const transport = new (wt as any).WebTransport(url, opts);
-  await transport.ready;
-  return transport;
+  return selectRelayTransport(url, draft, {
+    webtransport: async (target, selectedDraft) => {
+      const protocols = protocolsFor(selectedDraft);
+      return connectInteropWebTransport(target, {
+        ...(protocols ? { protocols } : {}),
+        disableCertificateVerification: TLS_DISABLE_VERIFY,
+        certificatePath: CERT_PATH,
+        onTapComment: (message) => process.stdout.write(`# ${message}\n`),
+      });
+    },
+    quic: async (target) => {
+      const { connectQuic } = await import("@moqt/quic");
+      return connectQuic(target, { allowUnauthorized: TLS_DISABLE_VERIFY });
+    },
+  });
 }
 
 // Map-aware, bigint-safe serializer. `parameters` / track-property blocks are
@@ -257,7 +252,10 @@ class Fatal {
 export class CaseScope {
   readonly fatal = new Fatal();
   private peers: Peer[] = [];
-  track(p: Peer) { this.peers.push(p); return p; }
+  track(p: Peer) {
+    if (!this.peers.includes(p)) this.peers.push(p);
+    return p;
+  }
   qlog: string[] = [];
   qlogSeen = 0;
   /** Race an outcome against this case's fatal signal, so a request-stream
@@ -277,10 +275,25 @@ export type ConnectFn = (draft: number, label: string, scope: CaseScope) => Prom
 let connectImpl: ConnectFn = (d, l, sc) => connectPeer(d, l, sc);
 export function __setConnect(f: ConnectFn) { connectImpl = f; }
 
-async function connectPeer(draft: number, label: string, scope: CaseScope): Promise<Peer> {
-  const raw = await makeTransport(RELAY_URL, draft);
+export interface ConnectPeerDependencies {
+  makeTransport(url: string, draft: number): Promise<any>;
+  makeConnection(draft: number): any;
+}
+
+const CONNECT_PEER_DEFAULTS: ConnectPeerDependencies = {
+  makeTransport,
+  makeConnection: (draft) => new MoqtConnection(draft as any),
+};
+
+export async function connectPeer(
+  draft: number,
+  label: string,
+  scope: CaseScope,
+  dependencies: ConnectPeerDependencies = CONNECT_PEER_DEFAULTS,
+): Promise<Peer> {
+  const raw = await dependencies.makeTransport(RELAY_URL, draft);
   const transport = WIRE_TAP ? tapTransport(raw, label) : raw;
-  const conn = new MoqtConnection(draft as any);
+  const conn = dependencies.makeConnection(draft);
   const inbox = new Inbox();
   // All three observers are installed before connect(), therefore before any
   // request can be emitted. onError is load-bearing: a request-stream reset,
@@ -305,9 +318,13 @@ async function connectPeer(draft: number, label: string, scope: CaseScope): Prom
   // forward an inbound SUBSCRIBE, so without this the relay's request is
   // correctly refused by our own limit ("exceeds our MAX_REQUEST_ID 0").
   // Draft 18 negotiates this differently and must NOT carry the option.
-  await conn.connect(transport, draft === 16 ? { maxRequestId: varint(LEGACY_MAX_REQUEST_ID) } : {});
+  const setupOptions = draft === 16
+    ? { maxRequestId: varint(LEGACY_MAX_REQUEST_ID) }
+    : {};
+  const peer = scope.track({ conn, transport, inbox });
+  await conn.connect(transport, setupOptions);
   diag(`${label}: connected draft=${draft} negotiated protocol='${transport.protocol ?? ""}'`);
-  return { conn, transport, inbox };
+  return peer;
 }
 
 /** Clean teardown. A local close() is deliberately quiet and does not fire
@@ -491,6 +508,8 @@ async function main() {
   out(`# Relay: ${RELAY_URL}`);
   out(`# Draft: ${draft} (MOQT_DRAFT='${process.env.MOQT_DRAFT ?? ""}')`);
   out(`# Offered protocols: ${(protocolsFor(draft) ?? ["<none: draft-14 in-band>"]).join(",")}`);
+  const securityDiagnostic = transportSecurityDiagnostic(RELAY_URL, TLS_DISABLE_VERIFY);
+  if (securityDiagnostic) out(`# ${securityDiagnostic}`);
 
   const selected = TESTCASE ? CASES.filter(([n]) => n === TESTCASE) : CASES;
   if (TESTCASE && selected.length === 0) { out(`Bail out! unknown TESTCASE '${TESTCASE}'`); process.exit(1); }
