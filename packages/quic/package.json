@@ -1,6 +1,6 @@
 {
   "name": "@moqt/quic",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "description": "Experimental Node.js native QUIC binding for Media over QUIC Transport (MoQT).",
   "license": "Apache-2.0",
   "author": "OpenMOQ (https://github.com/openmoq)",
