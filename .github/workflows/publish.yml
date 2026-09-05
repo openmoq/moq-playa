@@ -163,5 +163,5 @@ jobs:
               continue
             fi
             echo "Publishing ${name}@${version} from ${tgz}"
-            npm publish "$tgz" --access public
+            npm publish "./$tgz" --access public
           done
