@@ -395,6 +395,64 @@ describe('CMAF bootstrap deadlines while the document is hidden (browser defers 
   });
 });
 
+describe('CMAF media is held until the MediaSource attaches (resume at the live edge)', () => {
+  const videoObj = (alias: unknown, groupId: number, objectId: number): MoqtObject => ({
+    kind: 'data', trackAlias: alias, groupId: varint(groupId), subgroupId: varint(0),
+    objectId: varint(objectId), payload: boxPayload(['moof', 24], ['mdat', 32]),
+  } as MoqtObject);
+
+  it('an adapter that does not report attachment is treated as attached (back-compat)', async () => {
+    const { player, adapter, assembler, reqIdFor } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]));
+    const vid = await reqIdFor('video');
+    adapter._triggerObject(0n, videoObj(vid, 7, 0)); // group start → synced → pushed
+    expect(assembler.push).toHaveBeenCalledTimes(1);
+    await player.destroy();
+  });
+
+  it('attached=false: media is held (not fed to the assembler); on attach the assembler is reset, ' +
+     're-seeded with init, and video re-syncs to the next group start', async () => {
+    const { player, adapter, mockMs, assembler, reqIdFor } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]));
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+    const vid = await reqIdFor('video');
+    assembler.setInitSegment.mockClear();
+
+    // Browser has deferred the attachment (hidden tab): nothing may reach MSE.
+    (mockMs as { attached?: boolean }).attached = false;
+    adapter._triggerObject(0n, videoObj(vid, 7, 0));
+    adapter._triggerObject(0n, videoObj(vid, 7, 1));
+    adapter._triggerObject(0n, videoObj(vid, 8, 0));
+    expect(assembler.push).not.toHaveBeenCalled();
+    expect(assembler.reset).not.toHaveBeenCalled();
+
+    // Tab foregrounded → sourceopen → SourceBuffers → attached.
+    (mockMs as { attached?: boolean }).attached = true;
+    (mockMs as { onAttached?: () => void }).onAttached?.();
+    expect(assembler.reset).toHaveBeenCalledTimes(1);
+    expect(assembler.setInitSegment).toHaveBeenCalledWith('video', expect.any(Uint8Array)); // re-seeded
+
+    // Mid-group objects after attach are skipped until the next group start…
+    adapter._triggerObject(0n, videoObj(vid, 8, 3));
+    adapter._triggerObject(0n, videoObj(vid, 8, 4));
+    expect(assembler.push).not.toHaveBeenCalled();
+    // …then the keyframe-led group at the live edge is the first thing fed.
+    adapter._triggerObject(0n, videoObj(vid, 9, 0));
+    adapter._triggerObject(0n, videoObj(vid, 9, 1));
+    expect(assembler.push).toHaveBeenCalledTimes(2);
+    expect(assembler.push.mock.calls[0]![2]).toBe(9n);
+    await player.destroy();
+  });
+
+  it('onAttached without a preceding hold is a no-op (normal visible startup)', async () => {
+    const { player, mockMs, assembler } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]));
+    (mockMs as { onAttached?: () => void }).onAttached?.();
+    expect(assembler.reset).not.toHaveBeenCalled();
+    await player.destroy();
+  });
+});
+
 describe('CMAF in-band init detection strictness', () => {
   it('ftyp-only, moof, and garbage payloads are NOT accepted as init', async () => {
     const { player, adapter, mockMs, reqIdFor } =

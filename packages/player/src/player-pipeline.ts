@@ -71,6 +71,11 @@ export interface TrackInfo {
 
 /** Callbacks from pipeline to player. */
 export interface PipelineCallbacks {
+  /**
+   * The CMAF MediaSource became attached to its media element (MSE
+   * `sourceopen`). Optional: only CMAF sessions produce it.
+   */
+  onAttached?: () => void;
   onFirstFrame: () => void;
   onStall: (durationMs: number) => void;
   /**
@@ -187,6 +192,7 @@ export function createPipelines(
     // @see draft-ietf-moq-cmsf-00 §3.1 (Initialization headers)
     // @see draft-ietf-moq-catalogformat-01 §3.2.16 (initTrack)
 
+    mediaSource.onAttached = () => callbacks.onAttached?.();
     mediaSource.onFirstFrame = () => callbacks.onFirstFrame();
     mediaSource.onStall = (durationMs) => callbacks.onStall(durationMs);
     mediaSource.onStallRecovered = (durationMs) => callbacks.onStallRecovered?.(durationMs);

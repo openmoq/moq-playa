@@ -562,6 +562,18 @@ export class MseMediaSource implements MediaSourceLike {
 
   // ─── Callbacks ──────────────────────────────────────────────────
 
+  /**
+   * True once the media element has attached the MediaSource (`sourceopen`)
+   * and initialize() has created the SourceBuffers. Browsers defer the
+   * attachment while the document is hidden; until then appendChunk() has
+   * nothing to append to. Cleared by reset().
+   */
+  private _attached = false;
+  get attached(): boolean { return this._attached; }
+
+  /** Callback: the MediaSource attached and SourceBuffers now exist. */
+  onAttached: (() => void) | null = null;
+
   onFirstFrame: (() => void) | null = null;
   onError: ((error: Error) => void) | null = null;
   /** `cause` is set for stalls the adapter itself resolved by a gap-jump
@@ -956,6 +968,9 @@ export class MseMediaSource implements MediaSourceLike {
             this.runMutation('audio', 'init-append', () => ab.appendBuffer(audioInit.buffer as ArrayBuffer));
           }
         }
+        // SourceBuffers exist from here on: appendChunk() can take effect.
+        this._attached = true;
+        this.onAttached?.();
       } catch (err) {
         this.onError?.(err instanceof Error ? err : new Error(String(err)));
       }
@@ -1246,6 +1261,8 @@ export class MseMediaSource implements MediaSourceLike {
     this.videoQueue.length = 0;
     this.audioQueue.length = 0;
     this.initialized = false;
+    this._attached = false;
+    this.preInitDropLogged = false;
     // Timeline-owned append state.
     this.videoTimelines.clear();
     this.audioTimelines.clear();
