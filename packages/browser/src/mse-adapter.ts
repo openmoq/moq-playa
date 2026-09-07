@@ -603,6 +603,8 @@ export class MseMediaSource implements MediaSourceLike {
   onGapJump: ((info: GapJumpInfo) => void) | null = null;
 
   private firstFrameFired = false;
+  /** One-shot guard for the "no SourceBuffer yet" drop diagnostic in appendChunk(). */
+  private preInitDropLogged = false;
   private playTriggered = false;
   private stallStartTime: number | null = null;
   /** True once this episode has been reported as detected. */
@@ -982,6 +984,18 @@ export class MseMediaSource implements MediaSourceLike {
 
     const buffer = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
     if (!buffer) {
+      // No SourceBuffer yet: either initialize() hasn't been called, or it has
+      // and we are still waiting for `sourceopen`. The latter is normal for a
+      // hidden tab — browsers defer the media load (and so the MediaSource
+      // attachment) until the document is visible — but it must not be silent:
+      // every chunk dropped here is media the element will never see.
+      if (!this.preInitDropLogged) {
+        this.preInitDropLogged = true;
+        const doc = (globalThis as { document?: { visibilityState?: string } }).document;
+        this.logDebug('[MSE] dropping %s chunk: no SourceBuffer yet (initialized=%s, ms.readyState=%s, '
+          + 'document.visibilityState=%s) — waiting for sourceopen; further drops not logged',
+          mediaType, String(this.initialized), this.ms.readyState, doc?.visibilityState ?? 'n/a');
+      }
       return;
     }
 

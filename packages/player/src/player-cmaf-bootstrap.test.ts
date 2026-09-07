@@ -10,7 +10,7 @@
  * @module
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { MoqtPlayer } from './player.js';
 import { PlayerErrorCode } from './errors.js';
 import { PlayerState } from './state.js';
@@ -300,6 +300,97 @@ describe('CMAF bootstrap deadlines', () => {
     await sleep(150);
     expect(errors).toEqual([]);
     expect(player.state).not.toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+});
+
+describe('CMAF bootstrap deadlines while the document is hidden (browser defers media load)', () => {
+  /**
+   * Minimal `document` stand-in: browsers defer a media element's resource
+   * load (for MSE, the attachment that fires `sourceopen`) while the tab is
+   * hidden, so a bootstrap deadline expiring in that state is not a
+   * codec/init failure. These tests run in Node, where no `document` exists.
+   */
+  function stubDocument(state: 'hidden' | 'visible') {
+    const listeners = new Set<() => void>();
+    const doc = {
+      visibilityState: state,
+      addEventListener: (type: string, fn: () => void) => { if (type === 'visibilitychange') listeners.add(fn); },
+      removeEventListener: (_type: string, fn: () => void) => { listeners.delete(fn); },
+      show() { this.visibilityState = 'visible'; for (const fn of [...listeners]) fn(); },
+      listenerCount: () => listeners.size,
+    };
+    (globalThis as any).document = doc;
+    return doc;
+  }
+  afterEach(() => { delete (globalThis as any).document; });
+
+  it('hidden: the first-frame deadline is suspended (no fatal); visible again → re-armed and escalates normally', async () => {
+    const doc = stubDocument('hidden');
+    const { player, errors } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60 });
+    await sleep(200); // several deadlines' worth, all while hidden
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+    expect(player.state).not.toBe(PlayerState.ERROR);
+    expect(doc.listenerCount()).toBe(1); // waiting on visibilitychange
+
+    doc.show();
+    expect(doc.listenerCount()).toBe(0); // one-shot: removed once re-armed
+    await sleep(150); // > cmafBootstrapTimeoutMs after becoming visible, still no frame
+    const err = errors.find((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT);
+    expect(err).toBeDefined();
+    expect(err.message).toMatch(/no frame rendered/i);
+    await player.destroy();
+  });
+
+  it('hidden → visible → frame renders inside the re-armed deadline: no fatal', async () => {
+    const doc = stubDocument('hidden');
+    const { player, errors, mockMs } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60 });
+    await sleep(150);
+    doc.show();
+    mockMs.onFirstFrame?.(); // sourceopen → init → first paint, as a foregrounded tab does
+    await sleep(150);
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+    expect(player.state).not.toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('hidden: the cmaf_init deadline is suspended too', async () => {
+    stubDocument('hidden');
+    const { player, adapter, errors, reqIdFor } =
+      await bootPlayer(cmafCatalog([VIDEO_BASE]), { cmafBootstrapTimeoutMs: 60 });
+    adapter._triggerObject(0n, {
+      kind: 'data', trackAlias: await reqIdFor('video'), groupId: varint(0), subgroupId: varint(0),
+      objectId: varint(1), payload: boxPayload(['moof', 32]),
+    } as MoqtObject);
+    await sleep(200);
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+    expect(player.state).not.toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('destroy() while deferred removes the visibilitychange listener', async () => {
+    const doc = stubDocument('hidden');
+    const { player } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60 });
+    await sleep(150);
+    expect(doc.listenerCount()).toBe(1);
+    await player.destroy();
+    expect(doc.listenerCount()).toBe(0);
+  });
+
+  it('a visible document keeps the historical escalation (regression guard)', async () => {
+    stubDocument('visible');
+    const { player, errors } = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60 });
+    await sleep(150);
+    expect(errors.some((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toBe(true);
+    expect(player.state).toBe(PlayerState.ERROR);
     await player.destroy();
   });
 });

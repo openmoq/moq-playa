@@ -375,6 +375,16 @@ export class MoqtPlayer {
   /** Whether we've seen a keyframe (group start) since init — video only. */
   private cmafVideoSynced = false;
 
+  /**
+   * CMAF bootstrap deadlines suspended because the document is hidden, keyed
+   * by watchdog event name → the timeout to re-arm once visible. See
+   * {@link deferCmafBootstrapDeadline}.
+   */
+  private readonly cmafDeadlinesDeferredForHidden = new Map<string, number>();
+
+  /** `visibilitychange` listener installed while any CMAF deadline is deferred. */
+  private visibilityListener: (() => void) | null = null;
+
   /** Assembles moof+mdat pairs, patches tfdt, emits complete segments. */
   private cmafAssembler: CmafAssemblerLike | null = null;
 
@@ -897,6 +907,17 @@ export class MoqtPlayer {
         // CMAF bootstrap deadlines ESCALATE (fatal); all other
         // expectations keep the historical diagnostic-only behavior.
         if (e.event === 'cmaf_init' || e.event === 'cmaf_first_frame') {
+          // Browsers (Chrome in particular) defer a media element's resource
+          // load — for MSE, the MediaSource attachment that fires
+          // `sourceopen` — while the document is hidden (background tab), and
+          // resume it when the tab becomes visible. Until then no SourceBuffer
+          // exists and nothing can render, no matter how healthy delivery is.
+          // That is not a codec/init mismatch: suspend the deadline instead of
+          // escalating, and re-arm it fresh once the document is visible.
+          if (this.documentHidden()) {
+            this.deferCmafBootstrapDeadline(e.event, e.timeoutMs);
+            return;
+          }
           const detail = e.event === 'cmaf_init'
             ? 'CMAF media arriving but no init segment materialized (initData / initTrack / in-band ftyp+moov)'
             : 'CMAF MediaSource initialized but no frame rendered (init/codec mismatch?)';
@@ -4559,6 +4580,8 @@ export class MoqtPlayer {
     this.cmafPendingInit = null;
     this.cmafPreInitDropWarned.clear();
     this.cmafInitDeadlineArmed = false;
+    this.cmafDeadlinesDeferredForHidden.clear();
+    this.removeVisibilityListener();
     this.watchdog.destroy();
     this.cmafAssembler?.destroy();
     this.cmafAssembler = null;
@@ -6399,6 +6422,54 @@ export class MoqtPlayer {
     }
     this.log.info('CMAF MediaSource initialized (%s)',
       entries.map(([mt, e]) => `${mt}=${e.bytes!.byteLength}B`).join(' '));
+  }
+
+  /** Whether a DOM document exists and is currently hidden (background tab). */
+  private documentHidden(): boolean {
+    const doc = (globalThis as { document?: { visibilityState?: string } }).document;
+    return doc?.visibilityState === 'hidden';
+  }
+
+  /**
+   * Suspend a CMAF bootstrap deadline that expired while the document was
+   * hidden. The browser has deferred the media load (no `sourceopen`, no
+   * SourceBuffer, nothing appended), so the deadline cannot be meaningful
+   * until the tab is visible again. The expectation is re-armed with its full
+   * timeout on the first `visibilitychange` to visible; if the deadline then
+   * expires with the document visible, it escalates normally.
+   */
+  private deferCmafBootstrapDeadline(event: string, timeoutMs: number): void {
+    if (!this.cmafDeadlinesDeferredForHidden.has(event)) {
+      this.log.warn(
+        'CMAF bootstrap deferred: document is hidden (background tab) — the browser '
+        + 'defers media loading until the tab is visible; waiting for %s', event);
+    }
+    this.cmafDeadlinesDeferredForHidden.set(event, timeoutMs);
+    this.installVisibilityListener();
+  }
+
+  private installVisibilityListener(): void {
+    if (this.visibilityListener) return;
+    const doc = (globalThis as { document?: EventTarget }).document;
+    if (!doc) return;
+    this.visibilityListener = () => {
+      if (this.documentHidden()) return;
+      const deferred = [...this.cmafDeadlinesDeferredForHidden];
+      this.cmafDeadlinesDeferredForHidden.clear();
+      this.removeVisibilityListener();
+      for (const [event, timeoutMs] of deferred) {
+        this.log.info('Document visible — re-arming CMAF bootstrap deadline %s (%dms)', event, timeoutMs);
+        this.watchdog.expect(event, timeoutMs);
+      }
+    };
+    doc.addEventListener('visibilitychange', this.visibilityListener);
+  }
+
+  private removeVisibilityListener(): void {
+    if (!this.visibilityListener) return;
+    const doc = (globalThis as { document?: EventTarget }).document;
+    doc?.removeEventListener('visibilitychange', this.visibilityListener);
+    this.visibilityListener = null;
   }
 
   /** Create the moof+mdat assembler wired to the MediaSource (single site). */
