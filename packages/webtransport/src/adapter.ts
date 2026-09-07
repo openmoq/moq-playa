@@ -77,7 +77,8 @@ import type {
 import type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions } from '@moqt/transport';
 import { ControlStreamFramer } from './framer.js';
 import { createBidiControlTopology } from './topology/bidi-control.js';
-import { createUniPairTopology, RequestCancelledError, RequestGoawayError, type UniPairTopology, type RequestStream } from './topology/uni-pair.js';
+import { createUniPairTopology, RequestCancelledError, RequestGoawayError, PeerSetupRejectedError, type UniPairTopology, type RequestStream } from './topology/uni-pair.js';
+import { IncomingUniRouter } from './topology/incoming-uni.js';
 import { InboundRequestStreamContext } from './topology/inbound-request.js';
 import { MoqtConnectionError } from './adapter-error.js';
 import type { WebTransportLike, WebTransportBidirectionalStream } from './types.js';
@@ -288,6 +289,12 @@ export class MoqtConnection {
 
   /** draft-18 control/request stream topology. Null for draft-14/16. */
   private uniPair: UniPairTopology | null = null;
+  /**
+   * draft-18 only: classifies the shared incoming-unidirectional-stream space
+   * (SETUP vs. subgroup/FETCH/PADDING data) so the peer's control stream isn't
+   * assumed to always be QUIC stream #1 — see the draft-18 setup block below.
+   */
+  private incomingUniRouter: IncomingUniRouter | null = null;
 
   private framer!: ControlStreamFramer;
   private controlWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
@@ -621,6 +628,13 @@ export class MoqtConnection {
     this.namespaceStreams.clear();
     // Topology request-stream contexts (outbound + continuing).
     this.uniPair?.shutdown();
+    // The transport owns the aggregate incoming-stream readable's terminal
+    // transition. Retire our classifier and child readers, but leave that
+    // source for transport.close(); some backends close its controller from
+    // onClose.
+    const incomingUniRouter = this.incomingUniRouter;
+    this.incomingUniRouter = null;
+    incomingUniRouter?.retire(new Error('session terminated'));
   }
 
   /**
@@ -1189,19 +1203,52 @@ export class MoqtConnection {
     if (this.session.draftVersion === 18) {
       // draft-18: open the uni control-stream pair and exchange SETUP. Request
       // responses arrive on their own bidi streams (see subscribe()), so no
-      // shared control read loop is started. Data, however, flows the same way
-      // as 14/16 — incoming uni (subgroup/fetch) streams and datagrams — so we
-      // start those loops here. establish() has already consumed the inbound
-      // control stream (#1) and released the lock, so runIncomingStreamLoop
-      // picks up data streams (#2+) without contending for the control stream.
+      // shared control read loop is started. SETUP, subgroup, and FETCH can
+      // arrive on independent unidirectional streams in any order — QUIC gives
+      // no ordering guarantee across streams — so a single classifier
+      // (IncomingUniRouter) owns the whole incoming-uni space instead of
+      // assuming the peer's control stream is always stream #1. Driven
+      // directly here (rather than via UniPairTopology.establish()'s
+      // convenience wrapper) so an accept-loop death can be classified FATAL,
+      // matching the historical legacy-loop behavior below.
       // WebTransport carries the path in the URL, so never put PATH in SETUP.
       // AUTHORITY over WebTransport is prohibited by draft-16 §9.3.1.1, but
       // some tenant-routed deployments require it; preserve it only when the
       // caller explicitly opts into that interop deviation.
       const { path, ...cleanOptions } = options;
       void path;
-      await this.uniPair!.establish(transport, cleanOptions);
-      this.runIncomingStreamLoop(transport);
+      let localSetupFailure: unknown;
+      const localSetup = this.uniPair!.openControlStream(transport, cleanOptions).catch((error) => {
+        localSetupFailure = error;
+        throw error;
+      });
+      const router = new IncomingUniRouter({
+        onSetup: (stream) => this.uniPair!.acceptControlStream(stream),
+        onData: (stream) => {
+          const streamId = this.nextStreamId++;
+          void this.processDataStream(stream.reader, streamId, stream.prefix);
+        },
+        onViolation: (reason, error) => this.handleIncomingUniViolation(reason, error),
+        onTransportError: (error) => this.handleIncomingUniTransportError(error),
+      });
+      this.incomingUniRouter = router;
+      try {
+        await Promise.all([
+          localSetup,
+          router.start(transport.incomingUnidirectionalStreams),
+        ]);
+        router.releaseData();
+      } catch (error) {
+        router.retire(error);
+        if (this.incomingUniRouter === router) this.incomingUniRouter = null;
+        if (error === localSetupFailure && this.session.state !== SessionState.CLOSED) {
+          this.onError?.(new MoqtConnectionError(
+            `local SETUP failed: ${error instanceof Error ? error.message : String(error)}`,
+            { errorSource: 'transport', isFatal: true, ...(error instanceof Error ? { cause: error } : {}) },
+          ));
+        }
+        throw error;
+      }
       this.runDatagramLoop(transport);
       this.runIncomingBidiLoop(transport);
       return;
@@ -4883,7 +4930,7 @@ export class MoqtConnection {
         if (done) break;
         // Process each stream in the background
         const streamId = this.nextStreamId++;
-        this.processDataStream(stream, streamId);
+        this.processDataStream(stream.getReader(), streamId);
       }
     } catch (err) {
       // The ACCEPT loop dying is terminal for media delivery: no future data
@@ -4896,6 +4943,25 @@ export class MoqtConnection {
         { errorSource: 'transport', isFatal: true, ...(err instanceof Error ? { cause: err } : {}) },
       ));
     }
+  }
+
+  /** Preserve the established-session behavior of the legacy accept loop (draft-18). */
+  private handleIncomingUniTransportError(error: Error): void {
+    if (this.session.state === SessionState.CLOSED) return;
+    this.onError?.(new MoqtConnectionError(
+      error.message,
+      { errorSource: 'transport', isFatal: true, cause: error },
+    ));
+  }
+
+  /** Preserve an exact Session-selected SETUP close; classify other failures normally. */
+  private handleIncomingUniViolation(reason: string, error: Error): void {
+    if (error instanceof PeerSetupRejectedError) {
+      this.swallow(() => this.executeActions([error.closeAction]));
+      this.notifyClose(error.closeAction, 'peer SETUP rejected');
+      return;
+    }
+    this.handleControlStreamViolation(reason);
   }
 
   /**
@@ -5659,13 +5725,16 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-16 §10.4, draft-ietf-moq-transport-18 §11.4
    */
   private async processDataStream(
-    stream: ReadableStream<Uint8Array>,
+    reader: ReadableStreamDefaultReader<Uint8Array>,
     streamId: bigint,
+    prefix: Uint8Array = new Uint8Array(0),
   ): Promise<void> {
-    const reader = stream.getReader();
     // Track the reader so STOP_SENDING can be sent later (§10.4.3)
     this.dataStreamReaders.set(streamId, reader);
-    let buf: Uint8Array = new Uint8Array(0);
+    // `prefix` carries bytes an incoming-stream classifier (draft-18
+    // IncomingUniRouter) already consumed while peeking to distinguish this
+    // stream from SETUP — they must be replayed before further reads.
+    let buf: Uint8Array = prefix;
 
     try {
       // Phase 1: Accumulate bytes and decode the stream header

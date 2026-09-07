@@ -31,12 +31,43 @@ export class SimStream implements WebTransportBidirectionalStream {
   writeAborted = false;
   /** Whether the readable side was cancelled (the consumer sent STOP_SENDING). */
   readCancelled = false;
+  /**
+   * When set, `reader.cancel()` fails WITHOUT closing the readable — the shape
+   * a broken backend produces, and the one that leaves a decoder live if local
+   * provenance is only a terminal classifier.
+   */
+  failCancel: 'throws-sync' | 'rejects' | null = null;
 
   readonly readable: ReadableStream<Uint8Array>;
   readonly writable: WritableStream<Uint8Array>;
 
   private ctrl!: ReadableStreamDefaultController<Uint8Array>;
   private readClosed = false;
+
+  /**
+   * The readable as the consumer sees it. With `failCancel` set, `cancel()`
+   * fails without delegating, so the underlying stream stays readable.
+   */
+  readableForConsumer(): ReadableStream<Uint8Array> {
+    return {
+      getReader: () => {
+        const reader = this.readable.getReader();
+        return new Proxy(reader, {
+          get: (target, prop, recv) => {
+            if (prop !== 'cancel') {
+              const v = Reflect.get(target, prop, recv);
+              return typeof v === 'function' ? v.bind(target) : v;
+            }
+            return (reason?: unknown) => {
+              if (this.failCancel === 'throws-sync') throw new Error('cancel() threw');
+              if (this.failCancel === 'rejects') return Promise.reject(new Error('cancel() rejected'));
+              return target.cancel(reason);
+            };
+          },
+        });
+      },
+    } as unknown as ReadableStream<Uint8Array>;
+  }
 
   constructor() {
     this.readable = new ReadableStream<Uint8Array>({
@@ -122,7 +153,19 @@ export class TransportSim implements WebTransportLike {
     this.closedResolve(this.closeInfo);
   }
 
+  /**
+   * Model the backend side of a session close. Double-closing an aggregate
+   * source intentionally throws, matching Web Streams controller semantics.
+   */
+  closeIncomingSources(): void {
+    this.incomingBidiCtrl.close();
+    this.incomingCtrl.close();
+    this.datagramCtrl.close();
+  }
+
   private incomingCtrl!: ReadableStreamDefaultController<ReadableStream<Uint8Array>>;
+  /** Whether a consumer cancelled the transport-owned incoming-uni source. */
+  incomingUniSourceCancelled = false;
   readonly incomingUnidirectionalStreams: ReadableStream<ReadableStream<Uint8Array>>;
 
   private incomingBidiCtrl!: ReadableStreamDefaultController<SimStream>;
@@ -137,6 +180,9 @@ export class TransportSim implements WebTransportLike {
     this.incomingUnidirectionalStreams = new ReadableStream<ReadableStream<Uint8Array>>({
       start: (c) => {
         this.incomingCtrl = c;
+      },
+      cancel: () => {
+        this.incomingUniSourceCancelled = true;
       },
     });
     this.incomingBidirectionalStreams = new ReadableStream<SimStream>({
@@ -214,7 +260,7 @@ export class TransportSim implements WebTransportLike {
   /** Inject an inbound unidirectional stream the test controls (no auto-close). */
   openIncomingUni(): SimStream {
     const s = new SimStream();
-    this.incomingCtrl.enqueue(s.readable);
+    this.incomingCtrl.enqueue(s.readableForConsumer());
     return s;
   }
 }
