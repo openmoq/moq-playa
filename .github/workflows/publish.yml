@@ -40,7 +40,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
 
       - name: Install npm CLI with trusted publishing support
         run: npm install --global "npm@${NPM_CLI_VERSION}"
@@ -125,7 +124,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          tarballs=(release/*.tgz)
+          tarballs=(./release/*.tgz)
           if [ ${#tarballs[@]} -eq 0 ]; then
             echo "No tarballs in release/"
             exit 1
@@ -143,7 +142,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          tarballs=(release/*.tgz)
+          tarballs=(./release/*.tgz)
           if [ ${#tarballs[@]} -eq 0 ]; then
             echo "No tarballs in release/"
             exit 1
@@ -163,5 +162,5 @@ jobs:
               continue
             fi
             echo "Publishing ${name}@${version} from ${tgz}"
-            npm publish "./$tgz" --access public
+            npm publish "file:${tgz}" --access public
           done
