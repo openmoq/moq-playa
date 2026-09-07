@@ -375,6 +375,14 @@ export class MoqtPlayer {
   /** Whether we've seen a keyframe (group start) since init — video only. */
   private cmafVideoSynced = false;
 
+  /**
+   * Wall-clock time `cmaf_init` fulfilled, i.e. when the `cmaf_first_frame`
+   * watchdog expectation was first armed. Used to bound how long video
+   * segment arrivals may keep renewing that deadline — see
+   * `cmafFirstFrameMaxWaitMs`.
+   */
+  private cmafFirstFrameDeadlineStartedAt: number | undefined;
+
   /** Assembles moof+mdat pairs, patches tfdt, emits complete segments. */
   private cmafAssembler: CmafAssemblerLike | null = null;
 
@@ -4559,6 +4567,7 @@ export class MoqtPlayer {
     this.cmafPendingInit = null;
     this.cmafPreInitDropWarned.clear();
     this.cmafInitDeadlineArmed = false;
+    this.cmafFirstFrameDeadlineStartedAt = undefined;
     this.watchdog.destroy();
     this.cmafAssembler?.destroy();
     this.cmafAssembler = null;
@@ -6395,6 +6404,11 @@ export class MoqtPlayer {
     if (this.config.cmafBootstrapTimeoutMs! > 0) {
       // Second bootstrap deadline: initialized but never rendered a frame
       // (codec/init mismatch class) must not be a silent black player.
+      // Renewed on each video segment arrival in buildCmafAssembler's
+      // onSegment (bounded by cmafFirstFrameMaxWaitMs) so a fixed 10s
+      // deadline from here doesn't misfire while delivery is healthy but
+      // startup buffering legitimately takes longer (e.g. long-haul RTT).
+      this.cmafFirstFrameDeadlineStartedAt = Date.now();
       this.watchdog.expect('cmaf_first_frame', this.config.cmafBootstrapTimeoutMs!);
     }
     this.log.info('CMAF MediaSource initialized (%s)',
@@ -6417,6 +6431,7 @@ export class MoqtPlayer {
           }
         }
         ms.appendChunk(mediaType, segment, segTrackName, groupId);
+        this.renewCmafFirstFrameDeadline(mediaType);
       },
       onDiscontinuity: (mediaType, trackName) => {
         if ('clearTimeline' in ms) {
@@ -6424,6 +6439,35 @@ export class MoqtPlayer {
         }
       },
     });
+  }
+
+  /**
+   * Renew the `cmaf_first_frame` watchdog deadline on a video segment
+   * arrival, as long as media is still flowing.
+   *
+   * A fixed 10s deadline measured only from `cmaf_init` treats "delivery is
+   * healthy but startup buffering needs more time" (observed on long-haul
+   * RTT paths) the same as "nothing is arriving at all" — firing a fatal
+   * `CMAF_INIT_TIMEOUT` and tearing the player down to `ERROR` even though
+   * the underlying transport is fine and a frame would render moments later.
+   *
+   * Only renews while the expectation is still pending (a no-op after
+   * `onFirstFrame` has already fulfilled it) and only within
+   * `cmafFirstFrameMaxWaitMs` of the original `cmaf_init` — past that
+   * ceiling, renewal stops so a genuinely broken decode path (segments
+   * arriving, appendBuffer succeeding, but the browser never painting a
+   * frame) still surfaces as fatal rather than buffering forever.
+   */
+  private renewCmafFirstFrameDeadline(mediaType: 'video' | 'audio'): void {
+    if (mediaType !== 'video') return;
+    if (!this.config.cmafBootstrapTimeoutMs || this.config.cmafBootstrapTimeoutMs <= 0) return;
+    if (!this.watchdog.activeExpectations.includes('cmaf_first_frame')) return;
+
+    const maxWaitMs = this.config.cmafFirstFrameMaxWaitMs!;
+    const elapsed = Date.now() - (this.cmafFirstFrameDeadlineStartedAt ?? Date.now());
+    if (elapsed >= maxWaitMs) return;
+
+    this.watchdog.expect('cmaf_first_frame', this.config.cmafBootstrapTimeoutMs);
   }
 
   /**

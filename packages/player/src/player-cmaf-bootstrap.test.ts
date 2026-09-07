@@ -304,6 +304,111 @@ describe('CMAF bootstrap deadlines', () => {
   });
 });
 
+describe('CMAF first-frame deadline renewal (false-positive fix)', () => {
+  /**
+   * Like `bootPlayer`, but also captures the `onSegment` callback handed to
+   * `createCmafAssembler` so tests can simulate video segments actually
+   * flowing through the real assembler wiring (the bare `bootPlayer` mock
+   * assembler's `push()` is a no-op spy that never invokes it).
+   */
+  async function bootPlayerCapturingAssembler(catalogJson: string, cfg?: Partial<MoqtPlayerConfig>) {
+    let onSegment: ((mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string, groupId: bigint) => void) | null = null;
+    const adapter = createMockAdapter();
+    const mockMs = makeMockMs();
+    const assembler = { push: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(), setInitSegment: vi.fn(), clearPending: vi.fn() };
+    const player = new MoqtPlayer({
+      url: 'https://relay.example.com/moq',
+      namespace: 'live/broadcast',
+      createTransport: vi.fn(async () => ({}) as any),
+      createConnection: () => adapter as unknown as MoqtConnection,
+      createMediaSource: () => mockMs,
+      createCmafAssembler: (callbacks: any) => { onSegment = callbacks.onSegment; return assembler; },
+      catalogBootstrap: 'subscribe',
+      ...cfg,
+    });
+    const errors: any[] = [];
+    player.on('error', (e) => errors.push(e.error));
+
+    const loadPromise = player.load();
+    await vi.waitFor(() => expect(adapter.connect).toHaveBeenCalled());
+    adapter._connectResolve?.();
+    await loadPromise;
+    const catalogReqId = await adapter.subscribe.mock.results[0]?.value;
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: catalogReqId, trackAlias: catalogReqId, parameters: new Map(),
+    } as unknown as ControlMessage);
+    adapter._triggerObject(0n, {
+      kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
+      objectId: varint(0), payload: new TextEncoder().encode(catalogJson),
+    } as MoqtObject);
+    await new Promise((r) => setTimeout(r, 30)); // async subscribe fan-out
+
+    return {
+      player, adapter, mockMs, assembler, errors,
+      sendVideoSegment: () => onSegment?.('video', new Uint8Array([0]), 'video', 0n),
+    };
+  }
+
+  it('video segments arriving keep renewing the deadline — no false-positive fatal past cmafBootstrapTimeoutMs', async () => {
+    const { player, errors, mockMs, sendVideoSegment } = await bootPlayerCapturingAssembler(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 100, cmafFirstFrameMaxWaitMs: 2_000 });
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1); // cmaf_init armed cmaf_first_frame
+
+    // Renew immediately (the bootPlayer harness's own async fan-out wait
+    // already consumes part of the very first deadline window), then keep
+    // renewing well inside the 100ms deadline on every pass. Total span
+    // (≈320ms) exceeds cmafBootstrapTimeoutMs several times over but stays
+    // under the 2000ms ceiling.
+    sendVideoSegment();
+    for (let i = 0; i < 8; i++) {
+      await sleep(40);
+      sendVideoSegment();
+    }
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+
+    mockMs.onFirstFrame?.(); // frame finally renders — clean shutdown
+    await sleep(150);
+    expect(errors.filter((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT)).toEqual([]);
+    await player.destroy();
+  });
+
+  it('delivery genuinely stalling (no more segments) still fires the fatal after a renewed deadline', async () => {
+    const { player, errors, mockMs, sendVideoSegment } = await bootPlayerCapturingAssembler(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60, cmafFirstFrameMaxWaitMs: 1_000 });
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+
+    sendVideoSegment(); // one renewal, then delivery stops entirely
+    await sleep(150); // > cmafBootstrapTimeoutMs since the last renewal
+
+    const err = errors.find((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT);
+    expect(err).toBeDefined();
+    expect(err.message).toMatch(/no frame rendered/i);
+    expect(player.state).toBe(PlayerState.ERROR);
+    await player.destroy();
+  });
+
+  it('renewal stops past cmafFirstFrameMaxWaitMs — a stream that never renders still surfaces fatal eventually', async () => {
+    const { player, errors, mockMs, sendVideoSegment } = await bootPlayerCapturingAssembler(
+      cmafCatalog([{ ...VIDEO_BASE, initData: btoa('\x01\x02\x03\x04') }]),
+      { cmafBootstrapTimeoutMs: 60, cmafFirstFrameMaxWaitMs: 120 });
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+
+    // Keep renewing past the 120ms ceiling — segments never stop arriving,
+    // but no frame ever renders (a genuine codec/init-mismatch class bug).
+    for (let i = 0; i < 10; i++) {
+      await sleep(30);
+      sendVideoSegment();
+    }
+
+    const err = errors.find((e) => e.code === PlayerErrorCode.CMAF_INIT_TIMEOUT);
+    expect(err).toBeDefined();
+    expect(err.message).toMatch(/no frame rendered/i);
+    await player.destroy();
+  });
+});
+
 describe('CMAF in-band init detection strictness', () => {
   it('ftyp-only, moof, and garbage payloads are NOT accepted as init', async () => {
     const { player, adapter, mockMs, reqIdFor } =
