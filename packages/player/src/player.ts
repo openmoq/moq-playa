@@ -384,6 +384,13 @@ export class MoqtPlayer {
   private cmafFirstFrameDeadlineStartedAt: number | undefined;
 
   /**
+   * CMAF media is being held because the MediaSource is not attached yet
+   * (`mediaSource.attached === false`, e.g. hidden tab). See the attach gate
+   * in the CMAF object path and {@link handleCmafMediaSourceAttached}.
+   */
+  private cmafHoldingForAttach = false;
+
+  /**
    * CMAF bootstrap deadlines suspended because the document is hidden, keyed
    * by watchdog event name → the timeout to re-arm once visible. See
    * {@link deferCmafBootstrapDeadline}.
@@ -1896,6 +1903,21 @@ export class MoqtPlayer {
       // deadline (no more silent pre-init drops).
       if (!this.cmafInitialized) {
         this.handlePreInitCmafObject(mediaType, trackName, obj.payload);
+        return;
+      }
+
+      // Gate: the MediaSource must be attached (MSE `sourceopen`) before
+      // anything can reach a SourceBuffer. Browsers defer that attachment
+      // while the document is hidden (background tab). Hold media here rather
+      // than feeding the assembler, so (a) the shared epoch anchors on the
+      // first segment actually appended and (b) on attach we re-sync to the
+      // next group start — playback resumes at the live edge on a keyframe
+      // instead of on a stale timeline built from dropped segments.
+      if (this.mediaSource?.attached === false) {
+        if (!this.cmafHoldingForAttach) {
+          this.cmafHoldingForAttach = true;
+          this.log.info('[CMAF] MediaSource not attached yet (sourceopen pending — hidden tab?); holding media until attached');
+        }
         return;
       }
 
@@ -6052,6 +6074,7 @@ export class MoqtPlayer {
     if (this.pipelinesCreated) return;
 
     const pipelines = createPipelines(this.config, this.clock, trackInfo, {
+      onAttached: () => this.handleCmafMediaSourceAttached(),
       onFirstFrame: () => {
         this._stats.recordFirstFrameRendered();
         this.watchdog.fulfill('cmaf_first_frame'); // bootstrap deadline met
@@ -6436,6 +6459,28 @@ export class MoqtPlayer {
     }
     this.log.info('CMAF MediaSource initialized (%s)',
       entries.map(([mt, e]) => `${mt}=${e.bytes!.byteLength}B`).join(' '));
+  }
+
+  /**
+   * The CMAF MediaSource just attached (MSE `sourceopen` → SourceBuffers).
+   * If media was held while unattached, everything the assembler had seen
+   * was dropped before MSE: start its timeline over on what will actually be
+   * appended (re-seeding the init segments it needs for timescales/trex) and
+   * wait for the next group start so the first appended video sample is a
+   * keyframe — i.e. resume at the live edge.
+   */
+  private handleCmafMediaSourceAttached(): void {
+    if (!this.cmafHoldingForAttach) return;
+    this.cmafHoldingForAttach = false;
+    this.cmafAssembler?.reset();
+    if (this.cmafPendingInit) {
+      for (const mt of ['video', 'audio'] as const) {
+        const bytes = this.cmafPendingInit[mt]?.bytes;
+        if (bytes) this.cmafAssembler?.setInitSegment?.(mt, bytes);
+      }
+    }
+    this.cmafVideoSynced = false;
+    this.log.info('[CMAF] MediaSource attached — resuming at the next group start (live edge)');
   }
 
   /** Whether a DOM document exists and is currently hidden (background tab). */

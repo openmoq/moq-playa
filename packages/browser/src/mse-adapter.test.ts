@@ -379,6 +379,52 @@ async function flush(): Promise<void> {
 
 // ─── Tests ────────────────────────────────────────────────────────
 
+describe('MseMediaSource — attachment (sourceopen) reporting', () => {
+    it('attached is false until sourceopen creates the SourceBuffers, then onAttached fires once', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const onAttached = vi.fn();
+        adapter.onAttached = onAttached;
+        expect(adapter.attached).toBe(false);
+
+        // Browsers defer the attachment while the tab is hidden: initialize()
+        // must not claim attachment before sourceopen.
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        expect(adapter.attached).toBe(false);
+        expect(onAttached).not.toHaveBeenCalled();
+        // …and appendChunk() has nothing to append to yet (dropped, logged once).
+        adapter.appendChunk('video', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]), 'v');
+        expect(currentMs.addSourceBufferCalls).toEqual([]);
+
+        currentMs.open();
+        expect(adapter.attached).toBe(true);
+        expect(onAttached).toHaveBeenCalledTimes(1);
+        expect(currentMs.addSourceBufferCalls).toHaveLength(1);
+        await flush();
+    });
+
+    it('attached is true immediately when the MediaSource is already open at initialize()', () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const onAttached = vi.fn();
+        adapter.onAttached = onAttached;
+        currentMs.open();
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        expect(adapter.attached).toBe(true);
+        expect(onAttached).toHaveBeenCalledTimes(1);
+    });
+
+    it('reset() clears attached; a re-initialize re-attaches', async () => {
+        const { adapter } = await makeReadyAdapter();
+        expect(adapter.attached).toBe(true);
+        adapter.reset();
+        expect(adapter.attached).toBe(false);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        expect(adapter.attached).toBe(true); // MediaSource still open → synchronous doInit
+        await flush();
+    });
+});
+
 describe('MseMediaSource — timeline-owned append integration', () => {
     it('non-overlapping segments both get appended', async () => {
         const { adapter, vsb } = await makeReadyAdapter();

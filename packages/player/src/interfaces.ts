@@ -311,6 +311,18 @@ export interface MediaSourceLike {
    */
   getBufferAheadUs?(): number | null;
 
+  /**
+   * Whether the media element has attached the MediaSource (MSE
+   * `sourceopen`), i.e. SourceBuffers exist and appendChunk() can take
+   * effect. Browsers defer that attachment while the document is hidden
+   * (background tab). `undefined` means the implementation does not report
+   * attachment and is treated as always attached.
+   */
+  readonly attached?: boolean;
+
+  /** Callback: the MediaSource became attached (SourceBuffers created). */
+  onAttached?: (() => void) | null;
+
   /** Callback: first frame rendered by the media element. */
   onFirstFrame: (() => void) | null;
 
