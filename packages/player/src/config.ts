@@ -436,6 +436,24 @@ export interface RecoveryConfig {
   readonly cmafBootstrapTimeoutMs?: number;
 
   /**
+   * CMAF first-frame bootstrap deadline EXTENSION ceiling.
+   *
+   * The `cmaf_first_frame` deadline (`cmafBootstrapTimeoutMs`) is renewed
+   * each time a video segment is appended, as long as media keeps arriving —
+   * a fixed 10s deadline from `cmaf_init` alone misfires on longer-RTT paths
+   * (e.g. long-haul QUIC handshakes) where legitimate startup buffering can
+   * take longer than 10s even though delivery is healthy the whole time.
+   * This caps the total renewal window measured from `cmaf_init`: once
+   * elapsed time since init exceeds this value, renewal stops and the next
+   * `cmafBootstrapTimeoutMs` deadline is allowed to fire — so a genuinely
+   * broken decode path (segments arriving, appendBuffer succeeding, but the
+   * browser never painting a frame) still surfaces as fatal instead of
+   * buffering forever.
+   * Default: 60_000. Only meaningful when `cmafBootstrapTimeoutMs` > 0.
+   */
+  readonly cmafFirstFrameMaxWaitMs?: number;
+
+  /**
    * Media-liveness starvation threshold: while PLAYING, a track with no
    * object arrivals for this long triggers the restart ladder.
    * The gap detector handles gaps BETWEEN arrivals; this handles NO
@@ -687,6 +705,7 @@ export const DEFAULT_PLAYER_CONFIG = {
 
   // CMAF bootstrap (0 disables)
   cmafBootstrapTimeoutMs: 10_000,
+  cmafFirstFrameMaxWaitMs: 60_000,
 
   // Media liveness (0 disables)
   livenessTimeoutMs: 10_000,
@@ -760,6 +779,11 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   // cmafBootstrapTimeoutMs: >= 0 (0 disables the bootstrap deadlines)
   if (config.cmafBootstrapTimeoutMs !== undefined && config.cmafBootstrapTimeoutMs < 0) {
     throw new RangeError(`cmafBootstrapTimeoutMs must be >= 0 (0 disables), got ${config.cmafBootstrapTimeoutMs}`);
+  }
+
+  // cmafFirstFrameMaxWaitMs: > 0 (it bounds renewal, not a disable switch)
+  if (config.cmafFirstFrameMaxWaitMs !== undefined && config.cmafFirstFrameMaxWaitMs <= 0) {
+    throw new RangeError(`cmafFirstFrameMaxWaitMs must be > 0, got ${config.cmafFirstFrameMaxWaitMs}`);
   }
 
   if (config.authority !== undefined && config.authority.trim().length === 0) {
