@@ -24,10 +24,20 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "fast-check": "^4.8.0",
+    "fast-check": "^4.9.0",
     "tsup": "^8.5.1",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.2.7"
+  },
+  "pnpm": {
+    "overrides": {
+      "esbuild": "0.28.1",
+      "fast-uri": "3.1.6",
+      "nanoid": "3.3.18",
+      "picomatch": "4.0.4",
+      "postcss": "8.5.23",
+      "tar": "7.5.21"
+    }
   },
   "packageManager": "pnpm@10.32.1+sha512.a706938f0e89ac1456b6563eab4edf1d1faf3368d1191fc5c59790e96dc918e4456ab2e67d613de1043d2e8c81f87303e6b40d4ffeca9df15ef1ad567348f2be"
 }

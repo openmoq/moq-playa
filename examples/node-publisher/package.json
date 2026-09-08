@@ -19,12 +19,12 @@
     "@moqt/msf": "workspace:*",
     "@moqt/loc": "workspace:*",
     "@moqt/browser": "workspace:*",
-    "@fails-components/webtransport": "1.6.3",
-    "@fails-components/webtransport-transport-http3-quiche": "1.6.3"
+    "@fails-components/webtransport": "1.6.8",
+    "@fails-components/webtransport-transport-http3-quiche": "1.6.8"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "tsx": "^4.19.0",
+    "tsx": "^4.23.13",
     "typescript": "^5.7.0"
   }
 }
