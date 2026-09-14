@@ -39,8 +39,9 @@ export function isDelta(obj: CatalogObject): obj is CatalogDelta {
  * Set of known packaging values.
  * @see draft-ietf-moq-msf-00 §5.1.12 Table 3
  * @see draft-ietf-moq-cmsf-00 §3.5.1 (adds 'cmaf')
+ * @see draft-einarsson-moq-locmaf-01 §5 (adds 'locmaf')
  */
-const VALID_PACKAGING = new Set<string>(['loc', 'mediatimeline', 'eventtimeline', 'cmaf']);
+const VALID_PACKAGING = new Set<string>(['loc', 'mediatimeline', 'eventtimeline', 'cmaf', 'locmaf']);
 
 /**
  * Parse an independent (non-delta) MSF catalog from JSON.
@@ -258,6 +259,31 @@ export function validateReferences(catalog: {
 }
 
 /**
+ * Validate the LOCMAF locmafVersion presence rule: it MUST be present (as a JSON
+ * string) when packaging is "locmaf" and MUST NOT be present otherwise. The
+ * version VALUE is not checked here — an unsupported version parses and is
+ * excluded from subscription by `isTrackPackagingSupported`.
+ * @see draft-einarsson-moq-locmaf-01 §5
+ */
+export function validateLocmafVersion(track: {
+    readonly name: string;
+    readonly packaging: string;
+    readonly locmafVersion?: unknown;
+}): void {
+    if (track.packaging === 'locmaf') {
+        if (typeof track.locmafVersion !== 'string') {
+            throw new Error(
+                `Track "${track.name}": locmafVersion is required and must be a string when packaging is "locmaf" (LOCMAF §5)`,
+            );
+        }
+    } else if (track.locmafVersion !== undefined) {
+        throw new Error(
+            `Track "${track.name}": locmafVersion MUST NOT be present when packaging is not "locmaf" (LOCMAF §5)`,
+        );
+    }
+}
+
+/**
  * Parse and validate a single track object.
  * Strips unknown fields per §5.1.
  */
@@ -320,6 +346,12 @@ function parseTrack(
             `Track "${name}": eventType MUST NOT be used when packaging is not "eventtimeline" (§5.1.13)`,
         );
     }
+
+    // LOCMAF §5: locmafVersion (a JSON string) required iff packaging="locmaf".
+    // Checked on the RAW value so a non-string is rejected, not silently dropped.
+    // An unsupported version is NOT a parse error — the track is filtered at
+    // selection time (isTrackPackagingSupported).
+    validateLocmafVersion({ name, packaging, locmafVersion: obj['locmafVersion'] });
 
     // §7.2 / §8.2: mediatimeline/eventtimeline tracks MUST carry a depends array
     // (both profiles). The canonical mimeType "application/json" MUST is enforced
@@ -428,6 +460,8 @@ export function extractRecognizedOptionalFields(
         // CMSF extensions (draft-ietf-moq-cmsf-00 §3.5.2)
         ...(typeof obj['maxGrpSapStartingType'] === 'number' ? { maxGrpSapStartingType: obj['maxGrpSapStartingType'] } : {}),
         ...(typeof obj['maxObjSapStartingType'] === 'number' ? { maxObjSapStartingType: obj['maxObjSapStartingType'] } : {}),
+        // LOCMAF (draft-einarsson-moq-locmaf-01 §5)
+        ...(typeof obj['locmafVersion'] === 'string' ? { locmafVersion: obj['locmafVersion'] } : {}),
         // MSF-01 / CMSF-01
         ...(typeof obj['initRef'] === 'string' ? { initRef: obj['initRef'] } : {}),               // §5.2.13
         ...(obj['template'] !== undefined ? { template: parseTemplate(trackName, obj['template']) } : {}), // §5.2.15

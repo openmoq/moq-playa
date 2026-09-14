@@ -24,8 +24,9 @@ import type { DraftVersion } from '@moqt/transport';
  * Packaging type for container format dispatch.
  * @see draft-ietf-moq-msf-00 §5.1.12 Table 3
  * @see draft-ietf-moq-msf-00 §8 (eventtimeline)
+ * @see draft-einarsson-moq-locmaf-01 §5 (locmaf)
  */
-export type TrackPackaging = 'loc' | 'cmaf' | 'init' | 'mediatimeline' | 'eventtimeline';
+export type TrackPackaging = 'loc' | 'cmaf' | 'locmaf' | 'init' | 'mediatimeline' | 'eventtimeline';
 
 /** Track registration info. */
 interface TrackInfo {
@@ -90,6 +91,20 @@ export class SubscriptionManager {
    * @see draft-ietf-moq-cmsf-00 §3.3 (Object Packaging)
    */
   onCmafObject:
+    | ((
+        mediaType: 'video' | 'audio',
+        trackName: string,
+        obj: MoqtObject,
+      ) => void)
+    | null = null;
+
+  /**
+   * Callback: LOCMAF object (a compacted CMAF chunk) for reconstruction.
+   * Called with (mediaType, trackName, object) after objectTransform. No LOC
+   * header parsing — LOCMAF carries its fields in the object payload.
+   * @see draft-einarsson-moq-locmaf-01 §7 (Object Encoding)
+   */
+  onLocmafObject:
     | ((
         mediaType: 'video' | 'audio',
         trackName: string,
@@ -212,6 +227,7 @@ export class SubscriptionManager {
    * 3. Branch on packaging:
    *    - LOC: Parse LOC headers → onObject callback
    *    - CMAF: Skip header parsing → onCmafObject callback
+   *    - LOCMAF: Skip header parsing → onLocmafObject callback
    *    - mediatimeline: raw JSON → onTimelineObject callback
    *    - eventtimeline: raw JSON → onEventTimelineObject callback
    *
@@ -279,6 +295,11 @@ export class SubscriptionManager {
         // CMAF path: skip LOC header parsing, route directly to MediaSource
         // §3.3: payload contains moof+mdat pairs
         this.onCmafObject?.(mediaType, info.trackName, transformed);
+      } else if (info.packaging === 'locmaf') {
+        // LOCMAF path: skip LOC header parsing; the payload is a LOCMAF Object
+        // that reconstructs to a CMAF chunk (moof+mdat).
+        // @see draft-einarsson-moq-locmaf-01 §7, §15
+        this.onLocmafObject?.(mediaType, info.trackName, transformed);
       } else {
         // LOC path: parse extension headers and route to PlaybackPipeline
         const extensions = transformed.kind === 'data' ? transformed.extensions : undefined;

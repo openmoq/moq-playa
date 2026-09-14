@@ -475,6 +475,16 @@ describe('LOC pipeline diagnostics (stutter observability)', () => {
   });
 });
 
+describe('LOCMAF stats', () => {
+  it('recordLocmafObjectRejected increments locmafObjectsRejected in the snapshot', () => {
+    const stats = new StatsAccumulator();
+    expect(stats.snapshot().locmafObjectsRejected).toBe(0);
+    stats.recordLocmafObjectRejected();
+    stats.recordLocmafObjectRejected();
+    expect(stats.snapshot().locmafObjectsRejected).toBe(2);
+  });
+});
+
 describe('gap-jump stats', () => {
   it('recordGapJump increments gapJumpCount in the snapshot', () => {
     const stats = new StatsAccumulator();

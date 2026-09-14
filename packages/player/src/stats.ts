@@ -117,6 +117,10 @@ export interface PlayerStats {
   /** Bounded buffered-hole gap-jumps performed by the MSE adapter (source
    *  media missing and skipped; distinct from the LOC-pipeline gapCount). */
   readonly gapJumpCount: number;
+  /** LOCMAF Objects that could not be reconstructed into a CMAF chunk and were
+   *  dropped (malformed, or a delta without its in-group reference after a gap).
+   *  @see draft-einarsson-moq-locmaf-01 §3, §18 */
+  readonly locmafObjectsRejected: number;
   /**
    * Summed length of stalls that **completed**.
    *
@@ -245,6 +249,7 @@ export class StatsAccumulator {
   private _gapCount = 0;
   private _stallCount = 0;
   private _gapJumpCount = 0;
+  private _locmafObjectsRejected = 0;
   private _totalStallDurationMs = 0;
   private _decodeErrorCount = 0;
   private _recoveryActionCount = 0;
@@ -386,6 +391,11 @@ export class StatsAccumulator {
   /** One MSE buffered-hole gap-jump performed. */
   recordGapJump(): void {
     this._gapJumpCount++;
+  }
+
+  /** One LOCMAF Object rejected by reconstruction. */
+  recordLocmafObjectRejected(): void {
+    this._locmafObjectsRejected++;
   }
 
   /** Record a playback stall. */
@@ -574,6 +584,7 @@ export class StatsAccumulator {
       gapCount: this._gapCount,
       stallCount: this._stallCount,
       gapJumpCount: this._gapJumpCount,
+      locmafObjectsRejected: this._locmafObjectsRejected,
       totalStallDurationMs: this._totalStallDurationMs,
       decodeErrorCount: this._decodeErrorCount,
       recoveryActionCount: this._recoveryActionCount,

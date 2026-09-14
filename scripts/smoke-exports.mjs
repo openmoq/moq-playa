@@ -34,6 +34,7 @@ const packages = [
   ['webtransport', '@moqt/webtransport'],
   ['quic',          '@moqt/quic'],
   ['loc',          '@moqt/loc'],
+  ['locmaf',       '@moqt/locmaf'],
   ['msf',          '@moqt/msf'],
   ['playback',     '@moqt/playback'],
   ['player',       '@moqt/player'],
@@ -124,6 +125,7 @@ testImport('@moqt/transport',       `import '@moqt/transport'`);
 testImport('@moqt/webtransport',    `import '@moqt/webtransport'`);
 testImport('@moqt/quic',            `import '@moqt/quic'`);
 testImport('@moqt/loc',             `import '@moqt/loc'`);
+testImport('@moqt/locmaf',          `import '@moqt/locmaf'`);
 testImport('@moqt/msf',             `import '@moqt/msf'`);
 testImport('@moqt/playback',        `import '@moqt/playback'`);
 testImport('@moqt/player',          `import '@moqt/player'`);
@@ -145,6 +147,7 @@ testImport('Session',            `import { Session } from '@moqt/transport'; if 
 testImport('parseCatalog',       `import { parseCatalog } from '@moqt/msf'; if (!parseCatalog) throw 1;`);
 testImport('PlaybackPipeline',   `import { PlaybackPipeline } from '@moqt/playback'; if (!PlaybackPipeline) throw 1;`);
 testImport('parseLocHeaders',    `import { parseLocHeaders } from '@moqt/loc'; if (!parseLocHeaders) throw 1;`);
+testImport('LocmafTrackDecoder', `import { LocmafTrackDecoder, deserializeLocmafObject, LOCMAF_VERSION } from '@moqt/locmaf'; if (typeof LocmafTrackDecoder !== 'function' || typeof deserializeLocmafObject !== 'function') throw 1; if (LOCMAF_VERSION !== '0.3') throw 1;`);
 
 // ── Trace recorder exports (docs/playout-trace.md) ───────────────
 

@@ -32,6 +32,9 @@ importers:
       '@moqt/loc':
         specifier: workspace:*
         version: link:../../../packages/loc
+      '@moqt/locmaf':
+        specifier: workspace:*
+        version: link:../../../packages/locmaf
       '@moqt/msf':
         specifier: workspace:*
         version: link:../../../packages/msf
@@ -87,6 +90,9 @@ importers:
       '@moqt/loc':
         specifier: workspace:*
         version: link:../../packages/loc
+      '@moqt/locmaf':
+        specifier: workspace:*
+        version: link:../../packages/locmaf
       '@moqt/msf':
         specifier: workspace:*
         version: link:../../packages/msf
@@ -153,6 +159,8 @@ importers:
         specifier: workspace:*
         version: link:../transport
 
+  packages/locmaf: {}
+
   packages/msf:
     dependencies:
       fast-json-patch:
@@ -188,6 +196,9 @@ importers:
       '@moqt/loc':
         specifier: workspace:*
         version: link:../loc
+      '@moqt/locmaf':
+        specifier: workspace:*
+        version: link:../locmaf
       '@moqt/msf':
         specifier: workspace:*
         version: link:../msf

@@ -1,0 +1,43 @@
+{
+  "format": "locmaf-golden-vectors/1",
+  "note": "Read-only third-party corpus, copied verbatim (minus its README) from the Eyevinn reference implementation. Each case directory keeps its own manifest.json with the SHA-256 of every file. Not a moq-media-corpus/1 domain: cases are multi-object groups decoded against an init segment, which that schema does not model. Executed by runner/src/corpus-locmaf.test.ts.",
+  "source": {
+    "repository": "https://github.com/Eyevinn/locmaf",
+    "commit": "177e798ca3cb6394e9f59dc923be190be2773101",
+    "path": "testdata/vectors",
+    "license": "MIT",
+    "licenseFile": "LICENSE",
+    "copyright": "Copyright (c) 2026 Eyevinn Technology AB"
+  },
+  "provenance": {
+    "class": "third-party",
+    "expectationBasis": "interop",
+    "generator": "locmaf vectors gen",
+    "spec": "draft-einarsson-moq-locmaf-01",
+    "locmafVersion": "0.3",
+    "draftCommit": "6a2439a"
+  },
+  "layout": {
+    "init": "init.mp4",
+    "objects": "objects/gNNN_oNNN.locmafobj",
+    "canonical": "canonical/gNNN_oNNN.cmfc",
+    "effective": "effective/gNNN_oNNN.json",
+    "framedFile": "file.locmaf"
+  },
+  "cases": [
+    { "name": "uniform", "objects": 3, "framedFile": false },
+    { "name": "varying-sizes", "objects": 3, "framedFile": false },
+    { "name": "single-sample", "objects": 4, "framedFile": false },
+    { "name": "negative-ctos", "objects": 3, "framedFile": false },
+    { "name": "first-sample-flags", "objects": 3, "framedFile": false },
+    { "name": "per-sample-flags", "objects": 2, "framedFile": false },
+    { "name": "list-grow-shrink", "objects": 3, "framedFile": false },
+    { "name": "bmdt-reanchor", "objects": 4, "framedFile": false },
+    { "name": "cenc-subsamples", "objects": 3, "framedFile": false },
+    { "name": "cbcs-omit", "objects": 2, "framedFile": false },
+    { "name": "genboxes", "objects": 2, "framedFile": false },
+    { "name": "strict-cmf2-pair", "objects": 1, "framedFile": false },
+    { "name": "rawboxes-file", "objects": 3, "framedFile": true },
+    { "name": "event-only", "objects": 2, "framedFile": false }
+  ]
+}

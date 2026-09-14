@@ -20,7 +20,7 @@
  */
 
 import type { CatalogTrack, CatalogState, Msf01Delta, Msf01DeltaOp, Msf01DeltaOpKind } from './types.js';
-import { extractRecognizedOptionalFields, validateReferences } from './catalog-msf00.js';
+import { extractRecognizedOptionalFields, validateLocmafVersion, validateReferences } from './catalog-msf00.js';
 import { assertFiniteMsf01Delta, assertFiniteCatalogNumbers } from './catalog-validate.js';
 
 const VALID_OPS = new Set<string>(['add', 'remove', 'clone']);
@@ -238,5 +238,8 @@ export function applyMsf01Delta(
 
     assertFiniteCatalogNumbers(next);
     validateReferences(next);
+    // LOCMAF §5: an add may omit locmafVersion and a clone may change packaging
+    // while inheriting it — re-check the presence rule on the applied state.
+    for (const t of next.tracks) validateLocmafVersion(t);
     return next;
 }

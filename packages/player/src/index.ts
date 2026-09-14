@@ -144,6 +144,8 @@ export { QualityController } from './quality-controller.js';
 export type { QualityControllerConfig, SelectionConstraints, SelectedTracks } from './quality-controller.js';
 /** @experimental Advanced API — may change between minor versions. */
 export { SubscriptionManager } from './subscription-manager.js';
+export type { TrackPackaging } from './subscription-manager.js';
+export { isMsePackaging } from './packaging.js';
 
 // ─── Watchdog (diagnostics) ─────────────────────────────────────────
 

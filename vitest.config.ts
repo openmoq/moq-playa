@@ -17,6 +17,7 @@ export default defineConfig({
       '@moqt/quic': resolve(__dirname, 'packages/quic/src/index.ts'),
       '@moqt/msf': resolve(__dirname, 'packages/msf/src/index.ts'),
       '@moqt/loc': resolve(__dirname, 'packages/loc/src/index.ts'),
+      '@moqt/locmaf': resolve(__dirname, 'packages/locmaf/src/index.ts'),
       '@moqt/playback': resolve(__dirname, 'packages/playback/src/index.ts'),
       '@moqt/player': resolve(__dirname, 'packages/player/src/index.ts'),
       '@moqt/browser': resolve(__dirname, 'packages/browser/src/index.ts'),

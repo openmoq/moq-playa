@@ -165,3 +165,31 @@ describe('Player.setQuality', () => {
     expect(player.currentLevel).toBe(1); // NOW updated
   });
 });
+
+// ─── Render sink choice on catalog_received ───────────────────────────
+
+describe('Player sink choice (MSE <video> vs <canvas>)', () => {
+  function receiveCatalog(packaging: string, extra: Record<string, unknown> = {}): Player {
+    const container = mockElement();
+    container.parentNode = { removeChild: vi.fn() };
+    const player = new Player(container, { url: 'https://relay.example.com/moq', namespace: 'test', autoplay: false });
+    const catalog = {
+      version: 1,
+      tracks: [
+        { name: 'video', packaging, isLive: true, role: 'video', codec: 'avc1.640028', width: 1280, height: 720, bitrate: 2_000_000, ...extra },
+        { name: 'audio', packaging: 'loc', isLive: true, role: 'audio', codec: 'opus', samplerate: 48000, channelConfig: '2' },
+      ],
+    } as unknown as CatalogState;
+    (player as any).engine.emitter.emit('catalog_received', { type: 'catalog_received', catalog });
+    return player;
+  }
+
+  it('a locmaf video track selects the <video> (MSE) sink, like cmaf', () => {
+    expect((receiveCatalog('locmaf', { locmafVersion: '0.3' }) as any)._activeMediaType).toBe('video');
+    expect((receiveCatalog('cmaf') as any)._activeMediaType).toBe('video');
+  });
+
+  it('a LOC-only catalog keeps the <canvas> sink', () => {
+    expect((receiveCatalog('loc') as any)._activeMediaType).toBe('canvas');
+  });
+});

@@ -17,7 +17,7 @@
  * @see draft-ietf-moq-loc-01 §4.1 (audio independently decodable)
  */
 
-import { MoqtPlayer, PlayerErrorCode } from '@moqt/player';
+import { MoqtPlayer, PlayerErrorCode, isMsePackaging } from '@moqt/player';
 import { MoqtConnection } from '@moqt/webtransport';
 import { QlogTrace, varint } from '@moqt/transport';
 import { CATALOG_TRACK_NAME } from '@moqt/msf';
@@ -1206,8 +1206,8 @@ async function startPlayback(): Promise<void> {
             log(`  ${parts.join(' | ')}`);
         }
 
-        // Detect packaging: CMAF uses <video> element, LOC uses <canvas>
-        const hasCmaf = e.catalog.tracks.some(t => t.packaging === 'cmaf');
+        // Detect packaging: CMAF/LOCMAF use <video> element (MSE), LOC uses <canvas>
+        const hasCmaf = e.catalog.tracks.some(t => isMsePackaging(t.packaging));
         cmafActive = hasCmaf; // gates unexpected-pause recovery to the <video> sink
         if (hasCmaf) {
             canvas.style.display = 'none';

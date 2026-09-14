@@ -1,0 +1,51 @@
+{
+  "name": "@moqt/locmaf",
+  "version": "0.5.9",
+  "description": "Low Overhead CMAF (LOCMAF) codec for Media over QUIC (MoQ): parses, reconstructs, and encodes LOCMAF Objects into canonical CMAF chunks.",
+  "license": "Apache-2.0",
+  "author": "OpenMOQ (https://github.com/openmoq)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./browser": {
+      "import": "./dist/browser/index.js",
+      "default": "./dist/browser/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "moq",
+    "media-over-quic",
+    "moqt",
+    "quic",
+    "streaming",
+    "low-latency",
+    "cmaf",
+    "locmaf",
+    "container",
+    "mse"
+  ],
+  "homepage": "https://github.com/openmoq/moq-playa/tree/main/packages/locmaf#readme",
+  "bugs": {
+    "url": "https://github.com/openmoq/moq-playa/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openmoq/moq-playa.git",
+    "directory": "packages/locmaf"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc && tsup",
+    "build:browser": "tsup"
+  }
+}

@@ -34,7 +34,7 @@
  */
 
 import {
-  MoqtPlayer, TypedEmitter, checkSupport,
+  MoqtPlayer, TypedEmitter, checkSupport, isMsePackaging,
 } from '@moqt/player';
 import type { MoqtPlayerConfig, SupportReport } from '@moqt/player';
 import { MoqtConnection } from '@moqt/webtransport';
@@ -580,7 +580,8 @@ export class Player {
     this.engine.on('catalog_received', (e) => {
       this._levels = mapLevels(e.catalog);
       this._audioTracks = mapAudioTracks(e.catalog);
-      const hasCmaf = e.catalog.tracks.some(track => track.packaging === 'cmaf');
+      // cmaf and locmaf both render through MSE into the <video> element.
+      const hasCmaf = e.catalog.tracks.some(track => isMsePackaging(track.packaging));
 
       // Record which element is the active render sink so callers can react.
       this._activeMediaType = hasCmaf ? 'video' : 'canvas';
