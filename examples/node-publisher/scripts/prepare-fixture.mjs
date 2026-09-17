@@ -135,7 +135,9 @@ for (const a of AUDIO) {
   const chunks = rendition(a.name, ['-map', a.map, '-vn'], ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2']);
   tracks.push({
     name: a.name, packaging: 'cmaf', role: 'audio', codec: 'mp4a.40.2',
-    samplerate: 48_000, channelConfig: '2', init: 'init.mp4', chunks,
+    // MSF §5.2.22: bitrate MUST be specified for audio and video tracks (a
+    // conforming relay refuses the catalog without it); matches -b:a above.
+    samplerate: 48_000, channelConfig: '2', bitrate: 128_000, init: 'init.mp4', chunks,
   });
   console.log(`${a.name}: ${chunks.length} chunks`);
 }
