@@ -1070,6 +1070,10 @@ async function startPlayback(): Promise<void> {
     // Lets a standard/object-url control carry the same disableRemotePlayback
     // flag that managed always sets, so that flag is not a hidden variable.
     const mseRemote = pickParam('mseremote', ['auto', 'disabled'] as const, 'auto');
+    // ?locmaf=mse|frame — how LOCMAF tracks are consumed (draft-einarsson-moq-locmaf-01
+    // §16): reconstructed into CMAF chunks for MSE (default), or sliced into
+    // coded frames for the WebCodecs decoders, the same sink LOC tracks use.
+    const locmafDecoding = pickParam('locmaf', ['mse', 'frame'] as const, 'mse');
     // DIAGNOSTIC: `legacy` restores pre-RED5DEV-2315 per-track zero-basing, which
     // maps both tracks to 0 and erases the publisher's real A/V offset. It is
     // knowingly incorrect and exists only to compare startup geometry in one
@@ -1114,6 +1118,7 @@ async function startPlayback(): Promise<void> {
         ...(prefetched ? { catalog: prefetched.catalog, connection: prefetched.connection } : {}),
         ...(lateMs ? { lateFrameThresholdMs: lateMs } : {}),
         ...(gapMs ? { gapTimeoutMs: gapMs } : {}),
+        ...(locmafDecoding !== 'mse' ? { locmafDecoding } : {}),
         createTransport: createWebTransport({ ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) }),
         createConnection: () => new MoqtConnection(draftVersion),
         createVideoDecoder: () => new WebCodecsVideoDecoder({ preferSoftwareDecoder }),

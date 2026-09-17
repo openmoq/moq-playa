@@ -27,7 +27,7 @@ import type { LocDiagnosticKind } from './stats.js';
 import { RenderCushionSmoother } from './render-cushion.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
-import { isMsePackaging } from './packaging.js';
+import { usesMsePath } from './packaging.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -178,8 +178,9 @@ export function createPipelines(
 
   // ── Create MediaSource adapter for CMAF tracks ────────────────
   // cmaf and locmaf both play through MSE (LOCMAF §6).
-  const hasCmafVideo = isMsePackaging(trackInfo.video?.packaging);
-  const hasCmafAudio = isMsePackaging(trackInfo.audio?.packaging);
+  // cmaf always; locmaf unless config.locmafDecoding selects the §16 frame path.
+  const hasCmafVideo = usesMsePath(trackInfo.video?.packaging, config.locmafDecoding);
+  const hasCmafAudio = usesMsePath(trackInfo.audio?.packaging, config.locmafDecoding);
   const hasCmaf = hasCmafVideo || hasCmafAudio;
 
   if (hasCmaf && config.createMediaSource) {

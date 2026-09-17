@@ -145,7 +145,8 @@ export type { QualityControllerConfig, SelectionConstraints, SelectedTracks } fr
 /** @experimental Advanced API — may change between minor versions. */
 export { SubscriptionManager } from './subscription-manager.js';
 export type { TrackPackaging } from './subscription-manager.js';
-export { isMsePackaging } from './packaging.js';
+export { isMsePackaging, usesMsePath } from './packaging.js';
+export type { LocmafDecoding } from './packaging.js';
 
 // ─── Watchdog (diagnostics) ─────────────────────────────────────────
 

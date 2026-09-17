@@ -15,6 +15,14 @@
 import type { TrackPackaging } from './subscription-manager.js';
 
 /**
+ * How a LOCMAF track is consumed (draft-einarsson-moq-locmaf-01 §16):
+ * `mse` reconstructs each Object into a canonical CMAF chunk for MSE (the
+ * chunk interface); `frame` slices each Object into coded samples for the
+ * LOC WebCodecs pipeline (the frame interface).
+ */
+export type LocmafDecoding = 'mse' | 'frame';
+
+/**
  * True when a track of this packaging is played through MSE with a CMAF init
  * bootstrap (cmaf, locmaf); false for LOC, metadata packagings and unknown.
  */
@@ -26,6 +34,16 @@ export function isMsePackaging(packaging: string | undefined): packaging is 'cma
  * The SubscriptionManager packaging for a selected media track: 'cmaf' and
  * 'locmaf' are preserved as distinct values, everything else collapses to 'loc'.
  */
+/**
+ * True when a track of this packaging plays through MSE in a player configured
+ * with `locmafDecoding`: cmaf always, locmaf unless the frame path is selected,
+ * never LOC, metadata packagings or unknown.
+ */
+export function usesMsePath(packaging: string | undefined, locmafDecoding: LocmafDecoding | undefined): boolean {
+  if (packaging === 'locmaf') return locmafDecoding !== 'frame';
+  return packaging === 'cmaf';
+}
+
 export function mediaTrackPackaging(packaging: string | undefined): TrackPackaging {
   return isMsePackaging(packaging) ? packaging : 'loc';
 }

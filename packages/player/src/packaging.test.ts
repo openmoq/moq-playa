@@ -8,8 +8,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { isMsePackaging } from './packaging.js';
-import { isMsePackaging as exported } from './index.js';
+import { isMsePackaging, usesMsePath } from './packaging.js';
+import { isMsePackaging as exported, usesMsePath as exportedUsesMsePath } from './index.js';
 
 describe('isMsePackaging', () => {
   it('is true for cmaf and locmaf', () => {
@@ -25,5 +25,26 @@ describe('isMsePackaging', () => {
 
   it('is exported from the package entry point', () => {
     expect(exported).toBe(isMsePackaging);
+  });
+});
+
+describe('usesMsePath (draft-einarsson-moq-locmaf-01 §16 consumption path)', () => {
+  it('cmaf always takes MSE; locmaf takes MSE unless the frame path is selected', () => {
+    expect(usesMsePath('cmaf', undefined)).toBe(true);
+    expect(usesMsePath('cmaf', 'frame')).toBe(true);
+    expect(usesMsePath('locmaf', undefined)).toBe(true);
+    expect(usesMsePath('locmaf', 'mse')).toBe(true);
+    expect(usesMsePath('locmaf', 'frame')).toBe(false);
+  });
+
+  it('never routes loc, metadata packagings, init or undefined to MSE', () => {
+    for (const p of ['loc', 'mediatimeline', 'eventtimeline', 'init', undefined]) {
+      expect(usesMsePath(p, undefined), String(p)).toBe(false);
+      expect(usesMsePath(p, 'frame'), String(p)).toBe(false);
+    }
+  });
+
+  it('is exported from the package entry point', () => {
+    expect(exportedUsesMsePath).toBe(usesMsePath);
   });
 });

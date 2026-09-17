@@ -106,7 +106,7 @@ export class SubscriptionManager {
    */
   onLocmafObject:
     | ((
-        mediaType: 'video' | 'audio',
+        mediaType: 'video' | 'audio' | 'eventtimeline',
         trackName: string,
         obj: MoqtObject,
       ) => void)
@@ -296,10 +296,12 @@ export class SubscriptionManager {
         // §3.3: payload contains moof+mdat pairs
         this.onCmafObject?.(mediaType, info.trackName, transformed);
       } else if (info.packaging === 'locmaf') {
-        // LOCMAF path: skip LOC header parsing; the payload is a LOCMAF Object
+        // LOCMAF path: skip LOC header parsing; the payload is a LOCMAF Object.
+        // An event-only track (§14) is registered as 'eventtimeline' and takes
+        // the same path; the player dispatches on the media type.
         // that reconstructs to a CMAF chunk (moof+mdat).
         // @see draft-einarsson-moq-locmaf-01 §7, §15
-        this.onLocmafObject?.(mediaType, info.trackName, transformed);
+        this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed);
       } else {
         // LOC path: parse extension headers and route to PlaybackPipeline
         const extensions = transformed.kind === 'data' ? transformed.extensions : undefined;

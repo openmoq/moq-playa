@@ -17,6 +17,7 @@
 import type { PlayerStateValue } from './state.js';
 import type { RecoveryAction, DecoderCommand } from '@moqt/playback';
 import type { CatalogState, SapTimelineEntry, EventTimelineRecord } from '@moqt/msf';
+import type { EmsgEvent } from '@moqt/locmaf';
 import type { PlayerError } from './errors.js';
 
 // ─── Session Events ──────────────────────────────────────────────────
@@ -572,6 +573,28 @@ export interface EventTimelineReceivedEvent {
   readonly records: EventTimelineRecord[];
 }
 
+/**
+ * Timed events carried by a LOCMAF event-only track: the `emsg` boxes that
+ * rode as genBox elements ahead of one chunk's header, parsed. A version-0
+ * emsg's presentation time is a delta from this chunk's
+ * `baseMediaDecodeTime`; a version-1 emsg's is absolute.
+ *
+ * @see draft-einarsson-moq-locmaf-01 §8, §14 (Event-Only Tracks)
+ */
+export interface LocmafEventReceivedEvent {
+  readonly type: 'locmaf_event';
+  /** Name of the locmaf track in the catalog. */
+  readonly trackName: string;
+  readonly groupId: bigint;
+  readonly objectId: bigint;
+  /** The track's timescale (mdhd), which the chunk's decode time is in. */
+  readonly timescale: number;
+  /** The chunk's tfdt base media decode time. */
+  readonly baseMediaDecodeTime: bigint;
+  /** The chunk's emsg boxes, in order. */
+  readonly events: readonly EmsgEvent[];
+}
+
 // ─── Seek Events ────────────────────────────────────────────────────
 
 /**
@@ -676,6 +699,7 @@ export interface PlayerEventMap {
   // SAP / Event Timeline
   sap_event: SapEventReceivedEvent;
   event_timeline: EventTimelineReceivedEvent;
+  locmaf_event: LocmafEventReceivedEvent;
 
   // Seek
   seeking: SeekingEvent;

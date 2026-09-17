@@ -454,6 +454,19 @@ export interface RecoveryConfig {
   readonly cmafFirstFrameMaxWaitMs?: number;
 
   /**
+   * Consumption path for LOCMAF tracks (draft-einarsson-moq-locmaf-01 §16).
+   * `'mse'` (default) reconstructs every Object into a canonical CMAF chunk
+   * and plays it through MSE like a cmaf track. `'frame'` slices every Object
+   * into its coded samples and feeds them to the LOC WebCodecs pipeline
+   * (`createVideoDecoder` / `createAudioDecoder`), with the codec configuration
+   * read from the track's CMAF Header. The frame path cannot decrypt: a
+   * protected (CENC) LOCMAF track is dropped with a warning there, while the
+   * MSE path hands the reconstructed senc/saiz/saio to the browser for EME.
+   * Default: 'mse'.
+   */
+  readonly locmafDecoding?: 'mse' | 'frame';
+
+  /**
    * Media-liveness starvation threshold: while PLAYING, a track with no
    * object arrivals for this long triggers the restart ladder.
    * The gap detector handles gaps BETWEEN arrivals; this handles NO
@@ -803,6 +816,10 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     throw new RangeError(
       `warmStartCurrentGroup requires the LargestObject subscription filter (§9.16.2), got ${config.subscriptionFilter.type}`,
     );
+  }
+
+  if (config.locmafDecoding !== undefined && !['mse', 'frame'].includes(config.locmafDecoding)) {
+    throw new RangeError(`locmafDecoding must be 'mse' | 'frame', got ${String(config.locmafDecoding)}`);
   }
 
   if (config.catalogBootstrap !== undefined

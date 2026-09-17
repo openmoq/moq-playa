@@ -34,7 +34,8 @@ import type { AbrTrack } from '@moqt/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@moqt/playback';
 import type { CatalogState, CatalogTrack } from '@moqt/msf';
 import type { LocHeaders } from '@moqt/loc';
-import { LocmafFormatError, LocmafTrackDecoder, readVi64 } from '@moqt/locmaf';
+import { LocmafFormatError, LocmafTrackDecoder, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, parseEmsgBoxes } from '@moqt/locmaf';
+import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@moqt/locmaf';
 import { parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@moqt/msf';
 
 import { TypedEmitter } from './emitter.js';
@@ -55,7 +56,16 @@ import type { SupportReport } from './support.js';
 import { CatalogManager } from './catalog-manager.js';
 import { QualityController } from './quality-controller.js';
 import { SubscriptionManager, type TrackPackaging } from './subscription-manager.js';
-import { isMsePackaging, mediaTrackPackaging } from './packaging.js';
+import { isMsePackaging, mediaTrackPackaging, usesMsePath } from './packaging.js';
+
+/** What a reconstructed LOCMAF chunk exposes beyond its CMAF bytes (frame path, event-only tracks). */
+interface LocmafChunkDetails {
+  readonly effective: LocmafEffectiveSamples;
+  readonly mdat: Uint8Array;
+  readonly genBoxes: readonly GenBox[];
+  readonly timescale: number;
+  readonly baseMediaDecodeTime: bigint;
+}
 import type { MediaSourceLike } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import { StatsAccumulator } from './stats.js';
@@ -358,6 +368,14 @@ export class MoqtPlayer {
   private locmafBadInit = new Set<string>();
   /** Once-per-track warning keys for LOCMAF rejections and missing CMAF Headers. */
   private locmafWarned = new Set<string>();
+  /**
+   * Frame path (§16) bookkeeping per LOCMAF track: the next synthetic object id
+   * for each recent group, so every coded sample becomes one pipeline object in
+   * decode order, and the codec description read from the CMAF Header the
+   * track's decoder was seeded from.
+   */
+  private locmafFrameIds = new Map<string, Map<bigint, bigint>>();
+  private locmafDescriptions = new Map<string, { init: Uint8Array; description: Uint8Array | null }>();
   /**
    * Playback intent as declared through play()/pause()/destroy(), or `null`
    * when the embedder has never declared one. A media source created later
@@ -1163,7 +1181,11 @@ export class MoqtPlayer {
    * sample flags), never on object ids.
    * @see draft-einarsson-moq-locmaf-01 §3, §9, §15, §16
    */
-  private onLocmafMediaObject(mediaType: 'video' | 'audio', trackName: string, obj: MoqtObject): void {
+  private onLocmafMediaObject(mediaType: 'video' | 'audio' | 'eventtimeline', trackName: string, obj: MoqtObject): void {
+    if (mediaType === 'eventtimeline') {
+      this.onLocmafEventObject(trackName, obj);
+      return;
+    }
     // Liveness: stamp before every early return (gates, staging, drops).
     this.stampMediaArrival(BigInt(obj.trackAlias));
 
@@ -1194,6 +1216,12 @@ export class MoqtPlayer {
     // §9: a rawBoxes Object carries complete ISO boxes, possibly a CMAF Header.
     const rawBoxes = MoqtPlayer.locmafRawBoxes(obj.payload);
 
+    // §16 frame interface: no MSE gates apply; the LOC pipeline takes the samples.
+    if (this.locmafFramePath) {
+      this.onLocmafFrameObject(mediaType, trackName, obj, rawBoxes);
+      return;
+    }
+
     // Gate: nothing reaches MSE before initialization. An in-band CMAF Header
     // (as rawBoxes) is an init source, exactly like a CMAF in-band ftyp+moov.
     if (!this.cmafInitialized) {
@@ -1212,15 +1240,7 @@ export class MoqtPlayer {
 
     // A later in-band CMAF Header re-seeds this track's reconstruction (§6, §9.3).
     if (rawBoxes && MoqtPlayer.looksLikeCmafInitSegment(rawBoxes)) {
-      this.initSegmentByTrack.set(trackName, rawBoxes);
-      const current = this.locmafDecoderInit.get(trackName);
-      if (!current || !MoqtPlayer.sameBytes(current, rawBoxes)) {
-        // A different header re-seeds reconstruction; repeating the same one must
-        // not discard the in-flight groups' references.
-        this.locmafDecoders.delete(trackName);
-        this.locmafDecoderInit.delete(trackName);
-        this.locmafBadInit.delete(trackName);
-      }
+      this.noteLocmafInBandHeader(trackName, rawBoxes);
       return;
     }
 
@@ -1273,13 +1293,13 @@ export class MoqtPlayer {
    * group, but whole groups failing in a row means the stream cannot be decoded.
    */
   private decodeLocmafObject(
-    mediaType: 'video' | 'audio',
+    mediaType: 'video' | 'audio' | 'eventtimeline',
     trackName: string,
     trackAlias: bigint,
     groupId: bigint,
     objectId: bigint,
     payload: Uint8Array,
-  ): { bytes: Uint8Array; sync: boolean } | null {
+  ): { bytes: Uint8Array; sync: boolean; chunk?: LocmafChunkDetails } | null {
     const decoder = this.locmafDecoderFor(mediaType, trackName, trackAlias);
     if (!decoder) return null;
     const result = decoder.push(groupId, objectId, payload);
@@ -1326,11 +1346,241 @@ export class MoqtPlayer {
       // read sync from, so fall back to the CMAF object-id rule.
       return { bytes: result.bytes, sync: objectId <= 1n };
     }
-    return { bytes: result.bytes, sync: result.startsWithSync };
+    return {
+      bytes: result.bytes,
+      sync: result.startsWithSync,
+      chunk: {
+        effective: result.effective,
+        mdat: result.mdat,
+        genBoxes: result.genBoxes,
+        timescale: result.timescale,
+        baseMediaDecodeTime: result.baseMediaDecodeTime,
+      },
+    };
+  }
+
+  /** Whether a track of this packaging plays through MSE in this player (LOCMAF may take the frame path). */
+  private usesMse(packaging: string | undefined): boolean {
+    return usesMsePath(packaging, this.config.locmafDecoding);
+  }
+
+  /** LOCMAF tracks are consumed through the §16 frame interface (LOC WebCodecs pipeline). */
+  private get locmafFramePath(): boolean {
+    return this.config.locmafDecoding === 'frame';
+  }
+
+  /**
+   * The base64 init the pipelines are configured with: the catalog's inline init
+   * as-is, except that a LOCMAF track on the frame path gets the codec
+   * description read from its CMAF Header (§16) -- what a frame decoder takes as
+   * `description`, not the whole ftyp+moov. Undefined when the Header has no
+   * known codec configuration; the per-frame VideoConfig then configures video on
+   * its first keyframe.
+   */
+  private pipelineInitData(track: CatalogTrack): string | undefined {
+    if (track.packaging !== 'locmaf' || !this.locmafFramePath) return this.resolveInlineInitData(track);
+    try {
+      const init = this.decodeResolvedInlineInitData(track);
+      const description = init ? codecDescriptionFromInit(init) : null;
+      return description ? btoa(String.fromCharCode(...description)) : undefined;
+    } catch {
+      return undefined; // an invalid inline init was already surfaced at selection time
+    }
+  }
+
+  /** The codec description of a LOCMAF track's current CMAF Header, cached per Header. */
+  private locmafDescription(trackName: string): Uint8Array | null {
+    const init = this.locmafDecoderInit.get(trackName);
+    if (!init) return null;
+    const cached = this.locmafDescriptions.get(trackName);
+    if (cached && cached.init === init) return cached.description;
+    let description: Uint8Array | null = null;
+    try {
+      description = codecDescriptionFromInit(init);
+    } catch {
+      description = null;
+    }
+    this.locmafDescriptions.set(trackName, { init, description });
+    return description;
+  }
+
+  /** Next synthetic pipeline object id for `count` frames of a LOCMAF track's group. */
+  private nextLocmafFrameId(trackName: string, groupId: bigint, count: number): bigint {
+    let groups = this.locmafFrameIds.get(trackName);
+    if (!groups) {
+      groups = new Map();
+      this.locmafFrameIds.set(trackName, groups);
+    }
+    const next = groups.get(groupId) ?? 0n;
+    groups.set(groupId, next + BigInt(count));
+    if (groups.size > MoqtPlayer.LOCMAF_TRACKED_GROUPS) {
+      const oldest = groups.keys().next().value;
+      if (oldest !== undefined) groups.delete(oldest);
+    }
+    return next;
+  }
+
+  /**
+   * An in-band CMAF Header on a LOCMAF track (rawBoxes, §9): remember it and
+   * re-seed the decoder if it changed. A different header re-seeds
+   * reconstruction; repeating the same one must not discard the in-flight
+   * groups' references.
+   */
+  private noteLocmafInBandHeader(trackName: string, header: Uint8Array): void {
+    this.initSegmentByTrack.set(trackName, header);
+    const current = this.locmafDecoderInit.get(trackName);
+    if (!current || !MoqtPlayer.sameBytes(current, header)) {
+      this.locmafDecoders.delete(trackName);
+      this.locmafDecoderInit.delete(trackName);
+      this.locmafBadInit.delete(trackName);
+      this.locmafFrameIds.delete(trackName);
+    }
+  }
+
+  /**
+   * A LOCMAF media object on the frame path (§16): reconstruct it, slice the
+   * mdat payload into coded samples and push each one into the LOC pipeline as
+   * its own object, in decode order, with LOC-shaped headers -- the presentation
+   * time as CaptureTimestamp, the sync flag as the independent frame marking and
+   * the CMAF Header's codec configuration as VideoConfig on keyframes. Protected
+   * tracks are dropped: a frame decoder has no way to decrypt them.
+   */
+  private onLocmafFrameObject(
+    mediaType: 'video' | 'audio',
+    trackName: string,
+    obj: MoqtObject & { kind: 'data' },
+    rawBoxes: Uint8Array | null,
+  ): void {
+    if (rawBoxes && isCmafHeader(rawBoxes)) {
+      this.noteLocmafInBandHeader(trackName, rawBoxes);
+      return;
+    }
+    const groupId = BigInt(obj.groupId);
+    const decoded = this.decodeLocmafObject(mediaType, trackName, BigInt(obj.trackAlias), groupId,
+      BigInt(obj.objectId), obj.payload);
+    if (!decoded?.chunk) return;
+    const decoder = this.locmafDecoders.get(trackName);
+    if (decoder?.context.isProtected) {
+      if (!this.locmafWarned.has(`protected:${trackName}`)) {
+        this.locmafWarned.add(`protected:${trackName}`);
+        this.log.warn('[LOCMAF] "%s" (%s): protected track (%s) cannot be decrypted on the frame path — dropping objects; use locmafDecoding "mse"',
+          trackName, mediaType, decoder.context.schemeType ?? 'cenc');
+      }
+      return;
+    }
+    let frames;
+    try {
+      frames = sliceFrames(decoded.chunk.effective, decoded.chunk.mdat);
+    } catch (err) {
+      this._stats.recordLocmafObjectRejected();
+      if (!this.locmafWarned.has(`frames:${trackName}`)) {
+        this.locmafWarned.add(`frames:${trackName}`);
+        this.log.warn('[LOCMAF] "%s" (%s): object g=%s o=%s cannot be sliced into frames: %s',
+          trackName, mediaType, String(groupId), String(obj.objectId), err instanceof Error ? err.message : String(err));
+      }
+      return;
+    }
+    if (frames.length === 0) return;
+    const description = mediaType === 'video' ? this.locmafDescription(trackName) : null;
+    const timescale = decoded.chunk.timescale;
+    const firstId = this.nextLocmafFrameId(trackName, groupId, frames.length);
+    for (const frame of frames) {
+      const synthetic: MoqtObject = {
+        kind: 'data',
+        trackAlias: obj.trackAlias,
+        groupId: obj.groupId,
+        subgroupId: obj.subgroupId,
+        objectId: varint(firstId + BigInt(frame.index)),
+        publisherPriority: obj.publisherPriority,
+        payload: frame.data,
+      };
+      const headers: LocHeaders = {
+        captureTimestamp: ticksToMicros(frame.presentationTime, timescale),
+        ...(mediaType === 'video'
+          ? {
+              videoFrameMarking: {
+                startOfFrame: true,
+                endOfFrame: true,
+                independent: frame.isSync,
+                // sample_is_depended_on == 2: no other sample depends on this one.
+                discardable: !frame.isSync && ((frame.flags >>> 22) & 0x3) === 2,
+                baseLayerSync: false,
+                temporalId: 0,
+              },
+              ...(frame.isSync && description ? { videoConfig: description } : {}),
+            }
+          : {}),
+      };
+      this.routeLocmafFrame(mediaType, trackName, synthetic, headers);
+    }
+  }
+
+  /** Route one frame-path object like a LOC object: switch staging, old-track drop, pipeline push. */
+  private routeLocmafFrame(mediaType: 'video' | 'audio', trackName: string, frame: MoqtObject, headers: LocHeaders): void {
+    if (this.pendingVideoSwitch && mediaType === 'video'
+        && trackName === this.pendingVideoSwitch.newTrackName) {
+      this.switchStagingBuffer.push({ obj: frame, headers });
+      if (this.switchStagingBuffer.length === 1) {
+        this.switchStagingTimeout = setTimeout(() => {
+          this.log.warn('[SWITCH] LOCMAF keyframe timeout — force-completing after %dms', SWITCH_STAGING_TIMEOUT_MS);
+          this.completePendingVideoSwitch();
+        }, SWITCH_STAGING_TIMEOUT_MS);
+      }
+      if (headers.videoFrameMarking?.independent) {
+        this.completePendingVideoSwitch();
+      } else if (this.switchStagingBuffer.length >= SWITCH_STAGING_MAX_OBJECTS) {
+        this.log.warn('[SWITCH] LOCMAF staging overflow (%d objects) — force-completing', SWITCH_STAGING_MAX_OBJECTS);
+        this.completePendingVideoSwitch();
+      }
+      return;
+    }
+    if (this.switchInProgress && this.pendingVideoSwitch
+        && mediaType === 'video'
+        && trackName === this.pendingVideoSwitch.oldTrackName) {
+      return;
+    }
+    const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
+    pipeline?.pushObject(frame, headers);
+  }
+
+  /**
+   * A chunk of a LOCMAF event-only track (§14): reconstruct it for its genBoxes
+   * and emit the parsed emsg boxes. The chunk carries no samples, so nothing
+   * reaches a media sink; a version-0 emsg's presentation time is relative to
+   * the chunk's base media decode time, which the event carries.
+   */
+  private onLocmafEventObject(trackName: string, obj: MoqtObject): void {
+    if (obj.kind !== 'data' || !obj.payload) return;
+    const rawBoxes = MoqtPlayer.locmafRawBoxes(obj.payload);
+    if (rawBoxes && isCmafHeader(rawBoxes)) {
+      this.noteLocmafInBandHeader(trackName, rawBoxes);
+      return;
+    }
+    const groupId = BigInt(obj.groupId);
+    const objectId = BigInt(obj.objectId);
+    const decoded = this.decodeLocmafObject('eventtimeline', trackName, BigInt(obj.trackAlias), groupId, objectId, obj.payload);
+    if (!decoded?.chunk) return;
+    let events: EmsgEvent[];
+    try {
+      events = parseEmsgBoxes(decoded.chunk.genBoxes);
+    } catch (err) {
+      this.log.warn('[LOCMAF] "%s": emsg in g=%s o=%s does not parse: %s',
+        trackName, String(groupId), String(objectId), err instanceof Error ? err.message : String(err));
+      return;
+    }
+    this.emitter.emit('locmaf_event', {
+      type: 'locmaf_event',
+      trackName,
+      groupId,
+      objectId,
+      timescale: decoded.chunk.timescale,
+      baseMediaDecodeTime: decoded.chunk.baseMediaDecodeTime,
+      events,
+    });
   }
 
   /** The track's LOCMAF decoder, created from its CMAF Header on first use. */
-  private locmafDecoderFor(mediaType: 'video' | 'audio', trackName: string, trackAlias: bigint): LocmafTrackDecoder | null {
+  private locmafDecoderFor(mediaType: 'video' | 'audio' | 'eventtimeline', trackName: string, trackAlias: bigint): LocmafTrackDecoder | null {
     const existing = this.locmafDecoders.get(trackName);
     if (existing) return existing;
     if (this.locmafBadInit.has(trackName)) return null;
@@ -1548,7 +1798,7 @@ export class MoqtPlayer {
     // switch can't proceed. Reject now so the existing subscription
     // stays intact — better than racing the rejection mid-async, where
     // the abort path would have to undo a partial commit.
-    const needsCodecChange = isMsePackaging(targetTrack.packaging)
+    const needsCodecChange = this.usesMse(targetTrack.packaging)
         && targetTrack.codec !== undefined
         && (this.currentVideoCodec === null
             || !codecsCompatible(targetTrack.codec, this.currentVideoCodec));
@@ -1731,7 +1981,7 @@ export class MoqtPlayer {
     // bytes are dropped — and the user sees an error event. Without
     // this, a failed pivot tears down the only known-good subscription
     // and strands playback in an unrecoverable state.
-    const needsChangeType = newTrack !== undefined && isMsePackaging(newTrack.packaging)
+    const needsChangeType = newTrack !== undefined && this.usesMse(newTrack.packaging)
       && newTrack.codec !== undefined
       && (this.currentVideoCodec === null
           || !codecsCompatible(newTrack.codec, this.currentVideoCodec));
@@ -1811,7 +2061,7 @@ export class MoqtPlayer {
       const trackInfo: TrackInfo = {
         video: defined({
           codec: newTrack.codec ?? '',
-          initData: this.resolveInlineInitData(newTrack),
+          initData: this.pipelineInitData(newTrack),
           width: newTrack.width,
           height: newTrack.height,
         }),
@@ -4923,6 +5173,8 @@ export class MoqtPlayer {
     this.locmafDecoders.clear();
     this.locmafDecoderInit.clear();
     this.locmafHealth.clear();
+    this.locmafFrameIds.clear();
+    this.locmafDescriptions.clear();
     this.locmafWarned.clear();
     this.locmafBadInit.clear();
     this.cmafInitDeadlineArmed = false;
@@ -6687,13 +6939,13 @@ export class MoqtPlayer {
       const decodeBase64 = (b64: string): Uint8Array =>
         Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
       this.cmafPendingInit = {};
-      if (trackInfo.video && isMsePackaging(trackInfo.video.packaging) && trackInfo.video.codec) {
+      if (trackInfo.video && this.usesMse(trackInfo.video.packaging) && trackInfo.video.codec) {
         this.cmafPendingInit.video = {
           codec: trackInfo.video.codec,
           bytes: trackInfo.video.initData ? decodeBase64(trackInfo.video.initData) : null,
         };
       }
-      if (trackInfo.audio && isMsePackaging(trackInfo.audio.packaging) && trackInfo.audio.codec) {
+      if (trackInfo.audio && this.usesMse(trackInfo.audio.packaging) && trackInfo.audio.codec) {
         this.cmafPendingInit.audio = {
           codec: trackInfo.audio.codec,
           bytes: trackInfo.audio.initData ? decodeBase64(trackInfo.audio.initData) : null,
@@ -7112,7 +7364,7 @@ export class MoqtPlayer {
         codec: selected.video.codec,
         width: selected.video.width,
         height: selected.video.height,
-        initData: this.resolveInlineInitData(selected.video),
+        initData: this.pipelineInitData(selected.video),
         initTrack: selected.video.initTrack,
         packaging: videoPackaging,
       }) : undefined,
@@ -7120,7 +7372,7 @@ export class MoqtPlayer {
         codec: selected.audio.codec,
         samplerate: selected.audio.samplerate,
         channels: selected.audio.channelConfig ? Number(selected.audio.channelConfig) : undefined,
-        initData: this.resolveInlineInitData(selected.audio),
+        initData: this.pipelineInitData(selected.audio),
         initTrack: selected.audio.initTrack,
         packaging: audioPackaging,
       }) : undefined,
@@ -7361,6 +7613,30 @@ export class MoqtPlayer {
       });
       this.log.info('Subscribe eventtimeline "%s" (eventType=%s) requestId=%s',
         evtTrack.name, evtTrack.eventType ?? '(none)', reqIdBigInt);
+    }
+
+    // LOCMAF event-only tracks (draft-einarsson-moq-locmaf-01 §14): a locmaf track
+    // of a non-media role whose chunks carry emsg genBoxes and no samples. Selected
+    // like eventtimeline tracks -- by dependence on a selected media track -- and
+    // delivered as `locmaf_event` player events rather than media.
+    const locmafEventTracks = catalog.tracks.filter(
+      (t: CatalogTrack) =>
+        t.packaging === 'locmaf' &&
+        t.role !== 'video' && t.role !== 'audio' &&
+        isTrackPackagingSupported(t) &&
+        Array.isArray(t.depends) &&
+        t.depends.some((dep: string) => selectedNames.has(dep)),
+    );
+    for (const evtTrack of locmafEventTracks) {
+      if (!this.connection || !this.subscriptionManager) break;
+      const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+      const nameBytes = this.enc.encode(evtTrack.name);
+      const eventOptions = subscribeOptions ?? { subscriptionFilter: { type: 'LargestObject' as const } };
+      const reqIdBigInt = await this.subscribeAuxTrackOwned(nsBytes, nameBytes, eventOptions, {
+        trackName: evtTrack.name, mediaType: 'eventtimeline', packaging: 'locmaf',
+      });
+      this.log.info('Subscribe LOCMAF event-only track "%s" (role=%s) requestId=%s',
+        evtTrack.name, evtTrack.role ?? '(none)', reqIdBigInt);
     }
   }
 
@@ -7739,7 +8015,12 @@ export class MoqtPlayer {
    */
   private flushForLivenessRestart(track: LivenessTrack): void {
     const catalogTrack = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === track.trackName);
-    if (isMsePackaging(catalogTrack?.packaging)) {
+    // LOCMAF on either path: drop the in-group reference; the restarted delivery begins at a full header.
+    if (catalogTrack?.packaging === 'locmaf') {
+      this.locmafDecoders.get(track.trackName)?.reset();
+      this.locmafFrameIds.delete(track.trackName);
+    }
+    if (this.usesMse(catalogTrack?.packaging)) {
       // CMAF bypasses the LOC pipelines: re-arm the wait-for-keyframe gate
       // (post-restart mid-group deltas must be dropped, as on init) and drop
       // any stranded moof half-pair so it can't mispair after the restart.
@@ -7747,8 +8028,6 @@ export class MoqtPlayer {
       // it, and the live-edge chase follows the post-restart PTS jump.
       if (track.mediaType === 'video') this.cmafVideoSynced = false;
       this.cmafAssembler?.clearPending?.(track.mediaType);
-      // LOCMAF: drop the in-group reference; the restarted delivery begins at a full header.
-      this.locmafDecoders.get(track.trackName)?.reset();
       return;
     }
     // LOC: flush pipeline + sync. Video also gates out stale in-flight

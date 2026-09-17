@@ -120,6 +120,45 @@ describe('handleControlMessage', () => {
     expect(subMgr.unregisterTrack).toHaveBeenCalledWith(1n);
   });
 
+  it('SUBSCRIBE_OK: registers a pending track whose alias equals the request id when nothing is registered under it (switch target on an alias-echoing relay)', () => {
+    // A make-before-break switch target is deliberately not registered
+    // optimistically. A relay that assigns alias == request id (moqx does)
+    // therefore needs the SUBSCRIBE_OK to bind it, or its objects stay parked
+    // and the switch never completes.
+    const ctx = createContext();
+    const subMgr = { unregisterTrack: vi.fn(), registerTrack: vi.fn(), getMediaType: vi.fn().mockReturnValue(undefined) };
+    ctx.subscriptionManager = subMgr as any;
+    ctx.pendingMediaSubs.set(7n, { trackName: 'video-360', mediaType: 'video', packaging: 'locmaf' });
+    ctx.activeSubscriptions.set(7n, { trackName: 'video-360', trackAlias: 7n });
+    const resolved: bigint[] = [];
+    ctx.onAliasResolved = (alias) => resolved.push(alias);
+
+    handleControlMessage({
+      type: 'SUBSCRIBE_OK', requestId: 7n, trackAlias: 7n,
+      expires: 0n, groupOrder: 0x1n, contentExists: false,
+    } as ControlMessage, ctx);
+
+    expect(subMgr.registerTrack).toHaveBeenCalledWith(7n, 'video-360', 'video', 'locmaf');
+    expect(subMgr.unregisterTrack).not.toHaveBeenCalled();
+    expect(resolved).toEqual([7n]);
+  });
+
+  it('SUBSCRIBE_OK: an alias equal to the request id that is already registered (optimistic initial subscribe) is left alone', () => {
+    const ctx = createContext();
+    const subMgr = { unregisterTrack: vi.fn(), registerTrack: vi.fn(), getMediaType: vi.fn().mockReturnValue('video') };
+    ctx.subscriptionManager = subMgr as any;
+    ctx.pendingMediaSubs.set(3n, { trackName: 'video', mediaType: 'video', packaging: 'loc' });
+    ctx.activeSubscriptions.set(3n, { trackName: 'video', trackAlias: 3n });
+
+    handleControlMessage({
+      type: 'SUBSCRIBE_OK', requestId: 3n, trackAlias: 3n,
+      expires: 0n, groupOrder: 0x1n, contentExists: false,
+    } as ControlMessage, ctx);
+
+    expect(subMgr.registerTrack).not.toHaveBeenCalled();
+    expect(subMgr.unregisterTrack).not.toHaveBeenCalled();
+  });
+
   it('SUBSCRIBE_OK: re-registers track when alias differs (§9.10)', () => {
     const ctx = createContext();
     const subMgr = { unregisterTrack: vi.fn(), registerTrack: vi.fn(), getMediaType: vi.fn().mockReturnValue(undefined) };
