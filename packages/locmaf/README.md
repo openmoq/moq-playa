@@ -4,7 +4,7 @@
 
 # @moqt/locmaf
 
-Low Overhead CMAF (LOCMAF) codec for Media over QUIC (MoQ): parses, reconstructs, and encodes LOCMAF Objects into canonical CMAF chunks.
+Low Overhead CMAF (LOCMAF) codec for Media over QUIC (MoQ): parses, reconstructs, and encodes LOCMAF Objects into canonical CMAF chunks, slices them into coded frames for frame decoders, and reads the emsg events of event-only tracks.
 
 Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implementation of Media over QUIC (MoQ). See the [project README](https://github.com/openmoq/moq-playa#readme) for architecture and API documentation.
 

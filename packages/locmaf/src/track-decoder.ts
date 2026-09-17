@@ -18,6 +18,7 @@ import { deserializeLocmafObject } from './deserializer.js';
 import { isSyncSampleFlags, type LocmafEffectiveSamples } from './effective.js';
 import { LocmafFormatError } from './errors.js';
 import { LocmafGroupState } from './group-state.js';
+import type { GenBox } from './model.js';
 import { LocmafReconstructor } from './reconstruct.js';
 import { parseLocmafTrackContext, type LocmafTrackContext } from './track-context.js';
 
@@ -35,6 +36,10 @@ export type LocmafDecodeResult =
           readonly sampleCount: number;
           /** Effective per-sample values, for frame-based consumers (section 16). */
           readonly effective: LocmafEffectiveSamples;
+          /** The mdat payload alone (coded samples back to back), for slicing into frames (section 16). */
+          readonly mdat: Uint8Array;
+          /** The chunk's generic boxes verbatim, e.g. the emsg boxes of an event-only track (section 14). */
+          readonly genBoxes: readonly GenBox[];
       }
     | {
           /** A rawBoxes Object: complete ISO boxes, verbatim (possibly a CMAF Header). */
@@ -78,7 +83,7 @@ export class LocmafTrackDecoder {
         try {
             const object = deserializeLocmafObject(payload);
             const out = this.reconstructor.reconstruct(object, state, this.context, objectId);
-            if (out.kind === 'raw') return { kind: 'raw', bytes: out.bytes };
+            if (out.kind === 'raw' || object.kind !== 'moof') return { kind: 'raw', bytes: out.bytes };
             const effective = out.effective;
             const first = effective.flags[0];
             return {
@@ -89,6 +94,8 @@ export class LocmafTrackDecoder {
                 timescale: this.context.timescale,
                 sampleCount: effective.durations.length,
                 effective,
+                mdat: object.mdat,
+                genBoxes: object.genBoxes,
             };
         } catch (e) {
             if (e instanceof LocmafFormatError) {

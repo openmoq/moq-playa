@@ -7,6 +7,8 @@ import {
     deserializeLocmafObject,
     parseLocmafTrackContext,
     serializeLocmafObject,
+    sliceFrames,
+    parseEmsgBoxes,
     LOCMAF_VERSION,
 } from '@moqt/locmaf';
 import { effectiveProjection, loadLocmafCorpus, rawProjection, splitFramed } from './locmaf-exec.js';
@@ -52,6 +54,28 @@ describe('corpus/locmaf — Eyevinn golden vectors (third-party, interop)', () =
                     const result = decoder.push(BigInt(o.group), BigInt(o.object), o.payload);
                     expect(result.kind, o.file).not.toBe('rejected');
                     if (result.kind !== 'rejected') expect(result.bytes, o.file).toEqual(o.canonical);
+                }
+            });
+
+            it('slices every chunk into frames that tile its mdat payload (section 16)', () => {
+                const decoder = new LocmafTrackDecoder(c.init);
+                for (const o of c.objects) {
+                    const result = decoder.push(BigInt(o.group), BigInt(o.object), o.payload);
+                    if (result.kind !== 'chunk') continue;
+                    const frames = sliceFrames(result.effective, result.mdat);
+                    expect(frames.length, o.file).toBe(result.sampleCount);
+                    expect(frames.reduce((n, f) => n + f.data.length, 0), o.file).toBe(result.mdat.length);
+                    expect(result.bytes.subarray(result.bytes.length - result.mdat.length), o.file).toEqual(result.mdat);
+                    let expectedDecodeTime = result.baseMediaDecodeTime;
+                    for (const f of frames) {
+                        expect(f.decodeTime, `${o.file} frame ${f.index}`).toBe(expectedDecodeTime);
+                        expectedDecodeTime += BigInt(f.duration);
+                    }
+                    if (c.name === 'event-only') {
+                        const events = parseEmsgBoxes(result.genBoxes);
+                        expect(events.length, o.file).toBe(1);
+                        expect(events[0]!.schemeIdUri, o.file).toBe('urn:y');
+                    }
                 }
             });
 
