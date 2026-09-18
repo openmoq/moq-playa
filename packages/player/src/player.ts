@@ -34,7 +34,7 @@ import type { AbrTrack } from '@moqt/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@moqt/playback';
 import type { CatalogState, CatalogTrack } from '@moqt/msf';
 import type { LocHeaders } from '@moqt/loc';
-import { LocmafFormatError, LocmafTrackDecoder, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, parseEmsgBoxes } from '@moqt/locmaf';
+import { LocmafFormatError, LocmafTrackDecoder, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, parseCmafChunk, parseEmsgBoxes } from '@moqt/locmaf';
 import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@moqt/locmaf';
 import { parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@moqt/msf';
 
@@ -1210,8 +1210,14 @@ export class MoqtPlayer {
       ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
     });
 
-    if (obj.kind !== 'data' || !obj.payload) return;
     if (this.stateMachine.state === PlayerState.PAUSED) return;
+    if (obj.kind === 'gap') {
+      // §16: END_OF_GROUP / END_OF_TRACK markers let the LOC pipeline advance
+      // to the next group at once instead of waiting out the gap timeout.
+      if (this.locmafFramePath) this.routeLocmafFrame(mediaType, trackName, obj, {});
+      return;
+    }
+    if (!obj.payload) return;
 
     // §9: a rawBoxes Object carries complete ISO boxes, possibly a CMAF Header.
     const rawBoxes = MoqtPlayer.locmafRawBoxes(obj.payload);
@@ -1342,8 +1348,29 @@ export class MoqtPlayer {
     group.decoded = true;
     health.failedGroups = 0;
     if (result.kind === 'raw') {
-      // rawBoxes media (a chunk the field model cannot carry, §9): no header to
-      // read sync from, so fall back to the CMAF object-id rule.
+      // rawBoxes media (§9): the chunk is carried verbatim, so read its samples
+      // from the moof itself. A chunk outside the field model (or one that is
+      // not a moof+mdat chunk) has no header to read sync from: fall back to
+      // the CMAF object-id rule.
+      try {
+        const parsed = parseCmafChunk(result.bytes, decoder.context);
+        if (parsed.fits) {
+          const first = parsed.effective.flags[0];
+          return {
+            bytes: result.bytes,
+            sync: first !== undefined && isSyncSampleFlags(first),
+            chunk: {
+              effective: parsed.effective,
+              mdat: parsed.mdat,
+              genBoxes: parsed.genBoxes,
+              timescale: decoder.context.timescale,
+              baseMediaDecodeTime: parsed.effective.baseMediaDecodeTime,
+            },
+          };
+        }
+      } catch (err) {
+        if (!(err instanceof LocmafFormatError)) throw err;
+      }
       return { bytes: result.bytes, sync: objectId <= 1n };
     }
     return {
@@ -1458,7 +1485,16 @@ export class MoqtPlayer {
     const groupId = BigInt(obj.groupId);
     const decoded = this.decodeLocmafObject(mediaType, trackName, BigInt(obj.trackAlias), groupId,
       BigInt(obj.objectId), obj.payload);
-    if (!decoded?.chunk) return;
+    if (!decoded) return;
+    if (!decoded.chunk) {
+      this._stats.recordLocmafObjectRejected();
+      if (!this.locmafWarned.has(`raw:${trackName}`)) {
+        this.locmafWarned.add(`raw:${trackName}`);
+        this.log.warn('[LOCMAF] "%s" (%s): rawBoxes object g=%s o=%s is not a CMAF chunk; dropped on the frame path',
+          trackName, mediaType, String(groupId), String(obj.objectId));
+      }
+      return;
+    }
     const decoder = this.locmafDecoders.get(trackName);
     if (decoder?.context.isProtected) {
       if (!this.locmafWarned.has(`protected:${trackName}`)) {
@@ -2626,7 +2662,6 @@ export class MoqtPlayer {
         trackName, obj.kind, obj.kind === 'data' && obj.payload ? obj.payload.byteLength : 0,
         this.mediaSource ? 'exists' : 'null');
       if (obj.kind !== 'data' || !obj.payload) return;
-      if (!this.mediaSource) return;
 
       // Find which catalog tracks reference this initTrack
       const catalog = this.catalogManager?.currentState;
@@ -2665,8 +2700,9 @@ export class MoqtPlayer {
       }
 
       // Already initialized → this delivery is cache-warming for a future
-      // codec switch only (the cache write above did the work).
-      if (this.cmafInitialized) return;
+      // codec switch only (the cache write above did the work). Without a
+      // MediaSource (LOCMAF frame path) the cache is all the delivery feeds.
+      if (this.cmafInitialized || !this.mediaSource) return;
 
       // Supply the bytes to the init state machine for every selected CMAF
       // track referencing this init track. initialize() fires once ALL

@@ -19,7 +19,7 @@ import { MoqtPlayer } from './player.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@moqt/webtransport';
 import type { ControlMessage, MoqtObject } from '@moqt/transport';
-import { varint } from '@moqt/transport';
+import { ObjectStatus, varint } from '@moqt/transport';
 import type { ClockSource } from '@moqt/playback';
 import { LocmafEncoder, LocmafGroupState, parseLocmafTrackContext, serializeLocmafObject, ticksToMicros } from '@moqt/locmaf';
 import { NON_SYNC_FLAGS, SYNC_FLAGS, buildChunk, cencVideoInit, videoInit } from '../../locmaf/test-support/cmaf.js';
@@ -132,6 +132,93 @@ function sendLocmaf(adapter: any, alias: unknown, groupId: number, objectId: num
 const nal = (type: number, ...body: number[]) => Uint8Array.of(0, 0, 0, 1 + body.length, type, ...body);
 const IDR = nal(5, 0x88, 0x84);
 const P_SLICE = nal(1, 0x9a, 0x10);
+
+describe('LOCMAF frame-path regressions', () => {
+  it('decodes when the CMAF header comes from the subscribed init track', async () => {
+    const init = videoInit();
+    const h = await bootPlayer(
+      cmsfCatalog([{ ...LOCMAF_VIDEO, initTrack: 'video-init' }]),
+      { locmafDecoding: 'frame' },
+    );
+    try {
+      const initAlias = await h.reqIdFor('video-init');
+      expect(initAlias).toBeDefined();
+      sendLocmaf(h.adapter, initAlias, 0, 0, init);
+      const alias = await h.reqIdFor('video');
+      sendLocmaf(h.adapter, alias, 5, 0, locmafGroup(init, 90000, 1).objects[0]!);
+      for (let i = 0; i < 20; i++) {
+        h.advance(40);
+        h.player.tick();
+        await sleep(0);
+      }
+      expect(h.videoDecoder.decode).toHaveBeenCalledTimes(2);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
+  it('decodes a valid rawBoxes media chunk on the frame path', async () => {
+    const init = videoInit();
+    const h = await bootPlayer(
+      cmsfCatalog([{ ...LOCMAF_VIDEO, initRef: 'v' }], [{ id: 'v', type: 'inline', data: b64(init) }]),
+      { locmafDecoding: 'frame' },
+    );
+    try {
+      const chunk = buildChunk({
+        bmdt: 90000,
+        samples: [
+          { duration: 3000, size: IDR.length, flags: SYNC_FLAGS },
+          { duration: 3000, size: P_SLICE.length, flags: NON_SYNC_FLAGS },
+        ],
+        mdat: concat(IDR, P_SLICE),
+      });
+      const alias = await h.reqIdFor('video');
+      sendLocmaf(h.adapter, alias, 5, 0, serializeLocmafObject({ kind: 'rawBoxes', boxes: chunk }));
+      for (let i = 0; i < 20; i++) {
+        h.advance(40);
+        h.player.tick();
+        await sleep(0);
+      }
+      expect(h.videoDecoder.decode).toHaveBeenCalledTimes(2);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
+  it.each([false, true])('advances immediately after END_OF_GROUP (pipeline control=%s)', async (directControl) => {
+    const init = videoInit();
+    const h = await bootPlayer(
+      cmsfCatalog([{ ...LOCMAF_VIDEO, initRef: 'v' }], [{ id: 'v', type: 'inline', data: b64(init) }]),
+      { locmafDecoding: 'frame' },
+    );
+    try {
+      const alias = await h.reqIdFor('video');
+      sendLocmaf(h.adapter, alias, 5, 0, locmafGroup(init, 90000, 1).objects[0]!);
+      for (let i = 0; i < 20 && h.videoDecoder.decode.mock.calls.length < 2; i++) {
+        h.advance(40);
+        h.player.tick();
+        await sleep(0);
+      }
+      expect(h.videoDecoder.decode).toHaveBeenCalledTimes(2);
+      const end = {
+        kind: 'gap', trackAlias: alias, groupId: varint(5), subgroupId: varint(0),
+        objectId: varint(1), status: ObjectStatus.END_OF_GROUP,
+      } as MoqtObject;
+      // Control: the same terminal marker lets the pipeline advance when it reaches it.
+      if (directControl) (h.player as any).videoPipeline.pushObject(end);
+      else h.adapter._triggerObject(0n, end);
+      sendLocmaf(h.adapter, alias, 6, 0, locmafGroup(init, 96000, 1).objects[0]!);
+      for (let i = 0; i < 3; i++) {
+        h.advance(1);
+        h.player.tick();
+        await sleep(0);
+      }
+      expect(h.videoDecoder.decode).toHaveBeenCalledTimes(4);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+});
 
 /**
  * One MOQT group of LOCMAF video objects, two samples per chunk: chunk 0 opens

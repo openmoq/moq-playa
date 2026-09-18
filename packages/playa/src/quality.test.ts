@@ -169,6 +169,28 @@ describe('Player.setQuality', () => {
 // ─── Render sink choice on catalog_received ───────────────────────────
 
 describe('Player sink choice (MSE <video> vs <canvas>)', () => {
+  it('keeps the canvas visible for LOCMAF frame decoding', async () => {
+    const player = new Player(mockElement(), {
+      url: 'https://relay.example.com/moq', namespace: 'test',
+      moqtPlayerConfig: { locmafDecoding: 'frame' },
+    });
+    try {
+      (player as any).engine.emitter.emit('catalog_received', {
+        type: 'catalog_received',
+        catalog: {
+          tracks: [{
+            name: 'v', packaging: 'locmaf', locmafVersion: '0.3',
+            role: 'video', codec: 'avc1.640028', isLive: true,
+          }],
+        },
+      });
+      expect((player as any).canvas.hidden).toBe(false);
+      expect((player as any)._activeMediaType).toBe('canvas');
+    } finally {
+      await player.destroy();
+    }
+  });
+
   function receiveCatalog(packaging: string, extra: Record<string, unknown> = {}): Player {
     const container = mockElement();
     container.parentNode = { removeChild: vi.fn() };
