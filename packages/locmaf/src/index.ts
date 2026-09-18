@@ -58,6 +58,8 @@ export type { LocmafDecodeResult } from './track-decoder.js';
 // ─── Frame interface (section 16) and event-only tracks (section 14) ─
 
 export { sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader } from './frame.js';
+export { readCmafChunkSamples } from './chunk-samples.js';
+export type { CmafChunkSamples } from './chunk-samples.js';
 export type { LocmafFrame, LocmafFrameCenc, LocmafFrameSubsample } from './frame.js';
 export { parseEmsgPayload, parseEmsgBoxes } from './emsg.js';
 export type { EmsgEvent } from './emsg.js';

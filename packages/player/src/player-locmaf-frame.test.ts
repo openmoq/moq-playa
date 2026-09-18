@@ -23,7 +23,7 @@ import { ObjectStatus, varint } from '@moqt/transport';
 import type { ClockSource } from '@moqt/playback';
 import { LocmafEncoder, LocmafGroupState, parseLocmafTrackContext, serializeLocmafObject, ticksToMicros } from '@moqt/locmaf';
 import { NON_SYNC_FLAGS, SYNC_FLAGS, buildChunk, cencVideoInit, videoInit } from '../../locmaf/test-support/cmaf.js';
-import { concat, isoBox } from '../../locmaf/test-support/bytes.js';
+import { concat, fullBox, isoBox, u32 } from '../../locmaf/test-support/bytes.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const VECTORS = join(here, '..', '..', '..', 'conformance', 'media', 'vectors', 'locmaf');
@@ -168,6 +168,43 @@ describe('LOCMAF frame-path regressions', () => {
         await sleep(0);
       }
       expect(h.videoDecoder.decode).toHaveBeenCalledTimes(2);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
+  it.each<[string, Parameters<typeof buildChunk>[0]]>([
+    ['base data offset', { baseDataOffset: true }],
+    ['sample groups in the traf', { extraTrafBoxes: [fullBox('sbgp', 0, 0, u32(0))] }],
+    ['a trailing box', { trailing: [isoBox('free')] }],
+  ])('decodes rawBoxes media outside the field model on the frame path: %s', async (_name, extra) => {
+    const init = videoInit();
+    const h = await bootPlayer(
+      cmsfCatalog([{ ...LOCMAF_VIDEO, initRef: 'v' }], [{ id: 'v', type: 'inline', data: b64(init) }]),
+      { locmafDecoding: 'frame' },
+    );
+    try {
+      const chunk = buildChunk({
+        bmdt: 90000,
+        samples: [
+          { duration: 3000, size: IDR.length, flags: SYNC_FLAGS },
+          { duration: 3000, size: P_SLICE.length, flags: NON_SYNC_FLAGS },
+        ],
+        mdat: concat(IDR, P_SLICE),
+        ...extra,
+      });
+      // §9: such a chunk rides verbatim; the encoder confirms it is outside the model.
+      const encoded = new LocmafEncoder().encode(chunk, new LocmafGroupState(), parseLocmafTrackContext(init), false, 0n);
+      expect(encoded.kind).toBe('rawBoxes');
+      const alias = await h.reqIdFor('video');
+      sendLocmaf(h.adapter, alias, 5, 0, serializeLocmafObject({ kind: 'rawBoxes', boxes: chunk }));
+      for (let i = 0; i < 20; i++) {
+        h.advance(40);
+        h.player.tick();
+        await sleep(0);
+      }
+      expect(h.videoDecoder.decode).toHaveBeenCalledTimes(2);
+      expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(0);
     } finally {
       await h.player.destroy();
     }

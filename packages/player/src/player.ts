@@ -34,7 +34,7 @@ import type { AbrTrack } from '@moqt/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@moqt/playback';
 import type { CatalogState, CatalogTrack } from '@moqt/msf';
 import type { LocHeaders } from '@moqt/loc';
-import { LocmafFormatError, LocmafTrackDecoder, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, parseCmafChunk, parseEmsgBoxes } from '@moqt/locmaf';
+import { LocmafFormatError, LocmafTrackDecoder, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes } from '@moqt/locmaf';
 import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@moqt/locmaf';
 import { parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@moqt/msf';
 
@@ -1305,7 +1305,7 @@ export class MoqtPlayer {
     groupId: bigint,
     objectId: bigint,
     payload: Uint8Array,
-  ): { bytes: Uint8Array; sync: boolean; chunk?: LocmafChunkDetails } | null {
+  ): { bytes: Uint8Array; sync: boolean; chunk?: LocmafChunkDetails; rawError?: string } | null {
     const decoder = this.locmafDecoderFor(mediaType, trackName, trackAlias);
     if (!decoder) return null;
     const result = decoder.push(groupId, objectId, payload);
@@ -1348,30 +1348,29 @@ export class MoqtPlayer {
     group.decoded = true;
     health.failedGroups = 0;
     if (result.kind === 'raw') {
-      // rawBoxes media (§9): the chunk is carried verbatim, so read its samples
-      // from the moof itself. A chunk outside the field model (or one that is
-      // not a moof+mdat chunk) has no header to read sync from: fall back to
-      // the CMAF object-id rule.
+      // rawBoxes media (§9): the chunk is carried verbatim, often because its
+      // moof falls outside the LOCMAF field model. Read its samples leniently
+      // (any decodable moof+mdat, not only what the encoder could have carried
+      // as a header). A chunk whose samples cannot be placed has no header to
+      // read sync from: fall back to the CMAF object-id rule and report why.
       try {
-        const parsed = parseCmafChunk(result.bytes, decoder.context);
-        if (parsed.fits) {
-          const first = parsed.effective.flags[0];
-          return {
-            bytes: result.bytes,
-            sync: first !== undefined && isSyncSampleFlags(first),
-            chunk: {
-              effective: parsed.effective,
-              mdat: parsed.mdat,
-              genBoxes: parsed.genBoxes,
-              timescale: decoder.context.timescale,
-              baseMediaDecodeTime: parsed.effective.baseMediaDecodeTime,
-            },
-          };
-        }
+        const read = readCmafChunkSamples(result.bytes, decoder.context);
+        const first = read.effective.flags[0];
+        return {
+          bytes: result.bytes,
+          sync: first !== undefined && isSyncSampleFlags(first),
+          chunk: {
+            effective: read.effective,
+            mdat: read.mdat,
+            genBoxes: read.genBoxes,
+            timescale: decoder.context.timescale,
+            baseMediaDecodeTime: read.effective.baseMediaDecodeTime,
+          },
+        };
       } catch (err) {
         if (!(err instanceof LocmafFormatError)) throw err;
+        return { bytes: result.bytes, sync: objectId <= 1n, rawError: err.message };
       }
-      return { bytes: result.bytes, sync: objectId <= 1n };
     }
     return {
       bytes: result.bytes,
@@ -1490,8 +1489,8 @@ export class MoqtPlayer {
       this._stats.recordLocmafObjectRejected();
       if (!this.locmafWarned.has(`raw:${trackName}`)) {
         this.locmafWarned.add(`raw:${trackName}`);
-        this.log.warn('[LOCMAF] "%s" (%s): rawBoxes object g=%s o=%s is not a CMAF chunk; dropped on the frame path',
-          trackName, mediaType, String(groupId), String(obj.objectId));
+        this.log.warn('[LOCMAF] "%s" (%s): rawBoxes object g=%s o=%s carries no decodable chunk; dropped on the frame path: %s',
+          trackName, mediaType, String(groupId), String(obj.objectId), decoded.rawError ?? 'unknown');
       }
       return;
     }
