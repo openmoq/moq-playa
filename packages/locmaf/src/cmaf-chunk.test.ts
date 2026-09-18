@@ -124,6 +124,18 @@ describe('parseCmafChunk', () => {
         expect(parsed.mdat).toEqual(Uint8Array.of(1, 2, 3));
     });
 
+    it('carries a pre-moof uuid box as a genBox with the usertype leading the payload (section 8.1)', () => {
+        const usertype = new Uint8Array(16).map((_, i) => 0xa0 + i);
+        const uuid = isoBox('uuid', usertype, Uint8Array.of(42));
+        const chunk = buildChunk({ bmdt: 0, preMoof: [uuid], samples: [{ duration: 1, size: 3, flags: 0 }], mdat: Uint8Array.of(1, 2, 3) });
+        const parsed = parseCmafChunk(chunk, video);
+        expect(parsed.fits).toBe(true);
+        if (!parsed.fits) return;
+        expect(parsed.genBoxes.map((b) => b.type)).toEqual(['uuid']);
+        expect(parsed.genBoxes[0]!.payload).toEqual(uuid.subarray(8));
+        expect(parsed.genBoxes[0]!.payload.subarray(0, 16)).toEqual(usertype);
+    });
+
     it('reports chunks outside the LOCMAF field model', () => {
         const sample = [{ duration: 1, size: 1, flags: 0 }];
         const cases: Array<[string, Uint8Array]> = [

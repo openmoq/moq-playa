@@ -23,7 +23,7 @@ import { ObjectStatus, varint } from '@moqt/transport';
 import type { ClockSource } from '@moqt/playback';
 import { LocmafEncoder, LocmafGroupState, parseLocmafTrackContext, serializeLocmafObject, ticksToMicros } from '@moqt/locmaf';
 import { NON_SYNC_FLAGS, SYNC_FLAGS, buildChunk, cencVideoInit, videoInit } from '../../locmaf/test-support/cmaf.js';
-import { concat } from '../../locmaf/test-support/bytes.js';
+import { concat, isoBox } from '../../locmaf/test-support/bytes.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const VECTORS = join(here, '..', '..', '..', 'conformance', 'media', 'vectors', 'locmaf');
@@ -134,6 +134,45 @@ const IDR = nal(5, 0x88, 0x84);
 const P_SLICE = nal(1, 0x9a, 0x10);
 
 describe('LOCMAF frame-path regressions', () => {
+  it.each([false, true])('decodes rawBoxes media with a pre-moof uuid (uuid=%s)', async (withUuid) => {
+    const init = videoInit();
+    const h = await bootPlayer(
+      cmsfCatalog([{ ...LOCMAF_VIDEO, initRef: 'v' }], [{ id: 'v', type: 'inline', data: b64(init) }]),
+      { locmafDecoding: 'frame' },
+    );
+    try {
+      const chunk = buildChunk({
+        bmdt: 90000,
+        samples: [
+          { duration: 3000, size: IDR.length, flags: SYNC_FLAGS },
+          { duration: 3000, size: P_SLICE.length, flags: NON_SYNC_FLAGS },
+        ],
+        mdat: concat(IDR, P_SLICE),
+        preMoof: withUuid ? [isoBox('uuid', new Uint8Array(16), Uint8Array.of(42))] : [],
+      });
+      if (withUuid) {
+        // §8: a pre-moof uuid is a genBox (usertype first in the payload), not a
+        // reason to fall back to rawBoxes. The chunk is still sent as rawBoxes
+        // below, which §9 permits for any chunk.
+        const encoded = new LocmafEncoder().encode(chunk, new LocmafGroupState(), parseLocmafTrackContext(init), false, 0n);
+        expect(encoded.kind).toBe('moof');
+        if (encoded.kind !== 'moof') return;
+        expect(encoded.genBoxes.map((b) => b.type)).toEqual(['uuid']);
+        expect(encoded.genBoxes[0]!.payload).toEqual(concat(new Uint8Array(16), Uint8Array.of(42)));
+      }
+      const alias = await h.reqIdFor('video');
+      sendLocmaf(h.adapter, alias, 5, 0, serializeLocmafObject({ kind: 'rawBoxes', boxes: chunk }));
+      for (let i = 0; i < 20; i++) {
+        h.advance(40);
+        h.player.tick();
+        await sleep(0);
+      }
+      expect(h.videoDecoder.decode).toHaveBeenCalledTimes(2);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
   it('decodes when the CMAF header comes from the subscribed init track', async () => {
     const init = videoInit();
     const h = await bootPlayer(

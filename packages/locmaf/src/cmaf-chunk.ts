@@ -51,12 +51,17 @@ export function parseCmafChunk(chunk: Uint8Array, context: LocmafTrackContext): 
     if (moofs.length !== 1) return outside(`chunk has ${moofs.length} moof boxes`);
     const moofIndex = top.indexOf(moofs[0]!);
     const moof = moofs[0]!;
-    const escaped = (b: IsoBoxHeader): boolean => b.headerSize !== 8 || view.getUint32(b.start) === 0;
+    // Size escapes (0 = to end of file, 1 = 64-bit largesize) fall outside the
+    // model (sections 8.3, 9.1). A uuid box is not an escape: its 16-byte
+    // usertype only widens the header the reader reports.
+    const escaped = (b: IsoBoxHeader): boolean => view.getUint32(b.start) < 2;
 
     const genBoxes: GenBox[] = [];
     for (const box of top.slice(0, moofIndex)) {
         if (box.type === 'mdat' || escaped(box)) return outside(`pre-moof box '${box.type}' cannot be a genBox`);
-        genBoxes.push({ type: box.type, payload: chunk.subarray(box.contentStart, box.end) });
+        // Section 8.1: the payload is everything after the 8-byte size + type
+        // header, so a uuid box's usertype leads its payload.
+        genBoxes.push({ type: box.type, payload: chunk.subarray(box.start + 8, box.end) });
     }
     const mdat = top[moofIndex + 1];
     if (mdat?.type !== 'mdat' || escaped(mdat)) return outside('moof is not followed by a 32-bit mdat');
