@@ -22,6 +22,7 @@ stryker.*.conf.json
 scripts/debug-playback.mjs
 release/
 
+docs/superpowers/
 graphify-out/*
 graphify-work/*
 !graphify-out/graph.html
