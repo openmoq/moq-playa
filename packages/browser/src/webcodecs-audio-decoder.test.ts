@@ -21,6 +21,8 @@ describe('WebCodecsAudioDecoder', () => {
     decodeQueueSize: number;
     output: (data: unknown) => void;
     error: (error: DOMException) => void;
+    lastConfig?: AudioDecoderConfig;
+    decoded: unknown[];
   }>;
 
   beforeEach(() => {
@@ -32,6 +34,8 @@ describe('WebCodecsAudioDecoder', () => {
       decodeQueueSize = 0;
       readonly output: (data: unknown) => void;
       readonly error: (error: DOMException) => void;
+      lastConfig: AudioDecoderConfig | undefined;
+      decoded: unknown[] = [];
 
       constructor(init: { output: (data: unknown) => void; error: (error: DOMException) => void }) {
         this.output = init.output;
@@ -39,11 +43,13 @@ describe('WebCodecsAudioDecoder', () => {
         createdDecoders.push(this);
       }
 
-      configure(): void {
+      configure(config: AudioDecoderConfig): void {
         this.state = 'configured';
+        this.lastConfig = config;
       }
 
       decode(chunk: unknown): void {
+        this.decoded.push(chunk);
         decodeSpy(chunk);
       }
 
@@ -64,9 +70,9 @@ describe('WebCodecsAudioDecoder', () => {
   });
 
   /** Opus (non-AAC) sidesteps ADTS wrapping — payload bytes are irrelevant here. */
-  function configuredDecoder(): WebCodecsAudioDecoder {
+  function configuredDecoder(codec = 'opus', config: Uint8Array = new Uint8Array(0)): WebCodecsAudioDecoder {
     const decoder = new WebCodecsAudioDecoder();
-    decoder.configure(new Uint8Array(0), 'opus', 48000, 2);
+    decoder.configure(config, codec, 48000, 2);
     return decoder;
   }
 
@@ -162,5 +168,22 @@ describe('WebCodecsAudioDecoder', () => {
     expect(decodeSpy).toHaveBeenCalledOnce();
     createdDecoders[1]!.output({});
     expect(received).toEqual([200]);
+  });
+
+  describe('WebCodecsAudioDecoder — Audio Config description', () => {
+    it('passes non-empty config bytes as description and skips ADTS wrapping', () => {
+      const desc = Uint8Array.from([0x12, 0x10]);
+      const decoder = configuredDecoder('mp4a.40.2', desc);
+      const mock = createdDecoders[0]!;
+      expect(mock.lastConfig?.description).toEqual(desc);
+      decoder.decode({ type: 'key', timestamp: 0, data: Uint8Array.from([0xaa, 0xbb]) }, 0);
+      expect((mock.decoded[0] as { data: Uint8Array })?.data).toEqual(Uint8Array.from([0xaa, 0xbb]));
+    });
+
+    it('empty config keeps ADTS mode for AAC', () => {
+      configuredDecoder('mp4a.40.2', new Uint8Array(0));
+      const mock = createdDecoders[0]!;
+      expect(mock.lastConfig?.description).toBeUndefined();
+    });
   });
 });

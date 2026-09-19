@@ -45,6 +45,7 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
   private lastCodec = '';
   private lastSampleRate = 48000;
   private lastChannels = 2;
+  private lastDescription: Uint8Array | null = null;
 
   /** Whether the codec is AAC (needs ADTS wrapping). */
   private isAAC = false;
@@ -63,7 +64,7 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
   // ─── AudioDecoderLike ───────────────────────────────────────────
 
   /**
-   * Configure the decoder with codec metadata from MSF catalog.
+   * Configure the decoder with codec metadata from the MSF catalog or a LOC Audio Config property.
    *
    * For AAC codecs, configures in ADTS mode (no description) because
    * Chrome's platform decoders (AudioToolbox on macOS, Media Foundation
@@ -79,11 +80,16 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
    * @see draft-ietf-moq-msf-00 §5.1.26 (channelConfig)
    * @see W3C AAC WebCodecs Registration §2 (ADTS mode)
    */
-  configure(_config: Uint8Array, codec: string, sampleRate?: number, channels?: number): void {
+  configure(config: Uint8Array, codec: string, sampleRate?: number, channels?: number): void {
     this.lastCodec = codec;
     this.lastSampleRate = sampleRate ?? 48000;
     this.lastChannels = channels ?? 2;
-    this.isAAC = codec.startsWith('mp4a.');
+    this.lastDescription = config.length > 0 ? config : null;
+    // AAC without a description runs in ADTS mode (client-side framing).
+    // With an Audio Config description the payload is raw access units.
+    // @see draft-ietf-moq-loc-04 §2.3.3.1
+    // @see W3C AAC WebCodecs Registration §2
+    this.isAAC = codec.startsWith('mp4a.') && this.lastDescription === null;
     this.errorCount = 0;
 
     this.createDecoder();
@@ -200,6 +206,7 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
       codec: this.lastCodec,
       sampleRate: this.lastSampleRate,
       numberOfChannels: this.lastChannels,
+      ...(this.lastDescription ? { description: this.lastDescription } : {}),
     };
 
     this.decoder.configure(audioConfig);

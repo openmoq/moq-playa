@@ -2046,3 +2046,31 @@ describe('PlaybackPipeline', () => {
         });
     });
 });
+
+describe('PlaybackPipeline — LOC-04 Audio Config', () => {
+    it('emits configure once for repeated identical audioConfig', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, commands } = createPipeline({ mediaType: 'audio', clock });
+        const cfg = Uint8Array.from([0x12, 0x10]);
+        pipeline.pushObject(makeData(0, 0), { captureTimestamp: 0n, audioConfig: cfg });
+        pipeline.pushObject(makeData(1, 0), { captureTimestamp: 20_000n, audioConfig: Uint8Array.from(cfg) });
+        pipeline.tick();
+        const configures = commands.filter(c => c.type === 'configure');
+        expect(configures).toHaveLength(1);
+        expect(configures[0]).toEqual({ type: 'configure', mediaType: 'audio', config: cfg });
+    });
+
+    it('a video pipeline ignores audioConfig', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, commands } = createPipeline({ mediaType: 'video', clock });
+        pipeline.pushObject(makeData(0, 0), {
+            captureTimestamp: 0n,
+            audioConfig: Uint8Array.from([1]),
+            videoFrameMarking: { startOfFrame: true, endOfFrame: true, independent: true, discardable: false, baseLayerSync: false, temporalId: 0 },
+        });
+        pipeline.tick();
+        expect(commands.filter(c => c.type === 'configure')).toHaveLength(0);
+    });
+});

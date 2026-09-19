@@ -745,14 +745,17 @@ export class PlaybackPipeline {
         const headers = this.headerMap.get(key) ?? {};
         this.headerMap.delete(key);
 
-        // 1. Configure decoder if videoConfig present
-        if (headers.videoConfig) {
-            const configDecision = this.decoderState.configure(headers.videoConfig);
+        // 1. Configure decoder if the object carries codec config for this
+        //    media type. DecoderStateMachine.configure dedupes equal bytes.
+        //    @see draft-ietf-moq-loc-04 §2.3.2.1 (Video Config), §2.3.3.1 (Audio Config)
+        const config = this.mediaType === 'video' ? headers.videoConfig : headers.audioConfig;
+        if (config) {
+            const configDecision = this.decoderState.configure(config);
             if (configDecision.action === 'configure') {
                 this.onCommand({
                     type: 'configure',
                     mediaType: this.mediaType,
-                    config: headers.videoConfig,
+                    config,
                 });
             }
         }
