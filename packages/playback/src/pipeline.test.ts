@@ -2024,6 +2024,9 @@ describe('PlaybackPipeline', () => {
             const a = createPipeline({ mediaType: 'audio', clock: clockA });
             const b = createPipeline({ mediaType: 'audio', clock: clockB });
 
+            a.pipeline.configure(new Uint8Array([0x01]));
+            b.pipeline.configure(new Uint8Array([0x01]));
+
             for (let i = 0; i < 3; i++) {
                 a.pipeline.pushObject(makeData(i, 0), { captureTimestamp: BigInt(i) * 20_000n, timestampIsWallClock: true });
                 b.pipeline.pushObject(makeData(i, 0), {
@@ -2038,6 +2041,7 @@ describe('PlaybackPipeline', () => {
 
             const renderA = a.commands.filter(c => c.type === 'decode_audio').map(c => c.renderTimeUs);
             const renderB = b.commands.filter(c => c.type === 'decode_audio').map(c => c.renderTimeUs);
+            expect(renderA.length).toBe(3);
             expect(renderB).toEqual(renderA);
         });
     });
