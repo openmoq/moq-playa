@@ -91,7 +91,7 @@ player.play();
 `VideoDecoder.isConfigSupported()` is checked before configuring each codec. When a codec is unsupported the decoder shuts down cleanly — no decode-error loops, no frozen frames.
 
 **Decode paths:**
-- **LOC (Low Overhead Container)** — WebCodecs direct path, lowest latency. H.264, HEVC, AV1.
+- **LOC (Low Overhead Container)** — WebCodecs direct path, lowest latency. H.264, HEVC, AV1. Parses LOC-04 and LOC-01 properties; emits LOC-04 by default.
 - **CMAF (fragmented MP4)** — MSE + `<video>` path, broader compatibility.
 
 ---
@@ -241,7 +241,8 @@ player.on('catch_up_changed', ({ active, rate, latencyMs }) => { ... });
 - **draft-ietf-moq-transport-16** — default supported transport draft
 - **draft-ietf-moq-transport-14** — Red5/moq-rs interop (`draftVersion: 14`)
 - **draft-ietf-moq-msf-00** — Catalog, track selection, ABR (`altGroup`), timeline
-- **draft-ietf-moq-loc-01** — Low Overhead Container (CaptureTimestamp, VideoFrameMarking)
+- **draft-ietf-moq-loc-04** — Low Overhead Container (Timestamp + Timescale, Video Frame Marking, Audio Config); default on encode
+- **draft-ietf-moq-loc-01** — Low Overhead Container (CaptureTimestamp, VideoFrameMarking); auto-detected on parse, `locVersion: 1` to emit
 - **draft-ietf-moq-cmsf-00** — CMAF Streaming Format (moof+mdat, MSE path)
 
 ### Draft version selection

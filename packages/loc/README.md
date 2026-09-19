@@ -4,7 +4,7 @@
 
 # @moqt/loc
 
-Low Overhead Media Container (LOC) codec for Media over QUIC (MoQ): parses and builds LOC header extensions and yields WebCodecs-ready media chunks.
+Low Overhead Media Container (LOC) codec for Media over QUIC (MoQ): parses draft-04 and draft-01 LOC properties, emits either, and yields WebCodecs-ready media chunks.
 
 Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implementation of Media over QUIC (MoQ). See the [project README](https://github.com/openmoq/moq-playa#readme) for architecture and API documentation.
 
