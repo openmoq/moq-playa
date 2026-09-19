@@ -49,14 +49,19 @@ export interface MediaPublishConnection {
 
 export interface VideoChunkMeta {
   isKeyframe: boolean;
-  /** Capture timestamp in microseconds (WebCodecs chunk timestamp). */
+  /**
+   * WebCodecs chunk timestamp in microseconds. Its base is browser-defined
+   * (and may differ between the audio and video tracks), so the publisher
+   * rebases it per track to Unix-epoch microseconds before it goes on the
+   * wire as the LOC Timestamp. @see draft-ietf-moq-loc-04 §2.3.1.1
+   */
   timestampUs: number;
   /** Codec description (decoder config) to ride as the LOC videoConfig. */
   videoConfig?: Uint8Array;
 }
 
 export interface AudioChunkMeta {
-  /** Capture timestamp in microseconds (WebCodecs chunk timestamp). */
+  /** WebCodecs chunk timestamp in microseconds; rebased like {@link VideoChunkMeta.timestampUs}. */
   timestampUs: number;
 }
 
@@ -69,6 +74,12 @@ export interface MediaPublisherOptions {
   draft: DraftVersion;
   /** LOC draft to emit: 4 (default) or 1 for LOC-01-only subscribers. */
   locVersion?: LocVersion;
+  /**
+   * Wall clock in microseconds since the Unix epoch, used to anchor each
+   * track's first chunk timestamp. Injectable for tests. Default:
+   * `() => Date.now() * 1000`.
+   */
+  wallClockUs?: () => number;
   /** Failure sink — publication errors are contained, never unhandled. */
   onError?: (context: string, err: unknown) => void;
   /** Counter sink for UI updates: called after each published object. */
@@ -105,6 +116,10 @@ export class MediaPublisher {
   private readonly wrapInt: (n: bigint) => unknown;
   private readonly draft: DraftVersion;
   private readonly locVersion: LocVersion;
+  private readonly wallClockUs: () => number;
+  /** Per-track offset from the WebCodecs timestamp base to the wall clock, fixed at each track's first chunk. */
+  private videoTsOffsetUs: number | null = null;
+  private audioTsOffsetUs: number | null = null;
   private readonly onError: (context: string, err: unknown) => void;
   private readonly onCounts: ((v: number, a: number) => void) | null;
   private readonly videoQueueMax: number;
@@ -154,6 +169,7 @@ export class MediaPublisher {
     this.wrapInt = options.wrapInt;
     this.draft = options.draft;
     this.locVersion = options.locVersion ?? 4;
+    this.wallClockUs = options.wallClockUs ?? (() => Date.now() * 1000);
     this.onError = options.onError ?? (() => {});
     this.onCounts = options.onCounts ?? null;
     this.videoQueueMax = options.videoQueueMax ?? 60;
@@ -330,9 +346,26 @@ export class MediaPublisher {
     return { wireProfile: locWireProfileForDraft(this.draft), locVersion: this.locVersion };
   }
 
+  /**
+   * Rebase a WebCodecs chunk timestamp to Unix-epoch microseconds. The first
+   * chunk of each track is anchored to the wall clock; later chunks keep
+   * their spacing relative to it. Audio and video get independent anchors
+   * because the browser may hand them timestamps on different bases.
+   * @see draft-ietf-moq-loc-04 §2.3.1.1 (Timestamp without Timescale = µs since epoch)
+   */
+  private toWallClockUs(track: 'video' | 'audio', timestampUs: number): bigint {
+    const key = track === 'video' ? 'videoTsOffsetUs' : 'audioTsOffsetUs';
+    let offset = this[key];
+    if (offset === null) {
+      offset = this.wallClockUs() - timestampUs;
+      this[key] = offset;
+    }
+    return BigInt(Math.round(timestampUs + offset));
+  }
+
   private videoExtensions(meta: VideoChunkMeta): Uint8Array | undefined {
     return encodeLocHeaders({
-      captureTimestamp: BigInt(Math.round(meta.timestampUs)),
+      captureTimestamp: this.toWallClockUs('video', meta.timestampUs),
       videoFrameMarking: {
         independent: meta.isKeyframe,
         discardable: !meta.isKeyframe,
@@ -389,7 +422,7 @@ export class MediaPublisher {
 
   private async sendAudioChunk(data: Uint8Array, meta: AudioChunkMeta, groupId: bigint): Promise<void> {
     const extensions = encodeLocHeaders({
-      captureTimestamp: BigInt(Math.round(meta.timestampUs)),
+      captureTimestamp: this.toWallClockUs('audio', meta.timestampUs),
     }, this.locOptions());
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.

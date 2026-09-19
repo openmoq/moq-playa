@@ -389,7 +389,7 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
   it('draft-18 LOC extensions use the vi64 profile: they parse as d18 and are NOT d16 bytes', async () => {
     const timestampUs = Date.now() * 1000; // a current capture timestamp
     const conn18 = recordingConnection();
-    const pub18 = makePublisher(conn18, { draft: 18 });
+    const pub18 = makePublisher(conn18, { draft: 18, wallClockUs: () => timestampUs });
     pub18.setVideoAlias(2n);
     pub18.publishVideo(chunk(7), { isKeyframe: true, timestampUs });
     await settle();
@@ -403,7 +403,7 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
     // The same publisher under draft 16 emits DIFFERENT bytes (QUIC-varint
     // profile) — proving the profile is draft-bound, not fixed.
     const conn16 = recordingConnection();
-    const pub16 = makePublisher(conn16, { draft: 16 });
+    const pub16 = makePublisher(conn16, { draft: 16, wallClockUs: () => timestampUs });
     pub16.setVideoAlias(2n);
     pub16.publishVideo(chunk(7), { isKeyframe: true, timestampUs });
     await settle();
@@ -411,6 +411,56 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
     expect(Buffer.from(ext16!).equals(Buffer.from(ext!))).toBe(false);
     const parsed16 = parseLocHeaders(ext16, { wireProfile: locWireProfileForDraft(16) });
     expect(parsed16.captureTimestamp).toBe(BigInt(Math.round(timestampUs)));
+  });
+});
+
+describe('MediaPublisher — timestamps are rebased per track to wall-clock microseconds', () => {
+  // WebCodecs chunk timestamps from getUserMedia are not Unix-epoch based, and
+  // Chrome can hand audio and video timestamps on DIFFERENT bases. LOC's
+  // Timestamp without a Timescale is microseconds since the Unix epoch
+  // (draft-ietf-moq-loc-04 §2.3.1.1), so each track is anchored to the wall
+  // clock at its first chunk and offsets are preserved after that.
+  it('anchors each track to the wall clock at its first chunk and keeps intra-track spacing', async () => {
+    const wallUs = 1_800_000_000_000_000; // a fixed "now" so the test is deterministic
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { wallClockUs: () => wallUs });
+    pub.setVideoAlias(2n);
+    pub.setAudioAlias(3n);
+
+    pub.publishVideo(chunk(1), { isKeyframe: true, timestampUs: 208_027_000_000 }); // boot-relative base
+    pub.publishVideo(chunk(2), { isKeyframe: false, timestampUs: 208_027_033_333 });
+    pub.publishAudio(chunk(3), { timestampUs: 107_000_000 }); // audio-context-relative base
+    pub.publishAudio(chunk(4), { timestampUs: 107_020_000 });
+    await settle();
+
+    const ts = (i: number) => parseLocHeaders(conn.sends[i]!.extensions).captureTimestamp;
+    const video = conn.sends.filter((s) => s.payload[0] === 1 || s.payload[0] === 2);
+    const audio = conn.sends.filter((s) => s.payload[0] === 3 || s.payload[0] === 4);
+    expect(video).toHaveLength(2);
+    expect(audio).toHaveLength(2);
+
+    const v0 = parseLocHeaders(video[0]!.extensions).captureTimestamp!;
+    const v1 = parseLocHeaders(video[1]!.extensions).captureTimestamp!;
+    const a0 = parseLocHeaders(audio[0]!.extensions).captureTimestamp!;
+    const a1 = parseLocHeaders(audio[1]!.extensions).captureTimestamp!;
+    expect(v0).toBe(BigInt(wallUs));
+    expect(a0).toBe(BigInt(wallUs));
+    expect(v1 - v0).toBe(33_333n);
+    expect(a1 - a0).toBe(20_000n);
+    void ts;
+  });
+
+  it('defaults the wall clock to Date.now() in microseconds', async () => {
+    const before = Date.now() * 1000;
+    const conn = recordingConnection();
+    const pub = makePublisher(conn);
+    pub.setAudioAlias(3n);
+    pub.publishAudio(chunk(0), { timestampUs: 42 });
+    await settle();
+    const after = Date.now() * 1000;
+    const ts = parseLocHeaders(conn.sends[0]!.extensions).captureTimestamp!;
+    expect(ts >= BigInt(before)).toBe(true);
+    expect(ts <= BigInt(after)).toBe(true);
   });
 });
 
