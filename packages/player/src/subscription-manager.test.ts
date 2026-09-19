@@ -730,7 +730,7 @@ describe('SubscriptionManager', () => {
         startOfFrame: true, endOfFrame: true, independent: true,
         discardable: false, baseLayerSync: false, temporalId: 0,
       }},
-      { deltaEncoded: false },
+      { deltaEncoded: false, locVersion: 1 },
     );
     const obj = createMockObject({ trackAlias: varint(1), extensions });
     await mgr.routeObject(0n, obj);
