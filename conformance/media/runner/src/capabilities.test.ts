@@ -8,11 +8,11 @@ const allEntries: CorpusEntry[] = CORPUS_DOMAINS.flatMap((d) => loadDomain(d).ve
 describe('capability accounting (no silent skips)', () => {
   it('every corpus vector is executable — nothing deferred or unsupported', () => {
     const counts = tallyCapabilities(allEntries);
-    // executable = properties(33) + loc-properties(28) + loc-semantics(4)
-    //            + catalog(55) + bmff(7) = 127.
-    expect(counts.executable).toBe(127);
+    // executable = properties(33) + loc-properties(47) + loc-semantics(4)
+    //            + catalog(55) + bmff(7) = 146.
+    expect(counts.executable).toBe(146);
     expect(counts.forwardLooking).toBe(0);
-    expect(counts.executable + counts.forwardLooking).toBe(127);
+    expect(counts.executable + counts.forwardLooking).toBe(146);
   });
 
   it('no vector is forward-looking: every format the corpus names has an implementation', () => {

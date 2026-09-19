@@ -8,7 +8,14 @@
  * @module
  */
 
-import { parseLocHeaders, encodeLocHeaders, resolveLocHeaders, type LocHeaders } from '@moqt/loc';
+import {
+  parseLocHeaders,
+  encodeLocHeaders,
+  resolveLocHeaders,
+  LocHeaderError,
+  LocEncodeError,
+  type LocHeaders,
+} from '@moqt/loc';
 import { PropertyWireError } from '@moqt/transport';
 import { toHex } from './canonical.js';
 import type { ExecResult } from './exec-compare.js';
@@ -20,7 +27,11 @@ export type LocRunResult = ExecResult;
 /** Canonical projection of parsed LocHeaders (wide ints as decimal strings). */
 export function locProjection(h: LocHeaders): unknown {
   const out: Record<string, unknown> = {};
+  if (h.version !== undefined) out['version'] = h.version;
   if (h.captureTimestamp !== undefined) out['captureTimestamp'] = h.captureTimestamp.toString(10);
+  if (h.timestamp !== undefined) out['timestamp'] = h.timestamp.toString(10);
+  if (h.timescale !== undefined) out['timescale'] = h.timescale.toString(10);
+  if (h.timestampIsWallClock !== undefined) out['timestampIsWallClock'] = h.timestampIsWallClock;
   if (h.videoFrameMarking !== undefined) {
     const v = h.videoFrameMarking;
     const vfm: Record<string, unknown> = {
@@ -32,12 +43,14 @@ export function locProjection(h: LocHeaders): unknown {
       temporalId: v.temporalId,
     };
     if (v.layerId !== undefined) vfm['layerId'] = v.layerId;
+    if (v.tl0PicIdx !== undefined) vfm['tl0PicIdx'] = v.tl0PicIdx;
     out['videoFrameMarking'] = vfm;
   }
   if (h.audioLevel !== undefined) {
     out['audioLevel'] = { voiceActivity: h.audioLevel.voiceActivity, level: h.audioLevel.level };
   }
   if (h.videoConfig !== undefined) out['videoConfig'] = toHex(h.videoConfig);
+  if (h.audioConfig !== undefined) out['audioConfig'] = toHex(h.audioConfig);
   if (h.unknown !== undefined) {
     out['unknown'] = [...h.unknown.entries()].map(([id, val]) => ({
       id: id.toString(10),
@@ -54,6 +67,10 @@ export function categorizeLocError(err: unknown): string {
   // odd-value-too-long, delta-overflow, …). PropertyWireError extends RangeError,
   // so it must be checked first.
   if (err instanceof PropertyWireError) return err.category;
+  // A LOC semantic violation (e.g. Timescale 0) — malformed for the reader.
+  if (err instanceof LocHeaderError) return 'loc-malformed';
+  // A header set that has no representation under the requested LOC version.
+  if (err instanceof LocEncodeError) return 'loc-unrepresentable';
   // A varint/vi64 that runs off the end of the buffer.
   if (err instanceof RangeError) return 'truncated';
   // Any other error from the parser is an unexpected crash — surface it.
@@ -89,14 +106,16 @@ export function runLocSemantics(propertyMap: readonly PropertyMapEntryJson[]): L
  * emits the correct vi64 form; a draft-16 target above the QUIC-varint range is a
  * typed value-out-of-range error.
  */
-export function runLocEncode(propertyMap: readonly PropertyMapEntryJson[], wireProfile: WireProfile): LocRunResult {
-  const headers: { -readonly [K in keyof LocHeaders]: LocHeaders[K] } = {};
-  for (const e of propertyMap) {
-    if (e.id === '2' && e.valueKind === 'varint') headers.captureTimestamp = BigInt(e.value);
-    // (only Capture Timestamp is needed for the current encode drivers)
-  }
+export function runLocEncode(
+  propertyMap: readonly PropertyMapEntryJson[],
+  wireProfile: WireProfile,
+  locVersion: 1 | 4 = 1,
+): LocRunResult {
+  // The input map is interpreted under the same version it will be emitted
+  // in, so the corpus can drive both dialects from ids alone.
+  const headers = resolveLocHeaders(entriesFromJson(propertyMap));
   try {
-    const bytes = encodeLocHeaders(headers, locOptionsFor(wireProfile)) ?? new Uint8Array(0);
+    const bytes = encodeLocHeaders(headers, { wireProfile, locVersion }) ?? new Uint8Array(0);
     return { status: 'ok', bytesHex: toHex(bytes) };
   } catch (err) {
     return { status: 'error', category: categorizeLocError(err) };

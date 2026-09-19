@@ -47,6 +47,7 @@ const DRAFT_SHA: Record<string, string> = {
   'draft-ietf-moq-transport-16': '2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18',
   'draft-ietf-moq-transport-18': '9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6',
   'draft-ietf-moq-loc-01': '2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f',
+  'draft-ietf-moq-loc-04': 'fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47',
   'draft-ietf-moq-msf-00': '55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f',
   'draft-ietf-moq-msf-01': 'c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af',
   'draft-ietf-moq-cmsf-00': '8dee5af3d6c028a3be8e808ac2afcf50f4aeaf6074a39f6804b2385814a68a86',
@@ -357,12 +358,12 @@ function buildLocSemantics(): void {
   // Authored Layer-B contract literals (independent of the impl).
   mk('loc/sem-all-four',
     [{ id: 2n, value: 42n }, { id: 4n, value: 0x20n }, { id: 6n, value: 0x7fn }, { id: 13n, value: Uint8Array.from([0x01, 0x02, 0x03]) }],
-    { captureTimestamp: '42', videoFrameMarking: VFM_INDEPENDENT, audioLevel: { voiceActivity: false, level: 127 }, videoConfig: '010203' },
+    { version: 1, captureTimestamp: '42', timestamp: '42', timestampIsWallClock: true, videoFrameMarking: VFM_INDEPENDENT, audioLevel: { voiceActivity: false, level: 127 }, videoConfig: '010203' },
     'LOC-01 interpretation of all four known properties from a structured PropertyMap.', 'normative');
 
   mk('loc/sem-duplicate-last-wins',
     [{ id: 2n, value: 100n }, { id: 2n, value: 200n }],
-    { captureTimestamp: '200' },
+    { version: 1, captureTimestamp: '200', timestamp: '200', timestampIsWallClock: true },
     'Duplicate Capture Timestamp: current behavior silently keeps the LAST value (regression pin of the Layer-B policy the resolver must reproduce).', 'regression');
 
   mk('loc/sem-unknown-full-width-id',
@@ -373,7 +374,7 @@ function buildLocSemantics(): void {
 
   mk('loc/sem-audio-level-high-bits',
     [{ id: 6n, value: 0x1ffn }],
-    { audioLevel: { voiceActivity: true, level: 127 } },
+    { version: 1, audioLevel: { voiceActivity: true, level: 127 } },
     'Audio Level value 0x1FF: current behavior silently masks to the low 8 bits (level 127, voice active) — regression pin.', 'regression');
 }
 
@@ -409,14 +410,14 @@ function buildLocProperties(): void {
   };
 
   // 8 correct d16 decodes (Playa handles d16 → no divergence).
-  decode('loc/props-capture-ts-zero', [{ id: 2n, value: 0n }], 'd16-delta-varint', { captureTimestamp: '0' }, 'Capture Timestamp of 0.', 'normative', 'props_ts_zero.bin');
-  decode('loc/props-capture-ts-above-2p53', [{ id: 2n, value: 9007199254740993n }], 'd16-delta-varint', { captureTimestamp: '9007199254740993' }, 'Capture Timestamp above 2^53-1 (Number-safety probe); kept exact as bigint.', 'normative', 'props_ts_above_2p53.bin');
-  decode('loc/props-capture-ts-max62', [{ id: 2n, value: 4611686018427387903n }], 'd16-delta-varint', { captureTimestamp: '4611686018427387903' }, 'Capture Timestamp at the QUIC-varint maximum (2^62-1).', 'normative', 'props_ts_max62.bin');
-  decode('loc/props-vfm-varint', [{ id: 4n, value: 0x20n }], 'd16-delta-varint', { videoFrameMarking: VFM_INDEPENDENT }, 'Video Frame Marking (RFC 9626) independent-frame bit set.', 'normative', 'props_vfm.bin');
-  decode('loc/props-audio-level', [{ id: 6n, value: 0x7fn }], 'd16-delta-varint', { audioLevel: { voiceActivity: false, level: 127 } }, 'Audio Level (RFC 6464) magnitude 127, no voice activity.', 'normative', 'props_audio.bin');
+  decode('loc/props-capture-ts-zero', [{ id: 2n, value: 0n }], 'd16-delta-varint', { version: 1, captureTimestamp: '0', timestamp: '0', timestampIsWallClock: true }, 'Capture Timestamp of 0.', 'normative', 'props_ts_zero.bin');
+  decode('loc/props-capture-ts-above-2p53', [{ id: 2n, value: 9007199254740993n }], 'd16-delta-varint', { version: 1, captureTimestamp: '9007199254740993', timestamp: '9007199254740993', timestampIsWallClock: true }, 'Capture Timestamp above 2^53-1 (Number-safety probe); kept exact as bigint.', 'normative', 'props_ts_above_2p53.bin');
+  decode('loc/props-capture-ts-max62', [{ id: 2n, value: 4611686018427387903n }], 'd16-delta-varint', { version: 1, captureTimestamp: '4611686018427387903', timestamp: '4611686018427387903', timestampIsWallClock: true }, 'Capture Timestamp at the QUIC-varint maximum (2^62-1).', 'normative', 'props_ts_max62.bin');
+  decode('loc/props-vfm-varint', [{ id: 4n, value: 0x20n }], 'd16-delta-varint', { version: 1, videoFrameMarking: VFM_INDEPENDENT }, 'Video Frame Marking (RFC 9626) independent-frame bit set.', 'normative', 'props_vfm.bin');
+  decode('loc/props-audio-level', [{ id: 6n, value: 0x7fn }], 'd16-delta-varint', { version: 1, audioLevel: { voiceActivity: false, level: 127 } }, 'Audio Level (RFC 6464) magnitude 127, no voice activity.', 'normative', 'props_audio.bin');
   decode('loc/props-video-config', [{ id: 13n, value: Uint8Array.from([0x01, 0x64, 0x00, 0x1f]) }], 'd16-delta-varint', { videoConfig: '0164001f' }, 'Video Config (odd id 13) length-prefixed codec extradata.', 'normative', 'props_vconfig.bin');
-  decode('loc/props-all-four', [{ id: 2n, value: 42n }, { id: 4n, value: 0x20n }, { id: 6n, value: 0x7fn }, { id: 13n, value: Uint8Array.from([0xaa, 0xbb]) }], 'd16-delta-varint', { captureTimestamp: '42', videoFrameMarking: VFM_INDEPENDENT, audioLevel: { voiceActivity: false, level: 127 }, videoConfig: 'aabb' }, 'All four known LOC-01 properties in one block.', 'normative', 'props_all_four.bin');
-  decode('loc/props-unknown-even-and-odd-skip', [{ id: 8n, value: 99n }, { id: 15n, value: Uint8Array.from([0xde, 0xad]) }], 'd16-delta-varint', { unknown: [{ id: '8', name: null, value: '99' }, { id: '15', name: null, value: 'dead' }] }, 'An unknown even id (8, varint) and unknown odd id (15, bytes) are preserved in the unknown map (each with an explicit null name).', 'normative', 'props_unknown.bin');
+  decode('loc/props-all-four', [{ id: 2n, value: 42n }, { id: 4n, value: 0x20n }, { id: 6n, value: 0x7fn }, { id: 13n, value: Uint8Array.from([0xaa, 0xbb]) }], 'd16-delta-varint', { version: 1, captureTimestamp: '42', timestamp: '42', timestampIsWallClock: true, videoFrameMarking: VFM_INDEPENDENT, audioLevel: { voiceActivity: false, level: 127 }, videoConfig: 'aabb' }, 'All four known LOC-01 properties in one block.', 'normative', 'props_all_four.bin');
+  decode('loc/props-unknown-even-and-odd-skip', [{ id: 0x20n, value: 99n }, { id: 0x21n, value: Uint8Array.from([0xde, 0xad]) }], 'd16-delta-varint', { unknown: [{ id: '32', name: null, value: '99' }, { id: '33', name: null, value: 'dead' }] }, 'An unknown even id (32, varint) and unknown odd id (33, bytes) are preserved in the unknown map (each with an explicit null name).', 'normative', 'props_unknown.bin');
 
   decodeErr('loc/props-err-truncated-varint', concat(varintB(2n), Uint8Array.from([0xc0])), 'truncated', 'The value varint (8-byte QUIC form) runs off the end.', 'props_err_truncated.bin');
   decodeErr('loc/props-err-length-overrun', concat(varintB(13n), varintB(10n), Uint8Array.from([0x01, 0x02])), 'length-overrun', 'An odd-id (Video Config) declares length 10 but only 2 value bytes remain.', 'props_err_overrun.bin');
@@ -431,7 +432,7 @@ function buildLocProperties(): void {
 
   // DECODE drivers: parseLocHeaders reads the vi64 block with the QUIC codec.
   for (const [label, v] of GE64) {
-    decode(`loc/props-d18-ts-${label}-diverges`, [{ id: 2n, value: v }], 'd18-delta-vi64', { captureTimestamp: v.toString(10) },
+    decode(`loc/props-d18-ts-${label}-diverges`, [{ id: 2n, value: v }], 'd18-delta-vi64', { version: 1, captureTimestamp: v.toString(10), timestamp: v.toString(10), timestampIsWallClock: true },
       `DECODE driver: a draft-18 (vi64) Capture Timestamp ${v} (>= 64, where vi64 and QUIC diverge) decodes correctly under the d18 profile. An earlier build read it with the QUIC codec and mis-decoded it; the id suffix records that origin.`,
       'normative', `props_d18_ts_${label}.bin`);
   }
@@ -448,6 +449,94 @@ function buildLocProperties(): void {
       input: { propertyMap: input },
       ...withDifferential({ status: 'ok', stage: 'encode', bytesHex: toHex(canonicalBlock([{ id: 2n, value: v }], 'd18-delta-vi64')) }, actual, REASON),
       expectationBasis: 'normative', provenance: specProv('draft-ietf-moq-loc-01', '2.3.1.1'),
+    });
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// LOC-04 PROPERTIES (A+B end-to-end) — executable
+// ════════════════════════════════════════════════════════════════════
+
+function buildLoc04Properties(): void {
+  const src = specProv('draft-ietf-moq-loc-04', '2.3');
+  const REASON = 'resolveLocHeaders accepts both LOC-01 and LOC-04 property sets in one pass.';
+  const VFM_KEY = { startOfFrame: true, endOfFrame: true, independent: true, discardable: false, baseLayerSync: false, temporalId: 0 };
+
+  const decode = (id: string, entries: PropEntry[], profile: WireProfile, expectSemantics: unknown, description: string, file: string): void => {
+    const bytes = encodeBlock(entries, profile);
+    const actual = runLocProperties(bytes, profile);
+    addEntry('loc', {
+      id, kind: 'loc-properties', profile: 'loc-04', wireProfile: profile, scope: 'object', description,
+      input: fileInput('loc', file, bytes),
+      ...withDifferential({ status: 'ok', stage: 'semantic', semantics: expectSemantics }, actual, REASON),
+      expectationBasis: 'normative', provenance: src,
+    });
+  };
+
+  for (const profile of ['d14-absolute-varint', 'd16-delta-varint', 'd18-delta-vi64'] as const) {
+    const tag = profile.slice(0, 3);
+    decode(`loc/v4-ts-no-timescale-${tag}`, [{ id: 0x10n, value: 42n }], profile,
+      { version: 4, captureTimestamp: '42', timestamp: '42', timestampIsWallClock: true },
+      'LOC-04 Timestamp without Timescale is microseconds since the Unix epoch.', `v4_ts_${tag}.bin`);
+    decode(`loc/v4-ts-90k-${tag}`, [{ id: 0x08n, value: 90_000n }, { id: 0x10n, value: 900_000n }], profile,
+      { version: 4, captureTimestamp: '10000000', timestamp: '900000', timescale: '90000', timestampIsWallClock: false },
+      'LOC-04 Timestamp 900000 at Timescale 90000 derives 10 s of microseconds.', `v4_ts_90k_${tag}.bin`);
+    decode(`loc/v4-ts-48k-truncates-${tag}`, [{ id: 0x08n, value: 48_000n }, { id: 0x10n, value: 1n }], profile,
+      { version: 4, captureTimestamp: '20', timestamp: '1', timescale: '48000', timestampIsWallClock: false },
+      'LOC-04 Timescale derivation truncates toward zero (1/48000 s = 20.83 us).', `v4_ts_48k_${tag}.bin`);
+  }
+
+  decode('loc/v4-vfm-short', [{ id: 0x09n, value: Uint8Array.from([0xe0]) }], 'd16-delta-varint',
+    { version: 4, videoFrameMarking: VFM_KEY }, 'LOC-04 Video Frame Marking 1-byte short header.', 'v4_vfm_short.bin');
+  decode('loc/v4-vfm-long', [{ id: 0x09n, value: Uint8Array.from([0xe0, 0x02, 0x7f]) }], 'd16-delta-varint',
+    { version: 4, videoFrameMarking: { ...VFM_KEY, layerId: 2, tl0PicIdx: 127 } }, 'LOC-04 Video Frame Marking 3-byte long header with LID and TL0PICIDX.', 'v4_vfm_long.bin');
+  decode('loc/v4-audio-config', [{ id: 0x0fn, value: Uint8Array.from([0x12, 0x10]) }], 'd16-delta-varint',
+    { version: 4, audioConfig: '1210' }, 'LOC-04 Audio Config (AudioSpecificConfig for AAC-LC 44.1 kHz stereo).', 'v4_audio_config.bin');
+  decode('loc/v4-audio-level', [{ id: 0x0cn, value: 0x85n }], 'd16-delta-varint',
+    { version: 4, audioLevel: { voiceActivity: true, level: 5 } }, 'LOC-04 Audio Level at id 0x0C.', 'v4_audio_level.bin');
+  decode('loc/v4-all', [
+    { id: 0x08n, value: 1_000_000n }, { id: 0x09n, value: Uint8Array.from([0xe0]) }, { id: 0x0cn, value: 0x7fn },
+    { id: 0x0dn, value: Uint8Array.from([0xaa]) }, { id: 0x0fn, value: Uint8Array.from([0xbb]) }, { id: 0x10n, value: 5n },
+  ], 'd16-delta-varint',
+    { version: 4, captureTimestamp: '5', timestamp: '5', timescale: '1000000', timestampIsWallClock: false, videoFrameMarking: VFM_KEY, audioLevel: { voiceActivity: false, level: 127 }, videoConfig: 'aa', audioConfig: 'bb' },
+    'All six LOC-04 properties in one block.', 'v4_all.bin');
+  decode('loc/v4-mixed-01-ids-go-unknown', [{ id: 0x02n, value: 7n }, { id: 0x04n, value: 0x20n }, { id: 0x10n, value: 9n }], 'd16-delta-varint',
+    { version: 4, captureTimestamp: '9', timestamp: '9', timestampIsWallClock: true, unknown: [{ id: '2', name: null, value: '7' }, { id: '4', name: null, value: '32' }] },
+    'A block with both dialects resolves as LOC-04; LOC-01 ids are unregistered there and land in unknown.', 'v4_mixed.bin');
+
+  {
+    const bytes = encodeBlock([{ id: 0x08n, value: 0n }, { id: 0x10n, value: 1n }], 'd16-delta-varint');
+    const actual = runLocProperties(bytes, 'd16-delta-varint');
+    addEntry('loc', {
+      id: 'loc/v4-err-timescale-zero', kind: 'loc-properties', profile: 'loc-04', wireProfile: 'd16-delta-varint', scope: 'object',
+      description: 'A Timescale of 0 cannot define a unit; the block is malformed.',
+      input: fileInput('loc', 'v4_err_timescale_zero.bin', bytes),
+      ...withDifferential({ status: 'error', stage: 'semantic', error: { category: 'loc-malformed' } }, actual, REASON),
+      expectationBasis: 'normative', provenance: specProv('draft-ietf-moq-loc-04', '2.3.1.2'),
+    });
+  }
+
+  // Encode drivers: same input map, both target versions.
+  const encodeInput = propMapInput([{ id: 0x10n, value: 100n }]);
+  for (const [locVersion, expectedEntries] of [[4, [{ id: 0x10n, value: 100n }]], [1, [{ id: 0x02n, value: 100n }]]] as const) {
+    const actual = runLocEncode(encodeInput, 'd18-delta-vi64', locVersion);
+    addEntry('loc', {
+      id: `loc/v4-encode-as-v${locVersion}`, kind: 'loc-properties', profile: locVersion === 4 ? 'loc-04' : 'loc-01', wireProfile: 'd18-delta-vi64', scope: 'object',
+      description: `A LOC-04 Timestamp of 100 encoded for LOC-${locVersion} yields the canonical ${locVersion === 4 ? '0x10' : '0x02'} entry.`,
+      input: { propertyMap: encodeInput, locVersion },
+      ...withDifferential({ status: 'ok', stage: 'encode', bytesHex: toHex(canonicalBlock([...expectedEntries], 'd18-delta-vi64')) }, actual, REASON),
+      expectationBasis: 'normative', provenance: src,
+    });
+  }
+  {
+    const input = propMapInput([{ id: 0x0fn, value: Uint8Array.from([1]) }]);
+    const actual = runLocEncode(input, 'd16-delta-varint', 1);
+    addEntry('loc', {
+      id: 'loc/v4-encode-audio-config-as-v1-rejected', kind: 'loc-properties', profile: 'loc-01', wireProfile: 'd16-delta-varint', scope: 'object',
+      description: 'Audio Config has no LOC-01 representation; encoding for LOC-01 is a typed error, never a silent drop.',
+      input: { propertyMap: input, locVersion: 1 },
+      ...withDifferential({ status: 'error', stage: 'encode', error: { category: 'loc-unrepresentable' } }, actual, REASON),
+      expectationBasis: 'normative', provenance: src,
     });
   }
 }
@@ -1059,6 +1148,7 @@ function main(): void {
   buildProperties();
   buildLocSemantics();
   buildLocProperties();
+  buildLoc04Properties();
   buildCatalog();
   buildLibmoqImports();
   buildSpecMsf01();

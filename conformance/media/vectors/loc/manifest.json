@@ -37,7 +37,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
+          "version": 1,
           "captureTimestamp": "42",
+          "timestamp": "42",
+          "timestampIsWallClock": true,
           "videoFrameMarking": {
             "startOfFrame": false,
             "endOfFrame": false,
@@ -88,7 +91,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "200"
+          "version": 1,
+          "captureTimestamp": "200",
+          "timestamp": "200",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "regression",
@@ -160,6 +166,7 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
+          "version": 1,
           "audioLevel": {
             "voiceActivity": true,
             "level": 127
@@ -194,7 +201,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "0"
+          "version": 1,
+          "captureTimestamp": "0",
+          "timestamp": "0",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "normative",
@@ -225,7 +235,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "9007199254740993"
+          "version": 1,
+          "captureTimestamp": "9007199254740993",
+          "timestamp": "9007199254740993",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "normative",
@@ -256,7 +269,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "4611686018427387903"
+          "version": 1,
+          "captureTimestamp": "4611686018427387903",
+          "timestamp": "4611686018427387903",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "normative",
@@ -287,6 +303,7 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
+          "version": 1,
           "videoFrameMarking": {
             "startOfFrame": false,
             "endOfFrame": false,
@@ -325,6 +342,7 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
+          "version": 1,
           "audioLevel": {
             "voiceActivity": false,
             "level": 127
@@ -390,7 +408,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
+          "version": 1,
           "captureTimestamp": "42",
+          "timestamp": "42",
+          "timestampIsWallClock": true,
           "videoFrameMarking": {
             "startOfFrame": false,
             "endOfFrame": false,
@@ -423,12 +444,12 @@
       "profile": "loc-01",
       "wireProfile": "d16-delta-varint",
       "scope": "object",
-      "description": "An unknown even id (8, varint) and unknown odd id (15, bytes) are preserved in the unknown map (each with an explicit null name).",
+      "description": "An unknown even id (32, varint) and unknown odd id (33, bytes) are preserved in the unknown map (each with an explicit null name).",
       "input": {
         "file": "props_unknown.bin",
         "byteLength": 7,
-        "sha256": "0e7ef5451d5ee872ab5330bca63659374b01fa26616f318c398f183d77277f40",
-        "hex": "0840630702dead"
+        "sha256": "337ce96f2027cc9ef77286ea651b2a531c555002744803d99ed972f4faeede7e",
+        "hex": "2040630102dead"
       },
       "expect": {
         "status": "ok",
@@ -436,12 +457,12 @@
         "semantics": {
           "unknown": [
             {
-              "id": "8",
+              "id": "32",
               "name": null,
               "value": "99"
             },
             {
-              "id": "15",
+              "id": "33",
               "name": null,
               "value": "dead"
             }
@@ -538,7 +559,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "64"
+          "version": 1,
+          "captureTimestamp": "64",
+          "timestamp": "64",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "normative",
@@ -569,7 +593,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "127"
+          "version": 1,
+          "captureTimestamp": "127",
+          "timestamp": "127",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "normative",
@@ -600,7 +627,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "128"
+          "version": 1,
+          "captureTimestamp": "128",
+          "timestamp": "128",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "normative",
@@ -631,7 +661,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "16383"
+          "version": 1,
+          "captureTimestamp": "16383",
+          "timestamp": "16383",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "normative",
@@ -662,7 +695,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "16384"
+          "version": 1,
+          "captureTimestamp": "16384",
+          "timestamp": "16384",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "normative",
@@ -693,7 +729,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "1726000000000000"
+          "version": 1,
+          "captureTimestamp": "1726000000000000",
+          "timestamp": "1726000000000000",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "normative",
@@ -724,7 +763,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "4611686018427387903"
+          "version": 1,
+          "captureTimestamp": "4611686018427387903",
+          "timestamp": "4611686018427387903",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "normative",
@@ -755,7 +797,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "4611686018427387904"
+          "version": 1,
+          "captureTimestamp": "4611686018427387904",
+          "timestamp": "4611686018427387904",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "normative",
@@ -786,7 +831,10 @@
         "status": "ok",
         "stage": "semantic",
         "semantics": {
-          "captureTimestamp": "18446744073709551615"
+          "version": 1,
+          "captureTimestamp": "18446744073709551615",
+          "timestamp": "18446744073709551615",
+          "timestampIsWallClock": true
         }
       },
       "expectationBasis": "normative",
@@ -1086,6 +1134,692 @@
         "generatorVersion": "n/a",
         "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
         "sourceHash": "2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f"
+      }
+    },
+    {
+      "id": "loc/v4-ts-no-timescale-d14",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d14-absolute-varint",
+      "scope": "object",
+      "description": "LOC-04 Timestamp without Timescale is microseconds since the Unix epoch.",
+      "input": {
+        "file": "v4_ts_d14.bin",
+        "byteLength": 2,
+        "sha256": "6591786051d3780dbd2ae62da67b19fa169eb0dbfae9bb1845b4a0164d0d9d01",
+        "hex": "102a"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "captureTimestamp": "42",
+          "timestamp": "42",
+          "timestampIsWallClock": true
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-ts-90k-d14",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d14-absolute-varint",
+      "scope": "object",
+      "description": "LOC-04 Timestamp 900000 at Timescale 90000 derives 10 s of microseconds.",
+      "input": {
+        "file": "v4_ts_90k_d14.bin",
+        "byteLength": 10,
+        "sha256": "97860afc2b1468082f20c51b732b970bac05f030941b9cc7186577ced8798f2b",
+        "hex": "0880015f9010800dbba0"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "captureTimestamp": "10000000",
+          "timestamp": "900000",
+          "timescale": "90000",
+          "timestampIsWallClock": false
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-ts-48k-truncates-d14",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d14-absolute-varint",
+      "scope": "object",
+      "description": "LOC-04 Timescale derivation truncates toward zero (1/48000 s = 20.83 us).",
+      "input": {
+        "file": "v4_ts_48k_d14.bin",
+        "byteLength": 7,
+        "sha256": "78bfec0ff4b7777078fd6903aa92da5371481dff0df31e6a345640f803874fcd",
+        "hex": "088000bb801001"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "captureTimestamp": "20",
+          "timestamp": "1",
+          "timescale": "48000",
+          "timestampIsWallClock": false
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-ts-no-timescale-d16",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "LOC-04 Timestamp without Timescale is microseconds since the Unix epoch.",
+      "input": {
+        "file": "v4_ts_d16.bin",
+        "byteLength": 2,
+        "sha256": "6591786051d3780dbd2ae62da67b19fa169eb0dbfae9bb1845b4a0164d0d9d01",
+        "hex": "102a"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "captureTimestamp": "42",
+          "timestamp": "42",
+          "timestampIsWallClock": true
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-ts-90k-d16",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "LOC-04 Timestamp 900000 at Timescale 90000 derives 10 s of microseconds.",
+      "input": {
+        "file": "v4_ts_90k_d16.bin",
+        "byteLength": 10,
+        "sha256": "d14839f10106e1d780480bafbbeb361e61a9dbbb0e156ca1708e89be9203ce89",
+        "hex": "0880015f9008800dbba0"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "captureTimestamp": "10000000",
+          "timestamp": "900000",
+          "timescale": "90000",
+          "timestampIsWallClock": false
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-ts-48k-truncates-d16",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "LOC-04 Timescale derivation truncates toward zero (1/48000 s = 20.83 us).",
+      "input": {
+        "file": "v4_ts_48k_d16.bin",
+        "byteLength": 7,
+        "sha256": "3784b713d58e9f33f9766837387a3d7ea9d0a0bf7a9bac334413bfd50af9c5c4",
+        "hex": "088000bb800801"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "captureTimestamp": "20",
+          "timestamp": "1",
+          "timescale": "48000",
+          "timestampIsWallClock": false
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-ts-no-timescale-d18",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "LOC-04 Timestamp without Timescale is microseconds since the Unix epoch.",
+      "input": {
+        "file": "v4_ts_d18.bin",
+        "byteLength": 2,
+        "sha256": "6591786051d3780dbd2ae62da67b19fa169eb0dbfae9bb1845b4a0164d0d9d01",
+        "hex": "102a"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "captureTimestamp": "42",
+          "timestamp": "42",
+          "timestampIsWallClock": true
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-ts-90k-d18",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "LOC-04 Timestamp 900000 at Timescale 90000 derives 10 s of microseconds.",
+      "input": {
+        "file": "v4_ts_90k_d18.bin",
+        "byteLength": 8,
+        "sha256": "c34ae01fe845663cf224780508606fd9ba4f03fc2e58990ee49a9aa288fd6aae",
+        "hex": "08c15f9008cdbba0"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "captureTimestamp": "10000000",
+          "timestamp": "900000",
+          "timescale": "90000",
+          "timestampIsWallClock": false
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-ts-48k-truncates-d18",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "LOC-04 Timescale derivation truncates toward zero (1/48000 s = 20.83 us).",
+      "input": {
+        "file": "v4_ts_48k_d18.bin",
+        "byteLength": 6,
+        "sha256": "9bb043abfb51834b32d2ef687cbd912af2810a9e6db6f20aa4ce8ec3737b3d78",
+        "hex": "08c0bb800801"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "captureTimestamp": "20",
+          "timestamp": "1",
+          "timescale": "48000",
+          "timestampIsWallClock": false
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-vfm-short",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "LOC-04 Video Frame Marking 1-byte short header.",
+      "input": {
+        "file": "v4_vfm_short.bin",
+        "byteLength": 3,
+        "sha256": "e34c7fbf13c14e33e91998fd8031426fba5d721d85837110e944c10958c57d83",
+        "hex": "0901e0"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "videoFrameMarking": {
+            "startOfFrame": true,
+            "endOfFrame": true,
+            "independent": true,
+            "discardable": false,
+            "baseLayerSync": false,
+            "temporalId": 0
+          }
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-vfm-long",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "LOC-04 Video Frame Marking 3-byte long header with LID and TL0PICIDX.",
+      "input": {
+        "file": "v4_vfm_long.bin",
+        "byteLength": 5,
+        "sha256": "0d4fb8edf1c53d4f68f85bf46aa1c898ce1848b0822002e78520f22361839a55",
+        "hex": "0903e0027f"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "videoFrameMarking": {
+            "startOfFrame": true,
+            "endOfFrame": true,
+            "independent": true,
+            "discardable": false,
+            "baseLayerSync": false,
+            "temporalId": 0,
+            "layerId": 2,
+            "tl0PicIdx": 127
+          }
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-audio-config",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "LOC-04 Audio Config (AudioSpecificConfig for AAC-LC 44.1 kHz stereo).",
+      "input": {
+        "file": "v4_audio_config.bin",
+        "byteLength": 4,
+        "sha256": "0fd820a73a14da3bf41a1573bb0ea4d78f74c7aa526a3ecb420b988e284d4c09",
+        "hex": "0f021210"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "audioConfig": "1210"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-audio-level",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "LOC-04 Audio Level at id 0x0C.",
+      "input": {
+        "file": "v4_audio_level.bin",
+        "byteLength": 3,
+        "sha256": "7b694ee4b3016e323ae2a708dab6339f990af0e780113341f959e2a3e6fa0a13",
+        "hex": "0c4085"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "audioLevel": {
+            "voiceActivity": true,
+            "level": 5
+          }
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-all",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "All six LOC-04 properties in one block.",
+      "input": {
+        "file": "v4_all.bin",
+        "byteLength": 19,
+        "sha256": "568c45ec4637f8f1b1bca4345e77a4a8d20d79b0754b6c538fec7f80eb618050",
+        "hex": "08800f42400101e003407f0101aa0201bb0105"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "captureTimestamp": "5",
+          "timestamp": "5",
+          "timescale": "1000000",
+          "timestampIsWallClock": false,
+          "videoFrameMarking": {
+            "startOfFrame": true,
+            "endOfFrame": true,
+            "independent": true,
+            "discardable": false,
+            "baseLayerSync": false,
+            "temporalId": 0
+          },
+          "audioLevel": {
+            "voiceActivity": false,
+            "level": 127
+          },
+          "videoConfig": "aa",
+          "audioConfig": "bb"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-mixed-01-ids-go-unknown",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "A block with both dialects resolves as LOC-04; LOC-01 ids are unregistered there and land in unknown.",
+      "input": {
+        "file": "v4_mixed.bin",
+        "byteLength": 6,
+        "sha256": "962a4ee5307045b35d3c96e1269299de6994239a4573a0ee27167f01befa6d7b",
+        "hex": "020702200c09"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "version": 4,
+          "captureTimestamp": "9",
+          "timestamp": "9",
+          "timestampIsWallClock": true,
+          "unknown": [
+            {
+              "id": "2",
+              "name": null,
+              "value": "7"
+            },
+            {
+              "id": "4",
+              "name": null,
+              "value": "32"
+            }
+          ]
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-err-timescale-zero",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "A Timescale of 0 cannot define a unit; the block is malformed.",
+      "input": {
+        "file": "v4_err_timescale_zero.bin",
+        "byteLength": 4,
+        "sha256": "fd7e16e9d734e26fa9cd4a33a6868d3847bdbe5b9e942494d68820acbef3ed80",
+        "hex": "08000801"
+      },
+      "expect": {
+        "status": "error",
+        "stage": "semantic",
+        "error": {
+          "category": "loc-malformed"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3.1.2",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-encode-as-v4",
+      "kind": "loc-properties",
+      "profile": "loc-04",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "A LOC-04 Timestamp of 100 encoded for LOC-4 yields the canonical 0x10 entry.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "16",
+            "valueKind": "varint",
+            "value": "100"
+          }
+        ],
+        "locVersion": 4
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "1064"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-encode-as-v1",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d18-delta-vi64",
+      "scope": "object",
+      "description": "A LOC-04 Timestamp of 100 encoded for LOC-1 yields the canonical 0x02 entry.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "16",
+            "valueKind": "varint",
+            "value": "100"
+          }
+        ],
+        "locVersion": 1
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "encode",
+        "bytesHex": "0264"
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
+      }
+    },
+    {
+      "id": "loc/v4-encode-audio-config-as-v1-rejected",
+      "kind": "loc-properties",
+      "profile": "loc-01",
+      "wireProfile": "d16-delta-varint",
+      "scope": "object",
+      "description": "Audio Config has no LOC-01 representation; encoding for LOC-01 is a typed error, never a silent drop.",
+      "input": {
+        "propertyMap": [
+          {
+            "id": "15",
+            "valueKind": "bytes",
+            "value": "01"
+          }
+        ],
+        "locVersion": 1
+      },
+      "expect": {
+        "status": "error",
+        "stage": "encode",
+        "error": {
+          "category": "loc-unrepresentable"
+        }
+      },
+      "expectationBasis": "normative",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-loc-04",
+        "section": "2.3",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47"
       }
     }
   ]
