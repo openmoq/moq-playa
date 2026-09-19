@@ -35,6 +35,7 @@ const params = new URLSearchParams(window.location.search);
 const videoCodec = params.get('codec') ?? 'avc1.42001f'; // Baseline Level 3.1 (720p)
 const videoBitrate = parseInt(params.get('bitrate') ?? '2000', 10) * 1000;
 const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
+const locVersion = params.get('loc') === '1' ? 1 : 4;
 
 // ─── Settings modal ──────────────────────────────────────────────────
 
@@ -45,6 +46,7 @@ const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
   const sNs = document.getElementById('s-ns') as HTMLInputElement;
   const sHash = document.getElementById('s-hash') as HTMLInputElement;
   const sVersion = document.getElementById('s-version') as HTMLSelectElement;
+  const sLoc = document.getElementById('s-loc') as HTMLSelectElement;
   const sCodec = document.getElementById('s-codec') as HTMLSelectElement;
   const sBitrate = document.getElementById('s-bitrate') as HTMLInputElement;
   const sKeyframe = document.getElementById('s-keyframe') as HTMLInputElement;
@@ -74,6 +76,7 @@ const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
     sNs.value = params.get('ns') ?? 'live';
     sHash.value = params.get('hash') ?? '';
     sVersion.value = params.get('v') ?? '';
+    sLoc.value = params.get('loc') ?? '4';
     sCodec.value = videoCodec;
     sBitrate.value = String(videoBitrate / 1000);
     sKeyframe.value = String(keyframeInterval);
@@ -94,6 +97,7 @@ const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
     if (ns && ns !== 'live') np.set('ns', ns);
     if (sHash.value.trim()) np.set('hash', sHash.value.trim());
     if (sVersion.value) np.set('v', sVersion.value);
+    if (sLoc.value !== '4') np.set('loc', sLoc.value);
     if (sCodec.value !== 'avc1.42001f') np.set('codec', sCodec.value);
     if (sBitrate.value !== '2000') np.set('bitrate', sBitrate.value);
     if (sKeyframe.value !== '60') np.set('keyframe', sKeyframe.value);
@@ -302,6 +306,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
         publisher: {
           wrapInt: (n) => varint(n),
           draft: negotiatedDraft,
+          locVersion,
           onError: (context, err) => log(`Failed ${context}: ${(err as Error)?.message ?? err}`),
           onCounts: (videoFrames, audioChunks) => {
             if (videoFrames % 30 === 0) {

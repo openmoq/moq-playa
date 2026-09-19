@@ -32,7 +32,7 @@
  * in-flight work is awaited by `drain()`, and late enqueues are ignored —
  * an old generation can never write to a replacement session.
  */
-import { encodeLocHeaders, locWireProfileForDraft } from '@moqt/loc';
+import { encodeLocHeaders, locWireProfileForDraft, type LocVersion } from '@moqt/loc';
 import type { DraftVersion } from '@moqt/transport';
 
 /** The subset of MoqtConnection the media publication path uses. */
@@ -67,6 +67,8 @@ export interface MediaPublisherOptions {
    *  the mandatory FIRST_OBJECT subgroup bit. Typed (not `number`) so an
    *  unsupported draft cannot silently inherit draft-16 LOC behavior. */
   draft: DraftVersion;
+  /** LOC draft to emit: 4 (default) or 1 for LOC-01-only subscribers. */
+  locVersion?: LocVersion;
   /** Failure sink — publication errors are contained, never unhandled. */
   onError?: (context: string, err: unknown) => void;
   /** Counter sink for UI updates: called after each published object. */
@@ -102,6 +104,7 @@ export class MediaPublisher {
   private readonly connection: MediaPublishConnection;
   private readonly wrapInt: (n: bigint) => unknown;
   private readonly draft: DraftVersion;
+  private readonly locVersion: LocVersion;
   private readonly onError: (context: string, err: unknown) => void;
   private readonly onCounts: ((v: number, a: number) => void) | null;
   private readonly videoQueueMax: number;
@@ -150,6 +153,7 @@ export class MediaPublisher {
     this.connection = connection;
     this.wrapInt = options.wrapInt;
     this.draft = options.draft;
+    this.locVersion = options.locVersion ?? 4;
     this.onError = options.onError ?? (() => {});
     this.onCounts = options.onCounts ?? null;
     this.videoQueueMax = options.videoQueueMax ?? 60;
@@ -322,6 +326,10 @@ export class MediaPublisher {
     }
   }
 
+  private locOptions() {
+    return { wireProfile: locWireProfileForDraft(this.draft), locVersion: this.locVersion };
+  }
+
   private videoExtensions(meta: VideoChunkMeta): Uint8Array | undefined {
     return encodeLocHeaders({
       captureTimestamp: BigInt(Math.round(meta.timestampUs)),
@@ -334,7 +342,7 @@ export class MediaPublisher {
         temporalId: 0,
       },
       ...(meta.videoConfig ? { videoConfig: meta.videoConfig } : {}),
-    }, { wireProfile: locWireProfileForDraft(this.draft) });
+    }, this.locOptions());
   }
 
   private async sendVideoChunk(data: Uint8Array, meta: VideoChunkMeta): Promise<void> {
@@ -382,7 +390,7 @@ export class MediaPublisher {
   private async sendAudioChunk(data: Uint8Array, meta: AudioChunkMeta, groupId: bigint): Promise<void> {
     const extensions = encodeLocHeaders({
       captureTimestamp: BigInt(Math.round(meta.timestampUs)),
-    }, { wireProfile: locWireProfileForDraft(this.draft) });
+    }, this.locOptions());
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.
     const streamId = await this.connection.openSubgroup(

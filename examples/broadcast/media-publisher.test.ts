@@ -545,3 +545,24 @@ describe('MediaPublisher — audio publication concurrency', () => {
     expect(drained).toBe(true);
   });
 });
+
+describe('MediaPublisher — LOC version', () => {
+  it('emits LOC-04 by default', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn);
+    pub.setAudioAlias(3n);
+    pub.publishAudio(Uint8Array.from([1]), { timestampUs: 1_000_000 });
+    await settle();
+    const ext = conn.sends[0]!.extensions!;
+    expect(parseLocHeaders(ext).version).toBe(4);
+  });
+
+  it('emits LOC-01 when locVersion is 1', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { locVersion: 1 });
+    pub.setAudioAlias(3n);
+    pub.publishAudio(Uint8Array.from([1]), { timestampUs: 1_000_000 });
+    await settle();
+    expect(parseLocHeaders(conn.sends[0]!.extensions!).version).toBe(1);
+  });
+});
