@@ -148,35 +148,37 @@ describe('parseLocHeaders', () => {
     });
 
     it('preserves unknown even extension IDs (§2.3)', () => {
-        // Use ID 8 (even, unknown) with varint value
+        // Use ID 0x20 (even, unknown to both LOC-01 and LOC-04) with varint value.
+        // (ID 8 is no longer safe to use here — draft-04 registers it as Timescale.)
         const bytes = buildExtensionBytes([
-            { id: 8, value: 42n },
+            { id: 0x20, value: 42n },
         ]);
         const headers = parseLocHeaders(bytes);
         expect(headers.unknown).toBeDefined();
-        expect(headers.unknown!.get(8n)).toBe(42n);
+        expect(headers.unknown!.get(0x20n)).toBe(42n);
     });
 
     it('preserves unknown odd extension IDs (§2.3)', () => {
-        // Use ID 9 (odd, unknown) with byte value
+        // Use ID 0x21 (odd, unknown to both LOC-01 and LOC-04) with byte value.
+        // (ID 9 is no longer safe to use here — draft-04 registers it as VideoFrameMarking.)
         const data = new Uint8Array([0x01, 0x02, 0x03]);
         const bytes = buildExtensionBytes([
-            { id: 9, value: data },
+            { id: 0x21, value: data },
         ]);
         const headers = parseLocHeaders(bytes);
         expect(headers.unknown).toBeDefined();
-        expect(headers.unknown!.get(9n)).toEqual(data);
+        expect(headers.unknown!.get(0x21n)).toEqual(data);
     });
 
     it('handles mix of known and unknown extensions (§2.3)', () => {
         const bytes = buildExtensionBytes([
             { id: LocExtensionId.CAPTURE_TIMESTAMP, value: 1000000n },
-            { id: 8, value: 99n },  // unknown even
+            { id: 0x20, value: 99n },  // unknown even
         ]);
         const headers = parseLocHeaders(bytes);
         expect(headers.captureTimestamp).toBe(1000000n);
         expect(headers.unknown).toBeDefined();
-        expect(headers.unknown!.get(8n)).toBe(99n);
+        expect(headers.unknown!.get(0x20n)).toBe(99n);
     });
 });
 
