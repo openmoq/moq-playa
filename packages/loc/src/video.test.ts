@@ -16,7 +16,10 @@ import { describe, it, expect } from 'vitest';
 import {
     parseVideoFrameMarking,
     encodeVideoFrameMarking,
+    parseVideoFrameMarkingBytes,
+    encodeVideoFrameMarkingBytes,
 } from './video.js';
+import { LocHeaderError } from './errors.js';
 import type { VideoFrameMarking } from './types.js';
 
 describe('parseVideoFrameMarking', () => {
@@ -226,5 +229,66 @@ describe('encodeVideoFrameMarking', () => {
         const decoded = parseVideoFrameMarking(encoded);
         expect(decoded.layerId).toBe(42);
         expect(decoded.baseLayerSync).toBe(false);
+    });
+});
+
+describe('LOC-04 byte form (RFC 9626 §3.1)', () => {
+    it('parses the 1-byte short form', () => {
+        const m = parseVideoFrameMarkingBytes(Uint8Array.from([0xa3])); // S=1 I=1 TID=3
+        expect(m).toEqual({
+            startOfFrame: true, endOfFrame: false, independent: true,
+            discardable: false, baseLayerSync: false, temporalId: 3,
+        });
+    });
+
+    it('parses the 3-byte long form with LID and TL0PICIDX', () => {
+        const m = parseVideoFrameMarkingBytes(Uint8Array.from([0xc8, 0x05, 0x7e]));
+        expect(m.startOfFrame).toBe(true);
+        expect(m.endOfFrame).toBe(true);
+        expect(m.baseLayerSync).toBe(true);
+        expect(m.layerId).toBe(5);
+        expect(m.tl0PicIdx).toBe(0x7e);
+    });
+
+    it('accepts a 2-byte form (LID only) on parse', () => {
+        const m = parseVideoFrameMarkingBytes(Uint8Array.from([0x20, 0x09]));
+        expect(m.independent).toBe(true);
+        expect(m.layerId).toBe(9);
+        expect(m.tl0PicIdx).toBeUndefined();
+    });
+
+    it('accepts a 4-byte form and ignores the fourth byte', () => {
+        const m = parseVideoFrameMarkingBytes(Uint8Array.from([0x20, 0x01, 0x02, 0xff]));
+        expect(m.layerId).toBe(1);
+        expect(m.tl0PicIdx).toBe(2);
+    });
+
+    it('rejects empty and over-long input', () => {
+        expect(() => parseVideoFrameMarkingBytes(new Uint8Array(0))).toThrow(LocHeaderError);
+        expect(() => parseVideoFrameMarkingBytes(new Uint8Array(5))).toThrow(LocHeaderError);
+    });
+
+    it('encodes 1 byte when layerId is absent', () => {
+        expect(encodeVideoFrameMarkingBytes({
+            startOfFrame: true, endOfFrame: true, independent: true,
+            discardable: false, baseLayerSync: false, temporalId: 0,
+        })).toEqual(Uint8Array.from([0xe0]));
+    });
+
+    it('encodes 3 bytes when layerId is present, tl0PicIdx defaults to 0', () => {
+        expect(encodeVideoFrameMarkingBytes({
+            startOfFrame: false, endOfFrame: false, independent: false,
+            discardable: true, baseLayerSync: false, temporalId: 2, layerId: 7,
+        })).toEqual(Uint8Array.from([0x12, 0x07, 0x00]));
+        expect(encodeVideoFrameMarkingBytes({
+            startOfFrame: false, endOfFrame: false, independent: false,
+            discardable: false, baseLayerSync: false, temporalId: 0, layerId: 1, tl0PicIdx: 200,
+        })).toEqual(Uint8Array.from([0x00, 0x01, 0xc8]));
+    });
+
+    it('round trips short and long forms', () => {
+        for (const bytes of [Uint8Array.from([0x5b]), Uint8Array.from([0xff, 0xff, 0xff])]) {
+            expect(encodeVideoFrameMarkingBytes(parseVideoFrameMarkingBytes(bytes))).toEqual(bytes);
+        }
     });
 });

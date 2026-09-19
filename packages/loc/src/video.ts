@@ -9,6 +9,7 @@
  * @module
  */
 
+import { LocHeaderError } from './errors.js';
 import type { VideoFrameMarking } from './types.js';
 
 /**
@@ -71,6 +72,30 @@ export function parseVideoFrameMarking(value: bigint): VideoFrameMarking {
     return result;
 }
 
+// ─── LOC-01 integer form ───────────────────────────────────────────────
+
+/** Read the S|E|I|D|B|TID byte shared by both forms. */
+function fromFirstByte(firstByte: number): VideoFrameMarking {
+    return {
+        startOfFrame: (firstByte & 0x80) !== 0,
+        endOfFrame: (firstByte & 0x40) !== 0,
+        independent: (firstByte & 0x20) !== 0,
+        discardable: (firstByte & 0x10) !== 0,
+        baseLayerSync: (firstByte & 0x08) !== 0,
+        temporalId: firstByte & 0x07,
+    };
+}
+
+function toFirstByte(marking: VideoFrameMarking): number {
+    let b = 0;
+    if (marking.startOfFrame) b |= 0x80;
+    if (marking.endOfFrame) b |= 0x40;
+    if (marking.independent) b |= 0x20;
+    if (marking.discardable) b |= 0x10;
+    if (marking.baseLayerSync) b |= 0x08;
+    return b | (marking.temporalId & 0x07);
+}
+
 /**
  * Encode VideoFrameMarking into a bigint value for use in a varint.
  *
@@ -80,19 +105,45 @@ export function parseVideoFrameMarking(value: bigint): VideoFrameMarking {
  * @see RFC 9626 §3.1
  */
 export function encodeVideoFrameMarking(marking: VideoFrameMarking): bigint {
-    let firstByte = 0;
-    if (marking.startOfFrame) firstByte |= 0x80;
-    if (marking.endOfFrame) firstByte |= 0x40;
-    if (marking.independent) firstByte |= 0x20;
-    if (marking.discardable) firstByte |= 0x10;
-    if (marking.baseLayerSync) firstByte |= 0x08;
-    firstByte |= marking.temporalId & 0x07;
-
+    const firstByte = toFirstByte(marking);
     if (marking.layerId !== undefined) {
-        // RFC 9626 §3.1: LID is 8 bits
-        const secondByte = marking.layerId & 0xFF;
-        return BigInt((firstByte << 8) | secondByte);
+        return BigInt((firstByte << 8) | (marking.layerId & 0xFF));
     }
-
     return BigInt(firstByte);
+}
+
+// ─── LOC-04 byte form ───────────────────────────────────────────────
+
+/**
+ * Parse the LOC-04 Video Frame Marking byte form.
+ *
+ * RFC 9626 §3.1 defines a 1-byte short header (S|E|I|D|B|TID) and a 3-byte
+ * long header that appends LID and TL0PICIDX. draft-04 allows 1 to 4 bytes:
+ * a 2-byte value is read as short header plus LID, and a fourth byte is
+ * accepted and ignored. Anything else is malformed.
+ *
+ * @see draft-ietf-moq-loc-04 §2.3.2.2
+ * @see RFC 9626 §3.1
+ */
+export function parseVideoFrameMarkingBytes(bytes: Uint8Array): VideoFrameMarking {
+    if (bytes.length < 1 || bytes.length > 4) {
+        throw new LocHeaderError('videoFrameMarking', `expected 1 to 4 bytes, got ${bytes.length}`);
+    }
+    const result = fromFirstByte(bytes[0]!) as { -readonly [K in keyof VideoFrameMarking]: VideoFrameMarking[K] };
+    if (bytes.length >= 2) result.layerId = bytes[1]!;
+    if (bytes.length >= 3) result.tl0PicIdx = bytes[2]!;
+    return result;
+}
+
+/**
+ * Encode the LOC-04 Video Frame Marking byte form: 1 byte without a layer id,
+ * otherwise the 3-byte long header with `tl0PicIdx` defaulting to 0.
+ *
+ * @see draft-ietf-moq-loc-04 §2.3.2.2
+ * @see RFC 9626 §3.1
+ */
+export function encodeVideoFrameMarkingBytes(marking: VideoFrameMarking): Uint8Array {
+    const first = toFirstByte(marking);
+    if (marking.layerId === undefined) return Uint8Array.from([first]);
+    return Uint8Array.from([first, marking.layerId & 0xff, (marking.tl0PicIdx ?? 0) & 0xff]);
 }
