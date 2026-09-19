@@ -21,9 +21,9 @@
 import type { PropertyEntry, PropertyMap } from '@moqt/transport';
 import { Loc01PropertyId, Loc04PropertyId } from './types.js';
 import type { LocHeaders, LocExtensionValue, LocTrackContext, LocVersion, VideoFrameMarking, AudioLevel } from './types.js';
-import { parseVideoFrameMarking, encodeVideoFrameMarking, parseVideoFrameMarkingBytes } from './video.js';
+import { parseVideoFrameMarking, encodeVideoFrameMarking, parseVideoFrameMarkingBytes, encodeVideoFrameMarkingBytes } from './video.js';
 import { parseAudioLevel, encodeAudioLevel } from './audio.js';
-import { LocHeaderError } from './errors.js';
+import { LocHeaderError, LocEncodeError } from './errors.js';
 
 const ID01 = {
   captureTimestamp: BigInt(Loc01PropertyId.CAPTURE_TIMESTAMP),
@@ -152,23 +152,66 @@ export function resolveLocHeaders(propertyMap: PropertyMap, track?: LocTrackCont
 
 /**
  * Project structured {@link LocHeaders} to an ordered {@link PropertyMap} for
- * encoding. Layer A canonicalises the order (stable ascending id), so the entry
- * order here is not significant.
+ * the given LOC version. Layer A canonicalises the order, so entry order here
+ * is not significant.
+ *
+ * Version 4: `timestamp` (else `captureTimestamp`) into 0x10; `timescale` into
+ * 0x08 only when `timestamp` was the source. Version 1: microseconds into 0x02,
+ * derived from `timestamp` and `timescale` when `captureTimestamp` is absent.
+ * Fields version 1 cannot carry throw {@link LocEncodeError}.
+ *
+ * @see draft-ietf-moq-loc-01 §2.3
+ * @see draft-ietf-moq-loc-04 §2.3
  */
-export function locHeadersToPropertyMap(headers: LocHeaders): PropertyEntry[] {
+export function locHeadersToPropertyMap(headers: LocHeaders, version: LocVersion = 4): PropertyEntry[] {
   const entries: PropertyEntry[] = [];
-  if (headers.captureTimestamp !== undefined) {
-    entries.push({ id: ID01.captureTimestamp, value: headers.captureTimestamp });
+
+  if (version === 4) {
+    if (headers.timestamp !== undefined) {
+      entries.push({ id: ID04.timestamp, value: headers.timestamp });
+      if (headers.timescale !== undefined) entries.push({ id: ID04.timescale, value: headers.timescale });
+    } else if (headers.captureTimestamp !== undefined) {
+      entries.push({ id: ID04.timestamp, value: headers.captureTimestamp });
+    } else if (headers.timescale !== undefined) {
+      entries.push({ id: ID04.timescale, value: headers.timescale });
+    }
+    if (headers.videoFrameMarking !== undefined) {
+      entries.push({ id: ID04.videoFrameMarking, value: encodeVideoFrameMarkingBytes(headers.videoFrameMarking) });
+    }
+    if (headers.audioLevel !== undefined) {
+      entries.push({ id: ID04.audioLevel, value: encodeAudioLevel(headers.audioLevel) });
+    }
+    if (headers.videoConfig !== undefined) entries.push({ id: ID04.videoConfig, value: headers.videoConfig });
+    if (headers.audioConfig !== undefined) entries.push({ id: ID04.audioConfig, value: headers.audioConfig });
+  } else {
+    let micros = headers.captureTimestamp;
+    if (micros === undefined && headers.timestamp !== undefined) {
+      if (headers.timescale === undefined) {
+        micros = headers.timestamp;
+      } else if (headers.timescale === 0n) {
+        throw new LocEncodeError('timescale', 'must be non-zero');
+      } else {
+        micros = (headers.timestamp * MICROS_PER_SECOND) / headers.timescale;
+      }
+    } else if (headers.timescale !== undefined && headers.timestamp === undefined && micros === undefined) {
+      throw new LocEncodeError('timescale', 'not representable in LOC-01 without a timestamp');
+    }
+    if (micros !== undefined) entries.push({ id: ID01.captureTimestamp, value: micros });
+    if (headers.videoFrameMarking !== undefined) {
+      if (headers.videoFrameMarking.tl0PicIdx !== undefined) {
+        throw new LocEncodeError('videoFrameMarking.tl0PicIdx', 'not representable in LOC-01');
+      }
+      entries.push({ id: ID01.videoFrameMarking, value: encodeVideoFrameMarking(headers.videoFrameMarking) });
+    }
+    if (headers.audioLevel !== undefined) {
+      entries.push({ id: ID01.audioLevel, value: encodeAudioLevel(headers.audioLevel) });
+    }
+    if (headers.videoConfig !== undefined) entries.push({ id: ID01.videoConfig, value: headers.videoConfig });
+    if (headers.audioConfig !== undefined) {
+      throw new LocEncodeError('audioConfig', 'not representable in LOC-01');
+    }
   }
-  if (headers.videoFrameMarking !== undefined) {
-    entries.push({ id: ID01.videoFrameMarking, value: encodeVideoFrameMarking(headers.videoFrameMarking) });
-  }
-  if (headers.audioLevel !== undefined) {
-    entries.push({ id: ID01.audioLevel, value: encodeAudioLevel(headers.audioLevel) });
-  }
-  if (headers.videoConfig !== undefined) {
-    entries.push({ id: ID01.videoConfig, value: headers.videoConfig });
-  }
+
   if (headers.unknown) {
     for (const [id, value] of headers.unknown) entries.push({ id, value });
   }

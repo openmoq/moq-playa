@@ -20,8 +20,9 @@ import {
     toVideoChunkInit,
     toAudioChunkInit,
 } from './headers.js';
-import { LocExtensionId } from './types.js';
+import { LocExtensionId, Loc04PropertyId } from './types.js';
 import type { LocHeaders } from './types.js';
+import { LocEncodeError } from './errors.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
@@ -415,7 +416,7 @@ describe('encodeLocHeaders with absolute type IDs (draft-14 §1.4.2)', () => {
                 temporalId: 0,
             },
         };
-        const bytes = encodeLocHeaders(headers, { deltaEncoded: false })!;
+        const bytes = encodeLocHeaders(headers, { deltaEncoded: false, locVersion: 1 })!;
         // First extension: type=2 (0x02), value=42 (0x2A)
         expect(bytes[0]).toBe(0x02);
         expect(bytes[1]).toBe(0x2A);
@@ -500,5 +501,99 @@ describe('toAudioChunkInit', () => {
         const init = toAudioChunkInit(payload, headers);
         expect(init.type).toBe('key');
         expect(init.timestamp).toBe(0);
+    });
+});
+
+// ─── encodeLocHeaders — versioned encode ───────────────────────────────
+
+describe('encodeLocHeaders — LOC-04 (default)', () => {
+    it('emits 0x10 Timestamp with no Timescale from captureTimestamp alone', () => {
+        const bytes = encodeLocHeaders({ captureTimestamp: 42n })!;
+        const back = parseLocHeaders(bytes);
+        expect(back.version).toBe(4);
+        expect(back.captureTimestamp).toBe(42n);
+        expect(back.timescale).toBeUndefined();
+        expect(back.timestampIsWallClock).toBe(true);
+    });
+
+    it('emits Timestamp and Timescale when timestamp is the source', () => {
+        const bytes = encodeLocHeaders({ timestamp: 90_000n, timescale: 90_000n })!;
+        const back = parseLocHeaders(bytes);
+        expect(back.timestamp).toBe(90_000n);
+        expect(back.timescale).toBe(90_000n);
+        expect(back.captureTimestamp).toBe(1_000_000n);
+    });
+
+    it('round trips every LOC-04 field under every wire profile', () => {
+        const headers: LocHeaders = {
+            timestamp: 4800n, timescale: 48_000n,
+            videoFrameMarking: { startOfFrame: true, endOfFrame: true, independent: true, discardable: false, baseLayerSync: false, temporalId: 1, layerId: 2, tl0PicIdx: 3 },
+            audioLevel: { voiceActivity: true, level: 40 },
+            videoConfig: Uint8Array.from([1, 100, 0, 31]),
+            audioConfig: Uint8Array.from([0x12, 0x10]),
+        };
+        for (const wireProfile of ['d14-absolute-varint', 'd16-delta-varint', 'd18-delta-vi64'] as const) {
+            const back = parseLocHeaders(encodeLocHeaders(headers, { wireProfile }), { wireProfile });
+            expect(back.version).toBe(4);
+            expect(back.timestamp).toBe(4800n);
+            expect(back.timescale).toBe(48_000n);
+            expect(back.captureTimestamp).toBe(100_000n);
+            expect(back.videoFrameMarking).toEqual(headers.videoFrameMarking);
+            expect(back.audioLevel).toEqual(headers.audioLevel);
+            expect(back.videoConfig).toEqual(headers.videoConfig);
+            expect(back.audioConfig).toEqual(headers.audioConfig);
+        }
+    });
+
+    it('passes unknown entries through', () => {
+        const back = parseLocHeaders(encodeLocHeaders({ captureTimestamp: 1n, unknown: new Map([[0x20n, 5n]]) })!);
+        expect(back.unknown?.get(0x20n)).toBe(5n);
+    });
+});
+
+describe('encodeLocHeaders — LOC-01 (locVersion: 1)', () => {
+    it('round trips the four LOC-01 fields', () => {
+        const headers: LocHeaders = {
+            captureTimestamp: 42n,
+            videoFrameMarking: { startOfFrame: false, endOfFrame: false, independent: true, discardable: false, baseLayerSync: false, temporalId: 0 },
+            audioLevel: { voiceActivity: false, level: 127 },
+            videoConfig: Uint8Array.from([0xaa]),
+        };
+        const back = parseLocHeaders(encodeLocHeaders(headers, { locVersion: 1 })!);
+        expect(back.version).toBe(1);
+        expect(back.captureTimestamp).toBe(42n);
+        expect(back.videoFrameMarking).toEqual(headers.videoFrameMarking);
+        expect(back.audioLevel).toEqual(headers.audioLevel);
+        expect(back.videoConfig).toEqual(headers.videoConfig);
+    });
+
+    it('derives microseconds when only timestamp and timescale are set', () => {
+        const back = parseLocHeaders(encodeLocHeaders({ timestamp: 90_000n, timescale: 90_000n }, { locVersion: 1 })!);
+        expect(back.version).toBe(1);
+        expect(back.captureTimestamp).toBe(1_000_000n);
+    });
+
+    it('rejects audioConfig', () => {
+        expect(() => encodeLocHeaders({ captureTimestamp: 1n, audioConfig: Uint8Array.from([1]) }, { locVersion: 1 }))
+            .toThrow(LocEncodeError);
+    });
+
+    it('rejects tl0PicIdx', () => {
+        expect(() => encodeLocHeaders({
+            videoFrameMarking: { startOfFrame: false, endOfFrame: false, independent: false, discardable: false, baseLayerSync: false, temporalId: 0, layerId: 1, tl0PicIdx: 1 },
+        }, { locVersion: 1 })).toThrow(LocEncodeError);
+    });
+
+    it('rejects a timescale that cannot be derived away (no timestamp)', () => {
+        expect(() => encodeLocHeaders({ timescale: 90_000n }, { locVersion: 1 })).toThrow(LocEncodeError);
+    });
+});
+
+describe('parseLocHeaders — track option', () => {
+    it('applies track context', () => {
+        const bytes = encodeLocHeaders({ timestamp: 48_000n })!;
+        const back = parseLocHeaders(bytes, { track: { timescale: 48_000n } });
+        expect(back.captureTimestamp).toBe(1_000_000n);
+        expect(back.timestampIsWallClock).toBe(false);
     });
 });
