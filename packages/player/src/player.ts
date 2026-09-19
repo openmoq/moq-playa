@@ -1530,7 +1530,10 @@ export class MoqtPlayer {
         payload: frame.data,
       };
       const headers: LocHeaders = {
+        // CMAF presentation time is media time, never wall clock, so
+        // wall-clock latency features must stay off for this path.
         captureTimestamp: ticksToMicros(frame.presentationTime, timescale),
+        timestampIsWallClock: false,
         ...(mediaType === 'video'
           ? {
               videoFrameMarking: {

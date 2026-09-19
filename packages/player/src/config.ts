@@ -590,6 +590,8 @@ export interface TransformConfig {
    * Custom extension parser for non-LOC packaging formats.
    *
    * When set, called instead of parseLocHeaders() for LOC-packaged tracks.
+   * The default parser accepts both draft-ietf-moq-loc-01 and -04 property
+   * sets; see LocHeaders.version.
    * Return LocHeaders with whatever fields could be extracted.
    * Default: undefined (uses standard LOC parser per draft-ietf-moq-loc-01 §2.3).
    *

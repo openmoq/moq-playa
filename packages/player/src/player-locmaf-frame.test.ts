@@ -367,6 +367,29 @@ describe('LOCMAF frame path (draft-einarsson-moq-locmaf-01 §16) — locmafDecod
     await player.destroy();
   });
 
+  it('synthesized LOCMAF headers mark the timestamp as media time', async () => {
+    const { player, adapter, videoDecoder, reqIdFor, advance } = await bootPlayer(
+      cmsfCatalog([{ ...LOCMAF_VIDEO, initRef: 'v' }], [{ id: 'v', type: 'inline', data: b64(init) }]),
+      { locmafDecoding: 'frame' },
+    );
+    const alias = await reqIdFor('video');
+    const pushObject = vi.spyOn((player as any).videoPipeline, 'pushObject');
+
+    const { objects, samples } = locmafGroup(init, 90000, 2);
+    objects.forEach((payload, i) => sendLocmaf(adapter, alias, 5, i, payload));
+    for (let i = 0; i < 20 && videoDecoder.decode.mock.calls.length < samples.length; i++) {
+      advance(40);
+      player.tick();
+      await sleep(0);
+    }
+
+    const pushed = pushObject.mock.calls.map((c: any[]) => c[1]);
+    const headers = pushed.find((h) => h?.captureTimestamp !== undefined)!;
+    expect(headers).toBeDefined();
+    expect(headers.timestampIsWallClock).toBe(false);
+    await player.destroy();
+  });
+
   it('a mid-group join waits for the next group that opens on a sync sample (rejections counted, nothing decoded)', async () => {
     const { player, adapter, videoDecoder, reqIdFor, advance } = await bootPlayer(
       cmsfCatalog([{ ...LOCMAF_VIDEO, initRef: 'v' }], [{ id: 'v', type: 'inline', data: b64(init) }]),
