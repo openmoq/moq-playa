@@ -12,8 +12,9 @@
  * Allowed packaging values.
  * @see draft-ietf-moq-msf-00 §5.1.12 Table 3
  * @see draft-ietf-moq-cmsf-00 §3.5.1 (adds 'cmaf')
+ * @see draft-einarsson-moq-locmaf-01 §5 (adds 'locmaf'; CMSF catalogs only)
  */
-export type Packaging = 'loc' | 'mediatimeline' | 'eventtimeline' | 'cmaf';
+export type Packaging = 'loc' | 'mediatimeline' | 'eventtimeline' | 'cmaf' | 'locmaf';
 
 /**
  * MSF-01 media-timeline template (§5.2.15 / §7.4): the inline fixed-duration
@@ -169,6 +170,16 @@ export interface CatalogTrack {
     readonly maxGrpSapStartingType?: number;
     /** @see draft-ietf-moq-cmsf-00 §3.5.2.2 — max SAP type at object start */
     readonly maxObjSapStartingType?: number;
+
+    // ─── LOCMAF extension (draft-einarsson-moq-locmaf-01 §5) ─────
+
+    /**
+     * LOCMAF packaging version of the track. MUST be present iff
+     * packaging="locmaf". A receiver MUST NOT subscribe to a version it does
+     * not support — see {@link SUPPORTED_LOCMAF_VERSIONS}.
+     * @see draft-einarsson-moq-locmaf-01 §5
+     */
+    readonly locmafVersion?: string;
 
     // ─── MSF-01 / CMSF-01 catalog fields ─────────────────────────
 
@@ -391,6 +402,19 @@ export interface SapTimelineEntry {
  * @see draft-ietf-moq-msf-00 §5.1.1
  */
 export const MSF_VERSION = 1;
+
+/**
+ * LOCMAF packaging version specified by draft-einarsson-moq-locmaf-01.
+ * @see draft-einarsson-moq-locmaf-01 §5
+ */
+export const LOCMAF_VERSION = '0.3';
+
+/**
+ * locmafVersion values this implementation can consume. A locmaf track whose
+ * locmafVersion is not listed MUST NOT be subscribed (the catalog still parses).
+ * @see draft-einarsson-moq-locmaf-01 §5
+ */
+export const SUPPORTED_LOCMAF_VERSIONS: readonly string[] = [LOCMAF_VERSION];
 
 /**
  * The fixed catalog track name.

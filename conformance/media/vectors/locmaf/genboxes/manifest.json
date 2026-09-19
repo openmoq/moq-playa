@@ -1,0 +1,17 @@
+{
+  "name": "genboxes",
+  "description": "prft and emsg boxes ride verbatim as genBox elements ahead of full and delta headers",
+  "locmafVersion": "0.3",
+  "draftCommit": "6a2439a",
+  "groups": 1,
+  "objects": 2,
+  "files": {
+    "canonical/g000_o000.cmfc": "2cf8b91fb13eda2f960cdf74dfa4414a64968f1049aa4b78b8679886cbf32a80",
+    "canonical/g000_o001.cmfc": "4055d75adcda6bff38c47760a658ad479dd3b031e3597580c4944419c56f563c",
+    "effective/g000_o000.json": "2d017e148b8dfbcf63c5d139891d9b1b554ae0d9296ed75bcc56dae1e1a0448b",
+    "effective/g000_o001.json": "7e8eb752815fdda1c357d846af4cb0717e3b87e61a246735c6fee6a77dc94191",
+    "init.mp4": "837edbacc52571ac324d828de79711a3336e95ccaaaf67dc2439823a10d76a03",
+    "objects/g000_o000.locmafobj": "d084db91382a11b10aee7fa2f6447770ac98cfbee4ae786c69b592bfc8a4ce28",
+    "objects/g000_o001.locmafobj": "6872b21daf99ab1489752c151c337d01426c6331e55999390f57e233921280a5"
+  }
+}

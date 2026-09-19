@@ -1,0 +1,20 @@
+{
+  "name": "negative-ctos",
+  "description": "B-frame composition offsets: negative CTOs force trun v1; ID 5 zigzag in both contexts",
+  "locmafVersion": "0.3",
+  "draftCommit": "6a2439a",
+  "groups": 1,
+  "objects": 3,
+  "files": {
+    "canonical/g000_o000.cmfc": "08cccc4364626af0fc465f40f95cf8d2a13e7451e0f3392d56a46d20fcd61740",
+    "canonical/g000_o001.cmfc": "1bcf19b205d142da522aee008e3ce62e92bbaf7eea380d85abfaed0af18d581a",
+    "canonical/g000_o002.cmfc": "4cee44cd85354a8d064e5fdf1f5b04699c5714fd3fe01e7fe34001f82e1b8858",
+    "effective/g000_o000.json": "53189179095ba0ea9c89503803155ab60cd286238e0c83c3b8b55e0fad6b7373",
+    "effective/g000_o001.json": "8f8179abed7901b83211a2daf8d98c474313095981881da5aacbf5dfdbc36715",
+    "effective/g000_o002.json": "b0a894ed481973ffabdf1d8a7ef199713be88860c14996932de6609fadeb1a06",
+    "init.mp4": "837edbacc52571ac324d828de79711a3336e95ccaaaf67dc2439823a10d76a03",
+    "objects/g000_o000.locmafobj": "a5a8deb079a69fcf763442e08d9ed477659b4b9335f537198724a5bb7327fca3",
+    "objects/g000_o001.locmafobj": "a03c3841b19203fc54a8fb9a69f79e3a0de6ba7b9cd859b09330a37dfbc82562",
+    "objects/g000_o002.locmafobj": "0e6beeebe899a722ac6ad52374738e45a7ad0b597a7a4236d2ab955d650797be"
+  }
+}

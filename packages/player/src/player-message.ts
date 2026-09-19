@@ -258,6 +258,16 @@ export function handleControlMessage(
             // fetches registered under the optimistic alias).
             ctx.onMediaAliasRemapped?.(okReqId, okReqId, alias);
           }
+        } else if (ctx.subscriptionManager?.getMediaType(alias) === undefined) {
+          // The relay echoed the request id as the alias and nothing is
+          // registered under it. A make-before-break switch target is
+          // deliberately not registered optimistically (its objects must
+          // stay parked until the switch completes), so this is the only
+          // point that binds it; without it the target's objects stay
+          // parked forever and the switch never completes.
+          ctx.log.debug('SUBSCRIBE_OK alias=%s equals reqId and is unregistered — registering track=%s',
+            alias, pending.trackName);
+          ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging);
         }
         // Replay objects that arrived before this alias was resolved
         ctx.onAliasResolved?.(alias);

@@ -1,0 +1,29 @@
+{
+  "sampleCount": 2,
+  "bmdt": 0,
+  "sampleDescriptionIndex": 1,
+  "durations": [
+    3000,
+    3000
+  ],
+  "sizes": [
+    400,
+    410
+  ],
+  "flags": [
+    33554432,
+    16842752
+  ],
+  "ctos": [
+    0,
+    0
+  ],
+  "genBoxes": [
+    {
+      "name": "prft",
+      "payload": "0000000000000001e80102030405060700002328"
+    }
+  ],
+  "mdatLength": 810,
+  "mdatSha256": "13414b9626a144b2a4fb5533f5e52325ede856181fcaca8d137f2297f2b227f7"
+}

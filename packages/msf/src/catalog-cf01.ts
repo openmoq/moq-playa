@@ -12,6 +12,7 @@ import fjp from 'fast-json-patch';
 const { applyPatch, validate } = fjp;
 import type { Catalog, CatalogTrack, Packaging } from './types.js';
 import { assertFiniteCatalogNumbers } from './catalog-validate.js';
+import { validateLocmafVersion } from './catalog-msf00.js';
 
 /**
  * Extended result from cf01 parsing — includes raw document for future JSON Patch deltas.
@@ -26,7 +27,7 @@ export interface Cf01ParseResult {
 }
 
 /** Valid packaging values (shared with MSF-00). */
-const VALID_PACKAGING = new Set<string>(['loc', 'mediatimeline', 'eventtimeline', 'cmaf']);
+const VALID_PACKAGING = new Set<string>(['loc', 'mediatimeline', 'eventtimeline', 'cmaf', 'locmaf']);
 
 /** Video codec prefixes for role inference. */
 const VIDEO_CODEC_PREFIXES = ['avc1', 'hev1', 'hvc1', 'vp09', 'av01'];
@@ -262,6 +263,9 @@ function parseCf01Track(
         packaging = 'cmaf';
     }
 
+    // LOCMAF §5: locmafVersion required iff packaging="locmaf" (after inheritance).
+    validateLocmafVersion({ name, packaging, locmafVersion: merged['locmafVersion'] });
+
     // isLive — not in cf01, default true
     const isLive = typeof merged['isLive'] === 'boolean'
         ? merged['isLive'] as boolean
@@ -292,6 +296,7 @@ function parseCf01Track(
         ...(typeof merged['spatialId'] === 'number' ? { spatialId: merged['spatialId'] as number } : {}),
         ...(typeof merged['targetLatency'] === 'number' ? { targetLatency: merged['targetLatency'] as number } : {}),
         ...(typeof merged['trackDuration'] === 'number' ? { trackDuration: merged['trackDuration'] as number } : {}),
+        ...(typeof merged['locmafVersion'] === 'string' ? { locmafVersion: merged['locmafVersion'] as string } : {}),
         // Flatten selectionParams onto track
         ...(selectionParams ? flattenSelectionParams(selectionParams) : {}),
     };

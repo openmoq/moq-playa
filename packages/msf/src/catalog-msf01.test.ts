@@ -12,6 +12,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { parseCatalogAuto } from './catalog-detect.js';
+import { isTrackPackagingSupported } from './selection.js';
+import { LOCMAF_VERSION, SUPPORTED_LOCMAF_VERSIONS } from './types.js';
 
 const parse = (o: unknown): ReturnType<typeof parseCatalogAuto> =>
     parseCatalogAuto(JSON.stringify(o));
@@ -198,6 +200,75 @@ describe('CMSF-01 — contentProtections / contentProtectionRefIDs (§4.1)', () 
     it('rejects a duplicate contentProtections refID', () => {
         expect(() => parse(withProtection(['1'], [cp('1'), cp('1', '1077efec-c0b2-4d02-ace3-3c1e52e2fb4b')])))
             .toThrow(/Duplicate contentProtections refID/i);
+    });
+});
+
+describe('LOCMAF — packaging "locmaf" and locmafVersion (draft-einarsson-moq-locmaf-01 §5)', () => {
+    const INIT = [{ id: 'v', type: 'inline', data: 'AAAB' }];
+    const locmafVideo = (extra: Record<string, unknown> = {}) => ({
+        name: 'video', packaging: 'locmaf', locmafVersion: '0.3', role: 'video', isLive: true,
+        codec: 'avc1.640028', bitrate: 2_000_000, initRef: 'v', ...extra,
+    });
+
+    it('the supported version is "0.3"', () => {
+        expect(LOCMAF_VERSION).toBe('0.3');
+        expect(SUPPORTED_LOCMAF_VERSIONS).toContain('0.3');
+    });
+
+    it('parses a locmaf track carrying locmafVersion and an initRef that resolves (§5, §6)', () => {
+        const cat = parse({ version: 'draft-01', tracks: [locmafVideo()], initDataList: INIT });
+        const t = cat.tracks[0]!;
+        expect(t.packaging).toBe('locmaf');
+        expect(t.locmafVersion).toBe('0.3');
+        expect(t.initRef).toBe('v');
+        expect(isTrackPackagingSupported(t)).toBe(true);
+    });
+
+    it('parses the mixed locmaf video + loc audio catalog (tracks MAY be mixed)', () => {
+        const cat = parse({
+            version: 'draft-01', generatedAt: 1, isComplete: true,
+            tracks: [
+                locmafVideo(),
+                { name: 'audio', packaging: 'loc', role: 'audio', isLive: true, codec: 'opus', bitrate: 64000, samplerate: 48000, channelConfig: '2' },
+            ],
+            initDataList: INIT,
+        });
+        expect(cat.tracks.map((t) => t.packaging)).toEqual(['locmaf', 'loc']);
+        expect(cat.tracks[1]!.locmafVersion).toBeUndefined();
+        expect(cat.tracks.every(isTrackPackagingSupported)).toBe(true);
+    });
+
+    it('rejects a locmaf track without locmafVersion (MUST be present)', () => {
+        const { locmafVersion: _omit, ...noVersion } = locmafVideo();
+        expect(() => parse({ version: '1', tracks: [noVersion], initDataList: INIT })).toThrow(/locmafVersion/);
+    });
+
+    it('rejects a non-string locmafVersion (JSON type is String)', () => {
+        expect(() => parse({ version: '1', tracks: [locmafVideo({ locmafVersion: 0.3 })], initDataList: INIT }))
+            .toThrow(/locmafVersion/);
+    });
+
+    it('rejects locmafVersion on a non-locmaf track (MUST NOT be present otherwise)', () => {
+        for (const packaging of ['cmaf', 'loc']) {
+            expect(() => parse({
+                version: '1',
+                tracks: [{ name: 'v', packaging, isLive: true, codec: 'avc1.640028', locmafVersion: '0.3' }],
+            }), packaging).toThrow(/locmafVersion/);
+        }
+    });
+
+    it('an unsupported locmafVersion still parses but the track is marked unsupported (receiver MUST NOT subscribe)', () => {
+        const cat = parse({
+            version: '1',
+            tracks: [
+                locmafVideo({ locmafVersion: '9.9' }),
+                { name: 'video-cmaf', packaging: 'cmaf', role: 'video', isLive: true, codec: 'avc1.640028', initRef: 'v' },
+            ],
+            initDataList: INIT,
+        });
+        expect(cat.tracks[0]!.locmafVersion).toBe('9.9');
+        expect(isTrackPackagingSupported(cat.tracks[0]!)).toBe(false);
+        expect(isTrackPackagingSupported(cat.tracks[1]!)).toBe(true); // the alternative stays selectable
     });
 });
 

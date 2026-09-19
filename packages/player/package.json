@@ -51,6 +51,7 @@
     "@moqt/transport": "workspace:*",
     "@moqt/webtransport": "workspace:*",
     "@moqt/loc": "workspace:*",
+    "@moqt/locmaf": "workspace:*",
     "@moqt/msf": "workspace:*",
     "@moqt/playback": "workspace:*"
   },

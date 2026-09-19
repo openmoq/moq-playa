@@ -10,6 +10,22 @@
  */
 
 import type { CatalogTrack, CatalogState, RenderGroup, AltGroup, TrackConstraints } from './types.js';
+import { SUPPORTED_LOCMAF_VERSIONS } from './types.js';
+
+/**
+ * Whether a receiver may subscribe to this track given its packaging version.
+ *
+ * Returns false only for a `locmaf` track whose `locmafVersion` is not in
+ * {@link SUPPORTED_LOCMAF_VERSIONS}: such a track MUST NOT be subscribed, but the
+ * catalog remains valid and an alternative packaging of the same source MAY be
+ * selected instead. Every other packaging is reported supported here (codec
+ * capability is a separate, runtime concern).
+ * @see draft-einarsson-moq-locmaf-01 §5
+ */
+export function isTrackPackagingSupported(track: CatalogTrack): boolean {
+    if (track.packaging !== 'locmaf') return true;
+    return track.locmafVersion !== undefined && SUPPORTED_LOCMAF_VERSIONS.includes(track.locmafVersion);
+}
 
 /**
  * Group tracks by renderGroup.
