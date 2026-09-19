@@ -181,9 +181,19 @@ describe('WebCodecsAudioDecoder', () => {
     });
 
     it('empty config keeps ADTS mode for AAC', () => {
-      configuredDecoder('mp4a.40.2', new Uint8Array(0));
+      const decoder = configuredDecoder('mp4a.40.2', new Uint8Array(0));
       const mock = createdDecoders[0]!;
       expect(mock.lastConfig?.description).toBeUndefined();
+
+      const payload = Uint8Array.from([0xaa, 0xbb, 0xcc]);
+      decoder.decode({ type: 'key', timestamp: 0, data: payload }, 0);
+
+      const wrapped = (mock.decoded[0] as { data: Uint8Array })?.data;
+      expect(wrapped).toBeDefined();
+      expect(wrapped!.length).toBe(payload.length + 7);
+      expect(wrapped![0]).toBe(0xff);
+      expect(wrapped![1]! & 0xf0).toBe(0xf0);
+      expect(wrapped!.subarray(7)).toEqual(payload);
     });
   });
 });

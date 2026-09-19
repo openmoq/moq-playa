@@ -200,7 +200,8 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
       },
     });
 
-    // Configure in ADTS mode for AAC (no description → ADTS framing expected).
+    // AAC with an Audio Config description runs in raw mode via `description`
+    // (payload is raw access units); AAC without one uses ADTS framing.
     // Non-AAC codecs (Opus) use raw mode with the codec string.
     const audioConfig: AudioDecoderConfig = {
       codec: this.lastCodec,
