@@ -1,7 +1,8 @@
 /**
  * LOC (Low Overhead Container) type definitions.
  *
- * All types correspond to fields defined in draft-ietf-moq-loc-01.
+ * All types correspond to fields defined in draft-ietf-moq-loc-01 and
+ * draft-ietf-moq-loc-04.
  * Each field is annotated with the spec section that defines it.
  *
  * @see draft-ietf-moq-loc-01
@@ -92,7 +93,11 @@ export interface VideoFrameMarking {
     readonly baseLayerSync: boolean;
     /** Temporal layer ID (0-7). @see RFC 9626 §3.1 */
     readonly temporalId: number;
-    /** Layer ID (0-255). Present when varint value >= 256. @see RFC 9626 §3.1 */
+    /**
+     * Layer ID (0-255). Present when the LOC-01 integer form carries a second
+     * byte (varint value >= 256) or the LOC-04 byte form has at least 2 bytes.
+     * @see RFC 9626 §3.1
+     */
     readonly layerId?: number;
     /**
      * TL0PICIDX (0-255). Present only when the LOC-04 byte form carries the

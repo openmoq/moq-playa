@@ -72,7 +72,7 @@ export function parseVideoFrameMarking(value: bigint): VideoFrameMarking {
     return result;
 }
 
-// ─── LOC-01 integer form ───────────────────────────────────────────────
+// ─── Shared first-byte helpers (LOC-01 integer form and LOC-04 byte form) ──
 
 /** Read the S|E|I|D|B|TID byte shared by both forms. */
 function fromFirstByte(firstByte: number): VideoFrameMarking {

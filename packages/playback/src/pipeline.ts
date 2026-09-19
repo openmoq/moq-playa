@@ -262,9 +262,9 @@ export class PlaybackPipeline {
     /**
  * Provide codec configuration (from catalog or initial headers).
  *
- * For video, this is also triggered automatically when a videoConfig
- * LOC extension is encountered. For audio, this must be called
- * externally since audio config comes from the MSF catalog.
+ * This is also triggered automatically when a LOC object carries the
+ * matching config property: Video Config for video, Audio Config for
+ * audio.
  *
  * @param config Codec-specific configuration bytes
  */
