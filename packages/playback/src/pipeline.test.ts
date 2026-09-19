@@ -8,7 +8,7 @@
  * @see draft-ietf-moq-transport-16 §10.2.1.1 (Object Status)
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { PlaybackPipeline } from './pipeline.js';
 import { SyncController } from './sync.js';
 import { DefaultRecoveryController } from './recovery.js';
@@ -2000,6 +2000,45 @@ describe('PlaybackPipeline', () => {
 
             const decodes = commands.filter(c => c.type === 'decode_audio');
             expect(decodes.length).toBe(1);
+        });
+    });
+
+    describe('PlaybackPipeline — media-time timestamps', () => {
+        it('does not feed adaptive tolerance or catch-up when timestampIsWallClock is false', () => {
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const config: PlaybackConfig = { ...DEFAULT_CONFIG, adaptiveTolerance: true };
+            const { pipeline, sync } = createPipeline({ mediaType: 'audio', clock, config });
+            const spy = vi.spyOn(sync, 'evaluateCatchUp');
+
+            pipeline.pushObject(makeData(1, 0), { captureTimestamp: 1_000_000n, timestampIsWallClock: false });
+            pipeline.tick();
+
+            expect(spy).toHaveBeenCalledWith(1_000_000n, false);
+            expect(sync.latencyUs).toBe(0);
+        });
+
+        it('a timescale-bearing stream schedules like its microsecond equivalent', () => {
+            const clockA = new MockClock();
+            const clockB = new MockClock();
+            const a = createPipeline({ mediaType: 'audio', clock: clockA });
+            const b = createPipeline({ mediaType: 'audio', clock: clockB });
+
+            for (let i = 0; i < 3; i++) {
+                a.pipeline.pushObject(makeData(i, 0), { captureTimestamp: BigInt(i) * 20_000n, timestampIsWallClock: true });
+                b.pipeline.pushObject(makeData(i, 0), {
+                    timestamp: BigInt(i) * 960n,
+                    timescale: 48_000n,
+                    captureTimestamp: BigInt(i) * 20_000n,
+                    timestampIsWallClock: false,
+                });
+            }
+            a.pipeline.tick();
+            b.pipeline.tick();
+
+            const renderA = a.commands.filter(c => c.type === 'decode_audio').map(c => c.renderTimeUs);
+            const renderB = b.commands.filter(c => c.type === 'decode_audio').map(c => c.renderTimeUs);
+            expect(renderB).toEqual(renderA);
         });
     });
 });

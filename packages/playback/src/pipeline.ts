@@ -333,8 +333,11 @@ export class PlaybackPipeline {
             });
         }
 
-        // Feed adaptive tolerance controller
-        if (this.adaptiveTolerance && headers?.captureTimestamp !== undefined) {
+        // Feed adaptive tolerance controller. Only wall-clock timestamps are
+        // comparable to the local clock; a media-time timestamp (LOC-04 with
+        // Timescale) would feed garbage jitter. @see draft-ietf-moq-loc-04 §2.3.1.2
+        if (this.adaptiveTolerance && headers?.captureTimestamp !== undefined
+            && headers.timestampIsWallClock !== false) {
             const nowMs = this.clock.now() / 1000; // µs → ms
             const captureUs = Number(headers.captureTimestamp);
             this.adaptiveTolerance.onFrameArrived(nowMs, captureUs, nowMs);
@@ -815,7 +818,7 @@ export class PlaybackPipeline {
         // @see draft-ietf-moq-loc-01 §2.3.1.1 (latency measurement)
         // @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
         if (headers.captureTimestamp !== undefined) {
-            const catchUp = this.sync.evaluateCatchUp(headers.captureTimestamp);
+            const catchUp = this.sync.evaluateCatchUp(headers.captureTimestamp, headers.timestampIsWallClock);
             if (catchUp !== null && catchUp.currentRate !== this._lastEmittedRate) {
                 this._lastEmittedRate = catchUp.currentRate;
                 this.onEvent({ type: 'catch_up_changed', state: catchUp });
