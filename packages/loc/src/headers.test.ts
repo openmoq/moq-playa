@@ -549,6 +549,17 @@ describe('encodeLocHeaders — LOC-04 (default)', () => {
         const back = parseLocHeaders(encodeLocHeaders({ captureTimestamp: 1n, unknown: new Map([[0x20n, 5n]]) })!);
         expect(back.unknown?.get(0x20n)).toBe(5n);
     });
+
+    it('round trips a bare Timescale with no timestamp', () => {
+        const back = parseLocHeaders(encodeLocHeaders({ timescale: 90_000n }, { locVersion: 4 })!);
+        expect(back.timescale).toBe(90_000n);
+        expect(back.timestamp).toBeUndefined();
+    });
+
+    it('rejects captureTimestamp with timescale but no raw timestamp', () => {
+        expect(() => encodeLocHeaders({ captureTimestamp: 1n, timescale: 90_000n }, { locVersion: 4 }))
+            .toThrow(LocEncodeError);
+    });
 });
 
 describe('encodeLocHeaders — LOC-01 (locVersion: 1)', () => {
@@ -586,6 +597,11 @@ describe('encodeLocHeaders — LOC-01 (locVersion: 1)', () => {
 
     it('rejects a timescale that cannot be derived away (no timestamp)', () => {
         expect(() => encodeLocHeaders({ timescale: 90_000n }, { locVersion: 1 })).toThrow(LocEncodeError);
+    });
+
+    it('rejects captureTimestamp with timescale but no raw timestamp', () => {
+        expect(() => encodeLocHeaders({ captureTimestamp: 1n, timescale: 90_000n }, { locVersion: 1 }))
+            .toThrow(LocEncodeError);
     });
 });
 

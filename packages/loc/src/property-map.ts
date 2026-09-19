@@ -171,6 +171,9 @@ export function locHeadersToPropertyMap(headers: LocHeaders, version: LocVersion
       entries.push({ id: ID04.timestamp, value: headers.timestamp });
       if (headers.timescale !== undefined) entries.push({ id: ID04.timescale, value: headers.timescale });
     } else if (headers.captureTimestamp !== undefined) {
+      if (headers.timescale !== undefined) {
+        throw new LocEncodeError('timescale', 'requires timestamp; captureTimestamp is always microseconds');
+      }
       entries.push({ id: ID04.timestamp, value: headers.captureTimestamp });
     } else if (headers.timescale !== undefined) {
       entries.push({ id: ID04.timescale, value: headers.timescale });
@@ -185,6 +188,9 @@ export function locHeadersToPropertyMap(headers: LocHeaders, version: LocVersion
     if (headers.audioConfig !== undefined) entries.push({ id: ID04.audioConfig, value: headers.audioConfig });
   } else {
     let micros = headers.captureTimestamp;
+    if (headers.timescale !== undefined && headers.timestamp === undefined) {
+      throw new LocEncodeError('timescale', 'requires timestamp; captureTimestamp is always microseconds');
+    }
     if (micros === undefined && headers.timestamp !== undefined) {
       if (headers.timescale === undefined) {
         micros = headers.timestamp;
@@ -193,8 +199,6 @@ export function locHeadersToPropertyMap(headers: LocHeaders, version: LocVersion
       } else {
         micros = (headers.timestamp * MICROS_PER_SECOND) / headers.timescale;
       }
-    } else if (headers.timescale !== undefined && headers.timestamp === undefined && micros === undefined) {
-      throw new LocEncodeError('timescale', 'not representable in LOC-01 without a timestamp');
     }
     if (micros !== undefined) entries.push({ id: ID01.captureTimestamp, value: micros });
     if (headers.videoFrameMarking !== undefined) {
