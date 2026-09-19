@@ -20,7 +20,7 @@ import {
     toVideoChunkInit,
     toAudioChunkInit,
 } from './headers.js';
-import { LocExtensionId, Loc04PropertyId } from './types.js';
+import { LocExtensionId } from './types.js';
 import type { LocHeaders } from './types.js';
 import { LocEncodeError } from './errors.js';
 
@@ -611,5 +611,23 @@ describe('parseLocHeaders — track option', () => {
         const back = parseLocHeaders(bytes, { track: { timescale: 48_000n } });
         expect(back.captureTimestamp).toBe(1_000_000n);
         expect(back.timestampIsWallClock).toBe(false);
+    });
+});
+
+describe('encodeLocHeaders — unknown dedupe against the projection', () => {
+    it('drops an unknown entry whose id the projection already emitted', () => {
+        const bytes = buildExtensionBytes([{ id: 0x02, value: 7n }, { id: 0x10, value: 9n }]);
+        const parsed = parseLocHeaders(bytes);
+        const back = parseLocHeaders(encodeLocHeaders(parsed, { locVersion: 1 })!);
+        expect(back.captureTimestamp).toBe(9n);
+        expect(back.unknown).toBeUndefined();
+    });
+
+    it('projected values win when a caller-supplied unknown entry collides with a version-4 field', () => {
+        const bytes = encodeLocHeaders({ captureTimestamp: 1n, unknown: new Map([[0x10n, 5n]]) })!;
+        const back = parseLocHeaders(bytes);
+        expect(back.timestamp).toBe(1n);
+        expect(back.captureTimestamp).toBe(1n);
+        expect(back.unknown).toBeUndefined();
     });
 });

@@ -61,6 +61,21 @@ describe('resolveLocHeaders — dialect detection', () => {
         expect(h.unknown?.get(0x04n)).toBe(0x20n);
     });
 
+    it('mixed block with no 0x10 Timestamp honours 0x02 as wall-clock microseconds', () => {
+        const h = resolveLocHeaders([e(0x02, 7n), e(0x09, Uint8Array.from([0x20]))]);
+        expect(h.version).toBe(4);
+        expect(h.captureTimestamp).toBe(7n);
+        expect(h.timestampIsWallClock).toBe(true);
+        expect(h.unknown).toBeUndefined();
+    });
+
+    it('mixed block with no 0x10 Timestamp still reports a present Timescale without deriving from it', () => {
+        const h = resolveLocHeaders([e(0x02, 7n), e(0x08, 90_000n), e(0x09, Uint8Array.from([0x20]))]);
+        expect(h.captureTimestamp).toBe(7n);
+        expect(h.timescale).toBe(90_000n);
+        expect(h.timestampIsWallClock).toBe(true);
+    });
+
     it('truly unknown ids are preserved in either dialect', () => {
         const h1 = resolveLocHeaders([e(0x02, 1n), e(0x20, 5n)]);
         expect(h1.version).toBe(1);

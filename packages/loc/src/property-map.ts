@@ -15,6 +15,7 @@
  * `bigint` id, never narrowed.
  *
  * @see draft-ietf-moq-loc-01 §2.3
+ * @see draft-ietf-moq-loc-04 §2.3
  * @module
  */
 
@@ -102,13 +103,19 @@ export function resolveLocHeaders(propertyMap: PropertyMap, track?: LocTrackCont
   let videoFrameMarking: VideoFrameMarking | undefined;
   let audioLevel: AudioLevel | undefined;
 
+  // LOC-01 CaptureTimestamp honoured as-is when a mixed block carries no
+  // 0x10 Timestamp: wall-clock microseconds, no Timescale derivation.
+  let wallClockCaptureTimestamp: bigint | undefined;
+
   if (saw04) {
     version = 4;
     if (saw01) {
-      unknown ??= new Map();
-      if (ts01 !== undefined) unknown.set(ID01.captureTimestamp, ts01);
-      if (vfm01 !== undefined) unknown.set(ID01.videoFrameMarking, vfm01);
-      if (al01 !== undefined) unknown.set(ID01.audioLevel, al01);
+      if (ts01 !== undefined) {
+        if (ts04 !== undefined) (unknown ??= new Map()).set(ID01.captureTimestamp, ts01);
+        else wallClockCaptureTimestamp = ts01;
+      }
+      if (vfm01 !== undefined) (unknown ??= new Map()).set(ID01.videoFrameMarking, vfm01);
+      if (al01 !== undefined) (unknown ??= new Map()).set(ID01.audioLevel, al01);
     }
     timestamp = ts04;
     timescale = scale04 ?? track?.timescale;
@@ -127,7 +134,14 @@ export function resolveLocHeaders(propertyMap: PropertyMap, track?: LocTrackCont
   audioConfig ??= track?.audioConfig;
 
   if (version !== undefined) out.version = version;
-  if (timestamp !== undefined) {
+  if (wallClockCaptureTimestamp !== undefined) {
+    out.captureTimestamp = wallClockCaptureTimestamp;
+    out.timestampIsWallClock = true;
+    if (timescale !== undefined) {
+      if (timescale === 0n) throw new LocHeaderError('timescale', 'must be non-zero');
+      out.timescale = timescale;
+    }
+  } else if (timestamp !== undefined) {
     out.timestamp = timestamp;
     if (timescale !== undefined) {
       if (timescale === 0n) throw new LocHeaderError('timescale', 'must be non-zero');
@@ -158,34 +172,39 @@ export function resolveLocHeaders(propertyMap: PropertyMap, track?: LocTrackCont
  * Version 4: `timestamp` (else `captureTimestamp`) into 0x10; `timescale` into
  * 0x08 only when `timestamp` was the source. Version 1: microseconds into 0x02,
  * derived from `timestamp` and `timescale` when `captureTimestamp` is absent.
- * Fields version 1 cannot carry throw {@link LocEncodeError}.
+ * Fields that version 1 cannot carry throw {@link LocEncodeError}.
  *
  * @see draft-ietf-moq-loc-01 §2.3
  * @see draft-ietf-moq-loc-04 §2.3
  */
 export function locHeadersToPropertyMap(headers: LocHeaders, version: LocVersion = 4): PropertyEntry[] {
   const entries: PropertyEntry[] = [];
+  const emitted = new Set<bigint>();
+  const emit = (id: bigint, value: LocExtensionValue) => {
+    entries.push({ id, value });
+    emitted.add(id);
+  };
 
   if (version === 4) {
     if (headers.timestamp !== undefined) {
-      entries.push({ id: ID04.timestamp, value: headers.timestamp });
-      if (headers.timescale !== undefined) entries.push({ id: ID04.timescale, value: headers.timescale });
+      emit(ID04.timestamp, headers.timestamp);
+      if (headers.timescale !== undefined) emit(ID04.timescale, headers.timescale);
     } else if (headers.captureTimestamp !== undefined) {
       if (headers.timescale !== undefined) {
         throw new LocEncodeError('timescale', 'requires timestamp; captureTimestamp is always microseconds');
       }
-      entries.push({ id: ID04.timestamp, value: headers.captureTimestamp });
+      emit(ID04.timestamp, headers.captureTimestamp);
     } else if (headers.timescale !== undefined) {
-      entries.push({ id: ID04.timescale, value: headers.timescale });
+      emit(ID04.timescale, headers.timescale);
     }
     if (headers.videoFrameMarking !== undefined) {
-      entries.push({ id: ID04.videoFrameMarking, value: encodeVideoFrameMarkingBytes(headers.videoFrameMarking) });
+      emit(ID04.videoFrameMarking, encodeVideoFrameMarkingBytes(headers.videoFrameMarking));
     }
     if (headers.audioLevel !== undefined) {
-      entries.push({ id: ID04.audioLevel, value: encodeAudioLevel(headers.audioLevel) });
+      emit(ID04.audioLevel, encodeAudioLevel(headers.audioLevel));
     }
-    if (headers.videoConfig !== undefined) entries.push({ id: ID04.videoConfig, value: headers.videoConfig });
-    if (headers.audioConfig !== undefined) entries.push({ id: ID04.audioConfig, value: headers.audioConfig });
+    if (headers.videoConfig !== undefined) emit(ID04.videoConfig, headers.videoConfig);
+    if (headers.audioConfig !== undefined) emit(ID04.audioConfig, headers.audioConfig);
   } else {
     let micros = headers.captureTimestamp;
     if (headers.timescale !== undefined && headers.timestamp === undefined) {
@@ -200,24 +219,27 @@ export function locHeadersToPropertyMap(headers: LocHeaders, version: LocVersion
         micros = (headers.timestamp * MICROS_PER_SECOND) / headers.timescale;
       }
     }
-    if (micros !== undefined) entries.push({ id: ID01.captureTimestamp, value: micros });
+    if (micros !== undefined) emit(ID01.captureTimestamp, micros);
     if (headers.videoFrameMarking !== undefined) {
       if (headers.videoFrameMarking.tl0PicIdx !== undefined) {
         throw new LocEncodeError('videoFrameMarking.tl0PicIdx', 'not representable in LOC-01');
       }
-      entries.push({ id: ID01.videoFrameMarking, value: encodeVideoFrameMarking(headers.videoFrameMarking) });
+      emit(ID01.videoFrameMarking, encodeVideoFrameMarking(headers.videoFrameMarking));
     }
     if (headers.audioLevel !== undefined) {
-      entries.push({ id: ID01.audioLevel, value: encodeAudioLevel(headers.audioLevel) });
+      emit(ID01.audioLevel, encodeAudioLevel(headers.audioLevel));
     }
-    if (headers.videoConfig !== undefined) entries.push({ id: ID01.videoConfig, value: headers.videoConfig });
+    if (headers.videoConfig !== undefined) emit(ID01.videoConfig, headers.videoConfig);
     if (headers.audioConfig !== undefined) {
       throw new LocEncodeError('audioConfig', 'not representable in LOC-01');
     }
   }
 
   if (headers.unknown) {
-    for (const [id, value] of headers.unknown) entries.push({ id, value });
+    for (const [id, value] of headers.unknown) {
+      if (emitted.has(id)) continue;
+      entries.push({ id, value });
+    }
   }
   return entries;
 }
