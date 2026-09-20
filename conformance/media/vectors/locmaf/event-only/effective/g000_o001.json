@@ -1,0 +1,17 @@
+{
+  "sampleCount": 0,
+  "bmdt": 90000,
+  "sampleDescriptionIndex": 1,
+  "durations": [],
+  "sizes": [],
+  "flags": [],
+  "ctos": [],
+  "genBoxes": [
+    {
+      "name": "emsg",
+      "payload": "0100000000015f900000000000015f9000000bb80000000275726e3a79006500"
+    }
+  ],
+  "mdatLength": 0,
+  "mdatSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

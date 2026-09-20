@@ -18,6 +18,9 @@ import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@moqt/webtransport';
 import type { ControlMessage, MoqtObject } from '@moqt/transport';
 import { varint } from '@moqt/transport';
+import { LocmafEncoder, LocmafGroupState, LocmafTrackDecoder, parseLocmafTrackContext, serializeLocmafObject } from '@moqt/locmaf';
+import { NON_SYNC_FLAGS, SYNC_FLAGS, buildChunk, videoInit } from '../../locmaf/test-support/cmaf.js';
+import { concat, vi as vi64 } from '../../locmaf/test-support/bytes.js';
 
 // ─── Mock adapter (thin copy of the player.test.ts harness) ──────────
 
@@ -202,6 +205,237 @@ describe('CMAF bootstrap validation (fail before SUBSCRIBE)', () => {
       e.code === PlayerErrorCode.CATALOG_PARSE_ERROR || e.code === PlayerErrorCode.CMAF_INIT_INVALID,
     )).toBe(true);
     expect(subscribedNames()).toEqual(['catalog']); // nothing else hit the wire
+    await player.destroy();
+  });
+});
+
+describe('LOCMAF bootstrap (draft-einarsson-moq-locmaf-01 §5, §6) — same CMAF init path', () => {
+  const LOCMAF_VIDEO = { ...VIDEO_BASE, packaging: 'locmaf', locmafVersion: '0.3' };
+  const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
+  const cmsfCatalog = (tracks: Array<Record<string, unknown>>, initDataList?: unknown[]) =>
+    JSON.stringify({ version: 'draft-01', tracks, ...(initDataList ? { initDataList } : {}) });
+
+  it('initRef → root inline initDataList resolves for a locmaf track: subscribes, initializes MSE once with those bytes', async () => {
+    const init = initSegmentPayload(48);
+    const { player, mockMs, errors, subscribedNames } = await bootPlayer(cmsfCatalog(
+      [{ ...LOCMAF_VIDEO, initRef: 'v' }],
+      [{ id: 'v', type: 'inline', data: b64(init) }],
+    ));
+
+    expect(subscribedNames()).toEqual(['catalog', 'video']);
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+    const cfg = mockMs.initialize.mock.calls[0]![0];
+    expect(cfg.video.codec).toBe('avc1.4D4028');
+    expect(cfg.video.initData).toEqual(init);
+    expect(errors).toEqual([]);
+    await player.destroy();
+  });
+
+  it('codec missing on a selected locmaf track → fatal CMAF_INIT_INVALID, zero media subscribes', async () => {
+    const { player, errors, subscribedNames } = await bootPlayer(
+      cmsfCatalog([{ ...LOCMAF_VIDEO, codec: undefined }]));
+    expect(errors.some((e) => e.code === PlayerErrorCode.CMAF_INIT_INVALID)).toBe(true);
+    expect(subscribedNames()).toEqual(['catalog']);
+    await player.destroy();
+  });
+
+  it('an unsupported locmafVersion is never subscribed; the cmaf alternative of the same source is selected', async () => {
+    const init = initSegmentPayload(48);
+    const { player, subscribedNames } = await bootPlayer(cmsfCatalog(
+      [
+        { ...LOCMAF_VIDEO, name: 'video-locmaf', locmafVersion: '9.9', altGroup: 1, bitrate: 3_000_000, initRef: 'v' },
+        { ...VIDEO_BASE, altGroup: 1, initRef: 'v' },
+      ],
+      [{ id: 'v', type: 'inline', data: b64(init) }],
+    ));
+
+    expect(subscribedNames()).toEqual(['catalog', 'video']);
+    await expect(player.selectVideoTrack('video-locmaf')).rejects.toThrow(/locmafVersion/);
+    expect(subscribedNames()).not.toContain('video-locmaf');
+    await player.destroy();
+  });
+
+  // ─── LOCMAF media: reconstruction into the CMAF assembler (§15, §16) ───
+
+  const locmafInit = videoInit();
+  const locmafContext = parseLocmafTrackContext(locmafInit);
+
+  /** One MOQT group of single-sample LOCMAF video objects (full header first, deltas after). */
+  function locmafGroup(bmdt: number, count: number, firstFlags = SYNC_FLAGS): Uint8Array[] {
+    const encoder = new LocmafEncoder();
+    const state = new LocmafGroupState();
+    return Array.from({ length: count }, (_, i) => serializeLocmafObject(encoder.encode(
+      buildChunk({ bmdt: bmdt + i * 3000, samples: [{ duration: 3000, size: 10 + i, flags: i === 0 ? firstFlags : NON_SYNC_FLAGS }] }),
+      state, locmafContext, false, BigInt(i))));
+  }
+
+  /** The canonical chunks an independent decoder reconstructs from the same objects. */
+  function canonical(groupId: bigint, objects: Uint8Array[]): Uint8Array[] {
+    const decoder = new LocmafTrackDecoder(locmafInit);
+    return objects.map((payload, i) => {
+      const r = decoder.push(groupId, BigInt(i), payload);
+      if (r.kind !== 'chunk') throw new Error(`expected a chunk, got ${r.kind}`);
+      return r.bytes;
+    });
+  }
+
+  function sendLocmaf(adapter: any, alias: unknown, groupId: number, objectId: number, payload: Uint8Array): void {
+    adapter._triggerObject(0n, {
+      kind: 'data', trackAlias: alias, groupId: varint(groupId), subgroupId: varint(0),
+      objectId: varint(objectId), payload,
+    } as MoqtObject);
+  }
+
+  async function bootLocmaf(withInit = true) {
+    const booted = await bootPlayer(withInit
+      ? cmsfCatalog([{ ...LOCMAF_VIDEO, initRef: 'v' }], [{ id: 'v', type: 'inline', data: b64(locmafInit) }])
+      : cmsfCatalog([{ ...LOCMAF_VIDEO }]));
+    return { ...booted, alias: await booted.reqIdFor('video') };
+  }
+
+  it('locmaf objects are reconstructed into canonical CMAF chunks and fed to the assembler in order', async () => {
+    const { player, adapter, assembler, alias, errors } = await bootLocmaf();
+    const objects = locmafGroup(90000, 3);
+    objects.forEach((payload, i) => sendLocmaf(adapter, alias, 4, i, payload));
+    await sleep(10);
+
+    const expected = canonical(4n, objects);
+    expect(assembler.push).toHaveBeenCalledTimes(3);
+    assembler.push.mock.calls.forEach((call: any[], i: number) => {
+      expect(call.slice(0, 3)).toEqual(['video', 'video', 4n]);
+      expect(call[3]).toEqual(expected[i]);
+      expect(String.fromCharCode(...(call[3] as Uint8Array).subarray(4, 8))).toBe('moof');
+    });
+    expect(errors).toEqual([]);
+    await player.destroy();
+  });
+
+  it('a mid-group join is held: deltas without a reference are rejected until the next group\'s sync chunk', async () => {
+    const { player, adapter, assembler, alias } = await bootLocmaf();
+    const g0 = locmafGroup(0, 3);
+    sendLocmaf(adapter, alias, 0, 1, g0[1]!);
+    sendLocmaf(adapter, alias, 0, 2, g0[2]!);
+    await sleep(10);
+    expect(assembler.push).not.toHaveBeenCalled();
+    expect((player as any)._stats.snapshot().locmafObjectsRejected).toBe(2);
+
+    const g1 = locmafGroup(9000, 2);
+    g1.forEach((payload, i) => sendLocmaf(adapter, alias, 1, i, payload));
+    await sleep(10);
+    expect(assembler.push).toHaveBeenCalledTimes(2);
+    expect(assembler.push.mock.calls[0]![2]).toBe(1n);
+    await player.destroy();
+  });
+
+  it('the video keyframe gate reads sample flags, not object ids: a non-sync group start is not a splice point', async () => {
+    const { player, adapter, assembler, alias } = await bootLocmaf();
+    locmafGroup(0, 2, NON_SYNC_FLAGS).forEach((payload, i) => sendLocmaf(adapter, alias, 0, i, payload));
+    await sleep(10);
+    expect(assembler.push).not.toHaveBeenCalled();
+
+    locmafGroup(6000, 2).forEach((payload, i) => sendLocmaf(adapter, alias, 1, i, payload));
+    await sleep(10);
+    expect(assembler.push).toHaveBeenCalledTimes(2);
+    await player.destroy();
+  });
+
+  it('an in-band CMAF Header carried as a rawBoxes object (§9) initializes MSE, then media flows', async () => {
+    const { player, adapter, mockMs, assembler, alias, errors } = await bootLocmaf(false);
+    expect(mockMs.initialize).not.toHaveBeenCalled();
+
+    sendLocmaf(adapter, alias, 0, 0, concat(vi64(4), locmafInit));
+    expect(mockMs.initialize).toHaveBeenCalledTimes(1);
+    expect(mockMs.initialize.mock.calls[0]![0].video.initData).toEqual(locmafInit);
+
+    locmafGroup(0, 2).forEach((payload, i) => sendLocmaf(adapter, alias, 1, i, payload));
+    await sleep(10);
+    expect(assembler.push).toHaveBeenCalledTimes(2);
+    expect(errors).toEqual([]);
+    await player.destroy();
+  });
+
+  it('interleaved groups (the tail of one group overlapping the head of the next) all reach the assembler, no malformed teardown', async () => {
+    const { player, adapter, assembler, alias } = await bootLocmaf();
+    const g7 = locmafGroup(0, 4);
+    const g8 = locmafGroup(12000, 3);
+    const arrival: Array<[number, number, Uint8Array]> = [
+      [7, 0, g7[0]!], [7, 1, g7[1]!], [8, 0, g8[0]!], [7, 2, g7[2]!], [8, 1, g8[1]!], [7, 3, g7[3]!], [8, 2, g8[2]!],
+    ];
+    for (const [g, o, payload] of arrival) sendLocmaf(adapter, alias, g, o, payload);
+    await sleep(10);
+
+    expect(assembler.push).toHaveBeenCalledTimes(arrival.length);
+    expect((player as any)._stats.snapshot().locmafObjectsRejected).toBe(0);
+    expect(adapter.unsubscribe).not.toHaveBeenCalled();
+    await player.destroy();
+  });
+
+  it('a same-codec switch to a locmaf rendition with only an initTrack prefetches that CMAF Header first', async () => {
+    const { player, subscribedNames } = await bootPlayer(cmsfCatalog(
+      [
+        { ...LOCMAF_VIDEO, name: 'video', altGroup: 1, bitrate: 800_000, initRef: 'v' },
+        { ...LOCMAF_VIDEO, name: 'video-hi', altGroup: 1, bitrate: 2_500_000, initTrack: 'init-hi' },
+      ],
+      [{ id: 'v', type: 'inline', data: b64(locmafInit) }],
+    ));
+    expect(subscribedNames()).toEqual(['catalog', 'video']);
+
+    const switching = player.selectVideoTrack('video-hi').catch(() => undefined);
+    await sleep(30);
+    const names = subscribedNames();
+    expect(names).toContain('init-hi');
+    const targetIndex = names.indexOf('video-hi');
+    if (targetIndex >= 0) expect(names.indexOf('init-hi')).toBeLessThan(targetIndex);
+    await player.destroy();
+    await switching;
+  });
+
+  it('a switch target torn down as malformed aborts the pending switch; the old track stays subscribed', async () => {
+    const { player, adapter, reqIdFor, subscribedNames } = await bootPlayer(cmsfCatalog(
+      [
+        { ...LOCMAF_VIDEO, name: 'video', altGroup: 1, bitrate: 800_000, initRef: 'v' },
+        { ...LOCMAF_VIDEO, name: 'video-hi', altGroup: 1, bitrate: 2_500_000, initRef: 'v' },
+      ],
+      [{ id: 'v', type: 'inline', data: b64(locmafInit) }],
+    ));
+    const failed: unknown[] = [];
+    player.on('quality_switch_failed', (e) => failed.push(e));
+    expect(subscribedNames()).toEqual(['catalog', 'video']);
+    const oldAlias = await reqIdFor('video');
+
+    void player.selectVideoTrack('video-hi').catch(() => undefined);
+    await sleep(30);
+    expect(subscribedNames()).toContain('video-hi');
+    const newReqId = await reqIdFor('video-hi');
+    // A switch target is not registered optimistically: its objects route once
+    // SUBSCRIBE_OK binds the relay-assigned alias.
+    const newAlias = varint(BigInt(newReqId) + 100n);
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: newReqId, trackAlias: newAlias, parameters: new Map(),
+    } as unknown as ControlMessage);
+    await sleep(10);
+    const garbage = Uint8Array.of(0x3f, 0x00);
+    for (let g = 0; g < 3; g++) sendLocmaf(adapter, newAlias, g, 0, garbage);
+    await sleep(10);
+
+    expect(failed).toHaveLength(1);
+    expect((player as any).pendingVideoSwitch).toBeNull();
+    const unsubscribed = adapter.unsubscribe.mock.calls.map((c: any[]) => c[0]);
+    expect(unsubscribed).not.toContainEqual(oldAlias);
+    await player.destroy();
+  });
+
+  it('one undecodable group is tolerated; consecutive undecodable groups make the track malformed (unsubscribe)', async () => {
+    const { player, adapter, alias } = await bootLocmaf();
+    const garbage = Uint8Array.of(0x3f, 0x00);
+    sendLocmaf(adapter, alias, 0, 0, garbage);
+    locmafGroup(3000, 1).forEach((payload) => sendLocmaf(adapter, alias, 1, 0, payload));
+    await sleep(10);
+    expect(adapter.unsubscribe).not.toHaveBeenCalled();
+
+    for (let g = 2; g < 5; g++) sendLocmaf(adapter, alias, g, 0, garbage);
+    await sleep(10);
+    expect(adapter.unsubscribe).toHaveBeenCalled();
     await player.destroy();
   });
 });

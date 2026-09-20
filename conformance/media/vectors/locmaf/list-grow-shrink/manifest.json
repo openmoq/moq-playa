@@ -1,0 +1,20 @@
+{
+  "name": "list-grow-shrink",
+  "description": "sample count 2 → 4 → 1 across deltas: list grow (absolute-as-zigzag) and shrink (truncate)",
+  "locmafVersion": "0.3",
+  "draftCommit": "6a2439a",
+  "groups": 1,
+  "objects": 3,
+  "files": {
+    "canonical/g000_o000.cmfc": "ce40f562c34518d0421153ff7235e2c49e314ff58162fa555358fe15e56dbbd1",
+    "canonical/g000_o001.cmfc": "23a5b1659187acd16100d6dfd6e964cc0cdd097b2b7ee0526001596568318332",
+    "canonical/g000_o002.cmfc": "fc81d8170ec965bc94f7ca1b5943bafe85c2a36f4e7e5aae2c2603febd24f622",
+    "effective/g000_o000.json": "c40503c77952148be09601eb99d343b17b196e2a999853a3e9bd523597f37e6a",
+    "effective/g000_o001.json": "14bcea17e4b0920c837ae01253adfb930be3712bb35cd51840aaa085ab3365dd",
+    "effective/g000_o002.json": "03c6fd1dd54d1d715fbbb14c1f292ef4d87e56dc55dd56607d7ea2f9a22c538f",
+    "init.mp4": "837edbacc52571ac324d828de79711a3336e95ccaaaf67dc2439823a10d76a03",
+    "objects/g000_o000.locmafobj": "2681716d9402c9ce3a6f3716556ad837ff1a8b9b4aa2ce2139f2cb4552b197d8",
+    "objects/g000_o001.locmafobj": "be931c4765a3d1bcbbe7e8ba4aead1f2d2fc1176bdc2f2f6c6fad22a117f734c",
+    "objects/g000_o002.locmafobj": "feedb96dfd248765ad401464b845ea600a97a411255af98944e2a7d83492da9d"
+  }
+}

@@ -239,6 +239,20 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     await player.destroy();
   });
 
+  it('LOCMAF tracks are skipped like CMAF (MSE path): no joining FETCH, NextGroupStart preserved', async () => {
+    const locmafCatalog = locCatalog([
+      { name: 'video', packaging: 'locmaf', locmafVersion: '0.3', isLive: true, role: 'video', renderGroup: 1,
+        codec: 'avc1.4D4028', width: 1280, height: 720, bitrate: 2_500_000 },
+    ]);
+    const { player, adapter, subscribeCalls } = await bootPlayer(
+      locmafCatalog, { warmStartCurrentGroup: true });
+
+    expect(adapter.joiningFetch).not.toHaveBeenCalled();
+    const call = subscribeCalls().find(([n]: [string, unknown]) => n === 'video');
+    expect(call![1]?.subscriptionFilter?.type).toBe('NextGroupStart');
+    await player.destroy();
+  });
+
   it('non-live (VOD) tracks are skipped: AbsoluteStart preserved, no joining FETCH', async () => {
     const vodCatalog = locCatalog([{ ...VIDEO_LOC, isLive: false }]);
     const { player, adapter, subscribeCalls } = await bootPlayer(

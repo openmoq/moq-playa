@@ -1,0 +1,20 @@
+{
+  "name": "cenc-subsamples",
+  "description": "cenc-protected chunks: per-sample IVs (ID 9 overwrite) and subsample maps (IDs 11/13/15)",
+  "locmafVersion": "0.3",
+  "draftCommit": "6a2439a",
+  "groups": 1,
+  "objects": 3,
+  "files": {
+    "canonical/g000_o000.cmfc": "b55a6b67be1b5c116809071c97824593194496f1554fff3e0a3ebe484c454a71",
+    "canonical/g000_o001.cmfc": "883c9fac42821fc931ed50f04b96c4f46d7b2deeb5cf650c3d5c29897678e862",
+    "canonical/g000_o002.cmfc": "d522acf656cd76a1df40c80411acef1f5b956b9f242a644b663dc8ab3e580674",
+    "effective/g000_o000.json": "f6925ff103a5017b15feabbfec4a7436fc93496cfdafed60ca032643d9358b1b",
+    "effective/g000_o001.json": "894bea74b46c7deb2d917f246d375c88f784806218e37f6398b28daebac21288",
+    "effective/g000_o002.json": "3655a2b5d7b57810e999dcce8a3f9aae36cf03663bcc7e02011d5d9dc3fec1d2",
+    "init.mp4": "7b249120d9782753e8263db073b7848d76ac6b70f4564dcdaeb6a785f6872870",
+    "objects/g000_o000.locmafobj": "0927660baa5b70382bb7d5a26898be2bcaa99618dc54354ba0604851400e7767",
+    "objects/g000_o001.locmafobj": "864a6dba7eb48fe026355acf73d77e1e14c79bd6007df8ed249931e03c704fb7",
+    "objects/g000_o002.locmafobj": "2edcb6d67c4df5ff2e5caa3123a6e6d4214320045b3fa64c02b396e125c92ac7"
+  }
+}

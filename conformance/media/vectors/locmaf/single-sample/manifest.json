@@ -1,0 +1,23 @@
+{
+  "name": "single-sample",
+  "description": "one sample per chunk: sizes never on the wire (P authoritative); ID 8 sync flags deleted via ID 27",
+  "locmafVersion": "0.3",
+  "draftCommit": "6a2439a",
+  "groups": 1,
+  "objects": 4,
+  "files": {
+    "canonical/g000_o000.cmfc": "f118adab385966d89b4b35036f2791ef6839e1a36acef8cceec3a88223fded79",
+    "canonical/g000_o001.cmfc": "46815491984a375d7cad2a546b85825fccddccbf259f06d010c09053286f2a00",
+    "canonical/g000_o002.cmfc": "61da213b55c125d9ce02621aa54aa0e28d27451f494f1dae4df99a3baa41d05b",
+    "canonical/g000_o003.cmfc": "9e48c1af483d11662b05f14a8ae41b559a6a6505b3ea36bd267e103d13a4a385",
+    "effective/g000_o000.json": "0cc8cefb4dcafef35a1b67c3626b935c04cd0263622b65ccf28af59794685b5b",
+    "effective/g000_o001.json": "25ca1112b1dd42c2f1052268e3833ce7edff1c8455317fbbe5c3d66c2a251bf9",
+    "effective/g000_o002.json": "49eb4e1e574fc9932085060ab6c0c732be6a06fb1fe4240943e662edc2fe1af9",
+    "effective/g000_o003.json": "05e23ac9feb340cbefa9a31888bdfa11468a095f03997e4c8d31eb384b6805d2",
+    "init.mp4": "837edbacc52571ac324d828de79711a3336e95ccaaaf67dc2439823a10d76a03",
+    "objects/g000_o000.locmafobj": "210f3e7eb54a7cc3a2c1b530a08f69d791d187a2f2d6f9598194df1b310013de",
+    "objects/g000_o001.locmafobj": "f5f37c36e1b53bd8e2959669608eec2c8e74dce905b60a47853f3bb84a65ab84",
+    "objects/g000_o002.locmafobj": "0ab5d22790dee6d17719c7f039be3b4cbe395c51d9b4ac6cd42c21ceb24c1d38",
+    "objects/g000_o003.locmafobj": "4b192c95b9a24880866f0b0cc08a3f228442b672e6931cc8f5adfd2fcec36fdf"
+  }
+}

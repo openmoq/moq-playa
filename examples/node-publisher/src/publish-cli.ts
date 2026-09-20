@@ -13,13 +13,17 @@
  * endless live demo. `--loop-count N` sends exactly N groups (finite smoke/debug).
  * Default (no flag) is the one-shot behavior.
  *
+ * Packaging: `--packaging locmaf` (alias `--locmaf`) sends every media chunk as a
+ * LOCMAF Object and signals `packaging: "locmaf"` in the catalog; `cmaf` is the
+ * default.
+ *
  * Default url https://127.0.0.1:4433/moq. PACE_MS env (default = the manifest's
  * chunkDurationMs) paces chunk sends like a live origin; PACE_MS=0 sends as fast
  * as possible.
  */
 import { resolve } from 'node:path';
 import { connectClient } from './client.js';
-import { publishFixture, type CatalogFormat } from './publisher.js';
+import { publishFixture, type CatalogFormat, type MediaPackaging } from './publisher.js';
 import { loadSyntheticFixture } from './synthetic-fixture.js';
 import { loadFixtureFromDisk, validateFixtureLayout, validateFixtureBoxes } from './fixture.js';
 
@@ -31,10 +35,13 @@ import { loadFixtureFromDisk, validateFixtureLayout, validateFixtureBoxes } from
 //   --msf01                   alias for --catalog-format cmsf-01
 //   --emit-delta              publish an op-array catalog delta after the catalog
 //   --delta-after-ms N        emit-delta with an explicit delay (default 2000ms)
+//   --packaging <p>           cmaf (default) | locmaf (LOCMAF Objects, catalog packaging "locmaf")
+//   --locmaf                  alias for --packaging locmaf
 const rawArgs = process.argv.slice(2);
 let loops = 1;
 let catalogFormat: CatalogFormat = 'msf-00';
 let deltaAfterMs: number | undefined;
+let packaging: MediaPackaging = 'cmaf';
 const positionals: string[] = [];
 for (let i = 0; i < rawArgs.length; i++) {
   const a = rawArgs[i]!;
@@ -55,6 +62,12 @@ for (let i = 0; i < rawArgs.length; i++) {
     const n = Number(rawArgs[++i]);
     if (!Number.isInteger(n) || n < 0) { console.error('--delta-after-ms requires a non-negative integer'); process.exit(2); }
     deltaAfterMs = n;
+  } else if (a === '--packaging') {
+    const p = rawArgs[++i];
+    if (p !== 'cmaf' && p !== 'locmaf') { console.error('--packaging must be cmaf or locmaf'); process.exit(2); }
+    packaging = p;
+  } else if (a === '--locmaf') {
+    packaging = 'locmaf';
   } else positionals.push(a);
 }
 const url = positionals.find((a) => a.startsWith('https://')) ?? process.env.URL ?? 'https://127.0.0.1:4433/moq';
@@ -76,10 +89,10 @@ if (fixtureDir) {
 }
 
 const paceMs = process.env.PACE_MS !== undefined ? Number(process.env.PACE_MS) : fixture.manifest.chunkDurationMs;
-console.log(`[publish] connecting to ${url} (paceMs=${paceMs}, loops=${loops === Infinity ? '∞' : loops}, catalog=${catalogFormat}${deltaAfterMs !== undefined ? `, delta@${deltaAfterMs}ms` : ''})`);
+console.log(`[publish] connecting to ${url} (paceMs=${paceMs}, loops=${loops === Infinity ? '∞' : loops}, catalog=${catalogFormat}, packaging=${packaging}${deltaAfterMs !== undefined ? `, delta@${deltaAfterMs}ms` : ''})`);
 connectClient(url, 'publisher')
   .then(async (h) => {
-    await publishFixture(h.conn, fixture, { paceMs, loops, catalogFormat, ...(deltaAfterMs !== undefined ? { deltaAfterMs } : {}) });
+    await publishFixture(h.conn, fixture, { paceMs, loops, catalogFormat, packaging, ...(deltaAfterMs !== undefined ? { deltaAfterMs } : {}) });
     await h.close();
     process.exit(0);
   })

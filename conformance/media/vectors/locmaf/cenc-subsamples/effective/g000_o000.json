@@ -1,0 +1,38 @@
+{
+  "sampleCount": 2,
+  "bmdt": 0,
+  "sampleDescriptionIndex": 1,
+  "durations": [
+    3000,
+    3000
+  ],
+  "sizes": [
+    200,
+    200
+  ],
+  "flags": [
+    33554432,
+    16842752
+  ],
+  "ctos": [
+    0,
+    0
+  ],
+  "perSampleIVSize": 8,
+  "ivs": "a0a1a2a3a4a5a6a7a1a2a3a4a5a6a7a8",
+  "hasSubsamples": true,
+  "subsampleCounts": [
+    1,
+    1
+  ],
+  "clearBytes": [
+    7,
+    7
+  ],
+  "protectedBytes": [
+    193,
+    193
+  ],
+  "mdatLength": 400,
+  "mdatSha256": "9a61e8bd8365c32ff4af79b5411ed7b17c7a53a491f59cdc1268de95a85dbe07"
+}

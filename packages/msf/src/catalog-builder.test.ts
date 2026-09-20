@@ -165,6 +165,22 @@ describe('buildCatalog — MSF-01/CMSF-01 init-by-reference emission', () => {
     expect(cat.tracks.every((t) => t.initData === undefined)).toBe(true);
   });
 
+  it('emits packaging "locmaf" with its locmafVersion and round-trips through parseCatalogAuto (draft-einarsson-moq-locmaf-01 §5)', () => {
+    const payload = buildCatalog({
+      version: '1',
+      initDataList: [{ id: 'init-video', type: 'inline', data: 'AAAAGGZ0eXA=' }],
+      tracks: [
+        { name: 'video', packaging: 'locmaf', locmafVersion: '0.3', isLive: true, role: 'video', codec: 'avc1.640028', renderGroup: 1, initRef: 'init-video' },
+      ],
+    });
+    const json = JSON.parse(new TextDecoder().decode(payload));
+    expect(json.tracks[0].packaging).toBe('locmaf');
+    expect(json.tracks[0].locmafVersion).toBe('0.3');
+    const cat = parseCatalogAuto(payload);
+    expect(cat.tracks[0]!.packaging).toBe('locmaf');
+    expect(cat.tracks[0]!.locmafVersion).toBe('0.3');
+  });
+
   it('the numeric MSF-00 default is unchanged (version 1, inline initData, no initDataList)', () => {
     const json = JSON.parse(new TextDecoder().decode(buildCatalog({
       tracks: [{ name: 'v', packaging: 'cmaf', isLive: true, role: 'video', codec: 'avc1.640028', initData: 'AAAB' }],

@@ -1,0 +1,17 @@
+{
+  "name": "event-only",
+  "description": "zero-sample event chunks: emsg genBoxes, full header per chunk, empty mdat",
+  "locmafVersion": "0.3",
+  "draftCommit": "6a2439a",
+  "groups": 1,
+  "objects": 2,
+  "files": {
+    "canonical/g000_o000.cmfc": "d75e34c059ca9e157786f7b821655224f9f6fc25a0a7da41738d6d502acdb41d",
+    "canonical/g000_o001.cmfc": "570ae870afbab61e048e5605f9835469d5538812ea676d9f952d412eedc6375e",
+    "effective/g000_o000.json": "25141620f1ece4a803de5868c07025d403a3136c0f52aefe60185cfdf3d8d917",
+    "effective/g000_o001.json": "dfd6bd189e00cbfd85d8cbf5280d9be80009ac29ba176b3b7b2820721597e4d1",
+    "init.mp4": "46100019a4cce52021a9e489d4dfc867fff33894f4e02862875421ad86c26aae",
+    "objects/g000_o000.locmafobj": "3d09919ba8576ec09c0f49c79afe44b2477b851dc769375f6b6f0d69e7fb4e4f",
+    "objects/g000_o001.locmafobj": "16c4c4adb20f6f971f8ec3e06608ed5db59fb03f56e813e4c6a317791c7d5243"
+  }
+}

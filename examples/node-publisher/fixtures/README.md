@@ -41,7 +41,7 @@ that is what the Playa player's CMAF/MSE pipeline expects per object (CMSF §3.3
       "packaging": "cmaf",
       "role": "audio",
       "codec": "mp4a.40.2",
-      "samplerate": 48000, "channelConfig": "2",
+      "samplerate": 48000, "channelConfig": "2", "bitrate": 128000,
       "init": "init.mp4",
       "chunks": ["chunk-000.m4s", "chunk-001.m4s", "chunk-002.m4s", "chunk-003.m4s"]
     }

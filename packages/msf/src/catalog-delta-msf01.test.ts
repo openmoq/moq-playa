@@ -255,6 +255,29 @@ describe('applyMsf01Delta — reference integrity is re-validated against the re
     });
 });
 
+describe('applyMsf01Delta — LOCMAF locmafVersion (draft-einarsson-moq-locmaf-01 §5)', () => {
+    it('an add op carries locmafVersion through to the applied locmaf track', () => {
+        const st = apply(cmsfState(), { deltaUpdate: [{ op: 'add', tracks: [{ name: 'vl', packaging: 'locmaf', locmafVersion: '0.3', isLive: true, codec: 'avc1.640028', initRef: 'i1' }] }] });
+        const t = st.tracks.find((x) => x.name === 'vl')!;
+        expect(t.packaging).toBe('locmaf');
+        expect(t.locmafVersion).toBe('0.3');
+    });
+
+    it('rejects a delta that adds a locmaf track without locmafVersion', () => {
+        expect(() => apply(cmsfState(), { deltaUpdate: [{ op: 'add', tracks: [{ name: 'vl', packaging: 'locmaf', isLive: true, initRef: 'i1' }] }] }))
+            .toThrow(/locmafVersion/);
+    });
+
+    it('rejects a clone that switches packaging away from locmaf but inherits locmafVersion', () => {
+        const base: CatalogState = {
+            ...cmsfState(),
+            tracks: [{ name: 'vl', packaging: 'locmaf', locmafVersion: '0.3', isLive: true, role: 'video', initRef: 'i1' }],
+        };
+        expect(() => apply(base, { deltaUpdate: [{ op: 'clone', tracks: [{ parentName: 'vl', name: 'vc', packaging: 'cmaf' }] }] }))
+            .toThrow(/locmafVersion/);
+    });
+});
+
 describe('applyMsf01Delta — an MSF-00 base state stays clean', () => {
     it('an MSF-00 base (no root lists) applies an add with no injected root fields', () => {
         const st = apply({ version: 1, tracks: [{ name: 'v', packaging: 'loc', isLive: true }] },

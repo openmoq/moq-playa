@@ -15,7 +15,7 @@
  */
 
 import type { CatalogTrack, CatalogState, TrackConstraints } from '@moqt/msf';
-import { groupByAlt, selectTrack } from '@moqt/msf';
+import { groupByAlt, selectTrack, isTrackPackagingSupported } from '@moqt/msf';
 import type { ClockSource } from '@moqt/playback';
 
 /** Configuration for the quality controller. */
@@ -100,9 +100,13 @@ export class QualityController {
     catalog: CatalogState,
     constraints?: SelectionConstraints,
   ): SelectedTracks {
+    // LOCMAF §5: a receiver MUST NOT subscribe to a locmafVersion it does not
+    // support — exclude those tracks so an alternative packaging is chosen.
+    const usable = catalog.tracks.filter(isTrackPackagingSupported);
+
     // Split tracks by role
-    const videoTracks = catalog.tracks.filter(t => t.role === 'video');
-    const audioTracks = catalog.tracks.filter(t => t.role === 'audio');
+    const videoTracks = usable.filter(t => t.role === 'video');
+    const audioTracks = usable.filter(t => t.role === 'audio');
 
     // Build video alternatives from altGroup
     let videoAlts: CatalogTrack[];

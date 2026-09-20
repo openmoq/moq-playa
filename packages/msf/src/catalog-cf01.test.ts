@@ -218,6 +218,22 @@ describe('parseCatalogFormat01', () => {
         }
     });
 
+    it('accepts packaging "locmaf" and carries locmafVersion (draft-einarsson-moq-locmaf-01 §5)', () => {
+        const catalog = {
+            version: 1,
+            streamingFormat: 1,
+            tracks: [{ name: 'v', packaging: 'locmaf', locmafVersion: '0.3', selectionParams: { codec: 'avc1.640028' } }],
+        };
+        const t = parseCatalogFormat01(JSON.stringify(catalog)).catalog.tracks[0]!;
+        expect(t.packaging).toBe('locmaf');
+        expect(t.locmafVersion).toBe('0.3');
+    });
+
+    it('rejects a locmaf track without locmafVersion (draft-einarsson-moq-locmaf-01 §5)', () => {
+        const catalog = { version: 1, streamingFormat: 1, tracks: [{ name: 'v', packaging: 'locmaf' }] };
+        expect(() => parseCatalogFormat01(JSON.stringify(catalog))).toThrow(/locmafVersion/);
+    });
+
     it('defaults packaging to cmaf when absent everywhere (interop mode)', () => {
         const catalog = {
             version: 1,

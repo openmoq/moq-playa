@@ -1,0 +1,31 @@
+{
+  "sampleCount": 4,
+  "bmdt": 8192,
+  "sampleDescriptionIndex": 1,
+  "durations": [
+    1024,
+    1024,
+    1024,
+    1024
+  ],
+  "sizes": [
+    200,
+    200,
+    200,
+    200
+  ],
+  "flags": [
+    33554432,
+    33554432,
+    33554432,
+    33554432
+  ],
+  "ctos": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "mdatLength": 800,
+  "mdatSha256": "37a43e234b5707050797a28e30b56f1e5117fc51e7042606c3bdd99c84fddb2c"
+}

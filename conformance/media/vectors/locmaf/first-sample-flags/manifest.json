@@ -1,0 +1,20 @@
+{
+  "name": "first-sample-flags",
+  "description": "sync-led chunks: ID 12 emitted, then deleted via ID 27, then re-introduced by delta",
+  "locmafVersion": "0.3",
+  "draftCommit": "6a2439a",
+  "groups": 1,
+  "objects": 3,
+  "files": {
+    "canonical/g000_o000.cmfc": "3b1ba4b69d87fca69ae7ace99798ba6204e620ca931eefe991e063126a10fc62",
+    "canonical/g000_o001.cmfc": "547c80ac5f71249bb2fede8a01ccf4cc729349a5789695c10ffc33abb23fb21a",
+    "canonical/g000_o002.cmfc": "6649b1170884c370a24ee5703e8547dc7a528e15573070f3155fceb0e6440897",
+    "effective/g000_o000.json": "72dd6246dfb941dd2561d05835e8a9b958aec267435a2565a7644da74d63b32e",
+    "effective/g000_o001.json": "ff2fca0ea2833c003bd58f49d3a2df6cab63ca1989b0fe94125839790b76175d",
+    "effective/g000_o002.json": "0c5939320740c25b0c982c25b622339129476ac00c9b67e7afd4d724f34e7c41",
+    "init.mp4": "837edbacc52571ac324d828de79711a3336e95ccaaaf67dc2439823a10d76a03",
+    "objects/g000_o000.locmafobj": "5b748c635c68420bed4e2c9982efe5339c61d4793c56b724ad3e1a1e3e5bd269",
+    "objects/g000_o001.locmafobj": "f93dfa8a7147dcb5a222e04240c40fd6b7ada15a0958f5ed21ff282841c3b1bd",
+    "objects/g000_o002.locmafobj": "94a967b0c322a4f7f11e20526237b287113ead31f5a714a779daabc66b1671f8"
+  }
+}
