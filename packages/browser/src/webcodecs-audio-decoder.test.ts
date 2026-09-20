@@ -21,6 +21,8 @@ describe('WebCodecsAudioDecoder', () => {
     decodeQueueSize: number;
     output: (data: unknown) => void;
     error: (error: DOMException) => void;
+    lastConfig?: AudioDecoderConfig;
+    decoded: unknown[];
   }>;
 
   beforeEach(() => {
@@ -32,6 +34,8 @@ describe('WebCodecsAudioDecoder', () => {
       decodeQueueSize = 0;
       readonly output: (data: unknown) => void;
       readonly error: (error: DOMException) => void;
+      lastConfig: AudioDecoderConfig | undefined;
+      decoded: unknown[] = [];
 
       constructor(init: { output: (data: unknown) => void; error: (error: DOMException) => void }) {
         this.output = init.output;
@@ -39,11 +43,13 @@ describe('WebCodecsAudioDecoder', () => {
         createdDecoders.push(this);
       }
 
-      configure(): void {
+      configure(config: AudioDecoderConfig): void {
         this.state = 'configured';
+        this.lastConfig = config;
       }
 
       decode(chunk: unknown): void {
+        this.decoded.push(chunk);
         decodeSpy(chunk);
       }
 
@@ -64,9 +70,9 @@ describe('WebCodecsAudioDecoder', () => {
   });
 
   /** Opus (non-AAC) sidesteps ADTS wrapping — payload bytes are irrelevant here. */
-  function configuredDecoder(): WebCodecsAudioDecoder {
+  function configuredDecoder(codec = 'opus', config: Uint8Array = new Uint8Array(0)): WebCodecsAudioDecoder {
     const decoder = new WebCodecsAudioDecoder();
-    decoder.configure(new Uint8Array(0), 'opus', 48000, 2);
+    decoder.configure(config, codec, 48000, 2);
     return decoder;
   }
 
@@ -140,6 +146,70 @@ describe('WebCodecsAudioDecoder', () => {
     expect(received[0]).toBe(fakeAudioData); // same object, timestamp untouched
   });
 
+  it('pairs output after an Audio Config change with the new chunk render time', () => {
+    const decoder = configuredDecoder('mp4a.40.2', Uint8Array.from([0x12, 0x10]));
+    const received: number[] = [];
+    decoder.onData = (_data, renderTimeUs) => received.push(renderTimeUs);
+    decoder.decode(chunk(0), 100_000);
+    decoder.decode(chunk(20_000), 120_000);
+    createdDecoders[0]!.output({});
+
+    decoder.configure(Uint8Array.from([0x11, 0x90]), 'mp4a.40.2', 48000, 2);
+    decoder.decode(chunk(40_000), 140_000);
+    createdDecoders[1]!.output({});
+
+    expect(received).toEqual([100_000, 140_000]);
+    decoder.destroy();
+  });
+
+  it('ignores retired decoder callbacks without consuming the new render time', () => {
+    const decoder = configuredDecoder('mp4a.40.2', Uint8Array.of(0x12, 0x10));
+    const received: number[] = [];
+    const onError = vi.fn();
+    decoder.onData = (_data, time) => received.push(time);
+    decoder.onError = onError;
+    decoder.configure(Uint8Array.of(0x11, 0x90), 'mp4a.40.2', 48000, 2);
+    decoder.decode(chunk(20_000), 120_000);
+    const retiredData = { close: vi.fn() };
+    createdDecoders[0]!.output(retiredData);
+    createdDecoders[0]!.error(new DOMException('late failure'));
+    expect(retiredData.close).toHaveBeenCalledOnce();
+    expect(onError).not.toHaveBeenCalled();
+    expect(createdDecoders).toHaveLength(2);
+    createdDecoders[1]!.output({});
+    expect(received).toEqual([120_000]);
+    decoder.destroy();
+  });
+
+  it('keeps Audio Config through reset and error recovery', () => {
+    const description = Uint8Array.of(0x12, 0x10);
+    const decoder = configuredDecoder('mp4a.40.2', description);
+    decoder.reset();
+    expect(createdDecoders[1]!.lastConfig?.description).toEqual(description);
+    createdDecoders[1]!.error(new DOMException('decode failure'));
+    expect(createdDecoders[2]!.lastConfig?.description).toEqual(description);
+    decoder.decode(chunk(0), 0);
+    expect((createdDecoders[2]!.decoded[0] as MockEncodedAudioChunk).data).toEqual(chunk(0).data);
+    decoder.destroy();
+  });
+
+  it('does not recreate a decoder destroyed by its error callback', () => {
+    const decoder = configuredDecoder();
+    decoder.onError = () => decoder.destroy();
+    createdDecoders[0]!.error(new DOMException('decode failure'));
+    expect(createdDecoders).toHaveLength(1);
+  });
+
+  it('does not replace a new configuration installed by its error callback', () => {
+    const decoder = configuredDecoder();
+    const description = Uint8Array.of(0x11, 0x90);
+    decoder.onError = () => decoder.configure(description, 'mp4a.40.2', 48000, 2);
+    createdDecoders[0]!.error(new DOMException('decode failure'));
+    expect(createdDecoders).toHaveLength(2);
+    expect(createdDecoders[1]!.lastConfig?.description).toEqual(description);
+    decoder.destroy();
+  });
+
   it('resets and reports on decode queue overflow instead of dropping silently', () => {
     const decoder = configuredDecoder();
     const received: number[] = [];
@@ -162,5 +232,32 @@ describe('WebCodecsAudioDecoder', () => {
     expect(decodeSpy).toHaveBeenCalledOnce();
     createdDecoders[1]!.output({});
     expect(received).toEqual([200]);
+  });
+
+  describe('WebCodecsAudioDecoder — Audio Config description', () => {
+    it('passes non-empty config bytes as description and skips ADTS wrapping', () => {
+      const desc = Uint8Array.from([0x12, 0x10]);
+      const decoder = configuredDecoder('mp4a.40.2', desc);
+      const mock = createdDecoders[0]!;
+      expect(mock.lastConfig?.description).toEqual(desc);
+      decoder.decode({ type: 'key', timestamp: 0, data: Uint8Array.from([0xaa, 0xbb]) }, 0);
+      expect((mock.decoded[0] as { data: Uint8Array })?.data).toEqual(Uint8Array.from([0xaa, 0xbb]));
+    });
+
+    it('empty config keeps ADTS mode for AAC', () => {
+      const decoder = configuredDecoder('mp4a.40.2', new Uint8Array(0));
+      const mock = createdDecoders[0]!;
+      expect(mock.lastConfig?.description).toBeUndefined();
+
+      const payload = Uint8Array.from([0xaa, 0xbb, 0xcc]);
+      decoder.decode({ type: 'key', timestamp: 0, data: payload }, 0);
+
+      const wrapped = (mock.decoded[0] as { data: Uint8Array })?.data;
+      expect(wrapped).toBeDefined();
+      expect(wrapped!.length).toBe(payload.length + 7);
+      expect(wrapped![0]).toBe(0xff);
+      expect(wrapped![1]! & 0xf0).toBe(0xf0);
+      expect(wrapped!.subarray(7)).toEqual(payload);
+    });
   });
 });

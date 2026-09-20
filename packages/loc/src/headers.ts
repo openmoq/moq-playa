@@ -16,6 +16,7 @@
  * profile — `deltaEncoded` alone cannot express it).
  *
  * @see draft-ietf-moq-loc-01 §2.3
+ * @see draft-ietf-moq-loc-04 §2.3
  * @see draft-ietf-moq-transport-16 §2.5 (Extension Headers)
  * @module
  */
@@ -23,6 +24,8 @@
 import { decodePropertyBlock, encodePropertyBlock, type PropertyWireProfile } from '@moqt/transport';
 import type {
     LocHeaders,
+    LocTrackContext,
+    LocVersion,
     VideoChunkInit,
     AudioChunkInit,
 } from './types.js';
@@ -59,6 +62,23 @@ export interface LocHeaderOptions {
      * @see draft-ietf-moq-transport-18 §1.4.1 (vi64), §1.4.3 (property block)
      */
     readonly wireProfile?: PropertyWireProfile;
+
+    /**
+     * LOC draft to emit. Encode only; parse auto-detects. Default 1.
+     * Version 1 cannot carry Timescale, Audio Config, or TL0PICIDX and
+     * throws {@link LocEncodeError} for them.
+     *
+     * @see draft-ietf-moq-loc-04 §6.1
+     */
+    readonly locVersion?: LocVersion;
+
+    /**
+     * Track-scoped defaults (Timescale, Video Config, Audio Config). Parse
+     * only. Object-level values always win.
+     *
+     * @see draft-ietf-moq-loc-04 §6.1 (Scope column)
+     */
+    readonly track?: LocTrackContext;
 }
 
 /** Map LOC options to a transport wire profile, preserving legacy defaults. */
@@ -90,20 +110,23 @@ export function locWireProfileForDraft(draft: number): PropertyWireProfile {
  * `{ deltaEncoded: false }` for draft-14 absolute type IDs, or
  * `{ wireProfile: 'd18-delta-vi64' }` for draft-18.
  *
+ * Accepts LOC-01 and LOC-04 property sets; see `LocHeaders.version`.
+ *
  * @param extensions Raw extension bytes from `MoqtObjectData.extensions`
  * @param options Parsing options (defaults to draft-16 delta)
  * @returns Parsed LOC headers
  * @see draft-ietf-moq-loc-01 §2.3
+ * @see draft-ietf-moq-loc-04 §2.3
  */
 export function parseLocHeaders(
     extensions: Uint8Array | undefined,
     options?: LocHeaderOptions,
 ): LocHeaders {
     if (!extensions || extensions.length === 0) {
-        return {};
+        return options?.track ? resolveLocHeaders([], options.track) : {};
     }
     const { entries } = decodePropertyBlock(extensions, 0, { profile: resolveWireProfile(options) });
-    return resolveLocHeaders(entries);
+    return resolveLocHeaders(entries, options?.track);
 }
 
 /**
@@ -113,16 +136,19 @@ export function parseLocHeaders(
  * stable ascending-ID order, minimal integer encodings. Returns undefined if no
  * headers are present.
  *
+ * Preserves LOC-01 output by default. Pass `locVersion: 4` for LOC-04.
+ *
  * @param headers Structured LOC headers
  * @param options Encoding options (defaults to draft-16 delta)
  * @returns Encoded extension bytes, or undefined if empty
  * @see draft-ietf-moq-loc-01 §2.3
+ * @see draft-ietf-moq-loc-04 §2.3
  */
 export function encodeLocHeaders(
     headers: LocHeaders,
     options?: LocHeaderOptions,
 ): Uint8Array | undefined {
-    const entries = locHeadersToPropertyMap(headers);
+    const entries = locHeadersToPropertyMap(headers, options?.locVersion ?? 1);
     if (entries.length === 0) return undefined;
     return encodePropertyBlock(entries, resolveWireProfile(options));
 }

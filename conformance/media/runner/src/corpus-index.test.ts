@@ -35,6 +35,6 @@ describe('corpus MANIFEST.json index', () => {
 
   it('total matches the sum of loaded vectors', () => {
     expect(index.totalVectors).toBe(total);
-    expect(total).toBe(127);
+    expect(total).toBe(146);
   });
 });

@@ -262,9 +262,9 @@ export class PlaybackPipeline {
     /**
  * Provide codec configuration (from catalog or initial headers).
  *
- * For video, this is also triggered automatically when a videoConfig
- * LOC extension is encountered. For audio, this must be called
- * externally since audio config comes from the MSF catalog.
+ * This is also triggered automatically when a LOC object carries the
+ * matching config property: Video Config for video, Audio Config for
+ * audio.
  *
  * @param config Codec-specific configuration bytes
  */
@@ -333,7 +333,8 @@ export class PlaybackPipeline {
             });
         }
 
-        // Feed adaptive tolerance controller
+        // Interarrival jitter uses transit differences, so the timestamp epoch
+        // cancels out. Media time is suitable here, but not for latency/catch-up.
         if (this.adaptiveTolerance && headers?.captureTimestamp !== undefined) {
             const nowMs = this.clock.now() / 1000; // µs → ms
             const captureUs = Number(headers.captureTimestamp);
@@ -742,14 +743,17 @@ export class PlaybackPipeline {
         const headers = this.headerMap.get(key) ?? {};
         this.headerMap.delete(key);
 
-        // 1. Configure decoder if videoConfig present
-        if (headers.videoConfig) {
-            const configDecision = this.decoderState.configure(headers.videoConfig);
+        // 1. Configure decoder if the object carries codec config for this
+        //    media type. DecoderStateMachine.configure dedupes equal bytes.
+        //    @see draft-ietf-moq-loc-04 §2.3.2.1 (Video Config), §2.3.3.1 (Audio Config)
+        const config = this.mediaType === 'video' ? headers.videoConfig : headers.audioConfig;
+        if (config) {
+            const configDecision = this.decoderState.configure(config);
             if (configDecision.action === 'configure') {
                 this.onCommand({
                     type: 'configure',
                     mediaType: this.mediaType,
-                    config: headers.videoConfig,
+                    config,
                 });
             }
         }
@@ -815,7 +819,7 @@ export class PlaybackPipeline {
         // @see draft-ietf-moq-loc-01 §2.3.1.1 (latency measurement)
         // @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
         if (headers.captureTimestamp !== undefined) {
-            const catchUp = this.sync.evaluateCatchUp(headers.captureTimestamp);
+            const catchUp = this.sync.evaluateCatchUp(headers.captureTimestamp, headers.timestampIsWallClock);
             if (catchUp !== null && catchUp.currentRate !== this._lastEmittedRate) {
                 this._lastEmittedRate = catchUp.currentRate;
                 this.onEvent({ type: 'catch_up_changed', state: catchUp });

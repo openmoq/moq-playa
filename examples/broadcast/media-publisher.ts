@@ -32,7 +32,7 @@
  * in-flight work is awaited by `drain()`, and late enqueues are ignored —
  * an old generation can never write to a replacement session.
  */
-import { encodeLocHeaders, locWireProfileForDraft } from '@moqt/loc';
+import { encodeLocHeaders, locWireProfileForDraft, type LocVersion } from '@moqt/loc';
 import type { DraftVersion } from '@moqt/transport';
 
 /** The subset of MoqtConnection the media publication path uses. */
@@ -49,14 +49,20 @@ export interface MediaPublishConnection {
 
 export interface VideoChunkMeta {
   isKeyframe: boolean;
-  /** Capture timestamp in microseconds (WebCodecs chunk timestamp). */
+  /**
+   * WebCodecs chunk timestamp in microseconds. Its base is browser-defined
+   * (and may differ between the audio and video tracks), so the publisher
+   * rebases it per track using the capture-time anchor. Without a capture
+   * observation, the first enqueue supplies the anchor.
+   * @see draft-ietf-moq-loc-04 §2.3.1.1
+   */
   timestampUs: number;
   /** Codec description (decoder config) to ride as the LOC videoConfig. */
   videoConfig?: Uint8Array;
 }
 
 export interface AudioChunkMeta {
-  /** Capture timestamp in microseconds (WebCodecs chunk timestamp). */
+  /** WebCodecs chunk timestamp in microseconds; rebased like {@link VideoChunkMeta.timestampUs}. */
   timestampUs: number;
 }
 
@@ -67,6 +73,14 @@ export interface MediaPublisherOptions {
    *  the mandatory FIRST_OBJECT subgroup bit. Typed (not `number`) so an
    *  unsupported draft cannot silently inherit draft-16 LOC behavior. */
   draft: DraftVersion;
+  /** LOC draft to emit: 1 (default) or 4. */
+  locVersion?: LocVersion;
+  /**
+   * Wall clock in microseconds since the Unix epoch, used to anchor each
+   * track's capture timestamp. Injectable for tests. Default:
+   * `() => Date.now() * 1000`.
+   */
+  wallClockUs?: () => number;
   /** Failure sink — publication errors are contained, never unhandled. */
   onError?: (context: string, err: unknown) => void;
   /** Counter sink for UI updates: called after each published object. */
@@ -102,6 +116,11 @@ export class MediaPublisher {
   private readonly connection: MediaPublishConnection;
   private readonly wrapInt: (n: bigint) => unknown;
   private readonly draft: DraftVersion;
+  private readonly locVersion: LocVersion;
+  private readonly wallClockUs: () => number;
+  /** Per-track WebCodecs-to-wall-clock offset, fixed at the first capture observation. */
+  private videoTsOffsetUs: number | null = null;
+  private audioTsOffsetUs: number | null = null;
   private readonly onError: (context: string, err: unknown) => void;
   private readonly onCounts: ((v: number, a: number) => void) | null;
   private readonly videoQueueMax: number;
@@ -150,6 +169,9 @@ export class MediaPublisher {
     this.connection = connection;
     this.wrapInt = options.wrapInt;
     this.draft = options.draft;
+    this.locVersion = options.locVersion ?? 1;
+    if (this.locVersion !== 1 && this.locVersion !== 4) throw new Error('Unsupported LOC version');
+    this.wallClockUs = options.wallClockUs ?? (() => Date.now() * 1000);
     this.onError = options.onError ?? (() => {});
     this.onCounts = options.onCounts ?? null;
     this.videoQueueMax = options.videoQueueMax ?? 60;
@@ -173,6 +195,7 @@ export class MediaPublisher {
    */
   publishVideo(data: Uint8Array, meta: VideoChunkMeta): void {
     if (this.stopped || this.videoAlias === null) return;
+    this.observeCaptureTimestamp('video', meta.timestampUs);
     if (this.videoQueue.length >= this.videoQueueMax) {
       // Overflow: the queued dependents can never all be delivered in time —
       // continuity is lost. Invalidate the whole backlog and recover at the
@@ -195,6 +218,7 @@ export class MediaPublisher {
   /** Enqueue one encoded audio chunk (same contract as {@link publishVideo}). */
   publishAudio(data: Uint8Array, meta: AudioChunkMeta): void {
     if (this.stopped || this.audioAlias === null) return;
+    this.observeCaptureTimestamp('audio', meta.timestampUs);
     if (this.audioQueue.length >= this.audioQueueMax) {
       // Audio chunks are independently decodable — drop the OLDEST to keep
       // the live edge. Report once per overflow episode.
@@ -322,19 +346,46 @@ export class MediaPublisher {
     }
   }
 
+  /** Observe raw capture before encoding so encoder and network waits cannot shift A/V time. */
+  observeCaptureTimestamp(track: 'video' | 'audio', timestampUs: number): void {
+    if (!this.stopped) this.toWallClockUs(track, timestampUs);
+  }
+
+  private locOptions() {
+    return { wireProfile: locWireProfileForDraft(this.draft), locVersion: this.locVersion };
+  }
+
+  /**
+   * Rebase a WebCodecs timestamp to Unix-epoch microseconds. Each track's
+   * first capture observation anchors it; later chunks keep their spacing
+   * relative to that observation. Audio and video get independent anchors
+   * because the browser may hand them timestamps on different bases.
+   * @see draft-ietf-moq-loc-04 §2.3.1.1 (Timestamp without Timescale = µs since epoch)
+   */
+  private toWallClockUs(track: 'video' | 'audio', timestampUs: number): bigint {
+    const key = track === 'video' ? 'videoTsOffsetUs' : 'audioTsOffsetUs';
+    let offset = this[key];
+    if (offset === null) {
+      offset = this.wallClockUs() - timestampUs;
+      this[key] = offset;
+    }
+    return BigInt(Math.round(timestampUs + offset));
+  }
+
   private videoExtensions(meta: VideoChunkMeta): Uint8Array | undefined {
     return encodeLocHeaders({
-      captureTimestamp: BigInt(Math.round(meta.timestampUs)),
+      captureTimestamp: this.toWallClockUs('video', meta.timestampUs),
       videoFrameMarking: {
         independent: meta.isKeyframe,
-        discardable: !meta.isKeyframe,
+        // WebCodecs key/delta classification does not identify non-reference frames.
+        discardable: false,
         baseLayerSync: false,
         startOfFrame: true,
         endOfFrame: true,
         temporalId: 0,
       },
       ...(meta.videoConfig ? { videoConfig: meta.videoConfig } : {}),
-    }, { wireProfile: locWireProfileForDraft(this.draft) });
+    }, this.locOptions());
   }
 
   private async sendVideoChunk(data: Uint8Array, meta: VideoChunkMeta): Promise<void> {
@@ -381,8 +432,8 @@ export class MediaPublisher {
 
   private async sendAudioChunk(data: Uint8Array, meta: AudioChunkMeta, groupId: bigint): Promise<void> {
     const extensions = encodeLocHeaders({
-      captureTimestamp: BigInt(Math.round(meta.timestampUs)),
-    }, { wireProfile: locWireProfileForDraft(this.draft) });
+      captureTimestamp: this.toWallClockUs('audio', meta.timestampUs),
+    }, this.locOptions());
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.
     const streamId = await this.connection.openSubgroup(

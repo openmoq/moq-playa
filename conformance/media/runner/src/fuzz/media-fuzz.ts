@@ -22,6 +22,7 @@
 
 import * as fc from 'fast-check';
 import { PropertyWireError } from '@moqt/transport';
+import { LocHeaderError } from '@moqt/loc';
 
 // ─── run configuration (FC_RUNS / FC_SEED) ───────────────────────────────────
 
@@ -74,10 +75,11 @@ export function expectParserSafe<T>(
   }
 }
 
-/** LOC: malformed bytes may be rejected ONLY with PropertyWireError/RangeError.
+/** LOC: malformed bytes may be rejected ONLY with PropertyWireError/RangeError,
+ *  or a typed LOC semantic rejection (LocHeaderError, e.g. a Timescale of 0).
  *  (PropertyWireError extends RangeError; TypeError/ReferenceError do not.) */
 export const allowLocError = (e: unknown): boolean =>
-  e instanceof PropertyWireError || e instanceof RangeError;
+  e instanceof PropertyWireError || e instanceof RangeError || e instanceof LocHeaderError;
 
 /** Catalog: a native SyntaxError (JSON.parse) or an INTENTIONAL base `Error`.
  *  A TypeError/ReferenceError is a bug even though it extends Error, so the

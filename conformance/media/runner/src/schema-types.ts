@@ -73,6 +73,9 @@ export const ERROR_CATEGORIES = [
   'duplicate-protection-ref',
   'unknown-delta-op',
   'illegal-delta-field',
+  // LOC-04 semantic / representability failures (LocHeaderError, LocEncodeError).
+  'loc-malformed',
+  'loc-unrepresentable',
 ] as const;
 export type ErrorCategory = (typeof ERROR_CATEGORIES)[number];
 
@@ -120,6 +123,8 @@ export interface FileInput {
 /** Inline structured PropertyMap input (encode-direction / loc-semantics). */
 export interface PropertyMapInput {
   readonly propertyMap: readonly PropertyMapEntryJson[];
+  /** LOC draft the map is interpreted and re-emitted under (encode direction). */
+  readonly locVersion?: 1 | 4;
 }
 
 export type EntryInput = FileInput | PropertyMapInput;

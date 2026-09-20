@@ -331,17 +331,21 @@ export class SyncController {
     // ─── Live Catch-Up ──────────────────────────────────────────────
 
     /**
-     * Measure end-to-end latency from CaptureTimestamp.
+     * Measure end-to-end latency from a wall-clock timestamp.
      *
-     * Compares publisher wall-clock (CaptureTimestamp) to subscriber
-     * wall-clock (Date.now()). Both in Unix epoch microseconds.
+     * Compares the publisher's wall-clock timestamp to the subscriber's
+     * wall clock, both in Unix epoch microseconds. A media-time timestamp
+     * (LOC-04 with Timescale) has no wall-clock meaning, so latency is
+     * unmeasurable and this returns null.
      *
-     * @param captureTimestampUs CaptureTimestamp in microseconds (Unix epoch)
-     * @returns Latency in microseconds, or null if timestamp is missing/zero
+     * @param captureTimestampUs Timestamp in microseconds
+     * @param isWallClock False when the timestamp is media time. Undefined means wall clock.
+     * @returns Latency in microseconds, or null if unmeasurable
      * @see draft-ietf-moq-loc-01 §2.3.1.1
+     * @see draft-ietf-moq-loc-04 §2.3.1.2
      */
-    measureLatency(captureTimestampUs: bigint): number | null {
-        if (captureTimestampUs === 0n) return null;
+    measureLatency(captureTimestampUs: bigint, isWallClock?: boolean): number | null {
+        if (captureTimestampUs === 0n || isWallClock === false) return null;
         return this.wallClock.now() - Number(captureTimestampUs);
     }
 
@@ -357,9 +361,9 @@ export class SyncController {
      * @returns CatchUpState if evaluated, null if catch-up is disabled or no timestamp
      * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
      */
-    evaluateCatchUp(captureTimestampUs: bigint): CatchUpState | null {
+    evaluateCatchUp(captureTimestampUs: bigint, isWallClock?: boolean): CatchUpState | null {
         // Measure latency
-        const latencyUs = this.measureLatency(captureTimestampUs);
+        const latencyUs = this.measureLatency(captureTimestampUs, isWallClock);
         if (latencyUs === null) return null;
 
         this._lastLatencyUs = latencyUs;

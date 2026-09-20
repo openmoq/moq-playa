@@ -91,7 +91,7 @@ player.play();
 `VideoDecoder.isConfigSupported()` is checked before configuring each codec. When a codec is unsupported the decoder shuts down cleanly — no decode-error loops, no frozen frames.
 
 **Decode paths:**
-- **LOC (Low Overhead Container)** — WebCodecs direct path, lowest latency. H.264, HEVC, AV1.
+- **LOC (Low Overhead Container)** — WebCodecs direct path, lowest latency. H.264, HEVC, AV1. Parses LOC-04 and LOC-01 properties; preserves LOC-01 output unless `locVersion: 4` is selected.
 - **CMAF (fragmented MP4)** — MSE + `<video>` path, broader compatibility.
 
 ---
@@ -241,10 +241,20 @@ player.on('catch_up_changed', ({ active, rate, latencyMs }) => { ... });
 - **draft-ietf-moq-transport-16** — default supported transport draft
 - **draft-ietf-moq-transport-14** — Red5/moq-rs interop (`draftVersion: 14`)
 - **draft-ietf-moq-msf-00** — Catalog, track selection, ABR (`altGroup`), timeline
-- **draft-ietf-moq-loc-01** — Low Overhead Container (CaptureTimestamp, VideoFrameMarking)
+- **draft-ietf-moq-loc-04** — Low Overhead Container (Timestamp + Timescale, Video Frame Marking, Audio Config); `locVersion: 4` to emit
+- **draft-ietf-moq-loc-01** — Low Overhead Container (CaptureTimestamp, VideoFrameMarking); auto-detected on parse, default on encode
 - **draft-ietf-moq-cmsf-00** — CMAF Streaming Format (moof+mdat, MSE path)
 
 ### Draft version selection
+
+LOC and transport versions are independent. The broadcast example explicitly
+selects LOC-04; `?loc=1` selects LOC-01. Library encoding remains LOC-01 by
+default. A LOC-04 Timescale makes timestamps media-relative; conversion to
+LOC-01 requires an application-provided wall-clock anchor, not just unit scaling.
+LOC support here covers public properties and clear payloads. Secure Objects,
+encrypted/private properties, and automatic transport track-property delivery
+are not implemented. Callers with track-scoped defaults can pass `track` to
+`parseLocHeaders()`.
 
 Browser WebTransport may expose `transport.protocol`, enabling automatic draft detection from the negotiated `WT-Available-Protocols`:
 
