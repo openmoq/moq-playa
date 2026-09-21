@@ -197,6 +197,94 @@ function ackCatalog(adapter: ReturnType<typeof createMockAdapter>, reqId?: bigin
   } as unknown as ControlMessage);
 }
 
+async function ackMedia(adapter: ReturnType<typeof createMockAdapter>): Promise<void> {
+  for (const result of vi.mocked(adapter.subscribe).mock.results.slice(1)) {
+    const requestId = await result.value;
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId, trackAlias: requestId, parameters: new Map() } as ControlMessage);
+  }
+}
+
+describe('request ID and track alias namespace separation', () => {
+  const scenarios = [
+    { name: 'distinct values', videoAlias: 40n, audioAlias: 50n, order: ['video', 'audio'], early: 'none' },
+    { name: 'video alias equals pending audio request ID', videoAlias: 4n, audioAlias: 5n, order: ['video', 'audio'], early: 'none' },
+    { name: 'same alias assignment with reversed acknowledgements', videoAlias: 4n, audioAlias: 5n, order: ['audio', 'video'], early: 'none' },
+    { name: 'early video on an unknown alias', videoAlias: 40n, audioAlias: 50n, order: ['video', 'audio'], early: 'before' },
+    { name: 'early video alias equals pending audio request ID', videoAlias: 4n, audioAlias: 5n, order: ['audio', 'video'], early: 'before' },
+    { name: 'video between overlapping acknowledgements', videoAlias: 4n, audioAlias: 5n, order: ['video', 'audio'], early: 'between' },
+  ] as const;
+
+  it.each(scenarios)('$name', async ({ videoAlias, audioAlias, order, early }) => {
+    const adapter = createMockAdapter();
+    Object.defineProperty(adapter, 'draftVersion', { value: 18 });
+    let nextId = 0n;
+    vi.mocked(adapter.subscribe).mockImplementation(async (_ns, _name, options) => {
+      const id = varint(nextId);
+      nextId += 2n;
+      options?.onRequestId?.(id);
+      return id;
+    });
+    const player = new MoqtPlayer({
+      ...createConfig(adapter),
+      createMediaSource: () => ({
+        initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(),
+        mediaElement: null, destroy: vi.fn(), onFirstFrame: null, onError: null, onStall: null,
+      }),
+      createCmafAssembler: () => ({
+        push: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
+        setInitSegment: vi.fn(), clearPending: vi.fn(),
+      }),
+    });
+    const delivered: Array<{ track: string; mediaType: string; marker: number | undefined }> = [];
+    player.on('media_object', (event) => delivered.push({
+      track: event.trackName, mediaType: event.mediaType, marker: event.payload?.[8],
+    }));
+    const ack = (track: 'video' | 'audio') => adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(track === 'video' ? 2 : 4),
+      trackAlias: varint(track === 'video' ? videoAlias : audioAlias), parameters: new Map(),
+    } as unknown as ControlMessage);
+    // Routing is observed before CMAF parsing. Payload markers identify the
+    // source track independently of the player's chosen media type.
+    const send = (alias: bigint, marker: number) => adapter._triggerObject(BigInt(marker), {
+      kind: 'data', trackAlias: varint(alias), groupId: varint(0), subgroupId: varint(0),
+      objectId: varint(0), payload: Uint8Array.of(0, 0, 0, 9, 109, 100, 97, 116, marker),
+    } as MoqtObject);
+    try {
+      const load = player.load();
+      await resolveConnect(adapter);
+      await load;
+      ackCatalog(adapter, 0n);
+      adapter._triggerObject(0n, {
+        kind: 'data', trackAlias: varint(0), groupId: varint(0), subgroupId: varint(0),
+        objectId: varint(0), payload: new TextEncoder().encode(JSON.stringify({
+          version: 1,
+          tracks: [
+            { name: 'vide_1', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1, codec: 'avc1.640029', width: 1920, height: 1080, bitrate: 1_500_000 },
+            { name: 'soun_2', packaging: 'cmaf', isLive: true, role: 'audio', renderGroup: 1, codec: 'mp4a.40.2', samplerate: 48000, channelConfig: '2', bitrate: 128000 },
+          ],
+        })),
+      } as MoqtObject);
+      await vi.waitFor(() => expect(adapter.subscribe).toHaveBeenCalledTimes(3));
+      const calls = vi.mocked(adapter.subscribe).mock.calls;
+      expect(calls.slice(1).map((call) => new TextDecoder().decode(call[1]))).toEqual(['vide_1', 'soun_2']);
+      expect(await vi.mocked(adapter.subscribe).mock.results[1]!.value).toBe(2n);
+      expect(await vi.mocked(adapter.subscribe).mock.results[2]!.value).toBe(4n);
+      if (early === 'before') send(videoAlias, 1);
+      ack(order[0]);
+      if (early === 'between') send(videoAlias, 1);
+      ack(order[1]);
+      if (early === 'none') send(videoAlias, 1);
+      send(audioAlias, 2);
+      expect(delivered).toEqual([
+        { track: 'vide_1', mediaType: 'video', marker: 1 },
+        { track: 'soun_2', mediaType: 'audio', marker: 2 },
+      ]);
+    } finally {
+      await player.destroy();
+    }
+  });
+});
+
 // ─── Tests ───────────────────────────────────────────────────────────
 
 describe('MoqtPlayer', () => {
@@ -4744,6 +4832,7 @@ describe('MoqtPlayer', () => {
       await vi.waitFor(() => {
         expect(spyInfo.mock.calls.some(c => c[1] === 'Catalog received: %d tracks')).toBe(true);
       });
+      await ackMedia(adapter);
 
       spyDebug.mockClear();
 
@@ -4989,6 +5078,7 @@ describe('MoqtPlayer', () => {
 
       // Flush async subscription setup
       await new Promise(r => setTimeout(r, 0));
+      await ackMedia(adapter);
 
       return { player, catalogReqId };
     }
@@ -6998,6 +7088,7 @@ describe('MoqtPlayer', () => {
       // Start playback
       player.play();
 
+      await ackMedia(adapter);
       // Now deliver a CMAF video frame as two objects: moof then mdat
       // The assembler pairs them and emits a concatenated segment.
 
@@ -7434,6 +7525,7 @@ describe('MoqtPlayer', () => {
 
       player.play();
 
+      await ackMedia(adapter);
       // Deliver a CMAF media object
 
       adapter._triggerObject(1n, {
@@ -7528,6 +7620,7 @@ describe('MoqtPlayer', () => {
         payload: new TextEncoder().encode(VOD_CATALOG_JSON),
       } as MoqtObject);
       await new Promise(r => setTimeout(r, 10));
+      await ackMedia(adapter);
     }
 
     it('subscribes to mediatimeline track when present in catalog (§7.2)', async () => {

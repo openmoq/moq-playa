@@ -82,6 +82,7 @@ import { computePlaybackDelayUs,
 } from './player-pipeline.js';
 import {
   handleControlMessage as doControlMessage,
+  removeSubscription,
   validateKnownTracks as doValidateKnownTracks,
 } from './player-message.js';
 import { wireConnectionCallbacks } from './player-wiring.js';
@@ -693,7 +694,7 @@ export class MoqtPlayer {
     oldRequestId: bigint;
     oldTrackName: string;
     newTrackName: string;
-    newTrackAlias: bigint;
+    newRequestId: bigint;
     newTrackPackaging: TrackPackaging;
     /** Carried from `selectVideoTrack` so commit/abort events report it. */
     reason: string;
@@ -760,7 +761,7 @@ export class MoqtPlayer {
    */
   private readonly activeSubscriptions = new Map<
     bigint,
-    { trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; trackAlias: bigint }
+    { trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; trackAlias: bigint | null }
   >();
 
   /**
@@ -808,7 +809,7 @@ export class MoqtPlayer {
    */
   private readonly activeFetches = new Map<
     bigint,
-    { trackName: string; mediaType: 'video' | 'audio'; trackAlias: bigint; warmStart?: boolean }
+    { trackName: string; mediaType: 'video' | 'audio'; subscriptionRequestId: bigint | null; trackAlias: bigint | null; warmStart?: boolean }
   >();
 
   /**
@@ -850,10 +851,8 @@ export class MoqtPlayer {
   private readonly catalogFetchStreams = new Map<bigint, bigint>();
 
   /**
-   * Fetch stream → track alias mapping for object routing.
-   * When a FETCH data stream arrives (§10.4.4), we map the stream ID
-   * to the correct track alias so fetch objects can be routed through
-   * the subscription manager.
+   * Confirmed FETCH stream -> alias routing. Streams waiting for their
+   * subscription's SUBSCRIBE_OK stay in pendingFetchStreams instead.
    * @see draft-ietf-moq-transport-16 §10.4.4 (FETCH_HEADER)
    */
   private readonly fetchStreamAliases = new Map<bigint, bigint>();
@@ -866,8 +865,8 @@ export class MoqtPlayer {
   private readonly fetchStreamRequestIds = new Map<bigint, bigint>();
 
   /**
-   * FETCH data streams whose request ID is not (yet) registered in
-   * {@link activeFetches}. §9.16.3 allows fetch data at any time relative to
+   * FETCH data streams whose request or subscription alias is not yet known.
+   * §9.16.3 allows fetch data at any time relative to
    * FETCH_OK — which can beat the joiningFetch()/fetch() promise continuation
    * that registers the fetch. Objects buffer here (bounded) and replay
    * through the normal alias remap once the fetch is registered; they are
@@ -875,7 +874,7 @@ export class MoqtPlayer {
    */
   private readonly pendingFetchStreams = new Map<
     bigint,
-    { requestId: bigint; objects: MoqtObject[]; terminal?: DataStreamTerminal }
+    { requestId: bigint; objects: MoqtObject[]; bytes: number; terminal?: DataStreamTerminal }
   >();
 
   /**
@@ -895,6 +894,13 @@ export class MoqtPlayer {
   private static readonly MAX_QUARANTINED_FETCHES = 16;
 
   private quarantineFetchRequest(reqId: bigint): void {
+    this.activeFetches.delete(reqId);
+    for (const [streamId, requestId] of this.fetchStreamRequestIds) {
+      if (requestId !== reqId) continue;
+      this.fetchStreamRequestIds.delete(streamId);
+      this.fetchStreamAliases.delete(streamId);
+      this.droppedFetchStreams.add(streamId);
+    }
     if (this.quarantinedFetchRequests.size >= MoqtPlayer.MAX_QUARANTINED_FETCHES) {
       const oldest = this.quarantinedFetchRequests.values().next().value;
       if (oldest !== undefined) this.quarantinedFetchRequests.delete(oldest);
@@ -910,9 +916,28 @@ export class MoqtPlayer {
   }
   /** Entry-count bound for pendingFetchStreams (FIFO eviction of the oldest). */
   private static readonly MAX_PENDING_FETCH_STREAMS = 8;
+  private static readonly MAX_PENDING_FETCH_BYTES = 4 * 1024 * 1024;
+
+  /** Release a request's routing only on the session that created it. */
+  private retireMediaSubscription(requestId: bigint, conn: MoqtConnection) {
+    if (conn !== this.connection) return undefined;
+    this.settleParkedOwnership(requestId, null, conn);
+    const sub = removeSubscription(requestId, {
+      activeSubscriptions: this.activeSubscriptions,
+      pendingMediaSubs: this.pendingMediaSubs,
+      subscriptionManager: this.subscriptionManager,
+    });
+    if (sub?.trackAlias != null && this.subscriptionManager?.getMediaType(sub.trackAlias) === undefined) {
+      this.pendingObjectsByAlias.delete(sub.trackAlias);
+    }
+    for (const [fetchId, info] of this.activeFetches) {
+      if (info.subscriptionRequestId === requestId) this.quarantineFetchRequest(fetchId);
+    }
+    return sub;
+  }
 
   /**
-   * Tombstones for OVERFLOWED unregistered fetch streams: their later objects
+   * Tombstones for discarded fetch streams: their later objects
    * must be swallowed (a fetch stream's wire trackAlias is 0, which can
    * collide with a real alias-0 subscription). Entries clear on FIN/reset,
    * so the set is bounded by the peer's concurrently-open streams.
@@ -1908,10 +1933,8 @@ export class MoqtPlayer {
     const packaging: TrackPackaging = mediaTrackPackaging(targetTrack.packaging);
     // Pre-send ownership (§9.10): the pending entry (alias remap) and the
     // activeSubscriptions record are installed inside onRequestId so a
-    // same-tick SUBSCRIBE_OK cannot miss them. DON'T register with the
-    // subscription manager yet — new-track objects would feed the pipeline
-    // while the old track is still playing; they buffer in
-    // pendingObjectsByAlias until the switch completes.
+    // same-tick SUBSCRIBE_OK cannot miss them. Only SUBSCRIBE_OK binds
+    // routing; objects arriving before it remain parked by their wire alias.
     const switchConn = this.connection;
     let switchRegisteredId: bigint | null = null;
     const registerSwitchSub = (id: bigint): void => {
@@ -1919,7 +1942,7 @@ export class MoqtPlayer {
       switchRegisteredId = id;
       if (!this.subscriptionManager || this.connection !== switchConn) return;
       this.pendingAliasBinds.add(id);
-      this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: id });
+      this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null });
       this.pendingMediaSubs.set(id, { trackName, mediaType: 'video', packaging });
     };
     let reqIdBigInt: bigint;
@@ -1930,9 +1953,7 @@ export class MoqtPlayer {
       registerSwitchSub(reqIdBigInt);
     } catch (err) {
       if (switchRegisteredId !== null) {
-        this.settleParkedOwnership(switchRegisteredId, null, switchConn);
-        this.activeSubscriptions.delete(switchRegisteredId);
-        this.pendingMediaSubs.delete(switchRegisteredId);
+        this.retireMediaSubscription(switchRegisteredId, switchConn);
       }
       throw err;
     }
@@ -1951,7 +1972,7 @@ export class MoqtPlayer {
         oldRequestId: currentVideoRequestId,
         oldTrackName: currentVideoTrackName ?? '',
         newTrackName: trackName,
-        newTrackAlias: reqIdBigInt,
+        newRequestId: reqIdBigInt,
         newTrackPackaging: packaging,
         reason,
         ...(abrAction ? { abrAction } : {}),
@@ -2147,14 +2168,8 @@ export class MoqtPlayer {
    */
   private unsubscribeOldVideoTrack(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
     if (!this.connection || !this.subscriptionManager) return;
-    const oldAlias =
-      this.activeSubscriptions.get(sw.oldRequestId)?.trackAlias ?? sw.oldRequestId;
-    this.subscriptionManager.unregisterTrack(oldAlias);
-    this.settleParkedOwnership(sw.oldRequestId, null, this.connection);
+    this.retireMediaSubscription(sw.oldRequestId, this.connection);
     this.connection.unsubscribe(varint(sw.oldRequestId));
-    this.activeSubscriptions.delete(sw.oldRequestId);
-    this.pendingMediaSubs.delete(sw.oldRequestId);
-    this.pendingObjectsByAlias.delete(oldAlias);
   }
 
   /**
@@ -2226,14 +2241,8 @@ export class MoqtPlayer {
     cause: Error,
   ): void {
     if (this.connection && this.subscriptionManager) {
-      const newAlias =
-        this.activeSubscriptions.get(sw.newTrackAlias)?.trackAlias ?? sw.newTrackAlias;
-      this.subscriptionManager.unregisterTrack(newAlias);
-      this.settleParkedOwnership(sw.newTrackAlias, null, this.connection);
-      try { this.connection.unsubscribe(varint(sw.newTrackAlias)); } catch { /* ignore */ }
-      this.activeSubscriptions.delete(sw.newTrackAlias);
-      this.pendingMediaSubs.delete(sw.newTrackAlias);
-      this.pendingObjectsByAlias.delete(newAlias);
+      this.retireMediaSubscription(sw.newRequestId, this.connection);
+      try { this.connection.unsubscribe(varint(sw.newRequestId)); } catch { /* ignore */ }
     }
     this.cmafSwitchStagingBuffer = [];
     this.switchStagingBuffer = [];
@@ -2689,12 +2698,7 @@ export class MoqtPlayer {
       const initReqId = this.initTrackRequestIds.get(trackName);
       if (initReqId !== undefined) {
         this.initTrackRequestIds.delete(trackName);
-        const active = this.activeSubscriptions.get(initReqId);
-        const alias = active?.trackAlias ?? initReqId;
-        this.activeSubscriptions.delete(initReqId);
-        this.pendingMediaSubs.delete(initReqId);
-        this.subscriptionManager?.unregisterTrack(alias);
-        if (this.connection) this.settleParkedOwnership(initReqId, null, this.connection);
+        if (this.connection) this.retireMediaSubscription(initReqId, this.connection);
         this.connection?.unsubscribe(varint(initReqId)).catch(() => {});
       }
 
@@ -2892,9 +2896,8 @@ export class MoqtPlayer {
             if (!this.subscriptionManager || this.connection !== conn) return;
             this.pendingAliasBinds.add(reqIdBigInt);
             this.activeSubscriptions.set(reqIdBigInt, {
-              trackName: track.name, mediaType, trackAlias: reqIdBigInt,
+              trackName: track.name, mediaType, trackAlias: null,
             });
-            this.subscriptionManager.registerTrack(reqIdBigInt, track.name, mediaType);
             this.pendingMediaSubs.set(reqIdBigInt, { trackName: track.name, mediaType });
             this.log.info('Subscribe %s "%s" requestId=%s (pre-known)', mediaType, track.name, reqIdBigInt);
           };
@@ -2916,10 +2919,7 @@ export class MoqtPlayer {
             });
           } catch (err) {
             if (knownRegisteredId !== null) {
-              this.settleParkedOwnership(knownRegisteredId, null, conn);
-              this.activeSubscriptions.delete(knownRegisteredId);
-              this.subscriptionManager?.unregisterTrack(knownRegisteredId);
-              this.pendingMediaSubs.delete(knownRegisteredId);
+              this.retireMediaSubscription(knownRegisteredId, conn);
             }
             throw err;
           }
@@ -3595,20 +3595,16 @@ export class MoqtPlayer {
       endObject: varint(BigInt(options.endObject)),
     };
 
-    // Find the media type and track alias for this track name from the
-    // active subscriptions (catalog-selected tracks) BEFORE issuing the
-    // request, so pre-send ownership can register inside onRequestId — a
-    // zero-latency data stream or response never beats the registration.
-    // (registerMediaFetch re-resolves the alias against the CURRENT
-    // subscription state anyway, covering a remap during the await.)
+    // Capture the owning subscription before sending. Its confirmed alias
+    // may arrive later, but a replacement subscription must not inherit this FETCH.
     let mediaType: 'video' | 'audio' = 'video';
-    let knownAlias: bigint | null = null;
-    for (const [, sub] of this.activeSubscriptions) {
+    let subscriptionRequestId: bigint | null = null;
+    for (const [requestId, sub] of this.activeSubscriptions) {
       if (sub.trackName === trackName &&
           sub.mediaType !== 'mediatimeline' &&
           sub.mediaType !== 'eventtimeline') {
         mediaType = sub.mediaType;
-        knownAlias = sub.trackAlias;
+        subscriptionRequestId = requestId;
         break;
       }
     }
@@ -3617,15 +3613,14 @@ export class MoqtPlayer {
       if (fetchRegisteredId !== null) return;
       fetchRegisteredId = id;
       if (!this.subscriptionManager || this.connection !== connAtCall) return;
-      this.registerMediaFetch(id, { trackName, mediaType, trackAlias: knownAlias ?? id });
+      this.registerMediaFetch(id, { trackName, mediaType, subscriptionRequestId, trackAlias: null });
     };
     let reqId: Awaited<ReturnType<MoqtConnection['fetch']>>;
     try {
       reqId = await connAtCall.fetch(nsBytes, nameBytes,
         { ...fetchOptions, onRequestId: (id: bigint) => registerPublicFetch(BigInt(id)) } as never);
     } catch (err) {
-      if (fetchRegisteredId !== null) {
-        this.activeFetches.delete(fetchRegisteredId);
+      if (fetchRegisteredId !== null && this.connection === connAtCall) {
         this.quarantineFetchRequest(fetchRegisteredId);
       }
       throw err;
@@ -3637,7 +3632,6 @@ export class MoqtPlayer {
     // (fetchCancel would target the NEW connection). Best-effort cancel on
     // the captured old connection and reject loudly.
     if (!this.subscriptionManager || this.connection !== connAtCall) {
-      if (fetchRegisteredId !== null) this.activeFetches.delete(fetchRegisteredId);
       try { await connAtCall.fetchCancel(reqId); } catch { /* old session gone */ }
       throw new Error('fetch() aborted: player destroyed or session migrated while the FETCH was in flight');
     }
@@ -3654,7 +3648,7 @@ export class MoqtPlayer {
    */
   private registerMediaFetch(
     fetchReqId: bigint,
-    info: { trackName: string; mediaType: 'video' | 'audio'; trackAlias: bigint; warmStart?: boolean },
+    info: { trackName: string; mediaType: 'video' | 'audio'; subscriptionRequestId: bigint | null; trackAlias: bigint | null; warmStart?: boolean },
   ): void {
     // A REQUEST_ERROR that raced the fetch()/joiningFetch() continuation
     // already refused this request — honor it instead of resurrecting a
@@ -3662,42 +3656,51 @@ export class MoqtPlayer {
     const refused = this.refusedFetchRequests.get(fetchReqId);
     if (refused) {
       this.refusedFetchRequests.delete(fetchReqId);
-      for (const [streamId, pending] of this.pendingFetchStreams) {
-        if (pending.requestId === fetchReqId) this.pendingFetchStreams.delete(streamId);
-      }
+      this.quarantineFetchRequest(fetchReqId);
       this.log.warn('[%s] media FETCH %s for "%s" was refused before registration: %s (code=0x%s) — continuing live-only',
         info.warmStart ? 'warm-start' : 'fetch',
         fetchReqId, info.trackName, refused.reason, refused.code.toString(16));
       return;
     }
 
-    // An alias remap (SUBSCRIBE_OK with a server-assigned alias) may have
-    // landed during the same await window — always register against the
-    // track's CURRENT alias, not the one captured before the await.
-    for (const sub of this.activeSubscriptions.values()) {
-      if (sub.trackName === info.trackName && sub.mediaType === info.mediaType) {
-        info = { ...info, trackAlias: sub.trackAlias };
-        break;
-      }
+    if (this.quarantinedFetchRequests.has(fetchReqId)) return;
+
+    // Resolve only against the subscription that owned this FETCH when sent.
+    // A replacement request for the same track must not inherit its data.
+    const subscription = info.subscriptionRequestId === null
+      ? undefined : this.activeSubscriptions.get(info.subscriptionRequestId);
+    if (!subscription) {
+      this.quarantineFetchRequest(fetchReqId);
+      return;
     }
+    info = { ...info, trackAlias: subscription.trackAlias };
 
     this.activeFetches.set(fetchReqId, info);
+    if (info.trackAlias === null) return;
+    this.drainMediaFetch(fetchReqId);
+  }
+
+  private drainMediaFetch(fetchReqId: bigint): void {
+    const info = this.activeFetches.get(fetchReqId);
+    if (!info || info.trackAlias === null) return;
+    const conn = this.connection;
     for (const [streamId, pending] of this.pendingFetchStreams) {
       if (pending.requestId !== fetchReqId) continue;
       this.pendingFetchStreams.delete(streamId);
-      for (const obj of pending.objects) {
-        // Fetch state is per-session (cleared on migrate), so the current
-        // connection is the source session here.
-        this.routeFetchObject(streamId, info.trackAlias, obj, this.connection?.draftVersion, this.connection ?? undefined);
+      if (pending.terminal === undefined) {
+        this.fetchStreamAliases.set(streamId, info.trackAlias);
+        this.fetchStreamRequestIds.set(streamId, fetchReqId);
       }
-      if (pending.terminal !== undefined) {
+      for (const obj of pending.objects) {
+        if (this.connection !== conn || this.activeFetches.get(fetchReqId) !== info) break;
+        this.routeFetchObject(streamId, info.trackAlias, obj, conn?.draftVersion, conn ?? undefined);
+      }
+      if (this.connection !== conn) return;
+      if (pending.terminal !== undefined && this.activeFetches.get(fetchReqId) === info) {
         // The stream already ended — however it ended, no live routing maps
         // are needed and the fetch bookkeeping ends with it. Only the
         // BOOTSTRAP path below needs the terminal to be a peer FIN.
         this.activeFetches.delete(fetchReqId);
-      } else {
-        this.fetchStreamAliases.set(streamId, info.trackAlias);
-        this.fetchStreamRequestIds.set(streamId, fetchReqId);
       }
     }
   }
@@ -3722,8 +3725,8 @@ export class MoqtPlayer {
    */
   async fetchCancel(requestId: bigint): Promise<void> {
     if (!this.connection) throw new Error('Player not loaded');
+    this.quarantineFetchRequest(BigInt(requestId));
     await this.connection.fetchCancel(varint(requestId));
-    this.activeFetches.delete(BigInt(requestId));
   }
 
   /**
@@ -5701,8 +5704,14 @@ export class MoqtPlayer {
         // stream and replay on registration. Never route as wire alias 0.
         const pendingFetch = fetchMapsAuthoritative ? this.pendingFetchStreams.get(streamId) : undefined;
         if (pendingFetch) {
-          if (pendingFetch.objects.length < MoqtPlayer.MAX_PENDING_PER_ALIAS) {
+          const bytes = obj.kind === 'data' ? obj.payload.byteLength + (obj.extensions?.byteLength ?? 0) : 0;
+          if (pendingFetch.objects.length < MoqtPlayer.MAX_PENDING_PER_ALIAS
+              && pendingFetch.bytes + bytes <= MoqtPlayer.MAX_PENDING_FETCH_BYTES) {
             pendingFetch.objects.push(obj);
+            pendingFetch.bytes += bytes;
+          } else {
+            this.quarantineFetchRequest(pendingFetch.requestId);
+            this.log.warn('Pending FETCH %s exceeded its buffer limit; continuing live-only', pendingFetch.requestId);
           }
           return;
         }
@@ -5995,19 +6004,10 @@ export class MoqtPlayer {
           const mode = getSubgroupIdMode(sub.typeByte);
           // Track a stream only when its alias is a CONFIRMED video track.
           //
-          // A subscription is registered optimistically under its request ID
-          // before SUBSCRIBE_OK, because many relays echo the request ID as the
-          // track alias — but the two are separate spaces. Trusting that guess
-          // could label an audio subgroup, whose real alias happens to equal a
-          // pending video request ID, as video. This record exists to settle a
-          // root-cause dispute, so it must never classify from a guess.
-          //
           // Classification is made once and never revised: a stream opened
           // against an unconfirmed alias is simply never reported, which also
           // means no state is retained for it.
-          const confirmed = this.pendingMediaSubs.has(alias)
-            ? undefined
-            : this.subscriptionManager?.getMediaType(alias);
+          const confirmed = this.subscriptionManager?.getMediaType(alias);
           if (confirmed !== 'video') return;
           subgroupLifecycle.set(streamId, {
             groupId: sub.groupId,
@@ -6049,38 +6049,29 @@ export class MoqtPlayer {
             this.bootstrapFetchStreams.set(streamId, { attempt: bootstrap.attempt, conn });
             return;
           }
-          // A QUARANTINED request (ownership rolled back after an ambiguous
-          // send failure): its late streams are tombstoned, never parked as
+          // A cancelled, refused, or discarded request's late streams are
+          // tombstoned, never parked as
           // unowned pending streams awaiting an owner that will never come.
           if (this.quarantinedFetchRequests.has(reqId)) {
             this.droppedFetchStreams.add(streamId);
             return;
           }
           const fetchInfo = this.activeFetches.get(reqId);
-          if (fetchInfo) {
+          if (fetchInfo?.trackAlias != null) {
             this.fetchStreamAliases.set(streamId, fetchInfo.trackAlias);
             this.fetchStreamRequestIds.set(streamId, reqId);
           } else {
-            // §9.16.3 defensive fallback: a stream whose request has no owner
-            // yet. Registration is pre-send and synchronous today, so this
-            // should not happen — park the stream rather than drop it, and
-            // registerMediaFetch() replays the buffered objects if it does.
+            // Data can beat request registration or its subscription's alias
+            // binding. Keep it FETCH-owned until both are known.
             // BOUNDED: a peer cycling unknown fetch streams must not grow
             // this for the session lifetime — evict the oldest entry.
             if (this.pendingFetchStreams.size >= MoqtPlayer.MAX_PENDING_FETCH_STREAMS) {
-              const oldest = this.pendingFetchStreams.keys().next().value;
+              const oldest = this.pendingFetchStreams.values().next().value;
               if (oldest !== undefined) {
-                const evicted = this.pendingFetchStreams.get(oldest);
-                this.pendingFetchStreams.delete(oldest);
-                // Keep the CLASSIFICATION for a still-open stream: its later
-                // objects are dropped, never alias-routed. A stream that has
-                // ALREADY ENDED gets NO tombstone — no close event will ever
-                // clear it, and repeated header→terminal→overflow cycles
-                // would grow the set forever.
-                if (evicted?.terminal === undefined) this.droppedFetchStreams.add(oldest);
+                this.quarantineFetchRequest(oldest.requestId);
               }
             }
-            this.pendingFetchStreams.set(streamId, { requestId: reqId, objects: [] });
+            this.pendingFetchStreams.set(streamId, { requestId: reqId, objects: [], bytes: 0 });
           }
         }
       }, 'data'),
@@ -6192,6 +6183,7 @@ export class MoqtPlayer {
       adapter: this.connection,
       activeSubscriptions: this.activeSubscriptions,
       pendingMediaSubs: this.pendingMediaSubs,
+      removeSubscription: (requestId) => this.retireMediaSubscription(requestId, conn),
       pendingTrackStatuses: this.pendingTrackStatuses,
       catalogRequestId: this.catalogRequestId,
       catalogTrackAlias: this.catalogTrackAlias,
@@ -6435,12 +6427,10 @@ export class MoqtPlayer {
             if (oldest !== undefined) this.refusedFetchRequests.delete(oldest);
           }
           this.refusedFetchRequests.set(requestId, { reason: errorReason, code: errorCode });
-          for (const [streamId, pending] of this.pendingFetchStreams) {
-            if (pending.requestId === requestId) this.pendingFetchStreams.delete(streamId);
-          }
+          this.quarantineFetchRequest(requestId);
           return;
         }
-        this.activeFetches.delete(requestId);
+        this.quarantineFetchRequest(requestId);
         // Non-fatal by design: a refused warm-start (or manual) media fetch
         // just means no pre-roll — the live subscription is untouched and
         // playback starts at the next group boundary.
@@ -6448,16 +6438,13 @@ export class MoqtPlayer {
           fetchInfo.warmStart ? 'warm-start' : 'fetch',
           requestId, fetchInfo.trackName, errorReason, errorCode.toString(16));
       },
-      onMediaAliasRemapped: (_requestId, oldAlias, newAlias) => {
-        // §9.10: the server assigned a different track alias — fetch
-        // bookkeeping registered under the optimistic alias must follow, or
-        // a warm-start fetch's objects orphan on relays that don't echo the
-        // request ID as the alias.
-        for (const info of this.activeFetches.values()) {
-          if (info.trackAlias === oldAlias) info.trackAlias = newAlias;
-        }
-        for (const [streamId, alias] of this.fetchStreamAliases) {
-          if (alias === oldAlias) this.fetchStreamAliases.set(streamId, newAlias);
+      onMediaAliasBound: (requestId, alias) => {
+        // FETCH ownership follows the associated subscription, never a
+        // coincidentally equal Request ID or another track's numeric alias.
+        for (const [fetchId, info] of this.activeFetches) {
+          if (info.subscriptionRequestId !== requestId) continue;
+          info.trackAlias = alias;
+          this.drainMediaFetch(fetchId);
         }
       },
     });
@@ -7454,8 +7441,7 @@ export class MoqtPlayer {
         ? { ...(subscribeOptions ?? {}), subscriptionFilter: { type: 'LargestObject' as const } }
         : (subscribeOptions ?? defaultMediaSubscriptionFilter(track?.isLive === true));
       // Pre-send ownership (§9.10): register inside onRequestId — a
-      // zero-latency SUBSCRIBE_OK must find the pending entry (and the
-      // requestId-as-alias optimistic registration) already in place. Adapters
+      // zero-latency SUBSCRIBE_OK must find the pending entry already in place. Adapters
       // that don't invoke the callback fall back to post-await registration.
       const connAtSubscribe = this.connection;
       let subRegistered = false;
@@ -7464,11 +7450,7 @@ export class MoqtPlayer {
         subRegistered = true;
         if (!this.subscriptionManager || this.connection !== connAtSubscribe) return;
         this.pendingAliasBinds.add(reqIdBigInt);
-        this.activeSubscriptions.set(reqIdBigInt, { trackName: name, mediaType, trackAlias: reqIdBigInt });
-        // Register immediately using requestId as alias — many relays
-        // echo requestId as trackAlias. If SUBSCRIBE_OK provides a
-        // different alias, the registration is updated in handleControlMessage.
-        this.subscriptionManager.registerTrack(reqIdBigInt, name, mediaType, packaging);
+        this.activeSubscriptions.set(reqIdBigInt, { trackName: name, mediaType, trackAlias: null });
         this.pendingMediaSubs.set(reqIdBigInt, { trackName: name, mediaType, packaging });
       };
       let registeredId: bigint | null = null;
@@ -7480,13 +7462,10 @@ export class MoqtPlayer {
         registerMediaSub(reqIdBigInt);
       } catch (err) {
         // The send failed AFTER pre-send registration: undo the ownership so
-        // no phantom pending/optimistic-alias entry survives a request the
+        // no pending ownership survives a request the
         // peer never (usably) received.
         if (registeredId !== null) {
-          this.settleParkedOwnership(registeredId, null, connAtSubscribe);
-          this.activeSubscriptions.delete(registeredId);
-          this.subscriptionManager?.unregisterTrack(registeredId);
-          this.pendingMediaSubs.delete(registeredId);
+          this.retireMediaSubscription(registeredId, connAtSubscribe);
         }
         throw err;
       }
@@ -7522,7 +7501,7 @@ export class MoqtPlayer {
             registered = true;
             warmFetchId = id;
             this.registerMediaFetch(id, {
-              trackName: name, mediaType, trackAlias: reqIdBigInt, warmStart: true,
+              trackName: name, mediaType, subscriptionRequestId: reqIdBigInt, trackAlias: null, warmStart: true,
             });
           };
           try {
@@ -7539,15 +7518,7 @@ export class MoqtPlayer {
             // The send failed AFTER pre-send registration: reclaim the fetch
             // ownership, or a phantom activeFetches entry could alias-route
             // raced traffic for a request that was reported as failed.
-            if (warmFetchId !== null) {
-              this.activeFetches.delete(warmFetchId);
-              for (const [sid, mappedReq] of this.fetchStreamRequestIds) {
-                if (mappedReq === warmFetchId) {
-                  this.fetchStreamRequestIds.delete(sid);
-                  this.fetchStreamAliases.delete(sid);
-                  this.droppedFetchStreams.add(sid);
-                }
-              }
+            if (warmFetchId !== null && this.connection === connAtCall) {
               // Tombstone the request: late traffic quarantines (dropped, not
               // parked unowned) until the session boundary reclaims it.
               this.quarantineFetchRequest(warmFetchId);
@@ -7677,8 +7648,7 @@ export class MoqtPlayer {
 
   /**
    * Subscribe an auxiliary track (mediatimeline / init / eventtimeline) with
-   * PRE-SEND ownership: registration in activeSubscriptions / the
-   * SubscriptionManager / pendingMediaSubs happens inside `onRequestId`
+   * PRE-SEND ownership: pending subscription registration happens inside `onRequestId`
    * (post-allocation, pre-emission), so a zero-latency SUBSCRIBE_OK can never
    * beat it (§9.10 alias remap included). Adapters that don't invoke the
    * callback fall back to post-await registration; a send failure AFTER
@@ -7701,9 +7671,8 @@ export class MoqtPlayer {
       if (!this.subscriptionManager || this.connection !== conn) return;
       this.pendingAliasBinds.add(reqId);
       this.activeSubscriptions.set(reqId, {
-        trackName: info.trackName, mediaType: info.mediaType, trackAlias: reqId,
+        trackName: info.trackName, mediaType: info.mediaType, trackAlias: null,
       });
-      this.subscriptionManager.registerTrack(reqId, info.trackName, info.mediaType, info.packaging);
       this.pendingMediaSubs.set(reqId, {
         trackName: info.trackName, mediaType: info.mediaType, packaging: info.packaging,
       });
@@ -7716,10 +7685,7 @@ export class MoqtPlayer {
       return BigInt(reqId);
     } catch (err) {
       if (registered !== null) {
-        this.settleParkedOwnership(registered, null, conn);
-        this.activeSubscriptions.delete(registered);
-        this.subscriptionManager?.unregisterTrack(registered);
-        this.pendingMediaSubs.delete(registered);
+        this.retireMediaSubscription(registered, conn);
         onRolledBack?.(registered);
       }
       throw err;
@@ -7896,6 +7862,7 @@ export class MoqtPlayer {
     const out: LivenessTrack[] = [];
     for (const [requestId, sub] of this.activeSubscriptions) {
       if (sub.mediaType !== 'video' && sub.mediaType !== 'audio') continue;
+      if (sub.trackAlias === null) continue;
       if (requestId === this.catalogRequestId || requestId === this.timelineRequestId) continue;
       if (initRequestIds.has(requestId)) continue;
       out.push({
@@ -8111,14 +8078,10 @@ export class MoqtPlayer {
     if (!this.connection || !this.subscriptionManager) return;
     for (const [requestId, sub] of [...this.activeSubscriptions.entries()]) {
       if (sub.trackName !== track.trackName || sub.mediaType !== track.mediaType) continue;
-      this.subscriptionManager.unregisterTrack(sub.trackAlias);
-      this.settleParkedOwnership(requestId, null, this.connection);
+      this.retireMediaSubscription(requestId, this.connection);
       // Async — a sync try/catch would let the rejection escape. Best-effort:
       // the request stream may have died with the delivery path.
       void this.connection.unsubscribe(varint(requestId)).catch(() => { /* gone */ });
-      this.activeSubscriptions.delete(requestId);
-      this.pendingMediaSubs.delete(requestId);
-      this.pendingObjectsByAlias.delete(sub.trackAlias);
     }
     this.replaceSubscription(track.trackName, 'liveness');
   }
@@ -8184,8 +8147,7 @@ export class MoqtPlayer {
       resubRegisteredId = id;
       if (!this.subscriptionManager || this.connection !== resubConn) return;
       this.pendingAliasBinds.add(id);
-      this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: id });
-      this.subscriptionManager.registerTrack(id, trackName, mediaType, packaging);
+      this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null });
       this.pendingMediaSubs.set(id, { trackName, mediaType, packaging });
     };
     // Start through the CAPTURED connection and attach both observers before
@@ -8209,10 +8171,7 @@ export class MoqtPlayer {
       });
     }).catch((err: unknown) => {
       if (resubRegisteredId !== null) {
-        this.settleParkedOwnership(resubRegisteredId, null, resubConn);
-        this.activeSubscriptions.delete(resubRegisteredId);
-        this.subscriptionManager?.unregisterTrack(resubRegisteredId);
-        this.pendingMediaSubs.delete(resubRegisteredId);
+        this.retireMediaSubscription(resubRegisteredId, resubConn);
       }
       const failure = err instanceof Error ? err : new Error(String(err));
       this.log.warn('Resubscribe "%s" failed: %s', trackName, failure.message);
@@ -8294,12 +8253,8 @@ export class MoqtPlayer {
 
     if (matchedRequestId !== undefined) {
       // §2.4.2 MUST: UNSUBSCRIBE
-      if (this.connection) this.settleParkedOwnership(matchedRequestId, null, this.connection);
+      if (this.connection) this.retireMediaSubscription(matchedRequestId, this.connection);
       this.connection?.unsubscribe(varint(matchedRequestId));
-
-      // Clean up local state
-      this.activeSubscriptions.delete(matchedRequestId);
-      this.subscriptionManager?.unregisterTrack(trackAlias);
 
       // §2.4.2 SHOULD: deliver error to application
       this.emitter.emit('track_unsubscribed', {

@@ -118,6 +118,11 @@ async function bootPlayer(catalogJson: string, cfg?: Partial<MoqtPlayerConfig>) 
   } as MoqtObject);
   await new Promise((r) => setTimeout(r, 30)); // async subscribe fan-out
 
+  for (const result of adapter.subscribe.mock.results.slice(1)) {
+    const requestId = await result.value;
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId, trackAlias: requestId, parameters: new Map() } as ControlMessage);
+  }
+
   /** Subscribed track names, decoded from the subscribe() calls. */
   const subscribedNames = () => adapter.subscribe.mock.calls
     .map((c: any[]) => { try { return new TextDecoder().decode(c[1]); } catch { return '?'; } });

@@ -166,6 +166,7 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     const videoJoinCall = adapter.joiningFetch.mock.calls.findIndex(
       (c: any[]) => BigInt(c[0].joiningRequestId) === videoReqId);
     const fetchReqId = BigInt(await adapter.joiningFetch.mock.results[videoJoinCall]?.value);
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as ControlMessage);
 
     // FETCH data stream announces itself, then delivers alias-0 objects.
     const streamId = 77n;
@@ -332,6 +333,7 @@ describe('warm start — alias remap and stream races', () => {
       });
     const videoReqId = (await reqIdFor('video'))!;
     expect(adapter.joiningFetch).toHaveBeenCalled(); // request sent, promise pending
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as ControlMessage);
 
     // Data stream + objects land BEFORE the player learns the request ID.
     const streamId = 80n;
@@ -370,6 +372,7 @@ describe('warm start — alias remap and stream races', () => {
     const fetchReqId = BigInt(await adapter.joiningFetch.mock.results[0]?.value);
 
     const streamId = 90n;
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as ControlMessage);
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(fetchReqId) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(1n), subgroupId: varint(0),
@@ -416,6 +419,7 @@ describe('warm start — races against the joiningFetch() await window', () => {
 
     // Fast cached fetch: stream opens, delivers everything, and FINs — all
     // before the joiningFetch() promise continuation registers the request.
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as ControlMessage);
     const streamId = 88n;
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
     adapter._triggerObject(streamId, {
