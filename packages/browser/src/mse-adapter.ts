@@ -179,7 +179,24 @@ export function validateStallThresholdMs(value: number | undefined): number {
   return value;
 }
 
+/**
+ * DRM configuration for EME (Encrypted Media Extensions) support.
+ * When provided, the adapter sets up MediaKeys on the video element
+ * and handles license acquisition transparently.
+ */
+export interface DrmConfig {
+  /** License server URL — receives POST with the license challenge. */
+  readonly licenseUrl: string;
+  /** EME key system identifier. Default: 'com.widevine.alpha'. */
+  readonly keySystem?: string;
+  /** Optional server certificate (for Widevine provisioning). */
+  readonly serverCertificate?: Uint8Array;
+}
+
 export interface MseMediaSourceOptions {
+  /** DRM configuration. When set, EME is initialized and license requests
+   *  are handled automatically via the encrypted event. */
+  readonly drmConfig?: DrmConfig;
   /** Seconds of played-out media to keep behind currentTime; older buffered data
    *  is evicted via SourceBuffer.remove() so the browser quota is never exhausted
    *  by stale history. Default 10. */
@@ -627,6 +644,12 @@ export class MseMediaSource implements MediaSourceLike {
   private stallDetectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly stallThresholdMs: number;
 
+  // ── EME / DRM state ──
+  private readonly drmConfig: DrmConfig | null = null;
+  private mediaKeys: MediaKeys | null = null;
+  private mediaKeysReady: Promise<void> | null = null;
+  private keySession: MediaKeySession | null = null;
+
   // ── Playhead-wedge watchdog state ──
   /** Watchdog cadence; detection threshold per escalation rung. */
   private static readonly WEDGE_CHECK_INTERVAL_MS = 1_000;
@@ -861,6 +884,13 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.addEventListener('waiting', this.handleWaiting);
     this.video.addEventListener('timeupdate', this.handleTimeUpdate);
     this.video.addEventListener('error', this.handleVideoError);
+
+    // ── EME / DRM setup ─────────────────────────────────────────────
+    this.drmConfig = options.drmConfig ?? null;
+    if (this.drmConfig) {
+      this.video.addEventListener('encrypted', this.handleEncrypted);
+      this.mediaKeysReady = this.setupMediaKeys(this.drmConfig);
+    }
   }
 
   // ─── MediaSourceLike ───────────────────────────────────────────
@@ -1320,6 +1350,10 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.removeEventListener('waiting', this.handleWaiting);
     this.video.removeEventListener('timeupdate', this.handleTimeUpdate);
     this.video.removeEventListener('error', this.handleVideoError);
+    this.video.removeEventListener('encrypted', this.handleEncrypted);
+    // Don't close keySession or clear mediaKeys — the <video> element
+    // is reused across reconnects and the browser won't allow removing
+    // the existing CDM. The next MseMediaSource reuses them.
     this.reset();
     if (this.objectUrl) {
       URL.revokeObjectURL(this.objectUrl);
@@ -1334,6 +1368,94 @@ export class MseMediaSource implements MediaSourceLike {
     this.onStall = null;
     this.onStallRecovered = null;
   }
+
+  // ─── EME / DRM ─────────────────────────────────────────────────
+
+  /**
+   * Asynchronously set up MediaKeys on the video element. Fire-and-forget
+   * from the constructor — EME is transparent to MSE once configured; the
+   * browser enqueues encrypted frames until keys are available.
+   */
+  private async setupMediaKeys(drm: DrmConfig): Promise<void> {
+    const keySystem = drm.keySystem ?? 'com.widevine.alpha';
+    try {
+      // Reuse existing MediaKeys if the video element already has one
+      // (reconnect reuses the same <video> element).
+      if (this.video.mediaKeys) {
+        this.mediaKeys = this.video.mediaKeys;
+        console.warn('[DRM] Reusing existing MediaKeys on video element');
+        return;
+      }
+      const access = await navigator.requestMediaKeySystemAccess(keySystem, [{
+        initDataTypes: ['cenc'],
+        videoCapabilities: [
+          { contentType: 'video/mp4; codecs="avc1.640028"', robustness: '' },
+          { contentType: 'video/mp4; codecs="avc3.640028"', robustness: '' },
+        ],
+        audioCapabilities: [
+          { contentType: 'audio/mp4; codecs="mp4a.40.2"', robustness: '' },
+        ],
+      }]);
+      this.mediaKeys = await access.createMediaKeys();
+      if (drm.serverCertificate) {
+        await this.mediaKeys.setServerCertificate(drm.serverCertificate.buffer as ArrayBuffer);
+      }
+      await this.video.setMediaKeys(this.mediaKeys);
+      console.warn('[DRM] MediaKeys set (%s)', keySystem);
+    } catch (err) {
+      console.warn('[DRM] MediaKeys setup failed: %s', (err as Error).message);
+      this.onError?.(err instanceof Error ? err : new Error(`DRM setup failed: ${String(err)}`));
+    }
+  }
+
+  /**
+   * Handle the 'encrypted' event on the video element. Fired when the
+   * browser encounters PSSH in an init segment. Creates a key session
+   * and fetches the license from the configured server.
+   */
+  private handleEncrypted = async (event: MediaEncryptedEvent): Promise<void> => {
+    console.warn('[DRM] encrypted event fired (initDataType=%s, has initData=%s)', event.initDataType, !!event.initData);
+    if (!this.drmConfig || !event.initData) return;
+    // Wait for MediaKeys to be ready (setupMediaKeys is async).
+    if (this.mediaKeysReady) await this.mediaKeysReady;
+    if (!this.mediaKeys) return;
+    // Only create one session — subsequent encrypted events for the same
+    // key system are handled by the existing session.
+    if (this.keySession) return;
+    try {
+      const session = this.mediaKeys.createSession('temporary');
+      this.keySession = session;
+      session.addEventListener('message', this.handleKeyMessage);
+      await session.generateRequest(event.initDataType, event.initData);
+      console.warn('[DRM] Key session created (initDataType=%s)', event.initDataType);
+    } catch (err) {
+      console.warn('[DRM] generateRequest failed: %s', (err as Error).message);
+      this.onError?.(err instanceof Error ? err : new Error(`DRM session failed: ${String(err)}`));
+    }
+  };
+
+  /**
+   * Handle license request from the CDM. POST the challenge to the
+   * license server and feed the response back to the session.
+   */
+  private handleKeyMessage = async (event: MediaKeyMessageEvent): Promise<void> => {
+    if (!this.drmConfig) return;
+    try {
+      const response = await fetch(this.drmConfig.licenseUrl, {
+        method: 'POST',
+        body: event.message,
+      });
+      if (!response.ok) {
+        throw new Error(`License server returned ${response.status} ${response.statusText}`);
+      }
+      const license = await response.arrayBuffer();
+      await (event.target as MediaKeySession).update(new Uint8Array(license));
+      console.warn('[DRM] License acquired, keys active');
+    } catch (err) {
+      console.warn('[DRM] License fetch failed: %s', (err as Error).message);
+      this.onError?.(err instanceof Error ? err : new Error(`DRM license failed: ${String(err)}`));
+    }
+  };
 
   // ─── Internal ──────────────────────────────────────────────────
 
