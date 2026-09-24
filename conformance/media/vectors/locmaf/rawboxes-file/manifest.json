@@ -1,0 +1,21 @@
+{
+  "name": "rawboxes-file",
+  "description": "the .locmaf file format: a leading rawBoxes Object carries the init in-band, then normal chunks",
+  "locmafVersion": "0.3",
+  "draftCommit": "6a2439a",
+  "groups": 1,
+  "objects": 3,
+  "files": {
+    "canonical/g000_o000.cmfc": "837edbacc52571ac324d828de79711a3336e95ccaaaf67dc2439823a10d76a03",
+    "canonical/g000_o001.cmfc": "cf4a79f57c88f8862dc9632ff956c1e7d1ba917b05d568c9517b23e5590e3251",
+    "canonical/g000_o002.cmfc": "6a92568304d4d3dd43326507a89f6e2af0d3a2e9f6b27b0d4b8bcb7a4666041c",
+    "effective/g000_o000.json": "45a19f5f8734a681834d5c2907ce88a12fd314d60cb607e263b6ecb3d140c997",
+    "effective/g000_o001.json": "22fa052fd4f60f7940d3306942355828b5475c06c8fe0d1e82ff089683a7ffa8",
+    "effective/g000_o002.json": "65015cd44495cf714d18117c9109d4d77b1ab871342bfd6ada1c3f062853f85b",
+    "file.locmaf": "1f37ffedd0b479376a1d8407231c1bcdaee8f8748e8e77301e9ad60548efa4f5",
+    "init.mp4": "837edbacc52571ac324d828de79711a3336e95ccaaaf67dc2439823a10d76a03",
+    "objects/g000_o000.locmafobj": "e43d5ee37917eeff5ffc8ad4ccbe9822a368c3fdd248b2ff35fb2cc49f044d8e",
+    "objects/g000_o001.locmafobj": "9717a36f640a73815bcf7ea85ebfb8de6dad55451bb4905b9b727c85b293c58a",
+    "objects/g000_o002.locmafobj": "3a2c58e9b91a23bbe78ce742bbad7bf6a618387876550c76eb00274abb9bdcf3"
+  }
+}

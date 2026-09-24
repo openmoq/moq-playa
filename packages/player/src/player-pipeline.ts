@@ -27,6 +27,7 @@ import type { LocDiagnosticKind } from './stats.js';
 import { RenderCushionSmoother } from './render-cushion.js';
 import type { QualityController } from './quality-controller.js';
 import type { TrackPackaging } from './subscription-manager.js';
+import { usesMsePath } from './packaging.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -71,8 +72,19 @@ export interface TrackInfo {
 
 /** Callbacks from pipeline to player. */
 export interface PipelineCallbacks {
+  /**
+   * The CMAF MediaSource became attached to its media element (MSE
+   * `sourceopen`). Optional: only CMAF sessions produce it.
+   */
+  onAttached?: () => void;
   onFirstFrame: () => void;
   onStall: (durationMs: number) => void;
+  /**
+   * A detected stall ended with genuine recovery. Full outage length.
+   *
+   * Optional: a caller that only wants detection stays source-compatible.
+   */
+  onStallRecovered?: (durationMs: number) => void;
   onDecodeError: (mediaType: 'video' | 'audio', error: Error) => void;
   onFrameRendered: (captureTimestampUs: number, actualRenderUs: number) => void;
   onFeedback: (fb: DecoderFeedback) => void;
@@ -165,8 +177,10 @@ export function createPipelines(
   let mediaSource: MediaSourceLike | null = null;
 
   // ── Create MediaSource adapter for CMAF tracks ────────────────
-  const hasCmafVideo = trackInfo.video?.packaging === 'cmaf';
-  const hasCmafAudio = trackInfo.audio?.packaging === 'cmaf';
+  // cmaf and locmaf both play through MSE (LOCMAF §6).
+  // cmaf always; locmaf unless config.locmafDecoding selects the §16 frame path.
+  const hasCmafVideo = usesMsePath(trackInfo.video?.packaging, config.locmafDecoding);
+  const hasCmafAudio = usesMsePath(trackInfo.audio?.packaging, config.locmafDecoding);
   const hasCmaf = hasCmafVideo || hasCmafAudio;
 
   if (hasCmaf && config.createMediaSource) {
@@ -181,8 +195,10 @@ export function createPipelines(
     // @see draft-ietf-moq-cmsf-00 §3.1 (Initialization headers)
     // @see draft-ietf-moq-catalogformat-01 §3.2.16 (initTrack)
 
+    mediaSource.onAttached = () => callbacks.onAttached?.();
     mediaSource.onFirstFrame = () => callbacks.onFirstFrame();
     mediaSource.onStall = (durationMs) => callbacks.onStall(durationMs);
+    mediaSource.onStallRecovered = (durationMs) => callbacks.onStallRecovered?.(durationMs);
     mediaSource.onError = (error) => callbacks.onDecodeError('video', error);
   }
 
@@ -242,6 +258,7 @@ export function createPipelines(
       audioChannels: trackInfo.audio?.channels,
       onFirstFrame: () => callbacks.onFirstFrame(),
       onStall: (durationMs: number) => callbacks.onStall(durationMs),
+      onStallRecovered: (durationMs: number) => callbacks.onStallRecovered?.(durationMs),
       onError: (mediaType: 'video' | 'audio', error: Error) => callbacks.onDecodeError(mediaType, error),
       onFrameRendered: (captureTimestampUs: number, actualRenderUs: number) => callbacks.onFrameRendered(captureTimestampUs, actualRenderUs),
       onFeedback: (fb: DecoderFeedback) => callbacks.onFeedback(fb),

@@ -158,6 +158,28 @@ export interface GapJumpInfo {
 }
 
 /**
+ * Validate a stall-detection threshold.
+ *
+ * This becomes a `setTimeout` delay, where a NaN, negative, or overflowing
+ * value silently degrades to an immediate timer in browsers — turning an
+ * explicit policy back into an accidental one.
+ */
+export function validateStallThresholdMs(value: number | undefined): number {
+  if (value === undefined) return 250;
+  if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+    throw new RangeError(
+      `stallThresholdMs must be a non-negative integer number of milliseconds (got ${value})`,
+    );
+  }
+  // setTimeout stores its delay in a 32-bit signed int; beyond that it fires
+  // immediately.
+  if (value > 2_147_483_647) {
+    throw new RangeError(`stallThresholdMs exceeds the maximum timer delay (got ${value})`);
+  }
+  return value;
+}
+
+/**
  * DRM configuration for EME (Encrypted Media Extensions) support.
  * When provided, the adapter sets up MediaKeys on the video element
  * and handles license acquisition transparently.
@@ -195,6 +217,14 @@ export interface MseMediaSourceOptions {
    * watchdog, so effective resolution is ±1 s. Must be finite and >= 0.
    */
   readonly gapJumpMs?: number;
+  /**
+   * How long playback must be stalled before a stall is *detected*.
+   *
+   * Detection previously happened on whichever `timeupdate` landed first,
+   * so the threshold was really the browser's ~250 ms event cadence. This
+   * makes it explicit and independent of that cadence.
+   */
+  readonly stallThresholdMs?: number;
   /**
    * Which MediaSource implementation to construct.
    *
@@ -390,6 +420,10 @@ export class MseMediaSource implements MediaSourceLike {
     this.playbackIntent = intent;
     this.diag('playback-intent %s', String(intent));
     if (!intent) {
+      // Withdrawn intent supersedes playback rather than recovering it: an
+      // in-flight episode must not span the paused interval and then complete
+      // on resume.
+      this.cancelStallEpisode();
       // Cancel a startup in flight AND stop playback that already started —
       // withdrawing intent is a pause, not merely "don't start".
       // Also drop any armed gap candidate AND the post-jump landing watch
@@ -542,8 +576,22 @@ export class MseMediaSource implements MediaSourceLike {
   private objectUrl: string | null = null;
   private destroyed = false;
   private initialized = false;
+  /** Deferred initialization owned by the current buffer generation. */
+  private sourceOpenListener: (() => void) | null = null;
 
   // ─── Callbacks ──────────────────────────────────────────────────
+
+  /**
+   * True once the media element has attached the MediaSource (`sourceopen`)
+   * and initialize() has created the SourceBuffers. Browsers defer the
+   * attachment while the document is hidden; until then appendChunk() has
+   * nothing to append to. Cleared by reset().
+   */
+  private _attached = false;
+  get attached(): boolean { return this._attached; }
+
+  /** Callback: the MediaSource attached and SourceBuffers now exist. */
+  onAttached: (() => void) | null = null;
 
   onFirstFrame: (() => void) | null = null;
   onError: ((error: Error) => void) | null = null;
@@ -551,6 +599,12 @@ export class MseMediaSource implements MediaSourceLike {
    *  (a source hole, not bandwidth) — consumers may exempt those from
    *  bandwidth-driven reactions while still counting them. */
   onStall: ((durationMs: number, cause?: 'media-gap') => void) | null = null;
+
+  /**
+   * A detected stall ended with genuine playback resumption (`playing`).
+   * Carries the full outage length.
+   */
+  onStallRecovered: ((durationMs: number) => void) | null = null;
   /** Fired after the adapter repositioned playback toward the live edge —
    *  'behind-live' (buffered-ahead cap) or 'quota' (flush + rejoin after
    *  QuotaExceededError). INFORMATIONAL, concrete-class only: it is NOT part of
@@ -580,8 +634,15 @@ export class MseMediaSource implements MediaSourceLike {
   onGapJump: ((info: GapJumpInfo) => void) | null = null;
 
   private firstFrameFired = false;
+  /** One-shot guard for the "no SourceBuffer yet" drop diagnostic in appendChunk(). */
+  private preInitDropLogged = false;
   private playTriggered = false;
   private stallStartTime: number | null = null;
+  /** True once this episode has been reported as detected. */
+  private stallDetected = false;
+  /** Fires detection at the explicit threshold, not on an event cadence. */
+  private stallDetectTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly stallThresholdMs: number;
 
   // ── EME / DRM state ──
   private readonly drmConfig: DrmConfig | null = null;
@@ -763,6 +824,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.maxAheadSec = options.maxAheadSec ?? 15;
     this.targetAheadSec = options.targetAheadSec ?? 2;
     const gapJumpMs = options.gapJumpMs ?? 2_000;
+    this.stallThresholdMs = validateStallThresholdMs(options.stallThresholdMs);
     if (!Number.isFinite(gapJumpMs) || gapJumpMs < 0) {
       throw new Error(`gapJumpMs must be finite and >= 0 (got ${String(options.gapJumpMs)})`);
     }
@@ -892,7 +954,13 @@ export class MseMediaSource implements MediaSourceLike {
     }
     this.initialized = true;
 
+    const generation = this.bufferGen;
     const doInit = () => {
+      if (this.sourceOpenListener === doInit) {
+        this.ms.removeEventListener('sourceopen', doInit);
+        this.sourceOpenListener = null;
+      }
+      if (this.destroyed || this.bufferGen !== generation || !this.initialized) return;
       try {
         if (config.video) {
           const mimeType = `video/mp4; codecs="${config.video.codec}"`;
@@ -938,6 +1006,9 @@ export class MseMediaSource implements MediaSourceLike {
             this.runMutation('audio', 'init-append', () => ab.appendBuffer(audioInit.buffer as ArrayBuffer));
           }
         }
+        // SourceBuffers exist from here on: appendChunk() can take effect.
+        this._attached = true;
+        this.onAttached?.();
       } catch (err) {
         this.onError?.(err instanceof Error ? err : new Error(String(err)));
       }
@@ -946,6 +1017,7 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.ms.readyState === 'open') {
       doInit();
     } else {
+      this.sourceOpenListener = doInit;
       this.ms.addEventListener('sourceopen', doInit, { once: true });
     }
     return true;
@@ -966,6 +1038,18 @@ export class MseMediaSource implements MediaSourceLike {
 
     const buffer = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
     if (!buffer) {
+      // No SourceBuffer yet: either initialize() hasn't been called, or it has
+      // and we are still waiting for `sourceopen`. The latter is normal for a
+      // hidden tab — browsers defer the media load (and so the MediaSource
+      // attachment) until the document is visible — but it must not be silent:
+      // every chunk dropped here is media the element will never see.
+      if (!this.preInitDropLogged) {
+        this.preInitDropLogged = true;
+        const doc = (globalThis as { document?: { visibilityState?: string } }).document;
+        this.logDebug('[MSE] dropping %s chunk: no SourceBuffer yet (initialized=%s, ms.readyState=%s, '
+          + 'document.visibilityState=%s) — waiting for sourceopen; further drops not logged',
+          mediaType, String(this.initialized), this.ms.readyState, doc?.visibilityState ?? 'n/a');
+      }
       return;
     }
 
@@ -1197,6 +1281,10 @@ export class MseMediaSource implements MediaSourceLike {
     // Cancel any in-flight startup FIRST: a late seeked/play from the
     // superseded generation must not resurrect playback against new buffers.
     this.cancelStartup();
+    if (this.sourceOpenListener) {
+      this.ms.removeEventListener('sourceopen', this.sourceOpenListener);
+      this.sourceOpenListener = null;
+    }
     this.diag('reset (buffer generation %d → %d)', this.bufferGen, this.bufferGen + 1);
     this.bufferGen++;
     // New session: stale facts must never join a later summary.
@@ -1216,6 +1304,8 @@ export class MseMediaSource implements MediaSourceLike {
     this.videoQueue.length = 0;
     this.audioQueue.length = 0;
     this.initialized = false;
+    this._attached = false;
+    this.preInitDropLogged = false;
     // Timeline-owned append state.
     this.videoTimelines.clear();
     this.audioTimelines.clear();
@@ -1246,6 +1336,7 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   destroy(): void {
+    this.cancelStallEpisode();
     this.diag('destroy');
     this.destroyed = true;
     this.cancelStartup();
@@ -1272,8 +1363,10 @@ export class MseMediaSource implements MediaSourceLike {
     (this.video as any).srcObject = null;
     this.video.load();
     this.onFirstFrame = null;
+    this.onAttached = null;
     this.onError = null;
     this.onStall = null;
+    this.onStallRecovered = null;
   }
 
   // ─── EME / DRM ─────────────────────────────────────────────────
@@ -1951,7 +2044,9 @@ export class MseMediaSource implements MediaSourceLike {
    *  it transferred — intentional pause/seek must leave nothing armed. */
   private retireGapLanding(): void {
     if (this.gapStallFromLanding) {
-      this.stallStartTime = null;
+      // Intentional pause/seek: abandon the whole episode, timer included, so
+      // nothing is left armed to fire against superseded playback.
+      this.cancelStallEpisode();
       this.gapStallFromLanding = false;
     }
     this.gapLanding = null;
@@ -2145,7 +2240,9 @@ export class MseMediaSource implements MediaSourceLike {
     this.gapCandidate = null;
     this.gapLastPlayheadTime = null;
     this.lastGapJumpAtMs = nowMs;
-    this.stallStartTime = null;
+    // The jump reports its own `media-gap` stall below; retire the ordinary
+    // episode wholesale rather than leaving its timer armed.
+    this.cancelStallEpisode();
     this.gapStallEpisode = true;
     this.gapEpisodeTicks = 0;
     this.gapLanding = { to, jumpedAtMs: nowMs, waitingAtMs: null, spent: false };
@@ -2769,11 +2866,23 @@ export class MseMediaSource implements MediaSourceLike {
 
   private handlePlaying = (): void => {
     this.gapStallEpisode = false;                 // post-jump churn episode over
-    if (this.stallStartTime !== null) this.stallStartTime = null;
+    // `playing` is the only genuine resumption signal: it is queued when ready
+    // state recovers. A sub-threshold wait clears silently.
+    // Capture, but publish after every internal commit below: emit()
+    // propagates listener exceptions, and a throwing `stall_recovered`
+    // listener must not leave first-frame state uncommitted.
+    let recoveredMs: number | null = null;
+    if (this.stallStartTime !== null) {
+      const startedAt = this.stallStartTime;
+      const detected = this.stallDetected;
+      this.cancelStallEpisode();
+      if (detected) recoveredMs = performance.now() - startedAt;
+    }
     if (!this.firstFrameFired) {
       this.firstFrameFired = true;
       this.onFirstFrame?.();
     }
+    if (recoveredMs !== null) this.onStallRecovered?.(recoveredMs);
   };
 
   private handleWaiting = (): void => {
@@ -2789,8 +2898,39 @@ export class MseMediaSource implements MediaSourceLike {
       if (this.gapLanding !== null) this.gapLanding.waitingAtMs ??= performance.now();
       return;
     }
+    // A `waiting` delivered after intent was withdrawn describes stopped
+    // playback, not a stall.
+    if (!this.playbackIntent) return;
     this.gapStallFromLanding = false;   // fresh evidence, not landing-owned
-    this.stallStartTime = performance.now();
+    // First `waiting` owns the episode: a browser may re-emit it during one
+    // uninterrupted freeze, and restarting the clock would shorten the outage.
+    this.stallStartTime ??= performance.now();
+    this.armStallDetection();
+  };
+
+  /** Detect once, at an explicit threshold, independent of `timeupdate`. */
+  private armStallDetection(): void {
+    if (this.stallDetectTimer !== null || this.stallDetected) return;
+    this.stallDetectTimer = setTimeout(() => {
+      this.stallDetectTimer = null;
+      if (this.stallStartTime === null || this.stallDetected) return;
+      this.stallDetected = true;
+      this.onStall?.(performance.now() - this.stallStartTime);
+    }, this.stallThresholdMs);
+  }
+
+  /**
+   * Abandon an in-flight episode without completing it.
+   *
+   * For teardown and for playback that is superseded rather than recovered.
+   */
+  cancelStallEpisode(): void {
+    if (this.stallDetectTimer !== null) {
+      clearTimeout(this.stallDetectTimer);
+      this.stallDetectTimer = null;
+    }
+    this.stallStartTime = null;
+    this.stallDetected = false;
   };
 
   private handleTimeUpdate = (): void => {
@@ -2804,12 +2944,10 @@ export class MseMediaSource implements MediaSourceLike {
       this.gapStallEpisode = false;
       return;
     }
-    if (this.stallStartTime !== null) {
-      const durationMs = performance.now() - this.stallStartTime;
-      this.stallStartTime = null;
-      this.gapStallFromLanding = false;
-      this.onStall?.(durationMs);
-    }
+    // Deliberately does NOT close the episode. `timeupdate` is queued when the
+    // ready state falls and `waiting` is fired, and runs on a ~250 ms cadence,
+    // so treating it as recovery both ended measurement early and let a
+    // continuing freeze go unmeasured.
   };
 
   /**

@@ -24,6 +24,7 @@ import {
 import { writeKvpList, kvpListEncodingLength, kvpListEntryCount, type KvpValue } from '../primitives/kvp.js';
 import { toKvpParams } from './kvp-params.js';
 import { MessageParam } from './parameters.js';
+import { ProtocolViolationError } from '../errors.js';
 import { writeLocation, locationEncodingLength } from '../primitives/location.js';
 import { writeReasonPhrase, reasonPhraseEncodingLength } from '../primitives/reason.js';
 
@@ -65,6 +66,13 @@ function validateMessageParams(params: Parameters): void {
     if (UNIQUE_MESSAGE_PARAMS.has(key as bigint) && values.length > 1) {
       const name = MESSAGE_PARAM_NAMES.get(key as bigint) ?? `0x${(key as bigint).toString(16)}`;
       throw new Error(`Duplicate message parameter: ${name} may not appear multiple times`);
+    }
+    if (key === MessageParam.FORWARD) {
+      const value = values[0];
+      if (values.length !== 1 || typeof value !== 'bigint'
+          || (value !== 0n && value !== 1n)) {
+        throw new ProtocolViolationError('FORWARD must be exactly one value, 0 or 1');
+      }
     }
   }
 }

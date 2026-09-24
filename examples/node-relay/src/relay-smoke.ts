@@ -8,7 +8,7 @@ import { startRelayServer } from './server.js';
 import { connectClient, beginSubscribe, type CollectedObject } from './client.js';
 import { publishDemo } from './publisher.js';
 import { certsExist } from './cert.js';
-import { DEMO_PAYLOADS } from './demo.js';
+import { DEMO_EXTENSIONS, DEMO_PAYLOADS } from './demo.js';
 
 const log = (...a: unknown[]) => console.log('[relay-smoke]', ...a);
 
@@ -22,6 +22,10 @@ function assertFanout(name: string, got: CollectedObject[]): void {
     if (o.groupId !== 0n) errs.push(`#${i} groupId=${o.groupId}`);
     if (o.subgroupId !== 0n) errs.push(`#${i} subgroupId=${o.subgroupId}`);
     if (o.objectId !== BigInt(i)) errs.push(`#${i} objectId=${o.objectId}`);
+    if (o.extensions?.length !== DEMO_EXTENSIONS.length
+        || !o.extensions.every((byte, j) => byte === DEMO_EXTENSIONS[j])) {
+      errs.push(`#${i} Object Properties were not preserved`);
+    }
   });
   if (errs.length) throw new Error(`${name} mismatch: ${errs.join(', ')}`);
 }
@@ -54,7 +58,7 @@ async function main(): Promise<number> {
     const fmt = (g: CollectedObject[]) => g.map((o) => `${o.payload}@g${o.groupId}/sg${o.subgroupId}/o${o.objectId}`);
     log(`subA received ${JSON.stringify(fmt(pa))} ✓`);
     log(`subB received ${JSON.stringify(fmt(pb))} ✓`);
-    log('RESULT: relay preserved group/subgroup/object IDs and fanned out to BOTH subscribers. PASS.');
+    log('RESULT: relay preserved IDs and Object Properties for BOTH subscribers. PASS.');
     return 0;
   } catch (err) {
     log('RESULT: FAIL —', (err as Error).message);

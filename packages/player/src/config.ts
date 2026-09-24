@@ -436,6 +436,37 @@ export interface RecoveryConfig {
   readonly cmafBootstrapTimeoutMs?: number;
 
   /**
+   * CMAF first-frame bootstrap deadline EXTENSION ceiling.
+   *
+   * The `cmaf_first_frame` deadline (`cmafBootstrapTimeoutMs`) is renewed
+   * each time a video segment is appended, as long as media keeps arriving —
+   * a fixed 10s deadline from `cmaf_init` alone misfires on longer-RTT paths
+   * (e.g. long-haul QUIC handshakes) where legitimate startup buffering can
+   * take longer than 10s even though delivery is healthy the whole time.
+   * This caps the total renewal window measured from `cmaf_init`: once
+   * elapsed time since init exceeds this value, renewal stops and the next
+   * `cmafBootstrapTimeoutMs` deadline is allowed to fire — so a genuinely
+   * broken decode path (segments arriving, appendBuffer succeeding, but the
+   * browser never painting a frame) still surfaces as fatal instead of
+   * buffering forever.
+   * Default: 60_000. Only meaningful when `cmafBootstrapTimeoutMs` > 0.
+   */
+  readonly cmafFirstFrameMaxWaitMs?: number;
+
+  /**
+   * Consumption path for LOCMAF tracks (draft-einarsson-moq-locmaf-01 §16).
+   * `'mse'` (default) reconstructs every Object into a canonical CMAF chunk
+   * and plays it through MSE like a cmaf track. `'frame'` slices every Object
+   * into its coded samples and feeds them to the LOC WebCodecs pipeline
+   * (`createVideoDecoder` / `createAudioDecoder`), with the codec configuration
+   * read from the track's CMAF Header. The frame path cannot decrypt: a
+   * protected (CENC) LOCMAF track is dropped with a warning there, while the
+   * MSE path hands the reconstructed senc/saiz/saio to the browser for EME.
+   * Default: 'mse'.
+   */
+  readonly locmafDecoding?: 'mse' | 'frame';
+
+  /**
    * Media-liveness starvation threshold: while PLAYING, a track with no
    * object arrivals for this long triggers the restart ladder.
    * The gap detector handles gaps BETWEEN arrivals; this handles NO
@@ -559,8 +590,10 @@ export interface TransformConfig {
    * Custom extension parser for non-LOC packaging formats.
    *
    * When set, called instead of parseLocHeaders() for LOC-packaged tracks.
+   * The default parser accepts both draft-ietf-moq-loc-01 and -04 property
+   * sets; see LocHeaders.version.
    * Return LocHeaders with whatever fields could be extracted.
-   * Default: undefined (uses standard LOC parser per draft-ietf-moq-loc-01 §2.3).
+   * Default: undefined (uses the LOC-01/LOC-04 property parser).
    *
    * Use case: relays that use non-standard extension encoding (e.g., absolute
    * type IDs instead of delta-encoded KVPs per MoQT §1.4.2).
@@ -587,7 +620,7 @@ export interface TransformConfig {
 export interface DebugConfig {
   /**
    * qlog event callback.
-   * @see draft-pardue-moq-qlog-moq-events-04
+   * @see draft-pardue-moq-qlog-moq-events-06
    */
   readonly onQlogEvent?: (event: QlogEvent) => void;
 
@@ -687,6 +720,7 @@ export const DEFAULT_PLAYER_CONFIG = {
 
   // CMAF bootstrap (0 disables)
   cmafBootstrapTimeoutMs: 10_000,
+  cmafFirstFrameMaxWaitMs: 60_000,
 
   // Media liveness (0 disables)
   livenessTimeoutMs: 10_000,
@@ -762,6 +796,12 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     throw new RangeError(`cmafBootstrapTimeoutMs must be >= 0 (0 disables), got ${config.cmafBootstrapTimeoutMs}`);
   }
 
+  // cmafFirstFrameMaxWaitMs: > 0 (it bounds renewal, not a disable switch)
+  if (config.cmafFirstFrameMaxWaitMs !== undefined
+      && (!Number.isFinite(config.cmafFirstFrameMaxWaitMs) || config.cmafFirstFrameMaxWaitMs <= 0)) {
+    throw new RangeError(`cmafFirstFrameMaxWaitMs must be finite and > 0, got ${config.cmafFirstFrameMaxWaitMs}`);
+  }
+
   if (config.authority !== undefined && config.authority.trim().length === 0) {
     throw new RangeError('authority must be non-empty when set');
   }
@@ -778,6 +818,10 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     throw new RangeError(
       `warmStartCurrentGroup requires the LargestObject subscription filter (§9.16.2), got ${config.subscriptionFilter.type}`,
     );
+  }
+
+  if (config.locmafDecoding !== undefined && !['mse', 'frame'].includes(config.locmafDecoding)) {
+    throw new RangeError(`locmafDecoding must be 'mse' | 'frame', got ${String(config.locmafDecoding)}`);
   }
 
   if (config.catalogBootstrap !== undefined

@@ -661,18 +661,23 @@ describe('CatalogBootstrap — retained chain (rung 2)', () => {
         expect(h.calls.updated).toEqual([['base', 'replayed']]);
     });
 
-    it('#23f-race: a reset on the contributing stream dirties the chain — not applied', () => {
-        const h = makeHarness();
-        h.coord.start();
-        h.coord.onSubscribeOk({ group: 8n, object: 0n });
-        h.coord.onLiveCatalogObject({ location: { group: 7n, object: 0n }, kind: 'payload', payload: msf00Indep(['newer']) }, 203n);
-        h.coord.onLiveStreamEvent(203n, 'reset');  // NOT clean
-        h.f.err('refused');
-        h.f.err('refused');
-        h.coord.onLiveCatalogObject({ location: { group: 2n, object: 0n }, kind: 'payload', payload: msf00Indep(['old']) }, 204n);
-        expect(h.calls.ready).toEqual([['old']]);
-        expect(h.calls.updated).toEqual([]);       // dirty chain dropped, never applied
-    });
+    // Only a peer FIN is clean. A reset, OUR OWN cancellation, and a generic
+    // failure are all non-clean — and the chain rule must test for the one
+    // clean value rather than exclude the reset it was first written against.
+    for (const terminal of ['reset', 'local-discard', 'error'] as const) {
+        it(`#23f-race: a ${terminal} on the contributing stream dirties the chain — not applied`, () => {
+            const h = makeHarness();
+            h.coord.start();
+            h.coord.onSubscribeOk({ group: 8n, object: 0n });
+            h.coord.onLiveCatalogObject({ location: { group: 7n, object: 0n }, kind: 'payload', payload: msf00Indep(['newer']) }, 203n);
+            h.coord.onLiveStreamEvent(203n, terminal);  // NOT clean
+            h.f.err('refused');
+            h.f.err('refused');
+            h.coord.onLiveCatalogObject({ location: { group: 2n, object: 0n }, kind: 'payload', payload: msf00Indep(['old']) }, 204n);
+            expect(h.calls.ready).toEqual([['old']]);
+            expect(h.calls.updated).toEqual([]);       // dirty chain dropped, never applied
+        });
+    }
 });
 
 describe('CatalogBootstrap — live profile bookkeeping (F6/F10)', () => {

@@ -16,6 +16,7 @@ import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@moqt/webtransport';
 import type { ControlMessage, MoqtObject, DataStreamHeader } from '@moqt/transport';
 import { varint } from '@moqt/transport';
+import type { DataStreamTerminal } from '@moqt/webtransport';
 
 const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
 const CATALOG = {
@@ -64,7 +65,12 @@ function createMockAdapter(draft: 14 | 16 | 18 = 16) {
         _triggerMessage: (msg: ControlMessage) => adapter.onMessage?.(msg),
         _triggerObject: (streamId: bigint, obj: MoqtObject) => adapter.onObject?.(streamId, obj),
         _triggerDataStream: (streamId: bigint, header: DataStreamHeader) => adapter.onDataStream?.(streamId, header),
-        _triggerStreamClosed: (streamId: bigint, error?: number) => adapter.onStreamClosed?.(streamId, error),
+        /**
+         * Legacy calls default to the terminal their error code implies; the
+         * ambiguity tests pass a kind explicitly.
+         */
+        _triggerStreamClosed: (streamId: bigint, error?: number, terminal?: DataStreamTerminal) =>
+            adapter.onStreamClosed?.(streamId, error, terminal ?? (error === undefined ? 'fin' : 'reset')),
         _triggerClose: (error?: number, reason?: string) => adapter.onClose?.(error, reason),
     };
     return adapter;
@@ -600,6 +606,95 @@ describe('catalog bootstrap wiring — staged-recovery races (F1/F2/F4/F5/F6)', 
         const candFetchReqId = BigInt(await adapter.joiningFetch.mock.results[1]!.value);
         return { ...loaded, candSubReqId, candFetchReqId };
     }
+
+    /**
+     * Positive clean-FIN evidence must come from an explicit peer terminal.
+     * `error === undefined` also describes our OWN reader cancellation and a
+     * generic read failure, so deriving completion from it lets a locally
+     * discarded stream settle a recovery transaction that was truncated.
+     *
+     * Diagnosis by Paul Gregoire (openmoq/moq-playa#7).
+     */
+    type RecoveryInternals = {
+        catalogRecovery: {
+            coord: { onFetchStreamClosed(attempt: unknown, cleanFin: boolean): void };
+            parkedEvents: Map<bigint, DataStreamTerminal>;
+        } | null;
+    };
+
+    /** Replace the candidate coordinator's callback with a recording stub. */
+    function captureFetchCloses(player: unknown): Array<boolean> {
+        const recovery = (player as RecoveryInternals).catalogRecovery;
+        if (recovery === null) throw new Error('no catalogRecovery transaction staged');
+        const seen: boolean[] = [];
+        const inner = recovery.coord.onFetchStreamClosed.bind(recovery.coord);
+        recovery.coord.onFetchStreamClosed = (attempt, cleanFin) => {
+            seen.push(cleanFin);
+            inner(attempt, cleanFin);
+        };
+        return seen;
+    }
+
+    for (const terminal of ['local-discard', 'error'] as const) {
+        it(`a ${terminal} of a recovery fetch stream is not clean completion`, async () => {
+            const adapter = createMockAdapter(16);
+            const { player, candFetchReqId } = await toCandidate(adapter);
+            const closes = captureFetchCloses(player);
+            await deliverFetchObject(adapter, candFetchReqId, 501n, 8n, 0n, enc(CATALOG));
+
+            adapter._triggerStreamClosed(501n, undefined, terminal);
+            await flush();
+
+            expect(closes).toEqual([false]);
+        });
+    }
+
+    it('a genuine peer FIN of a recovery fetch stream IS clean completion', async () => {
+        const adapter = createMockAdapter(16);
+        const { player, candFetchReqId } = await toCandidate(adapter);
+        const closes = captureFetchCloses(player);
+        await deliverFetchObject(adapter, candFetchReqId, 501n, 8n, 0n, enc(CATALOG));
+
+        adapter._triggerStreamClosed(501n, undefined, 'fin');
+        await flush();
+
+        expect(closes).toEqual([true]);
+    });
+
+    for (const terminal of ['local-discard', 'error'] as const) {
+        it(`a ${terminal} of a parked retired-alias stream records that exact kind`, async () => {
+            const adapter = createMockAdapter(16);
+            const { player } = await toCandidate(adapter);
+            adapter._triggerObject(701n, {
+                kind: 'data', trackAlias: varint(1n), groupId: varint(9n), subgroupId: varint(0n),
+                objectId: varint(0n), publisherPriority: 128, extensions: undefined,
+                payload: enc(CATALOG),
+            } as unknown as MoqtObject);
+
+            adapter._triggerStreamClosed(701n, undefined, terminal);
+            await flush();
+
+            // Recorded verbatim: not FIN, and not falsely attributed to the peer.
+            const events = (player as RecoveryInternals).catalogRecovery?.parkedEvents;
+            expect(events?.get(701n)).toBe(terminal);
+        });
+    }
+
+    it('a genuine peer FIN of a parked retired-alias stream DOES record FIN evidence', async () => {
+        const adapter = createMockAdapter(16);
+        const { player } = await toCandidate(adapter);
+        adapter._triggerObject(700n, {
+            kind: 'data', trackAlias: varint(1n), groupId: varint(9n), subgroupId: varint(0n),
+            objectId: varint(0n), publisherPriority: 128, extensions: undefined,
+            payload: enc(CATALOG),
+        } as unknown as MoqtObject);
+
+        adapter._triggerStreamClosed(700n, undefined, 'fin');
+        await flush();
+
+        const events = (player as RecoveryInternals).catalogRecovery?.parkedEvents;
+        expect(events?.get(700n)).toBe('fin');
+    });
 
     /** Complete the candidate's prefix → adoption. */
     async function adoptCandidate(
@@ -3263,5 +3358,164 @@ describe('catalog bootstrap wiring — MSF-01 fallback conformance', () => {
         const { events, errors } = await viaEmulation(adapter, enc({ ...CATALOG, version: 1 }));
         expect(events).toEqual(['catalog_received']);
         expect(errors).toEqual([]);
+    });
+});
+
+/**
+ * A parked fetch stream's record must carry HOW the stream ended, not merely
+ * that it did — otherwise claiming it at registration converts every terminal
+ * into positive completion evidence. Registration is pre-send and synchronous,
+ * so an unowned request is a DEFENSIVE fallback rather than a race the current
+ * code produces; hence the artificial request id below.
+ *
+ * Diagnosis by Paul Gregoire (openmoq/moq-playa#7).
+ */
+describe('catalog bootstrap wiring — a pre-registration terminal is not completion', () => {
+    type PendingInternals = {
+        pendingFetchStreams: Map<bigint, { requestId: bigint; terminal?: DataStreamTerminal }>;
+        catalogBootstrapCoord?: { onFetchStreamClosed(attempt: unknown, cleanFin: boolean): void };
+        registerBootstrapFetch(conn: unknown, reqId: bigint, attempt: number, gen: number): void;
+        bootstrapGeneration: number;
+    };
+
+    for (const [terminal, clean] of [
+        ['fin', true], ['reset', false], ['local-discard', false], ['error', false],
+    ] as const) {
+        it(`a ${terminal} before registration is replayed as cleanFin=${clean}`, async () => {
+            const adapter = createMockAdapter(16);
+            const { player } = await loadPlayer(adapter);
+            await flush();
+            ackCatalog(adapter);
+            const internals = player as unknown as PendingInternals;
+
+            // A stream for a request NOT yet registered — it parks.
+            const unownedReqId = 777n;
+            await deliverFetchObject(adapter, unownedReqId, 900n, 5n, 0n, enc(CATALOG));
+            expect(internals.pendingFetchStreams.has(900n)).toBe(true);
+
+            adapter._triggerStreamClosed(900n, terminal === 'reset' ? 0x2a : undefined, terminal);
+            await flush();
+
+            const coord = internals.catalogBootstrapCoord!;
+            const closes: boolean[] = [];
+            const inner = coord.onFetchStreamClosed.bind(coord);
+            coord.onFetchStreamClosed = (attempt, cleanFin) => { closes.push(cleanFin); inner(attempt, cleanFin); };
+
+            // Registration now claims the parked stream and replays its terminal.
+            internals.registerBootstrapFetch(adapter, unownedReqId, 1, internals.bootstrapGeneration);
+            await flush();
+
+            expect(closes).toEqual([clean]);
+        });
+    }
+});
+
+/**
+ * The bootstrap and live-catalog coordinators also derive positive completion
+ * from the close callback. An absent error code describes three different
+ * outcomes — peer FIN, our own reader cancellation, and a generic read
+ * failure — so only an explicit terminal kind is evidence of a peer FIN.
+ *
+ * Diagnosis by Paul Gregoire (openmoq/moq-playa#7).
+ */
+describe('catalog bootstrap wiring — terminal evidence requires a peer FIN', () => {
+    type BootstrapInternals = {
+        catalogBootstrapCoord?: { onFetchStreamClosed(attempt: unknown, cleanFin: boolean): void };
+        catalogLiveStreams: Map<bigint, {
+            coord: { onLiveStreamEvent(sid: bigint, kind: 'header' | DataStreamTerminal): void };
+        }>;
+    };
+
+    /** Stage a real bootstrap fetch stream and record its completion verdict. */
+    async function bootstrapFetchInFlight(adapter: ReturnType<typeof createMockAdapter>) {
+        const { player } = await loadPlayer(adapter);
+        await flush();
+        ackCatalog(adapter);
+        await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
+        const coord = (player as unknown as BootstrapInternals).catalogBootstrapCoord;
+        if (coord === undefined) throw new Error('no bootstrap coordinator staged');
+        const closes: boolean[] = [];
+        const inner = coord.onFetchStreamClosed.bind(coord);
+        coord.onFetchStreamClosed = (attempt, cleanFin) => {
+            closes.push(cleanFin);
+            inner(attempt, cleanFin);
+        };
+        return { player, closes };
+    }
+
+    for (const terminal of ['local-discard', 'error'] as const) {
+        it(`does not accept a ${terminal} as a bootstrap fetch completion`, async () => {
+            const adapter = createMockAdapter(16);
+            const { closes } = await bootstrapFetchInFlight(adapter);
+
+            adapter._triggerStreamClosed(100n, undefined, terminal);
+            await flush();
+
+            expect(closes).toEqual([false]);
+        });
+    }
+
+    it('still accepts a genuine peer FIN as a bootstrap fetch completion', async () => {
+        const adapter = createMockAdapter(16);
+        const { closes } = await bootstrapFetchInFlight(adapter);
+
+        adapter._triggerStreamClosed(100n, undefined, 'fin');
+        await flush();
+
+        expect(closes).toEqual([true]);
+    });
+
+    /** Stage a live catalog stream and record its lifecycle events. */
+    async function liveCatalogStreamInFlight(adapter: ReturnType<typeof createMockAdapter>) {
+        const { player } = await loadPlayer(adapter);
+        await flush();
+        ackCatalog(adapter);
+        await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
+        adapter._triggerMessage({
+            type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+        } as unknown as ControlMessage);
+        adapter._triggerStreamClosed(100n, undefined, 'fin');
+        await flush();
+        // A LIVE catalog object on the bound alias registers a live stream.
+        adapter._triggerObject(800n, {
+            kind: 'data', trackAlias: varint(1n), groupId: varint(6n), subgroupId: varint(0n),
+            objectId: varint(0n), publisherPriority: 128, extensions: undefined,
+            payload: enc(CATALOG),
+        } as unknown as MoqtObject);
+        await flush();
+        const live = (player as unknown as BootstrapInternals).catalogLiveStreams.get(800n);
+        if (live === undefined) throw new Error('no live catalog stream registered');
+        const kinds: string[] = [];
+        const inner = live.coord.onLiveStreamEvent.bind(live.coord);
+        live.coord.onLiveStreamEvent = (sid, kind) => {
+            kinds.push(kind);
+            inner(sid, kind);
+        };
+        return { player, kinds };
+    }
+
+    for (const terminal of ['local-discard', 'error'] as const) {
+        it(`records a ${terminal} live-stream terminal as that exact kind`, async () => {
+            const adapter = createMockAdapter(16);
+            const { kinds } = await liveCatalogStreamInFlight(adapter);
+
+            adapter._triggerStreamClosed(800n, undefined, terminal);
+            await flush();
+
+            // Neither a clean FIN nor, falsely, a peer reset — and the callback
+            // must actually fire, which `not.toContain` alone would not prove.
+            expect(kinds).toEqual([terminal]);
+        });
+    }
+
+    it('still records a genuine peer FIN as live-stream fin evidence', async () => {
+        const adapter = createMockAdapter(16);
+        const { kinds } = await liveCatalogStreamInFlight(adapter);
+
+        adapter._triggerStreamClosed(800n, undefined, 'fin');
+        await flush();
+
+        expect(kinds).toEqual(['fin']);
     });
 });

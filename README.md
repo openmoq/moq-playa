@@ -2,9 +2,9 @@
 
 > **Pre-release.** The API surface is under active development and may change between minor versions. Pin to exact versions in production.
 
-Reference implementation of **Media over QUIC Transport (MoQT)** in TypeScript — the next-generation live media streaming protocol built on WebTransport.
+Reference implementation of **Media over QUIC Transport (MoQT)** in TypeScript, with browser WebTransport and experimental native QUIC support for Node.js.
 
-Full stack from WebTransport to viewport, published under two npm scopes so you
+Full stack from transport to viewport, published under two npm scopes so you
 pick the integration path that fits:
 
 - **`@moqt/*`** — the reference-implementation building blocks: protocol core, playback, and browser adapters, composed however you need.
@@ -91,7 +91,7 @@ player.play();
 `VideoDecoder.isConfigSupported()` is checked before configuring each codec. When a codec is unsupported the decoder shuts down cleanly — no decode-error loops, no frozen frames.
 
 **Decode paths:**
-- **LOC (Low Overhead Container)** — WebCodecs direct path, lowest latency. H.264, HEVC, AV1.
+- **LOC (Low Overhead Container)** — WebCodecs direct path, lowest latency. H.264, HEVC, AV1. Parses LOC-04 and LOC-01 properties; preserves LOC-01 output unless `locVersion: 4` is selected.
 - **CMAF (fragmented MP4)** — MSE + `<video>` path, broader compatibility.
 
 ---
@@ -101,7 +101,8 @@ player.play();
 ```
 packages/
   transport/      @moqt/transport     — Sans-I/O protocol core (draft-14 / -16 / -18)
-  webtransport/   @moqt/webtransport  — MoQT connection over WebTransport
+  webtransport/   @moqt/webtransport  — MoQT connection adapter and WebTransport binding
+  quic/           @moqt/quic          — Experimental native QUIC binding for Node.js (draft-18)
   loc/            @moqt/loc           — Low Overhead Container (CaptureTimestamp, VideoFrameMarking)
   msf/            @moqt/msf           — MSF catalog parsing, track selection, timeline
   playback/       @moqt/playback      — Jitter buffer, A/V sync, decoder state, gap detection
@@ -115,7 +116,9 @@ packages/
 The playback core (`@moqt/playback`) has **no browser dependencies**. It produces `DecoderCommand` and `PlaybackEvent` objects. Browser adapters (`@moqt/browser`) consume these. This separation enables testing in Node.js without WebCodecs/Canvas/WebAudio.
 
 ```
-WebTransport ──► @moqt/transport ──► @moqt/player ──► @moqt/playback
+WebTransport ──────────────────────────┐
+                                       ├─► @moqt/webtransport ──► @moqt/transport ──► @moqt/player ──► @moqt/playback
+Native QUIC via @moqt/quic ────────────┘
                                                             │
                                               DecoderCommand│PlaybackEvent
                                                             ▼
@@ -238,10 +241,20 @@ player.on('catch_up_changed', ({ active, rate, latencyMs }) => { ... });
 - **draft-ietf-moq-transport-16** — default supported transport draft
 - **draft-ietf-moq-transport-14** — Red5/moq-rs interop (`draftVersion: 14`)
 - **draft-ietf-moq-msf-00** — Catalog, track selection, ABR (`altGroup`), timeline
-- **draft-ietf-moq-loc-01** — Low Overhead Container (CaptureTimestamp, VideoFrameMarking)
+- **draft-ietf-moq-loc-04** — Low Overhead Container (Timestamp + Timescale, Video Frame Marking, Audio Config); `locVersion: 4` to emit
+- **draft-ietf-moq-loc-01** — Low Overhead Container (CaptureTimestamp, VideoFrameMarking); auto-detected on parse, default on encode
 - **draft-ietf-moq-cmsf-00** — CMAF Streaming Format (moof+mdat, MSE path)
 
 ### Draft version selection
+
+LOC and transport versions are independent. The broadcast example explicitly
+selects LOC-04; `?loc=1` selects LOC-01. Library encoding remains LOC-01 by
+default. A LOC-04 Timescale makes timestamps media-relative; conversion to
+LOC-01 requires an application-provided wall-clock anchor, not just unit scaling.
+LOC support here covers public properties and clear payloads. Secure Objects,
+encrypted/private properties, and automatic transport track-property delivery
+are not implemented. Callers with track-scoped defaults can pass `track` to
+`parseLocHeaders()`.
 
 Browser WebTransport may expose `transport.protocol`, enabling automatic draft detection from the negotiated `WT-Available-Protocols`:
 
@@ -260,6 +273,21 @@ const conn = new MoqtConnection(14); // required — CLIENT_SETUP is draft-speci
 ```
 
 `MoqtConnection` auto-detects the draft from **any** `WebTransportLike` whose `protocol` exposes a supported token (`moqt-18`, `moqt-16`, or `moq-00`) — there's nothing factory-specific about detection. The browser transport factory is just the convenience that sets the WebTransport `protocols` offer for you. If you construct your own `WebTransport`, pass the appropriate `protocols` option yourself and make sure `transport.protocol` is readable; Playa reads it the same way. Some Node/polyfill transports may not support `protocols` yet.
+
+Node applications can use the experimental native QUIC binding for draft 18:
+
+```ts
+import { connectQuic } from '@moqt/quic';
+import { MoqtConnection } from '@moqt/webtransport';
+
+const transport = await connectQuic('moqt://relay.example.com:443/moq');
+const connection = new MoqtConnection(18);
+await connection.connect(transport);
+```
+
+`@moqt/quic` requires a Node build configured and launched with
+`--experimental-quic`. It offers only the `moqt-18` ALPN, requires QUIC
+DATAGRAM negotiation, disables 0-RTT, and does not fall back to WebTransport.
 
 #### draft-18 known gaps (non-blocking)
 

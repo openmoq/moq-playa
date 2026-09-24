@@ -321,6 +321,11 @@ export function patchBaseMediaDecodeTime(moof: Uint8Array, newValue: bigint): vo
   const tfdt = findTfdtOffset(moof);
   if (!tfdt) return;
 
+  const max = tfdt.version === 0 ? 0xffff_ffffn : 0xffff_ffff_ffff_ffffn;
+  if (newValue < 0n || newValue > max) {
+    throw new RangeError(`baseMediaDecodeTime ${newValue} does not fit tfdt version ${tfdt.version}`);
+  }
+
   const view = new DataView(moof.buffer, moof.byteOffset, moof.byteLength);
   const valueOffset = tfdt.offset + 12;
   // findTfdtOffset validates the declared box holds the value, but guard the

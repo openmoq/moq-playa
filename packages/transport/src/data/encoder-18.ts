@@ -174,12 +174,14 @@ export function encodeFetchHeader18(requestId: bigint): Uint8Array {
   return buf;
 }
 
-/** A normal fetch object's absolute fields (status/properties deferred). */
+/** A normal fetch object's absolute fields. */
 export interface FetchObjectFields {
   readonly groupId: bigint;
   readonly subgroupId: bigint;
   readonly objectId: bigint;
   readonly publisherPriority: number;
+  /** Raw draft-18 Object Properties bytes. */
+  readonly extensions?: Uint8Array | undefined;
   readonly payload: Uint8Array;
 }
 
@@ -197,11 +199,12 @@ export function encodeFetchObject18(
   isFirstObject: boolean,
   groupOrder: GroupOrder,
 ): { bytes: Uint8Array; nextPrior: FetchObjectPrior18 } {
-  const { groupId, subgroupId, objectId, publisherPriority, payload } = fields;
+  const { groupId, subgroupId, objectId, publisherPriority, extensions, payload } = fields;
   const newGroup = isFirstObject || groupId !== prior!.groupId;
 
   // Subgroup ID explicit (mode 0b11), Object ID Delta + Priority always present.
   let flags = FetchSubgroupMode.EXPLICIT | FetchFlags.OBJECT_ID | FetchFlags.PRIORITY;
+  if (extensions !== undefined) flags |= FetchFlags.EXTENSIONS;
 
   let groupDelta: bigint | undefined;
   let objDelta: bigint;
@@ -229,6 +232,9 @@ export function encodeFetchObject18(
   size += vi64EncodingLength(subgroupId);
   size += vi64EncodingLength(objDelta);
   size += 1; // priority
+  if (extensions !== undefined) {
+    size += vi64EncodingLength(BigInt(extensions.length)) + extensions.length;
+  }
   size += vi64EncodingLength(BigInt(n));
   size += n; // payload bytes (0 when empty — a normal fetch object carries no status)
 
@@ -238,6 +244,10 @@ export function encodeFetchObject18(
   p += writeVi64(subgroupId, buf, p);
   p += writeVi64(objDelta, buf, p);
   buf[p++] = publisherPriority;
+  if (extensions !== undefined) {
+    p += writeVi64(BigInt(extensions.length), buf, p);
+    buf.set(extensions, p); p += extensions.length;
+  }
   p += writeVi64(BigInt(n), buf, p);
   // §11.4.4: a normal fetch object is Payload Length + payload bytes. It has NO
   // Object Status field (unlike subgroup/datagram objects) — fetch status / end

@@ -94,8 +94,13 @@ describe('wireConnectionCallbacks', () => {
     const handlers = createHandlers();
     wireConnectionCallbacks(adapter as any, handlers);
 
-    adapter.onStreamClosed(10n, 0x1);
-    expect(handlers.onStreamClosed).toHaveBeenCalledWith(10n, 0x1);
+    adapter.onStreamClosed(10n, 0x1, 'reset');
+    expect(handlers.onStreamClosed).toHaveBeenCalledWith(10n, 0x1, 'reset');
+
+    // The terminal kind must survive the boundary — it is the only thing that
+    // distinguishes a peer FIN from our own cancellation.
+    adapter.onStreamClosed(11n, undefined, 'local-discard');
+    expect(handlers.onStreamClosed).toHaveBeenCalledWith(11n, undefined, 'local-discard');
   });
 
   it('routes data stream headers to onDataStream (§10.4.4)', () => {

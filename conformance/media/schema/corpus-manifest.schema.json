@@ -27,7 +27,8 @@
         "missing-mdat", "timestamp-unsafe-number", "mixed-clock-domain",
         "unsupported-profile", "unsupported-delta", "malformed-json",
         "duplicate-init-ref", "duplicate-protection-ref",
-        "unknown-delta-op", "illegal-delta-field"
+        "unknown-delta-op", "illegal-delta-field",
+        "loc-malformed", "loc-unrepresentable"
       ]
     },
     "diagnostics": { "type": "array", "items": { "type": "string" } },
@@ -111,7 +112,8 @@
               "value": { "type": "string" }
             }
           }
-        }
+        },
+        "locVersion": { "enum": [1, 4] }
       }
     },
     "entry": { "oneOf": [{ "$ref": "#/$defs/fullEntry" }, { "$ref": "#/$defs/tombstone" }] },

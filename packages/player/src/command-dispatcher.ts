@@ -54,6 +54,8 @@ export interface CommandDispatcherOptions {
 
   readonly onFirstFrame?: () => void;
   readonly onStall?: (durationMs: number) => void;
+  /** A detected stall ended with a rendered frame. Full outage length. */
+  readonly onStallRecovered?: (durationMs: number) => void;
   readonly onFrameRendered?: (captureTimestampUs: bigint, actualRenderUs: number) => void;
   /**
    * Measured A/V skew at video frame render time:
@@ -231,10 +233,14 @@ export class CommandDispatcher {
         const onStall = opts.onStall;
         this.renderer.onStall = (durationMs) => onStall(durationMs);
       }
+      if (opts.onStallRecovered) {
+        const onStallRecovered = opts.onStallRecovered;
+        this.renderer.onStallRecovered = (durationMs) => onStallRecovered(durationMs);
+      }
       // Always wire onFrameRendered when renderer exists — for feedback path.
       // User callback is also fired if provided.
       const audioOutput = this.audioOutput;
-      this.renderer.onFrameRendered = (captureTimestampUs, actualRenderUs) => {
+      this.renderer.onFrameRendered = (captureTimestampUs, actualRenderUs, scheduledRenderUs) => {
         opts.onFrameRendered?.(captureTimestampUs, actualRenderUs);
         // A/V skew observability: compare the rendered frame's capture
         // timestamp against what the speakers are playing RIGHT NOW.
@@ -245,7 +251,10 @@ export class CommandDispatcher {
             opts.onAvSkew(Number(captureTimestampUs) - playheadUs);
           }
         }
-        this.onFeedback?.({ type: 'frame_rendered', mediaType: 'video', captureTimestampUs, actualRenderUs });
+        this.onFeedback?.({
+          type: 'frame_rendered', mediaType: 'video', captureTimestampUs, actualRenderUs,
+          ...(scheduledRenderUs !== undefined ? { scheduledRenderUs } : {}),
+        });
       };
     }
   }
@@ -388,8 +397,19 @@ export class CommandDispatcher {
     this.videoHoldQueue.length = 0;
   }
 
-  /** Flush all pending output — stop scheduled audio and discard queued frames. */
+  /**
+   * Flush all pending output — stop scheduled audio and discard queued frames.
+   *
+   * Reached only from pause and from a seek, both of which supersede playback
+   * rather than recover it, so any in-flight stall episode is abandoned. The
+   * `reset` command path deliberately does not do this: that flush is owned by
+   * stall recovery, and its episode must survive to be completed by the next
+   * rendered frame.
+   */
   flush(): void {
+    // Cancel BEFORE the fallible flush: a custom renderer whose flush throws
+    // would otherwise leave the episode live across an intentional pause.
+    this.renderer?.cancelStallEpisode?.();
     this.closeVideoHoldQueue();
     this.renderer?.flush();
     this.audioOutput?.flush();

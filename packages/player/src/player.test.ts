@@ -28,6 +28,7 @@ import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } fro
 import { varint, ObjectStatus } from '@moqt/transport';
 import { encodeLocHeaders } from '@moqt/loc';
 import type { ClockSource } from '@moqt/playback';
+import type { DataStreamTerminal } from '@moqt/webtransport';
 
 // ─── Mock Adapter ────────────────────────────────────────────────────
 
@@ -37,7 +38,7 @@ function createMockAdapter(): MoqtConnection & {
   _triggerObject: (streamId: bigint, obj: MoqtObject) => void;
   _triggerDatagram: (datagram: ObjectDatagram) => void;
   _triggerDataStream: (streamId: bigint, header: DataStreamHeader) => void;
-  _triggerStreamClosed: (streamId: bigint, error?: number) => void;
+  _triggerStreamClosed: (streamId: bigint, error?: number, terminal?: DataStreamTerminal) => void;
   _triggerClose: (error?: number, reason?: string) => void;
   _triggerError: (err: Error) => void;
   _triggerNamespaceMessage: (requestId: bigint, msg: ControlMessage) => void;
@@ -67,7 +68,7 @@ function createMockAdapter(): MoqtConnection & {
     onError: null as ((error: Error) => void) | null,
     onDataStream: null,
     onObject: null as ((streamId: bigint, obj: MoqtObject) => void) | null,
-    onStreamClosed: null as ((streamId: bigint, error?: number) => void) | null,
+    onStreamClosed: null as ((streamId: bigint, error: number | undefined, terminal: DataStreamTerminal) => void) | null,
     onDatagram: null as ((datagram: ObjectDatagram) => void) | null,
     onNamespaceMessage: null as ((requestId: bigint, msg: ControlMessage) => void) | null,
     onQlogEvent: null as ((event: any) => void) | null,
@@ -99,8 +100,14 @@ function createMockAdapter(): MoqtConnection & {
     _triggerDataStream(streamId: bigint, header: DataStreamHeader) {
       adapter.onDataStream?.(streamId, header);
     },
-    _triggerStreamClosed(streamId: bigint, error?: number) {
-      adapter.onStreamClosed?.(streamId, error);
+  /**
+   * Ordinary calls default to the terminal their error code implies: no error
+   * means a peer FIN, a numeric error means a peer reset. Ambiguity tests pass
+   * the kind explicitly — the player accepts only 'fin' as completion evidence,
+   * so an unclassified call would silently stop being a clean FIN.
+   */
+    _triggerStreamClosed(streamId: bigint, error?: number, terminal?: DataStreamTerminal) {
+      adapter.onStreamClosed?.(streamId, error, terminal ?? (error === undefined ? 'fin' : 'reset'));
     },
     _triggerClose(error?: number, reason?: string) {
       adapter.onClose?.(error, reason);
@@ -189,6 +196,94 @@ function ackCatalog(adapter: ReturnType<typeof createMockAdapter>, reqId?: bigin
     parameters: new Map(),
   } as unknown as ControlMessage);
 }
+
+async function ackMedia(adapter: ReturnType<typeof createMockAdapter>): Promise<void> {
+  for (const result of vi.mocked(adapter.subscribe).mock.results.slice(1)) {
+    const requestId = await result.value;
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId, trackAlias: requestId, parameters: new Map() } as ControlMessage);
+  }
+}
+
+describe('request ID and track alias namespace separation', () => {
+  const scenarios = [
+    { name: 'distinct values', videoAlias: 40n, audioAlias: 50n, order: ['video', 'audio'], early: 'none' },
+    { name: 'video alias equals pending audio request ID', videoAlias: 4n, audioAlias: 5n, order: ['video', 'audio'], early: 'none' },
+    { name: 'same alias assignment with reversed acknowledgements', videoAlias: 4n, audioAlias: 5n, order: ['audio', 'video'], early: 'none' },
+    { name: 'early video on an unknown alias', videoAlias: 40n, audioAlias: 50n, order: ['video', 'audio'], early: 'before' },
+    { name: 'early video alias equals pending audio request ID', videoAlias: 4n, audioAlias: 5n, order: ['audio', 'video'], early: 'before' },
+    { name: 'video between overlapping acknowledgements', videoAlias: 4n, audioAlias: 5n, order: ['video', 'audio'], early: 'between' },
+  ] as const;
+
+  it.each(scenarios)('$name', async ({ videoAlias, audioAlias, order, early }) => {
+    const adapter = createMockAdapter();
+    Object.defineProperty(adapter, 'draftVersion', { value: 18 });
+    let nextId = 0n;
+    vi.mocked(adapter.subscribe).mockImplementation(async (_ns, _name, options) => {
+      const id = varint(nextId);
+      nextId += 2n;
+      options?.onRequestId?.(id);
+      return id;
+    });
+    const player = new MoqtPlayer({
+      ...createConfig(adapter),
+      createMediaSource: () => ({
+        initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(),
+        mediaElement: null, destroy: vi.fn(), onFirstFrame: null, onError: null, onStall: null,
+      }),
+      createCmafAssembler: () => ({
+        push: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
+        setInitSegment: vi.fn(), clearPending: vi.fn(),
+      }),
+    });
+    const delivered: Array<{ track: string; mediaType: string; marker: number | undefined }> = [];
+    player.on('media_object', (event) => delivered.push({
+      track: event.trackName, mediaType: event.mediaType, marker: event.payload?.[8],
+    }));
+    const ack = (track: 'video' | 'audio') => adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(track === 'video' ? 2 : 4),
+      trackAlias: varint(track === 'video' ? videoAlias : audioAlias), parameters: new Map(),
+    } as unknown as ControlMessage);
+    // Routing is observed before CMAF parsing. Payload markers identify the
+    // source track independently of the player's chosen media type.
+    const send = (alias: bigint, marker: number) => adapter._triggerObject(BigInt(marker), {
+      kind: 'data', trackAlias: varint(alias), groupId: varint(0), subgroupId: varint(0),
+      objectId: varint(0), payload: Uint8Array.of(0, 0, 0, 9, 109, 100, 97, 116, marker),
+    } as MoqtObject);
+    try {
+      const load = player.load();
+      await resolveConnect(adapter);
+      await load;
+      ackCatalog(adapter, 0n);
+      adapter._triggerObject(0n, {
+        kind: 'data', trackAlias: varint(0), groupId: varint(0), subgroupId: varint(0),
+        objectId: varint(0), payload: new TextEncoder().encode(JSON.stringify({
+          version: 1,
+          tracks: [
+            { name: 'vide_1', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1, codec: 'avc1.640029', width: 1920, height: 1080, bitrate: 1_500_000 },
+            { name: 'soun_2', packaging: 'cmaf', isLive: true, role: 'audio', renderGroup: 1, codec: 'mp4a.40.2', samplerate: 48000, channelConfig: '2', bitrate: 128000 },
+          ],
+        })),
+      } as MoqtObject);
+      await vi.waitFor(() => expect(adapter.subscribe).toHaveBeenCalledTimes(3));
+      const calls = vi.mocked(adapter.subscribe).mock.calls;
+      expect(calls.slice(1).map((call) => new TextDecoder().decode(call[1]))).toEqual(['vide_1', 'soun_2']);
+      expect(await vi.mocked(adapter.subscribe).mock.results[1]!.value).toBe(2n);
+      expect(await vi.mocked(adapter.subscribe).mock.results[2]!.value).toBe(4n);
+      if (early === 'before') send(videoAlias, 1);
+      ack(order[0]);
+      if (early === 'between') send(videoAlias, 1);
+      ack(order[1]);
+      if (early === 'none') send(videoAlias, 1);
+      send(audioAlias, 2);
+      expect(delivered).toEqual([
+        { track: 'vide_1', mediaType: 'video', marker: 1 },
+        { track: 'soun_2', mediaType: 'audio', marker: 2 },
+      ]);
+    } finally {
+      await player.destroy();
+    }
+  });
+});
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
@@ -1183,6 +1278,245 @@ describe('MoqtPlayer', () => {
           reason: 'Track ended',
         }),
       );
+    });
+
+    // TOO_FAR_BEHIND means the subscriber fell behind the live edge. The
+    // player replaces the subscription rather than ending the track, so
+    // `track_unsubscribed` would be wrong: the app's logical track is still
+    // selected. Without a distinct action the app cannot tell that its stream
+    // was restarted, or why.
+    describe('TOO_FAR_BEHIND resubscribe (§13.4.3 / §15.10.3)', () => {
+      it('emits track_resubscribe with its trigger on draft-16 0x06', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('recovery_action', fn);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        const before = (adapter.subscribe as any).mock.calls.length;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(fn).toHaveBeenCalledTimes(1);
+        expect(fn.mock.calls[0]![0]).toEqual({
+          type: 'recovery_action',
+          action: {
+            type: 'track_resubscribe',
+            trigger: 'too_far_behind',
+            trackName: 'video',
+            mediaType: 'video',
+          },
+        });
+        expect((adapter.subscribe as any).mock.calls.length).toBe(before + 1);
+      });
+
+      it('emits nothing for draft-18 EXPIRED, which reuses 0x06', async () => {
+        // The tables are swapped: 0x06 is TOO_FAR_BEHIND on draft-14/16 and
+        // EXPIRED on draft-18. Comparing against the wrong one both misses the
+        // real signal and mis-fires recovery.
+        const adapter = createMockAdapter();
+        adapter.draftVersion = 18;
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('recovery_action', fn);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        const before = (adapter.subscribe as any).mock.calls.length;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'expired',
+        } as ControlMessage);
+
+        expect(fn).not.toHaveBeenCalled();
+        expect((adapter.subscribe as any).mock.calls.length).toBe(before);
+      });
+
+      it('emits track_resubscribe on draft-18 0x05', async () => {
+        const adapter = createMockAdapter();
+        adapter.draftVersion = 18;
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('recovery_action', fn);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x5),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(fn).toHaveBeenCalledTimes(1);
+        expect((fn.mock.calls[0]![0] as any).action.trigger).toBe('too_far_behind');
+      });
+
+      it('emits nothing for a PUBLISH_DONE on an unknown request', async () => {
+        // Never reaches the helper at all; the catalog gate is covered below.
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('recovery_action', fn);
+        const before = (adapter.subscribe as any).mock.calls.length;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: varint(9999),
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(fn).not.toHaveBeenCalled();
+        expect((adapter.subscribe as any).mock.calls.length).toBe(before);
+      });
+
+      it('emits nothing when the active track is absent from the catalog', async () => {
+        // Exercises the helper's own catalog lookup gate.
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('recovery_action', fn);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        (player as any)._catalogState = { tracks: [] };
+        const before = (adapter.subscribe as any).mock.calls.length;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(fn).not.toHaveBeenCalled();
+        expect((adapter.subscribe as any).mock.calls.length).toBe(before);
+      });
+
+      it('emits nothing while a video switch is pending', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('recovery_action', fn);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        (player as any).pendingVideoSwitch = {
+          oldTrackName: 'video', newTrackName: 'video-hi',
+        };
+        const before = (adapter.subscribe as any).mock.calls.length;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(fn).not.toHaveBeenCalled();
+        expect((adapter.subscribe as any).mock.calls.length).toBe(before);
+      });
+
+      it('publishes only after the replacement subscribe has started', async () => {
+        // The event's contract is "a replacement was started", so the call must
+        // already exist when a listener observes it. Publishing first would
+        // also let a listener tear the player down mid-flight.
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        const before = (adapter.subscribe as any).mock.calls.length;
+        let callsAtEvent = -1;
+        player.on('recovery_action', () => {
+          callsAtEvent = (adapter.subscribe as any).mock.calls.length;
+        });
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(callsAtEvent).toBe(before + 1);
+      });
+
+      it('survives a listener that tears the player down reentrantly', async () => {
+        // The action is published synchronously from the PUBLISH_DONE handler,
+        // so a listener can destroy the player before the subscribe settles.
+        // Because the replacement is started and observed first, that teardown
+        // cannot orphan the promise or throw back into the message handler.
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        const before = (adapter.subscribe as any).mock.calls.length;
+        player.on('recovery_action', () => { void player.destroy(); });
+
+        expect(() => adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage)).not.toThrow();
+
+        expect((adapter.subscribe as any).mock.calls.length).toBe(before + 1);
+        await new Promise((r) => setTimeout(r, 0));
+      });
+
+      it('reports failure after the started action, never a false success', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const actions = vi.fn();
+        const subscribed = vi.fn();
+        const unsubscribed = vi.fn();
+        player.on('recovery_action', actions);
+        player.on('track_subscribed', subscribed);
+        player.on('track_unsubscribed', unsubscribed);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        (adapter.subscribe as any).mockRejectedValueOnce(new Error('relay refused'));
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(actions).toHaveBeenCalledTimes(1);
+        expect(subscribed).not.toHaveBeenCalled();
+        expect(unsubscribed).toHaveBeenCalledWith(expect.objectContaining({
+          reason: expect.stringContaining('too_far_behind resubscribe failed'),
+        }));
+      });
+
+      it('does not emit track_unsubscribed for TOO_FAR_BEHIND', async () => {
+        // The logical track is still selected; only its subscription changed.
+        const adapter = createMockAdapter();
+        const player = await loadAndSubscribeMedia(adapter);
+        const fn = vi.fn();
+        player.on('track_unsubscribed', fn);
+        const videoReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+
+        adapter._triggerMessage({
+          type: 'PUBLISH_DONE',
+          requestId: videoReqId,
+          statusCode: varint(0x6),
+          streamCount: varint(5),
+          errorReason: 'too far behind',
+        } as ControlMessage);
+
+        expect(fn).not.toHaveBeenCalled();
+      });
     });
 
     it('removes subscription from active set — no REQUEST_UPDATE after PUBLISH_DONE', async () => {
@@ -2546,6 +2880,61 @@ describe('MoqtPlayer', () => {
       expect(createAudioDecoder).toHaveBeenCalledOnce();
       expect(createRenderer).toHaveBeenCalledOnce();
       expect(createAudioOutput).toHaveBeenCalledOnce();
+    });
+
+    // The stall metric only means something if the player actually wires both
+    // phases. Driving the renderer callbacks directly keeps that wiring
+    // load-bearing rather than assumed.
+    describe('stall lifecycle wiring', () => {
+      async function playerWithRenderer(adapter: ReturnType<typeof createMockAdapter>) {
+        const renderer: any = {
+          enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(),
+          onFirstFrame: null, onFrameRendered: null, onStall: null,
+          onStallRecovered: null, cancelStallEpisode: vi.fn(),
+        };
+        const player = await loadWithCatalog(adapter, {
+          ...createPipelineConfig(adapter),
+          createVideoDecoder: vi.fn(() => ({
+            configure: vi.fn(), decode: vi.fn(), flush: vi.fn(() => Promise.resolve()),
+            reset: vi.fn(), queueDepth: 0, onFrame: null, onError: null, destroy: vi.fn(),
+          })),
+          createAudioDecoder: vi.fn(() => ({
+            configure: vi.fn(), decode: vi.fn(), flush: vi.fn(() => Promise.resolve()),
+            reset: vi.fn(), queueDepth: 0, onData: null, onError: null, destroy: vi.fn(),
+          })),
+          createRenderer: vi.fn(() => renderer),
+          createAudioOutput: vi.fn(() => ({
+            schedule: vi.fn(), flush: vi.fn(), currentPlayoutTimeUs: 0, destroy: vi.fn(),
+          })),
+        });
+        return { player, renderer };
+      }
+
+      it('publishes detection and completion, and totals only the completion', async () => {
+        const adapter = createMockAdapter();
+        const { player, renderer } = await playerWithRenderer(adapter);
+        const detected: number[] = [];
+        const recovered: number[] = [];
+        player.on('stall', (e) => detected.push(e.durationMs));
+        player.on('stall_recovered', (e) => recovered.push(e.durationMs));
+
+        renderer.onStall(250);
+        renderer.onStallRecovered(43_360);
+
+        expect(detected).toEqual([250]);
+        expect(recovered).toEqual([43_360]);
+        expect(player.stats.stallCount).toBe(1);
+        // The 43s outage, not the 250ms detection latency.
+        expect(player.stats.totalStallDurationMs).toBe(43_360);
+      });
+
+      it('counts a detected stall that never recovers, without duration', async () => {
+        const adapter = createMockAdapter();
+        const { player, renderer } = await playerWithRenderer(adapter);
+        renderer.onStall(250);
+        expect(player.stats.stallCount).toBe(1);
+        expect(player.stats.totalStallDurationMs).toBe(0);
+      });
     });
 
     it('measures A/V skew from rendered frames vs audio playhead (observability only)', async () => {
@@ -4443,6 +4832,7 @@ describe('MoqtPlayer', () => {
       await vi.waitFor(() => {
         expect(spyInfo.mock.calls.some(c => c[1] === 'Catalog received: %d tracks')).toBe(true);
       });
+      await ackMedia(adapter);
 
       spyDebug.mockClear();
 
@@ -4688,6 +5078,7 @@ describe('MoqtPlayer', () => {
 
       // Flush async subscription setup
       await new Promise(r => setTimeout(r, 0));
+      await ackMedia(adapter);
 
       return { player, catalogReqId };
     }
@@ -5100,7 +5491,7 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
-    it('frame rendered feeds SyncController drift detection', async () => {
+    it('wires the renderer frame-rendered callback into the feedback path', async () => {
       const adapter = createMockAdapter();
       const mockRenderer = {
         enqueue: vi.fn(),
@@ -5136,8 +5527,8 @@ describe('MoqtPlayer', () => {
 
       // Trigger a frame_rendered with large drift — this goes through:
       // renderer.onFrameRendered → CommandDispatcher.onFeedback
-      // → player.handleFeedback → pipeline.handleFeedback → sync.reportActualRenderTime
-      // → needsResync → sync_drift event
+      // → player.handleFeedback → pipeline.handleFeedback → sync.reportPresentationTiming
+      // → presentationDriftExceeded → sync_drift event
       // (Only fires if sync reference is established, which requires audio pipeline activity)
 
       await player.destroy();
@@ -6697,6 +7088,7 @@ describe('MoqtPlayer', () => {
       // Start playback
       player.play();
 
+      await ackMedia(adapter);
       // Now deliver a CMAF video frame as two objects: moof then mdat
       // The assembler pairs them and emits a concatenated segment.
 
@@ -7133,6 +7525,7 @@ describe('MoqtPlayer', () => {
 
       player.play();
 
+      await ackMedia(adapter);
       // Deliver a CMAF media object
 
       adapter._triggerObject(1n, {
@@ -7227,6 +7620,7 @@ describe('MoqtPlayer', () => {
         payload: new TextEncoder().encode(VOD_CATALOG_JSON),
       } as MoqtObject);
       await new Promise(r => setTimeout(r, 10));
+      await ackMedia(adapter);
     }
 
     it('subscribes to mediatimeline track when present in catalog (§7.2)', async () => {
@@ -7852,6 +8246,7 @@ describe('MoqtPlayer', () => {
         // new codec isn't supported (or any other MSE-level failure).
         changeType: vi.fn(() => Promise.reject(new Error('mock changeType rejected'))),
       };
+      const selectCmafTrack = vi.fn();
       const cmafAssemblerFactory = (
         options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void },
       ) => {
@@ -7875,6 +8270,7 @@ describe('MoqtPlayer', () => {
               }
             }
           },
+          selectTrack: selectCmafTrack,
           getEpoch(_mt: 'video' | 'audio') { return null; },
           reset() { pending.clear(); },
           destroy() { pending.clear(); },
@@ -7927,6 +8323,7 @@ describe('MoqtPlayer', () => {
       expect((adapter.subscribe as any).mock.calls.length).toBe(subscribesBefore + 1);
       expect(switchingFn).toHaveBeenCalledTimes(1);
       expect(switchedFn).not.toHaveBeenCalled();
+      expect(selectCmafTrack).not.toHaveBeenCalled();
 
       // Ack the new subscription with a DIFFERENT trackAlias so the
       // SUBSCRIBE_OK handler registers the track with the
@@ -7969,6 +8366,7 @@ describe('MoqtPlayer', () => {
       });
       // No "switched" event ever fires for the failed switch.
       expect(switchedFn).not.toHaveBeenCalled();
+      expect(selectCmafTrack).not.toHaveBeenCalled();
       // An `error` event also surfaces (PlayerErrorCode.VIDEO_DECODE_ERROR).
       expect(errorFn).toHaveBeenCalled();
 
@@ -8040,6 +8438,7 @@ describe('MoqtPlayer', () => {
         // changeType resolves successfully — the happy path.
         changeType: vi.fn(() => Promise.resolve()),
       };
+      const selectCmafTrack = vi.fn();
       const cmafAssemblerFactory = (
         options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void },
       ) => {
@@ -8063,6 +8462,7 @@ describe('MoqtPlayer', () => {
               }
             }
           },
+          selectTrack: selectCmafTrack,
           getEpoch(_mt: 'video' | 'audio') { return null; },
           reset() { pending.clear(); },
           destroy() { pending.clear(); },
@@ -8138,6 +8538,7 @@ describe('MoqtPlayer', () => {
       expect(ctCodec).toBe('hvc1.1.6.L93.90');
       expect(ctInit).toBeInstanceOf(Uint8Array);
       expect(Array.from(ctInit as Uint8Array)).toEqual([0x10, 0x11, 0x12, 0x13]);
+      expect(selectCmafTrack).toHaveBeenCalledWith('video', 'video_hevc');
 
       // Commit-time event fired exactly once with the right payload.
       expect(switchedFn).toHaveBeenCalledTimes(1);
@@ -10847,6 +11248,76 @@ describe('MSE gap-jump escalation and wiring', () => {
     expect(peek).toHaveBeenCalledTimes(1);             // downshift path still live
     expect(stallEvents).toHaveLength(2);
     expect(stallEvents[1].cause).toBeUndefined();
+    await player.destroy();
+  });
+
+  it('a media-gap interval still contributes to the aggregate exactly once', async () => {
+    // Separating detection from completion moved ordinary duration onto the
+    // recovery event. The gap-jump path reports an interval that has already
+    // elapsed and is never followed by a recovery, so it must keep its own
+    // contribution rather than silently dropping to zero.
+    const { player, mockMs } = await cmafPlayer();
+    const recovered: any[] = [];
+    player.on('stall_recovered', (e: any) => recovered.push(e));
+
+    mockMs.onStall(2100, 'media-gap');
+
+    expect(player.stats.stallCount).toBe(1);
+    expect(player.stats.totalStallDurationMs).toBe(2100);
+    // The jump is an attempt, not proof the landing recovered.
+    expect(recovered).toEqual([]);
+    await player.destroy();
+  });
+
+  it('a committed seek cancels the episode, before the pipeline resets', async () => {
+    // Cancellation belongs at the commit boundary: every guard has passed and
+    // `seeking` has been published, so the seek really does supersede playback.
+    const { player, mockMs } = await cmafPlayer();
+    const order: string[] = [];
+    (mockMs as any).cancelStallEpisode = () => order.push('cancel');
+    (player as any).videoPipeline = {
+      reset: () => order.push('reset'), tick: () => {}, destroy: () => {},
+    };
+    (player as any).timelineState = {
+      entries: [{ mediaPts: 0, location: [0, 0] as const, wallclockTime: 0 }],
+    };
+    player.play();
+
+    mockMs.onStall(250);
+    await player.seek(1_000).catch(() => { /* downstream update is not under test */ });
+
+    expect(order[0]).toBe('cancel');
+    expect(order).toContain('reset');
+    await player.destroy();
+  });
+
+  it('a rejected seek does not censor a live stall', async () => {
+    // A seek that changes no playback state must leave a running outage alone.
+    const { player, mockMs } = await cmafPlayer();
+    const cancel = vi.fn();
+    (mockMs as any).cancelStallEpisode = cancel;
+    player.play();
+    (player as any).timelineState = { entries: [] };   // seek will reject
+
+    mockMs.onStall(250);
+    await expect(player.seek(1_000)).rejects.toThrow(/timeline/);
+
+    expect(cancel).not.toHaveBeenCalled();
+    // The episode is still live, so its eventual recovery still reports.
+    mockMs.onStallRecovered(43_360);
+    expect(player.stats.totalStallDurationMs).toBe(43_360);
+    await player.destroy();
+  });
+
+  it('an ordinary detection contributes no duration until it recovers', async () => {
+    const { player, mockMs } = await cmafPlayer();
+    mockMs.onStall(250);
+    expect(player.stats.stallCount).toBe(1);
+    expect(player.stats.totalStallDurationMs).toBe(0);
+
+    mockMs.onStallRecovered(43_360);
+    expect(player.stats.stallCount).toBe(1);
+    expect(player.stats.totalStallDurationMs).toBe(43_360);
     await player.destroy();
   });
 

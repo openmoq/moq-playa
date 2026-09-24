@@ -1,0 +1,23 @@
+{
+  "name": "bmdt-reanchor",
+  "description": "a BMDT discontinuity mid-group re-anchors with a full header",
+  "locmafVersion": "0.3",
+  "draftCommit": "6a2439a",
+  "groups": 1,
+  "objects": 4,
+  "files": {
+    "canonical/g000_o000.cmfc": "d5ad66d70856b53586d4de39f7c4ce24278aafe830488262d6a93e8496a252b2",
+    "canonical/g000_o001.cmfc": "547c80ac5f71249bb2fede8a01ccf4cc729349a5789695c10ffc33abb23fb21a",
+    "canonical/g000_o002.cmfc": "d7102b9450e013e9abf5e5ce15eeca5c9fc0a8c083a854ab9d764344f56bd467",
+    "canonical/g000_o003.cmfc": "19929092668cc31905862ded200bc6286f573e72026b4f6026d9ce170de21919",
+    "effective/g000_o000.json": "a0c3a01a9f6be77db3f5935c2b4382c58e21d83a8ba99056007ef0aa864e9dea",
+    "effective/g000_o001.json": "ff2fca0ea2833c003bd58f49d3a2df6cab63ca1989b0fe94125839790b76175d",
+    "effective/g000_o002.json": "439865c176425f84ea0b9fb7dae1e93fddda27edccbe8a8a9427ce42ac959734",
+    "effective/g000_o003.json": "7d862b0516258283a25e108e446d92918b5aacd915ba7814eb13d975a2056fca",
+    "init.mp4": "837edbacc52571ac324d828de79711a3336e95ccaaaf67dc2439823a10d76a03",
+    "objects/g000_o000.locmafobj": "fd61da0a55899dbd8d298c9fecbee6b6a4fe4dc6713635b141ac4309b4563ec4",
+    "objects/g000_o001.locmafobj": "8d1f68cae6182e1b8d4acf54e33a09fcb1a117494496d7afdb067dae1f9fe0d2",
+    "objects/g000_o002.locmafobj": "3ccc44283ee79c4e2c9907b31d80783acc6222e8437c33bcd43573369a123383",
+    "objects/g000_o003.locmafobj": "bf339590767b279ba62fec7951e5a7f744a79f5cc4c49c5bbda0811cd62b35c9"
+  }
+}

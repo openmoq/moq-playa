@@ -18,7 +18,7 @@ import { startRelayServer } from './server.js';
 import { connectClient, beginSubscribe } from './client.js';
 import { publishDemo } from './publisher.js';
 import { certsExist } from './cert.js';
-import { DEMO_NAMESPACE, DEMO_TRACK, DEMO_PAYLOADS, nsBytes, te, td } from './demo.js';
+import { DEMO_EXTENSIONS, DEMO_NAMESPACE, DEMO_TRACK, DEMO_PAYLOADS, nsBytes, te, td } from './demo.js';
 import { RequestError18, varint, type ControlMessage, type MoqtObject, type RequestErrorMsg } from '@moqt/transport';
 
 const log = (...a: unknown[]) => console.log('[relay-fetch-smoke]', ...a);
@@ -76,12 +76,21 @@ async function main(): Promise<number> {
     await waitFor(() => data().length >= DEMO_PAYLOADS.length, 'joining-FETCH pre-roll objects');
 
     // The fetch delivered EXACTLY the cached current group, in order.
-    const got = data().map((o) => ({ g: o.groupId, id: o.objectId, p: td(o.payload) }));
+    const got = data().map((o) => ({
+      g: o.groupId,
+      id: o.objectId,
+      p: td(o.payload),
+      extensions: o.properties ?? o.extensions,
+    }));
     const wantPayloads = [...DEMO_PAYLOADS];
     if (got.length !== wantPayloads.length) throw new Error(`fetched ${got.length} objects, want ${wantPayloads.length}`);
     got.forEach((o, i) => {
       if (o.p !== wantPayloads[i] || o.g !== 0n || o.id !== BigInt(i)) {
         throw new Error(`fetched #${i} = ${JSON.stringify(o)} (want ${wantPayloads[i]} @ g0/o${i})`);
+      }
+      if (o.extensions?.length !== DEMO_EXTENSIONS.length
+          || !o.extensions.every((byte, j) => byte === DEMO_EXTENSIONS[j])) {
+        throw new Error(`fetched #${i} did not preserve Object Properties`);
       }
     });
     log(`joining FETCH delivered ${got.length} object(s): ${JSON.stringify(got.map((o) => o.p))} ✓`);

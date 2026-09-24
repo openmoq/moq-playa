@@ -142,10 +142,19 @@ export interface VideoRendererLike {
   onFirstFrame: (() => void) | null;
 
   /** Callback: frame was rendered (for sync feedback). */
-  onFrameRendered: ((captureTimestampUs: bigint, actualRenderUs: number) => void) | null;
+  /**
+   * Presentation report. `scheduledRenderUs` is optional at this swappable
+   * boundary: a custom renderer that cannot report the schedule causes the
+   * presentation-drift diagnostic to be suppressed rather than fabricated.
+   */
+  onFrameRendered: ((captureTimestampUs: bigint, actualRenderUs: number, scheduledRenderUs?: number) => void) | null;
 
   /** Callback: no frames rendered for longer than stall threshold. */
   onStall: ((durationMs: number) => void) | null;
+  /** A detected stall ended with a genuinely rendered frame. Full duration. */
+  onStallRecovered?: ((durationMs: number) => void) | null;
+  /** Cancel an in-flight stall episode without completing it (pause/seek/destroy). */
+  cancelStallEpisode?: (() => void) | null;
 }
 
 /**
@@ -302,6 +311,18 @@ export interface MediaSourceLike {
    */
   getBufferAheadUs?(): number | null;
 
+  /**
+   * Whether the media element has attached the MediaSource (MSE
+   * `sourceopen`), i.e. SourceBuffers exist and appendChunk() can take
+   * effect. Browsers defer that attachment while the document is hidden
+   * (background tab). `undefined` means the implementation does not report
+   * attachment and is treated as always attached.
+   */
+  readonly attached?: boolean;
+
+  /** Callback: the MediaSource became attached (SourceBuffers created). */
+  onAttached?: (() => void) | null;
+
   /** Callback: first frame rendered by the media element. */
   onFirstFrame: (() => void) | null;
 
@@ -312,6 +333,16 @@ export interface MediaSourceLike {
    *  itself resolved the stall by jumping a source hole ('media-gap') —
    *  such stalls are not bandwidth signals. */
   onStall: ((durationMs: number, cause?: 'media-gap') => void) | null;
+  /**
+   * A detected stall ended with genuine playback resumption. Full duration.
+   *
+   * No cause parameter: the only causal variant, `media-gap`, is resolved at
+   * report time and never completes, so advertising one would describe a
+   * lifecycle no producer can emit.
+   */
+  onStallRecovered?: ((durationMs: number) => void) | null;
+  /** Abandon an in-flight stall episode — playback superseded, not recovered. */
+  cancelStallEpisode?: () => void;
 
   /**
    * OPTIONAL callback: the adapter jumped the playhead across a bounded
@@ -356,7 +387,7 @@ export interface MediaSourceLike {
  * baseMediaDecodeTime to zero-based, and emits via onSegment.
  * The concrete implementation lives in @moqt/browser.
  *
- * @see draft-ietf-moq-cmsf-00 §3.3 (Object Packaging — moof+mdat)
+ * @see draft-ietf-moq-cmsf-01 §3.3 (Object Packaging — moof+mdat)
  */
 export interface CmafAssemblerLike {
   push(
@@ -376,6 +407,13 @@ export interface CmafAssemblerLike {
    * sample-table surgery may ignore the call.
    */
   setInitSegment?(mediaType: 'video' | 'audio', initBytes: Uint8Array): void;
+  /**
+   * Commit the track that may feed one media type after a successful switch.
+   * Implementations may use this to discard late objects from the retired
+   * track. Optional for compatibility with assemblers that do not retain
+   * cross-object track state.
+   */
+  selectTrack?(mediaType: 'video' | 'audio', trackName: string): void;
   getEpoch(mediaType: 'video' | 'audio'): bigint | null;
   /**
    * Drop pending half-pairs (moof without mdat) for one media type, leaving

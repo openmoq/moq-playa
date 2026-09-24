@@ -34,6 +34,32 @@ describe('RequestIdAllocator', () => {
       expect(allocator.allocate()).toBe(6n);
     });
 
+    it('reuses the latest allocation when its request was never sent', () => {
+      allocator.updatePeerMaxRequestId(varint(100n));
+      const requestId = allocator.allocate();
+
+      expect(allocator.releaseUnsent(requestId)).toBe(true);
+      expect(allocator.allocate()).toBe(requestId);
+    });
+
+    it('does not rewind past a later allocation', () => {
+      allocator.updatePeerMaxRequestId(varint(100n));
+      const first = allocator.allocate();
+      allocator.allocate();
+
+      expect(allocator.releaseUnsent(first)).toBe(false);
+      expect(allocator.allocate()).toBe(4n);
+    });
+
+    it('rejects negative and wrong-parity release attempts', () => {
+      allocator.updatePeerMaxRequestId(varint(100n));
+
+      expect(allocator.releaseUnsent(-2n)).toBe(false);
+      expect(allocator.releaseUnsent(-1n)).toBe(false);
+      expect(allocator.releaseUnsent(1n)).toBe(false);
+      expect(allocator.allocate()).toBe(0n);
+    });
+
     it('blocks when reaching MAX_REQUEST_ID', () => {
       allocator.updatePeerMaxRequestId(varint(4n)); // Allows 0, 2
 

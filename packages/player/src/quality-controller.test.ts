@@ -177,6 +177,25 @@ describe('QualityController', () => {
     expect(selected.audio).toBeUndefined();
   });
 
+  it('never selects a locmaf track with an unsupported locmafVersion; supported locmaf is selectable like cmaf (LOCMAF §5)', () => {
+    const qc = new QualityController();
+    const catalog: CatalogState = {
+      version: 1,
+      tracks: [
+        { name: 'v-locmaf-future', packaging: 'locmaf', locmafVersion: '9.9', isLive: true, role: 'video', altGroup: 1, codec: 'avc1.640028', bitrate: 4_000_000 },
+        { name: 'v-locmaf', packaging: 'locmaf', locmafVersion: '0.3', isLive: true, role: 'video', altGroup: 1, codec: 'avc1.640028', bitrate: 2_000_000 },
+        { name: 'v-cmaf', packaging: 'cmaf', isLive: true, role: 'video', altGroup: 1, codec: 'avc1.640028', bitrate: 1_000_000 },
+        { name: 'a-future', packaging: 'locmaf', locmafVersion: '9.9', isLive: true, role: 'audio', codec: 'mp4a.40.2' },
+        { name: 'a-loc', packaging: 'loc', isLive: true, role: 'audio', codec: 'opus' },
+      ],
+    };
+    const selected = qc.selectInitialTracks(catalog);
+    const names = qc.allAlternatives.map((t) => t.name);
+    expect(names).toEqual(['v-locmaf', 'v-cmaf']);
+    expect(selected.video?.name).not.toBe('v-locmaf-future');
+    expect(selected.audio?.name).toBe('a-loc');
+  });
+
   it('handles catalog with single video quality (no altGroup)', () => {
     const qc = new QualityController();
     const catalog: CatalogState = {

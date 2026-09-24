@@ -117,7 +117,19 @@ export interface PlayerStats {
   /** Bounded buffered-hole gap-jumps performed by the MSE adapter (source
    *  media missing and skipped; distinct from the LOC-pipeline gapCount). */
   readonly gapJumpCount: number;
-  /** Total stall duration (ms). */
+  /** LOCMAF Objects that could not be reconstructed into a CMAF chunk and were
+   *  dropped (malformed, or a delta without its in-group reference after a gap).
+   *  @see draft-einarsson-moq-locmaf-01 §3, §18 */
+  readonly locmafObjectsRejected: number;
+  /**
+   * Summed length of stalls that **completed**.
+   *
+   * A detection reports elapsed-at-threshold, a fixed latency into an outage
+   * still in progress, so it contributes nothing. Episodes censored by pause,
+   * seek, or destroy never complete and are likewise excluded. A gap-jump's
+   * `media-gap` interval is already resolved when reported and does contribute
+   * once.
+   */
   readonly totalStallDurationMs: number;
   /** Number of decode errors. */
   readonly decodeErrorCount: number;
@@ -237,6 +249,7 @@ export class StatsAccumulator {
   private _gapCount = 0;
   private _stallCount = 0;
   private _gapJumpCount = 0;
+  private _locmafObjectsRejected = 0;
   private _totalStallDurationMs = 0;
   private _decodeErrorCount = 0;
   private _recoveryActionCount = 0;
@@ -380,8 +393,43 @@ export class StatsAccumulator {
     this._gapJumpCount++;
   }
 
+  /** One LOCMAF Object rejected by reconstruction. */
+  recordLocmafObjectRejected(): void {
+    this._locmafObjectsRejected++;
+  }
+
   /** Record a playback stall. */
   recordStall(durationMs: number): void {
+    void durationMs; // elapsed at detection, not the outage length
+    this._stallCount++;
+  }
+
+  /**
+   * Record a stall that ended with genuine playback recovery.
+   *
+   * Only a completed episode contributes to `totalStallDurationMs`. Detection
+   * reports elapsed-at-threshold, which is a fixed latency, not the outage —
+   * adding it would make a 43 s freeze read as a few hundred milliseconds.
+   * Episodes censored by pause, seek, or destroy never complete and so
+   * contribute nothing.
+   */
+  recordStallRecovered(durationMs: number): void {
+    this._totalStallDurationMs += durationMs;
+  }
+
+  /**
+   * Record a stall whose measured interval is already resolved at report time.
+   *
+   * The gap-jump path reports the span from stall onset to the seek attempt,
+   * which has genuinely elapsed — unlike ordinary detection, whose value is a
+   * fixed latency into an outage that is still running. It counts and
+   * contributes in one call, preserving the aggregate this path had before
+   * detection and completion were separated.
+   *
+   * It is NOT proof that the landing recovered; the gap-attempt lifecycle is
+   * deliberately unmodelled here, so no completion event is published.
+   */
+  recordResolvedStall(durationMs: number): void {
     this._stallCount++;
     this._totalStallDurationMs += durationMs;
   }
@@ -536,6 +584,7 @@ export class StatsAccumulator {
       gapCount: this._gapCount,
       stallCount: this._stallCount,
       gapJumpCount: this._gapJumpCount,
+      locmafObjectsRejected: this._locmafObjectsRejected,
       totalStallDurationMs: this._totalStallDurationMs,
       decodeErrorCount: this._decodeErrorCount,
       recoveryActionCount: this._recoveryActionCount,

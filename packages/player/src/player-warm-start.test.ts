@@ -24,6 +24,7 @@ import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@moqt/webtransport';
 import type { ControlMessage, MoqtObject } from '@moqt/transport';
 import { varint } from '@moqt/transport';
+import type { DataStreamTerminal } from '@moqt/webtransport';
 
 // ─── Mock adapter (thin copy of the player.test.ts harness) ──────────
 
@@ -49,7 +50,14 @@ function createMockAdapter() {
     _triggerMessage: (msg: ControlMessage) => adapter.onMessage?.(msg),
     _triggerObject: (streamId: bigint, obj: MoqtObject) => adapter.onObject?.(streamId, obj),
     _triggerDataStream: (streamId: bigint, header: unknown) => adapter.onDataStream?.(streamId, header),
-    _triggerStreamClosed: (streamId: bigint, error?: number) => adapter.onStreamClosed?.(streamId, error),
+    /**
+     * Ordinary calls default to the terminal their error code implies: no error
+     * means a peer FIN, a numeric error means a peer reset. Ambiguity tests pass
+     * the kind explicitly — the player accepts only 'fin' as completion evidence,
+     * so an unclassified call would silently stop being a clean FIN.
+     */
+    _triggerStreamClosed: (streamId: bigint, error?: number, terminal?: DataStreamTerminal) =>
+      adapter.onStreamClosed?.(streamId, error, terminal ?? (error === undefined ? 'fin' : 'reset')),
   };
   return adapter;
 }
@@ -158,6 +166,7 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     const videoJoinCall = adapter.joiningFetch.mock.calls.findIndex(
       (c: any[]) => BigInt(c[0].joiningRequestId) === videoReqId);
     const fetchReqId = BigInt(await adapter.joiningFetch.mock.results[videoJoinCall]?.value);
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as ControlMessage);
 
     // FETCH data stream announces itself, then delivers alias-0 objects.
     const streamId = 77n;
@@ -224,6 +233,20 @@ describe('warm start ON (warmStartCurrentGroup: true, live LOC)', () => {
     ]);
     const { player, adapter, subscribeCalls } = await bootPlayer(
       cmafCatalog, { warmStartCurrentGroup: true });
+
+    expect(adapter.joiningFetch).not.toHaveBeenCalled();
+    const call = subscribeCalls().find(([n]: [string, unknown]) => n === 'video');
+    expect(call![1]?.subscriptionFilter?.type).toBe('NextGroupStart');
+    await player.destroy();
+  });
+
+  it('LOCMAF tracks are skipped like CMAF (MSE path): no joining FETCH, NextGroupStart preserved', async () => {
+    const locmafCatalog = locCatalog([
+      { name: 'video', packaging: 'locmaf', locmafVersion: '0.3', isLive: true, role: 'video', renderGroup: 1,
+        codec: 'avc1.4D4028', width: 1280, height: 720, bitrate: 2_500_000 },
+    ]);
+    const { player, adapter, subscribeCalls } = await bootPlayer(
+      locmafCatalog, { warmStartCurrentGroup: true });
 
     expect(adapter.joiningFetch).not.toHaveBeenCalled();
     const call = subscribeCalls().find(([n]: [string, unknown]) => n === 'video');
@@ -310,6 +333,7 @@ describe('warm start — alias remap and stream races', () => {
       });
     const videoReqId = (await reqIdFor('video'))!;
     expect(adapter.joiningFetch).toHaveBeenCalled(); // request sent, promise pending
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as ControlMessage);
 
     // Data stream + objects land BEFORE the player learns the request ID.
     const streamId = 80n;
@@ -348,6 +372,7 @@ describe('warm start — alias remap and stream races', () => {
     const fetchReqId = BigInt(await adapter.joiningFetch.mock.results[0]?.value);
 
     const streamId = 90n;
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as ControlMessage);
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(fetchReqId) } });
     adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: varint(0n), groupId: varint(1n), subgroupId: varint(0),
@@ -394,6 +419,7 @@ describe('warm start — races against the joiningFetch() await window', () => {
 
     // Fast cached fetch: stream opens, delivers everything, and FINs — all
     // before the joiningFetch() promise continuation registers the request.
+    adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: videoReqId, trackAlias: videoReqId, parameters: new Map() } as ControlMessage);
     const streamId = 88n;
     adapter._triggerDataStream(streamId, { type: 'fetch', header: { requestId: varint(FETCH_REQ) } });
     adapter._triggerObject(streamId, {

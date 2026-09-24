@@ -135,6 +135,29 @@ describe('createPipelines', () => {
     expect(result.mediaSource).not.toBeNull();
   });
 
+  it('locmaf tracks go through MSE like CMAF — no WebCodecs decoder/renderer, no LOC pipeline (LOCMAF §6)', () => {
+    const createVideoDecoder = vi.fn();
+    const createRenderer = vi.fn();
+    const config = minimalConfig({
+      createMediaSource: () => ({
+        initialize: vi.fn(), appendChunk: vi.fn(), destroy: vi.fn(),
+        onFirstFrame: null, onStall: null, onError: null,
+      }) as any,
+      createVideoDecoder,
+      createRenderer,
+    });
+    const trackInfo: TrackInfo = {
+      video: { codec: 'avc1.640028', packaging: 'locmaf', initData: btoa('ftyp') },
+      audio: undefined,
+    };
+    const result = createPipelines(config, mockClock, trackInfo, mockCallbacks());
+    expect(result.mediaSource).not.toBeNull();
+    expect(result.videoPipeline).toBeNull();
+    expect(createVideoDecoder).not.toHaveBeenCalled();
+    expect(createRenderer).not.toHaveBeenCalled();
+    expect(result.getRenderCushionUs).toBeUndefined();
+  });
+
   it('returns null CommandDispatcher when no decoder factories', () => {
     const trackInfo: TrackInfo = {
       video: { codec: 'avc1.64001e', packaging: 'loc' },

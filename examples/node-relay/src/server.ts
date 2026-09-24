@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { nodeSessionToWebTransportLike } from './wt-adapter.js';
 import { loadCert } from './cert.js';
 import { DEMO_NAMESPACE, DEMO_TRACK, DEMO_ALIAS, DEMO_PAYLOADS, te, td, nsStr } from './demo.js';
-import { Relay } from './relay.js';
+import { Relay, type RelayOptions } from './relay.js';
 
 const log = (...a: unknown[]) => console.log('[server]', ...a);
 
@@ -35,12 +35,17 @@ export interface RunningServer {
   stop: () => void;
 }
 
+export interface StartRelayServerOptions extends Omit<StartServerOptions, 'relay'> {
+  relayOptions?: RelayOptions;
+}
+
 /** Convenience: a relay-mode server sharing one in-memory {@link Relay} route table. */
 export async function startRelayServer(
-  opts: Omit<StartServerOptions, 'relay'> = {},
+  opts: StartRelayServerOptions = {},
 ): Promise<RunningServer & { relay: Relay }> {
-  const relay = new Relay();
-  const srv = await startServer({ ...opts, relay });
+  const { relayOptions, ...serverOptions } = opts;
+  const relay = new Relay(relayOptions);
+  const srv = await startServer({ ...serverOptions, relay });
   return { ...srv, relay };
 }
 

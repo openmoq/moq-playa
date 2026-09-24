@@ -17,7 +17,9 @@ export interface CatalogBuilderTrack {
   /** Track name (unique within namespace). @see §5.1.11 */
   readonly name: string;
   /** Packaging format. @see §5.1.12 */
-  readonly packaging: 'loc' | 'cmaf' | 'mediatimeline' | 'eventtimeline';
+  readonly packaging: 'loc' | 'cmaf' | 'locmaf' | 'mediatimeline' | 'eventtimeline';
+  /** LOCMAF packaging version; present iff packaging is "locmaf". @see draft-einarsson-moq-locmaf-01 §5 */
+  readonly locmafVersion?: string;
   /** Whether this is a live track. @see §5.1.15 */
   readonly isLive: boolean;
   /** Track role. @see §5.1.14 */
@@ -91,6 +93,7 @@ export function buildCatalog(options: BuildCatalogOptions): Uint8Array {
       packaging: t.packaging,
       isLive: t.isLive,
     };
+    if (t.locmafVersion !== undefined) track.locmafVersion = t.locmafVersion;
     if (t.role !== undefined) track.role = t.role;
     if (t.codec !== undefined) track.codec = t.codec;
     if (t.width !== undefined) track.width = t.width;

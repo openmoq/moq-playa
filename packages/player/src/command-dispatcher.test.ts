@@ -150,6 +150,41 @@ describe('CommandDispatcher A/V skew observability', () => {
 });
 
 describe('CommandDispatcher', () => {
+  // ─── Stall episode ownership ─────────────────────────────────
+
+  it('cancels the stall episode before the fallible renderer flush', () => {
+    // flush() is reached only from pause and seek, which supersede playback.
+    // A custom renderer whose flush throws must not leave the episode live to
+    // complete across the paused interval.
+    const order: string[] = [];
+    const renderer: any = {
+      enqueue: () => {}, destroy: () => {},
+      onFirstFrame: null, onFrameRendered: null, onStall: null, onStallRecovered: null,
+      cancelStallEpisode: () => order.push('cancel'),
+      flush: () => { order.push('flush'); throw new Error('renderer flush failed'); },
+    };
+    const dispatcher = new CommandDispatcher({ renderer });
+
+    expect(() => dispatcher.flush()).toThrow('renderer flush failed');
+    expect(order).toEqual(['cancel', 'flush']);
+  });
+
+  it('does not cancel the episode on a recovery-owned reset', () => {
+    // The `reset` command is issued by stall recovery itself; its flush must
+    // preserve the detected episode so the next rendered frame can complete it.
+    const order: string[] = [];
+    const renderer: any = {
+      enqueue: () => {}, destroy: () => {}, flush: () => order.push('flush'),
+      onFirstFrame: null, onFrameRendered: null, onStall: null, onStallRecovered: null,
+      cancelStallEpisode: () => order.push('cancel'),
+    };
+    const dispatcher = new CommandDispatcher({ renderer, videoDecoder: createMockVideoDecoder() });
+
+    dispatcher.dispatch({ type: 'reset', mediaType: 'video' } as DecoderCommand);
+
+    expect(order).toEqual(['flush']);
+  });
+
   // ─── Configure dispatch ──────────────────────────────────────
 
   it('dispatches configure to video decoder with codec and dimensions (§5.1.24, §5.1.29-30)', () => {

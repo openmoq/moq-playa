@@ -23,7 +23,8 @@ import type { TrackPackaging } from './subscription-manager.js';
 /** Active subscription info stored per requestId. */
 export interface ActiveSubscription {
   trackName: string;
-  trackAlias: bigint;
+  /** Unknown until SUBSCRIBE_OK; a Request ID is never an alias. */
+  trackAlias: bigint | null;
 }
 
 /** Pending media subscription info stored per requestId. */
@@ -95,6 +96,7 @@ export interface ControlMessageContext {
   adapter: MessageAdapter | null;
   activeSubscriptions: Map<bigint, ActiveSubscription>;
   pendingMediaSubs: Map<bigint, PendingMediaSub>;
+  removeSubscription: (requestId: bigint) => ActiveSubscription | undefined;
   pendingTrackStatuses: Map<bigint, PendingTrackStatus>;
   catalogRequestId: bigint | null;
   catalogTrackAlias: bigint | null;
@@ -111,7 +113,7 @@ export interface ControlMessageContext {
   /** Called when REQUEST_ERROR matches a pending media subscription. @see §9.8 */
   onMediaSubscribeError?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', reason: string, errorCode: bigint) => void;
   /** Called when PUBLISH_DONE arrives — player can re-subscribe if needed. */
-  onPublishDone?: (requestId: bigint, trackName: string, trackAlias: bigint, statusCode: bigint, errorReason: string) => void;
+  onPublishDone?: (requestId: bigint, trackName: string, trackAlias: bigint | null, statusCode: bigint, errorReason: string) => void;
   /**
    * Called when REQUEST_ERROR matches a pending fetchCatalog. The
    * player layer dispatches the error to the right pending promise.
@@ -127,13 +129,25 @@ export interface ControlMessageContext {
    */
   onMediaFetchError?: (requestId: bigint, errorReason: string, errorCode: bigint) => void;
   /**
-   * Called when SUBSCRIBE_OK assigns a track alias different from the
-   * request ID (§9.10). Fetch bookkeeping registered under the optimistic
-   * alias (activeFetches, fetchStreamAliases) must follow the remap or a
-   * warm-start fetch's objects are orphaned on relays that do not echo
-   * the request ID as the alias.
+   * Called after SUBSCRIBE_OK binds the alias. Joining FETCH data waiting
+   * for this subscription can now be delivered, even when alias == requestId.
    */
-  onMediaAliasRemapped?: (requestId: bigint, oldAlias: bigint, newAlias: bigint) => void;
+  onMediaAliasBound?: (requestId: bigint, alias: bigint) => void;
+}
+
+/** Retire only routing owned by this request, never by its numeric ID. */
+export function removeSubscription(
+  requestId: bigint,
+  ctx: Pick<ControlMessageContext, 'activeSubscriptions' | 'pendingMediaSubs' | 'subscriptionManager'>,
+): ActiveSubscription | undefined {
+  const sub = ctx.activeSubscriptions.get(requestId);
+  ctx.activeSubscriptions.delete(requestId);
+  ctx.pendingMediaSubs.delete(requestId);
+  if (sub?.trackAlias != null
+      && ![...ctx.activeSubscriptions.values()].some((other) => other.trackAlias === sub.trackAlias)) {
+    ctx.subscriptionManager?.unregisterTrack(sub.trackAlias);
+  }
+  return sub;
 }
 
 /** Known tracks config (subset of MoqtPlayerConfig.knownTracks). */
@@ -217,55 +231,22 @@ export function handleControlMessage(
           ctx.onCatalogSubscribeOk(extractLargestLocation(msg.parameters as Parameters | undefined));
         }
         ctx.setCatalogTrackAlias(alias);
-
-        // Evict optimistic media registration if it collides with the catalog alias.
-        // knownTracks registers media tracks with requestId as alias BEFORE
-        // SUBSCRIBE_OK arrives. If the server assigns the catalog a trackAlias
-        // that matches a media track's requestId, catalog objects would be
-        // misrouted to the media pipeline (subscriptionManager is checked first
-        // in the object routing path). Evicting here ensures catalog objects
-        // reach the catalog handler. The media track's own SUBSCRIBE_OK will
-        // re-register with the server's actual alias.
-        if (ctx.subscriptionManager?.getMediaType(alias) !== undefined) {
-          ctx.log.debug('Catalog alias=%s collides with optimistic media registration — evicting', alias);
-          ctx.subscriptionManager.unregisterTrack(alias);
-        }
       }
 
-      // Media subscriptions: update SubscriptionManager if the server
-      // assigned a different track alias than the requestId
+      // The session has validated alias uniqueness. Only its confirmed
+      // binding may enter the data routing table (draft-18 section 11.1).
       const pending = ctx.pendingMediaSubs.get(okReqId);
-      if (pending) {
+      const active = ctx.activeSubscriptions.get(okReqId);
+      if (pending && active) {
         ctx.pendingMediaSubs.delete(okReqId);
+        active.trackAlias = alias;
+        ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging);
         if (pending.mediaType === 'video' || pending.mediaType === 'audio') {
           ctx.onMediaSubscribeOk?.(okReqId, pending.trackName, pending.mediaType);
         }
-        if (alias !== okReqId) {
-          // Server assigned a different alias — check for collision before re-register.
-          const existing = ctx.subscriptionManager?.getMediaType(alias);
-          if (existing !== undefined) {
-            ctx.log.warn('SUBSCRIBE_OK alias collision: alias=%s already registered (type=%s), keeping original for track=%s',
-              alias, existing, pending.trackName);
-          } else {
-            ctx.log.debug('SUBSCRIBE_OK alias remap: reqId=%s → alias=%s track=%s',
-              okReqId, alias, pending.trackName);
-            ctx.subscriptionManager?.unregisterTrack(okReqId);
-            ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging);
-            // Update stored alias for PUBLISH_DONE cleanup
-            const active = ctx.activeSubscriptions.get(okReqId);
-            if (active) active.trackAlias = alias;
-            // Follow the remap in fetch bookkeeping (warm-start joining
-            // fetches registered under the optimistic alias).
-            ctx.onMediaAliasRemapped?.(okReqId, okReqId, alias);
-          }
-        }
+        ctx.onMediaAliasBound?.(okReqId, alias);
         // Replay objects that arrived before this alias was resolved
         ctx.onAliasResolved?.(alias);
-        // Also replay from the original requestId alias (objects may have
-        // arrived on the optimistic alias before the remap)
-        if (alias !== okReqId) {
-          ctx.onAliasResolved?.(okReqId);
-        }
       }
       break;
     }
@@ -306,8 +287,7 @@ export function handleControlMessage(
       ctx.log.debug('PUBLISH_DONE reqId=%s sub=%s', doneReqId, sub ? sub.trackName : '(none)');
       if (sub) {
         ctx.log.info('PUBLISH_DONE "%s": %s', sub.trackName, msg.errorReason ?? '(no reason)');
-        ctx.activeSubscriptions.delete(doneReqId);
-        ctx.subscriptionManager?.unregisterTrack(sub.trackAlias);
+        ctx.removeSubscription(doneReqId);
 
         // Let the player re-subscribe if this is a track we still want
         if (ctx.onPublishDone) {
@@ -364,19 +344,14 @@ export function handleControlMessage(
         ));
       }
 
-      // §9.8: REQUEST_ERROR for a media subscription — clean up optimistic
-      // state and notify player. The subscribe path optimistically registers
-      // activeSubscriptions and SubscriptionManager aliases before SUBSCRIBE_OK;
-      // a refusal must undo both.
+      // A refused pending subscription has no alias to unregister.
       const pendingMedia = ctx.pendingMediaSubs.get(errReqId);
-      if (pendingMedia && (pendingMedia.mediaType === 'video' || pendingMedia.mediaType === 'audio')) {
-        ctx.pendingMediaSubs.delete(errReqId);
-        const active = ctx.activeSubscriptions.get(errReqId);
-        const alias = active?.trackAlias ?? errReqId;
-        ctx.activeSubscriptions.delete(errReqId);
-        ctx.subscriptionManager?.unregisterTrack(alias);
-        ctx.onMediaSubscribeError?.(errReqId, pendingMedia.trackName, pendingMedia.mediaType,
-          msg.errorReason ?? '', BigInt(msg.errorCode));
+      if (pendingMedia) {
+        ctx.removeSubscription(errReqId);
+        if (pendingMedia.mediaType === 'video' || pendingMedia.mediaType === 'audio') {
+          ctx.onMediaSubscribeError?.(errReqId, pendingMedia.trackName, pendingMedia.mediaType,
+            msg.errorReason ?? '', BigInt(msg.errorCode));
+        }
       }
 
       // Catalog-bootstrap fetch: INVALID_RANGE (empty track) vs any other

@@ -527,4 +527,21 @@ describe('SyncController', () => {
             expect(after!.renderTimeUs).toBe(before!.renderTimeUs);
         });
     });
+
+    describe('SyncController — media-time timestamps', () => {
+        it('measureLatency returns null when the timestamp is not wall clock', () => {
+            const sync = new SyncController({ wallClock: { now: () => 5_000_000 } });
+            expect(sync.measureLatency(1_000_000n)).toBe(4_000_000);
+            expect(sync.measureLatency(1_000_000n, true)).toBe(4_000_000);
+            expect(sync.measureLatency(1_000_000n, false)).toBeNull();
+        });
+
+        it('evaluateCatchUp returns null and leaves latency untouched for media time', () => {
+            const sync = new SyncController({ wallClock: { now: () => 5_000_000 }, targetLatencyMs: 100, maxCatchUpRate: 1.5 });
+            sync.evaluateCatchUp(1_000_000n);
+            const before = sync.latencyUs;
+            expect(sync.evaluateCatchUp(2_000_000n, false)).toBeNull();
+            expect(sync.latencyUs).toBe(before);
+        });
+    });
 });

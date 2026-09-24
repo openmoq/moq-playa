@@ -12,12 +12,13 @@ import { CmafAssembler } from './cmaf-assembler.js';
 import {
   readU32, writeU32, boxType,
   findTfdtOffset, readBaseMediaDecodeTime, patchBaseMediaDecodeTime,
+  readSegmentTimeRanges,
 } from './mp4-box.js';
 
 // ─── Test helpers ─────────────────────────────────────────────────────
 
 /** Build a minimal moof box with tfdt carrying the given baseMediaDecodeTime. */
-function buildMoof(baseMediaDecodeTime: number, sequenceNumber = 1): Uint8Array {
+function buildMoof(baseMediaDecodeTime: number, sequenceNumber = 1, sampleDuration?: number): Uint8Array {
   // mfhd: size(4) + type(4) + version+flags(4) + sequence_number(4) = 16 bytes
   const mfhd = new Uint8Array(16);
   writeU32(mfhd, 0, 16);
@@ -25,9 +26,13 @@ function buildMoof(baseMediaDecodeTime: number, sequenceNumber = 1): Uint8Array 
   writeU32(mfhd, 12, sequenceNumber);
 
   // tfhd: size(4) + type(4) + version+flags(4) + track_id(4) = 16 bytes
-  const tfhd = new Uint8Array(16);
-  writeU32(tfhd, 0, 16);
+  const tfhd = new Uint8Array(sampleDuration === undefined ? 16 : 20);
+  writeU32(tfhd, 0, tfhd.byteLength);
   tfhd[4] = 0x74; tfhd[5] = 0x66; tfhd[6] = 0x68; tfhd[7] = 0x64; // 'tfhd'
+  if (sampleDuration !== undefined) {
+    tfhd[11] = 0x08; // default_sample_duration_present
+    writeU32(tfhd, 16, sampleDuration);
+  }
   writeU32(tfhd, 12, 1); // track_id = 1
 
   // tfdt version 0: size(4) + type(4) + version+flags(4) + baseMediaDecodeTime(4) = 16 bytes
@@ -183,6 +188,13 @@ describe('mp4-box tfdt helpers', () => {
     const moof = buildMoofV1(9876543210n);
     patchBaseMediaDecodeTime(moof, 1000n);
     expect(readBaseMediaDecodeTime(moof)).toBe(1000n);
+  });
+
+  it('rejects values that do not fit the tfdt version', () => {
+    expect(() => patchBaseMediaDecodeTime(buildMoof(0), -1n)).toThrow(RangeError);
+    expect(() => patchBaseMediaDecodeTime(buildMoof(0), 0x1_0000_0000n)).toThrow(RangeError);
+    expect(() => patchBaseMediaDecodeTime(buildMoofV1(0n), -1n)).toThrow(RangeError);
+    expect(() => patchBaseMediaDecodeTime(buildMoofV1(0n), 0x1_0000_0000_0000_0000n)).toThrow(RangeError);
   });
 });
 
@@ -903,6 +915,244 @@ describe('CmafAssembler — shared cross-track epoch (RED5DEV-2315)', () => {
     expect(onDiscontinuity).toHaveBeenCalledWith('video', 'video0');
     expect(outBmd(onSegment, 2)).toBe(0n);                        // audio re-anchors new epoch at t=1s
     expect(outBmd(onSegment, 3)).toBe(BigInt(0.75 * VIDEO_TS));   // video keeps its 0.75s lead on the new epoch
+  });
+
+  it('keeps a looping track on one monotonic output timeline', () => {
+    const onSegment = vi.fn();
+    const onDiscontinuity = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+
+    const push = (groupId: bigint, rawBmd: number) => assembler.push(
+      'video',
+      'video0',
+      groupId,
+      concat(buildMoof(rawBmd, Number(groupId) + 1, 1_000), buildMdat(new Uint8Array([1]))),
+    );
+
+    push(0n, 10_000);
+    push(1n, 11_000);
+    push(2n, 12_000);
+    push(3n, 10_000); // source loop: raw tfdt returns to its first value
+    push(4n, 11_000);
+
+    expect(onDiscontinuity).toHaveBeenCalledOnce();
+    expect(onSegment.mock.calls.map((_, i) => outBmd(onSegment, i)))
+      .toEqual([0n, 1_000n, 2_000n, 3_000n, 4_000n]);
+  });
+
+  it('ignores a retired-epoch group that arrives after the loop restart', () => {
+    const onSegment = vi.fn();
+    const onDiscontinuity = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+    assembler.setInitSegment('audio', initWithTimescale(AUDIO_TS));
+
+    const push = (groupId: bigint, rawBmd: number) => assembler.push(
+      'audio',
+      'audio0',
+      groupId,
+      concat(buildMoof(rawBmd, Number(groupId), 1_024), buildMdat(new Uint8Array([1]))),
+    );
+
+    push(100n, 4_502_528);
+    push(101n, 4_503_552);
+    push(102n, 0);         // the loop establishes a new epoch
+    push(101n, 4_504_576); // an old-epoch stream finishes late
+    push(103n, 1_024);
+
+    expect(onDiscontinuity).toHaveBeenCalledOnce();
+    expect(onSegment.mock.calls.map((_, i) => outBmd(onSegment, i)))
+      .toEqual([0n, 1_024n, 2_048n, 3_072n]);
+  });
+
+  it('does not mistake an older out-of-order group for a source restart', () => {
+    const onSegment = vi.fn();
+    const onDiscontinuity = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+
+    const push = (groupId: bigint, rawBmd: number) => assembler.push(
+      'video',
+      'video0',
+      groupId,
+      concat(buildMoof(rawBmd, Number(groupId), 1_000), buildMdat(new Uint8Array([1]))),
+    );
+
+    push(100n, 10_000);
+    push(102n, 12_000);
+    push(101n, 11_000);
+    push(103n, 13_000);
+
+    expect(onDiscontinuity).not.toHaveBeenCalled();
+    expect(onSegment.mock.calls.map((_, i) => outBmd(onSegment, i)))
+      .toEqual([0n, 2_000n, 1_000n, 3_000n]);
+  });
+
+  it('patches every chunk in a multi-chunk CMSF object', () => {
+    const onSegment = vi.fn();
+    const onDiscontinuity = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+
+    const object = (firstBmd: number, sequence: number) => concat(
+      buildMoof(firstBmd, sequence, 1_000), buildMdat(new Uint8Array([1])),
+      buildMoof(firstBmd + 1_000, sequence + 1, 1_000), buildMdat(new Uint8Array([2])),
+    );
+
+    assembler.push('video', 'video0', 100n, object(10_000, 1));
+    assembler.push('video', 'video0', 101n, object(0, 3));
+
+    const starts = onSegment.mock.calls.flatMap((call) =>
+      readSegmentTimeRanges(call[1] as Uint8Array)!.map((range) => range.startTime));
+    expect(onDiscontinuity).toHaveBeenCalledOnce();
+    expect(starts).toEqual([0n, 1_000n, 2_000n, 3_000n]);
+  });
+
+  it('uses the latest output bmd when newer fragments cannot be duration-scored', () => {
+    const onSegment = vi.fn();
+    const assembler = new CmafAssembler({ onSegment });
+
+    const push = (groupId: bigint, rawBmd: number, duration?: number) => assembler.push(
+      'video',
+      'video0',
+      groupId,
+      concat(buildMoof(rawBmd, Number(groupId), duration), buildMdat(new Uint8Array([1]))),
+    );
+
+    push(100n, 10_000, 1_000);
+    push(101n, 11_000);
+    push(102n, 12_000);
+    push(103n, 0, 1_000);
+
+    expect(outBmd(onSegment, 3)).toBe(2_000n);
+  });
+
+  it('commits a restart before publishing the discontinuity callback', () => {
+    const onSegment = vi.fn();
+    let assembler!: CmafAssembler;
+    const onDiscontinuity = vi.fn(() => {
+      assembler.push(
+        'video',
+        'video0',
+        103n,
+        concat(buildMoof(1_000, 4, 1_000), buildMdat(new Uint8Array([4]))),
+      );
+    });
+    assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+
+    assembler.push('video', 'video0', 100n,
+      concat(buildMoof(10_000, 1, 1_000), buildMdat(new Uint8Array([1]))));
+    assembler.push('video', 'video0', 101n,
+      concat(buildMoof(11_000, 2, 1_000), buildMdat(new Uint8Array([2]))));
+    assembler.push('video', 'video0', 102n,
+      concat(buildMoof(0, 3, 1_000), buildMdat(new Uint8Array([3]))));
+
+    expect(onDiscontinuity).toHaveBeenCalledOnce();
+    expect(onSegment.mock.calls.map((_, i) => outBmd(onSegment, i)))
+      .toEqual([0n, 1_000n, 2_000n, 3_000n]);
+  });
+
+  it('contains a throwing discontinuity callback', () => {
+    const onSegment = vi.fn();
+    const assembler = new CmafAssembler({
+      onSegment,
+      onDiscontinuity: () => { throw new Error('diagnostic failed'); },
+    });
+
+    assembler.push('video', 'video0', 100n,
+      concat(buildMoof(10_000, 1, 1_000), buildMdat(new Uint8Array([1]))));
+    expect(() => assembler.push('video', 'video0', 101n,
+      concat(buildMoof(0, 2, 1_000), buildMdat(new Uint8Array([2]))))).not.toThrow();
+    expect(onSegment).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses one continuation origin for both tracks across a source restart', () => {
+    const onDiscontinuity = vi.fn();
+    const { assembler, onSegment } = assemblerWithInits(onDiscontinuity);
+
+    const segment = (bmd: number, duration: number, sequence: number) =>
+      concat(buildMoof(bmd, sequence, duration), buildMdat(new Uint8Array([sequence])));
+
+    assembler.push('audio', 'audio0', 0n, segment(105 * AUDIO_TS, AUDIO_TS, 1));
+    assembler.push('video', 'video0', 0n, segment(105.75 * VIDEO_TS, VIDEO_TS, 1));
+    assembler.push('audio', 'audio0', 1n, segment(106 * AUDIO_TS, AUDIO_TS, 2));
+    assembler.push('video', 'video0', 1n, segment(106.75 * VIDEO_TS, VIDEO_TS, 2));
+
+    assembler.push('audio', 'audio0', 2n, segment(1 * AUDIO_TS, AUDIO_TS, 3));
+    assembler.push('video', 'video0', 2n, segment(1.75 * VIDEO_TS, VIDEO_TS, 3));
+
+    expect(onDiscontinuity).toHaveBeenCalledTimes(2);
+    expect(outBmd(onSegment, 4)).toBe(BigInt(2 * AUDIO_TS));
+    expect(outBmd(onSegment, 5)).toBe(BigInt(2.75 * VIDEO_TS));
+  });
+
+  it('preserves the restart offset when video detects the new epoch first', () => {
+    const onDiscontinuity = vi.fn();
+    const { assembler, onSegment } = assemblerWithInits(onDiscontinuity);
+
+    const segment = (bmd: number, duration: number, sequence: number) =>
+      concat(buildMoof(bmd, sequence, duration), buildMdat(new Uint8Array([sequence])));
+
+    assembler.push('audio', 'audio0', 0n, segment(105 * AUDIO_TS, AUDIO_TS, 1));
+    assembler.push('video', 'video0', 0n, segment(105.75 * VIDEO_TS, VIDEO_TS, 1));
+    assembler.push('audio', 'audio0', 1n, segment(106 * AUDIO_TS, AUDIO_TS, 2));
+    assembler.push('video', 'video0', 1n, segment(106.75 * VIDEO_TS, VIDEO_TS, 2));
+
+    assembler.push('video', 'video0', 2n, segment(1.75 * VIDEO_TS, VIDEO_TS, 3));
+    assembler.push('audio', 'audio0', 2n, segment(1 * AUDIO_TS, AUDIO_TS, 3));
+
+    expect(onDiscontinuity).toHaveBeenCalledTimes(2);
+    expect(outBmd(onSegment, 4)).toBe(BigInt(2.75 * VIDEO_TS));
+    expect(outBmd(onSegment, 5)).toBe(BigInt(2 * AUDIO_TS));
+  });
+
+  it('does not rewind the second restarted track when output horizons are asymmetric', () => {
+    const onDiscontinuity = vi.fn();
+    const { assembler, onSegment } = assemblerWithInits(onDiscontinuity);
+
+    const segment = (bmd: number, duration: number, sequence: number) =>
+      concat(buildMoof(bmd, sequence, duration), buildMdat(new Uint8Array([sequence])));
+
+    assembler.push('audio', 'audio0', 100n, segment(100 * AUDIO_TS, AUDIO_TS, 1));
+    assembler.push('video', 'video0', 100n, segment(100.75 * VIDEO_TS, VIDEO_TS, 1));
+    assembler.push('audio', 'audio0', 101n, segment(101 * AUDIO_TS, AUDIO_TS, 2));
+    assembler.push('video', 'video0', 102n, segment(102.75 * VIDEO_TS, VIDEO_TS, 2));
+
+    assembler.push('audio', 'audio0', 103n, segment(1 * AUDIO_TS, AUDIO_TS, 3));
+    assembler.push('video', 'video0', 103n, segment(1.75 * VIDEO_TS, VIDEO_TS, 3));
+
+    expect(onDiscontinuity).toHaveBeenCalledTimes(2);
+    expect(outBmd(onSegment, 4)).toBe(BigInt(2 * AUDIO_TS));
+    expect(outBmd(onSegment, 5)).toBe(BigInt(3.75 * VIDEO_TS));
+  });
+
+  it('keeps cumulative output when the video track changes after a restart', () => {
+    const onSegment = vi.fn();
+    const assembler = new CmafAssembler({ onSegment });
+    assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+    const segment = (bmd: number, sequence: number) =>
+      concat(buildMoof(bmd, sequence, VIDEO_TS), buildMdat(new Uint8Array([sequence])));
+
+    assembler.push('video', 'videoA', 100n, segment(10 * VIDEO_TS, 1));
+    assembler.push('video', 'videoA', 101n, segment(11 * VIDEO_TS, 2));
+    assembler.push('video', 'videoA', 102n, segment(0, 3));
+    assembler.selectTrack('video', 'videoB');
+    assembler.push('video', 'videoB', 103n, segment(VIDEO_TS, 4));
+    assembler.push('video', 'videoA', 104n, segment(2 * VIDEO_TS, 5));
+
+    expect(onSegment.mock.calls.map((_, i) => outBmd(onSegment, i)))
+      .toEqual([0n, BigInt(VIDEO_TS), BigInt(2 * VIDEO_TS), BigInt(3 * VIDEO_TS)]);
+  });
+
+  it('reset clears an explicitly selected track', () => {
+    const onSegment = vi.fn();
+    const assembler = new CmafAssembler({ onSegment });
+    const segment = concat(buildMoof(10_000, 1, 1_000), buildMdat(new Uint8Array([1])));
+
+    assembler.selectTrack('video', 'videoB');
+    assembler.push('video', 'videoA', 100n, segment);
+    expect(onSegment).not.toHaveBeenCalled();
+
+    assembler.reset();
+    assembler.push('video', 'videoA', 100n, segment);
+    expect(onSegment).toHaveBeenCalledOnce();
   });
 
   it('advances normally after a restart instead of repeatedly re-anchoring', () => {

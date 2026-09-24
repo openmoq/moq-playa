@@ -36,6 +36,7 @@ import type {
   Fetch,
   RequestUpdate,
   TrackExtensions,
+  Publish,
   PublishOk,
   PublishError,
   PublishDone,
@@ -126,6 +127,7 @@ export class Draft14Codec implements ControlCodec {
       case 'PUBLISH_NAMESPACE': return this.encodePublishNamespace(msg);
       case 'PUBLISH_NAMESPACE_OK': return this.encodeSimpleRequestId(D14.PUBLISH_NAMESPACE_OK, msg.requestId);
       case 'PUBLISH_NAMESPACE_ERROR': return this.encodePublishNamespaceError(msg);
+      case 'PUBLISH': return this.encodePublish(msg);
       case 'PUBLISH_OK': return this.encodePublishOk(msg);
       case 'PUBLISH_ERROR': return this.encodePublishError(msg);
       case 'SUBSCRIBE_OK': return this.encodeSubscribeOk(msg);
@@ -539,6 +541,99 @@ export class Draft14Codec implements ControlCodec {
     return this.frame16(D14.PUBLISH_NAMESPACE_ERROR, payload);
   }
 
+  /** Encode draft-14 PUBLISH with its state fields inlined on the wire (§9.13). */
+  private encodePublish(msg: Publish): Uint8Array {
+    validateTrackNamespace(msg.trackNamespace);
+
+    const trackProperties = msg.trackProperties ?? msg.trackExtensions ?? new Map();
+    if (trackProperties.size > 0) {
+      throw new ProtocolViolationError('PUBLISH Track Properties are not defined in draft-14');
+    }
+
+    const groupOrder = Number(
+      this.extractSingleVarintParam(
+        msg.parameters,
+        MessageParam.GROUP_ORDER,
+        'GROUP_ORDER',
+        'PUBLISH',
+      ) ?? 1n,
+    );
+    if (groupOrder !== 1 && groupOrder !== 2) {
+      throw new ProtocolViolationError(
+        `PUBLISH: GROUP_ORDER must be Ascending (0x1) or Descending (0x2), got ${groupOrder}`,
+      );
+    }
+
+    const forward = Number(
+      this.extractSingleVarintParam(
+        msg.parameters,
+        MessageParam.FORWARD,
+        'FORWARD',
+        'PUBLISH',
+      ) ?? 1n,
+    );
+    if (forward !== 0 && forward !== 1) {
+      throw new ProtocolViolationError(`PUBLISH: FORWARD must be 0 or 1, got ${forward}`);
+    }
+
+    let largestLocation: Location | undefined;
+    const largestValues = msg.parameters.get(MessageParam.LARGEST_OBJECT);
+    if (largestValues !== undefined) {
+      const encoded = largestValues.length === 1 ? largestValues[0] : undefined;
+      if (!(encoded instanceof Uint8Array)) {
+        throw new ProtocolViolationError(
+          'PUBLISH: LARGEST_OBJECT must contain exactly one Location byte string',
+        );
+      }
+      try {
+        const decoded = readLocation(encoded, 0);
+        if (decoded.bytesRead !== encoded.byteLength) {
+          throw new RangeError('trailing bytes');
+        }
+        largestLocation = decoded.value;
+      } catch {
+        throw new ProtocolViolationError(
+          'PUBLISH: LARGEST_OBJECT must contain exactly one Location',
+        );
+      }
+    }
+
+    const remainingParams = this.cloneParamsWithout(msg.parameters, [
+      MessageParam.GROUP_ORDER,
+      MessageParam.LARGEST_OBJECT,
+      MessageParam.FORWARD,
+    ]);
+    const largestLength = largestLocation === undefined
+      ? 0
+      : locationEncodingLength(largestLocation);
+    const payloadLen =
+      varintEncodingLength(msg.requestId) +
+      tupleEncodingLength(msg.trackNamespace) +
+      lengthPrefixedBytesEncodingLength(msg.trackName) +
+      varintEncodingLength(msg.trackAlias) +
+      1 + // Group Order
+      1 + // Content Exists
+      largestLength +
+      1 + // Forward
+      this.paramsLength(remainingParams);
+
+    const payload = new Uint8Array(payloadLen);
+    let pos = 0;
+    pos += writeVarint(msg.requestId, payload, pos);
+    pos += writeTuple(msg.trackNamespace, payload, pos);
+    pos += writeLengthPrefixedBytes(msg.trackName, payload, pos);
+    pos += writeVarint(msg.trackAlias, payload, pos);
+    payload[pos++] = groupOrder;
+    payload[pos++] = largestLocation === undefined ? 0 : 1;
+    if (largestLocation !== undefined) {
+      pos += writeLocation(largestLocation, payload, pos);
+    }
+    payload[pos++] = forward;
+    pos += this.writeParams(remainingParams, payload, pos);
+
+    return this.frameVarint(D14.PUBLISH, payload);
+  }
+
   // ─── Decode Helpers ───────────────────────────────────────────────
 
   private decodePayload(typeNum: number, buf: Uint8Array, offset: number, payloadEnd: number): ControlMessage {
@@ -938,9 +1033,11 @@ export class Draft14Codec implements ControlCodec {
             `PUBLISH Content Exists must be 0 or 1, got ${contentExists}`,
           );
         }
+        let largestLocation: Location | undefined;
         if (contentExists === 1) {
-          const { bytesRead: llBytes } = readLocation(buf, pos);
+          const { value, bytesRead: llBytes } = readLocation(buf, pos);
           pos += llBytes;
+          largestLocation = value;
         }
         const pubForward = buf[pos++]!;
         const { value: pubParams, bytesRead: ppBytes } = this.readParams(buf, pos);
@@ -948,6 +1045,11 @@ export class Draft14Codec implements ControlCodec {
 
         pubParams.set(MessageParam.GROUP_ORDER, [varint(pubGroupOrder)]);
         pubParams.set(MessageParam.FORWARD, [varint(pubForward)]);
+        if (largestLocation !== undefined) {
+          const encoded = new Uint8Array(locationEncodingLength(largestLocation));
+          writeLocation(largestLocation, encoded, 0);
+          pubParams.set(MessageParam.LARGEST_OBJECT, [encoded]);
+        }
 
         this.assertConsumed(pos, payloadEnd, 'PUBLISH');
         // No trackExtensions in draft-14
@@ -1108,6 +1210,23 @@ export class Draft14Codec implements ControlCodec {
   private extractParamVarint(params: Parameters, key: Varint): Varint | undefined {
     const values = params.get(key);
     if (!values || values.length === 0) return undefined;
+    return values[0] as Varint;
+  }
+
+  /** Extract exactly one locally-authored varint used by an inline field. */
+  private extractSingleVarintParam(
+    params: Parameters,
+    key: Varint,
+    field: string,
+    message: string,
+  ): Varint | undefined {
+    const values = params.get(key);
+    if (values === undefined) return undefined;
+    if (values.length !== 1 || typeof values[0] !== 'bigint') {
+      throw new ProtocolViolationError(
+        `${message}: ${field} must contain exactly one integer`,
+      );
+    }
     return values[0] as Varint;
   }
 
@@ -1306,13 +1425,27 @@ export class Draft14Codec implements ControlCodec {
    * @see draft-ietf-moq-transport-14 §9.14
    */
   private encodePublishOk(msg: PublishOk): Uint8Array {
-    const forward = Number(this.extractParamVarint(msg.parameters, MessageParam.FORWARD) ?? 1n);
-    const subscriberPriority = Number(this.extractParamVarint(msg.parameters, MessageParam.SUBSCRIBER_PRIORITY) ?? 128n);
+    const forward = Number(this.extractSingleVarintParam(
+      msg.parameters, MessageParam.FORWARD, 'FORWARD', 'PUBLISH_OK',
+    ) ?? 1n);
+    const subscriberPriority = Number(this.extractSingleVarintParam(
+      msg.parameters, MessageParam.SUBSCRIBER_PRIORITY, 'SUBSCRIBER_PRIORITY', 'PUBLISH_OK',
+    ) ?? 128n);
     // Draft-14 §9.14: GROUP_ORDER must be 0x1 (Ascending) or 0x2 (Descending); 0x0 is a protocol error.
-    const groupOrder = Number(this.extractParamVarint(msg.parameters, MessageParam.GROUP_ORDER) ?? 1n);
+    const groupOrder = Number(this.extractSingleVarintParam(
+      msg.parameters, MessageParam.GROUP_ORDER, 'GROUP_ORDER', 'PUBLISH_OK',
+    ) ?? 1n);
     this.assertUint8(forward, 'FORWARD', 'PUBLISH_OK');
     this.assertUint8(subscriberPriority, 'SUBSCRIBER_PRIORITY', 'PUBLISH_OK');
     this.assertUint8(groupOrder, 'GROUP_ORDER', 'PUBLISH_OK');
+    if (forward !== 0 && forward !== 1) {
+      throw new ProtocolViolationError(`PUBLISH_OK: FORWARD must be 0 or 1, got ${forward}`);
+    }
+    if (groupOrder !== 1 && groupOrder !== 2) {
+      throw new ProtocolViolationError(
+        `PUBLISH_OK: GROUP_ORDER must be Ascending (0x1) or Descending (0x2), got ${groupOrder}`,
+      );
+    }
 
     // Extract filter from parameters or default to NextGroupStart (0x1)
     const filterResult = this.extractFilter(msg.parameters);

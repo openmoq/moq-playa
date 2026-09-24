@@ -1,0 +1,22 @@
+{
+  // Typecheck gate for test and test-support code.
+  //
+  // The package tsconfigs deliberately compile only `src/**/*.ts` minus tests,
+  // because that is what ships in `dist`. The consequence is that simulation
+  // suites and `test-support/` helpers were never typechecked at all, allowing
+  // missing interface fields to survive package-level typechecks.
+  // Vitest transpiles without typechecking, so this project is the only gate.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  // Scoped to the simulation suites and test-support helpers. The wider
+  // `*.test.ts` corpus predates any typecheck gate and does not compile clean
+  // under these options; widening this include is a separate cleanup.
+  "include": [
+    "packages/*/src/**/*.sim.test.ts",
+    "packages/*/test-support/**/*.ts"
+  ]
+}

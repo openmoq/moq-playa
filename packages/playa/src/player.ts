@@ -34,9 +34,9 @@
  */
 
 import {
-  MoqtPlayer, TypedEmitter, checkSupport,
+  MoqtPlayer, TypedEmitter, checkSupport, usesMsePath,
 } from '@moqt/player';
-import type { MoqtPlayerConfig, SupportReport } from '@moqt/player';
+import type { LocmafDecoding, MoqtPlayerConfig, SupportReport } from '@moqt/player';
 import { MoqtConnection } from '@moqt/webtransport';
 import {
   AudioAlignedClock,
@@ -79,7 +79,7 @@ export class Player {
   // ─── Static ──────────────────────────────────────────────────────
 
   /** Player version (set at build time). */
-  static readonly version = '0.5.7';
+  static readonly version = '0.5.9';
 
   /** Check if the current browser supports MoQ playback. */
   static isSupported(): boolean {
@@ -98,6 +98,8 @@ export class Player {
   private readonly container: HTMLElement | null;
   private readonly options: PlayerOptions;
   private readonly strategy: DecoderStrategy;
+  /** How the engine consumes LOCMAF tracks; decides the render sink for them. */
+  private readonly locmafDecoding: LocmafDecoding | undefined;
 
   // DOM elements — may be user-provided (borrowed) or created by Player (owned).
   private canvas: HTMLCanvasElement | null = null;
@@ -197,6 +199,7 @@ export class Player {
 
     // Build MoqtPlayer config and create MoqtPlayer
     const moqtPlayerConfig = this.buildMoqtPlayerConfig();
+    this.locmafDecoding = moqtPlayerConfig.locmafDecoding;
     this.engine = new MoqtPlayer(moqtPlayerConfig);
 
     // Wire MoqtPlayer events → Player events
@@ -580,7 +583,9 @@ export class Player {
     this.engine.on('catalog_received', (e) => {
       this._levels = mapLevels(e.catalog);
       this._audioTracks = mapAudioTracks(e.catalog);
-      const hasCmaf = e.catalog.tracks.some(track => track.packaging === 'cmaf');
+      // cmaf renders through MSE into the <video> element, as does locmaf
+      // unless the engine decodes it frame by frame onto the canvas.
+      const hasCmaf = e.catalog.tracks.some(track => usesMsePath(track.packaging, this.locmafDecoding));
 
       // Record which element is the active render sink so callers can react.
       this._activeMediaType = hasCmaf ? 'video' : 'canvas';

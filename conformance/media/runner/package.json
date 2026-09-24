@@ -11,6 +11,7 @@
   "dependencies": {
     "@moqt/browser": "workspace:*",
     "@moqt/loc": "workspace:*",
+    "@moqt/locmaf": "workspace:*",
     "@moqt/msf": "workspace:*",
     "@moqt/transport": "workspace:*",
     "ajv": "^8.17.1"

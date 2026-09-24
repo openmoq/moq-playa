@@ -236,6 +236,18 @@ describe('Session', () => {
       expect(sub?.state).toBe(SubscriptionState.PENDING);
     });
 
+    it('rejects a non-binary SUBSCRIBE Forward State before allocating request state', () => {
+      const namespace = [new Uint8Array([0x6c])];
+      const name = new Uint8Array([0x76]);
+
+      expect(() => session.subscribe(namespace, name, { forward: 2 as never }))
+        .toThrow(/Forward State must be 0 or 1/);
+
+      const { requestId } = session.subscribe(namespace, name);
+      expect(requestId).toBe(0n);
+      expect(session.getSubscription(requestId)?.forwardState).toBe(ForwardState.ACTIVE);
+    });
+
     it('handles SUBSCRIBE_OK', () => {
       const namespace = [new Uint8Array([0x6c, 0x69, 0x76, 0x65])];
       const name = new Uint8Array([0x76, 0x69, 0x64, 0x65, 0x6f]);
@@ -2225,6 +2237,39 @@ describe('Session', () => {
         expect(updateId).not.toBe(subId);
         expect(updateId % 2n).toBe(0n); // Client uses even IDs
       });
+
+      it.each([14, 16] as const)(
+        'draft-%i rejects a non-binary Forward update before allocation or mutation',
+        (draft) => {
+          const s = new Session(EndpointRole.CLIENT, draft);
+          s.initiateSetup({ maxRequestId: varint(100n) });
+          s.handleControlMessage({
+            type: 'SERVER_SETUP',
+            parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
+          });
+          const { requestId: subId } = s.subscribe(
+            [new Uint8Array([0x6c])],
+            new Uint8Array([0x76]),
+          );
+          s.handleControlMessage({
+            type: 'SUBSCRIBE_OK',
+            requestId: subId,
+            trackAlias: varint(1n),
+            parameters: new Map(),
+            trackExtensions: [],
+          } as SubscribeOk);
+
+          expect(() => s.requestUpdate(subId, { forward: 2 as never }))
+            .toThrow(/Forward State must be 0 or 1/);
+          expect(s.getSubscription(subId)?.forwardState).toBe(ForwardState.ACTIVE);
+
+          const valid = s.requestUpdate(subId, { forward: 0 });
+          expect(valid.requestId).toBe(2n);
+          expect(s.getSubscription(subId)?.forwardState).toBe(
+            draft === 14 ? ForwardState.PAUSED : ForwardState.ACTIVE,
+          );
+        },
+      );
 
       it('throws on unknown existing request ID', () => {
         expect(() => session.requestUpdate(varint(999n), { forward: 0 })).toThrow();
@@ -6015,6 +6060,17 @@ describe('inbound PUBLISH lifecycle helpers (draft-18 §10.11, §10.9)', () => {
     // The matching REQUEST_OK applies the pending update to the incoming sub.
     s.handleControlMessage({ type: 'REQUEST_OK', requestId: updateId, parameters: new Map() } as RequestOk, { requestId: updateId });
     expect(s.getIncomingSubscription(requestId)?.forwardState).toBe(ForwardState.PAUSED);
+  });
+
+  it('rejects a non-binary incoming-subscription update before allocating request state', () => {
+    const { s, requestId } = established18Publish();
+
+    expect(() => s.updateIncomingSubscription(requestId, { forward: 2 as never }))
+      .toThrow(/Forward State must be 0 or 1/);
+
+    const valid = s.updateIncomingSubscription(requestId, { forward: 0 });
+    expect(valid.requestId).toBe(0n);
+    expect(s.getIncomingSubscription(requestId)?.forwardState).toBe(ForwardState.ACTIVE);
   });
 });
 

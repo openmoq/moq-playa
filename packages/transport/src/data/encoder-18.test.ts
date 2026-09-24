@@ -97,6 +97,24 @@ describe('encodeFetchHeader18 ↔ decodeFetchHeader18', () => {
 });
 
 describe('encodeFetchObject18 ↔ decodeFetchObject18', () => {
+  it('round-trips draft-18 Object Properties', () => {
+    const properties = new Uint8Array([0x0b, 0x03, 0x01]);
+    const { bytes } = encodeFetchObject18(
+      {
+        groupId: 10n,
+        subgroupId: 2n,
+        objectId: 5n,
+        publisherPriority: 7,
+        extensions: properties,
+        payload: new Uint8Array([0xaa]),
+      },
+      undefined, true, 'ascending',
+    );
+
+    const { item } = decodeFetchObject18(bytes, 0, undefined, true, 'ascending');
+    expect((item as FetchObject).extensions).toEqual(properties);
+  });
+
   it('first object carries absolute group/object + priority and decodes as the first object', () => {
     const { bytes, nextPrior } = encodeFetchObject18(
       { groupId: 10n, subgroupId: 2n, objectId: 5n, publisherPriority: 7, payload: new Uint8Array([0xaa]) },

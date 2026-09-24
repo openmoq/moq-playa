@@ -12,6 +12,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   handleControlMessage,
+  removeSubscription,
   validateKnownTracks,
   type ControlMessageContext,
 } from './player-message.js';
@@ -26,10 +27,11 @@ const mockLog: LoggerLike = {
 };
 
 function createContext(overrides: Partial<ControlMessageContext> = {}): ControlMessageContext {
-  return {
+  const ctx: ControlMessageContext = {
     adapter: { unsubscribe: vi.fn() } as any,
     activeSubscriptions: new Map(),
     pendingMediaSubs: new Map(),
+    removeSubscription: (requestId) => removeSubscription(requestId, ctx),
     pendingTrackStatuses: new Map(),
     catalogRequestId: null,
     catalogTrackAlias: null,
@@ -37,14 +39,42 @@ function createContext(overrides: Partial<ControlMessageContext> = {}): ControlM
     log: { ...mockLog, debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     emitEvent: vi.fn(),
     setCatalogTrackAlias: vi.fn(),
+    clearCatalogState: vi.fn(),
     onGoaway: vi.fn(),
     ...overrides,
   };
+  return ctx;
 }
 
 // ─── handleControlMessage ───────────────────────────────────────────
 
 describe('handleControlMessage', () => {
+  it('retains a shared alias until its last subscription is retired', () => {
+    const ctx = createContext();
+    const unregisterTrack = vi.fn();
+    ctx.subscriptionManager = { registerTrack: vi.fn(), unregisterTrack, getMediaType: () => 'video' };
+    ctx.activeSubscriptions.set(2n, { trackName: 'video', trackAlias: 40n });
+    ctx.activeSubscriptions.set(4n, { trackName: 'video', trackAlias: 40n });
+    ctx.removeSubscription(2n);
+    expect(unregisterTrack).not.toHaveBeenCalled();
+    ctx.removeSubscription(4n);
+    expect(unregisterTrack).toHaveBeenCalledExactlyOnceWith(40n);
+  });
+
+  it.each(['init', 'mediatimeline', 'eventtimeline'] as const)('REQUEST_ERROR reclaims pending %s ownership', (packaging) => {
+    const ctx = createContext();
+    const unregisterTrack = vi.fn();
+    ctx.subscriptionManager = { registerTrack: vi.fn(), unregisterTrack, getMediaType: () => 'video' };
+    ctx.activeSubscriptions.set(2n, { trackName: 'video', trackAlias: 4n });
+    ctx.activeSubscriptions.set(4n, { trackName: packaging, trackAlias: null });
+    ctx.pendingMediaSubs.set(4n, { trackName: packaging, packaging, mediaType: packaging === 'init' ? 'video' : packaging });
+    handleControlMessage({ type: 'REQUEST_ERROR', requestId: 4n, errorCode: 16n, errorReason: 'not found' } as ControlMessage, ctx);
+    expect(ctx.activeSubscriptions.has(4n)).toBe(false);
+    expect(ctx.pendingMediaSubs.has(4n)).toBe(false);
+    expect(ctx.activeSubscriptions.get(2n)?.trackAlias).toBe(4n);
+    expect(unregisterTrack).not.toHaveBeenCalled();
+  });
+
   it('GOAWAY: unsubscribes all active subscriptions (§9.4)', () => {
     const ctx = createContext();
     ctx.activeSubscriptions.set(1n, { trackName: 'video', trackAlias: 1n });
@@ -90,22 +120,17 @@ describe('handleControlMessage', () => {
     expect(setCatalogAlias).toHaveBeenCalledWith(42n);
   });
 
-  it('SUBSCRIBE_OK: evicts optimistic media alias when catalog claims it (§9.10)', () => {
-    // Scenario: catalog reqId=0, video reqId=1 (optimistically registered as alias=1).
-    // Server returns SUBSCRIBE_OK for catalog with trackAlias=1.
-    // The optimistic video registration at alias=1 must be evicted so catalog
-    // objects route to the catalog handler, not the media pipeline.
+  it('SUBSCRIBE_OK: a catalog alias can equal a pending media request ID', () => {
     const subMgr = {
       unregisterTrack: vi.fn(),
       registerTrack: vi.fn(),
-      getMediaType: vi.fn().mockReturnValue('video'), // alias=1 claimed by video
+      getMediaType: vi.fn(),
     };
     const ctx = createContext({
       catalogRequestId: 0n,
       subscriptionManager: subMgr as any,
     });
-    // Video was optimistically registered at alias=1 (reqId=1)
-    ctx.activeSubscriptions.set(1n, { trackName: 'video0', trackAlias: 1n });
+    ctx.activeSubscriptions.set(1n, { trackName: 'video0', trackAlias: null });
     ctx.pendingMediaSubs.set(1n, { trackName: 'video0', mediaType: 'video', packaging: 'loc' });
 
     const msg: ControlMessage = {
@@ -116,16 +141,54 @@ describe('handleControlMessage', () => {
 
     // Catalog alias should be set
     expect(ctx.setCatalogTrackAlias).toHaveBeenCalledWith(1n);
-    // Video's optimistic alias=1 must be evicted
-    expect(subMgr.unregisterTrack).toHaveBeenCalledWith(1n);
+    expect(subMgr.unregisterTrack).not.toHaveBeenCalled();
+    expect(ctx.activeSubscriptions.get(1n)?.trackAlias).toBeNull();
   });
 
-  it('SUBSCRIBE_OK: re-registers track when alias differs (§9.10)', () => {
+  it('SUBSCRIBE_OK: registers a pending track whose alias equals the request id when nothing is registered under it (switch target on an alias-echoing relay)', () => {
+    const ctx = createContext();
+    const subMgr = { unregisterTrack: vi.fn(), registerTrack: vi.fn(), getMediaType: vi.fn().mockReturnValue(undefined) };
+    ctx.subscriptionManager = subMgr as any;
+    ctx.pendingMediaSubs.set(7n, { trackName: 'video-360', mediaType: 'video', packaging: 'locmaf' });
+    ctx.activeSubscriptions.set(7n, { trackName: 'video-360', trackAlias: null });
+    const resolved: bigint[] = [];
+    ctx.onAliasResolved = (alias) => resolved.push(alias);
+
+    handleControlMessage({
+      type: 'SUBSCRIBE_OK', requestId: 7n, trackAlias: 7n,
+      expires: 0n, groupOrder: 0x1n, contentExists: false,
+    } as ControlMessage, ctx);
+
+    expect(subMgr.registerTrack).toHaveBeenCalledWith(7n, 'video-360', 'video', 'locmaf');
+    expect(subMgr.unregisterTrack).not.toHaveBeenCalled();
+    expect(resolved).toEqual([7n]);
+  });
+
+  it('SUBSCRIBE_OK: a second subscription to the same track may share its alias', () => {
+    const ctx = createContext();
+    const subMgr = { unregisterTrack: vi.fn(), registerTrack: vi.fn(), getMediaType: vi.fn().mockReturnValue('video') };
+    ctx.subscriptionManager = subMgr as any;
+    ctx.pendingMediaSubs.set(3n, { trackName: 'video', mediaType: 'video', packaging: 'loc' });
+    ctx.activeSubscriptions.set(2n, { trackName: 'video', trackAlias: 3n });
+    ctx.activeSubscriptions.set(3n, { trackName: 'video', trackAlias: null });
+
+    handleControlMessage({
+      type: 'SUBSCRIBE_OK', requestId: 3n, trackAlias: 3n,
+      expires: 0n, groupOrder: 0x1n, contentExists: false,
+    } as ControlMessage, ctx);
+
+    expect(subMgr.registerTrack).toHaveBeenCalledWith(3n, 'video', 'video', 'loc');
+    expect(subMgr.unregisterTrack).not.toHaveBeenCalled();
+  });
+
+  it('SUBSCRIBE_OK: binds and replays only the assigned alias, not the request ID', () => {
     const ctx = createContext();
     const subMgr = { unregisterTrack: vi.fn(), registerTrack: vi.fn(), getMediaType: vi.fn().mockReturnValue(undefined) };
     ctx.subscriptionManager = subMgr as any;
     ctx.pendingMediaSubs.set(5n, { trackName: 'video', mediaType: 'video', packaging: 'loc' });
-    ctx.activeSubscriptions.set(5n, { trackName: 'video', trackAlias: 5n });
+    ctx.activeSubscriptions.set(5n, { trackName: 'video', trackAlias: null });
+    ctx.onAliasResolved = vi.fn();
+    ctx.onMediaAliasBound = vi.fn();
 
     const msg: ControlMessage = {
       type: 'SUBSCRIBE_OK', requestId: 5n, trackAlias: 99n,
@@ -133,17 +196,19 @@ describe('handleControlMessage', () => {
     };
     handleControlMessage(msg, ctx);
 
-    expect(subMgr.unregisterTrack).toHaveBeenCalledWith(5n);
+    expect(subMgr.unregisterTrack).not.toHaveBeenCalled();
     expect(subMgr.registerTrack).toHaveBeenCalledWith(99n, 'video', 'video', 'loc');
     expect(ctx.activeSubscriptions.get(5n)?.trackAlias).toBe(99n);
+    expect(ctx.onAliasResolved).toHaveBeenCalledExactlyOnceWith(99n);
+    expect(ctx.onMediaAliasBound).toHaveBeenCalledExactlyOnceWith(5n, 99n);
   });
 
-  it('SUBSCRIBE_OK: re-registers mediatimeline track when alias differs (§9.10)', () => {
+  it.each(['mediatimeline', 'eventtimeline'] as const)('SUBSCRIBE_OK: binds %s without unregistering its request ID', (packaging) => {
     const ctx = createContext();
     const subMgr = { unregisterTrack: vi.fn(), registerTrack: vi.fn(), getMediaType: vi.fn().mockReturnValue(undefined) };
     ctx.subscriptionManager = subMgr as any;
-    ctx.pendingMediaSubs.set(7n, { trackName: 'mediatimeline', mediaType: 'mediatimeline', packaging: 'mediatimeline' });
-    ctx.activeSubscriptions.set(7n, { trackName: 'mediatimeline', trackAlias: 7n });
+    ctx.pendingMediaSubs.set(7n, { trackName: packaging, mediaType: packaging, packaging });
+    ctx.activeSubscriptions.set(7n, { trackName: packaging, trackAlias: null });
 
     const msg: ControlMessage = {
       type: 'SUBSCRIBE_OK', requestId: 7n, trackAlias: 77n,
@@ -151,22 +216,23 @@ describe('handleControlMessage', () => {
     };
     handleControlMessage(msg, ctx);
 
-    expect(subMgr.unregisterTrack).toHaveBeenCalledWith(7n);
-    expect(subMgr.registerTrack).toHaveBeenCalledWith(77n, 'mediatimeline', 'mediatimeline', 'mediatimeline');
+    expect(subMgr.unregisterTrack).not.toHaveBeenCalled();
+    expect(subMgr.registerTrack).toHaveBeenCalledWith(77n, packaging, packaging, packaging);
     expect(ctx.activeSubscriptions.get(7n)?.trackAlias).toBe(77n);
   });
 
-  it('SUBSCRIBE_OK: skips re-register when alias collides with existing track (§9.10)', () => {
+  it('SUBSCRIBE_OK: init alias may equal another pending request ID', () => {
     const ctx = createContext();
     const subMgr = {
       unregisterTrack: vi.fn(),
       registerTrack: vi.fn(),
-      getMediaType: vi.fn().mockReturnValue('video'), // alias 2n already has video track
+      getMediaType: vi.fn(),
     };
     ctx.subscriptionManager = subMgr as any;
-    // Init track at reqId=6 gets server alias=2, which collides with video at alias=2
+    ctx.pendingMediaSubs.set(2n, { trackName: 'video', mediaType: 'video', packaging: 'cmaf' });
+    ctx.activeSubscriptions.set(2n, { trackName: 'video', trackAlias: null });
     ctx.pendingMediaSubs.set(6n, { trackName: '0.mp4', mediaType: 'video', packaging: 'init' });
-    ctx.activeSubscriptions.set(6n, { trackName: '0.mp4', trackAlias: 6n });
+    ctx.activeSubscriptions.set(6n, { trackName: '0.mp4', trackAlias: null });
 
     const msg: ControlMessage = {
       type: 'SUBSCRIBE_OK', requestId: 6n, trackAlias: 2n,
@@ -174,11 +240,10 @@ describe('handleControlMessage', () => {
     };
     handleControlMessage(msg, ctx);
 
-    // Should NOT re-register — alias 2n is occupied
     expect(subMgr.unregisterTrack).not.toHaveBeenCalled();
-    expect(subMgr.registerTrack).not.toHaveBeenCalled();
-    // Active subscription alias should remain unchanged
-    expect(ctx.activeSubscriptions.get(6n)?.trackAlias).toBe(6n);
+    expect(subMgr.registerTrack).toHaveBeenCalledWith(2n, '0.mp4', 'video', 'init');
+    expect(ctx.activeSubscriptions.get(6n)?.trackAlias).toBe(2n);
+    expect(ctx.activeSubscriptions.get(2n)?.trackAlias).toBeNull();
   });
 
   it('PUBLISH_DONE: cleans up subscription and emits event (§9.15)', () => {
@@ -233,7 +298,7 @@ describe('handleControlMessage', () => {
     expect(ctx.pendingTrackStatuses.size).toBe(0);
   });
 
-  it('REQUEST_ERROR: cleans optimistic active subscription and alias for refused media (§9.8)', () => {
+  it('REQUEST_ERROR: retires a pending request without unregistering an alias', () => {
     const unregisterTrack = vi.fn();
     const onMediaSubscribeError = vi.fn();
     const ctx = createContext({
@@ -245,7 +310,7 @@ describe('handleControlMessage', () => {
       } as any,
     });
     ctx.pendingMediaSubs.set(5n, { trackName: 'video', mediaType: 'video' });
-    ctx.activeSubscriptions.set(5n, { trackName: 'video', mediaType: 'video', trackAlias: 5n });
+    ctx.activeSubscriptions.set(5n, { trackName: 'video', trackAlias: null });
 
     const msg: ControlMessage = {
       type: 'REQUEST_ERROR', requestId: 5n,
@@ -255,7 +320,7 @@ describe('handleControlMessage', () => {
 
     expect(ctx.pendingMediaSubs.size).toBe(0);
     expect(ctx.activeSubscriptions.size).toBe(0);
-    expect(unregisterTrack).toHaveBeenCalledWith(5n);
+    expect(unregisterTrack).not.toHaveBeenCalled();
     expect(onMediaSubscribeError).toHaveBeenCalledWith(5n, 'video', 'video', 'Track not found', 0x10n);
   });
 

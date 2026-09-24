@@ -9,7 +9,7 @@
  * via the same vi64 `pack` helper used by the decoder unit tests; the publisher
  * send path uses the real d18 encoders and is verified by decoding the bytes.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { MoqtConnection } from './adapter.js';
 import { TransportSim, flush } from './testkit/stream-sim.js';
 import {
@@ -17,6 +17,8 @@ import {
   writeVi64,
   vi64EncodingLength,
   varint,
+  MessageParam,
+  SetupOption18,
   StreamType18,
   PADDING_DATAGRAM_TYPE,
   DatagramFlags18,
@@ -83,6 +85,101 @@ async function connected(): Promise<{ conn: MoqtConnection; transport: Transport
 }
 
 describe('MoqtConnection(18) subgroup stream delivery', () => {
+  it('accepts an Object stream before SETUP and delivers it after setup completes', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = new TransportSim();
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, object) => objects.push(object);
+
+    transport.pushIncomingUni(concat(
+      subgroupHeader(7n, 42n),
+      subgroupObject(3n, [0xaa, 0xbb]),
+    ));
+    const control = transport.openIncomingUni();
+
+    const connecting = conn.connect(transport);
+    await flush();
+    expect(objects).toEqual([]);
+
+    control.push(setupBytes());
+    await connecting;
+    await flush();
+
+    expect(objects).toHaveLength(1);
+    expect(objects[0]!.trackAlias).toBe(7n);
+    expect(objects[0]!.groupId).toBe(42n);
+  });
+
+  it('does not deliver an early Object before its outbound SETUP is sent', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = new TransportSim();
+    const realCreate = transport.createUnidirectionalStream.bind(transport);
+    let releaseLocalSetup!: () => void;
+    const localSetupGate = new Promise<void>((resolve) => { releaseLocalSetup = resolve; });
+    (transport as unknown as {
+      createUnidirectionalStream: () => Promise<WritableStream<Uint8Array>>;
+    }).createUnidirectionalStream = async () => {
+      await localSetupGate;
+      return realCreate();
+    };
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, object) => objects.push(object);
+
+    transport.pushIncomingUni(concat(
+      subgroupHeader(7n, 42n),
+      subgroupObject(3n, [0xaa, 0xbb]),
+    ));
+    transport.openIncomingUni().push(setupBytes());
+    const connecting = conn.connect(transport);
+    await flush();
+    await flush();
+
+    expect(objects).toEqual([]);
+
+    releaseLocalSetup();
+    await connecting;
+    await flush();
+    expect(objects).toHaveLength(1);
+    expect(objects[0]!.groupId).toBe(42n);
+  });
+
+  it('discards an early Object when peer SETUP is rejected', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = new TransportSim();
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, object) => objects.push(object);
+    const invalidSetup = codec18.encode({
+      type: 'SETUP',
+      setupOptions: new Map([[BigInt(SetupOption18.PATH), [new TextEncoder().encode('/forbidden')]]]),
+    });
+
+    transport.pushIncomingUni(concat(
+      subgroupHeader(7n, 42n),
+      subgroupObject(3n, [0xaa, 0xbb]),
+    ));
+    transport.openIncomingUni().push(invalidSetup);
+
+    await expect(conn.connect(transport)).rejects.toThrow(/PATH MUST NOT/i);
+    await flush();
+
+    expect(objects).toEqual([]);
+    expect(transport.closeInfo?.closeCode).toBe(0x8);
+  });
+
+  it('cancels a stream whose type is still pending when the connection closes', async () => {
+    const { conn, transport } = await connected();
+    const objects: MoqtObject[] = [];
+    conn.onObject = (_sid, object) => objects.push(object);
+    const pending = transport.openIncomingUni();
+    await flush();
+
+    await conn.close();
+    await flush();
+
+    expect(objects).toEqual([]);
+    expect(pending.readCancelled).toBe(true);
+  });
+
   it('delivers a subgroup object to onObject (unknown alias → raw onObject)', async () => {
     const { conn, transport } = await connected();
     const objects: MoqtObject[] = [];
@@ -230,6 +327,25 @@ describe('MoqtConnection(18) padding stream + invalid types', () => {
     expect(objects).toBe(0);
     expect(closedStream).toBe(true);
     expect(closedSession).toBe(false);
+  });
+
+  it('a padding drain stops on local discard even when cancel fails', async () => {
+    // Without a gate at the drain boundary the loop keeps consuming whatever
+    // the peer writes and never reaches `done`, so no terminal is ever
+    // published for a stream we already tore down.
+    const { conn, transport } = await connected();
+    const s = transport.openIncomingUni();
+    s.failCancel = 'rejects';
+    s.push(concat(pack(BigInt(StreamType18.PADDING)), new Uint8Array([0x00, 0x11])));
+    await flush();
+
+    const terminals: string[] = [];
+    conn.onStreamClosed = (_sid, _err, terminal) => terminals.push(terminal);
+    await conn.close();
+    s.push(new Uint8Array([0x22, 0x33]));   // the peer keeps padding
+    await flush();
+
+    expect(terminals).toEqual(['local-discard']);
   });
 
   it('raises a protocol violation on an unknown stream type', async () => {
@@ -828,15 +944,18 @@ describe('MoqtConnection(18) inbound PUBLISH (§10.10)', () => {
     conn.onPublish = (p) => { published++; p.onObject = (o) => objs.push(o); };
     conn.onObject = () => { /* generic */ };
 
+    // This stream is already accepted by the transport but has not exposed its
+    // type. A fatal PUBLISH must retire it along with the stream accept loop.
+    const pendingData = transport.openIncomingUni();
+    await flush();
+
     // requestId 2n is EVEN = our (client) parity, not the peer's — invalid.
     transport.pushIncomingBidi().push(publishBytes(2n, 50n, 'vid'));
     await flush();
 
     expect(published).toBe(0);
     expect(transport.closeInfo).toBeDefined();
-    // No alias binding happened: data on alias 50 does not reach a publish onObject.
-    transport.pushIncomingUni(concat(subgroupHeader(50n, 1n), subgroupObject(0n, [0x01])));
-    await flush();
+    expect(pendingData.readCancelled).toBe(true);
     expect(objs.length).toBe(0);
   });
 
@@ -930,6 +1049,24 @@ describe('MoqtConnection(18) inbound PUBLISH lifecycle', () => {
     const done = seen.find((m) => m.type === 'PUBLISH_DONE') as { requestId?: bigint } | undefined;
     expect(done).toBeDefined();
     expect(done!.requestId).toBe(1n); // stamped from stream context
+  });
+
+  it('PUBLISH_DONE does not recreate receiver state after onMessage closes', async () => {
+    // The inbound-PUBLISH path duplicates the terminal application; it must
+    // also run before the application callback, so a reentrant close() clears
+    // state rather than having its cleanup undone by a later arm.
+    const { conn, bidi } = await publishAccepted();
+    conn.onMessage = (m) => { if (m.type === 'PUBLISH_DONE') void conn.close(); };
+
+    bidi.push(publishDoneBytes());
+    await flush();
+
+    const maps = conn as unknown as {
+      terminatedAliases: Map<bigint, unknown>;
+      publishAliasMaps: Map<bigint, unknown>;
+    };
+    expect(maps.terminatedAliases.size).toBe(0);
+    expect(maps.publishAliasMaps.size).toBe(0);
   });
 
   it('a late stream on the published alias is EARLY-DISCARDED after PUBLISH_DONE, not delivered (§10.11 bounded terminal)', async () => {
@@ -1975,6 +2112,135 @@ describe('MoqtConnection(18) outbound PUBLISH (§10.10)', () => {
     const { message } = codec18.decode(transport.bidi[0]!.writtenBytes(), 0) as { message: { type: string; trackProperties?: Map<bigint, unknown> } };
     expect(message.type).toBe('PUBLISH');
     expect(message.trackProperties).toEqual(trackProperties);
+  });
+
+  it('REQUEST_OK Forward State 0 then a peer REQUEST_UPDATE FORWARD=1 report pause and resume (§5.1 / §9.5)', async () => {
+    const { conn, transport } = await connected();
+    const changes: [bigint, boolean][] = [];
+    let resumeWriteOffset: number | undefined;
+    let ackVisibleAtCallback = false;
+    conn.onPublishForwardStateChange = (id, fwd) => {
+      changes.push([id, fwd]);
+      if (fwd && resumeWriteOffset !== undefined) {
+        ackVisibleAtCallback = transport.bidi[0]!.writtenBytes()[resumeWriteOffset] === 0x07;
+      }
+    };
+    // d18 §5.1: resuming 0→1 makes the REQUEST_OK carry the current Largest Location.
+    conn.setLargestLocationProvider(() => ({ group: 0n, object: 0n }));
+    const forwardParams = (forward: bigint) => new Map([[MessageParam.FORWARD, [varint(forward)]]]);
+
+    const requestId = await conn.publish(ns('a'), nm('vid'), 42n);
+    expect(conn.getPublishForwardState(requestId)).toBe(true);
+    transport.bidi[0]!.push(codec18.encode({ type: 'REQUEST_OK', requestId: 0n, parameters: forwardParams(0n) } as RequestOk));
+    await flush();
+    expect(changes).toEqual([[requestId, false]]);
+    expect(conn.getPublishForwardState(requestId)).toBe(false);
+
+    resumeWriteOffset = transport.bidi[0]!.writtenBytes().length;
+    transport.bidi[0]!.push(codec18.encode({ type: 'REQUEST_UPDATE', requestId: 3n, parameters: forwardParams(1n) } as never));
+    await flush();
+    expect(changes).toEqual([[requestId, false], [requestId, true]]);
+    expect(conn.getPublishForwardState(requestId)).toBe(true);
+    expect(ackVisibleAtCallback).toBe(true);
+  });
+
+  it('an omitted PUBLISH_OK FORWARD resumes an initially paused publish', async () => {
+    const { conn, transport } = await connected();
+    const changes: [bigint, boolean][] = [];
+    conn.onPublishForwardStateChange = (id, forward) => changes.push([id, forward]);
+
+    const requestId = await conn.publish(ns('a'), nm('vid'), 42n, {
+      parameters: new Map([[MessageParam.FORWARD, [varint(0n)]]]),
+    });
+    expect(conn.getPublishForwardState(requestId)).toBe(false);
+
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'REQUEST_OK', requestId: 0n, parameters: new Map(),
+    } as RequestOk));
+    await flush();
+
+    expect(changes).toEqual([[requestId, true]]);
+    expect(conn.getPublishForwardState(requestId)).toBe(true);
+  });
+
+  it('refuses datagrams while Forward State is 0 and permits them after acceptance resumes', async () => {
+    const { conn, transport } = await connected();
+    const requestId = await conn.publish(ns('a'), nm('vid'), 42n, {
+      parameters: new Map([[MessageParam.FORWARD, [varint(0n)]]]),
+    });
+
+    await expect(conn.sendDatagram(42n, 0n, 0n, new Uint8Array([0x01])))
+      .rejects.toThrow(/Forward State 0/);
+    expect(transport.sentDatagrams).toEqual([]);
+
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'REQUEST_OK', requestId: 0n, parameters: new Map(),
+    } as RequestOk));
+    await flush();
+    await conn.sendDatagram(42n, 0n, 0n, new Uint8Array([0x02]));
+    expect(transport.sentDatagrams).toHaveLength(1);
+    expect(conn.getPublishForwardState(requestId)).toBe(true);
+  });
+
+  it('reports a pause before waiting for the request-stream REQUEST_OK write', async () => {
+    const { conn, transport } = await connected();
+    const requestId = await conn.publish(ns('a'), nm('vid'), 42n);
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'REQUEST_OK', requestId: 0n, parameters: new Map(),
+    } as RequestOk));
+    await flush();
+
+    const internal = conn as unknown as {
+      uniPair: { writeOnRequest(requestId: bigint, message: unknown): Promise<void> };
+    };
+    const original = internal.uniPair.writeOnRequest.bind(internal.uniPair);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    vi.spyOn(internal.uniPair, 'writeOnRequest').mockImplementation(async (id, message) => {
+      await gate;
+      await original(id, message);
+    });
+    const changes: boolean[] = [];
+    conn.onPublishForwardStateChange = (_id, forward) => changes.push(forward);
+
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'REQUEST_UPDATE', requestId: 3n,
+      parameters: new Map([[MessageParam.FORWARD, [varint(0n)]]]),
+    } as never));
+    await flush();
+
+    expect(conn.getPublishForwardState(requestId)).toBe(false);
+    expect(changes).toEqual([false]);
+    release();
+    await flush();
+    expect(changes).toEqual([false]);
+  });
+
+  it('queues REQUEST_OK before a pause observer terminalizes the publish', async () => {
+    const { conn, transport } = await connected();
+    const requestId = await conn.publish(ns('a'), nm('vid'), 42n);
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'REQUEST_OK', requestId: 0n, parameters: new Map(),
+    } as RequestOk));
+    await flush();
+
+    const writeOffset = transport.bidi[0]!.writtenBytes().length;
+    let terminal: Promise<void> | undefined;
+    conn.onPublishForwardStateChange = (_id, forward) => {
+      if (!forward) terminal = conn.publishDone(requestId, varint(0n), 'paused');
+    };
+    transport.bidi[0]!.push(codec18.encode({
+      type: 'REQUEST_UPDATE', requestId: 3n,
+      parameters: new Map([[MessageParam.FORWARD, [varint(0n)]]]),
+    } as never));
+    await flush();
+    await terminal;
+
+    const responseBytes = transport.bidi[0]!.writtenBytes().slice(writeOffset);
+    const first = codec18.decode(responseBytes, 0);
+    const second = codec18.decode(responseBytes, first.bytesRead);
+    expect([first.message.type, second.message.type]).toEqual(['REQUEST_OK', 'PUBLISH_DONE']);
+    expect(first.bytesRead + second.bytesRead).toBe(responseBytes.length);
   });
 
   it('REQUEST_OK on the PUBLISH stream is stamped to the publish requestId and keeps the stream open', async () => {

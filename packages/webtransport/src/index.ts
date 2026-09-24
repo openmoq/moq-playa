@@ -1,14 +1,16 @@
 /**
- * @moqt/webtransport — MoQT connection over WebTransport.
+ * @moqt/webtransport — MoQT connection adapter and WebTransport binding.
  * @module
  */
 
 export { MoqtConnection } from './adapter.js';
 export type { TrackSubscription, TrackSubscribeOptions, IncomingPublish } from './adapter.js';
+export type { DataStreamTerminal } from './adapter.js';
 export type {
   WebTransportLike,
   WebTransportBidirectionalStream,
   WebTransportCloseInfo,
+  MoqtSetupRouting,
 } from './types.js';
 export { MoqtConnectionError } from './adapter-error.js';
 export type { MoqtConnectionErrorSource, MoqtConnectionErrorOptions } from './adapter-error.js';

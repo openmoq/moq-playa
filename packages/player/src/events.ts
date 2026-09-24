@@ -17,6 +17,7 @@
 import type { PlayerStateValue } from './state.js';
 import type { RecoveryAction, DecoderCommand } from '@moqt/playback';
 import type { CatalogState, SapTimelineEntry, EventTimelineRecord } from '@moqt/msf';
+import type { EmsgEvent } from '@moqt/locmaf';
 import type { PlayerError } from './errors.js';
 
 // ─── Session Events ──────────────────────────────────────────────────
@@ -183,8 +184,9 @@ export interface SkipForwardEvent {
 }
 
 /**
- * A/V sync drift detected.
- * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp)
+ * Video presentation-schedule drift: the renderer missed the exact time a
+ * frame was scheduled to present. Measured as `actual - scheduled` on the local
+ * clock. For actual audio/video skew see `sync_skew`.
  */
 export interface SyncDriftEvent {
   readonly type: 'sync_drift';
@@ -243,6 +245,10 @@ export interface PartialGroupAbandonedEvent {
  *   from the live edge.
  * - `track_restart` — the media-liveness ladder restarted a starved track's
  *   delivery (REQUEST_UPDATE refresh or full resubscribe).
+ * - `track_resubscribe` — the publisher ended the subscription for a reason
+ *   the player recovers from by replacing it. The logical track stays
+ *   selected, so this is NOT a `track_unsubscribed`; `trigger` names the
+ *   reason so an application can tell backpressure from anything else.
  */
 export type PlayerRecoveryAction =
   | RecoveryAction
@@ -252,6 +258,17 @@ export type PlayerRecoveryAction =
     readonly mediaType: 'video' | 'audio';
     readonly trackName: string;
     readonly attempt: number;
+  }
+  | {
+    /**
+     * A replacement subscription was started after PUBLISH_DONE.
+     * @see draft-ietf-moq-transport-16 §13.4.3 (TOO_FAR_BEHIND)
+     * @see draft-ietf-moq-transport-18 §15.10.3 (renumbered)
+     */
+    readonly type: 'track_resubscribe';
+    readonly trigger: 'too_far_behind';
+    readonly trackName: string;
+    readonly mediaType: 'video' | 'audio';
   };
 
 /**
@@ -314,7 +331,12 @@ export interface FirstFrameEvent {
 }
 
 /**
- * Playback stalled — no frames rendered for longer than threshold.
+ * Playback stall **detected** — nothing rendered for longer than the
+ * threshold.
+ *
+ * `durationMs` is the elapsed time when detection fired, not the length of the
+ * outage: the episode is still in progress. Wait for {@link StallRecoveredEvent}
+ * for the completed duration.
  */
 export interface StallEvent {
   readonly type: 'stall';
@@ -322,6 +344,18 @@ export interface StallEvent {
   /** Set when the stall was caused by missing source media that the MSE
    *  adapter resolved by a gap-jump — NOT a bandwidth signal. */
   readonly cause?: 'media-gap';
+}
+
+/**
+ * A detected stall ended with genuine playback recovery.
+ *
+ * Emitted once per detected episode, carrying the **full** outage length.
+ * An episode cancelled by pause, seek, or destroy never emits this.
+ */
+export interface StallRecoveredEvent {
+  readonly type: 'stall_recovered';
+  /** Full outage length, from stall onset to recovery. */
+  readonly durationMs: number;
 }
 
 /**
@@ -539,6 +573,28 @@ export interface EventTimelineReceivedEvent {
   readonly records: EventTimelineRecord[];
 }
 
+/**
+ * Timed events carried by a LOCMAF event-only track: the `emsg` boxes that
+ * rode as genBox elements ahead of one chunk's header, parsed. A version-0
+ * emsg's presentation time is a delta from this chunk's
+ * `baseMediaDecodeTime`; a version-1 emsg's is absolute.
+ *
+ * @see draft-einarsson-moq-locmaf-01 §8, §14 (Event-Only Tracks)
+ */
+export interface LocmafEventReceivedEvent {
+  readonly type: 'locmaf_event';
+  /** Name of the locmaf track in the catalog. */
+  readonly trackName: string;
+  readonly groupId: bigint;
+  readonly objectId: bigint;
+  /** The track's timescale (mdhd), which the chunk's decode time is in. */
+  readonly timescale: number;
+  /** The chunk's tfdt base media decode time. */
+  readonly baseMediaDecodeTime: bigint;
+  /** The chunk's emsg boxes, in order. */
+  readonly events: readonly EmsgEvent[];
+}
+
 // ─── Seek Events ────────────────────────────────────────────────────
 
 /**
@@ -622,6 +678,7 @@ export interface PlayerEventMap {
   // Rendering
   first_frame: FirstFrameEvent;
   stall: StallEvent;
+  stall_recovered: StallRecoveredEvent;
   gap_jump: GapJumpEvent;
   quality_switching: QualitySwitchingEvent;
   quality_switched: QualitySwitchedEvent;
@@ -642,6 +699,7 @@ export interface PlayerEventMap {
   // SAP / Event Timeline
   sap_event: SapEventReceivedEvent;
   event_timeline: EventTimelineReceivedEvent;
+  locmaf_event: LocmafEventReceivedEvent;
 
   // Seek
   seeking: SeekingEvent;

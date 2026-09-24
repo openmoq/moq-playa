@@ -12,9 +12,9 @@
  * @module
  */
 
-import type { ControlMessage, ObjectDatagram, DataStreamHeader, QlogEvent } from '@moqt/transport';
+import type { ControlMessage, ObjectDatagram, DataStreamHeader, QlogEvent, SubgroupHeader } from '@moqt/transport';
 import type { MoqtObject } from '@moqt/transport';
-import type { MoqtConnection } from '@moqt/webtransport';
+import type { DataStreamTerminal, MoqtConnection } from '@moqt/webtransport';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -24,8 +24,18 @@ export interface ConnectionHandlers {
   onClose: (error?: number, reason?: string) => void;
   onError: (error: Error) => void;
   onObject: (streamId: bigint, obj: MoqtObject) => void;
-  onStreamClosed: (streamId: bigint, error?: number) => void;
+  /**
+   * A data stream ended. `terminal` classifies HOW: only `'fin'` is evidence
+   * the peer finished it — `error` is undefined for our own cancellation and
+   * for a generic read failure too.
+   */
+  onStreamClosed: (streamId: bigint, error: number | undefined, terminal: DataStreamTerminal) => void;
   onDataStream: (streamId: bigint, header: DataStreamHeader) => void;
+  /**
+   * Graceful subgroup FIN, with the finally resolved header. `onStreamClosed`
+   * classifies its own terminal, but carries no header.
+   */
+  onSubgroupFin?: (streamId: bigint, header: SubgroupHeader) => void;
   onNamespaceMessage: (requestId: bigint, msg: ControlMessage) => void;
   onDatagram: (datagram: ObjectDatagram) => void;
   onQlogEvent?: (event: QlogEvent) => void;
@@ -67,8 +77,8 @@ export function wireConnectionCallbacks(
     handlers.onObject(streamId, obj);
   };
 
-  conn.onStreamClosed = (streamId: bigint, error?: number) => {
-    handlers.onStreamClosed(streamId, error);
+  conn.onStreamClosed = (streamId: bigint, error: number | undefined, terminal: DataStreamTerminal) => {
+    handlers.onStreamClosed(streamId, error, terminal);
   };
 
   conn.onDataStream = (streamId: bigint, header: DataStreamHeader) => {
@@ -83,6 +93,9 @@ export function wireConnectionCallbacks(
     handlers.onDatagram(datagram);
   };
 
+  if (handlers.onSubgroupFin) {
+    conn.onSubgroupFin = handlers.onSubgroupFin;
+  }
   if (handlers.onQlogEvent) {
     conn.onQlogEvent = handlers.onQlogEvent;
   }

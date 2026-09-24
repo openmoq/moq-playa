@@ -45,6 +45,7 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
   private lastCodec = '';
   private lastSampleRate = 48000;
   private lastChannels = 2;
+  private lastDescription: Uint8Array | null = null;
 
   /** Whether the codec is AAC (needs ADTS wrapping). */
   private isAAC = false;
@@ -63,11 +64,10 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
   // ─── AudioDecoderLike ───────────────────────────────────────────
 
   /**
-   * Configure the decoder with codec metadata from MSF catalog.
+   * Configure the decoder with codec metadata from the MSF catalog or a LOC Audio Config property.
    *
-   * For AAC codecs, configures in ADTS mode (no description) because
-   * Chrome's platform decoders (AudioToolbox on macOS, Media Foundation
-   * on Windows) are more reliable with ADTS-framed data.
+   * AAC uses raw access units when description bytes are provided; otherwise
+   * it uses ADTS framing with catalog sample-rate and channel metadata.
    *
    * @param config Codec-specific configuration bytes (may be empty for Opus).
    * @param codec Codec string from MSF catalog (e.g., "mp4a.40.2", "opus").
@@ -79,11 +79,16 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
    * @see draft-ietf-moq-msf-00 §5.1.26 (channelConfig)
    * @see W3C AAC WebCodecs Registration §2 (ADTS mode)
    */
-  configure(_config: Uint8Array, codec: string, sampleRate?: number, channels?: number): void {
+  configure(config: Uint8Array, codec: string, sampleRate?: number, channels?: number): void {
     this.lastCodec = codec;
     this.lastSampleRate = sampleRate ?? 48000;
     this.lastChannels = channels ?? 2;
-    this.isAAC = codec.startsWith('mp4a.');
+    this.lastDescription = config.length > 0 ? config.slice() : null;
+    // AAC without a description runs in ADTS mode (client-side framing).
+    // With an Audio Config description the payload is raw access units.
+    // @see draft-ietf-moq-loc-04 §2.3.3.1
+    // @see W3C AAC WebCodecs Registration §2
+    this.isAAC = codec.startsWith('mp4a.') && this.lastDescription === null;
     this.errorCount = 0;
 
     this.createDecoder();
@@ -153,10 +158,9 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
   /** Release all resources. */
   destroy(): void {
     this.renderTimeQueue.length = 0;
-    if (this.decoder && this.decoder.state !== 'closed') {
-      this.decoder.close();
-    }
+    const decoder = this.decoder;
     this.decoder = null;
+    if (decoder && decoder.state !== 'closed') decoder.close();
     this.onData = null;
     this.onError = null;
   }
@@ -164,13 +168,14 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
   // ─── Internal ──────────────────────────────────────────────────
 
   private createDecoder(): void {
-    if (this.decoder && this.decoder.state !== 'closed') {
-      this.decoder.close();
-    }
+    const previous = this.decoder;
+    this.decoder = null;
+    this.renderTimeQueue.length = 0;
+    if (previous && previous.state !== 'closed') previous.close();
 
-    this.decoder = new AudioDecoder({
+    const decoder = new AudioDecoder({
       output: (audioData: AudioData) => {
-        if (!this.onData) {
+        if (this.decoder !== decoder || !this.onData) {
           // No consumer wired — MUST close to release native memory.
           audioData.close();
           return;
@@ -179,27 +184,31 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
         this.onData(audioData, renderTimeUs);
       },
       error: (err: DOMException) => {
+        if (this.decoder !== decoder) return;
         this.errorCount++;
-        this.onError?.(new Error(err.message));
 
         // Chunks in flight died with the failed decoder — discard their
         // queued render times. Leaving them would pair every later output
         // with a stale entry, drifting audio permanently behind (A/V desync).
         this.renderTimeQueue.length = 0;
+        this.onError?.(new Error(err.message));
 
         // Decoder enters 'closed' state on error — recreate.
         // Each audio frame is independently decodable (LOC §4.1),
         // so we can continue from the next frame.
-        this.createDecoder();
+        if (this.decoder === decoder) this.createDecoder();
       },
     });
+    this.decoder = decoder;
 
-    // Configure in ADTS mode for AAC (no description → ADTS framing expected).
+    // AAC with an Audio Config description runs in raw mode via `description`
+    // (payload is raw access units); AAC without one uses ADTS framing.
     // Non-AAC codecs (Opus) use raw mode with the codec string.
     const audioConfig: AudioDecoderConfig = {
       codec: this.lastCodec,
       sampleRate: this.lastSampleRate,
       numberOfChannels: this.lastChannels,
+      ...(this.lastDescription ? { description: this.lastDescription } : {}),
     };
 
     this.decoder.configure(audioConfig);

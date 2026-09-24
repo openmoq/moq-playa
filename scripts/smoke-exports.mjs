@@ -32,7 +32,9 @@ mkdirSync(consumerDir);
 const packages = [
   ['transport',    '@moqt/transport'],
   ['webtransport', '@moqt/webtransport'],
+  ['quic',          '@moqt/quic'],
   ['loc',          '@moqt/loc'],
+  ['locmaf',       '@moqt/locmaf'],
   ['msf',          '@moqt/msf'],
   ['playback',     '@moqt/playback'],
   ['player',       '@moqt/player'],
@@ -121,7 +123,9 @@ console.log('Root imports (must succeed):');
 
 testImport('@moqt/transport',       `import '@moqt/transport'`);
 testImport('@moqt/webtransport',    `import '@moqt/webtransport'`);
+testImport('@moqt/quic',            `import '@moqt/quic'`);
 testImport('@moqt/loc',             `import '@moqt/loc'`);
+testImport('@moqt/locmaf',          `import '@moqt/locmaf'`);
 testImport('@moqt/msf',             `import '@moqt/msf'`);
 testImport('@moqt/playback',        `import '@moqt/playback'`);
 testImport('@moqt/player',          `import '@moqt/player'`);
@@ -134,6 +138,7 @@ console.log('\nNamed exports from roots (must succeed):');
 
 testImport('MoqtConnection',     `import { MoqtConnection } from '@moqt/webtransport'; if (!MoqtConnection) throw 1;`);
 testImport('MoqtConnectionError', `import { MoqtConnectionError } from '@moqt/webtransport'; if (!MoqtConnectionError) throw 1;`);
+testImport('connectQuic',         `import { connectQuic, parseMoqtUri } from '@moqt/quic'; if (typeof connectQuic !== 'function') throw 1; if (parseMoqtUri('moqt://example.com/moq').setup.path !== '/moq') throw 1;`);
 testImport('MoqtPlayer',         `import { MoqtPlayer } from '@moqt/player'; if (!MoqtPlayer) throw 1;`);
 testImport('checkSupport',       `import { checkSupport } from '@moqt/player'; if (!checkSupport) throw 1;`);
 testImport('PlayerErrorCode',    `import { PlayerErrorCode } from '@moqt/player'; if (!PlayerErrorCode) throw 1;`);
@@ -142,6 +147,14 @@ testImport('Session',            `import { Session } from '@moqt/transport'; if 
 testImport('parseCatalog',       `import { parseCatalog } from '@moqt/msf'; if (!parseCatalog) throw 1;`);
 testImport('PlaybackPipeline',   `import { PlaybackPipeline } from '@moqt/playback'; if (!PlaybackPipeline) throw 1;`);
 testImport('parseLocHeaders',    `import { parseLocHeaders } from '@moqt/loc'; if (!parseLocHeaders) throw 1;`);
+testImport('LocmafTrackDecoder', `import { LocmafTrackDecoder, deserializeLocmafObject, LOCMAF_VERSION } from '@moqt/locmaf'; if (typeof LocmafTrackDecoder !== 'function' || typeof deserializeLocmafObject !== 'function') throw 1; if (LOCMAF_VERSION !== '0.3') throw 1;`);
+
+// ── Trace recorder exports (docs/playout-trace.md) ───────────────
+
+console.log('\nTrace recorder public surface:');
+
+testImport('TraceRecorder constructs and dumps', `import { TraceRecorder, DEFAULT_TRACE_LIMITS, PLAYA_EVENT_SCHEMA, LOGLEVEL_EVENT_SCHEMA, formatLogMessage } from '@moqt/player'; if (typeof TraceRecorder !== 'function') throw 1; if (typeof formatLogMessage !== 'function') throw 1; if (typeof DEFAULT_TRACE_LIMITS?.denseMaxAgeMs !== 'number') throw 1; if (PLAYA_EVENT_SCHEMA !== 'https://openmoq.org/082026/playa') throw 1; if (LOGLEVEL_EVENT_SCHEMA !== 'urn:ietf:params:qlog:events:loglevel') throw 1; const r = new TraceRecorder({ clock: { clock_id: 'smoke', clock_type: 'monotonic', now: () => 0 }, runId: 'smoke', eventSchemas: ['urn:ietf:params:qlog:events:moqt-06'], enabled: true }); r.record('moqt:a', {}); if (!r.dump().includes('playa:trace_window')) throw 1;`);
+testImport('assertEventName', `import { assertEventName } from '@moqt/transport'; if (typeof assertEventName !== 'function') throw 1; assertEventName('moqt:stream_type_set'); let threw = false; try { assertEventName('unnamespaced'); } catch { threw = true; } if (!threw) throw 1;`);
 
 // ── Deep imports (must FAIL) ─────────────────────────────────────────
 
@@ -150,6 +163,7 @@ console.log('\nDeep imports (must be blocked by exports maps):');
 testImport('@moqt/browser/dist/mse-adapter.js',          `import '@moqt/browser/dist/mse-adapter.js'`, false);
 testImport('@moqt/player/dist/player.js',                `import '@moqt/player/dist/player.js'`, false);
 testImport('@moqt/webtransport/dist/adapter.js',         `import '@moqt/webtransport/dist/adapter.js'`, false);
+testImport('@moqt/quic/dist/connect.js',                  `import '@moqt/quic/dist/connect.js'`, false);
 testImport('@moqt/transport/dist/session/session.js',    `import '@moqt/transport/dist/session/session.js'`, false);
 testImport('@moqt/browser/dist/codec-strategy-h264.js',  `import '@moqt/browser/dist/codec-strategy-h264.js'`, false);
 testImport('@moqt/playback/dist/pipeline.js',            `import '@moqt/playback/dist/pipeline.js'`, false);

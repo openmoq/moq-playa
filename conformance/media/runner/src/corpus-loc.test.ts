@@ -7,11 +7,16 @@ import type { PropertyMapEntryJson, PropertyMapInput, WireProfile } from './sche
 
 const loaded = loadDomain('loc');
 
+it('categorizes an invalid LOC-04 input before encoding', () => {
+  expect(runLocEncode([{ id: '8', valueKind: 'varint', value: '0' }], 'd18-delta-vi64', 4))
+    .toEqual({ status: 'error', category: 'loc-malformed' });
+});
+
 describe('corpus/loc — executable loc-properties (A+B against parseLocHeaders)', () => {
   const props = loaded.vectors.filter((v) => v.entry.kind === 'loc-properties');
 
   it('has the expected number of loc-properties vectors', () => {
-    expect(props.length).toBe(28); // 10 correct-d16 + 9 d18 decode drivers + 9 d18 encode drivers
+    expect(props.length).toBe(47); // 10 correct-d16 + 9 d18 decode drivers + 9 d18 encode drivers + 19 LOC-04
   });
 
   for (const { entry, bytes } of props) {
@@ -21,8 +26,8 @@ describe('corpus/loc — executable loc-properties (A+B against parseLocHeaders)
       let actual;
       if (entry.expect.stage === 'encode') {
         // Encode driver: run encodeLocHeaders from the propertyMap input.
-        const pm = (entry.input as PropertyMapInput).propertyMap;
-        actual = runLocEncode(pm, wireProfile);
+        const input = entry.input as PropertyMapInput;
+        actual = runLocEncode(input.propertyMap, wireProfile, input.locVersion);
       } else {
         expect(bytes).toBeInstanceOf(Uint8Array);
         actual = runLocProperties(bytes!, wireProfile);

@@ -144,6 +144,9 @@ export { QualityController } from './quality-controller.js';
 export type { QualityControllerConfig, SelectionConstraints, SelectedTracks } from './quality-controller.js';
 /** @experimental Advanced API — may change between minor versions. */
 export { SubscriptionManager } from './subscription-manager.js';
+export type { TrackPackaging } from './subscription-manager.js';
+export { isMsePackaging, usesMsePath } from './packaging.js';
+export type { LocmafDecoding } from './packaging.js';
 
 // ─── Watchdog (diagnostics) ─────────────────────────────────────────
 
@@ -151,3 +154,13 @@ export { SubscriptionManager } from './subscription-manager.js';
 export { WatchdogController } from './watchdog.js';
 /** @experimental Advanced API — may change between minor versions. */
 export type { WatchdogOptions, WatchdogTimeout, WatchdogWarning } from './watchdog.js';
+
+// ─── Trace recorder (docs/playout-trace.md) ─────────────────────────
+export {
+  TraceRecorder,
+  DEFAULT_TRACE_LIMITS,
+  PLAYA_EVENT_SCHEMA,
+  LOGLEVEL_EVENT_SCHEMA,
+  formatLogMessage,
+} from './trace-recorder.js';
+export type { TraceLimits, TraceLane, TraceRecorderOptions } from './trace-recorder.js';

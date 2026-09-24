@@ -379,6 +379,84 @@ async function flush(): Promise<void> {
 
 // ─── Tests ────────────────────────────────────────────────────────
 
+describe('MseMediaSource — attachment (sourceopen) reporting', () => {
+    it('attached is false until sourceopen creates the SourceBuffers, then onAttached fires once', async () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const onAttached = vi.fn();
+        adapter.onAttached = onAttached;
+        expect(adapter.attached).toBe(false);
+
+        // Browsers defer the attachment while the tab is hidden: initialize()
+        // must not claim attachment before sourceopen.
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        expect(adapter.attached).toBe(false);
+        expect(onAttached).not.toHaveBeenCalled();
+        // …and appendChunk() has nothing to append to yet (dropped, logged once).
+        adapter.appendChunk('video', new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]), 'v');
+        expect(currentMs.addSourceBufferCalls).toEqual([]);
+
+        currentMs.open();
+        expect(adapter.attached).toBe(true);
+        expect(onAttached).toHaveBeenCalledTimes(1);
+        expect(currentMs.addSourceBufferCalls).toHaveLength(1);
+        await flush();
+    });
+
+    it('attached is true immediately when the MediaSource is already open at initialize()', () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const onAttached = vi.fn();
+        adapter.onAttached = onAttached;
+        currentMs.open();
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        expect(adapter.attached).toBe(true);
+        expect(onAttached).toHaveBeenCalledTimes(1);
+    });
+
+    it('reset() clears attached; a re-initialize re-attaches', async () => {
+        const { adapter } = await makeReadyAdapter();
+        expect(adapter.attached).toBe(true);
+        adapter.reset();
+        expect(adapter.attached).toBe(false);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        expect(adapter.attached).toBe(true); // MediaSource still open → synchronous doInit
+        await flush();
+    });
+
+    it('reset invalidates a sourceopen deferred by the old initialization', () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const onAttached = vi.fn();
+        adapter.onAttached = onAttached;
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+
+        adapter.reset();
+        currentMs.open();
+
+        expect(adapter.attached).toBe(false);
+        expect(onAttached).not.toHaveBeenCalled();
+        expect(currentMs.addSourceBufferCalls).toEqual([]);
+        expect(currentMs.listenerCount('sourceopen')).toBe(0);
+    });
+
+    it('destroy invalidates a deferred sourceopen and clears its callback', () => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        const onAttached = vi.fn();
+        adapter.onAttached = onAttached;
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+
+        adapter.destroy();
+        currentMs.open();
+
+        expect(onAttached).not.toHaveBeenCalled();
+        expect(adapter.onAttached).toBeNull();
+        expect(currentMs.addSourceBufferCalls).toEqual([]);
+        expect(currentMs.listenerCount('sourceopen')).toBe(0);
+    });
+});
+
 describe('MseMediaSource — timeline-owned append integration', () => {
     it('non-overlapping segments both get appended', async () => {
         const { adapter, vsb } = await makeReadyAdapter();
@@ -3078,12 +3156,17 @@ describe('buffered-hole gap-jump', () => {
         // First real progress past the landing clears the episode…
         video.currentTime = 20.0;
         (adapter as any).handleTimeUpdate();
-        // …after which a genuine stall reports normally.
-        (adapter as any).handleWaiting();
-        video.currentTime = 20.5;
-        (adapter as any).handleTimeUpdate();
-        expect(stalls).toHaveLength(2);
-        expect(stalls[1].cause).toBeUndefined();
+        // …after which a genuine stall reports normally. Detection is the
+        // explicit threshold now; a `timeupdate` is not a stall signal.
+        vi.useFakeTimers();
+        try {
+          (adapter as any).handleWaiting();
+          vi.advanceTimersByTime(300);
+          expect(stalls).toHaveLength(2);
+          expect(stalls[1].cause).toBeUndefined();
+        } finally {
+          vi.useRealTimers();
+        }
     });
 
     it('a growing next range does not restart the wait (nextRangeEnd excluded from identity)', () => {
@@ -3202,13 +3285,20 @@ describe('buffered-hole gap-jump', () => {
         (adapter as any).handleWaiting();                              // the ONLY waiting (seek-generated)
         check(3_100);
         check(4_100);                                                  // fallback expiry restores the evidence
-        // No further waiting ever fires. When the playhead finally moves,
-        // the frozen span still reports as a genuine stall.
+        // No further waiting ever fires. The single suppressed waiting still
+        // owns an episode, so the explicit threshold reports it as a genuine
+        // stall without needing a second waiting.
         video.currentTime = 19.9;
         video.seekCount = 1;                                           // manual move isn't an adapter seek
-        (adapter as any).handleTimeUpdate();
-        expect(stalls).toHaveLength(2);
-        expect(stalls[1].cause).toBeUndefined();
+        vi.useFakeTimers();
+        try {
+          (adapter as any).armStallDetection();
+          vi.advanceTimersByTime(300);
+          expect(stalls).toHaveLength(2);
+          expect(stalls[1].cause).toBeUndefined();
+        } finally {
+          vi.useRealTimers();
+        }
     });
 
     it('a failed landing with a single suppressed waiting reaches a bounded fatal (no wedge eligibility needed)', () => {

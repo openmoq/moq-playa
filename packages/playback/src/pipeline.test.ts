@@ -8,7 +8,7 @@
  * @see draft-ietf-moq-transport-16 §10.2.1.1 (Object Status)
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { PlaybackPipeline } from './pipeline.js';
 import { SyncController } from './sync.js';
 import { DefaultRecoveryController } from './recovery.js';
@@ -1092,16 +1092,19 @@ describe('PlaybackPipeline', () => {
 
             const { pipeline } = createPipeline({ mediaType: 'video', clock, sync });
 
-            // Report actual render time
+            // Presentation-schedule drift: actual minus the SCHEDULED time
+            // carried with the frame. (Previously this compared against the
+            // uncushioned PTS time, which reported the deliberate playout
+            // cushion as drift on every frame.)
             pipeline.handleFeedback({
                 type: 'frame_rendered',
                 mediaType: 'video',
                 captureTimestampUs: 1_000_100_000n,
-                actualRenderUs: 5_100_500, // 500µs off from expected
+                scheduledRenderUs: 5_100_000,
+                actualRenderUs: 5_100_500, // 500µs later than scheduled
             });
 
-            // Drift should be updated
-            expect(sync.currentDriftUs).not.toBe(0);
+            expect(sync.currentDriftUs).toBe(500);
         });
 
         it('emits sync_drift when drift exceeds threshold', () => {
@@ -1115,19 +1118,20 @@ describe('PlaybackPipeline', () => {
 
             const { pipeline, events } = createPipeline({ mediaType: 'video', clock, sync });
 
-            // Report a render time with massive drift (>500ms)
+            // Presented 600ms later than scheduled — real schedule lateness.
             pipeline.handleFeedback({
                 type: 'frame_rendered',
                 mediaType: 'video',
                 captureTimestampUs: 1_000_100_000n,
-                actualRenderUs: 5_700_000, // expected ~5_100_000, so drift ~600_000
+                scheduledRenderUs: 5_100_000,
+                actualRenderUs: 5_700_000,
             });
 
             const driftEvt = events.find(e => e.type === 'sync_drift');
             expect(driftEvt).toBeDefined();
         });
 
-        it('no sync_drift when drift below threshold', () => {
+        it('no sync_drift when the renderer reports no schedule', () => {
             const clock = new MockClock();
             clock.set(5_000_000);
             const sync = new SyncController({
@@ -1138,42 +1142,19 @@ describe('PlaybackPipeline', () => {
 
             const { pipeline, events } = createPipeline({ mediaType: 'video', clock, sync });
 
-            // Report a render time with small drift (<500ms)
+            // An actual presentation time alone is not measurable: without the
+            // frame's scheduled time there is nothing to compare it against.
             pipeline.handleFeedback({
                 type: 'frame_rendered',
                 mediaType: 'video',
                 captureTimestampUs: 1_000_100_000n,
-                actualRenderUs: 5_100_100, // ~100µs drift — well within threshold
+                actualRenderUs: 5_100_100,
             });
 
             const driftEvt = events.find(e => e.type === 'sync_drift');
             expect(driftEvt).toBeUndefined();
         });
 
-        it('ignores frame_rendered with zero captureTimestampUs', () => {
-            const clock = new MockClock();
-            clock.set(5_000_000);
-            const sync = new SyncController({
-                driftThresholdUs: 500_000,
-                clock,
-            });
-            sync.setAudioReference(1_000_000_000n);
-
-            const { pipeline, events } = createPipeline({ mediaType: 'video', clock, sync });
-
-            // Report with 0n — e.g., CanvasRenderer doesn't track capture timestamps
-            pipeline.handleFeedback({
-                type: 'frame_rendered',
-                mediaType: 'video',
-                captureTimestampUs: 0n,
-                actualRenderUs: 5_100_000,
-            });
-
-            // Drift should NOT be updated (0n guard)
-            expect(sync.currentDriftUs).toBe(0);
-            // No sync_drift event
-            expect(events.find(e => e.type === 'sync_drift')).toBeUndefined();
-        });
 
         it('flush_complete is no-op', () => {
             const clock = new MockClock();
@@ -1355,11 +1336,12 @@ describe('PlaybackPipeline', () => {
             pipeline.tick();
             expect(sync.hasReference).toBe(true);
 
-            // Simulate drift
+            // Simulate real schedule lateness (presented 300ms after schedule).
             clock.set(5_700_000);
             pipeline.handleFeedback({
                 type: 'frame_rendered',
                 captureTimestampUs: 1_000_400_000n,
+                scheduledRenderUs: 5_400_000,
                 actualRenderUs: 5_700_000,
             });
 
@@ -1399,15 +1381,16 @@ describe('PlaybackPipeline', () => {
 
             pipeline.configure(new Uint8Array([0x01]));
 
-            // Simulate drift
+            // Simulate real schedule lateness (presented 300ms after schedule).
             clock.set(5_700_000);
             pipeline.handleFeedback({
                 type: 'frame_rendered',
                 captureTimestampUs: 1_000_400_000n,
+                scheduledRenderUs: 5_400_000,
                 actualRenderUs: 5_700_000,
             });
 
-            expect(sync.needsResync).toBe(true);
+            expect(sync.presentationDriftExceeded).toBe(true);
 
             // Push a video keyframe — should NOT re-anchor (that's audio's job)
             pipeline.pushObject(
@@ -1416,10 +1399,9 @@ describe('PlaybackPipeline', () => {
             );
             pipeline.tick();
 
-            // Video doesn't reset the audio sync reference.
-            // needsResync may be suppressed during video join phase (offset active),
-            // but the audio reference (localBaselineUs/captureBaselineUs) is unchanged.
-            // Verify the drift value itself is still large (reference wasn't reset).
+            // A video keyframe resets neither the audio sync reference
+            // (localBaselineUs/captureBaselineUs) nor the recorded schedule
+            // drift — the large value below proves the reference stood.
             expect(Math.abs(sync.currentDriftUs)).toBeGreaterThan(200_000);
         });
     });
@@ -2019,5 +2001,96 @@ describe('PlaybackPipeline', () => {
             const decodes = commands.filter(c => c.type === 'decode_audio');
             expect(decodes.length).toBe(1);
         });
+    });
+
+    describe('PlaybackPipeline — media-time timestamps', () => {
+        it('adapts equally to arrival jitter for wall-clock and media-time timestamp epochs', () => {
+            const run = (isWallClock: boolean) => {
+                const clock = new MockClock();
+                const { pipeline } = createPipeline({
+                    mediaType: 'audio', clock,
+                    config: { ...DEFAULT_CONFIG, adaptiveTolerance: true },
+                });
+                const epoch = isWallClock ? 1_800_000_000_000_000n : 0n;
+                for (let i = 0; i < 30; i++) {
+                    clock.advance(i % 2 === 0 ? 20_000 : 270_000);
+                    pipeline.pushObject(makeData(i, 0), {
+                        captureTimestamp: epoch + BigInt(i) * 20_000n,
+                        timestampIsWallClock: isWallClock,
+                    });
+                }
+                return pipeline.effectiveGapTimeoutUs;
+            };
+            expect(run(false)).toBeCloseTo(run(true), 0);
+        });
+
+        it('does not measure wall-clock latency when timestampIsWallClock is false', () => {
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const config: PlaybackConfig = { ...DEFAULT_CONFIG, adaptiveTolerance: true };
+            const { pipeline, sync } = createPipeline({ mediaType: 'audio', clock, config });
+            const spy = vi.spyOn(sync, 'evaluateCatchUp');
+
+            pipeline.pushObject(makeData(1, 0), { captureTimestamp: 1_000_000n, timestampIsWallClock: false });
+            pipeline.tick();
+
+            expect(spy).toHaveBeenCalledWith(1_000_000n, false);
+            expect(sync.latencyUs).toBe(0);
+        });
+
+        it('a timescale-bearing stream schedules like its microsecond equivalent', () => {
+            const clockA = new MockClock();
+            const clockB = new MockClock();
+            const a = createPipeline({ mediaType: 'audio', clock: clockA });
+            const b = createPipeline({ mediaType: 'audio', clock: clockB });
+
+            a.pipeline.configure(new Uint8Array([0x01]));
+            b.pipeline.configure(new Uint8Array([0x01]));
+
+            for (let i = 0; i < 3; i++) {
+                a.pipeline.pushObject(makeData(i, 0), { captureTimestamp: BigInt(i) * 20_000n, timestampIsWallClock: true });
+                b.pipeline.pushObject(makeData(i, 0), {
+                    timestamp: BigInt(i) * 960n,
+                    timescale: 48_000n,
+                    captureTimestamp: BigInt(i) * 20_000n,
+                    timestampIsWallClock: false,
+                });
+            }
+            a.pipeline.tick();
+            b.pipeline.tick();
+
+            const renderA = a.commands.filter(c => c.type === 'decode_audio').map(c => c.renderTimeUs);
+            const renderB = b.commands.filter(c => c.type === 'decode_audio').map(c => c.renderTimeUs);
+            expect(renderA.length).toBe(3);
+            expect(renderB).toEqual(renderA);
+        });
+    });
+});
+
+describe('PlaybackPipeline — LOC-04 Audio Config', () => {
+    it('emits configure once for repeated identical audioConfig', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, commands } = createPipeline({ mediaType: 'audio', clock });
+        const cfg = Uint8Array.from([0x12, 0x10]);
+        pipeline.pushObject(makeData(0, 0), { captureTimestamp: 0n, audioConfig: cfg });
+        pipeline.pushObject(makeData(1, 0), { captureTimestamp: 20_000n, audioConfig: Uint8Array.from(cfg) });
+        pipeline.tick();
+        const configures = commands.filter(c => c.type === 'configure');
+        expect(configures).toHaveLength(1);
+        expect(configures[0]).toEqual({ type: 'configure', mediaType: 'audio', config: cfg });
+    });
+
+    it('a video pipeline ignores audioConfig', () => {
+        const clock = new MockClock();
+        clock.set(5_000_000);
+        const { pipeline, commands } = createPipeline({ mediaType: 'video', clock });
+        pipeline.pushObject(makeData(0, 0), {
+            captureTimestamp: 0n,
+            audioConfig: Uint8Array.from([1]),
+            videoFrameMarking: { startOfFrame: true, endOfFrame: true, independent: true, discardable: false, baseLayerSync: false, temporalId: 0 },
+        });
+        pipeline.tick();
+        expect(commands.filter(c => c.type === 'configure')).toHaveLength(0);
     });
 });

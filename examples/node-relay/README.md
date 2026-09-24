@@ -49,7 +49,8 @@ pnpm --filter @moqt/example-node-relay client https://127.0.0.1:4433/moq
 Relay mode forwards objects from **one publisher** to **many subscribers** over a
 registered track set (a toy ABR ladder: `catalog`, `video-1080/720/360`,
 `audio-en/es`, plus the demo track), preserving each object's
-`groupId`/`subgroupId`/`objectId` and mirroring each graceful subgroup FIN. It
+`groupId`/`subgroupId`/`objectId` and raw Object Properties/Extensions, while
+mirroring each graceful subgroup FIN. It
 supports multiple subscriptions per viewer connection (one alias each), a tiny
 latest-group cache replayed to late joiners, and per-subscription cleanup when a
 viewer unsubscribes one track (ABR switch) without closing the connection.
@@ -68,7 +69,8 @@ way to backfill the current group.
 PORT=4433 pnpm --filter @moqt/example-node-relay relay-server
 
 # self-contained smokes:
-pnpm --filter @moqt/example-node-relay relay-smoke        # 1 publisher → 2 subscribers, IDs preserved
+pnpm --filter @moqt/example-node-relay relay-smoke        # 1 publisher → 2 subscribers, IDs + Properties preserved
+pnpm --filter @moqt/example-node-relay relay-load-smoke   # compare 1 vs 8 downstream subgroup lanes over real QUIC
 pnpm --filter @moqt/example-node-relay relay-media-smoke  # multi-track fanout + late join + ABR cleanup
 pnpm --filter @moqt/example-node-relay relay-fetch-smoke  # late viewer gets the current group via joining FETCH
 ```
@@ -81,15 +83,29 @@ generate a CMAF fixture from an MP4, publish it (optionally looped) into
 
 ## Limitations (toy relay, not production)
 
+- **Development scale only** — intended for one publisher and a handful of
+  subscribers. Independent subgroup streams are forwarded concurrently (up to
+  8 per subscription); a subscription retaining more than 256 objects or 4 MiB
+  of payload is treated as a slow consumer and its connection is closed rather
+  than allowing latency and memory to grow without limit. This single-process
+  example still runs on one Node event loop; sustained CPU saturation requires more
+  capacity or a production relay, and it is not intended for multiple concurrent
+  video publishers or production capacity testing.
 - **Live, latest-group cache only** — a late joiner gets the most-recent group, not
   history (no DVR, no init-segment retention policy). FETCH is served from the same
   single-group cache: ranges reaching further back truncate honestly (gaps in the
-  response indicate objects that no longer exist, §9.16.3).
+  response indicate objects that no longer exist, §9.16.3). The cache has no
+  configurable byte limit.
 - **Fixed track registry** — only the names above are routed; a catalog-driven
   registry is a possible follow-up.
 - **Data objects only** — gap/status objects (incl. `END_OF_GROUP`) are not relayed;
   graceful subgroup FIN is mirrored so downstream stream credit is returned.
-- **No route authorization, backpressure/fairness, reconnect/migration, or persistence.**
+- **Property presence is inferred from the first object in each subgroup** — if
+  properties first appear on a later object, the relay reports and drops that
+  object because the outgoing subgroup header is already fixed. LOC streams that
+  carry frame marking on every object do not hit this limitation.
+- **No route authorization, publisher-facing flow-control coordination,
+  cross-subscription fairness, reconnect/migration, or persistence.**
 - The FAILS backend does not echo an application protocol, so endpoints construct
   `MoqtConnection(18)` **explicitly** (draft auto-negotiation would fall back to 16).
 

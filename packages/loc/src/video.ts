@@ -9,6 +9,7 @@
  * @module
  */
 
+import { LocHeaderError, LocEncodeError } from './errors.js';
 import type { VideoFrameMarking } from './types.js';
 
 /**
@@ -71,6 +72,30 @@ export function parseVideoFrameMarking(value: bigint): VideoFrameMarking {
     return result;
 }
 
+// ─── Shared first-byte helpers (LOC-01 integer form and LOC-04 byte form) ──
+
+/** Read the S|E|I|D|B|TID byte shared by both forms. */
+function fromFirstByte(firstByte: number): VideoFrameMarking {
+    return {
+        startOfFrame: (firstByte & 0x80) !== 0,
+        endOfFrame: (firstByte & 0x40) !== 0,
+        independent: (firstByte & 0x20) !== 0,
+        discardable: (firstByte & 0x10) !== 0,
+        baseLayerSync: (firstByte & 0x08) !== 0,
+        temporalId: firstByte & 0x07,
+    };
+}
+
+function toFirstByte(marking: VideoFrameMarking): number {
+    let b = 0;
+    if (marking.startOfFrame) b |= 0x80;
+    if (marking.endOfFrame) b |= 0x40;
+    if (marking.independent) b |= 0x20;
+    if (marking.discardable) b |= 0x10;
+    if (marking.baseLayerSync) b |= 0x08;
+    return b | (marking.temporalId & 0x07);
+}
+
 /**
  * Encode VideoFrameMarking into a bigint value for use in a varint.
  *
@@ -80,19 +105,55 @@ export function parseVideoFrameMarking(value: bigint): VideoFrameMarking {
  * @see RFC 9626 §3.1
  */
 export function encodeVideoFrameMarking(marking: VideoFrameMarking): bigint {
-    let firstByte = 0;
-    if (marking.startOfFrame) firstByte |= 0x80;
-    if (marking.endOfFrame) firstByte |= 0x40;
-    if (marking.independent) firstByte |= 0x20;
-    if (marking.discardable) firstByte |= 0x10;
-    if (marking.baseLayerSync) firstByte |= 0x08;
-    firstByte |= marking.temporalId & 0x07;
-
+    const firstByte = toFirstByte(marking);
     if (marking.layerId !== undefined) {
-        // RFC 9626 §3.1: LID is 8 bits
-        const secondByte = marking.layerId & 0xFF;
-        return BigInt((firstByte << 8) | secondByte);
+        return BigInt((firstByte << 8) | (marking.layerId & 0xFF));
     }
-
     return BigInt(firstByte);
+}
+
+// ─── LOC-04 byte form ───────────────────────────────────────────────
+
+/**
+ * Parse the LOC-04 Video Frame Marking byte form.
+ *
+ * RFC 9626 §3.1 defines a 1-byte short header (S|E|I|D|B|TID) and a 3-byte
+ * long header that appends LID and optional TL0PICIDX. draft-04 allows 1 to 4 bytes:
+ * a 2-byte value is read as short header plus LID, and a fourth byte is
+ * accepted and ignored. Anything else is malformed.
+ *
+ * @see draft-ietf-moq-loc-04 §2.3.2.2
+ * @see RFC 9626 §3.1
+ */
+export function parseVideoFrameMarkingBytes(bytes: Uint8Array): VideoFrameMarking {
+    if (bytes.length < 1 || bytes.length > 4) {
+        throw new LocHeaderError('videoFrameMarking', `expected 1 to 4 bytes, got ${bytes.length}`);
+    }
+    const result = fromFirstByte(bytes[0]!) as { -readonly [K in keyof VideoFrameMarking]: VideoFrameMarking[K] };
+    if (bytes.length >= 2) result.layerId = bytes[1]!;
+    if (bytes.length >= 3) result.tl0PicIdx = bytes[2]!;
+    return result;
+}
+
+/**
+ * Encode 1, 2, or 3 bytes according to the fields supplied. An unknown
+ * TL0PICIDX must be omitted, not replaced with a valid index value of zero.
+ *
+ * @see draft-ietf-moq-loc-04 §2.3.2.2
+ * @see RFC 9626 §3.1
+ */
+export function encodeVideoFrameMarkingBytes(marking: VideoFrameMarking): Uint8Array {
+    for (const [field, max] of [['temporalId', 7], ['layerId', 255], ['tl0PicIdx', 255]] as const) {
+        const value = marking[field];
+        if (value !== undefined && (!Number.isInteger(value) || value < 0 || value > max)) {
+            throw new LocEncodeError(`videoFrameMarking.${field}`, `must be an integer from 0 to ${max}`);
+        }
+    }
+    if (marking.tl0PicIdx !== undefined && marking.layerId === undefined) {
+        throw new LocEncodeError('videoFrameMarking.tl0PicIdx', 'requires layerId');
+    }
+    const first = toFirstByte(marking);
+    if (marking.layerId === undefined) return Uint8Array.from([first]);
+    if (marking.tl0PicIdx === undefined) return Uint8Array.from([first, marking.layerId & 0xff]);
+    return Uint8Array.from([first, marking.layerId & 0xff, marking.tl0PicIdx & 0xff]);
 }

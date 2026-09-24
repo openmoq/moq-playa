@@ -12,9 +12,12 @@
  * demo); the smoke uses 0 (as fast as possible).
  */
 import { buildCatalog, CATALOG_TRACK_NAME } from '@moqt/msf';
+import { LOCMAF_VERSION } from '@moqt/locmaf';
 import type { MoqtConnection } from '@moqt/webtransport';
 import type { LoadedFixture, LoadedTrack } from './fixture.js';
-import { analyzeLoopSpan, rebaseTfdtCopy } from './cmaf-loop-rebase.js';
+import { TrackObjectSource, type MediaPackaging } from './track-packager.js';
+
+export type { MediaPackaging } from './track-packager.js';
 
 /**
  * Catalog wire shape to emit:
@@ -100,11 +103,22 @@ async function publishObjects(
  * rides inline as base64 `initData`; in `cmsf-01` mode the init segments become a
  * root `initDataList` and tracks reference them by `initRef` (no per-track inline
  * init). Both are built with the same @moqt/msf `buildCatalog`.
+ *
+ * `packaging` `locmaf` signals every track as `packaging: "locmaf"` with
+ * `locmafVersion` (draft-einarsson-moq-locmaf-01 section 5); the init is
+ * signalled exactly as in `cmaf` mode, since a LOCMAF receiver seeds
+ * reconstruction from the same CMAF Header (section 6).
  */
-export function buildFixtureCatalog(fixture: LoadedFixture, format: CatalogFormat = 'msf-00'): Uint8Array {
+export function buildFixtureCatalog(
+  fixture: LoadedFixture,
+  format: CatalogFormat = 'msf-00',
+  packaging: MediaPackaging = 'cmaf',
+): Uint8Array {
   const common = (t: LoadedTrack) => ({
     name: t.meta.name,
-    packaging: t.meta.packaging,
+    ...(packaging === 'locmaf'
+      ? { packaging: 'locmaf' as const, locmafVersion: LOCMAF_VERSION }
+      : { packaging: t.meta.packaging }),
     isLive: true as const,
     role: t.meta.role,
     codec: t.meta.codec,
@@ -158,23 +172,32 @@ export function buildFixtureDelta(fixture: LoadedFixture): Uint8Array | null {
  * track's chunks as a NEW group (groupId 0, 1, 2, …; object IDs 0..N-1 within each
  * group) — never a replay of group 0, so the relay's latest-group cache and the
  * player timeline stay sane. `Infinity` loops until killed.
+ *
+ * `packaging` (default `cmaf`) selects the media Object format for every track;
+ * `locmaf` sends each (rebased) CMAF chunk as one LOCMAF Object with the same
+ * group/object numbering, and fails before anything is published when a track
+ * has no usable CMAF Header.
  */
 export async function publishFixture(
   conn: MoqtConnection,
   fixture: LoadedFixture,
-  opts: { paceMs?: number; loops?: number; catalogFormat?: CatalogFormat; deltaAfterMs?: number } = {},
+  opts: { paceMs?: number; loops?: number; catalogFormat?: CatalogFormat; deltaAfterMs?: number; packaging?: MediaPackaging } = {},
 ): Promise<void> {
   const paceMs = opts.paceMs ?? 0;
   const loops = opts.loops ?? 1;
   const catalogFormat = opts.catalogFormat ?? 'msf-00';
+  const packaging = opts.packaging ?? 'cmaf';
   const ns = fixture.manifest.namespace;
   const deltaBytes = opts.deltaAfterMs !== undefined ? buildFixtureDelta(fixture) : null;
   if (opts.deltaAfterMs !== undefined && deltaBytes === null) {
     throw new Error('cannot emit catalog delta: fixture has no video track to clone');
   }
 
-  const catalogBytes = buildFixtureCatalog(fixture, catalogFormat);
-  log(`catalog built: ${catalogBytes.byteLength} bytes, ${fixture.tracks.length} tracks (${catalogFormat})`);
+  // Built before anything is sent: in locmaf mode this rejects a fixture without CMAF Headers.
+  const sources = fixture.tracks.map((t) => new TrackObjectSource(t, packaging));
+
+  const catalogBytes = buildFixtureCatalog(fixture, catalogFormat, packaging);
+  log(`catalog built: ${catalogBytes.byteLength} bytes, ${fixture.tracks.length} tracks (${catalogFormat}, ${packaging})`);
   await publishObjects(conn, ns, CATALOG_TRACK_NAME, 10n, [catalogBytes], 0);
 
   // Optional live op-array delta: after `deltaAfterMs`, publish a catalog
@@ -191,8 +214,8 @@ export async function publishFixture(
   if (loops === 1) {
     // One-shot (unchanged behavior): each track established + group 0 sent.
     let alias = 11n;
-    for (const t of fixture.tracks) {
-      await publishObjects(conn, ns, t.meta.name, alias++, t.chunks, paceMs);
+    for (const s of sources) {
+      await publishObjects(conn, ns, s.name, alias++, s.objectsForGroup(0), paceMs);
     }
     if (deltaTask) await deltaTask; // finite run: don't exit before the delta lands
     log('fixture fully published');
@@ -205,29 +228,23 @@ export async function publishFixture(
   // one endless stream instead of replaying timestamps (which wedges MSE
   // players at the seam — the timeline-overlap dropper discards replays).
   let alias = 11n;
-  const handles: { track: string; alias: bigint; chunks: readonly Uint8Array[]; spanTicks: bigint | null }[] = [];
-  for (const t of fixture.tracks) {
+  const handles: { alias: bigint; source: TrackObjectSource }[] = [];
+  for (const s of sources) {
     const a = alias++;
-    await establishTrack(conn, ns, t.meta.name, a);
-    const spanTicks = t.meta.packaging === 'cmaf' ? analyzeLoopSpan(t.chunks) : null;
-    if (t.meta.packaging === 'cmaf' && spanTicks === null) {
-      log(`NOTE: ${t.meta.name} chunks are not parseable CMAF (synthetic fixture?) — loop will replay timestamps`);
-    } else if (spanTicks !== null) {
-      log(`${t.meta.name}: loop span ${spanTicks} ticks — tfdt rebased per iteration`);
+    await establishTrack(conn, ns, s.name, a);
+    if (s.spanTicks === null) {
+      log(`NOTE: ${s.name} chunks are not parseable CMAF (synthetic fixture?) — loop will replay timestamps`);
+    } else {
+      log(`${s.name}: loop span ${s.spanTicks} ticks — tfdt rebased per iteration`);
     }
-    handles.push({ track: t.meta.name, alias: a, chunks: t.chunks, spanTicks });
+    handles.push({ alias: a, source: s });
   }
   log(`loop mode: ${handles.length} tracks established; sending ${loops === Infinity ? 'endless' : loops} group(s)`);
 
   for (let g = 0; g < loops; g++) {
     // Tracks send each group concurrently so one loop iteration ≈ one group duration.
-    await Promise.all(handles.map((h) => {
-      const chunks = (g === 0 || h.spanTicks === null)
-        ? h.chunks
-        // Always rebase from the ORIGINAL bytes — offsets never compound.
-        : h.chunks.map((c) => rebaseTfdtCopy(c, h.spanTicks! * BigInt(g)));
-      return sendGroup(conn, h.alias, BigInt(g), chunks, paceMs);
-    }));
+    // Rebased (and, in locmaf mode, encoded with a fresh group state) per iteration.
+    await Promise.all(handles.map((h) => sendGroup(conn, h.alias, BigInt(g), h.source.objectsForGroup(g), paceMs)));
     log(`group ${g} sent on ${handles.length} track(s)`);
   }
   if (deltaTask) await deltaTask; // finite loop count: ensure the delta landed

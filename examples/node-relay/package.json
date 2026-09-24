@@ -15,18 +15,19 @@
     "publisher": "tsx src/publisher.ts",
     "relay-server": "tsx src/relay-server.ts",
     "relay-smoke": "tsx src/relay-smoke.ts",
+    "relay-load-smoke": "tsx src/relay-load-smoke.ts",
     "relay-media-smoke": "tsx src/relay-media-smoke.ts",
     "relay-fetch-smoke": "tsx src/relay-fetch-smoke.ts"
   },
   "dependencies": {
     "@moqt/transport": "workspace:*",
     "@moqt/webtransport": "workspace:*",
-    "@fails-components/webtransport": "1.6.3",
-    "@fails-components/webtransport-transport-http3-quiche": "1.6.3"
+    "@fails-components/webtransport": "1.6.8",
+    "@fails-components/webtransport-transport-http3-quiche": "1.6.8"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "tsx": "^4.19.0",
+    "tsx": "^4.23.13",
     "typescript": "^5.7.0"
   }
 }

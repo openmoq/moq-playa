@@ -6,6 +6,8 @@ export const DEMO_NAMESPACE = (process.env.DEMO_NAMESPACE ?? 'demo').split('/');
 export const DEMO_TRACK = process.env.DEMO_TRACK ?? 'objects';
 export const DEMO_ALIAS = 7n;
 export const DEMO_PAYLOADS = ['hello-0', 'hello-1', 'hello-2'] as const;
+/** Opaque Object Properties bytes used to prove the relay preserves metadata. */
+export const DEMO_EXTENSIONS = new Uint8Array([0x0b, 0x03, 0x01]);
 
 /** A toy ABR-style media ladder (all under DEMO_NAMESPACE) the relay can route. */
 export const MEDIA_TRACKS = [

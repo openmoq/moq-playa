@@ -327,10 +327,12 @@ async function main(): Promise<void> {
     // stream are lost; we need the next keyframe to resume decoding.
     // @see draft-ietf-moq-transport-16 §9.2.2.2 (DELIVERY_TIMEOUT)
     // @see draft-ietf-moq-transport-16 §13.4.4 (error code 0x2)
-    connection.onStreamClosed = (_streamId, error) => {
+    connection.onStreamClosed = (_streamId, error, terminal) => {
         if (epoch !== attemptEpoch) return;
-        if (error !== undefined) {
-            log(`Stream reset: error=0x${error.toString(16)}`);
+        // Only a PEER reset loses objects. Our own cancellation and a read
+        // failure end the stream too, but neither means the decoder fell behind.
+        if (terminal === 'reset') {
+            log(`Stream reset: error=0x${error!.toString(16)}`);
             needsKeyframe = true;
         }
     };

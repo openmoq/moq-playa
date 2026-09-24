@@ -5,9 +5,11 @@
  * mapping CaptureTimestamp (wall-clock microseconds) to local clock time.
  * Video render times are computed relative to this reference.
  *
- * Drift detection: reportActualRenderTime measures the gap between expected
- * and actual render times. If drift exceeds the adaptive threshold, needsResync
+ * Drift detection: reportPresentationTiming measures VIDEO PRESENTATION SCHEDULE
+ * drift — actual presentation time minus the exact scheduled time carried with
+ * the frame. If it exceeds the adaptive threshold, presentationDriftExceeded
  * signals and a sync_drift event is emitted — but no automatic re-anchor occurs.
+ * Actual audio/video skew is a separate metric (sync_skew).
  * The reference is set once to avoid audio glitching from re-anchor jumps.
  * In practice, gap recovery (skip_forward) and seek/pause naturally re-anchor.
  *
@@ -149,9 +151,26 @@ export class SyncController {
     get driftThresholdUs(): number { return this._driftThresholdUs; }
     set driftThresholdUs(value: number) { this._driftThresholdUs = value; }
 
-    /** Whether drift exceeds the threshold and resync is recommended. */
+    /**
+     * Whether PRESENTATION SCHEDULE drift exceeds the threshold.
+     *
+     * Deliberately has NO live-join suppression. The exact queued schedule
+     * already contains the join offset, so missing that schedule during a join
+     * is a real miss. (The legacy PTS-era metric needed the suppression because
+     * the offset itself showed up as drift; see {@link needsResync}.)
+     */
+    get presentationDriftExceeded(): boolean {
+        return Math.abs(this._currentDriftUs) >= this._driftThresholdUs;
+    }
+
+    /**
+     * @deprecated Threshold check for the legacy {@link reportActualRenderTime}
+     * metric, retaining its live-join suppression. Use
+     * {@link presentationDriftExceeded} with schedule-based measurement.
+     */
     get needsResync(): boolean {
-        // Suppress during video join — the offset would look like drift
+        // Suppress during video join — under the LEGACY PTS-anchored metric the
+        // offset itself appeared as drift.
         if (this._videoJoinOffsetUs > 0) return false;
         return Math.abs(this._currentDriftUs) >= this._driftThresholdUs;
     }
@@ -275,10 +294,30 @@ export class SyncController {
     }
 
     /**
-     * Report actual render/playout time for drift detection.
+     * Record PRESENTATION SCHEDULE drift: did the renderer present the frame
+     * when it was told to?
      *
-     * @param captureTimestampUs CaptureTimestamp of the rendered frame
-     * @param actualLocalUs Actual local clock time when frame was rendered
+     * `scheduledUs` must be the EXACT timestamp stored with the rendered frame.
+     * It already accounts for the playout cushion actually applied to that
+     * frame, the live-join offset, decode-output recomputation and late-frame
+     * handling — none of which may be recomputed or subtracted later, because an
+     * adaptive cushion can move between enqueue and presentation.
+     *
+     * The schedule is REQUIRED here. Optionality lives at
+     * `FrameRenderedFeedback`, where the pipeline suppresses the whole
+     * measurement/event transaction cleanly: missing evidence is not drift.
+     *
+     * Actual audio/video skew is measured separately as `sync_skew`.
+     */
+    reportPresentationTiming(scheduledUs: number, actualUs: number): void {
+        this._currentDriftUs = actualUs - scheduledUs;
+    }
+
+    /**
+     * @deprecated Compares against the UNCUSHIONED PTS-anchored time, so a
+     * stream presenting exactly on its intended schedule reports the whole
+     * playout cushion as drift. Retained as a compatibility path only; use
+     * {@link reportPresentationTiming}.
      */
     reportActualRenderTime(captureTimestampUs: bigint, actualLocalUs: number): void {
         if (this.localBaselineUs === undefined || this.captureBaselineUs === undefined) return;
@@ -292,17 +331,21 @@ export class SyncController {
     // ─── Live Catch-Up ──────────────────────────────────────────────
 
     /**
-     * Measure end-to-end latency from CaptureTimestamp.
+     * Measure end-to-end latency from a wall-clock timestamp.
      *
-     * Compares publisher wall-clock (CaptureTimestamp) to subscriber
-     * wall-clock (Date.now()). Both in Unix epoch microseconds.
+     * Compares the publisher's wall-clock timestamp to the subscriber's
+     * wall clock, both in Unix epoch microseconds. A media-time timestamp
+     * (LOC-04 with Timescale) has no wall-clock meaning, so latency is
+     * unmeasurable and this returns null.
      *
-     * @param captureTimestampUs CaptureTimestamp in microseconds (Unix epoch)
-     * @returns Latency in microseconds, or null if timestamp is missing/zero
+     * @param captureTimestampUs Timestamp in microseconds
+     * @param isWallClock False when the timestamp is media time. Undefined means wall clock.
+     * @returns Latency in microseconds, or null if unmeasurable
      * @see draft-ietf-moq-loc-01 §2.3.1.1
+     * @see draft-ietf-moq-loc-04 §2.3.1.2
      */
-    measureLatency(captureTimestampUs: bigint): number | null {
-        if (captureTimestampUs === 0n) return null;
+    measureLatency(captureTimestampUs: bigint, isWallClock?: boolean): number | null {
+        if (captureTimestampUs === 0n || isWallClock === false) return null;
         return this.wallClock.now() - Number(captureTimestampUs);
     }
 
@@ -318,9 +361,9 @@ export class SyncController {
      * @returns CatchUpState if evaluated, null if catch-up is disabled or no timestamp
      * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
      */
-    evaluateCatchUp(captureTimestampUs: bigint): CatchUpState | null {
+    evaluateCatchUp(captureTimestampUs: bigint, isWallClock?: boolean): CatchUpState | null {
         // Measure latency
-        const latencyUs = this.measureLatency(captureTimestampUs);
+        const latencyUs = this.measureLatency(captureTimestampUs, isWallClock);
         if (latencyUs === null) return null;
 
         this._lastLatencyUs = latencyUs;

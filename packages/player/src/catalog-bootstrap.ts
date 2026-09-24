@@ -43,6 +43,7 @@
  * @module
  */
 
+import type { DataStreamTerminal } from '@moqt/webtransport';
 import type { CatalogState } from '@moqt/msf';
 
 /** Inactivity/progress deadline for an ACTIVE attempt (ms). Re-armed on every
@@ -329,7 +330,10 @@ export class CatalogBootstrap {
     const attempt = this.attempt;
     if (!attempt || attempt.id !== attemptId || attempt.cancelled) return;
     if (!clean) {
-      this.failAttempt('fetch stream reset');
+      // Only cleanliness is propagated here — a reset, our own discard, and a
+      // read failure all arrive as the same `false`, so the diagnostic must
+      // not name a cause it was not told.
+      this.failAttempt('fetch stream did not finish cleanly');
       return;
     }
     attempt.finClean = true;
@@ -431,7 +435,7 @@ export class CatalogBootstrap {
     }
   }
 
-  onLiveStreamEvent(streamId: bigint, kind: 'header' | 'fin' | 'reset'): void {
+  onLiveStreamEvent(streamId: bigint, kind: 'header' | DataStreamTerminal): void {
     if (this.inert()) return;
     // Clean-FIN evidence exists for the retained chain, i.e. for streams that
     // contributed SUFFIX entries. In the live steady state nothing is buffered,
@@ -442,6 +446,9 @@ export class CatalogBootstrap {
       if (!this.suffixStreams.has(streamId)) this.suffixStreams.set(streamId, undefined);
       return;
     }
+    // Only a peer FIN is positive evidence. A reset and our OWN discard are
+    // both non-clean, and they are kept distinct so a local teardown is never
+    // reported as a peer action.
     if (!this.suffixStreams.has(streamId)) return;
     this.suffixStreams.set(streamId, kind === 'fin');
   }

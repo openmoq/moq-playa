@@ -27,6 +27,7 @@ export interface CollectedObject {
   readonly groupId: bigint;
   readonly subgroupId: bigint;
   readonly objectId: bigint;
+  readonly extensions: Uint8Array | undefined;
   readonly payload: string;
 }
 
@@ -64,7 +65,11 @@ export async function beginSubscribe(
     onObject: (obj) => {
       if (obj.kind !== 'data') return; // ignore gap signals
       const rec: CollectedObject = {
-        groupId: obj.groupId, subgroupId: obj.subgroupId, objectId: obj.objectId, payload: td(obj.payload),
+        groupId: obj.groupId,
+        subgroupId: obj.subgroupId,
+        objectId: obj.objectId,
+        extensions: obj.properties ?? obj.extensions,
+        payload: td(obj.payload),
       };
       objects.push(rec);
       log(`${tag}[${trackName}] object ${objects.length}/${expected}: ${JSON.stringify(rec.payload)} (g${rec.groupId} sg${rec.subgroupId} o${rec.objectId})`);

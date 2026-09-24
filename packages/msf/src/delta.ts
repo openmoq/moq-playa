@@ -7,6 +7,7 @@
 
 import type { CatalogDelta, CatalogState, CatalogTrack, RemoveTrackRef } from './types.js';
 import { assertFiniteCatalogDelta, assertFiniteCatalogNumbers } from './catalog-validate.js';
+import { validateLocmafVersion } from './catalog-msf00.js';
 
 /** Fields allowed in a removeTracks entry per §5.1.4. */
 const REMOVE_TRACK_ALLOWED_FIELDS = new Set<string>(['name', 'namespace']);
@@ -205,6 +206,9 @@ export function applyCatalogUpdate(
     // A delta can introduce tracks / generatedAt with a non-finite number — reject
     // the applied state on the same contract as a freshly-parsed catalog.
     assertFiniteCatalogNumbers(next);
+    // LOCMAF §5: locmafVersion presence rule on the applied tracks (an added
+    // locmaf track may omit it; a clone may change packaging but inherit it).
+    for (const t of next.tracks) validateLocmafVersion(t);
     return next;
 }
 
@@ -328,6 +332,7 @@ function parseTrackFromRaw(
         ...(typeof obj['targetLatency'] === 'number' ? { targetLatency: obj['targetLatency'] } : {}),
         ...(typeof obj['trackDuration'] === 'number' ? { trackDuration: obj['trackDuration'] } : {}),
         ...(typeof obj['eventType'] === 'string' ? { eventType: obj['eventType'] } : {}),
+        ...(typeof obj['locmafVersion'] === 'string' ? { locmafVersion: obj['locmafVersion'] } : {}),
         ...(typeof obj['parentName'] === 'string' ? { parentName: obj['parentName'] } : {}),
     };
 
@@ -383,6 +388,7 @@ function cloneTrack(
     if (overrides.targetLatency !== undefined) result['targetLatency'] = overrides.targetLatency;
     if (overrides.trackDuration !== undefined) result['trackDuration'] = overrides.trackDuration;
     if (overrides.eventType !== undefined) result['eventType'] = overrides.eventType;
+    if (overrides.locmafVersion !== undefined) result['locmafVersion'] = overrides.locmafVersion;
 
     // Apply namespace inheritance if needed
     if (result['namespace'] === undefined && catalogNamespace !== undefined) {
