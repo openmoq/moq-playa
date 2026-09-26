@@ -283,6 +283,33 @@ describe('handleControlMessage', () => {
     expect(ctx.pendingTrackStatuses.size).toBe(0);
   });
 
+  it('REQUEST_ERROR: notifies onCatalogSubscribeError with the error code when the catalog subscription is rejected', () => {
+    const onCatalogSubscribeError = vi.fn();
+    const ctx = createContext({ catalogRequestId: 3n, onCatalogSubscribeError });
+
+    const msg: ControlMessage = {
+      type: 'REQUEST_ERROR', requestId: 3n,
+      errorCode: 0x10n, errorReason: 'Track not found',
+    };
+    handleControlMessage(msg, ctx);
+
+    expect(onCatalogSubscribeError).toHaveBeenCalledWith(0x10n, 'Track not found');
+    expect(ctx.clearCatalogState).toHaveBeenCalled(); // still runs alongside it
+  });
+
+  it('REQUEST_ERROR: does not call onCatalogSubscribeError for a non-catalog request', () => {
+    const onCatalogSubscribeError = vi.fn();
+    const ctx = createContext({ catalogRequestId: 3n, onCatalogSubscribeError });
+
+    const msg: ControlMessage = {
+      type: 'REQUEST_ERROR', requestId: 9n,
+      errorCode: 0x10n, errorReason: 'Track not found',
+    };
+    handleControlMessage(msg, ctx);
+
+    expect(onCatalogSubscribeError).not.toHaveBeenCalled();
+  });
+
   it('REQUEST_ERROR: rejects pending track status (§9.8)', () => {
     const ctx = createContext();
     const reject = vi.fn();

@@ -93,6 +93,8 @@ export interface ControlMessageContext {
   onCatalogBootstrapFetchError?: (requestId: bigint, errorCode: bigint) => void;
   /** Catalog bootstrap: PUBLISH_DONE on the catalog subscription (raw status). */
   onCatalogPublishDone?: (statusCode: bigint) => void;
+  /** The catalog SUBSCRIBE itself was refused (REQUEST_ERROR on `catalogRequestId`). */
+  onCatalogSubscribeError?: (errorCode: bigint, errorReason: string) => void;
   adapter: MessageAdapter | null;
   activeSubscriptions: Map<bigint, ActiveSubscription>;
   pendingMediaSubs: Map<bigint, PendingMediaSub>;
@@ -332,6 +334,7 @@ export function handleControlMessage(
       if (ctx.catalogRequestId !== null && errReqId === ctx.catalogRequestId) {
         ctx.log.warn('Catalog subscription rejected: %s (code=0x%s)',
           msg.errorReason, BigInt(msg.errorCode).toString(16));
+        ctx.onCatalogSubscribeError?.(BigInt(msg.errorCode), msg.errorReason ?? '');
         ctx.clearCatalogState();
       }
 
