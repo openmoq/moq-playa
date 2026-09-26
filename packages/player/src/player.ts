@@ -21,7 +21,7 @@
  */
 
 import type { ControlMessage, Parameters, DraftVersion } from '@moqt/transport';
-import { varint, PublishDoneCode, PublishDoneCode18 } from '@moqt/transport';
+import { varint, PublishDoneCode, PublishDoneCode18, RequestError } from '@moqt/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import { MoqtConnectionError } from '@moqt/webtransport';
@@ -672,6 +672,12 @@ export class MoqtPlayer {
 
   /** Whether the first catalog object has been received. */
   private catalogReceived = false;
+
+  /** Pending catalog-subscribe retry timer; null when none is pending. */
+  private catalogSubscribeRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Delay before re-issuing a catalog SUBSCRIBE refused with DOES_NOT_EXIST. */
+  private static readonly CATALOG_SUBSCRIBE_RETRY_MS = 1_000;
 
   /** Stored catalog state for track switching. */
   private _catalogState: CatalogState | null = null;
@@ -2932,27 +2938,55 @@ export class MoqtPlayer {
       await Promise.all(promises);
     } else {
       // ── Standard path: catalog-first ───────────────────────────────
-      // Subscribe to the catalog track (MSF §9.1, §5.1.10; name is always
-      // "catalog" on every draft). Bootstrap mode pairs a LargestObject
-      // filter with a relative Joining FETCH (MSF-01 §5); legacy mode keeps
-      // AbsoluteStart{0,0} byte-identical.
-      const nameBytes = this.enc.encode(catalogTrackName());
-      const standardCoord = this.resolvedCatalogMode(conn) === 'joining-fetch'
-        ? this.createCatalogBootstrap(conn) : null;
-      let reqId: Awaited<ReturnType<MoqtConnection['subscribe']>>;
-      try {
-        reqId = await conn.subscribe(nsBytes, nameBytes, this.catalogSubscribeOptions(conn) as never);
-      } catch (err) {
-        // The pre-send callback may have registered the bind — settle it.
-        if (this.catalogRequestId !== null) this.settleParkedOwnership(this.catalogRequestId, null, conn);
-        throw err;
-      }
-      this.catalogRequestId = BigInt(reqId);
-      // catalogTrackAlias set by SUBSCRIBE_OK — never assume alias=requestId.
-      // Callback-less adapter fallback: the subscribe is awaiting its OK.
-      if (this.catalogTrackAlias === null) this.pendingAliasBinds.add(BigInt(reqId));
-      standardCoord?.start();
+      await this.subscribeCatalog(conn);
     }
+  }
+
+  /**
+   * Issue the catalog SUBSCRIBE (MSF §9.1, §5.1.10). Bootstrap mode pairs a
+   * LargestObject filter with a Joining FETCH (MSF-01 §5); legacy mode keeps
+   * AbsoluteStart{0,0}. Shared by the initial subscribe and by
+   * {@link scheduleCatalogSubscribeRetry}.
+   */
+  private async subscribeCatalog(conn: MoqtConnection): Promise<void> {
+    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+    const nameBytes = this.enc.encode(catalogTrackName());
+    const coord = this.resolvedCatalogMode(conn) === 'joining-fetch'
+      ? this.createCatalogBootstrap(conn) : null;
+    let reqId: Awaited<ReturnType<MoqtConnection['subscribe']>>;
+    try {
+      reqId = await conn.subscribe(nsBytes, nameBytes, this.catalogSubscribeOptions(conn) as never);
+    } catch (err) {
+      // The pre-send callback may have registered the bind — settle it.
+      if (this.catalogRequestId !== null) this.settleParkedOwnership(this.catalogRequestId, null, conn);
+      throw err;
+    }
+    this.catalogRequestId = BigInt(reqId);
+    // catalogTrackAlias set by SUBSCRIBE_OK — never assume alias=requestId.
+    // Callback-less adapter fallback: the subscribe is awaiting its OK.
+    if (this.catalogTrackAlias === null) this.pendingAliasBinds.add(BigInt(reqId));
+    coord?.start();
+  }
+
+  /**
+   * Retry the catalog SUBSCRIBE after REQUEST_ERROR(DOES_NOT_EXIST) — the
+   * viewer reached the relay before the publisher, an open-ended condition,
+   * not a failure. Retries indefinitely; the watchdog's `catalog_received`
+   * deadline is diagnostics only, so this is what actually recovers.
+   */
+  private scheduleCatalogSubscribeRetry(conn: MoqtConnection): void {
+    if (this._destroyed || this.connection !== conn || this.catalogReceived) return;
+    if (this.catalogSubscribeRetryTimer !== null) return;
+    this.catalogSubscribeRetryTimer = setTimeout(() => {
+      this.catalogSubscribeRetryTimer = null;
+      if (this._destroyed || this.connection !== conn || this.catalogReceived) return;
+      this.log.info('Retrying catalog subscription for namespace "%s" (no publisher yet)',
+        this.config.namespace);
+      this.subscribeCatalog(conn).catch((err) => {
+        this.log.warn('Catalog subscribe retry failed to send: %s',
+          err instanceof Error ? err.message : String(err));
+      });
+    }, MoqtPlayer.CATALOG_SUBSCRIBE_RETRY_MS);
   }
 
   /**
@@ -5194,6 +5228,10 @@ export class MoqtPlayer {
       pending.reject(new Error('Player destroyed'));
     }
     this.pendingTrackStatuses.clear();
+    if (this.catalogSubscribeRetryTimer !== null) {
+      clearTimeout(this.catalogSubscribeRetryTimer);
+      this.catalogSubscribeRetryTimer = null;
+    }
     this.catalogBootstrapCoord?.abort();
     this.catalogBootstrapCoord = null;
     this.catalogRecovery?.coord.abort();
@@ -6266,6 +6304,14 @@ export class MoqtPlayer {
       },
       onCatalogSubscribeOk: (largest) => {
         this.catalogBootstrapCoord?.onSubscribeOk(largest);
+      },
+      onCatalogSubscribeError: (errorCode) => {
+        if (conn !== this.connection) return;
+        // Only "not published yet" is retriable; other codes are real refusals.
+        if (errorCode !== BigInt(RequestError.DOES_NOT_EXIST)) return;
+        this.catalogBootstrapCoord?.abort();
+        this.catalogBootstrapCoord = null;
+        this.scheduleCatalogSubscribeRetry(conn);
       },
       onRecoveryCatalogSubscribeOk: (reqId, alias, largest) => {
         const r = this.catalogRecovery;

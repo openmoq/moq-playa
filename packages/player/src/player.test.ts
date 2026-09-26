@@ -723,6 +723,162 @@ describe('MoqtPlayer', () => {
     });
   });
 
+  // ─── Catalog subscribe retry (viewer arrives before publisher) ─────
+  //
+  // Regression coverage: a viewer subscribing before the publisher exists
+  // got REQUEST_ERROR(DOES_NOT_EXIST) and the player gave up permanently
+  // instead of retrying (reproduced live against moq-relay.red5.net).
+  describe('catalog subscribe retry on DOES_NOT_EXIST (viewer arrives before publisher)', () => {
+    it('retries the catalog subscribe and reaches catalog_received once the publisher shows up', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = createMockAdapter();
+        const player = new MoqtPlayer(createConfig(adapter));
+        const fn = vi.fn();
+        player.on('catalog_received', fn);
+
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+        const firstReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+
+        // No publisher yet: the relay refuses the catalog subscribe.
+        adapter._triggerMessage({
+          type: 'REQUEST_ERROR',
+          requestId: firstReqId,
+          errorCode: varint(0x10),
+          retryInterval: varint(0n),
+          errorReason: 'Track not found',
+        } as ControlMessage);
+
+        // The retry is timed, not synchronous.
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+
+        await vi.advanceTimersByTimeAsync(2000);
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+        const secondReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        expect(secondReqId).not.toBe(firstReqId);
+
+        // Publisher has since shown up: this attempt succeeds.
+        ackCatalog(adapter, secondReqId);
+        adapter._triggerObject(0n, {
+          kind: 'data',
+          trackAlias: secondReqId,
+          groupId: varint(0),
+          subgroupId: varint(0),
+          objectId: varint(0),
+          payload: new TextEncoder().encode(CATALOG_JSON),
+        } as MoqtObject);
+
+        expect(fn).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'catalog_received' }),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps retrying across repeated DOES_NOT_EXIST rejections', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = createMockAdapter();
+        const player = new MoqtPlayer(createConfig(adapter));
+        const fn = vi.fn();
+        player.on('catalog_received', fn);
+
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        for (let i = 0; i < 3; i++) {
+          const reqId = await (adapter.subscribe as any).mock.results[i]?.value;
+          adapter._triggerMessage({
+            type: 'REQUEST_ERROR',
+            requestId: reqId,
+            errorCode: varint(0x10),
+            retryInterval: varint(0n),
+            errorReason: 'Track not found',
+          } as ControlMessage);
+          await vi.advanceTimersByTimeAsync(2000);
+        }
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(4);
+        const fourthReqId = await (adapter.subscribe as any).mock.results[3]?.value;
+        ackCatalog(adapter, fourthReqId);
+        adapter._triggerObject(0n, {
+          kind: 'data',
+          trackAlias: fourthReqId,
+          groupId: varint(0),
+          subgroupId: varint(0),
+          objectId: varint(0),
+          payload: new TextEncoder().encode(CATALOG_JSON),
+        } as MoqtObject);
+
+        expect(fn).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'catalog_received' }),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not retry on a non-retriable REQUEST_ERROR (e.g. UNAUTHORIZED)', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = createMockAdapter();
+        const player = new MoqtPlayer(createConfig(adapter));
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        const firstReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+        adapter._triggerMessage({
+          type: 'REQUEST_ERROR',
+          requestId: firstReqId,
+          errorCode: varint(0x01),
+          retryInterval: varint(0n),
+          errorReason: 'unauthorized',
+        } as ControlMessage);
+
+        await vi.advanceTimersByTimeAsync(5000);
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('stops retrying once the player is destroyed', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = createMockAdapter();
+        const player = new MoqtPlayer(createConfig(adapter));
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        const firstReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+        adapter._triggerMessage({
+          type: 'REQUEST_ERROR',
+          requestId: firstReqId,
+          errorCode: varint(0x10),
+          retryInterval: varint(0n),
+          errorReason: 'Track not found',
+        } as ControlMessage);
+
+        await player.destroy();
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   // ─── Catalog routing (MSF §5.1, §5.2) ─────────────────────
 
   describe('catalog object routing (MSF §5.1)', () => {
