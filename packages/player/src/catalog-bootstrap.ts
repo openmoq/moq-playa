@@ -177,7 +177,7 @@ interface Attempt {
 
 export class CatalogBootstrap {
   private readonly cb: CatalogBootstrapCallbacks;
-  private readonly draft: 14 | 16 | 18;
+  private readonly draft: 14 | 16 | 18 | 21;
 
   private _phase: BootstrapPhase = 'idle';
   private attemptSeq = 0;
@@ -223,7 +223,7 @@ export class CatalogBootstrap {
    *  degradation. */
   private readonly strict: boolean;
 
-  constructor(callbacks: CatalogBootstrapCallbacks, options: { draft: 14 | 16 | 18; startMode?: 'joining' | 'legacy'; strict?: boolean }) {
+  constructor(callbacks: CatalogBootstrapCallbacks, options: { draft: 14 | 16 | 18 | 21; startMode?: 'joining' | 'legacy'; strict?: boolean }) {
     this.cb = callbacks;
     this.draft = options.draft;
     this.startMode = options.startMode ?? 'joining';

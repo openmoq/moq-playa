@@ -116,8 +116,8 @@ export interface DataCodec {
  * @throws {Error} for draft versions without a wired data codec.
  */
 export function createDataCodec(version: DraftVersion = 16): DataCodec {
-  if (version === 18) {
-    return createDataCodec18();
+  if (version === 18 || version === 21) {
+    return createDataCodec18(version);
   }
   if (!isWiredDraft(version)) {
     throw new Error(`DataCodec: draft-${version} data plane is not yet implemented`);

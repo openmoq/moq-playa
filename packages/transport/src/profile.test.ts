@@ -9,7 +9,7 @@ import { createDataCodec } from './data/data-codec.js';
 import { getRequestPolicy } from './session/request-policy.js';
 
 describe('getProtocolProfile', () => {
-  for (const version of [14, 16, 18] as const) {
+  for (const version of [14, 16, 18, 21] as const) {
     it(`bundles control + data + policy for draft-${version}`, () => {
       const profile = getProtocolProfile(version);
       expect(profile.version).toBe(version);
@@ -65,5 +65,12 @@ describe('createDataCodec — version selection', () => {
     expect(createDataCodec(16).version).toBe(16);
     // draft-18 data codec is now wired (subgroup + datagram decode increment).
     expect(createDataCodec(18).version).toBe(18);
+  });
+});
+
+describe('draft 21', () => {
+  it('shares the draft-18 stream model capabilities and request policy', () => {
+    expect(getProtocolProfile(21).capabilities).toEqual(getProtocolProfile(18).capabilities);
+    expect(getRequestPolicy(21)).toEqual(getRequestPolicy(18));
   });
 });

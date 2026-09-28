@@ -16,6 +16,7 @@ import { SetupOption18 } from '../control/codes-18.js';
 import type { DraftVersion } from '../control/codec.js';
 import { EndpointRole, type EndpointRoleValue, SessionState, type SessionStateValue } from './types.js';
 import { AliasType, parseAuthorizationToken, parseAuthorizationToken18, type AuthorizationToken } from '../control/auth-token.js';
+import { isRequestStreamDraft } from '../versions.js';
 
 /**
  * Error thrown for setup handshake violations.
@@ -148,7 +149,7 @@ export class SetupGate {
    * @throws {SetupError} If message violates handshake rules
    */
   validateMessage(msg: ControlMessage): void {
-    if (this.draftVersion === 18) {
+    if (isRequestStreamDraft(this.draftVersion)) {
       // draft-18: each side sends a single unified SETUP on its uni control
       // stream; the first message received before ESTABLISHED must be SETUP.
       if (this.state !== SessionState.ESTABLISHED && msg.type !== 'SETUP') {

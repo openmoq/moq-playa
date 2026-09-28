@@ -34,6 +34,7 @@
  */
 import { encodeLocHeaders, locWireProfileForDraft, type LocVersion } from '@moqt/loc';
 import type { DraftVersion } from '@moqt/transport';
+import { isRequestStreamDraft } from '@moqt/transport';
 
 /** The subset of MoqtConnection the media publication path uses. */
 export interface MediaPublishConnection {
@@ -296,7 +297,7 @@ export class MediaPublisher {
       hasExtensions: true,
       endOfGroup: true,
       publisherPriority: priority,
-      ...(this.draft === 18 ? { firstObject: true } : {}),
+      ...(isRequestStreamDraft(this.draft) ? { firstObject: true } : {}),
     };
   }
 

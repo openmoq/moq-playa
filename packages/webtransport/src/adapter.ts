@@ -82,6 +82,7 @@ import { IncomingUniRouter, type RoutedIncomingUniStream } from './topology/inco
 import { InboundRequestStreamContext } from './topology/inbound-request.js';
 import { MoqtConnectionError } from './adapter-error.js';
 import type { WebTransportLike, WebTransportBidirectionalStream, MoqtSetupRouting } from './types.js';
+import { isRequestStreamDraft, isWiredDraft } from '@moqt/transport';
 
 
 
@@ -221,7 +222,7 @@ export interface IncomingPublish {
  * than trying to construct a codec for an unwired draft.
  *
  * @see draft-ietf-moq-transport-16 §3.1
- * - 'moqt-18' → 18, 'moqt-16' → 16
+ * - 'moqt-21' → 21, 'moqt-18' → 18, 'moqt-16' → 16
  * - 'moq-00' → 14 (pre-15 convention)
  * - '' / undefined / unsupported token → undefined (use constructor version)
  */
@@ -231,7 +232,7 @@ function protocolToDraftVersion(protocol: string | undefined): DraftVersion | un
   const match = protocol.match(/^moqt-(\d+)$/);
   if (!match) return undefined;
   const n = parseInt(match[1]!, 10);
-  return n === 14 || n === 16 || n === 18 ? (n as DraftVersion) : undefined;
+  return isWiredDraft(n) ? n : undefined;
 }
 
 /**
@@ -1229,7 +1230,7 @@ export class MoqtConnection {
     // PATH/AUTHORITY are forbidden over WebTransport but carry native-QUIC
     // routing information. The sans-I/O gate enforces the selected binding.
     this.session = new Session(this._role, version, { webtransport: transportKind === 'webtransport' });
-    if (version === 18) {
+    if (isRequestStreamDraft(version)) {
       this.codec = createControlCodec(18);
       this.framer = new ControlStreamFramer(this.codec);
       this.dataCodec = createDataCodec(18);
@@ -1298,7 +1299,7 @@ export class MoqtConnection {
           `native QUIC negotiated ALPN ${JSON.stringify(transport.protocol ?? '')}; expected "moqt-18"`,
         );
       }
-      if (this._requestedVersion !== undefined && this._requestedVersion !== 18) {
+      if (this._requestedVersion !== undefined && !isRequestStreamDraft(this._requestedVersion)) {
         throw new Error(`native QUIC supports draft 18 only, not draft ${this._requestedVersion}`);
       }
       if (!Number.isSafeInteger(transport.maxDatagramSize) || transport.maxDatagramSize! <= 0) {
@@ -1331,7 +1332,7 @@ export class MoqtConnection {
     // terminal coordinator, ignores a stale transport after migration.
     void this.watchTransportClosed(transport);
 
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       // draft-18: open the uni control-stream pair and exchange SETUP. Request
       // responses arrive on their own bidi streams (see subscribe()), so no
       // shared control read loop is started. SETUP, subgroup, FETCH, and
@@ -1518,7 +1519,7 @@ export class MoqtConnection {
       await send();
     } catch (err) {
       this.session.rollbackRequest(requestId, { retainCancellationProvenance: true });
-      if (this.session.draftVersion !== 18) {
+      if (!isRequestStreamDraft(this.session.draftVersion)) {
         this.closeSessionFatal(
           `control-stream write failed: ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -1584,7 +1585,7 @@ export class MoqtConnection {
    * may answer (e.g. a §3.2 reserved-namespace REQUEST_ERROR) synchronously.
    */
   private async sendSubscribeActions(actions: SessionOutboundAction[]): Promise<void> {
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       const subscribeMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
       const requestId = (subscribeMsg as { requestId: bigint }).requestId;
       // The delivery IS the topology's wire-order barrier: the read loop awaits
@@ -1648,7 +1649,7 @@ export class MoqtConnection {
     // Associate the advertised alias with this publish for §10.11 Stream Count
     // accounting and terminal enforcement on the data-plane APIs.
     this.publisherAliasRequests.set(trackAlias, requestId);
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       const publishMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
       // Roll back the publisher-alias authority too (so openSubgroup can't publish
       // on an alias the peer never learned) if the request-stream open fails.
@@ -2047,7 +2048,7 @@ export class MoqtConnection {
     // session.unsubscribe: draft-14/16 → UNSUBSCRIBE control action + alias
     // unregister; draft-18 → no control action + alias unregister.
     await this.executeActions(this.session.unsubscribe(requestId));
-    if (this.session.draftVersion === 18) await this.uniPair!.cancelRequest(requestId);
+    if (isRequestStreamDraft(this.session.draftVersion)) await this.uniPair!.cancelRequest(requestId);
     this.onError?.(err);
   }
 
@@ -2993,7 +2994,7 @@ export class MoqtConnection {
     existingRequestId: bigint,
     options?: RequestUpdateOptions,
   ): Promise<bigint> {
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       // Local REQUEST_UPDATE is only valid for an inbound PUBLISH (we are the
       // subscriber there). For an inbound SUBSCRIBE we are the publisher — the
       // peer updates that subscription, not us — so it is NOT eligible here.
@@ -3113,7 +3114,7 @@ export class MoqtConnection {
 
     const actions = this.session.unsubscribe(requestId); // draft-18 returns no send_control
     await this.executeActions(actions);
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       // Reset the subscribe request stream; this is the draft-18 cancellation
       // signal (a LOCAL cancel — the response handler ignores the resulting
       // RequestCancelledError, so it surfaces no onError).
@@ -3168,7 +3169,7 @@ export class MoqtConnection {
   async sendGoaway(options: { newSessionUri?: string; timeout?: bigint; requestId?: bigint } = {}): Promise<void> {
     const newSessionUri = options.newSessionUri ?? '';
 
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       // §10.4 local guards — never emit an invalid control-stream GOAWAY. The peer
       // would reject these; refuse to put them on the wire in the first place.
       if (options.requestId === undefined) {
@@ -3220,7 +3221,7 @@ export class MoqtConnection {
       namespacePrefix,
       subscribeOptions,
     );
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       // draft-18 §10.18: SUBSCRIBE_NAMESPACE opens a CONTINUING request stream.
       // The first response (REQUEST_OK / REQUEST_ERROR) goes through the normal
       // stamped pipeline; subsequent NAMESPACE / NAMESPACE_DONE are routed to
@@ -3341,7 +3342,7 @@ export class MoqtConnection {
       return;
     }
 
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       // draft-18 §10.18: gracefully close the continuing request stream.
       await this.uniPair!.closeContinuingRequest(requestId);
       return;
@@ -3369,7 +3370,7 @@ export class MoqtConnection {
    * @param requestId The request ID of the track subscription to cancel
    */
   async cancelTracks(requestId: bigint): Promise<void> {
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       await this.uniPair!.closeContinuingRequest(requestId);
     }
   }
@@ -3395,7 +3396,7 @@ export class MoqtConnection {
     const { sessionOptions, onRequestId } = splitOwnership(options);
     const { requestId, actions } = this.session.fetch(namespace, name, sessionOptions as FetchOptions);
     this.invokeOwnershipCallback(requestId, onRequestId);
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       // draft-18: FETCH opens its own bidi request stream rather than travelling
       // on the control stream. Same machinery as subscribe(). Remember the
       // requested Group Order so the fetch-object decoder can read deltas.
@@ -3427,7 +3428,7 @@ export class MoqtConnection {
     const { sessionOptions, onRequestId } = splitOwnership(options);
     const { requestId, actions } = this.session.joiningFetch(sessionOptions as JoiningFetchOptions);
     this.invokeOwnershipCallback(requestId, onRequestId);
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       this.fetchGroupOrder.set(requestId, options.groupOrder ?? 'ascending');
       const fetchMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
       await this.openD18Request(requestId, fetchMsg, () => this.fetchGroupOrder.delete(requestId));
@@ -3499,7 +3500,7 @@ export class MoqtConnection {
     const actions = this.session.fetchCancel(requestId);
     await this.executeActions(actions);
 
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       // §3.3.2: cancel the bidi request stream (STOP_SENDING + RESET_STREAM).
       // This is a LOCAL cancel, so the request-stream response handler ignores
       // the resulting RequestCancelledError (no onError, no unhandled rejection).
@@ -3546,7 +3547,7 @@ export class MoqtConnection {
     name: Uint8Array,
   ): Promise<bigint> {
     const { requestId, actions } = this.session.trackStatus(namespace, name);
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       const msg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
       await this.openD18Request(requestId, msg);
       return requestId;
@@ -3590,7 +3591,7 @@ export class MoqtConnection {
    */
   async publishNamespace(namespace: Uint8Array[]): Promise<bigint> {
     const { requestId, actions } = this.session.publishNamespace(namespace);
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       const msg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
       await this.openD18Request(requestId, msg);
       return requestId;
@@ -3613,7 +3614,7 @@ export class MoqtConnection {
    */
   async publishNamespaceDone(requestId: bigint): Promise<void> {
     const actions = this.session.publishNamespaceDone(requestId);
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       // Terminate local state (no send_control action) and cancel the request
       // stream — that cancellation IS the draft-18 withdrawal signal.
       await this.executeActions(actions);
@@ -3802,7 +3803,7 @@ export class MoqtConnection {
     actions: SessionOutboundAction[],
     finalize = false,
   ): Promise<boolean> {
-    if (this.session.draftVersion !== 18) return false;
+    if (!isRequestStreamDraft(this.session.draftVersion)) return false;
     const ctx = this.inboundRequestContexts.get(requestId);
     if (!ctx) return false;
     const send = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
@@ -4231,7 +4232,7 @@ export class MoqtConnection {
     // subscription's own bidi request stream (an accepted inbound SUBSCRIBE),
     // then the stream is sealed and fully closed (FIN + STOP_SENDING). Not the
     // uni control stream.
-    if (this.session.draftVersion === 18) {
+    if (isRequestStreamDraft(this.session.draftVersion)) {
       const ctx = this.inboundRequestContexts.get(requestId);
       if (ctx) {
         const send = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
@@ -4515,7 +4516,7 @@ export class MoqtConnection {
   ): Promise<bigint> {
     // §10.4.2 bit 6: FIRST_OBJECT (0x40) is a draft-18-only header bit — reject the
     // option on draft-14/16 BEFORE opening a stream.
-    if (opts?.firstObject && this.session.draftVersion !== 18) {
+    if (opts?.firstObject && !isRequestStreamDraft(this.session.draftVersion)) {
       throw new MoqtConnectionError('openSubgroup: firstObject is a draft-18-only option', { errorSource: 'data' });
     }
     if (!this.transport?.createUnidirectionalStream) {
@@ -4605,7 +4606,7 @@ export class MoqtConnection {
         // bits 1-2 are the subgroup-ID mode. draft-18 renamed EXTENSIONS→PROPERTIES
         // (bit 0x01) vs draft-14/16 (0x20), so the flag bit differs by version.
         const mode = opts?.subgroupIdMode ?? SubgroupIdMode.EXPLICIT;
-        const d18 = this.session.draftVersion === 18;
+        const d18 = isRequestStreamDraft(this.session.draftVersion);
         let typeByte = SubgroupFlags.SUBGROUP_MARKER | (mode << 1);
         if (opts?.hasExtensions) typeByte |= d18 ? SubgroupFlags18.PROPERTIES : SubgroupFlags.EXTENSIONS;
         if (opts?.endOfGroup) typeByte |= d18 ? SubgroupFlags18.END_OF_GROUP : SubgroupFlags.END_OF_GROUP;
@@ -4717,7 +4718,7 @@ export class MoqtConnection {
     }
 
     const obj = { objectId, extensions, payload, status: undefined };
-    const objectBytes = this.session.draftVersion === 18
+    const objectBytes = isRequestStreamDraft(this.session.draftVersion)
       ? encodeSubgroupObject18(obj, state.hasExtensions, state.previousObjectId, state.isFirstObject)
       : encodeSubgroupObject(obj, state.hasExtensions, varint(state.previousObjectId), state.isFirstObject);
 
@@ -4746,7 +4747,7 @@ export class MoqtConnection {
     payload: Uint8Array,
     opts?: { publisherPriority?: number },
   ): Promise<void> {
-    if (this.session.draftVersion !== 18) {
+    if (!isRequestStreamDraft(this.session.draftVersion)) {
       throw new MoqtConnectionError('sendDatagram is draft-18 only', { errorSource: 'data' });
     }
     if (!this.transport?.datagrams) {
@@ -4843,7 +4844,7 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-18 §11.4.4
    */
   async openFetchStream(requestId: bigint): Promise<bigint> {
-    if (this.session.draftVersion !== 18) {
+    if (!isRequestStreamDraft(this.session.draftVersion)) {
       throw new MoqtConnectionError('openFetchStream is draft-18 only', { errorSource: 'data' });
     }
     const groupOrder = this.inboundFetchGroupOrder.get(requestId);
@@ -5015,7 +5016,7 @@ export class MoqtConnection {
           }
           this.pendingGenericSubscriptions.delete(action.requestId);
           this.settlePendingAliasOwnership(action.requestId);
-          if (this.session.draftVersion === 18) await this.uniPair?.cancelRequest(action.requestId);
+          if (isRequestStreamDraft(this.session.draftVersion)) await this.uniPair?.cancelRequest(action.requestId);
           break;
         }
         case 'close_stream':
@@ -5923,7 +5924,7 @@ export class MoqtConnection {
       // forward-state rule for joins: §9.16.2 permits association with a
       // Pending subscription and requires only the Largest Object filter, so
       // a legal pending d16 join must not be rejected here.
-      if (this.session.draftVersion === 18) {
+      if (isRequestStreamDraft(this.session.draftVersion)) {
         const sub = this.session.getIncomingSubscription(subRequestId);
         if (!sub || sub.forwardState !== ForwardState.ACTIVE) {
           try {
@@ -6269,7 +6270,7 @@ export class MoqtConnection {
         // Phase 2: Decode fetch objects. draft-18 has its own object format
         // (group-order-aware deltas, End-of-Range prior rules) and correlates by
         // FETCH_HEADER.requestId — not by a (fabricated) track alias.
-        readTerminal = this.dataCodec!.version === 18
+        readTerminal = isRequestStreamDraft(this.dataCodec!.version)
           ? await this.readFetchObjects18(reader, buf, streamId, header)
           : await this.readFetchObjects(reader, buf, streamId);
       }

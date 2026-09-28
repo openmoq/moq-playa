@@ -93,6 +93,7 @@ import {
   getTimelineDuration,
   type TimelineState,
 } from './timeline-manager.js';
+import { isRequestStreamDraft } from '@moqt/transport';
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -4133,7 +4134,7 @@ export class MoqtPlayer {
       },
       log: (msg, ...args) => this.log.debug(msg, ...args),
     }, {
-      draft: (conn.draftVersion ?? this.config.draftVersion ?? 16) as 14 | 16 | 18,
+      draft: (conn.draftVersion ?? this.config.draftVersion ?? 16) as 14 | 16 | 18 | 21,
       strict: this.strictCatalogMode(),
     });
 
@@ -4506,7 +4507,7 @@ export class MoqtPlayer {
       },
       log: (msg, ...args) => this.log.debug(msg, ...args),
     }, {
-      draft: (conn.draftVersion ?? this.config.draftVersion ?? 16) as 14 | 16 | 18,
+      draft: (conn.draftVersion ?? this.config.draftVersion ?? 16) as 14 | 16 | 18 | 21,
       // Legacy catalog mode (the explicit 'subscribe' compatibility option):
       // the candidate is a fresh AbsoluteStart subscribe — subscription-only
       // retrieval, ready on the first acceptable base; NEVER a Joining FETCH.
@@ -6230,7 +6231,7 @@ export class MoqtPlayer {
         // uses 0x5 (§15.10.3), draft-14/16 use 0x6 (§13.4.3). On draft-18, 0x6 is
         // EXPIRED, so comparing against the wrong table would both miss real
         // TOO_FAR_BEHIND and mis-fire recovery on EXPIRED.
-        const tooFarBehind = this.connection?.draftVersion === 18
+        const tooFarBehind = isRequestStreamDraft(this.connection?.draftVersion)
           ? PublishDoneCode18.TOO_FAR_BEHIND
           : PublishDoneCode.TOO_FAR_BEHIND;
         if (statusCode === BigInt(tooFarBehind)) {

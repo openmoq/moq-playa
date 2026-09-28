@@ -87,6 +87,7 @@ import { MessageParam } from '../control/parameters.js';
 import type { Parameters, ParameterValue, TrackProperties } from '../control/messages.js';
 import { AuthTokenCache, AuthCacheError } from './auth-cache.js';
 import { AliasType, parseAuthorizationToken, parseAuthorizationToken18, type AuthorizationToken, type ResolvedToken } from '../control/auth-token.js';
+import { isRequestStreamDraft } from '../versions.js';
 
 /**
  * Set of known message parameter type codes.
@@ -697,7 +698,7 @@ export class Session {
   initiateSetup(options: SetupOptions = {}): SessionOutboundAction[] {
     this.assertState(SessionState.IDLE, 'initiateSetup');
 
-    if (this._draftVersion === 18) {
+    if (isRequestStreamDraft(this._draftVersion)) {
       // draft-18: send the unified SETUP (no MAX_REQUEST_ID — QUIC stream limits).
       const setup = this.setupGate.createSetup18(options);
       if (options.maxAuthTokenCacheSize !== undefined) {
@@ -735,7 +736,7 @@ export class Session {
       throw new SessionError('Only server can call completeSetup', 'INVALID_STATE');
     }
 
-    if (this._draftVersion === 18) {
+    if (isRequestStreamDraft(this._draftVersion)) {
       const setup = this.setupGate.createSetup18(options);
       if (options.maxAuthTokenCacheSize !== undefined) {
         this._ownMaxAuthTokenCacheSize = Number(options.maxAuthTokenCacheSize);
@@ -836,14 +837,14 @@ export class Session {
           // draft-18 only: inbound SUBSCRIBE_NAMESPACE is a publisher-side
           // continuing request stream (§10.18). For draft-14/16 it is not handled
           // as an inbound message — fall through to the unsupported-type path.
-          if (this._draftVersion === 18) {
+          if (isRequestStreamDraft(this._draftVersion)) {
             return this.handleIncomingSubscribeNamespace(msg as SubscribeNamespace);
           }
           return this.handleUnsupportedControlMessage(msg);
         case 'SUBSCRIBE_TRACKS':
           // draft-18 only: inbound SUBSCRIBE_TRACKS is a publisher-side continuing
           // request stream (§10.19). It has no draft-14/16 inbound form.
-          if (this._draftVersion === 18) {
+          if (isRequestStreamDraft(this._draftVersion)) {
             return this.handleIncomingSubscribeTracks(msg as SubscribeTracks);
           }
           return this.handleUnsupportedControlMessage(msg);
@@ -1127,7 +1128,7 @@ export class Session {
 
     // draft-18 Token internals (Alias Type / Token Alias / Token Type) are vi64
     // (full uint64); draft-14/16 use QUIC varint. Pick the wire parser by version.
-    const parseToken = this._draftVersion === 18 ? parseAuthorizationToken18 : parseAuthorizationToken;
+    const parseToken = isRequestStreamDraft(this._draftVersion) ? parseAuthorizationToken18 : parseAuthorizationToken;
 
     for (const rawValue of values) {
       if (!(rawValue instanceof Uint8Array)) continue;
@@ -1210,7 +1211,7 @@ export class Session {
     // draft-18 §10.4: a control-stream GOAWAY MUST carry the Request ID, and its
     // parity MUST match the receiver's own request-id parity (the GOAWAY refers
     // to the smallest of OUR requests the peer may not have processed).
-    if (this._draftVersion === 18) {
+    if (isRequestStreamDraft(this._draftVersion)) {
       if (msg.requestId === undefined) {
         return this.closeWithError(
           SessionErrorCode.PROTOCOL_VIOLATION,
@@ -1593,7 +1594,7 @@ export class Session {
     // draft-18 §10.2.1: validate the REQUEST_OK's Message Parameters against the
     // scope of the RESPONSE it stands in for, resolved from the request stream
     // (PUBLISH_OK / REQUEST_UPDATE_OK / TRACK_STATUS_OK / namespace responses).
-    if (this._draftVersion === 18 && (msg.parameters?.size ?? 0) > 0) {
+    if (isRequestStreamDraft(this._draftVersion) && (msg.parameters?.size ?? 0) > 0) {
       const context = this.d18RequestOkContext(msg.requestId as bigint);
       if (context) {
         const paramError = this.validateMessageParams(msg.parameters, context);
@@ -1801,7 +1802,7 @@ export class Session {
    * behavior unchanged). An empty namespace is permitted (allowEmptyNamespace).
    */
   private validateFullName18(namespace: Uint8Array[], trackName: Uint8Array): SessionOutboundAction[] | null {
-    if (this._draftVersion !== 18) return null;
+    if (!isRequestStreamDraft(this._draftVersion)) return null;
     try {
       validateFullTrackName(namespace, trackName, { allowEmptyNamespace: true });
     } catch (e) {
@@ -1816,7 +1817,7 @@ export class Session {
   /** Draft-18 §2.4.1 defensive validation for a full Track Namespace (no track name,
    *  e.g. PUBLISH_NAMESPACE). Same contract as {@link validateFullName18}. */
   private validateNamespace18(namespace: Uint8Array[]): SessionOutboundAction[] | null {
-    if (this._draftVersion !== 18) return null;
+    if (!isRequestStreamDraft(this._draftVersion)) return null;
     try {
       validateTrackNamespace(namespace, { allowEmpty: true });
     } catch (e) {
@@ -2035,7 +2036,7 @@ export class Session {
       requestId: localReqId,
       reason: 'local SUBSCRIBE superseded by a peer PUBLISH for the same track (§5.1)',
     };
-    if (this._draftVersion === 18) return [cancel];
+    if (isRequestStreamDraft(this._draftVersion)) return [cancel];
     return [this.sendControl({ type: 'UNSUBSCRIBE', requestId: localReqId } as Unsubscribe), cancel];
   }
 
@@ -2190,7 +2191,7 @@ export class Session {
         return [this.sendControl(errorMsg), ...(validated.replenish ?? [])];
       }
 
-      if (this._draftVersion === 18) {
+      if (isRequestStreamDraft(this._draftVersion)) {
         // draft-18 §10.12.2: "A Joining Fetch is only permitted when the
         // associated subscription has Forward State 1; otherwise the publisher
         // MUST respond with a REQUEST_ERROR with error code INVALID_RANGE."
@@ -2336,7 +2337,7 @@ export class Session {
     // ONLY when it targets a SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS (handled
     // above). On a REQUEST_UPDATE for a normal subscription/fetch/publish it is
     // out of scope → PROTOCOL_VIOLATION.
-    if (this._draftVersion === 18 && msg.parameters.has(MessageParam.TRACK_NAMESPACE_PREFIX as bigint)) {
+    if (isRequestStreamDraft(this._draftVersion) && msg.parameters.has(MessageParam.TRACK_NAMESPACE_PREFIX as bigint)) {
       return this.closeWithError(
         SessionErrorCode.PROTOCOL_VIOLATION,
         `TRACK_NAMESPACE_PREFIX is out of scope for a REQUEST_UPDATE that does not target a SUBSCRIBE_NAMESPACE/SUBSCRIBE_TRACKS (§10.2.14)`,
@@ -2377,7 +2378,7 @@ export class Session {
     // cover publish-initiated subscriptions: an update acknowledgement before
     // PUBLISH_OK has ambiguous correlation on the publish stream.
     if (sub && sub.state !== 'established'
-        && !(this._draftVersion === 18 && sub.state === 'pending' && !sub.isPublishInitiated)) {
+        && !(isRequestStreamDraft(this._draftVersion) && sub.state === 'pending' && !sub.isPublishInitiated)) {
       return this.closeWithError(
         SessionErrorCode.PROTOCOL_VIOLATION,
         `REQUEST_UPDATE for subscription ${msg.existingRequestId} in state ${sub.state}; expected established`,
@@ -2438,7 +2439,7 @@ export class Session {
     // emitted after them carries the current largest and satisfies the save
     // requirement for the resumed state. Failing such an update closed here
     // would reject the very races §10.12.2 requires publishers to tolerate.
-    const wantsResume = this._draftVersion === 18 && isSubscriptionScope
+    const wantsResume = isRequestStreamDraft(this._draftVersion) && isSubscriptionScope
       && sub!.state === 'established'
       && prevForwardState === ForwardState.PAUSED
       && forwardValues !== undefined && forwardValues.length > 0
@@ -2866,7 +2867,7 @@ export class Session {
     // draft-18 removed the UNSUBSCRIBE message; the subscriber cancels by tearing
     // down the request stream (RESET_STREAM + STOP_SENDING, §3.3.2) — the I/O layer
     // does that; emit NO control message. draft-14/16 send UNSUBSCRIBE.
-    if (this._draftVersion === 18) return [];
+    if (isRequestStreamDraft(this._draftVersion)) return [];
     return [this.sendControl({ type: 'UNSUBSCRIBE', requestId } as Unsubscribe)];
   }
 
@@ -2925,7 +2926,7 @@ export class Session {
     // draft-18 §10.12.2 contemplates REQUEST_UPDATE racing establishment
     // ("process any pending REQUEST_UPDATE messages ... before evaluating"),
     // so a d18 subscriber may update a still-PENDING subscription.
-    const updatableWhilePending = this._draftVersion === 18 && sub.state === 'pending';
+    const updatableWhilePending = isRequestStreamDraft(this._draftVersion) && sub.state === 'pending';
     if (sub.state !== 'established' && !updatableWhilePending) {
       throw new SessionError(
         `Cannot update subscription in state ${sub.state}; expected established`,
@@ -2973,7 +2974,7 @@ export class Session {
     // §8 / §10.2.3: SUBGROUP_DELIVERY_TIMEOUT (0x06) is a draft-18-only Message
     // Parameter — emitting it on draft-14/16 would make a conformant peer close on
     // the unknown parameter, so reject it locally outside draft-18.
-    if (options.subgroupDeliveryTimeout !== undefined && this._draftVersion !== 18) {
+    if (options.subgroupDeliveryTimeout !== undefined && !isRequestStreamDraft(this._draftVersion)) {
       throw new SessionError(
         'subgroupDeliveryTimeout (SUBGROUP_DELIVERY_TIMEOUT, 0x06) is draft-18 only',
         'INVALID_STATE',
@@ -3037,7 +3038,7 @@ export class Session {
     existingRequestId: bigint,
     options: RequestUpdateOptions,
   ): RequestResult {
-    if (this._draftVersion !== 18) {
+    if (!isRequestStreamDraft(this._draftVersion)) {
       throw new SessionError(
         `Track Namespace Prefix REQUEST_UPDATE requires draft-18 (current draft-${this._draftVersion})`,
         'INVALID_STATE',
@@ -3346,7 +3347,7 @@ export class Session {
     this.fetches.delete(requestId as bigint);
     if (!established) this.recordCancellation(requestId, 'fetch', false);
 
-    if (this._draftVersion === 18) {
+    if (isRequestStreamDraft(this._draftVersion)) {
       // draft-18 removed the FETCH_CANCEL control message (§3.3.2): cancellation
       // is STOP_SENDING / RESET_STREAM on the request + data streams, performed by
       // the I/O layer. No control message is emitted.
@@ -3474,7 +3475,7 @@ export class Session {
         this._newSessionUri ?? '',
       );
     }
-    if (this._draftVersion !== 18) {
+    if (!isRequestStreamDraft(this._draftVersion)) {
       throw new SessionError('SUBSCRIBE_TRACKS is a draft-18 message', 'INVALID_STATE');
     }
 
@@ -3616,7 +3617,7 @@ export class Session {
 
     // draft-18 §3.3.2: no PUBLISH_NAMESPACE_DONE on the wire — withdrawal is a
     // request-stream cancellation handled by the I/O layer. Terminate state only.
-    if (this._draftVersion === 18) {
+    if (isRequestStreamDraft(this._draftVersion)) {
       return [];
     }
 
@@ -3684,7 +3685,7 @@ export class Session {
    */
   private resolveTrackProperties(trackProperties: TrackProperties | undefined, context: string): TrackProperties {
     const props = trackProperties ?? new Map();
-    if (this._draftVersion !== 18 && props.size > 0) {
+    if (!isRequestStreamDraft(this._draftVersion) && props.size > 0) {
       throw new SessionError(
         `Track Properties on ${context} require draft-18 (current draft-${this._draftVersion})`,
         'INVALID_STATE',
@@ -3947,7 +3948,7 @@ export class Session {
         message: msg,
       };
       // draft-18: track the inbound announce so a stream FIN/reset can withdraw it.
-      if (this._draftVersion === 18) {
+      if (isRequestStreamDraft(this._draftVersion)) {
         this.incomingPublishNamespaces.set(msg.requestId as bigint, { namespace: msg.trackNamespace });
       }
       return [this.sendControl(okMsg), notifyAction, ...(validated.replenish ?? [])];
@@ -3955,7 +3956,7 @@ export class Session {
 
     // Match found — record the announced namespace.
     match.nsSm.handleNamespace(msg.trackNamespace);
-    if (this._draftVersion === 18) {
+    if (isRequestStreamDraft(this._draftVersion)) {
       this.incomingPublishNamespaces.set(msg.requestId as bigint, { namespace: msg.trackNamespace });
     }
 
@@ -4634,7 +4635,7 @@ export class Session {
       // capacity), return ONLY the close — do NOT also append an acceptance.
       if (preActions.some((a) => a.type === 'close_connection')) return preActions;
       let responseParameters: Parameters;
-      if (this._draftVersion === 18) {
+      if (isRequestStreamDraft(this._draftVersion)) {
         responseParameters = options.parameters ?? new Map();
       } else {
         // Draft-14/16 §9.14: derived initial-state fields first, with caller-
@@ -4654,7 +4655,7 @@ export class Session {
           : ForwardState.ACTIVE,
       );
 
-      if (this._draftVersion === 18) {
+      if (isRequestStreamDraft(this._draftVersion)) {
         // draft-18 §10.10: PUBLISH_OK is REQUEST_OK shorthand (wire 0x07, no
         // Request ID); the I/O layer writes it on the inbound PUBLISH request
         // stream, not the control stream. Caller-supplied response parameters
@@ -5053,7 +5054,7 @@ export class Session {
     requestId: bigint,
     replenish: SessionOutboundAction[] | undefined,
   ): SessionOutboundAction[] | undefined {
-    if (this._draftVersion !== 18) return undefined;
+    if (!isRequestStreamDraft(this._draftVersion)) return undefined;
     const isDot = isReservedDotNamespace(namespace);
     if (!isDot && !isReservedSessionNamespace(namespace)) return undefined;
     const errorMsg: RequestErrorMsg = {
@@ -5083,7 +5084,7 @@ export class Session {
     const combined = [...prefix, ...suffix];
     try {
       // §2.4.1: draft-18 permits a zero-field full namespace; draft-14/16 do not.
-      validateTrackNamespace(combined, { allowEmpty: this._draftVersion === 18 });
+      validateTrackNamespace(combined, { allowEmpty: isRequestStreamDraft(this._draftVersion) });
     } catch (e) {
       return this.closeWithError(
         SessionErrorCode.PROTOCOL_VIOLATION,
@@ -5114,7 +5115,7 @@ export class Session {
       return true;
     }
 
-    const table = this._draftVersion === 18
+    const table = isRequestStreamDraft(this._draftVersion)
       ? VALID_PARAMS_FOR_MESSAGE_TYPE_18
       : VALID_PARAMS_FOR_MESSAGE_TYPE;
     return table.get(key as bigint)?.has(messageType) ?? false;
@@ -5128,7 +5129,7 @@ export class Session {
    * @returns Error with code and reason if validation fails, undefined if valid
    */
   private validateMessageParams(params: Parameters, messageType: string): { error: Varint; reason: string } | undefined {
-    const isDraft18 = this._draftVersion === 18;
+    const isDraft18 = isRequestStreamDraft(this._draftVersion);
     const knownParams = isDraft18 ? KNOWN_MESSAGE_PARAMS_18 : KNOWN_MESSAGE_PARAMS;
     for (const [key, values] of params) {
       // §9.2: Unknown message parameters are a protocol violation (draft-16/18).
@@ -5336,7 +5337,7 @@ export class Session {
       // scope depends on WHICH request it answers, which is only known once the
       // request stream is resolved — so defer to handleRequestOk. (draft-14/16
       // REQUEST_OK keeps the by-type scope here.)
-      if (this._draftVersion === 18 && msg.type === 'REQUEST_OK') {
+      if (isRequestStreamDraft(this._draftVersion) && msg.type === 'REQUEST_OK') {
         return undefined;
       }
       return this.validateMessageParams(msg.parameters, msg.type);

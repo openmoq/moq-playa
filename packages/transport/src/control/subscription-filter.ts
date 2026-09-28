@@ -21,6 +21,7 @@
 import { varint, writeVarint, varintEncodingLength, readVarint } from '../primitives/varint.js';
 import { readLocation } from '../primitives/location.js';
 import { readVi64, writeVi64, vi64EncodingLength, MAX_VI64 } from '../primitives/vi64.js';
+import { isRequestStreamDraft } from '../versions.js';
 
 /**
  * Subscription filter — controls which objects pass through a subscription.
@@ -66,7 +67,7 @@ export function encodeSubscriptionFilter(filter: SubscriptionFilter, draftVersio
   const filterType = FILTER_TYPE[filter.type];
 
   // draft-18 §5.1.2: vi64 internals; AbsoluteRange carries an End Group DELTA.
-  if (draftVersion === 18) {
+  if (isRequestStreamDraft(draftVersion)) {
     let endGroupDelta = 0n;
     if (filter.type === 'AbsoluteRange') {
       if (filter.endGroup < filter.startGroup) {
@@ -140,7 +141,7 @@ export function decodeSubscriptionFilter(bytes: Uint8Array, draftVersion: number
     throw new RangeError(`decodeSubscriptionFilter: ${reason}`);
   }
 
-  const read = draftVersion === 18
+  const read = isRequestStreamDraft(draftVersion)
     ? (pos: number) => readVi64(bytes, pos)
     : (pos: number) => {
         const { value, bytesRead } = readVarint(bytes, pos);
@@ -165,7 +166,7 @@ export function decodeSubscriptionFilter(bytes: Uint8Array, draftVersion: number
 
   // AbsoluteRange (0x4): draft-18 carries an End Group DELTA, 14/16 the absolute value.
   const e = read(pos);
-  const endGroup = draftVersion === 18 ? g.value + e.value : e.value;
+  const endGroup = isRequestStreamDraft(draftVersion) ? g.value + e.value : e.value;
   return { type: 'AbsoluteRange', startGroup: g.value, startObject: o.value, endGroup };
 }
 
@@ -175,7 +176,7 @@ export function decodeSubscriptionFilter(bytes: Uint8Array, draftVersion: number
  *   The caller maps a returned reason to a PROTOCOL_VIOLATION close.
  */
 export function validateSubscriptionFilter(bytes: Uint8Array, draftVersion: number): string | undefined {
-  return draftVersion === 18
+  return isRequestStreamDraft(draftVersion)
     ? validateSubscriptionFilter18(bytes)
     : validateSubscriptionFilterLegacy(bytes);
 }

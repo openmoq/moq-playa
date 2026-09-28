@@ -25,6 +25,7 @@ import { createControlCodec, type ControlCodec } from './control/codec.js';
 import { createDataCodec, type DataCodec } from './data/data-codec.js';
 import { getRequestPolicy, type RequestPolicy } from './session/request-policy.js';
 import type { DraftVersion } from './versions.js';
+import { isRequestStreamDraft } from './versions.js';
 
 /**
  * Coarse, session/adapter-facing per-draft semantic facts.
@@ -97,7 +98,7 @@ const D18_CAPABILITIES: ProfileCapabilities = {
 
 /** Resolve the {@link ProfileCapabilities} for a draft version. */
 function getCapabilities(version: DraftVersion): ProfileCapabilities {
-  return version === 18 ? D18_CAPABILITIES : LEGACY_CAPABILITIES;
+  return isRequestStreamDraft(version) ? D18_CAPABILITIES : LEGACY_CAPABILITIES;
 }
 
 /**

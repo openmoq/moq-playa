@@ -182,7 +182,7 @@ async function run(): Promise<void> {
   const ns = (document.getElementById('namespace') as HTMLInputElement).value.trim();
   const vRaw = (document.getElementById('draft-version') as HTMLSelectElement).value;
   const hashHex = (document.getElementById('cert-hash') as HTMLInputElement).value.trim();
-  const v: 14 | 16 | 18 | undefined = vRaw === '14' ? 14 : vRaw === '16' ? 16 : vRaw === '18' ? 18 : undefined;
+  const v: 14 | 16 | 18 | 21 | undefined = vRaw === '14' ? 14 : vRaw === '16' ? 16 : vRaw === '18' ? 18 : vRaw === '21' ? 21 : undefined;
 
   if (!ns) { setStatus('Namespace required.', 'error'); return; }
   if (!url) {

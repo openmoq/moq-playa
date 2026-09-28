@@ -29,6 +29,7 @@ import { flush, type PipeFaults } from './loopback.js';
 import { makePrng } from './prng.js';
 import { fnv1a64, type TraceRecord } from './trace-hash.js';
 import type { TrackSubscription } from '../adapter.js';
+import { isRequestStreamDraft } from '@moqt/transport';
 
 /** Stable op codes (folded into the trace hash). */
 export const Op = {
@@ -219,7 +220,7 @@ export async function runScenario(opts: ScenarioOptions): Promise<ScenarioResult
   // post-SETUP lengths — any later byte on the control stream is a leak. (For
   // draft-14/16 the control stream legitimately carries requests, so this
   // invariant does not apply.)
-  const isUniPair = version === 18;
+  const isUniPair = isRequestStreamDraft(version);
   const setupLenA = isUniPair ? a.uniOut[0]!.writtenBytes().length : 0;
   const setupLenB = isUniPair ? b.uniOut[0]!.writtenBytes().length : 0;
 
@@ -849,7 +850,7 @@ export async function runScenario(opts: ScenarioOptions): Promise<ScenarioResult
   }
 
   // ── main loop ───────────────────────────────────────────────────────────
-  const opCodes = version === 18 ? [...SUBSCRIBE_OPS, ...FETCH_OPS, ...PUBLISH_OPS, ...CONTINUING_OPS] : SUBSCRIBE_OPS;
+  const opCodes = isRequestStreamDraft(version) ? [...SUBSCRIBE_OPS, ...FETCH_OPS, ...PUBLISH_OPS, ...CONTINUING_OPS] : SUBSCRIBE_OPS;
   for (step = 1; step <= opts.steps; step++) {
     const op = prng.pick(opCodes);
     switch (op) {

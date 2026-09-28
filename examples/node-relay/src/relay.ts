@@ -33,6 +33,7 @@ import type { MoqtConnection, IncomingPublish } from '@moqt/webtransport';
 import { MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@moqt/transport';
 import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, nsStr, hex } from './demo.js';
 import { SubgroupForwarder, type ForwardLimits } from './subgroup-forwarder.js';
+import { isRequestStreamDraft } from '@moqt/transport';
 
 const log = (...a: unknown[]) => console.log('[relay]', ...a);
 
@@ -172,7 +173,7 @@ export class Relay {
       const cachedLargest = latestCached(this.tracks.get(key));
       let acceptParams: Parameters | undefined;
       if (cachedLargest) {
-        const value = conn.draftVersion === 18
+        const value = isRequestStreamDraft(conn.draftVersion)
           ? { group: cachedLargest.groupId, object: cachedLargest.objectId }
           : (() => {
               const loc = { group: varint(cachedLargest.groupId), object: varint(cachedLargest.objectId) };

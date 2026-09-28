@@ -15,13 +15,30 @@
  * - `16` — draft-ietf-moq-transport-16 (default)
  * - `18` — draft-ietf-moq-transport-18 (fully wired: control + data codecs,
  *   uni-pair topology, request profile)
+ * - `21` — draft-ietf-moq-transport-21 (the draft-18 stream model with
+ *   LOCATION_FILTER, fill fetch streams, PUBLISH_STATE_NOTIFY and a
+ *   FETCH that carries its range as a LOCATION_FILTER)
  */
-export type DraftVersion = 14 | 16 | 18;
+export type DraftVersion = 14 | 16 | 18 | 21;
 
 /** Draft versions with a fully-wired wire codec today. */
-export const WIRED_DRAFTS: readonly DraftVersion[] = [14, 16, 18];
+export const WIRED_DRAFTS: readonly DraftVersion[] = [14, 16, 18, 21];
 
 /** Whether `v` has a fully-wired control + data codec. */
 export function isWiredDraft(v: number): v is DraftVersion {
-  return v === 14 || v === 16 || v === 18;
+  return v === 14 || v === 16 || v === 18 || v === 21;
+}
+
+/**
+ * Whether `v` uses the draft-18 stream model: a unified SETUP on a uni
+ * control-stream pair, one bidi stream per request, stream-correlated
+ * responses and vi64 integers. True for draft 18 and every later draft.
+ */
+export function isRequestStreamDraft(v: number | undefined): boolean {
+  return v !== undefined && v >= 18;
+}
+
+/** Whether `v` is draft 21 or later (LOCATION_FILTER, fills, no Joining FETCH). */
+export function isDraft21(v: number | undefined): boolean {
+  return v !== undefined && v >= 21;
 }

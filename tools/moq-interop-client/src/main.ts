@@ -51,7 +51,7 @@ export function __setBoundScale(v: number) { BOUND_SCALE = v; }
 /** MOQT_DRAFT is THE draft selector. The old scaffold read DRAFT_VERSION while
  *  compose sets MOQT_DRAFT, so a planned draft-16 row silently ran the default.
  *  A non-empty unsupported value fails closed rather than defaulting. */
-const SUPPORTED_DRAFTS = [18, 16] as const;
+const SUPPORTED_DRAFTS = [18, 16, 21] as const;
 function selectDraft(): number {
   const raw = (process.env.MOQT_DRAFT ?? "").trim();
   if (raw === "") return 18;
@@ -63,6 +63,7 @@ function selectDraft(): number {
 }
 /** Over WebTransport these are WT-Available-Protocols values, not QUIC ALPNs. */
 function protocolsFor(draft: number): string[] | undefined {
+  if (draft === 21) return ["moqt-21"];
   if (draft === 18) return ["moqt-18"];
   if (draft === 16) return ["moqt-16"];
   return undefined; // draft 14: plain h3 + in-band CLIENT_SETUP

@@ -143,7 +143,7 @@ export { createControlCodec } from './control/codec.js';
 export type { ControlCodec, DraftVersion, DecodedControlMessage } from './control/codec.js';
 
 // ─── Profile (per-draft behavior bundle) ─────────────────────────────
-export { isWiredDraft, WIRED_DRAFTS } from './versions.js';
+export { isDraft21, isRequestStreamDraft, isWiredDraft, WIRED_DRAFTS } from './versions.js';
 export { getProtocolProfile } from './profile.js';
 export type { ProtocolProfile, ProfileCapabilities } from './profile.js';
 export { getRequestPolicy } from './session/request-policy.js';

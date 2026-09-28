@@ -22,9 +22,9 @@ import {
 import { classifyStream18, classifyDatagram18 } from './stream-type-18.js';
 
 /** Create the draft-18 {@link DataCodec}. */
-export function createDataCodec18(): DataCodec {
+export function createDataCodec18(version: 18 | 21 = 18): DataCodec {
   return {
-    version: 18,
+    version,
 
     decodeSubgroupHeader: (buf, offset) => decodeSubgroupHeader18(buf, offset),
 

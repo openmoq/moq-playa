@@ -363,7 +363,11 @@ const notImplemented = (what: string): never => {
 };
 
 export class Draft18Codec implements ControlCodec {
-  readonly version = 18 as const;
+  /**
+   * @param version 18, or 21 for the draft-21 variant of the same stream
+   *   model (its differing messages branch on this).
+   */
+  constructor(readonly version: 18 | 21 = 18) {}
 
   encode(msg: ControlMessage): Uint8Array {
     switch (msg.type) {
