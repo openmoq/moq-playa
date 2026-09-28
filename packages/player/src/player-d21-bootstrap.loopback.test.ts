@@ -38,7 +38,7 @@ interface ServerState {
     mediaSubs: Array<{ reqId: bigint; name: string; fill: boolean }>;
 }
 
-function wireServer(server: MoqtConnection, opts?: { resetFill?: boolean }): ServerState {
+function wireServer(server: MoqtConnection, opts?: { resetFill?: boolean; empty?: boolean }): ServerState {
     const state: ServerState = { catalogAlias: 40n, catalogFill: null, fetches: 0, mediaSubs: [] };
     let nextAlias = 41n;
     server.onFetch = () => { state.fetches += 1; };
@@ -52,6 +52,11 @@ function wireServer(server: MoqtConnection, opts?: { resetFill?: boolean }): Ser
                 return;
             }
             state.catalogFill = fill ?? null;
+            if (opts?.empty) {
+                // No content yet: no LARGEST_OBJECT, so no fill stream (§3.4).
+                await server.acceptSubscribe(requestId, state.catalogAlias);
+                return;
+            }
             await server.acceptSubscribe(requestId, state.catalogAlias, {
                 parameters: new Map([[0x09n, [{ group: 5n, object: 1n }]]]) as never,
             });
@@ -123,6 +128,36 @@ describe('d21 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
         expect(done.normalizePublishDoneStatus(0x2n)).toBe('ended');
         expect(done.normalizePublishDoneStatus(0x3n)).toBe('retriable');
         expect(done.normalizePublishDoneStatus(0x12n)).toBe('fatal-track');
+        await player.destroy();
+    });
+
+    it('an empty track opens no fill: the first live catalog object completes the bootstrap', async () => {
+        const { client, server, errors } = await connectedPair(21);
+        const state = wireServer(server as unknown as MoqtConnection, { empty: true });
+        let catalogSubs = 0;
+        const orig = server.onSubscribe!;
+        server.onSubscribe = (requestId, ns, trackName, params) => {
+            if (td.decode(trackName) === 'catalog') catalogSubs += 1;
+            orig(requestId, ns, trackName, params);
+        };
+        const player = newPlayer(client);
+        const received: string[][] = [];
+        player.on('catalog_received', (e) => received.push(e.catalog.tracks.map((t) => t.name)));
+
+        await player.load();
+        await settle();
+        expect(received).toEqual([]);
+
+        const gid = await (server as unknown as MoqtConnection).openSubgroup(
+            varint(state.catalogAlias), varint(0n), varint(0n), { endOfGroup: false, publisherPriority: 128 });
+        await (server as unknown as MoqtConnection).sendObject(gid, varint(0n), enc(CATALOG));
+        await (server as unknown as MoqtConnection).closeSubgroup(gid);
+        await settle();
+
+        expect(received).toEqual([['video']]);
+        expect(catalogSubs).toBe(1);
+        expect(state.fetches).toBe(0);
+        expect(errors).toEqual([]);
         await player.destroy();
     });
 

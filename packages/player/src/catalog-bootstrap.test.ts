@@ -56,7 +56,7 @@ interface Harness {
     };
 }
 
-function makeHarness(overrides?: { draft?: 14 | 16 | 18 }): Harness {
+function makeHarness(overrides?: { draft?: 14 | 16 | 18 | 21 }): Harness {
     const manager = new CatalogManager('live/test');
     const calls: Harness['calls'] = {
         joiningFetch: 0, standaloneFetches: [], cancels: 0,
@@ -465,6 +465,45 @@ describe('CatalogBootstrap — failure ladder', () => {
         // Then a stall trips it.
         vi.advanceTimersByTime(1_100);
         expect(h.calls.standaloneFetches).toHaveLength(1);
+    });
+});
+
+describe('CatalogBootstrap — draft-21 fill', () => {
+    // draft-21 §3.4: a fill range that starts after Largest Object opens no fill
+    // stream. With no Largest Object the track is empty: wait for the first
+    // live head, exactly like a Joining FETCH answered with INVALID_RANGE.
+    it('SUBSCRIBE_OK without a Largest Object resolves the fill attempt as an empty track', () => {
+        vi.useFakeTimers();
+        const h = makeHarness({ draft: 21 });
+        h.coord.start();
+        h.coord.onSubscribeOk(null);
+        expect(h.coord.phase).toBe('empty-wait');
+        vi.advanceTimersByTime(60_000);
+        expect(h.calls.legacyResubscribes).toBe(0);
+        expect(h.calls.standaloneFetches).toHaveLength(0);
+        h.coord.onLiveCatalogObject({ location: { group: 0n, object: 0n }, kind: 'payload', payload: msf01Indep(['video']) }, 110n);
+        expect(h.calls.ready).toEqual([['video']]);
+    });
+
+    it('the same holds when SUBSCRIBE_OK arrives before the coordinator starts', () => {
+        const h = makeHarness({ draft: 21 });
+        h.coord.onSubscribeOk(null);
+        h.coord.start();
+        expect(h.coord.phase).toBe('empty-wait');
+    });
+
+    it('with a Largest Object the fill is awaited', () => {
+        const h = makeHarness({ draft: 21 });
+        h.coord.start();
+        h.coord.onSubscribeOk({ group: 5n, object: 1n });
+        expect(h.coord.phase).toBe('fetching');
+    });
+
+    it('draft 18 keeps waiting for the Joining FETCH response', () => {
+        const h = makeHarness({ draft: 18 });
+        h.coord.start();
+        h.coord.onSubscribeOk(null);
+        expect(h.coord.phase).toBe('fetching');
     });
 });
 

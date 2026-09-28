@@ -280,6 +280,22 @@ export class CatalogBootstrap {
     if (this.draft === 14 && this._phase === 'joining' && !this.attempt) {
       this.beginAttempt('joining');
     }
+    this.resolveEmptyFill();
+  }
+
+  /**
+   * draft-21 §3.4: the fill range never extends beyond Largest Object, and a
+   * range starting after it opens no fill stream. A SUBSCRIBE_OK without a
+   * Largest Object therefore means no fill will come: resolve the attempt as
+   * an empty track, as INVALID_RANGE does for a Joining FETCH.
+   */
+  private resolveEmptyFill(): void {
+    const attempt = this.attempt;
+    // `largest` is undefined until SUBSCRIBE_OK; null means it carried none.
+    if (this.draft !== 21 || this.largest !== null) return;
+    if (!attempt || attempt.kind !== 'joining' || attempt.cancelled) return;
+    this.cb.log('[catalog-bootstrap] SUBSCRIBE_OK has no Largest Object: the track is empty, no fill will open');
+    this.onFetchError(attempt.id, 'invalid-range');
   }
 
   // ─── FETCH side (attempt-token-guarded) ───────────────────────────
@@ -530,6 +546,7 @@ export class CatalogBootstrap {
     this._phase = 'fetching';
     if (kind === 'joining') this.cb.issueJoiningFetch(this.attempt.id);
     this.armInactivity();
+    if (kind === 'joining') this.resolveEmptyFill();
   }
 
   /** First-payload / prefix ingestion with the profile-specific base rules. */
