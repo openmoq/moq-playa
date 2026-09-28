@@ -107,8 +107,9 @@ export interface ContinuingRequestStream {
 }
 
 export class UniPairTopology {
-  readonly version = 18 as const;
-  private readonly codec: ControlCodec = createControlCodec(18);
+  /** The request-stream draft (18 or 21) this topology speaks. */
+  readonly version: 18 | 21;
+  private readonly codec: ControlCodec;
 
   /** Our outbound uni control stream writer. Held open for the session lifetime
    *  (the draft-18 control stream pair must NOT be closed after SETUP). */
@@ -168,7 +169,10 @@ export class UniPairTopology {
    *  topology (and our writable half is FINned on a clean FIN — no half-open). */
   onRequestClosed?: (requestId: bigint, disposition: 'fin' | 'reset') => void | Promise<void>;
 
-  constructor(private readonly session: Session) {}
+  constructor(private readonly session: Session) {
+    this.version = session.draftVersion === 21 ? 21 : 18;
+    this.codec = createControlCodec(this.version);
+  }
 
   /**
    * Establish the draft-18 control-stream pair: open our outbound uni control
@@ -966,6 +970,22 @@ class RequestStreamContext {
               throw new ProtocolViolationError(
                 'peer REQUEST_UPDATE before the initial PUBLISH response',
               );
+            }
+            await this.onPeerRequest?.(message);
+            continue;
+          }
+          // draft-21 §9.10: PUBLISH_STATE_NOTIFY is a publisher's report on a
+          // subscription's request stream, after SUBSCRIBE_OK. Not a response to
+          // any local operation — never FIFO-matched. Anywhere else it is a
+          // protocol violation.
+          if (message.type === 'PUBLISH_STATE_NOTIFY') {
+            if (this.openerType !== 'SUBSCRIBE') {
+              throw new ProtocolViolationError(
+                `PUBLISH_STATE_NOTIFY not accepted on a ${this.openerType} request stream`,
+              );
+            }
+            if (!this.subscribeEstablished) {
+              throw new ProtocolViolationError('PUBLISH_STATE_NOTIFY without a preceding SUBSCRIBE_OK');
             }
             await this.onPeerRequest?.(message);
             continue;

@@ -146,7 +146,12 @@ export interface ObjectDatagram {
  */
 export type DataStreamHeader =
   | { readonly type: 'subgroup'; readonly header: SubgroupHeader }
-  | { readonly type: 'fetch'; readonly header: FetchHeader };
+  /**
+   * `fill` (draft 21 §3.4): a fill fetch stream, whose FETCH_HEADER carries the
+   * Request ID of the SUBSCRIBE (or REQUEST_UPDATE) that asked for the fill. It
+   * has no FETCH_OK: a FIN completes it, a reset fails it.
+   */
+  | { readonly type: 'fetch'; readonly header: FetchHeader; readonly fill?: boolean };
 
 /**
  * Discriminated union for objects delivered via subscription.

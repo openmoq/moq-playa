@@ -38,7 +38,7 @@ export function createDataCodec18(version: 18 | 21 = 18): DataCodec {
     },
 
     decodeFetchObject18: (buf, offset, prior, isFirstObject, groupOrder) =>
-      decodeFetchObject18(buf, offset, prior, isFirstObject, groupOrder),
+      decodeFetchObject18(buf, offset, prior, isFirstObject, groupOrder, version),
 
     decodeObjectDatagram: (buf, offset) => decodeObjectDatagram18(buf, offset),
 

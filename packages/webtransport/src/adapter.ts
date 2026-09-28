@@ -82,7 +82,7 @@ import { IncomingUniRouter, type RoutedIncomingUniStream } from './topology/inco
 import { InboundRequestStreamContext } from './topology/inbound-request.js';
 import { MoqtConnectionError } from './adapter-error.js';
 import type { WebTransportLike, WebTransportBidirectionalStream, MoqtSetupRouting } from './types.js';
-import { isRequestStreamDraft, isWiredDraft } from '@moqt/transport';
+import { isDraft21, isRequestStreamDraft, isWiredDraft } from '@moqt/transport';
 
 
 
@@ -128,6 +128,13 @@ export interface TrackSubscribeOptions {
    * still legitimately in flight (§10.11).
    */
   readonly deliveryTimeout?: SubscribeOptions['deliveryTimeout'];
+  /**
+   * draft-21 §3.4 FILL_PARAMETERS: the publisher also delivers the fill range on
+   * a fill fetch stream. Its objects reach the connection's `onObject` like FETCH
+   * objects; `onDataStream` announces the stream with `fill: true` and this
+   * subscription's Request ID in the FETCH_HEADER.
+   */
+  readonly fill?: SubscribeOptions['fill'];
   /** Called for each object delivered on this subscription (stream-based only; datagrams excluded). */
   onObject?: (obj: MoqtObject) => void;
   /**
@@ -682,6 +689,7 @@ export class MoqtConnection {
     this.inboundFetchGroupOrder.clear();
     this.fetchServeReserved.clear();
     this.fetchStreams.clear();
+    this.fillStreams.clear();
     this.recentlyCancelledFetches.clear();
     // Incoming data-stream readers — cancel each, then drop. This is a LOCAL
     // teardown: route it through the ownership primitive so a read parked in
@@ -1163,6 +1171,12 @@ export class MoqtConnection {
   private fetchServeReserved = new Set<bigint>();
   /** §9.15 sentinel: publisher could not set an exact Stream Count. */
   private static readonly STREAM_COUNT_UNKNOWN = (1n << 62n) - 1n;
+  /**
+   * draft-21 §3.4 fill fetch streams, by the Request ID of the SUBSCRIBE that
+   * asked for the fill. Kept apart from `fetchStreams`: a fill has no FETCH of
+   * its own, and ending it must not touch the subscription's request stream.
+   */
+  private fillStreams = new Map<bigint, bigint>();
   /** setTimeout's safe upper bound (2^31-1 ms); longer durations are chunked. */
   private static readonly MAX_TIMER_MS = 2_147_483_647;
 
@@ -1231,9 +1245,9 @@ export class MoqtConnection {
     // routing information. The sans-I/O gate enforces the selected binding.
     this.session = new Session(this._role, version, { webtransport: transportKind === 'webtransport' });
     if (isRequestStreamDraft(version)) {
-      this.codec = createControlCodec(18);
+      this.codec = createControlCodec(version);
       this.framer = new ControlStreamFramer(this.codec);
-      this.dataCodec = createDataCodec(18);
+      this.dataCodec = createDataCodec(version);
       this.uniPair = createUniPairTopology(this.session);
       // Surface request-stream failures (unsolicited/wrong-typed response) at once,
       // de-duped against the response-consumer path (same Error instance).
@@ -2160,6 +2174,15 @@ export class MoqtConnection {
       await discard;
       return;
     }
+    // draft-21 §9.10: the publisher's report on OUR subscription's request stream.
+    // Stamp the subscription's request ID, let the session apply it (Largest
+    // Location; an out-of-scope parameter closes the session), surface to the app.
+    if (message.type === 'PUBLISH_STATE_NOTIFY') {
+      const stampedNotify = { ...message, requestId: originalRequestId } as ControlMessage;
+      this.onMessage?.(stampedNotify);
+      await this.executeActions(this.session.handleControlMessage(stampedNotify));
+      return;
+    }
     const updateId = (message as { requestId: bigint }).requestId;
     const stamped = { ...message, existingRequestId: originalRequestId } as ControlMessage;
     this.onMessage?.(stamped);
@@ -2321,6 +2344,9 @@ export class MoqtConnection {
     }
     if (options?.deliveryTimeout !== undefined) {
       subscribeOpts.deliveryTimeout = options.deliveryTimeout;
+    }
+    if (options?.fill !== undefined) {
+      subscribeOpts.fill = options.fill;
     }
     // Build the SUBSCRIBE synchronously (allocates the Request ID) so the response
     // resolver is registered BEFORE any bytes go out. Otherwise a zero-latency peer
@@ -2892,7 +2918,8 @@ export class MoqtConnection {
     // the updated window are still valid.
     this.refreshAliasDeliveryTimeout(alias);
     const seen = this.aliasStreamsSeen.get(alias) ?? 0n;
-    const remaining: bigint | null = streamCount === MoqtConnection.STREAM_COUNT_UNKNOWN
+    // draft 21 raised the sentinel to 2^64-1 (§9.9); anything at or above 2^62-1 is unknown.
+    const remaining: bigint | null = streamCount >= MoqtConnection.STREAM_COUNT_UNKNOWN
       ? null // §9.15 sentinel: exact count unknown — rely on the TTL only
       : (streamCount - seen > 0n ? streamCount - seen : 0n);
     this.armTerminatedAlias(alias, remaining, /* strict */ true);
@@ -3112,6 +3139,8 @@ export class MoqtConnection {
       this.armSubscriberAliasTeardown(raw.trackAlias);
     }
 
+    // draft-21 §3.4: the fill ends with its subscription.
+    await this.cancelFill(requestId);
     const actions = this.session.unsubscribe(requestId); // draft-18 returns no send_control
     await this.executeActions(actions);
     if (isRequestStreamDraft(this.session.draftVersion)) {
@@ -3480,6 +3509,29 @@ export class MoqtConnection {
    * @param requestId The request ID of the fetch to cancel
    * @see draft-ietf-moq-transport-16 §5.2, §9.18; draft-ietf-moq-transport-18 §3.3.2
    */
+  /**
+   * Stop a draft-21 fill (§3.4) without touching its subscription: STOP_SENDING on
+   * the fill fetch stream if it is open, or discard it when it arrives. The
+   * subscription keeps delivering live objects.
+   *
+   * @param requestId the Request ID of the SUBSCRIBE that asked for the fill
+   */
+  async cancelFill(requestId: bigint): Promise<void> {
+    const streamId = this.fillStreams.get(requestId);
+    if (streamId === undefined) {
+      const sub = this.session.getSubscription(requestId);
+      if (sub?.fillRequested === true) {
+        sub.fillRequested = false;
+        // One-shot marker: the FETCH_HEADER handler discards the late fill stream.
+        this.recentlyCancelledFetches.add(requestId);
+      }
+      return;
+    }
+    this.fillStreams.delete(requestId);
+    const reader = this.dataStreamReaders.get(streamId);
+    if (reader) await this.discardLocalReader(streamId, reader, new Error('fill cancelled'));
+  }
+
   async fetchCancel(requestId: bigint): Promise<void> {
     // §5.2: the fetch may already have ended (its data stream FIN'd/reset → reclaimed
     // by handleFetchStreamFinished, or a REQUEST_ERROR). Cancelling a fetch that is
@@ -6219,6 +6271,31 @@ export class MoqtConnection {
       } else {
         const header = headerResult.header as FetchHeader;
         const fetchReqId = header.requestId as bigint;
+        // draft-21 §3.4: a fill fetch stream carries the Request ID of the SUBSCRIBE
+        // that asked for it. One stream per fill; the subscription stops expecting
+        // it once this one is accepted.
+        const fillSub = isDraft21(this.session.draftVersion) && !this.recentlyCancelledFetches.has(fetchReqId)
+          ? this.session.getSubscription(fetchReqId)
+          : undefined;
+        if (fillSub?.fillRequested === true) {
+          fillSub.fillRequested = false;
+          this.fillStreams.set(fetchReqId, streamId);
+          if (fillSub.trackAlias !== undefined) {
+            // §9.9: a fill stream counts toward the subscription's PUBLISH_DONE Stream Count.
+            const alias = fillSub.trackAlias as bigint;
+            this.aliasStreamsSeen.set(alias, (this.aliasStreamsSeen.get(alias) ?? 0n) + 1n);
+          }
+          this.onQlogEvent?.({ type: 'stream_type_set', owner: 'remote', stream_id: streamId, stream_type: 'fetch_header' });
+          this.onQlogEvent?.({ type: 'fetch_header_parsed', stream_id: streamId, request_id: fetchReqId });
+          if (this.locallyDiscardedReaders.has(reader)) {
+            this.onStreamClosed?.(streamId, undefined, 'local-discard');
+            return;
+          }
+          this.onDataStream?.(streamId, { type: 'fetch', header, fill: true });
+          readTerminal = await this.readFetchObjects18(reader, buf, streamId, header);
+          this.onStreamClosed?.(streamId, undefined, terminalKind(readTerminal));
+          return;
+        }
         // §10.13: a data stream for a fetch WE cancelled may still be in flight. It is
         // NOT a new fetch nor a §11.4.4 duplicate — DISCARD it (STOP_SENDING via the
         // finally's reader cleanup) and CONSUME the one-shot marker (a cancellation
@@ -6330,6 +6407,12 @@ export class MoqtConnection {
       // response stream per fetch) — a cancelled fetch is instead recognized by its
       // lossless cancellation marker and its late stream discarded; a completed one
       // has no marker, so a second stream is correctly rejected.
+      for (const [reqId, sid] of this.fillStreams) {
+        if (sid === streamId) {
+          this.fillStreams.delete(reqId);
+          break;
+        }
+      }
       for (const [reqId, sid] of this.fetchStreams) {
         if (sid === streamId) {
           this.fetchStreams.delete(reqId);
@@ -6698,7 +6781,9 @@ export class MoqtConnection {
     // group-order map is recorded for every fetch() (Ascending by default), so a
     // missing entry means an unknown/unrequested fetch — a PROTOCOL_VIOLATION,
     // never a silently-defaulted decode.
-    const groupOrder = this.fetchGroupOrder.get(header.requestId);
+    // A draft-21 fill is delivered in ascending order (§3.4); a FETCH records its own.
+    const groupOrder = this.fetchGroupOrder.get(header.requestId)
+      ?? (this.fillStreams.get(header.requestId as bigint) === streamId ? 'ascending' : undefined);
     if (groupOrder === undefined) {
       // No group-order entry AND no cancellation marker (the marker is checked — and
       // consumed — at the FETCH_HEADER handler and the loop-top guard BEFORE we reach
