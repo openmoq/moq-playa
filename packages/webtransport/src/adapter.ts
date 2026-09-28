@@ -312,6 +312,9 @@ function splitOwnership<T extends object>(
   return { sessionOptions: rest as T, onRequestId };
 }
 
+/** draft-21 FILL_PARAMETERS message parameter (§9.20.16). */
+const FILL_PARAMETERS = 0x23n;
+
 export class MoqtConnection {
   /** The underlying sans-I/O session state machine. Set by {@link configureForVersion}. */
   session!: Session;
@@ -477,7 +480,11 @@ export class MoqtConnection {
     groupOrder: GroupOrder;
     prior: FetchObjectPrior18 | undefined;
     isFirstObject: boolean;
+    /** A draft-21 fill stream: its request is the SUBSCRIBE, not a FETCH. */
+    fill?: boolean;
   }>();
+  /** Inbound draft-21 SUBSCRIBEs that asked for a fill not yet served. */
+  private readonly inboundFillRequests = new Set<bigint>();
 
   /**
    * Called for each application-relevant control message received after setup.
@@ -688,6 +695,7 @@ export class MoqtConnection {
     this.fetchGroupOrder.clear();
     this.inboundFetchGroupOrder.clear();
     this.fetchServeReserved.clear();
+    this.inboundFillRequests.clear();
     this.fetchStreams.clear();
     this.fillStreams.clear();
     this.recentlyCancelledFetches.clear();
@@ -4949,6 +4957,23 @@ export class MoqtConnection {
     return streamId;
   }
 
+  /**
+   * draft-21 §3.4: open the fill stream for an inbound SUBSCRIBE that carried
+   * FILL_PARAMETERS. It is a fetch stream whose FETCH_HEADER carries the
+   * SUBSCRIBE's Request ID, written with {@link sendFetchObject} /
+   * {@link sendFetchEndOfRange} in ascending order; {@link closeFetchStream}
+   * FINs it (the fill is complete). There is no FETCH_OK. One per request.
+   */
+  async openFillStream(requestId: bigint): Promise<bigint> {
+    if (!this.inboundFillRequests.delete(requestId)) {
+      throw new MoqtConnectionError(`SUBSCRIBE ${requestId} did not ask for a fill`, { errorSource: 'data' });
+    }
+    this.inboundFetchGroupOrder.set(requestId, 'ascending');
+    const streamId = await this.openFetchStream(requestId);
+    this.fetchOutgoingStreams.get(streamId)!.fill = true;
+    return streamId;
+  }
+
   /** Send a normal fetch object on a FETCH response stream (§11.4.4). */
   async sendFetchObject(streamId: bigint, fields: FetchObjectFields): Promise<void> {
     const state = this.fetchOutgoingStreams.get(streamId);
@@ -4975,6 +5000,12 @@ export class MoqtConnection {
     if (!state) return;
     try { await state.writer.close(); } catch { /* already closed */ }
     this.fetchOutgoingStreams.delete(streamId);
+    if (state.fill) {
+      // The request is the live SUBSCRIBE: nothing to reclaim. The one-stream
+      // reservation stays until the subscription is torn down.
+      this.inboundFetchGroupOrder.delete(state.requestId);
+      return;
+    }
     // §10.13: the publisher finished serving — RECLAIM the accepted incoming fetch in
     // the Session so serving-side state is bounded. Do NOT release the one-stream
     // reservation: §11.4.4 permits EXACTLY ONE response stream per fetch, and that
@@ -5546,6 +5577,7 @@ export class MoqtConnection {
       if (pubAlias !== undefined) this.armTerminatedAlias(pubAlias, null, /* strict */ false);
       this.inboundFetchGroupOrder.delete(requestId);
       this.fetchServeReserved.delete(requestId); // the one-stream reservation is released on teardown
+      this.inboundFillRequests.delete(requestId);
       this.inboundPublishTimeouts.delete(requestId); // never-accepted inbound PUBLISH
       // §10.13: DETACH every open FETCH response stream SYNCHRONOUSLY (before the
       // first await), so sendFetchObject()/closeFetchStream() for this cancelled
@@ -5886,6 +5918,9 @@ export class MoqtConnection {
     await this.executeActions(actions);
     ctx.bind(requestId, 'subscribe');
     this.inboundRequestContexts.set(requestId, ctx);
+    if (isDraft21(this.session.draftVersion) && sub.parameters.has(FILL_PARAMETERS)) {
+      this.inboundFillRequests.add(requestId);
+    }
     this.onSubscribe?.(requestId, sub.trackNamespace, sub.trackName, sub.parameters as Map<bigint, unknown>);
   }
 

@@ -19,6 +19,7 @@ import {
     encodeLocHeaders,
     toVideoChunkInit,
     toAudioChunkInit,
+    locWireProfileForDraft,
 } from './headers.js';
 import { LocExtensionId } from './types.js';
 import type { LocHeaders } from './types.js';
@@ -68,6 +69,16 @@ function buildExtensionBytes(
 }
 
 // ─── parseLocHeaders ──────────────────────────────────────────────────
+
+describe('locWireProfileForDraft', () => {
+  it('maps each wired draft to its property wire profile', () => {
+    expect(locWireProfileForDraft(14)).toBe('d14-absolute-varint');
+    expect(locWireProfileForDraft(16)).toBe('d16-delta-varint');
+    expect(locWireProfileForDraft(18)).toBe('d18-delta-vi64');
+    // draft 21 keeps draft 18's vi64 Object Properties encoding
+    expect(locWireProfileForDraft(21)).toBe('d18-delta-vi64');
+  });
+});
 
 describe('parseLocHeaders', () => {
     it('returns empty headers for undefined extensions (§2.3)', () => {

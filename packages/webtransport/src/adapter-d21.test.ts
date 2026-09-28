@@ -172,3 +172,43 @@ describe('MoqtConnection(21) PUBLISH_STATE_NOTIFY', () => {
     expect(conn.session.state).toBe(SessionState.CLOSED);
   });
 });
+
+describe('MoqtConnection(21) serving a fill (publisher side)', () => {
+  it('openFillStream answers a SUBSCRIBE fill on one fetch stream and leaves the subscription up', async () => {
+    const { connectedPair } = await import('./testkit/pair.js');
+    const { client, server, errors } = await connectedPair(21);
+    let fillRefusedWithoutRequest = false;
+    let alias = 12n;
+    server.onSubscribe = (requestId, _ns, trackName) => {
+      void (async () => {
+        await server.acceptSubscribe(requestId, alias++);
+        if (new TextDecoder().decode(trackName) !== 'catalog') {
+          await server.openFillStream(requestId).catch(() => { fillRefusedWithoutRequest = true; });
+          return;
+        }
+        const sid = await server.openFillStream(requestId);
+        await server.sendFetchObject(sid, { groupId: 4n, subgroupId: 0n, objectId: 0n, publisherPriority: 3, payload: new Uint8Array([1]) });
+        await server.sendFetchObject(sid, { groupId: 4n, subgroupId: 0n, objectId: 1n, publisherPriority: 3, payload: new Uint8Array([2]) });
+        await server.closeFetchStream(sid);
+      })();
+    };
+    const objects: MoqtObject[] = [];
+    const streams: DataStreamHeader[] = [];
+    client.onObject = (_sid, o) => objects.push(o);
+    client.onDataStream = (_sid, h) => streams.push(h);
+
+    const sub = await client.subscribeTrack(ns('live'), nm('catalog'), {
+      filter: { type: 'LargestObject' },
+      fill: { filter: { type: 'RelativeStart', groups: 1n } },
+    });
+    await client.subscribeTrack(ns('live'), nm('video'));
+    for (let i = 0; i < 10; i++) await flush();
+
+    expect(streams).toEqual([expect.objectContaining({ fill: true })]);
+    expect(objects.map((o) => o.objectId)).toEqual([0n, 1n]);
+    expect(fillRefusedWithoutRequest).toBe(true);
+    expect(client.session.getSubscription(sub.requestId)).toBeDefined();
+    expect(server.session.state).toBe(SessionState.ESTABLISHED);
+    expect(errors).toEqual([]);
+  });
+});

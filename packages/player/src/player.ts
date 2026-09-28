@@ -100,6 +100,12 @@ import { isRequestStreamDraft } from '@moqt/transport';
 /** Max objects to stage during make-before-break switch before force-completing. */
 const SWITCH_STAGING_MAX_OBJECTS = 100;
 
+/** draft-21 FILL_PARAMETERS for joining the current group: a LOCATION_FILTER
+ *  of [1] (one group back from Largest, i.e. the current group), the
+ *  counterpart of a relative Joining FETCH at offset 0. */
+const CURRENT_GROUP_FILL = { filter: { type: 'RelativeStart' as const, groups: 1n } };
+const CATALOG_FILL = CURRENT_GROUP_FILL;
+
 /** Max time (ms) to wait for a keyframe during make-before-break switch. */
 const SWITCH_STAGING_TIMEOUT_MS = 3_000;
 
@@ -571,6 +577,9 @@ export class MoqtPlayer {
   private bootstrapGeneration = 0;
   /** The coordinator's CURRENT fetch: connection-scoped ownership. */
   private bootstrapFetch: { conn: MoqtConnection; reqId: bigint; attempt: number; gen: number } | null = null;
+  /** draft-21 catalog SUBSCRIBEs whose fill stands in for the Joining FETCH:
+   *  retiring one cancels the fill, never the subscription it rides on. */
+  private readonly catalogFillRequests = new Set<bigint>();
   /** Fetch data streams belonging to the bootstrap — CONNECTION-SCOPED: an
    *  old session's stream 0 must never be read as the new session's stream 0
    *  during migration. */
@@ -3468,6 +3477,7 @@ export class MoqtPlayer {
     this.fetchStreamAliases.clear();
     this.fetchStreamRequestIds.clear();
     this.pendingFetchStreams.clear();
+    this.catalogFillRequests.clear();
     this.refusedFetchRequests.clear();
     this.quarantinedFetchRequests.clear();
     this.droppedFetchStreams.clear();
@@ -3884,6 +3894,13 @@ export class MoqtPlayer {
    * Profile is unknowable before the first catalog parse, so this depends
    * only on configuration.
    */
+  private usesCatalogFill(conn: MoqtConnection): boolean {
+    // draft 21 has no Joining FETCH: the SUBSCRIBE carries FILL_PARAMETERS
+    // and the fill fetch stream (FETCH_HEADER with the SUBSCRIBE's Request ID)
+    // is the MSF-01 §5 prefix. There is no FETCH_OK; a FIN completes it.
+    return conn.draftVersion === 21;
+  }
+
   private resolvedCatalogMode(_conn: MoqtConnection): 'joining-fetch' | 'subscribe' {
     const mode = this.config.catalogBootstrap ?? 'auto';
     if (mode === 'subscribe') return 'subscribe';
@@ -3952,6 +3969,7 @@ export class MoqtPlayer {
     const gen = this.bootstrapGeneration;
     return {
       subscriptionFilter: { type: 'LargestObject' as const },
+      ...(this.usesCatalogFill(conn) ? { fill: CATALOG_FILL } : {}),
       onRequestId: (id: bigint) => {
         if (gen !== this.bootstrapGeneration) return;
         this.catalogRequestId = id;
@@ -3989,6 +4007,17 @@ export class MoqtPlayer {
       resetManager: () => this.catalogManager?.reset(),
       currentState: () => this.catalogManager?.currentState ?? null,
       issueJoiningFetch: (attempt) => {
+        if (this.usesCatalogFill(conn)) {
+          void Promise.resolve().then(() => {
+            if (!live()) return;
+            const subReqId = this.catalogRequestId;
+            if (subReqId === null) { coord.onFetchError(attempt, 'refused'); return; }
+            this.catalogFillRequests.add(subReqId);
+            coord.onFetchOk(attempt, { group: 0n, object: 0n }, false);
+            this.registerBootstrapFetch(conn, subReqId, attempt, gen);
+          });
+          return;
+        }
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
@@ -4167,6 +4196,20 @@ export class MoqtPlayer {
     }
   }
 
+  /** A recovery candidate's draft-21 fill stream can arrive before the
+   *  coordinator asks for it (the fill rides on the SUBSCRIBE): claim it. */
+  private claimParkedRecoveryFill(
+    recovery: NonNullable<MoqtPlayer['catalogRecovery']>, reqId: bigint, attempt: number,
+  ): void {
+    for (const [streamId, parked] of [...this.pendingFetchStreams]) {
+      if (parked.requestId !== reqId) continue;
+      this.pendingFetchStreams.delete(streamId);
+      recovery.fetchStreams.set(streamId, attempt);
+      for (const obj of parked.objects) recovery.coord.onFetchObject(attempt, this.toCatalogEvent(obj));
+      if (parked.terminal !== undefined) recovery.coord.onFetchStreamClosed(attempt, parked.terminal === 'fin');
+    }
+  }
+
   /** Emit the raw-catalog diagnostic exactly as the legacy path does. */
   private emitCatalogRaw(obj: MoqtObject): void {
     if (obj.kind !== 'data') return;
@@ -4281,7 +4324,11 @@ export class MoqtPlayer {
    * supersession, rung transitions, and candidate teardown.
    */
   private retireBootstrapFetch(conn: MoqtConnection, reqId: bigint, opts?: { attempt?: number; extraStreams?: Iterable<bigint> }): void {
-    void conn.fetchCancel(varint(reqId)).catch(() => { /* gone */ });
+    if (this.catalogFillRequests.delete(reqId)) {
+      void conn.cancelFill(reqId).catch(() => { /* gone */ });
+    } else {
+      void conn.fetchCancel(varint(reqId)).catch(() => { /* gone */ });
+    }
     this.quarantineFetchRequest(reqId);
     for (const [sid, entry] of this.bootstrapFetchStreams) {
       // Attempt-scoped: retiring attempt A must never sweep streams that a
@@ -4341,6 +4388,22 @@ export class MoqtPlayer {
       resetManager: () => manager.reset(),
       currentState: () => manager.currentState,
       issueJoiningFetch: (attempt) => {
+        if (this.usesCatalogFill(conn)) {
+          void Promise.resolve().then(() => {
+            if (!live()) return;
+            const subReqId = ownedAsCandidate() ? this.catalogRecovery!.reqId : this.catalogRequestId;
+            if (subReqId == null) { coord.onFetchError(attempt, 'refused'); return; }
+            this.catalogFillRequests.add(subReqId);
+            coord.onFetchOk(attempt, { group: 0n, object: 0n }, false);
+            if (ownedAsCandidate()) {
+              this.catalogRecovery!.fetch = { reqId: subReqId, attempt };
+              this.claimParkedRecoveryFill(this.catalogRecovery!, subReqId, attempt);
+            } else if (ownedAsMain()) {
+              this.registerBootstrapFetch(conn, subReqId, attempt, this.bootstrapGeneration);
+            }
+          });
+          return;
+        }
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
@@ -4539,6 +4602,7 @@ export class MoqtPlayer {
           : { type: 'LargestObject' as const };
         const reqId = await conn.subscribe(nsBytes, nameBytes, {
           subscriptionFilter: candidateFilter,
+          ...(candidateFilter.type === 'LargestObject' && this.usesCatalogFill(conn) ? { fill: CATALOG_FILL } : {}),
           onRequestId: (id: bigint) => {
             const r = this.catalogRecovery;
             if (!live() || !r) return;
@@ -4869,13 +4933,14 @@ export class MoqtPlayer {
     // NEGOTIATED draft: the status tables differ per draft, and the session's
     // actual draft can diverge from configuration under auto-negotiation.
     const draft = this.connection?.draftVersion ?? this.config.draftVersion ?? 16;
-    if (code === 0x2n || code === 0x3n) return 'ended';          // TRACK_ENDED / SUBSCRIPTION_ENDED
+    if (code === 0x2n) return 'ended';                            // TRACK_ENDED
+    if (code === 0x3n && draft !== 21) return 'ended';            // SUBSCRIPTION_ENDED (gone in draft 21)
     if (code === 0x4n) return 'going-away';                       // GOING_AWAY
     if (code === 0x1n) return 'fatal-track';                      // UNAUTHORIZED
     if (draft === 14 && code === 0x7n) return 'fatal-track';      // d14 MALFORMED_TRACK
-    if (draft !== 14 && code === 0x12n) return 'fatal-track';     // d16/18 MALFORMED_TRACK
+    if (draft !== 14 && code === 0x12n) return 'fatal-track';     // d16+ MALFORMED_TRACK
     // INTERNAL_ERROR(0x0), EXPIRED/TOO_FAR_BEHIND (0x5/0x6, either draft
-    // orientation), UPDATE_FAILED(0x8), d18 EXCESSIVE_LOAD(0x9), unknown.
+    // orientation), UPDATE_FAILED(0x8), d18/21 EXCESSIVE_LOAD(0x9), unknown.
     if (code !== 0x0n && code !== 0x5n && code !== 0x6n && code !== 0x8n && code !== 0x9n) {
       this.log.warn('[catalog-bootstrap] unknown PUBLISH_DONE status 0x%s — treated as retriable', code.toString(16));
     }
@@ -5175,6 +5240,7 @@ export class MoqtPlayer {
     this.fetchStreamAliases.clear();
     this.fetchStreamRequestIds.clear();
     this.pendingFetchStreams.clear();
+    this.catalogFillRequests.clear();
     this.refusedFetchRequests.clear();
     this.quarantinedFetchRequests.clear();
     this.droppedFetchStreams.clear();
@@ -7441,8 +7507,14 @@ export class MoqtPlayer {
       }
       // Warm start overrides ONLY the filter — configured subscribe options
       // (deliveryTimeout, subscriberPriority, groupOrder) are preserved.
+      // draft 21: the SUBSCRIBE itself asks for the current group as a fill.
+      const warmFill = warmStart && this.connection.draftVersion === 21;
       const mediaOptions = warmStart
-        ? { ...(subscribeOptions ?? {}), subscriptionFilter: { type: 'LargestObject' as const } }
+        ? {
+          ...(subscribeOptions ?? {}),
+          subscriptionFilter: { type: 'LargestObject' as const },
+          ...(warmFill ? { fill: CURRENT_GROUP_FILL } : {}),
+        }
         : (subscribeOptions ?? defaultMediaSubscriptionFilter(track?.isLive === true));
       // Pre-send ownership (§9.10): register inside onRequestId — a
       // zero-latency SUBSCRIBE_OK must find the pending entry already in place. Adapters
@@ -7477,7 +7549,14 @@ export class MoqtPlayer {
       // Re-check after await — destroy() may have been called
       if (!this.subscriptionManager) return;
 
-      if (warmStart) {
+      if (warmFill) {
+        // The fill stream carries the SUBSCRIBE's Request ID: route it under
+        // that ID like a warm-start joining FETCH (parked until the alias binds).
+        this.registerMediaFetch(reqIdBigInt, {
+          trackName: name, mediaType, subscriptionRequestId: reqIdBigInt, trackAlias: null, warmStart: true,
+        });
+        this.log.info('[warm-start] fill requested on subscribe %s for %s "%s"', reqIdBigInt, mediaType, name);
+      } else if (warmStart) {
         // §9.16.2 / §10.12.2: a Joining Fetch may reference a PENDING
         // subscription, so this is issued immediately after SUBSCRIBE without
         // awaiting SUBSCRIBE_OK. Registering the fetch under the LIVE track's
