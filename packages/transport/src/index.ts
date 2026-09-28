@@ -331,5 +331,7 @@ export {
   encodeFillParameters,
   encodeLocationFilterFields,
   decodeLocationFilterFields,
+  subscriptionWindow,
+  windowContains,
 } from './control/subscription-filter.js';
-export type { SubscriptionFilter } from './control/subscription-filter.js';
+export type { SubscriptionFilter, SubscriptionWindow } from './control/subscription-filter.js';

@@ -326,3 +326,97 @@ describe('MoqtConnection native QUIC at draft 21', () => {
     await conn.close();
   });
 });
+
+describe('MoqtConnection(21) subscriptions sharing a Track Alias (§3.1)', () => {
+  const SHARED = 50n;
+
+  async function sharedPair() {
+    const pair = await connectedPair21();
+    pair.server.onSubscribe = (requestId) => { void pair.server.acceptSubscribe(requestId, SHARED); };
+    return pair;
+  }
+
+  async function publish(server: MoqtConnection, group: bigint, object: bigint): Promise<void> {
+    const sid = await server.openSubgroup(varint(SHARED), varint(group), varint(0n), { endOfGroup: false, publisherPriority: 1 });
+    await server.sendObject(sid, varint(object), new Uint8Array([Number(group), Number(object)]));
+    await server.closeSubgroup(sid);
+    await flushN();
+  }
+
+  const locations = (objs: MoqtObject[]) => objs.map((o) => `${o.groupId}/${o.objectId}`);
+
+  it('both subscriptions stay bound and each gets only the objects its filter selects', async () => {
+    const { client, server, errors } = await sharedPair();
+    const a: MoqtObject[] = [];
+    const b: MoqtObject[] = [];
+    const subA = await client.subscribeTrack(ns('live'), nm('video'), {
+      filter: { type: 'AbsoluteRange', startGroup: 0n, startObject: 0n, endGroup: 1n },
+      onObject: (o) => a.push(o),
+    });
+    const subB = await client.subscribeTrack(ns('live'), nm('video'), {
+      filter: { type: 'AbsoluteStart', startGroup: 2n, startObject: 0n },
+      onObject: (o) => b.push(o),
+    });
+    expect(subA.trackAlias).toBe(SHARED);
+    expect(subB.trackAlias).toBe(SHARED);
+
+    await publish(server, 1n, 0n);
+    await publish(server, 2n, 0n);
+
+    expect(locations(a)).toEqual(['1/0']);
+    expect(locations(b)).toEqual(['2/0']);
+    expect(client.session.state).toBe(SessionState.ESTABLISHED);
+    expect(errors).toEqual([]);
+  });
+
+  it('an object sent once per matching subscription reaches each of them once', async () => {
+    const { client, server } = await sharedPair();
+    const a: MoqtObject[] = [];
+    const b: MoqtObject[] = [];
+    await client.subscribeTrack(ns('live'), nm('video'), { onObject: (o) => a.push(o) });
+    await client.subscribeTrack(ns('live'), nm('video'), { onObject: (o) => b.push(o) });
+
+    await publish(server, 3n, 0n);
+    await publish(server, 3n, 0n); // the publisher's copy for the second subscription
+
+    expect(locations(a)).toEqual(['3/0']);
+    expect(locations(b)).toEqual(['3/0']);
+  });
+
+  it('a PUBLISH_DONE for one subscription leaves the other receiving on the alias', async () => {
+    const pair = await connectedPair21();
+    const ids: bigint[] = [];
+    pair.server.onSubscribe = (requestId) => { ids.push(requestId); void pair.server.acceptSubscribe(requestId, SHARED); };
+    const { client, server, errors } = pair;
+    const a: MoqtObject[] = [];
+    const b: MoqtObject[] = [];
+    await client.subscribeTrack(ns('live'), nm('video'), { onObject: (o) => a.push(o) });
+    await client.subscribeTrack(ns('live'), nm('video'), { onObject: (o) => b.push(o) });
+
+    await server.publishDone(ids[0]!, varint(0x2n), 'track ended for the first');
+    await flushN();
+    await publish(server, 5n, 0n);
+
+    expect(a).toEqual([]);
+    expect(locations(b)).toEqual(['5/0']);
+    expect(client.session.state).toBe(SessionState.ESTABLISHED);
+    expect(errors).toEqual([]);
+  });
+
+  it('ending one subscription leaves the other receiving on the alias', async () => {
+    const { client, server, errors } = await sharedPair();
+    const a: MoqtObject[] = [];
+    const b: MoqtObject[] = [];
+    const subA = await client.subscribeTrack(ns('live'), nm('video'), { onObject: (o) => a.push(o) });
+    await client.subscribeTrack(ns('live'), nm('video'), { onObject: (o) => b.push(o) });
+
+    await subA.unsubscribe();
+    await flushN();
+    await publish(server, 4n, 0n);
+
+    expect(a).toEqual([]);
+    expect(locations(b)).toEqual(['4/0']);
+    expect(client.session.state).toBe(SessionState.ESTABLISHED);
+    expect(errors).toEqual([]);
+  });
+});

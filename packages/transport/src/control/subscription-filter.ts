@@ -457,3 +457,57 @@ function validateSubscriptionFilter18(bytes: Uint8Array): string | undefined {
 
   return undefined;
 }
+
+// ─── Subscription windows (draft-21 §3.1 shared Track Aliases) ────────
+
+/** The absolute Locations a subscription's filter selects. `end` is inclusive; without `end.object` the whole end group. */
+export interface SubscriptionWindow {
+  readonly start: { readonly group: bigint; readonly object: bigint };
+  readonly end?: { readonly group: bigint; readonly object?: bigint };
+}
+
+/**
+ * Resolve a subscription's Location filter against the Largest Object it was
+ * established with (SUBSCRIBE_OK's LARGEST_OBJECT; `undefined` for an empty
+ * track). A subscriber sharing one Track Alias across several subscriptions to
+ * the same track re-applies each window to attribute an object (draft-21 §3.1).
+ * No filter selects the whole track.
+ */
+export function subscriptionWindow(
+  filter: SubscriptionFilter | undefined,
+  largest: { readonly group: bigint; readonly object: bigint } | undefined,
+): SubscriptionWindow {
+  const origin = { group: 0n, object: 0n };
+  switch (filter?.type) {
+    case undefined:
+      return { start: origin };
+    case 'NextGroupStart':
+      return { start: largest ? { group: largest.group + 1n, object: 0n } : origin };
+    case 'LargestObject':
+    case 'LatestObject':
+      return { start: largest ? { group: largest.group, object: largest.object + 1n } : origin };
+    case 'RelativeStart': {
+      if (!largest) return { start: origin };
+      const group = largest.group + 1n - filter.groups;
+      return { start: { group: group > 0n ? group : 0n, object: 0n } };
+    }
+    case 'AbsoluteStart':
+      return { start: { group: filter.startGroup, object: filter.startObject } };
+    case 'AbsoluteRange':
+      return {
+        start: { group: filter.startGroup, object: filter.startObject },
+        end: filter.endObject === undefined
+          ? { group: filter.endGroup }
+          : { group: filter.endGroup, object: filter.endObject },
+      };
+  }
+}
+
+/** Whether Location {group, object} falls inside `window`. */
+export function windowContains(window: SubscriptionWindow, group: bigint, object: bigint): boolean {
+  const { start, end } = window;
+  if (group < start.group || (group === start.group && object < start.object)) return false;
+  if (end === undefined) return true;
+  if (group > end.group) return false;
+  return group < end.group || end.object === undefined || object <= end.object;
+}

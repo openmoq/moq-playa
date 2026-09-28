@@ -299,7 +299,9 @@ Draft 21 (`new MoqtConnection(21)`, `draftVersion: 21`, ALPN/WT protocol `moqt-2
 - **Player.** The MSF-01 catalog bootstrap and warm start ask for the current group as a fill (`LOCATION_FILTER [1]`). A SUBSCRIBE_OK without a Largest Object means an empty track, so the player waits for the first live catalog object and does not expect a fill.
 - **Other changes.** PUBLISH_STATE_NOTIFY on the subscription stream advances the Largest Location. GOAWAY has no Request ID. The End of Timed-Out Range fetch marker (`0x20C`) is accepted. PUBLISH_DONE `0x3` no longer exists.
 
-Not yet implemented on draft 21: the MAX_REQUEST_UPDATES cap, the `moqt-21` ALPN on `@moqt/quic`, and fills on REQUEST_UPDATE.
+- **REQUEST_UPDATE.** `requestUpdate()` also takes `fill`; that fill stream carries the update's Request ID. `SetupOptions.maxRequestUpdates` advertises MAX_REQUEST_UPDATES. Updates never exceed the peer's limit, and a peer that exceeds ours closes the session with TOO_MANY_REQUEST_UPDATES.
+- **Several subscriptions to one track.** Draft 21 allows them, and a publisher may give them one Track Alias. `subscribeTrack()` subscriptions sharing an alias each receive the objects their own filter selects, once each. Ending one leaves the others running.
+- **Native QUIC.** `connectQuic(uri, { draft: 21 })` offers `moqt-21`.
 
 #### draft-18 known gaps (non-blocking)
 

@@ -35,7 +35,10 @@ import {
   RequestError18,
   SubscriptionState,
   ForwardState,
+  subscriptionWindow,
+  windowContains,
 } from '@moqt/transport';
+import type { SubscriptionFilter, SubscriptionWindow } from '@moqt/transport';
 import type {
   EndpointRoleValue,
   ControlMessage,
@@ -171,6 +174,20 @@ interface RawSubState {
   readonly sub: TrackSubscription;
   resolve: ((sub: TrackSubscription) => void) | null;
   reject: ((err: Error) => void) | null;
+  /** The subscription's Location filter, re-applied when its alias is shared (draft-21 §3.1). */
+  readonly filter?: SubscriptionFilter;
+  /** `filter` resolved against SUBSCRIBE_OK's Largest Object (draft 21). */
+  window?: SubscriptionWindow;
+  /** Objects already delivered while the alias is shared, for deduplication (bounded). */
+  seen?: Set<string>;
+}
+
+/** Bound on the per-subscription dedup set of a shared Track Alias. */
+const SHARED_ALIAS_SEEN_LIMIT = 4096;
+
+/** Whether any Location of `group` falls inside `window`. */
+function windowCoversGroup(window: SubscriptionWindow, group: bigint): boolean {
+  return group >= window.start.group && (window.end === undefined || group <= window.end.group);
 }
 
 type PendingAliasEvent = {
@@ -412,6 +429,12 @@ export class MoqtConnection {
   private rawSubscriptions = new Map<bigint, RawSubState>();
   /** Track subscriptions by trackAlias (active, alias resolved). */
   private rawAliasMaps = new Map<bigint, RawSubState>();
+  /**
+   * draft-21 §3.1: every subscription sharing a Track Alias (two or more, same
+   * track), in binding order. `rawAliasMaps` keeps the first as the alias owner
+   * for the terminal machinery; objects go to each member whose filter matches.
+   */
+  private readonly sharedAliasSubs = new Map<bigint, RawSubState[]>();
   /** Generic subscribe() requests awaiting SUBSCRIBE_OK / REQUEST_ERROR. */
   private pendingGenericSubscriptions = new Set<bigint>();
   /** Local monotonic ownership generation for every unanswered SUBSCRIBE. */
@@ -2142,6 +2165,7 @@ export class MoqtConnection {
     }
     this.rawSubscriptions.clear();
     this.rawAliasMaps.clear();
+    this.sharedAliasSubs.clear();
     this.pendingGenericSubscriptions.clear();
     this.pendingSubscriptionGenerations.clear();
     this.clearAllPendingAliases();
@@ -2167,8 +2191,12 @@ export class MoqtConnection {
     // streams are actively stopped, not merely unrouted. The topology FINs our
     // send direction and drains to the publisher's FIN.
     if (message.type === 'PUBLISH_DONE') {
+      // A subscription sharing its alias ends alone: the alias, its streams and
+      // their terminal accounting stay with the other subscriptions (draft-21 §3.1).
+      const doneRaw = this.rawSubscriptions.get(originalRequestId);
+      const aliasStillShared = doneRaw !== undefined && this.detachSharedAlias(doneRaw);
       // Capture the alias BEFORE the session reclaims the subscription.
-      const doneAlias = this.session.getSubscription(originalRequestId)?.trackAlias;
+      const doneAlias = aliasStillShared ? undefined : this.session.getSubscription(originalRequestId)?.trackAlias;
       const streamCount = (message as { streamCount?: bigint }).streamCount ?? 0n;
       const stampedDone = { ...message, requestId: originalRequestId } as ControlMessage;
       // Terminal drain: arm SYNCHRONOUSLY, BEFORE the application callback —
@@ -2185,6 +2213,16 @@ export class MoqtConnection {
       this.onMessage?.(stampedDone);
       await this.executeActions(this.session.handleControlMessage(stampedDone));
       await discard;
+      if (aliasStillShared) {
+        // No alias drain runs for it: its terminal delivery is complete now.
+        const cfg = this.drainConfigs.get(originalRequestId);
+        this.drainConfigs.delete(originalRequestId);
+        try {
+          cfg?.onDrained?.(originalRequestId);
+        } catch (err) {
+          this.onError?.(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
       return;
     }
     // draft-21 §9.10: the publisher's report on OUR subscription's request stream.
@@ -2275,6 +2313,8 @@ export class MoqtConnection {
     // request STILL owns the alias routing: a delayed peer-close after the alias
     // was legitimately reused by a new subscription must not re-tombstone it.
     const raw = this.rawSubscriptions.get(requestId);
+    // A subscription sharing its alias leaves it to the others (draft-21 §3.1).
+    if (raw) this.detachSharedAlias(raw);
     const teardownAlias = raw && raw.trackAlias !== null && this.rawAliasMaps.get(raw.trackAlias) === raw
       ? raw.trackAlias : null;
     if (teardownAlias !== null) this.armSubscriberAliasTeardown(teardownAlias);
@@ -2385,7 +2425,10 @@ export class MoqtConnection {
 
     // Register the resolver/rejecter synchronously (executor runs now), THEN send.
     const result = new Promise<TrackSubscription>((resolve, reject) => {
-      this.rawSubscriptions.set(reqIdBigint, { requestId: reqIdBigint, trackAlias: null, sub, resolve, reject });
+      this.rawSubscriptions.set(reqIdBigint, {
+        requestId: reqIdBigint, trackAlias: null, sub, resolve, reject,
+        ...(options?.filter !== undefined ? { filter: options.filter } : {}),
+      });
     });
     try {
       await this.sendSubscribeActions(actions);
@@ -2409,6 +2452,66 @@ export class MoqtConnection {
    * Returns true if the object was claimed by a track subscription.
    * Called from data stream handlers before this.onObject.
    */
+  /**
+   * Bind a subscription's route at SUBSCRIBE_OK. On draft 21 a publisher MAY give
+   * concurrent subscriptions to one track the same alias (§3.1); the session has
+   * already verified it is the same track, so the subscription joins the alias's
+   * group instead of replacing the route.
+   */
+  private bindRawAlias(alias: bigint, raw: RawSubState, ok: ControlMessage): void {
+    if (!isDraft21(this.session.draftVersion)) {
+      this.rawAliasMaps.set(alias, raw);
+      return;
+    }
+    const largest = (ok as { parameters?: Map<bigint, unknown[]> }).parameters?.get(0x09n)?.[0];
+    raw.window = subscriptionWindow(raw.filter,
+      largest !== null && typeof largest === 'object' && 'group' in largest
+        ? largest as { group: bigint; object: bigint } : undefined);
+    const current = this.rawAliasMaps.get(alias);
+    if (current === undefined || current === raw) {
+      this.rawAliasMaps.set(alias, raw);
+      return;
+    }
+    const group = this.sharedAliasSubs.get(alias) ?? [current];
+    if (!group.includes(raw)) group.push(raw);
+    this.sharedAliasSubs.set(alias, group);
+  }
+
+  /**
+   * draft-21 §3.1: an object on a shared alias could belong to any of the
+   * subscriptions; each receives it when its filter matches, at most once (the
+   * publisher sends one copy per matching subscription).
+   */
+  private deliverToSharedAlias(group: readonly RawSubState[], obj: MoqtObject): void {
+    const groupId = BigInt(obj.groupId);
+    const objectId = BigInt(obj.objectId);
+    const key = `${groupId}/${String(obj.subgroupId ?? '')}/${objectId}`;
+    for (const raw of [...group]) {
+      if (raw.window && !windowContains(raw.window, groupId, objectId)) continue;
+      const seen = raw.seen ??= new Set<string>();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (seen.size > SHARED_ALIAS_SEEN_LIMIT) seen.delete(seen.values().next().value!);
+      raw.sub.onObject?.(obj);
+    }
+  }
+
+  /**
+   * Take `raw` out of its alias group. True when other subscriptions still use
+   * the alias, so the caller must leave the alias route and its streams alone.
+   */
+  private detachSharedAlias(raw: RawSubState): boolean {
+    const alias = raw.trackAlias;
+    if (alias === null) return false;
+    const group = this.sharedAliasSubs.get(alias);
+    if (!group || !group.includes(raw)) return false;
+    const rest = group.filter((r) => r !== raw);
+    if (rest.length > 1) this.sharedAliasSubs.set(alias, rest);
+    else this.sharedAliasSubs.delete(alias);
+    if (this.rawAliasMaps.get(alias) === raw) this.rawAliasMaps.set(alias, rest[0]!);
+    return true;
+  }
+
   private routeToTrackSubscription(streamId: bigint, obj: MoqtObject): boolean {
     const alias = BigInt(obj.trackAlias);
     const replay = this.pendingAliasReplays.get(alias);
@@ -2416,6 +2519,11 @@ export class MoqtConnection {
       return this.appendPendingAliasReplay(replay, {
         kind: 'object', streamId, object: obj, ownerGeneration: 0n,
       });
+    }
+    const shared = this.sharedAliasSubs.get(alias);
+    if (shared) {
+      this.deliverToSharedAlias(shared, obj);
+      return true;
     }
     const rawSub = this.rawAliasMaps.get(alias);
     if (rawSub) {
@@ -2466,6 +2574,15 @@ export class MoqtConnection {
       this.appendPendingAliasReplay(replay, {
         kind: 'close', header, ownerGeneration: 0n,
       });
+      return;
+    }
+    const shared = this.sharedAliasSubs.get(alias);
+    if (shared) {
+      const group = BigInt(header.groupId);
+      for (const raw of shared) {
+        if (raw.window && !windowCoversGroup(raw.window, group)) continue;
+        raw.sub.onSubgroupClosed?.(header);
+      }
       return;
     }
     const rawSub = this.rawAliasMaps.get(alias);
@@ -2725,6 +2842,7 @@ export class MoqtConnection {
   }
 
   private removeRawSubscription(raw: RawSubState): void {
+    this.detachSharedAlias(raw);
     if (this.rawSubscriptions.get(raw.requestId) === raw) this.rawSubscriptions.delete(raw.requestId);
     if (raw.trackAlias !== null && this.rawAliasMaps.get(raw.trackAlias) === raw) {
       this.rawAliasMaps.delete(raw.trackAlias);
@@ -2770,6 +2888,7 @@ export class MoqtConnection {
     this.refreshAliasDeliveryTimeout(alias); // §8: reflect any accepted REQUEST_UPDATE before arming
     this.armTerminatedAlias(alias, null, /* strict */ false); // TTL-only; refuses reuse until it expires
     this.rawAliasMaps.delete(alias);
+    this.sharedAliasSubs.delete(alias);
   }
 
   /** Early-discard (STOP_SENDING) every incoming subgroup stream open on `alias`. */
@@ -2828,6 +2947,7 @@ export class MoqtConnection {
     // where no request-stream close tears rawAliasMaps down separately).
     this.publishAliasMaps.delete(alias);
     this.rawAliasMaps.delete(alias);
+    this.sharedAliasSubs.delete(alias);
     this.cancelPendingAliasReplay(alias);
     const existing = this.terminatedAliases.get(alias);
     // Do NOT downgrade a STRICT Stream-Count tombstone (which tracks outstanding
@@ -2964,7 +3084,7 @@ export class MoqtConnection {
         // alias, just before this call. Here we only bind routing + resolve.
         raw.trackAlias = alias;
         (raw.sub as { trackAlias: bigint }).trackAlias = alias;
-        this.rawAliasMaps.set(alias, raw);
+        this.bindRawAlias(alias, raw, msg);
         // Claim only events that named this exact request while it was pending.
         // Callback delivery remains deferred until after raw.resolve() below.
         // onObject/onSubgroupClosed are documented "mutable, read live on each delivery":
@@ -3148,6 +3268,8 @@ export class MoqtConnection {
     // direct API, the TrackSubscription wrapper, and the peer-close path all
     // arm at the same point and cannot diverge.
     const raw = this.rawSubscriptions.get(requestId);
+    // A subscription sharing its alias leaves it to the others (draft-21 §3.1).
+    if (raw) this.detachSharedAlias(raw);
     if (raw && raw.trackAlias !== null && this.rawAliasMaps.get(raw.trackAlias) === raw) {
       this.armSubscriberAliasTeardown(raw.trackAlias);
     }

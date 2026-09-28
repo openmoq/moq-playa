@@ -1997,12 +1997,13 @@ export class Session {
     );
 
     // §5.1: at most ONE subscription per Track per ROLE (drafts 16/18 only —
-    // draft-14 defines neither this rule nor DUPLICATE_SUBSCRIPTION 0x19). A peer
+    // draft-14 defines neither this rule nor DUPLICATE_SUBSCRIPTION 0x19, and
+    // draft 21 §3.1 allows concurrent subscriptions to one Track). A peer
     // SUBSCRIBE makes US the publisher; if we already hold a publisher-role
     // subscription for the same Full Track Name — an inbound SUBSCRIBE (incl. one
     // Pending) OR a LOCAL outbound PUBLISH — the REQUEST MUST fail with
     // DUPLICATE_SUBSCRIPTION. Request-level, not a session close.
-    if (this._draftVersion !== 14 && sub.trackKey !== undefined
+    if (this._draftVersion !== 14 && !isDraft21(this._draftVersion) && sub.trackKey !== undefined
         && (this.findLiveIncomingByTrack(sub.trackKey, /* publishInitiated */ false)
             || this.findLiveOutboundPublishByTrack(sub.trackKey))) {
       const errorMsg: RequestErrorMsg = {
@@ -2077,9 +2078,10 @@ export class Session {
 
     // §5.1: an endpoint may hold at most ONE subscription per Track per ROLE
     // (drafts 16/18 only — draft-14 defines neither this rule nor
-    // DUPLICATE_SUBSCRIPTION 0x19). A PUBLISH makes US the subscriber. Checked
-    // BEFORE touching the alias registry.
-    if (this._draftVersion !== 14 && sub.trackKey !== undefined) {
+    // DUPLICATE_SUBSCRIPTION 0x19, and draft 21 §3.1 allows concurrent
+    // subscriptions). A PUBLISH makes US the subscriber. Checked BEFORE
+    // touching the alias registry.
+    if (this._draftVersion !== 14 && !isDraft21(this._draftVersion) && sub.trackKey !== undefined) {
       const outboundSub = this.findLiveOutboundSubscribeByTrack(sub.trackKey);
       // (a) A committed subscriber-role subscription — an earlier PUBLISH we
       //     accepted, or a local ESTABLISHED SUBSCRIBE — is a duplicate: reject.
