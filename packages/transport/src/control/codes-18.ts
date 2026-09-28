@@ -44,6 +44,8 @@ export const ControlMessageType18 = {
   FETCH: 0x16,
   FETCH_OK: 0x18,
   PUBLISH: 0x1d,
+  /** draft-21 §9.10 only: a publisher's report of its subscription state. */
+  PUBLISH_STATE_NOTIFY: 0x22,
   // PUBLISH_OK (0x1E) intentionally omitted — see the note above (REQUEST_OK shorthand).
   SUBSCRIBE_NAMESPACE: 0x50,
   SUBSCRIBE_TRACKS: 0x51,
@@ -90,6 +92,35 @@ export const MessageParam18: Record<string, { type: number; kind: ParamValueKind
   GROUP_ORDER: { type: 0x22, kind: 'uint8' },
   NEW_GROUP_REQUEST: { type: 0x32, kind: 'varint' },
   TRACK_NAMESPACE_PREFIX: { type: 0x34, kind: 'namespace' },
+} as const;
+
+/**
+ * draft-21 Message Parameter codes + value encodings (draft-21 §16.7). Draft 18's
+ * table with 0x21 renamed LOCATION_FILTER (a length-driven 0-4 field Location
+ * filter, §9.20.10) and FILL_PARAMETERS (0x23), the Range Filters (0x25-0x29)
+ * and INCLUDE_PROPERTIES (0x35) added.
+ */
+export const MessageParam21: Record<string, { type: number; kind: ParamValueKind }> = {
+  OBJECT_DELIVERY_TIMEOUT: { type: 0x02, kind: 'varint' },
+  AUTHORIZATION_TOKEN: { type: 0x03, kind: 'bytes' },
+  RENDEZVOUS_TIMEOUT: { type: 0x04, kind: 'varint' },
+  SUBGROUP_DELIVERY_TIMEOUT: { type: 0x06, kind: 'varint' },
+  EXPIRES: { type: 0x08, kind: 'varint' },
+  LARGEST_OBJECT: { type: 0x09, kind: 'location' },
+  FILL_TIMEOUT: { type: 0x0a, kind: 'varint' },
+  FORWARD: { type: 0x10, kind: 'uint8' },
+  SUBSCRIBER_PRIORITY: { type: 0x20, kind: 'uint8' },
+  LOCATION_FILTER: { type: 0x21, kind: 'bytes' },
+  GROUP_ORDER: { type: 0x22, kind: 'uint8' },
+  FILL_PARAMETERS: { type: 0x23, kind: 'bytes' },
+  SUBGROUP_FILTER: { type: 0x25, kind: 'bytes' },
+  OBJECTID_FILTER: { type: 0x26, kind: 'bytes' },
+  PRIORITY_FILTER: { type: 0x27, kind: 'bytes' },
+  OBJECT_PROPERTY_FILTER: { type: 0x28, kind: 'bytes' },
+  TRACK_PROPERTY_FILTER: { type: 0x29, kind: 'bytes' },
+  NEW_GROUP_REQUEST: { type: 0x32, kind: 'varint' },
+  TRACK_NAMESPACE_PREFIX: { type: 0x34, kind: 'namespace' },
+  INCLUDE_PROPERTIES: { type: 0x35, kind: 'uint8' },
 } as const;
 
 /** Property type ranges (§2.5, §12). Properties are carried by control messages

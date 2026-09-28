@@ -16,6 +16,7 @@ export {
   ControlMessageType18,
   SetupOption18,
   MessageParam18,
+  MessageParam21,
   PropertyRange18,
   isMandatoryProperty,
 } from './control/codes-18.js';
@@ -39,6 +40,7 @@ export {
   decodeMessageParams18,
   messageParams18EncodingLength,
   DEFAULT_MESSAGE_PARAM_REGISTRY,
+  DRAFT21_MESSAGE_PARAM_REGISTRY,
 } from './control/message-params-18.js';
 export type {
   MessageParamValue,
@@ -81,7 +83,7 @@ export { readReasonPhrase, writeReasonPhrase, reasonPhraseEncodingLength } from 
 // ─── Error Codes ─────────────────────────────────────────────────────
 export { SessionError, RequestError, PublishDoneCode, DataStreamError, ProtocolViolationError } from './errors.js';
 // draft-18 error code registries (canonical; the legacy exports above stay draft-14/16).
-export { RequestError18, PublishDoneCode18, StreamResetCode18, DataStreamError18 } from './errors.js';
+export { RequestError18, RequestError21, PublishDoneCode18, StreamResetCode18, DataStreamError18 } from './errors.js';
 
 // ─── Control Messages ────────────────────────────────────────────────
 export { MessageType } from './control/codes.js';
@@ -125,6 +127,7 @@ export type {
   SubscribeNamespace,
   SubscribeTracks,
   PublishBlocked,
+  PublishStateNotify,
   UnsubscribeNamespace,
   PublishNamespaceOk,
   PublishNamespaceError,
@@ -323,5 +326,10 @@ export { Session } from './session/session.js';
 export { SessionError as SessionProtocolError, SessionDrainingError } from './session/session.js';
 export type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions, RequestResult } from './session/session.js';
 export { resolveJoiningFetchRange, type JoiningFetchFields } from './session/joining.js';
-export { decodeSubscriptionFilter } from './control/subscription-filter.js';
+export {
+  decodeSubscriptionFilter,
+  encodeFillParameters,
+  encodeLocationFilterFields,
+  decodeLocationFilterFields,
+} from './control/subscription-filter.js';
 export type { SubscriptionFilter } from './control/subscription-filter.js';

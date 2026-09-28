@@ -32,6 +32,8 @@ export const SessionError = {
   EXPIRED_AUTH_TOKEN: varint(0x18),
   INVALID_AUTHORITY: varint(0x19),
   MALFORMED_AUTHORITY: varint(0x1a),
+  /** draft-21: more than MAX_REQUEST_UPDATES updates outstanding on one request. */
+  TOO_MANY_REQUEST_UPDATES: varint(0x1b),
 } as const;
 
 /**
@@ -124,6 +126,31 @@ export const RequestError18 = {
   INVALID_JOINING_REQUEST_ID: varint(0x32),
   UNSUPPORTED_EXTENSION: varint(0x33),
   REDIRECT: varint(0x34),
+} as const;
+
+/**
+ * REQUEST_ERROR codes — **draft-21** (§12.3): draft 18's without
+ * DUPLICATE_SUBSCRIPTION and INVALID_JOINING_REQUEST_ID, plus the filter codes.
+ */
+export const RequestError21 = {
+  INTERNAL_ERROR: varint(0x0),
+  UNAUTHORIZED: varint(0x1),
+  TIMEOUT: varint(0x2),
+  NOT_SUPPORTED: varint(0x3),
+  MALFORMED_AUTH_TOKEN: varint(0x4),
+  EXPIRED_AUTH_TOKEN: varint(0x5),
+  GOING_AWAY: varint(0x6),
+  EXCESSIVE_LOAD: varint(0x9),
+  DOES_NOT_EXIST: varint(0x10),
+  INVALID_RANGE: varint(0x11),
+  MALFORMED_TRACK: varint(0x12),
+  UNINTERESTED: varint(0x20),
+  PREFIX_OVERLAP: varint(0x30),
+  NAMESPACE_TOO_LARGE: varint(0x31),
+  UNSUPPORTED_EXTENSION: varint(0x33),
+  REDIRECT: varint(0x34),
+  CONFLICTING_FILTERS: varint(0x35),
+  INVALID_FILTER: varint(0x36),
 } as const;
 
 /**

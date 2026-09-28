@@ -1,0 +1,39 @@
+# Draft-21 (draft-ietf-moq-transport-21, version 0xff000015, ALPN moqt-21) wire vectors.
+# Format: <name> <kind> <source> <hex>
+#   kind:   control   = one framed control message {Type vi64, Length (16), Body}
+#           parameter = one message parameter {Type, Length, Value}
+#           stream    = bytes at the start of a data/fetch stream
+#   source: moqxr-encoder          = produced by moqxr (openmoq/moqxr#45, feature/draft-21 @ 478d6c0)
+#           moqxr-decoder-verified = hand-built, accepted by moqxr's draft-21 decoders
+#           draft-text             = hand-built from docs/draft-ietf-moq-transport-21.txt only
+# Copied from red5-moq-relay (src/test/resources/draft21/wire-vectors.txt), which regenerates
+# them with scripts/draft21-vectors/gen.cpp against moqxr. Keep the vector lines identical.
+client_setup control moqxr-encoder af00001901042f6d6f71041172656c61792e6578616d706c652e636f6d
+publish_namespace control moqxr-encoder 0600080001046c69766500
+publish control moqxr-encoder 1d000f0201046c69766505766964656f0100
+subscribe_ok_no_largest control moqxr-encoder 0400020100
+subscribe_ok_largest_3_7 control moqxr-encoder 0400050101090307
+request_update_ok_largest_3_7 control moqxr-encoder 07000401090307
+publish_done_track_ended_unknown_count control moqxr-encoder 0b000f02ffffffffffffffffff04646f6e65
+fetch_header_fill_req_95 stream moqxr-encoder 055f
+subgroup_header_alias1_g3_sg0 stream moqxr-encoder 300103
+server_setup_filter_ranges_16_request_updates_4 control moqxr-decoder-verified af00000406100204
+subscribe_location_filter_empty control moqxr-decoder-verified 0300100901046c69766505766964656f012100
+subscribe_location_filter_next_group control moqxr-decoder-verified 0300110901046c69766505766964656f01210100
+subscribe_location_filter_relative_3 control moqxr-decoder-verified 0300110901046c69766505766964656f01210103
+subscribe_location_filter_next_object control moqxr-decoder-verified 0300120901046c69766505766964656f0121020000
+subscribe_location_filter_start_12_5 control moqxr-decoder-verified 0300120901046c69766505766964656f0121020c05
+subscribe_location_filter_range_12_5_delta_3 control moqxr-decoder-verified 0300130901046c69766505766964656f0121030c0503
+subscribe_location_filter_range_12_5_delta_3_end_object_7 control moqxr-decoder-verified 0300140901046c69766505766964656f0121040c050307
+subscribe_join_current_group_with_fill_include_properties_0 control moqxr-decoder-verified 0300190901046c69766505766964656f032102000002032101011200
+subscribe_tracks_next_object_group_order_descending control moqxr-decoder-verified 51000e5d01046c69766502210200000102
+request_update_fill_whole_track control moqxr-decoder-verified 0200045f012300
+publish_ok_expires_30000 control moqxr-decoder-verified 0700050108c07530
+fetch_range_12_5_to_15_9 control draft-text 1600140701046c69766505766964656f0121040c050309
+fetch_ok_inclusive_end_15_9 control draft-text 180004000f0900
+goaway_no_uri_timeout_5000 control draft-text 100003009388
+publish_state_notify_largest_3_7_forward_0 control draft-text 220006020903070700
+publish_skipped_cam2_video control draft-text 0f000c010463616d3205766964656f
+param_subgroup_filter_set0_3to5_10to15 parameter draft-text 25050003020505
+param_object_property_filter_set1_prop16_from100 parameter draft-text 2803011064
+fetch_object_end_of_timed_out_range_g2_o4 stream draft-text 820c0204

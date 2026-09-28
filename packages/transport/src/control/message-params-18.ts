@@ -21,7 +21,7 @@
 import { readVi64, writeVi64, vi64EncodingLength, MAX_VI64 } from '../primitives/vi64.js';
 import { readUint8, writeUint8, validateTrackNamespacePrefix } from '../primitives/bytes.js';
 import { ProtocolViolationError } from '../errors.js';
-import { MessageParam18, type ParamValueKind } from './codes-18.js';
+import { MessageParam18, MessageParam21, type ParamValueKind } from './codes-18.js';
 
 export type { ParamValueKind };
 
@@ -102,6 +102,11 @@ export type MessageParamRegistry = ReadonlyMap<bigint, ParamValueKind>;
 /** Default registry built from the draft-18 message-parameter type table (§10.2). */
 export const DEFAULT_MESSAGE_PARAM_REGISTRY: MessageParamRegistry = new Map(
   Object.values(MessageParam18).map((d) => [BigInt(d.type), d.kind] as const),
+);
+
+/** Registry built from the draft-21 message-parameter type table (draft-21 §16.7). */
+export const DRAFT21_MESSAGE_PARAM_REGISTRY: MessageParamRegistry = new Map(
+  Object.values(MessageParam21).map((d) => [BigInt(d.type), d.kind] as const),
 );
 
 // ─── value length / write / read ─────────────────────────────────────

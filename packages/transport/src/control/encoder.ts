@@ -199,6 +199,7 @@ function messageTypeCode(type: ControlMessage['type']): Varint {
     // Draft-18-only types — not valid in the draft-14/16 encoder
     case 'SUBSCRIBE_TRACKS':
     case 'PUBLISH_BLOCKED':
+    case 'PUBLISH_STATE_NOTIFY':
       throw new Error(`Cannot encode draft-18-only message type "${type}" with draft-16 encoder`);
   }
 }
@@ -403,6 +404,7 @@ function payloadLength(msg: ControlMessage): number {
     // Draft-18-only types — unreachable (messageTypeCode throws first)
     case 'SUBSCRIBE_TRACKS':
     case 'PUBLISH_BLOCKED':
+    case 'PUBLISH_STATE_NOTIFY':
       throw new Error(`Cannot encode draft-18-only message type "${msg.type}" with draft-16 encoder`);
   }
 }
@@ -557,6 +559,7 @@ function writePayload(msg: ControlMessage, buf: Uint8Array, offset: number): num
     // Draft-18-only types — unreachable (messageTypeCode throws first)
     case 'SUBSCRIBE_TRACKS':
     case 'PUBLISH_BLOCKED':
+    case 'PUBLISH_STATE_NOTIFY':
       throw new Error(`Cannot encode draft-18-only message type "${msg.type}" with draft-16 encoder`);
   }
 

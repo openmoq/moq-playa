@@ -445,6 +445,7 @@ function decodePayloadFields(
     // Draft-18-only types — not decodable by the draft-14/16 decoder
     case 'SUBSCRIBE_TRACKS':
     case 'PUBLISH_BLOCKED':
+    case 'PUBLISH_STATE_NOTIFY':
       throw new ProtocolViolationError(`Draft-18-only message type "${typeName}" cannot be decoded by draft-16 decoder`);
   }
 }
