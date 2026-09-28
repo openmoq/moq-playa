@@ -70,6 +70,11 @@ export class SubscriptionStateMachine {
    */
   private _currentFilter: Uint8Array | undefined;
   /**
+   * draft-21 §3.4: the SUBSCRIBE asked for a fill (FILL_PARAMETERS), so a fill
+   * fetch stream whose FETCH_HEADER carries this Request ID belongs to it.
+   */
+  fillRequested = false;
+  /**
    * Last-sent SUBSCRIBER_PRIORITY for this subscription.
    * Used by draft-14 to replay unchanged values in SUBSCRIBE_UPDATE.
    * @see draft-ietf-moq-transport-14 §9.10
