@@ -212,3 +212,117 @@ describe('MoqtConnection(21) serving a fill (publisher side)', () => {
     expect(errors).toEqual([]);
   });
 });
+
+describe('MoqtConnection(21) fills on REQUEST_UPDATE (§3.4)', () => {
+  it('routes the fill stream carrying the REQUEST_UPDATE Request ID to the subscription', async () => {
+    const { client, server, errors } = await connectedPair21();
+    let subReq = -1n;
+    server.onSubscribe = (requestId) => { subReq = requestId; void server.acceptSubscribe(requestId, 30n); };
+    const streams: DataStreamHeader[] = [];
+    const objects: MoqtObject[] = [];
+    client.onDataStream = (_sid, h) => streams.push(h);
+    client.onObject = (_sid, o) => objects.push(o);
+    const sub = await client.subscribeTrack(ns('live'), nm('video'), { filter: { type: 'LargestObject' } });
+
+    const updateId = await client.requestUpdate(sub.requestId, {
+      fill: { filter: { type: 'AbsoluteRange', startGroup: 1n, startObject: 0n, endGroup: 1n } },
+    });
+    await flushN();
+    const sid = await server.openFillStream(updateId);
+    await server.sendFetchObject(sid, { groupId: 1n, subgroupId: 0n, objectId: 0n, publisherPriority: 1, payload: new Uint8Array([9]) });
+    await server.closeFetchStream(sid);
+    await flushN();
+
+    expect(subReq).toBe(sub.requestId);
+    expect(streams).toEqual([expect.objectContaining({ fill: true, header: expect.objectContaining({ requestId: updateId }) })]);
+    expect(objects.map((o) => [o.groupId, o.objectId])).toEqual([[1n, 0n]]);
+    expect(client.session.state).toBe(SessionState.ESTABLISHED);
+    expect(errors).toEqual([]);
+  });
+
+  it('cancelFill on the subscription also drops a fill its update asked for', async () => {
+    const { client, server } = await connectedPair21();
+    server.onSubscribe = (requestId) => { void server.acceptSubscribe(requestId, 31n); };
+    const objects: MoqtObject[] = [];
+    client.onObject = (_sid, o) => objects.push(o);
+    const sub = await client.subscribeTrack(ns('live'), nm('video'));
+    const updateId = await client.requestUpdate(sub.requestId, { fill: {} });
+    await client.cancelFill(sub.requestId);
+
+    const sid = await server.openFillStream(updateId);
+    await server.sendFetchObject(sid, { groupId: 0n, subgroupId: 0n, objectId: 0n, publisherPriority: 1, payload: new Uint8Array([1]) });
+    await server.closeFetchStream(sid);
+    await flushN();
+
+    expect(objects).toEqual([]);
+    expect(client.session.state).toBe(SessionState.ESTABLISHED);
+  });
+});
+
+describe('MoqtConnection(21) MAX_REQUEST_UPDATES (§9.1.7)', () => {
+  it('the client keeps within the limit the server advertised', async () => {
+    const { client, server } = await connectedPair21({ serverSetup: { maxRequestUpdates: 1n } });
+    server.onSubscribe = () => { /* leave it pending: updates stay unanswered */ };
+    const pending = client.subscribeTrack(ns('live'), nm('video'));
+    pending.catch(() => undefined);
+    await flushN();
+    const subId = [...(client.session as unknown as { subscriptions: Map<bigint, unknown> }).subscriptions.keys()][0]!;
+    await client.requestUpdate(subId, { forward: 0 });
+    await expect(client.requestUpdate(subId, { forward: 1 })).rejects.toThrow(/MAX_REQUEST_UPDATES/);
+  });
+
+  it('a peer exceeding our limit closes the session with TOO_MANY_REQUEST_UPDATES', async () => {
+    const { client, server } = await connectedPair21({ serverSetup: { maxRequestUpdates: 1n } });
+    server.onSubscribe = () => { /* pending: updates are queued, not answered */ };
+    let closedWith: bigint | undefined;
+    server.onClose = (code) => { closedWith = BigInt(code as never); };
+    // A client that ignores the advertised limit.
+    (client.session as unknown as { _peerMaxRequestUpdates: bigint })._peerMaxRequestUpdates = 0n;
+    const pending = client.subscribeTrack(ns('live'), nm('video'));
+    pending.catch(() => undefined);
+    await flushN();
+    const subId = [...(client.session as unknown as { subscriptions: Map<bigint, unknown> }).subscriptions.keys()][0]!;
+    await client.requestUpdate(subId, { forward: 0 });
+    await flushN();
+    expect(server.session.state).toBe(SessionState.ESTABLISHED); // one outstanding is allowed
+    await client.requestUpdate(subId, { forward: 1 }).catch(() => undefined);
+    await flushN();
+    expect(server.session.state).toBe(SessionState.CLOSED);
+    expect(closedWith).toBe(0x1bn);
+  });
+});
+
+async function connectedPair21(opts: Parameters<typeof import('./testkit/pair.js')['connectedPair']>[1] = {}) {
+  const { connectedPair } = await import('./testkit/pair.js');
+  return connectedPair(21, opts);
+}
+
+async function flushN(n = 10): Promise<void> {
+  for (let i = 0; i < n; i++) await flush();
+}
+
+
+describe('MoqtConnection native QUIC at draft 21', () => {
+  const quicTransport = (protocol: string) => Object.assign(new TransportSim(), {
+    kind: 'quic' as const,
+    protocol,
+    maxDatagramSize: 1200,
+    setupOptions: { path: '/moq', authority: 'relay.example:443' },
+  });
+
+  it('a moqt-21 transport selects draft 21', async () => {
+    const conn = new MoqtConnection();
+    const transport = quicTransport('moqt-21');
+    transport.openIncomingUni().push(setupBytes());
+    await conn.connect(transport);
+    expect(conn.draftVersion).toBe(21);
+    expect(conn.session.state).toBe(SessionState.ESTABLISHED);
+  });
+
+  it('a connection made for draft 21 refuses a moqt-18 transport', async () => {
+    const conn = new MoqtConnection(21);
+    const transport = quicTransport('moqt-18');
+    await expect(conn.connect(transport)).rejects.toThrow(/draft 18.*draft 21/);
+    await conn.close();
+  });
+});

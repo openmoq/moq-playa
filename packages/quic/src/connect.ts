@@ -5,11 +5,11 @@ import {
   BoundedReadableQueue,
   NodeQuicTransport,
   routeNativeStream,
+  type MoqtQuicProtocol,
   type MoqtQuicTransport,
 } from './transport.js';
 import type { WebTransportBidirectionalStream } from '@moqt/webtransport';
 
-const ALPN = 'moqt-18';
 const DEFAULT_PORT = '443';
 const DEFAULT_MAX_DATAGRAM_FRAME_SIZE = 1200;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
@@ -24,6 +24,8 @@ export interface QuicConnectOptions {
   readonly handshakeTimeoutMs?: number;
   /** Maximum QUIC DATAGRAM frame size advertised to the peer. */
   readonly maxDatagramFrameSize?: number;
+  /** MOQT draft to offer: ALPN `moqt-18` (default) or `moqt-21`. */
+  readonly draft?: 18 | 21;
 }
 
 export interface ParsedMoqtUri {
@@ -96,7 +98,8 @@ export function parseMoqtUri(input: string | URL): ParsedMoqtUri {
  * Connect to a native-QUIC MoQT endpoint using Node's experimental QUIC API.
  *
  * Requires a Node build configured with `--experimental-quic`, launched with
- * `--experimental-quic`. The returned transport is draft-18 only.
+ * `--experimental-quic`. The returned transport speaks the one draft offered in
+ * `options.draft` (18 by default, or 21).
  */
 export async function connectQuic(
   uri: string | URL,
@@ -188,6 +191,9 @@ export async function connectQuicWithRuntime(
   runtime: NativeQuicRuntime,
 ): Promise<MoqtQuicTransport> {
   const parsed = parseMoqtUri(uri);
+  const draft = options.draft ?? 18;
+  if (draft !== 18 && draft !== 21) throw new RangeError(`native QUIC supports drafts 18 and 21, not ${String(draft)}`);
+  const ALPN: MoqtQuicProtocol = `moqt-${draft}`;
   const maxDatagramFrameSize = options.maxDatagramFrameSize ?? DEFAULT_MAX_DATAGRAM_FRAME_SIZE;
   const handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
   positiveInteger(maxDatagramFrameSize, 'maxDatagramFrameSize');
@@ -296,6 +302,7 @@ export async function connectQuicWithRuntime(
       bidirectional,
       datagrams,
       () => observedSessionError,
+      ALPN,
     );
   } catch (error) {
     const reported = observedSessionError ?? closedFailure ?? error;

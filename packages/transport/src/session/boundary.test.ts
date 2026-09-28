@@ -63,10 +63,11 @@ const FORBIDDEN_IMPORT_SUBSTRINGS = [
  *
  * `control/codes-18.js` is a code-point enum table; `SetupOption18` is a set of
  * well-known setup-option codes (PATH, AUTHORITY, …) the SetupGate negotiates
- * by name. That is semantic, not serialization. Keep this map tiny + justified.
+ * by name, and `SetupOption21` extends it with the draft-21 options
+ * (MAX_FILTER_RANGES, MAX_REQUEST_UPDATES). That is semantic, not serialization. Keep this map tiny + justified.
  */
 const NAME_SPECIFIC_ALLOW: Readonly<Record<string, ReadonlyArray<string>>> = {
-  '../control/codes-18.js': ['SetupOption18'],
+  '../control/codes-18.js': ['SetupOption18', 'SetupOption21'],
 };
 
 /** Raw draft-18 wire details that must never appear in session source code. */

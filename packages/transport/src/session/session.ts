@@ -336,6 +336,12 @@ export interface SetupOptions {
    * @see draft-ietf-moq-transport-16 §9.3.1.5
    */
   authTokens?: Uint8Array[];
+  /**
+   * draft-21 §9.1.7: the MAX_REQUEST_UPDATES to advertise, the number of
+   * unanswered REQUEST_UPDATEs per request stream we accept. Omitted (or 0)
+   * means no limit; ignored before draft 21.
+   */
+  maxRequestUpdates?: bigint;
 }
 
 /**
@@ -399,6 +405,11 @@ export interface RequestUpdateOptions {
    * a draft-18-only concept; there is no such update in draft-14/16).
    */
   trackNamespacePrefix?: Uint8Array[];
+  /**
+   * draft-21 §3.4: FILL_PARAMETERS. The publisher opens another fill fetch stream
+   * whose FETCH_HEADER carries this REQUEST_UPDATE's Request ID. Draft 21 only.
+   */
+  fill?: { readonly filter?: SubscriptionFilter };
 }
 
 /**
@@ -701,6 +712,10 @@ export class Session {
   private _state: SessionStateValue = SessionState.IDLE;
   private _newSessionUri: string | undefined;
   private _peerMaxRequestId: Varint = varint(0n);
+  private _ownMaxRequestUpdates = 0n;
+  private _peerMaxRequestUpdates = 0n;
+  /** draft-21 fills still expected: fill Request ID → subscription Request ID. */
+  private readonly fillRequests = new Map<bigint, bigint>();
   private _goawayReceived: boolean = false;
 
   constructor(
@@ -754,6 +769,46 @@ export class Session {
     return this._peerMaxAuthTokenCacheSize;
   }
 
+  /** draft-21 §9.1.7: the MAX_REQUEST_UPDATES we advertised (0 = no limit). */
+  get ownMaxRequestUpdates(): bigint {
+    return this._ownMaxRequestUpdates;
+  }
+
+  /** draft-21 §9.1.7: the peer's MAX_REQUEST_UPDATES (0 = no limit). */
+  get peerMaxRequestUpdates(): bigint {
+    return this._peerMaxRequestUpdates;
+  }
+
+  /** The subscription a fill with this Request ID (a SUBSCRIBE's or a REQUEST_UPDATE's) belongs to, while one is expected. */
+  fillSubscriptionFor(requestId: bigint): SubscriptionStateMachine | undefined {
+    const subscriptionId = this.fillRequests.get(requestId);
+    return subscriptionId === undefined ? undefined : this.subscriptions.get(subscriptionId);
+  }
+
+  /** Accept the fill stream for `requestId`: it stops being expected. */
+  takeFill(requestId: bigint): SubscriptionStateMachine | undefined {
+    const sub = this.fillSubscriptionFor(requestId);
+    this.cancelFillRequest(requestId);
+    return sub;
+  }
+
+  /** Stop expecting the fill for `requestId`; true when one was expected. */
+  cancelFillRequest(requestId: bigint): boolean {
+    const subscriptionId = this.fillRequests.get(requestId);
+    if (subscriptionId === undefined) return false;
+    this.fillRequests.delete(requestId);
+    if (subscriptionId === requestId) {
+      const sub = this.subscriptions.get(subscriptionId);
+      if (sub) sub.fillRequested = false;
+    }
+    return true;
+  }
+
+  /** Request IDs of the fills still expected for subscription `subscriptionId`. */
+  expectedFillsOf(subscriptionId: bigint): bigint[] {
+    return [...this.fillRequests].filter(([, sub]) => sub === subscriptionId).map(([id]) => id);
+  }
+
   // ─── Setup Handshake ──────────────────────────────────────────────────
 
   /**
@@ -766,6 +821,7 @@ export class Session {
     if (isRequestStreamDraft(this._draftVersion)) {
       // draft-18: send the unified SETUP (no MAX_REQUEST_ID — QUIC stream limits).
       const setup = this.setupGate.createSetup18(options);
+      if (isDraft21(this._draftVersion)) this._ownMaxRequestUpdates = options.maxRequestUpdates ?? 0n;
       if (options.maxAuthTokenCacheSize !== undefined) {
         this._ownMaxAuthTokenCacheSize = Number(options.maxAuthTokenCacheSize);
       }
@@ -803,6 +859,7 @@ export class Session {
 
     if (isRequestStreamDraft(this._draftVersion)) {
       const setup = this.setupGate.createSetup18(options);
+      if (isDraft21(this._draftVersion)) this._ownMaxRequestUpdates = options.maxRequestUpdates ?? 0n;
       if (options.maxAuthTokenCacheSize !== undefined) {
         this._ownMaxAuthTokenCacheSize = Number(options.maxAuthTokenCacheSize);
       }
@@ -1046,6 +1103,7 @@ export class Session {
         // draft-18 unified SETUP (role-neutral wire; this side interprets it).
         const result = this.setupGate.handleSetup18(msg as Setup);
         this._peerMaxRequestId = result.peerMaxRequestId; // 0 — draft-18 has no credit
+        this._peerMaxRequestUpdates = result.peerMaxRequestUpdates ?? 0n;
         // No MAX_REQUEST_ID in draft-18: do NOT update the request-id allocator credit.
         if (result.peerMaxAuthTokenCacheSize !== undefined) {
           this._peerMaxAuthTokenCacheSize = result.peerMaxAuthTokenCacheSize;
@@ -1429,7 +1487,8 @@ export class Session {
     const pending = this.pendingUpdates.get(msg.requestId as bigint);
     if (pending) {
       this.pendingUpdates.delete(msg.requestId as bigint);
-      // Don't apply the update — it was rejected
+      // Don't apply the update — it was rejected, and it opens no fill.
+      this.fillRequests.delete(msg.requestId as bigint);
       return [];
     }
 
@@ -2826,6 +2885,7 @@ export class Session {
       }
       parameters.set(FILL_PARAMETERS, [encodeFillParameters(options.fill.filter)]);
       sub.fillRequested = true;
+      this.fillRequests.set(requestId as bigint, requestId as bigint);
     }
 
     const subscribeMsg: Subscribe = {
@@ -2979,6 +3039,7 @@ export class Session {
    */
   rollbackRequestUpdate(requestId: bigint): void {
     this.pendingUpdates.delete(requestId as bigint);
+    this.fillRequests.delete(requestId as bigint);
   }
 
   /**
@@ -2992,6 +3053,23 @@ export class Session {
   ): RequestResult {
     this.assertEstablishedOrDraining('requestUpdate');
     const requestedForward = this.normalizeLocalForwardState(options.forward, 'REQUEST_UPDATE');
+    // draft-21 §9.1.7: never more than the peer's MAX_REQUEST_UPDATES unanswered
+    // updates on one request stream; each REQUEST_OK / REQUEST_ERROR restores one.
+    if (isDraft21(this._draftVersion) && this._peerMaxRequestUpdates > 0n) {
+      let outstanding = 0n;
+      for (const pending of this.pendingUpdates.values()) {
+        if (pending.existingRequestId === (existingRequestId as bigint)) outstanding += 1n;
+      }
+      if (outstanding >= this._peerMaxRequestUpdates) {
+        throw new SessionError(
+          `${outstanding} REQUEST_UPDATEs on request ${existingRequestId} are unanswered; the peer's MAX_REQUEST_UPDATES is ${this._peerMaxRequestUpdates}`,
+          'INVALID_STATE',
+        );
+      }
+    }
+    if (options.fill !== undefined && !isDraft21(this._draftVersion)) {
+      throw new RangeError(`FILL_PARAMETERS needs draft 21; this session speaks draft ${this._draftVersion}`);
+    }
 
     // draft-18 §10.9.2: a prefix update targets an outbound SUBSCRIBE_NAMESPACE /
     // SUBSCRIBE_TRACKS request (tracked in separate maps, not `subscriptions`).
@@ -3084,6 +3162,10 @@ export class Session {
     }
     if (options.subgroupDeliveryTimeout !== undefined) {
       parameters.set(MessageParam.SUBGROUP_DELIVERY_TIMEOUT, [options.subgroupDeliveryTimeout]);
+    }
+    if (options.fill !== undefined) {
+      parameters.set(FILL_PARAMETERS, [encodeFillParameters(options.fill.filter)]);
+      this.fillRequests.set(requestId as bigint, existingRequestId as bigint);
     }
 
     if (this._draftVersion === 14) {

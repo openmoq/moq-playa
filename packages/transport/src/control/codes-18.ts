@@ -65,6 +65,13 @@ export const SetupOption18 = {
   MOQT_IMPLEMENTATION: 0x07,
 } as const;
 
+/** draft-21 Setup Options added to the draft-18 set (§9.1.6, §9.1.7). */
+export const SetupOption21 = {
+  ...SetupOption18,
+  MAX_FILTER_RANGES: 0x06,
+  MAX_REQUEST_UPDATES: 0x08,
+} as const;
+
 /**
  * Value-encoding kind for a draft-18 message parameter (§10.2).
  * `namespace` is a Track Namespace structure (§2.4.1): a vi64 field count
