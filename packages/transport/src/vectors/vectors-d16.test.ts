@@ -37,10 +37,6 @@ const CONTROL_TYPES = new Set([
 const KNOWN_DIVERGENCES: Record<string, string> = {
   'fetch_ok.bin':
     "draft-16 FETCH_OK: Playa's decoder diverges from LibMoQ's payload layout (params/extensions ordering) — decode throws",
-  'fetch_eor_non_existent.bin':
-    "draft-16 FETCH End-of-Range marker: Playa's decoder reads past LibMoQ's 4-byte marker — decode throws",
-  'fetch_eor_unknown.bin':
-    "draft-16 FETCH End-of-Range marker: Playa's decoder reads past LibMoQ's marker — decode throws",
 };
 
 const codec16 = createControlCodec(16);

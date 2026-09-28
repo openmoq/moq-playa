@@ -443,10 +443,11 @@ describe('MoqtConnection(18) FETCH data', () => {
     transport.pushIncomingUni(concat(
       fetchHeader(reqId),
       firstFetchObj(1n, 0n, 3, [0xaa]),
-      pack(0x8cn, 1n, 5n, 0n), // End of Non-Existent Range at {1,5}
+      pack(0x8cn, 1n, 5n), // End of Non-Existent Range at {1,5}
     ));
     await flush();
 
+    expect(objs).toHaveLength(2);
     expect(objs[0]!.kind).toBe('data');
     expect(objs[1]!.kind).toBe('gap');
     expect(objs[1]!.groupId).toBe(1n);

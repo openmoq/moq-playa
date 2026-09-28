@@ -14,6 +14,7 @@ import { vectorsDir, bytesToHex, hexToBytes } from './load-vectors.js';
 import { createControlCodec } from '../control/codec.js';
 import { decodeMessageParams18, DRAFT21_MESSAGE_PARAM_REGISTRY } from '../control/message-params-18.js';
 import { decodeLocationFilterFields } from '../control/subscription-filter.js';
+import { decodeFetchObject18 } from '../data/decoder-18.js';
 import type {
   ControlMessage, Fetch, FetchOk, Goaway, PublishStateNotify, Subscribe, SubscribeOk, PublishDone,
 } from '../control/messages.js';
@@ -119,6 +120,14 @@ describe('draft-21 wire vectors (shared with red5-moq-relay and moqxr)', () => {
   it('PUBLISH_DONE with an unknown Stream Count (2^64-1)', () => {
     const done = decode<PublishDone>('publish_done_track_ended_unknown_count');
     expect(done.streamCount).toBe((1n << 64n) - 1n);
+  });
+
+  it('End of Timed-Out Range: Group ID and Object ID, no payload length', () => {
+    const bytes = vector('fetch_object_end_of_timed_out_range_g2_o4');
+    const { item, bytesRead } = decodeFetchObject18(bytes, 0, undefined, true, 'ascending', 21);
+    expect(bytesRead).toBe(bytes.length);
+    expect(item).toMatchObject({ flags: 0x20cn, groupId: 2n, objectId: 4n, nonExistent: false });
+    expect(() => decodeFetchObject18(bytes, 0, undefined, true, 'ascending', 18)).toThrow();
   });
 
   it('range-filter parameters are known to the draft-21 registry', () => {
