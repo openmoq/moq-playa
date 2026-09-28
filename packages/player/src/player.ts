@@ -101,7 +101,7 @@ import { isRequestStreamDraft } from '@moqt/transport';
 const SWITCH_STAGING_MAX_OBJECTS = 100;
 
 /** draft-21 FILL_PARAMETERS for joining the current group: a LOCATION_FILTER
- *  of [1] (one group back from Largest, i.e. the current group), the
+ *  of [1] (the current group: Largest.Group + 1 - 1), the
  *  counterpart of a relative Joining FETCH at offset 0. */
 const CURRENT_GROUP_FILL = { filter: { type: 'RelativeStart' as const, groups: 1n } };
 const CATALOG_FILL = CURRENT_GROUP_FILL;
