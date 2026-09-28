@@ -70,7 +70,7 @@ export interface AudioChunkMeta {
 export interface MediaPublisherOptions {
   /** Wraps a bigint as the wire integer type (the example passes `varint`). */
   wrapInt: (n: bigint) => unknown;
-  /** NEGOTIATED MoQT draft — selects the LOC wire profile and, on draft-18,
+  /** NEGOTIATED MoQT draft — selects the LOC wire profile and, on draft 18+,
    *  the mandatory FIRST_OBJECT subgroup bit. Typed (not `number`) so an
    *  unsupported draft cannot silently inherit draft-16 LOC behavior. */
   draft: DraftVersion;
@@ -100,7 +100,7 @@ export interface MediaPublisherOptions {
 }
 
 /** Drafts whose wire behavior this publisher implements explicitly. */
-const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18];
+const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18, 21];
 
 /** Validate a queue bound: NaN/Infinity would disable backpressure entirely
  *  and a non-positive or fractional cap has no coherent meaning. */

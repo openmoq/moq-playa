@@ -366,8 +366,8 @@ describe('MediaPublisher — broadcast generations', () => {
 });
 
 describe('MediaPublisher — negotiated-draft wire binding', () => {
-  it('draft-18 subgroup opens set FIRST_OBJECT on video AND audio; 16/14 do not', async () => {
-    for (const draft of [14, 16, 18] as const) {
+  it('draft-18 and 21 subgroup opens set FIRST_OBJECT on video AND audio; 16/14 do not', async () => {
+    for (const draft of [14, 16, 18, 21] as const) {
       const conn = recordingConnection();
       const pub = makePublisher(conn, { draft });
       pub.setVideoAlias(2n);
@@ -377,13 +377,24 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
       await settle();
       expect(conn.opened).toHaveLength(2);
       for (const o of conn.opened) {
-        if (draft === 18) {
+        if (draft >= 18) {
           expect(o.options['firstObject']).toBe(true); // §2.2 MUST for the original publisher
         } else {
           expect('firstObject' in o.options).toBe(false); // d14/16 bytes preserved
         }
       }
     }
+  });
+
+  it('draft 21 keeps the draft-18 LOC wire profile', async () => {
+    const timestampUs = Date.now() * 1000;
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { draft: 21, wallClockUs: () => timestampUs });
+    pub.setVideoAlias(2n);
+    pub.publishVideo(chunk(7), { isKeyframe: true, timestampUs });
+    await settle();
+    const parsed = parseLocHeaders(conn.sends[0]!.extensions, { wireProfile: locWireProfileForDraft(18) });
+    expect(parsed.captureTimestamp).toBe(BigInt(Math.round(timestampUs)));
   });
 
   it('draft-18 LOC extensions use the vi64 profile: they parse as d18 and are NOT d16 bytes', async () => {
