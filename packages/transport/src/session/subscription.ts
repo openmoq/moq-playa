@@ -19,6 +19,8 @@
 
 import { varint, type Varint } from '../primitives/varint.js';
 import type { Parameters } from '../control/messages.js';
+import type { GroupOrder } from '../data/types.js';
+import type { SubscriptionWindow } from '../control/subscription-filter.js';
 import {
   SubscriptionState,
   ForwardState,
@@ -30,14 +32,22 @@ import {
  * Location within a track (group + object ID).
  */
 export interface Location {
-  readonly groupId: Varint;
-  readonly objectId: Varint;
+  readonly groupId: bigint;
+  readonly objectId: bigint;
 }
 
 /**
  * Manages the state machine for a single subscription.
  */
 export class SubscriptionStateMachine {
+  requestedGroupOrder: GroupOrder | undefined;
+  publisherGroupOrder: GroupOrder = 'ascending';
+  locationWindow: SubscriptionWindow | undefined;
+
+  get groupOrder(): GroupOrder {
+    return this.requestedGroupOrder ?? this.publisherGroupOrder;
+  }
+
   private _state: SubscriptionStateValue = SubscriptionState.PENDING;
   private _forwardState: ForwardStateValue = ForwardState.ACTIVE;
   private _remoteFilterType: string | undefined;
@@ -519,7 +529,7 @@ export class SubscriptionStateMachine {
    * Update largest location seen on this subscription.
    * Only updates if the new location is larger.
    */
-  updateLargestLocation(groupId: Varint, objectId: Varint): void {
+  updateLargestLocation(groupId: bigint, objectId: bigint): void {
     if (!this._largestLocation) {
       this._largestLocation = { groupId, objectId };
       return;

@@ -223,7 +223,7 @@ export class LoopPipe {
 /** One endpoint of a loopback pair. Streams it opens surface on the peer. */
 export class LoopbackTransport implements WebTransportLike {
   /** No negotiated protocol — callers pass the draft version explicitly. */
-  readonly protocol: string | undefined = undefined;
+  readonly protocol?: string;
 
   /** Outbound uni streams WE opened (uniOut[0] is our control stream). */
   readonly uniOut: LoopPipe[] = [];

@@ -173,6 +173,11 @@ export class TrackAliasManager {
     return this.aliasToTrack.has(alias as bigint);
   }
 
+  /** Request identities retaining this alias, without transferring ownership. */
+  owners(alias: bigint): Iterable<bigint> {
+    return this.aliasToOwner.get(alias) ?? [];
+  }
+
   /**
    * Check if a track is registered.
    *

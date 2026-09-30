@@ -806,12 +806,13 @@ describe('decodeFetchObject', () => {
 
   describe('End of Range markers (§10.4.4.2)', () => {
     it('decodes END_NON_EXISTENT (0x8C)', () => {
-      // §10.4.4.2: only Group ID and Object ID follow the flags (no Payload
-      // Length, as moxygen, LibMoQ and red5-moq-relay encode the marker)
+      // §10.4.4.2: Group ID and Object ID present; Subgroup/Priority/Extensions absent
+      // Object Payload Length is always present per §10.4.4
       const buf = buildBuffer(
         0x8cn,                     // special flag: end non-existent
         100n,                      // group ID
         50n,                       // object ID
+        0n,                        // payload length (always present, should be 0)
       );
 
       const { item, bytesRead } = decodeFetchObject(buf, 0, undefined, true);
@@ -828,6 +829,7 @@ describe('decodeFetchObject', () => {
         0x10cn,                    // special flag: end unknown
         200n,                      // group ID
         75n,                       // object ID
+        0n,                        // payload length (always present)
       );
 
       const { item, bytesRead } = decodeFetchObject(buf, 0, undefined, true);
@@ -843,6 +845,7 @@ describe('decodeFetchObject', () => {
       const buf = buildBuffer(
         0x8cn,
         1n, 1n,
+        0n,                        // payload length = 0 (always present per §10.4.4)
       );
 
       const { item } = decodeFetchObject(buf, 0, undefined, true);

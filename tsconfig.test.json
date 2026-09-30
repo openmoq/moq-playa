@@ -12,11 +12,14 @@
     "rootDir": ".",
     "types": ["node"]
   },
-  // Scoped to the simulation suites and test-support helpers. The wider
+  // Scoped to simulation suites, test-support helpers, and draft-21 conformance
+  // tests. The wider
   // `*.test.ts` corpus predates any typecheck gate and does not compile clean
   // under these options; widening this include is a separate cleanup.
   "include": [
     "packages/*/src/**/*.sim.test.ts",
-    "packages/*/test-support/**/*.ts"
+    "packages/*/test-support/**/*.ts",
+    "packages/transport/src/session/session-d21-conformance.test.ts",
+    "packages/webtransport/src/adapter-d21-conformance.test.ts"
   ]
 }

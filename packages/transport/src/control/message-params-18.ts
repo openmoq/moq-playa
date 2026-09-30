@@ -287,13 +287,27 @@ export function decodeMessageParams18(
   offset: number,
   registry: MessageParamRegistry,
 ): { params: MessageParams18; bytesRead: number } {
+  const count = readVi64(buf, offset);
+  const decoded = readParameterSequence(buf, offset + count.bytesRead, registry, count.value);
+  return { params: decoded.params, bytesRead: count.bytesRead + decoded.bytesRead };
+}
+
+/** Decode a length-bounded parameter sequence without a count (draft-21 fills). */
+export function decodeParameterSequence(buf: Uint8Array, registry: MessageParamRegistry): MessageParams18 {
+  return readParameterSequence(buf, 0, registry).params;
+}
+
+function readParameterSequence(
+  buf: Uint8Array,
+  offset: number,
+  registry: MessageParamRegistry,
+  count?: bigint,
+): { params: MessageParams18; bytesRead: number } {
   let p = offset;
-  const count = readVi64(buf, p);
-  p += count.bytesRead;
 
   const params = new Map<bigint, MessageParamValue[]>();
   let prevType = 0n;
-  for (let i = 0n; i < count.value; i++) {
+  for (let i = 0n; count === undefined ? p < buf.length : i < count; i++) {
     const delta = readVi64(buf, p);
     p += delta.bytesRead;
     const type = prevType + delta.value;

@@ -425,6 +425,8 @@ export function encodeFetchEndOfRange(marker: FetchEndOfRange): Uint8Array {
   let size = varintEncodingLength(marker.flags);
   size += varintEncodingLength(marker.groupId);
   size += varintEncodingLength(marker.objectId);
+  // Payload length (always 0 for end of range)
+  size += varintEncodingLength(varint(0));
 
   const buf = new Uint8Array(size);
   let pos = 0;
@@ -432,6 +434,7 @@ export function encodeFetchEndOfRange(marker: FetchEndOfRange): Uint8Array {
   pos += writeVarint(marker.flags, buf, pos);
   pos += writeVarint(marker.groupId, buf, pos);
   pos += writeVarint(marker.objectId, buf, pos);
+  pos += writeVarint(varint(0), buf, pos); // zero-length payload
 
   return buf;
 }

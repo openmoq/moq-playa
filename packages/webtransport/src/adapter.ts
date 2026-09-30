@@ -35,10 +35,12 @@ import {
   RequestError18,
   SubscriptionState,
   ForwardState,
-  subscriptionWindow,
   windowContains,
+  decodeFillParameters,
+  decodeSubscriptionFilter,
+  resolveFillWindow,
 } from '@moqt/transport';
-import type { SubscriptionFilter, SubscriptionWindow } from '@moqt/transport';
+import type { FillOptions, SubscriptionWindow } from '@moqt/transport';
 import type {
   EndpointRoleValue,
   ControlMessage,
@@ -174,10 +176,6 @@ interface RawSubState {
   readonly sub: TrackSubscription;
   resolve: ((sub: TrackSubscription) => void) | null;
   reject: ((err: Error) => void) | null;
-  /** The subscription's Location filter, re-applied when its alias is shared (draft-21 §3.1). */
-  readonly filter?: SubscriptionFilter;
-  /** `filter` resolved against SUBSCRIBE_OK's Largest Object (draft 21). */
-  window?: SubscriptionWindow;
   /** Objects already delivered while the alias is shared, for deduplication (bounded). */
   seen?: Set<string>;
 }
@@ -468,7 +466,8 @@ export class MoqtConnection {
   /** Inbound PUBLISH (draft-18 §10.10) stream contexts, keyed by Request ID. */
   private inboundRequestContexts = new Map<bigint, InboundRequestStreamContext>();
   /** Inbound PUBLISH tracks by Track Alias, for routing data objects. */
-  private publishAliasMaps = new Map<bigint, IncomingPublish>();
+  private publishAliasMaps = new Map<bigint, IncomingPublish[]>();
+  private subscriberObjectHistory = new WeakMap<SubscriptionStateMachine, Set<string>>();
 
   /** Requested Group Order per inbound FETCH Request ID (default ascending). */
   private inboundFetchGroupOrder = new Map<bigint, GroupOrder>();
@@ -503,12 +502,19 @@ export class MoqtConnection {
     groupOrder: GroupOrder;
     prior: FetchObjectPrior18 | undefined;
     isFirstObject: boolean;
+    closing?: Promise<void>;
     /** A draft-21 fill stream: the Request ID of the subscription it fills. */
     fillOf?: bigint;
+    fillWindow?: SubscriptionWindow;
   }>();
-  /** Inbound draft-21 fills asked for and not yet served: fill Request ID → SUBSCRIBE Request ID. */
-  private readonly inboundFillRequests = new Map<bigint, bigint>();
-  /** Inbound draft-21 fills served (their one-stream reservation stays): fill Request ID → SUBSCRIBE Request ID. */
+  private static readonly MAX_PENDING_FILLS = 256;
+  /** Inbound draft-21 fills awaiting an application response stream. */
+  private readonly inboundFillRequests = new Map<bigint, {
+    subscriptionId: bigint;
+    options: FillOptions;
+    window?: SubscriptionWindow;
+  }>();
+  /** Fills with a reserved or open response stream, mapped to their subscription. */
   private readonly servedFills = new Map<bigint, bigint>();
 
   /**
@@ -688,6 +694,9 @@ export class MoqtConnection {
     // Receiver terminal tracker (tombstone TTL timers) + seen counts.
     for (const alias of [...this.terminatedAliases.keys()]) this.clearTerminatedAlias(alias);
     this.aliasStreamsSeen.clear();
+    this.aliasTerminalTotals.clear();
+    for (const retained of this.terminalSubscribers.values()) retained.cancelTimer();
+    this.terminalSubscribers.clear();
     this.aliasDeliveryTimeoutMs.clear();
     this.aliasPublisherTimeout.clear();
     this.inboundPublishTimeouts.clear();
@@ -724,6 +733,8 @@ export class MoqtConnection {
     this.servedFills.clear();
     this.fetchStreams.clear();
     this.fillStreams.clear();
+    for (const pending of this.pendingFillHeaders.values()) pending.finish(false);
+    this.pendingFillHeaders.clear();
     this.recentlyCancelledFetches.clear();
     // Incoming data-stream readers — cancel each, then drop. This is a LOCAL
     // teardown: route it through the ownership primitive so a read parked in
@@ -1026,6 +1037,7 @@ export class MoqtConnection {
    */
   private outgoingStreams = new Map<bigint, {
     writer: WritableStreamDefaultWriter<Uint8Array>;
+    groupId: bigint;
     hasExtensions: boolean;
     previousObjectId: bigint;
     isFirstObject: boolean;
@@ -1050,7 +1062,7 @@ export class MoqtConnection {
    * On termination the entry is RETIRED (moved to {@link retiredPublisherAliases}),
    * so this map tracks only live subscriptions.
    */
-  private publisherAliasRequests = new Map<bigint, bigint>();
+  private publisherAliasRequests = new Map<bigint, Set<bigint>>();
 
   /**
    * BOUNDED LRU of recently-RETIRED publisher alias → request ID. A send on a
@@ -1137,6 +1149,11 @@ export class MoqtConnection {
    * observed or `terminatedAliasTtlMs` expires — never retained indefinitely.
    */
   private aliasStreamsSeen = new Map<bigint, bigint>();
+  private readonly aliasTerminalTotals = new Map<bigint, bigint | null>();
+  private readonly terminalSubscribers = new Map<bigint, {
+    sub: SubscriptionStateMachine;
+    cancelTimer: () => void;
+  }>();
   /**
    * Per-alias tombstone. `remaining` is how many late streams are still expected
    * (bigint, counted down as they arrive); `null` means the count is UNKNOWN —
@@ -1211,7 +1228,8 @@ export class MoqtConnection {
    * Kept apart from `fetchStreams`: a fill has no FETCH of its own, and ending
    * it must not touch the subscription's request stream.
    */
-  private fillStreams = new Map<bigint, { streamId: bigint; subscriptionId: bigint }>();
+  private fillStreams = new Map<bigint, { streamId: bigint; subscriptionId: bigint; groupOrder: GroupOrder }>();
+  private readonly pendingFillHeaders = new Map<bigint, { streamId: bigint; finish: (accepted: boolean) => void }>();
   /** setTimeout's safe upper bound (2^31-1 ms); longer durations are chunked. */
   private static readonly MAX_TIMER_MS = 2_147_483_647;
 
@@ -1606,7 +1624,7 @@ export class MoqtConnection {
         message: send.message,
       });
     } catch (err) {
-      this.publisherAliasRequests.delete(trackAlias);
+      this.removePublisherAliasRequest(trackAlias, requestId);
       if (!this.session.rollbackUnsentPublish(requestId)) {
         this.closeSessionFatal(
           `could not preserve the request sequence after PUBLISH ${requestId} failed before emission`,
@@ -1618,7 +1636,7 @@ export class MoqtConnection {
     try {
       await this.controlWriter!.write(bytes);
     } catch (err) {
-      this.publisherAliasRequests.delete(trackAlias);
+      this.removePublisherAliasRequest(trackAlias, requestId);
       this.session.rollbackRequest(requestId, { retainCancellationProvenance: true });
       this.closeSessionFatal(
         `control-stream write failed while publishing request ${requestId}: ${err instanceof Error ? err.message : String(err)}`,
@@ -1698,12 +1716,12 @@ export class MoqtConnection {
     const { requestId, actions } = this.session.publish(namespace, name, trackAlias, options);
     // Associate the advertised alias with this publish for §10.11 Stream Count
     // accounting and terminal enforcement on the data-plane APIs.
-    this.publisherAliasRequests.set(trackAlias, requestId);
+    this.addPublisherAliasRequest(trackAlias, requestId);
     if (isRequestStreamDraft(this.session.draftVersion)) {
       const publishMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
       // Roll back the publisher-alias authority too (so openSubgroup can't publish
       // on an alias the peer never learned) if the request-stream open fails.
-      await this.openD18Request(requestId, publishMsg, () => this.publisherAliasRequests.delete(trackAlias));
+      await this.openD18Request(requestId, publishMsg, () => this.removePublisherAliasRequest(trackAlias, requestId));
       return requestId;
     }
     await this.emitLegacyPublishOrRollback(requestId, trackAlias, actions);
@@ -1855,7 +1873,7 @@ export class MoqtConnection {
    */
   private refreshAliasDeliveryTimeout(alias: bigint): void {
     const reqId = this.rawAliasMaps.get(alias)?.requestId
-      ?? [...this.publishAliasMaps].find(([a]) => a === alias)?.[1]?.requestId;
+      ?? this.publishAliasMaps.get(alias)?.[0]?.requestId;
     if (reqId === undefined || reqId === null) return;
     const sub = this.session.getSubscription(reqId) ?? this.session.getIncomingSubscription(reqId);
     if (!sub) return;
@@ -1992,7 +2010,9 @@ export class MoqtConnection {
     if (!suppress) this.onMessage?.(stamped);
     const fwdTarget = this.outboundPublishForwardTarget(stamped as { type: string; requestId?: bigint });
     const fwdBefore = fwdTarget === undefined ? undefined : this.getPublishForwardState(fwdTarget);
-    await this.executeActions(this.session.handleControlMessage(message, { requestId }));
+    const actions = this.session.handleControlMessage(message, { requestId });
+    this.settleFillHeaders();
+    await this.executeActions(actions);
     const fwdAfter = this.changedPublishForwardState(fwdTarget, fwdBefore);
     if (fwdTarget !== undefined && fwdAfter !== undefined) {
       this.notifyPublishForwardChange(fwdTarget, fwdAfter);
@@ -2070,6 +2090,7 @@ export class MoqtConnection {
       this.beginPendingAliasReplay(alias, requestId, null, replay);
       this.onMessage?.(stampedOk);
     }
+    this.settleFillHeaders();
     await this.executeActions(actions);
   }
 
@@ -2111,6 +2132,10 @@ export class MoqtConnection {
    */
   private aliasReuseSafe(alias: bigint): boolean {
     if (this.drainingAliases.has(alias)) return false; // drain window in progress
+    const live = this.session.getSubscriberRequestsForAlias(alias);
+    for (const { sub } of this.terminalSubscribers.values()) {
+      if (sub.trackAlias === alias && !live.some((owner) => owner.trackKey === sub.trackKey)) return false;
+    }
     const t = this.terminatedAliases.get(alias);
     return !t || (t.strict && t.remaining === 0n);
   }
@@ -2194,35 +2219,33 @@ export class MoqtConnection {
       // A subscription sharing its alias ends alone: the alias, its streams and
       // their terminal accounting stay with the other subscriptions (draft-21 §3.1).
       const doneRaw = this.rawSubscriptions.get(originalRequestId);
-      const aliasStillShared = doneRaw !== undefined && this.detachSharedAlias(doneRaw);
+      const subscription = this.session.getSubscription(originalRequestId);
+      const alias = subscription?.trackAlias;
+      const aliasStillShared = alias !== undefined && this.aliasHasOtherSubscriber(alias, originalRequestId);
+      if (doneRaw) this.detachSharedAlias(doneRaw);
       // Capture the alias BEFORE the session reclaims the subscription.
-      const doneAlias = aliasStillShared ? undefined : this.session.getSubscription(originalRequestId)?.trackAlias;
-      const streamCount = (message as { streamCount?: bigint }).streamCount ?? 0n;
+      const doneAlias = aliasStillShared ? undefined : alias;
+      const ownCount = (message as { streamCount?: bigint }).streamCount ?? 0n;
+      const streamCount = alias === undefined ? ownCount : this.recordSubscriberTerminal(alias, ownCount);
       const stampedDone = { ...message, requestId: originalRequestId } as ControlMessage;
       // Terminal drain: arm SYNCHRONOUSLY, BEFORE the application callback —
       // no callback may observe a DONE'd subscription without the drain pending.
-      const draining = this.drainConfigs.has(originalRequestId) && doneAlias !== undefined;
-      if (draining) this.applyTerminalDrain(doneAlias!, BigInt(streamCount), originalRequestId);
+      const draining = this.drainConfigs.has(originalRequestId) && alias !== undefined;
+      if (draining && subscription) this.retainTerminalSubscriber(subscription);
+      const cancelFills = draining ? Promise.resolve() : this.cancelFill(originalRequestId);
+      const aliasDraining = draining || (doneAlias !== undefined && [...this.terminalSubscribers.values()].some(({ sub }) => sub.trackAlias === doneAlias));
+      if (aliasDraining && doneAlias !== undefined) this.applyTerminalDrain(doneAlias, BigInt(streamCount), originalRequestId);
       // Non-drained terminal application starts BEFORE the callback, like the
       // drain above: its arm runs before the first await, so a reentrant
       // close() inside the callback CLEARS the terminal state instead of having
       // its cleanup undone by an arm that follows it.
-      const discard = !draining && doneAlias !== undefined
+      const discard = !aliasDraining && doneAlias !== undefined
         ? this.applyTerminalStreamCount(doneAlias, BigInt(streamCount), originalRequestId)
         : Promise.resolve();
       this.onMessage?.(stampedDone);
       await this.executeActions(this.session.handleControlMessage(stampedDone));
+      await cancelFills;
       await discard;
-      if (aliasStillShared) {
-        // No alias drain runs for it: its terminal delivery is complete now.
-        const cfg = this.drainConfigs.get(originalRequestId);
-        this.drainConfigs.delete(originalRequestId);
-        try {
-          cfg?.onDrained?.(originalRequestId);
-        } catch (err) {
-          this.onError?.(err instanceof Error ? err : new Error(String(err)));
-        }
-      }
       return;
     }
     // draft-21 §9.10: the publisher's report on OUR subscription's request stream.
@@ -2254,6 +2277,10 @@ export class MoqtConnection {
     // may send PUBLISH_DONE, which must remain behind this update response on
     // the request stream. Do not await yet: Forward=0 must still be reported
     // promptly when the transport write is blocked.
+    if (isDraft21(this.session.draftVersion) && send?.message.type === 'REQUEST_OK') {
+      if (!this.rememberInboundFill(updateId, originalRequestId, (message as { parameters: Parameters }).parameters)) return;
+      this.finalizeInboundFill(updateId, send.message.parameters);
+    }
     const responseWrite = send
       ? this.uniPair!.writeOnRequest(originalRequestId, send.message)
       : Promise.resolve();
@@ -2315,17 +2342,22 @@ export class MoqtConnection {
     const raw = this.rawSubscriptions.get(requestId);
     // A subscription sharing its alias leaves it to the others (draft-21 §3.1).
     if (raw) this.detachSharedAlias(raw);
-    const teardownAlias = raw && raw.trackAlias !== null && this.rawAliasMaps.get(raw.trackAlias) === raw
-      ? raw.trackAlias : null;
+    const alias = isDraft21(this.session.draftVersion)
+      ? this.session.getSubscription(requestId)?.trackAlias ?? raw?.trackAlias
+      : raw?.trackAlias;
+    const retained = this.terminalSubscribers.has(requestId);
+    if (alias != null && this.session.getSubscription(requestId)) this.recordSubscriberTerminal(alias, null);
+    const teardownAlias = !retained && alias != null
+      && !this.deliverySubscribers21(alias).some((sub) => sub.requestId !== requestId)
+      && (!raw || this.rawAliasMaps.get(alias) === raw) ? alias : null;
     if (teardownAlias !== null) this.armSubscriberAliasTeardown(teardownAlias);
     this.cancelPendingAliasReplaysForRequest(requestId);
-
-    await this.executeActions(this.session.handleOutboundRequestClosed(requestId));
+    const cancelledFills = !retained && (alias == null || !this.drainingAliases.has(alias)) ? this.cancelFill(requestId) : Promise.resolve();
+    const closeActions = this.session.handleOutboundRequestClosed(requestId);
+    await cancelledFills;
+    await this.executeActions(closeActions);
+    if (teardownAlias !== null) await this.discardOpenStreamsForAlias(teardownAlias);
     if (raw) {
-      if (teardownAlias !== null) {
-        // Tombstone armed above; now early-discard any streams still open.
-        await this.discardOpenStreamsForAlias(teardownAlias);
-      }
       this.removeRawSubscription(raw);
       // Defensive: a still-pending subscribeTrack() (no SUBSCRIBE_OK yet) must not
       // hang when its request stream closes before the response (peer FIN/reset, or
@@ -2427,7 +2459,6 @@ export class MoqtConnection {
     const result = new Promise<TrackSubscription>((resolve, reject) => {
       this.rawSubscriptions.set(reqIdBigint, {
         requestId: reqIdBigint, trackAlias: null, sub, resolve, reject,
-        ...(options?.filter !== undefined ? { filter: options.filter } : {}),
       });
     });
     try {
@@ -2458,15 +2489,11 @@ export class MoqtConnection {
    * already verified it is the same track, so the subscription joins the alias's
    * group instead of replacing the route.
    */
-  private bindRawAlias(alias: bigint, raw: RawSubState, ok: ControlMessage): void {
+  private bindRawAlias(alias: bigint, raw: RawSubState): void {
     if (!isDraft21(this.session.draftVersion)) {
       this.rawAliasMaps.set(alias, raw);
       return;
     }
-    const largest = (ok as { parameters?: Map<bigint, unknown[]> }).parameters?.get(0x09n)?.[0];
-    raw.window = subscriptionWindow(raw.filter,
-      largest !== null && typeof largest === 'object' && 'group' in largest
-        ? largest as { group: bigint; object: bigint } : undefined);
     const current = this.rawAliasMaps.get(alias);
     if (current === undefined || current === raw) {
       this.rawAliasMaps.set(alias, raw);
@@ -2475,6 +2502,78 @@ export class MoqtConnection {
     const group = this.sharedAliasSubs.get(alias) ?? [current];
     if (!group.includes(raw)) group.push(raw);
     this.sharedAliasSubs.set(alias, group);
+  }
+
+  private bindPublishAlias(pub: IncomingPublish): void {
+    const members = isDraft21(this.session.draftVersion) ? this.publishAliasMaps.get(pub.trackAlias) ?? [] : [];
+    members.push(pub);
+    this.publishAliasMaps.set(pub.trackAlias, members);
+  }
+
+  private publishAliasForRequest(requestId: bigint): bigint | undefined {
+    for (const [alias, members] of this.publishAliasMaps) {
+      if (members.some((pub) => pub.requestId === requestId)) return alias;
+    }
+    return undefined;
+  }
+
+  private removePublishAliasMember(alias: bigint, requestId: bigint): void {
+    const members = this.publishAliasMaps.get(alias)?.filter((pub) => pub.requestId !== requestId) ?? [];
+    if (members.length > 0) this.publishAliasMaps.set(alias, members);
+    else this.publishAliasMaps.delete(alias);
+  }
+
+  private aliasHasOtherSubscriber(alias: bigint, requestId: bigint): boolean {
+    return isDraft21(this.session.draftVersion)
+      && this.session.getSubscriberRequestsForAlias(alias).some((sub) => sub.requestId !== requestId);
+  }
+
+  private deliverySubscribers21(alias: bigint): SubscriptionStateMachine[] {
+    return [
+      ...this.session.getSubscriberRequestsForAlias(alias),
+      ...[...this.terminalSubscribers.values()].filter(({ sub }) => sub.trackAlias === alias).map(({ sub }) => sub),
+    ];
+  }
+
+  private recordSubscriberTerminal(alias: bigint, count: bigint | null): bigint {
+    if (!isDraft21(this.session.draftVersion)) return count ?? MoqtConnection.STREAM_COUNT_UNKNOWN;
+    const unknown = 0xffffffffffffffffn;
+    const prior = this.aliasTerminalTotals.get(alias);
+    const total = prior === null || count === null || count === unknown ? null : (prior ?? 0n) + count;
+    this.aliasTerminalTotals.set(alias, total);
+    return total === null || total >= unknown ? unknown : total;
+  }
+
+  private retainTerminalSubscriber(sub: SubscriptionStateMachine): void {
+    if (!isDraft21(this.session.draftVersion) || this.terminalSubscribers.has(sub.requestId)) return;
+    const ttl = Math.max(this.terminatedAliasTtlMs, this.aliasDeliveryTimeoutMs.get(sub.trackAlias!) ?? 0);
+    const cancelTimer = this.armGuardTimer(ttl, () => { void this.finishTerminalSubscriber(sub.requestId); });
+    this.terminalSubscribers.set(sub.requestId, { sub, cancelTimer });
+  }
+
+  private async finishTerminalSubscriber(requestId: bigint): Promise<void> {
+    const retained = this.terminalSubscribers.get(requestId);
+    if (!retained) return;
+    this.terminalSubscribers.delete(requestId);
+    retained.cancelTimer();
+    await this.cancelFill(requestId);
+    if (this._terminated) return;
+    const cfg = this.drainConfigs.get(requestId);
+    this.drainConfigs.delete(requestId);
+    try { cfg?.onDrained?.(requestId); }
+    catch (err) {
+      try { this.onError?.(err instanceof Error ? err : new Error(String(err))); } catch { /* observer failure */ }
+    }
+  }
+
+  private hasDeliveredObject(sub: SubscriptionStateMachine, obj: MoqtObject): boolean {
+    const key = `${obj.groupId}/${obj.subgroupId ?? ''}/${obj.objectId}`;
+    let seen = this.subscriberObjectHistory.get(sub);
+    if (seen?.has(key)) return true;
+    if (!seen) this.subscriberObjectHistory.set(sub, seen = new Set());
+    seen.add(key);
+    if (seen.size > SHARED_ALIAS_SEEN_LIMIT) seen.delete(seen.values().next().value!);
+    return false;
   }
 
   /**
@@ -2487,7 +2586,9 @@ export class MoqtConnection {
     const objectId = BigInt(obj.objectId);
     const key = `${groupId}/${String(obj.subgroupId ?? '')}/${objectId}`;
     for (const raw of [...group]) {
-      if (raw.window && !windowContains(raw.window, groupId, objectId)) continue;
+      if (this.rawSubscriptions.get(raw.requestId) !== raw) continue;
+      const window = this.session.getSubscription(raw.requestId)?.locationWindow;
+      if (window && !windowContains(window, groupId, objectId)) continue;
       const seen = raw.seen ??= new Set<string>();
       if (seen.has(key)) continue;
       seen.add(key);
@@ -2520,6 +2621,27 @@ export class MoqtConnection {
         kind: 'object', streamId, object: obj, ownerGeneration: 0n,
       });
     }
+    if (isDraft21(this.session.draftVersion)) {
+      const members = this.deliverySubscribers21(alias);
+      if (members.length > 0) {
+        const generic: SubscriptionStateMachine[] = [];
+        for (const member of members) {
+          if (this._terminated || !this.deliverySubscribers21(alias).includes(member)) continue;
+          const window = member.locationWindow;
+          if (window && !windowContains(window, obj.groupId, obj.objectId)) continue;
+          if (this.hasDeliveredObject(member, obj)) continue;
+          const raw = this.rawSubscriptions.get(member.requestId);
+          if (raw) raw.sub.onObject?.(obj);
+          else if (!member.isPublishInitiated) generic.push(member);
+          else {
+            this.publishAliasMaps.get(alias)?.find((pub) => pub.requestId === member.requestId)?.onObject?.(obj);
+          }
+        }
+        if (!this._terminated && generic.some((sub) => this.deliverySubscribers21(alias).includes(sub))) this.onObject?.(streamId, obj);
+        return true;
+      }
+      if (this.drainingAliases.has(alias)) return true;
+    }
     const shared = this.sharedAliasSubs.get(alias);
     if (shared) {
       this.deliverToSharedAlias(shared, obj);
@@ -2527,11 +2649,12 @@ export class MoqtConnection {
     }
     const rawSub = this.rawAliasMaps.get(alias);
     if (rawSub) {
-      rawSub.sub.onObject?.(obj);
+      if (isDraft21(this.session.draftVersion)) this.deliverToSharedAlias([rawSub], obj);
+      else rawSub.sub.onObject?.(obj);
       return true;
     }
     // draft-18 §10.10: objects for an accepted inbound PUBLISH route by alias.
-    const pub = this.publishAliasMaps.get(alias);
+    const pub = this.publishAliasMaps.get(alias)?.[0];
     if (pub) {
       pub.onObject?.(obj);
       return true;
@@ -2546,7 +2669,7 @@ export class MoqtConnection {
     if (this.terminatedAliases.has(alias)) return true;
     // An established generic subscribe() intentionally uses the connection-wide
     // onObject callback. A pending raw subscription elsewhere must not steal it.
-    if (this.session.getTrackByAlias(varint(alias)) !== undefined) return false;
+    if (this.session.getTrackByAlias(alias) !== undefined) return false;
     // The publisher may deliver objects before its SUBSCRIBE_OK is processed
     // (control and data streams are not ordered relative to each other, §10.4);
     // dropping them would permanently starve the subscription of anything it
@@ -2576,11 +2699,27 @@ export class MoqtConnection {
       });
       return;
     }
+    if (isDraft21(this.session.draftVersion)) {
+      const members = this.session.getSubscriberRequestsForAlias(alias);
+      if (members.length > 0) {
+        for (const member of members) {
+          if (this._terminated || !this.session.getSubscriberRequestsForAlias(alias).includes(member)) continue;
+          const window = member.locationWindow;
+          if (window && !windowCoversGroup(window, header.groupId)) continue;
+          const raw = this.rawSubscriptions.get(member.requestId);
+          if (raw) raw.sub.onSubgroupClosed?.(header);
+          else this.publishAliasMaps.get(alias)?.find((pub) => pub.requestId === member.requestId)?.onSubgroupClosed?.(header);
+        }
+        return;
+      }
+    }
     const shared = this.sharedAliasSubs.get(alias);
     if (shared) {
       const group = BigInt(header.groupId);
       for (const raw of shared) {
-        if (raw.window && !windowCoversGroup(raw.window, group)) continue;
+        if (this.rawSubscriptions.get(raw.requestId) !== raw) continue;
+        const window = this.session.getSubscription(raw.requestId)?.locationWindow;
+        if (window && !windowCoversGroup(window, group)) continue;
         raw.sub.onSubgroupClosed?.(header);
       }
       return;
@@ -2590,12 +2729,12 @@ export class MoqtConnection {
       rawSub.sub.onSubgroupClosed?.(header);
       return;
     }
-    const pub = this.publishAliasMaps.get(alias);
-    if (pub) {
-      pub.onSubgroupClosed?.(header);
+    const publications = this.publishAliasMaps.get(alias);
+    if (publications) {
+      for (const pub of [...publications]) pub.onSubgroupClosed?.(header);
       return;
     }
-    if (this.session.getTrackByAlias(varint(alias)) !== undefined) return;
+    if (this.session.getTrackByAlias(alias) !== undefined) return;
     this.bufferPendingAlias(alias, undefined, header);
   }
 
@@ -2658,7 +2797,7 @@ export class MoqtConnection {
     if (!this.hasPendingRawSubscription()) return false;
     if (this.terminatedAliases.has(alias)) return false;
     if (this.publishAliasMaps.has(alias)) return false;
-    if (this.session.getTrackByAlias(varint(alias)) !== undefined) return false;
+    if (this.session.getTrackByAlias(alias) !== undefined) return false;
 
     const ownerGeneration = this.latestPendingSubscriptionGeneration();
     if (ownerGeneration === undefined) return false;
@@ -2902,7 +3041,9 @@ export class MoqtConnection {
   private clearTerminatedAlias(alias: bigint): void {
     const t = this.terminatedAliases.get(alias);
     if (t) { t.cancelTimer(); this.terminatedAliases.delete(alias); }
+    if (!t && isDraft21(this.session.draftVersion) && this.deliverySubscribers21(alias).length > 1) return;
     this.aliasStreamsSeen.delete(alias);
+    this.aliasTerminalTotals.delete(alias);
     this.aliasDeliveryTimeoutMs.delete(alias);
     this.aliasPublisherTimeout.delete(alias);
   }
@@ -2982,14 +3123,14 @@ export class MoqtConnection {
    */
   private applyTerminalDrain(alias: bigint, streamCount: bigint, owningRequestId: bigint): void {
     const owner = this.rawAliasMaps.get(alias)?.requestId
-      ?? this.publishAliasMaps.get(alias)?.requestId;
+      ?? this.publishAliasMaps.get(alias)?.[0]?.requestId;
     if (owner !== undefined && owner !== owningRequestId) return; // crossed OLD DONE on a reused alias
     if (this.drainingAliases.has(alias)) return; // already draining — exactly-once
     // §8: reflect any accepted REQUEST_UPDATE in the effective timeout first.
     this.refreshAliasDeliveryTimeout(alias);
-    const UNKNOWN_COUNT = (1n << 62n) - 1n; // "could not give an exact count" sentinel
+    const UNKNOWN_COUNT = isDraft21(this.session.draftVersion) ? 0xffffffffffffffffn : MoqtConnection.STREAM_COUNT_UNKNOWN;
     const seen = this.aliasStreamsSeen.get(alias) ?? 0n;
-    const acceptRemaining = streamCount >= UNKNOWN_COUNT
+    const acceptRemaining = streamCount === UNKNOWN_COUNT
       ? null
       : (streamCount > seen ? streamCount - seen : 0n);
     const ttlMs = Math.max(this.terminatedAliasTtlMs, this.aliasDeliveryTimeoutMs.get(alias) ?? 0);
@@ -3007,6 +3148,7 @@ export class MoqtConnection {
     // through the sweep's await window below.
     state.drained = true;
     state.cancelTimer();
+    await this.cancelFill(state.requestId);
     // Cancel still-open streams and AWAIT their cleanup (fail-closed: a
     // cancellation that never settles keeps the drain safely blocked).
     await this.discardOpenStreamsForAlias(alias);
@@ -3015,6 +3157,11 @@ export class MoqtConnection {
     // teardown race this guards.
     if (this.drainingAliases.get(alias) !== state) return;
     this.drainingAliases.delete(alias);
+    this.aliasStreamsSeen.delete(alias);
+    this.aliasTerminalTotals.delete(alias);
+    for (const [id, retained] of [...this.terminalSubscribers]) {
+      if (retained.sub.trackAlias === alias) await this.finishTerminalSubscriber(id);
+    }
     // Deliberately NO tombstone: the drain window WAS the §10.11 retention.
     // The alias is now free, and a same-alias stream arriving next may be the
     // REUSED alias's first data (racing its SUBSCRIBE_OK) — it must reach the
@@ -3041,7 +3188,7 @@ export class MoqtConnection {
     // new route (§11.1). `undefined` owner (no live route) is the terminating
     // request's own already-partly-torn-down subscription — proceed.
     const owner = this.rawAliasMaps.get(alias)?.requestId
-      ?? this.publishAliasMaps.get(alias)?.requestId;
+      ?? this.publishAliasMaps.get(alias)?.[0]?.requestId;
     if (owner !== undefined && owner !== owningRequestId) return;
 
     // 1) Install terminal state synchronously (before any await).
@@ -3051,8 +3198,8 @@ export class MoqtConnection {
     // the updated window are still valid.
     this.refreshAliasDeliveryTimeout(alias);
     const seen = this.aliasStreamsSeen.get(alias) ?? 0n;
-    // draft 21 raised the sentinel to 2^64-1 (§9.9); anything at or above 2^62-1 is unknown.
-    const remaining: bigint | null = streamCount >= MoqtConnection.STREAM_COUNT_UNKNOWN
+    const unknown = isDraft21(this.session.draftVersion) ? 0xffffffffffffffffn : MoqtConnection.STREAM_COUNT_UNKNOWN;
+    const remaining: bigint | null = streamCount === unknown
       ? null // §9.15 sentinel: exact count unknown — rely on the TTL only
       : (streamCount - seen > 0n ? streamCount - seen : 0n);
     this.armTerminatedAlias(alias, remaining, /* strict */ true);
@@ -3084,7 +3231,7 @@ export class MoqtConnection {
         // alias, just before this call. Here we only bind routing + resolve.
         raw.trackAlias = alias;
         (raw.sub as { trackAlias: bigint }).trackAlias = alias;
-        this.bindRawAlias(alias, raw, msg);
+        this.bindRawAlias(alias, raw);
         // Claim only events that named this exact request while it was pending.
         // Callback delivery remains deferred until after raw.resolve() below.
         // onObject/onSubgroupClosed are documented "mutable, read live on each delivery":
@@ -3179,7 +3326,7 @@ export class MoqtConnection {
           // ALSO drop publishAliasMaps and arm the terminal-alias guard — otherwise
           // the route stays live and a late/independent data stream on the alias
           // would keep reaching the application.
-          const pubAlias = [...this.publishAliasMaps].find(([, p]) => p.requestId === existingRequestId)?.[0];
+          const pubAlias = this.publishAliasForRequest(existingRequestId);
           if (pubAlias !== undefined) {
             await this.rollbackFailedAcceptance(existingRequestId, pubAlias, /* isPublishInitiated */ true);
           } else {
@@ -3268,25 +3415,29 @@ export class MoqtConnection {
     // direct API, the TrackSubscription wrapper, and the peer-close path all
     // arm at the same point and cannot diverge.
     const raw = this.rawSubscriptions.get(requestId);
+    const alias = isDraft21(this.session.draftVersion)
+      ? this.session.getSubscription(requestId)?.trackAlias ?? raw?.trackAlias
+      : raw?.trackAlias;
     // A subscription sharing its alias leaves it to the others (draft-21 §3.1).
+    const aliasStillShared = alias != null && isDraft21(this.session.draftVersion)
+      && this.deliverySubscribers21(alias).some((sub) => sub.requestId !== requestId);
+    if (alias != null && this.session.getSubscription(requestId)) this.recordSubscriberTerminal(alias, null);
     if (raw) this.detachSharedAlias(raw);
-    if (raw && raw.trackAlias !== null && this.rawAliasMaps.get(raw.trackAlias) === raw) {
-      this.armSubscriberAliasTeardown(raw.trackAlias);
-    }
+    if (!aliasStillShared && alias != null) this.armSubscriberAliasTeardown(alias);
 
     // draft-21 §3.4: the fill ends with its subscription.
-    await this.cancelFill(requestId);
-    const actions = this.session.unsubscribe(requestId); // draft-18 returns no send_control
+    const cancelledFills = this.cancelFill(requestId);
+    const actions = this.session.unsubscribe(requestId); // Retire before any callback can resume.
+    await cancelledFills;
     await this.executeActions(actions);
     if (isRequestStreamDraft(this.session.draftVersion)) {
       // Reset the subscribe request stream; this is the draft-18 cancellation
       // signal (a LOCAL cancel — the response handler ignores the resulting
       // RequestCancelledError, so it surfaces no onError).
       await this.uniPair!.cancelRequest(requestId);
-      const current = this.rawSubscriptions.get(requestId) ?? raw;
-      if (current && current.trackAlias !== null) {
+      if (!aliasStillShared && alias != null) {
         // Tombstone already armed above; now early-discard open streams.
-        await this.discardOpenStreamsForAlias(current.trackAlias);
+        await this.discardOpenStreamsForAlias(alias);
       }
     }
     // Drop the raw subscription for EVERY draft: draft-14/16 has no request-stream
@@ -3327,31 +3478,37 @@ export class MoqtConnection {
    * timeout timer — those remain application/timer concerns. A server MAY supply a
    * `newSessionUri`; a client MUST leave it empty. For draft-18, `requestId` (the
    * smallest peer Request ID that may be unprocessed) is required by the receiver
-   * and MUST match the peer's request-id parity.
+   * and MUST match the peer's request-id parity. Draft 21 omits this field.
    * @see draft-ietf-moq-transport-18 §10.4
+   * @see draft-ietf-moq-transport-21 §9.2
    */
   async sendGoaway(options: { newSessionUri?: string; timeout?: bigint; requestId?: bigint } = {}): Promise<void> {
     const newSessionUri = options.newSessionUri ?? '';
 
     if (isRequestStreamDraft(this.session.draftVersion)) {
-      // §10.4 local guards — never emit an invalid control-stream GOAWAY. The peer
-      // would reject these; refuse to put them on the wire in the first place.
-      if (options.requestId === undefined) {
-        throw new MoqtConnectionError('sendGoaway (draft-18): a control-stream GOAWAY requires a Request ID', { errorSource: 'control' });
-      }
       if (this._role === EndpointRole.CLIENT && newSessionUri.length > 0) {
-        throw new MoqtConnectionError('sendGoaway (draft-18): a client MUST send a zero-length New Session URI', { errorSource: 'control' });
+        throw new MoqtConnectionError(`sendGoaway (draft-${this.session.draftVersion}): a client MUST send a zero-length New Session URI`, { errorSource: 'control' });
       }
-      // The Request ID refers to the RECEIVER's request IDs, so it must carry the
-      // peer's parity: server→client is even, client→server is odd.
-      const expectedParity = this._role === EndpointRole.SERVER ? 0n : 1n;
-      if ((options.requestId & 1n) !== expectedParity) {
-        throw new MoqtConnectionError(
-          `sendGoaway (draft-18): Request ID ${options.requestId} has the wrong parity for the peer (expected ${expectedParity === 0n ? 'even' : 'odd'})`,
-          { errorSource: 'control' },
-        );
+      let requestId: bigint | undefined;
+      if (!isDraft21(this.session.draftVersion)) {
+        if (options.requestId === undefined) {
+          throw new MoqtConnectionError('sendGoaway (draft-18): a control-stream GOAWAY requires a Request ID', { errorSource: 'control' });
+        }
+        // Draft 18 refers to the receiver's requests: server-to-client is even,
+        // client-to-server is odd. Draft 21 has no Request ID in GOAWAY.
+        const expectedParity = this._role === EndpointRole.SERVER ? 0n : 1n;
+        if ((options.requestId & 1n) !== expectedParity) {
+          throw new MoqtConnectionError(
+            `sendGoaway (draft-18): Request ID ${options.requestId} has the wrong parity for the peer (expected ${expectedParity === 0n ? 'even' : 'odd'})`,
+            { errorSource: 'control' },
+          );
+        }
+        requestId = options.requestId;
       }
-      const message: Goaway = { type: 'GOAWAY', newSessionUri, timeout: options.timeout ?? 0n, requestId: options.requestId };
+      const message: Goaway = {
+        type: 'GOAWAY', newSessionUri, timeout: options.timeout ?? 0n,
+        ...(requestId !== undefined ? { requestId } : {}),
+      };
       await this.uniPair!.sendControl(message); // draft-18 control stream is the uni pair
       return;
     }
@@ -3627,24 +3784,6 @@ export class MoqtConnection {
   }
 
   /**
-   * Cancel an active fetch.
-   *
-   * draft-14/16: sends FETCH_CANCEL on the control stream, and STOP_SENDING on
-   * the associated data stream if open.
-   *   §9.18: "A subscriber sends a FETCH_CANCEL message to a publisher to
-   *   indicate it is no longer interested in receiving objects for the fetch
-   *   identified by the 'Request ID'."
-   *   §5.2: "If the data stream is already open, it MAY send STOP_SENDING for
-   *   the data stream along with FETCH_CANCEL, but MUST send FETCH_CANCEL."
-   *
-   * draft-18: FETCH_CANCEL was REMOVED; cancellation is STOP_SENDING /
-   * RESET_STREAM on the bidi request stream and the fetch data stream (§3.3.2).
-   * No control message is sent.
-   *
-   * @param requestId The request ID of the fetch to cancel
-   * @see draft-ietf-moq-transport-16 §5.2, §9.18; draft-ietf-moq-transport-18 §3.3.2
-   */
-  /**
    * Stop a draft-21 fill (§3.4) without touching its subscription: STOP_SENDING on
    * the fill fetch stream if it is open, or discard it when it arrives. The
    * subscription keeps delivering live objects.
@@ -3657,19 +3796,49 @@ export class MoqtConnection {
     for (const [fillId, fill] of this.fillStreams) {
       if (fill.subscriptionId === requestId) targets.add(fillId);
     }
+    const discards: Promise<void>[] = [];
     for (const fillId of targets) {
       const open = this.fillStreams.get(fillId);
       if (open === undefined) {
         // One-shot marker: the FETCH_HEADER handler discards the late fill stream.
         if (this.session.cancelFillRequest(fillId)) this.recentlyCancelledFetches.add(fillId);
+        this.pendingFillHeaders.get(fillId)?.finish(false);
         continue;
       }
       this.fillStreams.delete(fillId);
       const reader = this.dataStreamReaders.get(open.streamId);
-      if (reader) await this.discardLocalReader(open.streamId, reader, new Error('fill cancelled'));
+      if (reader) discards.push(this.discardLocalReader(open.streamId, reader, new Error('fill cancelled')));
+    }
+    await Promise.all(discards);
+  }
+
+  private settleFillHeaders(): void {
+    for (const [requestId, pending] of this.pendingFillHeaders) {
+      if (!this.session.isFillResponsePending(requestId)) {
+        pending.finish(this.session.fillSubscriptionFor(requestId) !== undefined);
+      }
     }
   }
 
+  private async waitForFillResponse(requestId: bigint, streamId: bigint): Promise<boolean> {
+    if (this.pendingFillHeaders.has(requestId)) throw new ProtocolViolationError(`Second fill stream for request ${requestId}`);
+    if (this.pendingFillHeaders.size >= MoqtConnection.MAX_PENDING_ALIASES) return false;
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => finish(false), this.joiningFetchTimeoutMs);
+      const finish = (accepted: boolean): void => {
+        clearTimeout(timer);
+        this.pendingFillHeaders.delete(requestId);
+        resolve(accepted);
+      };
+      this.pendingFillHeaders.set(requestId, { streamId, finish });
+    });
+  }
+
+  /**
+   * Cancel an ordinary fetch. Draft-14/16 sends FETCH_CANCEL and stops its data
+   * stream. Draft-18/21 cancels the request and data streams without a control
+   * message. Use cancelFill() for a draft-21 fill, which has no FETCH request.
+   */
   async fetchCancel(requestId: bigint): Promise<void> {
     // §5.2: the fetch may already have ended (its data stream FIN'd/reset → reclaimed
     // by handleFetchStreamFinished, or a REQUEST_ERROR). Cancelling a fetch that is
@@ -3850,6 +4019,7 @@ export class MoqtConnection {
       );
     }
     const actions = this.session.acceptSubscribe(requestId, trackAlias, options);
+    this.finalizeInboundFill(requestId, options?.parameters);
     // §5.1: the acceptance may itself force a session close (e.g. the superseded-set
     // is at capacity, §5.1). Then there is no acceptance to report — execute the
     // close, settle parked joins as NOT accepted, and reject rather than resolving
@@ -3867,7 +4037,7 @@ export class MoqtConnection {
     // §10.11: authorize publisher data-plane ops (openSubgroup / sendObject /
     // sendDatagram) on this alias ONLY for an inbound SUBSCRIBE we serve — never for
     // an inbound PUBLISH, where we are the subscriber.
-    if (!isPublishInitiated) this.publisherAliasRequests.set(trackAlias, requestId);
+    if (!isPublishInitiated) this.addPublisherAliasRequest(trackAlias, requestId);
     // §8: for an inbound PUBLISH (we are the subscriber), COMPUTE the effective
     // timeout by combining the publisher's Track-Property timeouts (captured at bind)
     // with OUR PUBLISH_OK Message Parameters — but DEFER committing it until the
@@ -3952,14 +4122,15 @@ export class MoqtConnection {
    * The caller re-throws so the failed acceptance is not reported as success.
    */
   private async rollbackFailedAcceptance(requestId: bigint, trackAlias: bigint, isPublishInitiated: boolean): Promise<void> {
-    this.publisherAliasRequests.delete(trackAlias);
+    this.removePublisherAliasRequest(trackAlias, requestId);
     // For an inbound PUBLISH, tear down its route AND arm a bounded late-object
     // guard SYNCHRONOUSLY (before the first await), exactly like the inbound-FIN
     // teardown — a subgroup opened BEFORE the failed PUBLISH_OK and delivered after
     // would otherwise fall through to the connection-level onObject. Owner-checked
     // so a reused alias's newer publication is untouched.
-    const ownsRoute = isPublishInitiated
-      && this.publishAliasMaps.get(trackAlias)?.requestId === requestId;
+    const ownsRoute = isPublishInitiated && this.publishAliasForRequest(requestId) === trackAlias
+      && !this.aliasHasOtherSubscriber(trackAlias, requestId);
+    if (isPublishInitiated) this.removePublishAliasMember(trackAlias, requestId);
     if (ownsRoute) this.armTerminatedAlias(trackAlias, null, /* strict */ false); // drops route + installs guard
     this.inboundPublishTimeouts.delete(requestId);
     await this.executeActions(this.session.handleInboundRequestClosed(requestId));
@@ -4031,7 +4202,9 @@ export class MoqtConnection {
     // callback. Owner-checked so a reused alias's newer publication is untouched.
     const incoming = this.session.getIncomingSubscription(requestId);
     const pubAlias = incoming?.isPublishInitiated ? incoming.trackAlias : undefined;
-    const ownsRoute = pubAlias !== undefined && this.publishAliasMaps.get(pubAlias)?.requestId === requestId;
+    const ownsRoute = pubAlias !== undefined && this.publishAliasForRequest(requestId) === pubAlias
+      && !this.aliasHasOtherSubscriber(pubAlias, requestId);
+    if (pubAlias !== undefined) this.removePublishAliasMember(pubAlias, requestId);
     if (ownsRoute) this.armTerminatedAlias(pubAlias, null, /* strict */ false);
     const actions = this.session.rejectSubscribe(requestId, errorCode, reason);
     if (await this.writeInboundRequestResponse(requestId, actions)) {
@@ -4112,10 +4285,23 @@ export class MoqtConnection {
       // §3.4.1: ending a subscription resets its open fill streams, including
       // those a REQUEST_UPDATE asked for under its own Request ID.
       if (st.requestId !== requestId && st.fillOf !== requestId) continue;
-      this.fetchOutgoingStreams.delete(streamId);
+      this.removeOutgoingFetchStream(streamId);
       writers.push(st.writer);
     }
     return writers;
+  }
+
+  private removeOutgoingFetchStream(streamId: bigint): void {
+    const state = this.fetchOutgoingStreams.get(streamId);
+    this.fetchOutgoingStreams.delete(streamId);
+    if (state?.fillOf !== undefined) {
+      this.servedFills.delete(state.requestId);
+      this.inboundFetchGroupOrder.delete(state.requestId);
+      this.fetchServeReserved.delete(state.requestId);
+      const open = this.openSubgroupsByRequest.get(state.fillOf);
+      open?.delete(streamId);
+      if (open?.size === 0) this.openSubgroupsByRequest.delete(state.fillOf);
+    }
   }
 
   /** Detach (synchronously) + abort every open FETCH response stream for `requestId`. */
@@ -4454,8 +4640,16 @@ export class MoqtConnection {
    */
   private publisherSubscriptionForAlias(
     trackAlias: bigint,
+    selectedRequestId?: bigint,
   ): { requestId: bigint; sub: SubscriptionStateMachine | undefined } | undefined {
-    const requestId = this.publisherAliasRequests.get(trackAlias);
+    const requests = this.publisherAliasRequests.get(trackAlias);
+    if (selectedRequestId === undefined && requests && requests.size > 1) {
+      throw new MoqtConnectionError(`Track alias ${trackAlias} is shared; specify requestId for publisher ownership`, { errorSource: 'data' });
+    }
+    const requestId = selectedRequestId ?? requests?.values().next().value;
+    if (selectedRequestId !== undefined && !requests?.has(selectedRequestId)) {
+      return { requestId: selectedRequestId, sub: undefined };
+    }
     if (requestId === undefined) {
       // A recently-retired alias: still refuse sends (sub undefined) so a
       // post-termination open is rejected, until it ages out of the bounded LRU.
@@ -4466,6 +4660,19 @@ export class MoqtConnection {
     const sub = this.publisherSubscriptionForRequest(requestId);
     if (sub && sub.state === SubscriptionState.TERMINATED) return { requestId, sub: undefined };
     return { requestId, sub };
+  }
+
+  private addPublisherAliasRequest(alias: bigint, requestId: bigint): void {
+    const requests = this.publisherAliasRequests.get(alias) ?? new Set<bigint>();
+    requests.add(requestId);
+    this.publisherAliasRequests.set(alias, requests);
+    this.retiredPublisherAliases.delete(alias);
+  }
+
+  private removePublisherAliasRequest(alias: bigint, requestId: bigint): void {
+    const requests = this.publisherAliasRequests.get(alias);
+    requests?.delete(requestId);
+    if (requests?.size === 0) this.publisherAliasRequests.delete(alias);
   }
 
   /** Publisher-side subscription state for an adapter-owned request ID. */
@@ -4481,9 +4688,11 @@ export class MoqtConnection {
    * subscription churn stays bounded.
    */
   private retirePublisherRequest(requestId: bigint): void {
-    for (const [alias, rid] of this.publisherAliasRequests) {
-      if (rid !== requestId) continue;
-      this.publisherAliasRequests.delete(alias);
+    this.revokePublisherFills(requestId);
+    for (const [alias, requests] of this.publisherAliasRequests) {
+      if (!requests.has(requestId)) continue;
+      this.removePublisherAliasRequest(alias, requestId);
+      if (requests.size > 0) continue;
       if (this.retiredPublisherAliases.size >= MoqtConnection.MAX_RETIRED_PUBLISHER_ALIASES) {
         const oldest = this.retiredPublisherAliases.keys().next().value;
         if (oldest !== undefined) this.retiredPublisherAliases.delete(oldest);
@@ -4495,6 +4704,18 @@ export class MoqtConnection {
     // captured before cancellation still checks it. It is bounded separately by
     // {@link boundPublisherGeneration}, which only evicts entries with no
     // pending op so an in-flight generation is never lost.
+  }
+
+  private revokePublisherFills(requestId: bigint): void {
+    for (const [fillId, fill] of this.inboundFillRequests) {
+      if (fill.subscriptionId === requestId) this.inboundFillRequests.delete(fillId);
+    }
+    for (const [fillId, subscriptionId] of this.servedFills) {
+      if (subscriptionId !== requestId) continue;
+      this.servedFills.delete(fillId);
+      this.inboundFetchGroupOrder.delete(fillId);
+      this.fetchServeReserved.delete(fillId);
+    }
   }
 
   /** Cap publisherGeneration: evict the oldest entry that has no pending op. */
@@ -4515,8 +4736,9 @@ export class MoqtConnection {
   private beginPublishOp(
     trackAlias: bigint,
     what: string,
+    requestId?: bigint,
   ): { requestId: bigint; sub: SubscriptionStateMachine; generation: number } {
-    const assoc = this.publisherSubscriptionForAlias(trackAlias);
+    const assoc = this.publisherSubscriptionForAlias(trackAlias, requestId);
     // The public API documents trackAlias as coming from acceptSubscribe() /
     // publish(). An UNKNOWN alias (never associated, or aged out of the retired
     // LRU) is rejected — never silently published with no accounting.
@@ -4645,9 +4867,10 @@ export class MoqtConnection {
     const aborts: Array<Promise<boolean>> = [];
     if (open) {
       for (const sid of [...open]) {
-        const st = this.outgoingStreams.get(sid);
+        const st = this.outgoingStreams.get(sid) ?? this.fetchOutgoingStreams.get(sid);
         if (st) {
           this.outgoingStreams.delete(sid);
+          this.removeOutgoingFetchStream(sid);
           // INITIATE every cancellation before awaiting any individual one.
           // The FULFILMENT of each abort is what proves the stream was reset
           // (§5.1.1), so a rejection is recorded, not swallowed.
@@ -4690,6 +4913,8 @@ export class MoqtConnection {
     groupId: bigint,
     subgroupId: bigint,
     opts?: {
+      /** Required when concurrent subscriptions share this alias (draft 21). */
+      requestId?: bigint;
       publisherPriority?: number;
       hasExtensions?: boolean;
       endOfGroup?: boolean;
@@ -4722,7 +4947,7 @@ export class MoqtConnection {
     // sees it in flight and refuses — the terminated check and the reservation
     // are one atomic step, not a pre-await check that a deferred stream
     // creation could slip past.
-    const assoc = this.beginPublishOp(trackAlias, 'openSubgroup');
+    const assoc = this.beginPublishOp(trackAlias, 'openSubgroup', opts?.requestId);
     try {
       let writable: WritableStream<Uint8Array>;
       try {
@@ -4766,6 +4991,7 @@ export class MoqtConnection {
       const streamId = this.nextOutgoingStreamId++;
       this.outgoingStreams.set(streamId, {
         writer,
+        groupId,
         hasExtensions: opts?.hasExtensions ?? false,
         previousObjectId: 0n,
         isFirstObject: true,
@@ -4907,6 +5133,7 @@ export class MoqtConnection {
           { errorSource: 'data' },
         );
       }
+      this.assertPublisherLocation(sub, state.groupId, objectId);
     }
 
     const obj = { objectId, extensions, payload, status: undefined };
@@ -4937,7 +5164,7 @@ export class MoqtConnection {
     groupId: bigint,
     objectId: bigint,
     payload: Uint8Array,
-    opts?: { publisherPriority?: number },
+    opts?: { publisherPriority?: number; requestId?: bigint },
   ): Promise<void> {
     if (!isRequestStreamDraft(this.session.draftVersion)) {
       throw new MoqtConnectionError('sendDatagram is draft-18 only', { errorSource: 'data' });
@@ -4947,8 +5174,9 @@ export class MoqtConnection {
     }
     // §10.11: no datagrams for a terminated subscription; reserve the operation
     // synchronously so a concurrent publishDone refuses (see openSubgroup).
-    const assoc = this.beginPublishOp(trackAlias, 'sendDatagram');
+    const assoc = this.beginPublishOp(trackAlias, 'sendDatagram', opts?.requestId);
     try {
+      if (assoc?.sub) this.assertPublisherLocation(assoc.sub, groupId, objectId);
       const bytes = encodeObjectDatagram18({
         typeByte: 0x00, // plain OBJECT_DATAGRAM: priority present, no flags
         trackAlias,
@@ -4971,6 +5199,12 @@ export class MoqtConnection {
       }
     } finally {
       this.endPublishOp(assoc?.requestId);
+    }
+  }
+
+  private assertPublisherLocation(sub: SubscriptionStateMachine, group: bigint, object: bigint): void {
+    if (isDraft21(this.session.draftVersion) && sub.locationWindow && !windowContains(sub.locationWindow, group, object)) {
+      throw new MoqtConnectionError(`Object ${group}/${object} is outside the subscription Location Filter`, { errorSource: 'data' });
     }
   }
 
@@ -5055,6 +5289,7 @@ export class MoqtConnection {
       throw new MoqtConnectionError(`FETCH ${requestId} already has its one response stream (§11.4.4)`, { errorSource: 'data' });
     }
     this.fetchServeReserved.add(requestId);
+    const fillOf = this.servedFills.get(requestId);
     const writer = (await this.transport.createUnidirectionalStream()).getWriter();
     // §10.13: authorization was validated BEFORE the createUnidirectionalStream
     // await. A rejectFetch() or a request-stream close during that await
@@ -5064,8 +5299,19 @@ export class MoqtConnection {
     // RESURRECT itself. Abort the freshly-opened stream and refuse.
     if (!this.inboundFetchGroupOrder.has(requestId)) {
       this.fetchServeReserved.delete(requestId); // no stream established — release the reservation
-      try { await writer.abort(new Error('inbound FETCH deauthorized during stream open')); } catch { /* already down */ }
+      await this.abortFetchWriter(writer, new Error('inbound FETCH deauthorized during stream open'), fillOf);
       throw new MoqtConnectionError(`No admitted inbound FETCH for request ${requestId}`, { errorSource: 'data' });
+    }
+    const streamId = this.nextOutgoingStreamId++;
+    this.fetchOutgoingStreams.set(streamId, {
+      requestId, writer, groupOrder, prior: undefined, isFirstObject: true,
+      ...(fillOf === undefined ? {} : { fillOf }),
+    });
+    if (fillOf !== undefined) {
+      this.publisherSubscriptionForRequest(fillOf)!.incrementStreamCount();
+      const open = this.openSubgroupsByRequest.get(fillOf) ?? new Set<bigint>();
+      open.add(streamId);
+      this.openSubgroupsByRequest.set(fillOf, open);
     }
     try {
       await writer.write(encodeFetchHeader18(requestId));
@@ -5073,7 +5319,8 @@ export class MoqtConnection {
       // The FETCH_HEADER write failed: the stream is unusable — abort it so it is
       // not left half-open, and surface the failure (do not register a dead writer).
       this.fetchServeReserved.delete(requestId); // no stream established — release the reservation
-      try { await writer.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already down */ }
+      await this.abortFetchWriter(writer, err instanceof Error ? err : new Error(String(err)), fillOf);
+      this.removeOutgoingFetchStream(streamId);
       throw err instanceof Error ? err : new Error(String(err));
     }
     // Re-check once more after the header write (single-threaded: no await between
@@ -5081,38 +5328,99 @@ export class MoqtConnection {
     // landed during the header write itself.
     if (!this.inboundFetchGroupOrder.has(requestId)) {
       this.fetchServeReserved.delete(requestId);
-      try { await writer.abort(new Error('inbound FETCH deauthorized during stream open')); } catch { /* already down */ }
+      await this.abortFetchWriter(writer, new Error('inbound FETCH deauthorized during stream open'), fillOf);
+      this.removeOutgoingFetchStream(streamId);
       throw new MoqtConnectionError(`No admitted inbound FETCH for request ${requestId}`, { errorSource: 'data' });
     }
-    const streamId = this.nextOutgoingStreamId++;
-    this.fetchOutgoingStreams.set(streamId, { requestId, writer, groupOrder, prior: undefined, isFirstObject: true });
     return streamId;
+  }
+
+  private async abortFetchWriter(writer: WritableStreamDefaultWriter<Uint8Array>, reason: Error, fillOf: bigint | undefined): Promise<void> {
+    if (fillOf === undefined) {
+      try { await writer.abort(reason); } catch { /* already down */ }
+      return;
+    }
+    // A fill counts toward its subscription's terminal stream count. If its
+    // reset cannot be proved, closing the session prevents a false clean end.
+    const reset = Promise.resolve().then(() => writer.abort(reason)).then(() => true, () => false);
+    if (!await this.allFulfilledWithin([reset], MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS)) {
+      this.closeSessionInternalError(`Fill for subscription ${fillOf} could not be reset`);
+    }
   }
 
   /**
    * draft-21 §3.4: open the fill stream for an inbound SUBSCRIBE, or a
    * REQUEST_UPDATE on one, that carried FILL_PARAMETERS. It is a fetch stream
    * whose FETCH_HEADER carries that message's Request ID, written with {@link sendFetchObject} /
-   * {@link sendFetchEndOfRange} in ascending order; {@link closeFetchStream}
+   * {@link sendFetchEndOfRange} in the fill's effective group order; {@link closeFetchStream}
    * FINs it (the fill is complete). There is no FETCH_OK. One per request.
    */
   async openFillStream(requestId: bigint): Promise<bigint> {
-    const subscriptionId = this.inboundFillRequests.get(requestId);
-    if (subscriptionId === undefined) {
-      throw new MoqtConnectionError(`Request ${requestId} did not ask for a fill`, { errorSource: 'data' });
+    const fill = this.inboundFillRequests.get(requestId);
+    if (fill === undefined) {
+      throw new MoqtConnectionError(`No pending fill for request ${requestId}`, { errorSource: 'data' });
     }
+    const { subscriptionId, options } = fill;
+    const sub = this.publisherSubscriptionForRequest(subscriptionId);
+    if (!sub || sub.state !== SubscriptionState.ESTABLISHED || sub.forwardState === ForwardState.PAUSED) {
+      throw new MoqtConnectionError(`Fill ${requestId} has no active subscription`, { errorSource: 'data' });
+    }
+    if (fill.window === undefined) throw new MoqtConnectionError(`Fill ${requestId} has no response snapshot`, { errorSource: 'data' });
+    const assoc = this.beginPublishOp(sub.trackAlias!, 'openFillStream', subscriptionId);
     this.inboundFillRequests.delete(requestId);
     this.servedFills.set(requestId, subscriptionId);
-    this.inboundFetchGroupOrder.set(requestId, 'ascending');
-    const streamId = await this.openFetchStream(requestId);
-    this.fetchOutgoingStreams.get(streamId)!.fillOf = subscriptionId;
-    return streamId;
+    this.inboundFetchGroupOrder.set(requestId, options.groupOrder ?? sub.groupOrder);
+    try {
+      const stream = await this.openFetchStream(requestId);
+      const state = this.fetchOutgoingStreams.get(stream);
+      if (!state) throw new MoqtConnectionError(`Fill ${requestId} was cancelled during stream open`, { errorSource: 'data' });
+      state.fillWindow = fill.window;
+      return stream;
+    } finally {
+      this.endPublishOp(assoc.requestId);
+    }
+  }
+
+  private rememberInboundFill(requestId: bigint, subscriptionId: bigint, parameters: Parameters): boolean {
+    const bytes = parameters.get(FILL_PARAMETERS)?.[0];
+    const sub = this.publisherSubscriptionForRequest(subscriptionId);
+    if (!(bytes instanceof Uint8Array) || !sub || sub.forwardState !== ForwardState.ACTIVE) return true;
+    if (this.inboundFillRequests.size + this.servedFills.size >= MoqtConnection.MAX_PENDING_FILLS) {
+      this.closeSessionInternalError('Too many outstanding fill streams');
+      return false;
+    }
+    const options = decodeFillParameters(bytes);
+    const filter = options.filter ?? (sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, 21));
+    const groupOrder = options.groupOrder ?? sub.requestedGroupOrder;
+    this.inboundFillRequests.set(requestId, {
+      subscriptionId,
+      options: {
+        ...(filter === undefined ? {} : { filter }),
+        ...(groupOrder === undefined ? {} : { groupOrder }),
+      },
+    });
+    return true;
+  }
+
+  private finalizeInboundFill(requestId: bigint, parameters?: Parameters): void {
+    const fill = this.inboundFillRequests.get(requestId);
+    if (!fill) return;
+    const value = parameters?.get(0x09n)?.[0];
+    const largest = value !== null && typeof value === 'object' && 'group' in value && 'object' in value
+      ? value as { group: bigint; object: bigint } : undefined;
+    const window = resolveFillWindow(fill.options.filter, largest);
+    if (window === null) this.inboundFillRequests.delete(requestId);
+    else fill.window = window;
   }
 
   /** Send a normal fetch object on a FETCH response stream (§11.4.4). */
   async sendFetchObject(streamId: bigint, fields: FetchObjectFields): Promise<void> {
     const state = this.fetchOutgoingStreams.get(streamId);
     if (!state) throw new MoqtConnectionError(`Unknown fetch stream ${streamId}`, { errorSource: 'data' });
+    if (state.closing) throw new MoqtConnectionError(`Fetch stream ${streamId} is closing`, { errorSource: 'data' });
+    if (state.fillWindow && !windowContains(state.fillWindow, fields.groupId, fields.objectId)) {
+      throw new MoqtConnectionError(`Object ${fields.groupId}/${fields.objectId} is outside the fill range`, { errorSource: 'data' });
+    }
     const { bytes, nextPrior } = encodeFetchObject18(fields, state.prior, state.isFirstObject, state.groupOrder);
     await state.writer.write(bytes);
     state.prior = nextPrior;
@@ -5123,7 +5431,12 @@ export class MoqtConnection {
   async sendFetchEndOfRange(streamId: bigint, nonExistent: boolean, groupId: bigint, objectId: bigint): Promise<void> {
     const state = this.fetchOutgoingStreams.get(streamId);
     if (!state) throw new MoqtConnectionError(`Unknown fetch stream ${streamId}`, { errorSource: 'data' });
-    const { bytes, nextPrior } = encodeFetchEndOfRange18(nonExistent, groupId, objectId, state.prior);
+    if (state.closing) throw new MoqtConnectionError(`Fetch stream ${streamId} is closing`, { errorSource: 'data' });
+    if (state.fillWindow && !windowContains(state.fillWindow, groupId, objectId)) {
+      throw new MoqtConnectionError(`Range end ${groupId}/${objectId} is outside the fill range`, { errorSource: 'data' });
+    }
+    const { bytes, nextPrior } = encodeFetchEndOfRange18(nonExistent, groupId, objectId, state.prior,
+      isDraft21(this.session.draftVersion) ? 21 : 18);
     await state.writer.write(bytes);
     state.prior = nextPrior;
     state.isFirstObject = false;
@@ -5133,14 +5446,23 @@ export class MoqtConnection {
   async closeFetchStream(streamId: bigint): Promise<void> {
     const state = this.fetchOutgoingStreams.get(streamId);
     if (!state) return;
+    if (state.closing) return state.closing;
+    if (state.fillOf !== undefined) {
+      const fin = (async () => {
+        try { await state.writer.close(); }
+        catch (err) {
+          this.closeSessionInternalError(`Fill ${state.requestId} could not finish: ${String(err)}`);
+          throw err;
+        } finally {
+          this.removeOutgoingFetchStream(streamId);
+          this.inboundFetchGroupOrder.delete(state.requestId);
+        }
+      })();
+      state.closing = fin;
+      return fin;
+    }
     try { await state.writer.close(); } catch { /* already closed */ }
     this.fetchOutgoingStreams.delete(streamId);
-    if (state.fillOf !== undefined) {
-      // The request is the live SUBSCRIBE: nothing to reclaim. The one-stream
-      // reservation stays until the subscription is torn down.
-      this.inboundFetchGroupOrder.delete(state.requestId);
-      return;
-    }
     // §10.13: the publisher finished serving — RECLAIM the accepted incoming fetch in
     // the Session so serving-side state is bounded. Do NOT release the one-stream
     // reservation: §11.4.4 permits EXACTLY ONE response stream per fetch, and that
@@ -5404,7 +5726,7 @@ export class MoqtConnection {
                 onObject: null,
                 onSubgroupClosed: null,
               };
-              this.publishAliasMaps.set(incoming.trackAlias, incoming);
+              this.bindPublishAlias(incoming);
               this.onPublish(incoming);
             }
           }
@@ -5699,9 +6021,14 @@ export class MoqtConnection {
       // — but only for the route THIS request still owns (found by requestId), so
       // a reused alias's newer publication is untouched. Captured before the
       // session teardown below (which unregisters the session alias).
-      const pubAlias = ctx.openerKind === 'publish'
-        ? [...this.publishAliasMaps].find(([, p]) => p.requestId === requestId)?.[0]
-        : undefined;
+      const pubAlias = ctx.openerKind === 'publish' ? this.publishAliasForRequest(requestId) : undefined;
+      const endsAlias = pubAlias !== undefined && !this.aliasHasOtherSubscriber(pubAlias, requestId)
+        && ![...this.terminalSubscribers.values()].some(({ sub }) => sub.trackAlias === pubAlias);
+      if (pubAlias !== undefined) {
+        this.recordSubscriberTerminal(pubAlias, null);
+        this.removePublishAliasMember(pubAlias, requestId);
+      }
+      const cancelledFills = pubAlias === undefined ? Promise.resolve() : this.cancelFill(requestId);
       // SYNCHRONOUS route removal + tombstone install + FETCH deauthorization
       // (before the FIRST await) so nothing can slip through the teardown window:
       //   - a late object can't route (armTerminatedAlias drops publishAliasMaps);
@@ -5709,26 +6036,20 @@ export class MoqtConnection {
       //     cancelled FETCH — its group-order authorization is gone before we await,
       //     and its post-await re-check now fails (§10.13). Deauthorizing only AFTER
       //     the session-teardown await left a window in which a new stream opened.
-      if (pubAlias !== undefined) this.armTerminatedAlias(pubAlias, null, /* strict */ false);
+      if (endsAlias) this.armTerminatedAlias(pubAlias!, null, /* strict */ false);
       this.inboundFetchGroupOrder.delete(requestId);
       this.fetchServeReserved.delete(requestId); // the one-stream reservation is released on teardown
-      for (const fills of [this.inboundFillRequests, this.servedFills]) {
-        for (const [fillId, subId] of [...fills]) {
-          if (subId !== requestId) continue;
-          fills.delete(fillId);
-          this.inboundFetchGroupOrder.delete(fillId);
-          this.fetchServeReserved.delete(fillId);
-        }
-      }
+      this.revokePublisherFills(requestId);
       this.inboundPublishTimeouts.delete(requestId); // never-accepted inbound PUBLISH
       // §10.13: DETACH every open FETCH response stream SYNCHRONOUSLY (before the
       // first await), so sendFetchObject()/closeFetchStream() for this cancelled
       // fetch fail immediately rather than continuing to write during the teardown
       // awaits below. The writers are aborted afterward.
-      const fetchWriters = this.detachFetchStreamsForRequest(requestId);
+      const fetchWriters = wasSubscribe ? [] : this.detachFetchStreamsForRequest(requestId);
       await this.executeActions(this.session.handleInboundRequestClosed(requestId));
+      await cancelledFills;
       this.inboundRequestContexts.delete(requestId);
-      if (pubAlias !== undefined) await this.discardOpenStreamsForAlias(pubAlias);
+      if (endsAlias) await this.discardOpenStreamsForAlias(pubAlias!);
       // §5.1.1: the subscriber cancelled — RESET every publisher data stream
       // still open for this subscription and drop its accounting, so no more
       // objects can be written for a subscription the peer abandoned.
@@ -5824,6 +6145,15 @@ export class MoqtConnection {
     }
 
     const originalId = ctx.requestId;
+    if (message.type === 'PUBLISH_STATE_NOTIFY') {
+      if (ctx.openerKind !== 'publish' || this.session.getIncomingSubscription(originalId)?.state !== SubscriptionState.ESTABLISHED) {
+        throw new ProtocolViolationError('PUBLISH_STATE_NOTIFY requires an established inbound PUBLISH (9.10)');
+      }
+      const stamped = { ...message, requestId: originalId } as ControlMessage;
+      await this.executeActions(this.session.handleControlMessage(stamped));
+      if (!this._terminated) this.onMessage?.(stamped);
+      return;
+    }
     if (message.type === 'PUBLISH_DONE') {
       // §10.11: terminate the subscription. Only an inbound PUBLISH carries a
       // PUBLISH_DONE; on any other opener it is a protocol violation.
@@ -5834,22 +6164,29 @@ export class MoqtConnection {
       // then apply the Stream Count so open/late streams are STOP_SENDINGed and
       // the alias tombstone is cleared once the count is met (or the TTL fires),
       // rather than retaining the publication's routing indefinitely.
-      const doneAlias = [...this.publishAliasMaps].find(([, p]) => p.requestId === originalId)?.[0];
-      const streamCount = (message as { streamCount?: bigint }).streamCount ?? 0n;
+      const alias = this.publishAliasForRequest(originalId);
+      const aliasStillShared = alias !== undefined && this.aliasHasOtherSubscriber(alias, originalId);
+      const doneAlias = aliasStillShared ? undefined : alias;
+      if (aliasStillShared) this.removePublishAliasMember(alias!, originalId);
+      const ownCount = (message as { streamCount?: bigint }).streamCount ?? 0n;
+      const streamCount = alias === undefined ? ownCount : this.recordSubscriberTerminal(alias, ownCount);
       const stamped = { ...message, requestId: originalId } as ControlMessage;
       const pubDraining = this.drainConfigs.has(originalId) && doneAlias !== undefined;
-      if (pubDraining) this.applyTerminalDrain(doneAlias!, BigInt(streamCount), originalId);
+      const aliasDraining = pubDraining || (doneAlias !== undefined && [...this.terminalSubscribers.values()].some(({ sub }) => sub.trackAlias === doneAlias));
+      if (aliasDraining && doneAlias !== undefined) this.applyTerminalDrain(doneAlias, BigInt(streamCount), originalId);
+      const cancelledFills = pubDraining ? Promise.resolve() : this.cancelFill(originalId);
       // Non-drained terminal application starts BEFORE the callback, like the
       // drain above: its arm runs before the first await, so a reentrant
       // close() inside the callback CLEARS the terminal state instead of having
       // its cleanup undone by an arm that follows it.
-      const discard = !pubDraining && doneAlias !== undefined
+      const discard = !aliasDraining && doneAlias !== undefined
         ? this.applyTerminalStreamCount(doneAlias, BigInt(streamCount), originalId)
         : Promise.resolve();
       this.onMessage?.(stamped);
       await this.executeActions(this.session.handleInboundPublishDone(originalId));
       ctx.seal();
       this.inboundRequestContexts.delete(originalId);
+      await cancelledFills;
       await discard;
       return;
     }
@@ -5897,7 +6234,8 @@ export class MoqtConnection {
       if (isDraft21(this.session.draftVersion) && ctx.openerKind === 'subscribe'
           && send?.message.type !== 'REQUEST_ERROR'
           && (message as { parameters?: Map<bigint, unknown> }).parameters?.has(FILL_PARAMETERS)) {
-        this.inboundFillRequests.set(updateId, originalId);
+        if (!this.rememberInboundFill(updateId, originalId, (message as { parameters: Parameters }).parameters)) return;
+        if (send?.message.type === 'REQUEST_OK') this.finalizeInboundFill(updateId, send.message.parameters);
       }
       // §10.8: SUBSCRIBE_OK is the FIRST response on a successful subscribe
       // stream. An update racing a still-PENDING subscription is APPLIED
@@ -6021,7 +6359,7 @@ export class MoqtConnection {
       onObject: null,
       onSubgroupClosed: null,
     };
-    this.publishAliasMaps.set(incoming.trackAlias, incoming);
+    this.bindPublishAlias(incoming);
     // §8 applies to a PUBLISH-initiated subscription too. Capture the publisher's raw
     // OBJECT/SUBGROUP_DELIVERY_TIMEOUT Track Properties so acceptSubscribe can COMBINE
     // them with OUR PUBLISH_OK Message Parameters; set a provisional (publisher-only)
@@ -6080,7 +6418,7 @@ export class MoqtConnection {
     ctx.bind(requestId, 'subscribe');
     this.inboundRequestContexts.set(requestId, ctx);
     if (isDraft21(this.session.draftVersion) && sub.parameters.has(FILL_PARAMETERS)) {
-      this.inboundFillRequests.set(requestId, requestId);
+      if (!this.rememberInboundFill(requestId, requestId, sub.parameters)) return;
     }
     this.onSubscribe?.(requestId, sub.trackNamespace, sub.trackName, sub.parameters as Map<bigint, unknown>);
   }
@@ -6342,6 +6680,28 @@ export class MoqtConnection {
     await this.processDataStreamReader(stream.reader, streamId, stream.prefix);
   }
 
+  /** Both subgroup and fill streams count toward the alias's terminal budget. */
+  private admitSubscriberStream(alias: bigint): string | undefined {
+    const drain = this.drainingAliases.get(alias);
+    if (drain) {
+      if (drain.drained) return 'stream during terminal-drain completion';
+      if (drain.acceptRemaining !== null) {
+        if (drain.acceptRemaining <= 0n) return 'stream beyond the announced Stream Count';
+        drain.acceptRemaining -= 1n;
+      }
+    }
+    const tombstone = this.terminatedAliases.get(alias);
+    if (tombstone) {
+      if (tombstone.remaining !== null) {
+        tombstone.remaining -= 1n;
+        if (tombstone.remaining <= 0n) this.clearTerminatedAlias(alias);
+      }
+      return 'late stream on a terminated alias';
+    }
+    this.aliasStreamsSeen.set(alias, (this.aliasStreamsSeen.get(alias) ?? 0n) + 1n);
+    return undefined;
+  }
+
   private async processDataStreamReader(
     reader: ReadableStreamDefaultReader<Uint8Array>,
     streamId: bigint,
@@ -6388,50 +6748,12 @@ export class MoqtConnection {
       if (headerResult.type === 'subgroup') {
         const header = headerResult.header as SubgroupHeader;
         const subgroupAlias = header.trackAlias as bigint;
-        // §10.11 receiver terminal tracker: a stream for an alias whose
-        // PUBLISH_DONE already arrived is a LATE expected stream — early-discard
-        // it (STOP_SENDING), count it against the announced total, and clear the
-        // tombstone once the whole count is observed. Never delivered.
-        // Terminal drain: a draining alias still DELIVERS late streams, capped
-        // by the announced Stream Count. Beyond the cap, discard like a
-        // tombstoned stream (but without the tombstone countdown).
-        const drainState = this.drainingAliases.get(subgroupAlias);
-        if (drainState) {
-          // A completing drain (sweep in progress) no longer delivers: discard,
-          // closing the race between `drained` flipping and the tombstone
-          // being installed after the sweep's awaits.
-          if (drainState.drained) {
-            await this.discardLocalReader(streamId, reader, new Error('stream during terminal-drain completion — discarded'));
-            this.onStreamClosed?.(streamId, undefined, 'local-discard');
-            return;
-          }
-          if (drainState.acceptRemaining !== null) {
-            if (drainState.acceptRemaining <= 0n) {
-              await this.discardLocalReader(streamId, reader, new Error('stream beyond the announced Stream Count during terminal drain — discarded'));
-              this.onStreamClosed?.(streamId, undefined, 'local-discard');
-              return;
-            }
-            drainState.acceptRemaining -= 1n;
-          }
-          // fall through: deliver normally (routing is still alive)
-        }
-        const tombstone = this.terminatedAliases.get(subgroupAlias);
-        if (tombstone) {
-          // Count down only a KNOWN remaining (bigint); a null remaining is the
-          // 2^62-1 sentinel — unknown count, cleared by TTL alone. Clear as soon
-          // as the known count is met so a legitimately reused alias isn't held.
-          if (tombstone.remaining !== null) {
-            tombstone.remaining -= 1n;
-            if (tombstone.remaining <= 0n) this.clearTerminatedAlias(subgroupAlias);
-          }
-          await this.discardLocalReader(streamId, reader, new Error('late stream on a terminated alias — early discard (§10.11)'));
+        const discardReason = this.admitSubscriberStream(subgroupAlias);
+        if (discardReason) {
+          await this.discardLocalReader(streamId, reader, new Error(discardReason));
           this.onStreamClosed?.(streamId, undefined, 'local-discard');
           return;
         }
-        // Count the stream toward this alias's lifetime total (so a later
-        // PUBLISH_DONE knows how many streams are still outstanding) and track
-        // it as open so the terminal message can STOP_SENDING it.
-        this.aliasStreamsSeen.set(subgroupAlias, (this.aliasStreamsSeen.get(subgroupAlias) ?? 0n) + 1n);
         this.incomingSubgroupAliases.set(streamId, subgroupAlias);
         // Header decoded — route objects below
         this.onQlogEvent?.({
@@ -6467,19 +6789,32 @@ export class MoqtConnection {
       } else {
         const header = headerResult.header as FetchHeader;
         const fetchReqId = header.requestId as bigint;
+        if (this.session.isFillResponsePending(fetchReqId)) {
+          if (!await this.waitForFillResponse(fetchReqId, streamId)) {
+            this.session.cancelFillRequest(fetchReqId);
+            this.recentlyCancelledFetches.delete(fetchReqId);
+            await this.discardLocalReader(streamId, reader, new Error('fill response unavailable'));
+            this.onStreamClosed?.(streamId, undefined, 'local-discard');
+            return;
+          }
+        }
         // draft-21 §3.4: a fill fetch stream carries the Request ID of the SUBSCRIBE
         // or REQUEST_UPDATE that asked for it. One stream per fill; the session
         // stops expecting it once this one is accepted.
+        const fillOrder = this.session.fillGroupOrderFor(fetchReqId);
         const fillSub = isDraft21(this.session.draftVersion) && !this.recentlyCancelledFetches.has(fetchReqId)
           ? this.session.takeFill(fetchReqId)
           : undefined;
         if (fillSub !== undefined) {
-          this.fillStreams.set(fetchReqId, { streamId, subscriptionId: fillSub.requestId as bigint });
           if (fillSub.trackAlias !== undefined) {
-            // §9.9: a fill stream counts toward the subscription's PUBLISH_DONE Stream Count.
-            const alias = fillSub.trackAlias as bigint;
-            this.aliasStreamsSeen.set(alias, (this.aliasStreamsSeen.get(alias) ?? 0n) + 1n);
+            const discardReason = this.admitSubscriberStream(fillSub.trackAlias);
+            if (discardReason) {
+              await this.discardLocalReader(streamId, reader, new Error(discardReason));
+              this.onStreamClosed?.(streamId, undefined, 'local-discard');
+              return;
+            }
           }
+          this.fillStreams.set(fetchReqId, { streamId, subscriptionId: fillSub.requestId as bigint, groupOrder: fillOrder! });
           this.onQlogEvent?.({ type: 'stream_type_set', owner: 'remote', stream_id: streamId, stream_type: 'fetch_header' });
           this.onQlogEvent?.({ type: 'fetch_header_parsed', stream_id: streamId, request_id: fetchReqId });
           if (this.locallyDiscardedReaders.has(reader)) {
@@ -6978,7 +7313,8 @@ export class MoqtConnection {
     // never a silently-defaulted decode.
     // A draft-21 fill is delivered in ascending order (§3.4); a FETCH records its own.
     const groupOrder = this.fetchGroupOrder.get(header.requestId)
-      ?? (this.fillStreams.get(header.requestId as bigint)?.streamId === streamId ? 'ascending' : undefined);
+      ?? (this.fillStreams.get(header.requestId as bigint)?.streamId === streamId
+        ? this.fillStreams.get(header.requestId as bigint)!.groupOrder : undefined);
     if (groupOrder === undefined) {
       // No group-order entry AND no cancellation marker (the marker is checked — and
       // consumed — at the FETCH_HEADER handler and the loop-top guard BEFORE we reach

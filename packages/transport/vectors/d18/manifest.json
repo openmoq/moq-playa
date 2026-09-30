@@ -167,8 +167,8 @@
     {
       "file": "fetch_eor.bin",
       "type": "FETCH_DATA",
-      "wire_length": 4,
-      "wire_hex": "808c050a",
+      "wire_length": 5,
+      "wire_hex": "808c050a00",
       "expected": {
         "end_of_range": true,
         "non_existent": true,
