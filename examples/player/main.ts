@@ -1134,10 +1134,12 @@ async function startPlayback(): Promise<void> {
             // ?gapjump=<ms> overrides the buffered-hole gap-jump wait
             // (0 disables) for A/B against hole-carrying streams.
             const gapJumpParam = params.get('gapjump');
+            const licenseUrl = params.get('license');
             const ms: MseMediaSource = new MseMediaSource(videoEl, {
                 mseImplementation: mseImpl,
                 mseAttachment: mseAttach,
                 ...(gapJumpParam !== null ? { gapJumpMs: Number(gapJumpParam) } : {}),
+                ...(licenseUrl ? { drmConfig: { licenseUrl } } : {}),
             });
             ms.debug = mseDebug;
             mediaSourceRef = ms;

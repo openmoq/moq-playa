@@ -179,7 +179,43 @@ export function validateStallThresholdMs(value: number | undefined): number {
   return value;
 }
 
+/**
+ * DRM configuration for EME (Encrypted Media Extensions) support.
+ * When provided, the adapter sets up MediaKeys on the video element
+ * and handles license acquisition transparently.
+ */
+export interface DrmConfig {
+  /** License server URL — receives POST with the license challenge. */
+  readonly licenseUrl: string;
+  /** EME key system identifier. Default: 'com.widevine.alpha'. */
+  readonly keySystem?: string;
+  /** Optional license-server certificate passed to the CDM. */
+  readonly serverCertificate?: Uint8Array;
+}
+
+interface DrmElementState {
+  ready: Promise<void>;
+  keys: MediaKeys | null;
+  keySystem: string | null;
+  certificate: Uint8Array | undefined;
+}
+
+interface DrmSessionState {
+  initDataType: string;
+  initData: Uint8Array;
+  abort: AbortController;
+}
+
+function equalDrmBytes(a: Uint8Array | undefined, b: Uint8Array | undefined): boolean {
+  if (a === b) return true;
+  return a !== undefined && b !== undefined && a.length === b.length
+    && a.every((byte, i) => byte === b[i]);
+}
+
 export interface MseMediaSourceOptions {
+  /** DRM configuration. When set, EME is initialized and license requests
+   *  are handled automatically via the encrypted event. */
+  readonly drmConfig?: DrmConfig;
   /** Seconds of played-out media to keep behind currentTime; older buffered data
    *  is evicted via SourceBuffer.remove() so the browser quota is never exhausted
    *  by stale history. Default 10. */
@@ -627,6 +663,15 @@ export class MseMediaSource implements MediaSourceLike {
   private stallDetectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly stallThresholdMs: number;
 
+  // ── EME / DRM state ──
+  private readonly drmConfig: DrmConfig | null = null;
+  private mediaKeys: MediaKeys | null = null;
+  private mediaKeysReady: Promise<void> | null = null;
+  private readonly keySessions = new Map<MediaKeySession, DrmSessionState>();
+  // Attachment can outlive an adapter; serialize it across reconnects on the
+  // same element. Sessions and license requests remain adapter-owned.
+  private static readonly drmElements = new WeakMap<HTMLVideoElement, DrmElementState>();
+
   // ── Playhead-wedge watchdog state ──
   /** Watchdog cadence; detection threshold per escalation rung. */
   private static readonly WEDGE_CHECK_INTERVAL_MS = 1_000;
@@ -861,6 +906,24 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.addEventListener('waiting', this.handleWaiting);
     this.video.addEventListener('timeupdate', this.handleTimeUpdate);
     this.video.addEventListener('error', this.handleVideoError);
+
+    // ── EME / DRM setup ─────────────────────────────────────────────
+    const drm = options.drmConfig;
+    this.drmConfig = drm ? {
+      ...drm,
+      ...(drm.serverCertificate ? { serverCertificate: new Uint8Array(drm.serverCertificate) } : {}),
+    } : null;
+    if (this.drmConfig) {
+      const config = this.drmConfig;
+      let state = MseMediaSource.drmElements.get(this.video);
+      if (!state) {
+        state = { ready: Promise.resolve(), keys: null, keySystem: null, certificate: undefined };
+        MseMediaSource.drmElements.set(this.video, state);
+      }
+      const elementState = state;
+      this.video.addEventListener('encrypted', this.handleEncrypted);
+      this.mediaKeysReady = Promise.resolve().then(() => this.setupMediaKeys(config, elementState));
+    }
   }
 
   // ─── MediaSourceLike ───────────────────────────────────────────
@@ -1306,6 +1369,7 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   destroy(): void {
+    if (this.destroyed) return;
     this.cancelStallEpisode();
     this.diag('destroy');
     this.destroyed = true;
@@ -1320,6 +1384,11 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.removeEventListener('waiting', this.handleWaiting);
     this.video.removeEventListener('timeupdate', this.handleTimeUpdate);
     this.video.removeEventListener('error', this.handleVideoError);
+    this.video.removeEventListener('encrypted', this.handleEncrypted);
+    for (const session of this.keySessions.keys()) this.retireKeySession(session);
+    this.mediaKeys = null;
+    // Leave the attachment available for a compatible reconnect. Temporary
+    // sessions are closed; no old license work survives the adapter.
     this.reset();
     if (this.objectUrl) {
       URL.revokeObjectURL(this.objectUrl);
@@ -1333,6 +1402,139 @@ export class MseMediaSource implements MediaSourceLike {
     this.onError = null;
     this.onStall = null;
     this.onStallRecovered = null;
+  }
+
+  // ─── EME / DRM ─────────────────────────────────────────────────
+
+  /**
+   * Asynchronously set up MediaKeys on the video element. Fire-and-forget
+   * from the constructor — EME is transparent to MSE once configured; the
+   * browser enqueues encrypted frames until keys are available.
+   */
+  private async setupMediaKeys(drm: DrmConfig, state: DrmElementState): Promise<void> {
+    if (this.destroyed) return;
+    const keySystem = drm.keySystem ?? 'com.widevine.alpha';
+    try {
+      await state.ready;
+      if (this.destroyed) return;
+      // An arbitrary MediaKeys object does not expose its key system. Only
+      // reuse an attachment whose configuration we established ourselves.
+      if (state.keys && this.video.mediaKeys === state.keys
+          && state.keySystem === keySystem
+          && equalDrmBytes(state.certificate, drm.serverCertificate)) {
+        this.mediaKeys = state.keys;
+        return;
+      }
+      const access = await navigator.requestMediaKeySystemAccess(keySystem, [{
+        initDataTypes: ['cenc'],
+        videoCapabilities: [
+          { contentType: 'video/mp4; codecs="avc1.640028"', robustness: '' },
+          { contentType: 'video/mp4; codecs="avc3.640028"', robustness: '' },
+        ],
+        audioCapabilities: [
+          { contentType: 'audio/mp4; codecs="mp4a.40.2"', robustness: '' },
+        ],
+      }]);
+      if (this.destroyed) return;
+      const keys = await access.createMediaKeys();
+      if (this.destroyed) return;
+      if (drm.serverCertificate) {
+        await keys.setServerCertificate(new Uint8Array(drm.serverCertificate).buffer);
+        if (this.destroyed) return;
+      }
+      const attach = state.ready.then(async () => {
+        if (this.destroyed) return;
+        await this.video.setMediaKeys(keys);
+        // setMediaKeys cannot be cancelled. Record the completed attachment for
+        // the next queued owner even if this adapter was destroyed meanwhile.
+        state.keys = keys;
+        state.keySystem = keySystem;
+        state.certificate = drm.serverCertificate;
+        if (!this.destroyed) this.mediaKeys = keys;
+      });
+      // A failed attachment must not poison the next owner's queue. Permission
+      // requests are not queued: a retired prompt may never finish.
+      state.ready = attach.catch(() => {});
+      await attach;
+    } catch (err) {
+      this.reportDrmError('setup', err);
+    }
+  }
+
+  /**
+   * Handle the 'encrypted' event on the video element. Fired when the
+   * browser encounters PSSH in an init segment. Creates a key session
+   * and fetches the license from the configured server.
+   */
+  private handleEncrypted = async (event: MediaEncryptedEvent): Promise<void> => {
+    if (this.destroyed || !this.drmConfig || !event.initData) return;
+    const initData = new Uint8Array(event.initData).slice();
+    let session: MediaKeySession | null = null;
+    try {
+      await this.mediaKeysReady;
+      if (this.destroyed || !this.mediaKeys) return;
+      for (const state of this.keySessions.values()) {
+        if (state.initDataType === event.initDataType && equalDrmBytes(state.initData, initData)) return;
+      }
+      session = this.mediaKeys.createSession('temporary');
+      this.keySessions.set(session, {
+        initDataType: event.initDataType, initData, abort: new AbortController(),
+      });
+      session.addEventListener('message', this.handleKeyMessage);
+      const ownedSession = session;
+      void session.closed.then(() => this.retireKeySession(ownedSession, false));
+      await session.generateRequest(event.initDataType, initData);
+    } catch (err) {
+      if (session && !this.keySessions.has(session)) return;
+      if (session) this.retireKeySession(session);
+      this.reportDrmError('session', err);
+    }
+  };
+
+  /**
+   * Handle license request from the CDM. POST the challenge to the
+   * license server and feed the response back to the session.
+   */
+  private handleKeyMessage = async (event: MediaKeyMessageEvent): Promise<void> => {
+    const session = event.target as MediaKeySession;
+    const state = this.keySessions.get(session);
+    if (!this.drmConfig || !state || this.destroyed) return;
+    const live = (): boolean => !this.destroyed && this.keySessions.get(session) === state;
+    try {
+      const response = await fetch(this.drmConfig.licenseUrl, {
+        method: 'POST',
+        body: event.message,
+        signal: state.abort.signal,
+      });
+      if (!live()) return;
+      if (!response.ok) {
+        throw new Error(`License server returned ${response.status} ${response.statusText}`);
+      }
+      const license = await response.arrayBuffer();
+      if (!live()) return;
+      await session.update(new Uint8Array(license));
+    } catch (err) {
+      if (!live()) return;
+      this.retireKeySession(session);
+      this.reportDrmError('license', err);
+    }
+  };
+
+  private retireKeySession(session: MediaKeySession, close = true): void {
+    const state = this.keySessions.get(session);
+    if (!state) return;
+    this.keySessions.delete(session);
+    session.removeEventListener('message', this.handleKeyMessage);
+    state.abort.abort();
+    if (close) {
+      try { void session.close().catch(() => {}); } catch { /* Already closed by the CDM. */ }
+    }
+  }
+
+  private reportDrmError(stage: string, err: unknown): void {
+    if (this.destroyed) return;
+    const error = err instanceof Error ? err : new Error(`DRM ${stage} failed: ${String(err)}`);
+    try { this.onError?.(error); } catch { /* Do not reject an asynchronous event handler. */ }
   }
 
   // ─── Internal ──────────────────────────────────────────────────

@@ -10,7 +10,7 @@
  * @see draft-ietf-moq-msf-01 §5, draft-ietf-moq-transport-16 §9.16.2
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MoqtPlayer } from './player.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@moqt/webtransport';
@@ -122,6 +122,124 @@ async function deliverFetchObject(
     } as unknown as MoqtObject);
     await flush();
 }
+
+describe('catalog retry with Joining FETCH', () => {
+    const players: MoqtPlayer[] = [];
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(async () => {
+        for (const player of players.splice(0)) await player.destroy();
+        vi.useRealTimers();
+    });
+
+    function rejectCatalog(adapter: ReturnType<typeof createMockAdapter>, requestId: bigint, retryInterval: bigint) {
+        adapter._triggerMessage({
+            type: 'REQUEST_ERROR', requestId, errorCode: 0x10n,
+            retryInterval, errorReason: 'Track not found',
+        } as ControlMessage);
+    }
+
+    function completeFetch(adapter: ReturnType<typeof createMockAdapter>, requestId: bigint) {
+        adapter._triggerDataStream(100n, { type: 'fetch', header: { requestId } } as DataStreamHeader);
+        adapter._triggerObject(100n, {
+            kind: 'data', trackAlias: varint(0), groupId: varint(10), subgroupId: varint(0),
+            objectId: varint(0), publisherPriority: 128, extensions: undefined, payload: enc(CATALOG),
+        } as MoqtObject);
+        adapter._triggerMessage({
+            type: 'FETCH_OK', requestId, endOfTrack: 0,
+            endLocation: { group: 10n, object: 1n }, parameters: new Map(), trackExtensions: [],
+        } as ControlMessage);
+        adapter._triggerStreamClosed(100n);
+    }
+
+    it.each([16, 18] as const)('draft %i: retries with a new subscription and matching Joining FETCH', async (draft) => {
+        const adapter = createMockAdapter(draft);
+        const { player, events, errors } = await loadPlayer(adapter);
+        players.push(player);
+        rejectCatalog(adapter, 1n, 2001n);
+        expect(adapter.fetchCancel).toHaveBeenCalledWith(3n);
+        await vi.advanceTimersByTimeAsync(1999);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+        expect(adapter.subscribe.mock.calls[1]![2]).toMatchObject({
+            subscriptionFilter: { type: 'LargestObject' }, terminalDelivery: 'drain',
+        });
+        expect(adapter.joiningFetch).toHaveBeenCalledTimes(2);
+        expect(adapter.joiningFetch.mock.calls[1]![0]).toMatchObject({
+            joiningRequestId: 5n, joiningFetchType: 'relative', joiningStart: 0n,
+        });
+
+        ackCatalog(adapter, 5n, 40n);
+        completeFetch(adapter, 7n);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(events).toEqual(['catalog_received']);
+        expect(errors).toEqual([]);
+        const subscriptions = adapter.subscribe.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(3000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(subscriptions);
+    });
+
+    it('does not retry or enter fallback when the relay says not to retry', async () => {
+        const adapter = createMockAdapter();
+        const { player, errors } = await loadPlayer(adapter);
+        players.push(player);
+        rejectCatalog(adapter, 1n, 0n);
+        expect(adapter.fetchCancel).toHaveBeenCalledWith(3n);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+        expect(adapter.joiningFetch).toHaveBeenCalledTimes(1);
+        expect(adapter.fetch).not.toHaveBeenCalled();
+        expect(errors).toEqual([]);
+    });
+
+    const lateSendCases = (['catalog-first', 'known-tracks'] as const).flatMap((mode) =>
+        (['resolves', 'rejects'] as const).map((outcome) => ({ mode, outcome })));
+    it.each(lateSendCases)('$mode: keeps the retry authoritative when the refused send $outcome late', async ({ mode, outcome }) => {
+        const adapter = createMockAdapter(18);
+        const error = new Error('Refused request stream closed');
+        let completeFirst!: () => void;
+        const subscribe = adapter.subscribe.getMockImplementation()!;
+        adapter.subscribe.mockImplementationOnce(async (ns: unknown, name: unknown, options?: { onRequestId?: (id: bigint) => void }) => {
+            const id = await subscribe(ns, name, options);
+            rejectCatalog(adapter, id, 1001n);
+            await new Promise<void>((resolve) => { completeFirst = resolve; });
+            if (outcome === 'rejects') throw error;
+            return id;
+        });
+        const player = makePlayer(adapter, mode === 'known-tracks' ? {
+            knownTracks: { video: { name: 'video', codec: 'av01.0.08M.10', width: 1920, height: 1080 } },
+        } : undefined);
+        players.push(player);
+        const events: string[] = [];
+        player.on('catalog_received', () => events.push('catalog_received'));
+        player.on('catalog_updated', () => events.push('catalog_updated'));
+        const loading = player.load().then(() => null, (err: unknown) => err);
+        await vi.waitFor(() => expect(adapter.connect).toHaveBeenCalled());
+        adapter._connectResolve?.();
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(mode === 'known-tracks' ? 3 : 2);
+        expect(adapter.joiningFetch).toHaveBeenCalledTimes(1);
+        const retryId = mode === 'known-tracks' ? 5n : 3n;
+        expect(adapter.joiningFetch.mock.calls[0]![0].joiningRequestId).toBe(retryId);
+
+        completeFirst();
+        expect(await loading).toBe(outcome === 'rejects' ? error : null);
+        ackCatalog(adapter, retryId, 40n);
+        completeFetch(adapter, retryId + 2n);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(events).toEqual(['catalog_received']);
+        adapter._triggerObject(200n, {
+            kind: 'data', trackAlias: varint(40), groupId: varint(10), subgroupId: varint(0),
+            objectId: varint(1), publisherPriority: 128, extensions: undefined,
+            payload: enc({ deltaUpdate: [{ op: 'add', tracks: [
+                { name: 'captions', packaging: 'loc', renderGroup: 1, isLive: true },
+            ] }] }),
+        } as MoqtObject);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(events).toEqual(['catalog_received', 'catalog_updated']);
+    });
+});
 
 describe('catalog bootstrap wiring — subscribe + join', () => {
     it('#2/#22: default auto on d16 → catalog subscribe LargestObject + relative join offset 0 referencing it, chosen atomically', async () => {
