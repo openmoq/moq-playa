@@ -488,6 +488,8 @@ export interface TrackSubscriptionState {
   /** Mutable: a §10.9.2 prefix update replaces it on REQUEST_OK. */
   trackNamespacePrefix: Uint8Array[];
   state: 'pending' | 'active' | 'terminated';
+  /** draft-21 Forward State for future matching subscriptions. */
+  forward: ForwardStateValue;
   /** Tracks the publisher reported it cannot serve, via PUBLISH_BLOCKED. */
   readonly blockedTracks: Array<{ trackNamespaceSuffix: Uint8Array[]; trackName: Uint8Array }>;
 }
@@ -690,7 +692,7 @@ export class Session {
    * OUTBOUND, subscriber side) AND from {@link incomingNamespaceSubscriptions}
    * (SUBSCRIBE_NAMESPACE) so prefix-overlap checks never cross request types.
    */
-  private readonly incomingTrackSubscriptions = new Map<bigint, { trackNamespacePrefix: Uint8Array[]; state: 'pending' | 'active' }>();
+  private readonly incomingTrackSubscriptions = new Map<bigint, { trackNamespacePrefix: Uint8Array[]; state: 'pending' | 'active'; forward: ForwardStateValue }>();
 
   /**
    * Auth token alias cache for tokens the peer registers with us.
@@ -1799,6 +1801,10 @@ export class Session {
         }
       }
       if (pending.forward !== undefined) {
+        if (pending.prefixTarget === 'tracks') {
+          const tracks = this.trackSubscriptions.get(pending.existingRequestId);
+          if (tracks?.state === 'active') tracks.forward = pending.forward;
+        }
         const sub = this.subscriptions.get(pending.existingRequestId)
           ?? this.incomingSubscriptions.get(pending.existingRequestId);
         if (sub) {
@@ -2841,10 +2847,13 @@ export class Session {
     if (filterError) return filterError;
 
     // §10.9: a parameter absent from REQUEST_UPDATE leaves its value unchanged.
-    // No TRACK_NAMESPACE_PREFIX → nothing to change; acknowledge.
+    // Forward on SUBSCRIBE_TRACKS changes future subscriptions only (§9.20.19).
+    const forward = isDraft21(this._draftVersion) && incTracks
+      ? msg.parameters.get(MessageParam.FORWARD)?.[0] : undefined;
     const prefixVals = msg.parameters.get(MessageParam.TRACK_NAMESPACE_PREFIX as bigint);
     const newPrefix = prefixVals && prefixVals.length > 0 ? prefixVals[prefixVals.length - 1] : undefined;
     if (newPrefix === undefined) {
+      if (incTracks && typeof forward === 'bigint') incTracks.forward = Number(forward) as ForwardStateValue;
       const ok: RequestOk = { type: 'REQUEST_OK', requestId: msg.requestId, parameters: new Map() };
       return [this.sendControl(ok), ...(replenish ?? [])];
     }
@@ -2881,6 +2890,7 @@ export class Session {
         }
       }
       incTracks.trackNamespacePrefix = newPrefix;
+      if (typeof forward === 'bigint') incTracks.forward = Number(forward) as ForwardStateValue;
     }
 
     const ok: RequestOk = { type: 'REQUEST_OK', requestId: msg.requestId, parameters: new Map() };
@@ -3057,7 +3067,12 @@ export class Session {
     namespace: Uint8Array[],
     name: Uint8Array,
     trackAlias: bigint,
-    options: { parameters?: Parameters; trackProperties?: TrackProperties } = {},
+    options: {
+      parameters?: Parameters;
+      trackProperties?: TrackProperties;
+      /** draft-21: the accepted SUBSCRIBE_TRACKS that caused this PUBLISH. */
+      subscribeTracksRequestId?: bigint;
+    } = {},
   ): RequestResult {
     this.assertEstablishedOrDraining('publish');
     this.assertNotReservedNamespace(namespace, 'publish');
@@ -3075,6 +3090,19 @@ export class Session {
     // PUBLISH and leave a locally-authorized subscription behind if encoding
     // later rejected it.
     this.assertLocalForwardParameter(options.parameters, 'PUBLISH');
+    if (options.subscribeTracksRequestId !== undefined) {
+      const tracks = this.incomingTrackSubscriptions.get(options.subscribeTracksRequestId);
+      if (!isDraft21(this._draftVersion) || tracks?.state !== 'active'
+          || tracks.trackNamespacePrefix.length > namespace.length
+          || !prefixesOverlap(tracks.trackNamespacePrefix, namespace)) {
+        throw new SessionError('PUBLISH requires an active matching draft-21 SUBSCRIBE_TRACKS', 'INVALID_STATE');
+      }
+      // Inherit only when the caller identifies this as a resulting PUBLISH.
+      // Independent publications retain publisher authority (§9.8 / §9.18.1).
+      const parameters = new Map(options.parameters);
+      parameters.set(MessageParam.FORWARD, [varint(BigInt(tracks.forward))]);
+      options = { ...options, parameters };
+    }
     this.assertPublisherAliasAvailable(trackAlias, namespace, name);
     if (isDraft21(this._draftVersion)) {
       const error = this.validateMessageParams(options.parameters ?? new Map(), 'PUBLISH');
@@ -3389,24 +3417,32 @@ export class Session {
     }
 
     const prefix = options.trackNamespacePrefix;
-    if (!prefix) {
+    const forward = this.normalizeLocalForwardState(options.forward, 'REQUEST_UPDATE');
+    const supportsForward = isDraft21(this._draftVersion) && trackSub !== undefined;
+    if (!prefix && !(supportsForward && forward !== undefined)) {
       throw new SessionError(
         `REQUEST_UPDATE for a ${target === 'namespace' ? 'SUBSCRIBE_NAMESPACE' : 'SUBSCRIBE_TRACKS'} requires trackNamespacePrefix`,
         'INVALID_STATE',
       );
     }
+    if (forward !== undefined && !supportsForward) {
+      throw new SessionError('FORWARD prefix updates require draft-21 SUBSCRIBE_TRACKS', 'INVALID_STATE');
+    }
     try {
-      validateTrackNamespacePrefix(prefix);
+      if (prefix) validateTrackNamespacePrefix(prefix);
     } catch (e) {
       throw new SessionError(e instanceof Error ? e.message : 'Malformed Track Namespace Prefix', 'PROTOCOL_VIOLATION');
     }
 
     const requestId = this.requestIdAllocator.allocate();
-    const parameters: Parameters = new Map([[MessageParam.TRACK_NAMESPACE_PREFIX as bigint, [prefix]]]);
+    const parameters: Parameters = new Map();
+    if (prefix) parameters.set(MessageParam.TRACK_NAMESPACE_PREFIX as bigint, [prefix]);
+    if (forward !== undefined) parameters.set(MessageParam.FORWARD, [varint(BigInt(forward))]);
     this.pendingUpdates.set(requestId as bigint, {
       existingRequestId: existingRequestId as bigint,
-      namespacePrefix: prefix,
+      ...(prefix === undefined ? {} : { namespacePrefix: prefix }),
       prefixTarget: target,
+      ...(forward === undefined ? {} : { forward }),
     });
     const updateMsg: RequestUpdate = { type: 'REQUEST_UPDATE', requestId, existingRequestId, parameters };
     return { requestId, actions: [this.sendControl(updateMsg)] };
@@ -3827,6 +3863,7 @@ export class Session {
       trackNamespacePrefix: namespacePrefix,
       state: 'pending',
       blockedTracks: [],
+      forward: ForwardState.ACTIVE,
     });
 
     const msg: SubscribeTracks = {
@@ -4528,6 +4565,8 @@ export class Session {
     this.incomingTrackSubscriptions.set(msg.requestId as bigint, {
       trackNamespacePrefix: msg.trackNamespacePrefix,
       state: 'pending',
+      forward: isDraft21(this._draftVersion) && msg.parameters.get(MessageParam.FORWARD)?.[0] === 0n
+        ? ForwardState.PAUSED : ForwardState.ACTIVE,
     });
     return validated.replenish ?? [];
   }
@@ -4584,7 +4623,7 @@ export class Session {
   }
 
   /** Whether we are serving an incoming SUBSCRIBE_TRACKS (pending or active). */
-  getIncomingTrackSubscription(requestId: bigint): { trackNamespacePrefix: Uint8Array[]; state: 'pending' | 'active' } | undefined {
+  getIncomingTrackSubscription(requestId: bigint): { trackNamespacePrefix: Uint8Array[]; state: 'pending' | 'active'; forward: ForwardStateValue } | undefined {
     return this.incomingTrackSubscriptions.get(requestId as bigint);
   }
 

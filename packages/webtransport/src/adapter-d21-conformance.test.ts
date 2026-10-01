@@ -77,6 +77,30 @@ describe('draft-21 GOAWAY through the public adapter', () => {
   });
 });
 
+describe('draft-21 SUBSCRIBE_TRACKS Forward through the public adapter', () => {
+  it('inherits the accepted update only on an explicitly associated PUBLISH', async () => {
+    const p = await pair();
+    p.server.onSubscribeTracks = (id) => {
+      void p.server.acceptSubscribeTracks(id).catch((e: Error) => p.errors.push(e));
+    };
+    const forwards: number[] = [];
+    p.client.onPublish = (pub) => {
+      forwards.push(p.client.session.getIncomingSubscription(pub.requestId)!.forwardState);
+      void p.client.acceptSubscribe(pub.requestId, pub.trackAlias).catch((e: Error) => p.errors.push(e));
+    };
+    const id = await p.client.subscribeTracks(ns('live'));
+    await settle();
+    await p.client.requestUpdate(id, { forward: 0 });
+    await settle();
+    await p.server.publish(ns('live'), nm('video'), ALIAS, { subscribeTracksRequestId: id });
+    await settle();
+    await p.server.publish(ns('live'), nm('audio'), ALIAS + 1n, { parameters: new Map([[0x10n, [1n]]]) });
+    await settle();
+    expect(forwards).toEqual([0, 1]);
+    expect(p.errors).toEqual([]);
+  });
+});
+
 describe('draft-21 fill group order (3.4 and 9.20.9)', () => {
   it('inherits the publisher Group Order advertised in SUBSCRIBE_OK', async () => {
     const p = await pair();
@@ -545,6 +569,64 @@ describe('draft-21 fill lifecycle (3.4 and 9.9)', () => {
     await settle();
     expect(p.server.session.getIncomingSubscription(id)).toBeUndefined();
     expect(p.server.session.state).toBe(SessionState.ESTABLISHED);
+  });
+
+  it('keeps a fill retryable when transport stream allocation rejects', async () => {
+    const p = await pair();
+    serveSubscriptions(p);
+    const id = await p.client.subscribe(ns('live'), nm('video'), { fill: {} });
+    await settle();
+    const create = p.b.createUnidirectionalStream.bind(p.b);
+    const failure = new Error('stream allocation failed');
+    p.b.createUnidirectionalStream = async () => { throw failure; };
+    for (let i = 0; i < 3; i++) {
+      await expect(p.server.openFillStream(id)).rejects.toBe(failure);
+    }
+    p.b.createUnidirectionalStream = create;
+    const stream = await p.server.openFillStream(id);
+    await p.server.sendFetchObject(stream, {
+      groupId: 5n, subgroupId: 0n, objectId: 0n, publisherPriority: 1, payload: new Uint8Array([1]),
+    });
+    await p.server.closeFetchStream(stream);
+    await expect(p.server.openFillStream(id)).rejects.toThrow(/No pending fill/);
+    expect(p.server.session.state).toBe(SessionState.ESTABLISHED);
+    expect(p.errors).toEqual([]);
+  });
+
+  it('does not restore a cancelled fill when its allocation later rejects', async () => {
+    const p = await pair();
+    serveSubscriptions(p);
+    const id = await p.client.subscribe(ns('live'), nm('video'), { fill: {} });
+    await settle();
+    let reject!: (error: Error) => void;
+    p.b.createUnidirectionalStream = () => new Promise((_resolve, fail) => { reject = fail; });
+    const opening = p.server.openFillStream(id).then(() => 'opened', () => 'rejected');
+    await expect(p.server.openFillStream(id)).rejects.toThrow(/No pending fill/);
+    await p.client.unsubscribe(id);
+    await settle();
+    reject(new Error('allocation failed after cancellation'));
+    expect(await opening).toBe('rejected');
+    await expect(p.server.openFillStream(id)).rejects.toThrow(/No pending fill/);
+    expect(p.server.session.getIncomingSubscription(id)).toBeUndefined();
+  });
+
+  it.each([18, 21] as const)('releases a failed ordinary FETCH allocation in draft %s', async (draft) => {
+    const p = await pair(draft);
+    p.server.onFetch = (id) => { void p.server.acceptFetch(id, {
+      endOfTrack: 0, endLocation: { group: 5n, object: 0n },
+    }).catch((e: Error) => p.errors.push(e)); };
+    const id = await p.client.fetch(ns('live'), nm('video'), {
+      startGroup: 0n, startObject: 0n, endGroup: 5n, endObject: 1n,
+    });
+    await settle();
+    const create = p.b.createUnidirectionalStream.bind(p.b);
+    p.b.createUnidirectionalStream = async () => { throw new Error('allocation failed'); };
+    await expect(p.server.openFetchStream(id)).rejects.toThrow(/allocation failed/);
+    p.b.createUnidirectionalStream = create;
+    const stream = await p.server.openFetchStream(id);
+    await p.server.closeFetchStream(stream);
+    await expect(p.server.openFetchStream(id)).rejects.toThrow(/No admitted inbound FETCH|one response stream/);
+    expect(p.errors).toEqual([]);
   });
 
   it('serves a REQUEST_UPDATE fill on a publisher-initiated subscription', async () => {

@@ -1711,7 +1711,12 @@ export class MoqtConnection {
     namespace: Uint8Array[],
     name: Uint8Array,
     trackAlias: bigint,
-    options?: { parameters?: Parameters; trackProperties?: TrackProperties },
+    options?: {
+      parameters?: Parameters;
+      trackProperties?: TrackProperties;
+      /** draft-21: inherit Forward from this accepted SUBSCRIBE_TRACKS. */
+      subscribeTracksRequestId?: bigint;
+    },
   ): Promise<bigint> {
     const { requestId, actions } = this.session.publish(namespace, name, trackAlias, options);
     // Associate the advertised alias with this publish for §10.11 Stream Count
@@ -5290,7 +5295,16 @@ export class MoqtConnection {
     }
     this.fetchServeReserved.add(requestId);
     const fillOf = this.servedFills.get(requestId);
-    const writer = (await this.transport.createUnidirectionalStream()).getWriter();
+    let stream: WritableStream<Uint8Array>;
+    try {
+      stream = await this.transport.createUnidirectionalStream();
+    } catch (err) {
+      // Allocation did not create a response stream, so the one-stream allowance
+      // remains available. Cancellation may already have revoked admission.
+      this.fetchServeReserved.delete(requestId);
+      throw err;
+    }
+    const writer = stream.getWriter();
     // §10.13: authorization was validated BEFORE the createUnidirectionalStream
     // await. A rejectFetch() or a request-stream close during that await
     // deauthorizes the FETCH SYNCHRONOUSLY (its group-order entry is dropped before
@@ -5376,6 +5390,17 @@ export class MoqtConnection {
       if (!state) throw new MoqtConnectionError(`Fill ${requestId} was cancelled during stream open`, { errorSource: 'data' });
       state.fillWindow = fill.window;
       return stream;
+    } catch (err) {
+      // Only restore a fill that never acquired its stream. Header failures and
+      // cancellation reclaim servedFills themselves; neither may be retried.
+      if (this.servedFills.get(requestId) === subscriptionId
+          && this.inboundFetchGroupOrder.has(requestId)
+          && !this.fetchServeReserved.has(requestId)) {
+        this.servedFills.delete(requestId);
+        this.inboundFetchGroupOrder.delete(requestId);
+        this.inboundFillRequests.set(requestId, fill);
+      }
+      throw err;
     } finally {
       this.endPublishOp(assoc.requestId);
     }

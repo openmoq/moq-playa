@@ -8,6 +8,120 @@ import { decodeSubscriptionFilter, subscriptionWindow } from '../control/subscri
 const namespace = [new TextEncoder().encode('live')];
 const name = new TextEncoder().encode('video');
 
+describe('draft-21 SUBSCRIBE_TRACKS Forward updates (9.20.19)', () => {
+  it.each(['unknown', 'pending', 'outside prefix', 'cancelled', 'older draft'] as const)(
+    'refuses a PUBLISH association with %s before allocating a request', (condition) => {
+      const session = established(condition === 'older draft' ? 18 : 21);
+      if (condition !== 'unknown') {
+        session.handleControlMessage({ type: 'SUBSCRIBE_TRACKS', requestId: 1n,
+          trackNamespacePrefix: namespace, parameters: new Map() });
+        if (condition !== 'pending') session.acceptSubscribeTracks(1n);
+        if (condition === 'cancelled') session.handleInboundSubscribeTracksClosed(1n);
+      }
+      const prefix = condition === 'outside prefix' ? [new TextEncoder().encode('other')] : namespace;
+      expect(() => session.publish(prefix, name, 10n, { subscribeTracksRequestId: 1n })).toThrow(/active matching draft-21/);
+      expect(session.publish(prefix, name, 10n).requestId).toBe(0n);
+    },
+  );
+  it.each([0n, 1n])('preserves independent PUBLISH Forward=%s inside a subscribed prefix', (forward) => {
+    const session = established();
+    session.handleControlMessage({ type: 'SUBSCRIBE_TRACKS', requestId: 1n,
+      trackNamespacePrefix: namespace, parameters: new Map([[0x10n, [1n - forward]]]) });
+    session.acceptSubscribeTracks(1n);
+    const pub = session.publish(namespace, name, 10n, { parameters: new Map([[0x10n, [forward]]]) });
+    expect(session.getOutgoingPublish(pub.requestId)!.forwardState).toBe(Number(forward));
+    const action = pub.actions.find((a) => a.type === 'send_control')!;
+    if (action.type !== 'send_control' || action.message.type !== 'PUBLISH') throw new Error('missing publish');
+    expect(action.message.parameters.get(0x10n)).toEqual([forward]);
+  });
+  it('leaves the previous Forward State intact when an outgoing update is rejected', () => {
+    const session = established();
+    const id = session.subscribeTracks(namespace).requestId;
+    session.handleControlMessage({ type: 'REQUEST_OK', requestId: id, parameters: new Map() });
+    const update = session.requestUpdate(id, { forward: 0 });
+    session.handleControlMessage({ type: 'REQUEST_ERROR', requestId: update.requestId,
+      errorCode: 16n, retryInterval: 0n, errorReason: 'rejected' });
+    expect(session.getTrackSubscription(id)).toHaveProperty('forward', 1);
+  });
+
+  it('does not apply Forward when a combined prefix update overlaps another request', () => {
+    const session = established();
+    const other = [new TextEncoder().encode('other')];
+    for (const [id, prefix] of [[1n, namespace], [3n, other]] as const) {
+      session.handleControlMessage({ type: 'SUBSCRIBE_TRACKS', requestId: id,
+        trackNamespacePrefix: prefix, parameters: new Map() });
+      session.acceptSubscribeTracks(id);
+    }
+    const actions = session.handleControlMessage({ type: 'REQUEST_UPDATE', requestId: 5n,
+      existingRequestId: 1n, parameters: new Map([[0x34n, [other]], [0x10n, [0n]]]) });
+    expect(actions).toContainEqual(expect.objectContaining({ type: 'send_control',
+      message: expect.objectContaining({ type: 'REQUEST_ERROR' }) }));
+    expect(session.getIncomingTrackSubscription(1n)).toMatchObject({ trackNamespacePrefix: namespace, forward: 1 });
+  });
+
+  it.each([0n, 1n])('retains initial Forward=%s and omission leaves it unchanged', (forward) => {
+    const session = established();
+    session.handleControlMessage({ type: 'SUBSCRIBE_TRACKS', requestId: 1n,
+      trackNamespacePrefix: namespace, parameters: new Map([[0x10n, [forward]]]) });
+    session.acceptSubscribeTracks(1n);
+    session.handleControlMessage({ type: 'REQUEST_UPDATE', requestId: 3n, existingRequestId: 1n,
+      parameters: new Map([[0x34n, [namespace]]]) });
+    expect(session.getIncomingTrackSubscription(1n)).toHaveProperty('forward', Number(forward));
+  });
+
+  it('rejects an invalid incoming Forward before applying the prefix', () => {
+    const session = established();
+    session.handleControlMessage({ type: 'SUBSCRIBE_TRACKS', requestId: 1n,
+      trackNamespacePrefix: namespace, parameters: new Map() });
+    session.acceptSubscribeTracks(1n);
+    const actions = session.handleControlMessage({ type: 'REQUEST_UPDATE', requestId: 3n,
+      existingRequestId: 1n, parameters: new Map([[0x34n, [[]]], [0x10n, [2n]]]) });
+    expect(actions).toContainEqual(expect.objectContaining({ type: 'close_connection', error: 3n }));
+  });
+
+  it('does not allocate a request for an out-of-scope draft-18 Forward update', () => {
+    const session = established(18);
+    const id = session.subscribeTracks(namespace).requestId;
+    session.handleControlMessage({ type: 'REQUEST_OK', requestId: id, parameters: new Map() });
+    expect(() => session.requestUpdate(id, { forward: 0, trackNamespacePrefix: namespace })).toThrow(/draft-21/);
+    expect(session.requestUpdate(id, { trackNamespacePrefix: namespace }).requestId).toBe(2n);
+  });
+
+  it.each([false, true])('emits Forward with a prefix change=%s and commits only on acknowledgment', (withPrefix) => {
+    const session = established();
+    const id = session.subscribeTracks(namespace).requestId;
+    session.handleControlMessage({ type: 'REQUEST_OK', requestId: id, parameters: new Map() });
+    const update = session.requestUpdate(id, { forward: 0, ...(withPrefix ? { trackNamespacePrefix: namespace } : {}) });
+    expect(update.actions).toContainEqual(expect.objectContaining({
+      type: 'send_control', message: expect.objectContaining({ parameters: expect.any(Map) }),
+    }));
+    const action = update.actions.find((a) => a.type === 'send_control')!;
+    if (action.type !== 'send_control' || action.message.type !== 'REQUEST_UPDATE') throw new Error('missing update');
+    expect(action.message.parameters.get(0x10n)).toEqual([0n]);
+    expect(session.getTrackSubscription(id)).toHaveProperty('forward', 1);
+    session.handleControlMessage({ type: 'REQUEST_OK', requestId: update.requestId, parameters: new Map() });
+    expect(session.getTrackSubscription(id)).toHaveProperty('forward', 0);
+  });
+
+  it('applies Forward to future matching PUBLISHes, not existing or unrelated subscriptions', () => {
+    const session = established();
+    const id = varint(1n);
+    session.handleControlMessage({ type: 'SUBSCRIBE_TRACKS', requestId: id, trackNamespacePrefix: namespace, parameters: new Map() });
+    session.acceptSubscribeTracks(id);
+    const first = session.publish(namespace, name, 10n, { subscribeTracksRequestId: id });
+    session.handleControlMessage({ type: 'REQUEST_UPDATE', requestId: varint(3n), existingRequestId: id, parameters: new Map([[0x10n, [0n]]]) });
+    expect(session.getIncomingTrackSubscription(id)).toHaveProperty('forward', 0);
+    expect(session.getOutgoingPublish(first.requestId)!.forwardState).toBe(1);
+    const next = session.publish(namespace, name, 11n, { subscribeTracksRequestId: id });
+    expect(session.getOutgoingPublish(next.requestId)!.forwardState).toBe(0);
+    const action = next.actions.find((a) => a.type === 'send_control')!;
+    if (action.type !== 'send_control' || action.message.type !== 'PUBLISH') throw new Error('missing publish');
+    expect(action.message.parameters.get(0x10n)).toEqual([0n]);
+    const unrelated = session.publish([new TextEncoder().encode('other')], name, 12n);
+    expect(session.getOutgoingPublish(unrelated.requestId)!.forwardState).toBe(1);
+  });
+});
+
 function established(draft: 18 | 21 = 21): Session {
   const session = new Session(EndpointRole.CLIENT, draft);
   session.initiateSetup();
