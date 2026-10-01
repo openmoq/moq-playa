@@ -12,10 +12,10 @@
  * @module
  */
 
-import type { MoqtConnection, WebTransportLike } from '@moqt/webtransport';
-import type { QlogEvent, MoqtObject, DraftVersion } from '@moqt/transport';
-import type { TrackConstraints, CatalogTrack, CatalogState } from '@moqt/msf';
-import type { ClockSource, DecoderCommand, RecoveryController } from '@moqt/playback';
+import type { MoqtConnection, WebTransportLike } from '@openmoq/webtransport';
+import type { QlogEvent, MoqtObject, DraftVersion } from '@openmoq/transport';
+import type { TrackConstraints, CatalogTrack, CatalogState } from '@openmoq/msf';
+import type { ClockSource, DecoderCommand, RecoveryController } from '@openmoq/playback';
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike, MediaSourceLike, CmafAssemblerLike } from './interfaces.js';
 import type { PlayerError } from './errors.js';
 import type { LogLevel, LoggerLike } from './logger.js';
@@ -531,7 +531,7 @@ export interface FactoryConfig {
    * The factory returns a ready `WebTransportLike` which is passed to `connection.connect()`.
    *
    * This cleanly separates transport creation (browser concern) from protocol logic.
-   * Browser usage: `createTransport: createWebTransport({ certHash })` from @moqt/browser.
+   * Browser usage: `createTransport: createWebTransport({ certHash })` from @openmoq/browser.
    */
   readonly createTransport?: (url: string) => Promise<WebTransportLike>;
 
@@ -601,7 +601,7 @@ export interface TransformConfig {
    * @see draft-ietf-moq-loc-01 §2.3 (LOC Header Extensions)
    * @see draft-ietf-moq-transport-16 §1.4.2 (KVP encoding)
    */
-  readonly extensionParser?: (extensions: Uint8Array | undefined) => import('@moqt/loc').LocHeaders;
+  readonly extensionParser?: (extensions: Uint8Array | undefined) => import('@openmoq/loc').LocHeaders;
 
   /**
    * Command transform: runs on every DecoderCommand before browser adapter execution.

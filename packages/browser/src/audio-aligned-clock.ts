@@ -8,14 +8,14 @@
  * Eliminates A/V drift caused by separate crystal oscillators driving
  * performance.now() and AudioContext.currentTime (10-50 ppm apart).
  *
- * Implements ClockSource from @moqt/playback — the sans-I/O playback
+ * Implements ClockSource from @openmoq/playback — the sans-I/O playback
  * core never knows which physical clock it's running on.
  *
  * @see W3C Web Audio API §10.3 (AudioContext.getOutputTimestamp)
  * @module
  */
 
-import type { ClockSource } from '@moqt/playback';
+import type { ClockSource } from '@openmoq/playback';
 
 /**
  * A ClockSource that tracks the audio hardware clock when available,

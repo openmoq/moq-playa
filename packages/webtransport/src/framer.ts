@@ -12,8 +12,8 @@
  * @module
  */
 
-import { createControlCodec } from '@moqt/transport';
-import type { ControlCodec, DecodedControlMessage } from '@moqt/transport';
+import { createControlCodec } from '@openmoq/transport';
+import type { ControlCodec, DecodedControlMessage } from '@openmoq/transport';
 
 /** Result of decoding a single framed message. */
 export interface FramedMessage {

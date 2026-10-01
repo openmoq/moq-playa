@@ -15,12 +15,12 @@
     "rebase-test": "tsx src/rebase-test.ts"
   },
   "dependencies": {
-    "@moqt/transport": "workspace:*",
-    "@moqt/webtransport": "workspace:*",
-    "@moqt/msf": "workspace:*",
-    "@moqt/loc": "workspace:*",
-    "@moqt/locmaf": "workspace:*",
-    "@moqt/browser": "workspace:*",
+    "@openmoq/transport": "workspace:*",
+    "@openmoq/webtransport": "workspace:*",
+    "@openmoq/msf": "workspace:*",
+    "@openmoq/loc": "workspace:*",
+    "@openmoq/locmaf": "workspace:*",
+    "@openmoq/browser": "workspace:*",
     "@fails-components/webtransport": "1.6.8",
     "@fails-components/webtransport-transport-http3-quiche": "1.6.8"
   },

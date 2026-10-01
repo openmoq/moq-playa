@@ -8,7 +8,7 @@ import {
   type MoqtQuicProtocol,
   type MoqtQuicTransport,
 } from './transport.js';
-import type { WebTransportBidirectionalStream } from '@moqt/webtransport';
+import type { WebTransportBidirectionalStream } from '@openmoq/webtransport';
 
 const DEFAULT_PORT = '443';
 const DEFAULT_MAX_DATAGRAM_FRAME_SIZE = 1200;

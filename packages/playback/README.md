@@ -2,7 +2,7 @@
      Content derives from this package's package.json (name, description).
      Run `node scripts/generate-package-readmes.mjs --write` after editing it. -->
 
-# @moqt/playback
+# @openmoq/playback
 
 Sans-I/O media playback core for Media over QUIC (MoQ): jitter buffer, A/V sync, gap detection, decoder state machine, and pipeline orchestration.
 
@@ -11,7 +11,7 @@ Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implement
 ## Install
 
 ```sh
-npm install @moqt/playback
+npm install @openmoq/playback
 ```
 
 ## License

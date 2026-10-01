@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decodePropertyBlock } from '@moqt/transport';
+import { decodePropertyBlock } from '@openmoq/transport';
 import { encodeLocHeaders, parseLocHeaders } from './headers.js';
 import { locHeadersToPropertyMap, resolveLocHeaders } from './property-map.js';
 import { LocEncodeError, LocHeaderError } from './errors.js';

@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { writeVi64, writeVarint } from '@moqt/transport';
+import { writeVi64, writeVarint } from '@openmoq/transport';
 import { refVi64, refQuicVarint, refEncodeBlock } from './ref-codec.js';
 import { toHex } from './canonical.js';
 

@@ -1,5 +1,5 @@
 /**
- * Browser WebTransport factory for @moqt/player.
+ * Browser WebTransport factory for @openmoq/player.
  *
  * Creates a `createTransport` factory that the player calls with a URL
  * to get a ready WebTransport connection. Handles cert hash pinning
@@ -21,7 +21,7 @@
  * @module
  */
 
-import type { WebTransportLike } from '@moqt/webtransport';
+import type { WebTransportLike } from '@openmoq/webtransport';
 
 /** Options for creating the WebTransport factory. */
 export interface WebTransportFactoryOptions {

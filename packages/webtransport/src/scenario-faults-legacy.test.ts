@@ -15,7 +15,7 @@ import { describe, it, expect } from 'vitest';
 import { connectedPair, ns, nm } from './testkit/pair.js';
 import { flush } from './testkit/loopback.js';
 import { runScenario } from './testkit/scenario.js';
-import { SessionState, SubscriptionState } from '@moqt/transport';
+import { SessionState, SubscriptionState } from '@openmoq/transport';
 
 const CHUNK1 = { a: { chunkSize: 1 }, b: { chunkSize: 1 } } as const;
 

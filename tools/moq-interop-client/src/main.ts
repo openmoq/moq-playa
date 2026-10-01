@@ -11,11 +11,11 @@
  *   - every async callback outcome is folded into the verdict; nothing rests
  *     on a bare sleep.
  */
-import { MoqtConnection } from "@moqt/webtransport";
-import type { ControlMessage } from "@moqt/transport";
+import { MoqtConnection } from "@openmoq/webtransport";
+import type { ControlMessage } from "@openmoq/transport";
 import { teardown as teardownPeer } from "./teardown.js";
 import { pathToFileURL } from "node:url";
-import { varint } from "@moqt/transport";
+import { varint } from "@openmoq/transport";
 import {
   connectInteropWebTransport,
   selectRelayTransport,
@@ -91,7 +91,7 @@ async function makeTransport(url: string, draft: number): Promise<any> {
       });
     },
     quic: async (target) => {
-      const { connectQuic } = await import("@moqt/quic");
+      const { connectQuic } = await import("@openmoq/quic");
       return connectQuic(target, { allowUnauthorized: TLS_DISABLE_VERIFY });
     },
   });

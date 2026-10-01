@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { SessionError, SessionState } from '@moqt/transport';
+import { SessionError, SessionState } from '@openmoq/transport';
 import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { flush } from '../../webtransport/src/testkit/loopback.js';
 import { MoqtPlayer } from './player.js';

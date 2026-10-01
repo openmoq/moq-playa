@@ -1,5 +1,5 @@
 /**
- * @moqt/loc — Low Overhead Media Container.
+ * @openmoq/loc — Low Overhead Media Container.
  *
  * Parses LOC header properties (LOC-01 and LOC-04) from MOQ Object property
  * bytes, and provides WebCodecs-compatible chunk init objects for zero-copy

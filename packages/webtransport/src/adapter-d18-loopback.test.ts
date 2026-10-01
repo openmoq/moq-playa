@@ -9,10 +9,10 @@ import { describe, it, expect, vi } from 'vitest';
 import { MoqtConnection } from './adapter.js';
 import { createLoopback, flush } from './testkit/loopback.js';
 import { connectedPair, withProtocol, ns, nm } from './testkit/pair.js';
-import { SessionState, ForwardState, varint, SessionError, RequestError18, decodeSubgroupHeader18, createControlCodec, encodeObjectDatagram18, encodeSubgroupHeader18, encodeSubgroupObject18, writeLocation, locationEncodingLength } from '@moqt/transport';
+import { SessionState, ForwardState, varint, SessionError, RequestError18, decodeSubgroupHeader18, createControlCodec, encodeObjectDatagram18, encodeSubgroupHeader18, encodeSubgroupObject18, writeLocation, locationEncodingLength } from '@openmoq/transport';
 
 const codec18 = createControlCodec(18);
-import type { MoqtObject, ControlMessage, Goaway, RequestErrorMsg } from '@moqt/transport';
+import type { MoqtObject, ControlMessage, Goaway, RequestErrorMsg } from '@openmoq/transport';
 
 describe('MoqtConnection(18) loopback — SETUP handshake', () => {
   it('client and server both reach ESTABLISHED via the uni SETUP pair', async () => {

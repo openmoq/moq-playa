@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { varint } from '@moqt/transport';
+import { varint } from '@openmoq/transport';
 import { buildConnectUrl, buildSetupOptions, buildSubscribeOptions } from './player-connect.js';
 import type { MoqtPlayerConfig } from './config.js';
 

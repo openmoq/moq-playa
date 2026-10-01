@@ -27,8 +27,8 @@ import {
   decodeObjectDatagram18,
   decodeFetchHeader18,
   decodeFetchObject18,
-} from '@moqt/transport';
-import type { MoqtObject, ObjectDatagram, SubscribeOk, RequestOk } from '@moqt/transport';
+} from '@openmoq/transport';
+import type { MoqtObject, ObjectDatagram, SubscribeOk, RequestOk } from '@openmoq/transport';
 
 const codec18 = createControlCodec(18);
 const setupBytes = (): Uint8Array => codec18.encode({ type: 'SETUP', setupOptions: new Map() });

@@ -32,9 +32,9 @@
  * in-flight work is awaited by `drain()`, and late enqueues are ignored —
  * an old generation can never write to a replacement session.
  */
-import { encodeLocHeaders, locWireProfileForDraft, type LocVersion } from '@moqt/loc';
-import type { DraftVersion } from '@moqt/transport';
-import { isRequestStreamDraft } from '@moqt/transport';
+import { encodeLocHeaders, locWireProfileForDraft, type LocVersion } from '@openmoq/loc';
+import type { DraftVersion } from '@openmoq/transport';
+import { isRequestStreamDraft } from '@openmoq/transport';
 
 /** The subset of MoqtConnection the media publication path uses. */
 export interface MediaPublishConnection {

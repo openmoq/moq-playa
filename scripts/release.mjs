@@ -130,7 +130,7 @@ run('node scripts/generate-package-readmes.mjs --check');
 // ── Step 5: Smoke ────────────────────────────────────────────────────
 
 console.log('\n🔍 Export smoke test...');
-run('node scripts/smoke-exports.mjs');
+run('pnpm smoke:exports');
 
 // ── Step 5: Pack ─────────────────────────────────────────────────────
 

@@ -15,7 +15,7 @@
  * @module
  */
 
-import type { MediaSourceLike } from '@moqt/player';
+import type { MediaSourceLike } from '@openmoq/player';
 import { readU32, writeU32, boxType, boxSize, trakHandlerType, trakTrackId, buildBox, filterMvex, filterInitSegment, describeBoxes } from './mp4-box.js';
 
 // ─── Adapter ──────────────────────────────────────────────────────────

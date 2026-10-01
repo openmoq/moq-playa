@@ -6,7 +6,7 @@ import {
   type MoqtObject,
   type Parameters,
   type ControlMessage,
-} from '@moqt/transport';
+} from '@openmoq/transport';
 import { MoqtConnection } from './adapter.js';
 import { connectedPair, nm, ns, type ConnectedPair } from './testkit/pair.js';
 import { TransportSim, flush } from './testkit/stream-sim.js';

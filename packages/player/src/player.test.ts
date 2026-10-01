@@ -22,13 +22,13 @@ import { QualityController } from './quality-controller.js';
 import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { PlayerEventMap } from './events.js';
-import { MoqtConnectionError } from '@moqt/webtransport';
-import type { MoqtConnection } from '@moqt/webtransport';
-import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } from '@moqt/transport';
-import { varint, ObjectStatus } from '@moqt/transport';
-import { encodeLocHeaders } from '@moqt/loc';
-import type { ClockSource } from '@moqt/playback';
-import type { DataStreamTerminal } from '@moqt/webtransport';
+import { MoqtConnectionError } from '@openmoq/webtransport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } from '@openmoq/transport';
+import { varint, ObjectStatus } from '@openmoq/transport';
+import { encodeLocHeaders } from '@openmoq/loc';
+import type { ClockSource } from '@openmoq/playback';
+import type { DataStreamTerminal } from '@openmoq/webtransport';
 
 // ─── Mock Adapter ────────────────────────────────────────────────────
 
@@ -6705,7 +6705,7 @@ describe('MoqtPlayer', () => {
 
     /**
      * Minimal CMAF assembler for testing — pairs moof+mdat by media type.
-     * Matches CmafAssemblerLike interface without importing @moqt/browser.
+     * Matches CmafAssemblerLike interface without importing @openmoq/browser.
      */
     function createCmafAssemblerFactory() {
       return (options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void }) => {

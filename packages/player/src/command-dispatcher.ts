@@ -20,7 +20,7 @@
  * @module
  */
 
-import type { DecoderCommand, DecoderFeedback } from '@moqt/playback';
+import type { DecoderCommand, DecoderFeedback } from '@openmoq/playback';
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike } from './interfaces.js';
 
 // ─── Queue pressure hysteresis thresholds ─────────────────────────────

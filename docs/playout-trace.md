@@ -338,9 +338,9 @@ anchor and enforcing monotonic output. It introduces no unlabeled epoch. Nor is
 `now()` whose `getOutputTimestamp()` yields valid nonzero `contextTime` and
 `performanceTime`, and detach or suspend causes the fallback.
 
-Two compositions must both work. `@playa/player` injects its
+Two compositions must both work. `@openmoq/playa` injects its
 `AudioAlignedClock` as `MoqtPlayerConfig.clock`, so playback and recorder may
-deliberately share it. Bare `@moqt/player` defaults to `performance.now()` and
+deliberately share it. Bare `@openmoq/player` defaults to `performance.now()` and
 accepts an arbitrary opaque `ClockSource`, where provenance may simply be
 unavailable.
 
@@ -354,8 +354,8 @@ and playback clocks differ, scheduled timestamps require an explicit
 correlation mapping before they can be normalized into qlog-relative time.
 
 Browser-specific AudioContext knowledge stays out of the generic
-`@moqt/transport` machinery: the foundation carries generic clock IDs and
-metadata, and `@moqt/browser`/`@playa/player` supply the audio-source
+`@openmoq/transport` machinery: the foundation carries generic clock IDs and
+metadata, and `@openmoq/browser`/`@openmoq/playa` supply the audio-source
 observations. Provenance callbacks and recorder failures preserve the
 zero-cost-disabled contract.
 
@@ -605,9 +605,9 @@ presentation localization. It may serve as an internal serializer smoke test.
 
 ### Package ownership
 
-Generic qlog file machinery in `@moqt/transport`; interoperable playout event
-types in `@moqt/playback`; browser-specific emission in `@moqt/browser`;
-recorder, dump, and analyzer orchestration in `@moqt/player`, with the demo
+Generic qlog file machinery in `@openmoq/transport`; interoperable playout event
+types in `@openmoq/playback`; browser-specific emission in `@openmoq/browser`;
+recorder, dump, and analyzer orchestration in `@openmoq/player`, with the demo
 control in `examples/shared`.
 
 ## What this does not do

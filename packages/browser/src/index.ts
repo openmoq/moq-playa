@@ -1,7 +1,7 @@
 /**
- * @moqt/browser — Browser adapter implementations.
+ * @openmoq/browser — Browser adapter implementations.
  *
- * Concrete implementations of @moqt/player's swappable interfaces
+ * Concrete implementations of @openmoq/player's swappable interfaces
  * (VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike,
  * MediaSourceLike) backed by browser APIs.
  *

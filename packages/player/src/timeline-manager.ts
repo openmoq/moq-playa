@@ -9,8 +9,8 @@
  * @module
  */
 
-import type { CatalogTrack, MediaTimelineEntry } from '@moqt/msf';
-import { parseMediaTimeline, mergeMediaTimeline, findLocationForPts } from '@moqt/msf';
+import type { CatalogTrack, MediaTimelineEntry } from '@openmoq/msf';
+import { parseMediaTimeline, mergeMediaTimeline, findLocationForPts } from '@openmoq/msf';
 
 /**
  * Materialized state of a media timeline track.

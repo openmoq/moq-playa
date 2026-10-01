@@ -2,7 +2,7 @@
  * LOC Layer B — semantic resolution.
  *
  * The property WIRE (bytes ⇄ ordered {@link PropertyMap}) is Layer A, owned by
- * `@moqt/transport`. This module is Layer B: it interprets a decoded, ordered
+ * `@openmoq/transport`. This module is Layer B: it interprets a decoded, ordered
  * `PropertyMap` as LOC metadata, and projects structured {@link LocHeaders} back
  * to a `PropertyMap` for encoding. There is NO byte-level parsing here.
  *
@@ -19,7 +19,7 @@
  * @module
  */
 
-import type { PropertyEntry, PropertyMap } from '@moqt/transport';
+import type { PropertyEntry, PropertyMap } from '@openmoq/transport';
 import { Loc01PropertyId, Loc04PropertyId } from './types.js';
 import type { LocHeaders, LocExtensionValue, LocTrackContext, LocVersion, VideoFrameMarking, AudioLevel } from './types.js';
 import { parseVideoFrameMarking, encodeVideoFrameMarking, parseVideoFrameMarkingBytes, encodeVideoFrameMarkingBytes } from './video.js';

@@ -1,13 +1,13 @@
 /**
  * Capability probe: which existing @moqt packages can this Node publisher reuse?
  * Exercises the publisher-side APIs with fake data and prints a concise capability
- * report. Exits 0 if the REQUIRED capabilities (@moqt/msf buildCatalog) work; the
- * @moqt/browser mp4-box probe is informational only (relevant to a possible future
+ * report. Exits 0 if the REQUIRED capabilities (@openmoq/msf buildCatalog) work; the
+ * @openmoq/browser mp4-box probe is informational only (relevant to a possible future
  * fragmented-MP4 ingest step — the publisher publishes prepared files and never
  * parses media).
  */
-import { buildCatalog, parseCatalogAuto, CATALOG_TRACK_NAME } from '@moqt/msf';
-import { encodeLocHeaders, parseLocHeaders } from '@moqt/loc';
+import { buildCatalog, parseCatalogAuto, CATALOG_TRACK_NAME } from '@openmoq/msf';
+import { encodeLocHeaders, parseLocHeaders } from '@openmoq/loc';
 
 const row = (label: string, value: string) => console.log(`  ${label.padEnd(34)} ${value}`);
 
@@ -15,8 +15,8 @@ async function main(): Promise<number> {
   console.log('=== node-publisher — capability probe ===\n');
   let ok = true;
 
-  // ── REQUIRED: @moqt/msf catalog build (publisher side) ─────────────────────
-  console.log('@moqt/msf:');
+  // ── REQUIRED: @openmoq/msf catalog build (publisher side) ─────────────────────
+  console.log('@openmoq/msf:');
   try {
     const fakeInit = Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]).toString('base64');
     const bytes = buildCatalog({
@@ -35,8 +35,8 @@ async function main(): Promise<number> {
     ok = false;
   }
 
-  // ── AVAILABLE: @moqt/loc header encode (not needed for the CMAF demo) ──────
-  console.log('\n@moqt/loc:');
+  // ── AVAILABLE: @openmoq/loc header encode (not needed for the CMAF demo) ──────
+  console.log('\n@openmoq/loc:');
   try {
     const ext = encodeLocHeaders({ captureTimestamp: 1_000_000n });
     if (!ext) throw new Error('encodeLocHeaders returned undefined for a non-empty header set');
@@ -46,11 +46,11 @@ async function main(): Promise<number> {
     row('encodeLocHeaders', `unavailable: ${(err as Error).message} (informational — CMAF demo does not need LOC)`);
   }
 
-  // ── INFORMATIONAL: @moqt/browser mp4-box from Node? ────────────────────────
+  // ── INFORMATIONAL: @openmoq/browser mp4-box from Node? ────────────────────────
   // Needed only for a later fragmented-MP4 INGEST slice; prepared fixtures avoid it.
-  console.log('\n@moqt/browser (informational):');
+  console.log('\n@openmoq/browser (informational):');
   try {
-    const browser: Record<string, unknown> = await import('@moqt/browser');
+    const browser: Record<string, unknown> = await import('@openmoq/browser');
     const wanted = ['boxType', 'filterInitSegment', 'iterateTrunSamples', 'peekSegmentMetadata'];
     const found = wanted.filter((n) => typeof browser[n] === 'function');
     row('package import from Node', 'OK (no import-time DOM crash)');

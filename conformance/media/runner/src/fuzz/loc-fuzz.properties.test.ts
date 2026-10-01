@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { parseLocHeaders, type LocHeaderOptions } from '@moqt/loc';
+import { parseLocHeaders, type LocHeaderOptions } from '@openmoq/loc';
 import { locProjection } from '../loc-exec.js';
 import { fc, fcParams, locFuzzBytes, toHex, expectParserSafe, allowLocError, assertNoMutation } from './media-fuzz.js';
 

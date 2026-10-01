@@ -12,8 +12,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { varint, writeVarint, varintEncodingLength } from '@moqt/transport';
-import type { Varint } from '@moqt/transport';
+import { varint, writeVarint, varintEncodingLength } from '@openmoq/transport';
+import type { Varint } from '@openmoq/transport';
 import {
     parseLocHeaders,
     encodeLocHeaders,

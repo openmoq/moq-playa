@@ -24,7 +24,7 @@ import {
   type QlogClock,
   type QlogEventRecord,
   type QlogTraceSpec,
-} from '@moqt/transport';
+} from '@openmoq/transport';
 import { isAbsoluteUri } from './absolute-uri.js';
 import type { LoggerLike } from './logger.js';
 

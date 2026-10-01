@@ -13,7 +13,7 @@ import type {
   WebTransportLike,
   WebTransportBidirectionalStream,
   WebTransportCloseInfo,
-} from '@moqt/webtransport';
+} from '@openmoq/webtransport';
 
 /**
  * The subset of a Node/W3C WebTransport session we consume. Stream element types are

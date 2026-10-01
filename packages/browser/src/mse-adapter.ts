@@ -15,7 +15,7 @@
  * @module
  */
 
-import type { MediaSourceLike } from '@moqt/player';
+import type { MediaSourceLike } from '@openmoq/player';
 import {
   filterInitSegment,
   describeBoxes,
@@ -2443,7 +2443,7 @@ export class MseMediaSource implements MediaSourceLike {
         break;
       }
       case 4: {
-        // Named error so @moqt/player can distinguish "rebuild required"
+        // Named error so @openmoq/player can distinguish "rebuild required"
         // from ordinary (degraded) decode errors and escalate to FATAL.
         const err = new Error(
           `playhead wedge unrecoverable: frozen at t=${ct.toFixed(2)} with `

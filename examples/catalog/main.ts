@@ -12,8 +12,8 @@
  * @module
  */
 
-import { MoqtConnection } from '@moqt/webtransport';
-import { varint } from '@moqt/transport';
+import { MoqtConnection } from '@openmoq/webtransport';
+import { varint } from '@openmoq/transport';
 import { createWebTransport } from '../shared/browser/index.js';
 import { resolveRelayEndpoint } from '../shared/relay-endpoint.js';
 import { parseCertHashHex, relayCandidates } from '../shared/relay-url.js';
@@ -28,7 +28,7 @@ import {
   parseMsfCatalog,
   type CatalogState,
   type CatalogTrack,
-} from '@moqt/msf';
+} from '@openmoq/msf';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();

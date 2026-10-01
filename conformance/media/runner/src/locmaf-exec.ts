@@ -1,7 +1,7 @@
 /**
  * LOCMAF golden-vector corpus (Eyevinn reference implementation): loader with
  * SHA-256 and reachability verification, and the projections used to compare
- * `@moqt/locmaf` output against the recorded canonical chunks and effective
+ * `@openmoq/locmaf` output against the recorded canonical chunks and effective
  * values.
  *
  * @see draft-einarsson-moq-locmaf-01 section 15 (canonical reconstruction)
@@ -12,7 +12,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, relative } from 'node:path';
 
-import { readVi64, type GenBox, type LocmafEffectiveSamples } from '@moqt/locmaf';
+import { readVi64, type GenBox, type LocmafEffectiveSamples } from '@openmoq/locmaf';
 import { vectorsRoot } from './load-corpus.js';
 import { toHex } from './canonical.js';
 

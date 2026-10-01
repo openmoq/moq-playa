@@ -15,9 +15,9 @@
  */
 
 import type { PlayerStateValue } from './state.js';
-import type { RecoveryAction, DecoderCommand } from '@moqt/playback';
-import type { CatalogState, SapTimelineEntry, EventTimelineRecord } from '@moqt/msf';
-import type { EmsgEvent } from '@moqt/locmaf';
+import type { RecoveryAction, DecoderCommand } from '@openmoq/playback';
+import type { CatalogState, SapTimelineEntry, EventTimelineRecord } from '@openmoq/msf';
+import type { EmsgEvent } from '@openmoq/locmaf';
 import type { PlayerError } from './errors.js';
 
 // ─── Session Events ──────────────────────────────────────────────────
@@ -160,7 +160,7 @@ export interface TrackSubscribeFailedEvent {
   readonly reason: string;
 }
 
-// ─── Playback Events (bridged from @moqt/playback) ──────────────────
+// ─── Playback Events (bridged from @openmoq/playback) ──────────────────
 
 /**
  * Group gap detected — missing objects in sequence.

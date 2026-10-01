@@ -12,7 +12,7 @@
  *
  * Audio requires a user gesture to start (Chrome autoplay policy).
  *
- * Uses the lower packages directly — not @moqt/player.
+ * Uses the lower packages directly — not @openmoq/player.
  *
  * @see draft-ietf-moq-transport-16 §3 (Session)
  * @see draft-ietf-moq-transport-16 §9.9 (SUBSCRIBE)
@@ -25,12 +25,12 @@
  * @see draft-ietf-moq-msf-00 §5.1.24 (Codec string)
  */
 
-import { MoqtConnection } from '@moqt/webtransport';
-import { varint } from '@moqt/transport';
-import type { MoqtObject, Varint } from '@moqt/transport';
-import { parseCatalog } from '@moqt/msf';
-import type { Catalog, CatalogTrack } from '@moqt/msf';
-import { parseLocHeaders, toVideoChunkInit } from '@moqt/loc';
+import { MoqtConnection } from '@openmoq/webtransport';
+import { varint } from '@openmoq/transport';
+import type { MoqtObject, Varint } from '@openmoq/transport';
+import { parseCatalog } from '@openmoq/msf';
+import type { Catalog, CatalogTrack } from '@openmoq/msf';
+import { parseLocHeaders, toVideoChunkInit } from '@openmoq/loc';
 import { log } from '../shared/log.js';
 import { namespace, certHash, draftVersion } from '../shared/cert.js';
 import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';

@@ -16,8 +16,8 @@ import {
   validateKnownTracks,
   type ControlMessageContext,
 } from './player-message.js';
-import type { ControlMessage } from '@moqt/transport';
-import type { CatalogState, CatalogTrack } from '@moqt/msf';
+import type { ControlMessage } from '@openmoq/transport';
+import type { CatalogState, CatalogTrack } from '@openmoq/msf';
 import type { LoggerLike } from './logger.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────

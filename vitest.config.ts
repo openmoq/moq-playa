@@ -12,16 +12,16 @@ export default defineConfig({
     // covered separately by `smoke:exports`.
     // Mirrors the list in `examples/vite.config.ts`.
     alias: {
-      '@moqt/transport': resolve(__dirname, 'packages/transport/src/index.ts'),
-      '@moqt/webtransport': resolve(__dirname, 'packages/webtransport/src/index.ts'),
-      '@moqt/quic': resolve(__dirname, 'packages/quic/src/index.ts'),
-      '@moqt/msf': resolve(__dirname, 'packages/msf/src/index.ts'),
-      '@moqt/loc': resolve(__dirname, 'packages/loc/src/index.ts'),
-      '@moqt/locmaf': resolve(__dirname, 'packages/locmaf/src/index.ts'),
-      '@moqt/playback': resolve(__dirname, 'packages/playback/src/index.ts'),
-      '@moqt/player': resolve(__dirname, 'packages/player/src/index.ts'),
-      '@moqt/browser': resolve(__dirname, 'packages/browser/src/index.ts'),
-      '@playa/player': resolve(__dirname, 'packages/playa/src/index.ts'),
+      '@openmoq/transport': resolve(__dirname, 'packages/transport/src/index.ts'),
+      '@openmoq/webtransport': resolve(__dirname, 'packages/webtransport/src/index.ts'),
+      '@openmoq/quic': resolve(__dirname, 'packages/quic/src/index.ts'),
+      '@openmoq/msf': resolve(__dirname, 'packages/msf/src/index.ts'),
+      '@openmoq/loc': resolve(__dirname, 'packages/loc/src/index.ts'),
+      '@openmoq/locmaf': resolve(__dirname, 'packages/locmaf/src/index.ts'),
+      '@openmoq/playback': resolve(__dirname, 'packages/playback/src/index.ts'),
+      '@openmoq/player': resolve(__dirname, 'packages/player/src/index.ts'),
+      '@openmoq/browser': resolve(__dirname, 'packages/browser/src/index.ts'),
+      '@openmoq/playa': resolve(__dirname, 'packages/playa/src/index.ts'),
     },
   },
   test: {
@@ -32,6 +32,8 @@ export default defineConfig({
       'examples/node-publisher/src/**/*.test.ts',
       'examples/broadcast/**/*.test.ts',
       'examples/shared/**/*.test.ts',
+      'scripts/**/*.test.ts',
+      '_migration/**/*.test.ts',
     ],
     // The external-probe differential lane (`*.diff.test.ts`) requires a built
     // LibMoQ probe via MOQ_MEDIA_PROBE_BIN; it is opt-in via `test:corpus:diff`

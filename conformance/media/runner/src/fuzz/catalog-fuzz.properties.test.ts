@@ -16,7 +16,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { parseCatalogAuto, type Catalog, type CatalogTrack } from '@moqt/msf';
+import { parseCatalogAuto, type Catalog, type CatalogTrack } from '@openmoq/msf';
 import { catalogProjection } from '../catalog-exec.js';
 import { fc, fcParams, catalogFuzzInput, catalogFuzzBytes, toHex, describeText, expectParserSafe, allowCatalogError, assertJsonSafe, assertNoMutation } from './media-fuzz.js';
 

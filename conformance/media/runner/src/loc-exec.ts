@@ -15,8 +15,8 @@ import {
   LocHeaderError,
   LocEncodeError,
   type LocHeaders,
-} from '@moqt/loc';
-import { PropertyWireError } from '@moqt/transport';
+} from '@openmoq/loc';
+import { PropertyWireError } from '@openmoq/transport';
 import { toHex } from './canonical.js';
 import type { ExecResult } from './exec-compare.js';
 import type { PropertyMapEntryJson, WireProfile } from './schema-types.js';

@@ -7,7 +7,7 @@
  * `new MseMediaSource(video, { gapJumpMs: 0 })` fails this test.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { MseMediaSource } from '@moqt/browser';
+import { MseMediaSource } from '@openmoq/browser';
 import { Player } from './player.js';
 
 function makeTimeRanges(ranges: readonly [number, number][]): TimeRanges {
@@ -32,7 +32,7 @@ class StubVideo {
 }
 
 // Node has no MediaSource; stub the minimum the constructor touches
-// (same approach as the @moqt/browser adapter suite).
+// (same approach as the @openmoq/browser adapter suite).
 beforeEach(() => {
   const ms = {
     readyState: 'closed',

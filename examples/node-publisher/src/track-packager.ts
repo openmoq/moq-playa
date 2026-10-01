@@ -22,7 +22,7 @@ import {
   parseLocmafTrackContext,
   serializeLocmafObject,
   type LocmafTrackContext,
-} from '@moqt/locmaf';
+} from '@openmoq/locmaf';
 import type { LoadedTrack } from './fixture.js';
 import { analyzeLoopSpan, rebaseTfdtCopy } from './cmaf-loop-rebase.js';
 

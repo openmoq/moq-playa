@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { MediaPublisher } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
-import { parseLocHeaders, locWireProfileForDraft } from '@moqt/loc';
+import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 
 const wrapInt = (n: bigint) => n;
 

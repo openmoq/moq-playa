@@ -12,10 +12,10 @@
  * @module
  */
 
-import type { MoqtObject, MoqtObjectData } from '@moqt/transport';
-import { ObjectStatus } from '@moqt/transport';
-import type { LocHeaders, VideoFrameMarking } from '@moqt/loc';
-import { toVideoChunkInit, toAudioChunkInit } from '@moqt/loc';
+import type { MoqtObject, MoqtObjectData } from '@openmoq/transport';
+import { ObjectStatus } from '@openmoq/transport';
+import type { LocHeaders, VideoFrameMarking } from '@openmoq/loc';
+import { toVideoChunkInit, toAudioChunkInit } from '@openmoq/loc';
 
 import { isKeyframePayload } from './keyframe-validator.js';
 import { JitterBuffer } from './jitter-buffer.js';

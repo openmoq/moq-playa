@@ -17,7 +17,7 @@
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-/** One track in the fixture manifest. Field names align with @moqt/msf's
+/** One track in the fixture manifest. Field names align with @openmoq/msf's
  *  CatalogBuilderTrack so the publisher can map 1:1 into buildCatalog(). */
 export interface FixtureTrack {
   /** MoQT track name (and the fixture subdirectory name), e.g. "video-720". */

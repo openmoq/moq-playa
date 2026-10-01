@@ -7,14 +7,14 @@
     "build": "tsc --noEmit && vite build"
   },
   "dependencies": {
-    "@moqt/transport": "workspace:*",
-    "@moqt/webtransport": "workspace:*",
-    "@moqt/msf": "workspace:*",
-    "@moqt/loc": "workspace:*",
-    "@moqt/playback": "workspace:*",
-    "@moqt/player": "workspace:*",
-    "@moqt/browser": "workspace:*",
-    "@playa/player": "workspace:*"
+    "@openmoq/transport": "workspace:*",
+    "@openmoq/webtransport": "workspace:*",
+    "@openmoq/msf": "workspace:*",
+    "@openmoq/loc": "workspace:*",
+    "@openmoq/playback": "workspace:*",
+    "@openmoq/player": "workspace:*",
+    "@openmoq/browser": "workspace:*",
+    "@openmoq/playa": "workspace:*"
   },
   "devDependencies": {
     "vite": "^6.4.3"

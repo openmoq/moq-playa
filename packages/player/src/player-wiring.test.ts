@@ -10,8 +10,8 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { varint } from '@moqt/transport';
-import type { ObjectDatagram, DataStreamHeader, ControlMessage } from '@moqt/transport';
+import { varint } from '@openmoq/transport';
+import type { ObjectDatagram, DataStreamHeader, ControlMessage } from '@openmoq/transport';
 import {
   wireConnectionCallbacks,
   type ConnectionHandlers,

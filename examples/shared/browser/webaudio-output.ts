@@ -9,7 +9,7 @@
  * @module
  */
 
-import type { AudioOutputLike } from '@moqt/player';
+import type { AudioOutputLike } from '@openmoq/player';
 
 /**
  * WebAudio playout behind AudioOutputLike.

@@ -1,8 +1,8 @@
 /**
- * @playa/player — Batteries-included MoQ media player.
+ * @openmoq/playa — Batteries-included MoQ media player.
  *
  * ```ts
- * import { Player } from '@playa/player';
+ * import { Player } from '@openmoq/playa';
  * const player = new Player(container, { url, namespace });
  * await player.load();
  * player.play();

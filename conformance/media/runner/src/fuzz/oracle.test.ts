@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { PropertyWireError } from '@moqt/transport';
+import { PropertyWireError } from '@openmoq/transport';
 import {
   expectParserSafe, allowLocError, allowCatalogError, allowNone,
   assertJsonSafe, assertNoMutation,

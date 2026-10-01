@@ -11,8 +11,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { varint } from '@moqt/transport';
-import type { MoqtObjectData, MoqtObjectGap } from '@moqt/transport';
+import { varint } from '@openmoq/transport';
+import type { MoqtObjectData, MoqtObjectGap } from '@openmoq/transport';
 import { JitterBuffer } from './jitter-buffer.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────

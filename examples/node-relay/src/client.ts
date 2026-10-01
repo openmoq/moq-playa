@@ -9,7 +9,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { WebTransport, quicheLoaded } from '@fails-components/webtransport';
-import { MoqtConnection } from '@moqt/webtransport';
+import { MoqtConnection } from '@openmoq/webtransport';
 import { fileURLToPath } from 'node:url';
 import { nodeSessionToWebTransportLike } from './wt-adapter.js';
 import { certSha256 } from './cert.js';
@@ -51,7 +51,7 @@ export interface Subscription {
 export async function beginSubscribe(
   conn: MoqtConnection,
   expected: number,
-  opts: { timeoutMs?: number; label?: string; track?: string; filter?: import('@moqt/transport').SubscriptionFilter } = {},
+  opts: { timeoutMs?: number; label?: string; track?: string; filter?: import('@openmoq/transport').SubscriptionFilter } = {},
 ): Promise<Subscription> {
   const timeoutMs = opts.timeoutMs ?? 10_000;
   const trackName = opts.track ?? DEMO_TRACK;

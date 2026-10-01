@@ -43,8 +43,8 @@
  * @module
  */
 
-import type { DataStreamTerminal } from '@moqt/webtransport';
-import type { CatalogState } from '@moqt/msf';
+import type { DataStreamTerminal } from '@openmoq/webtransport';
+import type { CatalogState } from '@openmoq/msf';
 
 /** Inactivity/progress deadline for an ACTIVE attempt (ms). Re-armed on every
  *  fetch object / FETCH_OK, and — in the waiting states — on live catalog

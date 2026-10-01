@@ -11,9 +11,9 @@
  * Pacing: `paceMs > 0` sleeps between chunks (timestamp-style pacing for a live
  * demo); the smoke uses 0 (as fast as possible).
  */
-import { buildCatalog, CATALOG_TRACK_NAME } from '@moqt/msf';
-import { LOCMAF_VERSION } from '@moqt/locmaf';
-import type { MoqtConnection } from '@moqt/webtransport';
+import { buildCatalog, CATALOG_TRACK_NAME } from '@openmoq/msf';
+import { LOCMAF_VERSION } from '@openmoq/locmaf';
+import type { MoqtConnection } from '@openmoq/webtransport';
 import type { LoadedFixture, LoadedTrack } from './fixture.js';
 import { TrackObjectSource, type MediaPackaging } from './track-packager.js';
 
@@ -102,7 +102,7 @@ async function publishObjects(
  * Map fixture metadata → MSF catalog bytes. In `msf-00` mode each init segment
  * rides inline as base64 `initData`; in `cmsf-01` mode the init segments become a
  * root `initDataList` and tracks reference them by `initRef` (no per-track inline
- * init). Both are built with the same @moqt/msf `buildCatalog`.
+ * init). Both are built with the same @openmoq/msf `buildCatalog`.
  *
  * `packaging` `locmaf` signals every track as `packaging: "locmaf"` with
  * `locmafVersion` (draft-einarsson-moq-locmaf-01 section 5); the init is

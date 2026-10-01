@@ -22,7 +22,7 @@
  * @module
  */
 
-import type { VideoRendererLike } from '@moqt/player';
+import type { VideoRendererLike } from '@openmoq/player';
 
 /** A queued frame awaiting presentation. */
 interface QueuedFrame {

@@ -147,10 +147,23 @@ jobs:
             echo "No tarballs in release/"
             exit 1
           fi
-          for tgz in "${tarballs[@]}"; do
+          ordered="$(node scripts/order-release-tarballs.mjs "${tarballs[@]}")"
+          while IFS= read -r tgz; do
             meta="$(tar -xOzf "$tgz" package/package.json)"
             name="$(printf '%s' "$meta" | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).name")"
             version="$(printf '%s' "$meta" | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")"
+            dependencies="$(printf '%s' "$meta" | node -e '
+              const pkg = JSON.parse(require("fs").readFileSync(0, "utf8"));
+              for (const [name, version] of Object.entries(pkg.dependencies || {})) {
+                if (name.startsWith("@openmoq/")) console.log(`${name}@${version}`);
+              }
+            ')"
+            while IFS= read -r dependency; do
+              [ -z "$dependency" ] && continue
+              # Do not advance a dependent's latest tag until its exact canonical
+              # dependencies have been published and are visible in the registry.
+              npm view "$dependency" version >/dev/null
+            done <<< "$dependencies"
             versions="$(npm view "$name" versions --json)"
             if VERSIONS_JSON="$versions" TARGET_VERSION="$version" node <<'NODE'
               const value = JSON.parse(process.env.VERSIONS_JSON);
@@ -163,4 +176,4 @@ jobs:
             fi
             echo "Publishing ${name}@${version} from ${tgz}"
             npm publish "file:${tgz}" --access public
-          done
+          done <<< "$ordered"

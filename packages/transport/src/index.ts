@@ -1,5 +1,5 @@
 /**
- * @moqt/transport — Sans-I/O protocol core for MOQT draft-ietf-moq-transport-16
+ * @openmoq/transport — Sans-I/O protocol core for MOQT draft-ietf-moq-transport-16
  * @module
  */
 

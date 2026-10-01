@@ -2,16 +2,16 @@
      Content derives from this package's package.json (name, description).
      Run `node scripts/generate-package-readmes.mjs --write` after editing it. -->
 
-# @moqt/webtransport
+# @openmoq/webtransport
 
-Media over QUIC Transport (MoQT) session over WebTransport — the WebTransport binding for @moqt/transport.
+Media over QUIC Transport (MoQT) session over WebTransport — the WebTransport binding for @openmoq/transport.
 
 Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implementation of Media over QUIC (MoQ). See the [project README](https://github.com/openmoq/moq-playa#readme) for architecture and API documentation.
 
 ## Install
 
 ```sh
-npm install @moqt/webtransport
+npm install @openmoq/webtransport
 ```
 
 ## License

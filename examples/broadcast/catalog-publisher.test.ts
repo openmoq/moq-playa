@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { acceptCatalogSubscribe } from './catalog-publisher.js';
 import type { BroadcastCatalogParams } from './catalog-publisher.js';
-import { parseCatalog } from '@moqt/msf';
+import { parseCatalog } from '@openmoq/msf';
 
 const PARAMS: BroadcastCatalogParams = {
   videoCodec: 'avc1.42001f',

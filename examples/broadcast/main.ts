@@ -13,8 +13,8 @@
  * @module
  */
 
-import { MoqtConnection } from '@moqt/webtransport';
-import { varint } from '@moqt/transport';
+import { MoqtConnection } from '@openmoq/webtransport';
+import { varint } from '@openmoq/transport';
 import { BroadcastSession } from './broadcast-session.js';
 import type { BroadcastSessionConnection } from './broadcast-session.js';
 import { BroadcastAttempt } from './broadcast-attempt.js';

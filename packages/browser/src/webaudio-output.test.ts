@@ -158,7 +158,7 @@ describe('WebAudioOutput.playheadCaptureUs', () => {
 
 describe('unified playout cushion (delay unification)', () => {
   it('DEFAULT construction adds no delay of its own — the dispatcher owns the cushion', () => {
-    // The documented @moqt/player + @moqt/browser composition wires this
+    // The documented @openmoq/player + @openmoq/browser composition wires this
     // output behind the CommandDispatcher, which already adds the shared
     // cushion to renderTimeUs. A non-zero default here would double-delay
     // audio ~200ms behind video after startup or an underrun.

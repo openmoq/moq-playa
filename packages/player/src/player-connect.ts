@@ -10,8 +10,8 @@
  * @module
  */
 
-import type { SubscriptionFilter, SetupOptions } from '@moqt/transport';
-import { varint } from '@moqt/transport';
+import type { SubscriptionFilter, SetupOptions } from '@openmoq/transport';
+import { varint } from '@openmoq/transport';
 import type { MoqtPlayerConfig } from './config.js';
 
 /**

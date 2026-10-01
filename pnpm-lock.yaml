@@ -34,19 +34,19 @@ importers:
 
   conformance/media/runner:
     dependencies:
-      '@moqt/browser':
+      '@openmoq/browser':
         specifier: workspace:*
         version: link:../../../packages/browser
-      '@moqt/loc':
+      '@openmoq/loc':
         specifier: workspace:*
         version: link:../../../packages/loc
-      '@moqt/locmaf':
+      '@openmoq/locmaf':
         specifier: workspace:*
         version: link:../../../packages/locmaf
-      '@moqt/msf':
+      '@openmoq/msf':
         specifier: workspace:*
         version: link:../../../packages/msf
-      '@moqt/transport':
+      '@openmoq/transport':
         specifier: workspace:*
         version: link:../../../packages/transport
       ajv:
@@ -55,30 +55,30 @@ importers:
 
   examples:
     dependencies:
-      '@moqt/browser':
+      '@openmoq/browser':
         specifier: workspace:*
         version: link:../packages/browser
-      '@moqt/loc':
+      '@openmoq/loc':
         specifier: workspace:*
         version: link:../packages/loc
-      '@moqt/msf':
+      '@openmoq/msf':
         specifier: workspace:*
         version: link:../packages/msf
-      '@moqt/playback':
-        specifier: workspace:*
-        version: link:../packages/playback
-      '@moqt/player':
-        specifier: workspace:*
-        version: link:../packages/player
-      '@moqt/transport':
-        specifier: workspace:*
-        version: link:../packages/transport
-      '@moqt/webtransport':
-        specifier: workspace:*
-        version: link:../packages/webtransport
-      '@playa/player':
+      '@openmoq/playa':
         specifier: workspace:*
         version: link:../packages/playa
+      '@openmoq/playback':
+        specifier: workspace:*
+        version: link:../packages/playback
+      '@openmoq/player':
+        specifier: workspace:*
+        version: link:../packages/player
+      '@openmoq/transport':
+        specifier: workspace:*
+        version: link:../packages/transport
+      '@openmoq/webtransport':
+        specifier: workspace:*
+        version: link:../packages/webtransport
     devDependencies:
       vite:
         specifier: ^6.4.3
@@ -92,22 +92,22 @@ importers:
       '@fails-components/webtransport-transport-http3-quiche':
         specifier: 1.6.8
         version: 1.6.8
-      '@moqt/browser':
+      '@openmoq/browser':
         specifier: workspace:*
         version: link:../../packages/browser
-      '@moqt/loc':
+      '@openmoq/loc':
         specifier: workspace:*
         version: link:../../packages/loc
-      '@moqt/locmaf':
+      '@openmoq/locmaf':
         specifier: workspace:*
         version: link:../../packages/locmaf
-      '@moqt/msf':
+      '@openmoq/msf':
         specifier: workspace:*
         version: link:../../packages/msf
-      '@moqt/transport':
+      '@openmoq/transport':
         specifier: workspace:*
         version: link:../../packages/transport
-      '@moqt/webtransport':
+      '@openmoq/webtransport':
         specifier: workspace:*
         version: link:../../packages/webtransport
     devDependencies:
@@ -129,10 +129,10 @@ importers:
       '@fails-components/webtransport-transport-http3-quiche':
         specifier: 1.6.8
         version: 1.6.8
-      '@moqt/transport':
+      '@openmoq/transport':
         specifier: workspace:*
         version: link:../../packages/transport
-      '@moqt/webtransport':
+      '@openmoq/webtransport':
         specifier: workspace:*
         version: link:../../packages/webtransport
     devDependencies:
@@ -148,22 +148,82 @@ importers:
 
   packages/browser:
     dependencies:
-      '@moqt/loc':
+      '@openmoq/loc':
         specifier: workspace:*
         version: link:../loc
-      '@moqt/playback':
+      '@openmoq/playback':
         specifier: workspace:*
         version: link:../playback
-      '@moqt/player':
+      '@openmoq/player':
         specifier: workspace:*
         version: link:../player
-      '@moqt/webtransport':
+      '@openmoq/webtransport':
+        specifier: workspace:*
+        version: link:../webtransport
+
+  packages/compat-browser:
+    dependencies:
+      '@openmoq/browser':
+        specifier: workspace:*
+        version: link:../browser
+
+  packages/compat-loc:
+    dependencies:
+      '@openmoq/loc':
+        specifier: workspace:*
+        version: link:../loc
+
+  packages/compat-locmaf:
+    dependencies:
+      '@openmoq/locmaf':
+        specifier: workspace:*
+        version: link:../locmaf
+
+  packages/compat-msf:
+    dependencies:
+      '@openmoq/msf':
+        specifier: workspace:*
+        version: link:../msf
+
+  packages/compat-playa:
+    dependencies:
+      '@openmoq/playa':
+        specifier: workspace:*
+        version: link:../playa
+
+  packages/compat-playback:
+    dependencies:
+      '@openmoq/playback':
+        specifier: workspace:*
+        version: link:../playback
+
+  packages/compat-player:
+    dependencies:
+      '@openmoq/player':
+        specifier: workspace:*
+        version: link:../player
+
+  packages/compat-quic:
+    dependencies:
+      '@openmoq/quic':
+        specifier: workspace:*
+        version: link:../quic
+
+  packages/compat-transport:
+    dependencies:
+      '@openmoq/transport':
+        specifier: workspace:*
+        version: link:../transport
+
+  packages/compat-webtransport:
+    dependencies:
+      '@openmoq/webtransport':
         specifier: workspace:*
         version: link:../webtransport
 
   packages/loc:
     dependencies:
-      '@moqt/transport':
+      '@openmoq/transport':
         specifier: workspace:*
         version: link:../transport
 
@@ -177,52 +237,52 @@ importers:
 
   packages/playa:
     dependencies:
-      '@moqt/browser':
+      '@openmoq/browser':
         specifier: workspace:*
         version: link:../browser
-      '@moqt/msf':
+      '@openmoq/msf':
         specifier: workspace:*
         version: link:../msf
-      '@moqt/player':
+      '@openmoq/player':
         specifier: workspace:*
         version: link:../player
-      '@moqt/webtransport':
+      '@openmoq/webtransport':
         specifier: workspace:*
         version: link:../webtransport
 
   packages/playback:
     dependencies:
-      '@moqt/loc':
+      '@openmoq/loc':
         specifier: workspace:*
         version: link:../loc
-      '@moqt/transport':
+      '@openmoq/transport':
         specifier: workspace:*
         version: link:../transport
 
   packages/player:
     dependencies:
-      '@moqt/loc':
+      '@openmoq/loc':
         specifier: workspace:*
         version: link:../loc
-      '@moqt/locmaf':
+      '@openmoq/locmaf':
         specifier: workspace:*
         version: link:../locmaf
-      '@moqt/msf':
+      '@openmoq/msf':
         specifier: workspace:*
         version: link:../msf
-      '@moqt/playback':
+      '@openmoq/playback':
         specifier: workspace:*
         version: link:../playback
-      '@moqt/transport':
+      '@openmoq/transport':
         specifier: workspace:*
         version: link:../transport
-      '@moqt/webtransport':
+      '@openmoq/webtransport':
         specifier: workspace:*
         version: link:../webtransport
 
   packages/quic:
     dependencies:
-      '@moqt/webtransport':
+      '@openmoq/webtransport':
         specifier: workspace:*
         version: link:../webtransport
 
@@ -230,7 +290,7 @@ importers:
 
   packages/webtransport:
     dependencies:
-      '@moqt/transport':
+      '@openmoq/transport':
         specifier: workspace:*
         version: link:../transport
 

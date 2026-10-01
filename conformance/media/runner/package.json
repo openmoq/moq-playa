@@ -9,11 +9,11 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@moqt/browser": "workspace:*",
-    "@moqt/loc": "workspace:*",
-    "@moqt/locmaf": "workspace:*",
-    "@moqt/msf": "workspace:*",
-    "@moqt/transport": "workspace:*",
+    "@openmoq/browser": "workspace:*",
+    "@openmoq/loc": "workspace:*",
+    "@openmoq/locmaf": "workspace:*",
+    "@openmoq/msf": "workspace:*",
+    "@openmoq/transport": "workspace:*",
     "ajv": "^8.17.1"
   }
 }

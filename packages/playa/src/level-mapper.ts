@@ -5,7 +5,7 @@
  * @module
  */
 
-import type { CatalogState } from '@moqt/msf';
+import type { CatalogState } from '@openmoq/msf';
 import type { Level, AudioTrack } from './types.js';
 
 /**

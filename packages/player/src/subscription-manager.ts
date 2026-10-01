@@ -15,10 +15,10 @@
  * @module
  */
 
-import type { MoqtObject } from '@moqt/transport';
-import type { LocHeaders, LocHeaderOptions } from '@moqt/loc';
-import { parseLocHeaders, locWireProfileForDraft } from '@moqt/loc';
-import type { DraftVersion } from '@moqt/transport';
+import type { MoqtObject } from '@openmoq/transport';
+import type { LocHeaders, LocHeaderOptions } from '@openmoq/loc';
+import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
+import type { DraftVersion } from '@openmoq/transport';
 
 /**
  * Packaging type for container format dispatch.

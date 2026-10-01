@@ -10,7 +10,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { DecoderStateMachine, DecoderState } from './decoder-state.js';
-import type { VideoChunkInit, AudioChunkInit, VideoFrameMarking } from '@moqt/loc';
+import type { VideoChunkInit, AudioChunkInit, VideoFrameMarking } from '@openmoq/loc';
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 

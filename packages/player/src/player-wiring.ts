@@ -12,9 +12,9 @@
  * @module
  */
 
-import type { ControlMessage, ObjectDatagram, DataStreamHeader, QlogEvent, SubgroupHeader } from '@moqt/transport';
-import type { MoqtObject } from '@moqt/transport';
-import type { DataStreamTerminal, MoqtConnection } from '@moqt/webtransport';
+import type { ControlMessage, ObjectDatagram, DataStreamHeader, QlogEvent, SubgroupHeader } from '@openmoq/transport';
+import type { MoqtObject } from '@openmoq/transport';
+import type { DataStreamTerminal, MoqtConnection } from '@openmoq/webtransport';
 
 // ─── Types ───────────────────────────────────────────────────────────
 

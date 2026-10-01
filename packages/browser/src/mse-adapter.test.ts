@@ -1483,7 +1483,7 @@ describe('playhead-wedge watchdog', () => {
         expect(errors).toHaveLength(1);
         expect(errors[0]!.message).toMatch(/wedge/i);
         // The final rung must be DISTINGUISHABLE from ordinary decode errors
-        // so @moqt/player can escalate it to a fatal (the app rebuild path).
+        // so @openmoq/player can escalate it to a fatal (the app rebuild path).
         expect(errors[0]!.name).toBe('PlayheadWedgeError');
 
         expect(wedges.map((w) => w.rung)).toEqual([1, 2, 3, 4]);

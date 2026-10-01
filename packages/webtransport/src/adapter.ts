@@ -39,8 +39,8 @@ import {
   decodeFillParameters,
   decodeSubscriptionFilter,
   resolveFillWindow,
-} from '@moqt/transport';
-import type { FillOptions, SubscriptionWindow } from '@moqt/transport';
+} from '@openmoq/transport';
+import type { FillOptions, SubscriptionWindow } from '@openmoq/transport';
 import type {
   EndpointRoleValue,
   ControlMessage,
@@ -78,8 +78,8 @@ import type {
   Parameters,
   TrackProperties,
   SubscriptionStateMachine,
-} from '@moqt/transport';
-import type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions } from '@moqt/transport';
+} from '@openmoq/transport';
+import type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions } from '@openmoq/transport';
 import { ControlStreamFramer } from './framer.js';
 import { createBidiControlTopology } from './topology/bidi-control.js';
 import { createUniPairTopology, PeerSetupRejectedError, RequestCancelledError, RequestGoawayError, type UniPairTopology, type RequestStream } from './topology/uni-pair.js';
@@ -87,7 +87,7 @@ import { IncomingUniRouter, type RoutedIncomingUniStream } from './topology/inco
 import { InboundRequestStreamContext } from './topology/inbound-request.js';
 import { MoqtConnectionError } from './adapter-error.js';
 import type { WebTransportLike, WebTransportBidirectionalStream, MoqtSetupRouting } from './types.js';
-import { isDraft21, isRequestStreamDraft, isWiredDraft } from '@moqt/transport';
+import { isDraft21, isRequestStreamDraft, isWiredDraft } from '@openmoq/transport';
 
 
 

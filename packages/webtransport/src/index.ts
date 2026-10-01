@@ -1,5 +1,5 @@
 /**
- * @moqt/webtransport — MoQT connection adapter and WebTransport binding.
+ * @openmoq/webtransport — MoQT connection adapter and WebTransport binding.
  * @module
  */
 

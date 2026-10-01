@@ -4,20 +4,24 @@
 
 Reference implementation of **Media over QUIC Transport (MoQT)** in TypeScript, with browser WebTransport and experimental native QUIC support for Node.js.
 
-Full stack from transport to viewport, published under two npm scopes so you
+Full stack from transport to viewport, published under one npm scope so you
 pick the integration path that fits:
 
-- **`@moqt/*`** — the reference-implementation building blocks: protocol core, playback, and browser adapters, composed however you need.
-- **`@playa/player`** — the batteries-included, drop-in browser player built on `@moqt/*`.
+- **`@openmoq/*`** — the reference-implementation building blocks: protocol core, playback, and browser adapters, composed however you need.
+- **`@openmoq/playa`** — the batteries-included, drop-in browser player built on `@openmoq/*`.
+
+The previous `@moqt/*` names and `@playa/player` are retained as compatibility
+re-exports. Use the new names for new integrations; see
+[package compatibility](docs/package-compatibility.md) for migration details.
 
 ---
 
 ## Quick Start
 
-### `@playa/player` — Drop-in Player
+### `@openmoq/playa` — Drop-in Player
 
 ```ts
-import { Player } from '@playa/player';
+import { Player } from '@openmoq/playa';
 
 const player = new Player(document.getElementById('container')!, {
   url: 'https://relay.example.com/moq',
@@ -47,15 +51,15 @@ player.play();
 
 When elements are supplied directly the Player never touches the DOM — no `appendChild`, no `hidden` toggling, no style mutations.
 
-### `@moqt/player` — Protocol-Level API
+### `@openmoq/player` — Protocol-Level API
 
 ```ts
-import { MoqtPlayer } from '@moqt/player';
-import { MoqtConnection } from '@moqt/webtransport';
+import { MoqtPlayer } from '@openmoq/player';
+import { MoqtConnection } from '@openmoq/webtransport';
 import {
   createWebTransport, WebCodecsVideoDecoder, CanvasRenderer,
   WebCodecsAudioDecoder, WebAudioOutput,
-} from '@moqt/browser';
+} from '@openmoq/browser';
 
 const player = new MoqtPlayer({
   url: 'https://relay.example.com/moq',
@@ -100,35 +104,35 @@ player.play();
 
 ```
 packages/
-  transport/      @moqt/transport     — Sans-I/O protocol core (draft-14 / -16 / -18)
-  webtransport/   @moqt/webtransport  — MoQT connection adapter and WebTransport binding
-  quic/           @moqt/quic          — Experimental native QUIC binding for Node.js (draft-18)
-  loc/            @moqt/loc           — Low Overhead Container (CaptureTimestamp, VideoFrameMarking)
-  msf/            @moqt/msf           — MSF catalog parsing, track selection, timeline
-  playback/       @moqt/playback      — Jitter buffer, A/V sync, decoder state, gap detection
-  player/         @moqt/player        — Player orchestrator (connect, catalog, subscribe, decode, render)
-  browser/        @moqt/browser       — Browser adapters (WebCodecs, Canvas, WebAudio, MSE)
-  playa/          @playa/player       — Batteries-included player with simple API
+  transport/      @openmoq/transport     — Sans-I/O protocol core (draft-14 / -16 / -18)
+  webtransport/   @openmoq/webtransport  — MoQT connection adapter and WebTransport binding
+  quic/           @openmoq/quic          — Experimental native QUIC binding for Node.js (draft-18)
+  loc/            @openmoq/loc           — Low Overhead Container (CaptureTimestamp, VideoFrameMarking)
+  msf/            @openmoq/msf           — MSF catalog parsing, track selection, timeline
+  playback/       @openmoq/playback      — Jitter buffer, A/V sync, decoder state, gap detection
+  player/         @openmoq/player        — Player orchestrator (connect, catalog, subscribe, decode, render)
+  browser/        @openmoq/browser       — Browser adapters (WebCodecs, Canvas, WebAudio, MSE)
+  playa/          @openmoq/playa       — Batteries-included player with simple API
 ```
 
 ### Architecture
 
-The playback core (`@moqt/playback`) has **no browser dependencies**. It produces `DecoderCommand` and `PlaybackEvent` objects. Browser adapters (`@moqt/browser`) consume these. This separation enables testing in Node.js without WebCodecs/Canvas/WebAudio.
+The playback core (`@openmoq/playback`) has **no browser dependencies**. It produces `DecoderCommand` and `PlaybackEvent` objects. Browser adapters (`@openmoq/browser`) consume these. This separation enables testing in Node.js without WebCodecs/Canvas/WebAudio.
 
 ```
 WebTransport ──────────────────────────┐
-                                       ├─► @moqt/webtransport ──► @moqt/transport ──► @moqt/player ──► @moqt/playback
-Native QUIC via @moqt/quic ────────────┘
+                                       ├─► @openmoq/webtransport ──► @openmoq/transport ──► @openmoq/player ──► @openmoq/playback
+Native QUIC via @openmoq/quic ────────────┘
                                                             │
                                               DecoderCommand│PlaybackEvent
                                                             ▼
-                                               @moqt/browser (browser)
+                                               @openmoq/browser (browser)
                                           WebCodecs / Canvas / WebAudio / MSE
 ```
 
 ---
 
-## `@playa/player` API
+## `@openmoq/playa` API
 
 ```ts
 const player = new Player(container, options);
@@ -189,7 +193,7 @@ player.on('statechange',    ({ from, to }) => { ... });
 
 ---
 
-## `@moqt/player` MoqtPlayer API
+## `@openmoq/player` MoqtPlayer API
 
 ```ts
 // Hooks — intercept and override decisions
@@ -279,15 +283,15 @@ const conn = new MoqtConnection(14); // required — CLIENT_SETUP is draft-speci
 Node applications can use the experimental native QUIC binding for draft 18:
 
 ```ts
-import { connectQuic } from '@moqt/quic';
-import { MoqtConnection } from '@moqt/webtransport';
+import { connectQuic } from '@openmoq/quic';
+import { MoqtConnection } from '@openmoq/webtransport';
 
 const transport = await connectQuic('moqt://relay.example.com:443/moq');
 const connection = new MoqtConnection(18);
 await connection.connect(transport);
 ```
 
-`@moqt/quic` requires a Node build configured and launched with
+`@openmoq/quic` requires a Node build configured and launched with
 `--experimental-quic`. It offers `moqt-18` by default, or `moqt-21` with
 `{ draft: 21 }`, requires QUIC
 DATAGRAM negotiation, disables 0-RTT, and does not fall back to WebTransport.

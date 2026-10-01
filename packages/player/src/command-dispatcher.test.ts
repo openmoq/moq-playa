@@ -19,7 +19,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { CommandDispatcher } from './command-dispatcher.js';
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike } from './interfaces.js';
-import type { DecoderCommand, DecoderFeedback } from '@moqt/playback';
+import type { DecoderCommand, DecoderFeedback } from '@openmoq/playback';
 
 // ─── Mock Factories ───────────────────────────────────────────────────
 

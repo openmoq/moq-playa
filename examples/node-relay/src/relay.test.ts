@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { SessionError, type Fetch, type MoqtObjectData, type SubgroupHeader } from '@moqt/transport';
-import type { IncomingPublish, MoqtConnection } from '@moqt/webtransport';
+import { SessionError, type Fetch, type MoqtObjectData, type SubgroupHeader } from '@openmoq/transport';
+import type { IncomingPublish, MoqtConnection } from '@openmoq/webtransport';
 import { DEMO_NAMESPACE, DEMO_TRACK, nsBytes, te } from './demo.js';
 import { Relay } from './relay.js';
 

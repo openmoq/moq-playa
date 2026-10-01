@@ -23,11 +23,11 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { PlaybackPipeline, SyncController, DefaultRecoveryController } from '@moqt/playback';
-import type { ClockSource, PlaybackConfig, DecoderCommand, PlaybackEvent } from '@moqt/playback';
-import type { LocHeaders } from '@moqt/loc';
-import type { MoqtObjectData, MoqtObjectGap } from '@moqt/transport';
-import { varint, ObjectStatus } from '@moqt/transport';
+import { PlaybackPipeline, SyncController, DefaultRecoveryController } from '@openmoq/playback';
+import type { ClockSource, PlaybackConfig, DecoderCommand, PlaybackEvent } from '@openmoq/playback';
+import type { LocHeaders } from '@openmoq/loc';
+import type { MoqtObjectData, MoqtObjectGap } from '@openmoq/transport';
+import { varint, ObjectStatus } from '@openmoq/transport';
 import { CommandDispatcher } from './command-dispatcher.js';
 import { createPipelines, configurePipelines, handlePipelineCommand, handlePipelineEvent } from './player-pipeline.js';
 import { DEFAULT_PLAYER_CONFIG } from './config.js';
@@ -736,7 +736,7 @@ describe('real-class playout composition — clean path', () => {
 /**
  * Module-resolution contract.
  *
- * `@moqt/playback`'s package `exports` map points at `dist/index.js`. Without a
+ * `@openmoq/playback`'s package `exports` map points at `dist/index.js`. Without a
  * source alias this suite exercises the PUBLISHED BUNDLE, which is how a
  * production pipeline fix appeared to have no effect here and how earlier
  * real-path numbers were measured against whatever `dist` happened to contain.
@@ -745,7 +745,7 @@ describe('real-class playout composition — clean path', () => {
  * under test.
  */
 describe('real-class playout composition — resolution contract', () => {
-  it('resolves @moqt/playback to workspace source, not the published bundle', async () => {
+  it('resolves @openmoq/playback to workspace source, not the published bundle', async () => {
     const fromSource = await import('../../playback/src/pipeline.js');
     expect(PlaybackPipeline).toBe(fromSource.PlaybackPipeline);
   });

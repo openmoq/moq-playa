@@ -1,0 +1,36 @@
+{
+  "name": "@moqt/webtransport",
+  "version": "0.5.9",
+  "description": "Compatibility re-export of @openmoq/webtransport. Use @openmoq/webtransport for new integrations.",
+  "license": "Apache-2.0",
+  "author": "OpenMOQ (https://github.com/openmoq)",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    },
+    "./browser": {
+      "types": "./browser.d.ts",
+      "import": "./browser.js",
+      "default": "./browser.js"
+    }
+  },
+  "files": [
+    "*.js",
+    "*.d.ts"
+  ],
+  "dependencies": {
+    "@openmoq/webtransport": "workspace:*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openmoq/moq-playa.git",
+    "directory": "packages/compat-webtransport"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

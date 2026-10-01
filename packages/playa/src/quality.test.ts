@@ -1,5 +1,5 @@
 /**
- * Tests for @playa/player quality switching API.
+ * Tests for @openmoq/playa quality switching API.
  *
  * Uses a real Player instance with stubbed engine to verify
  * setQuality() public behavior end-to-end.
@@ -11,7 +11,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Player } from './player.js';
 import { mapLevels } from './level-mapper.js';
 import type { Level } from './types.js';
-import type { CatalogState } from '@moqt/msf';
+import type { CatalogState } from '@openmoq/msf';
 
 // ─── DOM / global mocks ──────────────────────────────────────────────
 

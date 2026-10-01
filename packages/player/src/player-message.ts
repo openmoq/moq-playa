@@ -12,9 +12,9 @@
  * @module
  */
 
-import type { ControlMessage, Parameters } from '@moqt/transport';
-import { varint, readLocation, MessageParam } from '@moqt/transport';
-import type { CatalogState, CatalogTrack } from '@moqt/msf';
+import type { ControlMessage, Parameters } from '@openmoq/transport';
+import { varint, readLocation, MessageParam } from '@openmoq/transport';
+import type { CatalogState, CatalogTrack } from '@openmoq/msf';
 import type { LoggerLike } from './logger.js';
 import type { TrackPackaging } from './subscription-manager.js';
 

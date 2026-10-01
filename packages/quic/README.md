@@ -2,7 +2,7 @@
      Content derives from this package's package.json (name, description).
      Run `node scripts/generate-package-readmes.mjs --write` after editing it. -->
 
-# @moqt/quic
+# @openmoq/quic
 
 Experimental Node.js native QUIC binding for Media over QUIC Transport (MoQT).
 
@@ -11,7 +11,7 @@ Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implement
 ## Install
 
 ```sh
-npm install @moqt/quic
+npm install @openmoq/quic
 ```
 
 ## License

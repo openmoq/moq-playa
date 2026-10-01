@@ -11,8 +11,8 @@
 import { describe, it, expect } from 'vitest';
 import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { MoqtPlayer } from './player.js';
-import type { MoqtConnection } from '@moqt/webtransport';
-import { varint } from '@moqt/transport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import { varint } from '@openmoq/transport';
 
 const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
 const td = new TextDecoder();

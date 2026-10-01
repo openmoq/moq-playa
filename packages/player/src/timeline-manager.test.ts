@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import type { CatalogTrack } from '@moqt/msf';
+import type { CatalogTrack } from '@openmoq/msf';
 import {
   createTimelineState,
   processTimelineObject,

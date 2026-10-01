@@ -7,7 +7,7 @@
  * 3. Catalog subscription works (SUBSCRIBE / SUBSCRIBE_OK)
  * 4. Catalog format is compatible (MSF schema)
  *
- * Uses the lower packages directly — not @moqt/player.
+ * Uses the lower packages directly — not @openmoq/player.
  *
  * @see draft-ietf-moq-transport-16 §3 (Session lifecycle)
  * @see draft-ietf-moq-transport-16 §9.3 (CLIENT_SETUP)
@@ -15,10 +15,10 @@
  * @see draft-ietf-moq-msf-00 §5 (Catalog)
  */
 
-import { MoqtConnection } from '@moqt/webtransport';
-import { varint } from '@moqt/transport';
-import { parseCatalogAuto } from '@moqt/msf';
-import type { CatalogTrack } from '@moqt/msf';
+import { MoqtConnection } from '@openmoq/webtransport';
+import { varint } from '@openmoq/transport';
+import { parseCatalogAuto } from '@openmoq/msf';
+import type { CatalogTrack } from '@openmoq/msf';
 import { log } from '../shared/log.js';
 import { namespace, certHash, draftVersion } from '../shared/cert.js';
 import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
@@ -91,7 +91,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    // 8. Parse catalog with @moqt/msf
+    // 8. Parse catalog with @openmoq/msf
     //    @see draft-ietf-moq-msf-00 §5.1
     catalogReceived = true;
     try {

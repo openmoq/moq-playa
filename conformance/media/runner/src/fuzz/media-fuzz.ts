@@ -21,8 +21,8 @@
  */
 
 import * as fc from 'fast-check';
-import { PropertyWireError } from '@moqt/transport';
-import { LocHeaderError } from '@moqt/loc';
+import { PropertyWireError } from '@openmoq/transport';
+import { LocHeaderError } from '@openmoq/loc';
 
 // ─── run configuration (FC_RUNS / FC_SEED) ───────────────────────────────────
 

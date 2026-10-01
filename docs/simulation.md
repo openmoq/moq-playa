@@ -7,8 +7,8 @@ fully deterministic, in-process runs (no network, no timers, no randomness that
 isn't seeded).
 
 It is the Playa equivalent of LibMoQ's `docs/simulation.md`, adapted to a
-sans-I/O TypeScript core: the protocol logic (`@moqt/transport`) is driven through
-an in-memory loopback (`@moqt/webtransport`) so the same code paths that run in
+sans-I/O TypeScript core: the protocol logic (`@openmoq/transport`) is driven through
+an in-memory loopback (`@openmoq/webtransport`) so the same code paths that run in
 production are exercised under a controlled, repeatable schedule.
 
 ## Why it exists

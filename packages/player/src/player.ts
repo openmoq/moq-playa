@@ -20,23 +20,23 @@
  * @module
  */
 
-import type { ControlMessage, Parameters, DraftVersion } from '@moqt/transport';
-import { varint, PublishDoneCode, PublishDoneCode18, RequestError } from '@moqt/transport';
+import type { ControlMessage, Parameters, DraftVersion } from '@openmoq/transport';
+import { varint, PublishDoneCode, PublishDoneCode18, RequestError } from '@openmoq/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
-import { MoqtConnectionError } from '@moqt/webtransport';
-import type { DataStreamTerminal, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@moqt/webtransport';
-import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@moqt/transport';
-import { getSubgroupIdMode, SubgroupIdMode } from '@moqt/transport';
-import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@moqt/playback';
-import { BufferBasedController } from '@moqt/playback';
-import type { AbrTrack } from '@moqt/playback';
-import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@moqt/playback';
-import type { CatalogState, CatalogTrack } from '@moqt/msf';
-import type { LocHeaders } from '@moqt/loc';
-import { LocmafFormatError, LocmafTrackDecoder, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes } from '@moqt/locmaf';
-import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@moqt/locmaf';
-import { parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@moqt/msf';
+import { MoqtConnectionError } from '@openmoq/webtransport';
+import type { DataStreamTerminal, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
+import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
+import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
+import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@openmoq/playback';
+import { BufferBasedController } from '@openmoq/playback';
+import type { AbrTrack } from '@openmoq/playback';
+import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@openmoq/playback';
+import type { CatalogState, CatalogTrack } from '@openmoq/msf';
+import type { LocHeaders } from '@openmoq/loc';
+import { LocmafFormatError, LocmafTrackDecoder, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes } from '@openmoq/locmaf';
+import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@openmoq/locmaf';
+import { parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@openmoq/msf';
 
 import { TypedEmitter } from './emitter.js';
 import { HookChain } from './hooks.js';
@@ -93,7 +93,7 @@ import {
   getTimelineDuration,
   type TimelineState,
 } from './timeline-manager.js';
-import { isRequestStreamDraft } from '@moqt/transport';
+import { isRequestStreamDraft } from '@openmoq/transport';
 
 // ─── Constants ──────────────────────────────────────────────────────
 

@@ -40,7 +40,7 @@ import {
   createControlCodec,
   writeVarint,
   varintEncodingLength,
-} from '@moqt/transport';
+} from '@openmoq/transport';
 import type {
   ServerSetup,
   Goaway,
@@ -58,7 +58,7 @@ import type {
   NamespaceDone,
   Subscribe,
   PublishDone,
-} from '@moqt/transport';
+} from '@openmoq/transport';
 
 // ─── Mock WebTransport factory ──────────────────────────────────────
 
@@ -564,7 +564,7 @@ describe('MoqtConnection', () => {
       expect(mock.controlWritten.length).toBeGreaterThan(0);
       const { message } = decodeControlMessage(mock.controlWritten[0]!, 0);
       expect(message.type).toBe('CLIENT_SETUP');
-      const clientSetup = message as import('@moqt/transport').ClientSetup;
+      const clientSetup = message as import('@openmoq/transport').ClientSetup;
 
       // PATH (0x01) MUST NOT appear in the parameters
       expect(clientSetup.parameters.has(varint(SetupParam.PATH))).toBe(false);
@@ -585,7 +585,7 @@ describe('MoqtConnection', () => {
 
       // Decode the CLIENT_SETUP that was sent on the wire
       const { message } = decodeControlMessage(mock.controlWritten[0]!, 0);
-      const clientSetup = message as import('@moqt/transport').ClientSetup;
+      const clientSetup = message as import('@openmoq/transport').ClientSetup;
 
       const authority = clientSetup.parameters.get(varint(SetupParam.AUTHORITY))?.[0];
       expect(new TextDecoder().decode(authority as Uint8Array)).toBe('example.com');
@@ -1915,9 +1915,9 @@ describe('MoqtConnection', () => {
       // controlWritten: [0]=CLIENT_SETUP, [1]=SUBSCRIBE, [2]=FETCH
       const decoded = decodeControlMessage(mock.controlWritten[2]!, 0);
       expect(decoded.message.type).toBe('FETCH');
-      const f = (decoded.message as import('@moqt/transport').Fetch).fetch;
+      const f = (decoded.message as import('@openmoq/transport').Fetch).fetch;
       expect(f.fetchType).toBe(0x2);
-      const jf = f as import('@moqt/transport').JoiningFetch;
+      const jf = f as import('@openmoq/transport').JoiningFetch;
       expect(jf.joiningRequestId).toBe(subReqId);
       expect(jf.joiningStart).toBe(1n);
     });
