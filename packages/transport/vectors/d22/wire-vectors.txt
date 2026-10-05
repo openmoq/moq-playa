@@ -7,7 +7,8 @@
 #           moqxr-decoder-verified = hand-built, accepted by moqxr's draft-21 decoders
 #           draft-text             = hand-built from docs/draft-ietf-moq-transport-21.txt only
 #           converted-from-d21     = a draft-21 vector whose LOCATION_FILTER changed bytes on draft 22
-# Derived from the draft-21 set shared with red5-moq-relay (src/test/resources/draft21/wire-vectors.txt).
+# Copied from red5-moq-relay (src/test/resources/draft22/wire-vectors.txt), which decodes them with its
+# own draft-22 codec (Draft22VectorsTest). Keep the vector lines identical.
 # Draft 22 changes only LOCATION_FILTER: a Location Filter Type replaces the Length (section 9.20.9).
 # With single-byte fields the two encodings coincide for every form except the Next Object
 # (draft-21 {0, 0}, draft-22 type 0x05), so only those vectors were re-encoded; every other line,
