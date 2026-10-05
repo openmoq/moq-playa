@@ -16,7 +16,7 @@ export {
   ControlMessageType18,
   SetupOption18,
   MessageParam18,
-  MessageParam21,
+  MessageParam22,
   PropertyRange18,
   isMandatoryProperty,
 } from './control/codes-18.js';
@@ -40,7 +40,8 @@ export {
   decodeMessageParams18,
   messageParams18EncodingLength,
   DEFAULT_MESSAGE_PARAM_REGISTRY,
-  DRAFT21_MESSAGE_PARAM_REGISTRY,
+  DRAFT22_MESSAGE_PARAM_REGISTRY,
+  typedLocationFilterLength,
 } from './control/message-params-18.js';
 export type {
   MessageParamValue,
@@ -83,7 +84,7 @@ export { readReasonPhrase, writeReasonPhrase, reasonPhraseEncodingLength } from 
 // ─── Error Codes ─────────────────────────────────────────────────────
 export { SessionError, RequestError, PublishDoneCode, DataStreamError, ProtocolViolationError } from './errors.js';
 // draft-18 error code registries (canonical; the legacy exports above stay draft-14/16).
-export { RequestError18, RequestError21, PublishDoneCode18, StreamResetCode18, DataStreamError18 } from './errors.js';
+export { RequestError18, RequestError22, PublishDoneCode18, StreamResetCode18, DataStreamError18 } from './errors.js';
 
 // ─── Control Messages ────────────────────────────────────────────────
 export { MessageType } from './control/codes.js';
@@ -146,7 +147,8 @@ export { createControlCodec } from './control/codec.js';
 export type { ControlCodec, DraftVersion, DecodedControlMessage } from './control/codec.js';
 
 // ─── Profile (per-draft behavior bundle) ─────────────────────────────
-export { isDraft21, isRequestStreamDraft, isWiredDraft, WIRED_DRAFTS } from './versions.js';
+export { isDraft22, isRequestStreamDraft, isWiredDraft, WIRED_DRAFTS } from './versions.js';
+export type { RequestStreamDraft } from './versions.js';
 export { getProtocolProfile } from './profile.js';
 export type { ProtocolProfile, ProfileCapabilities } from './profile.js';
 export { getRequestPolicy } from './session/request-policy.js';
@@ -331,8 +333,9 @@ export { resolveJoiningFetchRange, type JoiningFetchFields } from './session/joi
 export {
   decodeSubscriptionFilter,
   encodeFillParameters,
-  encodeLocationFilterFields,
-  decodeLocationFilterFields,
+  encodeTypedLocationFilter,
+  encodeFetchLocationFilter,
+  decodeFetchLocationFilter,
   subscriptionWindow,
   windowContains,
 } from './control/subscription-filter.js';

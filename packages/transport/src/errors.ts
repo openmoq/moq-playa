@@ -32,7 +32,7 @@ export const SessionError = {
   EXPIRED_AUTH_TOKEN: varint(0x18),
   INVALID_AUTHORITY: varint(0x19),
   MALFORMED_AUTHORITY: varint(0x1a),
-  /** draft-21: more than MAX_REQUEST_UPDATES updates outstanding on one request. */
+  /** draft-22: more than MAX_REQUEST_UPDATES updates outstanding on one request. */
   TOO_MANY_REQUEST_UPDATES: varint(0x1b),
 } as const;
 
@@ -129,10 +129,10 @@ export const RequestError18 = {
 } as const;
 
 /**
- * REQUEST_ERROR codes — **draft-21** (§12.3): draft 18's without
+ * REQUEST_ERROR codes — **draft-22** (§12.3): draft 18's without
  * DUPLICATE_SUBSCRIPTION and INVALID_JOINING_REQUEST_ID, plus the filter codes.
  */
-export const RequestError21 = {
+export const RequestError22 = {
   INTERNAL_ERROR: varint(0x0),
   UNAUTHORIZED: varint(0x1),
   TIMEOUT: varint(0x2),

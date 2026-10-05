@@ -44,7 +44,7 @@ export const ControlMessageType18 = {
   FETCH: 0x16,
   FETCH_OK: 0x18,
   PUBLISH: 0x1d,
-  /** draft-21 §9.10 only: a publisher's report of its subscription state. */
+  /** draft-22 §9.10 only: a publisher's report of its subscription state. */
   PUBLISH_STATE_NOTIFY: 0x22,
   // PUBLISH_OK (0x1E) intentionally omitted — see the note above (REQUEST_OK shorthand).
   SUBSCRIBE_NAMESPACE: 0x50,
@@ -65,8 +65,8 @@ export const SetupOption18 = {
   MOQT_IMPLEMENTATION: 0x07,
 } as const;
 
-/** draft-21 Setup Options added to the draft-18 set (§9.1.6, §9.1.7). */
-export const SetupOption21 = {
+/** draft-22 Setup Options added to the draft-18 set (§9.1.6, §9.1.7). */
+export const SetupOption22 = {
   ...SetupOption18,
   MAX_FILTER_RANGES: 0x06,
   MAX_REQUEST_UPDATES: 0x08,
@@ -77,7 +77,11 @@ export const SetupOption21 = {
  * `namespace` is a Track Namespace structure (§2.4.1): a vi64 field count
  * followed by that many vi64-length-prefixed fields (used by TRACK_NAMESPACE_PREFIX).
  */
-export type ParamValueKind = 'uint8' | 'varint' | 'location' | 'bytes' | 'namespace';
+/**
+ * `locationFilter` is draft 22's LOCATION_FILTER (§9.20.9): a Location Filter
+ * Type followed by the 0-4 vi64 fields it selects, with no Length.
+ */
+export type ParamValueKind = 'uint8' | 'varint' | 'location' | 'bytes' | 'namespace' | 'locationFilter';
 
 /**
  * draft-18 Message Parameter codes + their value encodings (§10.2 registry).
@@ -102,12 +106,12 @@ export const MessageParam18: Record<string, { type: number; kind: ParamValueKind
 } as const;
 
 /**
- * draft-21 Message Parameter codes + value encodings (draft-21 §16.7). Draft 18's
- * table with 0x21 renamed LOCATION_FILTER (a length-driven 0-4 field Location
- * filter, §9.20.10) and FILL_PARAMETERS (0x23), the Range Filters (0x25-0x29)
- * and INCLUDE_PROPERTIES (0x35) added.
+ * draft-22 Message Parameter codes + value encodings. Draft 18's table with 0x21
+ * renamed LOCATION_FILTER (a typed Location filter with no Length, §9.20.9) and
+ * FILL_PARAMETERS (0x23), the Range Filters (0x25-0x29) and INCLUDE_PROPERTIES
+ * (0x35) added.
  */
-export const MessageParam21: Record<string, { type: number; kind: ParamValueKind }> = {
+export const MessageParam22: Record<string, { type: number; kind: ParamValueKind }> = {
   OBJECT_DELIVERY_TIMEOUT: { type: 0x02, kind: 'varint' },
   AUTHORIZATION_TOKEN: { type: 0x03, kind: 'bytes' },
   RENDEZVOUS_TIMEOUT: { type: 0x04, kind: 'varint' },
@@ -117,7 +121,7 @@ export const MessageParam21: Record<string, { type: number; kind: ParamValueKind
   FILL_TIMEOUT: { type: 0x0a, kind: 'varint' },
   FORWARD: { type: 0x10, kind: 'uint8' },
   SUBSCRIBER_PRIORITY: { type: 0x20, kind: 'uint8' },
-  LOCATION_FILTER: { type: 0x21, kind: 'bytes' },
+  LOCATION_FILTER: { type: 0x21, kind: 'locationFilter' },
   GROUP_ORDER: { type: 0x22, kind: 'uint8' },
   FILL_PARAMETERS: { type: 0x23, kind: 'bytes' },
   SUBGROUP_FILTER: { type: 0x25, kind: 'bytes' },

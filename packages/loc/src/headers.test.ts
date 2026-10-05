@@ -75,8 +75,8 @@ describe('locWireProfileForDraft', () => {
     expect(locWireProfileForDraft(14)).toBe('d14-absolute-varint');
     expect(locWireProfileForDraft(16)).toBe('d16-delta-varint');
     expect(locWireProfileForDraft(18)).toBe('d18-delta-vi64');
-    // draft 21 keeps draft 18's vi64 Object Properties encoding
-    expect(locWireProfileForDraft(21)).toBe('d18-delta-vi64');
+    // draft 22 keeps draft 18's vi64 Object Properties encoding
+    expect(locWireProfileForDraft(22)).toBe('d18-delta-vi64');
   });
 });
 

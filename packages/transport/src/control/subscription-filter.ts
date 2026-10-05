@@ -21,7 +21,7 @@
 import { varint, writeVarint, varintEncodingLength, readVarint } from '../primitives/varint.js';
 import { readLocation } from '../primitives/location.js';
 import { readVi64, writeVi64, vi64EncodingLength, MAX_VI64 } from '../primitives/vi64.js';
-import { isDraft21, isRequestStreamDraft } from '../versions.js';
+import { isDraft22, isRequestStreamDraft } from '../versions.js';
 
 /**
  * Subscription filter — controls which objects pass through a subscription.
@@ -43,7 +43,7 @@ export type SubscriptionFilter =
   /** §5.1.2: Start at an explicit location (open-ended). */
   | { readonly type: 'AbsoluteStart'; readonly startGroup: bigint; readonly startObject: bigint }
   /**
-   * §5.1.2: Explicit start and (absolute) end group. `endObject` (draft 21 only)
+   * §5.1.2: Explicit start and (absolute) end group. `endObject` (draft 22 only)
    * is the inclusive last object of the end group; without it the whole end
    * group is included.
    */
@@ -55,8 +55,8 @@ export type SubscriptionFilter =
       readonly endObject?: bigint;
     }
   /**
-   * draft-21 §9.20.10 only: start `groups` groups back from the Next Group
-   * (1 = the current group), open-ended. The one-field LOCATION_FILTER.
+   * draft-22 §9.20.9 only: start `groups` groups back from the Next Group
+   * (1 = the current group), open-ended. LOCATION_FILTER type 0x01.
    */
   | { readonly type: 'RelativeStart'; readonly groups: bigint };
 
@@ -68,77 +68,41 @@ const FILTER_TYPE: Record<Exclude<SubscriptionFilter['type'], 'RelativeStart'>, 
   AbsoluteRange: 0x4n,
 };
 
-// ─── draft-21 LOCATION_FILTER (§9.20.10) ─────────────────────────────
+// ─── draft-22 typed LOCATION_FILTER (§9.20.9) ────────────────────────
+
+/**
+ * draft-22 Location Filter Types. The type selects which fields follow and
+ * replaces draft 21's Length, so an absolute {0, 0} start (0x02) is no longer
+ * the same bytes as the Next Object (0x05).
+ */
+const LocationFilterType = {
+  NONE: 0x0n,
+  RELATIVE_START: 0x1n,
+  ABSOLUTE_START: 0x2n,
+  ABSOLUTE_START_GROUP_END: 0x3n,
+  ABSOLUTE_RANGE: 0x4n,
+  NEXT_OBJECT: 0x5n,
+} as const;
 
 /** A LOCATION_FILTER carries at most StartGroup, StartObject, EndGroupDelta, EndObject. */
 const MAX_LOCATION_FIELDS = 4;
 
-/** Encode 0-4 LOCATION_FILTER fields: bare vi64s, the count implied by the length. */
-export function encodeLocationFilterFields(fields: readonly bigint[]): Uint8Array {
-  if (fields.length > MAX_LOCATION_FIELDS) {
-    throw new RangeError(`LOCATION_FILTER has ${fields.length} fields; at most ${MAX_LOCATION_FIELDS}`);
-  }
-  let size = 0;
-  for (const f of fields) size += vi64EncodingLength(f);
-  const buf = new Uint8Array(size);
-  let offset = 0;
-  for (const f of fields) offset += writeVi64(f, buf, offset);
-  return buf;
-}
+/** Fields that follow each draft-22 Location Filter Type. */
+const TYPED_FIELD_COUNTS = [0, 1, 2, 3, 4, 0] as const;
 
-/**
- * Decode LOCATION_FILTER fields. The Length decides how many are present; more
- * than four, a truncated field, or StartGroup + EndGroupDelta above 2^64-1 is
- * malformed.
- * @throws {RangeError} on malformed bytes.
- */
-export function decodeLocationFilterFields(bytes: Uint8Array): bigint[] {
-  const reason = validateLocationFilter(bytes);
-  if (reason !== undefined) throw new RangeError(`decodeLocationFilterFields: ${reason}`);
-  const fields: bigint[] = [];
-  let pos = 0;
-  while (pos < bytes.length) {
-    const r = readVi64(bytes, pos);
-    fields.push(r.value);
-    pos += r.bytesRead;
-  }
-  return fields;
-}
-
-function validateLocationFilter(bytes: Uint8Array): string | undefined {
-  const fields: bigint[] = [];
-  let pos = 0;
-  while (pos < bytes.length) {
-    if (fields.length === MAX_LOCATION_FIELDS) return 'LOCATION_FILTER has more than four fields';
-    try {
-      const r = readVi64(bytes, pos);
-      fields.push(r.value);
-      pos += r.bytesRead;
-    } catch {
-      return 'LOCATION_FILTER has a truncated field';
-    }
-  }
-  if (fields.length >= 3 && fields[0]! + fields[2]! > MAX_VI64) {
-    return `LOCATION_FILTER overflows uint64: StartGroup ${fields[0]} + EndGroupDelta ${fields[2]}`;
-  }
-  return undefined;
-}
-
-/** The LOCATION_FILTER fields for a {@link SubscriptionFilter} (draft 21). */
-function locationFilterFields(filter: SubscriptionFilter): bigint[] {
+/** The draft-22 typed LOCATION_FILTER value (type, then fields) for `filter`. */
+function typedLocationFilterFields(filter: SubscriptionFilter): bigint[] {
   switch (filter.type) {
     case 'NextGroupStart':
-      return [0n];
+      return [LocationFilterType.RELATIVE_START, 0n];
     case 'LargestObject':
     case 'LatestObject':
-      return [0n, 0n]; // the Next Object
+      return [LocationFilterType.NEXT_OBJECT];
     case 'RelativeStart':
       if (filter.groups < 1n) throw new RangeError(`RelativeStart groups ${filter.groups} < 1 (0 is NextGroupStart)`);
-      return [filter.groups];
+      return [LocationFilterType.RELATIVE_START, filter.groups];
     case 'AbsoluteStart':
-      // {0, 0} as two fields would mean the Next Object; an open filter from the
-      // start of the track is the zero-length "no filter" instead.
-      return filter.startGroup === 0n && filter.startObject === 0n ? [] : [filter.startGroup, filter.startObject];
+      return [LocationFilterType.ABSOLUTE_START, filter.startGroup, filter.startObject];
     case 'AbsoluteRange': {
       if (filter.endGroup < filter.startGroup) {
         throw new RangeError(`AbsoluteRange endGroup ${filter.endGroup} < startGroup ${filter.startGroup}`);
@@ -146,48 +110,129 @@ function locationFilterFields(filter: SubscriptionFilter): bigint[] {
       if (filter.endGroup > MAX_VI64) {
         throw new RangeError(`AbsoluteRange endGroup ${filter.endGroup} exceeds 2^64-1`);
       }
-      const fields = [filter.startGroup, filter.startObject, filter.endGroup - filter.startGroup];
-      if (filter.endObject !== undefined) fields.push(filter.endObject);
-      return fields;
+      const delta = filter.endGroup - filter.startGroup;
+      return filter.endObject === undefined
+        ? [LocationFilterType.ABSOLUTE_START_GROUP_END, filter.startGroup, filter.startObject, delta]
+        : [LocationFilterType.ABSOLUTE_RANGE, filter.startGroup, filter.startObject, delta, filter.endObject];
     }
   }
 }
 
-/** The {@link SubscriptionFilter} a draft-21 LOCATION_FILTER expresses. */
-function filterFromLocationFields(fields: readonly bigint[]): SubscriptionFilter {
-  switch (fields.length) {
-    case 0:
-      return { type: 'AbsoluteStart', startGroup: 0n, startObject: 0n };
-    case 1:
-      return fields[0] === 0n ? { type: 'NextGroupStart' } : { type: 'RelativeStart', groups: fields[0]! };
-    case 2:
-      return fields[0] === 0n && fields[1] === 0n
-        ? { type: 'LargestObject' }
-        : { type: 'AbsoluteStart', startGroup: fields[0]!, startObject: fields[1]! };
-    default: {
-      const range = {
-        type: 'AbsoluteRange' as const,
-        startGroup: fields[0]!,
-        startObject: fields[1]!,
-        endGroup: fields[0]! + fields[2]!,
-      };
-      return fields.length === 4 ? { ...range, endObject: fields[3]! } : range;
+/** Encode a draft-22 typed LOCATION_FILTER value. */
+export function encodeTypedLocationFilter(filter: SubscriptionFilter): Uint8Array {
+  const values = typedLocationFilterFields(filter);
+  let size = 0;
+  for (const v of values) size += vi64EncodingLength(v);
+  const buf = new Uint8Array(size);
+  let offset = 0;
+  for (const v of values) offset += writeVi64(v, buf, offset);
+  return buf;
+}
+
+/**
+ * Validate a draft-22 typed LOCATION_FILTER value: a known type, exactly the
+ * fields it selects, nothing after them, and StartGroup + EndGroupDelta within
+ * 2^64-1.
+ */
+function validateTypedLocationFilter(bytes: Uint8Array): string | undefined {
+  let pos = 0;
+  const values: bigint[] = [];
+  try {
+    const type = readVi64(bytes, pos);
+    pos += type.bytesRead;
+    if (type.value > LocationFilterType.NEXT_OBJECT) return `unknown Location Filter Type ${type.value}`;
+    values.push(type.value);
+    for (let i = 0; i < TYPED_FIELD_COUNTS[Number(type.value)]!; i++) {
+      const r = readVi64(bytes, pos);
+      values.push(r.value);
+      pos += r.bytesRead;
     }
+  } catch {
+    return 'LOCATION_FILTER has a truncated field';
+  }
+  if (pos !== bytes.length) return 'LOCATION_FILTER has bytes after its fields';
+  if (values.length >= 4 && values[1]! + values[3]! > MAX_VI64) {
+    return `LOCATION_FILTER overflows uint64: StartGroup ${values[1]} + EndGroupDelta ${values[3]}`;
+  }
+  return undefined;
+}
+
+/**
+ * Encode a FETCH range as a LOCATION_FILTER. `fields` are the absolute
+ * StartGroup, StartObject, EndGroupDelta and EndObject, so two to four fields
+ * are types 0x02-0x04 and none is type 0x00 (no filter).
+ */
+export function encodeFetchLocationFilter(fields: readonly bigint[]): Uint8Array {
+  if (fields.length > MAX_LOCATION_FIELDS || fields.length === 1) {
+    throw new RangeError(`a FETCH LOCATION_FILTER has 0 or 2-4 fields, not ${fields.length}`);
+  }
+  const values = [BigInt(fields.length), ...fields];
+  let size = 0;
+  for (const v of values) size += vi64EncodingLength(v);
+  const buf = new Uint8Array(size);
+  let offset = 0;
+  for (const v of values) offset += writeVi64(v, buf, offset);
+  return buf;
+}
+
+/**
+ * Decode a FETCH's LOCATION_FILTER into its fields (StartGroup, StartObject,
+ * EndGroupDelta, EndObject; as many as the type carries). A relative start
+ * keeps its one field and the Next Object (0x05) is {0, 0}; the FETCH mapping
+ * leaves either to the receiver to resolve against the Largest Object.
+ * @throws {RangeError} on malformed bytes.
+ */
+export function decodeFetchLocationFilter(bytes: Uint8Array): bigint[] {
+  const reason = validateTypedLocationFilter(bytes);
+  if (reason !== undefined) throw new RangeError(`decodeFetchLocationFilter: ${reason}`);
+  const values: bigint[] = [];
+  let pos = 0;
+  while (pos < bytes.length) {
+    const r = readVi64(bytes, pos);
+    values.push(r.value);
+    pos += r.bytesRead;
+  }
+  return values[0] === LocationFilterType.NEXT_OBJECT ? [0n, 0n] : values.slice(1);
+}
+
+/** The {@link SubscriptionFilter} a draft-22 typed LOCATION_FILTER expresses. */
+function filterFromTypedLocationFilter(bytes: Uint8Array): SubscriptionFilter {
+  const values: bigint[] = [];
+  let pos = 0;
+  while (pos < bytes.length) {
+    const r = readVi64(bytes, pos);
+    values.push(r.value);
+    pos += r.bytesRead;
+  }
+  const [type, a, b, c, d] = values;
+  switch (type) {
+    case LocationFilterType.NONE:
+      return { type: 'AbsoluteStart', startGroup: 0n, startObject: 0n };
+    case LocationFilterType.RELATIVE_START:
+      return a === 0n ? { type: 'NextGroupStart' } : { type: 'RelativeStart', groups: a! };
+    case LocationFilterType.ABSOLUTE_START:
+      return { type: 'AbsoluteStart', startGroup: a!, startObject: b! };
+    case LocationFilterType.ABSOLUTE_START_GROUP_END:
+      return { type: 'AbsoluteRange', startGroup: a!, startObject: b!, endGroup: a! + c! };
+    case LocationFilterType.ABSOLUTE_RANGE:
+      return { type: 'AbsoluteRange', startGroup: a!, startObject: b!, endGroup: a! + c!, endObject: d! };
+    default:
+      return { type: 'LargestObject' };
   }
 }
 
 /**
- * The FILL_PARAMETERS value (draft-21 §9.20.16) for a fill over `filter`: a bare
- * parameter sequence (no count, bounded by the Length) holding its
- * LOCATION_FILTER. With no filter the value is empty, a fill of the whole track.
+ * The FILL_PARAMETERS value (§9.20.15) for a fill over `filter`: a bare
+ * parameter sequence (no count, bounded by the Length) holding its typed
+ * LOCATION_FILTER, which has no Length of its own (§9.20.9). With no filter the
+ * value is empty, a fill of the whole track.
  */
 export function encodeFillParameters(filter?: SubscriptionFilter): Uint8Array {
   if (filter === undefined) return new Uint8Array(0);
-  const value = encodeLocationFilterFields(locationFilterFields(filter));
+  const value = encodeTypedLocationFilter(filter);
   const type = 0x21n; // LOCATION_FILTER; the first Type delta is from 0
-  const buf = new Uint8Array(vi64EncodingLength(type) + vi64EncodingLength(BigInt(value.length)) + value.length);
-  let offset = writeVi64(type, buf, 0);
-  offset += writeVi64(BigInt(value.length), buf, offset);
+  const buf = new Uint8Array(vi64EncodingLength(type) + value.length);
+  const offset = writeVi64(type, buf, 0);
   buf.set(value, offset);
   return buf;
 }
@@ -203,8 +248,8 @@ export function encodeFillParameters(filter?: SubscriptionFilter): Uint8Array {
  *   valid but `Start Group + Delta` overflows uint64).
  */
 export function encodeSubscriptionFilter(filter: SubscriptionFilter, draftVersion: number): Uint8Array {
-  // draft-21 §9.20.10: the 0x21 parameter is a LOCATION_FILTER.
-  if (isDraft21(draftVersion)) return encodeLocationFilterFields(locationFilterFields(filter));
+  // draft-22 §9.20.9: the 0x21 parameter is a typed LOCATION_FILTER.
+  if (isDraft22(draftVersion)) return encodeTypedLocationFilter(filter);
   if (filter.type === 'RelativeStart') {
     throw new RangeError(`RelativeStart has no draft-${draftVersion} SUBSCRIPTION_FILTER form`);
   }
@@ -287,7 +332,7 @@ export function decodeSubscriptionFilter(bytes: Uint8Array, draftVersion: number
   if (reason !== undefined) {
     throw new RangeError(`decodeSubscriptionFilter: ${reason}`);
   }
-  if (isDraft21(draftVersion)) return filterFromLocationFields(decodeLocationFilterFields(bytes));
+  if (isDraft22(draftVersion)) return filterFromTypedLocationFilter(bytes);
 
   const read = isRequestStreamDraft(draftVersion)
     ? (pos: number) => readVi64(bytes, pos)
@@ -324,7 +369,7 @@ export function decodeSubscriptionFilter(bytes: Uint8Array, draftVersion: number
  *   The caller maps a returned reason to a PROTOCOL_VIOLATION close.
  */
 export function validateSubscriptionFilter(bytes: Uint8Array, draftVersion: number): string | undefined {
-  if (isDraft21(draftVersion)) return validateLocationFilter(bytes);
+  if (isDraft22(draftVersion)) return validateTypedLocationFilter(bytes);
   return isRequestStreamDraft(draftVersion)
     ? validateSubscriptionFilter18(bytes)
     : validateSubscriptionFilterLegacy(bytes);
@@ -458,7 +503,7 @@ function validateSubscriptionFilter18(bytes: Uint8Array): string | undefined {
   return undefined;
 }
 
-// ─── Subscription windows (draft-21 §3.1 shared Track Aliases) ────────
+// ─── Subscription windows (draft-22 §3.1 shared Track Aliases) ────────
 
 /** The absolute Locations a subscription's filter selects. `end` is inclusive; without `end.object` the whole end group. */
 export interface SubscriptionWindow {
@@ -470,7 +515,7 @@ export interface SubscriptionWindow {
  * Resolve a subscription's Location filter against the Largest Object it was
  * established with (SUBSCRIBE_OK's LARGEST_OBJECT; `undefined` for an empty
  * track). A subscriber sharing one Track Alias across several subscriptions to
- * the same track re-applies each window to attribute an object (draft-21 §3.1).
+ * the same track re-applies each window to attribute an object (draft-22 §3.1).
  * No filter selects the whole track.
  */
 export function subscriptionWindow(

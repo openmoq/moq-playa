@@ -15,18 +15,19 @@
  * - `16` — draft-ietf-moq-transport-16 (default)
  * - `18` — draft-ietf-moq-transport-18 (fully wired: control + data codecs,
  *   uni-pair topology, request profile)
- * - `21` — draft-ietf-moq-transport-21 (the draft-18 stream model with
- *   LOCATION_FILTER, fill fetch streams, PUBLISH_STATE_NOTIFY and a
- *   FETCH that carries its range as a LOCATION_FILTER)
+ * - `22` — draft-ietf-moq-transport-22 (the draft-18 stream model with a typed
+ *   LOCATION_FILTER, fill fetch streams, PUBLISH_STATE_NOTIFY and a FETCH that
+ *   carries its range as a LOCATION_FILTER). Draft 21 is not supported: 22 is
+ *   draft 21 with LOCATION_FILTER framed by its type instead of a Length.
  */
-export type DraftVersion = 14 | 16 | 18 | 21;
+export type DraftVersion = 14 | 16 | 18 | 22;
 
 /** Draft versions with a fully-wired wire codec today. */
-export const WIRED_DRAFTS: readonly DraftVersion[] = [14, 16, 18, 21];
+export const WIRED_DRAFTS: readonly DraftVersion[] = [14, 16, 18, 22];
 
 /** Whether `v` has a fully-wired control + data codec. */
 export function isWiredDraft(v: number): v is DraftVersion {
-  return v === 14 || v === 16 || v === 18 || v === 21;
+  return v === 14 || v === 16 || v === 18 || v === 22;
 }
 
 /**
@@ -38,7 +39,13 @@ export function isRequestStreamDraft(v: number | undefined): boolean {
   return v !== undefined && v >= 18;
 }
 
-/** Whether `v` is draft 21 or later (LOCATION_FILTER, fills, no Joining FETCH). */
-export function isDraft21(v: number | undefined): boolean {
-  return v !== undefined && v >= 21;
+/**
+ * Whether `v` is draft 22 or later: LOCATION_FILTER (typed, no Length,
+ * §9.20.9), fills, PUBLISH_STATE_NOTIFY and no Joining FETCH.
+ */
+export function isDraft22(v: number | undefined): boolean {
+  return v !== undefined && v >= 22;
 }
+
+/** A draft with the draft-18 stream model: 18 or 22. */
+export type RequestStreamDraft = 18 | 22;

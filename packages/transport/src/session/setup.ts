@@ -12,11 +12,11 @@
 import { varint, type Varint } from '../primitives/varint.js';
 import type { ControlMessage, ClientSetup, ServerSetup, Parameters, Setup, SetupOptionMap } from '../control/messages.js';
 import { SetupParam } from '../control/parameters.js';
-import { SetupOption18, SetupOption21 } from '../control/codes-18.js';
+import { SetupOption18, SetupOption22 } from '../control/codes-18.js';
 import type { DraftVersion } from '../control/codec.js';
 import { EndpointRole, type EndpointRoleValue, SessionState, type SessionStateValue } from './types.js';
 import { AliasType, parseAuthorizationToken, parseAuthorizationToken18, type AuthorizationToken } from '../control/auth-token.js';
-import { isDraft21, isRequestStreamDraft } from '../versions.js';
+import { isDraft22, isRequestStreamDraft } from '../versions.js';
 
 /**
  * Error thrown for setup handshake violations.
@@ -58,7 +58,7 @@ export interface SetupResult {
    * @see draft-ietf-moq-transport-18 §10.3.1.3
    */
   readonly peerMaxAuthTokenCacheSize?: bigint;
-  /** draft-21 §9.1.7 MAX_REQUEST_UPDATES from the peer's SETUP (absent = 0, no limit). */
+  /** draft-22 §9.1.7 MAX_REQUEST_UPDATES from the peer's SETUP (absent = 0, no limit). */
   readonly peerMaxRequestUpdates?: bigint;
   /**
    * Parsed AUTHORIZATION_TOKEN parameters from the peer's setup message.
@@ -206,7 +206,7 @@ export class SetupGate {
     // §10.3.1.3: vi64 (full uint64) — emitted as a vi64 Setup Option below.
     maxAuthTokenCacheSize?: bigint;
     authTokens?: Uint8Array[];
-    /** draft-21 §9.1.7: our MAX_REQUEST_UPDATES; ignored before draft 21. */
+    /** draft-22 §9.1.7: our MAX_REQUEST_UPDATES; ignored before draft 22. */
     maxRequestUpdates?: bigint;
   } = {}): Setup {
     const enc = new TextEncoder();
@@ -226,8 +226,8 @@ export class SetupGate {
     if (options.authTokens !== undefined && options.authTokens.length > 0) {
       setupOptions.set(BigInt(SetupOption18.AUTHORIZATION_TOKEN), options.authTokens);
     }
-    if (options.maxRequestUpdates !== undefined && isDraft21(this.draftVersion)) {
-      setupOptions.set(BigInt(SetupOption21.MAX_REQUEST_UPDATES), [options.maxRequestUpdates]);
+    if (options.maxRequestUpdates !== undefined && isDraft22(this.draftVersion)) {
+      setupOptions.set(BigInt(SetupOption22.MAX_REQUEST_UPDATES), [options.maxRequestUpdates]);
     }
     // Deliberately NO MAX_REQUEST_ID for draft-18.
     this.state = this.state === SessionState.IDLE ? SessionState.SETUP_PENDING : SessionState.ESTABLISHED;
@@ -307,9 +307,9 @@ export class SetupGate {
             .filter((v): v is Uint8Array => v instanceof Uint8Array)
             .map((v) => parseAuthorizationToken18(v));
           break;
-        case SetupOption21.MAX_REQUEST_UPDATES:
+        case SetupOption22.MAX_REQUEST_UPDATES:
           // A draft-18 peer would not send it; there it is an unknown option.
-          if (!isDraft21(this.draftVersion)) break;
+          if (!isDraft22(this.draftVersion)) break;
           if (values.length > 1) {
             throw new SetupError('Repeated Setup Option MAX_REQUEST_UPDATES (singleton)', 'PROTOCOL_VIOLATION');
           }

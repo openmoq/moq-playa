@@ -441,8 +441,8 @@ describe('MediaPublisher — broadcast generations', () => {
 });
 
 describe('MediaPublisher — negotiated-draft wire binding', () => {
-  it('draft-18 and 21 subgroup opens set FIRST_OBJECT on video AND audio; 16/14 do not', async () => {
-    for (const draft of [14, 16, 18, 21] as const) {
+  it('draft-18 and 22 subgroup opens set FIRST_OBJECT on video AND audio; 16/14 do not', async () => {
+    for (const draft of [14, 16, 18, 22] as const) {
       const conn = recordingConnection();
       const pub = makePublisher(conn, { draft });
       pub.setVideoAlias(2n);
@@ -461,10 +461,10 @@ describe('MediaPublisher — negotiated-draft wire binding', () => {
     }
   });
 
-  it('draft 21 keeps the draft-18 LOC wire profile', async () => {
+  it('draft 22 keeps the draft-18 LOC wire profile', async () => {
     const timestampUs = Date.now() * 1000;
     const conn = recordingConnection();
-    const pub = makePublisher(conn, { draft: 21, wallClockUs: () => timestampUs });
+    const pub = makePublisher(conn, { draft: 22, wallClockUs: () => timestampUs });
     pub.setVideoAlias(2n);
     pub.publishVideo(chunk(7), { isKeyframe: true, timestampUs });
     await settle();

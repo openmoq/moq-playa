@@ -262,7 +262,7 @@ are not implemented. Callers with track-scoped defaults can pass `track` to
 
 Browser WebTransport may expose `transport.protocol`, enabling automatic draft detection from the negotiated `WT-Available-Protocols`:
 
-- `moqt-21` → draft 21
+- `moqt-22` → draft 22
 - `moqt-18` → draft 18
 - `moqt-16` → draft 16
 - `moq-00` → draft 14
@@ -277,7 +277,7 @@ For **draft-14 relays** (moq-rs, Red5, moqtail), you must explicitly specify the
 const conn = new MoqtConnection(14); // required — CLIENT_SETUP is draft-specific
 ```
 
-`MoqtConnection` auto-detects the draft from **any** `WebTransportLike` whose `protocol` exposes a supported token (`moqt-21`, `moqt-18`, `moqt-16`, or `moq-00`) — there's nothing factory-specific about detection. The browser transport factory is just the convenience that sets the WebTransport `protocols` offer for you. If you construct your own `WebTransport`, pass the appropriate `protocols` option yourself and make sure `transport.protocol` is readable; Playa reads it the same way. Some Node/polyfill transports may not support `protocols` yet.
+`MoqtConnection` auto-detects the draft from **any** `WebTransportLike` whose `protocol` exposes a supported token (`moqt-22`, `moqt-18`, `moqt-16`, or `moq-00`) — there's nothing factory-specific about detection. The browser transport factory is just the convenience that sets the WebTransport `protocols` offer for you. If you construct your own `WebTransport`, pass the appropriate `protocols` option yourself and make sure `transport.protocol` is readable; Playa reads it the same way. Some Node/polyfill transports may not support `protocols` yet.
 
 Node applications can use the experimental native QUIC binding for draft 18:
 
@@ -294,18 +294,18 @@ await connection.connect(transport);
 `--experimental-quic`. It offers only the `moqt-18` ALPN, requires QUIC
 DATAGRAM negotiation, disables 0-RTT, and does not fall back to WebTransport.
 
-#### draft 21
+#### draft 22
 
-Draft 21 (`new MoqtConnection(21)`, `draftVersion: 21`, ALPN/WT protocol `moqt-21`) keeps the draft-18 stream model and adds:
+Draft 22 (`new MoqtConnection(22)`, `draftVersion: 22`, ALPN/WT protocol `moqt-22`) keeps the draft-18 stream model and adds the features below. Draft 21 is not supported: draft 22 is draft 21 with a typed LOCATION_FILTER (a Location Filter Type, 0x00-0x05, selects the fields that follow and replaces the Length), so a draft-21 peer and a draft-22 peer disagree on every LOCATION_FILTER.
 
-- **Location filters.** SUBSCRIBE and FETCH carry their range in LOCATION_FILTER. `SubscriptionFilter` gains `RelativeStart` (`groups: N` starts at group Largest + 1 - N, so 1 is the current group) and an optional inclusive `endObject` on `AbsoluteRange`.
-- **Fills instead of Joining FETCH.** Draft 21 has no Joining FETCH. `subscribe()` / `subscribeTrack()` take a `fill` option (`{ filter?: SubscriptionFilter }`). The publisher answers on a fill fetch stream whose FETCH_HEADER carries the SUBSCRIBE's Request ID. There is no FETCH_OK: a FIN completes the fill and a reset fails it. `onDataStream` reports that stream with `fill: true`, and `cancelFill(requestId)` stops it without touching the subscription. On the publisher side, `openFillStream(requestId)` serves a SUBSCRIBE that asked for a fill.
-- **Player.** The MSF-01 catalog bootstrap and warm start ask for the current group as a fill (`LOCATION_FILTER [1]`). A SUBSCRIBE_OK without a Largest Object means an empty track, so the player waits for the first live catalog object and does not expect a fill.
+- **Location filters.** SUBSCRIBE and FETCH carry their range in LOCATION_FILTER (§9.20.9). `SubscriptionFilter` gains `RelativeStart` (`groups: N` starts at group Largest + 1 - N, so 1 is the current group) and an optional inclusive `endObject` on `AbsoluteRange`.
+- **Fills instead of Joining FETCH.** Draft 22 has no Joining FETCH. `subscribe()` / `subscribeTrack()` take a `fill` option (`{ filter?: SubscriptionFilter }`). The publisher answers on a fill fetch stream whose FETCH_HEADER carries the SUBSCRIBE's Request ID. There is no FETCH_OK: a FIN completes the fill and a reset fails it. `onDataStream` reports that stream with `fill: true`, and `cancelFill(requestId)` stops it without touching the subscription. On the publisher side, `openFillStream(requestId)` serves a SUBSCRIBE that asked for a fill.
+- **Player.** The MSF-01 catalog bootstrap and warm start ask for the current group as a fill (LOCATION_FILTER type 0x01 with StartGroup 1). A SUBSCRIBE_OK without a Largest Object means an empty track, so the player waits for the first live catalog object and does not expect a fill.
 - **Other changes.** PUBLISH_STATE_NOTIFY on the subscription stream advances the Largest Location. GOAWAY has no Request ID. The End of Timed-Out Range fetch marker (`0x20C`) is accepted. PUBLISH_DONE `0x3` no longer exists.
 
 - **REQUEST_UPDATE.** `requestUpdate()` also takes `fill`; that fill stream carries the update's Request ID. `SetupOptions.maxRequestUpdates` advertises MAX_REQUEST_UPDATES. Updates never exceed the peer's limit, and a peer that exceeds ours closes the session with TOO_MANY_REQUEST_UPDATES.
-- **Several subscriptions to one track.** Draft 21 allows them, and a publisher may give them one Track Alias. `subscribeTrack()` subscriptions sharing an alias each receive the objects their own filter selects, once each. Ending one leaves the others running.
-- **Native QUIC.** `connectQuic(uri, { draft: 21 })` offers `moqt-21`.
+- **Several subscriptions to one track.** Draft 22 allows them, and a publisher may give them one Track Alias. `subscribeTrack()` subscriptions sharing an alias each receive the objects their own filter selects, once each. Ending one leaves the others running.
+- **Native QUIC.** `connectQuic(uri, { draft: 22 })` offers `moqt-22`.
 
 #### draft-18 known gaps (non-blocking)
 

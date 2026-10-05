@@ -1,10 +1,10 @@
 /**
- * Draft-21 cross-implementation wire vectors.
+ * Draft-22 wire vectors, derived from the draft-21 set shared with red5-moq-relay and moqxr.
  *
- * `packages/transport/vectors/d21/wire-vectors.txt` is shared with red5-moq-relay:
- * the vectors were produced by (or verified against) moqxr's draft-21 codec, so
+ * `packages/transport/vectors/d22/wire-vectors.txt` is shared with red5-moq-relay:
+ * the vectors were produced by (or verified against) moqxr's draft-22 codec, so
  * decoding them here checks Playa against two other implementations. Every
- * control vector must decode with the draft-21 codec and re-encode to the same
+ * control vector must decode with the draft-22 codec and re-encode to the same
  * bytes; the frames playback depends on are also checked field by field.
  */
 import { describe, it, expect } from 'vitest';
@@ -12,8 +12,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { vectorsDir, bytesToHex, hexToBytes } from './load-vectors.js';
 import { createControlCodec } from '../control/codec.js';
-import { decodeMessageParams18, DRAFT21_MESSAGE_PARAM_REGISTRY } from '../control/message-params-18.js';
-import { decodeLocationFilterFields } from '../control/subscription-filter.js';
+import { decodeMessageParams18, DRAFT22_MESSAGE_PARAM_REGISTRY } from '../control/message-params-18.js';
 import { decodeFetchObject18 } from '../data/decoder-18.js';
 import type {
   ControlMessage, Fetch, FetchOk, Goaway, PublishStateNotify, Subscribe, SubscribeOk, PublishDone,
@@ -25,8 +24,8 @@ interface Vector {
   readonly bytes: Uint8Array;
 }
 
-function loadD21(): Map<string, Vector> {
-  const text = readFileSync(join(vectorsDir('d21'), 'wire-vectors.txt'), 'utf8');
+function loadD22(): Map<string, Vector> {
+  const text = readFileSync(join(vectorsDir('d22'), 'wire-vectors.txt'), 'utf8');
   const vectors = new Map<string, Vector>();
   for (const line of text.split('\n')) {
     const trimmed = line.trim();
@@ -37,21 +36,21 @@ function loadD21(): Map<string, Vector> {
   return vectors;
 }
 
-const VECTORS = loadD21();
-const codec21 = createControlCodec(21);
+const VECTORS = loadD22();
+const codec22 = createControlCodec(22);
 const vector = (name: string): Uint8Array => {
   const v = VECTORS.get(name);
-  if (v === undefined) throw new Error(`no draft-21 vector ${name}`);
+  if (v === undefined) throw new Error(`no draft-22 vector ${name}`);
   return v.bytes;
 };
-const decode = <T extends ControlMessage>(name: string): T => codec21.decode(vector(name), 0).message as T;
+const decode = <T extends ControlMessage>(name: string): T => codec22.decode(vector(name), 0).message as T;
 const LOCATION_FILTER = 0x21n;
 const FILL_PARAMETERS = 0x23n;
 const INCLUDE_PROPERTIES = 0x35n;
 const LARGEST_OBJECT = 0x09n;
 const FORWARD = 0x10n;
 
-describe('draft-21 wire vectors (shared with red5-moq-relay and moqxr)', () => {
+describe('draft-22 wire vectors (shared with red5-moq-relay and moqxr)', () => {
   it('loads the full set', () => {
     expect(VECTORS.size).toBeGreaterThanOrEqual(29);
   });
@@ -59,28 +58,28 @@ describe('draft-21 wire vectors (shared with red5-moq-relay and moqxr)', () => {
   for (const v of VECTORS.values()) {
     if (v.kind !== 'control') continue;
     it(`${v.name} decodes and re-encodes byte for byte`, () => {
-      const { message, bytesRead } = codec21.decode(v.bytes, 0);
+      const { message, bytesRead } = codec22.decode(v.bytes, 0);
       expect(bytesRead).toBe(v.bytes.length);
-      expect(bytesToHex(codec21.encode(message))).toBe(bytesToHex(v.bytes));
+      expect(bytesToHex(codec22.encode(message))).toBe(bytesToHex(v.bytes));
     });
   }
 
-  it('SUBSCRIBE LOCATION_FILTER forms', () => {
+  it('SUBSCRIBE LOCATION_FILTER forms (typed, §9.20.9)', () => {
     const filter = (name: string) =>
-      decodeLocationFilterFields(decode<Subscribe>(name).parameters.get(LOCATION_FILTER)![0] as Uint8Array);
-    expect(filter('subscribe_location_filter_empty')).toEqual([]);
-    expect(filter('subscribe_location_filter_next_group')).toEqual([0n]);
-    expect(filter('subscribe_location_filter_next_object')).toEqual([0n, 0n]);
-    expect(filter('subscribe_location_filter_relative_3')).toEqual([3n]);
-    expect(filter('subscribe_location_filter_start_12_5')).toEqual([12n, 5n]);
-    expect(filter('subscribe_location_filter_range_12_5_delta_3')).toEqual([12n, 5n, 3n]);
-    expect(filter('subscribe_location_filter_range_12_5_delta_3_end_object_7')).toEqual([12n, 5n, 3n, 7n]);
+      bytesToHex(decode<Subscribe>(name).parameters.get(LOCATION_FILTER)![0] as Uint8Array);
+    expect(filter('subscribe_location_filter_empty')).toBe('00');
+    expect(filter('subscribe_location_filter_next_group')).toBe('0100');
+    expect(filter('subscribe_location_filter_next_object')).toBe('05');
+    expect(filter('subscribe_location_filter_relative_3')).toBe('0103');
+    expect(filter('subscribe_location_filter_start_12_5')).toBe('020c05');
+    expect(filter('subscribe_location_filter_range_12_5_delta_3')).toBe('030c0503');
+    expect(filter('subscribe_location_filter_range_12_5_delta_3_end_object_7')).toBe('040c050307');
   });
 
   it('SUBSCRIBE that joins the current group with a fill (the catalog recipe)', () => {
     const sub = decode<Subscribe>('subscribe_join_current_group_with_fill_include_properties_0');
-    expect(decodeLocationFilterFields(sub.parameters.get(LOCATION_FILTER)![0] as Uint8Array)).toEqual([0n, 0n]);
-    // FILL_PARAMETERS: a bare parameter sequence holding LOCATION_FILTER [1] (the current group).
+    expect(bytesToHex(sub.parameters.get(LOCATION_FILTER)![0] as Uint8Array)).toBe('05'); // the Next Object
+    // FILL_PARAMETERS: a bare parameter sequence holding LOCATION_FILTER type 1, StartGroup 1 (the current group).
     expect(bytesToHex(sub.parameters.get(FILL_PARAMETERS)![0] as Uint8Array)).toBe('210101');
     expect(sub.parameters.get(INCLUDE_PROPERTIES)).toEqual([0n]);
   });
@@ -124,19 +123,19 @@ describe('draft-21 wire vectors (shared with red5-moq-relay and moqxr)', () => {
 
   it('End of Timed-Out Range: Group ID and Object ID, no payload length', () => {
     const bytes = vector('fetch_object_end_of_timed_out_range_g2_o4');
-    const { item, bytesRead } = decodeFetchObject18(bytes, 0, undefined, true, 'ascending', 21);
+    const { item, bytesRead } = decodeFetchObject18(bytes, 0, undefined, true, 'ascending', 22);
     expect(bytesRead).toBe(bytes.length);
     expect(item).toMatchObject({ flags: 0x20cn, groupId: 2n, objectId: 4n, nonExistent: false });
     expect(() => decodeFetchObject18(bytes, 0, undefined, true, 'ascending', 18)).toThrow();
   });
 
-  it('range-filter parameters are known to the draft-21 registry', () => {
+  it('range-filter parameters are known to the draft-22 registry', () => {
     for (const v of VECTORS.values()) {
       if (v.kind !== 'parameter') continue;
       const counted = new Uint8Array(v.bytes.length + 1);
       counted[0] = 1;
       counted.set(v.bytes, 1);
-      const { bytesRead } = decodeMessageParams18(counted, 0, DRAFT21_MESSAGE_PARAM_REGISTRY);
+      const { bytesRead } = decodeMessageParams18(counted, 0, DRAFT22_MESSAGE_PARAM_REGISTRY);
       expect(bytesRead, v.name).toBe(counted.length);
     }
   });

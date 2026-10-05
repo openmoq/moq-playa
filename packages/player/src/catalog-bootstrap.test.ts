@@ -57,7 +57,7 @@ interface Harness {
     };
 }
 
-function makeHarness(overrides?: { draft?: 14 | 16 | 18 | 21; abortOnDegraded?: boolean; abortOnReady?: boolean }): Harness {
+function makeHarness(overrides?: { draft?: 14 | 16 | 18 | 22; abortOnDegraded?: boolean; abortOnReady?: boolean }): Harness {
     const manager = new CatalogManager('live/test');
     const calls: Harness['calls'] = {
         joiningFetch: 0, standaloneFetches: [], cancels: 0,
@@ -561,13 +561,13 @@ describe('CatalogBootstrap — failure ladder', () => {
     });
 });
 
-describe('CatalogBootstrap — draft-21 fill', () => {
-    // draft-21 §3.4: a fill range that starts after Largest Object opens no fill
+describe('CatalogBootstrap — draft-22 fill', () => {
+    // draft-22 §3.4: a fill range that starts after Largest Object opens no fill
     // stream. With no Largest Object the track is empty: wait for the first
     // live head, exactly like a Joining FETCH answered with INVALID_RANGE.
     it('SUBSCRIBE_OK without a Largest Object resolves the fill attempt as an empty track', () => {
         vi.useFakeTimers();
-        const h = makeHarness({ draft: 21 });
+        const h = makeHarness({ draft: 22 });
         h.coord.start();
         h.coord.onSubscribeOk(null);
         expect(h.coord.phase).toBe('empty-wait');
@@ -579,14 +579,14 @@ describe('CatalogBootstrap — draft-21 fill', () => {
     });
 
     it('the same holds when SUBSCRIBE_OK arrives before the coordinator starts', () => {
-        const h = makeHarness({ draft: 21 });
+        const h = makeHarness({ draft: 22 });
         h.coord.onSubscribeOk(null);
         h.coord.start();
         expect(h.coord.phase).toBe('empty-wait');
     });
 
     it('with a Largest Object the fill is awaited', () => {
-        const h = makeHarness({ draft: 21 });
+        const h = makeHarness({ draft: 22 });
         h.coord.start();
         h.coord.onSubscribeOk({ group: 5n, object: 1n });
         expect(h.coord.phase).toBe('fetching');

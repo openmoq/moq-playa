@@ -39,6 +39,7 @@ import type { SetupOptions } from '@openmoq/transport';
 import { ControlStreamFramer } from '../framer.js';
 import type { WebTransportLike, WebTransportBidirectionalStream } from '../types.js';
 import { IncomingUniRouter, type RoutedIncomingUniStream } from './incoming-uni.js';
+import type { RequestStreamDraft } from '@openmoq/transport';
 
 /**
  * Marks a request stream torn down by a LOCAL cancellation (e.g. draft-18 FETCH
@@ -107,8 +108,8 @@ export interface ContinuingRequestStream {
 }
 
 export class UniPairTopology {
-  /** The request-stream draft (18 or 21) this topology speaks. */
-  readonly version: 18 | 21;
+  /** The request-stream draft (18 or 22) this topology speaks. */
+  readonly version: RequestStreamDraft;
   private readonly codec: ControlCodec;
 
   /** Our outbound uni control stream writer. Held open for the session lifetime
@@ -170,7 +171,7 @@ export class UniPairTopology {
   onRequestClosed?: (requestId: bigint, disposition: 'fin' | 'reset') => void | Promise<void>;
 
   constructor(private readonly session: Session) {
-    this.version = session.draftVersion === 21 ? 21 : 18;
+    this.version = session.draftVersion === 22 ? 22 : 18;
     this.codec = createControlCodec(this.version);
   }
 
@@ -974,7 +975,7 @@ class RequestStreamContext {
             await this.onPeerRequest?.(message);
             continue;
           }
-          // draft-21 §9.10: PUBLISH_STATE_NOTIFY is a publisher's report on a
+          // draft-22 §9.10: PUBLISH_STATE_NOTIFY is a publisher's report on a
           // subscription's request stream, after SUBSCRIBE_OK. Not a response to
           // any local operation — never FIFO-matched. Anywhere else it is a
           // protocol violation.

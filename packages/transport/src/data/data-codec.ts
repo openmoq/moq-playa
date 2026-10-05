@@ -116,7 +116,7 @@ export interface DataCodec {
  * @throws {Error} for draft versions without a wired data codec.
  */
 export function createDataCodec(version: DraftVersion = 16): DataCodec {
-  if (version === 18 || version === 21) {
+  if (version === 18 || version === 22) {
     return createDataCodec18(version);
   }
   if (!isWiredDraft(version)) {

@@ -344,7 +344,7 @@ export interface Fetch {
 }
 
 /**
- * draft-21 §9.10 PUBLISH_STATE_NOTIFY: a publisher's report, on a subscription's
+ * draft-22 §9.10 PUBLISH_STATE_NOTIFY: a publisher's report, on a subscription's
  * request stream, of LARGEST_OBJECT, FORWARD and the LOCATION_FILTER in effect.
  * Parameters only; the topology stamps the Request ID from the stream context.
  */

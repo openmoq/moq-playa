@@ -87,7 +87,7 @@ import { IncomingUniRouter, type RoutedIncomingUniStream } from './topology/inco
 import { InboundRequestStreamContext } from './topology/inbound-request.js';
 import { MoqtConnectionError } from './adapter-error.js';
 import type { WebTransportLike, WebTransportBidirectionalStream, MoqtSetupRouting } from './types.js';
-import { isDraft21, isRequestStreamDraft, isWiredDraft } from '@openmoq/transport';
+import { isDraft22, isRequestStreamDraft, isWiredDraft } from '@openmoq/transport';
 
 
 
@@ -139,7 +139,7 @@ export interface TrackSubscribeOptions extends AuthorizationOptions {
    */
   readonly deliveryTimeout?: SubscribeOptions['deliveryTimeout'];
   /**
-   * draft-21 §3.4 FILL_PARAMETERS: the publisher also delivers the fill range on
+   * draft-22 §3.4 FILL_PARAMETERS: the publisher also delivers the fill range on
    * a fill fetch stream. Its objects reach the connection's `onObject` like FETCH
    * objects; `onDataStream` announces the stream with `fill: true` and this
    * subscription's Request ID in the FETCH_HEADER.
@@ -181,9 +181,9 @@ interface RawSubState {
   readonly sub: TrackSubscription;
   resolve: ((sub: TrackSubscription) => void) | null;
   reject: ((err: Error) => void) | null;
-  /** The subscription's Location filter, re-applied when its alias is shared (draft-21 §3.1). */
+  /** The subscription's Location filter, re-applied when its alias is shared (draft-22 §3.1). */
   readonly filter?: SubscriptionFilter;
-  /** `filter` resolved against SUBSCRIBE_OK's Largest Object (draft 21). */
+  /** `filter` resolved against SUBSCRIBE_OK's Largest Object (draft 22). */
   window?: SubscriptionWindow;
   /** Objects already delivered while the alias is shared, for deduplication (bounded). */
   seen?: Set<string>;
@@ -253,7 +253,7 @@ export interface IncomingPublish {
  * than trying to construct a codec for an unwired draft.
  *
  * @see draft-ietf-moq-transport-16 §3.1
- * - 'moqt-21' → 21, 'moqt-18' → 18, 'moqt-16' → 16
+ * - 'moqt-22' → 22, 'moqt-18' → 18, 'moqt-16' → 16
  * - 'moq-00' → 14 (pre-15 convention)
  * - '' / undefined / unsupported token → undefined (use constructor version)
  */
@@ -336,7 +336,7 @@ function splitOwnership<T extends object>(
   return { sessionOptions: rest as T, onRequestId };
 }
 
-/** draft-21 FILL_PARAMETERS message parameter (§9.20.16). */
+/** draft-22 FILL_PARAMETERS message parameter (§9.20.15). */
 const FILL_PARAMETERS = 0x23n;
 
 export class MoqtConnection {
@@ -440,7 +440,7 @@ export class MoqtConnection {
   /** Track subscriptions by trackAlias (active, alias resolved). */
   private rawAliasMaps = new Map<bigint, RawSubState>();
   /**
-   * draft-21 §3.1: every subscription sharing a Track Alias (two or more, same
+   * draft-22 §3.1: every subscription sharing a Track Alias (two or more, same
    * track), in binding order. `rawAliasMaps` keeps the first as the alias owner
    * for the terminal machinery; objects go to each member whose filter matches.
    */
@@ -513,12 +513,12 @@ export class MoqtConnection {
     groupOrder: GroupOrder;
     prior: FetchObjectPrior18 | undefined;
     isFirstObject: boolean;
-    /** A draft-21 fill stream: the Request ID of the subscription it fills. */
+    /** A draft-22 fill stream: the Request ID of the subscription it fills. */
     fillOf?: bigint;
   }>();
-  /** Inbound draft-21 fills asked for and not yet served: fill Request ID → SUBSCRIBE Request ID. */
+  /** Inbound draft-22 fills asked for and not yet served: fill Request ID → SUBSCRIBE Request ID. */
   private readonly inboundFillRequests = new Map<bigint, bigint>();
-  /** Inbound draft-21 fills served (their one-stream reservation stays): fill Request ID → SUBSCRIBE Request ID. */
+  /** Inbound draft-22 fills served (their one-stream reservation stays): fill Request ID → SUBSCRIBE Request ID. */
   private readonly servedFills = new Map<bigint, bigint>();
 
   /**
@@ -1219,7 +1219,7 @@ export class MoqtConnection {
   /** §9.15 sentinel: publisher could not set an exact Stream Count. */
   private static readonly STREAM_COUNT_UNKNOWN = (1n << 62n) - 1n;
   /**
-   * draft-21 §3.4 fill fetch streams, by the Request ID that asked for the fill
+   * draft-22 §3.4 fill fetch streams, by the Request ID that asked for the fill
    * (the SUBSCRIBE's, or a REQUEST_UPDATE's), with the subscription they fill.
    * Kept apart from `fetchStreams`: a fill has no FETCH of its own, and ending
    * it must not touch the subscription's request stream.
@@ -1379,10 +1379,10 @@ export class MoqtConnection {
       // Native QUIC support starts at draft 18. Unlike the historical
       // WebTransport fallback, ALPN is mandatory and must identify the exact
       // wire draft before any MOQT stream is opened.
-      const nativeDraft = transport.protocol === 'moqt-18' ? 18 : transport.protocol === 'moqt-21' ? 21 : undefined;
+      const nativeDraft = transport.protocol === 'moqt-18' ? 18 : transport.protocol === 'moqt-22' ? 22 : undefined;
       if (nativeDraft === undefined) {
         throw new ProtocolViolationError(
-          `native QUIC negotiated ALPN ${JSON.stringify(transport.protocol ?? '')}; expected "moqt-18" or "moqt-21"`,
+          `native QUIC negotiated ALPN ${JSON.stringify(transport.protocol ?? '')}; expected "moqt-18" or "moqt-22"`,
         );
       }
       if (this._requestedVersion !== undefined && this._requestedVersion !== nativeDraft) {
@@ -1602,7 +1602,7 @@ export class MoqtConnection {
       onRequestId(requestId);
     } catch (err) {
       // No bytes were sent — ordinary rollback, no provenance needed.
-      if (!this.session.rollbackUnsentRequest(requestId) && this.session.draftVersion !== 18) {
+      if (!this.session.rollbackUnsentRequest(requestId) && !isRequestStreamDraft(this.session.draftVersion)) {
         this.closeSessionInternalError('Unsent request ID cannot be reclaimed after reentrant allocation');
       }
       throw err;
@@ -2251,7 +2251,7 @@ export class MoqtConnection {
     // send direction and drains to the publisher's FIN.
     if (message.type === 'PUBLISH_DONE') {
       // A subscription sharing its alias ends alone: the alias, its streams and
-      // their terminal accounting stay with the other subscriptions (draft-21 §3.1).
+      // their terminal accounting stay with the other subscriptions (draft-22 §3.1).
       const doneRaw = this.rawSubscriptions.get(originalRequestId);
       const aliasStillShared = doneRaw !== undefined && this.detachSharedAlias(doneRaw);
       // Capture the alias BEFORE the session reclaims the subscription.
@@ -2284,7 +2284,7 @@ export class MoqtConnection {
       }
       return;
     }
-    // draft-21 §9.10: the publisher's report on OUR subscription's request stream.
+    // draft-22 §9.10: the publisher's report on OUR subscription's request stream.
     // Stamp the subscription's request ID, let the session apply it (Largest
     // Location; an out-of-scope parameter closes the session), surface to the app.
     if (message.type === 'PUBLISH_STATE_NOTIFY') {
@@ -2372,7 +2372,7 @@ export class MoqtConnection {
     // request STILL owns the alias routing: a delayed peer-close after the alias
     // was legitimately reused by a new subscription must not re-tombstone it.
     const raw = this.rawSubscriptions.get(requestId);
-    // A subscription sharing its alias leaves it to the others (draft-21 §3.1).
+    // A subscription sharing its alias leaves it to the others (draft-22 §3.1).
     if (raw) this.detachSharedAlias(raw);
     const teardownAlias = raw && raw.trackAlias !== null && this.rawAliasMaps.get(raw.trackAlias) === raw
       ? raw.trackAlias : null;
@@ -2518,13 +2518,13 @@ export class MoqtConnection {
    * Called from data stream handlers before this.onObject.
    */
   /**
-   * Bind a subscription's route at SUBSCRIBE_OK. On draft 21 a publisher MAY give
+   * Bind a subscription's route at SUBSCRIBE_OK. On draft 22 a publisher MAY give
    * concurrent subscriptions to one track the same alias (§3.1); the session has
    * already verified it is the same track, so the subscription joins the alias's
    * group instead of replacing the route.
    */
   private bindRawAlias(alias: bigint, raw: RawSubState, ok: ControlMessage): void {
-    if (!isDraft21(this.session.draftVersion)) {
+    if (!isDraft22(this.session.draftVersion)) {
       this.rawAliasMaps.set(alias, raw);
       return;
     }
@@ -2543,7 +2543,7 @@ export class MoqtConnection {
   }
 
   /**
-   * draft-21 §3.1: an object on a shared alias could belong to any of the
+   * draft-22 §3.1: an object on a shared alias could belong to any of the
    * subscriptions; each receives it when its filter matches, at most once (the
    * publisher sends one copy per matching subscription).
    */
@@ -3116,7 +3116,7 @@ export class MoqtConnection {
     // the updated window are still valid.
     this.refreshAliasDeliveryTimeout(alias);
     const seen = this.aliasStreamsSeen.get(alias) ?? 0n;
-    // draft 21 raised the sentinel to 2^64-1 (§9.9); anything at or above 2^62-1 is unknown.
+    // draft 22 raised the sentinel to 2^64-1 (§9.9); anything at or above 2^62-1 is unknown.
     const remaining: bigint | null = streamCount >= MoqtConnection.STREAM_COUNT_UNKNOWN
       ? null // §9.15 sentinel: exact count unknown — rely on the TTL only
       : (streamCount - seen > 0n ? streamCount - seen : 0n);
@@ -3374,13 +3374,13 @@ export class MoqtConnection {
     // direct API, the TrackSubscription wrapper, and the peer-close path all
     // arm at the same point and cannot diverge.
     const raw = this.rawSubscriptions.get(requestId);
-    // A subscription sharing its alias leaves it to the others (draft-21 §3.1).
+    // A subscription sharing its alias leaves it to the others (draft-22 §3.1).
     if (raw) this.detachSharedAlias(raw);
     if (raw && raw.trackAlias !== null && this.rawAliasMaps.get(raw.trackAlias) === raw) {
       this.armSubscriberAliasTeardown(raw.trackAlias);
     }
 
-    // draft-21 §3.4: the fill ends with its subscription.
+    // draft-22 §3.4: the fill ends with its subscription.
     await this.cancelFill(requestId);
     const actions = this.session.unsubscribe(requestId); // draft-18 returns no send_control
     await this.executeActions(actions);
@@ -3774,7 +3774,7 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-16 §5.2, §9.18; draft-ietf-moq-transport-18 §3.3.2
    */
   /**
-   * Stop a draft-21 fill (§3.4) without touching its subscription: STOP_SENDING on
+   * Stop a draft-22 fill (§3.4) without touching its subscription: STOP_SENDING on
    * the fill fetch stream if it is open, or discard it when it arrives. The
    * subscription keeps delivering live objects.
    *
@@ -5237,7 +5237,7 @@ export class MoqtConnection {
   }
 
   /**
-   * draft-21 §3.4: open the fill stream for an inbound SUBSCRIBE, or a
+   * draft-22 §3.4: open the fill stream for an inbound SUBSCRIBE, or a
    * REQUEST_UPDATE on one, that carried FILL_PARAMETERS. It is a fetch stream
    * whose FETCH_HEADER carries that message's Request ID, written with {@link sendFetchObject} /
    * {@link sendFetchEndOfRange} in ascending order; {@link closeFetchStream}
@@ -6013,11 +6013,11 @@ export class MoqtConnection {
       // session routes it by the opener — a PUBLISH subscription update, or a
       // §10.9.2 SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS prefix update.
       const updateId = (message as { requestId: bigint }).requestId;
-      // draft-21 §9.1.7: updates are answered at once except on a still-pending
+      // draft-22 §9.1.7: updates are answered at once except on a still-pending
       // SUBSCRIBE, where the answers queue behind SUBSCRIBE_OK. A peer that sends
       // one more than our MAX_REQUEST_UPDATES while they queue closes the session.
       const ownMaxUpdates = this.session.ownMaxRequestUpdates;
-      if (isDraft21(this.session.draftVersion) && ownMaxUpdates > 0n
+      if (isDraft22(this.session.draftVersion) && ownMaxUpdates > 0n
           && BigInt(this.deferredUpdateResponses.get(originalId)?.length ?? 0) >= ownMaxUpdates) {
         const reason = `more than MAX_REQUEST_UPDATES (${ownMaxUpdates}) unanswered REQUEST_UPDATEs on request ${originalId}`;
         const closeActions = this.session.close(SessionError.TOO_MANY_REQUEST_UPDATES, reason);
@@ -6041,9 +6041,9 @@ export class MoqtConnection {
         return;
       }
       const send = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
-      // draft-21 §3.4: an accepted update carrying FILL_PARAMETERS asks for a fill
+      // draft-22 §3.4: an accepted update carrying FILL_PARAMETERS asks for a fill
       // under the update's own Request ID (served with openFillStream).
-      if (isDraft21(this.session.draftVersion) && ctx.openerKind === 'subscribe'
+      if (isDraft22(this.session.draftVersion) && ctx.openerKind === 'subscribe'
           && send?.message.type !== 'REQUEST_ERROR'
           && (message as { parameters?: Map<bigint, unknown> }).parameters?.has(FILL_PARAMETERS)) {
         this.inboundFillRequests.set(updateId, originalId);
@@ -6228,7 +6228,7 @@ export class MoqtConnection {
     await this.executeActions(actions);
     ctx.bind(requestId, 'subscribe');
     this.inboundRequestContexts.set(requestId, ctx);
-    if (isDraft21(this.session.draftVersion) && sub.parameters.has(FILL_PARAMETERS)) {
+    if (isDraft22(this.session.draftVersion) && sub.parameters.has(FILL_PARAMETERS)) {
       this.inboundFillRequests.set(requestId, requestId);
     }
     this.onSubscribe?.(requestId, sub.trackNamespace, sub.trackName, sub.parameters as Map<bigint, unknown>);
@@ -6616,10 +6616,10 @@ export class MoqtConnection {
       } else {
         const header = headerResult.header as FetchHeader;
         const fetchReqId = header.requestId as bigint;
-        // draft-21 §3.4: a fill fetch stream carries the Request ID of the SUBSCRIBE
+        // draft-22 §3.4: a fill fetch stream carries the Request ID of the SUBSCRIBE
         // or REQUEST_UPDATE that asked for it. One stream per fill; the session
         // stops expecting it once this one is accepted.
-        const fillSub = isDraft21(this.session.draftVersion) && !this.recentlyCancelledFetches.has(fetchReqId)
+        const fillSub = isDraft22(this.session.draftVersion) && !this.recentlyCancelledFetches.has(fetchReqId)
           ? this.session.takeFill(fetchReqId)
           : undefined;
         if (fillSub !== undefined) {
@@ -7125,7 +7125,7 @@ export class MoqtConnection {
     // group-order map is recorded for every fetch() (Ascending by default), so a
     // missing entry means an unknown/unrequested fetch — a PROTOCOL_VIOLATION,
     // never a silently-defaulted decode.
-    // A draft-21 fill is delivered in ascending order (§3.4); a FETCH records its own.
+    // A draft-22 fill is delivered in ascending order (§3.4); a FETCH records its own.
     const groupOrder = this.fetchGroupOrder.get(header.requestId)
       ?? (this.fillStreams.get(header.requestId as bigint)?.streamId === streamId ? 'ascending' : undefined);
     if (groupOrder === undefined) {

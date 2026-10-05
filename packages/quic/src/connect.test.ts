@@ -299,19 +299,19 @@ describe('connectQuicWithRuntime', () => {
     expect(await transport.datagrams.readable.getReader().read()).toEqual({ done: false, value: new Uint8Array([4, 5]) });
   });
 
-  it('offers moqt-21 when asked for draft 21 and reports it as the protocol', async () => {
-    const session = new FakeSession({ protocol: 'moqt-21' });
+  it('offers moqt-22 when asked for draft 22 and reports it as the protocol', async () => {
+    const session = new FakeSession({ protocol: 'moqt-22' });
     const fake = fakeRuntime(session);
-    const transport = await connectQuicWithRuntime('moqt://relay.example/moq', { draft: 21 }, fake.runtime);
-    expect(fake.options()).toMatchObject({ alpn: 'moqt-21' });
-    expect(transport.protocol).toBe('moqt-21');
+    const transport = await connectQuicWithRuntime('moqt://relay.example/moq', { draft: 22 }, fake.runtime);
+    expect(fake.options()).toMatchObject({ alpn: 'moqt-22' });
+    expect(transport.protocol).toBe('moqt-22');
   });
 
   it('refuses a handshake that negotiated a different draft than the one offered', async () => {
     const session = new FakeSession({ protocol: 'moqt-18' });
     const fake = fakeRuntime(session);
-    await expect(connectQuicWithRuntime('moqt://relay.example/moq', { draft: 21 }, fake.runtime))
-      .rejects.toThrow(/negotiated ALPN "moqt-18"; expected "moqt-21"/);
+    await expect(connectQuicWithRuntime('moqt://relay.example/moq', { draft: 22 }, fake.runtime))
+      .rejects.toThrow(/negotiated ALPN "moqt-18"; expected "moqt-22"/);
   });
 
   it('fails startup even when rejecting an invalid incoming stream throws', async () => {

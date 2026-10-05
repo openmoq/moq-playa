@@ -62,7 +62,7 @@ export async function connectedPair(
     faults?: { a?: PipeFaults; b?: PipeFaults };
     serverOptions?: { joiningFetchTimeoutMs?: number; terminatedAliasTtlMs?: number };
     clientOptions?: { joiningFetchTimeoutMs?: number; terminatedAliasTtlMs?: number };
-    /** Extra Setup Options the server advertises (e.g. draft-21 maxRequestUpdates). */
+    /** Extra Setup Options the server advertises (e.g. draft-22 maxRequestUpdates). */
     serverSetup?: SetupOptions;
   } = {},
 ): Promise<ConnectedPair> {

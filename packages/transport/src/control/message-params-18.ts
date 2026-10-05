@@ -21,7 +21,7 @@
 import { readVi64, writeVi64, vi64EncodingLength, MAX_VI64 } from '../primitives/vi64.js';
 import { readUint8, writeUint8, validateTrackNamespacePrefix } from '../primitives/bytes.js';
 import { ProtocolViolationError } from '../errors.js';
-import { MessageParam18, MessageParam21, type ParamValueKind } from './codes-18.js';
+import { MessageParam18, MessageParam22, type ParamValueKind } from './codes-18.js';
 
 export type { ParamValueKind };
 
@@ -33,7 +33,37 @@ export type MessageParamValue =
   | { readonly kind: 'bytes'; readonly value: Uint8Array }
   // Track Namespace structure (§2.4.1): vi64 field count + vi64-length-prefixed
   // fields. The semantic value is the field list (e.g. TRACK_NAMESPACE_PREFIX).
-  | { readonly kind: 'namespace'; readonly value: Uint8Array[] };
+  | { readonly kind: 'namespace'; readonly value: Uint8Array[] }
+  // draft-22 LOCATION_FILTER (§9.20.9): the Location Filter Type and its fields,
+  // written as-is with no Length (the type delimits the value).
+  | { readonly kind: 'locationFilter'; readonly value: Uint8Array };
+
+// ─── draft-22 LOCATION_FILTER (type + 0-4 vi64 fields, no Length) ─────
+
+/** Fields that follow each draft-22 Location Filter Type (0x00-0x05). */
+const LOCATION_FILTER_FIELD_COUNTS = [0, 1, 2, 3, 4, 0] as const;
+
+/**
+ * The byte length of the draft-22 LOCATION_FILTER value starting at `offset`.
+ * @throws {ProtocolViolationError} on an unknown type or a truncated field.
+ */
+export function typedLocationFilterLength(buf: Uint8Array, offset: number): number {
+  let p = offset;
+  try {
+    const type = readVi64(buf, p);
+    p += type.bytesRead;
+    if (type.value > 5n) {
+      throw new ProtocolViolationError(`Unknown Location Filter Type 0x${type.value.toString(16)}`);
+    }
+    for (let i = 0; i < LOCATION_FILTER_FIELD_COUNTS[Number(type.value)]!; i++) {
+      p += readVi64(buf, p).bytesRead;
+    }
+  } catch (err) {
+    if (err instanceof ProtocolViolationError) throw err;
+    throw new ProtocolViolationError('LOCATION_FILTER has a truncated field');
+  }
+  return p - offset;
+}
 
 // ─── Track Namespace tuple (vi64 count + vi64-length-prefixed fields) ──
 
@@ -104,9 +134,9 @@ export const DEFAULT_MESSAGE_PARAM_REGISTRY: MessageParamRegistry = new Map(
   Object.values(MessageParam18).map((d) => [BigInt(d.type), d.kind] as const),
 );
 
-/** Registry built from the draft-21 message-parameter type table (draft-21 §16.7). */
-export const DRAFT21_MESSAGE_PARAM_REGISTRY: MessageParamRegistry = new Map(
-  Object.values(MessageParam21).map((d) => [BigInt(d.type), d.kind] as const),
+/** Registry built from the draft-22 message-parameter type table. */
+export const DRAFT22_MESSAGE_PARAM_REGISTRY: MessageParamRegistry = new Map(
+  Object.values(MessageParam22).map((d) => [BigInt(d.type), d.kind] as const),
 );
 
 // ─── value length / write / read ─────────────────────────────────────
@@ -123,6 +153,8 @@ function paramValueLength(v: MessageParamValue): number {
       return vi64EncodingLength(BigInt(v.value.length)) + v.value.length;
     case 'namespace':
       return namespaceTupleLength(v.value);
+    case 'locationFilter':
+      return v.value.length;
   }
 }
 
@@ -147,6 +179,9 @@ function writeParamValue(v: MessageParamValue, buf: Uint8Array, offset: number):
     }
     case 'namespace':
       return writeNamespaceTuple(v.value, buf, offset);
+    case 'locationFilter':
+      buf.set(v.value, offset);
+      return v.value.length;
   }
 }
 
@@ -187,6 +222,10 @@ function readParamValue(
     case 'namespace': {
       const { value, bytesRead } = readNamespaceTuple(buf, offset);
       return { value: { kind: 'namespace', value }, bytesRead };
+    }
+    case 'locationFilter': {
+      const n = typedLocationFilterLength(buf, offset);
+      return { value: { kind: 'locationFilter', value: buf.slice(offset, offset + n) }, bytesRead: n };
     }
   }
 }

@@ -13,7 +13,7 @@ const STREAM_RESET_CODES = new Set([0n, 1n, 2n, 3n, 4n, 5n, 6n, 7n, 9n, 0x12n]);
 const SESSION_ERROR_CODES = new Set([
   0n, 1n, 2n, 3n, 4n, 5n, 6n, 8n, 9n,
   0x10n, 0x11n, 0x12n, 0x13n, 0x14n, 0x15n, 0x16n, 0x17n, 0x18n, 0x19n, 0x1an,
-  0x1bn, // draft-21 TOO_MANY_REQUEST_UPDATES
+  0x1bn, // draft-22 TOO_MANY_REQUEST_UPDATES
 ]);
 
 interface MoqtSetupRouting {
@@ -22,7 +22,7 @@ interface MoqtSetupRouting {
 }
 
 /** The MOQT ALPN tokens the native binding can negotiate. */
-export type MoqtQuicProtocol = 'moqt-18' | 'moqt-21';
+export type MoqtQuicProtocol = 'moqt-18' | 'moqt-22';
 
 /** Native QUIC transport plus the routing fields required in MOQT SETUP. */
 export interface MoqtQuicTransport extends WebTransportLike {

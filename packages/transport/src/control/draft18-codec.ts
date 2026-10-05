@@ -67,12 +67,12 @@ import {
   decodeMessageParams18,
   messageParams18EncodingLength,
   DEFAULT_MESSAGE_PARAM_REGISTRY,
-  DRAFT21_MESSAGE_PARAM_REGISTRY,
+  DRAFT22_MESSAGE_PARAM_REGISTRY,
   type MessageParams18,
   type MessageParamRegistry,
   type MessageParamValue,
 } from './message-params-18.js';
-import { encodeLocationFilterFields, decodeLocationFilterFields } from './subscription-filter.js';
+import { encodeFetchLocationFilter, decodeFetchLocationFilter } from './subscription-filter.js';
 import {
   encodeTrackProperties18,
   decodeTrackProperties18,
@@ -80,6 +80,7 @@ import {
 } from './track-properties-18.js';
 import { ProtocolViolationError } from '../errors.js';
 import { validateTrackNamespacePrefix, validateFullTrackName, validateTrackNamespace } from '../primitives/bytes.js';
+import type { RequestStreamDraft } from '../versions.js';
 
 /** Error Code value that carries an optional Redirect structure (§10.6.2). */
 const REDIRECT_ERROR_CODE = 0x34n;
@@ -163,7 +164,7 @@ const TEXT_DECODER = new TextDecoder();
 /** §10.4: maximum New Session URI length; longer → PROTOCOL_VIOLATION. */
 const GOAWAY_MAX_URI_LENGTH = 8192;
 
-/** draft-21 LOCATION_FILTER (§9.20.10), the 0x21 message parameter. */
+/** draft-22 LOCATION_FILTER (§9.20.9), the 0x21 message parameter. */
 const LOCATION_FILTER_TYPE = 0x21n;
 
 /** §1.4.2: maximum Reason Phrase length in bytes; longer → PROTOCOL_VIOLATION. */
@@ -310,6 +311,9 @@ function toTypedParam(type: bigint, v: ParameterValue, registry: MessageParamReg
     case 'bytes':
       if (!(v instanceof Uint8Array)) throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} expects bytes`);
       return { kind: 'bytes', value: v };
+    case 'locationFilter':
+      if (!(v instanceof Uint8Array)) throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} expects a LOCATION_FILTER`);
+      return { kind: 'locationFilter', value: v };
     case 'location':
       if (!isLocation(v)) throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} expects Location`);
       return { kind: 'location', group: v.group, object: v.object };
@@ -348,6 +352,7 @@ function fromTypedParam(v: MessageParamValue): ParameterValue {
       // rather than re-capping through the QUIC Varint range.
       return v.value;
     case 'bytes':
+    case 'locationFilter':
       return v.value;
     case 'location':
       return { group: v.group, object: v.object };
@@ -370,14 +375,14 @@ const notImplemented = (what: string): never => {
 
 export class Draft18Codec implements ControlCodec {
   /**
-   * @param version 18, or 21 for the draft-21 variant of the same stream
+   * @param version 18, or 22 for the draft-22 variant of the same stream
    *   model (its differing messages branch on this).
    */
-  constructor(readonly version: 18 | 21 = 18) {}
+  constructor(readonly version: RequestStreamDraft = 18) {}
 
   /** The message-parameter table of this codec's draft. */
   private get paramRegistry(): MessageParamRegistry {
-    return this.version === 21 ? DRAFT21_MESSAGE_PARAM_REGISTRY : DEFAULT_MESSAGE_PARAM_REGISTRY;
+    return this.version === 22 ? DRAFT22_MESSAGE_PARAM_REGISTRY : DEFAULT_MESSAGE_PARAM_REGISTRY;
   }
 
   encode(msg: ControlMessage): Uint8Array {
@@ -395,7 +400,7 @@ export class Draft18Codec implements ControlCodec {
       case 'REQUEST_ERROR':
         return this.frame(ControlMessageType18.REQUEST_ERROR, this.encodeRequestError(msg));
       case 'FETCH':
-        return this.frame(ControlMessageType18.FETCH, this.version === 21 ? this.encodeFetch21(msg) : this.encodeFetch(msg));
+        return this.frame(ControlMessageType18.FETCH, this.version === 22 ? this.encodeFetch22(msg) : this.encodeFetch(msg));
       case 'FETCH_OK':
         return this.frame(ControlMessageType18.FETCH_OK, this.encodeFetchOk(msg));
       case 'TRACK_STATUS':
@@ -419,8 +424,8 @@ export class Draft18Codec implements ControlCodec {
       case 'GOAWAY':
         return this.frame(ControlMessageType18.GOAWAY, this.encodeGoaway(msg));
       case 'PUBLISH_STATE_NOTIFY':
-        if (this.version !== 21) {
-          throw new ProtocolViolationError('Draft18Codec: PUBLISH_STATE_NOTIFY exists only in draft 21');
+        if (this.version !== 22) {
+          throw new ProtocolViolationError('Draft18Codec: PUBLISH_STATE_NOTIFY exists only in draft 22');
         }
         return this.frame(ControlMessageType18.PUBLISH_STATE_NOTIFY, this.encodeParamsOnly(msg.parameters));
       case 'PUBLISH_NAMESPACE_DONE':
@@ -456,7 +461,7 @@ export class Draft18Codec implements ControlCodec {
       case ControlMessageType18.REQUEST_ERROR:
         return { message: this.decodeRequestError(payload), bytesRead: total };
       case ControlMessageType18.FETCH:
-        return { message: this.version === 21 ? this.decodeFetch21(payload) : this.decodeFetch(payload), bytesRead: total };
+        return { message: this.version === 22 ? this.decodeFetch22(payload) : this.decodeFetch(payload), bytesRead: total };
       case ControlMessageType18.FETCH_OK:
         return { message: this.decodeFetchOk(payload), bytesRead: total };
       case ControlMessageType18.TRACK_STATUS:
@@ -480,7 +485,7 @@ export class Draft18Codec implements ControlCodec {
       case ControlMessageType18.GOAWAY:
         return { message: this.decodeGoaway(payload), bytesRead: total };
       case ControlMessageType18.PUBLISH_STATE_NOTIFY:
-        if (this.version !== 21) return notImplemented(`decode of type 0x${type.toString(16)}`);
+        if (this.version !== 22) return notImplemented(`decode of type 0x${type.toString(16)}`);
         return {
           message: { type: 'PUBLISH_STATE_NOTIFY', parameters: this.decodeParamsOnly(payload, 'PUBLISH_STATE_NOTIFY') },
           bytesRead: total,
@@ -807,8 +812,8 @@ export class Draft18Codec implements ControlCodec {
       throw new ProtocolViolationError(`GOAWAY New Session URI length ${uri.length} exceeds maximum ${GOAWAY_MAX_URI_LENGTH} bytes`);
     }
     const timeout = msg.timeout ?? 0n;
-    // draft-21 §9.2 dropped the Request ID.
-    const requestId = this.version === 21 ? undefined : msg.requestId;
+    // draft-22 §9.2 dropped the Request ID.
+    const requestId = this.version === 22 ? undefined : msg.requestId;
     let len = vi64BytesLength(uri) + vi64EncodingLength(timeout);
     if (requestId !== undefined) len += vi64EncodingLength(requestId);
     const buf = new Uint8Array(len);
@@ -828,12 +833,12 @@ export class Draft18Codec implements ControlCodec {
     // Request ID is present only on the control stream (§10.4). The codec is
     // context-free: read it iff bytes remain, and expose it optionally.
     let requestId: bigint | undefined;
-    if (p < payload.length && this.version !== 21) {
+    if (p < payload.length && this.version !== 22) {
       const rid = readVi64(payload, p); p += rid.bytesRead;
       requestId = rid.value;
     }
     if (p !== payload.length) {
-      throw new ProtocolViolationError(this.version === 21
+      throw new ProtocolViolationError(this.version === 22
         ? `GOAWAY: ${payload.length - p} trailing bytes after Timeout`
         : `GOAWAY: ${payload.length - p} trailing bytes after Request ID`);
     }
@@ -1095,17 +1100,17 @@ export class Draft18Codec implements ControlCodec {
     return { type: 'FETCH', requestId: rid.value, fetch, parameters: typedToParams(params.params) };
   }
 
-  // ── draft-21 FETCH (§9.11): Request ID, Full Track Name, Parameters ──
+  // ── draft-22 FETCH (§9.11): Request ID, Full Track Name, Parameters ──
   // The range is a LOCATION_FILTER parameter. A StandaloneFetch's draft-18
   // range maps onto it: the draft-18 End Location's Object is exclusive, with 0
   // meaning the whole End Group, while the LOCATION_FILTER's EndObject is
   // inclusive and omitted for a whole group. There is no Joining FETCH: a
   // subscriber asks for the prefix with FILL_PARAMETERS on its SUBSCRIBE.
 
-  private encodeFetch21(msg: Fetch): Uint8Array {
+  private encodeFetch22(msg: Fetch): Uint8Array {
     const f = msg.fetch;
     if (f.fetchType !== 0x1) {
-      throw new ProtocolViolationError('draft-21 has no Joining FETCH; request the prefix with FILL_PARAMETERS');
+      throw new ProtocolViolationError('draft-22 has no Joining FETCH; request the prefix with FILL_PARAMETERS');
     }
     validateFullTrackName(f.trackNamespace, f.trackName, { allowEmptyNamespace: true });
     const parameters = new Map(msg.parameters);
@@ -1116,7 +1121,7 @@ export class Draft18Codec implements ControlCodec {
       }
       const fields = [start.group, start.object, end.group - start.group];
       if (end.object > 0n) fields.push(end.object - 1n);
-      parameters.set(LOCATION_FILTER_TYPE, [encodeLocationFilterFields(fields)]);
+      parameters.set(LOCATION_FILTER_TYPE, [encodeFetchLocationFilter(fields)]);
     }
     const typed = paramsToTyped(parameters, this.paramRegistry);
     const len =
@@ -1133,14 +1138,14 @@ export class Draft18Codec implements ControlCodec {
   }
 
   /**
-   * Decodes a draft-21 FETCH into a StandaloneFetch. An absolute LOCATION_FILTER
+   * Decodes a draft-22 FETCH into a StandaloneFetch. An absolute LOCATION_FILTER
    * with an end maps back to the draft-18 range; a filter that depends on the
    * Largest Object (one field, or two fields with no end) or no filter at all
    * gets a start of {0, 0} or its StartGroup/StartObject and an open end
    * ({2^64-1, 0}), and the LOCATION_FILTER stays in `parameters` for the
    * receiver to resolve.
    */
-  private decodeFetch21(payload: Uint8Array): DecodedControlMessage {
+  private decodeFetch22(payload: Uint8Array): DecodedControlMessage {
     let p = 0;
     const rid = readVi64(payload, p); p += rid.bytesRead;
     const ns = readVi64Tuple(payload, p); p += ns.bytesRead;
@@ -1157,7 +1162,7 @@ export class Draft18Codec implements ControlCodec {
     if (filter !== undefined) {
       if (!(filter instanceof Uint8Array)) throw new ProtocolViolationError('FETCH: LOCATION_FILTER is not bytes');
       try {
-        fields = decodeLocationFilterFields(filter);
+        fields = decodeFetchLocationFilter(filter);
       } catch (e) {
         throw new ProtocolViolationError(`FETCH: ${(e as Error).message}`);
       }
@@ -1180,7 +1185,7 @@ export class Draft18Codec implements ControlCodec {
     };
   }
 
-  // ── draft-21 PUBLISH_STATE_NOTIFY (§9.10): Parameters only ──────────
+  // ── draft-22 PUBLISH_STATE_NOTIFY (§9.10): Parameters only ──────────
 
   private encodeParamsOnly(parameters: Parameters): Uint8Array {
     const typed = paramsToTyped(parameters, this.paramRegistry);

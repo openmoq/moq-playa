@@ -38,7 +38,7 @@ export interface WebTransportFactoryOptions {
    * sends the `WT-Available-Protocols` header to the server. The server
    * selects a protocol and the result is available on `transport.protocol`.
    *
-   * - 21 → `["moqt-21"]`
+   * - 22 → `["moqt-22"]`
    * - 18 → `["moqt-18"]`
    * - 16 → `["moqt-16"]`
    * - 14 → no protocols sent (h3 ALPN fallback, in-band CLIENT_SETUP negotiation)
@@ -47,7 +47,7 @@ export interface WebTransportFactoryOptions {
    * @see draft-ietf-moq-transport-16 §3.1 (version negotiation)
    * @see W3C WebTransport §3.3 (WT-Available-Protocols)
    */
-  readonly draftVersion?: 14 | 16 | 18 | 21;
+  readonly draftVersion?: 14 | 16 | 18 | 22;
 }
 
 /**

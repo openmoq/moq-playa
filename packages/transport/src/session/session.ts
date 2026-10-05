@@ -90,7 +90,7 @@ import { MessageParam } from '../control/parameters.js';
 import type { Parameters, ParameterValue, TrackProperties } from '../control/messages.js';
 import { AuthTokenCache, AuthCacheError } from './auth-cache.js';
 import { AliasType, parseAuthorizationToken, parseAuthorizationToken18, type AuthorizationToken, type ResolvedToken } from '../control/auth-token.js';
-import { isDraft21, isRequestStreamDraft } from '../versions.js';
+import { isDraft22, isRequestStreamDraft } from '../versions.js';
 
 /**
  * Set of known message parameter type codes.
@@ -207,30 +207,30 @@ const VALID_PARAMS_FOR_MESSAGE_TYPE_18: Map<bigint, Set<string>> = new Map([
   [MessageParam.TRACK_NAMESPACE_PREFIX as bigint, new Set(['REQUEST_UPDATE'])],
 ]);
 
-// ─── draft-21 message parameters (draft-21 §9.20, §16.7) ─────────────
+// ─── draft-22 message parameters (draft-22 §9.20, §16.7) ─────────────
 
-/** draft-21 FILL_PARAMETERS (§9.20.16). */
+/** draft-22 FILL_PARAMETERS (§9.20.15). */
 const FILL_PARAMETERS = 0x23n;
 
-/** draft-21 Range Filters (§3.3.2): SUBGROUP, OBJECTID, PRIORITY, OBJECT_PROPERTY, TRACK_PROPERTY. */
-const RANGE_FILTER_PARAMS_21 = new Set<bigint>([0x25n, 0x26n, 0x27n, 0x28n, 0x29n]);
+/** draft-22 Range Filters (§3.3.2): SUBGROUP, OBJECTID, PRIORITY, OBJECT_PROPERTY, TRACK_PROPERTY. */
+const RANGE_FILTER_PARAMS_22 = new Set<bigint>([0x25n, 0x26n, 0x27n, 0x28n, 0x29n]);
 
-/** Every draft-21 message parameter (draft-21 §16.7). */
-const KNOWN_MESSAGE_PARAMS_21 = new Set<bigint>([
+/** Every draft-22 message parameter (draft-22 §16.7). */
+const KNOWN_MESSAGE_PARAMS_22 = new Set<bigint>([
   ...KNOWN_MESSAGE_PARAMS_18,
   FILL_PARAMETERS,
-  ...RANGE_FILTER_PARAMS_21,
+  ...RANGE_FILTER_PARAMS_22,
   0x35n, // INCLUDE_PROPERTIES
 ]);
 
 /**
- * draft-21 message-parameter scope table (§9.20). The same keys as the draft-18
+ * draft-22 message-parameter scope table (§9.20). The same keys as the draft-18
  * table plus PUBLISH_STATE_NOTIFY; PUBLISH_OK carries only EXPIRES (the
  * subscription parameters moved to PUBLISH and REQUEST_UPDATE), 0x21 is the
  * LOCATION_FILTER, which FETCH and PUBLISH_STATE_NOTIFY also carry, and FETCH
  * gains GROUP_ORDER and SUBSCRIBER_PRIORITY. Matches red5-moq-relay's matrix.
  */
-const VALID_PARAMS_FOR_MESSAGE_TYPE_21: Map<bigint, Set<string>> = new Map([
+const VALID_PARAMS_FOR_MESSAGE_TYPE_22: Map<bigint, Set<string>> = new Map([
   [MessageParam.OBJECT_DELIVERY_TIMEOUT as bigint, new Set(['SUBSCRIBE', 'PUBLISH', 'REQUEST_UPDATE', 'SUBSCRIBE_TRACKS'])],
   [MessageParam.AUTHORIZATION_TOKEN as bigint, new Set([
     'PUBLISH', 'SUBSCRIBE', 'REQUEST_UPDATE', 'SUBSCRIBE_NAMESPACE', 'SUBSCRIBE_TRACKS',
@@ -337,9 +337,9 @@ export interface SetupOptions {
    */
   authTokens?: Uint8Array[];
   /**
-   * draft-21 §9.1.7: the MAX_REQUEST_UPDATES to advertise, the number of
+   * draft-22 §9.1.7: the MAX_REQUEST_UPDATES to advertise, the number of
    * unanswered REQUEST_UPDATEs per request stream we accept. Omitted (or 0)
-   * means no limit; ignored before draft 21.
+   * means no limit; ignored before draft 22.
    */
   maxRequestUpdates?: bigint;
 }
@@ -382,12 +382,12 @@ export interface SubscribeOptions extends AuthorizationOptions {
    */
   subscriptionFilter?: SubscriptionFilter;
   /**
-   * draft-21 §3.4 only: FILL_PARAMETERS. The publisher delivers the fill range on
+   * draft-22 §3.4 only: FILL_PARAMETERS. The publisher delivers the fill range on
    * a fill fetch stream whose FETCH_HEADER carries this SUBSCRIBE's Request ID;
    * the stream ends with a FIN when complete, or is reset when the fill fails.
    * `filter` is the fill's Location filter (e.g. `RelativeStart` 1 for the
    * current group); without it the fill covers the whole track. This replaces
-   * the Joining FETCH, which draft 21 removed.
+   * the Joining FETCH, which draft 22 removed.
    */
   fill?: { readonly filter?: SubscriptionFilter };
 }
@@ -419,8 +419,8 @@ export interface RequestUpdateOptions extends AuthorizationOptions {
    */
   trackNamespacePrefix?: Uint8Array[];
   /**
-   * draft-21 §3.4: FILL_PARAMETERS. The publisher opens another fill fetch stream
-   * whose FETCH_HEADER carries this REQUEST_UPDATE's Request ID. Draft 21 only.
+   * draft-22 §3.4: FILL_PARAMETERS. The publisher opens another fill fetch stream
+   * whose FETCH_HEADER carries this REQUEST_UPDATE's Request ID. Draft 22 only.
    */
   fill?: { readonly filter?: SubscriptionFilter };
 }
@@ -727,7 +727,7 @@ export class Session {
   private _peerMaxRequestId: Varint = varint(0n);
   private _ownMaxRequestUpdates = 0n;
   private _peerMaxRequestUpdates = 0n;
-  /** draft-21 fills still expected: fill Request ID → subscription Request ID. */
+  /** draft-22 fills still expected: fill Request ID → subscription Request ID. */
   private readonly fillRequests = new Map<bigint, bigint>();
   private _goawayReceived: boolean = false;
 
@@ -782,12 +782,12 @@ export class Session {
     return this._peerMaxAuthTokenCacheSize;
   }
 
-  /** draft-21 §9.1.7: the MAX_REQUEST_UPDATES we advertised (0 = no limit). */
+  /** draft-22 §9.1.7: the MAX_REQUEST_UPDATES we advertised (0 = no limit). */
   get ownMaxRequestUpdates(): bigint {
     return this._ownMaxRequestUpdates;
   }
 
-  /** draft-21 §9.1.7: the peer's MAX_REQUEST_UPDATES (0 = no limit). */
+  /** draft-22 §9.1.7: the peer's MAX_REQUEST_UPDATES (0 = no limit). */
   get peerMaxRequestUpdates(): bigint {
     return this._peerMaxRequestUpdates;
   }
@@ -834,7 +834,7 @@ export class Session {
     if (isRequestStreamDraft(this._draftVersion)) {
       // draft-18: send the unified SETUP (no MAX_REQUEST_ID — QUIC stream limits).
       const setup = this.setupGate.createSetup18(options);
-      if (isDraft21(this._draftVersion)) this._ownMaxRequestUpdates = options.maxRequestUpdates ?? 0n;
+      if (isDraft22(this._draftVersion)) this._ownMaxRequestUpdates = options.maxRequestUpdates ?? 0n;
       if (options.maxAuthTokenCacheSize !== undefined) {
         this._ownMaxAuthTokenCacheSize = Number(options.maxAuthTokenCacheSize);
       }
@@ -872,7 +872,7 @@ export class Session {
 
     if (isRequestStreamDraft(this._draftVersion)) {
       const setup = this.setupGate.createSetup18(options);
-      if (isDraft21(this._draftVersion)) this._ownMaxRequestUpdates = options.maxRequestUpdates ?? 0n;
+      if (isDraft22(this._draftVersion)) this._ownMaxRequestUpdates = options.maxRequestUpdates ?? 0n;
       if (options.maxAuthTokenCacheSize !== undefined) {
         this._ownMaxAuthTokenCacheSize = Number(options.maxAuthTokenCacheSize);
       }
@@ -1348,9 +1348,9 @@ export class Session {
 
     // draft-18 §10.4: a control-stream GOAWAY MUST carry the Request ID, and its
     // parity MUST match the receiver's own request-id parity (the GOAWAY refers
-    // to the smallest of OUR requests the peer may not have processed). Draft 21
+    // to the smallest of OUR requests the peer may not have processed). Draft 22
     // (§9.2) dropped the Request ID.
-    if (isRequestStreamDraft(this._draftVersion) && !isDraft21(this._draftVersion)) {
+    if (isRequestStreamDraft(this._draftVersion) && !isDraft22(this._draftVersion)) {
       if (msg.requestId === undefined) {
         return this.closeWithError(
           SessionErrorCode.PROTOCOL_VIOLATION,
@@ -1878,7 +1878,7 @@ export class Session {
   }
 
   /**
-   * draft-21 §9.10: the publisher reports, on a subscription's request stream,
+   * draft-22 §9.10: the publisher reports, on a subscription's request stream,
    * the Largest Object it has sent, its Forward State and the Location Filter in
    * effect. The Largest Object advances the subscription's; the rest is the
    * publisher's view and is surfaced to the application as the message itself.
@@ -1886,7 +1886,7 @@ export class Session {
    * stream; one that crosses our own cancellation of the request is ignored.
    */
   private handlePublishStateNotify(msg: PublishStateNotify): SessionOutboundAction[] {
-    if (!isDraft21(this._draftVersion)) return this.handleUnsupportedControlMessage(msg);
+    if (!isDraft22(this._draftVersion)) return this.handleUnsupportedControlMessage(msg);
     const requestId = msg.requestId;
     const sub = requestId !== undefined ? this.subscriptions.get(requestId) : undefined;
     if (sub === undefined) return [];
@@ -2011,12 +2011,12 @@ export class Session {
 
     // §5.1: at most ONE subscription per Track per ROLE (drafts 16/18 only —
     // draft-14 defines neither this rule nor DUPLICATE_SUBSCRIPTION 0x19, and
-    // draft 21 §3.1 allows concurrent subscriptions to one Track). A peer
+    // draft 22 §3.1 allows concurrent subscriptions to one Track). A peer
     // SUBSCRIBE makes US the publisher; if we already hold a publisher-role
     // subscription for the same Full Track Name — an inbound SUBSCRIBE (incl. one
     // Pending) OR a LOCAL outbound PUBLISH — the REQUEST MUST fail with
     // DUPLICATE_SUBSCRIPTION. Request-level, not a session close.
-    if (this._draftVersion !== 14 && !isDraft21(this._draftVersion) && sub.trackKey !== undefined
+    if (this._draftVersion !== 14 && !isDraft22(this._draftVersion) && sub.trackKey !== undefined
         && (this.findLiveIncomingByTrack(sub.trackKey, /* publishInitiated */ false)
             || this.findLiveOutboundPublishByTrack(sub.trackKey))) {
       const errorMsg: RequestErrorMsg = {
@@ -2091,10 +2091,10 @@ export class Session {
 
     // §5.1: an endpoint may hold at most ONE subscription per Track per ROLE
     // (drafts 16/18 only — draft-14 defines neither this rule nor
-    // DUPLICATE_SUBSCRIPTION 0x19, and draft 21 §3.1 allows concurrent
+    // DUPLICATE_SUBSCRIPTION 0x19, and draft 22 §3.1 allows concurrent
     // subscriptions). A PUBLISH makes US the subscriber. Checked BEFORE
     // touching the alias registry.
-    if (this._draftVersion !== 14 && !isDraft21(this._draftVersion) && sub.trackKey !== undefined) {
+    if (this._draftVersion !== 14 && !isDraft22(this._draftVersion) && sub.trackKey !== undefined) {
       const outboundSub = this.findLiveOutboundSubscribeByTrack(sub.trackKey);
       // (a) A committed subscriber-role subscription — an earlier PUBLISH we
       //     accepted, or a local ESTABLISHED SUBSCRIBE — is a duplicate: reject.
@@ -2895,8 +2895,8 @@ export class Session {
       sub.currentFilter = filterBytes;
     }
     if (options.fill !== undefined) {
-      if (!isDraft21(this._draftVersion)) {
-        throw new RangeError(`FILL_PARAMETERS needs draft 21; this session speaks draft ${this._draftVersion}`);
+      if (!isDraft22(this._draftVersion)) {
+        throw new RangeError(`FILL_PARAMETERS needs draft 22; this session speaks draft ${this._draftVersion}`);
       }
       parameters.set(FILL_PARAMETERS, [encodeFillParameters(options.fill.filter)]);
       sub.fillRequested = true;
@@ -3069,9 +3069,9 @@ export class Session {
   ): RequestResult {
     this.assertEstablishedOrDraining('requestUpdate');
     const requestedForward = this.normalizeLocalForwardState(options.forward, 'REQUEST_UPDATE');
-    // draft-21 §9.1.7: never more than the peer's MAX_REQUEST_UPDATES unanswered
+    // draft-22 §9.1.7: never more than the peer's MAX_REQUEST_UPDATES unanswered
     // updates on one request stream; each REQUEST_OK / REQUEST_ERROR restores one.
-    if (isDraft21(this._draftVersion) && this._peerMaxRequestUpdates > 0n) {
+    if (isDraft22(this._draftVersion) && this._peerMaxRequestUpdates > 0n) {
       let outstanding = 0n;
       for (const pending of this.pendingUpdates.values()) {
         if (pending.existingRequestId === (existingRequestId as bigint)) outstanding += 1n;
@@ -3083,8 +3083,8 @@ export class Session {
         );
       }
     }
-    if (options.fill !== undefined && !isDraft21(this._draftVersion)) {
-      throw new RangeError(`FILL_PARAMETERS needs draft 21; this session speaks draft ${this._draftVersion}`);
+    if (options.fill !== undefined && !isDraft22(this._draftVersion)) {
+      throw new RangeError(`FILL_PARAMETERS needs draft 22; this session speaks draft ${this._draftVersion}`);
     }
     const parameters = authorizationParameters(options);
 
@@ -5319,8 +5319,8 @@ export class Session {
       return true;
     }
 
-    const table = isDraft21(this._draftVersion)
-      ? VALID_PARAMS_FOR_MESSAGE_TYPE_21
+    const table = isDraft22(this._draftVersion)
+      ? VALID_PARAMS_FOR_MESSAGE_TYPE_22
       : isRequestStreamDraft(this._draftVersion)
         ? VALID_PARAMS_FOR_MESSAGE_TYPE_18
         : VALID_PARAMS_FOR_MESSAGE_TYPE;
@@ -5336,8 +5336,8 @@ export class Session {
    */
   private validateMessageParams(params: Parameters, messageType: string): { error: Varint; reason: string } | undefined {
     const isDraft18 = isRequestStreamDraft(this._draftVersion);
-    const knownParams = isDraft21(this._draftVersion)
-      ? KNOWN_MESSAGE_PARAMS_21
+    const knownParams = isDraft22(this._draftVersion)
+      ? KNOWN_MESSAGE_PARAMS_22
       : isDraft18 ? KNOWN_MESSAGE_PARAMS_18 : KNOWN_MESSAGE_PARAMS;
     for (const [key, values] of params) {
       // §9.2: Unknown message parameters are a protocol violation (draft-16/18).
@@ -5361,9 +5361,9 @@ export class Session {
 
       // §9.2.2.1: AUTHORIZATION_TOKEN may appear multiple times
       // All other known message parameters must be unique
-      // draft-21 §3.3.2: Range Filters may repeat (one per SetID / Property Type).
+      // draft-22 §3.3.2: Range Filters may repeat (one per SetID / Property Type).
       if (key !== MessageParam.AUTHORIZATION_TOKEN && values.length > 1
-          && !(isDraft21(this._draftVersion) && RANGE_FILTER_PARAMS_21.has(key as bigint))) {
+          && !(isDraft22(this._draftVersion) && RANGE_FILTER_PARAMS_22.has(key as bigint))) {
         return { error: SessionErrorCode.PROTOCOL_VIOLATION, reason: `Duplicate message parameter type: ${key}` };
       }
 

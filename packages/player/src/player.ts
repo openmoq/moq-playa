@@ -93,14 +93,14 @@ import {
   getTimelineDuration,
   type TimelineState,
 } from './timeline-manager.js';
-import { isRequestStreamDraft } from '@openmoq/transport';
+import { isDraft22, isRequestStreamDraft } from '@openmoq/transport';
 
 // ─── Constants ──────────────────────────────────────────────────────
 
 /** Max objects to stage during make-before-break switch before force-completing. */
 const SWITCH_STAGING_MAX_OBJECTS = 100;
 
-/** draft-21 FILL_PARAMETERS for joining the current group: a LOCATION_FILTER
+/** draft-22 FILL_PARAMETERS for joining the current group: a LOCATION_FILTER
  *  of [1] (the current group: Largest.Group + 1 - 1), the
  *  counterpart of a relative Joining FETCH at offset 0. */
 const CURRENT_GROUP_FILL = { filter: { type: 'RelativeStart' as const, groups: 1n } };
@@ -577,7 +577,7 @@ export class MoqtPlayer {
   private bootstrapGeneration = 0;
   /** The coordinator's CURRENT fetch: connection-scoped ownership. */
   private bootstrapFetch: { conn: MoqtConnection; reqId: bigint; attempt: number; gen: number } | null = null;
-  /** draft-21 catalog SUBSCRIBEs whose fill stands in for the Joining FETCH:
+  /** draft-22 catalog SUBSCRIBEs whose fill stands in for the Joining FETCH:
    *  retiring one cancels the fill, never the subscription it rides on. */
   private readonly catalogFillRequests = new Set<bigint>();
   /** Fetch data streams belonging to the bootstrap — CONNECTION-SCOPED: an
@@ -3951,10 +3951,10 @@ export class MoqtPlayer {
    * only on configuration.
    */
   private usesCatalogFill(conn: MoqtConnection): boolean {
-    // draft 21 has no Joining FETCH: the SUBSCRIBE carries FILL_PARAMETERS
+    // draft 22 has no Joining FETCH: the SUBSCRIBE carries FILL_PARAMETERS
     // and the fill fetch stream (FETCH_HEADER with the SUBSCRIBE's Request ID)
     // is the MSF-01 §5 prefix. There is no FETCH_OK; a FIN completes it.
-    return conn.draftVersion === 21;
+    return isDraft22(conn.draftVersion);
   }
 
   private resolvedCatalogMode(_conn: MoqtConnection): 'joining-fetch' | 'subscribe' {
@@ -4231,7 +4231,7 @@ export class MoqtPlayer {
       },
       log: (msg, ...args) => this.log.debug(msg, ...args),
     }, {
-      draft: (conn.draftVersion ?? this.config.draftVersion ?? 16) as 14 | 16 | 18 | 21,
+      draft: (conn.draftVersion ?? this.config.draftVersion ?? 16) as 14 | 16 | 18 | 22,
       strict: this.strictCatalogMode(),
     });
 
@@ -4264,7 +4264,7 @@ export class MoqtPlayer {
     }
   }
 
-  /** A recovery candidate's draft-21 fill stream can arrive before the
+  /** A recovery candidate's draft-22 fill stream can arrive before the
    *  coordinator asks for it (the fill rides on the SUBSCRIBE): claim it. */
   private claimParkedRecoveryFill(
     recovery: NonNullable<MoqtPlayer['catalogRecovery']>, reqId: bigint, attempt: number,
@@ -4644,7 +4644,7 @@ export class MoqtPlayer {
       },
       log: (msg, ...args) => this.log.debug(msg, ...args),
     }, {
-      draft: (conn.draftVersion ?? this.config.draftVersion ?? 16) as 14 | 16 | 18 | 21,
+      draft: (conn.draftVersion ?? this.config.draftVersion ?? 16) as 14 | 16 | 18 | 22,
       // Legacy catalog mode (the explicit 'subscribe' compatibility option):
       // the candidate is a fresh AbsoluteStart subscribe — subscription-only
       // retrieval, ready on the first acceptable base; NEVER a Joining FETCH.
@@ -5008,7 +5008,7 @@ export class MoqtPlayer {
     // actual draft can diverge from configuration under auto-negotiation.
     const draft = this.connection?.draftVersion ?? this.config.draftVersion ?? 16;
     if (code === 0x2n) return 'ended';                            // TRACK_ENDED
-    if (code === 0x3n && draft !== 21) return 'ended';            // SUBSCRIPTION_ENDED (gone in draft 21)
+    if (code === 0x3n && !isDraft22(draft)) return 'ended';            // SUBSCRIPTION_ENDED (gone in draft 22)
     if (code === 0x4n) return 'going-away';                       // GOING_AWAY
     if (code === 0x1n) return 'fatal-track';                      // UNAUTHORIZED
     if (draft === 14 && code === 0x7n) return 'fatal-track';      // d14 MALFORMED_TRACK
@@ -7588,8 +7588,8 @@ export class MoqtPlayer {
       }
       // Warm start overrides ONLY the filter — configured subscribe options
       // (deliveryTimeout, subscriberPriority, groupOrder) are preserved.
-      // draft 21: the SUBSCRIBE itself asks for the current group as a fill.
-      const warmFill = warmStart && this.connection.draftVersion === 21;
+      // draft 22: the SUBSCRIBE itself asks for the current group as a fill.
+      const warmFill = warmStart && isDraft22(this.connection.draftVersion);
       const mediaOptions = warmStart
         ? {
           ...(subscribeOptions ?? {}),

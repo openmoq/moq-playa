@@ -87,8 +87,8 @@ export function createControlCodec(version: DraftVersion = 16): ControlCodec {
       return new Draft14Codec();
     case 18:
       return new Draft18Codec();
-    case 21:
-      return new Draft18Codec(21);
+    case 22:
+      return new Draft18Codec(22);
     default:
       // Unknown/unwired draft: a programming error, not a silent fallback.
       throw new Error(`createControlCodec: draft-${version as number} control codec is not yet implemented`);

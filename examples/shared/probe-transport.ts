@@ -20,7 +20,7 @@ export interface ProbeOptions {
   /** SHA-256 certificate hash for self-signed relays. */
   readonly certHash?: ArrayBuffer;
   /** MOQT draft version, controlling the WT protocols offer. */
-  readonly draftVersion?: 14 | 16 | 18 | 21;
+  readonly draftVersion?: 14 | 16 | 18 | 22;
   /** Abort the handshake: closes the connecting transport, rejects with `signal.reason`. */
   readonly signal?: AbortSignal;
 }

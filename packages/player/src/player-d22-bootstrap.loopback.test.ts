@@ -1,11 +1,11 @@
 /**
- * Catalog bootstrap over the in-memory draft-21 loopback: a REAL MoqtPlayer
- * drives a REAL MoqtConnection(21) client against a REAL server connection
- * acting as a minimal catalog publisher. Draft 21 has no Joining FETCH: the
+ * Catalog bootstrap over the in-memory draft-22 loopback: a REAL MoqtPlayer
+ * drives a REAL MoqtConnection(22) client against a REAL server connection
+ * acting as a minimal catalog publisher. Draft 22 has no Joining FETCH: the
  * catalog SUBSCRIBE carries FILL_PARAMETERS for the current group and the
  * publisher answers on a fill fetch stream (no FETCH_OK; the FIN completes it).
  *
- * @see draft-ietf-moq-msf-01 §5, draft-ietf-moq-transport-21 §3.4
+ * @see draft-ietf-moq-msf-01 §5, draft-ietf-moq-transport-22 §3.4
  */
 
 import { describe, it, expect } from 'vitest';
@@ -83,13 +83,13 @@ function newPlayer(client: unknown): MoqtPlayer {
         namespace: 'live/broadcast',
         connection: client as MoqtConnection,
         createTransport: async () => ({}) as never,
-        draftVersion: 21,
+        draftVersion: 22,
     });
 }
 
-describe('d21 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
+describe('d22 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
     it('the fill supplies head + delta, no FETCH is sent, and the live tail applies after readiness', async () => {
-        const { client, server, errors } = await connectedPair(21);
+        const { client, server, errors } = await connectedPair(22);
         const state = wireServer(server as unknown as MoqtConnection);
         const player = newPlayer(client);
         const events: string[] = [];
@@ -123,7 +123,7 @@ describe('d21 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
         expect(playerErrors).toEqual([]);
         expect(errors).toEqual([]);
 
-        // PUBLISH_DONE statuses on draft 21: SUBSCRIPTION_ENDED (0x3) is gone.
+        // PUBLISH_DONE statuses on draft 22: SUBSCRIPTION_ENDED (0x3) is gone.
         const done = player as unknown as { normalizePublishDoneStatus(code: bigint): string };
         expect(done.normalizePublishDoneStatus(0x2n)).toBe('ended');
         expect(done.normalizePublishDoneStatus(0x3n)).toBe('retriable');
@@ -132,7 +132,7 @@ describe('d21 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
     });
 
     it('an empty track opens no fill: the first live catalog object completes the bootstrap', async () => {
-        const { client, server, errors } = await connectedPair(21);
+        const { client, server, errors } = await connectedPair(22);
         const state = wireServer(server as unknown as MoqtConnection, { empty: true });
         let catalogSubs = 0;
         const orig = server.onSubscribe!;
@@ -162,7 +162,7 @@ describe('d21 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
     });
 
     it('a reset fill fails the attempt and the fallback ladder recovers', async () => {
-        const { client, server, errors } = await connectedPair(21);
+        const { client, server, errors } = await connectedPair(22);
         const state = wireServer(server as unknown as MoqtConnection, { resetFill: true });
         let catalogSubs = 0;
         const orig = server.onSubscribe!;

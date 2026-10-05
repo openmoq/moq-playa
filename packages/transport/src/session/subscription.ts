@@ -70,7 +70,7 @@ export class SubscriptionStateMachine {
    */
   private _currentFilter: Uint8Array | undefined;
   /**
-   * draft-21 §3.4: the SUBSCRIBE asked for a fill (FILL_PARAMETERS), so a fill
+   * draft-22 §3.4: the SUBSCRIBE asked for a fill (FILL_PARAMETERS), so a fill
    * fetch stream whose FETCH_HEADER carries this Request ID belongs to it.
    */
   fillRequested = false;

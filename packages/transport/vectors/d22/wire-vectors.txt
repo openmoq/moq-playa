@@ -1,4 +1,4 @@
-# Draft-21 (draft-ietf-moq-transport-21, version 0xff000015, ALPN moqt-21) wire vectors.
+# Draft-22 (draft-ietf-moq-transport-22, version 0xff000016, ALPN moqt-22) wire vectors.
 # Format: <name> <kind> <source> <hex>
 #   kind:   control   = one framed control message {Type vi64, Length (16), Body}
 #           parameter = one message parameter {Type, Length, Value}
@@ -6,8 +6,12 @@
 #   source: moqxr-encoder          = produced by moqxr (openmoq/moqxr#45, feature/draft-21 @ 478d6c0)
 #           moqxr-decoder-verified = hand-built, accepted by moqxr's draft-21 decoders
 #           draft-text             = hand-built from docs/draft-ietf-moq-transport-21.txt only
-# Copied from red5-moq-relay (src/test/resources/draft21/wire-vectors.txt), which regenerates
-# them with scripts/draft21-vectors/gen.cpp against moqxr. Keep the vector lines identical.
+#           converted-from-d21     = a draft-21 vector whose LOCATION_FILTER changed bytes on draft 22
+# Derived from the draft-21 set shared with red5-moq-relay (src/test/resources/draft21/wire-vectors.txt).
+# Draft 22 changes only LOCATION_FILTER: a Location Filter Type replaces the Length (section 9.20.9).
+# With single-byte fields the two encodings coincide for every form except the Next Object
+# (draft-21 {0, 0}, draft-22 type 0x05), so only those vectors were re-encoded; every other line,
+# its source included, is unchanged from the draft-21 file and is equally valid draft-22 bytes.
 client_setup control moqxr-encoder af00001901042f6d6f71041172656c61792e6578616d706c652e636f6d
 publish_namespace control moqxr-encoder 0600080001046c69766500
 publish control moqxr-encoder 1d000f0201046c69766505766964656f0100
@@ -21,12 +25,12 @@ server_setup_filter_ranges_16_request_updates_4 control moqxr-decoder-verified a
 subscribe_location_filter_empty control moqxr-decoder-verified 0300100901046c69766505766964656f012100
 subscribe_location_filter_next_group control moqxr-decoder-verified 0300110901046c69766505766964656f01210100
 subscribe_location_filter_relative_3 control moqxr-decoder-verified 0300110901046c69766505766964656f01210103
-subscribe_location_filter_next_object control moqxr-decoder-verified 0300120901046c69766505766964656f0121020000
+subscribe_location_filter_next_object control converted-from-d21 0300100901046c69766505766964656f012105
 subscribe_location_filter_start_12_5 control moqxr-decoder-verified 0300120901046c69766505766964656f0121020c05
 subscribe_location_filter_range_12_5_delta_3 control moqxr-decoder-verified 0300130901046c69766505766964656f0121030c0503
 subscribe_location_filter_range_12_5_delta_3_end_object_7 control moqxr-decoder-verified 0300140901046c69766505766964656f0121040c050307
-subscribe_join_current_group_with_fill_include_properties_0 control moqxr-decoder-verified 0300190901046c69766505766964656f032102000002032101011200
-subscribe_tracks_next_object_group_order_descending control moqxr-decoder-verified 51000e5d01046c69766502210200000102
+subscribe_join_current_group_with_fill_include_properties_0 control converted-from-d21 0300170901046c69766505766964656f03210502032101011200
+subscribe_tracks_next_object_group_order_descending control converted-from-d21 51000c5d01046c6976650221050102
 request_update_fill_whole_track control moqxr-decoder-verified 0200045f012300
 publish_ok_expires_30000 control moqxr-decoder-verified 0700050108c07530
 fetch_range_12_5_to_15_9 control draft-text 1600140701046c69766505766964656f0121040c050309

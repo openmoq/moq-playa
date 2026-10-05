@@ -177,7 +177,7 @@ interface Attempt {
 
 export class CatalogBootstrap {
   private readonly cb: CatalogBootstrapCallbacks;
-  private readonly draft: 14 | 16 | 18 | 21;
+  private readonly draft: 14 | 16 | 18 | 22;
 
   private _phase: BootstrapPhase = 'idle';
   private attemptSeq = 0;
@@ -224,7 +224,7 @@ export class CatalogBootstrap {
    *  degradation. */
   private readonly strict: boolean;
 
-  constructor(callbacks: CatalogBootstrapCallbacks, options: { draft: 14 | 16 | 18 | 21; startMode?: 'joining' | 'legacy'; strict?: boolean }) {
+  constructor(callbacks: CatalogBootstrapCallbacks, options: { draft: 14 | 16 | 18 | 22; startMode?: 'joining' | 'legacy'; strict?: boolean }) {
     this.cb = callbacks;
     this.draft = options.draft;
     this.startMode = options.startMode ?? 'joining';
@@ -301,7 +301,7 @@ export class CatalogBootstrap {
   }
 
   /**
-   * draft-21 §3.4: the fill range never extends beyond Largest Object, and a
+   * draft-22 §3.4: the fill range never extends beyond Largest Object, and a
    * range starting after it opens no fill stream. A SUBSCRIBE_OK without a
    * Largest Object therefore means no fill will come: resolve the attempt as
    * an empty track, as INVALID_RANGE does for a Joining FETCH.
@@ -309,7 +309,7 @@ export class CatalogBootstrap {
   private resolveEmptyFill(): void {
     const attempt = this.attempt;
     // `largest` is undefined until SUBSCRIBE_OK; null means it carried none.
-    if (this.draft !== 21 || this.largest !== null) return;
+    if (this.draft !== 22 || this.largest !== null) return;
     if (!attempt || attempt.kind !== 'joining' || attempt.cancelled) return;
     this.cb.log('[catalog-bootstrap] SUBSCRIBE_OK has no Largest Object: the track is empty, no fill will open');
     this.onFetchError(attempt.id, 'invalid-range');
