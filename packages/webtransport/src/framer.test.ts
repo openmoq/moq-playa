@@ -11,10 +11,10 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { ControlStreamFramer } from './framer.js';
-import { encodeControlMessage } from '@moqt/transport';
-import { varint } from '@moqt/transport';
-import type { ClientSetup, Goaway, Subscribe, MaxRequestId } from '@moqt/transport';
-import { SetupParam } from '@moqt/transport';
+import { encodeControlMessage } from '@openmoq/transport';
+import { varint } from '@openmoq/transport';
+import type { ClientSetup, Goaway, Subscribe, MaxRequestId } from '@openmoq/transport';
+import { SetupParam } from '@openmoq/transport';
 
 describe('ControlStreamFramer', () => {
   let framer: ControlStreamFramer;

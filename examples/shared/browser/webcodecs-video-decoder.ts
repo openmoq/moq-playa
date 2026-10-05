@@ -16,9 +16,9 @@
  * @module
  */
 
-import type { VideoDecoderLike } from '@moqt/player';
-import type { VideoChunkInit } from '@moqt/loc';
-// Codec strategies are not part of the @moqt/browser public API.
+import type { VideoDecoderLike } from '@openmoq/player';
+import type { VideoChunkInit } from '@openmoq/loc';
+// Codec strategies are not part of the @openmoq/browser public API.
 // Import directly from source for example/dev usage.
 import { createCodecStrategy, type CodecStrategy } from '../../../packages/browser/src/codec-strategy.js';
 

@@ -22,14 +22,14 @@
  *
  * @module
  */
-import { SessionState, SubscriptionState, FetchState, NamespaceState, varint } from '@moqt/transport';
-import type { MoqtObject, DraftVersion, DataStreamHeader, ControlMessage } from '@moqt/transport';
+import { SessionState, SubscriptionState, FetchState, NamespaceState, varint } from '@openmoq/transport';
+import type { MoqtObject, DraftVersion, DataStreamHeader, ControlMessage } from '@openmoq/transport';
 import { connectedPair, ns, nm, type ConnectedPair } from './pair.js';
 import { flush, type PipeFaults } from './loopback.js';
 import { makePrng } from './prng.js';
 import { fnv1a64, type TraceRecord } from './trace-hash.js';
 import type { TrackSubscription } from '../adapter.js';
-import { isRequestStreamDraft } from '@moqt/transport';
+import { isRequestStreamDraft } from '@openmoq/transport';
 
 /** Stable op codes (folded into the trace hash). */
 export const Op = {

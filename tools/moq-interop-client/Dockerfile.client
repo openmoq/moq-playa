@@ -38,6 +38,8 @@ RUN node --experimental-quic -e \
 FROM node-quic AS builder
 WORKDIR /app
 COPY tools/moq-interop-client/package.json tools/moq-interop-client/package-lock.json ./
+# Registry dependencies are third-party tooling only. MoQ libraries below come
+# from this checkout, including before the new package names exist on npm.
 RUN npm ci --no-audit --no-fund
 
 # Build the transport-neutral adapter and native binding from this checkout.
@@ -52,23 +54,26 @@ COPY packages/quic/package.json packages/quic/tsconfig.json /local/packages/quic
 COPY packages/quic/src /local/packages/quic/src
 RUN ln -s /app/node_modules /local/node_modules \
  && /app/node_modules/.bin/tsc -p /local/packages/transport/tsconfig.json \
- && rm -rf /app/node_modules/@moqt/transport \
- && mkdir -p /app/node_modules/@moqt/transport \
- && cp /local/packages/transport/package.json /app/node_modules/@moqt/transport/ \
- && cp -a /local/packages/transport/dist /app/node_modules/@moqt/transport/ \
+ && rm -rf /app/node_modules/@openmoq/transport \
+ && mkdir -p /app/node_modules/@openmoq/transport \
+ && cp /local/packages/transport/package.json /app/node_modules/@openmoq/transport/ \
+ && cp -a /local/packages/transport/dist /app/node_modules/@openmoq/transport/ \
  && /app/node_modules/.bin/tsc -p /local/packages/webtransport/tsconfig.json \
- && rm -rf /app/node_modules/@moqt/webtransport \
- && mkdir -p /app/node_modules/@moqt/webtransport \
- && cp /local/packages/webtransport/package.json /app/node_modules/@moqt/webtransport/ \
- && cp -a /local/packages/webtransport/dist /app/node_modules/@moqt/webtransport/ \
+ && rm -rf /app/node_modules/@openmoq/webtransport \
+ && mkdir -p /app/node_modules/@openmoq/webtransport \
+ && cp /local/packages/webtransport/package.json /app/node_modules/@openmoq/webtransport/ \
+ && cp -a /local/packages/webtransport/dist /app/node_modules/@openmoq/webtransport/ \
  && /app/node_modules/.bin/tsc -p /local/packages/quic/tsconfig.json \
- && mkdir -p /app/node_modules/@moqt/quic \
- && cp /local/packages/quic/package.json /app/node_modules/@moqt/quic/ \
- && cp -a /local/packages/quic/dist /app/node_modules/@moqt/quic/
+ && mkdir -p /app/node_modules/@openmoq/quic \
+ && cp /local/packages/quic/package.json /app/node_modules/@openmoq/quic/ \
+ && cp -a /local/packages/quic/dist /app/node_modules/@openmoq/quic/
 
 COPY tools/moq-interop-client/tsconfig.json ./
 COPY tools/moq-interop-client/src ./src
 RUN npx tsc -p tsconfig.json
+RUN test ! -e node_modules/@moqt && test ! -e node_modules/@playa \
+ && node --input-type=module -e \
+      "for (const name of ['@openmoq/transport', '@openmoq/webtransport', '@openmoq/quic']) await import(name)"
 
 # Tests use a separate output tree. The final stage copies their marker, which
 # makes them a mandatory image-build gate without shipping test-only code.

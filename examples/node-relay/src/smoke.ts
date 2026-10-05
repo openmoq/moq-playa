@@ -4,12 +4,12 @@
  * MoQT SETUP, then subscribe and receive/validate the 3 demo objects. Tears
  * everything down and exits non-zero on failure/timeout.
  */
-import { SessionState } from '@moqt/transport';
+import { SessionState } from '@openmoq/transport';
 import { startServer } from './server.js';
 import { connectClient, subscribeAndCollect } from './client.js';
 import { certsExist } from './cert.js';
 import { DEMO_PAYLOADS } from './demo.js';
-import type { MoqtConnection } from '@moqt/webtransport';
+import type { MoqtConnection } from '@openmoq/webtransport';
 
 const log = (...a: unknown[]) => console.log('[smoke]', ...a);
 

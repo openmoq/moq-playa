@@ -10,8 +10,9 @@
  * @module
  */
 
-import type { SubscriptionFilter, SetupOptions } from '@moqt/transport';
-import { varint } from '@moqt/transport';
+import type { SubscriptionFilter } from '@openmoq/transport';
+import { AuthorizationError, type ConnectOptions } from '@openmoq/webtransport';
+import { varint } from '@openmoq/transport';
 import type { MoqtPlayerConfig } from './config.js';
 
 /**
@@ -62,8 +63,8 @@ export function invalidGoawayUriReason(uri: string): string | null {
  * @see draft-ietf-moq-transport-16 §9.3.1 (Setup Parameters)
  * @see draft-ietf-moq-transport-16 §9.3.1.3 (MAX_REQUEST_ID)
  */
-export function buildSetupOptions(config: MoqtPlayerConfig): SetupOptions {
-  const options: SetupOptions = {
+export function buildSetupOptions(config: MoqtPlayerConfig, urlOverride?: string): ConnectOptions {
+  const options: ConnectOptions = {
     maxRequestId: varint(config.maxRequestId!),
   };
 
@@ -77,6 +78,26 @@ export function buildSetupOptions(config: MoqtPlayerConfig): SetupOptions {
 
   if (config.authTokens) {
     options.authTokens = config.authTokens;
+  }
+
+  if (config.authorization) {
+    if (config.authTokens !== undefined) throw new AuthorizationError('Specify authorization or authTokens, not both');
+    const relayUrl = buildConnectUrl(config, urlOverride);
+    // URL.origin is "null" for moqt URLs; preserve the actual authority.
+    const origin = (url: string) => {
+      const parsed = new URL(url);
+      return `${parsed.protocol}//${parsed.host}`;
+    };
+    const originalOrigin = origin(config.url);
+    const destinationOrigin = origin(relayUrl);
+    if (destinationOrigin !== originalOrigin && !config.authorization.allowedRelayOrigins?.includes(destinationOrigin)) {
+      throw new AuthorizationError('GOAWAY destination is not authorized for credential forwarding');
+    }
+    options.authorization = {
+      relayUrl,
+      getTokens: config.authorization.getTokens,
+      ...(config.authorization.timeoutMs !== undefined ? { timeoutMs: config.authorization.timeoutMs } : {}),
+    };
   }
 
   return options;

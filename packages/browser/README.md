@@ -2,16 +2,16 @@
      Content derives from this package's package.json (name, description).
      Run `node scripts/generate-package-readmes.mjs --write` after editing it. -->
 
-# @moqt/browser
+# @openmoq/browser
 
-Browser adapters for @moqt/player: WebCodecs decoding, Canvas and WebAudio rendering, and MSE/CMAF playback, implementing the player's swappable interfaces.
+Browser adapters for @openmoq/player: WebCodecs decoding, Canvas and WebAudio rendering, and MSE/CMAF playback, implementing the player's swappable interfaces.
 
 Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implementation of Media over QUIC (MoQ). See the [project README](https://github.com/openmoq/moq-playa#readme) for architecture and API documentation.
 
 ## Install
 
 ```sh
-npm install @moqt/browser
+npm install @openmoq/browser
 ```
 
 ## License

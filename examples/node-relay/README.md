@@ -1,7 +1,7 @@
 # @moqt/example-node-relay (example)
 
-A **Node WebTransport MoQT relay demo**: Playa's sans-I/O core (`@moqt/transport`)
-plus the WebTransport adapter (`@moqt/webtransport`) driving
+A **Node WebTransport MoQT relay demo**: Playa's sans-I/O core (`@openmoq/transport`)
+plus the WebTransport adapter (`@openmoq/webtransport`) driving
 `MoqtConnection(18, { role: 'server' })` over a real Node QUIC/HTTP3 session — no
 browser required. It runs the full draft-18 path: SETUP → SUBSCRIBE/PUBLISH → object
 fanout.

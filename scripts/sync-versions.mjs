@@ -42,8 +42,8 @@ for (const name of readdirSync(packagesDir)) {
 
 // Update the `static readonly version` literal in player class sources
 const versionStatics = [
-  ['@playa/playa Player.version', join(packagesDir, 'playa', 'src', 'player.ts')],
-  ['@moqt/player MoqtPlayer.version', join(packagesDir, 'player', 'src', 'player.ts')],
+  ['@openmoq/playa Player.version', join(packagesDir, 'playa', 'src', 'player.ts')],
+  ['@openmoq/player MoqtPlayer.version', join(packagesDir, 'player', 'src', 'player.ts')],
 ];
 for (const [label, srcPath] of versionStatics) {
   try {

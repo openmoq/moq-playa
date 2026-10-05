@@ -15,8 +15,8 @@
  * @module
  */
 
-import type { AudioDecoderLike } from '@moqt/player';
-import type { AudioChunkInit } from '@moqt/loc';
+import type { AudioDecoderLike } from '@openmoq/player';
+import type { AudioChunkInit } from '@openmoq/loc';
 
 /** Maximum audio decode queue depth before dropping frames. */
 const MAX_AUDIO_DECODE_QUEUE_SIZE = 32;

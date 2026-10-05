@@ -21,7 +21,7 @@
  * @module
  */
 
-import type { VideoChunkInit, AudioChunkInit, VideoFrameMarking } from '@moqt/loc';
+import type { VideoChunkInit, AudioChunkInit, VideoFrameMarking } from '@openmoq/loc';
 
 // ─── State constants ────────────────────────────────────────────────
 

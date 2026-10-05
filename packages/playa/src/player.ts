@@ -35,9 +35,9 @@
 
 import {
   MoqtPlayer, TypedEmitter, checkSupport, usesMsePath,
-} from '@moqt/player';
-import type { LocmafDecoding, MoqtPlayerConfig, SupportReport } from '@moqt/player';
-import { MoqtConnection } from '@moqt/webtransport';
+} from '@openmoq/player';
+import type { LocmafDecoding, MoqtPlayerConfig, SupportReport } from '@openmoq/player';
+import { MoqtConnection } from '@openmoq/webtransport';
 import {
   AudioAlignedClock,
   WebCodecsVideoDecoder,
@@ -48,7 +48,7 @@ import {
   MseMediaSource,
   CmafAssembler,
   createWebTransport,
-} from '@moqt/browser';
+} from '@openmoq/browser';
 
 import { detectStrategy } from './auto-detect.js';
 import type { DecoderStrategy } from './auto-detect.js';
@@ -71,7 +71,7 @@ const DEFAULTS = {
 /**
  * Batteries-included MoQ media player.
  *
- * Wraps MoqtPlayer (@moqt/player) with browser adapters (@moqt/browser)
+ * Wraps MoqtPlayer (@openmoq/player) with browser adapters (@openmoq/browser)
  * and a UI-friendly API. Handles DOM element creation, adapter wiring,
  * volume control, time tracking, and event bridging automatically.
  */
@@ -535,6 +535,8 @@ export class Player {
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
         createRenderer: () => {
           this.renderer = new CanvasRenderer(this.canvas!, { clock: this.audioClock });
+          // Catalog discovery can create the pipeline after play() has returned.
+          if (this._state === 'playing') this.renderer.start();
           return this.renderer;
         },
         createAudioOutput: () => {
@@ -567,6 +569,9 @@ export class Player {
     }
     if (opts.authTokens) {
       (base as unknown as Record<string, unknown>).authTokens = opts.authTokens;
+    }
+    if (opts.authorization !== undefined) {
+      Object.assign(base, { authorization: opts.authorization });
     }
 
     // Power-user escape hatch: merge moqtPlayerConfig overrides last

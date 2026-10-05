@@ -1,8 +1,8 @@
 /**
- * @moqt/player — Convenience facade for MOQT playback.
+ * @openmoq/player — Convenience facade for MOQT playback.
  *
- * Wires together the sans-I/O core packages (@moqt/transport,
- * @moqt/webtransport, @moqt/msf, @moqt/loc, @moqt/playback)
+ * Wires together the sans-I/O core packages (@openmoq/transport,
+ * @openmoq/webtransport, @openmoq/msf, @openmoq/loc, @openmoq/playback)
  * into a simple load()/play()/pause()/destroy() API.
  *
  * @see draft-ietf-moq-transport-16 §3 (Session)
@@ -89,6 +89,9 @@ export type { PlayerStateValue } from './state.js';
 // ─── Config ──────────────────────────────────────────────────────────
 
 export type { MoqtPlayerConfig } from './config.js';
+export type { PlayerAuthorization } from './config.js';
+export { catToken, AuthorizationError } from '@openmoq/webtransport';
+export type { AuthorizationToken, AuthorizationContext, AuthorizationProvider, AuthorizationOperation } from '@openmoq/webtransport';
 export {
   DEFAULT_GAP_TIMEOUT_MS,
   DEFAULT_DRIFT_THRESHOLD_MS,

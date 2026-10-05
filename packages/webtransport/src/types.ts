@@ -90,6 +90,19 @@ export interface WebTransportLike {
    */
   createUnidirectionalStream?(): Promise<WritableStream<Uint8Array>>;
 
+  /**
+   * Reset a send stream created by this transport. Fulfillment must prove that
+   * sending was aborted; rejection or non-settlement leaves the reset unproven.
+   * `pendingFin` is the caller's in-flight writer.close() promise, if any.
+   * Backends may normalize transport-specific abort outcomes here. Omission
+   * uses writer.abort() without interpreting its rejection as a successful reset.
+   */
+  resetSendStream?(
+    writer: WritableStreamDefaultWriter<Uint8Array>,
+    reason: unknown,
+    pendingFin?: Promise<void>,
+  ): Promise<void>;
+
   /** Close the session with optional error code and reason. */
   close(info?: WebTransportCloseInfo): void;
 

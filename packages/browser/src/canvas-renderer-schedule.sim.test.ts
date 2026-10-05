@@ -13,7 +13,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { CanvasRenderer } from './canvas-renderer.js';
-import type { ClockSource } from '@moqt/playback';
+import type { ClockSource } from '@openmoq/playback';
 
 class SimClock implements ClockSource {
   private nowUs = 0;

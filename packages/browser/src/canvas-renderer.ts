@@ -17,8 +17,8 @@
  * @module
  */
 
-import type { VideoRendererLike } from '@moqt/player';
-import type { ClockSource } from '@moqt/playback';
+import type { VideoRendererLike } from '@openmoq/player';
+import type { ClockSource } from '@openmoq/playback';
 import { validateStallThresholdMs } from './mse-adapter.js';
 
 /** A queued frame awaiting presentation. */

@@ -8,7 +8,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { isTrackPackagingSupported, parseCatalogAuto, SUPPORTED_LOCMAF_VERSIONS } from '@moqt/msf';
+import { isTrackPackagingSupported, parseCatalogAuto, SUPPORTED_LOCMAF_VERSIONS } from '@openmoq/msf';
 import {
   LOCMAF_VERSION,
   LocmafTrackDecoder,
@@ -16,8 +16,8 @@ import {
   deserializeLocmafObject,
   parseCmafChunk,
   parseLocmafTrackContext,
-} from '@moqt/locmaf';
-import type { MoqtConnection } from '@moqt/webtransport';
+} from '@openmoq/locmaf';
+import type { MoqtConnection } from '@openmoq/webtransport';
 import { NON_SYNC_FLAGS, SYNC_FLAGS, audioInit, buildChunk, videoInit } from '../../../packages/locmaf/test-support/cmaf.js';
 import { loadFixtureFromDisk, type LoadedFixture, type LoadedTrack } from './fixture.js';
 import { buildFixtureCatalog, publishFixture } from './publisher.js';

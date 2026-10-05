@@ -8,7 +8,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { fileURLToPath } from 'node:url';
-import type { MoqtConnection } from '@moqt/webtransport';
+import type { MoqtConnection } from '@openmoq/webtransport';
 import { connectClient } from './client.js';
 import { DEMO_EXTENSIONS, DEMO_NAMESPACE, DEMO_TRACK, DEMO_PAYLOADS, nsBytes, te } from './demo.js';
 

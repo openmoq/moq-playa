@@ -22,13 +22,13 @@ import { QualityController } from './quality-controller.js';
 import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { PlayerEventMap } from './events.js';
-import { MoqtConnectionError } from '@moqt/webtransport';
-import type { MoqtConnection } from '@moqt/webtransport';
-import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } from '@moqt/transport';
-import { varint, ObjectStatus } from '@moqt/transport';
-import { encodeLocHeaders } from '@moqt/loc';
-import type { ClockSource } from '@moqt/playback';
-import type { DataStreamTerminal } from '@moqt/webtransport';
+import { MoqtConnectionError } from '@openmoq/webtransport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import type { ControlMessage, ObjectDatagram, DataStreamHeader, MoqtObject } from '@openmoq/transport';
+import { varint, ObjectStatus } from '@openmoq/transport';
+import { encodeLocHeaders } from '@openmoq/loc';
+import type { ClockSource } from '@openmoq/playback';
+import type { DataStreamTerminal } from '@openmoq/webtransport';
 
 // ─── Mock Adapter ────────────────────────────────────────────────────
 
@@ -203,6 +203,177 @@ async function ackMedia(adapter: ReturnType<typeof createMockAdapter>): Promise<
     adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId, trackAlias: requestId, parameters: new Map() } as ControlMessage);
   }
 }
+
+describe('catalog subscribe retry intervals and ownership', () => {
+  const players: MoqtPlayer[] = [];
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(async () => {
+    for (const player of players.splice(0)) await player.destroy();
+    vi.useRealTimers();
+  });
+
+  async function loaded(draft: 16 | 18 = 16) {
+    const adapter = createMockAdapter();
+    Object.defineProperty(adapter, 'draftVersion', { value: draft });
+    const player = new MoqtPlayer(createConfig(adapter));
+    players.push(player);
+    const loading = player.load();
+    await resolveConnect(adapter);
+    await loading;
+    return { adapter, player };
+  }
+
+  function rejectCatalog(adapter: ReturnType<typeof createMockAdapter>, retryInterval = 1n) {
+    adapter._triggerMessage({
+      type: 'REQUEST_ERROR', requestId: varint(1), errorCode: varint(0x10),
+      retryInterval, errorReason: 'No publisher yet',
+    } as ControlMessage);
+  }
+
+  it('keeps a one-second backoff for an immediately retryable request', async () => {
+    const { adapter } = await loaded();
+    rejectCatalog(adapter);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([16, 18] as const)('draft %i: does not retry when Retry Interval is zero', async (draft) => {
+    const { adapter } = await loaded(draft);
+    rejectCatalog(adapter, 0n);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([16, 18] as const)('draft %i: waits Retry Interval minus one milliseconds', async (draft) => {
+    const { adapter } = await loaded(draft);
+    rejectCatalog(adapter, 5001n);
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it('splits waits exceeding the platform timer limit without retrying early', async () => {
+    const { adapter } = await loaded(18);
+    const timerLimit = 0x7fffffff;
+    rejectCatalog(adapter, BigInt(timerLimit) + 1001n);
+    await vi.advanceTimersByTimeAsync(timerLimit);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not overflow a draft-18 uint64 Retry Interval into an immediate retry', async () => {
+    const { adapter } = await loaded(18);
+    rejectCatalog(adapter, (1n << 64n) - 1n);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['close', 'fatal error'] as const)('cancels retries on session %s', async (terminal) => {
+    const { adapter } = await loaded();
+    rejectCatalog(adapter);
+    if (terminal === 'close') adapter._triggerClose();
+    else adapter._triggerError(new Error('Transport lost'));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the retry after a nonfatal data-stream error', async () => {
+    const { adapter } = await loaded();
+    rejectCatalog(adapter);
+    adapter._triggerError(new MoqtConnectionError('Subgroup reset', { errorSource: 'data' }));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it('still rejects load when the initial write fails after reporting a fatal error', async () => {
+    const adapter = createMockAdapter();
+    const error = new Error('Control stream write failed');
+    vi.mocked(adapter.subscribe).mockImplementationOnce(async () => {
+      adapter._triggerError(error);
+      throw error;
+    });
+    const player = new MoqtPlayer(createConfig(adapter));
+    players.push(player);
+    const loading = player.load().then(() => null, (err: unknown) => err);
+    await resolveConnect(adapter);
+    expect(await loading).toBe(error);
+  });
+
+  it('does not let a superseded timer suppress the replacement session retry', async () => {
+    const { adapter, player } = await loaded();
+    rejectCatalog(adapter);
+    const replacement = createMockAdapter();
+    const migrating = player.migrate(replacement);
+    await resolveConnect(replacement);
+    await migrating;
+    rejectCatalog(replacement);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(replacement.subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let a completed old retry overwrite the replacement catalog request', async () => {
+    const { adapter, player } = await loaded();
+    let finishRetry!: (id: ReturnType<typeof varint>) => void;
+    vi.mocked(adapter.subscribe).mockImplementationOnce(() => new Promise((resolve) => {
+      finishRetry = resolve;
+    }));
+    rejectCatalog(adapter);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+
+    const replacement = createMockAdapter();
+    const migrating = player.migrate(replacement);
+    await resolveConnect(replacement);
+    await migrating;
+    finishRetry(varint(2));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const received = vi.fn();
+    player.on('catalog_received', received);
+    ackCatalog(replacement);
+    replacement._triggerObject(0n, {
+      kind: 'data', trackAlias: varint(1), groupId: varint(0),
+      subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(CATALOG_JSON),
+    } as MoqtObject);
+    expect(received).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reclaim the replacement pending request when an old retry fails to send', async () => {
+    const { adapter, player } = await loaded();
+    let failRetry!: (error: Error) => void;
+    vi.mocked(adapter.subscribe).mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      failRetry = reject;
+    }));
+    rejectCatalog(adapter);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const replacement = createMockAdapter();
+    const migrating = player.migrate(replacement);
+    await resolveConnect(replacement);
+    await migrating;
+    failRetry(new Error('Old stream closed'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const received = vi.fn();
+    player.on('catalog_received', received);
+    replacement._triggerObject(0n, {
+      kind: 'data', trackAlias: varint(40), groupId: varint(0),
+      subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(CATALOG_JSON),
+    } as MoqtObject);
+    replacement._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(1), trackAlias: varint(40), parameters: new Map(),
+    } as ControlMessage);
+    expect(received).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('request ID and track alias namespace separation', () => {
   const scenarios = [
@@ -720,6 +891,162 @@ describe('MoqtPlayer', () => {
       expect(fn).toHaveBeenCalledWith(
         expect.objectContaining({ type: 'session_established' }),
       );
+    });
+  });
+
+  // ─── Catalog subscribe retry (viewer arrives before publisher) ─────
+  //
+  // Regression coverage: a viewer subscribing before the publisher exists
+  // got REQUEST_ERROR(DOES_NOT_EXIST) and the player gave up permanently
+  // instead of retrying (reproduced live against moq-relay.red5.net).
+  describe('catalog subscribe retry on DOES_NOT_EXIST (viewer arrives before publisher)', () => {
+    it('retries the catalog subscribe and reaches catalog_received once the publisher shows up', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = createMockAdapter();
+        const player = new MoqtPlayer(createConfig(adapter));
+        const fn = vi.fn();
+        player.on('catalog_received', fn);
+
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+        const firstReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+
+        // No publisher yet: the relay refuses the catalog subscribe but permits retry.
+        adapter._triggerMessage({
+          type: 'REQUEST_ERROR',
+          requestId: firstReqId,
+          errorCode: varint(0x10),
+          retryInterval: varint(1n),
+          errorReason: 'Track not found',
+        } as ControlMessage);
+
+        // The retry is timed, not synchronous.
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+
+        await vi.advanceTimersByTimeAsync(2000);
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+        const secondReqId = await (adapter.subscribe as any).mock.results[1]?.value;
+        expect(secondReqId).not.toBe(firstReqId);
+
+        // Publisher has since shown up: this attempt succeeds.
+        ackCatalog(adapter, secondReqId);
+        adapter._triggerObject(0n, {
+          kind: 'data',
+          trackAlias: secondReqId,
+          groupId: varint(0),
+          subgroupId: varint(0),
+          objectId: varint(0),
+          payload: new TextEncoder().encode(CATALOG_JSON),
+        } as MoqtObject);
+
+        expect(fn).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'catalog_received' }),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps retrying across repeated DOES_NOT_EXIST rejections', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = createMockAdapter();
+        const player = new MoqtPlayer(createConfig(adapter));
+        const fn = vi.fn();
+        player.on('catalog_received', fn);
+
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        for (let i = 0; i < 3; i++) {
+          const reqId = await (adapter.subscribe as any).mock.results[i]?.value;
+          adapter._triggerMessage({
+            type: 'REQUEST_ERROR',
+            requestId: reqId,
+            errorCode: varint(0x10),
+            retryInterval: varint(1n),
+            errorReason: 'Track not found',
+          } as ControlMessage);
+          await vi.advanceTimersByTimeAsync(2000);
+        }
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(4);
+        const fourthReqId = await (adapter.subscribe as any).mock.results[3]?.value;
+        ackCatalog(adapter, fourthReqId);
+        adapter._triggerObject(0n, {
+          kind: 'data',
+          trackAlias: fourthReqId,
+          groupId: varint(0),
+          subgroupId: varint(0),
+          objectId: varint(0),
+          payload: new TextEncoder().encode(CATALOG_JSON),
+        } as MoqtObject);
+
+        expect(fn).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'catalog_received' }),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not retry on a non-retriable REQUEST_ERROR (e.g. UNAUTHORIZED)', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = createMockAdapter();
+        const player = new MoqtPlayer(createConfig(adapter));
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        const firstReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+        adapter._triggerMessage({
+          type: 'REQUEST_ERROR',
+          requestId: firstReqId,
+          errorCode: varint(0x01),
+          retryInterval: varint(0n),
+          errorReason: 'unauthorized',
+        } as ControlMessage);
+
+        await vi.advanceTimersByTimeAsync(5000);
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('stops retrying once the player is destroyed', async () => {
+      vi.useFakeTimers();
+      try {
+        const adapter = createMockAdapter();
+        const player = new MoqtPlayer(createConfig(adapter));
+        const loadPromise = player.load();
+        await resolveConnect(adapter);
+        await loadPromise;
+
+        const firstReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+        adapter._triggerMessage({
+          type: 'REQUEST_ERROR',
+          requestId: firstReqId,
+          errorCode: varint(0x10),
+          retryInterval: varint(1n),
+          errorReason: 'Track not found',
+        } as ControlMessage);
+
+        await player.destroy();
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -6378,7 +6705,7 @@ describe('MoqtPlayer', () => {
 
     /**
      * Minimal CMAF assembler for testing — pairs moof+mdat by media type.
-     * Matches CmafAssemblerLike interface without importing @moqt/browser.
+     * Matches CmafAssemblerLike interface without importing @openmoq/browser.
      */
     function createCmafAssemblerFactory() {
       return (options: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string) => void }) => {

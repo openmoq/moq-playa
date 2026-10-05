@@ -14,11 +14,11 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { SubscriptionManager } from './subscription-manager.js';
-import { varint } from '@moqt/transport';
-import type { MoqtObject, MoqtObjectData } from '@moqt/transport';
-import type { LocHeaders } from '@moqt/loc';
-import { encodeLocHeaders } from '@moqt/loc';
-import type { LocHeaderOptions } from '@moqt/loc';
+import { varint } from '@openmoq/transport';
+import type { MoqtObject, MoqtObjectData } from '@openmoq/transport';
+import type { LocHeaders } from '@openmoq/loc';
+import { encodeLocHeaders } from '@openmoq/loc';
+import type { LocHeaderOptions } from '@openmoq/loc';
 
 /** Create a mock MoqtObjectData. */
 function createMockObject(overrides?: Partial<MoqtObjectData>): MoqtObjectData {

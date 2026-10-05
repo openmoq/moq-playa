@@ -100,7 +100,7 @@ export type QlogEvent =
  * Importance: Core.
  *
  * The `message` field contains the full ControlMessage from
- * `@moqt/transport`. QlogTrace.toJSON() converts it to the
+ * `@openmoq/transport`. QlogTrace.toJSON() converts it to the
  * `$MOQTControlMessage` qlog format (§5.6).
  *
  * @see draft-pardue-moq-qlog-moq-events-06 §4.1

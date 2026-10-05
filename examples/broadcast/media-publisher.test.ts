@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { MediaPublisher } from './media-publisher.js';
 import type { MediaPublishConnection, MediaPublisherOptions } from './media-publisher.js';
-import { parseLocHeaders, locWireProfileForDraft } from '@moqt/loc';
+import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 
 const wrapInt = (n: bigint) => n;
 
@@ -77,6 +77,81 @@ const makePublisher = (conn: MediaPublishConnection, opts: Partial<MediaPublishe
   new MediaPublisher(conn, { wrapInt, draft: 16, ...opts });
 
 async function settle() { await new Promise((r) => setTimeout(r, 0)); }
+
+describe('MediaPublisher — cancelled subscriptions', () => {
+  it.each(['video', 'audio'] as const)('does not count a cancelled %s send that fulfills late', async (track) => {
+    const conn = recordingConnection({ holdSends: true });
+    const pub = makePublisher(conn);
+    if (track === 'video') {
+      pub.setVideoAlias(2n);
+      pub.publishVideo(chunk(1), kf());
+    } else {
+      pub.setAudioAlias(2n);
+      pub.publishAudio(chunk(1), { timestampUs: 1 });
+    }
+    await settle();
+    if (track === 'video') pub.clearVideoAlias(2n); else pub.clearAudioAlias(2n);
+    await conn.releaseAll();
+    expect(pub.frameCount).toBe(0);
+    expect(pub.audioChunkCount).toBe(0);
+  });
+
+  it.each(['video', 'audio'] as const)('drops queued %s and contains a cancelled in-flight send', async (track) => {
+    const conn = recordingConnection({ holdSends: true });
+    const errors: unknown[] = [];
+    const pub = makePublisher(conn, { audioMaxInFlight: 1, onError: (_, error) => errors.push(error) });
+    if (track === 'video') pub.setVideoAlias(2n); else pub.setAudioAlias(2n);
+    const publish = (tag: number) => track === 'video'
+      ? pub.publishVideo(chunk(tag), kf(tag)) : pub.publishAudio(chunk(tag), { timestampUs: tag });
+    publish(1);
+    await settle();
+    publish(2);
+    if (track === 'video') pub.clearVideoAlias(2n); else pub.clearAudioAlias(2n);
+    await conn.rejectAllPending(new Error('subscription cancelled'));
+    publish(3);
+    await settle();
+    expect(conn.opened).toHaveLength(1);
+    expect(errors).toEqual([]);
+    if (track === 'video') pub.setVideoAlias(4n); else pub.setAudioAlias(4n);
+    publish(4);
+    await conn.releaseAll();
+    expect(conn.opened.map((s) => s.alias)).toEqual([2n, 4n]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([1, 4]);
+  });
+
+  it.each(['video', 'audio'] as const)('does not send or revive a cancelled %s stream when its open resolves late', async (track) => {
+    const conn = recordingConnection();
+    let release!: (id: bigint) => void;
+    const original = conn.openSubgroup;
+    conn.openSubgroup = () => new Promise((resolve) => { release = resolve; });
+    const pub = makePublisher(conn);
+    if (track === 'video') {
+      pub.setVideoAlias(2n);
+      pub.publishVideo(chunk(1), kf());
+      pub.clearVideoAlias(2n);
+      pub.setVideoAlias(4n);
+    } else {
+      pub.setAudioAlias(2n);
+      pub.publishAudio(chunk(1), { timestampUs: 1 });
+      pub.clearAudioAlias(2n);
+      pub.setAudioAlias(4n);
+    }
+    release(99n);
+    await settle();
+    expect(conn.sends).toEqual([]);
+    expect(conn.closed).toContain(99n);
+    conn.openSubgroup = original;
+    if (track === 'video') {
+      pub.publishVideo(chunk(2), delta());
+      await settle();
+      expect(conn.sends).toEqual([]);
+      pub.publishVideo(chunk(3), kf());
+    } else pub.publishAudio(chunk(3), { timestampUs: 3 });
+    await settle();
+    expect(conn.opened.map((s) => s.alias)).toEqual([4n]);
+    expect(conn.sends.map((s) => s.payload[0])).toEqual([3]);
+  });
+});
 
 describe('MediaPublisher — serialized video publication', () => {
   it('back-to-back chunks with deferred sends get UNIQUE, ORDERED object IDs on one subgroup', async () => {

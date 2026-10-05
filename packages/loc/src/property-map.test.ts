@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import type { PropertyEntry } from '@moqt/transport';
+import type { PropertyEntry } from '@openmoq/transport';
 import { resolveLocHeaders } from './property-map.js';
 import { LocHeaderError } from './errors.js';
 

@@ -1,6 +1,6 @@
 /**
  * Executable BMFF path against CURRENT production code. The parse helpers live
- * in `@moqt/browser`'s `mp4-box.ts` but are NOT in that package's public barrel,
+ * in `@openmoq/browser`'s `mp4-box.ts` but are NOT in that package's public barrel,
  * so we deep-import the module directly (test infrastructure, same repo).
  *
  * Critically, every mp4-box function is TOTAL — it returns null/empty on
@@ -12,7 +12,7 @@
  */
 
 // Deep relative import: mp4-box.ts is package-internal (not re-exported from
-// @moqt/browser). Pure byte manipulation (DataView/Uint8Array), no DOM.
+// @openmoq/browser). Pure byte manipulation (DataView/Uint8Array), no DOM.
 import {
   peekSegmentMetadata,
   readSegmentTimeRanges,

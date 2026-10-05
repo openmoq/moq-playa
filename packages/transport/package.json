@@ -1,5 +1,5 @@
 {
-  "name": "@moqt/transport",
+  "name": "@openmoq/transport",
   "version": "0.5.9",
   "description": "Sans-I/O protocol core for Media over QUIC Transport (MoQT): wire codec and session state machine for draft-14/16/18, with no I/O.",
   "license": "Apache-2.0",

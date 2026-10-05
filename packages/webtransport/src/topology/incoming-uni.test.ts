@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createControlCodec } from '@moqt/transport';
+import { createControlCodec } from '@openmoq/transport';
 import { IncomingUniRouter, type RoutedIncomingUniStream } from './incoming-uni.js';
 import { flush } from '../testkit/stream-sim.js';
 

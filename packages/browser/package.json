@@ -1,7 +1,7 @@
 {
-  "name": "@moqt/browser",
+  "name": "@openmoq/browser",
   "version": "0.5.9",
-  "description": "Browser adapters for @moqt/player: WebCodecs decoding, Canvas and WebAudio rendering, and MSE/CMAF playback, implementing the player's swappable interfaces.",
+  "description": "Browser adapters for @openmoq/player: WebCodecs decoding, Canvas and WebAudio rendering, and MSE/CMAF playback, implementing the player's swappable interfaces.",
   "license": "Apache-2.0",
   "author": "OpenMOQ (https://github.com/openmoq)",
   "contributors": [
@@ -50,10 +50,10 @@
     "access": "public"
   },
   "dependencies": {
-    "@moqt/playback": "workspace:*",
-    "@moqt/player": "workspace:*",
-    "@moqt/webtransport": "workspace:*",
-    "@moqt/loc": "workspace:*"
+    "@openmoq/playback": "workspace:*",
+    "@openmoq/player": "workspace:*",
+    "@openmoq/webtransport": "workspace:*",
+    "@openmoq/loc": "workspace:*"
   },
   "scripts": {
     "build": "tsc && tsup",

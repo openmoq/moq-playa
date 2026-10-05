@@ -18,8 +18,8 @@
  * @module
  */
 
-import type { VideoDecoderLike } from '@moqt/player';
-import type { VideoChunkInit } from '@moqt/loc';
+import type { VideoDecoderLike } from '@openmoq/player';
+import type { VideoChunkInit } from '@openmoq/loc';
 import { createCodecStrategy } from './codec-strategy.js';
 import type { CodecStrategy } from './codec-strategy.js';
 

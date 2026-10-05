@@ -1,6 +1,6 @@
 /**
  * BMFF crash-fuzz through the current corpus operations (`trex`, `peek`,
- * `timeRanges` → the `@moqt/browser` mp4-box helpers).
+ * `timeRanges` → the `@openmoq/browser` mp4-box helpers).
  *
  * Contract: these operations are documented TOTAL — on ANY input (random,
  * truncated, box-shaped, inconsistent box sizes) they return a sane result rather

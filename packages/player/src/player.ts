@@ -20,23 +20,23 @@
  * @module
  */
 
-import type { ControlMessage, Parameters, DraftVersion } from '@moqt/transport';
-import { varint, PublishDoneCode, PublishDoneCode18 } from '@moqt/transport';
+import type { ControlMessage, Parameters, DraftVersion } from '@openmoq/transport';
+import { varint, PublishDoneCode, PublishDoneCode18, RequestError } from '@openmoq/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
-import { MoqtConnectionError } from '@moqt/webtransport';
-import type { DataStreamTerminal, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@moqt/webtransport';
-import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@moqt/transport';
-import { getSubgroupIdMode, SubgroupIdMode } from '@moqt/transport';
-import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@moqt/playback';
-import { BufferBasedController } from '@moqt/playback';
-import type { AbrTrack } from '@moqt/playback';
-import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@moqt/playback';
-import type { CatalogState, CatalogTrack } from '@moqt/msf';
-import type { LocHeaders } from '@moqt/loc';
-import { LocmafFormatError, LocmafTrackDecoder, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes } from '@moqt/locmaf';
-import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@moqt/locmaf';
-import { parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@moqt/msf';
+import { MoqtConnectionError } from '@openmoq/webtransport';
+import type { DataStreamTerminal, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
+import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
+import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
+import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@openmoq/playback';
+import { BufferBasedController } from '@openmoq/playback';
+import type { AbrTrack } from '@openmoq/playback';
+import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@openmoq/playback';
+import type { CatalogState, CatalogTrack } from '@openmoq/msf';
+import type { LocHeaders } from '@openmoq/loc';
+import { LocmafFormatError, LocmafTrackDecoder, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes } from '@openmoq/locmaf';
+import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@openmoq/locmaf';
+import { parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@openmoq/msf';
 
 import { TypedEmitter } from './emitter.js';
 import { HookChain } from './hooks.js';
@@ -93,7 +93,7 @@ import {
   getTimelineDuration,
   type TimelineState,
 } from './timeline-manager.js';
-import { isRequestStreamDraft } from '@moqt/transport';
+import { isRequestStreamDraft } from '@openmoq/transport';
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -682,6 +682,12 @@ export class MoqtPlayer {
 
   /** Whether the first catalog object has been received. */
   private catalogReceived = false;
+
+  /** Pending catalog-subscribe retry timer; null when none is pending. */
+  private catalogSubscribeRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Delay before re-issuing a catalog SUBSCRIBE refused with DOES_NOT_EXIST. */
+  private static readonly CATALOG_SUBSCRIBE_RETRY_MS = 1_000;
 
   /** Stored catalog state for track switching. */
   private _catalogState: CatalogState | null = null;
@@ -2860,30 +2866,7 @@ export class MoqtPlayer {
       const subscribeOptions = buildSubscribeOptions(this.config);
       const promises: Promise<void>[] = [];
 
-      // Catalog subscription (always required — MSF §9.1). Under the
-      // bootstrap mode the filter is LargestObject and a relative Joining
-      // FETCH (offset 0) supplies the prefix (MSF-01 §5); the legacy mode
-      // keeps AbsoluteStart{0,0} byte-identical.
-      const catalogFilter = this.catalogSubscribeOptions(conn);
-      const bootstrapMode = this.resolvedCatalogMode(conn) === 'joining-fetch';
-      // Coordinator installed BEFORE the subscribe: a fast SUBSCRIBE_OK or
-      // first object must reach it, not the legacy path.
-      const knownTracksCoord = bootstrapMode ? this.createCatalogBootstrap(conn) : null;
-      promises.push((async () => {
-        let reqId: Awaited<ReturnType<MoqtConnection['subscribe']>>;
-        try {
-          reqId = await conn.subscribe(nsBytes, this.enc.encode(catalogTrackName()), catalogFilter as never);
-        } catch (err) {
-          // The pre-send callback may have registered the bind — settle it.
-          if (this.catalogRequestId !== null) this.settleParkedOwnership(this.catalogRequestId, null, conn);
-          throw err;
-        }
-        this.catalogRequestId = BigInt(reqId);
-        // catalogTrackAlias set by SUBSCRIBE_OK — never assume alias=requestId.
-        // Callback-less adapter fallback: the subscribe is awaiting its OK.
-        if (this.catalogTrackAlias === null) this.pendingAliasBinds.add(BigInt(reqId));
-        knownTracksCoord?.start();
-      })());
+      promises.push(this.subscribeCatalog(conn));
 
       // Pre-known media tracks (respecting disable flags)
       this._mediaSubsExpected = 0;
@@ -2942,27 +2925,102 @@ export class MoqtPlayer {
       await Promise.all(promises);
     } else {
       // ── Standard path: catalog-first ───────────────────────────────
-      // Subscribe to the catalog track (MSF §9.1, §5.1.10; name is always
-      // "catalog" on every draft). Bootstrap mode pairs a LargestObject
-      // filter with a relative Joining FETCH (MSF-01 §5); legacy mode keeps
-      // AbsoluteStart{0,0} byte-identical.
-      const nameBytes = this.enc.encode(catalogTrackName());
-      const standardCoord = this.resolvedCatalogMode(conn) === 'joining-fetch'
-        ? this.createCatalogBootstrap(conn) : null;
-      let reqId: Awaited<ReturnType<MoqtConnection['subscribe']>>;
-      try {
-        reqId = await conn.subscribe(nsBytes, nameBytes, this.catalogSubscribeOptions(conn) as never);
-      } catch (err) {
-        // The pre-send callback may have registered the bind — settle it.
-        if (this.catalogRequestId !== null) this.settleParkedOwnership(this.catalogRequestId, null, conn);
-        throw err;
-      }
-      this.catalogRequestId = BigInt(reqId);
-      // catalogTrackAlias set by SUBSCRIBE_OK — never assume alias=requestId.
-      // Callback-less adapter fallback: the subscribe is awaiting its OK.
-      if (this.catalogTrackAlias === null) this.pendingAliasBinds.add(BigInt(reqId));
-      standardCoord?.start();
+      await this.subscribeCatalog(conn);
     }
+  }
+
+  /**
+   * Issue the catalog SUBSCRIBE (MSF §9.1, §5.1.10). Bootstrap mode pairs a
+   * LargestObject filter with a Joining FETCH (MSF-01 §5); legacy mode keeps
+   * AbsoluteStart{0,0}. Shared by the initial subscribe and by
+   * {@link scheduleCatalogSubscribeRetry}.
+   */
+  private async subscribeCatalog(conn: MoqtConnection): Promise<void> {
+    const gen = this.bootstrapGeneration;
+    const live = (): boolean => !this._destroyed && this.connection === conn
+      && gen === this.bootstrapGeneration && !this.catalogQuarantinedConns.has(conn);
+    if (!live()) return;
+    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+    const nameBytes = this.enc.encode(catalogTrackName());
+    const coord = this.resolvedCatalogMode(conn) === 'joining-fetch'
+      ? this.createCatalogBootstrap(conn) : null;
+    const options = this.catalogSubscribeOptions(conn);
+    const register = options.onRequestId as (id: bigint) => void;
+    let allocatedId: bigint | null = null;
+    let reqId: Awaited<ReturnType<MoqtConnection['subscribe']>>;
+    try {
+      reqId = await conn.subscribe(nsBytes, nameBytes, {
+        ...options,
+        onRequestId: (id: bigint) => {
+          if (!live()) return;
+          allocatedId = id;
+          register(id);
+        },
+      } as never);
+    } catch (err) {
+      if (live()) {
+        // The pre-send callback may have registered the bind — settle it.
+        if (allocatedId !== null) this.settleParkedOwnership(allocatedId, null, conn);
+        this.cancelCatalogBootstrap();
+      }
+      throw err;
+    }
+    if (!live()) return;
+    // A response can precede send completion. Only callback-less adapters
+    // still need registration here; never restore an already-retired request.
+    if (allocatedId === null) {
+      this.catalogRequestId = BigInt(reqId);
+      if (this.catalogTrackAlias === null) this.pendingAliasBinds.add(BigInt(reqId));
+    }
+    coord?.start();
+  }
+
+  /**
+   * Honor the peer's retry guidance for DOES_NOT_EXIST. Draft-16 9.8 and
+   * draft-18 10.6.2 encode the minimum delay plus one; zero means no retry.
+   */
+  private scheduleCatalogSubscribeRetry(conn: MoqtConnection, retryInterval: bigint): void {
+    if (retryInterval <= 0n) return;
+    const gen = this.bootstrapGeneration;
+    const live = (): boolean => !this._destroyed && this.connection === conn
+      && gen === this.bootstrapGeneration && !this.catalogReceived
+      && !this.catalogQuarantinedConns.has(conn);
+    if (!live()) return;
+    if (this.catalogSubscribeRetryTimer !== null) return;
+    let remaining = retryInterval - 1n;
+    const backoff = BigInt(MoqtPlayer.CATALOG_SUBSCRIBE_RETRY_MS);
+    if (remaining < backoff) remaining = backoff;
+    const arm = (): void => {
+      // Wire intervals can be uint64; platform timers are signed 32-bit.
+      const delay = Number(remaining > 0x7fffffffn ? 0x7fffffffn : remaining);
+      const timer = setTimeout(() => {
+        if (this.catalogSubscribeRetryTimer !== timer) return;
+        this.catalogSubscribeRetryTimer = null;
+        if (!live()) return;
+        remaining -= BigInt(delay);
+        if (remaining > 0n) { arm(); return; }
+        this.log.info('Retrying catalog subscription for namespace "%s" (no publisher yet)',
+          this.config.namespace);
+        if (!live()) return;
+        this.subscribeCatalog(conn).catch((err) => {
+          this.log.warn('Catalog subscribe retry failed to send: %s',
+            err instanceof Error ? err.message : String(err));
+        });
+      }, delay);
+      this.catalogSubscribeRetryTimer = timer;
+    };
+    arm();
+  }
+
+  /** Retire bootstrap work and invalidate its outstanding async callbacks. */
+  private cancelCatalogBootstrap(): void {
+    this.bootstrapGeneration += 1;
+    if (this.catalogSubscribeRetryTimer !== null) {
+      clearTimeout(this.catalogSubscribeRetryTimer);
+      this.catalogSubscribeRetryTimer = null;
+    }
+    this.catalogBootstrapCoord?.abort();
+    this.catalogBootstrapCoord = null;
   }
 
   /**
@@ -3460,12 +3518,10 @@ export class MoqtPlayer {
     // Catalog bootstrap: the old coordinator is superseded wholesale; a fresh
     // one (new generation) binds to the committed session. Its joining fetch
     // fires immediately (Pending/Established association both legal on 16/18).
-    this.catalogBootstrapCoord?.abort();
-    this.catalogBootstrapCoord = null;
+    this.cancelCatalogBootstrap();
     this.catalogRecovery?.coord.abort();
     this.catalogRecovery = null;
     this.recoveryAttempted = false; // new session, fresh recovery budget
-    this.bootstrapGeneration += 1;
     this.bootstrapFetch = null;
     this.bootstrapFetchStreams.clear();
     this.catalogManager?.reset();
@@ -3571,7 +3627,7 @@ export class MoqtPlayer {
 
   private async migrateToUrl(newConnection: MoqtConnection, url: string): Promise<void> {
     const createTransport = this.config.createTransport!;
-    const setupOptions = buildSetupOptions(this.config);
+    const setupOptions = buildSetupOptions(this.config, url);
     await this.runMigrationTransaction(newConnection, () => createTransport(buildConnectUrl(this.config, url)), setupOptions);
 
     this._stats.recordReconnect();
@@ -4001,12 +4057,14 @@ export class MoqtPlayer {
     const live = (): boolean => gen === this.bootstrapGeneration && this.connection === conn;
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(catalogTrackName());
+    let pendingAttempt: number | null = null;
 
     const coord = new CatalogBootstrap({
       applyAt: (loc, payload, opts) => this.catalogManager!.processCatalogObjectAt(loc, payload, opts),
       resetManager: () => this.catalogManager?.reset(),
       currentState: () => this.catalogManager?.currentState ?? null,
       issueJoiningFetch: (attempt) => {
+        pendingAttempt = attempt;
         if (this.usesCatalogFill(conn)) {
           void Promise.resolve().then(() => {
             if (!live()) return;
@@ -4027,7 +4085,11 @@ export class MoqtPlayer {
               joiningRequestId: this.catalogRequestId,
               joiningStart: 0n,
               groupOrder: varint(0x1n), // ascending — explicit on every bootstrap fetch
-              onRequestId: (id: bigint) => { myFetchReqId = id; this.registerBootstrapFetch(conn, id, attempt, gen); },
+              onRequestId: (id: bigint) => {
+                if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
+                myFetchReqId = id;
+                this.registerBootstrapFetch(conn, id, attempt, gen);
+              },
             } as never);
           } catch (err) {
             if (!live()) return;
@@ -4046,6 +4108,7 @@ export class MoqtPlayer {
         })();
       },
       issueStandaloneFetch: (range, attempt) => {
+        pendingAttempt = attempt;
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
@@ -4060,7 +4123,11 @@ export class MoqtPlayer {
               endGroup: range.endGroupWholeOf,
               endObject: 0n,
               groupOrder: varint(0x1n),
-              onRequestId: (id: bigint) => { myFetchReqId = id; this.registerBootstrapFetch(conn, id, attempt, gen); },
+              onRequestId: (id: bigint) => {
+                if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
+                myFetchReqId = id;
+                this.registerBootstrapFetch(conn, id, attempt, gen);
+              },
             } as never);
           } catch (err) {
             if (!live()) return;
@@ -4078,6 +4145,7 @@ export class MoqtPlayer {
         })();
       },
       cancelFetch: () => {
+        pendingAttempt = null;
         const fetch = this.bootstrapFetch;
         this.bootstrapFetch = null;
         if (fetch) this.retireBootstrapFetch(fetch.conn, fetch.reqId, { attempt: fetch.attempt });
@@ -4377,6 +4445,7 @@ export class MoqtPlayer {
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(catalogTrackName());
     const manager = new CatalogManager(namespaceDisplay(this.config.namespace));
+    let pendingAttempt: number | null = null;
 
     const failCandidate = (reason: string): void => {
       if (!ownedAsCandidate()) return; // post-adoption failures follow main-role paths
@@ -4388,6 +4457,7 @@ export class MoqtPlayer {
       resetManager: () => manager.reset(),
       currentState: () => manager.currentState,
       issueJoiningFetch: (attempt) => {
+        pendingAttempt = attempt;
         if (this.usesCatalogFill(conn)) {
           void Promise.resolve().then(() => {
             if (!live()) return;
@@ -4415,6 +4485,7 @@ export class MoqtPlayer {
               joiningStart: 0n,
               groupOrder: varint(0x1n),
               onRequestId: (id: bigint) => {
+                if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
                 myFetchReqId = id;
                 if (ownedAsCandidate()) {
                   this.catalogRecovery!.fetch = { reqId: id, attempt };
@@ -4449,6 +4520,7 @@ export class MoqtPlayer {
         })();
       },
       issueStandaloneFetch: (range, attempt) => {
+        pendingAttempt = attempt;
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
@@ -4459,6 +4531,7 @@ export class MoqtPlayer {
               endGroup: range.endGroupWholeOf, endObject: 0n,
               groupOrder: varint(0x1n),
               onRequestId: (id: bigint) => {
+                if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
                 myFetchReqId = id;
                 if (ownedAsCandidate()) {
                   this.catalogRecovery!.fetch = { reqId: id, attempt };
@@ -4493,6 +4566,7 @@ export class MoqtPlayer {
         })();
       },
       cancelFetch: () => {
+        pendingAttempt = null;
         if (ownedAsCandidate()) {
           const r = this.catalogRecovery!;
           if (r.fetch) {
@@ -5261,11 +5335,9 @@ export class MoqtPlayer {
       pending.reject(new Error('Player destroyed'));
     }
     this.pendingTrackStatuses.clear();
-    this.catalogBootstrapCoord?.abort();
-    this.catalogBootstrapCoord = null;
+    this.cancelCatalogBootstrap();
     this.catalogRecovery?.coord.abort();
     this.catalogRecovery = null;
-    this.bootstrapGeneration += 1;
     this.bootstrapFetch = null;
     this.bootstrapFetchStreams.clear();
     this.rejectPendingCatalogFetches('Player destroyed');
@@ -5651,6 +5723,7 @@ export class MoqtPlayer {
           this.log.info('[SESSION] superseded session closed — not affecting the current session');
           return;
         }
+        this.cancelCatalogBootstrap();
         // Reject in-flight fetchCatalog promises — their stream IDs
         // belong to the closed session, so the FETCH response can't
         // arrive and the timeout would fire against a dead adapter.
@@ -5702,6 +5775,7 @@ export class MoqtPlayer {
           this.log.info('[SESSION] error on a superseded session — ignored: %s', error.message);
           return;
         }
+        if (classified.severity === 'fatal') this.cancelCatalogBootstrap();
         this.emitError(createPlayerError(
           classified.severity, 'connection', classified.code, error.message,
           defined({ cause: error, context: classified.context }),
@@ -6333,6 +6407,13 @@ export class MoqtPlayer {
       },
       onCatalogSubscribeOk: (largest) => {
         this.catalogBootstrapCoord?.onSubscribeOk(largest);
+      },
+      onCatalogSubscribeError: (errorCode, _reason, retryInterval) => {
+        if (conn !== this.connection) return;
+        this.cancelCatalogBootstrap();
+        // Only "not published yet" is retriable; other codes are real refusals.
+        if (errorCode !== BigInt(RequestError.DOES_NOT_EXIST)) return;
+        this.scheduleCatalogSubscribeRetry(conn, retryInterval);
       },
       onRecoveryCatalogSubscribeOk: (reqId, alias, largest) => {
         const r = this.catalogRecovery;

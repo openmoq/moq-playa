@@ -7,7 +7,7 @@
  * session, and player-mock levels.)
  *
  * Uses an internal relative testkit import by design — the testkit is not a
- * published export of @moqt/webtransport.
+ * published export of @openmoq/webtransport.
  *
  * @see draft-ietf-moq-msf-01 §5, draft-ietf-moq-transport-18 §10.12.2
  */
@@ -15,8 +15,8 @@
 import { describe, it, expect } from 'vitest';
 import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { MoqtPlayer } from './player.js';
-import type { MoqtConnection } from '@moqt/webtransport';
-import { varint } from '@moqt/transport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import { varint } from '@openmoq/transport';
 
 const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
 const td = new TextDecoder();

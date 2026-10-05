@@ -4,7 +4,7 @@
  * Bridges the opaque `extensions: Uint8Array` from MOQ Object Header Extensions
  * and structured {@link LocHeaders}. This module is the compatibility layer over
  * the two-layer split:
- *   - Layer A ({@link @moqt/transport}) — the profile-aware property WIRE codec
+ *   - Layer A ({@link @openmoq/transport}) — the profile-aware property WIRE codec
  *     (bytes ⇄ ordered `PropertyMap`), shared across draft-14/16/18.
  *   - Layer B ({@link ./property-map.js}) — LOC semantic resolution (PropertyMap
  *     ⇄ `LocHeaders`).
@@ -21,7 +21,7 @@
  * @module
  */
 
-import { decodePropertyBlock, encodePropertyBlock, type PropertyWireProfile } from '@moqt/transport';
+import { decodePropertyBlock, encodePropertyBlock, type PropertyWireProfile } from '@openmoq/transport';
 import type {
     LocHeaders,
     LocTrackContext,

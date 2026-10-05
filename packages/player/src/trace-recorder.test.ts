@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { parseSeq, type QlogClock } from '@moqt/transport';
+import { parseSeq, type QlogClock } from '@openmoq/transport';
 import {
   TraceRecorder,
   formatLogMessage,

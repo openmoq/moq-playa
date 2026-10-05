@@ -1,7 +1,7 @@
 /**
  * QualityController tests — red/green TDD.
  *
- * Uses @moqt/msf selection APIs (groupByAlt, selectTrack) for ABR.
+ * Uses @openmoq/msf selection APIs (groupByAlt, selectTrack) for ABR.
  * Responds to recovery actions by selecting lower quality tracks.
  *
  * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
@@ -11,8 +11,8 @@
 
 import { describe, it, expect } from 'vitest';
 import { QualityController } from './quality-controller.js';
-import type { CatalogTrack, CatalogState } from '@moqt/msf';
-import type { ClockSource } from '@moqt/playback';
+import type { CatalogTrack, CatalogState } from '@openmoq/msf';
+import type { ClockSource } from '@openmoq/playback';
 
 class MockClock implements ClockSource {
   private _now = 0;

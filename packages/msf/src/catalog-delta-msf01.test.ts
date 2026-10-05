@@ -290,13 +290,13 @@ describe('applyMsf01Delta — an MSF-00 base state stays clean', () => {
 
 // ─── Publisher round-trip: build CMSF-01 catalog → op-array clone delta ───
 // Models the node-publisher example (--catalog-format cmsf-01 --emit-delta):
-// the emitted catalog + delta bytes must parse and apply through @moqt/msf.
+// the emitted catalog + delta bytes must parse and apply through @openmoq/msf.
 
 import { buildCatalog } from './catalog-builder.js';
 import { parseCatalogAuto } from './catalog-detect.js';
 import type { Catalog } from './types.js';
 
-describe('publisher CMSF-01 catalog + op-array clone delta round-trips through @moqt/msf', () => {
+describe('publisher CMSF-01 catalog + op-array clone delta round-trips through @openmoq/msf', () => {
     it('parses the built catalog and applies the emitted clone delta (clone inherits initRef)', () => {
         // 1. buildCatalog cmsf-01 shape (what buildFixtureCatalog emits).
         const catalogBytes = buildCatalog({

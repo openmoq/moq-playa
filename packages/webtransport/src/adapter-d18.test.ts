@@ -8,9 +8,9 @@ import { describe, it, expect } from 'vitest';
 import { MoqtConnection } from './adapter.js';
 import type { DataStreamTerminal } from './adapter.js';
 import { TransportSim, flush } from './testkit/stream-sim.js';
-import { createControlCodec, varint, writeVi64, SessionState } from '@moqt/transport';
-import { SetupOption18 } from '@moqt/transport';
-import type { SubscribeOk, RequestErrorMsg, RequestOk, Fetch, FetchOk, ControlMessage, QlogEvent, Setup, MoqtObject } from '@moqt/transport';
+import { createControlCodec, varint, writeVi64, SessionState } from '@openmoq/transport';
+import { SetupOption18 } from '@openmoq/transport';
+import type { SubscribeOk, RequestErrorMsg, RequestOk, Fetch, FetchOk, ControlMessage, QlogEvent, Setup, MoqtObject } from '@openmoq/transport';
 
 const codec18 = createControlCodec(18);
 const setupBytes = (): Uint8Array => codec18.encode({ type: 'SETUP', setupOptions: new Map() });

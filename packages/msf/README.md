@@ -2,7 +2,7 @@
      Content derives from this package's package.json (name, description).
      Run `node scripts/generate-package-readmes.mjs --write` after editing it. -->
 
-# @moqt/msf
+# @openmoq/msf
 
 Media over QUIC Streaming Format (MSF) catalog: JSON catalog parsing, validation, track selection and ABR, delta updates, and timeline parsing.
 
@@ -11,7 +11,7 @@ Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implement
 ## Install
 
 ```sh
-npm install @moqt/msf
+npm install @openmoq/msf
 ```
 
 ## License

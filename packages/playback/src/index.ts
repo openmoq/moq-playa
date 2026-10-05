@@ -1,5 +1,5 @@
 /**
- * @moqt/playback — Sans-I/O playback core.
+ * @openmoq/playback — Sans-I/O playback core.
  *
  * Jitter buffer, A/V sync, gap detection, decoder state machine,
  * and pipeline orchestrator — all testable in Node.js without browser APIs.

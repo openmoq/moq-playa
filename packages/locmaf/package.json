@@ -1,5 +1,5 @@
 {
-  "name": "@moqt/locmaf",
+  "name": "@openmoq/locmaf",
   "version": "0.5.9",
   "description": "Low Overhead CMAF (LOCMAF) codec for Media over QUIC (MoQ): parses, reconstructs, and encodes LOCMAF Objects into canonical CMAF chunks, slices them into coded frames for frame decoders, and reads the emsg events of event-only tracks.",
   "license": "Apache-2.0",

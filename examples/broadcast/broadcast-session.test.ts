@@ -51,6 +51,69 @@ function makeSession(conn: BroadcastSessionConnection, hooks: {
 async function settle() { await new Promise((r) => setTimeout(r, 0)); }
 
 describe('BroadcastSession — subscription routing', () => {
+  it('cancellation drops only that request and permits a clean rejoin', async () => {
+    const conn = recordingConnection();
+    const session = makeSession(conn);
+    session.handleSubscribe(1n, 'video');
+    session.handleSubscribe(3n, 'audio');
+    await settle();
+    session.handleSubscribeClosed(3n);
+    session.publisher.publishAudio(new Uint8Array([1]), { timestampUs: 1 });
+    session.publisher.publishVideo(new Uint8Array([2]), { isKeyframe: true, timestampUs: 2 });
+    await settle();
+    expect(conn.sends.map((p) => p[0])).toEqual([2]);
+    session.handleSubscribe(5n, 'audio');
+    await settle();
+    session.publisher.publishAudio(new Uint8Array([3]), { timestampUs: 3 });
+    await settle();
+    expect(conn.sends.map((p) => p[0])).toEqual([2, 3]);
+  });
+
+  it('cancellation before acceptance prevents the late accept from binding', async () => {
+    const conn = recordingConnection();
+    let accept!: () => void;
+    conn.acceptSubscribe = () => new Promise((resolve) => { accept = resolve; });
+    const session = makeSession(conn);
+    session.handleSubscribe(1n, 'video');
+    session.handleSubscribeClosed(1n);
+    accept();
+    await settle();
+    session.publisher.publishVideo(new Uint8Array([1]), { isKeyframe: true, timestampUs: 1 });
+    await settle();
+    expect(conn.sends).toEqual([]);
+  });
+
+  it('an old cancellation does not unbind the replacement subscription', async () => {
+    const conn = recordingConnection();
+    const session = makeSession(conn);
+    session.handleSubscribe(1n, 'video');
+    await settle();
+    session.handleSubscribe(3n, 'video');
+    await settle();
+    session.handleSubscribeClosed(1n);
+    session.handleSubscribeClosed(1n);
+    session.publisher.publishVideo(new Uint8Array([1]), { isKeyframe: true, timestampUs: 1 });
+    await settle();
+    expect(conn.sends).toHaveLength(1);
+  });
+
+  it('an older acceptance cannot displace a newer subscription', async () => {
+    const conn = recordingConnection();
+    const accepts = new Map<bigint, () => void>();
+    conn.acceptSubscribe = (rid) => new Promise((resolve) => { accepts.set(rid as bigint, resolve); });
+    const session = makeSession(conn);
+    session.handleSubscribe(1n, 'video');
+    session.handleSubscribe(3n, 'video');
+    accepts.get(3n)!();
+    await settle();
+    accepts.get(1n)!();
+    await settle();
+    session.handleSubscribeClosed(3n);
+    session.publisher.publishVideo(new Uint8Array([1]), { isKeyframe: true, timestampUs: 1 });
+    await settle();
+    expect(conn.sends).toEqual([]);
+  });
+
   it('serves catalog/video/audio on ITS connection with a per-generation alias space, rejects unknown tracks', async () => {
     const conn = recordingConnection();
     const published: number[] = [];

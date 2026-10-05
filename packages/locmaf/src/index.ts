@@ -1,5 +1,5 @@
 /**
- * @moqt/locmaf — Low Overhead CMAF for Media over QUIC.
+ * @openmoq/locmaf — Low Overhead CMAF for Media over QUIC.
  *
  * Parses LOCMAF Objects (genBox, full/delta moof headers, rawBoxes), keeps the
  * per-group delta reference, and reconstructs canonical CMAF chunks that feed

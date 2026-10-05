@@ -9,8 +9,8 @@ import type { WebTransportLike } from '../types.js';
 import {
   Session, EndpointRole, SessionError as SessionErrorCode, SessionState, SubscriptionState,
   SetupOption18, createControlCodec, varint,
-} from '@moqt/transport';
-import type { Setup, SubscribeOk, RequestOk, RequestErrorMsg, Subscribe, FetchOk, Namespace, NamespaceDone, Goaway, ControlMessage, DecodedControlMessage, SendControlAction, OpenNamespaceStreamAction, RequestResult } from '@moqt/transport';
+} from '@openmoq/transport';
+import type { Setup, SubscribeOk, RequestOk, RequestErrorMsg, Subscribe, FetchOk, Namespace, NamespaceDone, Goaway, ControlMessage, DecodedControlMessage, SendControlAction, OpenNamespaceStreamAction, RequestResult } from '@openmoq/transport';
 
 const codec18 = createControlCodec(18);
 const setupBytes = (): Uint8Array => codec18.encode({ type: 'SETUP', setupOptions: new Map() });

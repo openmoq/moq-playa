@@ -1,5 +1,5 @@
 {
-  "name": "@playa/player",
+  "name": "@openmoq/playa",
   "version": "0.5.9",
   "description": "Batteries-included Media over QUIC (MoQ) media player for the browser.",
   "license": "Apache-2.0",
@@ -49,10 +49,10 @@
     "access": "public"
   },
   "dependencies": {
-    "@moqt/player": "workspace:*",
-    "@moqt/msf": "workspace:*",
-    "@moqt/browser": "workspace:*",
-    "@moqt/webtransport": "workspace:*"
+    "@openmoq/player": "workspace:*",
+    "@openmoq/msf": "workspace:*",
+    "@openmoq/browser": "workspace:*",
+    "@openmoq/webtransport": "workspace:*"
   },
   "scripts": {
     "build": "tsc && tsup",

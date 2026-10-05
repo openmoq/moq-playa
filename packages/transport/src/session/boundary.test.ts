@@ -47,7 +47,7 @@ const FORBIDDEN_IMPORT_SUBSTRINGS = [
   'track-properties-18',
   'message-params-18',
   'primitives/vi64',
-  '@moqt/webtransport',
+  '@openmoq/webtransport',
   'topology/',
 ];
 
@@ -297,7 +297,7 @@ describe('session core boundary', () => {
         '../control/track-properties-18.js',
         '../control/message-params-18.js',
         '../primitives/vi64.js',
-        '@moqt/webtransport',
+        '@openmoq/webtransport',
         '../topology/uni-pair.js',
       ]) {
         expect(forbiddenImportsIn(`import { Whatever } from '${spec}';`)).toEqual([spec]);

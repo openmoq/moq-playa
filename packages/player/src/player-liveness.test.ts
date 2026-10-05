@@ -18,10 +18,10 @@ import { MoqtPlayer } from './player.js';
 import { PlayerErrorCode } from './errors.js';
 import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
-import type { MoqtConnection } from '@moqt/webtransport';
-import type { ControlMessage, DataStreamHeader, MoqtObject } from '@moqt/transport';
-import { varint } from '@moqt/transport';
-import type { DataStreamTerminal } from '@moqt/webtransport';
+import type { MoqtConnection } from '@openmoq/webtransport';
+import type { ControlMessage, DataStreamHeader, MoqtObject } from '@openmoq/transport';
+import { varint } from '@openmoq/transport';
+import type { DataStreamTerminal } from '@openmoq/webtransport';
 
 // ─── Mock adapter (thin copy of the player.test.ts harness) ──────────
 

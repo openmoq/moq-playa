@@ -22,8 +22,8 @@ import { PlaybackPipeline } from './pipeline.js';
 import { SyncController } from './sync.js';
 import { DefaultRecoveryController } from './recovery.js';
 import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig } from './types.js';
-import type { LocHeaders } from '@moqt/loc';
-import { varint, ObjectStatus } from '@moqt/transport';
+import type { LocHeaders } from '@openmoq/loc';
+import { varint, ObjectStatus } from '@openmoq/transport';
 
 class SimClock implements ClockSource {
   private nowUs = 0;

@@ -8,7 +8,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { WebTransport, quicheLoaded } from '@fails-components/webtransport';
-import { MoqtConnection } from '@moqt/webtransport';
+import { MoqtConnection } from '@openmoq/webtransport';
 import { nodeSessionToWebTransportLike } from './wt-adapter.js';
 import { relayCertSha256 } from './cert.js';
 

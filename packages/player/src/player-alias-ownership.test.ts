@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { varint } from '@moqt/transport';
-import type { MoqtObject } from '@moqt/transport';
-import type { MoqtConnection } from '@moqt/webtransport';
+import { varint } from '@openmoq/transport';
+import type { MoqtObject } from '@openmoq/transport';
+import type { MoqtConnection } from '@openmoq/webtransport';
 import { MoqtPlayer } from './player.js';
 import { audioInit, videoInit } from '../../locmaf/test-support/cmaf.js';
 

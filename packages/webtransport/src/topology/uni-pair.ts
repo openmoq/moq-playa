@@ -34,8 +34,8 @@ import {
   type DecodedControlMessage,
   type CloseConnectionAction,
   type Session,
-} from '@moqt/transport';
-import type { SetupOptions } from '@moqt/transport';
+} from '@openmoq/transport';
+import type { SetupOptions } from '@openmoq/transport';
 import { ControlStreamFramer } from '../framer.js';
 import type { WebTransportLike, WebTransportBidirectionalStream } from '../types.js';
 import { IncomingUniRouter, type RoutedIncomingUniStream } from './incoming-uni.js';

@@ -5,7 +5,7 @@
  * Everything else is DOM glue.
  */
 
-import { Player } from '@playa/player';
+import { Player } from '@openmoq/playa';
 import { namespace, certHash, draftVersion } from '../shared/cert.js';
 import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
 

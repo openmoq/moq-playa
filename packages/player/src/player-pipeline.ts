@@ -9,7 +9,7 @@
  * @module
  */
 
-import { PlaybackPipeline, SyncController, DefaultRecoveryController } from '@moqt/playback';
+import { PlaybackPipeline, SyncController, DefaultRecoveryController } from '@openmoq/playback';
 import type {
   ClockSource,
   DecoderCommand,
@@ -18,7 +18,7 @@ import type {
   RecoveryAction,
   RecoveryController,
   DecoderFeedback,
-} from '@moqt/playback';
+} from '@openmoq/playback';
 import type { MoqtPlayerConfig } from './config.js';
 import type { MediaSourceLike } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';

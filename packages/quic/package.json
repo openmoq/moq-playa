@@ -1,5 +1,5 @@
 {
-  "name": "@moqt/quic",
+  "name": "@openmoq/quic",
   "version": "0.5.9",
   "description": "Experimental Node.js native QUIC binding for Media over QUIC Transport (MoQT).",
   "license": "Apache-2.0",
@@ -39,7 +39,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@moqt/webtransport": "workspace:*"
+    "@openmoq/webtransport": "workspace:*"
   },
   "engines": {
     "node": ">=26.8.1"

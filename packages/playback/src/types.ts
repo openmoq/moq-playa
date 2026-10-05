@@ -9,7 +9,7 @@
  * @module
  */
 
-import type { VideoChunkInit, AudioChunkInit } from '@moqt/loc';
+import type { VideoChunkInit, AudioChunkInit } from '@openmoq/loc';
 import type { RecoveryAction } from './recovery.js';
 
 // ─── Clock ──────────────────────────────────────────────────────────

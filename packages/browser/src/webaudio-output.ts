@@ -9,8 +9,8 @@
  * @module
  */
 
-import type { AudioOutputLike } from '@moqt/player';
-import type { ClockSource } from '@moqt/playback';
+import type { AudioOutputLike } from '@openmoq/player';
+import type { ClockSource } from '@openmoq/playback';
 
 
 /**

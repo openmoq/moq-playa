@@ -10,7 +10,7 @@
  * @module
  */
 
-import type { MoqtObject, MoqtObjectData } from '@moqt/transport';
+import type { MoqtObject, MoqtObjectData } from '@openmoq/transport';
 
 /**
  * Compare two objects by (groupId, objectId) ascending.

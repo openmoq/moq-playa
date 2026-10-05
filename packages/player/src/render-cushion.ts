@@ -20,7 +20,7 @@
  * @module
  */
 
-import type { ClockSource } from '@moqt/playback';
+import type { ClockSource } from '@openmoq/playback';
 
 /**
  * Render-range cap, independent of the gap fuse's 2000 ms max. The observed

@@ -7,7 +7,7 @@
  *     "listening on <url>" line);
  *   - connects the PUBLISHER, publishes catalog + 5 media tracks (synthetic chunks);
  *   - connects a VERIFICATION SUBSCRIBER, subscribes the catalog, parses it with
- *     @moqt/msf parseCatalogAuto, asserts the track list + per-track initData; then
+ *     @openmoq/msf parseCatalogAuto, asserts the track list + per-track initData; then
  *     subscribes EVERY media track and asserts the exact synthetic chunk payloads
  *     and group/object IDs arrive.
  *
@@ -17,7 +17,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseCatalogAuto } from '@moqt/msf';
+import { parseCatalogAuto } from '@openmoq/msf';
 import { connectClient, subscribeCollect } from './client.js';
 import { publishFixture } from './publisher.js';
 import { loadSyntheticFixture, syntheticChunkPayload, CHUNKS_PER_TRACK } from './synthetic-fixture.js';

@@ -14,7 +14,7 @@
  *     number — e.g. "responses omit the Request ID").
  *
  * Stream topology (bidi control vs uni-pair + per-request bidi) is intentionally
- * NOT implemented here — it belongs to the I/O layer (`@moqt/webtransport`),
+ * NOT implemented here — it belongs to the I/O layer (`@openmoq/webtransport`),
  * keeping this package sans-I/O. The capability *flags* describe whether a draft
  * uses those mechanisms, but the wiring lives in the adapter.
  *
@@ -35,7 +35,7 @@ import { isRequestStreamDraft } from './versions.js';
  * key off so they branch on a named capability instead of re-deriving intent
  * from a bare `_draftVersion === N` check. The flags describe the draft-18
  * topology inversion without implementing it here (topology I/O is in
- * `@moqt/webtransport`).
+ * `@openmoq/webtransport`).
  */
 export interface ProfileCapabilities {
   /**

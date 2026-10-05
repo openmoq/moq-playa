@@ -1,5 +1,5 @@
 /**
- * @moqt/msf — MOQT Streaming Format catalog parsing, track selection,
+ * @openmoq/msf — MOQT Streaming Format catalog parsing, track selection,
  * delta updates, and timeline parsing.
  *
  * Implements the JSON catalog format defined in draft-ietf-moq-msf-00.

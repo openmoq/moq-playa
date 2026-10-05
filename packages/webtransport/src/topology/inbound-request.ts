@@ -20,7 +20,7 @@
  * @module
  */
 
-import { ProtocolViolationError, type ControlCodec, type ControlMessage, type DecodedControlMessage } from '@moqt/transport';
+import { ProtocolViolationError, type ControlCodec, type ControlMessage, type DecodedControlMessage } from '@openmoq/transport';
 import { ControlStreamFramer } from '../framer.js';
 import type { WebTransportBidirectionalStream } from '../types.js';
 

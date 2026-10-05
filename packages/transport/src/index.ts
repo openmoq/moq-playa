@@ -1,5 +1,5 @@
 /**
- * @moqt/transport — Sans-I/O protocol core for MOQT draft-ietf-moq-transport-16
+ * @openmoq/transport — Sans-I/O protocol core for MOQT draft-ietf-moq-transport-16
  * @module
  */
 
@@ -324,7 +324,9 @@ export { TrackAliasManager } from './session/track-alias.js';
 export type { TrackIdentity } from './session/track-alias.js';
 export { Session } from './session/session.js';
 export { SessionError as SessionProtocolError, SessionDrainingError } from './session/session.js';
-export type { SetupOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions, RequestResult } from './session/session.js';
+export type { SetupOptions, AuthorizationOptions, SubscribeOptions, RequestUpdateOptions, FetchOptions, JoiningFetchOptions, FetchAcceptOptions, TrackStatusAcceptOptions, RequestResult } from './session/session.js';
+export { AliasType, encodeAuthorizationToken, encodeAuthorizationToken18, parseAuthorizationToken, parseAuthorizationToken18 } from './control/auth-token.js';
+export type { AuthorizationToken as WireAuthorizationToken } from './control/auth-token.js';
 export { resolveJoiningFetchRange, type JoiningFetchFields } from './session/joining.js';
 export {
   decodeSubscriptionFilter,

@@ -13,8 +13,8 @@
  *   SCENARIO_SEEDS=2000 SCENARIO_STEPS=200 npx vitest run scenario-d18.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { SessionState, SubscriptionState, FetchState, NamespaceState, varint } from '@moqt/transport';
-import type { MoqtObject, ControlMessage } from '@moqt/transport';
+import { SessionState, SubscriptionState, FetchState, NamespaceState, varint } from '@openmoq/transport';
+import type { MoqtObject, ControlMessage } from '@openmoq/transport';
 import { connectedPair, ns, nm } from './testkit/pair.js';
 import { flush } from './testkit/loopback.js';
 import { runScenario } from './testkit/scenario.js';

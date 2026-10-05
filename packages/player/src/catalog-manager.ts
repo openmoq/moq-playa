@@ -19,7 +19,7 @@
  * @module
  */
 
-import type { CatalogState } from '@moqt/msf';
+import type { CatalogState } from '@openmoq/msf';
 import {
     parseMsfCatalog,
     parseDeltaUpdate,
@@ -28,7 +28,7 @@ import {
     applyMsf01Delta,
     parseCatalogFormat01,
     applyCf01Patch,
-} from '@moqt/msf';
+} from '@openmoq/msf';
 
 /**
  * Manages catalog state across independent catalogs and delta updates.

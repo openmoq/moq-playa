@@ -161,7 +161,7 @@ Troubleshooting:
 publishes a catalog + 5 **synthetic** tracks (fake bytes, same shapes/IDs as a real
 fixture — not decodable by MSE), then verifies the parsed catalog and every chunk's
 payload + group/object IDs through the relay. Useful as a fast end-to-end protocol
-check with no FFmpeg involved. `probe` prints which `@moqt/*` capabilities the
+check with no FFmpeg involved. `probe` prints which `@openmoq/*` capabilities the
 publisher uses; `typecheck` runs `tsc --noEmit`.
 
 ## Limitations / development notes

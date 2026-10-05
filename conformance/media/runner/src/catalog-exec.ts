@@ -10,7 +10,7 @@
  * @module
  */
 
-import { parseCatalogAuto, parseMsf01Delta, type Catalog, type CatalogTrack, type Msf01Delta } from '@moqt/msf';
+import { parseCatalogAuto, parseMsf01Delta, type Catalog, type CatalogTrack, type Msf01Delta } from '@openmoq/msf';
 import type { ErrorCategory } from './schema-types.js';
 import type { ExecResult } from './exec-compare.js';
 

@@ -6,8 +6,8 @@
 import { describe, it, expect } from 'vitest';
 import { InboundRequestStreamContext, type InboundRequestHandlers } from './inbound-request.js';
 import { SimStream, flush } from '../testkit/stream-sim.js';
-import { createControlCodec } from '@moqt/transport';
-import type { ControlMessage, RequestOk } from '@moqt/transport';
+import { createControlCodec } from '@openmoq/transport';
+import type { ControlMessage, RequestOk } from '@openmoq/transport';
 
 const codec18 = createControlCodec(18);
 const reqOkBytes = (): Uint8Array =>

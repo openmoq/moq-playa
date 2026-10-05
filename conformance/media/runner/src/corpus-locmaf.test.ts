@@ -10,7 +10,7 @@ import {
     sliceFrames,
     parseEmsgBoxes,
     LOCMAF_VERSION,
-} from '@moqt/locmaf';
+} from '@openmoq/locmaf';
 import { effectiveProjection, loadLocmafCorpus, rawProjection, splitFramed } from './locmaf-exec.js';
 
 const corpus = loadLocmafCorpus();

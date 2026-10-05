@@ -81,8 +81,8 @@ function mockElement(): any {
 // Engine stub — captures the audioOutput factory so we can assert what was passed
 let capturedAudioOutputFactory: (() => unknown) | undefined;
 
-vi.mock('@moqt/player', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@moqt/player')>();
+vi.mock('@openmoq/player', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@openmoq/player')>();
   class MockEngine {
     constructor(config: any) {
       capturedAudioOutputFactory = config.createAudioOutput;

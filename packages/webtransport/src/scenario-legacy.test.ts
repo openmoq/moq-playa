@@ -10,7 +10,7 @@
  * the same SCENARIO_SEEDS / SCENARIO_SEED_START / SCENARIO_STEPS env vars apply.
  */
 import { describe, it, expect } from 'vitest';
-import { SessionState, SubscriptionState } from '@moqt/transport';
+import { SessionState, SubscriptionState } from '@openmoq/transport';
 import { connectedPair, ns, nm } from './testkit/pair.js';
 import { flush } from './testkit/loopback.js';
 import { runScenario } from './testkit/scenario.js';

@@ -1,5 +1,5 @@
 /**
- * Tests for @playa/player quality switching API.
+ * Tests for @openmoq/playa quality switching API.
  *
  * Uses a real Player instance with stubbed engine to verify
  * setQuality() public behavior end-to-end.
@@ -11,7 +11,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Player } from './player.js';
 import { mapLevels } from './level-mapper.js';
 import type { Level } from './types.js';
-import type { CatalogState } from '@moqt/msf';
+import type { CatalogState } from '@openmoq/msf';
 
 // ─── DOM / global mocks ──────────────────────────────────────────────
 
@@ -59,6 +59,27 @@ beforeEach(() => {
 });
 
 // ─── mapLevels ───────────────────────────────────────────────────────
+
+describe('late renderer creation', () => {
+  for (const state of ['idle', 'playing', 'paused'] as const) {
+    it(`creates a renderer matching the ${state} playback state`, async () => {
+      const player = new Player(mockElement(), {
+        url: 'https://relay.example.com/moq', namespace: 'test',
+      });
+      const engine = (player as any).engine;
+      engine.play = vi.fn();
+      engine.pause = vi.fn();
+      engine.destroy = vi.fn(async () => {});
+      if (state !== 'idle') player.play();
+      if (state === 'paused') player.pause();
+
+      const renderer = engine.config.createRenderer();
+      expect((renderer as any).running).toBe(state === 'playing');
+      await player.destroy();
+      expect((renderer as any).running).toBe(false);
+    });
+  }
+});
 
 describe('mapLevels', () => {
   const catalog: CatalogState = {
@@ -167,6 +188,24 @@ describe('Player.setQuality', () => {
 });
 
 // ─── Render sink choice on catalog_received ───────────────────────────
+
+describe('Player authorization options', () => {
+  it('passes the credential provider and trust options to its engine', async () => {
+    const authorization = { getTokens: vi.fn(async () => [{ tokenType: 1n, value: new Uint8Array([1]) }]),
+      timeoutMs: 500, allowedRelayOrigins: ['https://trusted.example'] };
+    const player = new Player(mockElement(), { url: 'https://relay.example/moq', namespace: 'live/test', authorization });
+    try {
+      expect((player as any).engine.config.authorization).toBe(authorization);
+      expect(authorization.getTokens).not.toHaveBeenCalled();
+    } finally { await player.destroy(); }
+  });
+
+  it('does not discard an explicitly invalid credential configuration', () => {
+    expect(() => new Player(mockElement(), { url: 'https://relay.example/moq', namespace: 'live/test',
+      authorization: null as unknown as import('./types.js').PlayerOptions['authorization'],
+    })).toThrow('authorization');
+  });
+});
 
 describe('Player sink choice (MSE <video> vs <canvas>)', () => {
   it('keeps the canvas visible for LOCMAF frame decoding', async () => {

@@ -13,9 +13,9 @@ import { PlaybackPipeline } from './pipeline.js';
 import { SyncController } from './sync.js';
 import { DefaultRecoveryController } from './recovery.js';
 import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig, DecoderFeedback } from './types.js';
-import type { MoqtObjectData, MoqtObjectGap } from '@moqt/transport';
-import { varint, ObjectStatus } from '@moqt/transport';
-import type { LocHeaders } from '@moqt/loc';
+import type { MoqtObjectData, MoqtObjectGap } from '@openmoq/transport';
+import { varint, ObjectStatus } from '@openmoq/transport';
+import type { LocHeaders } from '@openmoq/loc';
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 

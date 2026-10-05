@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { parseCatalogAuto, parseMsf01Delta, applyMsf01Delta } from '@moqt/msf';
-import type { MoqtConnection } from '@moqt/webtransport';
+import { parseCatalogAuto, parseMsf01Delta, applyMsf01Delta } from '@openmoq/msf';
+import type { MoqtConnection } from '@openmoq/webtransport';
 import type { LoadedFixture } from './fixture.js';
 import { buildFixtureCatalog, buildFixtureDelta, publishFixture } from './publisher.js';
 

@@ -344,14 +344,27 @@ export interface SetupOptions {
   maxRequestUpdates?: bigint;
 }
 
-/**
- * Options for creating a subscription.
- */
-/**
- * Options for creating a subscription.
- * @see draft-ietf-moq-transport-16 §9.2.2
- */
-export interface SubscribeOptions {
+/** Explicit request credentials for sans-I/O callers. */
+export interface AuthorizationOptions {
+  /** Serialized MoQ Token structures, not bare CAT bytes. May repeat. */
+  authTokens?: readonly Uint8Array[];
+}
+
+function authorizationParameters(options: AuthorizationOptions, base?: Parameters): Parameters {
+  const parameters: Parameters = new Map(base);
+  if (options.authTokens !== undefined) {
+    if (parameters.has(MessageParam.AUTHORIZATION_TOKEN)) {
+      throw new SessionError('Specify authTokens or AUTHORIZATION_TOKEN parameters, not both', 'INVALID_STATE');
+    }
+    if (options.authTokens.length > 0) {
+      parameters.set(MessageParam.AUTHORIZATION_TOKEN, options.authTokens.map(token => Uint8Array.from(token)));
+    }
+  }
+  return parameters;
+}
+
+/** Options for creating a subscription (draft-16 section 9.2.2). */
+export interface SubscribeOptions extends AuthorizationOptions {
   /** §9.2.2.2: Duration in milliseconds. MUST be > 0. */
   deliveryTimeout?: Varint;
   /** §9.2.2.3: Priority relative to other subscriptions. Range 0-255. Lower = higher priority. */
@@ -383,7 +396,7 @@ export interface SubscribeOptions {
  * Options for sending a REQUEST_UPDATE.
  * @see draft-ietf-moq-transport-16 §9.11
  */
-export interface RequestUpdateOptions {
+export interface RequestUpdateOptions extends AuthorizationOptions {
   forward?: ForwardStateValue;
   /** §9.2.2.3: SUBSCRIBER_PRIORITY MAY appear in REQUEST_UPDATE. */
   subscriberPriority?: Varint;
@@ -415,7 +428,7 @@ export interface RequestUpdateOptions {
 /**
  * Options for creating a fetch.
  */
-export interface FetchOptions {
+export interface FetchOptions extends AuthorizationOptions {
   // Fetch Locations are vi64 (full uint64) on draft-18, so `bigint`. The
   // draft-14/16 FETCH encoder still range-checks them against the QUIC-varint
   // range on encode (a value above 2^62-1 throws there).
@@ -438,7 +451,7 @@ export interface FetchOptions {
  * all three from the referenced subscription, computing a range contiguous
  * with (and never overlapping) the subscription's delivery.
  */
-export interface JoiningFetchOptions {
+export interface JoiningFetchOptions extends AuthorizationOptions {
   /** 'relative' = Fetch Type 0x2, 'absolute' = 0x3. */
   joiningFetchType: 'relative' | 'absolute';
   /** Request ID of OUR outbound SUBSCRIBE to join (NOT a track alias). */
@@ -2845,6 +2858,7 @@ export class Session {
     }
 
     const requestedForward = this.normalizeLocalForwardState(options.forward, 'SUBSCRIBE');
+    const parameters = authorizationParameters(options);
 
     const requestId = this.requestIdAllocator.allocate();
 
@@ -2853,7 +2867,6 @@ export class Session {
     this.subscriptionTracks.set(requestId as bigint, { namespace, name });
 
     // §9.2.2: Build subscription parameters from options
-    const parameters: Parameters = new Map();
     if (options.deliveryTimeout !== undefined) {
       parameters.set(MessageParam.DELIVERY_TIMEOUT, [options.deliveryTimeout]);
       // Retain the requested value (ms) so the I/O layer can floor its terminal-
@@ -2927,7 +2940,7 @@ export class Session {
     namespace: Uint8Array[],
     name: Uint8Array,
     trackAlias: bigint,
-    options: { parameters?: Parameters; trackProperties?: TrackProperties } = {},
+    options: AuthorizationOptions & { parameters?: Parameters; trackProperties?: TrackProperties } = {},
   ): RequestResult {
     this.assertEstablishedOrDraining('publish');
     this.assertNotReservedNamespace(namespace, 'publish');
@@ -2947,6 +2960,7 @@ export class Session {
     this.assertLocalForwardParameter(options.parameters, 'PUBLISH');
 
     const trackProperties = this.resolveTrackProperties(options.trackProperties, 'PUBLISH');
+    const parameters = authorizationParameters(options, options.parameters);
 
     const requestId = this.requestIdAllocator.allocate();
 
@@ -2971,7 +2985,7 @@ export class Session {
       trackNamespace: namespace,
       trackName: name,
       trackAlias,
-      parameters: options.parameters ?? new Map(),
+      parameters,
       trackProperties,
     };
 
@@ -3072,6 +3086,7 @@ export class Session {
     if (options.fill !== undefined && !isDraft21(this._draftVersion)) {
       throw new RangeError(`FILL_PARAMETERS needs draft 21; this session speaks draft ${this._draftVersion}`);
     }
+    const parameters = authorizationParameters(options);
 
     // draft-18 §10.9.2: a prefix update targets an outbound SUBSCRIBE_NAMESPACE /
     // SUBSCRIBE_TRACKS request (tracked in separate maps, not `subscriptions`).
@@ -3112,8 +3127,6 @@ export class Session {
     const requestId = this.requestIdAllocator.allocate();
 
     // Build parameters
-    const parameters: Parameters = new Map();
-
     // FORWARD parameter
     if (requestedForward !== undefined) {
       parameters.set(MessageParam.FORWARD, [varint(BigInt(requestedForward))]);
@@ -3247,8 +3260,9 @@ export class Session {
       throw new SessionError(e instanceof Error ? e.message : 'Malformed Track Namespace Prefix', 'PROTOCOL_VIOLATION');
     }
 
+    const parameters = authorizationParameters(options);
+    parameters.set(MessageParam.TRACK_NAMESPACE_PREFIX, [prefix]);
     const requestId = this.requestIdAllocator.allocate();
-    const parameters: Parameters = new Map([[MessageParam.TRACK_NAMESPACE_PREFIX as bigint, [prefix]]]);
     this.pendingUpdates.set(requestId as bigint, {
       existingRequestId: existingRequestId as bigint,
       namespacePrefix: prefix,
@@ -3269,6 +3283,7 @@ export class Session {
     options: FetchOptions,
   ): RequestResult {
     this.assertEstablishedOrDraining('fetch');
+    const parameters = authorizationParameters(options);
 
     if (this._state === SessionState.DRAINING) {
       throw new SessionDrainingError(
@@ -3321,7 +3336,6 @@ export class Session {
 
     // §10.2: a requested Group Order travels as the GROUP_ORDER (0x22) parameter
     // — Ascending = 0x1, Descending = 0x2. Omitted ⇒ Ascending on decode.
-    const parameters: Parameters = new Map();
     if (options.groupOrder !== undefined) {
       parameters.set(MessageParam.GROUP_ORDER, [varint(options.groupOrder === 'descending' ? 2n : 1n)]);
     }
@@ -3356,6 +3370,7 @@ export class Session {
    */
   joiningFetch(options: JoiningFetchOptions): RequestResult {
     this.assertEstablishedOrDraining('joiningFetch');
+    const parameters = authorizationParameters(options);
 
     if (this._state === SessionState.DRAINING) {
       throw new SessionDrainingError(
@@ -3405,7 +3420,6 @@ export class Session {
     };
 
     // §10.2: a requested Group Order travels as the GROUP_ORDER (0x22) parameter.
-    const parameters: Parameters = new Map();
     if (options.groupOrder !== undefined) {
       parameters.set(MessageParam.GROUP_ORDER, [varint(options.groupOrder === 'descending' ? 2n : 1n)]);
     }
@@ -3593,8 +3607,10 @@ export class Session {
   subscribeNamespace(
     namespacePrefix: Uint8Array[],
     subscribeOptions: Varint = varint(0n),
+    options: AuthorizationOptions = {},
   ): RequestResult {
     this.assertEstablishedOrDraining('subscribeNamespace');
+    const parameters = authorizationParameters(options);
 
     if (this._state === SessionState.DRAINING) {
       throw new SessionDrainingError(
@@ -3613,7 +3629,7 @@ export class Session {
       requestId,
       trackNamespacePrefix: namespacePrefix,
       ...(this._draftVersion === 14 ? {} : { subscribeOptions }),
-      parameters: new Map(),
+      parameters,
     };
 
     if (this._draftVersion === 14) {
@@ -3646,7 +3662,7 @@ export class Session {
    * I/O layer opens the stream and routes the first REQUEST_OK / REQUEST_ERROR
    * plus follow-up PUBLISH_BLOCKED messages.
    */
-  subscribeTracks(namespacePrefix: Uint8Array[]): RequestResult {
+  subscribeTracks(namespacePrefix: Uint8Array[], options: AuthorizationOptions = {}): RequestResult {
     this.assertEstablishedOrDraining('subscribeTracks');
     if (this._state === SessionState.DRAINING) {
       throw new SessionDrainingError(
@@ -3658,6 +3674,7 @@ export class Session {
       throw new SessionError('SUBSCRIBE_TRACKS is a draft-18 message', 'INVALID_STATE');
     }
 
+    const parameters = authorizationParameters(options);
     const requestId = this.requestIdAllocator.allocate();
     this.trackSubscriptions.set(requestId as bigint, {
       trackNamespacePrefix: namespacePrefix,
@@ -3669,7 +3686,7 @@ export class Session {
       type: 'SUBSCRIBE_TRACKS',
       requestId,
       trackNamespacePrefix: namespacePrefix,
-      parameters: new Map(),
+      parameters,
     };
     return { requestId, actions: [this.sendControl(msg)] };
   }
@@ -3732,9 +3749,11 @@ export class Session {
    */
   publishNamespace(
     namespace: Uint8Array[],
+    options: AuthorizationOptions = {},
   ): RequestResult {
     this.assertEstablishedOrDraining('publishNamespace');
     this.assertNotReservedNamespace(namespace, 'publishNamespace');
+    const parameters = authorizationParameters(options);
 
     if (this._state === SessionState.DRAINING) {
       throw new SessionDrainingError(
@@ -3753,7 +3772,7 @@ export class Session {
       type: 'PUBLISH_NAMESPACE',
       requestId,
       trackNamespace: namespace,
-      parameters: new Map(),
+      parameters,
     };
 
     return {
@@ -3826,8 +3845,10 @@ export class Session {
   trackStatus(
     namespace: Uint8Array[],
     name: Uint8Array,
+    options: AuthorizationOptions = {},
   ): RequestResult {
     this.assertEstablishedOrDraining('trackStatus');
+    const parameters = authorizationParameters(options);
 
     if (this._state === SessionState.DRAINING) {
       throw new SessionDrainingError(
@@ -3846,7 +3867,7 @@ export class Session {
       requestId,
       trackNamespace: namespace,
       trackName: name,
-      parameters: new Map(),
+      parameters,
     };
 
     return {
@@ -4509,6 +4530,12 @@ export class Session {
     if (!retain) this.recentlyCancelled.delete(requestId as bigint);
   }
 
+  /** Roll back a proven-unsent request and reclaim its latest allocation. */
+  rollbackUnsentRequest(requestId: bigint): boolean {
+    this.rollbackRequest(requestId);
+    return this.requestIdAllocator.releaseUnsent(requestId);
+  }
+
   /**
    * Roll back an outbound PUBLISH whose bytes were proven not to leave this
    * endpoint. Legacy drafts require gap-free Request IDs, so the allocation is
@@ -4516,8 +4543,7 @@ export class Session {
    */
   rollbackUnsentPublish(requestId: bigint): boolean {
     if (!this.outgoingPublishes.has(requestId as bigint)) return false;
-    this.rollbackRequest(requestId);
-    return this.requestIdAllocator.releaseUnsent(requestId);
+    return this.rollbackUnsentRequest(requestId);
   }
 
   handleOutboundRequestClosed(requestId: bigint): SessionOutboundAction[] {
@@ -4977,9 +5003,8 @@ export class Session {
     }
 
     const requestedForward = this.normalizeLocalForwardState(options.forward, 'REQUEST_UPDATE');
-
+    const parameters = authorizationParameters(options);
     const requestId = this.requestIdAllocator.allocate();
-    const parameters: Parameters = new Map();
     if (requestedForward !== undefined) {
       parameters.set(MessageParam.FORWARD, [varint(BigInt(requestedForward))]);
     }

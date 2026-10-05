@@ -14,7 +14,7 @@
  * @module
  */
 
-import type { VideoChunkInit, AudioChunkInit } from '@moqt/loc';
+import type { VideoChunkInit, AudioChunkInit } from '@openmoq/loc';
 
 // ─── Layer 3: Decoder Backend (Swappable) ────────────────────────────
 
@@ -385,7 +385,7 @@ export interface MediaSourceLike {
  *
  * Pairs moof+mdat objects into complete segments, patches tfdt
  * baseMediaDecodeTime to zero-based, and emits via onSegment.
- * The concrete implementation lives in @moqt/browser.
+ * The concrete implementation lives in @openmoq/browser.
  *
  * @see draft-ietf-moq-cmsf-01 §3.3 (Object Packaging — moof+mdat)
  */

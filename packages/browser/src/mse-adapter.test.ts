@@ -21,7 +21,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { format } from 'node:util';
 import { MseMediaSource } from './mse-adapter.js';
-import type { MseStartupReport } from './mse-adapter.js';
+import type { DrmConfig, MseStartupReport } from './mse-adapter.js';
 
 // ─── Shared byte-building helpers (subset from mp4-box.test.ts) ──
 
@@ -1483,7 +1483,7 @@ describe('playhead-wedge watchdog', () => {
         expect(errors).toHaveLength(1);
         expect(errors[0]!.message).toMatch(/wedge/i);
         // The final rung must be DISTINGUISHABLE from ordinary decode errors
-        // so @moqt/player can escalate it to a fatal (the app rebuild path).
+        // so @openmoq/player can escalate it to a fatal (the app rebuild path).
         expect(errors[0]!.name).toBe('PlayheadWedgeError');
 
         expect(wedges.map((w) => w.rung)).toEqual([1, 2, 3, 4]);
@@ -3511,6 +3511,401 @@ describe('buffered-hole gap-jump', () => {
 
         adapter.destroy();
         expect((adapter as any).onGapJump).toBeNull();
+    });
+});
+
+describe('MseMediaSource DRM lifecycle', () => {
+    class KeySession extends MockEventTarget {
+        finishClose!: () => void;
+        closed = new Promise<void>((resolve) => { this.finishClose = resolve; });
+        generateRequest = vi.fn(async (_type: string, _data: BufferSource) => {});
+        update = vi.fn(async (_data: BufferSource) => {});
+        close = vi.fn(async () => { this.finishClose(); });
+    }
+
+    const adapters: MseMediaSource[] = [];
+    afterEach(() => {
+        for (const adapter of adapters.splice(0)) adapter.destroy();
+    });
+
+    async function settle() {
+        for (let i = 0; i < 12; i++) await flush();
+    }
+
+    function deferred<T>() {
+        let resolve!: (value: T) => void;
+        const promise = new Promise<T>((done) => { resolve = done; });
+        return { promise, resolve };
+    }
+
+    function setup(serverCertificate?: Uint8Array, deferAccess?: Promise<unknown>) {
+        const sessions: KeySession[] = [];
+        const keys = {
+            createSession: vi.fn(() => {
+                const session = new KeySession();
+                sessions.push(session);
+                return session;
+            }),
+            setServerCertificate: vi.fn(async (_bytes: ArrayBuffer) => true),
+        };
+        const access = { createMediaKeys: vi.fn(async () => keys) };
+        const requestAccess = vi.fn(async (_keySystem: string) => {
+            if (deferAccess) await deferAccess;
+            return access;
+        });
+        vi.stubGlobal('navigator', { requestMediaKeySystemAccess: requestAccess });
+        const video = Object.assign(new MockVideoElement(), {
+            mediaKeys: null as unknown,
+            setMediaKeys: vi.fn(async (value: unknown) => { video.mediaKeys = value; }),
+        });
+        const reconnect = (overrides: Partial<DrmConfig> = {}) => {
+            const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, {
+                drmConfig: { licenseUrl: 'https://license.example.invalid/', serverCertificate, ...overrides },
+            });
+            adapters.push(adapter);
+            return adapter;
+        };
+        const adapter = reconnect();
+        const encrypted = async (id: number, initDataType = 'cenc') => {
+            video.dispatch({
+                type: 'encrypted', initDataType, initData: Uint8Array.of(id).buffer,
+            } as unknown as Event);
+            await settle();
+        };
+        const message = (session: KeySession, byte = 1) => session.dispatch({
+            type: 'message', message: Uint8Array.of(byte).buffer, target: session,
+        } as unknown as Event);
+        return { adapter, video, keys, access, requestAccess, sessions, encrypted, reconnect, message };
+    }
+
+    it('repeated identical initialization does not duplicate the request', async () => {
+        const { encrypted, sessions } = setup();
+        await encrypted(1);
+        await encrypted(1);
+        expect(sessions).toHaveLength(1);
+        expect(sessions[0]!.generateRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('processes distinct initialization data instead of discarding the second key request', async () => {
+        const { encrypted, sessions } = setup();
+        await encrypted(1);
+        await encrypted(2);
+        expect(sessions.flatMap((session) => session.generateRequest.mock.calls)).toHaveLength(2);
+    });
+
+    it('does not attach keys or create a session when setup completes after destruction', async () => {
+        const pending = deferred<void>();
+        const { adapter, video, keys, access, encrypted } = setup(undefined, pending.promise);
+        await encrypted(1);
+        adapter.destroy();
+        pending.resolve();
+        await settle();
+        expect(access.createMediaKeys).not.toHaveBeenCalled();
+        expect(video.setMediaKeys).not.toHaveBeenCalled();
+        expect(keys.createSession).not.toHaveBeenCalled();
+    });
+
+    it('stops license requests from the old session after destruction', async () => {
+        const { adapter, encrypted, sessions, message } = setup();
+        const fetchLicense = vi.fn(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(1) }));
+        vi.stubGlobal('fetch', fetchLicense);
+        await encrypted(1);
+        adapter.destroy();
+        message(sessions[0]!);
+        await settle();
+        expect(fetchLicense).not.toHaveBeenCalled();
+        expect(sessions[0]!.close).toHaveBeenCalledTimes(1);
+    });
+
+    it('passes only the selected certificate bytes to the CDM', async () => {
+        const bytes = Uint8Array.of(99, 1, 2, 3, 88).subarray(1, 4);
+        const { keys, encrypted } = setup(bytes);
+        await encrypted(1);
+        expect([...new Uint8Array(keys.setServerCertificate.mock.calls[0]![0])]).toEqual([1, 2, 3]);
+    });
+
+    it('snapshots the certificate before asynchronous key setup', async () => {
+        const certificate = Uint8Array.of(1, 2, 3);
+        const pending = deferred<void>();
+        const { keys, encrypted } = setup(certificate, pending.promise);
+        await encrypted(1);
+        certificate.fill(9);
+        pending.resolve();
+        await settle();
+        expect([...new Uint8Array(keys.setServerCertificate.mock.calls[0]![0])]).toEqual([1, 2, 3]);
+    });
+
+    it('does not request EME access when DRM is not configured', async () => {
+        const requestAccess = vi.fn();
+        vi.stubGlobal('navigator', { requestMediaKeySystemAccess: requestAccess });
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapters.push(adapter);
+        video.dispatch({ type: 'encrypted', initDataType: 'cenc', initData: Uint8Array.of(1).buffer } as unknown as Event);
+        await settle();
+        expect(requestAccess).not.toHaveBeenCalled();
+    });
+
+    it('deduplicates identical initialization while key setup is pending', async () => {
+        const pending = deferred<void>();
+        const { encrypted, sessions } = setup(undefined, pending.promise);
+        await encrypted(1);
+        await encrypted(1);
+        pending.resolve();
+        await settle();
+        expect(sessions).toHaveLength(1);
+        expect(sessions[0]!.generateRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not conflate initialization data types', async () => {
+        const { encrypted, sessions } = setup();
+        await encrypted(1, 'cenc');
+        await encrypted(1, 'keyids');
+        expect(sessions).toHaveLength(2);
+    });
+
+    it('closes every session on destruction, without detaching compatible MediaKeys', async () => {
+        const { adapter, video, encrypted, sessions, keys } = setup();
+        await encrypted(1);
+        await encrypted(2);
+        adapter.destroy();
+        adapter.destroy();
+        expect(sessions).toHaveLength(2);
+        for (const session of sessions) expect(session.close).toHaveBeenCalledTimes(1);
+        expect(video.mediaKeys).toBe(keys);
+        expect(video.setMediaKeys).toHaveBeenCalledTimes(1);
+    });
+
+    it('reuses compatible keys on reconnect but creates fresh owned sessions', async () => {
+        const { adapter, encrypted, sessions, reconnect, requestAccess, video } = setup();
+        await encrypted(1);
+        adapter.destroy();
+        reconnect();
+        await encrypted(1);
+        expect(requestAccess).toHaveBeenCalledTimes(1);
+        expect(video.setMediaKeys).toHaveBeenCalledTimes(1);
+        expect(sessions).toHaveLength(2);
+        expect(sessions[0]!.close).toHaveBeenCalledTimes(1);
+        expect(sessions[1]!.close).not.toHaveBeenCalled();
+    });
+
+    it('does not reuse keys when the configured key system changes', async () => {
+        const { adapter, encrypted, reconnect, requestAccess, video } = setup();
+        await encrypted(1);
+        adapter.destroy();
+        reconnect({ keySystem: 'org.w3.clearkey' });
+        await encrypted(1);
+        expect(requestAccess).toHaveBeenCalledTimes(2);
+        expect(requestAccess.mock.calls[1]![0]).toBe('org.w3.clearkey');
+        expect(video.setMediaKeys).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not reuse keys when the configured server certificate changes', async () => {
+        const { adapter, encrypted, reconnect, keys } = setup(Uint8Array.of(1));
+        await encrypted(1);
+        adapter.destroy();
+        reconnect({ serverCertificate: Uint8Array.of(2) });
+        await encrypted(1);
+        expect(keys.setServerCertificate).toHaveBeenCalledTimes(2);
+        expect([...new Uint8Array(keys.setServerCertificate.mock.calls[1]![0])]).toEqual([2]);
+    });
+
+    it('serializes a replacement setup behind an in-flight setMediaKeys', async () => {
+        const { adapter, video, encrypted, sessions, reconnect, requestAccess } = setup();
+        const pending = deferred<void>();
+        const attach = video.setMediaKeys.getMockImplementation()!;
+        video.setMediaKeys.mockImplementationOnce(async (keys) => {
+            await pending.promise;
+            await attach(keys);
+        });
+        await encrypted(1);
+        expect(video.setMediaKeys).toHaveBeenCalledTimes(1);
+        adapter.destroy();
+        reconnect({ keySystem: 'org.w3.clearkey' });
+        await encrypted(2);
+        expect(requestAccess).toHaveBeenCalledTimes(1);
+        expect(video.setMediaKeys).toHaveBeenCalledTimes(1);
+        pending.resolve();
+        await settle();
+        expect(requestAccess).toHaveBeenCalledTimes(2);
+        expect(video.setMediaKeys).toHaveBeenCalledTimes(2);
+        expect(sessions).toHaveLength(1);
+        expect(new Uint8Array(sessions[0]!.generateRequest.mock.calls[0]![1] as ArrayBuffer)).toEqual(Uint8Array.of(2));
+    });
+
+    it('a retired permission request does not block the replacement adapter', async () => {
+        const pending = deferred<void>();
+        const { adapter, access, encrypted, sessions, reconnect, requestAccess } = setup(undefined, pending.promise);
+        await encrypted(1);
+        adapter.destroy();
+        requestAccess.mockResolvedValueOnce(access);
+        reconnect();
+        try {
+            await encrypted(2);
+            expect(requestAccess).toHaveBeenCalledTimes(2);
+            expect(sessions).toHaveLength(1);
+        } finally {
+            pending.resolve();
+            await settle();
+        }
+        expect(sessions).toHaveLength(1);
+    });
+
+    it.each(['create', 'certificate'] as const)('stops setup after destruction during %s', async (stage) => {
+        const { adapter, video, access, keys, encrypted } = setup(Uint8Array.of(1));
+        const pending = deferred<void>();
+        if (stage === 'create') access.createMediaKeys.mockImplementationOnce(async () => {
+            await pending.promise;
+            return keys;
+        });
+        else keys.setServerCertificate.mockImplementationOnce(async () => {
+            await pending.promise;
+            return true;
+        });
+        await encrypted(1);
+        adapter.destroy();
+        pending.resolve();
+        await settle();
+        if (stage === 'create') expect(keys.setServerCertificate).not.toHaveBeenCalled();
+        expect(video.setMediaKeys).not.toHaveBeenCalled();
+        expect(keys.createSession).not.toHaveBeenCalled();
+    });
+
+    it('does not create sessions if key attachment failed', async () => {
+        const { adapter, video, encrypted, keys } = setup();
+        const error = new Error('attachment failed');
+        video.setMediaKeys.mockRejectedValueOnce(error);
+        const onError = vi.fn();
+        adapter.onError = onError;
+        await encrypted(1);
+        expect(onError).toHaveBeenCalledExactlyOnceWith(error);
+        expect(keys.createSession).not.toHaveBeenCalled();
+    });
+
+    it('a failed attachment and throwing error listener do not block a reconnect', async () => {
+        const { adapter, video, encrypted, sessions, reconnect } = setup();
+        video.setMediaKeys.mockRejectedValueOnce(new Error('attachment failed'));
+        adapter.onError = () => { throw new Error('consumer error'); };
+        await encrypted(1);
+        expect(sessions).toHaveLength(0);
+        adapter.destroy();
+        reconnect();
+        await encrypted(1);
+        expect(sessions).toHaveLength(1);
+    });
+
+    it.each(['throw', 'reject'] as const)('contains a %s from session close without stranding other sessions', async (mode) => {
+        const { adapter, encrypted, sessions } = setup();
+        await encrypted(1);
+        await encrypted(2);
+        if (mode === 'throw') sessions[0]!.close.mockImplementationOnce(() => { throw new Error('close failed'); });
+        else sessions[0]!.close.mockRejectedValueOnce(new Error('close failed'));
+        expect(() => adapter.destroy()).not.toThrow();
+        await settle();
+        for (const session of sessions) expect(session.close).toHaveBeenCalledTimes(1);
+    });
+
+    it('releases a failed session so a repeated initialization can retry', async () => {
+        const { adapter, keys, encrypted, sessions } = setup();
+        const error = new Error('generate failed');
+        const create = keys.createSession.getMockImplementation()!;
+        keys.createSession.mockImplementationOnce(() => {
+            const session = create();
+            session.generateRequest.mockRejectedValueOnce(error);
+            return session;
+        });
+        const onError = vi.fn();
+        adapter.onError = onError;
+        await encrypted(1);
+        expect(onError).toHaveBeenCalledExactlyOnceWith(error);
+        expect(sessions[0]!.close).toHaveBeenCalledTimes(1);
+        await encrypted(1);
+        expect(sessions).toHaveLength(2);
+    });
+
+    it('forgets a session closed by the CDM so initialization can retry', async () => {
+        const { encrypted, sessions } = setup();
+        await encrypted(1);
+        sessions[0]!.finishClose();
+        await settle();
+        await encrypted(1);
+        expect(sessions).toHaveLength(2);
+    });
+
+    it('ignores a late generation failure from a session the CDM already closed', async () => {
+        const { adapter, encrypted, sessions, keys } = setup();
+        let reject!: (error: Error) => void;
+        const pending = new Promise<void>((_resolve, fail) => { reject = fail; });
+        const create = keys.createSession.getMockImplementation()!;
+        keys.createSession.mockImplementationOnce(() => {
+            const session = create();
+            session.generateRequest.mockReturnValueOnce(pending);
+            return session;
+        });
+        const onError = vi.fn();
+        adapter.onError = onError;
+        await encrypted(1);
+        sessions[0]!.finishClose();
+        await settle();
+        await encrypted(1);
+        reject(new Error('closed'));
+        await settle();
+        expect(sessions).toHaveLength(2);
+        expect(onError).not.toHaveBeenCalled();
+    });
+
+    it('delivers license replies and renewal replies to their own sessions', async () => {
+        const { encrypted, sessions, message } = setup();
+        const fetchLicense = vi.fn(async (_url: string, init: RequestInit) => ({
+            ok: true, arrayBuffer: async () => init.body as ArrayBuffer,
+        }));
+        vi.stubGlobal('fetch', fetchLicense);
+        await encrypted(1);
+        await encrypted(2);
+        message(sessions[0]!, 3);
+        message(sessions[1]!, 4);
+        await settle();
+        message(sessions[0]!, 5);
+        await settle();
+        expect(sessions[0]!.update.mock.calls.map(([data]) => [...new Uint8Array(data as ArrayBuffer)])).toEqual([[3], [5]]);
+        expect(sessions[1]!.update.mock.calls.map(([data]) => [...new Uint8Array(data as ArrayBuffer)])).toEqual([[4]]);
+    });
+
+    it.each(['response', 'body'] as const)('cancels an in-flight license %s and never updates a retired session', async (stage) => {
+        const { adapter, encrypted, sessions, message } = setup();
+        const pending = deferred<void>();
+        const fetchLicense = vi.fn(async (_url: string, _init: RequestInit) => {
+            if (stage === 'response') await pending.promise;
+            return { ok: true, arrayBuffer: async () => {
+                if (stage === 'body') await pending.promise;
+                return new ArrayBuffer(1);
+            } };
+        });
+        vi.stubGlobal('fetch', fetchLicense);
+        await encrypted(1);
+        message(sessions[0]!);
+        await settle();
+        expect(fetchLicense).toHaveBeenCalledTimes(1);
+        const signal = fetchLicense.mock.calls[0]![1].signal;
+        adapter.destroy();
+        pending.resolve();
+        await settle();
+        expect(sessions[0]!.update).not.toHaveBeenCalled();
+        expect(signal?.aborted).toBe(true);
+    });
+
+    it('surfaces license failures and releases the failed session', async () => {
+        const { adapter, encrypted, sessions, message } = setup();
+        vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 403, statusText: 'Forbidden' })));
+        const onError = vi.fn();
+        adapter.onError = onError;
+        await encrypted(1);
+        message(sessions[0]!);
+        await settle();
+        expect(onError).toHaveBeenCalledTimes(1);
+        expect(onError.mock.calls[0]![0].message).toContain('403');
+        expect(sessions[0]!.update).not.toHaveBeenCalled();
+        expect(sessions[0]!.close).toHaveBeenCalledTimes(1);
     });
 });
 

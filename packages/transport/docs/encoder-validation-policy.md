@@ -1,6 +1,6 @@
 # Encoder validation policy
 
-All encoders in `@moqt/transport` validate their inputs against the
+All encoders in `@openmoq/transport` validate their inputs against the
 wire-format spec at encode time. Invalid inputs throw `ProtocolViolationError`
 (or a plain `Error` where the codec pre-dates the unified error type) at
 the call site. Encoders MUST NOT silently truncate, default, or drop

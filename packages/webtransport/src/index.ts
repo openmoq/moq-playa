@@ -1,10 +1,12 @@
 /**
- * @moqt/webtransport — MoQT connection adapter and WebTransport binding.
+ * @openmoq/webtransport — MoQT connection adapter and WebTransport binding.
  * @module
  */
 
 export { MoqtConnection } from './adapter.js';
-export type { TrackSubscription, TrackSubscribeOptions, IncomingPublish } from './adapter.js';
+export type { TrackSubscription, TrackSubscribeOptions, IncomingPublish, ConnectOptions } from './adapter.js';
+export { catToken, AuthorizationError } from './authorization.js';
+export type { AuthorizationToken, AuthorizationContext, AuthorizationOperation, AuthorizationProvider, ConnectionAuthorization } from './authorization.js';
 export type { DataStreamTerminal } from './adapter.js';
 export type {
   WebTransportLike,

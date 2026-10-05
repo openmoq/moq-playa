@@ -2,7 +2,7 @@
      Content derives from this package's package.json (name, description).
      Run `node scripts/generate-package-readmes.mjs --write` after editing it. -->
 
-# @moqt/locmaf
+# @openmoq/locmaf
 
 Low Overhead CMAF (LOCMAF) codec for Media over QUIC (MoQ): parses, reconstructs, and encodes LOCMAF Objects into canonical CMAF chunks, slices them into coded frames for frame decoders, and reads the emsg events of event-only tracks.
 
@@ -11,7 +11,7 @@ Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implement
 ## Install
 
 ```sh
-npm install @moqt/locmaf
+npm install @openmoq/locmaf
 ```
 
 ## License

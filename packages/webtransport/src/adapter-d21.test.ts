@@ -5,7 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import { MoqtConnection } from './adapter.js';
 import { TransportSim } from './testkit/stream-sim.js';
-import { createControlCodec } from '@moqt/transport';
+import { createControlCodec } from '@openmoq/transport';
 
 const codec21 = createControlCodec(21);
 const setupBytes = (): Uint8Array => codec21.encode({ type: 'SETUP', setupOptions: new Map() });
@@ -35,8 +35,8 @@ describe('MoqtConnection(21) negotiation', () => {
 
 // ─── fills (draft-21 §3.4) and PUBLISH_STATE_NOTIFY (§9.10) ────────────
 
-import { writeVi64, vi64EncodingLength, varint, SessionState } from '@moqt/transport';
-import type { ControlMessage, MoqtObject, DataStreamHeader, SubscribeOk } from '@moqt/transport';
+import { writeVi64, vi64EncodingLength, varint, SessionState } from '@openmoq/transport';
+import type { ControlMessage, MoqtObject, DataStreamHeader, SubscribeOk } from '@openmoq/transport';
 import { flush } from './testkit/stream-sim.js';
 
 const ns = (s: string) => [new TextEncoder().encode(s)];

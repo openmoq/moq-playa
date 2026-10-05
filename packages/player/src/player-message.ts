@@ -12,9 +12,9 @@
  * @module
  */
 
-import type { ControlMessage, Parameters } from '@moqt/transport';
-import { varint, readLocation, MessageParam } from '@moqt/transport';
-import type { CatalogState, CatalogTrack } from '@moqt/msf';
+import type { ControlMessage, Parameters } from '@openmoq/transport';
+import { varint, readLocation, MessageParam } from '@openmoq/transport';
+import type { CatalogState, CatalogTrack } from '@openmoq/msf';
 import type { LoggerLike } from './logger.js';
 import type { TrackPackaging } from './subscription-manager.js';
 
@@ -93,6 +93,8 @@ export interface ControlMessageContext {
   onCatalogBootstrapFetchError?: (requestId: bigint, errorCode: bigint) => void;
   /** Catalog bootstrap: PUBLISH_DONE on the catalog subscription (raw status). */
   onCatalogPublishDone?: (statusCode: bigint) => void;
+  /** The catalog SUBSCRIBE itself was refused (REQUEST_ERROR on `catalogRequestId`). */
+  onCatalogSubscribeError?: (errorCode: bigint, errorReason: string, retryInterval: bigint) => void;
   adapter: MessageAdapter | null;
   activeSubscriptions: Map<bigint, ActiveSubscription>;
   pendingMediaSubs: Map<bigint, PendingMediaSub>;
@@ -333,6 +335,7 @@ export function handleControlMessage(
         ctx.log.warn('Catalog subscription rejected: %s (code=0x%s)',
           msg.errorReason, BigInt(msg.errorCode).toString(16));
         ctx.clearCatalogState();
+        ctx.onCatalogSubscribeError?.(BigInt(msg.errorCode), msg.errorReason ?? '', msg.retryInterval);
       }
 
       // §9.8: REQUEST_ERROR for a TRACK_STATUS query — reject the promise.

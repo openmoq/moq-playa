@@ -9,8 +9,8 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { Http3Server, quicheLoaded } from '@fails-components/webtransport';
-import { MoqtConnection } from '@moqt/webtransport';
-import { RequestError18 } from '@moqt/transport';
+import { MoqtConnection } from '@openmoq/webtransport';
+import { RequestError18 } from '@openmoq/transport';
 import { fileURLToPath } from 'node:url';
 import { nodeSessionToWebTransportLike } from './wt-adapter.js';
 import { loadCert } from './cert.js';

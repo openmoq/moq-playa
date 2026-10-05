@@ -198,6 +198,14 @@
     .modal .btn-row button { font-size: 0.85rem; padding: 8px 20px; border-radius: 6px; cursor: pointer; border: none; }
     .modal #settings-apply { background: #3b82f6; color: #fff; }
     .modal #settings-cancel { background: rgba(255,255,255,0.08); color: #e0e0e0; }
+    .authorization { margin-top: 16px; }
+    .authorization label { display: block; font-size: 0.8rem; margin: 10px 0 4px; }
+    .authorization input[type="password"], .authorization select {
+      box-sizing: border-box; width: 100%; min-width: 0; padding: 8px;
+      border: 1px solid rgba(255,255,255,0.2); border-radius: 6px;
+      background: #0d0d20; color: #fff;
+    }
+    .authorization :disabled { opacity: 0.5; }
   </style>
 </head>
 <body>
@@ -230,6 +238,16 @@
         <button id="start-camera">Camera</button>
         <button id="start-screen">Screen</button>
       </div>
+      <div class="authorization">
+        <label><input id="auth-enabled" type="checkbox"> CAT4MOQ authorization</label>
+        <label for="auth-profile">Token profile</label>
+        <select id="auth-profile" disabled>
+          <option value="cat4moq">CAT4MOQ (type 1)</option>
+          <option value="moqx-compat">moqx compatibility (type 16)</option>
+        </select>
+        <label for="auth-token">CAT token</label>
+        <input id="auth-token" type="password" autocomplete="off" spellcheck="false" placeholder="Base64 token" disabled>
+      </div>
     </div>
 
     <div class="card">
@@ -255,9 +273,6 @@
 <div id="share-backdrop" class="modal-backdrop">
   <div class="modal" style="width:min(440px,90vw)">
     <h2>Share Viewer Link</h2>
-    <p style="font-size:0.85rem;color:rgba(255,255,255,0.5);margin-bottom:12px">
-      Anyone with this link can watch your broadcast with sub-second latency.
-    </p>
     <div style="display:flex;gap:8px">
       <input id="share-url" type="text" readonly style="flex:1;font-size:0.8rem">
       <button id="share-copy" style="

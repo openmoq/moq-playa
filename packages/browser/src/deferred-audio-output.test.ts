@@ -7,7 +7,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { DeferredAudioOutput } from './deferred-audio-output.js';
-import type { AudioOutputLike } from '@moqt/player';
+import type { AudioOutputLike } from '@openmoq/player';
 
 function createMockOutput(): AudioOutputLike & {
   scheduled: Array<{ data: unknown; renderTimeUs: number }>;

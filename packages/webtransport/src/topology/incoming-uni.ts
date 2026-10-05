@@ -11,7 +11,7 @@
  * @module
  */
 
-import { createDataCodec, ProtocolViolationError } from '@moqt/transport';
+import { createDataCodec, ProtocolViolationError } from '@openmoq/transport';
 
 interface Deferred<T> {
   readonly promise: Promise<T>;

@@ -1,5 +1,5 @@
 /**
- * Browser WebTransport factory for @moqt/player.
+ * Browser WebTransport factory for @openmoq/player.
  *
  * Creates a `createTransport` factory that the player calls with a URL
  * to get a ready WebTransport connection. Handles cert hash pinning
@@ -21,7 +21,7 @@
  * @module
  */
 
-import type { WebTransportLike } from '@moqt/webtransport';
+import type { WebTransportLike } from '@openmoq/webtransport';
 
 /** Options for creating the WebTransport factory. */
 export interface WebTransportFactoryOptions {
@@ -149,6 +149,23 @@ export function createWebTransport(
       get handshakeRttMs() { return handshakeRttMs; },
       createBidirectionalStream: () => wt.createBidirectionalStream(),
       createUnidirectionalStream: () => (transport as any).createUnidirectionalStream(),
+      async resetSendStream(
+        writer: WritableStreamDefaultWriter<Uint8Array>,
+        reason: unknown,
+        pendingFin?: Promise<void>,
+      ): Promise<void> {
+        try {
+          await writer.abort(reason);
+        } catch (error) {
+          if (error !== reason || !pendingFin) throw error;
+          // W3C WebTransport §7.4 rejects PendingOperation with the abort
+          // signal's reason only AFTER the underlying reset fulfills. When a
+          // FIN is pending, Web Streams propagates that rejection to abort().
+          // This is reset evidence for WebTransport, not for arbitrary sinks.
+          const resetFin = await pendingFin.then(() => false, (finError) => finError === reason);
+          if (!resetFin) throw error;
+        }
+      },
       get incomingUnidirectionalStreams() { return wt.incomingUnidirectionalStreams; },
       // draft-18 inbound request streams (e.g. a publisher's PUBLISH, §10.10)
       // arrive as peer-initiated bidi streams; surface them when present.

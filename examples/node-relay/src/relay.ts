@@ -29,11 +29,11 @@
  *     subgroup-OPEN time (before the relay knows the group is ending). See README.
  * All forwarding uses the public MoqtConnection API — no internals.
  */
-import type { MoqtConnection, IncomingPublish } from '@moqt/webtransport';
-import { MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@moqt/transport';
+import type { MoqtConnection, IncomingPublish } from '@openmoq/webtransport';
+import { MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@openmoq/transport';
 import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, nsStr, hex } from './demo.js';
 import { SubgroupForwarder, type ForwardLimits } from './subgroup-forwarder.js';
-import { isRequestStreamDraft } from '@moqt/transport';
+import { isRequestStreamDraft } from '@openmoq/transport';
 
 const log = (...a: unknown[]) => console.log('[relay]', ...a);
 

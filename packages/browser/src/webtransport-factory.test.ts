@@ -37,6 +37,65 @@ afterEach(() => {
 // ─── Tests ──────────────────────────────────────────────────────────
 
 describe('createWebTransport', () => {
+  it('proves a reset when abort rejects the pending FIN with its own reason (§7.4)', async () => {
+    let rejectFin!: (reason: unknown) => void;
+    let completeReset!: () => void;
+    const resetCompletion = new Promise<void>((resolve) => { completeReset = resolve; });
+    let reset = false;
+    const stream = new WritableStream<Uint8Array>({
+      start(controller) {
+        controller.signal.addEventListener('abort', () => {
+          // WebTransport rejects PendingOperation only AFTER resetting the stream.
+          void resetCompletion.then(() => {
+            reset = true;
+            rejectFin(controller.signal.reason);
+          });
+        });
+      },
+      close: () => new Promise<void>((_, reject) => { rejectFin = reject; }),
+    });
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      createUnidirectionalStream = async () => stream;
+    });
+    const transport = await createWebTransport()('https://r/moq');
+    const writer = (await transport.createUnidirectionalStream!()).getWriter();
+    const fin = writer.close();
+    const reason = new Error('subscription cancelled');
+    const finOutcome = fin.catch((error) => error);
+    await Promise.resolve();
+    let settled = false;
+    const resetting = transport.resetSendStream!(writer, reason, fin).then(() => { settled = true; });
+    await Promise.resolve(); await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(reset).toBe(false);
+    completeReset();
+    await expect(resetting).resolves.toBeUndefined();
+    expect(reset).toBe(true);
+    expect(await finOutcome).toBe(reason);
+  });
+
+  it.each(['different reason', 'no pending FIN', 'fulfilled FIN', 'different FIN reason'])('does not normalize an abort rejection with %s', async (mode) => {
+    const reason = new Error('subscription cancelled');
+    const error = mode === 'different reason' ? new Error('network failure') : reason;
+    vi.stubGlobal('WebTransport', class { ready = Promise.resolve(); });
+    const transport = await createWebTransport()('https://r/moq');
+    const writer = { abort: vi.fn().mockRejectedValue(error) } as unknown as WritableStreamDefaultWriter<Uint8Array>;
+    const fin = mode === 'no pending FIN' ? undefined
+      : mode === 'fulfilled FIN' ? Promise.resolve()
+      : Promise.reject(mode === 'different FIN reason' ? new Error('FIN failed') : reason);
+    fin?.catch(() => {});
+    await expect(transport.resetSendStream!(writer, reason, fin)).rejects.toBe(error);
+    expect(writer.abort).toHaveBeenCalledExactlyOnceWith(reason);
+  });
+
+  it('accepts a normally fulfilled abort without a pending FIN', async () => {
+    vi.stubGlobal('WebTransport', class { ready = Promise.resolve(); });
+    const transport = await createWebTransport()('https://r/moq');
+    const writer = new WritableStream<Uint8Array>().getWriter();
+    await expect(transport.resetSendStream!(writer, new Error('cancelled'))).resolves.toBeUndefined();
+  });
+
   it('auto-negotiate offers moqt-16 only (safe default)', async () => {
     const factory = createWebTransport();
     await factory('https://relay.example.com/moq');

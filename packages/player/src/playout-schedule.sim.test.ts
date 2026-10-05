@@ -29,7 +29,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { AdaptiveToleranceController, DEFAULT_TOLERANCE_CONFIG } from '@moqt/playback';
+import { AdaptiveToleranceController, DEFAULT_TOLERANCE_CONFIG } from '@openmoq/playback';
 import { RenderCushionSmoother, RENDER_CUSHION_MAX_US } from './render-cushion.js';
 import { SerializedLinkModel } from '../../playback/test-support/serialized-link.js';
 

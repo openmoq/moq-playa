@@ -1,5 +1,5 @@
 /**
- * QualityController — ABR track selection using @moqt/msf APIs.
+ * QualityController — ABR track selection using @openmoq/msf APIs.
  *
  * Selects initial video and audio tracks from the catalog.
  * Responds to `reduce_quality` recovery actions by stepping down
@@ -14,9 +14,9 @@
  * @module
  */
 
-import type { CatalogTrack, CatalogState, TrackConstraints } from '@moqt/msf';
-import { groupByAlt, selectTrack, isTrackPackagingSupported } from '@moqt/msf';
-import type { ClockSource } from '@moqt/playback';
+import type { CatalogTrack, CatalogState, TrackConstraints } from '@openmoq/msf';
+import { groupByAlt, selectTrack, isTrackPackagingSupported } from '@openmoq/msf';
+import type { ClockSource } from '@openmoq/playback';
 
 /** Configuration for the quality controller. */
 export interface QualityControllerConfig {

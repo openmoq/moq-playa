@@ -1,6 +1,6 @@
 /**
  * Executable Layer-A `property-block-decode` path against the PRODUCTION shared
- * property-wire core (`@moqt/transport` — `decodePropertyBlock` /
+ * property-wire core (`@openmoq/transport` — `decodePropertyBlock` /
  * `encodePropertyBlock`). This is the codec extracted from `kvp.ts` and
  * `track-properties-18.ts`; the corpus exercises it directly, both directions.
  *
@@ -14,7 +14,7 @@ import {
   type PropertyEntry,
   type PropertyMap,
   type PropertyWireProfile,
-} from '@moqt/transport';
+} from '@openmoq/transport';
 import { createHash } from 'node:crypto';
 import { fromHex, toHex } from './canonical.js';
 import type { ExecResult } from './exec-compare.js';

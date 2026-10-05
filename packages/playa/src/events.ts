@@ -1,9 +1,9 @@
 /**
- * UI-friendly event map for @playa/player.
+ * UI-friendly event map for @openmoq/playa.
  *
  * Event names mirror HTMLMediaElement conventions where possible
  * (timeupdate, volumechange, durationchange) for familiarity.
- * Protocol-level events from @moqt/player are absorbed and re-emitted
+ * Protocol-level events from @openmoq/player are absorbed and re-emitted
  * as higher-level UI events.
  *
  * @module

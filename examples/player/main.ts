@@ -1,5 +1,5 @@
 /**
- * Player API example — A/V playback using @moqt/player with browser adapters.
+ * Player API example — A/V playback using @openmoq/player with browser adapters.
  *
  * Demonstrates the convenience facade: load()/play()/pause()/destroy()
  * with adapter factories for plug-and-play decode/render.
@@ -17,10 +17,10 @@
  * @see draft-ietf-moq-loc-01 §4.1 (audio independently decodable)
  */
 
-import { MoqtPlayer, PlayerErrorCode, isMsePackaging } from '@moqt/player';
-import { MoqtConnection } from '@moqt/webtransport';
-import { QlogTrace, varint } from '@moqt/transport';
-import { CATALOG_TRACK_NAME } from '@moqt/msf';
+import { MoqtPlayer, PlayerErrorCode, isMsePackaging } from '@openmoq/player';
+import { MoqtConnection } from '@openmoq/webtransport';
+import { QlogTrace, varint } from '@openmoq/transport';
+import { CATALOG_TRACK_NAME } from '@openmoq/msf';
 import { log } from '../shared/log.js';
 import { namespace, namespaceArg, authority, warmStart, certHash, draftVersion, catalogBootstrap } from '../shared/cert.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
@@ -35,9 +35,9 @@ import {
     type CmafStartupGeometry,
     CmafAssembler,
     createWebTransport,
-} from '@moqt/browser';
+} from '@openmoq/browser';
 
-import type { PlayerStats, TTFFBreakdown } from '@moqt/player';
+import type { PlayerStats, TTFFBreakdown } from '@openmoq/player';
 
 // ─── Settings Modal ──────────────────────────────────────────────────
 
@@ -1134,10 +1134,12 @@ async function startPlayback(): Promise<void> {
             // ?gapjump=<ms> overrides the buffered-hole gap-jump wait
             // (0 disables) for A/B against hole-carrying streams.
             const gapJumpParam = params.get('gapjump');
+            const licenseUrl = params.get('license');
             const ms: MseMediaSource = new MseMediaSource(videoEl, {
                 mseImplementation: mseImpl,
                 mseAttachment: mseAttach,
                 ...(gapJumpParam !== null ? { gapJumpMs: Number(gapJumpParam) } : {}),
+                ...(licenseUrl ? { drmConfig: { licenseUrl } } : {}),
             });
             ms.debug = mseDebug;
             mediaSourceRef = ms;

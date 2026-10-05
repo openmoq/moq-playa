@@ -2,7 +2,7 @@
      Content derives from this package's package.json (name, description).
      Run `node scripts/generate-package-readmes.mjs --write` after editing it. -->
 
-# @playa/player
+# @openmoq/playa
 
 Batteries-included Media over QUIC (MoQ) media player for the browser.
 
@@ -11,7 +11,7 @@ Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implement
 ## Install
 
 ```sh
-npm install @playa/player
+npm install @openmoq/playa
 ```
 
 ## License

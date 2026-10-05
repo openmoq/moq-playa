@@ -2,7 +2,7 @@ import type {
   WebTransportBidirectionalStream,
   WebTransportCloseInfo,
   WebTransportLike,
-} from '@moqt/webtransport';
+} from '@openmoq/webtransport';
 import type { NativeQuicSession, NativeQuicStream } from './native.js';
 
 const DEFAULT_QUEUE_LIMIT = 256;

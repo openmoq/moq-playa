@@ -1,7 +1,7 @@
 /**
  * INDEPENDENT reference codec for authoring spec-derived corpus bytes.
  *
- * Deliberately self-contained — it does NOT import `@moqt/transport`. The
+ * Deliberately self-contained — it does NOT import `@openmoq/transport`. The
  * production writeVarint/writeVi64 are exactly the primitives extracted into
  * the shared property-wire codec under test; authoring the "correct" bytes with
  * them would let a primitive defect bless itself. This module is small enough to

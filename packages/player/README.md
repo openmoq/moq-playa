@@ -2,7 +2,7 @@
      Content derives from this package's package.json (name, description).
      Run `node scripts/generate-package-readmes.mjs --write` after editing it. -->
 
-# @moqt/player
+# @openmoq/player
 
 Convenience facade for Media over QUIC (MoQ) playback: wires the sans-I/O core packages into a simple load()/play()/pause()/destroy() API.
 
@@ -11,7 +11,7 @@ Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implement
 ## Install
 
 ```sh
-npm install @moqt/player
+npm install @openmoq/player
 ```
 
 ## License
