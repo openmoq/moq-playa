@@ -167,6 +167,9 @@ export type MoqtObject =
  */
 export interface MoqtObjectData {
   readonly kind: 'data';
+  /** The delivering subgroup header declares it contains the group's largest
+   * object. Not an assertion that THIS object is last. Absent for FETCH/datagrams. */
+  readonly subgroupContainsEndOfGroup?: boolean;
   /** True only for the first object of a FIRST_OBJECT-marked subgroup stream.
    * False for later objects or an unmarked stream; undefined for older drafts,
    * datagrams, and FETCH delivery. */
@@ -188,6 +191,8 @@ export interface MoqtObjectData {
  */
 export interface MoqtObjectGap {
   readonly kind: 'gap';
+  /** Same delivering-subgroup header evidence as on data objects. */
+  readonly subgroupContainsEndOfGroup?: boolean;
   /** Same per-object FIRST_OBJECT evidence as {@link MoqtObjectData}. */
   readonly isFirstObjectInSubgroup?: boolean;
   readonly trackAlias: bigint;

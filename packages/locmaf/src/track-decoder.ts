@@ -106,6 +106,11 @@ export class LocmafTrackDecoder {
         }
     }
 
+    /** Forget one group's reference after a subgroup stream reset (section 3). */
+    resetGroup(groupId: bigint): void {
+        this.states.delete(groupId);
+    }
+
     /** Forget every group's reference (e.g. after a subscription restart). */
     reset(): void {
         this.states.clear();

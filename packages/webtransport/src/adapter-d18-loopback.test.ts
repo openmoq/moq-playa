@@ -414,6 +414,28 @@ describe('MoqtConnection(18) loopback — §5.1 pending SUBSCRIBE superseded by 
 });
 
 describe('MoqtConnection(18) loopback — outbound PUBLISH lifecycle (data + PUBLISH_DONE)', () => {
+  it.each([14, 16, 18, 22] as const)('draft %s exposes end-of-group subgroup evidence on every data object before FIN', async (draft) => {
+    const { client, server, errors } = await connectedPair(draft);
+    const received: MoqtObject[] = [];
+    let requestId = -1n;
+    server.onSubscribe = (id) => { requestId = id; };
+    const pending = client.subscribeTrack(ns('live'), nm('vid'), { onObject: (object) => received.push(object) });
+    await flush();
+    await server.acceptSubscribe(requestId, 33n);
+    await pending;
+    const final = await server.openSubgroup(33n, 7n, 1n, { endOfGroup: true });
+    const other = await server.openSubgroup(33n, 7n, 2n, { endOfGroup: false });
+    await server.sendObject(final, 5n, new Uint8Array([1]));
+    await server.sendObject(final, 6n, new Uint8Array([2]));
+    await server.sendObject(other, 0n, new Uint8Array([3]));
+    await flush();
+    expect(received.filter((o) => o.subgroupId === 1n).map((o) => o.subgroupContainsEndOfGroup)).toEqual([true, true]);
+    expect(received.find((o) => o.subgroupId === 2n)?.subgroupContainsEndOfGroup).toBe(false);
+    await server.closeSubgroup(final); await server.closeSubgroup(other);
+    await flush();
+    expect(errors).toEqual([]);
+  });
+
   it('carries per-object FIRST_OBJECT evidence through publication routing without guessing from object IDs', async () => {
     const { client, server, errors } = await connectedPair();
     const received: MoqtObject[] = [];

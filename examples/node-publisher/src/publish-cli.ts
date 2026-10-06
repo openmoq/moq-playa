@@ -31,7 +31,7 @@ import { loadFixtureFromDisk, validateFixtureLayout, validateFixtureBoxes } from
 // anything starting with https:// is the url, anything else is a fixture dir.
 //   --loop | --loop-count N   repeat media as new groups (endless / N groups)
 //   --pace-media             pace each track from its actual CMAF decode timeline
-//   --catalog-format <fmt>    msf-00 (default) | cmsf-01 (string version, root
+//   --catalog-format <fmt>    msf-00 (CMAF default) | cmsf-01 (LOCMAF default, root
 //                             initDataList, per-track initRef)
 //   --msf01                   alias for --catalog-format cmsf-01
 //   --emit-delta              publish an op-array catalog delta after the catalog
@@ -40,7 +40,7 @@ import { loadFixtureFromDisk, validateFixtureLayout, validateFixtureBoxes } from
 //   --locmaf                  alias for --packaging locmaf
 const rawArgs = process.argv.slice(2);
 let loops = 1;
-let catalogFormat: CatalogFormat = 'msf-00';
+let catalogFormat: CatalogFormat | undefined;
 let deltaAfterMs: number | undefined;
 let packaging: MediaPackaging = 'cmaf';
 let paceByMediaTime = false;
@@ -75,6 +75,11 @@ for (let i = 0; i < rawArgs.length; i++) {
 }
 const url = positionals.find((a) => a.startsWith('https://')) ?? process.env.URL ?? 'https://127.0.0.1:4433/moq';
 const fixtureDir = positionals.find((a) => !a.startsWith('https://'));
+catalogFormat ??= packaging === 'locmaf' ? 'cmsf-01' : 'msf-00';
+if (packaging === 'locmaf' && catalogFormat !== 'cmsf-01') {
+  console.error('LOCMAF publication requires a CMSF-01 catalog with initDataList/initRef');
+  process.exit(2);
+}
 
 let fixture;
 if (fixtureDir) {

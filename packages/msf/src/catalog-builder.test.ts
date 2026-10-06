@@ -11,6 +11,24 @@ import { parseMsfCatalog } from './catalog-msf00.js';
 import { parseCatalogAuto } from './catalog-detect.js';
 
 describe('buildCatalog', () => {
+  it('round-trips alternative, language and label fields without changing defaults', () => {
+    for (const version of [1, '1'] as const) {
+      const catalog = parseCatalogAuto(buildCatalog({ version, tracks: [
+        { name: 'video', packaging: 'cmaf', isLive: true, altGroup: 0, lang: 'en', label: 'Test signal' },
+        { name: 'plain', packaging: 'cmaf', isLive: true },
+      ] }));
+      expect(catalog.tracks[0]).toMatchObject({ altGroup: 0, lang: 'en', label: 'Test signal' });
+      expect(catalog.tracks[1]).not.toHaveProperty('altGroup');
+      expect(catalog.tracks[1]).not.toHaveProperty('lang');
+      expect(catalog.tracks[1]).not.toHaveProperty('label');
+    }
+  });
+
+  it('rejects nonfinite alternative-group IDs rather than emitting null', () => {
+    expect(() => buildCatalog({ tracks: [
+      { name: 'video', packaging: 'cmaf', isLive: true, altGroup: Infinity },
+    ] })).toThrow();
+  });
   it('builds valid MSF catalog JSON with video + audio', () => {
     const payload = buildCatalog({
       tracks: [

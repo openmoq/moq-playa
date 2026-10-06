@@ -7329,6 +7329,7 @@ export class MoqtConnection {
           const delivered: MoqtObject = isGap
             ? {
                 ...firstObjectEvidence,
+                subgroupContainsEndOfGroup: header.isEndOfGroup,
                 kind: 'gap',
                 trackAlias: header.trackAlias,
                 groupId: header.groupId,
@@ -7338,6 +7339,7 @@ export class MoqtConnection {
               } satisfies MoqtObjectGap
             : {
                 ...firstObjectEvidence,
+                subgroupContainsEndOfGroup: header.isEndOfGroup,
                 kind: 'data',
                 trackAlias: header.trackAlias,
                 groupId: header.groupId,
@@ -7395,6 +7397,7 @@ export class MoqtConnection {
         if (header.isEndOfGroup) {
           const eogGap: MoqtObjectGap = {
             kind: 'gap',
+            subgroupContainsEndOfGroup: true,
             trackAlias: header.trackAlias,
             groupId: header.groupId,
             subgroupId: header.subgroupId,

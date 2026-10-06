@@ -439,6 +439,12 @@ describe('encodeLocHeaders with absolute type IDs (draft-14 §1.4.2)', () => {
 // ─── toVideoChunkInit ──────────────────────────────────────────────────
 
 describe('toVideoChunkInit', () => {
+    it('preserves supplied duration in microseconds, including zero', () => {
+        for (const duration of [0, 33344, 50078]) {
+            expect(toVideoChunkInit(new Uint8Array(1), { captureTimestamp: 1010000n, duration }).duration).toBe(duration);
+        }
+        expect(toVideoChunkInit(new Uint8Array(1), {})).not.toHaveProperty('duration');
+    });
     it('creates key chunk for independent frame (§2.3.2.2)', () => {
         const payload = new Uint8Array([0x00, 0x00, 0x01, 0x67]);
         const headers: LocHeaders = {
@@ -497,6 +503,12 @@ describe('toVideoChunkInit', () => {
 // ─── toAudioChunkInit ──────────────────────────────────────────────────
 
 describe('toAudioChunkInit', () => {
+    it('preserves supplied duration in microseconds, including zero', () => {
+        for (const duration of [0, 62521, 93896]) {
+            expect(toAudioChunkInit(new Uint8Array(1), { captureTimestamp: 1010000n, duration }).duration).toBe(duration);
+        }
+        expect(toAudioChunkInit(new Uint8Array(1), {})).not.toHaveProperty('duration');
+    });
     it('creates key chunk with timestamp (§2, §2.3.1.1)', () => {
         const payload = new Uint8Array([0x4F, 0x70, 0x75, 0x73]);
         const headers: LocHeaders = { captureTimestamp: 2000000n };

@@ -178,6 +178,7 @@ export function toVideoChunkInit(
     return {
         type: isKey ? 'key' : 'delta',
         timestamp,
+        ...(headers.duration !== undefined ? { duration: headers.duration } : {}),
         data: payload,
     };
 }
@@ -204,6 +205,7 @@ export function toAudioChunkInit(
     return {
         type: 'key',
         timestamp,
+        ...(headers.duration !== undefined ? { duration: headers.duration } : {}),
         data: payload,
     };
 }

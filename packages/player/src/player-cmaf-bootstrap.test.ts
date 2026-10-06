@@ -17,10 +17,11 @@ import { PlayerState } from './state.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, MoqtObject } from '@openmoq/transport';
-import { varint } from '@openmoq/transport';
+import { ObjectStatus, varint } from '@openmoq/transport';
 import { LocmafEncoder, LocmafGroupState, LocmafTrackDecoder, parseLocmafTrackContext, serializeLocmafObject } from '@openmoq/locmaf';
 import { NON_SYNC_FLAGS, SYNC_FLAGS, buildChunk, videoInit } from '../../locmaf/test-support/cmaf.js';
-import { concat, vi as vi64 } from '../../locmaf/test-support/bytes.js';
+import { concat, isoBox, vi as vi64 } from '../../locmaf/test-support/bytes.js';
+import { malformedRawInits } from '../test-support/locmaf.js';
 
 // ─── Mock adapter (thin copy of the player.test.ts harness) ──────────
 
@@ -37,6 +38,7 @@ function createMockAdapter() {
     requestUpdate: vi.fn(async () => varint(nextRequestId++)),
     unsubscribe: vi.fn(async () => {}),
     fetch: vi.fn(async () => varint(nextRequestId++)),
+    joiningFetch: vi.fn(async () => varint(nextRequestId++)),
     fetchCancel: vi.fn(async () => {}),
     trackStatus: vi.fn(async () => varint(nextRequestId++)),
     subscribeNamespace: vi.fn(async () => varint(nextRequestId++)),
@@ -86,7 +88,7 @@ function makeMockMs() {
   };
 }
 
-async function bootPlayer(catalogJson: string, cfg?: Partial<MoqtPlayerConfig>) {
+async function bootPlayer(catalogJson: string, cfg?: Partial<MoqtPlayerConfig>, acknowledgeMedia = true) {
   const adapter = createMockAdapter();
   const mockMs = makeMockMs();
   const assembler = { push: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(), setInitSegment: vi.fn(), clearPending: vi.fn() };
@@ -113,12 +115,13 @@ async function bootPlayer(catalogJson: string, cfg?: Partial<MoqtPlayerConfig>) 
     type: 'SUBSCRIBE_OK', requestId: catalogReqId, trackAlias: catalogReqId, parameters: new Map(),
   } as unknown as ControlMessage);
   adapter._triggerObject(0n, {
-    kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
+    kind: 'data', trackAlias: catalogReqId, groupId: varint(cfg?.catalogBootstrap === 'auto' ? 9 : 0), subgroupId: varint(0),
     objectId: varint(0), payload: new TextEncoder().encode(catalogJson),
   } as MoqtObject);
   await new Promise((r) => setTimeout(r, 30)); // async subscribe fan-out
 
   for (const result of adapter.subscribe.mock.results.slice(1)) {
+    if (!acknowledgeMedia) break;
     const requestId = await result.value;
     adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId, trackAlias: requestId, parameters: new Map() } as ControlMessage);
   }
@@ -284,19 +287,362 @@ describe('LOCMAF bootstrap (draft-einarsson-moq-locmaf-01 §5, §6) — same CMA
     });
   }
 
-  function sendLocmaf(adapter: any, alias: unknown, groupId: number, objectId: number, payload: Uint8Array): void {
-    adapter._triggerObject(0n, {
+  function sendLocmaf(adapter: any, alias: unknown, groupId: number, objectId: number, payload: Uint8Array, streamId = 0n): void {
+    adapter._triggerObject(streamId, {
       kind: 'data', trackAlias: alias, groupId: varint(groupId), subgroupId: varint(0),
       objectId: varint(objectId), payload,
     } as MoqtObject);
   }
 
-  async function bootLocmaf(withInit = true) {
+  async function bootLocmaf(withInit = true, acknowledgeMedia = true, cfg?: Partial<MoqtPlayerConfig>) {
     const booted = await bootPlayer(withInit
       ? cmsfCatalog([{ ...LOCMAF_VIDEO, initRef: 'v' }], [{ id: 'v', type: 'inline', data: b64(locmafInit) }])
-      : cmsfCatalog([{ ...LOCMAF_VIDEO }]));
+      : cmsfCatalog([{ ...LOCMAF_VIDEO }]), cfg, acknowledgeMedia);
     return { ...booted, alias: await booted.reqIdFor('video') };
   }
+
+  describe.each(['before', 'after'] as const)('LOCMAF replacement delta %s alias binding', (timing) => {
+    it.each(['reset', 'fin'] as const)('replays the pre-alias %s in order and recovers at a full header', async (terminal) => {
+      const h = await bootLocmaf(true, false);
+      const alias = varint(50);
+      const open = (streamId: bigint) => h.adapter.onDataStream(streamId, {
+        type: 'subgroup', header: { typeByte: 0x10, trackAlias: alias, groupId: varint(4), subgroupId: varint(0), publisherPriority: 128 },
+      });
+      try {
+        const objects = locmafGroup(90000, 2);
+        open(40n);
+        sendLocmaf(h.adapter, alias, 4, 0, objects[0]!, 40n);
+        h.adapter.onStreamClosed(40n, terminal === 'reset' ? 0 : undefined, terminal);
+        open(44n);
+        if (timing === 'before') sendLocmaf(h.adapter, alias, 4, 1, objects[1]!, 44n);
+        expect(h.assembler.push).not.toHaveBeenCalled();
+        h.adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: h.alias, trackAlias: alias, parameters: new Map() } as ControlMessage);
+        if (timing === 'after') sendLocmaf(h.adapter, alias, 4, 1, objects[1]!, 44n);
+        expect(h.assembler.push).toHaveBeenCalledTimes(terminal === 'reset' ? 1 : 2);
+        expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(terminal === 'reset' ? 1 : 0);
+        const recovery = locmafGroup(96000, 2);
+        sendLocmaf(h.adapter, alias, 4, 2, recovery[0]!, 44n);
+        sendLocmaf(h.adapter, alias, 4, 3, recovery[1]!, 44n);
+        expect(h.assembler.push).toHaveBeenCalledTimes(terminal === 'reset' ? 3 : 4);
+        expect((h.player as any).pendingObjectsByAlias.has(50n)).toBe(false);
+        expect((h.player as any).pendingStreamEvents.get(h.adapter)).toBeUndefined();
+      } finally {
+        await h.player.destroy();
+      }
+    });
+
+    it('does not treat a replacement full received before the old reset as recovery', async () => {
+      const h = await bootLocmaf(true, false);
+      const alias = varint(50);
+      const open = (streamId: bigint) => h.adapter.onDataStream(streamId, {
+        type: 'subgroup', header: { typeByte: 0x10, trackAlias: alias, groupId: varint(4), subgroupId: varint(0), publisherPriority: 128 },
+      });
+      try {
+        const initial = locmafGroup(90000, 1);
+        const replacement = locmafGroup(93000, 2);
+        open(40n);
+        sendLocmaf(h.adapter, alias, 4, 0, initial[0]!, 40n);
+        open(44n);
+        sendLocmaf(h.adapter, alias, 4, 1, replacement[0]!, 44n);
+        h.adapter.onStreamClosed(40n, 0, 'reset');
+        if (timing === 'before') sendLocmaf(h.adapter, alias, 4, 2, replacement[1]!, 44n);
+        h.adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: h.alias, trackAlias: alias, parameters: new Map() } as ControlMessage);
+        if (timing === 'after') sendLocmaf(h.adapter, alias, 4, 2, replacement[1]!, 44n);
+        expect(h.assembler.push).toHaveBeenCalledTimes(2);
+        expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(1);
+        const recovery = locmafGroup(99000, 2);
+        sendLocmaf(h.adapter, alias, 4, 3, recovery[0]!, 44n);
+        sendLocmaf(h.adapter, alias, 4, 4, recovery[1]!, 44n);
+        expect(h.assembler.push).toHaveBeenCalledTimes(4);
+      } finally {
+        await h.player.destroy();
+      }
+    });
+  });
+
+  it('LOCMAF parked reset survives lifecycle FIFO pressure and preserves other groups', async () => {
+    const h = await bootLocmaf(true, false, { catalogBootstrap: 'auto' });
+    const alias = varint(50);
+    const open = (streamId: bigint, groupId: number) => h.adapter.onDataStream(streamId, {
+      type: 'subgroup', header: { typeByte: 0x10, trackAlias: alias, groupId: varint(groupId), subgroupId: varint(0), publisherPriority: 128 },
+    });
+    try {
+      const g4 = locmafGroup(90000, 2);
+      const g5 = locmafGroup(96000, 2);
+      open(40n, 4);
+      sendLocmaf(h.adapter, alias, 4, 0, g4[0]!, 40n);
+      open(44n, 5);
+      sendLocmaf(h.adapter, alias, 5, 0, g5[0]!, 44n);
+      h.adapter.onStreamClosed(40n, 0, 'reset');
+      const events = (h.player as any).pendingStreamEvents as Map<unknown, Map<bigint, unknown>>;
+      expect(events.get(h.adapter)?.has(40n)).toBe(true);
+      for (let i = 0; i < 65; i++) {
+        const streamId = BigInt(1000 + i);
+        sendLocmaf(h.adapter, varint(100 + i), 0, 0, Uint8Array.of(42), streamId);
+        h.adapter.onStreamClosed(streamId, undefined, 'fin');
+      }
+      expect(events.get(h.adapter)?.size).toBe(64);
+      expect(events.get(h.adapter)?.has(40n)).toBe(false);
+      sendLocmaf(h.adapter, alias, 5, 1, g5[1]!, 44n);
+      open(48n, 4);
+      sendLocmaf(h.adapter, alias, 4, 1, g4[1]!, 48n);
+      h.adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: h.alias, trackAlias: alias, parameters: new Map() } as ControlMessage);
+      expect(h.assembler.push).toHaveBeenCalledTimes(3);
+      expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(1);
+      expect((h.player as any).pendingObjectsByAlias.size).toBe(0);
+      expect(events.size).toBe(0);
+      const recovery = locmafGroup(102000, 2);
+      sendLocmaf(h.adapter, alias, 4, 2, recovery[0]!, 48n);
+      sendLocmaf(h.adapter, alias, 4, 3, recovery[1]!, 48n);
+      expect(h.assembler.push).toHaveBeenCalledTimes(5);
+      expect(h.errors).toEqual([]);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
+  it('LOCMAF parked reset matches connection identity despite colliding stream and alias IDs', async () => {
+    const h = await bootLocmaf(true, false);
+    const other = createMockAdapter();
+    const alias = varint(50);
+    try {
+      (h.player as any).wireConnection(other);
+      const objects = locmafGroup(90000, 3);
+      sendLocmaf(h.adapter, alias, 4, 0, objects[0]!, 40n);
+      sendLocmaf(other, alias, 4, 0, objects[0]!, 40n);
+      other.onStreamClosed(40n, 0, 'reset');
+      h.adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: h.alias, trackAlias: alias, parameters: new Map() } as ControlMessage);
+      sendLocmaf(h.adapter, alias, 4, 1, objects[1]!, 44n);
+      expect(h.assembler.push).toHaveBeenCalledTimes(2);
+      const retained = (h.player as any).pendingObjectsByAlias.get(50n);
+      expect(retained).toHaveLength(1);
+      expect(retained[0].sourceConnection).toBe(other);
+      expect(retained[0].locmafResetOrdinal).toBeDefined();
+      (h.player as any).purgePendingForConnection(other);
+      expect((h.player as any).pendingObjectsByAlias.has(50n)).toBe(false);
+      sendLocmaf(h.adapter, alias, 4, 2, objects[2]!, 44n);
+      expect(h.assembler.push).toHaveBeenCalledTimes(3);
+      expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(0);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
+  it('LOCMAF parked reset cannot transfer from an alias whose request ownership was removed', async () => {
+    const h = await bootLocmaf(true, false);
+    const alias = varint(50);
+    try {
+      const objects = locmafGroup(90000, 2);
+      sendLocmaf(h.adapter, alias, 4, 0, objects[0]!, 40n);
+      sendLocmaf(h.adapter, varint(51), 4, 0, objects[0]!, 44n);
+      h.adapter.onStreamClosed(44n, 0, 'reset');
+      h.adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: h.alias, trackAlias: alias, parameters: new Map() } as ControlMessage);
+      sendLocmaf(h.adapter, alias, 4, 1, objects[1]!, 40n);
+      expect(h.assembler.push).toHaveBeenCalledTimes(2);
+      expect((h.player as any).pendingObjectsByAlias.size).toBe(0);
+      expect((h.player as any).pendingStreamEvents.size).toBe(0);
+      expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(0);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
+  it('LOCMAF parked reset replay from a superseded connection cannot invalidate the current group', async () => {
+    const h = await bootLocmaf(true, false);
+    const other = createMockAdapter();
+    const alias = varint(50);
+    try {
+      (h.player as any).wireConnection(other);
+      other._triggerObject(40n, {
+        kind: 'gap', trackAlias: alias, groupId: varint(4), subgroupId: varint(0),
+        objectId: varint(0), status: ObjectStatus.OBJECT_DOES_NOT_EXIST,
+      } as MoqtObject);
+      other.onStreamClosed(40n, 0, 'reset');
+      h.adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: h.alias, trackAlias: alias, parameters: new Map() } as ControlMessage);
+      const objects = locmafGroup(90000, 3);
+      sendLocmaf(h.adapter, alias, 4, 0, objects[0]!, 44n);
+      expect(h.assembler.push).toHaveBeenCalledTimes(1);
+      (h.player as any).replayPendingObjects(50n, other);
+      sendLocmaf(h.adapter, alias, 4, 1, objects[1]!, 44n);
+      sendLocmaf(h.adapter, alias, 4, 2, objects[2]!, 44n);
+      expect(h.assembler.push).toHaveBeenCalledTimes(3);
+      expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(0);
+      expect((h.player as any).pendingObjectsByAlias.size).toBe(0);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
+  it.each([false, true])('a deferred full cannot restore state after reset (parked=%s)', async (parked) => {
+    let release: (() => void) | undefined;
+    const h = await bootLocmaf(true, !parked, {
+      objectTransform: (object) => object.objectId === 0n
+        ? new Promise<MoqtObject>((resolve) => { release = () => resolve(object); })
+        : object,
+    });
+    const alias = parked ? varint(50) : h.alias;
+    try {
+      h.adapter.onDataStream(40n, { type: 'subgroup', header: {
+        typeByte: 0x10, trackAlias: alias, groupId: varint(4), subgroupId: varint(0), publisherPriority: 128,
+      } });
+      const objects = locmafGroup(90000, 2);
+      sendLocmaf(h.adapter, alias, 4, 0, objects[0]!, 40n);
+      h.adapter.onStreamClosed(40n, 0, 'reset');
+      if (parked) h.adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: h.alias, trackAlias: alias, parameters: new Map() } as ControlMessage);
+      expect(release).toBeTypeOf('function');
+      release!();
+      await sleep(0);
+      sendLocmaf(h.adapter, alias, 4, 1, objects[1]!, 44n);
+      expect(h.assembler.push).not.toHaveBeenCalled();
+      expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(1);
+      const recovery = locmafGroup(96000, 2);
+      sendLocmaf(h.adapter, alias, 4, 2, recovery[0]!, 44n);
+      sendLocmaf(h.adapter, alias, 4, 3, recovery[1]!, 44n);
+      expect(h.assembler.push).toHaveBeenCalledTimes(2);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
+  it('retains a same-group reset after ownership cleanup removes every old-stream carrier', async () => {
+    const h = await bootLocmaf(true, false);
+    const alias = varint(50);
+    const internals = h.player as any;
+    const oldOwner = 999n;
+    try {
+      // Model a new request joining while another request owns the earlier data.
+      internals.pendingAliasBinds.delete(BigInt(h.alias));
+      internals.pendingAliasBinds.add(oldOwner);
+      sendLocmaf(h.adapter, alias, 4, 0, locmafGroup(90000, 1)[0]!, 40n);
+      internals.pendingAliasBinds.add(BigInt(h.alias));
+      const replacement = locmafGroup(93000, 3);
+      sendLocmaf(h.adapter, alias, 4, 1, replacement[0]!, 44n);
+      h.adapter.onStreamClosed(40n, 0, 'reset');
+      internals.settleParkedOwnership(oldOwner, null, h.adapter);
+      expect(internals.pendingObjectsByAlias.get(50n)).toHaveLength(1);
+      expect(internals.pendingObjectsByAlias.get(50n)[0].streamId).toBe(44n);
+      h.adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: h.alias, trackAlias: alias, parameters: new Map() } as ControlMessage);
+      sendLocmaf(h.adapter, alias, 4, 2, replacement[1]!, 44n);
+      expect(h.assembler.push).toHaveBeenCalledTimes(1);
+      expect(internals._stats.snapshot().locmafObjectsRejected).toBe(1);
+      const recovery = locmafGroup(99000, 2);
+      sendLocmaf(h.adapter, alias, 4, 3, recovery[0]!, 44n);
+      sendLocmaf(h.adapter, alias, 4, 4, recovery[1]!, 44n);
+      expect(h.assembler.push).toHaveBeenCalledTimes(3);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
+  it('preserves multiple parked reset boundaries without invalidating a later full recovery', async () => {
+    const h = await bootLocmaf(true, false);
+    const alias = varint(50);
+    try {
+      const first = locmafGroup(90000, 2);
+      const second = locmafGroup(96000, 2);
+      const third = locmafGroup(102000, 3);
+      sendLocmaf(h.adapter, alias, 4, 0, first[0]!, 40n);
+      h.adapter.onStreamClosed(40n, 0, 'reset');
+      sendLocmaf(h.adapter, alias, 4, 1, first[1]!, 44n);
+      sendLocmaf(h.adapter, alias, 4, 2, second[0]!, 44n);
+      sendLocmaf(h.adapter, alias, 4, 3, second[1]!, 44n);
+      h.adapter.onStreamClosed(44n, 0, 'reset');
+      sendLocmaf(h.adapter, alias, 4, 4, second[1]!, 48n);
+      sendLocmaf(h.adapter, alias, 4, 5, third[0]!, 48n);
+      sendLocmaf(h.adapter, alias, 4, 6, third[1]!, 48n);
+      h.adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: h.alias, trackAlias: alias, parameters: new Map() } as ControlMessage);
+      expect(h.assembler.push).toHaveBeenCalledTimes(5);
+      expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(2);
+      sendLocmaf(h.adapter, alias, 4, 7, third[2]!, 48n);
+      expect(h.assembler.push).toHaveBeenCalledTimes(6);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
+  it.each(['reset', 'fin'] as const)('LOCMAF subgroup %s preserves only valid group references', async (terminal) => {
+    const h = await bootLocmaf();
+    try {
+      const g4 = locmafGroup(90000, 3);
+      const g5 = locmafGroup(99000, 2);
+      h.adapter.onDataStream(40n, {
+        type: 'subgroup', header: { typeByte: 0x10, trackAlias: h.alias, groupId: varint(4), subgroupId: varint(0), publisherPriority: 128 },
+      });
+      sendLocmaf(h.adapter, h.alias, 4, 0, g4[0]!);
+      sendLocmaf(h.adapter, h.alias, 5, 0, g5[0]!);
+      expect(h.assembler.push).toHaveBeenCalledTimes(2);
+      h.adapter.onStreamClosed(40n, terminal === 'reset' ? 0 : undefined, terminal);
+      sendLocmaf(h.adapter, h.alias, 4, 1, g4[1]!);
+      expect(h.assembler.push).toHaveBeenCalledTimes(terminal === 'reset' ? 2 : 3);
+      expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(terminal === 'reset' ? 1 : 0);
+      sendLocmaf(h.adapter, h.alias, 5, 1, g5[1]!);
+      expect(h.assembler.push).toHaveBeenCalledTimes(terminal === 'reset' ? 3 : 4);
+      const recovery = locmafGroup(105000, 2);
+      sendLocmaf(h.adapter, h.alias, 4, 2, recovery[0]!);
+      sendLocmaf(h.adapter, h.alias, 4, 3, recovery[1]!);
+      expect(h.assembler.push).toHaveBeenCalledTimes(terminal === 'reset' ? 5 : 6);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
+  it.each(['Object ID gap', 'raw media', 'repeated raw init'])('LOCMAF resynchronizes after %s only at a full header', async (discontinuity) => {
+    const h = await bootLocmaf();
+    try {
+      const objects = locmafGroup(90000, 4);
+      sendLocmaf(h.adapter, h.alias, 4, 0, objects[0]!);
+      if (discontinuity !== 'Object ID gap') {
+        const boxes = discontinuity === 'raw media' ? isoBox('free') : locmafInit;
+        sendLocmaf(h.adapter, h.alias, 4, 1, concat(vi64(4), boxes));
+      }
+      const before = h.assembler.push.mock.calls.length;
+      sendLocmaf(h.adapter, h.alias, 4, 2, objects[2]!);
+      expect(h.assembler.push).toHaveBeenCalledTimes(before);
+      expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(1);
+      const recovery = locmafGroup(102000, 2);
+      sendLocmaf(h.adapter, h.alias, 4, 3, recovery[0]!);
+      sendLocmaf(h.adapter, h.alias, 4, 4, recovery[1]!);
+      expect(h.assembler.push).toHaveBeenCalledTimes(before + 2);
+    } finally {
+      await h.player.destroy();
+    }
+  });
+
+  describe.each([false, true])('LOCMAF raw init validation (initialized=%s)', (initialized) => {
+    it.each(malformedRawInits(locmafInit))('rejects %s before MSE initialization or append', async (_name, boxes) => {
+      const h = await bootLocmaf(initialized);
+      try {
+        const previousInit = (h.player as any).initSegmentByTrack.get('video');
+        h.mockMs.initialize.mockClear();
+        sendLocmaf(h.adapter, h.alias, 4, 0, concat(vi64(4), boxes));
+        expect(h.mockMs.initialize).not.toHaveBeenCalled();
+        expect(h.mockMs.appendChunk).not.toHaveBeenCalled();
+        expect(h.assembler.push).not.toHaveBeenCalled();
+        expect((h.player as any).initSegmentByTrack.get('video')).toBe(previousInit);
+        expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(1);
+        sendLocmaf(h.adapter, h.alias, 4, 1, concat(vi64(4), locmafInit));
+        expect((h.player as any).initSegmentByTrack.get('video')).toEqual(locmafInit);
+        sendLocmaf(h.adapter, h.alias, 4, 2, locmafGroup(90000, 1)[0]!);
+        expect(h.assembler.push).toHaveBeenCalledTimes(1);
+      } finally {
+        await h.player.destroy();
+      }
+    });
+  });
+
+  it('consecutive malformed rawBoxes groups retain malformed-track accounting', async () => {
+    const h = await bootLocmaf();
+    try {
+      const malformed = concat(vi64(4), isoBox('free'), Uint8Array.of(42));
+      for (let groupId = 0; groupId < 3; groupId++) sendLocmaf(h.adapter, h.alias, groupId, 0, malformed);
+      await sleep(10);
+      expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(3);
+      expect(h.adapter.unsubscribe).toHaveBeenCalled();
+      expect(h.assembler.push).not.toHaveBeenCalled();
+    } finally {
+      await h.player.destroy();
+    }
+  });
 
   it('locmaf objects are reconstructed into canonical CMAF chunks and fed to the assembler in order', async () => {
     const { player, adapter, assembler, alias, errors } = await bootLocmaf();

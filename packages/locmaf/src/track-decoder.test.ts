@@ -24,6 +24,19 @@ function group(bmdt: number, count: number): Uint8Array[] {
 }
 
 describe('LocmafTrackDecoder', () => {
+    it('invalidates only the reset group until its next full header', () => {
+        const decoder = new LocmafTrackDecoder(videoInit());
+        const objects = group(90000, 2);
+        expect(decoder.push(1n, 0n, objects[0]!).kind).toBe('chunk');
+        expect(decoder.push(2n, 0n, objects[0]!).kind).toBe('chunk');
+        decoder.resetGroup(1n);
+        expect(decoder.push(1n, 1n, objects[1]!).kind).toBe('rejected');
+        expect(decoder.push(2n, 1n, objects[1]!).kind).toBe('chunk');
+        expect(decoder.push(1n, 2n, objects[0]!).kind).toBe('chunk');
+        expect(decoder.push(1n, 3n, objects[1]!).kind).toBe('chunk');
+        decoder.resetGroup(99n);
+        expect(decoder.push(3n, 0n, objects[0]!).kind).toBe('chunk');
+    });
     it('exposes the track context and decodes a group into canonical chunks', () => {
         const decoder = new LocmafTrackDecoder(videoInit());
         expect(decoder.context.timescale).toBe(90000);

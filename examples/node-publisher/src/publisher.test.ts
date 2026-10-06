@@ -143,6 +143,14 @@ const audioOnlyFixture = (): LoadedFixture => fixture([
 ]);
 
 describe('node-publisher CMSF-01 catalog helpers', () => {
+  it('preserves switching-set and audio-language metadata in both catalog formats', () => {
+    const f = fixture(videoFixture().tracks.map((t) => ({ ...t,
+      meta: { ...t.meta, altGroup: 7, lang: 'en', label: 'Test signal' } })));
+    for (const format of ['msf-00', 'cmsf-01'] as const) {
+      expect(parseCatalogAuto(buildFixtureCatalog(f, format)).tracks[0])
+        .toMatchObject({ altGroup: 7, lang: 'en', label: 'Test signal' });
+    }
+  });
   it('emits string version, root initDataList, and per-track initRef without inline initData', () => {
     const bytes = buildFixtureCatalog(videoFixture(), 'cmsf-01');
     const raw = JSON.parse(new TextDecoder().decode(bytes));

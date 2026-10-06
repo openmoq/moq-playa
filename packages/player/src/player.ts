@@ -34,7 +34,7 @@ import type { AbrTrack } from '@openmoq/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@openmoq/playback';
 import type { CatalogState, CatalogTrack } from '@openmoq/msf';
 import type { LocHeaders } from '@openmoq/loc';
-import { LocmafFormatError, LocmafTrackDecoder, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes } from '@openmoq/locmaf';
+import { LocmafFormatError, LocmafTrackDecoder, deserializeLocmafObject, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes } from '@openmoq/locmaf';
 import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@openmoq/locmaf';
 import { parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@openmoq/msf';
 
@@ -511,7 +511,9 @@ export class MoqtPlayer {
     subgroupId: bigint | undefined;
   }>>();
 
-  private readonly pendingObjectsByAlias = new Map<bigint, { streamId: bigint; obj: MoqtObject; sourceDraft: DraftVersion | undefined; sourceConnection: MoqtConnection; owners?: bigint[] }[]>();
+  private readonly pendingObjectsByAlias = new Map<bigint, { streamId: bigint; obj: MoqtObject; sourceDraft: DraftVersion | undefined; sourceConnection: MoqtConnection; locmafResetOrdinal?: number; locmafResetBeforeOrdinal?: number; owners?: bigint[] }[]>();
+  /** Reset order shared by the bounded parked records; no separate reset queue. */
+  private pendingResetOrdinal = 0;
   private static readonly MAX_PENDING_PER_ALIAS = 256;
   private static readonly MAX_PENDING_ALIASES = 1024;
 
@@ -789,11 +791,12 @@ export class MoqtPlayer {
   private livenessMonitor: MediaLivenessMonitor | null = null;
 
   /**
-   * streamId → trackAlias for SUBGROUP data streams only. Lets a stream
+   * streamId to track alias and group for SUBGROUP data streams only. Lets a stream
    * reset shorten the owning track's liveness fuse (§10.4.3 resets are
-   * otherwise normal). Fetch streams and datagrams never enter this map.
+   * otherwise normal) and invalidate its LOCMAF reference (§3).
+   * Fetch streams and datagrams never enter this map.
    */
-  private readonly subgroupStreamAliases = new Map<bigint, bigint>();
+  private readonly subgroupStreams = new Map<bigint, { trackAlias: bigint; groupId: bigint }>();
 
   /**
    * Restart-ladder state per track, keyed `${mediaType}:${trackName}`
@@ -1261,7 +1264,8 @@ export class MoqtPlayer {
     if (!obj.payload) return;
 
     // §9: a rawBoxes Object carries complete ISO boxes, possibly a CMAF Header.
-    const rawBoxes = MoqtPlayer.locmafRawBoxes(obj.payload);
+    const rawBoxes = this.locmafRawBoxes(mediaType, trackName, obj);
+    if (rawBoxes === undefined) return;
 
     // §16 frame interface: no MSE gates apply; the LOC pipeline takes the samples.
     if (this.locmafFramePath) {
@@ -1332,6 +1336,54 @@ export class MoqtPlayer {
     this.cmafAssembler?.push(mediaType, trackName, groupId, decoded.bytes);
   }
 
+  /** Count reconstruction and pre-init rawBoxes validation through the same group-health policy. */
+  private recordLocmafObjectResult(
+    mediaType: 'video' | 'audio' | 'eventtimeline',
+    trackName: string,
+    trackAlias: bigint,
+    groupId: bigint,
+    objectId: bigint,
+    error: LocmafFormatError | null,
+  ): void {
+    let health = this.locmafHealth.get(trackName);
+    if (!health) {
+      health = { groups: new Map(), failedGroups: 0 };
+      this.locmafHealth.set(trackName, health);
+    }
+    let group = health.groups.get(groupId);
+    if (!group) {
+      group = { decoded: false, counted: false };
+      health.groups.set(groupId, group);
+      if (health.groups.size > MoqtPlayer.LOCMAF_TRACKED_GROUPS) {
+        const oldest = health.groups.keys().next().value;
+        if (oldest !== undefined) health.groups.delete(oldest);
+      }
+    }
+
+    if (error !== null) {
+      this._stats.recordLocmafObjectRejected();
+      if (!this.locmafWarned.has(`rejected:${trackName}`)) {
+        this.locmafWarned.add(`rejected:${trackName}`);
+        this.log.warn('[LOCMAF] "%s" (%s): object g=%s o=%s rejected: %s',
+          trackName, mediaType, String(groupId), String(objectId), error.message);
+      }
+      if (!group.decoded && !group.counted) {
+        group.counted = true;
+        health.failedGroups++;
+        if (health.failedGroups >= MoqtPlayer.LOCMAF_MAX_FAILED_GROUPS) {
+          this.locmafDecoders.delete(trackName);
+          this.locmafDecoderInit.delete(trackName);
+          this.locmafHealth.delete(trackName);
+          this.handleMalformedTrack(trackAlias, trackName, error);
+        }
+      }
+      return;
+    }
+
+    group.decoded = true;
+    health.failedGroups = 0;
+  }
+
   /**
    * Reconstruct one LOCMAF Object. Returns the CMAF bytes and whether they start
    * on a sync sample, or null when the object is rejected (counted, warned once
@@ -1350,44 +1402,9 @@ export class MoqtPlayer {
     const decoder = this.locmafDecoderFor(mediaType, trackName, trackAlias);
     if (!decoder) return null;
     const result = decoder.push(groupId, objectId, payload);
-
-    let health = this.locmafHealth.get(trackName);
-    if (!health) {
-      health = { groups: new Map(), failedGroups: 0 };
-      this.locmafHealth.set(trackName, health);
-    }
-    let group = health.groups.get(groupId);
-    if (!group) {
-      group = { decoded: false, counted: false };
-      health.groups.set(groupId, group);
-      if (health.groups.size > MoqtPlayer.LOCMAF_TRACKED_GROUPS) {
-        const oldest = health.groups.keys().next().value;
-        if (oldest !== undefined) health.groups.delete(oldest);
-      }
-    }
-
-    if (result.kind === 'rejected') {
-      this._stats.recordLocmafObjectRejected();
-      if (!this.locmafWarned.has(`rejected:${trackName}`)) {
-        this.locmafWarned.add(`rejected:${trackName}`);
-        this.log.warn('[LOCMAF] "%s" (%s): object g=%s o=%s rejected: %s',
-          trackName, mediaType, String(groupId), String(objectId), result.error.message);
-      }
-      if (!group.decoded && !group.counted) {
-        group.counted = true;
-        health.failedGroups++;
-        if (health.failedGroups >= MoqtPlayer.LOCMAF_MAX_FAILED_GROUPS) {
-          this.locmafDecoders.delete(trackName);
-          this.locmafDecoderInit.delete(trackName);
-          this.locmafHealth.delete(trackName);
-          this.handleMalformedTrack(trackAlias, trackName, result.error);
-        }
-      }
-      return null;
-    }
-
-    group.decoded = true;
-    health.failedGroups = 0;
+    this.recordLocmafObjectResult(mediaType, trackName, trackAlias, groupId, objectId,
+      result.kind === 'rejected' ? result.error : null);
+    if (result.kind === 'rejected') return null;
     if (result.kind === 'raw') {
       // rawBoxes media (§9): the chunk is carried verbatim, often because its
       // moof falls outside the LOCMAF field model. Read its samples leniently
@@ -1574,6 +1591,7 @@ export class MoqtPlayer {
         // CMAF presentation time is media time, never wall clock, so
         // wall-clock latency features must stay off for this path.
         captureTimestamp: ticksToMicros(frame.presentationTime, timescale),
+        duration: Number(ticksToMicros(BigInt(frame.duration), timescale)),
         timestampIsWallClock: false,
         ...(mediaType === 'video'
           ? {
@@ -1630,7 +1648,8 @@ export class MoqtPlayer {
    */
   private onLocmafEventObject(trackName: string, obj: MoqtObject): void {
     if (obj.kind !== 'data' || !obj.payload) return;
-    const rawBoxes = MoqtPlayer.locmafRawBoxes(obj.payload);
+    const rawBoxes = this.locmafRawBoxes('eventtimeline', trackName, obj);
+    if (rawBoxes === undefined) return;
     if (rawBoxes && isCmafHeader(rawBoxes)) {
       this.noteLocmafInBandHeader(trackName, rawBoxes);
       return;
@@ -1717,13 +1736,31 @@ export class MoqtPlayer {
     return true;
   }
 
-  /** The ISO boxes of a rawBoxes Object (element_type 4 as its first vi64), or null. §9.1 */
-  private static locmafRawBoxes(payload: Uint8Array): Uint8Array | null {
+  /** Validated rawBoxes (§9.1), null for another element, undefined for a rejected Object. */
+  private locmafRawBoxes(
+    mediaType: 'video' | 'audio' | 'eventtimeline',
+    trackName: string,
+    obj: MoqtObject & { kind: 'data' },
+  ): Uint8Array | null | undefined {
+    const payload = obj.payload;
+    let elementType: bigint;
     try {
-      const { value, bytesRead } = readVi64(payload, 0);
-      return value === 4n ? payload.subarray(bytesRead) : null;
+      elementType = readVi64(payload, 0).value;
     } catch {
       return null;
+    }
+    if (elementType !== 4n) return null;
+    const groupId = BigInt(obj.groupId);
+    // Even a repeated in-band Header ends this group's delta chain (§9.3).
+    this.subscriptionManager?.invalidateLocmafGroup(BigInt(obj.trackAlias), groupId, this.connection);
+    this.locmafDecoders.get(trackName)?.resetGroup(groupId);
+    try {
+      const object = deserializeLocmafObject(payload);
+      return object.kind === 'rawBoxes' ? object.boxes : null;
+    } catch (err) {
+      if (!(err instanceof LocmafFormatError)) throw err;
+      this.recordLocmafObjectResult(mediaType, trackName, BigInt(obj.trackAlias), groupId, BigInt(obj.objectId), err);
+      return undefined;
     }
   }
 
@@ -5308,7 +5345,7 @@ export class MoqtPlayer {
     // never emit MEDIA_STARVED for an intentional teardown) and disarm.
     for (const restart of this.livenessRestarts.values()) restart.cancelled = true;
     this.livenessMonitor?.clear();
-    this.subgroupStreamAliases.clear();
+    this.subgroupStreams.clear();
     this.pendingMediaSubs.clear();
     this.activeFetches.clear();
     this.fetchStreamAliases.clear();
@@ -5320,6 +5357,7 @@ export class MoqtPlayer {
     this.droppedFetchStreams.clear();
     this.pendingAliasBinds.clear();
     this.pendingObjectsByAlias.clear();
+    this.pendingResetOrdinal = 0;
     this.pendingStreamEvents.clear();
     // Clear make-before-break switch state
     this.pendingVideoSwitch = null;
@@ -5372,6 +5410,7 @@ export class MoqtPlayer {
     this.syncController = null;
     this.recoveryController = null;
     this.pipelinesCreated = false;
+    this.subscriptionManager?.clear();
     this.subscriptionManager = null;
     this.catalogManager = null;
     this.qualityController = null;
@@ -5966,7 +6005,14 @@ export class MoqtPlayer {
           // unrelated request that happens to receive this alias. Recovery
           // budgeting derives from the same ownership (no separate tag).
           const owners = conn === this.connection ? [...this.pendingAliasBinds] : undefined;
-          pending.push({ streamId, obj, sourceDraft: conn.draftVersion, sourceConnection: conn, ...(owners ? { owners } : {}) });
+          let resetBefore: number | undefined;
+          for (const entry of pending) {
+            if (entry.sourceConnection !== conn || entry.obj.groupId !== obj.groupId || entry.locmafResetOrdinal === undefined) continue;
+            resetBefore = Math.max(resetBefore ?? -1, entry.locmafResetOrdinal);
+          }
+          pending.push({ streamId, obj, sourceDraft: conn.draftVersion, sourceConnection: conn,
+            ...(resetBefore !== undefined ? { locmafResetBeforeOrdinal: resetBefore, locmafResetOrdinal: resetBefore } : {}),
+            ...(owners ? { owners } : {}) });
           this.pendingObjectsByAlias.set(alias, pending);
           if (!this.catalogParkingWithinBounds(conn)) {
             this.onCatalogParkingOverflow(conn);
@@ -6029,6 +6075,26 @@ export class MoqtPlayer {
           });
         }
         if (this.staleFetchStreams.get(streamId) === conn) this.staleFetchStreams.delete(streamId);
+        if (terminal === 'reset') {
+          // Carry negative evidence on every retained object of the affected group.
+          // Ownership filtering may remove all records of the reset stream; frozen
+          // before-arrival snapshots preserve earlier boundaries across later resets.
+          let resetOrdinal: number | undefined;
+          const known = conn === this.connection ? this.subgroupStreams.get(streamId) : undefined;
+          for (const [alias, bucket] of this.pendingObjectsByAlias) {
+            const groups = new Set<bigint>();
+            if (known?.trackAlias === alias) groups.add(known.groupId);
+            for (const entry of bucket) {
+              if (entry.streamId !== streamId || entry.sourceConnection !== conn) continue;
+              groups.add(BigInt(entry.obj.groupId));
+            }
+            for (const entry of bucket) {
+              if (entry.sourceConnection !== conn || !groups.has(BigInt(entry.obj.groupId))) continue;
+              resetOrdinal ??= this.pendingResetOrdinal++;
+              entry.locmafResetOrdinal = resetOrdinal;
+            }
+          }
+        }
         // §10.4.3: RESET_STREAM is normal (UNSUBSCRIBE, timeout, track switch).
         // Log at debug level — not an application error. But a reset on a
         // DELIVERING track's subgroup stream is a liveness hint: shorten that
@@ -6078,11 +6144,17 @@ export class MoqtPlayer {
           }
         }
 
-        const subgroupAlias = closeMapsAuthoritative ? this.subgroupStreamAliases.get(streamId) : undefined;
-        if (subgroupAlias !== undefined) {
-          this.subgroupStreamAliases.delete(streamId); // map never outlives the stream
+        const subgroup = closeMapsAuthoritative ? this.subgroupStreams.get(streamId) : undefined;
+        if (subgroup !== undefined) {
+          this.subgroupStreams.delete(streamId); // map never outlives the stream
           if (terminal === 'reset') {
-            this.livenessMonitor?.noteStreamReset(subgroupAlias, performance.now());
+            this.livenessMonitor?.noteStreamReset(subgroup.trackAlias, performance.now());
+            this.subscriptionManager?.invalidateLocmafGroup(subgroup.trackAlias, subgroup.groupId, conn);
+            for (const subscription of this.activeSubscriptions.values()) {
+              if (subscription.trackAlias === subgroup.trackAlias) {
+                this.locmafDecoders.get(subscription.trackName)?.resetGroup(subgroup.groupId);
+              }
+            }
           }
         }
         // §9.16.3: a fetch's single data stream ending (however it ended) ends
@@ -6140,7 +6212,7 @@ export class MoqtPlayer {
           // session's header must not overwrite a colliding current stream id.
           if (conn !== this.connection) return;
           const sub = header.header;
-          this.subgroupStreamAliases.set(streamId, BigInt(sub.trackAlias));
+          this.subgroupStreams.set(streamId, { trackAlias: BigInt(sub.trackAlias), groupId: BigInt(sub.groupId) });
           const alias = BigInt(sub.trackAlias);
           // Only FIRST_OBJECT defers its subgroup id; ZERO and EXPLICIT are
           // authoritative from the header, so reporting them as unknown would
@@ -6650,13 +6722,35 @@ export class MoqtPlayer {
     if (retain.length > 0) this.pendingObjectsByAlias.set(alias, retain);
     else this.pendingObjectsByAlias.delete(alias);
 
-    // Two-phase replay: EVERY object is delivered first; each stream's
+    // Catalog replay is two-phase: EVERY object is delivered first; each stream's
     // terminal event (fin/reset) is delivered exactly once AFTERWARDS. A
     // multi-object stream must never see its terminal replayed between its
     // own objects — that would corrupt the clean-chain evidence for an
     // otherwise valid independent-plus-delta sequence.
+    // LOCMAF resets instead occur at their original position relative to ALL
+    // parked objects, including full headers on a replacement stream.
+    const latestResetByGroup = new Map<bigint, number>();
+    for (const entry of replay) {
+      if (entry.locmafResetOrdinal !== undefined) {
+        const groupId = BigInt(entry.obj.groupId);
+        latestResetByGroup.set(groupId, Math.max(latestResetByGroup.get(groupId) ?? -1, entry.locmafResetOrdinal));
+      }
+    }
+    const appliedResetByGroup = new Map<bigint, number>();
+    let mediaReplayed = false;
+    const applyLocmafReset = (groupId: bigint, ordinal: number | undefined): void => {
+      if (resolvingConnection !== this.connection || ordinal === undefined
+          || ordinal <= (appliedResetByGroup.get(groupId) ?? -1)) return;
+      this.subscriptionManager?.invalidateLocmafGroup(alias, groupId, resolvingConnection);
+      for (const subscription of this.activeSubscriptions.values()) {
+        if (subscription.trackAlias === alias) {
+          this.locmafDecoders.get(subscription.trackName)?.resetGroup(groupId);
+        }
+      }
+      appliedResetByGroup.set(groupId, ordinal);
+    };
     const terminalTargets = new Map<bigint, CatalogBootstrap | null>();
-    for (const { streamId, obj, sourceDraft, sourceConnection } of replay) {
+    for (const { streamId, obj, sourceDraft, sourceConnection, locmafResetBeforeOrdinal } of replay) {
       // Re-route through the normal onObject path — alias is now resolved
       const resolvedAlias = BigInt(obj.trackAlias);
 
@@ -6665,6 +6759,8 @@ export class MoqtPlayer {
         continue; // a quarantined session's catalog alias — never re-attributed
       }
       if (this.subscriptionManager?.getMediaType(resolvedAlias) !== undefined) {
+        mediaReplayed = true;
+        applyLocmafReset(BigInt(obj.groupId), locmafResetBeforeOrdinal);
         // Route with the delivering session's own draft + connection.
         this.subscriptionManager.routeObject(streamId, obj, sourceDraft, sourceConnection);
         if (!terminalTargets.has(streamId)) terminalTargets.set(streamId, null);
@@ -6693,6 +6789,11 @@ export class MoqtPlayer {
       } else if (!terminalTargets.has(streamId)) {
         terminalTargets.set(streamId, null);
       }
+    }
+    // A reset after the last parked object must invalidate its newly replayed
+    // full header before a post-binding live delta can use it.
+    if (mediaReplayed) {
+      for (const [groupId, ordinal] of latestResetByGroup) applyLocmafReset(groupId, ordinal);
     }
     // Phase 2 — deliver each stream's saved terminal exactly once, and
     // consume the record on every outcome (it must not outlive its objects).

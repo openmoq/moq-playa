@@ -40,6 +40,9 @@ export interface FixtureTrack {
   readonly bitrate?: number;
   readonly samplerate?: number;
   readonly channelConfig?: string;
+  readonly altGroup?: number;
+  readonly lang?: string;
+  readonly label?: string;
 }
 
 /** The fixture's manifest.json. */

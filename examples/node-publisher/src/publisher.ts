@@ -3,8 +3,8 @@
  *
  *   1. catalog track first — `buildCatalog()` with each track's metadata and base64
  *      initData; one object (group 0, object 0).
- *   2. each media track — one PUBLISH, then one object per chunk, each on its own
- *      subgroup stream (MSF-00/01 section 6, inherited by CMSF-01 section 2).
+ *   2. each media track — one PUBLISH, then one object per chunk. CMAF uses one
+ *      subgroup per object (MSF section 6); LOCMAF uses one per group (LOCMAF section 3).
  *
  * Pacing: `paceMs > 0` sleeps between chunks (timestamp-style pacing for a live
  * demo); the smoke uses 0 (as fast as possible).
@@ -20,7 +20,7 @@ export type { MediaPackaging } from './track-packager.js';
 
 /**
  * Catalog wire shape to emit:
- *  - `msf-00`  (default): numeric `version: 1`, inline per-track base64 `initData`.
+ *  - `msf-00` (CMAF default): numeric `version: 1`, inline per-track base64 `initData`.
  *  - `cmsf-01`: string `version: "1"`, a root `initDataList`, and per-track
  *    `initRef` (the modern MSF-01/CMSF-01 init-by-reference form Playa resolves).
  */
@@ -50,7 +50,7 @@ function waitForPublishAccept(conn: MoqtConnection, requestId: bigint, timeoutMs
 }
 
 /** PUBLISH a track (request + acceptance) ONCE; group sends reuse the alias. */
-async function establishTrack(
+export async function establishTrack(
   conn: MoqtConnection,
   namespace: readonly string[],
   track: string,
@@ -62,7 +62,8 @@ async function establishTrack(
 }
 
 /**
- * Send one group with one stream per object (MSF-00/01 section 6).
+ * Send one group. LOCMAF keeps delta-dependent objects on one ordered stream;
+ * CMAF uses one stream per object (MSF section 6).
  * FIRST_OBJECT describes the first object in each subgroup, not object ID zero.
  */
 async function sendGroup(
@@ -71,26 +72,32 @@ async function sendGroup(
   groupId: bigint,
   objects: readonly Uint8Array[],
   paceMs: number,
-  opts: { timeline?: CmafTimeline; startMs?: number } = {},
+  opts: { timeline?: CmafTimeline; startMs?: number; packaging?: MediaPackaging } = {},
 ): Promise<void> {
   const waitUntil = async (target: number) => {
     const delay = target - performance.now();
     if (delay > 0) await sleep(delay);
   };
+  const sharedStream = opts.packaging === 'locmaf' && objects.length > 0
+    ? await conn.openSubgroup(alias, groupId, 0n, {
+        publisherPriority: 128, firstObject: true, endOfGroup: true,
+      })
+    : null;
   for (let i = 0; i < objects.length; i++) {
     if (opts.timeline) await waitUntil(opts.startMs! + opts.timeline.offsetsMs[i]!);
-    const sid = await conn.openSubgroup(alias, groupId, BigInt(i), {
+    const sid = sharedStream ?? await conn.openSubgroup(alias, groupId, BigInt(i), {
       publisherPriority: 128, firstObject: true, endOfGroup: i === objects.length - 1,
     });
     await conn.sendObject(sid, BigInt(i), objects[i]!);
-    await conn.closeSubgroup(sid);
+    if (sharedStream === null) await conn.closeSubgroup(sid);
     if (!opts.timeline && paceMs > 0 && i < objects.length - 1) await sleep(paceMs);
   }
+  if (sharedStream !== null) await conn.closeSubgroup(sharedStream);
   if (opts.timeline) await waitUntil(opts.startMs! + opts.timeline.durationMs);
 }
 
 /** PUBLISH one track and send `objects` as group 0 / objects 0..N-1 (one-shot). */
-async function publishObjects(
+export async function publishObjects(
   conn: MoqtConnection,
   namespace: readonly string[],
   track: string,
@@ -111,14 +118,16 @@ async function publishObjects(
  *
  * `packaging` `locmaf` signals every track as `packaging: "locmaf"` with
  * `locmafVersion` (draft-einarsson-moq-locmaf-01 section 5); the init is
- * signalled exactly as in `cmaf` mode, since a LOCMAF receiver seeds
- * reconstruction from the same CMAF Header (section 6).
+ * referenced through the CMSF initDataList/initRef form required by section 6.
  */
 export function buildFixtureCatalog(
   fixture: LoadedFixture,
   format: CatalogFormat = 'msf-00',
   packaging: MediaPackaging = 'cmaf',
 ): Uint8Array {
+  if (packaging === 'locmaf' && format !== 'cmsf-01') {
+    throw new Error('LOCMAF publication requires a CMSF-01 catalog with initDataList/initRef');
+  }
   const common = (t: LoadedTrack) => ({
     name: t.meta.name,
     ...(packaging === 'locmaf'
@@ -128,6 +137,9 @@ export function buildFixtureCatalog(
     role: t.meta.role,
     codec: t.meta.codec,
     renderGroup: fixture.manifest.renderGroup,
+    ...(t.meta.altGroup !== undefined ? { altGroup: t.meta.altGroup } : {}),
+    ...(t.meta.lang !== undefined ? { lang: t.meta.lang } : {}),
+    ...(t.meta.label !== undefined ? { label: t.meta.label } : {}),
     ...(t.meta.width !== undefined ? { width: t.meta.width } : {}),
     ...(t.meta.height !== undefined ? { height: t.meta.height } : {}),
     ...(t.meta.framerate !== undefined ? { framerate: t.meta.framerate } : {}),
@@ -190,8 +202,8 @@ export async function publishFixture(
 ): Promise<void> {
   const paceMs = opts.paceMs ?? 0;
   const loops = opts.loops ?? 1;
-  const catalogFormat = opts.catalogFormat ?? 'msf-00';
   const packaging = opts.packaging ?? 'cmaf';
+  const catalogFormat = opts.catalogFormat ?? (packaging === 'locmaf' ? 'cmsf-01' : 'msf-00');
   const ns = fixture.manifest.namespace;
   const deltaBytes = opts.deltaAfterMs !== undefined ? buildFixtureDelta(fixture) : null;
   if (opts.deltaAfterMs !== undefined && deltaBytes === null) {
@@ -222,7 +234,9 @@ export async function publishFixture(
     // One-shot: each track established and group 0 sent.
     let alias = 11n;
     for (const s of sources) {
-      await publishObjects(conn, ns, s.name, alias++, s.objectsForGroup(0), paceMs);
+      const a = alias++;
+      await establishTrack(conn, ns, s.name, a);
+      await sendGroup(conn, a, 0n, s.objectsForGroup(0), paceMs, { packaging });
     }
     if (deltaTask) await deltaTask; // finite run: don't exit before the delta lands
     log('fixture fully published');
@@ -250,18 +264,20 @@ export async function publishFixture(
 
   if (timelines) {
     const startMs = performance.now();
+    log(`media epoch_ms=${Date.now()}`);
     await Promise.all(handles.map(async (h, index) => {
       const timeline = timelines[index]!;
       if (!timeline) throw new Error('Missing track timing');
       for (let g = 0; g < loops; g++) {
         await sendGroup(conn, h.alias, BigInt(g), h.source.objectsForGroup(g), 0, {
           timeline, startMs: startMs + g * timeline.durationMs,
+          packaging,
         });
       }
     }));
   } else {
     for (let g = 0; g < loops; g++) {
-      await Promise.all(handles.map((h) => sendGroup(conn, h.alias, BigInt(g), h.source.objectsForGroup(g), paceMs)));
+      await Promise.all(handles.map((h) => sendGroup(conn, h.alias, BigInt(g), h.source.objectsForGroup(g), paceMs, { packaging })));
       log(`group ${g} sent on ${handles.length} track(s)`);
     }
   }

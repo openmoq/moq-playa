@@ -2,7 +2,7 @@
  * LOCMAF packaging mode of the node publisher (draft-einarsson-moq-locmaf-01
  * sections 3, 5, 6, 15.9): one LOCMAF Object per CMAF chunk, a full header on
  * the first Object of every group, deltas otherwise, and a catalog that
- * signals packaging "locmaf" with the init carried exactly as in CMAF mode.
+ * signals packaging "locmaf" with CMSF initDataList/initRef carriage.
  */
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -197,7 +197,7 @@ describe('TrackObjectSource', () => {
 });
 
 describe('buildFixtureCatalog packaging', () => {
-  for (const format of ['msf-00', 'cmsf-01'] as const) {
+  for (const format of ['cmsf-01'] as const) {
     it(`${format}: signals packaging locmaf and locmafVersion, init carried as in cmaf mode`, () => {
       const f = fixture();
       const cmafRaw = JSON.parse(new TextDecoder().decode(buildFixtureCatalog(f, format)));
@@ -225,6 +225,10 @@ describe('buildFixtureCatalog packaging', () => {
     });
   }
 
+  it('refuses LOCMAF signaling without CMSF initDataList/initRef carriage', () => {
+    expect(() => buildFixtureCatalog(fixture(), 'msf-00', 'locmaf')).toThrow(/CMSF-01/);
+  });
+
   it('leaves the default cmaf catalog without locmafVersion', () => {
     const raw = JSON.parse(new TextDecoder().decode(buildFixtureCatalog(fixture())));
     for (const t of raw.tracks) {
@@ -234,12 +238,13 @@ describe('buildFixtureCatalog packaging', () => {
   });
 });
 
-interface Sent { alias: bigint; group: bigint; subgroup: bigint; objectId: bigint; payload: Uint8Array }
+interface Sent { alias: bigint; group: bigint; subgroup: bigint; objectId: bigint; payload: Uint8Array; stream: number }
 
 /** A connection double recording every object; PUBLISH is accepted immediately. */
-function recordingConn(): { conn: MoqtConnection; sent: Sent[]; opens: { alias: bigint; group: bigint; firstObject: boolean }[] } {
+function recordingConn() {
   const sent: Sent[] = [];
-  const opens: { alias: bigint; group: bigint; firstObject: boolean }[] = [];
+  const opens: { alias: bigint; group: bigint; firstObject: boolean; endOfGroup: boolean; stream: number }[] = [];
+  const closes: number[] = [];
   const streams = new Map<number, { alias: bigint; group: bigint; subgroup: bigint }>();
   let nextRequest = 1n;
   let nextStream = 1;
@@ -250,23 +255,23 @@ function recordingConn(): { conn: MoqtConnection; sent: Sent[]; opens: { alias: 
       setTimeout(() => conn.onMessage?.({ type: 'REQUEST_OK', requestId: id }), 0);
       return id;
     },
-    async openSubgroup(alias: bigint, group: bigint, subgroup: bigint, opts: { firstObject?: boolean }) {
+    async openSubgroup(alias: bigint, group: bigint, subgroup: bigint, opts: { firstObject?: boolean; endOfGroup?: boolean }) {
       const sid = nextStream++;
       streams.set(sid, { alias, group, subgroup });
-      opens.push({ alias, group, firstObject: opts.firstObject === true });
+      opens.push({ alias, group, firstObject: opts.firstObject === true, endOfGroup: opts.endOfGroup === true, stream: sid });
       return sid;
     },
     async sendObject(sid: number, objectId: bigint, payload: Uint8Array) {
-      sent.push({ ...streams.get(sid)!, objectId, payload });
+      sent.push({ ...streams.get(sid)!, objectId, payload, stream: sid });
     },
-    async closeSubgroup() { /* recorded by open/send */ },
+    async closeSubgroup(sid: number) { closes.push(sid); },
   };
-  return { conn: conn as unknown as MoqtConnection, sent, opens };
+  return { conn: conn as unknown as MoqtConnection, sent, opens, closes };
 }
 
 describe('publishFixture packaging', () => {
   const media = (sent: Sent[]) => sent.filter((s) => s.alias !== 10n);
-  const numbering = (sent: Sent[]) => media(sent).map((s) => `${s.alias}/${s.group}/${s.subgroup}/${s.objectId}`);
+  const numbering = (sent: Sent[]) => media(sent).map((s) => `${s.alias}/${s.group}/${s.objectId}`);
 
   for (const loops of [1, 3]) {
     it(`loops=${loops}: locmaf keeps cmaf group/object numbering and every object decodes to what cmaf sent`, async () => {
@@ -277,7 +282,17 @@ describe('publishFixture packaging', () => {
       await publishFixture(locmaf.conn, f, { loops, packaging: 'locmaf' });
 
       expect(numbering(locmaf.sent)).toEqual(numbering(cmaf.sent));
-      expect(locmaf.opens).toEqual(cmaf.opens);
+      expect(locmaf.opens.filter((s) => s.alias !== 10n)).toHaveLength(2 * loops);
+      expect(cmaf.opens.filter((s) => s.alias !== 10n)).toHaveLength(7 * loops);
+      for (const alias of [11n, 12n]) {
+        for (let group = 0; group < loops; group++) {
+          const objects = locmaf.sent.filter((s) => s.alias === alias && s.group === BigInt(group));
+          expect(new Set(objects.map((s) => s.stream)).size).toBe(1);
+          expect(objects.every((s) => s.subgroup === 0n)).toBe(true);
+        }
+      }
+      expect(locmaf.opens.every((s) => s.firstObject && s.endOfGroup)).toBe(true);
+      expect([...locmaf.closes].sort((a, b) => a - b)).toEqual(locmaf.opens.map((s) => s.stream));
 
       const catalog = parseCatalogAuto(locmaf.sent.find((s) => s.alias === 10n)!.payload);
       expect(catalog.tracks.map((t) => t.packaging)).toEqual(['locmaf', 'locmaf']);
@@ -294,6 +309,22 @@ describe('publishFixture packaging', () => {
       });
     });
   }
+
+  it('defaults LOCMAF publication to the modern CMSF catalog', async () => {
+    const recorded = recordingConn();
+    await publishFixture(recorded.conn, fixture(), { packaging: 'locmaf' });
+    const catalog = JSON.parse(new TextDecoder().decode(recorded.sent.find((s) => s.alias === 10n)!.payload));
+    expect(catalog.version).toBe('1');
+    expect(catalog.initDataList).toHaveLength(2);
+    expect(catalog.tracks.every((t: Record<string, unknown>) => typeof t.initRef === 'string' && !('initData' in t))).toBe(true);
+  });
+
+  it('rejects explicit legacy LOCMAF catalogs before publishing', async () => {
+    const recorded = recordingConn();
+    await expect(publishFixture(recorded.conn, fixture(), { packaging: 'locmaf', catalogFormat: 'msf-00' })).rejects.toThrow(/CMSF-01/);
+    expect(recorded.sent).toHaveLength(0);
+    expect(recorded.opens).toHaveLength(0);
+  });
 
   it('fails before publishing when locmaf is requested for a non-CMAF fixture', async () => {
     const { conn, sent } = recordingConn();

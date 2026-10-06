@@ -182,7 +182,7 @@ export function analyzeCmafTimeline(init: Uint8Array, chunks: readonly Uint8Arra
  *   version-0 (32-bit) tfdt would overflow.
  */
 export function rebaseTfdtCopy(chunk: Uint8Array, deltaTicks: bigint): Uint8Array {
-  const out = chunk.slice();
+  const out = new Uint8Array(chunk);
   let patched = 0;
   for (const top of boxes(out, 0, out.byteLength)) {
     if (top.type !== 'moof') continue;

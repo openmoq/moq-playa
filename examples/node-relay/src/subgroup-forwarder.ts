@@ -37,20 +37,15 @@ export class SubgroupForwarder<T> {
   private activeLanes = 0;
   private pendingObjects = 0;
   private pendingBytes = 0;
-  private accepting = true;
   private stopped = false;
-  private readonly drained: Promise<void>;
-  private resolveDrained!: () => void;
 
   constructor(
     private readonly limits: ForwardLimits,
     private readonly handlers: SubgroupForwarderHandlers<T>,
-  ) {
-    this.drained = new Promise<void>((resolve) => { this.resolveDrained = resolve; });
-  }
+  ) {}
 
   enqueueObject(subgroupKey: string, value: T, retainedBytes: number): EnqueueResult {
-    if (!this.accepting || this.stopped) return { status: 'inactive' };
+    if (this.stopped) return { status: 'inactive' };
     let lane = this.lanes.get(subgroupKey);
     if (lane?.closeQueued) return { status: 'inactive' };
 
@@ -86,27 +81,14 @@ export class SubgroupForwarder<T> {
     else this.pump();
   }
 
-  /** Stop accepting work, deliver what was already queued, and FIN every lane. */
-  retire(): Promise<void> {
-    if (this.stopped) return Promise.resolve();
-    if (this.accepting) {
-      this.accepting = false;
-      for (const subgroupKey of this.lanes.keys()) this.enqueueClose(subgroupKey);
-      this.settleDrainedIfDone();
-    }
-    return this.drained;
-  }
-
-  /** Drop queued work immediately; connection teardown owns any in-flight write. */
+  /** Drop queued work; adapter request/session teardown owns in-flight writes. */
   abort(): void {
     if (this.stopped) return;
     this.stopped = true;
-    this.accepting = false;
     for (const [subgroupKey, lane] of this.lanes) {
       this.dropQueuedObjects(lane);
       if (!lane.running) this.releaseLane(subgroupKey, lane);
     }
-    this.resolveDrained();
   }
 
   private pump(): void {
@@ -174,10 +156,5 @@ export class SubgroupForwarder<T> {
       this.activeLanes -= 1;
     }
     this.pump();
-    this.settleDrainedIfDone();
-  }
-
-  private settleDrainedIfDone(): void {
-    if (!this.accepting && this.lanes.size === 0) this.resolveDrained();
   }
 }

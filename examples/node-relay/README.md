@@ -104,8 +104,12 @@ generate a CMAF fixture from an MP4, publish it (optionally looped) into
   configurable byte limit.
 - **Fixed track registry** — only the names above are routed; a catalog-driven
   registry is a possible follow-up.
-- **Data objects only** — gap/status objects (incl. `END_OF_GROUP`) are not relayed;
-  graceful subgroup FIN is mirrored so downstream stream credit is returned.
+- **Data objects and subgroup header flags** — the incoming `END_OF_GROUP` flag
+  is preserved for live forwarding and cached replay. Graceful FIN is mirrored,
+  so the receiver observes completion and downstream stream credit is returned.
+  Viewer cancellation drops queued forwarding; the adapter resets unfinished
+  streams rather than sending a misleading completion FIN.
+  Explicit wire gap/status objects are still not relayed.
 - **Property presence is inferred from the first object in each subgroup** — if
   properties first appear on a later object, the relay reports and drops that
   object because the outgoing subgroup header is already fixed. LOC streams that

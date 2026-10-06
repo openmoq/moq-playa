@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SessionError, type Fetch, type MoqtObjectData, type SubgroupHeader } from '@openmoq/transport';
-import type { IncomingPublish, MoqtConnection } from '@openmoq/webtransport';
+import { MoqtConnection, type IncomingPublish } from '@openmoq/webtransport';
 import { DEMO_NAMESPACE, DEMO_TRACK, nsBytes, te } from './demo.js';
 import { Relay } from './relay.js';
 import { publishFixture } from '../../node-publisher/src/publisher.js';
 import { videoInit } from '../../../packages/locmaf/test-support/cmaf.js';
+import { createLoopback, flush } from '../../../packages/webtransport/src/testkit/loopback.js';
 
 interface SubscriberHarness {
   readonly conn: MoqtConnection;
@@ -103,6 +104,72 @@ async function acceptPublisher(relay: Relay, publish: IncomingPublish): Promise<
 }
 
 describe('Relay subgroup lifecycle', () => {
+  it('drops queued forwarding on cancellation without sending FIN to an unfinished subgroup', async () => {
+    const relay = new Relay();
+    const sub = subscriberHarness(2);
+    let release!: () => void;
+    sub.sendObject.mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve; }));
+    await relay.handleSubscribe(sub.conn, 2n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    const publish = incomingPublish();
+    await acceptPublisher(relay, publish);
+    publish.onObject?.({ ...object(publish.trackAlias, 1n), subgroupContainsEndOfGroup: true });
+    await vi.waitFor(() => expect(sub.sendObject).toHaveBeenCalledOnce());
+    publish.onObject?.({ ...object(publish.trackAlias, 1n, 1n), subgroupContainsEndOfGroup: true });
+    relay.removeSubscription(sub.conn, 2n);
+    release();
+    await flush();
+    publish.onSubgroupClosed?.({ ...subgroupHeader(publish.trackAlias, 1n), isEndOfGroup: true });
+    await flush();
+    expect(sub.sendObject).toHaveBeenCalledOnce();
+    expect(sub.closeSubgroup).not.toHaveBeenCalled();
+    expect(sub.close).not.toHaveBeenCalled();
+  });
+
+  it.each([18, 22] as const)('draft %s cancellation resets unfinished relay output instead of sending FIN', async (draft) => {
+    const { a, b } = createLoopback();
+    const client = new MoqtConnection(draft);
+    const server = new MoqtConnection(draft, { role: 'server' });
+    const errors: Error[] = [];
+    client.onError = server.onError = (error) => errors.push(error);
+    const relay = new Relay();
+    server.onSubscribe = (requestId, namespace, name) => { void relay.handleSubscribe(server, requestId, namespace, name); };
+    server.onSubscribeClosed = (requestId) => relay.removeSubscription(server, requestId);
+    try {
+      await Promise.all([client.connect(a), server.connect(b)]);
+      const subscription = await client.subscribeTrack(nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+      const publish = incomingPublish();
+      await acceptPublisher(relay, publish);
+      publish.onObject?.({ ...object(publish.trackAlias, 1n), subgroupContainsEndOfGroup: true });
+      await vi.waitFor(() => expect(b.uniOut).toHaveLength(2));
+      await flush();
+      const stream = b.uniOut[1]!;
+      expect(stream.writeClosed).toBe(false);
+      expect(stream.writeAborted).toBe(false);
+      await subscription.unsubscribe();
+      await vi.waitFor(() => expect(stream.writeAborted).toBe(true));
+      expect(stream.writeClosed).toBe(false);
+      expect(errors).toEqual([]);
+    } finally { await client.close(); await server.close(); }
+  });
+
+  it('preserves the incoming END_OF_GROUP header through live forwarding and cache replay', async () => {
+    const relay = new Relay();
+    const live = subscriberHarness(4);
+    await relay.handleSubscribe(live.conn, 2n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    const publish = incomingPublish();
+    await acceptPublisher(relay, publish);
+    publish.onObject?.({ ...object(publish.trackAlias, 1n, 5n), isFirstObjectInSubgroup: true,
+      subgroupContainsEndOfGroup: true });
+    await vi.waitFor(() => expect(live.sendObject).toHaveBeenCalledOnce());
+    expect(live.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ endOfGroup: true });
+    publish.onSubgroupClosed?.({ ...subgroupHeader(publish.trackAlias, 1n), isEndOfGroup: true });
+    await vi.waitFor(() => expect(live.closeSubgroup).toHaveBeenCalledOnce());
+    const late = subscriberHarness(4);
+    await relay.handleSubscribe(late.conn, 3n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    await vi.waitFor(() => expect(late.closeSubgroup).toHaveBeenCalledOnce());
+    expect(late.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ endOfGroup: true });
+  });
+
   it('forwards the fixture publisher single-object subgroups with FIRST_OBJECT on each stream', async () => {
     const relay = new Relay();
     const live = subscriberHarness(4);

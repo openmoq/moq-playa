@@ -154,6 +154,11 @@ export interface LocHeaders {
      */
     readonly captureTimestamp?: bigint;
     /**
+     * Sample duration in microseconds, supplied by a container frame interface.
+     * Local decode metadata only; not a LOC wire property.
+     */
+    readonly duration?: number;
+    /**
      * Video frame marking flags (RFC 9626).
      * @see draft-ietf-moq-loc-01 §2.3.2.2
      */

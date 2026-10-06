@@ -47,7 +47,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           pnpm exec playwright install --with-deps chrome
-      - name: CMAF playback and negative controls
+      - name: Media playback and negative controls
         run: pnpm test:player:browser
       - name: Retain playback evidence
         if: always()

@@ -40,6 +40,12 @@ export interface CatalogBuilderTrack {
   readonly channelConfig?: string;
   /** Render group for A/V sync. @see §5.1.18 */
   readonly renderGroup?: number;
+  /** Alternative encoding group. @see draft-ietf-moq-msf-01 section 5.2.12 */
+  readonly altGroup?: number;
+  /** BCP 47 language tag. @see draft-ietf-moq-msf-01 section 5.2.32 */
+  readonly lang?: string;
+  /** Human-readable track label. */
+  readonly label?: string;
   /** Base64-encoded initialization data (MSF-00 inline form). @see §5.1.20 */
   readonly initData?: string;
   /** Reference to a root {@link BuildCatalogOptions.initDataList} id (MSF-01 init-by-reference). @see draft-ietf-moq-msf-01 §5.2.13 */
@@ -103,6 +109,9 @@ export function buildCatalog(options: BuildCatalogOptions): Uint8Array {
     if (t.samplerate !== undefined) track.samplerate = t.samplerate;
     if (t.channelConfig !== undefined) track.channelConfig = t.channelConfig;
     if (t.renderGroup !== undefined) track.renderGroup = t.renderGroup;
+    if (t.altGroup !== undefined) track.altGroup = t.altGroup;
+    if (t.lang !== undefined) track.lang = t.lang;
+    if (t.label !== undefined) track.label = t.label;
     if (t.initData !== undefined) track.initData = t.initData;
     if (t.initRef !== undefined) track.initRef = t.initRef;
     tracks.push(track);

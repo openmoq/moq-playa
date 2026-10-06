@@ -3,13 +3,16 @@ import { assessPlayback } from './assessment.mjs';
 
 function healthySamples() {
   return Array.from({ length: 29 }, (_, i) => ({
+    outputKind: 'video' as const,
     wallMs: i * 250,
     mediaTimeS: 2 + i / 4,
     presentedMediaTimeS: 2 + i / 4,
     presentedFrames: 48 + i * 6,
     pictureDigest: String(i),
     pictureChange: 4,
-    markerMatches: true,
+    markerRgb: [0, 255, 0],
+    videoWidth: 640,
+    videoHeight: 360,
     audioRms: 0.08,
     audioPeakHz: 445,
     paused: false,
@@ -17,6 +20,13 @@ function healthySamples() {
     visibility: 'visible',
     bufferedRanges: [{ start: 0, end: 12 }],
   }));
+}
+
+const canvasExpected = { outputKind: 'canvas' as const, timestampDomain: 'media' as const, publisherEpochMs: 1790000000000,
+  videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24 };
+function canvasSamples() {
+  return healthySamples().map((s) => ({ ...s, outputKind: 'canvas' as const, bufferedRanges: null,
+    frameTimestampUs: s.presentedMediaTimeS * 1_000_000, wallEpochMs: canvasExpected.publisherEpochMs + s.presentedMediaTimeS * 1000 + 100 }));
 }
 
 describe('browser playback acceptance', () => {
@@ -80,7 +90,7 @@ describe('browser playback acceptance', () => {
   });
 
   it('detects video from the wrong fixture', () => {
-    const samples = healthySamples().map((s) => ({ ...s, markerMatches: false }));
+    const samples = healthySamples().map((s) => ({ ...s, markerRgb: [255, 0, 0] }));
     expect(assessPlayback(samples).failures).toContain('video-identity');
   });
 
@@ -108,5 +118,53 @@ describe('browser playback acceptance', () => {
     const samples = healthySamples();
     samples.splice(8, 12);
     expect(assessPlayback(samples).failures).toContain('observation-gap');
+  });
+
+  it('accepts the selected high rendition and second audio signal', () => {
+    const samples = healthySamples().map((s) => ({ ...s, videoWidth: 1920, videoHeight: 1080, audioPeakHz: 879 }));
+    expect(assessPlayback(samples, { videoWidth: 1920, videoHeight: 1080, audioHz: 880, videoFps: 24 }).passed).toBe(true);
+  });
+
+  it('rejects unchanged audio when a different signal is expected', () => {
+    expect(assessPlayback(healthySamples(), { videoWidth: 640, videoHeight: 360, audioHz: 880, videoFps: 24 }).failures)
+      .toEqual(['audio-identity']);
+  });
+
+  it('rejects unchanged video even when timestamps, callbacks and pixels advance', () => {
+    expect(assessPlayback(healthySamples(), { videoWidth: 1280, videoHeight: 720, audioHz: 440, videoFps: 24 }).failures)
+      .toEqual(['video-identity']);
+  });
+
+  it('rejects missing or nonfinite decoded dimensions and marker channels', () => {
+    expect(assessPlayback(healthySamples().map((s) => ({ ...s, videoWidth: NaN }))).failures)
+      .toContain('invalid-observation');
+    expect(assessPlayback(healthySamples().map((s) => ({ ...s, markerRgb: [0, NaN, 0] }))).failures)
+      .toContain('video-identity');
+  });
+
+  it('accepts observed canvas output without inventing MSE residency', () => {
+    expect(assessPlayback(canvasSamples(), canvasExpected).passed).toBe(true);
+  });
+
+  it('rejects a missing or unexpected output kind', () => {
+    expect(assessPlayback(healthySamples().map((s) => ({ ...s, outputKind: undefined })) as never).failures).toContain('output-kind');
+    expect(assessPlayback(healthySamples(), { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24, outputKind: 'canvas' }).failures).toContain('output-kind');
+  });
+
+  it('requires real buffer observations for video and no fabricated ranges for canvas', () => {
+    expect(assessPlayback(healthySamples().map((s) => ({ ...s, bufferedRanges: null }))).failures).toContain('invalid-observation');
+    const expected = { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24, outputKind: 'canvas' as const };
+    expect(assessPlayback(healthySamples().map((s) => ({ ...s, outputKind: 'canvas' as const })), expected).failures).toContain('invalid-observation');
+  });
+
+  it('rejects nonfinite timestamps and the wrong LOC timestamp domain', () => {
+    expect(assessPlayback(canvasSamples().map((s) => ({ ...s, frameTimestampUs: NaN })), canvasExpected).failures).toContain('timestamp-domain');
+    expect(assessPlayback(canvasSamples(), { ...canvasExpected, timestampDomain: 'wall-clock' }).failures).toContain('timestamp-domain');
+    expect(assessPlayback(canvasSamples().map((s) => ({ ...s, frameTimestampUs: s.frameTimestampUs + canvasExpected.publisherEpochMs * 1000 })),
+      { ...canvasExpected, timestampDomain: 'wall-clock' }).passed).toBe(true);
+  });
+
+  it('rejects impossible presentation-time progress despite normal frame counts', () => {
+    expect(assessPlayback(canvasSamples().map((s) => ({ ...s, presentedMediaTimeS: s.presentedMediaTimeS * 1000 })), canvasExpected).failures).toContain('presentation-clock');
   });
 });

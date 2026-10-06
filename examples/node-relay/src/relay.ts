@@ -16,17 +16,16 @@
  *     draft-18 §10.12) — see handleFetch;
  *   - forwarding preserves the publisher's groupId/subgroupId/objectId and raw
  *     Object Properties/Extensions, and mirrors graceful subgroup FIN so
- *     downstream stream credit is returned.
+ *     downstream stream credit is returned. The incoming END_OF_GROUP header
+ *     bit is preserved before forwarding its first object.
  *
  * Deliberately a TOY — see README:
  *   - LIVE only: the cache holds just the latest group, so a late joiner gets that
  *     group, not full history (no DVR / no real init-segment retention policy).
  *   - NO route authorization, fairness, reconnect/migration, or persistence.
  *     A bounded per-subscription forwarder sheds a subscriber that cannot keep up.
- *   - Forwards DATA objects ONLY. Gap/status objects (incl. END_OF_GROUP) are NOT
- *     relayed: a live relay can't reproduce them with the public API — per-object
- *     status has no `sendObject` field, and the END_OF_GROUP header bit is set at
- *     subgroup-OPEN time (before the relay knows the group is ending). See README.
+ *   - Forwards DATA objects and their subgroup header evidence. Explicit wire
+ *     gap/status objects are not relayed; sendObject has no status argument.
  * All forwarding uses the public MoqtConnection API — no internals.
  */
 import type { MoqtConnection, IncomingPublish } from '@openmoq/webtransport';
@@ -42,6 +41,7 @@ const REGISTERED_TRACKS = new Set<string>([DEMO_TRACK, ...MEDIA_TRACKS]);
 
 interface CachedObject {
   readonly firstObject: boolean;
+  readonly endOfGroup: boolean;
   readonly groupId: bigint;
   readonly subgroupId: bigint;
   readonly objectId: bigint;
@@ -58,6 +58,7 @@ interface SubscriberSubgroup {
 
 interface ForwardObjectFields {
   readonly firstObject: boolean;
+  readonly endOfGroup: boolean;
   readonly groupId: bigint;
   readonly subgroupId: bigint;
   readonly objectId: bigint;
@@ -241,8 +242,10 @@ export class Relay {
         }
         const extensions = obj.properties ?? obj.extensions;
         const firstObject = obj.isFirstObjectInSubgroup === true;
+        const endOfGroup = obj.subgroupContainsEndOfGroup === true;
         track.cache.push({
           firstObject,
+          endOfGroup,
           groupId: obj.groupId,
           subgroupId: obj.subgroupId,
           objectId: obj.objectId,
@@ -254,7 +257,7 @@ export class Relay {
         const { groupId, subgroupId, objectId, payload } = obj;
         for (const sub of [...track.subscribers]) {
           this.enqueueObject(track, sub, {
-            groupId, subgroupId, objectId, payload, extensions, firstObject,
+            groupId, subgroupId, objectId, payload, extensions, firstObject, endOfGroup,
           });
         }
       };
@@ -389,8 +392,9 @@ export class Relay {
       const i = track.subscribers.findIndex((s) => s.conn === conn && s.requestId === requestId);
       if (i < 0) continue;
       const [sub] = track.subscribers.splice(i, 1);
-      // Finish already-queued forwards in subgroup order, then FIN each stream.
-      void sub!.forwarder.retire();
+      // Cancellation is not completion. Stop queued writes; the adapter resets
+      // this request's open data streams (§5.1.1), without inventing a FIN.
+      sub!.forwarder.abort();
       log(`subscription requestId=${requestId} unsubscribed; ${track.subscribers.length} subscriber(s) remain on this track`);
       return; // (conn, requestId) is unique to one subscription
     }
@@ -466,7 +470,7 @@ async function forwardObject(
   fields: ForwardObjectFields,
 ): Promise<void> {
   try {
-    const { groupId, subgroupId, objectId, payload, extensions, firstObject } = fields;
+    const { groupId, subgroupId, objectId, payload, extensions, firstObject, endOfGroup } = fields;
     const skey = subgroupKey(groupId, subgroupId);
     let subgroup = sub.subgroups.get(skey);
     if (subgroup === undefined) {
@@ -475,6 +479,7 @@ async function forwardObject(
         publisherPriority: 128,
         firstObject,
         hasExtensions,
+        ...(endOfGroup ? { endOfGroup: true } : {}),
       });
       subgroup = { streamId, hasExtensions };
       sub.subgroups.set(skey, subgroup);

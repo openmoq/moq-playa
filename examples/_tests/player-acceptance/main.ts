@@ -1,26 +1,19 @@
 import { Player } from '@openmoq/playa';
 import { createWebTransport } from '@openmoq/browser';
-import type { WebTransportLike } from '@openmoq/webtransport';
-
-interface Sample {
-  wallMs: number;
-  mediaTimeS: number;
-  presentedMediaTimeS: number;
-  presentedFrames: number;
-  pictureDigest: string;
-  pictureChange: number;
-  markerMatches: boolean;
-  audioRms: number;
-  audioPeakHz: number;
-  paused: boolean;
-  seeking: boolean;
-  visibility: string;
-  bufferedRanges: { start: number; end: number }[];
-}
+import { MoqtConnection, type WebTransportLike } from '@openmoq/webtransport';
+import type { PlaybackSample } from '../../../scripts/player-acceptance/assessment.mjs';
+import { observeAudio, observeCanvas } from './sinks.js';
+import { observeLocmafDelivery, assessLocmafDelivery, observeConnectionObjects } from './received.js';
 
 const video = document.querySelector<HTMLVideoElement>('#video')!;
 const canvas = document.querySelector<HTMLCanvasElement>('#canvas')!;
 const params = new URLSearchParams(location.search);
+const frameOutput = params.get('output') === 'canvas';
+const locmafObserver = params.has('locmaf') ? observeLocmafDelivery() : undefined;
+canvas.width = 640;
+canvas.height = 360;
+const canvasObserver = frameOutput ? observeCanvas(canvas) : undefined;
+const audioObserver = frameOutput ? observeAudio() : undefined;
 const pinHex = params.get('hash')!;
 if (!/^[a-f0-9]{64}$/.test(pinHex)) throw new Error('Missing local certificate pin');
 const pin = Uint8Array.from(pinHex.match(/../g)!, (byte) => parseInt(byte, 16)).buffer;
@@ -28,7 +21,7 @@ const createTransport = createWebTransport({ certHash: pin, draftVersion: 18 });
 const transports: WebTransportLike[] = [];
 const transportOutcomes: Promise<{ status: string; reason?: string }>[] = [];
 const events: { timeMs: number; type: string; data: unknown }[] = [];
-const samples: Sample[] = [];
+const samples: PlaybackSample[] = [];
 let startupError: string | null = null;
 let presentedFrames = 0;
 let presentedMediaTimeS = 0;
@@ -40,11 +33,23 @@ let audioContext: AudioContext | undefined;
 let source: MediaElementAudioSourceNode | undefined;
 let gain: GainNode | undefined;
 let analyser: AnalyserNode | undefined;
+let firstFrameTimestampUs: number | undefined;
 
 const player = new Player(null, {
   url: params.get('url')!, namespace: params.get('ns')!,
   video, canvas, certHash: pin, draftVersion: 18, autoQuality: false,
+  startLevel: Number(params.get('level') ?? 0),
   moqtPlayerConfig: {
+    logLevel: params.has('debug') ? 'debug' : 'none',
+    locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',
+    audioConstraints: { lang: params.get('lang') ?? 'en' },
+    createConnection: () => {
+      const connection = new MoqtConnection(18);
+      if (locmafObserver) {
+        observeConnectionObjects(connection, locmafObserver.record);
+      }
+      return connection;
+    },
     createTransport: async (url) => {
       const transport = await createTransport(url);
       transports.push(transport);
@@ -60,6 +65,14 @@ const player = new Player(null, {
 for (const type of ['ready', 'playing', 'statechange', 'error', 'stall'] as const) {
   player.on(type, (data) => events.push({ timeMs: performance.now(), type, data }));
 }
+player.on('ready', () => {
+  const expectedOutput = frameOutput ? 'canvas' : 'video';
+  if (player.activeMediaType !== expectedOutput) {
+    startupError = `Expected ${expectedOutput} output, got ${player.activeMediaType}`;
+  }
+  canvas.hidden = !frameOutput;
+  video.hidden = frameOutput;
+});
 
 const probeCanvas = document.createElement('canvas');
 probeCanvas.width = 64;
@@ -71,11 +84,23 @@ function observeFrame(_time: number, metadata: VideoFrameCallbackMetadata): void
   presentedMediaTimeS = metadata.mediaTime;
   callbackHandle = video.requestVideoFrameCallback(observeFrame);
 }
-callbackHandle = video.requestVideoFrameCallback(observeFrame);
+if (!frameOutput) callbackHandle = video.requestVideoFrameCallback(observeFrame);
+
+function audioRms(): number {
+  if (!analyser) return 0;
+  const waveform = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(waveform);
+  return Math.sqrt(waveform.reduce((sum, value) => sum + value * value, 0) / waveform.length);
+}
 
 function sample(): void {
   if (!recording || !analyser) return;
-  probe.drawImage(video, 0, 0, 64, 36);
+  probe.drawImage(frameOutput ? canvas : video, 0, 0, 64, 36);
+  if (canvasObserver) {
+    firstFrameTimestampUs ??= canvasObserver.timestampUs;
+    presentedFrames = canvasObserver.frames;
+    presentedMediaTimeS = (canvasObserver.timestampUs - firstFrameTimestampUs) / 1_000_000;
+  }
   const pixels = probe.getImageData(0, 0, 64, 36).data;
   let hash = 2166136261;
   let difference = 0;
@@ -85,47 +110,57 @@ function sample(): void {
     if (previousPixels) difference += Math.abs(pixels[i]! - previousPixels[i]!);
   }
   const marker = (2 * 64 + 2) * 4;
-  const markerMatches = pixels[marker]! < 60 && pixels[marker + 1]! > 180 && pixels[marker + 2]! < 60;
+  const markerRgb = Array.from(pixels.slice(marker, marker + 3));
   previousPixels = pixels;
-  const waveform = new Float32Array(analyser.fftSize);
   const spectrum = new Float32Array(analyser.frequencyBinCount);
-  analyser.getFloatTimeDomainData(waveform);
   analyser.getFloatFrequencyData(spectrum);
-  const audioRms = Math.sqrt(waveform.reduce((sum, value) => sum + value * value, 0) / waveform.length);
+  const rms = audioRms();
   let peak = 0;
   for (let i = 1; i < spectrum.length; i++) if (spectrum[i]! > spectrum[peak]!) peak = i;
   const ranges = video.buffered;
   samples.push({
-    wallMs: performance.now(), mediaTimeS: video.currentTime,
+    outputKind: frameOutput ? 'canvas' : 'video',
+    wallMs: performance.now(), wallEpochMs: Date.now(), mediaTimeS: frameOutput ? player.currentTime / 1000 : video.currentTime,
     presentedMediaTimeS, presentedFrames, pictureDigest: (hash >>> 0).toString(16),
-    pictureChange: difference / (64 * 36 * 3), markerMatches,
-    audioRms, audioPeakHz: audioRms > 0.015 ? peak * audioContext!.sampleRate / analyser.fftSize : 0,
-    paused: video.paused, seeking: video.seeking, visibility: document.visibilityState,
-    bufferedRanges: Array.from({ length: ranges.length }, (_, i) => ({ start: ranges.start(i), end: ranges.end(i) })),
+    pictureChange: difference / (64 * 36 * 3), markerRgb,
+    videoWidth: canvasObserver?.width ?? video.videoWidth, videoHeight: canvasObserver?.height ?? video.videoHeight,
+    ...(canvasObserver ? { frameTimestampUs: canvasObserver.timestampUs } : {}),
+    audioRms: rms, audioPeakHz: rms > 0.015 ? peak * audioContext!.sampleRate / analyser.fftSize : 0,
+    paused: frameOutput ? player.state !== 'playing' : video.paused, seeking: frameOutput ? false : video.seeking,
+    visibility: document.visibilityState,
+    bufferedRanges: frameOutput ? null : Array.from({ length: ranges.length }, (_, i) => ({ start: ranges.start(i), end: ranges.end(i) })),
   });
 }
 
 document.querySelector('#start')!.addEventListener('click', () => {
   void (async () => {
-    audioContext = new AudioContext();
-    await audioContext.resume();
-    source = audioContext.createMediaElementSource(video);
-    gain = audioContext.createGain();
-    analyser = audioContext.createAnalyser();
-    analyser.fftSize = 4096;
-    analyser.smoothingTimeConstant = 0;
-    source.connect(gain).connect(analyser).connect(audioContext.destination);
+    if (!frameOutput) {
+      audioContext = new AudioContext();
+      await audioContext.resume();
+      source = audioContext.createMediaElementSource(video);
+      gain = audioContext.createGain();
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 4096;
+      analyser.smoothingTimeConstant = 0;
+      source.connect(gain).connect(analyser).connect(audioContext.destination);
+    }
     await player.load();
     player.play();
+    if (audioObserver) {
+      if (audioObserver.taps.length !== 1) throw new Error(`Expected one player audio output, got ${audioObserver.taps.length}`);
+      ({ context: audioContext, analyser } = audioObserver.taps[0]!);
+    }
   })().catch((error: unknown) => { startupError = String(error); });
 }, { once: true });
 
 const acceptance = {
   get startupError() { return startupError; },
-  get presentedFrames() { return presentedFrames; },
-  get currentTime() { return video.currentTime; },
+  get presentedFrames() { return canvasObserver?.frames ?? presentedFrames; },
+  get currentTime() { return frameOutput ? player.currentTime / 1000 : video.currentTime; },
+  get audioRms() { return audioRms(); },
   begin(silent: boolean): void {
-    gain!.gain.value = silent ? 0 : 1;
+    if (frameOutput) { if (silent) player.mute(); }
+    else gain!.gain.value = silent ? 0 : 1;
     samples.length = 0;
     previousPixels = undefined;
     recording = true;
@@ -135,7 +170,10 @@ const acceptance = {
   finish() {
     recording = false;
     clearInterval(timer);
-    return { samples: [...samples], events: [...events], startupError };
+    const locmafDelivery = locmafObserver?.snapshot();
+    return { samples: [...samples], events: [...events], startupError,
+      ...(locmafDelivery ? { locmafDelivery, locmafFailures: assessLocmafDelivery(locmafDelivery) } : {}),
+      levels: player.levels, audioTracks: player.audioTracks };
   },
   async destroy() {
     recording = false;
@@ -145,7 +183,9 @@ const acceptance = {
     source?.disconnect();
     gain?.disconnect();
     analyser?.disconnect();
-    await audioContext?.close();
+    if (!frameOutput) await audioContext?.close();
+    canvasObserver?.restore();
+    audioObserver?.restore();
     const outcomes = await Promise.all(transportOutcomes);
     return {
       state: player.state, transports: transports.length,

@@ -107,9 +107,13 @@ Internet-Draft filename alone establishes identical contents.
 | `draft-ietf-moq-loc-01.txt` | `2d2be396d29c442a924b10d21766bbea33349fff39ca49d8f528c33b77a2499f` |
 | `draft-ietf-moq-loc-04.txt` | `fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47` |
 | `draft-ietf-moq-c4m-01.txt` | `13c7694d05997776a012f96e0271df720b3560e2a1ce032e85b883007f5f4121` |
+| `draft-einarsson-moq-locmaf-01.txt` | `f2e46e20fb308961fdc17f85a257ce54d9a36d3784f0024cf3727db980c394d9` |
 
-LOCMAF's implementation names `draft-einarsson-moq-locmaf-01`; its text was not
-found in the local Spec inventory. Pin it before changing LOCMAF semantics.
+The LOCMAF text was retrieved from the [IETF archive](https://www.ietf.org/archive/id/draft-einarsson-moq-locmaf-01.txt)
+for this qualification. Its version field is `0.3`. Section 3 specifically requires
+all objects in a group to share one subgroup stream, overriding the generic MSF
+one-stream-per-object mapping for this packaging. Section 6 uses CMSF
+`initDataList`/`initRef` carriage.
 Browser timing/rendering standards and WebVTT/IMSC carriage references must be
 pinned before their implementation slices. They have not been reviewed here.
 
@@ -204,7 +208,8 @@ with evidence, rather than making the row disappear.
 
 ## M1a: CMAF Browser Baseline
 
-Implemented on 2026-10-06, left uncommitted on `feat/player-completion`:
+Implemented on 2026-10-06 and committed locally as `41f1ec3`
+(`Add browser playback acceptance checks`) on `feat/player-completion`:
 
 - Command: `pnpm test:player:browser`; prerequisites and interpretation are in
   [Browser Playback Acceptance](../scripts/player-acceptance/README.md).
@@ -275,8 +280,188 @@ all three scenarios. These runs record the certificate SHA-256 used by both
 media processes and the browser. All 765 runtime/configuration file hashes in
 the final manifest matched the tested source after the run.
 
-M1 remains incomplete. B2 needs distinct audio and aligned alternative video
-fixtures before audio/ABR assertions; B3-B5 need real LOC and LOCMAF output before
+M1 remains incomplete. Real LOC and LOCMAF output remains required before
 shared-clock changes; VOD, event and text rows follow their specification slices.
-The next slice is B2 fixture/output discrimination, not an audio-switch or clock
-implementation yet.
+
+## Identifiable Media Alternatives
+
+The next uncommitted slice adds three H.264 video renditions (640x360, 1280x720,
+1920x1080) and two AAC test signals (440 Hz `en`, 880 Hz `es`) to the maintained
+browser command. The videos encode the same synthetic 1080p source, with the
+green marker applied before scaling, a common `altGroup`, matching sample times,
+and a shared `renderGroup`. The audio content is distinct and uses separate
+groups, with explicit language/test-signal labels.
+
+Sample validation uses the existing CMAF parser and frame slicer, records every
+sample's decode and presentation ticks, duration and sync flag, and compares
+time with exact cross-multiplication across timescales. Missing fragments,
+one-tick offsets, composition-time differences, non-sync starts, internal holes,
+and unsupported chunks fail. The signaled independence checks and actual browser
+decode are not independent codec-level SAP or complete CMAF conformance proof.
+
+All six initial video/audio combinations use public Playa options against the
+same five-track catalog. Decoded dimensions, pixel motion/marker RGB, and
+post-gain PCM tone establish output identity. Each capture is also assessed
+against a different rendition and tone and must fail exactly the respective
+identity check. This establishes wrong/unchanged-output detection, not live
+audio or ABR switching. Startup has a twenty-second observable audiovisual
+readiness bound; the measurement window then checks steady-state output.
+
+Two narrow public-library changes support the fixtures: the catalog builder
+now preserves optional `altGroup`, `lang`, and `label`; Playa maps catalog `lang`
+to public `AudioTrack.language` instead of reading an absent `language` key.
+The latter failed both legacy and modern catalog regression tests before the
+one-line correction. No playback, scheduling, or track-switch implementation
+changed.
+
+Final local browser evidence is
+`reports/player-acceptance/2026-10-06T21-28-52-361Z-9fb2a4d8/result.json`:
+nine cases passed on macOS arm64, Node v24.2.0, Chrome 155.0.8059.40, including
+all twelve counterfactual identity checks. Every transport `closed` promise
+fulfilled, observer AudioContext closed, player returned to idle, and no browser
+or player error occurred. All 423 runtime/configuration hashes checked against
+that capture matched the source at that checkpoint. The LOC extension below has
+its own capture; the nine-case artifact is not evidence for later runtime changes.
+
+The full suite passed 6686 tests in 247 files, with one existing prepared-fixture
+skip. Workspace build, example build, test/publisher/MSF typechecks, and
+built-export smoke passed. Focused coverage is 53 tests: 21 output-policy,
+10 alignment, 10 builder, 10 publisher, and two language-mapper tests.
+Deleting dimension comparisons fails the unchanged-video discriminator;
+hardcoding 440 Hz fails both the second-signal positive and unchanged-audio
+negative; disabling exact time comparisons fails offset, composition-time and
+per-sample-duration tests. All mutations were restored to green.
+Final independent read-only review found no blockers in the restored source,
+tests, documentation or nine-case browser artifact.
+
+At that checkpoint, audio codec/configuration-change fixtures, real switching,
+A/V sync, LOC and LOCMAF qualification remained outstanding.
+
+## LOC Browser Output
+
+The next uncommitted extension adds LOC-01 wall-clock, LOC-04 wall-clock and
+LOC-04 media-time H.264/Opus rows, plus LOC-04 frozen-picture and muted-audio
+controls. All use the default public Playa decoder, scheduler, clocks and
+buffers through a local draft-18 WebTransport publisher/relay.
+
+The synthetic publisher extracts H.264 access units and Opus packets from
+the generated MP4 fixtures. It rejects composition offsets, noncontiguous
+samples, dependent video starts, and Opus outside the declared single-frame
+20 ms profile. Each object has its own subgroup stream as MSF-00/01 section 6
+requires; video groups start at keyframes, audio uses one packet per group.
+LOC-01 carries Unix-epoch microseconds; LOC-04 covers both that domain and
+media ticks at the fixture's actual timescale, with application epoch zero.
+Keyframes carry AVC configuration. MP4's final partial duration does not trim
+the transmitted elementary Opus packet: its full 960 samples count toward the
+next loop. The resulting Opus span is 6.020 seconds versus video's 6.000;
+this fixture does not qualify A/V synchronization.
+
+Observers preserve the native canvas draw and audio speaker connections.
+They count the final VideoFrame draw per animation-frame callback rather than
+overwritten decode bursts, and tee post-gain PCM from the player's existing
+AudioContext. Canvas frame metadata and pixels establish real rendered output
+at refresh opportunities, not physical display/compositor presentation.
+Canvas `bufferedRanges` stays null, and currentTime remains the existing
+playback-duration statistic rather than a newly qualified content-position clock.
+Raw normalized timestamps must agree with their declared epoch/domain and
+progress near real time. Unit discriminators reject nonfinite timestamps,
+wrong epochs, 1000x clocks, wrong output surfaces and invented canvas buffering.
+
+Real playback exposed a relay defect: it dropped the delivering subgroup's
+END_OF_GROUP flag, causing the player to wait for a GOP-completion timeout
+and fall below the unchanged 24 fps acceptance threshold. Additive decoded
+`subgroupContainsEndOfGroup` metadata now preserves that header bit through
+live forwarding and cache replay. It means the subgroup contains the group's
+largest object, not that every delivered object is the last object. FIN still
+completes the subgroup. Loopbacks cover true/false evidence on drafts 14, 16,
+18 and 22; relay tests cover live/cache delivery and FIN. No core scheduling,
+decoding, timing or recovery policy changed.
+
+The cancellation review also found that the relay's old retirement helper
+sent FIN on unfinished subgroups. Cancellation now aborts queued forwarding;
+the adapter owns RESET of that request's streams (Transport-18 sections 5.1.1
+and 11.4.3). Three regressions failed before the correction: a blocked-write
+case detects unwanted queued sends/FIN, and real-adapter cases on drafts 18/22
+assert the original outgoing pipe was reset, not closed with FIN. The unused forced-FIN
+retirement helper was removed; ordinary upstream completion still forwards FIN.
+
+The fixture/observer findings were tested before fixing them. Removing relay
+flag preservation fails its live-delivery regression; counting raw canvas draws
+instead of refresh opportunities fails the observer test. Both mutations were
+restored. LOC publisher tests also discriminate full-packet loop timing from
+the MP4-trimmed duration.
+
+Final local evidence is
+`reports/player-acceptance/2026-10-06T22-11-04-309Z-1587fb7d/result.json`:
+all fourteen cases passed with exact intended failures in the four output
+controls, all twelve rendition/tone counterfactual checks, fulfilled original
+transport `closed` promises, closed AudioContexts, idle players and zero page
+errors. This is macOS arm64, Node v24.2.0, Chrome 155.0.8059.40 against source
+`41f1ec3` plus the captured uncommitted diff. Captured runtime/configuration
+hashes, including the browser observer page, match the final capture.
+
+The full suite passes 6712 tests in 249 files, with one existing fixture-dependent
+skip. Workspace and examples builds, example/test/publisher/relay typechecks,
+and built-export smoke passed. The new workflow has not run remotely.
+Final independent re-review found no remaining findings and separately passed
+170 relay/adapter tests, including the cancellation RESET/no-FIN regressions.
+LOCMAF MSE/frame browser rows are next. A/V synchronization, codec/configuration
+changes, live audio/ABR switching and independent producer/relay/browser profiles
+remain unqualified. Nothing committed in this extension, pushed or published.
+
+## LOCMAF Browser Output and Reset Recovery
+
+The next uncommitted extension qualifies clear H.264/AAC LOCMAF `0.3` through
+both public `locmafDecoding: 'mse'` and `'frame'` paths. The pinned LOCMAF-01
+text requires one ordered subgroup stream per group (section 3), CMSF inline
+initialization references (section 6), and full-header recovery after a missing
+object or RESET. The example publisher now follows that mapping in finite and
+looped publication and defaults LOCMAF to the modern catalog. Explicit legacy
+catalog selection fails before connection. Plain CMAF retains its existing mapping.
+
+Generated fixture evidence compares canonical reconstructed chunks, coded sample
+bytes, decode/presentation ticks, duration and flags across two groups. Full
+headers and real deltas are required; raw fallback cannot satisfy this fixture.
+Browser observers independently check the received catalog, initialization
+references, per-track full/delta objects, and one stream per group. Wrong versions,
+missing init references, plain CMAF payloads and split streams fail their tests.
+The fixture round trip uses our own encoder/decoder, not an independent oracle.
+
+Qualification and review found several narrow defects, each with RED-before-fix
+regressions:
+
+- Loop rebasing now copies Node Buffer inputs instead of mutating the original.
+- Frame delivery preserves each sample's duration in microseconds, including
+  variable durations and nonzero composition offsets.
+- Raw-box initialization shortcuts validate exact box coverage and reject size
+  escapes before caching or decoding. Repeated raw headers invalidate delta state;
+  malformed raw objects use the existing failed-group accounting and track limit.
+- RESET invalidates the affected LOCMAF group immediately. Parked pre-alias objects
+  preserve reset order through replacement streams, ownership filtering and
+  terminal-record pressure. FIN does not invalidate the reference. Old sessions
+  cannot invalidate a new session's matching alias/group.
+- Deferred application transforms cannot re-anchor a group after RESET, raw-header
+  replacement, unregistration or shutdown. Guards are bounded to 256 inputs and
+  8 MiB per manager; invalidated work keeps its charge until it settles. Reentrant
+  reset, late rejection, capacity exhaustion and subsequent recovery have tests.
+  This does not introduce transform ordering or qualify encrypted media.
+
+Final local evidence is
+`reports/player-acceptance/2026-10-06T22-59-57-285Z-8f047903/result.json`.
+All twenty scenarios passed: the prior fourteen plus healthy, frozen-picture and
+muted-audio LOCMAF cases on each path. The twelve wrong-output rendition/tone
+checks also passed. Original transport `closed` promises fulfilled, AudioContexts
+closed, players returned to idle, and no browser/player errors occurred. The run
+used macOS arm64, Node v24.2.0 and Chrome 155.0.8059.40 against `41f1ec3` plus the
+captured diff. All 508 checked runtime/configuration hashes match that source.
+
+The full suite passed 6786 tests in 252 files with one existing prepared-fixture
+skip. Workspace/example builds, test/publisher/relay typechecks, built-export
+smoke and workflow actionlint passed. Final independent cold review found no
+remaining blocking findings in this bounded qualification/reset scope.
+
+Protected media, changing initialization, real-browser loss/reset injection,
+A/V synchronization, live audio/ABR switching, independent producer/relay rows
+and Linux CI remain unqualified. These results are not complete LOCMAF conformance.
+The canvas content-position clock remains a separate API audit. Nothing in this
+extension is committed, pushed or published.

@@ -80,7 +80,7 @@ export function mapAudioTracks(catalog: CatalogState): AudioTrack[] {
   );
 
   return audioTracks.map((track, index) => {
-    const lang = (track as unknown as Record<string, unknown>).language as string | undefined;
+    const lang = track.lang;
     return {
       index,
       label: track.label ?? lang ?? `Audio ${index + 1}`,
