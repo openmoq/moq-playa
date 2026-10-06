@@ -7,8 +7,11 @@ import { connectQuic } from '../dist/index.js';
 const TIMEOUT_MS = 5_000;
 const keyPath = process.argv[2];
 const certPath = process.argv[3];
+const draft = Number(process.argv[4] ?? 18);
+assert.ok(draft === 18 || draft === 22, 'native smoke supports drafts 18 and 22');
+const protocol = `moqt-${draft}`;
 if (!keyPath || !certPath) {
-  throw new Error('usage: native-smoke.mjs <key.pem> <cert.pem>');
+  throw new Error('usage: native-smoke.mjs <key.pem> <cert.pem> [18|22]');
 }
 
 function deferred() {
@@ -122,7 +125,7 @@ try {
   }, {
     endpoint: { address: '127.0.0.1:0' },
     sni: { '*': { keys: [key], certs: [cert] } },
-    alpn: ['moqt-18'],
+    alpn: [protocol],
     transportParams: { maxDatagramFrameSize: 1200 },
     ondatagram: (data) => serverDatagramReceived.resolve(data.slice()),
     onstream: async (stream) => {
@@ -166,10 +169,11 @@ try {
 
   transport = await bounded(connectQuic(
     `moqt://127.0.0.1:${port}/alpha/../beta?x=1#track:local`,
-    { allowUnauthorized: true },
+    { allowUnauthorized: true, draft },
   ), 'native QUIC handshake');
   const server = await bounded(serverSessionReady.promise, 'server session');
-  assert.equal((await server.opened).protocol, 'moqt-18');
+  assert.equal((await server.opened).protocol, protocol);
+  assert.equal(transport.protocol, protocol);
   assert.deepEqual(transport.setupOptions, {
     authority: `127.0.0.1:${port}`,
     path: '/alpha/../beta?x=1',
@@ -298,7 +302,7 @@ try {
     { closeCode: 8, reason: 'smoke done' },
   );
   await bounded(endpoint.close(), 'server endpoint close');
-  console.log('native QUIC smoke: pass');
+  console.log(`native QUIC smoke (draft ${draft}): pass`);
 } finally {
   if (transport) {
     try { transport.close({ closeCode: 1, reason: 'smoke cleanup' }); } catch { /* closed */ }

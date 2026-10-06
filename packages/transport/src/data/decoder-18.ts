@@ -356,8 +356,14 @@ export function decodeFetchObject18(
   if (isEndOfRange18(flags, version)) {
     const gid = readVi64(buf, pos); pos += gid.bytesRead;
     const oid = readVi64(buf, pos); pos += oid.bytesRead;
-    // The marker ends after the Object ID, as moxygen, LibMoQ, red5-moq-relay and
-    // the draft-22 vector fetch_object_end_of_timed_out_range_g2_o4 encode it.
+    // Keep the established draft-18 framing separate from the draft-22
+    // marker-only form. Never guess the form from the following byte.
+    if (version === 18) {
+      const pl = readVi64(buf, pos); pos += pl.bytesRead;
+      if (pl.value !== 0n) {
+        throw new ProtocolViolationError(`End-of-Range marker has a non-zero payload length (${pl.value})`);
+      }
+    }
     const item: FetchEndOfRange = {
       flags: varint(flags),
       groupId: gid.value,

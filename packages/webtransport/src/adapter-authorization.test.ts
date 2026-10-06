@@ -21,7 +21,7 @@ async function pair(version: DraftVersion, getTokens: AuthorizationProvider, tim
   const observed = vi.spyOn(server.session, 'handleControlMessage');
   await Promise.all([
     client.connect(a, { authorization: { relayUrl: 'https://relay.example/moq', getTokens, ...(timeoutMs !== undefined ? { timeoutMs } : {}) } }),
-    server.connect(b, version === 18 ? {} : { maxRequestId: varint(1000n) }),
+    server.connect(b, version >= 18 ? {} : { maxRequestId: varint(1000n) }),
   ]);
   return { client, server, a, b, observed };
 }
@@ -440,6 +440,47 @@ describe.each([14, 16, 18] as const)('draft %i connection authorization', versio
       expect(p.client.session.state).toBe('established');
     } finally { await p.client.close(); await p.server.close(); }
   });
+});
+
+it('preserves draft-22 authorization alongside fills and typed location filters', async () => {
+  const contexts: AuthorizationContext[] = [];
+  const p = await pair(22, ctx => { contexts.push(ctx); return [catToken(signedCat)]; });
+  const errors: string[] = [];
+  p.client.onError = error => errors.push(error.message);
+  p.server.onError = error => errors.push(error.message);
+  try {
+    p.server.onSubscribe = rid => { void p.server.acceptSubscribe(rid, 9n); };
+    const sub = await p.client.subscribeTrack(ns('live'), nm('catalog'), {
+      fill: { filter: { type: 'RelativeStart', groups: 1n } },
+    });
+    await p.client.requestUpdate(sub.requestId, {
+      subscriptionFilter: { type: 'AbsoluteStart', startGroup: 128n, startObject: 0n },
+      fill: { groupOrder: 'descending' },
+    });
+    await p.client.fetch(ns('live'), nm('video'), { startGroup: 128n, startObject: 0n, endGroup: 129n });
+    await p.client.publishNamespace(ns('outgoing'));
+    await p.client.publish(ns('outgoing'), nm('video'), 33n);
+    await flush();
+    expect(errors).toEqual([]);
+    expect(contexts.map(ctx => ctx.operation)).toEqual([
+      'SETUP', 'SUBSCRIBE', 'REQUEST_UPDATE', 'FETCH', 'PUBLISH_NAMESPACE', 'PUBLISH',
+    ]);
+    expect(contexts.every(ctx => ctx.draftVersion === 22)).toBe(true);
+    const requests = p.observed.mock.calls.map(([msg]) => msg)
+      .filter(msg => contexts.some(ctx => ctx.operation === msg.type));
+    expect(requests).toHaveLength(6);
+    for (const msg of requests) {
+      const params = 'setupOptions' in msg ? msg.setupOptions : 'parameters' in msg ? msg.parameters : new Map();
+      const key = msg.type === 'SETUP' ? SetupParam.AUTHORIZATION_TOKEN : MessageParam.AUTHORIZATION_TOKEN;
+      expect(parseAuthorizationToken18(params.get(key)![0] as Uint8Array))
+        .toMatchObject({ tokenType: 1n, tokenValue: signedCat });
+    }
+    const update = requests.find(msg => msg.type === 'REQUEST_UPDATE')!;
+    if (update.type !== 'REQUEST_UPDATE') throw new Error('Missing update');
+    expect(decodeSubscriptionFilter(update.parameters.get(0x21n)![0] as Uint8Array, 22))
+      .toEqual({ type: 'AbsoluteStart', startGroup: 128n, startObject: 0n });
+    expect(update.parameters.get(0x23n)).toEqual([new Uint8Array([0x22, 2])]);
+  } finally { await p.client.close(); await p.server.close(); }
 });
 
 it('the signed CAT fixture has the issuer MAC and remains opaque to the client', () => {

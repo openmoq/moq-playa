@@ -74,7 +74,9 @@ async function subscribedWithFill(conn: MoqtConnection, transport: TransportSim)
     fill: { filter: { type: 'RelativeStart', groups: 1n } },
   });
   await flush();
-  transport.bidi[0]!.push(okBytes(7n)); // the subscription's request stream stays open
+  transport.bidi[0]!.push(codec22.encode({ type: 'SUBSCRIBE_OK', requestId: 0n, trackAlias: 7n,
+    parameters: new Map([[0x09n, [{ group: 4n, object: 0n }]]]), trackProperties: new Map(),
+  })); // a non-empty track has a Largest Object and keeps its request stream open
   return p;
 }
 
@@ -181,7 +183,7 @@ describe('MoqtConnection(22) serving a fill (publisher side)', () => {
     let alias = 12n;
     server.onSubscribe = (requestId, _ns, trackName) => {
       void (async () => {
-        await server.acceptSubscribe(requestId, alias++);
+        await server.acceptSubscribe(requestId, alias++, { parameters: new Map([[0x09n, [{ group: 4n, object: 1n }]]]) });
         if (new TextDecoder().decode(trackName) !== 'catalog') {
           await server.openFillStream(requestId).catch(() => { fillRefusedWithoutRequest = true; });
           return;
@@ -216,6 +218,7 @@ describe('MoqtConnection(22) serving a fill (publisher side)', () => {
 describe('MoqtConnection(22) fills on REQUEST_UPDATE (§3.4)', () => {
   it('routes the fill stream carrying the REQUEST_UPDATE Request ID to the subscription', async () => {
     const { client, server, errors } = await connectedPair22();
+    server.setLargestLocationProvider(() => ({ group: 1n, object: 0n }));
     let subReq = -1n;
     server.onSubscribe = (requestId) => { subReq = requestId; void server.acceptSubscribe(requestId, 30n); };
     const streams: DataStreamHeader[] = [];
@@ -242,6 +245,7 @@ describe('MoqtConnection(22) fills on REQUEST_UPDATE (§3.4)', () => {
 
   it('cancelFill on the subscription also drops a fill its update asked for', async () => {
     const { client, server } = await connectedPair22();
+    server.setLargestLocationProvider(() => ({ group: 0n, object: 0n }));
     server.onSubscribe = (requestId) => { void server.acceptSubscribe(requestId, 31n); };
     const objects: MoqtObject[] = [];
     client.onObject = (_sid, o) => objects.push(o);
@@ -336,8 +340,10 @@ describe('MoqtConnection(22) subscriptions sharing a Track Alias (§3.1)', () =>
     return pair;
   }
 
-  async function publish(server: MoqtConnection, group: bigint, object: bigint): Promise<void> {
-    const sid = await server.openSubgroup(varint(SHARED), varint(group), varint(0n), { endOfGroup: false, publisherPriority: 1 });
+  async function publish(server: MoqtConnection, group: bigint, object: bigint, requestId?: bigint): Promise<void> {
+    const sid = await server.openSubgroup(varint(SHARED), varint(group), varint(0n), {
+      endOfGroup: false, publisherPriority: 1, ...(requestId === undefined ? {} : { requestId }),
+    });
     await server.sendObject(sid, varint(object), new Uint8Array([Number(group), Number(object)]));
     await server.closeSubgroup(sid);
     await flushN();
@@ -360,8 +366,8 @@ describe('MoqtConnection(22) subscriptions sharing a Track Alias (§3.1)', () =>
     expect(subA.trackAlias).toBe(SHARED);
     expect(subB.trackAlias).toBe(SHARED);
 
-    await publish(server, 1n, 0n);
-    await publish(server, 2n, 0n);
+    await publish(server, 1n, 0n, subA.requestId);
+    await publish(server, 2n, 0n, subB.requestId);
 
     expect(locations(a)).toEqual(['1/0']);
     expect(locations(b)).toEqual(['2/0']);
@@ -373,11 +379,11 @@ describe('MoqtConnection(22) subscriptions sharing a Track Alias (§3.1)', () =>
     const { client, server } = await sharedPair();
     const a: MoqtObject[] = [];
     const b: MoqtObject[] = [];
-    await client.subscribeTrack(ns('live'), nm('video'), { onObject: (o) => a.push(o) });
-    await client.subscribeTrack(ns('live'), nm('video'), { onObject: (o) => b.push(o) });
+    const subA = await client.subscribeTrack(ns('live'), nm('video'), { onObject: (o) => a.push(o) });
+    const subB = await client.subscribeTrack(ns('live'), nm('video'), { onObject: (o) => b.push(o) });
 
-    await publish(server, 3n, 0n);
-    await publish(server, 3n, 0n); // the publisher's copy for the second subscription
+    await publish(server, 3n, 0n, subA.requestId);
+    await publish(server, 3n, 0n, subB.requestId);
 
     expect(locations(a)).toEqual(['3/0']);
     expect(locations(b)).toEqual(['3/0']);

@@ -10,8 +10,9 @@
 import {
   CaseScope, Inbox, __setConnect, __setBoundScale, connectPeer,
   caseSubscribeError, caseAnnounceSubscribe, caseSubscribeBeforeAnnounce,
-  casePublishNamespaceDone,
+  casePublishNamespaceDone, selectDraft, protocolsFor,
 } from "../src/main.js";
+import assert from 'node:assert/strict';
 
 let failures = 0;
 const check = (name: string, cond: boolean, detail = "") => {
@@ -97,6 +98,25 @@ async function run(caseFn: (d: number, s: CaseScope) => Promise<void>, sc: Scena
 }
 
 async function main() {
+  const previousDraft = process.env.MOQT_DRAFT;
+  try {
+    for (const draft of [16, 18, 22]) {
+      for (const raw of [String(draft), `draft-${draft}`]) {
+        process.env.MOQT_DRAFT = raw;
+        assert.equal(selectDraft(), draft);
+        assert.deepEqual(protocolsFor(selectDraft()), [`moqt-${draft}`]);
+      }
+    }
+    for (const raw of ['21', 'draft-21', 'draft-22-rc1', '22.5']) {
+      process.env.MOQT_DRAFT = raw;
+      assert.throws(() => selectDraft(), /unsupported MOQT_DRAFT/);
+    }
+    delete process.env.MOQT_DRAFT;
+    assert.equal(selectDraft(), 18);
+  } finally {
+    if (previousDraft === undefined) delete process.env.MOQT_DRAFT;
+    else process.env.MOQT_DRAFT = previousDraft;
+  }
   __setBoundScale(0.02);   // 8000ms bounds become 160ms
 
   // -- 2. subscribe-error
@@ -212,4 +232,4 @@ async function main() {
   console.log(failures === 0 ? "# all case discriminators passed" : `# ${failures} FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }
-main();
+main().catch(error => { console.error(error); process.exit(1); });

@@ -48,6 +48,8 @@ export type {
   MessageParams18,
   MessageParamRegistry,
 } from './control/message-params-18.js';
+export { decodeFillParameters, resolveFillWindow } from './control/fill-parameters.js';
+export type { FillOptions } from './control/fill-parameters.js';
 export {
   encodeTrackProperties18,
   decodeTrackProperties18,

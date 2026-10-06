@@ -1,5 +1,5 @@
 /**
- * Draft-22 wire vectors, derived from the draft-21 set shared with red5-moq-relay and moqxr.
+ * Draft-22 wire vectors, derived from the draft-22 set shared with red5-moq-relay and moqxr.
  *
  * `packages/transport/vectors/d22/wire-vectors.txt` is shared with red5-moq-relay:
  * the vectors were produced by (or verified against) moqxr's draft-22 codec, so

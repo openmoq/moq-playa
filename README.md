@@ -224,7 +224,7 @@ player.on('catch_up_changed', ({ active, rate, latencyMs }) => { ... });
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `draftVersion` | 14 \| 16 \| 18 \| 21 | 16 | Protocol version (14 for moq-rs / Red5 compat, 18 or 21 for relays speaking those drafts) |
+| `draftVersion` | 14 \| 16 \| 18 \| 22 | 16 | Protocol version; select the draft supported by your relay |
 | `maxRequestId` | number | 100 | Initial MOQT MAX_REQUEST_ID (auto-replenished) |
 | `knownTracks` | object | — | Pre-known codec metadata for TTFF optimization |
 | `catalog` | `{tracks}` | — | Inject catalog externally, skip catalog subscription |
@@ -241,6 +241,7 @@ player.on('catch_up_changed', ({ active, rate, latencyMs }) => { ... });
 
 ## Protocol Support
 
+- **draft-ietf-moq-transport-22** - opt-in (`draftVersion: 22` / `moqt-22`)
 - **draft-ietf-moq-transport-18** — uni control-stream pair + per-request bidi streams (`draftVersion: 18` / `moqt-18`)
 - **draft-ietf-moq-transport-16** — default supported transport draft
 - **draft-ietf-moq-transport-14** — Red5/moq-rs interop (`draftVersion: 14`)
@@ -291,21 +292,30 @@ await connection.connect(transport);
 ```
 
 `@openmoq/quic` requires a Node build configured and launched with
-`--experimental-quic`. It offers only the `moqt-18` ALPN, requires QUIC
+`--experimental-quic`. It offers `moqt-18` by default, or `moqt-22` with
+`{ draft: 22 }`, requires QUIC
 DATAGRAM negotiation, disables 0-RTT, and does not fall back to WebTransport.
 
 #### draft 22
 
-Draft 22 (`new MoqtConnection(22)`, `draftVersion: 22`, ALPN/WT protocol `moqt-22`) keeps the draft-18 stream model and adds the features below. Draft 21 is not supported: draft 22 is draft 21 with a typed LOCATION_FILTER (a Location Filter Type, 0x00-0x05, selects the fields that follow and replaces the Length), so a draft-21 peer and a draft-22 peer disagree on every LOCATION_FILTER.
+Draft 22 (`new MoqtConnection(22)`, `draftVersion: 22`, ALPN/WT protocol `moqt-22`) keeps the draft-18 stream model and adds the features below. It replaces the experimental draft-21 implementation. LOCATION_FILTER now starts with a type (0x00-0x05) selecting its fields, rather than a length. Some encodings coincide, but the two drafts are not wire-compatible.
 
-- **Location filters.** SUBSCRIBE and FETCH carry their range in LOCATION_FILTER (§9.20.9). `SubscriptionFilter` gains `RelativeStart` (`groups: N` starts at group Largest + 1 - N, so 1 is the current group) and an optional inclusive `endObject` on `AbsoluteRange`.
-- **Fills instead of Joining FETCH.** Draft 22 has no Joining FETCH. `subscribe()` / `subscribeTrack()` take a `fill` option (`{ filter?: SubscriptionFilter }`). The publisher answers on a fill fetch stream whose FETCH_HEADER carries the SUBSCRIBE's Request ID. There is no FETCH_OK: a FIN completes the fill and a reset fails it. `onDataStream` reports that stream with `fill: true`, and `cancelFill(requestId)` stops it without touching the subscription. On the publisher side, `openFillStream(requestId)` serves a SUBSCRIBE that asked for a fill.
-- **Player.** The MSF-01 catalog bootstrap and warm start ask for the current group as a fill (LOCATION_FILTER type 0x01 with StartGroup 1). A SUBSCRIBE_OK without a Largest Object means an empty track, so the player waits for the first live catalog object and does not expect a fill.
+- **Location filters.** SUBSCRIBE and FETCH carry their range in LOCATION_FILTER. `SubscriptionFilter` gains `RelativeStart` (`groups: N` starts at group Largest + 1 - N, so 1 is the current group) and an optional inclusive `endObject` on `AbsoluteRange`.
+- **Fills instead of Joining FETCH.** Draft 22 has no Joining FETCH. `subscribe()` / `subscribeTrack()` take `fill: { filter?: SubscriptionFilter, groupOrder?: GroupOrder }`. Omitted fields inherit the subscription policy. The fill is bounded by the Largest Location in its response; Forward=0 or an empty range opens no fill stream. Its FETCH_HEADER carries the SUBSCRIBE's or REQUEST_UPDATE's Request ID. There is no FETCH_OK: FIN completes the fill and reset fails it. `cancelFill(requestId)` stops a fill without cancelling live delivery; passing the subscription ID stops all of its fills. The publisher uses `openFillStream(requestId)` to serve it.
+- **Player.** The MSF-01 catalog bootstrap and warm start ask for the current group as a fill (`RelativeStart` with `groups: 1`). A SUBSCRIBE_OK without a Largest Object means an empty track, so the player waits for the first live catalog object and does not expect a fill.
 - **Other changes.** PUBLISH_STATE_NOTIFY on the subscription stream advances the Largest Location. GOAWAY has no Request ID. The End of Timed-Out Range fetch marker (`0x20C`) is accepted. PUBLISH_DONE `0x3` no longer exists.
 
 - **REQUEST_UPDATE.** `requestUpdate()` also takes `fill`; that fill stream carries the update's Request ID. `SetupOptions.maxRequestUpdates` advertises MAX_REQUEST_UPDATES. Updates never exceed the peer's limit, and a peer that exceeds ours closes the session with TOO_MANY_REQUEST_UPDATES.
-- **Several subscriptions to one track.** Draft 22 allows them, and a publisher may give them one Track Alias. `subscribeTrack()` subscriptions sharing an alias each receive the objects their own filter selects, once each. Ending one leaves the others running.
+- **Several subscriptions to one track.** Draft 22 allows them, and a publisher may give them one Track Alias. Each subscription's filter controls delivery. Ending one leaves the others running. Publisher calls to `openSubgroup()` and `sendDatagram()` must supply `requestId` when the alias has several active owners, so cancellation and terminal stream counts remain attributable to the right request.
 - **Native QUIC.** `connectQuic(uri, { draft: 22 })` offers `moqt-22`.
+
+Range Filters beyond LOCATION_FILTER are not implemented. The endpoint advertises
+the default MAX_FILTER_RANGES=0 and rejects requests that exceed it with
+INVALID_FILTER rather than ignoring the filter.
+
+Draft 22 does not change the default version or the framing of drafts 14/16/18.
+See [draft development](docs/draft-development.md) for compatibility policy and
+the unresolved FETCH End-of-Range framing question.
 
 #### draft-18 known gaps (non-blocking)
 

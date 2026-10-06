@@ -71,6 +71,15 @@ export class InboundRequestStreamContext {
   private readonly framer: ControlStreamFramer;
   private readonly pendingUpdates: PendingUpdate[] = [];
   private aborted = false;
+  private readFinished = false;
+  private failed = false;
+  private finishing: Promise<void> | null = null;
+
+  /** The peer has FINed its sending direction; our response side may remain open. */
+  get peerFinished(): boolean { return this.readFinished; }
+
+  /** A terminal failure or local teardown has revoked this context's work. */
+  get cancelled(): boolean { return this.aborted || this.failed; }
 
   constructor(
     stream: WebTransportBidirectionalStream,
@@ -80,6 +89,11 @@ export class InboundRequestStreamContext {
     this.writer = stream.writable.getWriter();
     this.reader = stream.readable.getReader();
     this.framer = new ControlStreamFramer(codec);
+    if (codec.version === 22) {
+      // STOP_SENDING can arrive after the peer has FINed its other direction.
+      // The read loop is then over, so cancellation must also observe writes.
+      void this.writer.closed.catch((err: unknown) => this.fail(err));
+    }
   }
 
   /** Begin the continuous read loop. */
@@ -128,7 +142,8 @@ export class InboundRequestStreamContext {
 
   /** FIN our writable — e.g. after writing PUBLISH_DONE (§10.11). */
   async finish(): Promise<void> {
-    try { await this.writer.close(); } catch { /* already closed/aborted */ }
+    this.finishing ??= this.writer.close().catch(() => { /* already closed/aborted */ });
+    await this.finishing;
   }
 
   /**
@@ -164,31 +179,40 @@ export class InboundRequestStreamContext {
     for (const d of this.pendingUpdates.splice(0)) d.reject(reason);
   }
 
+  private fail(error: unknown): void {
+    if (this.aborted || this.failed) return;
+    this.failed = true;
+    const err = error instanceof Error ? error : new Error(String(error));
+    this.rejectPendingUpdates(err);
+    this.handlers.onFailure(err, this);
+  }
+
   private async readLoop(): Promise<void> {
     try {
       for (;;) {
         for (const { message } of this.framer.drain()) {
-          if (this.aborted) return;
+          if (this.aborted || this.failed) return;
           await this.dispatch(message);
         }
-        if (this.aborted) return;
+        if (this.aborted || this.failed) return;
         const { value, done } = await this.reader.read();
-        if (this.aborted) return;
+        if (this.aborted || this.failed) return;
         if (value) this.framer.push(value);
         if (done) {
           for (const { message } of this.framer.drain()) await this.dispatch(message);
+          if (this.codec.version === 22 && this.framer.bufferedBytes !== 0) {
+            throw new ProtocolViolationError('inbound request stream FIN with a truncated control message');
+          }
           if (this.pendingUpdates.length > 0) {
             throw new ProtocolViolationError('inbound request stream ended with pending REQUEST_UPDATE responses');
           }
+          this.readFinished = true;
           this.handlers.onClosed(this);
           return;
         }
       }
     } catch (err) {
-      if (this.aborted) return;
-      const e = err instanceof Error ? err : new Error(String(err));
-      for (const d of this.pendingUpdates.splice(0)) d.reject(e);
-      this.handlers.onFailure(e, this);
+      this.fail(err);
     }
   }
 

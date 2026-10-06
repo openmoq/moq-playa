@@ -47,6 +47,7 @@ function buildOptions(options: ProbeOptions | undefined, withProtocols: boolean)
 }
 
 interface TransportLike {
+  readonly protocol?: string;
   readonly ready: Promise<void>;
   readonly closed?: { catch?: (fn: (reason: unknown) => void) => unknown };
   close(info?: { closeCode?: number; reason?: string }): void;
@@ -118,9 +119,9 @@ export async function probeTransport(url: string, options?: ProbeOptions): Promi
   } catch (err) {
     // An abort must never be misread as a protocol-negotiation failure.
     if (signal?.aborted) throw signal.reason;
-    if (!offersProtocols) throw err;
-    // Strict-UA fallback (mirrors the shared factory): MOQT negotiates its
-    // version in-band via CLIENT_SETUP, so retry once without offering.
+    if (!offersProtocols || options?.draftVersion === 22) throw err;
+    // Older-draft compatibility retry, matching the shared factory. Draft 22
+    // requires WT protocol negotiation (6.2.1), so never retry it bare.
     try {
       transport = await attempt(url, options, false);
     } catch (retryErr) {
@@ -131,6 +132,10 @@ export async function probeTransport(url: string, options?: ProbeOptions): Promi
     }
   }
 
+  if (options?.draftVersion === 22 && transport.protocol !== 'moqt-22') {
+    safeClose(transport);
+    throw new Error('WebTransport did not negotiate moqt-22 (draft-22 section 6.2.1)');
+  }
   let closed = false;
   return {
     close: () => {

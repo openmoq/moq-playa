@@ -408,9 +408,8 @@ export function decodeFetchObject(
   validateFetchFlags(flags);
 
   // Handle End of Range markers (§10.4.4.2)
-  // Only Group ID and Object ID follow the flags. Figure 28 leaves Object Payload
-  // Length unbracketed, but moxygen, LibMoQ and red5-moq-relay all end the marker
-  // after the Object ID (the LibMoQ vectors fetch_eor_*.bin), so Playa does too.
+  // Group ID and Object ID are present; Subgroup/Priority/Extensions are NOT present
+  // Object Payload Length is still present per §10.4.4 (always present in Fetch objects)
   if (isEndOfRangeFlags(flags)) {
     // Read Group ID and Object ID
     const { value: groupId, bytesRead: gidBytes } = readVarint(buf, pos);
@@ -418,6 +417,22 @@ export function decodeFetchObject(
 
     const { value: objectId, bytesRead: oidBytes } = readVarint(buf, pos);
     pos += oidBytes;
+
+    // Read Object Payload Length (should be 0 for End of Range, but must be present)
+    const { value: payloadLen, bytesRead: plBytes } = readVarint(buf, pos);
+    pos += plBytes;
+
+    // End of Range should have no payload - warn if non-zero but still consume it
+    const numPayloadLen = Number(payloadLen);
+    if (numPayloadLen > 0) {
+      // Bounds check and skip payload if present
+      if (pos + numPayloadLen > buf.length) {
+        throw new RangeError(
+          `End of Range payload length ${numPayloadLen} exceeds remaining buffer (${buf.length - pos} bytes)`,
+        );
+      }
+      pos += numPayloadLen;
+    }
 
     const endOfRange: FetchEndOfRange = {
       flags,

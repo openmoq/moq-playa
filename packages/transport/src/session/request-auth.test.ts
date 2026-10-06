@@ -15,7 +15,7 @@ const name = new Uint8Array([0x76]);
 function established(version: DraftVersion): Session {
   const session = new Session(EndpointRole.CLIENT, version);
   session.initiateSetup();
-  session.handleControlMessage(version === 18
+  session.handleControlMessage(version >= 18
     ? { type: 'SETUP', setupOptions: new Map() }
     : { type: 'SERVER_SETUP', parameters: new Map([[SetupParam.MAX_REQUEST_ID, [varint(1000n)]]]) });
   return session;
@@ -27,14 +27,16 @@ function message(result: RequestResult): ControlMessage {
   return action.message;
 }
 
-describe.each([14, 16, 18] as const)('draft %i request authorization', version => {
-  const encode = version === 18 ? encodeAuthorizationToken18 : encodeAuthorizationToken;
+describe.each([14, 16, 18, 22] as const)('draft %i request authorization', version => {
+  const encode = version >= 18 ? encodeAuthorizationToken18 : encodeAuthorizationToken;
   const tokens = [1n, 16n].map(tokenType => encode({
     aliasType: AliasType.USE_VALUE, tokenType, tokenValue: new Uint8Array([0xd2, 0x84, 0x41, 0xab]),
   }));
   const auth = { authTokens: tokens };
 
-  it.each(['subscribe', 'fetch', 'joiningFetch', 'publish', 'publishNamespace', 'subscribeNamespace', 'trackStatus'] as const)(
+  const operations = ['subscribe', 'fetch', 'publish', 'publishNamespace', 'subscribeNamespace', 'trackStatus',
+    ...(version === 22 ? [] : ['joiningFetch'] as const)] as const;
+  it.each(operations)(
     'preserves repeated tokens on %s through the wire codec', operation => {
       const session = established(version);
       let result: RequestResult;

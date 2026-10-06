@@ -9,8 +9,7 @@
 import { MoqtConnection } from '../adapter.js';
 import { createLoopback, type LoopbackTransport, type PipeFaults } from './loopback.js';
 import type { WebTransportLike } from '../types.js';
-import { varint, type DraftVersion, type SetupOptions } from '@openmoq/transport';
-import { isRequestStreamDraft } from '@openmoq/transport';
+import { varint, isRequestStreamDraft, type DraftVersion, type SetupOptions } from '@openmoq/transport';
 
 /** Build a single-field Track Namespace tuple from a string. */
 export const ns = (s: string): Uint8Array[] => [new TextEncoder().encode(s)];

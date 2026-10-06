@@ -22,6 +22,8 @@ import { varint, writeVarint, varintEncodingLength, readVarint } from '../primit
 import { readLocation } from '../primitives/location.js';
 import { readVi64, writeVi64, vi64EncodingLength, MAX_VI64 } from '../primitives/vi64.js';
 import { isDraft22, isRequestStreamDraft } from '../versions.js';
+import { encodeMessageParams18, DRAFT22_MESSAGE_PARAM_REGISTRY, type MessageParamValue } from './message-params-18.js';
+import type { GroupOrder } from '../data/types.js';
 
 /**
  * Subscription filter — controls which objects pass through a subscription.
@@ -222,19 +224,20 @@ function filterFromTypedLocationFilter(bytes: Uint8Array): SubscriptionFilter {
 }
 
 /**
- * The FILL_PARAMETERS value (§9.20.15) for a fill over `filter`: a bare
- * parameter sequence (no count, bounded by the Length) holding its typed
- * LOCATION_FILTER, which has no Length of its own (§9.20.9). With no filter the
- * value is empty, a fill of the whole track.
+ * The FILL_PARAMETERS value (draft-22 §9.20.15) for a fill over `filter`: a bare
+ * parameter sequence (no count, bounded by the Length) holding its
+ * LOCATION_FILTER. An omitted filter inherits the subscription's filter.
  */
-export function encodeFillParameters(filter?: SubscriptionFilter): Uint8Array {
-  if (filter === undefined) return new Uint8Array(0);
-  const value = encodeTypedLocationFilter(filter);
-  const type = 0x21n; // LOCATION_FILTER; the first Type delta is from 0
-  const buf = new Uint8Array(vi64EncodingLength(type) + value.length);
-  const offset = writeVi64(type, buf, 0);
-  buf.set(value, offset);
-  return buf;
+export function encodeFillParameters(filter?: SubscriptionFilter, groupOrder?: GroupOrder): Uint8Array {
+  const params = new Map<bigint, MessageParamValue[]>();
+  if (filter !== undefined) params.set(0x21n, [{ kind: 'locationFilter', value: encodeTypedLocationFilter(filter) }]);
+  if (groupOrder !== undefined) {
+    if (groupOrder !== 'ascending' && groupOrder !== 'descending') throw new RangeError('Invalid fill Group Order');
+    params.set(0x22n, [{ kind: 'uint8', value: groupOrder === 'descending' ? 2 : 1 }]);
+  }
+  const block = encodeMessageParams18(params, DRAFT22_MESSAGE_PARAM_REGISTRY);
+  // The enclosing FILL_PARAMETERS length replaces the message parameter count.
+  return block.slice(vi64EncodingLength(BigInt(params.size)));
 }
 
 /**
@@ -527,14 +530,14 @@ export function subscriptionWindow(
     case undefined:
       return { start: origin };
     case 'NextGroupStart':
-      return { start: largest ? { group: largest.group + 1n, object: 0n } : origin };
+      return { start: largest ? { group: largest.group < MAX_VI64 ? largest.group + 1n : MAX_VI64, object: 0n } : origin };
     case 'LargestObject':
     case 'LatestObject':
       return { start: largest ? { group: largest.group, object: largest.object + 1n } : origin };
     case 'RelativeStart': {
       if (!largest) return { start: origin };
       const group = largest.group + 1n - filter.groups;
-      return { start: { group: group > 0n ? group : 0n, object: 0n } };
+      return { start: { group: group < 0n ? 0n : group > MAX_VI64 ? MAX_VI64 : group, object: 0n } };
     }
     case 'AbsoluteStart':
       return { start: { group: filter.startGroup, object: filter.startObject } };

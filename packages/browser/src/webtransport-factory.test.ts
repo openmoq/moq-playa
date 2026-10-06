@@ -182,6 +182,30 @@ describe('createWebTransport', () => {
 // offering before giving up.
 
 describe('createWebTransport protocol fallback', () => {
+  it('does not retry draft 22 without its protocol offer', async () => {
+    stubWebTransport({ rejectWithProtocols: true });
+    await expect(createWebTransport({ draftVersion: 22 })('https://r:4433')).rejects.toThrow();
+    expect(constructed).toHaveLength(1);
+    expect(constructed[0]!.options.protocols).toEqual(['moqt-22']);
+  });
+
+  it('accepts a negotiated draft-22 session', async () => {
+    stubWebTransport({});
+    expect((await createWebTransport({ draftVersion: 22 })('https://r:4433')).protocol).toBe('moqt-22');
+    expect(constructed).toHaveLength(1);
+  });
+
+  it.each([undefined, '', 'moqt-18'])('closes a ready transport that selected %s instead of moqt-22', async (protocol) => {
+    const close = vi.fn();
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      closed = Promise.resolve();
+      protocol = protocol;
+      close = close;
+    });
+    await expect(createWebTransport({ draftVersion: 22 })('https://r:4433')).rejects.toThrow(/moqt-22/);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
   interface Constructed { options: any; closedCatches: number; }
   let constructed: Constructed[];
 

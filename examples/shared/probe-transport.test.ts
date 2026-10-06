@@ -121,6 +121,31 @@ describe('probeTransport option building', () => {
 // ─── No-protocols fallback (strict-UA mirror) ───────────────────────
 
 describe('probeTransport protocol fallback', () => {
+  it('does not retry draft 22 without its protocol offer', async () => {
+    rejectWithProtocols = true;
+    await expect(probeTransport('https://r:4433/moq', { draftVersion: 22 })).rejects.toThrow();
+    expect(constructed).toHaveLength(1);
+    expect(constructed[0]!.options.protocols).toEqual(['moqt-22']);
+  });
+
+  it.each([undefined, '', 'moqt-18', 'moqt-22'])('requires negotiated draft 22, got %s', async (protocol) => {
+    const close = vi.fn();
+    vi.stubGlobal('WebTransport', class {
+      ready = Promise.resolve();
+      closed = Promise.resolve();
+      protocol = protocol;
+      close = close;
+    });
+    const result = probeTransport('https://r:4433/moq', { draftVersion: 22 });
+    if (protocol === 'moqt-22') {
+      const session = await result;
+      expect(close).not.toHaveBeenCalled();
+      session.close();
+    } else {
+      await expect(result).rejects.toThrow(/moqt-22/);
+    }
+    expect(close).toHaveBeenCalledTimes(1);
+  });
   it('retries exactly once without protocols when the offered attempt fails', async () => {
     rejectWithProtocols = true;
     const session = await probeTransport('https://r:4433/moq', { draftVersion: 16 });

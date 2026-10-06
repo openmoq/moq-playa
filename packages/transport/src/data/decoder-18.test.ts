@@ -484,11 +484,9 @@ describe('decodeFetchObject18 — invalid flags', () => {
 describe('decodeFetchObject18 — tightenings', () => {
   const prior: FetchObjectPrior18 = { groupId: 10n, objectId: 5n, lastObjectSubgroupId: 4n, lastObjectPriority: 3 };
 
-  it('an End-of-Range marker ends after its Object ID (no Payload Length)', () => {
-    const buf = pack(0x8cn, 1n, 2n, 0x00n /* next object's flags */);
-    const { item, bytesRead } = decodeFetchObject18(buf, 0, undefined, true, 'ascending');
-    expect(item).toMatchObject({ groupId: 1n, objectId: 2n, nonExistent: true });
-    expect(bytesRead).toBe(buf.length - 1); // flags 0x8C is a 2-byte vi64
+  it('rejects an End-of-Range marker with a non-zero payload length', () => {
+    const buf = pack(0x8cn, 1n, 2n, 1n /*payloadLen*/, raw(0xff));
+    expect(() => decodeFetchObject18(buf, 0, undefined, true, 'ascending')).toThrow(/non-zero payload/i);
   });
 
   it('PRIOR_PLUS_ONE subgroup overflow above 2^64-1 is a PROTOCOL_VIOLATION', () => {

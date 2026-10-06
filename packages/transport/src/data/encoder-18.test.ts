@@ -84,6 +84,20 @@ describe('encodeObjectDatagram18 ↔ decodeObjectDatagram18', () => {
 });
 
 import { encodeFetchHeader18, encodeFetchObject18, encodeFetchEndOfRange18 } from './encoder-18.js';
+
+describe('End-of-Range draft isolation', () => {
+  it.each([18, 22] as const)('pins the draft-%s marker bytes', (draft) => {
+    const expected = draft === 18 ? [0x80, 0x8c, 5, 10, 0] : [0x80, 0x8c, 5, 10];
+    const { bytes } = encodeFetchEndOfRange18(true, 5n, 10n, undefined, draft);
+    expect(bytes).toEqual(new Uint8Array(expected));
+    const wire = new Uint8Array([...expected, 0x1c, 1, 0, 7, 1, 0xa3]);
+    const first = decodeFetchObject18(wire, 0, undefined, true, 'ascending', draft);
+    expect(first.bytesRead).toBe(expected.length);
+    const next = decodeFetchObject18(wire, first.bytesRead, first.nextPrior, false, 'ascending', draft);
+    expect(next.item).toMatchObject({ groupId: 7n, objectId: 0n, payload: new Uint8Array([0xa3]) });
+    expect(first.bytesRead + next.bytesRead).toBe(wire.length);
+  });
+});
 import { decodeFetchHeader18, decodeFetchObject18, type FetchObjectPrior18 } from './decoder-18.js';
 import type { FetchObject, FetchEndOfRange } from './types.js';
 

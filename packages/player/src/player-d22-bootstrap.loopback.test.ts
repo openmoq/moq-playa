@@ -38,7 +38,7 @@ interface ServerState {
     mediaSubs: Array<{ reqId: bigint; name: string; fill: boolean }>;
 }
 
-function wireServer(server: MoqtConnection, opts?: { resetFill?: boolean; empty?: boolean }): ServerState {
+function wireServer(server: MoqtConnection, opts?: { resetFill?: boolean; empty?: boolean; version?: 1 | 'draft-01' }): ServerState {
     const state: ServerState = { catalogAlias: 40n, catalogFill: null, fetches: 0, mediaSubs: [] };
     let nextAlias = 41n;
     server.onFetch = () => { state.fetches += 1; };
@@ -62,7 +62,7 @@ function wireServer(server: MoqtConnection, opts?: { resetFill?: boolean; empty?
             });
             if (fill === undefined) return;
             const sid = await server.openFillStream(requestId);
-            await server.sendFetchObject(sid, { groupId: 5n, subgroupId: 0n, objectId: 0n, publisherPriority: 5, payload: enc(CATALOG) });
+            await server.sendFetchObject(sid, { groupId: 5n, subgroupId: 0n, objectId: 0n, publisherPriority: 5, payload: enc({ ...CATALOG, version: opts?.version ?? CATALOG.version }) });
             if (opts?.resetFill) {
                 // No public reset API for served fetch streams: abort the writer.
                 const streams = (server as unknown as { fetchOutgoingStreams: Map<bigint, { writer: WritableStreamDefaultWriter }> })
@@ -161,9 +161,9 @@ describe('d22 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
         await player.destroy();
     });
 
-    it('a reset fill fails the attempt and the fallback ladder recovers', async () => {
+    it.each([1, 'draft-01'] as const)('a reset fill discards its prefix; version %s follows its fallback policy', async (version) => {
         const { client, server, errors } = await connectedPair(22);
-        const state = wireServer(server as unknown as MoqtConnection, { resetFill: true });
+        const state = wireServer(server as unknown as MoqtConnection, { resetFill: true, version });
         let catalogSubs = 0;
         const orig = server.onSubscribe!;
         server.onSubscribe = (requestId, ns, trackName, params) => {
@@ -172,15 +172,51 @@ describe('d22 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
         };
         const player = newPlayer(client);
         const received: string[][] = [];
+        const updated: string[][] = [];
+        const playerErrors: unknown[] = [];
         player.on('catalog_received', (e) => received.push(e.catalog.tracks.map((t) => t.name)));
+        player.on('catalog_updated', (e) => updated.push(e.catalog.tracks.map((t) => t.name)));
+        player.on('error', (e) => playerErrors.push(e.error));
+        let fallbackId: bigint | undefined;
+        const countFetch = server.onFetch!;
+        server.onFetch = (id, fetch) => { countFetch(id, fetch); fallbackId = id; };
 
         await player.load();
         await settle(24);
 
-        // The failed prefix is recovered by the fallback ladder; whichever rung
-        // served it, the session survives and the catalog is never half-applied.
-        expect(catalogSubs + state.fetches).toBeGreaterThan(1);
-        expect(received.every((r) => r.includes('video'))).toBe(true);
+        // The reset prefix must not apply a partial catalog. Complete the
+        // fallback FETCH independently, then prove that live delivery resumes.
+        expect(catalogSubs).toBe(1);
+        expect(state.fetches).toBe(1);
+        expect(received).toEqual([]);
+        expect(fallbackId).toBeDefined();
+        await server.acceptFetch(fallbackId!, { endOfTrack: 0, endLocation: { group: 5n, object: 1n } });
+        const stream = await server.openFetchStream(fallbackId!);
+        await server.sendFetchObject(stream, { groupId: 5n, subgroupId: 0n, objectId: 0n, publisherPriority: 5, payload: enc({ ...CATALOG, version }) });
+        await server.sendFetchObject(stream, { groupId: 5n, subgroupId: 0n, objectId: 1n, publisherPriority: 5, payload: enc(DELTA) });
+        await server.closeFetchStream(stream);
+        await settle(24);
+        if (version === 'draft-01') {
+            // The MSF-01 bootstrap requirement must not be bypassed by a
+            // standalone fallback merely because its bytes parse correctly.
+            expect(received).toEqual([]);
+            expect(playerErrors).toHaveLength(1);
+            expect(playerErrors[0]).toMatchObject({ message: expect.stringContaining('mandated SUBSCRIBE + Joining FETCH') });
+            expect(errors).toEqual([]);
+            await player.destroy();
+            return;
+        }
+        expect(received).toEqual([['video', 'audio']]);
+
+        const live = await server.openSubgroup(state.catalogAlias, 5n, 0n);
+        await server.sendObject(live, 2n, enc({ deltaUpdate: [{ op: 'add', tracks: [
+            { name: 'captions', packaging: 'loc', renderGroup: 1, isLive: true, role: 'caption', codec: 'wvtt' },
+        ] }] }));
+        await server.closeSubgroup(live);
+        await settle();
+        expect(updated).toEqual([['video', 'audio', 'captions']]);
+        expect(state.mediaSubs.map((m) => m.name)).toContain('video');
+        expect(playerErrors).toEqual([]);
         expect(errors).toEqual([]);
         await player.destroy();
     });

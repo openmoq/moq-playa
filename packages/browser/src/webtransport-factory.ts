@@ -110,6 +110,10 @@ export function createWebTransport(
       (transport as any).closed?.catch?.(() => {});
       const connectStart = performance.now();
       await transport.ready;
+      if (options?.draftVersion === 22 && (transport as unknown as { protocol?: string }).protocol !== 'moqt-22') {
+        transport.close();
+        throw new Error('WebTransport did not negotiate moqt-22 (draft-22 section 6.2.1)');
+      }
       return { transport, handshakeRttMs: performance.now() - connectStart };
     };
 
@@ -119,13 +123,12 @@ export function createWebTransport(
       connected = await attempt(true);
     } catch (err) {
       const detail = failureDetail(err, firstOpts.protocols);
-      if (!firstOpts.protocols) {
+      if (!firstOpts.protocols || options?.draftVersion === 22) {
         throw new Error(`WebTransport connection failed: ${detail}`);
       }
-      // Strict UAs (Safari 26) fail the session when WT-Available-Protocols
-      // negotiation does not complete. MOQT does not require it — the
-      // CLIENT_SETUP version list (§9.3) negotiates in-band — so retry
-      // once without offering before giving up.
+      // Preserve the older-draft compatibility retry for deployed endpoints
+      // without WT subprotocol negotiation. Draft 22 requires negotiation and
+      // cannot use this fallback; SETUP does not carry a version list.
       //
       // In auto mode, the fallback has no transport.protocol, so the adapter
       // uses its default draft unless the caller passed draftVersion

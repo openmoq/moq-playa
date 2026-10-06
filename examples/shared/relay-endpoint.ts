@@ -75,7 +75,7 @@ export function createRelayEndpointResolver(deps: RelayEndpointDeps): RelayEndpo
     const params = new URLSearchParams(deps.location.search);
     const hashHex = params.get('hash');
     const v = params.get('v');
-    const draftVersion = v === '14' ? 14 : v === '16' ? 16 : v === '18' ? 18 : undefined;
+    const draftVersion = v === '14' ? 14 : v === '16' ? 16 : v === '18' ? 18 : v === '22' ? 22 : undefined;
     return {
       ...(hashHex ? { certHash: parseCertHashHex(hashHex) } : {}),
       ...(draftVersion ? { draftVersion } : {}),

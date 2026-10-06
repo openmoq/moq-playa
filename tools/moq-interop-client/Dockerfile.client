@@ -95,11 +95,13 @@ RUN node dist-test/test/teardown.test.js \
       >/dev/null 2>&1 \
  && node --experimental-quic --no-warnings /local/packages/quic/test/native-smoke.mjs \
       /tmp/native-quic-smoke/key.pem /tmp/native-quic-smoke/cert.pem \
+ && node --experimental-quic --no-warnings /local/packages/quic/test/native-smoke.mjs \
+      /tmp/native-quic-smoke/key.pem /tmp/native-quic-smoke/cert.pem 22 \
  && touch /app/.tests-passed
 
 FROM node-quic
 LABEL org.opencontainers.image.source="https://github.com/openmoq/moq-playa"
-LABEL org.opencontainers.image.description="moq-playa MoQT interop test client (draft-18)"
+LABEL org.opencontainers.image.description="moq-playa MoQT interop test client (drafts 16, 18, 22)"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 WORKDIR /app
 COPY --from=builder /app/node_modules ./node_modules

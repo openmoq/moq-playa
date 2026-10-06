@@ -20,9 +20,10 @@ import { readLocation } from '../primitives/location.js';
  *  closed (kept local: the sans-I/O session imports no wire modules). */
 const MAX_VI64 = 18446744073709551615n;
 import {
-  encodeFillParameters, encodeSubscriptionFilter, validateSubscriptionFilter, decodeSubscriptionFilter, type SubscriptionFilter,
+  encodeFillParameters, encodeSubscriptionFilter, validateSubscriptionFilter, decodeSubscriptionFilter, subscriptionWindow, type SubscriptionFilter,
 } from '../control/subscription-filter.js';
 import { resolveJoiningFetchRange } from './joining.js';
+import { decodeFillParameters, resolveFillWindow, type FillOptions } from '../control/fill-parameters.js';
 import { validateTrackNamespace, validateTrackNamespacePrefix, validateFullTrackName, isReservedSessionNamespace, isReservedDotNamespace } from '../primitives/bytes.js';
 import { SessionError as SessionErrorCode, RequestError as RequestErrorCode } from '../errors.js';
 import type {
@@ -228,7 +229,8 @@ const KNOWN_MESSAGE_PARAMS_22 = new Set<bigint>([
  * table plus PUBLISH_STATE_NOTIFY; PUBLISH_OK carries only EXPIRES (the
  * subscription parameters moved to PUBLISH and REQUEST_UPDATE), 0x21 is the
  * LOCATION_FILTER, which FETCH and PUBLISH_STATE_NOTIFY also carry, and FETCH
- * gains GROUP_ORDER and SUBSCRIBER_PRIORITY. Matches red5-moq-relay's matrix.
+ * gains GROUP_ORDER and SUBSCRIBER_PRIORITY. SUBSCRIBE_TRACKS inherits the
+ * SUBSCRIBE parameter scope under 9.18.1.
  */
 const VALID_PARAMS_FOR_MESSAGE_TYPE_22: Map<bigint, Set<string>> = new Map([
   [MessageParam.OBJECT_DELIVERY_TIMEOUT as bigint, new Set(['SUBSCRIBE', 'PUBLISH', 'REQUEST_UPDATE', 'SUBSCRIBE_TRACKS'])],
@@ -238,7 +240,8 @@ const VALID_PARAMS_FOR_MESSAGE_TYPE_22: Map<bigint, Set<string>> = new Map([
   ])],
   [MessageParam.RENDEZVOUS_TIMEOUT as bigint, new Set(['SUBSCRIBE', 'SUBSCRIBE_TRACKS'])],
   [MessageParam.SUBGROUP_DELIVERY_TIMEOUT as bigint, new Set(['SUBSCRIBE', 'PUBLISH', 'REQUEST_UPDATE', 'SUBSCRIBE_TRACKS'])],
-  [MessageParam.EXPIRES as bigint, new Set(['SUBSCRIBE_OK', 'PUBLISH', 'PUBLISH_OK', 'REQUEST_UPDATE_OK'])],
+  [MessageParam.EXPIRES as bigint, new Set(['SUBSCRIBE_OK', 'PUBLISH', 'PUBLISH_OK', 'REQUEST_UPDATE_OK',
+    'SUBSCRIBE_NAMESPACE_OK', 'SUBSCRIBE_TRACKS_OK', 'PUBLISH_NAMESPACE_OK'])],
   [MessageParam.LARGEST_OBJECT as bigint, new Set([
     'SUBSCRIBE_OK', 'PUBLISH', 'REQUEST_UPDATE_OK', 'TRACK_STATUS_OK', 'PUBLISH_STATE_NOTIFY',
   ])],
@@ -386,10 +389,10 @@ export interface SubscribeOptions extends AuthorizationOptions {
    * a fill fetch stream whose FETCH_HEADER carries this SUBSCRIBE's Request ID;
    * the stream ends with a FIN when complete, or is reset when the fill fails.
    * `filter` is the fill's Location filter (e.g. `RelativeStart` 1 for the
-   * current group); without it the fill covers the whole track. This replaces
+   * current group); without it the fill inherits the subscription filter. This replaces
    * the Joining FETCH, which draft 22 removed.
    */
-  fill?: { readonly filter?: SubscriptionFilter };
+  fill?: FillOptions;
 }
 
 /**
@@ -422,7 +425,7 @@ export interface RequestUpdateOptions extends AuthorizationOptions {
    * draft-22 §3.4: FILL_PARAMETERS. The publisher opens another fill fetch stream
    * whose FETCH_HEADER carries this REQUEST_UPDATE's Request ID. Draft 22 only.
    */
-  fill?: { readonly filter?: SubscriptionFilter };
+  fill?: FillOptions;
 }
 
 /**
@@ -498,6 +501,8 @@ export interface TrackSubscriptionState {
   /** Mutable: a §10.9.2 prefix update replaces it on REQUEST_OK. */
   trackNamespacePrefix: Uint8Array[];
   state: 'pending' | 'active' | 'terminated';
+  /** draft-22 Forward State for future matching subscriptions. */
+  forward: ForwardStateValue;
   /** Tracks the publisher reported it cannot serve, via PUBLISH_BLOCKED. */
   readonly blockedTracks: Array<{ trackNamespaceSuffix: Uint8Array[]; trackName: Uint8Array }>;
 }
@@ -645,6 +650,7 @@ export class Session {
     // means the update did not carry that parameter (leave the current value).
     objectDeliveryTimeoutMs?: number;
     subgroupDeliveryTimeoutMs?: number;
+    subscriptionFilter?: Uint8Array;
   }>();
 
   /**
@@ -699,7 +705,12 @@ export class Session {
    * OUTBOUND, subscriber side) AND from {@link incomingNamespaceSubscriptions}
    * (SUBSCRIBE_NAMESPACE) so prefix-overlap checks never cross request types.
    */
-  private readonly incomingTrackSubscriptions = new Map<bigint, { trackNamespacePrefix: Uint8Array[]; state: 'pending' | 'active' }>();
+  private readonly incomingTrackSubscriptions = new Map<bigint, {
+    trackNamespacePrefix: Uint8Array[];
+    state: 'pending' | 'active';
+    forward: ForwardStateValue;
+    parameters: Parameters;
+  }>();
 
   /**
    * Auth token alias cache for tokens the peer registers with us.
@@ -728,7 +739,13 @@ export class Session {
   private _ownMaxRequestUpdates = 0n;
   private _peerMaxRequestUpdates = 0n;
   /** draft-22 fills still expected: fill Request ID → subscription Request ID. */
-  private readonly fillRequests = new Map<bigint, bigint>();
+  private readonly fillRequests = new Map<bigint, {
+    subscriptionId: bigint;
+    subscription: SubscriptionStateMachine;
+    filter: SubscriptionFilter | undefined;
+    groupOrder?: GroupOrder;
+    ready: boolean;
+  }>();
   private _goawayReceived: boolean = false;
 
   constructor(
@@ -792,10 +809,44 @@ export class Session {
     return this._peerMaxRequestUpdates;
   }
 
+  private registerFillRequest(requestId: bigint, sub: SubscriptionStateMachine, options: FillOptions, filter?: SubscriptionFilter): void {
+    const groupOrder = options.groupOrder ?? sub.requestedGroupOrder;
+    this.fillRequests.set(requestId, {
+      subscriptionId: sub.requestId, subscription: sub, ready: false,
+      filter: options.filter ?? filter,
+      ...(groupOrder === undefined ? {} : { groupOrder }),
+    });
+    sub.fillRequested = true;
+  }
+
+  private settleFillRequest(requestId: bigint, parameters: Parameters): void {
+    const fill = this.fillRequests.get(requestId);
+    if (!fill) return;
+    const filter = fill.filter ?? (fill.subscription.currentFilter === undefined
+      ? undefined : decodeSubscriptionFilter(fill.subscription.currentFilter, 22));
+    if (fill.subscription.forwardState !== ForwardState.ACTIVE
+        || resolveFillWindow(filter, this.extractLargestObjectParam(parameters) ?? undefined) === null) {
+      this.cancelFillRequest(requestId);
+      return;
+    }
+    fill.ready = true;
+  }
+
   /** The subscription a fill with this Request ID (a SUBSCRIBE's or a REQUEST_UPDATE's) belongs to, while one is expected. */
   fillSubscriptionFor(requestId: bigint): SubscriptionStateMachine | undefined {
-    const subscriptionId = this.fillRequests.get(requestId);
-    return subscriptionId === undefined ? undefined : this.subscriptions.get(subscriptionId);
+    // A clean terminal response can overtake its fill data. The I/O owner
+    // releases this context after consuming or explicitly cancelling the fill.
+    return this.fillRequests.get(requestId)?.subscription;
+  }
+
+  /** Effective order for one fill, including its per-message override. */
+  fillGroupOrderFor(requestId: bigint): GroupOrder | undefined {
+    const fill = this.fillRequests.get(requestId);
+    return fill === undefined ? undefined : fill.groupOrder ?? this.fillSubscriptionFor(requestId)?.groupOrder;
+  }
+
+  isFillResponsePending(requestId: bigint): boolean {
+    return this.fillRequests.get(requestId)?.ready === false;
   }
 
   /** Accept the fill stream for `requestId`: it stops being expected. */
@@ -807,19 +858,16 @@ export class Session {
 
   /** Stop expecting the fill for `requestId`; true when one was expected. */
   cancelFillRequest(requestId: bigint): boolean {
-    const subscriptionId = this.fillRequests.get(requestId);
-    if (subscriptionId === undefined) return false;
+    const fill = this.fillRequests.get(requestId);
+    if (fill === undefined) return false;
     this.fillRequests.delete(requestId);
-    if (subscriptionId === requestId) {
-      const sub = this.subscriptions.get(subscriptionId);
-      if (sub) sub.fillRequested = false;
-    }
+    fill.subscription.fillRequested = this.expectedFillsOf(fill.subscriptionId).length > 0;
     return true;
   }
 
   /** Request IDs of the fills still expected for subscription `subscriptionId`. */
   expectedFillsOf(subscriptionId: bigint): bigint[] {
-    return [...this.fillRequests].filter(([, sub]) => sub === subscriptionId).map(([id]) => id);
+    return [...this.fillRequests].filter(([, fill]) => fill.subscriptionId === subscriptionId).map(([id]) => id);
   }
 
   // ─── Setup Handshake ──────────────────────────────────────────────────
@@ -1470,6 +1518,15 @@ export class Session {
     }
 
     sub.handleSubscribeOk(msg.trackAlias);
+    this.settleFillRequest(msg.requestId as bigint, msg.parameters);
+    if (isDraft22(this._draftVersion)) {
+      const properties = msg.trackProperties ?? msg.trackExtensions;
+      if (properties instanceof Map) sub.publisherGroupOrder = properties.get(0x22n)?.[0] === 2n ? 'descending' : 'ascending';
+      sub.locationWindow = subscriptionWindow(
+        sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, 22),
+        this.extractLargestObjectParam(msg.parameters) ?? undefined,
+      );
+    }
 
     // Register track alias - §9.10/§10.1: duplicate alias must close connection
     const trackInfo = this.subscriptionTracks.get(msg.requestId as bigint);
@@ -1516,6 +1573,7 @@ export class Session {
     const sub = this.subscriptions.get(msg.requestId as bigint);
     if (sub) {
       sub.handleRequestError(msg.errorCode, msg.errorReason);
+      for (const fillId of this.expectedFillsOf(sub.requestId)) this.cancelFillRequest(fillId);
       // §5.1: REQUEST_ERROR is terminal for the (pending) subscribe — RECLAIM the
       // full state (bounded). A second REQUEST_ERROR then takes the unknown-request
       // path below.
@@ -1750,7 +1808,21 @@ export class Session {
 
       // Apply the update to the subscription (outgoing or, for a draft-18
       // PUBLISH-initiated subscription, the incoming one).
+      if (pending.subscriptionFilter !== undefined) {
+        const sub = this.subscriptions.get(pending.existingRequestId) ?? this.incomingSubscriptions.get(pending.existingRequestId);
+        if (sub && sub.state !== SubscriptionState.TERMINATED) {
+          sub.currentFilter = pending.subscriptionFilter;
+          sub.locationWindow = subscriptionWindow(
+            decodeSubscriptionFilter(pending.subscriptionFilter, 22),
+            this.extractLargestObjectParam(msg.parameters) ?? undefined,
+          );
+        }
+      }
       if (pending.forward !== undefined) {
+        if (pending.prefixTarget === 'tracks') {
+          const tracks = this.trackSubscriptions.get(pending.existingRequestId);
+          if (tracks?.state === 'active') tracks.forward = pending.forward;
+        }
         const sub = this.subscriptions.get(pending.existingRequestId)
           ?? this.incomingSubscriptions.get(pending.existingRequestId);
         if (sub) {
@@ -1765,6 +1837,9 @@ export class Session {
           // terminated: settle without applying.
         }
       }
+      // Earlier FIFO responses can change the inherited filter and Forward
+      // state. Decide whether this fill exists only after committing this ack.
+      this.settleFillRequest(msg.requestId as bigint, msg.parameters);
 
       // §8: COMMIT the staged delivery timeouts now that the update is confirmed
       // (never at send — see requestUpdate). Omitted parameters leave the current
@@ -1844,6 +1919,9 @@ export class Session {
    * delivery-timeout parameters apply only when present.
    */
   private applyPublishAcceptanceParams(sub: SubscriptionStateMachine, parameters: Parameters | undefined): void {
+    // Draft 22 PUBLISH_OK carries only EXPIRES; subscription parameters remain
+    // those sent in PUBLISH until an accepted REQUEST_UPDATE changes them.
+    if (isDraft22(this._draftVersion)) return;
     const fwd = parameters?.get(MessageParam.FORWARD)?.[0];
     // FORWARD omitted from an acceptance defaults to 1. Only omission from a
     // REQUEST_UPDATE preserves the existing state (§9.2.2.8 / d18 §10.2.12).
@@ -1888,11 +1966,13 @@ export class Session {
   private handlePublishStateNotify(msg: PublishStateNotify): SessionOutboundAction[] {
     if (!isDraft22(this._draftVersion)) return this.handleUnsupportedControlMessage(msg);
     const requestId = msg.requestId;
-    const sub = requestId !== undefined ? this.subscriptions.get(requestId) : undefined;
+    const incoming = requestId !== undefined ? this.incomingSubscriptions.get(requestId) : undefined;
+    const sub = requestId !== undefined
+      ? this.subscriptions.get(requestId) ?? (incoming?.isPublishInitiated ? incoming : undefined) : undefined;
     if (sub === undefined) return [];
     const largest = msg.parameters.get(MessageParam.LARGEST_OBJECT)?.[0];
     if (largest !== undefined && typeof largest === 'object' && 'group' in largest) {
-      sub.updateLargestLocation(varint(largest.group), varint(largest.object));
+      sub.updateLargestLocation(largest.group, largest.object);
     }
     return [];
   }
@@ -1998,6 +2078,9 @@ export class Session {
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
 
+    const filterError = this.rejectUnsupportedRangeFilters(msg.requestId, msg.parameters);
+    if (filterError) return filterError;
+
     // §3.2: reserved `.`/`.session` namespace → REQUEST_ERROR DOES_NOT_EXIST.
     const reserved = this.rejectReservedNamespace(msg.trackNamespace, msg.requestId, validated.replenish);
     if (reserved) return reserved;
@@ -2037,6 +2120,7 @@ export class Session {
     const filterValues = msg.parameters.get(MessageParam.SUBSCRIPTION_FILTER);
     const filterBytes = filterValues?.[0];
     if (filterBytes instanceof Uint8Array) {
+      sub.currentFilter = filterBytes;
       try {
         sub.setRemoteFilterType(decodeSubscriptionFilter(filterBytes, this._draftVersion).type);
       } catch { /* malformed — leave unfiltered */ }
@@ -2049,6 +2133,8 @@ export class Session {
     if (typeof forwardVal === 'bigint') {
       sub.setInitialForwardState(forwardVal === 0n ? ForwardState.PAUSED : ForwardState.ACTIVE);
     }
+    const order = msg.parameters.get(MessageParam.GROUP_ORDER)?.[0];
+    if (order !== undefined) sub.requestedGroupOrder = order === 2n ? 'descending' : 'ascending';
 
     this.incomingSubscriptions.set(msg.requestId as bigint, sub);
 
@@ -2087,6 +2173,9 @@ export class Session {
     const publishForward = msg.parameters.get(MessageParam.FORWARD)?.[0];
     if (typeof publishForward === 'bigint') {
       sub.setInitialForwardState(publishForward === 0n ? ForwardState.PAUSED : ForwardState.ACTIVE);
+    }
+    if (isDraft22(this._draftVersion)) {
+      this.initializePublishPolicy22(sub, msg.parameters, msg.trackProperties);
     }
 
     // §5.1: an endpoint may hold at most ONE subscription per Track per ROLE
@@ -2172,6 +2261,32 @@ export class Session {
     return undefined;
   }
 
+  private assertPublisherAliasAvailable(alias: bigint, namespace: Uint8Array[], name: Uint8Array): void {
+    if (!isDraft22(this._draftVersion)) return;
+    for (const requests of [this.incomingSubscriptions, this.outgoingPublishes]) {
+      for (const sub of requests.values()) {
+        if (!sub.isPublisher || sub.isTerminated || sub.trackAlias !== alias) continue;
+        const sameTrack = sub.trackNamespace?.length === namespace.length
+          && prefixesOverlap(sub.trackNamespace, namespace)
+          && sub.trackName?.length === name.length
+          && sub.trackName.every((byte, index) => byte === name[index]);
+        if (!sameTrack) throw new SessionError(`Track alias ${alias} already belongs to a different track`, 'INVALID_STATE');
+      }
+    }
+  }
+
+  private initializePublishPolicy22(sub: SubscriptionStateMachine, parameters: Parameters, properties: TrackProperties | undefined): void {
+    const filter = parameters.get(MessageParam.SUBSCRIPTION_FILTER)?.[0];
+    if (filter instanceof Uint8Array) sub.currentFilter = filter;
+    const order = parameters.get(MessageParam.GROUP_ORDER)?.[0];
+    if (order !== undefined) sub.requestedGroupOrder = order === 2n ? 'descending' : 'ascending';
+    sub.publisherGroupOrder = properties?.get(0x22n)?.[0] === 2n ? 'descending' : 'ascending';
+    sub.locationWindow = subscriptionWindow(
+      sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, 22),
+      this.extractLargestObjectParam(parameters) ?? undefined,
+    );
+  }
+
   /**
    * §5.1: perform a STAGED cancellation of a local SUBSCRIBE superseded by an
    * inbound PUBLISH, at the moment we accept that PUBLISH (before PUBLISH_OK). No
@@ -2211,6 +2326,7 @@ export class Session {
    */
   private terminateLocalSubscriberRequest(sub: SubscriptionStateMachine): void {
     const requestId = sub.requestId;
+    for (const fillId of this.expectedFillsOf(requestId)) this.cancelFillRequest(fillId);
     // Capture the phase BEFORE superseding: if it was already ESTABLISHED, no crossed
     // SUBSCRIBE_OK is legal (§5.1), so the shadow must start ESTABLISHED. (At cancel
     // time the SM is PENDING or ESTABLISHED — never yet TERMINATED.)
@@ -2310,6 +2426,9 @@ export class Session {
     // Validate incoming request ID and auto-replenish MAX_REQUEST_ID §9.5
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
+
+    const filterError = this.rejectUnsupportedRangeFilters(msg.requestId, msg.parameters);
+    if (filterError) return filterError;
 
     // Joining Fetch (0x2/0x3): enforce the MUSTs decidable from protocol state
     // BEFORE creating any fetch state (§9.16.2 / draft-18 §10.12.2).
@@ -2528,6 +2647,10 @@ export class Session {
     // draft-18 §10.9: a PUBLISH_NAMESPACE may be updated on its request stream.
     // We have no per-namespace mutable state to apply yet — acknowledge with
     // REQUEST_OK (or, for v14, no response). Params are accepted as-is.
+    const contextError = this.validateUpdateContext22(msg.parameters, sub ? 'SUBSCRIBE' : fetch ? 'FETCH' : 'PUBLISH_NAMESPACE');
+    if (contextError) return contextError;
+    const filterError = this.rejectUnsupportedRangeFilters(msg.requestId, msg.parameters);
+    if (filterError) return filterError;
     if (pubNs && !sub && !fetch) {
       if (this._draftVersion === 14) return validated.replenish ?? [];
       const requestOk: RequestOk = { type: 'REQUEST_OK', requestId: msg.requestId, parameters: new Map() };
@@ -2606,7 +2729,7 @@ export class Session {
       && prevForwardState === ForwardState.PAUSED
       && forwardValues !== undefined && forwardValues.length > 0
       && typeof forwardValues[0] === 'bigint' && forwardValues[0] !== 0n;
-    if (wantsResume) {
+    if (wantsResume || (isDraft22(this._draftVersion) && isSubscriptionScope)) {
       // d18 §10.11: "PUBLISH_DONE ... UPDATE_FAILED": an unsuccessful
       // subscription update terminates the subscription. The SESSION emits
       // only the REQUEST_ERROR here — the I/O layer owns the termination
@@ -2615,7 +2738,7 @@ export class Session {
       // stream, none of which bare Session actions can do). The adapter
       // detects the REQUEST_ERROR update response and runs its publishDone.
       const failClosed = (why: string): SessionOutboundAction[] => {
-        const reason = `cannot resume subscription ${msg.existingRequestId}: ${why} (§5.1 requires the REQUEST_UPDATE_OK to carry the current Largest Location)`;
+        const reason = `cannot update subscription ${msg.existingRequestId}: ${why} (REQUEST_UPDATE_OK requires the current Largest Location)`;
         return [this.sendControl({
           type: 'REQUEST_ERROR',
           requestId: msg.requestId,
@@ -2663,9 +2786,16 @@ export class Session {
     // Omitted ⇒ unchanged (per the same section).
     const updatedFilter = msg.parameters.get(MessageParam.SUBSCRIPTION_FILTER)?.[0];
     if (updatedFilter instanceof Uint8Array && sub) {
+      sub.currentFilter = updatedFilter;
       try {
         sub.setRemoteFilterType(decodeSubscriptionFilter(updatedFilter, this._draftVersion).type);
       } catch { /* malformed bytes were already rejected by parameter validation */ }
+    }
+    if (isDraft22(this._draftVersion) && isSubscriptionScope && sub && updatedFilter instanceof Uint8Array) {
+      sub.locationWindow = subscriptionWindow(
+        sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, 22),
+        resumeLocation ?? undefined,
+      );
     }
 
     // §8: OBJECT/SUBGROUP_DELIVERY_TIMEOUT MAY appear in REQUEST_UPDATE — the receiver
@@ -2729,11 +2859,19 @@ export class Session {
       );
     }
 
+    const contextError = this.validateUpdateContext22(msg.parameters, incNs ? 'SUBSCRIBE_NAMESPACE' : 'SUBSCRIBE_TRACKS');
+    if (contextError) return contextError;
+    const filterError = this.rejectUnsupportedRangeFilters(msg.requestId, msg.parameters);
+    if (filterError) return filterError;
+
     // §10.9: a parameter absent from REQUEST_UPDATE leaves its value unchanged.
-    // No TRACK_NAMESPACE_PREFIX → nothing to change; acknowledge.
+    // Forward on SUBSCRIBE_TRACKS changes future subscriptions only (§9.20.18).
+    const forward = isDraft22(this._draftVersion) && incTracks
+      ? msg.parameters.get(MessageParam.FORWARD)?.[0] : undefined;
     const prefixVals = msg.parameters.get(MessageParam.TRACK_NAMESPACE_PREFIX as bigint);
     const newPrefix = prefixVals && prefixVals.length > 0 ? prefixVals[prefixVals.length - 1] : undefined;
     if (newPrefix === undefined) {
+      if (incTracks && typeof forward === 'bigint') incTracks.forward = Number(forward) as ForwardStateValue;
       const ok: RequestOk = { type: 'REQUEST_OK', requestId: msg.requestId, parameters: new Map() };
       return [this.sendControl(ok), ...(replenish ?? [])];
     }
@@ -2770,6 +2908,7 @@ export class Session {
         }
       }
       incTracks.trackNamespacePrefix = newPrefix;
+      if (typeof forward === 'bigint') incTracks.forward = Number(forward) as ForwardStateValue;
     }
 
     const ok: RequestOk = { type: 'REQUEST_OK', requestId: msg.requestId, parameters: new Map() };
@@ -2858,6 +2997,14 @@ export class Session {
     }
 
     const requestedForward = this.normalizeLocalForwardState(options.forward, 'SUBSCRIBE');
+    if (options.fill !== undefined && !isDraft22(this._draftVersion)) {
+      throw new RangeError(`FILL_PARAMETERS needs draft 22; this session speaks draft ${this._draftVersion}`);
+    }
+    // Encode before allocating: bad local options must not leave a pending request.
+    const filterBytes = options.subscriptionFilter === undefined
+      ? undefined : encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
+    const fillBytes = options.fill === undefined
+      ? undefined : encodeFillParameters(options.fill.filter, options.fill.groupOrder);
     const parameters = authorizationParameters(options);
 
     const requestId = this.requestIdAllocator.allocate();
@@ -2881,6 +3028,7 @@ export class Session {
     }
     if (options.groupOrder !== undefined) {
       parameters.set(MessageParam.GROUP_ORDER, [options.groupOrder]);
+      sub.requestedGroupOrder = options.groupOrder === 2n ? 'descending' : 'ascending';
     }
     if (requestedForward !== undefined) {
       // §9.2.2.8: FORWARD MAY appear in SUBSCRIBE — initial forward state.
@@ -2888,19 +3036,16 @@ export class Session {
       parameters.set(MessageParam.FORWARD, [varint(BigInt(requestedForward))]);
       sub.setInitialForwardState(requestedForward);
     }
-    if (options.subscriptionFilter !== undefined) {
-      const filterBytes = encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
+    if (filterBytes !== undefined) {
       parameters.set(MessageParam.SUBSCRIPTION_FILTER, [filterBytes]);
       // Store for draft-14 SUBSCRIBE_UPDATE replay
       sub.currentFilter = filterBytes;
     }
-    if (options.fill !== undefined) {
-      if (!isDraft22(this._draftVersion)) {
-        throw new RangeError(`FILL_PARAMETERS needs draft 22; this session speaks draft ${this._draftVersion}`);
+    if (fillBytes !== undefined) {
+      parameters.set(FILL_PARAMETERS, [fillBytes]);
+      if (sub.forwardState === ForwardState.ACTIVE) {
+        this.registerFillRequest(requestId, sub, options.fill!, options.subscriptionFilter);
       }
-      parameters.set(FILL_PARAMETERS, [encodeFillParameters(options.fill.filter)]);
-      sub.fillRequested = true;
-      this.fillRequests.set(requestId as bigint, requestId as bigint);
     }
 
     const subscribeMsg: Subscribe = {
@@ -2940,7 +3085,12 @@ export class Session {
     namespace: Uint8Array[],
     name: Uint8Array,
     trackAlias: bigint,
-    options: AuthorizationOptions & { parameters?: Parameters; trackProperties?: TrackProperties } = {},
+    options: AuthorizationOptions & {
+      parameters?: Parameters;
+      trackProperties?: TrackProperties;
+      /** draft-22: the accepted SUBSCRIBE_TRACKS that caused this PUBLISH. */
+      subscribeTracksRequestId?: bigint;
+    } = {},
   ): RequestResult {
     this.assertEstablishedOrDraining('publish');
     this.assertNotReservedNamespace(namespace, 'publish');
@@ -2958,6 +3108,32 @@ export class Session {
     // PUBLISH and leave a locally-authorized subscription behind if encoding
     // later rejected it.
     this.assertLocalForwardParameter(options.parameters, 'PUBLISH');
+    if (options.subscribeTracksRequestId !== undefined) {
+      const tracks = this.incomingTrackSubscriptions.get(options.subscribeTracksRequestId);
+      if (!isDraft22(this._draftVersion) || tracks?.state !== 'active'
+          || tracks.trackNamespacePrefix.length > namespace.length
+          || !prefixesOverlap(tracks.trackNamespacePrefix, namespace)) {
+        throw new SessionError('PUBLISH requires an active matching draft-22 SUBSCRIBE_TRACKS', 'INVALID_STATE');
+      }
+      // Inherit only when the caller identifies this as a resulting PUBLISH.
+      // Independent publications retain publisher authority (§9.8 / §9.18.1).
+      const parameters = new Map(options.parameters);
+      // Delivery settings become the resulting subscription's initial policy
+      // (22 sections 3.6.2 and 9.8). Authorization belongs to the sender and
+      // MUST NOT be copied (9.20.2); filters not valid on PUBLISH stay local.
+      for (const key of [MessageParam.GROUP_ORDER, MessageParam.SUBSCRIBER_PRIORITY,
+        MessageParam.SUBSCRIPTION_FILTER, MessageParam.OBJECT_DELIVERY_TIMEOUT, MessageParam.SUBGROUP_DELIVERY_TIMEOUT]) {
+        const values = tracks.parameters.get(key);
+        if (values !== undefined) parameters.set(key, values);
+      }
+      parameters.set(MessageParam.FORWARD, [varint(BigInt(tracks.forward))]);
+      options = { ...options, parameters };
+    }
+    this.assertPublisherAliasAvailable(trackAlias, namespace, name);
+    if (isDraft22(this._draftVersion)) {
+      const error = this.validateMessageParams(options.parameters ?? new Map(), 'PUBLISH');
+      if (error) throw new SessionError(error.reason, 'INVALID_STATE');
+    }
 
     const trackProperties = this.resolveTrackProperties(options.trackProperties, 'PUBLISH');
     const parameters = authorizationParameters(options, options.parameters);
@@ -2971,6 +3147,7 @@ export class Session {
     // Location, exactly as with SUBSCRIBE_OK.
     const communicated = this.extractLargestObjectParam(options.parameters);
     if (communicated) this.incomingJoiningLocations.set(requestId as bigint, communicated);
+    if (isDraft22(this._draftVersion)) this.initializePublishPolicy22(sub, options.parameters ?? new Map(), trackProperties);
     // The PUBLISH's FORWARD parameter sets the subscription's initial Forward
     // State (§10.10) — the d18 joining-fetch gate consults it at establish.
     const initialForward = options.parameters?.get(MessageParam.FORWARD)?.[0];
@@ -3058,6 +3235,23 @@ export class Session {
     this.fillRequests.delete(requestId as bigint);
   }
 
+  private validateUpdateContext22(params: Parameters, requestType: string): SessionOutboundAction[] | undefined {
+    if (!isDraft22(this._draftVersion)) return undefined;
+    for (const key of params.keys()) {
+      const scopes = VALID_PARAMS_FOR_MESSAGE_TYPE_22.get(key);
+      if (!scopes) continue;
+      const prefixUpdate = key === MessageParam.TRACK_NAMESPACE_PREFIX
+        && (requestType === 'SUBSCRIBE_NAMESPACE' || requestType === 'SUBSCRIBE_TRACKS');
+      const subscriptionOnly = key === FILL_PARAMETERS || key === MessageParam.SUBSCRIPTION_FILTER
+        || (key >= 0x25n && key <= 0x28n);
+      if (!prefixUpdate && (!scopes.has(requestType) || (requestType === 'FETCH' && subscriptionOnly))) {
+        return this.closeWithError(SessionErrorCode.PROTOCOL_VIOLATION,
+          `Parameter 0x${key.toString(16)} is out of scope for REQUEST_UPDATE on ${requestType} (9.20)`);
+      }
+    }
+    return undefined;
+  }
+
   /**
    * Send a REQUEST_UPDATE to modify an existing subscription.
    * The forward state is not updated locally until REQUEST_OK is received.
@@ -3124,6 +3318,13 @@ export class Session {
       );
     }
 
+    const filterBytes = options.subscriptionFilter === undefined ? undefined
+      : encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
+    const fillBytes = options.fill === undefined ? undefined
+      : encodeFillParameters(options.fill.filter, options.fill.groupOrder);
+    if (options.subgroupDeliveryTimeout !== undefined && !isRequestStreamDraft(this._draftVersion)) {
+      throw new SessionError('subgroupDeliveryTimeout (SUBGROUP_DELIVERY_TIMEOUT, 0x06) is draft-18 only', 'INVALID_STATE');
+    }
     const requestId = this.requestIdAllocator.allocate();
 
     // Build parameters
@@ -3148,26 +3349,16 @@ export class Session {
     }
 
     // §9.2.2.5: SUBSCRIPTION_FILTER MAY appear in REQUEST_UPDATE
-    if (options.subscriptionFilter !== undefined) {
-      const filterBytes = encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
+    if (filterBytes !== undefined) {
       parameters.set(MessageParam.SUBSCRIPTION_FILTER, [filterBytes]);
       // Update stored filter for future draft-14 replays
-      sub.currentFilter = filterBytes;
+      if (!isDraft22(this._draftVersion)) sub.currentFilter = filterBytes;
     } else if (this._draftVersion === 14 && sub.currentFilter) {
       // Draft-14 §9.10: Start Location and End Group are mandatory inline fields.
       // If no new filter specified, replay the current filter to avoid widening.
       parameters.set(MessageParam.SUBSCRIPTION_FILTER, [sub.currentFilter]);
     }
 
-    // §8 / §10.2.3: SUBGROUP_DELIVERY_TIMEOUT (0x06) is a draft-18-only Message
-    // Parameter — emitting it on draft-14/16 would make a conformant peer close on
-    // the unknown parameter, so reject it locally outside draft-18.
-    if (options.subgroupDeliveryTimeout !== undefined && !isRequestStreamDraft(this._draftVersion)) {
-      throw new SessionError(
-        'subgroupDeliveryTimeout (SUBGROUP_DELIVERY_TIMEOUT, 0x06) is draft-18 only',
-        'INVALID_STATE',
-      );
-    }
     // §8: OBJECT/SUBGROUP_DELIVERY_TIMEOUT MAY appear in REQUEST_UPDATE. STAGE the new
     // values on the pending record (drafts 16/18 apply on REQUEST_OK; draft-14 inline
     // below) so a rejected update / write rollback cannot commit them prematurely. An
@@ -3178,9 +3369,9 @@ export class Session {
     if (options.subgroupDeliveryTimeout !== undefined) {
       parameters.set(MessageParam.SUBGROUP_DELIVERY_TIMEOUT, [options.subgroupDeliveryTimeout]);
     }
-    if (options.fill !== undefined) {
-      parameters.set(FILL_PARAMETERS, [encodeFillParameters(options.fill.filter)]);
-      this.fillRequests.set(requestId as bigint, existingRequestId as bigint);
+    if (fillBytes !== undefined) {
+      parameters.set(FILL_PARAMETERS, [fillBytes]);
+      this.registerFillRequest(requestId, sub, options.fill!, options.subscriptionFilter);
     }
 
     if (this._draftVersion === 14) {
@@ -3198,12 +3389,16 @@ export class Session {
       const pending: {
         existingRequestId: bigint; forward?: ForwardStateValue;
         objectDeliveryTimeoutMs?: number; subgroupDeliveryTimeoutMs?: number;
+        subscriptionFilter?: Uint8Array;
       } = { existingRequestId: existingRequestId as bigint };
       if (requestedForward !== undefined) {
         pending.forward = requestedForward;
       }
       if (options.objectDeliveryTimeout !== undefined) pending.objectDeliveryTimeoutMs = Number(options.objectDeliveryTimeout);
       if (options.subgroupDeliveryTimeout !== undefined) pending.subgroupDeliveryTimeoutMs = Number(options.subgroupDeliveryTimeout);
+      if (isDraft22(this._draftVersion) && options.subscriptionFilter !== undefined) {
+        pending.subscriptionFilter = parameters.get(MessageParam.SUBSCRIPTION_FILTER)![0] as Uint8Array;
+      }
       this.pendingUpdates.set(requestId as bigint, pending);
     }
 
@@ -3248,25 +3443,32 @@ export class Session {
     }
 
     const prefix = options.trackNamespacePrefix;
-    if (!prefix) {
+    const forward = this.normalizeLocalForwardState(options.forward, 'REQUEST_UPDATE');
+    const supportsForward = isDraft22(this._draftVersion) && trackSub !== undefined;
+    if (!prefix && !(supportsForward && forward !== undefined)) {
       throw new SessionError(
         `REQUEST_UPDATE for a ${target === 'namespace' ? 'SUBSCRIBE_NAMESPACE' : 'SUBSCRIBE_TRACKS'} requires trackNamespacePrefix`,
         'INVALID_STATE',
       );
     }
+    if (forward !== undefined && !supportsForward) {
+      throw new SessionError('FORWARD prefix updates require draft-22 SUBSCRIBE_TRACKS', 'INVALID_STATE');
+    }
     try {
-      validateTrackNamespacePrefix(prefix);
+      if (prefix) validateTrackNamespacePrefix(prefix);
     } catch (e) {
       throw new SessionError(e instanceof Error ? e.message : 'Malformed Track Namespace Prefix', 'PROTOCOL_VIOLATION');
     }
 
     const parameters = authorizationParameters(options);
-    parameters.set(MessageParam.TRACK_NAMESPACE_PREFIX, [prefix]);
+    if (prefix) parameters.set(MessageParam.TRACK_NAMESPACE_PREFIX, [prefix]);
     const requestId = this.requestIdAllocator.allocate();
+    if (forward !== undefined) parameters.set(MessageParam.FORWARD, [varint(BigInt(forward))]);
     this.pendingUpdates.set(requestId as bigint, {
       existingRequestId: existingRequestId as bigint,
-      namespacePrefix: prefix,
+      ...(prefix === undefined ? {} : { namespacePrefix: prefix }),
       prefixTarget: target,
+      ...(forward === undefined ? {} : { forward }),
     });
     const updateMsg: RequestUpdate = { type: 'REQUEST_UPDATE', requestId, existingRequestId, parameters };
     return { requestId, actions: [this.sendControl(updateMsg)] };
@@ -3591,8 +3793,18 @@ export class Session {
   /**
    * Get track info by alias.
    */
-  getTrackByAlias(alias: Varint) {
+  getTrackByAlias(alias: bigint) {
     return this.trackAliases.getByAlias(alias);
+  }
+
+  /** Live subscriber-side requests sharing one peer-assigned Track Alias. */
+  getSubscriberRequestsForAlias(alias: bigint): SubscriptionStateMachine[] {
+    const result: SubscriptionStateMachine[] = [];
+    for (const id of this.trackAliases.owners(alias)) {
+      const sub = this.subscriptions.get(id) ?? this.incomingSubscriptions.get(id);
+      if (sub && !sub.isTerminated) result.push(sub);
+    }
+    return result;
   }
 
   // ─── Namespace Discovery Operations ──────────────────────────────────
@@ -3680,6 +3892,7 @@ export class Session {
       trackNamespacePrefix: namespacePrefix,
       state: 'pending',
       blockedTracks: [],
+      forward: ForwardState.ACTIVE,
     });
 
     const msg: SubscribeTracks = {
@@ -4351,6 +4564,9 @@ export class Session {
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
 
+    const filterError = this.rejectUnsupportedRangeFilters(msg.requestId, msg.parameters);
+    if (filterError) return filterError;
+
     try {
       validateTrackNamespacePrefix(msg.trackNamespacePrefix);
     } catch (e) {
@@ -4382,6 +4598,9 @@ export class Session {
     this.incomingTrackSubscriptions.set(msg.requestId as bigint, {
       trackNamespacePrefix: msg.trackNamespacePrefix,
       state: 'pending',
+      parameters: new Map(msg.parameters),
+      forward: isDraft22(this._draftVersion) && msg.parameters.get(MessageParam.FORWARD)?.[0] === 0n
+        ? ForwardState.PAUSED : ForwardState.ACTIVE,
     });
     return validated.replenish ?? [];
   }
@@ -4438,7 +4657,7 @@ export class Session {
   }
 
   /** Whether we are serving an incoming SUBSCRIBE_TRACKS (pending or active). */
-  getIncomingTrackSubscription(requestId: bigint): { trackNamespacePrefix: Uint8Array[]; state: 'pending' | 'active' } | undefined {
+  getIncomingTrackSubscription(requestId: bigint): { trackNamespacePrefix: Uint8Array[]; state: 'pending' | 'active'; forward: ForwardStateValue } | undefined {
     return this.incomingTrackSubscriptions.get(requestId as bigint);
   }
 
@@ -4452,7 +4671,7 @@ export class Session {
   }
 
   /**
-   * Cancel an inbound PUBLISH / SUBSCRIBE / FETCH on a FIN/reset of its request
+   * Cancel an inbound PUBLISH / SUBSCRIBE / FETCH / TRACK_STATUS on a FIN/reset of its request
    * stream (draft-18 §3.3.2) — a normal lifecycle end, not a protocol error. Drops
    * the publisher-/subscriber-side request state; no-op if none exists. UNREGISTERS
    * the request's Track Alias from the session registry so a later request may
@@ -4466,6 +4685,7 @@ export class Session {
     this.incomingSubscriptions.delete(requestId as bigint);
     this.incomingJoiningLocations.delete(requestId as bigint);
     this.incomingFetches.delete(requestId as bigint);
+    this.incomingTrackStatuses.delete(requestId as bigint);
     // §5.1: the PUBLISH went away before acceptance — discard any staged collision
     // so the local SUBSCRIBE it would have superseded stays alive.
     this.pendingCollisions.delete(requestId as bigint);
@@ -4812,6 +5032,10 @@ export class Session {
       // Reject local misuse before sendSubscribeOk() establishes the state
       // machine or installs any alias authority.
       this.assertLocalForwardParameter(options.parameters, 'PUBLISH acceptance');
+      if (isDraft22(this._draftVersion)) {
+        const error = this.validateMessageParams(options.parameters ?? new Map(), 'PUBLISH_OK');
+        if (error) throw new SessionError(error.reason, 'INVALID_STATE');
+      }
     }
 
     // Validate ALL misuse up-front, BEFORE any state mutation: draft-14/16 Track
@@ -4825,6 +5049,12 @@ export class Session {
         'Track Properties are not valid on a PUBLISH acceptance (only SUBSCRIBE_OK / TRACK_STATUS_OK / FETCH_OK)',
         'INVALID_STATE',
       );
+    }
+
+    if (!sub.isPublishInitiated && isDraft22(this._draftVersion)) {
+      this.assertPublisherAliasAvailable(trackAlias, sub.trackNamespace!, sub.trackName!);
+      const error = this.validateMessageParams(options.parameters ?? new Map(), 'SUBSCRIBE_OK');
+      if (error) throw new SessionError(error.reason, 'INVALID_STATE');
     }
 
     sub.sendSubscribeOk(trackAlias);
@@ -4854,11 +5084,13 @@ export class Session {
       // Apply the exact value communicated on the wire, including the default
       // of 1 when FORWARD is absent, so the two endpoints cannot disagree.
       const acceptFwd = responseParameters.get(MessageParam.FORWARD)?.[0];
-      sub.updateForwardState(
-        typeof acceptFwd === 'bigint' && acceptFwd === 0n
-          ? ForwardState.PAUSED
-          : ForwardState.ACTIVE,
-      );
+      if (!isDraft22(this._draftVersion)) {
+        sub.updateForwardState(
+          typeof acceptFwd === 'bigint' && acceptFwd === 0n
+            ? ForwardState.PAUSED
+            : ForwardState.ACTIVE,
+        );
+      }
 
       if (isRequestStreamDraft(this._draftVersion)) {
         // draft-18 §10.10: PUBLISH_OK is REQUEST_OK shorthand (wire 0x07, no
@@ -4885,6 +5117,13 @@ export class Session {
     // any Joining FETCH while the subscription is active.
     const communicated = this.extractLargestObjectParam(options.parameters);
     if (communicated) this.incomingJoiningLocations.set(requestId as bigint, communicated);
+
+    if (isDraft22(this._draftVersion)) {
+      sub.publisherGroupOrder = trackProperties.get(0x22n)?.[0] === 2n ? 'descending' : 'ascending';
+      sub.locationWindow = subscriptionWindow(
+        sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, 22), communicated ?? undefined,
+      );
+    }
 
     const subscribeOk: SubscribeOk = {
       type: 'SUBSCRIBE_OK',
@@ -4988,6 +5227,7 @@ export class Session {
     existingRequestId: bigint,
     options: RequestUpdateOptions = {},
   ): RequestResult {
+    this.assertEstablishedOrDraining('updateIncomingSubscription');
     const sub = this.incomingSubscriptions.get(existingRequestId as bigint);
     if (!sub) {
       throw new SessionError(
@@ -5003,8 +5243,22 @@ export class Session {
     }
 
     const requestedForward = this.normalizeLocalForwardState(options.forward, 'REQUEST_UPDATE');
+    if (options.fill !== undefined && !isDraft22(this._draftVersion)) {
+      throw new RangeError(`FILL_PARAMETERS needs draft 22; this session speaks draft ${this._draftVersion}`);
+    }
+    if (isDraft22(this._draftVersion) && this._peerMaxRequestUpdates > 0n) {
+      const pending = [...this.pendingUpdates.values()].filter((p) => p.existingRequestId === existingRequestId).length;
+      if (BigInt(pending) >= this._peerMaxRequestUpdates) throw new SessionError('MAX_REQUEST_UPDATES exceeded', 'INVALID_STATE');
+    }
+    const filterBytes = options.subscriptionFilter === undefined ? undefined : encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
+    const fillBytes = options.fill === undefined ? undefined : encodeFillParameters(options.fill.filter, options.fill.groupOrder);
     const parameters = authorizationParameters(options);
     const requestId = this.requestIdAllocator.allocate();
+    if (filterBytes !== undefined) parameters.set(MessageParam.SUBSCRIPTION_FILTER, [filterBytes]);
+    if (fillBytes !== undefined) {
+      parameters.set(FILL_PARAMETERS, [fillBytes]);
+      this.registerFillRequest(requestId, sub, options.fill!, options.subscriptionFilter);
+    }
     if (requestedForward !== undefined) {
       parameters.set(MessageParam.FORWARD, [varint(BigInt(requestedForward))]);
     }
@@ -5022,6 +5276,7 @@ export class Session {
     // Stage ALL changes on the pending record — applied on REQUEST_OK, never at send.
     this.pendingUpdates.set(requestId as bigint, {
       existingRequestId,
+      ...(isDraft22(this._draftVersion) && filterBytes !== undefined ? { subscriptionFilter: filterBytes } : {}),
       ...(requestedForward !== undefined
         ? { forward: requestedForward }
         : {}),
@@ -5161,6 +5416,7 @@ export class Session {
    */
   close(error?: Varint, reason?: string): SessionOutboundAction[] {
     this._state = SessionState.CLOSED;
+    this.fillRequests.clear();
 
     const closeAction: CloseConnectionAction = {
       type: 'close_connection',
@@ -5182,6 +5438,7 @@ export class Session {
    */
   handleTransportClosed(): void {
     this._state = SessionState.CLOSED;
+    this.fillRequests.clear();
   }
 
   /**
@@ -5190,6 +5447,7 @@ export class Session {
    */
   private closeWithError(error: Varint, reason: string): SessionOutboundAction[] {
     this._state = SessionState.CLOSED;
+    this.fillRequests.clear();
 
     return [{
       type: 'close_connection',
@@ -5327,13 +5585,18 @@ export class Session {
     return table.get(key as bigint)?.has(messageType) ?? false;
   }
 
-  /**
-   * Validate message parameters: check for unknown types, invalid duplicates, and value constraints.
-   * AUTHORIZATION_TOKEN may repeat (§9.2.2.1), other known types must be unique.
-   * Parameters not valid for the given message type are ignored per §9.2.2.
-   * @see draft-ietf-moq-transport-16 §9.2
-   * @returns Error with code and reason if validation fails, undefined if valid
-   */
+  /** We advertise the default MAX_FILTER_RANGES=0; never silently ignore a filter. */
+  private rejectUnsupportedRangeFilters(requestId: bigint, params: Parameters): SessionOutboundAction[] | undefined {
+    if (!isDraft22(this._draftVersion)) return undefined;
+    const nested = params.get(FILL_PARAMETERS)?.[0];
+    const fill = nested instanceof Uint8Array ? decodeFillParameters(nested).parameters : undefined;
+    if (![...RANGE_FILTER_PARAMS_22].some((type) => params.has(type) || fill?.has(type))) return undefined;
+    return [this.sendControl({ type: 'REQUEST_ERROR', requestId, errorCode: varint(0x36n),
+      retryInterval: varint(0n), errorReason: 'Range filters exceed MAX_FILTER_RANGES=0 (9.1.6)',
+    })];
+  }
+
+  /** Validate parameter scope, multiplicity, and values using the selected draft. */
   private validateMessageParams(params: Parameters, messageType: string): { error: Varint; reason: string } | undefined {
     const isDraft18 = isRequestStreamDraft(this._draftVersion);
     const knownParams = isDraft22(this._draftVersion)
@@ -5421,6 +5684,11 @@ export class Session {
     // Even-type parameters: varint value constraint checks → PROTOCOL_VIOLATION
     if (typeof value === 'bigint') {
       switch (key) {
+        case 0x35n:
+          if (isDraft22(this._draftVersion) && value !== 0n && value !== 1n) {
+            return { error: SessionErrorCode.PROTOCOL_VIOLATION, reason: `INCLUDE_PROPERTIES must be 0 or 1, got ${value}` };
+          }
+          break;
         // DELIVERY_TIMEOUT (0x02). draft-16 §9.2.2.2: MUST be > 0. draft-14 allows
         // 0; draft-18 §10.2.4 renames it OBJECT_DELIVERY_TIMEOUT where 0 means
         // "no timeout" (and SUBGROUP_DELIVERY_TIMEOUT 0x06 is unconstrained) — so
@@ -5470,6 +5738,14 @@ export class Session {
     // a typed Location for LARGEST_OBJECT, which is valid by construction.
     if (value instanceof Uint8Array) {
       switch (key) {
+        case FILL_PARAMETERS:
+          if (isDraft22(this._draftVersion)) {
+            try { decodeFillParameters(value); }
+            catch (err) {
+              return { error: SessionErrorCode.PROTOCOL_VIOLATION, reason: `Invalid FILL_PARAMETERS: ${String(err)}` };
+            }
+          }
+          break;
         // §9.2.2.7: LARGEST_OBJECT is a Location structure (two varints).
         case MessageParam.LARGEST_OBJECT:
           return this.validateLargestObject(value);

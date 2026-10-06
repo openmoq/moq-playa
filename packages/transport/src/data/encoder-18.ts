@@ -261,23 +261,25 @@ export function encodeFetchObject18(
 }
 
 /**
- * Encode a draft-18 End-of-Range marker (§11.4.4.2): Serialization Flags 0x8C
- * (non-existent) or 0x10C (unknown), Group ID and Object ID, with no Payload
- * Length (as moxygen, LibMoQ and red5-moq-relay encode it). Position prior
- * advances to the marker; field priors are unchanged.
+ * Encode an End-of-Range marker: Serialization Flags 0x8C (non-existent) or
+ * 0x10C (unknown), Group ID and Object ID. Draft 18 retains its zero Payload
+ * Length field; the draft-22 form omits it. Position prior advances to the
+ * marker; field priors are unchanged.
  */
 export function encodeFetchEndOfRange18(
   nonExistent: boolean,
   groupId: bigint,
   objectId: bigint,
   prior: FetchObjectPrior18 | undefined,
+  version: 18 | 22 = 18,
 ): { bytes: Uint8Array; nextPrior: FetchObjectPrior18 } {
   const flags = BigInt(nonExistent ? FetchSpecialFlags.END_NON_EXISTENT : FetchSpecialFlags.END_UNKNOWN);
-  const size = vi64EncodingLength(flags) + vi64EncodingLength(groupId) + vi64EncodingLength(objectId);
+  const size = vi64EncodingLength(flags) + vi64EncodingLength(groupId) + vi64EncodingLength(objectId) + (version === 18 ? 1 : 0);
   const buf = new Uint8Array(size);
   let p = writeVi64(flags, buf, 0);
   p += writeVi64(groupId, buf, p);
-  writeVi64(objectId, buf, p);
+  p += writeVi64(objectId, buf, p);
+  if (version === 18) writeVi64(0n, buf, p);
   const nextPrior: FetchObjectPrior18 = {
     groupId, objectId,
     lastObjectSubgroupId: prior?.lastObjectSubgroupId,

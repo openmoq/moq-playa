@@ -13,6 +13,8 @@ import {
   DRAFT22_MESSAGE_PARAM_REGISTRY, decodeMessageParams18, encodeMessageParams18, type MessageParamValue,
 } from './message-params-18.js';
 import type { ControlMessage, Fetch, Goaway } from './messages.js';
+import { decodeFillParameters } from './fill-parameters.js';
+import { MAX_VI64 } from '../primitives/vi64.js';
 
 const codec18 = createControlCodec(18);
 const codec22 = createControlCodec(22);
@@ -137,6 +139,43 @@ describe('draft-22 LOCATION_FILTER mapping (§9.20.9)', () => {
     expect(back.bytesRead).toBe(bytes.length);
     expect(back.params.get(0x22n)).toEqual([{ kind: 'uint8', value: 2 }]);
   });
+
+  it('reads a non-minimal type and multibyte fields without consuming the following parameter', () => {
+    const bytes = Uint8Array.from(Buffer.from('02218004808080ff808080000102', 'hex'));
+    const decoded = decodeMessageParams18(bytes, 0, DRAFT22_MESSAGE_PARAM_REGISTRY);
+    expect(decoded.bytesRead).toBe(bytes.length);
+    const filter = decoded.params.get(0x21n)![0]!;
+    expect(filter.kind).toBe('locationFilter');
+    if (filter.kind !== 'locationFilter') throw new Error('Missing filter');
+    expect(decodeSubscriptionFilter(filter.value, 22)).toEqual({
+      type: 'AbsoluteRange', startGroup: 128n, startObject: 255n, endGroup: 256n, endObject: 0n,
+    });
+    expect(decoded.params.get(0x22n)).toEqual([{ kind: 'uint8', value: 2 }]);
+  });
+
+  it('keeps full-width group and object values in a nested fill', () => {
+    const filter: SubscriptionFilter = {
+      type: 'AbsoluteRange', startGroup: MAX_VI64 - 1n, startObject: MAX_VI64,
+      endGroup: MAX_VI64, endObject: MAX_VI64,
+    };
+    const bytes = encodeFillParameters(filter, 'descending');
+    expect(bytesToHex(bytes)).toBe('2104fffffffffffffffffeffffffffffffffffff01ffffffffffffffffff0102');
+    expect(decodeFillParameters(bytes)).toMatchObject({ filter, groupOrder: 'descending' });
+  });
+
+  it('rejects an overflowing absolute group range even when each field fits vi64', () => {
+    const bytes = Uint8Array.from(Buffer.from('03ffffffffffffffffff0001', 'hex'));
+    expect(validateSubscriptionFilter(bytes, 22)).toMatch(/overflows uint64/);
+    expect(() => decodeFillParameters(new Uint8Array([0x21, ...bytes]))).toThrow(/overflows uint64/);
+  });
+
+  it.each([0, 1, 2, 3, 4, 5])('never consumes a following Group Order parameter as part of filter type %s', type => {
+    const fields = [[], [2], [2, 3], [2, 3, 4], [2, 3, 4, 5], []][type]!;
+    const bytes = new Uint8Array([2, 0x21, type, ...fields, 1, 2]);
+    const decoded = decodeMessageParams18(bytes, 0, DRAFT22_MESSAGE_PARAM_REGISTRY);
+    expect(decoded.bytesRead).toBe(bytes.length);
+    expect(decoded.params.get(0x22n)).toEqual([{ kind: 'uint8', value: 2 }]);
+  });
 });
 
 describe('subscription windows (re-applying a filter to a shared Track Alias, §3.1)', () => {
@@ -154,6 +193,13 @@ describe('subscription windows (re-applying a filter to a shared Track Alias, §
   it('with no Largest Object (empty track) every relative start is the beginning', () => {
     expect(subscriptionWindow({ type: 'NextGroupStart' }, undefined)).toEqual({ start: { group: 0n, object: 0n } });
     expect(subscriptionWindow({ type: 'LargestObject' }, undefined)).toEqual({ start: { group: 0n, object: 0n } });
+  });
+
+  it('clamps relative starts at the full uint64 boundary', () => {
+    expect(subscriptionWindow({ type: 'NextGroupStart' }, { group: MAX_VI64, object: 0n }))
+      .toEqual({ start: { group: MAX_VI64, object: 0n } });
+    expect(subscriptionWindow({ type: 'RelativeStart', groups: MAX_VI64 }, L))
+      .toEqual({ start: { group: 0n, object: 0n } });
   });
 
   it('checks start and inclusive end', () => {

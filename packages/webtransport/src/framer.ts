@@ -50,6 +50,9 @@ export class ControlStreamFramer {
     this.codec = codec ?? createControlCodec();
   }
 
+  /** Bytes belonging to an incomplete trailing frame after drain(). */
+  get bufferedBytes(): number { return this.buffer.byteLength; }
+
   /**
    * Push a chunk of bytes into the accumulator.
    * @param chunk Bytes received from the stream

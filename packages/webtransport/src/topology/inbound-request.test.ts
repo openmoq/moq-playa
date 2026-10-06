@@ -13,7 +13,7 @@ const codec18 = createControlCodec(18);
 const reqOkBytes = (): Uint8Array =>
   codec18.encode({ type: 'REQUEST_OK', requestId: 0n, parameters: new Map() } as RequestOk);
 
-function setup() {
+function setup(version: 18 | 22 = 18) {
   const stream = new SimStream();
   const failures: Error[] = [];
   const closed: boolean[] = [];
@@ -22,7 +22,7 @@ function setup() {
     onFailure: (e) => { failures.push(e); },
     onClosed: () => { closed.push(true); },
   };
-  const ctx = new InboundRequestStreamContext(stream, codec18, handlers);
+  const ctx = new InboundRequestStreamContext(stream, createControlCodec(version), handlers);
   ctx.start();
   ctx.bind(1n, 'publish');
   return { ctx, stream, failures, closed };
@@ -74,5 +74,37 @@ describe('InboundRequestStreamContext.sendUpdate write-failure cleanup', () => {
     await flush();
     await ctx.terminate();
     await expect(pending).rejects.toThrow(/terminated/i);
+  });
+});
+
+describe('draft-22 request cancellation boundaries', () => {
+  it('rejects a failed update write without an orphaned deferred rejection', async () => {
+    const { ctx, stream, failures } = setup(22);
+    stream.failWrites = true;
+    await expect(ctx.sendUpdate({
+      type: 'REQUEST_UPDATE', requestId: 3n, existingRequestId: 1n, parameters: new Map(),
+    }, () => {})).rejects.toThrow(/write failure/);
+    await flush();
+    expect(failures).toHaveLength(1);
+    await ctx.abort();
+  });
+
+  it('reports simultaneous read and write failures only once', async () => {
+    const { ctx, stream, failures } = setup(22);
+    stream.failWrites = true;
+    const write = ctx.writeMessage({ type: 'REQUEST_OK', requestId: 1n, parameters: new Map() });
+    stream.resetReadable();
+    await expect(write).rejects.toThrow();
+    await flush();
+    expect(failures).toHaveLength(1);
+    await ctx.abort();
+  });
+
+  it.each(['abort', 'terminate'] as const)('does not report local %s as peer cancellation', async (method) => {
+    const { ctx, failures, closed } = setup(22);
+    await ctx[method]();
+    await flush();
+    expect(failures).toEqual([]);
+    expect(closed).toEqual([]);
   });
 });

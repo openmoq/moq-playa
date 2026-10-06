@@ -67,6 +67,15 @@ async function flush(): Promise<void> {
 }
 
 describe('explicit ?url=', () => {
+  it.each([14, 16, 18, 22])('preserves ?v=%s during discovery', async (draft) => {
+    const resolver = makeResolver(`?v=${draft}`);
+    const resolution = resolver.resolve();
+    await flush();
+    const probedDraft = probes[0]!.options.draftVersion;
+    probes[0]!.succeed();
+    await expect(resolution).resolves.toBe(MOQ);
+    expect(probedDraft).toBe(draft);
+  });
   it('resolves the explicit URL with zero probes', async () => {
     const url = 'https://relay.example.com:9999/custom?x=a%2Fb';
     const resolver = makeResolver(`?url=${encodeURIComponent(url)}`);
