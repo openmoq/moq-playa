@@ -7323,8 +7323,12 @@ export class MoqtConnection {
             object.payload.length === 0 &&
             object.status !== undefined &&
             object.status !== 0n;
+          const firstObjectEvidence = header.isFirstObjectInSubgroup === undefined
+            ? {}
+            : { isFirstObjectInSubgroup: isFirstObject && header.isFirstObjectInSubgroup };
           const delivered: MoqtObject = isGap
             ? {
+                ...firstObjectEvidence,
                 kind: 'gap',
                 trackAlias: header.trackAlias,
                 groupId: header.groupId,
@@ -7333,6 +7337,7 @@ export class MoqtConnection {
                 status: object.status!,
               } satisfies MoqtObjectGap
             : {
+                ...firstObjectEvidence,
                 kind: 'data',
                 trackAlias: header.trackAlias,
                 groupId: header.groupId,

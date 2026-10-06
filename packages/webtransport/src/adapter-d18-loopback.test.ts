@@ -414,6 +414,56 @@ describe('MoqtConnection(18) loopback — §5.1 pending SUBSCRIBE superseded by 
 });
 
 describe('MoqtConnection(18) loopback — outbound PUBLISH lifecycle (data + PUBLISH_DONE)', () => {
+  it('carries per-object FIRST_OBJECT evidence through publication routing without guessing from object IDs', async () => {
+    const { client, server, errors } = await connectedPair();
+    const received: MoqtObject[] = [];
+    let requestId = -1n;
+    server.onPublish = (publish) => {
+      requestId = publish.requestId;
+      publish.onObject = (object) => received.push(object);
+    };
+    await client.publish(ns('live'), nm('vid'), 33n);
+    await flush();
+    await server.acceptSubscribe(requestId, 33n);
+    const first = await client.openSubgroup(33n, 7n, 1n, { firstObject: true });
+    const resumed = await client.openSubgroup(33n, 7n, 2n, { firstObject: false });
+    await client.sendObject(first, 5n, new Uint8Array([1]));
+    await client.sendObject(resumed, 0n, new Uint8Array([2]));
+    await client.sendObject(first, 6n, new Uint8Array([3]));
+    await client.closeSubgroup(first);
+    await client.closeSubgroup(resumed);
+    await flush();
+    expect(received.filter((o) => o.subgroupId === 1n).map((o) => [o.objectId, o.isFirstObjectInSubgroup]))
+      .toEqual([[5n, true], [6n, false]]);
+    expect(received.find((o) => o.subgroupId === 2n)?.isFirstObjectInSubgroup).toBe(false);
+    expect(errors).toEqual([]);
+  });
+
+  it('preserves FIRST_OBJECT on an end-of-group gap with a derived subgroup ID', async () => {
+    const { client, server, a, errors } = await connectedPair();
+    const received: MoqtObject[] = [];
+    let requestId = -1n;
+    server.onPublish = (publish) => {
+      requestId = publish.requestId;
+      publish.onObject = (object) => received.push(object);
+    };
+    await client.publish(ns('live'), nm('vid'), 33n);
+    await flush();
+    await server.acceptSubscribe(requestId, 33n);
+    const writer = (await a.createUnidirectionalStream()).getWriter();
+    await writer.write(encodeSubgroupHeader18({ typeByte: 0x52, trackAlias: 33n, groupId: 7n,
+      subgroupId: 0n, publisherPriority: 128, hasExtensions: false, isEndOfGroup: false,
+      isFirstObjectInSubgroup: true }));
+    await writer.write(encodeSubgroupObject18({ objectId: 5n, payload: new Uint8Array(),
+      status: 3n, extensions: undefined }, false, 0n, true));
+    await vi.waitFor(() => { expect(errors).toEqual([]); expect(received).toHaveLength(1); });
+    await writer.close();
+    await flush();
+    expect(errors).toEqual([]);
+    expect(received.map((o) => [o.kind, o.subgroupId, o.objectId, o.isFirstObjectInSubgroup]))
+      .toEqual([['gap', 5n, 5n, true]]);
+  });
+
   it('delivers subgroup FIN to the inbound PUBLISH after its objects', async () => {
     const { client, server, errors } = await connectedPair();
     let pubReqId = -1n;

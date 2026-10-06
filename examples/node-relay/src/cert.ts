@@ -5,12 +5,12 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const certDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'certs');
-export const CERT_PATH = join(certDir, 'cert.pem');
-export const KEY_PATH = join(certDir, 'key.pem');
+export const CERT_PATH = resolve(process.env.RELAY_CERT ?? join(certDir, 'cert.pem'));
+export const KEY_PATH = resolve(process.env.RELAY_KEY ?? join(certDir, 'key.pem'));
 
 export function certsExist(): boolean {
   return existsSync(CERT_PATH) && existsSync(KEY_PATH);
@@ -19,7 +19,7 @@ export function certsExist(): boolean {
 /** PEM cert + private key for the Http3Server constructor. */
 export function loadCert(): { cert: string; privKey: string } {
   if (!certsExist()) {
-    throw new Error('Missing ./certs — run `pnpm --filter @moqt/example-node-relay gen-cert` first.');
+    throw new Error(`Missing certificate/key (${CERT_PATH}, ${KEY_PATH}) — run \`pnpm --filter @moqt/example-node-relay gen-cert\` first.`);
   }
   return { cert: readFileSync(CERT_PATH, 'utf8'), privKey: readFileSync(KEY_PATH, 'utf8') };
 }

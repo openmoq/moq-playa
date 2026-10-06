@@ -41,6 +41,7 @@ const log = (...a: unknown[]) => console.log('[relay]', ...a);
 const REGISTERED_TRACKS = new Set<string>([DEMO_TRACK, ...MEDIA_TRACKS]);
 
 interface CachedObject {
+  readonly firstObject: boolean;
   readonly groupId: bigint;
   readonly subgroupId: bigint;
   readonly objectId: bigint;
@@ -56,6 +57,7 @@ interface SubscriberSubgroup {
 }
 
 interface ForwardObjectFields {
+  readonly firstObject: boolean;
   readonly groupId: bigint;
   readonly subgroupId: bigint;
   readonly objectId: bigint;
@@ -238,7 +240,9 @@ export class Relay {
           track.cacheClosedSubgroups.clear();
         }
         const extensions = obj.properties ?? obj.extensions;
+        const firstObject = obj.isFirstObjectInSubgroup === true;
         track.cache.push({
+          firstObject,
           groupId: obj.groupId,
           subgroupId: obj.subgroupId,
           objectId: obj.objectId,
@@ -250,7 +254,7 @@ export class Relay {
         const { groupId, subgroupId, objectId, payload } = obj;
         for (const sub of [...track.subscribers]) {
           this.enqueueObject(track, sub, {
-            groupId, subgroupId, objectId, payload, extensions,
+            groupId, subgroupId, objectId, payload, extensions, firstObject,
           });
         }
       };
@@ -462,14 +466,14 @@ async function forwardObject(
   fields: ForwardObjectFields,
 ): Promise<void> {
   try {
-    const { groupId, subgroupId, objectId, payload, extensions } = fields;
+    const { groupId, subgroupId, objectId, payload, extensions, firstObject } = fields;
     const skey = subgroupKey(groupId, subgroupId);
     let subgroup = sub.subgroups.get(skey);
     if (subgroup === undefined) {
       const hasExtensions = extensions !== undefined;
       const streamId = await sub.conn.openSubgroup(sub.alias, groupId, subgroupId, {
         publisherPriority: 128,
-        firstObject: objectId === 0n,
+        firstObject,
         hasExtensions,
       });
       subgroup = { streamId, hasExtensions };

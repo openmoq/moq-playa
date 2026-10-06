@@ -27,6 +27,12 @@ committed):
 pnpm --filter @moqt/example-node-relay gen-cert
 ```
 
+For an isolated run, pass `gen-cert --out-dir /path/to/run/certs`, then set
+`RELAY_CERT=/path/to/run/certs/cert.pem` and `RELAY_KEY=/path/to/run/certs/key.pem`
+on the relay process. The publisher's `RELAY_CERT` selects the same certificate.
+The default cert paths remain unchanged; the browser acceptance harness never
+overwrites them.
+
 It prints the cert's SHA-256 — clients pin it via `serverCertificateHashes`
 (the browser player's `?hash=` takes the hex form).
 

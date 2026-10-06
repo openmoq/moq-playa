@@ -13,10 +13,12 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { parseArgs } from 'node:util';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const certDir = join(here, '..', 'certs');
+const { values } = parseArgs({ options: { 'out-dir': { type: 'string' } } });
+const certDir = values['out-dir'] ? resolve(values['out-dir']) : join(here, '..', 'certs');
 const certPath = join(certDir, 'cert.pem');
 const keyPath = join(certDir, 'key.pem');
 const DAYS = 10; // < 14 days (serverCertificateHashes requirement)

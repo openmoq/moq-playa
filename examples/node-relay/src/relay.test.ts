@@ -3,6 +3,8 @@ import { SessionError, type Fetch, type MoqtObjectData, type SubgroupHeader } fr
 import type { IncomingPublish, MoqtConnection } from '@openmoq/webtransport';
 import { DEMO_NAMESPACE, DEMO_TRACK, nsBytes, te } from './demo.js';
 import { Relay } from './relay.js';
+import { publishFixture } from '../../node-publisher/src/publisher.js';
+import { videoInit } from '../../../packages/locmaf/test-support/cmaf.js';
 
 interface SubscriberHarness {
   readonly conn: MoqtConnection;
@@ -75,6 +77,7 @@ function object(
     subgroupId: 0n,
     objectId,
     publisherPriority: 128,
+    isFirstObjectInSubgroup: objectId === 0n,
     properties,
     extensions: properties,
     payload: new Uint8Array([Number(groupId & 0xffn)]),
@@ -100,6 +103,85 @@ async function acceptPublisher(relay: Relay, publish: IncomingPublish): Promise<
 }
 
 describe('Relay subgroup lifecycle', () => {
+  it('forwards the fixture publisher single-object subgroups with FIRST_OBJECT on each stream', async () => {
+    const relay = new Relay();
+    const live = subscriberHarness(4);
+    await relay.handleSubscribe(live.conn, 2n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    const publications = new Map<bigint, IncomingPublish>();
+    const streams = new Map<bigint, { alias: bigint; group: bigint; subgroup: bigint; first: boolean }>();
+    let nextRequest = 0n;
+    const origin = {
+      onMessage: undefined as ((m: { type: string; requestId: bigint }) => void) | undefined,
+      async publish(namespace: Uint8Array[], name: Uint8Array, alias: bigint) {
+        const requestId = nextRequest++;
+        const p: IncomingPublish = { requestId, trackNamespace: namespace, trackName: name,
+          trackAlias: alias, onObject: null, onSubgroupClosed: null };
+        publications.set(alias, p);
+        await acceptPublisher(relay, p);
+        setTimeout(() => origin.onMessage?.({ type: 'REQUEST_OK', requestId }), 0);
+        return requestId;
+      },
+      async openSubgroup(alias: bigint, group: bigint, subgroup: bigint, opts: { firstObject?: boolean }) {
+        const id = BigInt(streams.size + 1);
+        streams.set(id, { alias, group, subgroup, first: opts.firstObject === true });
+        return id;
+      },
+      async sendObject(id: bigint, objectId: bigint, payload: Uint8Array) {
+        const s = streams.get(id)!;
+        publications.get(s.alias)!.onObject?.({ ...object(s.alias, s.group, objectId),
+          subgroupId: s.subgroup, payload, isFirstObjectInSubgroup: s.first });
+        s.first = false;
+      },
+      async closeSubgroup(id: bigint) {
+        const s = streams.get(id)!;
+        publications.get(s.alias)!.onSubgroupClosed?.({ ...subgroupHeader(s.alias, s.group), subgroupId: s.subgroup });
+      },
+    };
+    const meta = { name: DEMO_TRACK, role: 'video', packaging: 'cmaf', codec: 'avc1.42c01e',
+      init: 'init.mp4', chunks: [] } as const;
+    await publishFixture(origin as unknown as MoqtConnection, {
+      manifest: { namespace: DEMO_NAMESPACE, renderGroup: 1, chunkDurationMs: 500, tracks: [meta] },
+      tracks: [{ meta, initData: videoInit(), chunks: [1, 2, 3].map((v) => new Uint8Array([v])) }],
+    }, { catalogFormat: 'cmsf-01' });
+    await vi.waitFor(() => expect(live.sendObject).toHaveBeenCalledTimes(3));
+    expect(live.openSubgroup.mock.calls.map((c) => c[3])).toEqual([
+      { publisherPriority: 128, firstObject: true, hasExtensions: false },
+      { publisherPriority: 128, firstObject: true, hasExtensions: false },
+      { publisherPriority: 128, firstObject: true, hasExtensions: false },
+    ]);
+    expect(live.sendObject.mock.calls.map((c) => c[1])).toEqual([0n, 1n, 2n]);
+    const late = subscriberHarness(4);
+    await relay.handleSubscribe(late.conn, 3n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    await vi.waitFor(() => expect(late.sendObject).toHaveBeenCalledTimes(3));
+    expect(late.openSubgroup.mock.calls.map((c) => c[3])).toEqual(live.openSubgroup.mock.calls.map((c) => c[3]));
+  });
+
+  it('preserves nonzero FIRST_OBJECT evidence during live forwarding and cache replay', async () => {
+    const relay = new Relay();
+    const live = subscriberHarness(2);
+    await relay.handleSubscribe(live.conn, 2n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    const publish = incomingPublish();
+    await acceptPublisher(relay, publish);
+    publish.onObject?.({ ...object(publish.trackAlias, 1n, 5n), subgroupId: 1n, isFirstObjectInSubgroup: true });
+    await vi.waitFor(() => expect(live.sendObject).toHaveBeenCalledOnce());
+    expect(live.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ firstObject: true });
+    const late = subscriberHarness(2);
+    await relay.handleSubscribe(late.conn, 3n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    await vi.waitFor(() => expect(late.sendObject).toHaveBeenCalledOnce());
+    expect(late.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ firstObject: true });
+  });
+
+  it('does not invent FIRST_OBJECT when the decoded evidence is false', async () => {
+    const relay = new Relay();
+    const sub = subscriberHarness(2);
+    await relay.handleSubscribe(sub.conn, 2n, nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
+    const publish = incomingPublish();
+    await acceptPublisher(relay, publish);
+    publish.onObject?.({ ...object(publish.trackAlias, 1n), isFirstObjectInSubgroup: false });
+    await vi.waitFor(() => expect(sub.sendObject).toHaveBeenCalledOnce());
+    expect(sub.openSubgroup.mock.calls[0]?.[3]).toMatchObject({ firstObject: false });
+  });
+
   it('lets an independent subgroup advance while another subgroup write is blocked', async () => {
     const relay = new Relay({ maxConcurrentSubgroupsPerSubscription: 2 });
     const subscriber = subscriberHarness(2);

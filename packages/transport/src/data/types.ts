@@ -167,6 +167,10 @@ export type MoqtObject =
  */
 export interface MoqtObjectData {
   readonly kind: 'data';
+  /** True only for the first object of a FIRST_OBJECT-marked subgroup stream.
+   * False for later objects or an unmarked stream; undefined for older drafts,
+   * datagrams, and FETCH delivery. */
+  readonly isFirstObjectInSubgroup?: boolean;
   readonly trackAlias: bigint;
   readonly groupId: bigint;
   readonly subgroupId: bigint;
@@ -184,6 +188,8 @@ export interface MoqtObjectData {
  */
 export interface MoqtObjectGap {
   readonly kind: 'gap';
+  /** Same per-object FIRST_OBJECT evidence as {@link MoqtObjectData}. */
+  readonly isFirstObjectInSubgroup?: boolean;
   readonly trackAlias: bigint;
   readonly groupId: bigint;
   readonly subgroupId: bigint;

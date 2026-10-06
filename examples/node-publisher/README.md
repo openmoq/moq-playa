@@ -38,6 +38,17 @@ as group 0; the relay caches it for late joiners. One-time prerequisite: generat
 the relay's cert (`pnpm --filter @moqt/example-node-relay gen-cert`) — the publisher
 pins its hash to connect (`RELAY_CERT` env to override the cert path).
 
+`--pace-media` uses each track's parsed CMAF decode timestamps and final chunk
+duration instead of `PACE_MS`. It rejects fixtures without usable single-track,
+self-contained timing before publishing. Audio and video may have different
+fragment durations; looping tracks are scheduled independently from one monotonic
+start time. The browser acceptance harness uses this mode.
+
+Each object uses its own subgroup stream, followed by FIN, as required by
+MSF-00/01 section 6 (and inherited by CMSF-01 section 2). Within a group, subgroup
+and object IDs both run from zero upward; only the final stream has END_OF_GROUP.
+Catalog versions, payloads, and group/object numbering are unchanged.
+
 ## 3. Publish in loop mode (endless live demo)
 
 `--loop` publishes the catalog once, establishes each media track once, then keeps

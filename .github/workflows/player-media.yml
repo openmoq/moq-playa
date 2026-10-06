@@ -1,0 +1,59 @@
+name: player-media
+
+on:
+  pull_request:
+    paths:
+      - 'packages/**'
+      - 'examples/**'
+      - 'scripts/player-acceptance/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'tsconfig*.json'
+      - '.github/workflows/player-media.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/**'
+      - 'examples/**'
+      - 'scripts/player-acceptance/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'tsconfig*.json'
+      - '.github/workflows/player-media.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: player-media-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cmaf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install media and browser tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          pnpm exec playwright install --with-deps chrome
+      - name: CMAF playback and negative controls
+        run: pnpm test:player:browser
+      - name: Retain playback evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: player-media-${{ github.run_id }}
+          path: reports/player-acceptance/
+          if-no-files-found: warn
+          retention-days: 14

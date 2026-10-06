@@ -11,6 +11,7 @@
     "debug:h264-rebuild": "node scripts/h264-rebuild.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:player:browser": "node scripts/player-acceptance/run.mjs",
     "test:corpus": "vitest run conformance/media/runner",
     "test:soak": "SCENARIO_SEEDS=2000 SCENARIO_STEPS=200 vitest run scenario-d18.test.ts",
     "test:soak:legacy": "SCENARIO_SEEDS=300 SCENARIO_STEPS=120 vitest run scenario-legacy.test.ts",
@@ -25,6 +26,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "fast-check": "^4.9.0",
+    "playwright": "1.62.1",
     "tsup": "^8.5.1",
     "typescript": "^5.7.0",
     "vitest": "^3.2.7"
