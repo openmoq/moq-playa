@@ -21,7 +21,7 @@ import {
 import type { MoqtPlayerConfig } from './config.js';
 import type { DecoderCommand, PlaybackEvent, RecoveryAction, ClockSource, DecoderFeedback } from '@openmoq/playback';
 import type { CommandDispatcher } from './command-dispatcher.js';
-import type { MediaSourceLike } from './interfaces.js';
+import type { MediaSourceLike, VideoRendererLike } from './interfaces.js';
 import type { LoggerLike } from './logger.js';
 import type { QualityController } from './quality-controller.js';
 
@@ -65,6 +65,36 @@ function mockCallbacks(): PipelineCallbacks {
 // ─── createPipelines ─────────────────────────────────────────────────
 
 describe('createPipelines', () => {
+  it.each([0n, 9_007_199_254_740_993n])('preserves rendered timestamp %s through callbacks and feedback', (timestamp) => {
+    const renderer: VideoRendererLike = {
+      enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(),
+      onFirstFrame: null, onFrameRendered: null, onStall: null,
+    };
+    const callbacks = mockCallbacks();
+    const onFrameRendered = vi.fn((captureTimestampUs: bigint, actualRenderUs: number) => {
+      expect(captureTimestampUs + 1n).toBe(timestamp + 1n);
+      expect(actualRenderUs).toBe(123_456);
+    });
+    callbacks.onFrameRendered = onFrameRendered;
+    const result = createPipelines(minimalConfig({
+      createRenderer: () => renderer,
+      createVideoDecoder: () => ({ configure: vi.fn(), destroy: vi.fn() }) as any,
+    }), mockClock, {
+      video: { codec: 'avc1.64001e', packaging: 'loc' }, audio: undefined,
+    }, callbacks);
+
+    try {
+      renderer.onFrameRendered!(timestamp, 123_456, 120_000);
+      expect(onFrameRendered).toHaveBeenCalledExactlyOnceWith(timestamp, 123_456);
+      expect(callbacks.onFeedback).toHaveBeenCalledExactlyOnceWith({
+        type: 'frame_rendered', mediaType: 'video', captureTimestampUs: timestamp,
+        actualRenderUs: 123_456, scheduledRenderUs: 120_000,
+      });
+    } finally {
+      result.commandDispatcher?.destroy();
+    }
+  });
+
   it('creates video pipeline for LOC track', () => {
     const trackInfo: TrackInfo = {
       video: { codec: 'avc1.64001e', width: 1920, height: 1080, packaging: 'loc' },

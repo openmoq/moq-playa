@@ -35,13 +35,18 @@ import { usesMsePath } from './packaging.js';
  * Strip keys with `undefined` values from an object literal.
  * Required by `exactOptionalPropertyTypes`.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function defined(obj: Record<string, unknown>): any {
+type Defined<T> = {
+  [K in keyof T as undefined extends T[K] ? never : K]: T[K];
+} & {
+  [K in keyof T as undefined extends T[K] ? K : never]?: Exclude<T[K], undefined>;
+};
+
+function defined<T extends Record<string, unknown>>(obj: T): Defined<T> {
   const result: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj)) {
     if (v !== undefined) result[k] = v;
   }
-  return result;
+  return result as Defined<T>;
 }
 
 // ─── Types ───────────────────────────────────────────────────────────
@@ -86,7 +91,7 @@ export interface PipelineCallbacks {
    */
   onStallRecovered?: (durationMs: number) => void;
   onDecodeError: (mediaType: 'video' | 'audio', error: Error) => void;
-  onFrameRendered: (captureTimestampUs: number, actualRenderUs: number) => void;
+  onFrameRendered: (captureTimestampUs: bigint, actualRenderUs: number) => void;
   onFeedback: (fb: DecoderFeedback) => void;
   onCommand: (cmd: DecoderCommand) => void;
   onEvent: (mediaType: 'video' | 'audio', evt: PlaybackEvent) => void;
@@ -260,7 +265,7 @@ export function createPipelines(
       onStall: (durationMs: number) => callbacks.onStall(durationMs),
       onStallRecovered: (durationMs: number) => callbacks.onStallRecovered?.(durationMs),
       onError: (mediaType: 'video' | 'audio', error: Error) => callbacks.onDecodeError(mediaType, error),
-      onFrameRendered: (captureTimestampUs: number, actualRenderUs: number) => callbacks.onFrameRendered(captureTimestampUs, actualRenderUs),
+      onFrameRendered: (captureTimestampUs: bigint, actualRenderUs: number) => callbacks.onFrameRendered(captureTimestampUs, actualRenderUs),
       onFeedback: (fb: DecoderFeedback) => callbacks.onFeedback(fb),
       onAvSkew: callbacks.onAvSkew,
       // Recompute video render time at decode OUTPUT using the SyncController.

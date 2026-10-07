@@ -675,6 +675,97 @@ describe('CommandDispatcher', () => {
       }
     });
 
+    it('ignores a retained render callback after dispatcher destruction', () => {
+      const renderer = createMockRenderer();
+      const onFrameRendered = vi.fn();
+      const onFeedback = vi.fn();
+      const onAvSkew = vi.fn();
+      const dispatcher = new CommandDispatcher({
+        renderer, onFrameRendered, onFeedback, onAvSkew,
+        audioOutput: { ...createMockAudioOutput(), playheadCaptureUs: () => 0 },
+      });
+      const retiredCallback = renderer.onFrameRendered!;
+      retiredCallback(0n, 100, 90);
+      expect(onFrameRendered).toHaveBeenCalledOnce();
+      expect(onFeedback).toHaveBeenCalledOnce();
+      expect(onAvSkew).toHaveBeenCalledOnce();
+      onFrameRendered.mockClear();
+      onFeedback.mockClear();
+      onAvSkew.mockClear();
+      dispatcher.destroy();
+
+      retiredCallback(1_000_000n, 200, 190);
+      expect(onFrameRendered).not.toHaveBeenCalled();
+      expect(onFeedback).not.toHaveBeenCalled();
+      expect(onAvSkew).not.toHaveBeenCalled();
+    });
+
+    it('retires render feedback before fallible adapter destruction', () => {
+      const renderer = createMockRenderer();
+      const onFrameRendered = vi.fn();
+      const onFeedback = vi.fn();
+      const dispatcher = new CommandDispatcher({ renderer, onFrameRendered, onFeedback });
+      const retiredCallback = renderer.onFrameRendered!;
+      vi.mocked(renderer.destroy).mockImplementation(() => {
+        retiredCallback(0n, 100);
+        throw new Error('renderer teardown failed');
+      });
+
+      expect(() => dispatcher.destroy()).toThrow('renderer teardown failed');
+      retiredCallback(1n, 200);
+      expect(onFrameRendered).not.toHaveBeenCalled();
+      expect(onFeedback).not.toHaveBeenCalled();
+    });
+
+    it('stops the remaining render report when a listener destroys the dispatcher', () => {
+      const renderer = createMockRenderer();
+      const onFeedback = vi.fn();
+      const onAvSkew = vi.fn();
+      const onFrameRendered = vi.fn(() => dispatcher.destroy());
+      const dispatcher = new CommandDispatcher({
+        renderer, onFrameRendered, onFeedback, onAvSkew,
+        audioOutput: { ...createMockAudioOutput(), playheadCaptureUs: () => 0 },
+      });
+
+      renderer._triggerFrameRendered(0n, 100);
+      expect(onFrameRendered).toHaveBeenCalledOnce();
+      expect(onAvSkew).not.toHaveBeenCalled();
+      expect(onFeedback).not.toHaveBeenCalled();
+    });
+
+    it('stops render feedback when the skew listener destroys the dispatcher', () => {
+      const renderer = createMockRenderer();
+      const onFeedback = vi.fn();
+      const onAvSkew = vi.fn(() => dispatcher.destroy());
+      const onFrameRendered = vi.fn();
+      const dispatcher = new CommandDispatcher({
+        renderer, onFrameRendered, onFeedback, onAvSkew,
+        audioOutput: { ...createMockAudioOutput(), playheadCaptureUs: () => 0 },
+      });
+
+      renderer._triggerFrameRendered(0n, 100);
+      expect(onFrameRendered).toHaveBeenCalledOnce();
+      expect(onAvSkew).toHaveBeenCalledOnce();
+      expect(onFeedback).not.toHaveBeenCalled();
+    });
+
+    it('stops render feedback when the audio playhead hook destroys the dispatcher', () => {
+      const renderer = createMockRenderer();
+      const onFeedback = vi.fn();
+      const onAvSkew = vi.fn();
+      const dispatcher = new CommandDispatcher({
+        renderer, onFeedback, onAvSkew,
+        audioOutput: {
+          ...createMockAudioOutput(),
+          playheadCaptureUs: () => { dispatcher.destroy(); return 0; },
+        },
+      });
+
+      renderer._triggerFrameRendered(0n, 100);
+      expect(onAvSkew).not.toHaveBeenCalled();
+      expect(onFeedback).not.toHaveBeenCalled();
+    });
+
     it('emits flush_complete after flush resolves', async () => {
       const videoDecoder = createMockVideoDecoder();
       const feedbacks: DecoderFeedback[] = [];

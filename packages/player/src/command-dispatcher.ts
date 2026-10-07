@@ -125,6 +125,7 @@ export class CommandDispatcher {
   /** Hysteresis state for queue pressure — prevents oscillation. */
   private videoQueuePressureHigh = false;
   private audioQueuePressureHigh = false;
+  private renderFeedbackRetired = false;
 
   /** Hold queue for video frames decoded before sync reference exists. */
   private readonly videoHoldQueue: Array<{ frame: unknown; captureTimestampUs: bigint }> = [];
@@ -241,16 +242,20 @@ export class CommandDispatcher {
       // User callback is also fired if provided.
       const audioOutput = this.audioOutput;
       this.renderer.onFrameRendered = (captureTimestampUs, actualRenderUs, scheduledRenderUs) => {
+        if (this.renderFeedbackRetired) return;
         opts.onFrameRendered?.(captureTimestampUs, actualRenderUs);
+        if (this.renderFeedbackRetired) return;
         // A/V skew observability: compare the rendered frame's capture
         // timestamp against what the speakers are playing RIGHT NOW.
         // Measurement only — no scheduling/render behavior depends on it.
         if (opts.onAvSkew && audioOutput?.playheadCaptureUs) {
           const playheadUs = audioOutput.playheadCaptureUs();
+          if (this.renderFeedbackRetired) return;
           if (playheadUs !== null) {
             opts.onAvSkew(Number(captureTimestampUs) - playheadUs);
           }
         }
+        if (this.renderFeedbackRetired) return;
         this.onFeedback?.({
           type: 'frame_rendered', mediaType: 'video', captureTimestampUs, actualRenderUs,
           ...(scheduledRenderUs !== undefined ? { scheduledRenderUs } : {}),
@@ -417,6 +422,8 @@ export class CommandDispatcher {
 
   /** Release all adapter resources. */
   destroy(): void {
+    // Retire before fallible cleanup; custom adapters may retain callbacks.
+    this.renderFeedbackRetired = true;
     this.closeVideoHoldQueue();
     this.videoDecoder?.destroy();
     this.audioDecoder?.destroy();
