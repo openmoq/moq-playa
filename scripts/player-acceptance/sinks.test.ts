@@ -4,6 +4,42 @@ import { observeAudio, observeCanvas } from '../../examples/_tests/player-accept
 afterEach(() => vi.unstubAllGlobals());
 
 describe('native output observers', () => {
+  it('separates the latest successful draw timestamp from the next refresh observation', () => {
+    let nowMs = 10;
+    vi.stubGlobal('performance', { now: () => nowMs });
+    class Frame {
+      constructor(readonly timestamp: number) {}
+      displayWidth = 640;
+      displayHeight = 360;
+    }
+    vi.stubGlobal('VideoFrame', Frame);
+    let refresh!: () => void;
+    vi.stubGlobal('requestAnimationFrame', (callback: () => void) => { refresh = callback; return 7; });
+    vi.stubGlobal('cancelAnimationFrame', vi.fn());
+    const drawImage = vi.fn((source: unknown) => { if (source === null) throw new Error('bad source'); nowMs++; });
+    const context = { drawImage };
+    const state = observeCanvas({ getContext: () => context } as unknown as HTMLCanvasElement);
+    expect(state.lastDrawTimestampUs).toBeUndefined();
+    expect(state.lastDrawTimeMs).toBeUndefined();
+    context.drawImage(new Frame(0));
+    expect(state.lastDrawTimestampUs).toBe(0);
+    expect(state.lastDrawTimeMs).toBe(11);
+    expect(state.frames).toBe(0);
+    refresh();
+    nowMs = 100;
+    context.drawImage(new Frame(125000));
+    expect(state.lastDrawTimestampUs).toBe(125000);
+    expect(state.lastDrawTimeMs).toBe(101);
+    expect(state.timestampUs).toBe(0);
+    expect(() => context.drawImage(null)).toThrow('bad source');
+    expect(state.lastDrawTimestampUs).toBe(125000);
+    expect(state.lastDrawTimeMs).toBe(101);
+    refresh();
+    expect(state.timestampUs).toBe(125000);
+    expect(state.frames).toBe(2);
+    state.restore();
+  });
+
   it('counts only successful VideoFrame draws and preserves native draw arguments', () => {
     class Frame { timestamp = 125000; displayWidth = 640; displayHeight = 360; }
     vi.stubGlobal('VideoFrame', Frame);

@@ -9,6 +9,7 @@ import { randomUUID, X509Certificate, createHash } from 'node:crypto';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright';
 import { assessPlayback } from './assessment.mjs';
+import { assessVideoPresentation } from './presentation.mjs';
 import { prepareFixture } from './fixture.mjs';
 import { stopProcess as stop } from './shutdown.mjs';
 
@@ -222,6 +223,8 @@ try {
       const observed = await page.evaluate(() => window.playerAcceptance.finish());
       caseResult.observed = observed;
       caseResult.assessment = assessPlayback(observed.samples, scenario.expected);
+      caseResult.presentationFailures = assessVideoPresentation(observed.samples);
+      assert.deepEqual(caseResult.presentationFailures, [], 'Public video draw observation');
       if (scenario.locmaf) assert.deepEqual(observed.locmafFailures, [], 'Browser did not receive the required LOCMAF catalog/full/delta/group mapping');
       if (scenario.alternatives) {
         assert.deepEqual(observed.levels.map((level) => level.trackName), ['video-1080', 'video-720', 'video-360']);

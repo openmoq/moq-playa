@@ -17,7 +17,7 @@
  * @module
  */
 
-import type { VideoRendererLike } from '@openmoq/player';
+import type { VideoRendererLike, VideoPresentation } from '@openmoq/player';
 import type { ClockSource } from '@openmoq/playback';
 import { validateStallThresholdMs } from './mse-adapter.js';
 
@@ -71,6 +71,14 @@ export class CanvasRenderer implements VideoRendererLike {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private destroyed = false;
+  private lastVideoPresentation: VideoPresentation | null = null;
+  private drawDepth = 0;
+  private drawRevision = 0;
+
+  /** Last successful canvas draw; retained on pause, cleared on destruction. */
+  get videoPresentation(): VideoPresentation | null {
+    return this.destroyed || this.drawDepth > 0 ? null : this.lastVideoPresentation;
+  }
 
   // ─── Callbacks ──────────────────────────────────────────────────
 
@@ -149,15 +157,26 @@ export class CanvasRenderer implements VideoRendererLike {
         // On time — render
         this.queue.shift();
 
-        // Capture timestamp BEFORE close — VideoFrame.timestamp is the
-        // CaptureTimestamp set during toVideoChunkInit() (LOC §2.3.1.1).
-        // Used for drift detection in the feedback path.
-        const captureTimestampUs = BigInt(entry.frame.timestamp);
+        // Capture the decoded timestamp before releasing the frame.
+        const frameTimestampUs = entry.frame.timestamp;
+        const captureTimestampUs = BigInt(frameTimestampUs);
+        const revision = ++this.drawRevision;
 
-        this.ctx.drawImage(entry.frame, 0, 0, this.ctx.canvas.width, this.ctx.canvas.height);
-
-        // frame.close() is NON-NEGOTIABLE — GPU memory outside GC
-        entry.frame.close();
+        try {
+          this.drawDepth++;
+          try {
+            this.ctx.drawImage(entry.frame, 0, 0, this.ctx.canvas.width, this.ctx.canvas.height);
+          } finally {
+            this.drawDepth--;
+            // A wrapper may reenter before or after its native draw. Neither
+            // invocation nor return order proves the final image in that case.
+            if (revision !== this.drawRevision) this.lastVideoPresentation = null;
+          }
+          this.recordVideoPresentation(frameTimestampUs, revision);
+        } finally {
+          // Release even when drawing fails; only successful draws update evidence.
+          entry.frame.close();
+        }
 
         rendered = true;
         // A genuinely rendered frame is the only thing that completes an
@@ -271,6 +290,7 @@ export class CanvasRenderer implements VideoRendererLike {
 
   /** Release resources. MUST close() all held frames. */
   destroy(): void {
+    this.lastVideoPresentation = null;
     this.cancelStallEpisode();
     this.destroyed = true;
     this.stop();
@@ -282,6 +302,26 @@ export class CanvasRenderer implements VideoRendererLike {
   }
 
   // ─── Internal ──────────────────────────────────────────────────
+
+  private recordVideoPresentation(timestampUs: number, revision: number): void {
+    if (this.destroyed || this.drawDepth > 0 || revision !== this.drawRevision) return;
+    this.lastVideoPresentation = null;
+    let renderedAtUs: number;
+    try {
+      renderedAtUs = this.clock.now();
+    } catch {
+      // Treat anything escaping this diagnostic query as unavailable evidence,
+      // including exceptions from hooks it calls. Preserve the playback path.
+      return;
+    }
+    if (this.destroyed || this.drawDepth > 0 || revision !== this.drawRevision) return;
+    if (!Number.isFinite(renderedAtUs)) return;
+    this.lastVideoPresentation = Object.freeze({
+      frameTimestampUs: Number.isSafeInteger(timestampUs) ? BigInt(timestampUs) : null,
+      timestampDomain: 'unknown',
+      renderedAtUs,
+    });
+  }
 
   private readonly onVisibilityChange = (): void => {
     if (!this.running) return;

@@ -482,6 +482,39 @@ describe('CommandDispatcher', () => {
 
   // ─── Lifecycle ──────────────────────────────────────────────────
 
+  it('reports unavailable presentation for an older renderer without the optional observation', () => {
+    const dispatcher = new CommandDispatcher({ renderer: createMockRenderer() });
+    expect(dispatcher.videoPresentation).toBeNull();
+    dispatcher.destroy();
+  });
+
+  it('copies exact presentation evidence and retires it on destruction', () => {
+    const observation = { frameTimestampUs: 9_007_199_254_740_993n, timestampDomain: 'unknown' as const, renderedAtUs: 123 };
+    const renderer = { ...createMockRenderer(), videoPresentation: observation };
+    const dispatcher = new CommandDispatcher({ renderer });
+    const snapshot = dispatcher.videoPresentation;
+    expect(snapshot).toEqual(observation);
+    expect(snapshot).not.toBe(observation);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    observation.frameTimestampUs = 0n;
+    expect(snapshot?.frameTimestampUs).toBe(9_007_199_254_740_993n);
+    expect(dispatcher.videoPresentation?.frameTimestampUs).toBe(0n);
+    dispatcher.destroy();
+    expect(dispatcher.videoPresentation).toBeNull();
+  });
+
+  it('rejects a presentation getter that retires the dispatcher while being sampled', () => {
+    const renderer = {
+      ...createMockRenderer(),
+      get videoPresentation() {
+        dispatcher.destroy();
+        return { frameTimestampUs: 0n, timestampDomain: 'unknown' as const, renderedAtUs: 123 };
+      },
+    };
+    const dispatcher = new CommandDispatcher({ renderer });
+    expect(dispatcher.videoPresentation).toBeNull();
+  });
+
   it('destroy() calls destroy on all adapters', () => {
     const videoDecoder = createMockVideoDecoder();
     const audioDecoder = createMockAudioDecoder();

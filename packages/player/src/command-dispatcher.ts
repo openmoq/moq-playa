@@ -21,7 +21,7 @@
  */
 
 import type { DecoderCommand, DecoderFeedback } from '@openmoq/playback';
-import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike } from './interfaces.js';
+import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike, VideoPresentation } from './interfaces.js';
 
 // ─── Queue pressure hysteresis thresholds ─────────────────────────────
 
@@ -262,6 +262,19 @@ export class CommandDispatcher {
         });
       };
     }
+  }
+
+  /** Historical draw evidence; unavailable without the optional renderer hook. */
+  get videoPresentation(): VideoPresentation | null {
+    if (this.renderFeedbackRetired) return null;
+    const observation = this.renderer?.videoPresentation;
+    if (!observation || this.renderFeedbackRetired) return null;
+    const snapshot: VideoPresentation = {
+      frameTimestampUs: observation.frameTimestampUs,
+      timestampDomain: observation.timestampDomain,
+      renderedAtUs: observation.renderedAtUs,
+    };
+    return this.renderFeedbackRetired ? null : Object.freeze(snapshot);
   }
 
   /**

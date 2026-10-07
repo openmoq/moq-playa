@@ -4,7 +4,9 @@ export function observeCanvas(canvas: HTMLCanvasElement) {
   const original = context.drawImage;
   let pending: { timestampUs: number; width: number; height: number } | undefined;
   let refresh = 0;
-  const state = { frames: 0, draws: 0, timestampUs: 0, width: 0, height: 0,
+  const state = { frames: 0, draws: 0, timestampUs: 0,
+    lastDrawTimestampUs: undefined as number | undefined, lastDrawTimeMs: undefined as number | undefined,
+    width: 0, height: 0,
     restore() { cancelAnimationFrame(refresh); context.drawImage = original; } };
   // Multiple draws between refreshes overwrite the same surface. Count only
   // the final image available to the next browser refresh, not decode bursts.
@@ -18,6 +20,8 @@ export function observeCanvas(canvas: HTMLCanvasElement) {
     const frame = args[0];
     if (frame instanceof VideoFrame) {
       state.draws++;
+      state.lastDrawTimestampUs = frame.timestamp;
+      state.lastDrawTimeMs = performance.now();
       pending = { timestampUs: frame.timestamp, width: frame.displayWidth, height: frame.displayHeight };
     }
   } as typeof original;

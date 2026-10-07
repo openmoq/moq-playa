@@ -120,6 +120,7 @@ export type {
   VideoDecoderLike,
   AudioDecoderLike,
   VideoRendererLike,
+  VideoPresentation,
   AudioOutputLike,
   MediaSourceLike,
 } from './interfaces.js';

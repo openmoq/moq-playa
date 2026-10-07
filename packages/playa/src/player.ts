@@ -36,7 +36,7 @@
 import {
   MoqtPlayer, TypedEmitter, checkSupport, usesMsePath,
 } from '@openmoq/player';
-import type { LocmafDecoding, MoqtPlayerConfig, SupportReport } from '@openmoq/player';
+import type { LocmafDecoding, MoqtPlayerConfig, SupportReport, VideoPresentation } from '@openmoq/player';
 import { MoqtConnection } from '@openmoq/webtransport';
 import {
   AudioAlignedClock,
@@ -94,6 +94,7 @@ export class Player {
   // ─── Internals ───────────────────────────────────────────────────
 
   private readonly engine: MoqtPlayer;
+  private presentationRetired = false;
   private readonly emitter = new TypedEmitter<PlayerEventMap>();
   private readonly container: HTMLElement | null;
   private readonly options: PlayerOptions;
@@ -245,6 +246,13 @@ export class Player {
 
   /** Current playback position in ms. */
   get currentTime(): number { return this._currentTime; }
+
+  /** Last video draw evidence, not content position; null for unsupported outputs. */
+  get videoPresentation(): VideoPresentation | null {
+    if (this.presentationRetired) return null;
+    const observation = this.engine.videoPresentation;
+    return this.presentationRetired ? null : observation;
+  }
 
   /** Stream duration in ms, or undefined for live. */
   get duration(): number | undefined { return this._duration; }
@@ -487,6 +495,7 @@ export class Player {
 
   /** Destroy the player and release all resources. */
   async destroy(): Promise<void> {
+    this.presentationRetired = true;
     this.timeCtrl?.stop();
     this.stopStatsTimer();
     this.renderer?.destroy();

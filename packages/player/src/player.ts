@@ -66,7 +66,7 @@ interface LocmafChunkDetails {
   readonly timescale: number;
   readonly baseMediaDecodeTime: bigint;
 }
-import type { MediaSourceLike } from './interfaces.js';
+import type { MediaSourceLike, VideoPresentation } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import { StatsAccumulator } from './stats.js';
 import type { PlayerStats } from './stats.js';
@@ -1080,6 +1080,16 @@ export class MoqtPlayer {
   /** Current player state. */
   get state(): PlayerStateValue {
     return this.stateMachine.state;
+  }
+
+  /**
+   * Historical video draw evidence, not an advancing content playhead.
+   * Null after destruction or without renderer support (including MSE).
+   */
+  get videoPresentation(): VideoPresentation | null {
+    if (this._destroyed) return null;
+    const observation = this.commandDispatcher?.videoPresentation ?? null;
+    return this._destroyed ? null : observation;
   }
 
   /**

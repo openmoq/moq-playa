@@ -122,6 +122,16 @@ export interface AudioDecoderLike {
 
 // ─── Layer 4: Renderer and Audio Output (Swappable) ──────────────────
 
+/** Historical render evidence, not a content playhead or seek-completion signal. */
+export interface VideoPresentation {
+  /** Decoded frame timestamp in microseconds; null if numeric precision is unavailable. */
+  readonly frameTimestampUs: bigint | null;
+  /** The decoder timestamp's origin is not inferred from its value. */
+  readonly timestampDomain: 'unknown';
+  /** Renderer monotonic clock sampled after the successful draw call returns, in microseconds. */
+  readonly renderedAtUs: number;
+}
+
 /**
  * Video renderer interface — draws decoded frames to a display surface.
  *
@@ -129,6 +139,9 @@ export interface AudioDecoderLike {
  * MUST call frame.close() after rendering (GPU memory management).
  */
 export interface VideoRendererLike {
+  /** Most recent successful render observation; null when draw order or timing is unavailable. */
+  readonly videoPresentation?: VideoPresentation | null;
+
   /** Enqueue a decoded frame for presentation at the specified time. */
   enqueue(frame: unknown, renderTimeUs: number): void;
 

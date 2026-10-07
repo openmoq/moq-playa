@@ -118,6 +118,7 @@ function sample(): void {
   let peak = 0;
   for (let i = 1; i < spectrum.length; i++) if (spectrum[i]! > spectrum[peak]!) peak = i;
   const ranges = video.buffered;
+  const presentation = player.videoPresentation;
   samples.push({
     outputKind: frameOutput ? 'canvas' : 'video',
     wallMs: performance.now(), wallEpochMs: Date.now(), mediaTimeS: frameOutput ? player.currentTime / 1000 : video.currentTime,
@@ -125,6 +126,13 @@ function sample(): void {
     pictureChange: difference / (64 * 36 * 3), markerRgb,
     videoWidth: canvasObserver?.width ?? video.videoWidth, videoHeight: canvasObserver?.height ?? video.videoHeight,
     ...(canvasObserver ? { frameTimestampUs: canvasObserver.timestampUs } : {}),
+    ...(canvasObserver?.lastDrawTimestampUs !== undefined ? { nativeDrawTimestampUs: canvasObserver.lastDrawTimestampUs } : {}),
+    ...(canvasObserver?.lastDrawTimeMs !== undefined ? { nativeDrawTimeMs: canvasObserver.lastDrawTimeMs } : {}),
+    videoPresentation: presentation ? {
+      frameTimestampUs: presentation.frameTimestampUs?.toString() ?? null,
+      timestampDomain: presentation.timestampDomain,
+      renderedAtUs: presentation.renderedAtUs,
+    } : null,
     audioRms: rms, audioPeakHz: rms > 0.015 ? peak * audioContext!.sampleRate / analyser.fftSize : 0,
     paused: frameOutput ? player.state !== 'playing' : video.paused, seeking: frameOutput ? false : video.seeking,
     visibility: document.visibilityState,

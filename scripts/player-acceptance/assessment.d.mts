@@ -17,6 +17,9 @@ export interface PlaybackSample {
   visibility: string;
   bufferedRanges: { start: number; end: number }[] | null;
   frameTimestampUs?: number;
+  nativeDrawTimestampUs?: number;
+  nativeDrawTimeMs?: number;
+  videoPresentation?: { frameTimestampUs: string | null; timestampDomain: 'unknown'; renderedAtUs: number } | null;
 }
 
 export interface ExpectedPlayback {

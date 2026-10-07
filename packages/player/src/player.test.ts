@@ -3209,6 +3209,43 @@ describe('MoqtPlayer', () => {
       expect(createAudioOutput).toHaveBeenCalledOnce();
     });
 
+    it('exposes optional renderer draw evidence through the catalog-created pipeline', async () => {
+      const adapter = createMockAdapter();
+      const renderer = {
+        enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(),
+        onFirstFrame: null, onFrameRendered: null, onStall: null,
+        videoPresentation: null as import('./interfaces.js').VideoPresentation | null,
+      };
+      const player = await loadWithCatalog(adapter, {
+        ...createPipelineConfig(adapter),
+        createRenderer: () => renderer,
+        createVideoDecoder: () => ({
+          configure: vi.fn(), decode: vi.fn(), flush: vi.fn(async () => {}),
+          reset: vi.fn(), queueDepth: 0, onFrame: null, onError: null, destroy: vi.fn(),
+        }),
+      });
+      try {
+        expect(player.videoPresentation).toBeNull();
+        renderer.videoPresentation = {
+          frameTimestampUs: 0n, timestampDomain: 'unknown', renderedAtUs: 123,
+        };
+        expect(player.videoPresentation).toEqual(renderer.videoPresentation);
+        expect(player.videoPresentation).not.toBe(renderer.videoPresentation);
+      } finally {
+        await player.destroy();
+      }
+      expect(player.videoPresentation).toBeNull();
+    });
+
+    it('has no video presentation without an instrumented renderer', async () => {
+      const player = await loadWithCatalog(createMockAdapter());
+      try {
+        expect(player.videoPresentation).toBeNull();
+      } finally {
+        await player.destroy();
+      }
+    });
+
     // The stall metric only means something if the player actually wires both
     // phases. Driving the renderer callbacks directly keeps that wiring
     // load-bearing rather than assumed.
