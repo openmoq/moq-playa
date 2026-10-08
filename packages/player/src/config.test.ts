@@ -12,6 +12,33 @@ function minConfig(overrides?: Partial<MoqtPlayerConfig>): MoqtPlayerConfig {
   return { url: 'https://relay.example.com/moq', namespace: 'live', ...overrides };
 }
 
+describe('video altGroup configuration', () => {
+  it.each([0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('rejects invalid group ID %s', (videoAltGroup) => {
+    expect(() => validateConfig(minConfig({ videoAltGroup }))).toThrow('videoAltGroup');
+  });
+
+  it('accepts zero and leaves the default unset', () => {
+    expect(() => validateConfig(minConfig({ videoAltGroup: 0 }))).not.toThrow();
+    expect((DEFAULT_PLAYER_CONFIG as Partial<MoqtPlayerConfig>).videoAltGroup).toBeUndefined();
+  });
+
+  it('accepts negative integer group labels permitted by MSF', () => {
+    expect(() => validateConfig(minConfig({ videoAltGroup: -1 }))).not.toThrow();
+  });
+
+  it('rejects the catalog-free known-video fast path when a catalog group must be selected', () => {
+    expect(() => validateConfig(minConfig({ videoAltGroup: 0, knownTracks: {
+      video: { name: 'v', codec: 'avc1.640028' },
+    } }))).toThrow('knownTracks');
+  });
+
+  it('also rejects the known-audio fast path rather than silently ignoring a requested video group', () => {
+    expect(() => validateConfig(minConfig({ videoAltGroup: 0, knownTracks: {
+      audio: { name: 'a', codec: 'opus', samplerate: 48000, channels: 2 },
+    } }))).toThrow('knownTracks');
+  });
+});
+
 // ─── DEFAULT_PLAYER_CONFIG shape ─────────────────────────────────────
 
 describe('DEFAULT_PLAYER_CONFIG', () => {

@@ -34,7 +34,7 @@
  */
 
 import {
-  MoqtPlayer, TypedEmitter, checkSupport, usesMsePath,
+  MoqtPlayer, QualityController, TypedEmitter, checkSupport, usesMsePath,
 } from '@openmoq/player';
 import type { LocmafDecoding, MoqtPlayerConfig, SupportReport, VideoPresentation } from '@openmoq/player';
 import { MoqtConnection } from '@openmoq/webtransport';
@@ -57,6 +57,7 @@ import { TimeController } from './time-controller.js';
 import { mapLevels, mapAudioTracks } from './level-mapper.js';
 import type { PlayerOptions, Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
 import type { PlayerEventMap } from './events.js';
+import type { AltGroup } from '@openmoq/msf';
 
 /** Default player options, merged with user-provided options. */
 const DEFAULTS = {
@@ -101,6 +102,7 @@ export class Player {
   private readonly strategy: DecoderStrategy;
   /** How the engine consumes LOCMAF tracks; decides the render sink for them. */
   private readonly locmafDecoding: LocmafDecoding | undefined;
+  private readonly selectionConfig: MoqtPlayerConfig;
 
   // DOM elements — may be user-provided (borrowed) or created by Player (owned).
   private canvas: HTMLCanvasElement | null = null;
@@ -113,6 +115,7 @@ export class Player {
 
   // Resolved after catalog_received — 'canvas' for LOC/WebCodecs, 'video' for CMAF/MSE.
   private _activeMediaType: 'canvas' | 'video' | null = null;
+  private webAudioRequired = false;
 
   // Controllers
   private volumeCtrl: VolumeController | null = null;
@@ -201,6 +204,7 @@ export class Player {
     // Build MoqtPlayer config and create MoqtPlayer
     const moqtPlayerConfig = this.buildMoqtPlayerConfig();
     this.locmafDecoding = moqtPlayerConfig.locmafDecoding;
+    this.selectionConfig = moqtPlayerConfig;
     this.engine = new MoqtPlayer(moqtPlayerConfig);
 
     // Wire MoqtPlayer events → Player events
@@ -268,6 +272,9 @@ export class Player {
 
   /** Available quality levels (sorted by bitrate, highest first). */
   get levels(): readonly Level[] { return this._levels; }
+
+  /** Available catalog video views; select one with videoAltGroup at tune-in. */
+  get videoGroups(): readonly AltGroup[] { return this.engine.availableVideoGroups; }
 
   /** Current quality level index, or -1 if unknown. */
   get currentLevel(): number { return this._currentLevel; }
@@ -423,8 +430,8 @@ export class Player {
    * attaches the audio-aligned clock, creates VolumeController, and activates
    * the deferred audio output.
    *
-   * For CMAF/MSE playback, the HTMLVideoElement owns audio — no AudioContext
-   * is created. Safe to call either way.
+   * When the selected audio uses MSE, the HTMLVideoElement owns audio and
+   * no AudioContext is created. Safe to call either way.
    *
    * **Call from a user gesture** to satisfy browser autoplay policy.
    *
@@ -432,8 +439,7 @@ export class Player {
    * Retries on failure (does not latch on rejected resume).
    */
   async prepareAudio(): Promise<void> {
-    // CMAF/MSE path: HTMLVideoElement owns audio. No AudioContext needed.
-    if (this._activeMediaType === 'video') return;
+    if (this._activeMediaType === 'video' && !this.webAudioRequired) return;
 
     if (this._prepareAudioPromise) return this._prepareAudioPromise;
 
@@ -549,6 +555,7 @@ export class Player {
           return this.renderer;
         },
         createAudioOutput: () => {
+          this.webAudioRequired = true;
           if (this.options.audioActivation === 'gesture') {
             // Deferred: drops audio until prepareAudio()/unmute() from user gesture
             return this.deferredAudio;
@@ -573,6 +580,9 @@ export class Player {
     if (opts.maxResolution) {
       (base as unknown as Record<string, unknown>).capLevelToResolution = opts.maxResolution;
     }
+    if (opts.videoAltGroup !== undefined) {
+      Object.assign(base, { videoAltGroup: opts.videoAltGroup });
+    }
     if (opts.targetLatencyMs !== undefined) {
       (base as unknown as Record<string, unknown>).targetLatencyMs = opts.targetLatencyMs;
     }
@@ -595,14 +605,42 @@ export class Player {
 
   private wireEngineEvents(): void {
     this.engine.on('catalog_received', (e) => {
-      this._levels = mapLevels(e.catalog);
+      // Catalog events precede subscription selection. A missing requested
+      // group is reported by the engine, not thrown from an event listener.
+      const config = this.selectionConfig;
+      const knownVideo = !config.catalog && !config.disableVideo ? config.knownTracks?.video : undefined;
+      const activeVideo = knownVideo && e.catalog.tracks.find(t => t.role === 'video' && t.name === knownVideo.name);
+      const selectionCatalog = activeVideo ? {
+        ...e.catalog, tracks: e.catalog.tracks.filter(t => t.role !== 'video' || t.altGroup === activeVideo.altGroup),
+      } : e.catalog;
+      const selector = new QualityController({
+        autoQuality: config.autoQuality ?? true,
+        startLevel: config.startLevel ?? 'auto',
+        ...(config.capLevelToResolution ? { capLevelToResolution: config.capLevelToResolution } : {}),
+        qualitySwitchCooldownMs: config.qualitySwitchCooldownMs ?? 5000,
+        clock: this.audioClock,
+      });
+      let selected;
+      try {
+        selected = selector.selectInitialTracks(selectionCatalog, config);
+        if (activeVideo) {
+          selector.commitVideoTrack(activeVideo.name);
+          selected = { ...selected, video: activeVideo };
+        }
+      } catch {
+        this._levels = [];
+        return;
+      }
+      this._levels = mapLevels({ ...e.catalog, tracks: [...selector.allAlternatives] });
       this._audioTracks = mapAudioTracks(e.catalog);
       // cmaf renders through MSE into the <video> element, as does locmaf
       // unless the engine decodes it frame by frame onto the canvas.
-      const hasCmaf = e.catalog.tracks.some(track => usesMsePath(track.packaging, this.locmafDecoding));
+      const sinkTrack = selected.video ?? selected.audio;
+      const hasCmaf = sinkTrack !== undefined && usesMsePath(sinkTrack.packaging, this.locmafDecoding);
 
       // Record which element is the active render sink so callers can react.
       this._activeMediaType = hasCmaf ? 'video' : 'canvas';
+      this.webAudioRequired = selected.audio !== undefined && !usesMsePath(selected.audio.packaging, this.locmafDecoding);
       this.applyVolumeState();
 
       // Only toggle visibility on elements the Player created itself.
@@ -686,22 +724,22 @@ export class Player {
   }
 
   /**
-   * Apply current volume/mute state to whichever sink is active.
+   * Apply volume/mute to both audio outputs. The visible video sink does not
+   * determine where audio plays (LOC video can accompany CMAF audio).
    *
    * - CMAF/MSE path: HTMLVideoElement owns audio playout.
    * - LOC/WebCodecs path: WebAudioOutput graph owns audio playout.
    */
   private applyVolumeState(): void {
-    if (this._activeMediaType === 'video' && this.videoElement) {
+    if (this.videoElement) {
       this.videoElement.volume = this._volume;
       this.videoElement.muted = this._muted;
-      return;
     }
 
     if (this.strategy === 'webcodecs') {
       // Don't create AudioContext from volume/mute state changes in gesture mode.
       // Audio activation only happens via prepareAudio()/unmute().
-      if (this.options.audioActivation !== 'gesture') {
+      if (this.options.audioActivation !== 'gesture' && (this._activeMediaType !== 'video' || this.webAudioRequired)) {
         this.ensureAudioContext();
       }
       this.volumeCtrl?.setVolume(this._volume);

@@ -6,6 +6,7 @@
  */
 
 import type { CatalogState } from '@openmoq/msf';
+import { isTrackPackagingSupported, selectVideoAltGroup } from '@openmoq/msf';
 import type { Level, AudioTrack } from './types.js';
 
 /**
@@ -30,14 +31,14 @@ function resolutionLabel(track: { height?: number; bitrate?: number; name: strin
  * Map MSF catalog video tracks to a sorted Level array for UI display.
  *
  * Sorted by bitrate descending (highest quality first, index 0 = best).
- * If the catalog has altGroups, uses the first video altGroup.
+ * Uses the requested video altGroup, or the first group when omitted.
  * Otherwise, uses all video tracks.
  *
- * @see draft-ietf-moq-msf-00 §5.1.13 (altGroup)
+ * @see draft-ietf-moq-msf-01 §5.2.12 (altGroup)
  */
-export function mapLevels(catalog: CatalogState): Level[] {
+export function mapLevels(catalog: CatalogState, videoAltGroup?: number): Level[] {
   const videoTracks = catalog.tracks.filter(
-    t => t.codec && (
+    t => isTrackPackagingSupported(t) && t.codec && (
       t.codec.startsWith('avc1') ||
       t.codec.startsWith('hev1') ||
       t.codec.startsWith('hvc1') ||
@@ -47,10 +48,9 @@ export function mapLevels(catalog: CatalogState): Level[] {
     ),
   );
 
-  if (videoTracks.length === 0) return [];
-
   // Sort by bitrate descending (highest first)
-  const sorted = [...videoTracks].sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+  const sorted = selectVideoAltGroup(videoTracks, videoAltGroup)
+    .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
 
   return sorted.map((track, index) => ({
     index,

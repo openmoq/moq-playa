@@ -82,6 +82,23 @@ describe('late renderer creation', () => {
 });
 
 describe('mapLevels', () => {
+  const views = {
+    version: 1,
+    tracks: [
+      { name: 'landscape-high', role: 'video', packaging: 'loc', codec: 'avc1.640028', altGroup: 7, bitrate: 2000 },
+      { name: 'portrait', role: 'video', packaging: 'loc', codec: 'avc1.640028', altGroup: 0, bitrate: 3000 },
+      { name: 'landscape-low', role: 'video', packaging: 'loc', codec: 'avc1.640028', altGroup: 7, bitrate: 1000 },
+    ],
+  } as CatalogState;
+
+  it('does not mix different video views into the default quality menu', () => {
+    expect(mapLevels(views).map(l => l.trackName)).toEqual(['landscape-high', 'landscape-low']);
+  });
+
+  it('maps the requested view to its own quality indices', () => {
+    expect(mapLevels(views, 0).map(l => [l.index, l.trackName])).toEqual([[0, 'portrait']]);
+  });
+
   const catalog: CatalogState = {
     tracks: [
       { name: 'video-0', codec: 'avc1.640028', width: 1920, height: 1080, bitrate: 3_000_000 } as any,
@@ -190,6 +207,84 @@ describe('Player.setQuality', () => {
 // ─── Render sink choice on catalog_received ───────────────────────────
 
 describe('Player authorization options', () => {
+  it('previews the injected catalog instead of an unused known-video hint', async () => {
+    const catalog = { version: 1, tracks: [
+      { name: 'landscape', role: 'video' as const, packaging: 'cmaf' as const, isLive: true, codec: 'avc1.640028', altGroup: 7 },
+      { name: 'portrait', role: 'video' as const, packaging: 'loc' as const, isLive: true, codec: 'avc1.640028', altGroup: 0 },
+    ] };
+    const player = new Player(mockElement(), { url: 'https://relay.example/moq', namespace: 'views',
+      moqtPlayerConfig: { catalog, knownTracks: { video: { name: 'portrait', codec: 'avc1.640028' } } },
+    });
+    try {
+      (player as any).engine.emitter.emit('catalog_received', { type: 'catalog_received', catalog });
+      expect(player.levels.map(l => l.trackName)).toEqual(['landscape']);
+      expect(player.activeMediaType).toBe('video');
+    } finally { await player.destroy(); }
+  });
+  it('previews the actual known-video view rather than the default catalog group', async () => {
+    const player = new Player(mockElement(), { url: 'https://relay.example/moq', namespace: 'views',
+      moqtPlayerConfig: { knownTracks: { video: { name: 'portrait', codec: 'avc1.640028' } } },
+    });
+    try {
+      (player as any).engine.emitter.emit('catalog_received', { type: 'catalog_received', catalog: { version: 1, tracks: [
+        { name: 'landscape', role: 'video', packaging: 'cmaf', codec: 'avc1.640028', altGroup: 7 },
+        { name: 'portrait', role: 'video', packaging: 'loc', codec: 'avc1.640028', altGroup: 0 },
+      ] } });
+      expect(player.levels.map(l => l.trackName)).toEqual(['portrait']);
+      expect(player.activeMediaType).toBe('canvas');
+    } finally { await player.destroy(); }
+  });
+  it('passes the initial view to the engine and scopes the quality menu to that view', async () => {
+    const player = new Player(mockElement(), {
+      url: 'https://relay.example/moq', namespace: 'views', videoAltGroup: 0,
+    });
+    try {
+      const engine = (player as any).engine;
+      expect(engine.config.videoAltGroup).toBe(0);
+      engine.emitter.emit('catalog_received', { type: 'catalog_received', catalog: { version: 1, tracks: [
+        { name: 'landscape', role: 'video', packaging: 'cmaf', codec: 'avc1.640028', altGroup: 7 },
+        { name: 'portrait', role: 'video', packaging: 'loc', codec: 'avc1.640028', altGroup: 0 },
+      ] } });
+      expect(player.levels.map(l => l.trackName)).toEqual(['portrait']);
+      expect(player.activeMediaType).toBe('canvas');
+      expect((player as any).canvas.hidden).toBe(false);
+    } finally { await player.destroy(); }
+  });
+
+  it('uses effective engine overrides for view, quality, resolution cap and render sink', async () => {
+    const player = new Player(mockElement(), {
+      url: 'https://relay.example/moq', namespace: 'views', videoAltGroup: 7,
+      moqtPlayerConfig: { videoAltGroup: 0, startLevel: 'lowest', capLevelToResolution: { width: 640, height: 640 } },
+    });
+    try {
+      const engine = (player as any).engine;
+      engine.emitter.emit('catalog_received', { type: 'catalog_received', catalog: { version: 1, tracks: [
+        { name: 'landscape', role: 'video', packaging: 'cmaf', codec: 'avc1.640028', altGroup: 7 },
+        { name: 'portrait-high', role: 'video', packaging: 'cmaf', codec: 'avc1.640028', altGroup: 0, width: 1080, height: 1920, bitrate: 3000 },
+        { name: 'portrait-low', role: 'video', packaging: 'loc', codec: 'avc1.640028', altGroup: 0, width: 360, height: 640, bitrate: 500 },
+      ] } });
+      expect(player.levels.map(l => l.trackName)).toEqual(['portrait-low']);
+      expect(player.activeMediaType).toBe('canvas');
+    } finally { await player.destroy(); }
+  });
+
+  it('does not announce ready with an empty fallback menu for a missing requested group', async () => {
+    const player = new Player(mockElement(), {
+      url: 'https://relay.example/moq', namespace: 'views', videoAltGroup: 99,
+    });
+    try {
+      const ready = vi.fn();
+      player.on('ready', ready);
+      expect(() => (player as any).engine.emitter.emit('catalog_received', {
+        type: 'catalog_received', catalog: { version: 1, tracks: [
+          { name: 'landscape', role: 'video', packaging: 'loc', codec: 'avc1.640028', altGroup: 7 },
+        ] },
+      })).not.toThrow();
+      expect(player.levels).toEqual([]);
+      expect(ready).not.toHaveBeenCalled();
+    } finally { await player.destroy(); }
+  });
+
   it('passes the credential provider and trust options to its engine', async () => {
     const authorization = { getTokens: vi.fn(async () => [{ tokenType: 1n, value: new Uint8Array([1]) }]),
       timeoutMs: 500, allowedRelayOrigins: ['https://trusted.example'] };
@@ -208,6 +303,61 @@ describe('Player authorization options', () => {
 });
 
 describe('Player sink choice (MSE <video> vs <canvas>)', () => {
+  it('activates gesture LOC audio alongside CMAF video but not for an MSE-only selection', async () => {
+    for (const packaging of ['loc', 'cmaf']) {
+      const player = new Player(mockElement(), { url: 'https://relay.example/moq', namespace: 'mixed', audioActivation: 'gesture' });
+      const p = player as any;
+      try {
+        p.engine.emitter.emit('catalog_received', { type: 'catalog_received', catalog: { version: 1, tracks: [
+          { name: 'v', role: 'video', packaging: 'cmaf', codec: 'avc1.640028' },
+          { name: 'a', role: 'audio', packaging, codec: packaging === 'loc' ? 'opus' : 'mp4a.40.2' },
+        ] } });
+        expect(p.audioCtx).toBeNull();
+        await player.unmute();
+        expect(p.audioCtx !== null).toBe(packaging === 'loc');
+        expect(p.deferredAudio.isActive).toBe(packaging === 'loc');
+      } finally { await player.destroy(); }
+    }
+  });
+  it('controls existing WebAudio with CMAF video without eagerly activating gesture audio', async () => {
+    const player = new Player(mockElement(), { url: 'https://relay.example/moq', namespace: 'mixed', audioActivation: 'gesture' });
+    const p = player as any;
+    try {
+      p.engine.emitter.emit('catalog_received', { type: 'catalog_received', catalog: { version: 1, tracks: [
+        { name: 'v', role: 'video', packaging: 'cmaf', codec: 'avc1.640028' },
+        { name: 'a', role: 'audio', packaging: 'loc', codec: 'opus' },
+      ] } });
+      expect(player.activeMediaType).toBe('video');
+      player.mute();
+      player.setVolume(0.5);
+      expect(p.audioCtx).toBeNull();
+      const volume = { setVolume: vi.fn(), setMuted: vi.fn() };
+      p.volumeCtrl = volume;
+      player.setVolume(0.25);
+      player.mute();
+      expect(volume.setVolume).toHaveBeenLastCalledWith(0.25);
+      expect(volume.setMuted).toHaveBeenLastCalledWith(true);
+      expect(p.videoElement.muted).toBe(true);
+      expect(p.videoElement.volume).toBe(0.25);
+      expect(p.audioCtx).toBeNull();
+    } finally { p.volumeCtrl = null; await player.destroy(); }
+  });
+  it('controls CMAF audio even when LOC video uses the canvas', async () => {
+    const player = new Player(mockElement(), { url: 'https://relay.example/moq', namespace: 'mixed' });
+    try {
+      (player as any).engine.emitter.emit('catalog_received', { type: 'catalog_received', catalog: { version: 1, tracks: [
+        { name: 'v', role: 'video', packaging: 'loc', codec: 'avc1.640028' },
+        { name: 'a', role: 'audio', packaging: 'cmaf', codec: 'mp4a.40.2' },
+      ] } });
+      expect(player.activeMediaType).toBe('canvas');
+      player.mute();
+      expect((player as any).videoElement.muted).toBe(true);
+      player.setVolume(0.25);
+      expect((player as any).videoElement.volume).toBe(0.25);
+      await player.unmute();
+      expect((player as any).videoElement.muted).toBe(false);
+    } finally { await player.destroy(); }
+  });
   it('keeps the canvas visible for LOCMAF frame decoding', async () => {
     const player = new Player(mockElement(), {
       url: 'https://relay.example.com/moq', namespace: 'test',

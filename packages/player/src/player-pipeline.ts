@@ -311,7 +311,8 @@ export function createPipelines(
       onCommand: (cmd) => callbacks.onCommand(cmd),
       onEvent: (evt) => callbacks.onEvent('video', evt),
       recovery: recoveryController,
-      videoOnly: !trackInfo.audio,
+      // MSE audio never supplies a reference to the LOC sync controller.
+      videoOnly: !trackInfo.audio || hasCmafAudio,
       ...(trackInfo.isLive !== undefined ? { isLive: trackInfo.isLive } : {}),
     });
   }

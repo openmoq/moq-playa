@@ -97,6 +97,25 @@ export function groupByAlt(
 }
 
 /**
+ * Select one video switching set. Callers filter unsupported tracks first.
+ * Omission preserves first-group selection and the legacy ungrouped ladder.
+ * An explicit group never falls back to another view.
+ * @see draft-ietf-moq-msf-01 §5.2.12
+ */
+export function selectVideoAltGroup(
+    tracks: readonly CatalogTrack[],
+    altGroup?: number,
+): CatalogTrack[] {
+    const { groups } = groupByAlt(tracks);
+    if (altGroup !== undefined) {
+        const group = groups.find(g => g.altGroup === altGroup);
+        if (!group) throw new Error(`Unknown video altGroup: ${altGroup}`);
+        return [...group.tracks];
+    }
+    return groups.length > 0 ? [...groups[0]!.tracks] : [...tracks];
+}
+
+/**
  * Select best track from candidates matching constraints.
  *
  * Filtering order:

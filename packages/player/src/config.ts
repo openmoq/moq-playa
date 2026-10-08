@@ -402,6 +402,15 @@ export interface QualityConfig {
   readonly videoConstraints?: TrackConstraints;
 
   /**
+   * Video alternate group to select at tune-in. Omitted: first video group.
+   * Quality selection and ABR stay within this group. Selecting another group
+   * requires a new player; groups need not share a media timeline or Group IDs.
+   * Cannot be combined with the catalog-free knownTracks fast path.
+   * @see draft-ietf-moq-msf-01 §4.2, §5.2.12
+   */
+  readonly videoAltGroup?: number;
+
+  /**
    * Constraints for initial audio track selection from altGroup.
    * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
    */
@@ -752,6 +761,14 @@ export const DEFAULT_PLAYER_CONFIG = {
  * into a stream.
  */
 export function validateConfig(config: MoqtPlayerConfig): void {
+  if (config.videoAltGroup !== undefined) {
+    if (!Number.isSafeInteger(config.videoAltGroup)) {
+      throw new RangeError('videoAltGroup must be a safe integer');
+    }
+    if (config.knownTracks && !config.catalog && !config.disableVideo) {
+      throw new TypeError('videoAltGroup cannot be combined with knownTracks; select from the catalog');
+    }
+  }
   if (config.authorization !== undefined && (!config.authorization || typeof config.authorization.getTokens !== 'function')) {
     throw new TypeError('Invalid authorization configuration');
   }

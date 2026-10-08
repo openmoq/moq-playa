@@ -684,8 +684,9 @@ describe('MoqtPlayer', () => {
   it('destroy() cleans up and transitions to ended', async () => {
     const adapter = createMockAdapter();
     const player = new MoqtPlayer(createConfig(adapter));
-    player.load();
+    const loading = player.load();
     await resolveConnect(adapter);
+    await loading;
 
     await player.destroy();
     expect(adapter.close).toHaveBeenCalled();
@@ -762,8 +763,9 @@ describe('MoqtPlayer', () => {
     const player = new MoqtPlayer(createConfig(adapter));
     const errorEvents: unknown[] = [];
     player.on('error', (e) => errorEvents.push(e));
-    player.load();
+    const loading = player.load();
     await resolveConnect(adapter);
+    await loading;
 
     // Quiet-destroy contract: a dead transport rejecting close() must not
     // make destroy() reject for library consumers without a try/catch.

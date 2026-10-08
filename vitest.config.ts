@@ -31,6 +31,7 @@ export default defineConfig({
       'examples/node-relay/src/**/*.test.ts',
       'examples/node-publisher/src/**/*.test.ts',
       'examples/broadcast/**/*.test.ts',
+      'examples/player/**/*.test.ts',
       'examples/shared/**/*.test.ts',
       'scripts/**/*.test.ts',
       '_migration/**/*.test.ts',

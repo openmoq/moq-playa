@@ -6,7 +6,7 @@
  * through the altGroup (lower bitrate alternatives).
  *
  * Quality switches happen at MOQT Group boundaries per §4.2
- * (tracks in common renderGroup are time-aligned).
+ * (tracks in a common altGroup are time-aligned).
  *
  * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
  * @see draft-ietf-moq-msf-00 §4.2 (time-alignment)
@@ -15,7 +15,7 @@
  */
 
 import type { CatalogTrack, CatalogState, TrackConstraints } from '@openmoq/msf';
-import { groupByAlt, selectTrack, isTrackPackagingSupported } from '@openmoq/msf';
+import { selectVideoAltGroup, selectTrack, isTrackPackagingSupported } from '@openmoq/msf';
 import type { ClockSource } from '@openmoq/playback';
 
 /** Configuration for the quality controller. */
@@ -34,6 +34,7 @@ export interface QualityControllerConfig {
 
 /** Selection constraints for initial track selection. */
 export interface SelectionConstraints {
+  readonly videoAltGroup?: number;
   readonly videoConstraints?: TrackConstraints;
   readonly audioConstraints?: TrackConstraints;
   readonly disableVideo?: boolean;
@@ -109,15 +110,8 @@ export class QualityController {
     const audioTracks = usable.filter(t => t.role === 'audio');
 
     // Build video alternatives from altGroup
-    let videoAlts: CatalogTrack[];
-    const { groups } = groupByAlt(videoTracks);
-    if (groups.length > 0) {
-      // Use the first altGroup's tracks
-      videoAlts = [...groups[0]!.tracks];
-    } else {
-      // No altGroup — treat all video tracks as alternatives
-      videoAlts = [...videoTracks];
-    }
+    let videoAlts = constraints?.disableVideo
+      ? [] : selectVideoAltGroup(videoTracks, constraints?.videoAltGroup);
 
     // Sort by bitrate descending (highest quality first)
     videoAlts.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
@@ -274,11 +268,13 @@ export class QualityController {
    * committed to the pipeline/MSE, not when the subscription starts.
    */
   commitVideoTrack(trackName: string): void {
-    const idx = this.videoAlternatives.findIndex(t => t.name === trackName);
-    if (idx >= 0) {
-      this.videoIndex = idx;
-      this.lastSwitchTimeUs = this.clock.now();
-    }
+    const track = this.allVideoAlternatives.find(t => t.name === trackName);
+    if (!track) return;
+    const family = track.codec?.split('.')[0];
+    this.videoAlternatives = family === undefined ? [...this.allVideoAlternatives]
+      : this.allVideoAlternatives.filter(t => t.codec?.split('.')[0] === family);
+    this.videoIndex = this.videoAlternatives.indexOf(track);
+    this.lastSwitchTimeUs = this.clock.now();
   }
 
   /** Lock to current quality — disables reduce/increase until unlocked. */

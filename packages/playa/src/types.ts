@@ -60,6 +60,8 @@ export interface PlayerOptions {
   readonly autoQuality?: boolean;
   /** Initial quality level: 'auto' | 'lowest' | level index. Default: 'auto'. */
   readonly startLevel?: number | 'lowest' | 'auto';
+  /** Initial video view (catalog altGroup). Omitted: first video group. */
+  readonly videoAltGroup?: number;
   /** Cap quality to a maximum resolution. */
   readonly maxResolution?: { readonly width: number; readonly height: number };
 

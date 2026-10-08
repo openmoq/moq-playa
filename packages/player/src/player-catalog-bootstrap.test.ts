@@ -331,6 +331,36 @@ describe('catalog bootstrap wiring — subscribe + join', () => {
 });
 
 describe('catalog bootstrap wiring — convergence end-to-end', () => {
+    it.each([16, 18] as const)('draft %i: the converged catalog selects the requested view and decoder metadata', async (draft) => {
+        const adapter = createMockAdapter(draft);
+        const decoder = {
+            configure: vi.fn(), decode: vi.fn(), flush: vi.fn(async () => {}), reset: vi.fn(), destroy: vi.fn(),
+            onFrame: null, onError: null,
+        };
+        const { player, errors } = await loadPlayer(adapter, {
+            videoAltGroup: 0, createVideoDecoder: () => decoder,
+        });
+        try {
+            ackCatalog(adapter);
+            await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc({
+                ...CATALOG, tracks: [
+                    { ...CATALOG.tracks[0], altGroup: 7 },
+                    { ...CATALOG.tracks[0], name: 'portrait', altGroup: 0, codec: 'avc1.640028',
+                      width: 360, height: 640, initData: 'AQID' },
+                    CATALOG.tracks[1],
+                ],
+            }));
+            adapter._triggerMessage({ type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
+                endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            } as unknown as ControlMessage);
+            adapter._triggerStreamClosed(100n);
+            await flush();
+            expect(adapter.subscribe.mock.calls.map(call => new TextDecoder().decode(call[1]))).toEqual(['catalog', 'portrait', 'audio']);
+            expect(decoder.configure).toHaveBeenCalledWith(Uint8Array.of(1, 2, 3), 'avc1.640028', 360, 640);
+            expect(errors).toEqual([]);
+        } finally { await player.destroy(); }
+    });
+
     it('#4/#7: fetched head+delta then FETCH_OK+FIN → ONE catalog_received; live delta → catalog_updated', async () => {
         const adapter = createMockAdapter(16);
         const { events, errors } = await loadPlayer(adapter);

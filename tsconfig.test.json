@@ -24,6 +24,8 @@
     "packages/webtransport/src/adapter-d22-lifecycle.test.ts",
     "packages/webtransport/src/topology/inbound-request.test.ts",
     "packages/player/src/player-d22-bootstrap.loopback.test.ts",
+    "packages/msf/src/video-alt-group.test.ts",
+    "packages/player/src/player-video-alt-group.test.ts",
     "scripts/**/*.test.ts",
     "_migration/**/*.test.ts"
   ]

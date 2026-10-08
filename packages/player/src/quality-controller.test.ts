@@ -78,6 +78,54 @@ function createTestCatalog(): CatalogState {
 }
 
 describe('QualityController', () => {
+  it('commits manual cross-codec quality changes within the selected view', () => {
+    const catalog = createTestCatalog();
+    catalog.tracks.push({ ...catalog.tracks[1]!, name: 'avc', codec: 'avc1.640028', bitrate: 100_000 });
+    const qc = new QualityController();
+    qc.selectInitialTracks(catalog);
+    qc.commitVideoTrack('avc');
+    expect(qc.currentVideoTrack?.name).toBe('avc');
+    expect(qc.alternatives.map(t => t.name)).toEqual(['avc']);
+    expect(qc.peekHigherVideoQuality()).toBeNull();
+    expect(qc.peekLowerVideoQuality()).toBeNull();
+  });
+  it('selects quality and constrains ABR within the requested video altGroup', () => {
+    const catalog = createTestCatalog();
+    catalog.tracks.push(
+      { ...catalog.tracks[0]!, name: 'portrait-high', altGroup: 0, bitrate: 2_000_000 },
+      { ...catalog.tracks[1]!, name: 'portrait-low', altGroup: 0, bitrate: 200_000 },
+    );
+    const qc = new QualityController();
+    const selected = qc.selectInitialTracks(catalog, { videoAltGroup: 0 });
+    expect(selected.video?.name).toBe('portrait-low');
+    expect(selected.audio?.name).toBe('audio');
+    expect(qc.allAlternatives.map(t => t.name)).toEqual(['portrait-high', 'portrait-low']);
+    expect(qc.increaseVideoQuality()?.name).toBe('portrait-high');
+    expect(qc.increaseVideoQuality()).toBeNull();
+    expect(qc.reduceVideoQuality()?.name).toBe('portrait-low');
+    expect(qc.reduceVideoQuality()).toBeNull();
+  });
+
+  it('applies resolution constraints after selecting the requested group', () => {
+    const catalog = createTestCatalog();
+    catalog.tracks.push({ ...catalog.tracks[1]!, name: 'portrait', altGroup: 9 });
+    const qc = new QualityController();
+    expect(qc.selectInitialTracks(catalog, { videoAltGroup: 9, videoConstraints: { maxHeight: 720 } }).video?.name).toBe('portrait');
+    expect(qc.allAlternatives.map(t => t.name)).toEqual(['portrait']);
+  });
+
+  it('does not fall back when the requested group has only unsupported packaging', () => {
+    const catalog = createTestCatalog();
+    catalog.tracks.push({ ...catalog.tracks[0]!, name: 'future', altGroup: 9, packaging: 'locmaf', locmafVersion: '9.9' });
+    expect(() => new QualityController().selectInitialTracks(catalog, { videoAltGroup: 9 })).toThrow('Unknown video altGroup: 9');
+  });
+
+  it('does not require a requested video group when video is disabled', () => {
+    const qc = new QualityController();
+    expect(qc.selectInitialTracks(createTestCatalog(), { videoAltGroup: 9, disableVideo: true }).video).toBeUndefined();
+    expect(qc.allAlternatives).toEqual([]);
+  });
+
   it('auto start-level picks middle of video ladder (safe default)', () => {
     const qc = new QualityController();
     const catalog = createTestCatalog(); // 3 tracks: 1080p, 720p, 360p

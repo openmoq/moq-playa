@@ -30,13 +30,12 @@ import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transp
 import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
 import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@openmoq/playback';
 import { BufferBasedController } from '@openmoq/playback';
-import type { AbrTrack } from '@openmoq/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@openmoq/playback';
-import type { CatalogState, CatalogTrack } from '@openmoq/msf';
+import type { AltGroup, CatalogState, CatalogTrack } from '@openmoq/msf';
 import type { LocHeaders } from '@openmoq/loc';
 import { LocmafFormatError, LocmafTrackDecoder, deserializeLocmafObject, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes } from '@openmoq/locmaf';
 import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@openmoq/locmaf';
-import { parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@openmoq/msf';
+import { groupByAlt, parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@openmoq/msf';
 
 import { TypedEmitter } from './emitter.js';
 import { HookChain } from './hooks.js';
@@ -1162,6 +1161,14 @@ export class MoqtPlayer {
 
   // ─── Track switching (§5.1.19 altGroup, §4.2 group boundaries) ───
 
+  /** Catalog video views for selecting videoAltGroup on a new player. */
+  get availableVideoGroups(): AltGroup[] {
+    const tracks = this._catalogState?.tracks.filter(t => t.role === 'video' && isTrackPackagingSupported(t)) ?? [];
+    return groupByAlt(tracks).groups.map(group => ({
+      altGroup: group.altGroup, tracks: group.tracks.map(track => ({ ...track })),
+    }));
+  }
+
   /**
    * Available video tracks from the altGroup.
    * Sorted by bitrate descending (highest first).
@@ -1875,12 +1882,6 @@ export class MoqtPlayer {
       throw new Error('Cannot switch track: player not loaded');
     }
 
-    // Manual selection locks quality — disables bandwidth estimator
-    // and recovery-driven auto-switching until the user re-enables auto.
-    if (reason === 'manual' && this.qualityController) {
-      this.qualityController.lockManual();
-    }
-
     // Find the target track in the catalog
     const targetTrack = this._catalogState.tracks.find(
       (t: CatalogTrack) => t.name === trackName && t.role === 'video',
@@ -1905,6 +1906,15 @@ export class MoqtPlayer {
         break;
       }
     }
+
+    const currentTrack = this._catalogState.tracks.find(t => t.role === 'video' && t.name === currentVideoTrackName);
+    if (!currentTrack) throw new Error('Cannot switch track: video selection not ready');
+    if (currentTrack.altGroup !== targetTrack.altGroup) {
+      throw new Error(`Cannot switch to "${trackName}": different video altGroup; select that view at tune-in with videoAltGroup`);
+    }
+
+    // A rejected selection must not change the active group's ABR policy.
+    if (reason === 'manual') this.qualityController?.lockManual();
 
     // No-op if already on the target track
     if (currentVideoTrackName === trackName) return;
@@ -2283,12 +2293,7 @@ export class MoqtPlayer {
     }
     // Commit QualityController to the new track index.
     this.qualityController?.commitVideoTrack(sw.newTrackName);
-    // Commit BufferBasedController if this was an ABR-driven switch.
-    if (sw.abrAction === 'downshift') {
-      this.bufferAbrController?.commitDownshift();
-    } else if (sw.abrAction === 'upshift') {
-      this.bufferAbrController?.commitUpshift();
-    }
+    this.syncBufferAbrController();
     this.emitter.emit('quality_switched', {
       type: 'quality_switched',
       fromTrackName: sw.oldTrackName,
@@ -2791,6 +2796,10 @@ export class MoqtPlayer {
       // Must pass a nonzero value for subscriptions to work.
       const setupOptions = buildSetupOptions(this.config);
       const transport = await this.config.createTransport!(buildConnectUrl(this.config));
+      if (this._destroyed || this.connection !== conn || this.isTerminalState()) {
+        transport.close();
+        throw new Error('Player destroyed or connection superseded during transport creation');
+      }
       this._handshakeRttMs = transport.handshakeRttMs;
       if (this._handshakeRttMs !== undefined) {
         const classification = this._handshakeRttMs < 1 ? 'LAN (2 frames)'
@@ -2820,6 +2829,10 @@ export class MoqtPlayer {
     } else {
       // External adapter: already connected, skip handshake
       this.log.info('Using externally owned adapter (already connected)');
+    }
+
+    if (this._destroyed || this.connection !== conn || this.isTerminalState()) {
+      throw new Error('Player destroyed or connection superseded during establishment');
     }
 
     // The NEGOTIATED draft is authoritative for the LOC property wire profile —
@@ -2944,6 +2957,11 @@ export class MoqtPlayer {
               trackName: track.name, mediaType, trackAlias: null,
             });
             this.pendingMediaSubs.set(reqIdBigInt, { trackName: track.name, mediaType });
+            // Authorization may delay this registration until after the catalog
+            // arrives. Adopt the registered view before ABR can use its ladder.
+            if (mediaType === 'video' && this.catalogReceived && this._catalogState) {
+              this.selectCatalogTracks(this._catalogState);
+            }
             this.log.info('Subscribe %s "%s" requestId=%s (pre-known)', mediaType, track.name, reqIdBigInt);
           };
           let knownRegisteredId: bigint | null = null;
@@ -4367,12 +4385,7 @@ export class MoqtPlayer {
         qualitySwitchCooldownMs: this.config.qualitySwitchCooldownMs!,
         clock: this.clock,
       });
-      this.qualityController.selectInitialTracks(catalogState, defined({
-        videoConstraints: this.config.videoConstraints,
-        audioConstraints: this.config.audioConstraints,
-        ...(this.config.disableVideo ? { disableVideo: true } : {}),
-        ...(this.config.disableAudio ? { disableAudio: true } : {}),
-      }));
+      this.selectCatalogTracks(catalogState);
       this.validateKnownTracks(catalogState);
     } else {
       this.subscribeToMediaTracks(catalogState).catch((err: unknown) => {
@@ -6865,12 +6878,7 @@ export class MoqtPlayer {
             qualitySwitchCooldownMs: this.config.qualitySwitchCooldownMs!,
             clock: this.clock,
           });
-          this.qualityController.selectInitialTracks(catalogState, defined({
-            videoConstraints: this.config.videoConstraints,
-            audioConstraints: this.config.audioConstraints,
-            ...(this.config.disableVideo ? { disableVideo: true } : {}),
-            ...(this.config.disableAudio ? { disableAudio: true } : {}),
-          }));
+          this.selectCatalogTracks(catalogState);
           this.validateKnownTracks(catalogState);
         } else {
           // Standard path — catalog-first: create pipelines and subscribe
@@ -7548,27 +7556,49 @@ export class MoqtPlayer {
     }
   }
 
-  /**
-   * Subscribe to video and audio tracks selected by the QualityController.
-   *
-   * Each subscription passes through the beforeSubscribe hook.
-   * Tracks are registered in SubscriptionManager for object routing.
-   * Subscriptions are fired in parallel via Promise.all.
-   *
-   * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup for ABR selection)
-   * @see draft-ietf-moq-transport-16 §9.9 (SUBSCRIBE)
-   * @see draft-ietf-moq-transport-16 §9.5 (MAX_REQUEST_ID — parallel subscriptions)
-   */
-  private async subscribeToMediaTracks(catalog: CatalogState): Promise<void> {
-    this._mediaSubsExpected = 0;
-    this._mediaSubsOk = 0;
-    this._mediaSubsFailed = 0;
-    const selected = this.qualityController!.selectInitialTracks(catalog, defined({
+  /** Select a catalog switching set, or adopt an already-active known track. */
+  private selectCatalogTracks(catalog: CatalogState) {
+    const activeSubscription = [...this.activeSubscriptions.values()].find(sub => sub.mediaType === 'video');
+    const activeVideo = activeSubscription && catalog.tracks.find(t => t.role === 'video' && t.name === activeSubscription.trackName);
+    // Pre-known subscriptions are already active: catalog arrival must describe
+    // their switching set, not choose another view behind their back.
+    const selectionCatalog = activeVideo ? {
+      ...catalog, tracks: catalog.tracks.filter(t => t.role !== 'video' || t.altGroup === activeVideo.altGroup),
+    } : catalog;
+    const selected = this.qualityController!.selectInitialTracks(selectionCatalog, defined({
+      videoAltGroup: this.config.videoAltGroup,
       videoConstraints: this.config.videoConstraints,
       audioConstraints: this.config.audioConstraints,
       ...(this.config.disableVideo ? { disableVideo: true } : {}),
       ...(this.config.disableAudio ? { disableAudio: true } : {}),
     }));
+    if (activeVideo) {
+      this.qualityController!.commitVideoTrack(activeVideo.name);
+      this.syncBufferAbrController();
+      return { ...selected, video: activeVideo };
+    }
+    this.syncBufferAbrController();
+    return selected;
+  }
+
+  /** Keep both ABR controllers on the committed track and codec family. */
+  private syncBufferAbrController(): void {
+    const alts = this.qualityController?.alternatives ?? [];
+    this.bufferAbrController = alts.length > 1 ? new BufferBasedController({
+      clock: this.clock,
+      ladder: alts.map(t => ({ name: t.name, bitrateKbps: (t.bitrate ?? 0) / 1000 })),
+      initialIndex: this.qualityController!.currentIndex,
+      lowThresholdUs: 500_000,
+      highThresholdUs: 4_000_000,
+    }) : null;
+  }
+
+  /** Subscribe to selected media tracks in parallel through beforeSubscribe. */
+  private async subscribeToMediaTracks(catalog: CatalogState): Promise<void> {
+    this._mediaSubsExpected = 0;
+    this._mediaSubsOk = 0;
+    this._mediaSubsFailed = 0;
+    const selected = this.selectCatalogTracks(catalog);
 
     // ── CMAF bootstrap validation: fail BEFORE any media SUBSCRIBE ──
     // A selected CMAF track with no codec string, or inline initData that
@@ -7603,22 +7633,6 @@ export class MoqtPlayer {
         if (!this.isTerminalState()) this.transitionState(PlayerState.ERROR);
         return;
       }
-    }
-
-    // Build buffer-based ABR controller from the quality ladder
-    const alts = this.qualityController!.alternatives;
-    if (alts.length > 1) {
-      const ladder: AbrTrack[] = alts.map(t => ({
-        name: t.name,
-        bitrateKbps: (t.bitrate ?? 0) / 1000,
-      }));
-      this.bufferAbrController = new BufferBasedController({
-        clock: this.clock,
-        ladder,
-        initialIndex: this.qualityController!.currentIndex,
-        lowThresholdUs: 500_000,      // 0.5s → emergency downshift
-        highThresholdUs: 4_000_000,   // 4s → consider upshift
-      });
     }
 
     // Record initial quality info for stats

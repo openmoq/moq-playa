@@ -28,7 +28,7 @@ uses those timestamps, not the manifest's nominal chunk duration, for pacing.
 CMAF and LOC use one stream per object (MSF section 6). LOCMAF keeps all
 objects of a group on one ordered subgroup stream (LOCMAF section 3).
 
-Twenty scenarios are mandatory:
+Twenty-seven scenarios are mandatory:
 
 | Scenario | Required result |
 | --- | --- |
@@ -41,6 +41,9 @@ Twenty scenarios are mandatory:
 | LOC-04 media time with muted output | Only `audio-missing` fails |
 | LOCMAF-01 MSE and frame mode, each with moving video and AAC | Healthy video/audio across a loop, with full and delta header evidence |
 | Each LOCMAF mode with a frozen picture or muted output | Only `picture-frozen` or `audio-missing` fails, respectively |
+| Default view and portrait alternatives in CMAF and LOC | Selected view identity, dimensions and healthy output |
+| CMAF and LOC view selection through the demo controls | Correct output after selection and clean stop/retry |
+| CMAF video with LOC audio, and LOC video with CMAF audio | Moving output, nonzero PCM, quarter-volume attenuation, mute and unmute |
 
 The fault controls passing means the harness correctly rejected their output, not
 that frozen or silent playback was accepted. Every scenario also requires clean
@@ -85,6 +88,10 @@ This measures canvas output at refresh opportunities, not physical display or
 compositor presentation. An analyser tees the player's existing post-gain
 speaker connection without rerouting it or creating a replacement AudioContext.
 LOC retains the default decoder, audio scheduler, clock and buffer settings.
+
+Mixed-format cases exercise the actual element and Web Audio output graphs,
+including gesture-scoped unmute. They establish output and volume control, not
+precise synchronization between the independently scheduled media paths.
 
 LOC-01 timestamps are Unix-epoch microseconds. LOC-04 tests both that domain
 and media ticks with explicit non-microsecond timescales and an application
@@ -144,4 +151,4 @@ artifacts for fourteen days. A local macOS result is not a Linux CI result.
 
 For a diagnostic rerun, add `--case loc-4-media` to select one exact scenario.
 The retained result records this selection; a selected-case pass is not a pass
-for the full twenty-case campaign.
+for the full twenty-seven-case campaign.

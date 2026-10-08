@@ -10,11 +10,12 @@ const video = document.querySelector<HTMLVideoElement>('#video')!;
 const canvas = document.querySelector<HTMLCanvasElement>('#canvas')!;
 const params = new URLSearchParams(location.search);
 const frameOutput = params.get('output') === 'canvas';
+const webAudioOutput = params.has('audio') ? params.get('audio') === 'webcodecs' : frameOutput;
 const locmafObserver = params.has('locmaf') ? observeLocmafDelivery() : undefined;
 canvas.width = 640;
 canvas.height = 360;
 const canvasObserver = frameOutput ? observeCanvas(canvas) : undefined;
-const audioObserver = frameOutput ? observeAudio() : undefined;
+const audioObserver = webAudioOutput ? observeAudio() : undefined;
 const decodedSource = frameOutput ? observeDecodedSource() : undefined;
 const pinHex = params.get('hash')!;
 if (!/^[a-f0-9]{64}$/.test(pinHex)) throw new Error('Missing local certificate pin');
@@ -40,7 +41,9 @@ let firstFrameTimestampUs: number | undefined;
 const player = new Player(null, {
   url: params.get('url')!, namespace: params.get('ns')!,
   video, canvas, certHash: pin, draftVersion: 18, autoQuality: false,
+  ...(params.has('gestureAudio') ? { audioActivation: 'gesture' as const } : {}),
   startLevel: Number(params.get('level') ?? 0),
+  ...(params.has('altGroup') ? { videoAltGroup: Number(params.get('altGroup')) } : {}),
   moqtPlayerConfig: {
     logLevel: params.has('debug') ? 'debug' : 'none',
     locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',
@@ -145,7 +148,7 @@ function sample(): void {
 
 document.querySelector('#start')!.addEventListener('click', () => {
   void (async () => {
-    if (!frameOutput) {
+    if (!webAudioOutput) {
       audioContext = new AudioContext();
       await audioContext.resume();
       source = audioContext.createMediaElementSource(video);
@@ -156,6 +159,7 @@ document.querySelector('#start')!.addEventListener('click', () => {
       source.connect(gain).connect(analyser).connect(audioContext.destination);
     }
     await player.load();
+    if (params.has('gestureAudio')) await player.unmute();
     player.play();
     if (audioObserver) {
       if (audioObserver.taps.length !== 1) throw new Error(`Expected one player audio output, got ${audioObserver.taps.length}`);
@@ -170,7 +174,7 @@ const acceptance = {
   get currentTime() { return frameOutput ? player.currentTime / 1000 : video.currentTime; },
   get audioRms() { return audioRms(); },
   begin(silent: boolean): void {
-    if (frameOutput) { if (silent) player.mute(); }
+    if (webAudioOutput) { if (silent) player.mute(); }
     else gain!.gain.value = silent ? 0 : 1;
     samples.length = 0;
     previousPixels = undefined;
@@ -183,10 +187,16 @@ const acceptance = {
     clearInterval(timer);
     const locmafDelivery = locmafObserver?.snapshot();
     return { samples: [...samples], events: [...events], startupError,
+      outputState: { presentedFrames: canvasObserver?.frames ?? presentedFrames,
+        currentTime: player.currentTime, audioRms: audioRms(), audioContext: audioContext?.state,
+        videoPaused: video.paused, videoTime: video.currentTime, videoReadyState: video.readyState,
+        buffered: Array.from({ length: video.buffered.length }, (_, i) => [video.buffered.start(i), video.buffered.end(i)]) },
       decodedSource: decodedSource?.snapshot() ?? null,
       ...(locmafDelivery ? { locmafDelivery, locmafFailures: assessLocmafDelivery(locmafDelivery) } : {}),
-      levels: player.levels, audioTracks: player.audioTracks };
+      levels: player.levels, videoGroups: player.videoGroups, audioTracks: player.audioTracks };
   },
+  setVolume(value: number) { player.setVolume(value); },
+  async setMuted(value: boolean) { if (value) player.mute(); else await player.unmute(); },
   async destroy() {
     recording = false;
     clearInterval(timer);
@@ -195,7 +205,7 @@ const acceptance = {
     source?.disconnect();
     gain?.disconnect();
     analyser?.disconnect();
-    if (!frameOutput) await audioContext?.close();
+    if (!webAudioOutput) await audioContext?.close();
     canvasObserver?.restore();
     audioObserver?.restore();
     const outcomes = await Promise.all(transportOutcomes);

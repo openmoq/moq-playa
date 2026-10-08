@@ -12,6 +12,7 @@ import { assessPlayback } from './assessment.mjs';
 import { assessVideoPresentation } from './presentation.mjs';
 import { prepareFixture } from './fixture.mjs';
 import { stopProcess as stop } from './shutdown.mjs';
+import { checkExampleViews } from './view-ui.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
@@ -128,7 +129,9 @@ try {
     result.fixtures[name] = await prepareFixture(join(artifacts, name), namespace, frozen, abort.signal);
   }
   result.fixtures.alternatives = await prepareFixture(join(artifacts, 'alternatives'), namespace, false, abort.signal, true);
+  result.fixtures.views = await prepareFixture(join(artifacts, 'views'), namespace, false, abort.signal, false, 'aac', true);
   result.fixtures.loc = await prepareFixture(join(artifacts, 'loc'), namespace, false, abort.signal, false, 'opus');
+  result.fixtures.locViews = await prepareFixture(join(artifacts, 'locViews'), namespace, false, abort.signal, false, 'opus', true);
   result.fixtures.locFrozen = await prepareFixture(join(artifacts, 'locFrozen'), namespace, true, abort.signal, false, 'opus');
   browser = await chromium.launch({ channel: process.env.PLAYER_TEST_BROWSER ?? 'chrome' });
   result.platform.browser = browser.version();
@@ -138,6 +141,18 @@ try {
     { name: 'moving-video-and-audio', fixture: 'moving', silent: false, expectedFailure: null },
     { name: 'frozen-picture-control', fixture: 'frozen', silent: false, expectedFailure: 'picture-frozen' },
     { name: 'missing-audio-control', fixture: 'moving', silent: true, expectedFailure: 'audio-missing' },
+    { name: 'default-video-view', fixture: 'views', view: 1, silent: false, expectedFailure: null,
+      expected: { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24 } },
+    { name: 'portrait-video-view', fixture: 'views', view: 0, altGroup: 0, silent: false, expectedFailure: null,
+      expected: { videoWidth: 360, videoHeight: 640, audioHz: 440, videoFps: 24 } },
+    { name: 'portrait-loc-video-view', fixture: 'locViews', view: 0, altGroup: 0, version: 4, mode: 'media', silent: false, expectedFailure: null,
+      expected: { videoWidth: 360, videoHeight: 640, audioHz: 440, videoFps: 24, outputKind: 'canvas' } },
+    { name: 'example-views-cmaf', fixture: 'views', exampleViews: true, silent: false, expectedFailure: null },
+    { name: 'example-views-loc', fixture: 'locViews', exampleViews: true, version: 4, mode: 'media', silent: false, expectedFailure: null },
+    ...['video', 'audio'].map(cmafRole => ({
+      name: `mixed-cmaf-${cmafRole}`, fixture: 'moving', mixed: cmafRole, silent: false, expectedFailure: null,
+      expected: { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24, outputKind: cmafRole === 'video' ? 'video' : 'canvas' },
+    })),
     ...[360, 720, 1080].flatMap((height, index) => ['en', 'es'].map((lang) => ({
       name: `${height}p-${lang}-selection`, fixture: 'alternatives', silent: false, expectedFailure: null,
       level: 2 - index, lang, alternatives: true,
@@ -165,9 +180,12 @@ try {
   result.selectedCase = selectedCase;
   for (const scenario of scenarios.filter((s) => selectedCase === null || s.name === selectedCase)) {
     const relay = launch(`${scenario.name}-relay`, 'pnpm', ['--filter', '@moqt/example-node-relay', 'relay-server'],
-      { HOST: '127.0.0.1', PORT: '0', DEMO_NAMESPACE: namespace, RELAY_CERT: relayCert, RELAY_KEY: relayKey });
+      { HOST: '127.0.0.1', PORT: '0', DEMO_NAMESPACE: namespace, RELAY_CERT: relayCert, RELAY_KEY: relayKey,
+        ...(scenario.view !== undefined || scenario.exampleViews ? { DEMO_TRACK: 'video-portrait' } : {}) });
     const relayUrl = await waitForLine(relay, /listening on (https:\/\/127\.0\.0\.1:\d+\/moq)/);
-    const publisher = launch(`${scenario.name}-publisher`, 'pnpm', scenario.version ? [
+    const publisher = scenario.mixed ? launch(`${scenario.name}-publisher`, process.execPath, [
+      'scripts/player-acceptance/mixed-publisher.mjs', relayUrl, join(artifacts, 'moving'), join(artifacts, 'loc'), scenario.mixed,
+    ], { RELAY_CERT: relayCert }) : launch(`${scenario.name}-publisher`, 'pnpm', scenario.version ? [
       '--filter', '@moqt/example-node-publisher', 'exec', 'tsx', 'src/publish-loc.ts',
       relayUrl, join(artifacts, scenario.fixture), String(scenario.version), scenario.mode,
     ] : [
@@ -176,9 +194,9 @@ try {
       relayUrl, join(artifacts, scenario.fixture),
     ], { RELAY_CERT: relayCert });
     await waitForLine(publisher, /loop mode: (\d+ tracks established)/);
-    if (scenario.version) {
+    if ((scenario.version || scenario.mixed === 'audio') && scenario.expected) {
       const epochUs = await waitForLine(publisher, /epoch_us=(\d+)/);
-      scenario.expected.timestampDomain = scenario.mode;
+      scenario.expected.timestampDomain = scenario.mode ?? 'media';
       scenario.expected.publisherEpochMs = Number(epochUs) / 1000;
     }
     if (scenario.locmaf === 'frame') {
@@ -201,6 +219,13 @@ try {
     try {
       const query = new URLSearchParams({ url: relayUrl, ns: namespace, hash: pin });
       if (scenario.version) { query.set('output', 'canvas'); query.set('debug', 'render'); }
+      if (scenario.mixed) {
+        query.set('audio', scenario.mixed === 'video' ? 'webcodecs' : 'mse');
+        query.set('gestureAudio', '1');
+        if (scenario.mixed === 'audio') query.set('output', 'canvas');
+        caseResult.media = { video: scenario.mixed === 'video' ? 'CMAF/H.264' : 'LOC-04/H.264',
+          audio: scenario.mixed === 'video' ? 'LOC-04/Opus' : 'CMAF/AAC', audioActivation: 'gesture' };
+      }
       if (scenario.locmaf) {
         query.set('locmaf', scenario.locmaf);
         if (scenario.locmaf === 'frame') query.set('output', 'canvas');
@@ -209,49 +234,97 @@ try {
         caseResult.expected = scenario.expected;
       }
       if (scenario.alternatives) { query.set('level', String(scenario.level)); query.set('lang', scenario.lang); }
-      await page.goto(`${webUrl}_tests/player-acceptance/?${query}`, { waitUntil: 'domcontentloaded' });
-      await page.locator('#start').click();
-      const startupStart = performance.now();
-      await page.waitForFunction(() => {
-        const state = window.playerAcceptance;
-        if (state?.startupError) throw new Error(state.startupError);
-        return state?.presentedFrames >= 8 && state.currentTime > 0.1 && state.audioRms > 0.015;
-      }, null, { timeout: 20000 });
-      caseResult.outputReadyAfterMs = performance.now() - startupStart;
-      await page.evaluate((silent) => window.playerAcceptance.begin(silent), scenario.silent);
-      await page.waitForTimeout(7250);
-      const observed = await page.evaluate(() => window.playerAcceptance.finish());
-      caseResult.observed = observed;
-      caseResult.assessment = assessPlayback(observed.samples, scenario.expected);
-      caseResult.presentationFailures = assessVideoPresentation(observed.samples);
-      assert.deepEqual(caseResult.presentationFailures, [], 'Public video draw observation');
-      if (scenario.expected?.outputKind === 'canvas') {
-        assert.ok(observed.decodedSource?.matched > 0, 'No decoded source timestamp evidence');
-        assert.deepEqual(observed.decodedSource.failures, [], 'Decoded source timestamp correlation');
-      } else assert.equal(observed.decodedSource, null, 'MSE must not claim WebCodecs output evidence');
-      if (scenario.locmaf) assert.deepEqual(observed.locmafFailures, [], 'Browser did not receive the required LOCMAF catalog/full/delta/group mapping');
-      if (scenario.alternatives) {
-        assert.deepEqual(observed.levels.map((level) => level.trackName), ['video-1080', 'video-720', 'video-360']);
-        assert.deepEqual(observed.audioTracks.map((track) => track.language), ['en', 'es']);
-        const wrongVideo = { ...scenario.expected, videoHeight: scenario.expected.videoHeight === 360 ? 720 : 360,
-          videoWidth: scenario.expected.videoHeight === 360 ? 1280 : 640 };
-        const wrongAudio = { ...scenario.expected, audioHz: scenario.expected.audioHz === 440 ? 880 : 440 };
-        caseResult.identityControls = {
-          wrongVideo: assessPlayback(observed.samples, wrongVideo),
-          wrongAudio: assessPlayback(observed.samples, wrongAudio),
-        };
-        assert.deepEqual(caseResult.identityControls.wrongVideo.failures, ['video-identity']);
-        assert.deepEqual(caseResult.identityControls.wrongAudio.failures, ['audio-identity']);
+      if (scenario.altGroup !== undefined) query.set('altGroup', String(scenario.altGroup));
+      if (scenario.exampleViews) {
+        caseResult.observed = await checkExampleViews(page, webUrl, query, artifacts, scenario.name, Boolean(scenario.version));
+        caseResult.assessment = { passed: true, failures: [] };
+      } else {
+        await page.goto(`${webUrl}_tests/player-acceptance/?${query}`, { waitUntil: 'domcontentloaded' });
+        await page.locator('#start').click();
+        const startupStart = performance.now();
+        await page.waitForFunction(() => {
+          const state = window.playerAcceptance;
+          if (state?.startupError) throw new Error(state.startupError);
+          return state?.presentedFrames >= 8 && state.currentTime > 0.1 && state.audioRms > 0.015;
+        }, null, { timeout: 20000 });
+        caseResult.outputReadyAfterMs = performance.now() - startupStart;
+        await page.evaluate((silent) => window.playerAcceptance.begin(silent), scenario.silent);
+        await page.waitForTimeout(7250);
+        const observed = await page.evaluate(() => window.playerAcceptance.finish());
+        caseResult.observed = observed;
+        caseResult.assessment = assessPlayback(observed.samples, scenario.expected);
+        caseResult.presentationFailures = assessVideoPresentation(observed.samples);
+        assert.deepEqual(caseResult.presentationFailures, [], 'Public video draw observation');
+        if (scenario.expected?.outputKind === 'canvas') {
+          assert.ok(observed.decodedSource?.matched > 0, 'No decoded source timestamp evidence');
+          assert.deepEqual(observed.decodedSource.failures, [], 'Decoded source timestamp correlation');
+        } else assert.equal(observed.decodedSource, null, 'MSE must not claim WebCodecs output evidence');
+        if (scenario.locmaf) assert.deepEqual(observed.locmafFailures, [], 'Browser did not receive the required LOCMAF catalog/full/delta/group mapping');
+        if (scenario.view !== undefined) {
+          assert.deepEqual(observed.videoGroups.map(g => g.altGroup), [1, 0]);
+          assert.deepEqual(observed.levels.map(level => level.trackName), [scenario.view === 0 ? 'video-portrait' : 'video-360']);
+          const otherView = { ...scenario.expected,
+            videoWidth: scenario.view === 0 ? 640 : 360, videoHeight: scenario.view === 0 ? 360 : 640 };
+          caseResult.identityControls = { otherView: assessPlayback(observed.samples, otherView) };
+          assert.deepEqual(caseResult.identityControls.otherView.failures, ['video-identity']);
+        }
+        if (scenario.alternatives) {
+          assert.deepEqual(observed.levels.map((level) => level.trackName), ['video-1080', 'video-720', 'video-360']);
+          assert.deepEqual(observed.audioTracks.map((track) => track.language), ['en', 'es']);
+          const wrongVideo = { ...scenario.expected, videoHeight: scenario.expected.videoHeight === 360 ? 720 : 360,
+            videoWidth: scenario.expected.videoHeight === 360 ? 1280 : 640 };
+          const wrongAudio = { ...scenario.expected, audioHz: scenario.expected.audioHz === 440 ? 880 : 440 };
+          caseResult.identityControls = {
+            wrongVideo: assessPlayback(observed.samples, wrongVideo),
+            wrongAudio: assessPlayback(observed.samples, wrongAudio),
+          };
+          assert.deepEqual(caseResult.identityControls.wrongVideo.failures, ['video-identity']);
+          assert.deepEqual(caseResult.identityControls.wrongAudio.failures, ['audio-identity']);
+        }
+        if (scenario.mixed) {
+          const rms = async () => {
+            await page.waitForTimeout(250);
+            const values = [];
+            for (let i = 0; i < 8; i++) {
+              values.push(await page.evaluate(() => window.playerAcceptance.audioRms));
+              await page.waitForTimeout(100);
+            }
+            return values.reduce((sum, value) => sum + value, 0) / values.length;
+          };
+          const full = await rms();
+          await page.evaluate(() => window.playerAcceptance.setVolume(0.25));
+          const quarter = await rms();
+          await page.evaluate(() => window.playerAcceptance.setMuted(true));
+          const duringMute = () => page.evaluate(() => {
+            const video = document.querySelector('#video');
+            return { frames: window.playerAcceptance.presentedFrames, audioTime: video.currentTime, audioPaused: video.paused };
+          });
+          const beforeMute = await duringMute();
+          const muted = await rms();
+          const afterMute = await duringMute();
+          await page.evaluate(() => window.playerAcceptance.setMuted(false));
+          const unmuted = await rms();
+          caseResult.volume = { full, quarter, muted, unmuted,
+            framesDuringMute: afterMute.frames - beforeMute.frames, beforeMute, afterMute };
+          assert.ok(full > 0.015 && quarter / full > 0.15 && quarter / full < 0.35, 'Player volume must attenuate the actual audio output');
+          assert.ok(muted < 0.001 && unmuted > 0.005, 'Mute/unmute must affect the actual audio output');
+          assert.ok(unmuted / quarter > 0.8 && unmuted / quarter < 1.2, 'Unmute must preserve the selected volume');
+          assert.ok(afterMute.frames - beforeMute.frames >= 16, 'Video must keep advancing while muted');
+          if (scenario.mixed === 'audio') {
+            assert.ok(!beforeMute.audioPaused && !afterMute.audioPaused
+              && afterMute.audioTime - beforeMute.audioTime > 0.75, 'MSE audio must keep advancing while muted');
+          }
+        }
+        await page.screenshot({ path: join(artifacts, `${scenario.name}.png`) });
+        caseResult.teardown = await bounded(page.evaluate(() => window.playerAcceptance.destroy()), 5000, 'player teardown');
+        assert.equal(caseResult.teardown.transports, 1, 'Expected one established transport');
+        assert.ok(caseResult.teardown.transportOutcomes.every((outcome) => outcome.status === 'closed'), 'Transport did not close cleanly');
+        assert.equal(caseResult.teardown.audioState, 'closed', 'Observer AudioContext leaked');
+        assert.ok(!caseResult.teardown.videoSource, 'MediaSource URL remained attached');
+        assert.equal(caseResult.teardown.state, 'idle', 'Player did not return to idle');
       }
-      await page.screenshot({ path: join(artifacts, `${scenario.name}.png`) });
-      caseResult.teardown = await bounded(page.evaluate(() => window.playerAcceptance.destroy()), 5000, 'player teardown');
-      assert.equal(caseResult.teardown.transports, 1, 'Expected one established transport');
-      assert.ok(caseResult.teardown.transportOutcomes.every((outcome) => outcome.status === 'closed'), 'Transport did not close cleanly');
-      assert.equal(caseResult.teardown.audioState, 'closed', 'Observer AudioContext leaked');
-      assert.ok(!caseResult.teardown.videoSource, 'MediaSource URL remained attached');
-      assert.equal(caseResult.teardown.state, 'idle', 'Player did not return to idle');
       assert.deepEqual(pageErrors, [], 'Uncaught browser error');
-      assert.ok(!caseResult.teardown.events.some((event) => event.type === 'error'), 'Player emitted an error, including during teardown');
+      if (!scenario.exampleViews) assert.ok(!caseResult.teardown.events.some((event) => event.type === 'error'), 'Player emitted an error, including during teardown');
       assert.ok(!relay.exited && !publisher.exited, 'Media process exited before test teardown');
       if (scenario.expectedFailure) {
         assert.deepEqual(caseResult.assessment.failures, [scenario.expectedFailure], 'Control must fail only its intended output check');

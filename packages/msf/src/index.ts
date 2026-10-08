@@ -65,7 +65,7 @@ export { parseDeltaUpdate, applyCatalogUpdate } from './delta.js';
 
 // ─── Track selection ─────────────────────────────────────────────────
 
-export { groupByRender, groupByAlt, selectTrack, resolveDependencies, isTrackPackagingSupported } from './selection.js';
+export { groupByRender, groupByAlt, selectVideoAltGroup, selectTrack, resolveDependencies, isTrackPackagingSupported } from './selection.js';
 
 // ─── Timeline parsing ────────────────────────────────────────────────
 

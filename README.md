@@ -152,6 +152,7 @@ player.seekable       // true when timeline track is available
 player.volume         // 0–1
 player.muted          // boolean
 player.levels         // available video quality levels
+player.videoGroups    // catalog video altGroups, each with its track metadata
 player.audioTracks    // available audio tracks
 player.currentLevel   // active level index
 player.activeMediaType  // 'canvas' | 'video' — which element is rendering
@@ -187,9 +188,38 @@ player.on('statechange',    ({ from, to }) => { ... });
 | `targetLatencyMs` | number | — | Live edge target latency |
 | `autoQuality` | boolean | true | Enable ABR |
 | `startLevel` | number \| 'auto' \| 'lowest' | 'auto' | Initial quality level |
+| `videoAltGroup` | number | first video group | Initial video view; quality and ABR stay within it |
 | `maxResolution` | `{width, height}` | — | Cap video quality |
 | `canvas` | HTMLCanvasElement | — | Caller-owned canvas (framework mode) |
 | `video` | HTMLVideoElement | — | Caller-owned video element (framework mode) |
+
+### Video Views
+
+A catalog can carry separate video views, such as landscape and portrait, in
+different `altGroup`s. Set `videoAltGroup` on `Player` or `MoqtPlayer` to choose
+one at tune-in. Group `0` is valid; an unknown group fails rather than falling
+back to different content. Omission retains first-group selection.
+
+```ts
+const portrait = new Player(container, {
+  url: relayUrl,
+  namespace: 'live/stream',
+  videoAltGroup: 0,
+});
+await portrait.load();
+portrait.play();
+```
+
+`levels` and automatic quality selection only contain alternatives from that
+view. `videoGroups` (`availableVideoGroups` on `MoqtPlayer`) lists the catalog's
+supported video groups. Multiple players can select different groups independently.
+To change views, destroy the old player and create another with the desired
+group. `setQuality`/`selectVideoTrack` are quality switches within a view, not
+cross-view timeline mappings: different groups need not share timestamps or
+Group IDs. The player example's View selector stops and creates a fresh player
+for the requested group; `?altGroup=0` selects its initial view. Stop also cancels
+an in-progress retune. `videoAltGroup` cannot be combined with the catalog-free
+`knownTracks` fast path when video is enabled.
 
 ---
 

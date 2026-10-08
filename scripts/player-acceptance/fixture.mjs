@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 
 const exec = promisify(execFile);
 
-export async function prepareFixture(directory, namespace, frozen = false, signal, alternatives = false, audioCodec = 'aac') {
+export async function prepareFixture(directory, namespace, frozen = false, signal, alternatives = false, audioCodec = 'aac', views = false) {
   const commands = [];
   const timing = {};
   const tracks = [];
@@ -25,6 +25,14 @@ export async function prepareFixture(directory, namespace, frozen = false, signa
       '-preset', 'veryfast', '-b:v', String(bitrate), '-g', '12', '-keyint_min', '12', '-sc_threshold', '0', '-bf', '0'],
     metadata: { width, height, framerate: 24, bitrate, altGroup: 1, label: `${height}p synthetic video` },
   }));
+  if (views) definitions.push({
+    name: 'video-portrait', role: 'video', codec: 'avc1.42c01e',
+    source: 'testsrc2=size=360x640:rate=24',
+    encoding: ['-an', '-vf', 'drawbox=x=0:y=0:w=27:h=48:color=0x00ff00:t=fill',
+      '-c:v', 'libx264', '-profile:v', 'baseline', '-level:v', '3.0', '-pix_fmt', 'yuv420p',
+      '-preset', 'veryfast', '-b:v', '800000', '-g', '12', '-keyint_min', '12', '-sc_threshold', '0', '-bf', '0'],
+    metadata: { width: 360, height: 640, framerate: 24, bitrate: 800000, altGroup: 0, label: 'Portrait' },
+  });
   for (const [lang, frequency] of (alternatives ? [['en', 440], ['es', 880]] : [['en', 440]])) {
     definitions.push({
       name: `audio-${lang}`, role: 'audio', codec: audioCodec === 'opus' ? 'opus' : 'mp4a.40.2',
@@ -82,11 +90,12 @@ export async function prepareFixture(directory, namespace, frozen = false, signa
   }
   const provenance = { generator: 'player-acceptance', source: 'FFmpeg synthetic testsrc2 and sine signals',
     sourceRights: 'Synthetic test signals; no third-party media', ffmpeg, durationS: duration,
-    frozen, alternatives, audioCodec, commands, sha256: hashes, timing, alignment,
+    frozen, alternatives, views, audioCodec, commands, sha256: hashes, timing, alignment,
     ...(locmaf ? { locmaf, locmafProof: 'local encoder/decoder equality, not an independent conformance oracle' } : {}),
     ...(elementaryLoc ? { elementaryLoc, opusTiming: 'single-frame 20ms packets; MP4 final trim not carried into LOC' } : {}),
     expected: { videoMarker: 'green top-left square covering 7.5% of width', videoFps: 24,
-      videos: videoDefinitions.map(([width, height]) => ({ name: `video-${height}`, width, height })),
+      videos: definitions.filter(track => track.role === 'video')
+        .map(track => ({ name: track.name, width: track.metadata.width, height: track.metadata.height, altGroup: track.metadata.altGroup })),
       audio: alternatives ? { 'audio-en': 440, 'audio-es': 880 } : { 'audio-en': 440 } } };
   await writeFile(join(directory, 'provenance.json'), `${JSON.stringify(provenance, null, 2)}\n`);
   return provenance;

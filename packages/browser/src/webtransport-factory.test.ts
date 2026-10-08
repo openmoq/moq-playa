@@ -37,6 +37,46 @@ afterEach(() => {
 // ─── Tests ──────────────────────────────────────────────────────────
 
 describe('createWebTransport', () => {
+  it('does not construct a transport after startup is cancelled', async () => {
+    const construct = vi.fn();
+    vi.stubGlobal('WebTransport', class { ready = Promise.resolve(); constructor() { construct(); } });
+    const controller = new AbortController();
+    const reason = new Error('stopped');
+    controller.abort(reason);
+    await expect(createWebTransport({ signal: controller.signal })('https://r/moq')).rejects.toBe(reason);
+    expect(construct).not.toHaveBeenCalled();
+  });
+
+  it('closes a connecting transport on cancellation without retrying', async () => {
+    let release!: () => void;
+    const ready = new Promise<void>(resolve => { release = resolve; });
+    const close = vi.fn();
+    const construct = vi.fn();
+    vi.stubGlobal('WebTransport', class { ready = ready; close = close; constructor() { construct(); } });
+    const controller = new AbortController();
+    const reason = new Error('stopped');
+    const pending = createWebTransport({ signal: controller.signal })('https://r/moq');
+    void pending.catch(() => {});
+    try {
+      controller.abort(reason);
+      await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+      await expect(pending).rejects.toBe(reason);
+      expect(construct).toHaveBeenCalledTimes(1);
+    } finally { release(); }
+  });
+
+  it('removes its startup listener and does not close an established transport on late abort', async () => {
+    const close = vi.fn();
+    vi.stubGlobal('WebTransport', class { ready = Promise.resolve(); close = close; });
+    const controller = new AbortController();
+    const add = vi.spyOn(controller.signal, 'addEventListener');
+    const remove = vi.spyOn(controller.signal, 'removeEventListener');
+    await createWebTransport({ signal: controller.signal })('https://r/moq');
+    controller.abort();
+    expect(add).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(close).not.toHaveBeenCalled();
+  });
   it('proves a reset when abort rejects the pending FIN with its own reason (§7.4)', async () => {
     let rejectFin!: (reason: unknown) => void;
     let completeReset!: () => void;

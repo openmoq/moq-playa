@@ -12,7 +12,10 @@ function observer(errorOnDestroy: boolean) {
       if (errorOnDestroy) this.handlers.get('error')?.({ message: 'teardown failed' });
     }
   }
-  const video = { requestVideoFrameCallback: () => 1, cancelVideoFrameCallback: () => {}, getAttribute: () => null };
+  const video = {
+    requestVideoFrameCallback: () => 1, cancelVideoFrameCallback: () => {}, getAttribute: () => null,
+    currentTime: 0, paused: true, readyState: 0, buffered: { length: 0 },
+  };
   const source = readFileSync(new URL('../../examples/_tests/player-acceptance/main.ts', import.meta.url), 'utf8');
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const window: { playerAcceptance?: { finish(): { events: unknown[] }; destroy(): Promise<{ events: { type: string }[] }> } } = {};

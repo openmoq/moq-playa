@@ -100,6 +100,7 @@
       position: absolute; inset: 0;
       display: flex; align-items: center; justify-content: center;
       z-index: 15;
+      pointer-events: none;
     }
     .loading-spinner svg {
       width: 40px; height: 40px; color: rgba(255,255,255,0.6);
@@ -131,6 +132,17 @@
     .controls-row button:disabled { opacity: 0.3; cursor: default; }
     .controls-row svg { width: 20px; height: 20px; }
     .controls-spacer { flex: 1; }
+    .view-control select {
+      max-width: 150px; min-width: 72px; height: 28px;
+      border: 1px solid rgba(255,255,255,0.15); border-radius: 5px;
+      background: #222; color: #e0e0e0; padding: 2px 6px; font-size: 0.75rem;
+    }
+    .view-control select:disabled { opacity: 0.5; }
+    @media (max-width: 520px) {
+      .controls-row { flex-wrap: wrap; }
+      .controls { padding-left: 8px; padding-right: 8px; }
+      .view-control select { max-width: 112px; }
+    }
 
     /* ─── Track dropdowns (in controls) ──────────── */
     .track-dropdown { position: relative; display: none; }
@@ -391,6 +403,9 @@
         </button>
 
         <!-- Track dropdowns -->
+        <div id="view-control" class="view-control" hidden>
+          <select id="view-select" aria-label="Video view" title="Video view"></select>
+        </div>
         <div id="video-track-dropdown" class="track-dropdown">
           <div class="track-dropdown-btn" id="video-track-btn">
             <span id="video-track-label">Video</span>

@@ -17,7 +17,7 @@
  * @see draft-ietf-moq-loc-01 §4.1 (audio independently decodable)
  */
 
-import { MoqtPlayer, PlayerErrorCode, isMsePackaging } from '@openmoq/player';
+import { MoqtPlayer, PlayerErrorCode, usesMsePath } from '@openmoq/player';
 import { MoqtConnection } from '@openmoq/webtransport';
 import { QlogTrace, varint } from '@openmoq/transport';
 import { CATALOG_TRACK_NAME } from '@openmoq/msf';
@@ -37,7 +37,9 @@ import {
     createWebTransport,
 } from '@openmoq/browser';
 
-import type { PlayerStats, TTFFBreakdown } from '@openmoq/player';
+import type { PlayerEventMap, PlayerStats, TTFFBreakdown } from '@openmoq/player';
+import type { CatalogTrack } from '@openmoq/msf';
+import { TeardownBarrier, ViewRetuner, parseVideoAltGroup } from './view-selection.js';
 
 // ─── Settings Modal ──────────────────────────────────────────────────
 
@@ -219,6 +221,9 @@ const audioTrackDropdown = document.getElementById('audio-track-dropdown')!;
 const audioTrackBtn = document.getElementById('audio-track-btn')!;
 const audioTrackLabel = document.getElementById('audio-track-label')!;
 const audioTrackMenu = document.getElementById('audio-track-menu')!;
+const viewControl = document.getElementById('view-control')!;
+const viewSelect = document.getElementById('view-select') as HTMLSelectElement;
+let selectedVideoAltGroup: number | undefined;
 
 let player: MoqtPlayer | null = null;
 /** Adapter handle for the current session (diagnostics + playback recovery). */
@@ -421,6 +426,7 @@ let reconnecting = false;     // a reconnect loop is in flight
 let reconnectCancelled = false; // user pressed Stop during a reconnect loop
 let retryCount = 0;
 let startupDiscovery: AbortController | null = null; // aborts endpoint discovery on Stop
+let startupTransport: AbortController | null = null;
 let playEpoch = 0;            // bumped by every stopPlayback(); a startPlayback()
                               // that observes a stale epoch must not touch state
 
@@ -613,7 +619,8 @@ function setControlIcon(playing: boolean) {
  * `player.destroy()` unsubscribes everything and (for player-owned connections)
  * closes the session; the `?fetchCatalog=1` external connection is closed here.
  */
-async function stopPlayback(): Promise<void> {
+const teardownBarrier = new TeardownBarrier();
+async function stopPlayback(strict = false): Promise<void> {
     // Immediate visual stop FIRST — never let the element drain its buffer.
     videoEl.pause();
     renderer?.stop();
@@ -623,9 +630,15 @@ async function stopPlayback(): Promise<void> {
     playEpoch++;     // invalidate any in-flight startPlayback() attempt
     startupDiscovery?.abort(new Error('playback stopped'));
     startupDiscovery = null;
+    startupTransport?.abort(new Error('playback stopped'));
+    startupTransport = null;
 
     const p = player;
+    const oldExternalConnection = externalConnection;
     player = null;
+    externalConnection = null;
+    renderer = null;
+    mediaSourceRef = null;
     (window as any).__player = null;
     isPlaying = false;
     setControlIcon(false);
@@ -633,21 +646,63 @@ async function stopPlayback(): Promise<void> {
     showPlayerControls();
     if (hideTimer) clearTimeout(hideTimer);
 
+    if (p || oldExternalConnection) {
+        void teardownBarrier.run(async () => {
+            const failures: unknown[] = [];
+            try { await p?.destroy(); } catch (err) { failures.push(err); }
+            try { await oldExternalConnection?.close(); } catch (err) { failures.push(err); }
+            if (failures.length) throw new AggregateError(failures, 'Player teardown failed');
+        }).catch(() => {});
+    }
     try {
-        await p?.destroy(); // unsubscribes; closes player-owned connection; MSE detached
+        await teardownBarrier.wait();
+        log('Stopped. Press play to tune back in at the live edge.');
     } catch (err) {
-        log(`stop: destroy error (ignored): ${(err as Error).message}`);
+        log(`stop: ${(err as Error).message}`);
+        if (strict) throw err;
     }
-    if (externalConnection) {
-        try { await externalConnection.close(); } catch { /* already closed */ }
-        externalConnection = null;
-    }
-    renderer = null;
-    log('Stopped. Press play to tune back in at the live edge.');
 }
+
+const viewRetuner = new ViewRetuner({
+    stop: () => stopPlayback(true),
+    start: async (group, signal) => {
+        selectedVideoAltGroup = group;
+        await startPlayback(signal);
+    },
+});
+
+viewSelect.addEventListener('change', () => {
+    const p = player;
+    if (!p || transitioning || reconnecting || viewRetuner.busy) return;
+    const group = Number(viewSelect.value);
+    const current = currentVideoGroup(p);
+    transitioning = true;
+    viewSelect.disabled = true;
+    loadingSpinner.style.display = '';
+    void viewRetuner.change(group, p.availableVideoGroups, current).then(changed => {
+        if (changed) {
+            params.set('altGroup', String(group));
+            const url = new URL(location.href);
+            url.searchParams.set('altGroup', String(group));
+            history.replaceState(null, '', url);
+        }
+    }).catch((error: Error) => {
+        log(`View change failed: ${error.message}`);
+    }).finally(() => {
+        transitioning = false;
+        viewSelect.disabled = false;
+        loadingSpinner.style.display = 'none';
+        if (!isPlaying) centerPlay.style.display = '';
+        if (player) buildTrackSelector(player);
+    });
+});
 
 /** Stop ⇄ fresh-tune-in toggle, guarded against double clicks. */
 async function toggleStopPlay(): Promise<void> {
+    if (viewRetuner.busy) {
+        viewRetuner.cancel();
+        return;
+    }
     // A user action overrides any in-flight auto-reconnect loop — checked BEFORE
     // the transition guard, because the loop's own stop/start phases set
     // `transitioning` and a Stop click during them must still cancel.
@@ -948,13 +1003,18 @@ function renderPipelineBar(s: PlayerStats): string {
  * Demo-quality: assumes JSON (MSF) catalog; would need parseCatalogAuto
  * for CF01-encoded catalogs.
  */
-async function prefetchCatalogViaFetch(relayUrl: string): Promise<{
+async function prefetchCatalogViaFetch(relayUrl: string, signal: AbortSignal): Promise<{
     connection: InstanceType<typeof MoqtConnection>;
     catalog: { tracks: any[] };
 }> {
     log('FETCH-catalog mode: pre-fetching catalog (no SUBSCRIBE)...');
-    const transport = await createWebTransport({ ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) })(relayUrl);
+    const transport = await createWebTransport({ signal, ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) })(relayUrl);
+    if (signal.aborted) {
+        transport.close();
+        signal.throwIfAborted();
+    }
     const connection = new MoqtConnection(draftVersion);
+    externalConnection = connection;
 
     const enc = new TextEncoder();
     const dec = new TextDecoder();
@@ -963,10 +1023,10 @@ async function prefetchCatalogViaFetch(relayUrl: string): Promise<{
         : namespaceArg;
     const nsBytes = nsFields.map((s) => enc.encode(s));
 
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let aborted: (() => void) | undefined;
     const catalogPromise = new Promise<{ tracks: any[] }>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('FETCH catalog timeout (10s)')), 10_000);
         connection.onObject = (_streamId, obj) => {
-            clearTimeout(timer);
             if (obj.kind === 'gap') { reject(new Error('FETCH returned gap — catalog not in cache')); return; }
             if (!obj.payload || obj.payload.byteLength === 0) { reject(new Error('FETCH returned empty payload')); return; }
             try {
@@ -976,28 +1036,68 @@ async function prefetchCatalogViaFetch(relayUrl: string): Promise<{
             } catch (err) { reject(err instanceof Error ? err : new Error(String(err))); }
         };
     });
-
-    await connection.connect(transport, {
-        maxRequestId: varint(100),
-        ...(authority ? { authority } : {}),
+    void catalogPromise.catch(() => {});
+    const interrupted = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('FETCH catalog timeout (10s)')), 10_000);
+        aborted = () => reject(signal.reason);
+        signal.addEventListener('abort', aborted, { once: true });
+        if (signal.aborted) aborted();
     });
-    const reqId = await connection.fetch(nsBytes, enc.encode(CATALOG_TRACK_NAME), {
-        startGroup: varint(0n), startObject: varint(0n),
-        endGroup: varint(0n), endObject: varint(0n),
-    });
-    log(`FETCH catalog: reqId=${reqId} group=0 object=0`);
-
-    const catalog = await catalogPromise;
-    log(`FETCH'd catalog: ${catalog.tracks.length} tracks`);
-    return { connection, catalog };
+    try {
+        return await Promise.race([(async () => {
+            await connection.connect(transport, {
+                maxRequestId: varint(100),
+                ...(authority ? { authority } : {}),
+            });
+            signal.throwIfAborted();
+            const reqId = await connection.fetch(nsBytes, enc.encode(CATALOG_TRACK_NAME), {
+                startGroup: varint(0n), startObject: varint(0n),
+                endGroup: varint(0n), endObject: varint(0n),
+            });
+            signal.throwIfAborted();
+            log(`FETCH catalog: reqId=${reqId} group=0 object=0`);
+            const catalog = await catalogPromise;
+            log(`FETCH'd catalog: ${catalog.tracks.length} tracks`);
+            return { connection, catalog };
+        })(), interrupted]);
+    } catch (error) {
+        // Stop may already own this connection's teardown.
+        if (externalConnection === connection) {
+            externalConnection = null;
+            await connection.close();
+        }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+        if (aborted) signal.removeEventListener('abort', aborted);
+        delete connection.onObject;
+    }
 }
 
 /** Fresh tune-in: connect → catalog → subscribe → play. Re-invokable after stopPlayback(). */
-async function startPlayback(): Promise<void> {
+async function startPlayback(outputSignal?: AbortSignal): Promise<void> {
+    const epoch = playEpoch;
+    await teardownBarrier.wait();
+    if (epoch !== playEpoch || outputSignal?.aborted) return;
+    const transportAbort = new AbortController();
+    const abortTransport = () => transportAbort.abort(outputSignal?.reason);
+    startupTransport = transportAbort;
+    outputSignal?.addEventListener('abort', abortTransport, { once: true });
+    try {
+        await startPlaybackAttempt(epoch, transportAbort, outputSignal);
+    } catch (error) {
+        if (epoch === playEpoch) await stopPlayback(true);
+        throw error;
+    } finally {
+        outputSignal?.removeEventListener('abort', abortTransport);
+    }
+}
+
+async function startPlaybackAttempt(epoch: number, transportAbort: AbortController, outputSignal?: AbortSignal): Promise<void> {
+    const videoAltGroup = selectedVideoAltGroup ?? parseVideoAltGroup(params.get('altGroup'));
     // Stale-attempt token: a reconnect attempt that times out (withTimeout) keeps
     // running underneath — the loop's cleanup stopPlayback() bumps playEpoch, and
     // this attempt must then bail without mutating player/UI state.
-    const epoch = playEpoch;
     // One latch per session; both adapter factories below close over it.
     const latch = newStartupLatch();
     const { ctx: audioCtx, clock: audioClock } = ensureAudio();
@@ -1006,7 +1106,7 @@ async function startPlayback(): Promise<void> {
     // the shared discovery probes the page host's common endpoint paths.
     // The consumer is tied to this startup attempt: Stop aborts it (which
     // closes any connecting probe transport once no consumer remains).
-    const discovery = new AbortController();
+    const discovery = transportAbort;
     startupDiscovery = discovery;
     let relayUrl: string;
     try {
@@ -1017,7 +1117,7 @@ async function startPlayback(): Promise<void> {
         log(`Endpoint discovery failed: ${(err as Error).message}`);
         isPlaying = false;
         setControlIcon(false);
-        return;
+        throw err;
     } finally {
         // Identity-safe: a stale attempt must not clear a successor's
         // controller (Stop nulls the slot itself when it aborts).
@@ -1036,7 +1136,8 @@ async function startPlayback(): Promise<void> {
     // These wrap browser APIs behind the player's swappable interfaces.
     // CommandDispatcher routes pipeline decoder commands to them.
 
-    renderer = new CanvasRenderer(canvas, { clock: audioClock });
+    const attemptRenderer = new CanvasRenderer(canvas, { clock: audioClock });
+    renderer = attemptRenderer;
 
     // ── Create player with adapter factories ─────────────────────────
     // The player internally creates these after catalog arrives (so it
@@ -1086,13 +1187,11 @@ async function startPlayback(): Promise<void> {
     // the connect handshake AND the catalog SUBSCRIBE.
     let prefetched: { connection: InstanceType<typeof MoqtConnection>; catalog: { tracks: any[] } } | null = null;
     if (params.get('fetchCatalog') === '1' && !catalogFromUrl) {
-        prefetched = await prefetchCatalogViaFetch(relayUrl);
+        prefetched = await prefetchCatalogViaFetch(relayUrl, transportAbort.signal);
         if (epoch !== playEpoch) {
-            // Superseded (timeout/stop) while prefetching — leave state alone.
-            try { await prefetched.connection.close(); } catch { /* already closed */ }
+            // Stop already owns the registered preflight connection.
             return;
         }
-        externalConnection = prefetched.connection; // closed by stopPlayback()
     }
 
     // ?res=720 → quality controller picks the matching track at startup
@@ -1103,7 +1202,7 @@ async function startPlayback(): Promise<void> {
     const videoConstraints = resHeight > 0
         ? { maxHeight: resHeight } : undefined;
 
-    player = new MoqtPlayer({
+    const p = new MoqtPlayer({
         url: relayUrl,
         namespace: namespaceArg,
         ...(authority ? { authority } : {}),
@@ -1114,16 +1213,18 @@ async function startPlayback(): Promise<void> {
         ...(draftVersion ? { draftVersion } : {}),
         clock: audioClock,
         ...(videoConstraints ? { videoConstraints } : {}),
+        ...(videoAltGroup !== undefined ? { videoAltGroup } : {}),
         ...(catalogFromUrl ? { catalog: catalogFromUrl } : {}),
         ...(prefetched ? { catalog: prefetched.catalog, connection: prefetched.connection } : {}),
         ...(lateMs ? { lateFrameThresholdMs: lateMs } : {}),
         ...(gapMs ? { gapTimeoutMs: gapMs } : {}),
         ...(locmafDecoding !== 'mse' ? { locmafDecoding } : {}),
-        createTransport: createWebTransport({ ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) }),
+        createTransport: createWebTransport({ signal: transportAbort.signal,
+            ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) }),
         createConnection: () => new MoqtConnection(draftVersion),
         createVideoDecoder: () => new WebCodecsVideoDecoder({ preferSoftwareDecoder }),
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
-        createRenderer: () => renderer!,
+        createRenderer: () => attemptRenderer,
         // Delay 0: the shared playout cushion is applied upstream by the
         // CommandDispatcher (delay unification) — no independent audio delay.
         createAudioOutput: () => new WebAudioOutput(audioCtx, undefined, 0, audioClock),
@@ -1180,15 +1281,30 @@ async function startPlayback(): Promise<void> {
         },
         onQlogEvent: (e) => trace?.record(e),
     });
+    if (outputSignal?.aborted) transportAbort.abort(outputSignal.reason);
+    player = p;
+    const on = <K extends keyof PlayerEventMap>(type: K, listener: (event: PlayerEventMap[K]) => void) =>
+        p.on(type, event => { if (player === p && epoch === playEpoch) listener(event); });
+    let catalogTracks: readonly CatalogTrack[] = [];
+    const applySurface = (track: CatalogTrack) => {
+        cmafActive = usesMsePath(track.packaging, locmafDecoding);
+        canvas.style.display = cmafActive ? 'none' : 'block';
+        videoEl.hidden = !cmafActive;
+        videoEl.style.display = cmafActive ? 'block' : 'none';
+        if (track.role === 'video') {
+            canvas.width = track.width ?? 1920;
+            canvas.height = track.height ?? 1080;
+        }
+    };
 
     // ── Wire player events ──────────────────────────────────────────
 
-    player.on('session_connecting', (e) => log(`Connecting to ${e.url}...`));
-    player.on('session_established', () => log('Session established.'));
-    player.on('session_goaway', (e) => log(`GOAWAY: ${e.newSessionUri ?? 'no URI'}`));
-    player.on('session_closed', (e) => log(`Closed: ${e.reason ?? 'clean'}`));
-    player.on('session_error', (e) => log(`Error: ${e.error.message}`));
-    player.on('error', (e) => {
+    on('session_connecting', (e) => log(`Connecting to ${e.url}...`));
+    on('session_established', () => log('Session established.'));
+    on('session_goaway', (e) => log(`GOAWAY: ${e.newSessionUri ?? 'no URI'}`));
+    on('session_closed', (e) => log(`Closed: ${e.reason ?? 'clean'}`));
+    on('session_error', (e) => log(`Error: ${e.error.message}`));
+    on('error', (e) => {
         const err = e.error;
         log(`[ErrorTaxonomy] ${err.severity}/${err.source} code=0x${err.code.toString(16)}: ${err.message}`);
         // Fatal connection loss → same Stop + fresh-tune-in lifecycle as the
@@ -1203,7 +1319,8 @@ async function startPlayback(): Promise<void> {
         }
     });
 
-    player.on('catalog_received', (e) => {
+    on('catalog_received', (e) => {
+        catalogTracks = e.catalog.tracks;
         log(`Catalog: ${e.catalog.tracks.length} tracks`);
         for (const t of e.catalog.tracks) {
             const parts: string[] = [t.name];
@@ -1213,54 +1330,44 @@ async function startPlayback(): Promise<void> {
             log(`  ${parts.join(' | ')}`);
         }
 
-        // Detect packaging: CMAF/LOCMAF use <video> element (MSE), LOC uses <canvas>
-        const hasCmaf = e.catalog.tracks.some(t => isMsePackaging(t.packaging));
-        cmafActive = hasCmaf; // gates unexpected-pause recovery to the <video> sink
-        if (hasCmaf) {
-            canvas.style.display = 'none';
-            videoEl.hidden = false;
-            videoEl.style.display = 'block';
-            log('  [CMAF mode — using MSE/<video>]');
-        }
-
-        // Size canvas to video dimensions from catalog
-        const videoTrack = e.catalog.tracks.find(t => t.role === 'video');
-        if (videoTrack) {
-            canvas.width = videoTrack.width ?? 1920;
-            canvas.height = videoTrack.height ?? 1080;
-        }
-
         // Populate track selector after subscriptions are set up (next microtask)
-        setTimeout(() => { if (player) buildTrackSelector(player); }, 0);
+        setTimeout(() => { if (player === p && epoch === playEpoch) buildTrackSelector(p); }, 0);
     });
 
-    player.on('catalog_updated', () => log('Catalog updated (delta).'));
+    on('catalog_updated', (e) => {
+        catalogTracks = e.catalog.tracks;
+        buildTrackSelector(p);
+        log('Catalog updated (delta).');
+    });
 
-    player.on('track_subscribed', (e) => {
+    on('track_subscribed', (e) => {
+        const track = catalogTracks.find(track => track.name === e.trackName);
+        if (track && (e.mediaType === 'video' || (e.mediaType === 'audio' && p.availableVideoTracks.length === 0))) applySurface(track);
+        buildTrackSelector(p);
         log(`Subscribed: ${e.trackName} (${e.mediaType}, reqId=${e.requestId})`);
     });
 
     // Rendering lifecycle events from the CanvasRenderer
-    player.on('first_frame', () => log('First video frame rendered!'));
-    player.on('stall', (e) => log(`Stall detected: ${e.durationMs.toFixed(0)}ms${e.cause ? ` (${e.cause})` : ''}`));
-    player.on('gap_jump', (e) => log(
+    on('first_frame', () => log('First video frame rendered!'));
+    on('stall', (e) => log(`Stall detected: ${e.durationMs.toFixed(0)}ms${e.cause ? ` (${e.cause})` : ''}`));
+    on('gap_jump', (e) => log(
         `Gap-jump: skipped ${e.holeSec.toFixed(2)}s hole ${e.from.toFixed(2)}s -> ${e.to.toFixed(2)}s (waited ${e.waitedMs.toFixed(0)}ms)`));
 
     // Playback events from the pipeline
-    player.on('gap_detected', (e) => log(`Gap: ${e.mediaType} group=${e.groupId}`));
-    player.on('skip_forward', (e) => log(`Skip: ${e.mediaType} ${e.fromGroupId}->${e.toGroupId}`));
-    player.on('track_ended', (e) => log(`Track ended: ${e.mediaType}`));
-    player.on('keyframe_waiting', (e) => log(`Keyframe waiting: ${e.mediaType} group=${e.groupId}`));
-    player.on('recovery_action', (e) => log(`Recovery: ${e.action.type}`));
+    on('gap_detected', (e) => log(`Gap: ${e.mediaType} group=${e.groupId}`));
+    on('skip_forward', (e) => log(`Skip: ${e.mediaType} ${e.fromGroupId}->${e.toGroupId}`));
+    on('track_ended', (e) => log(`Track ended: ${e.mediaType}`));
+    on('keyframe_waiting', (e) => log(`Keyframe waiting: ${e.mediaType} group=${e.groupId}`));
+    on('recovery_action', (e) => log(`Recovery: ${e.action.type}`));
 
-    player.on('state_changed', (e) => log(`State: ${e.from} -> ${e.to}`));
-    player.on('quality_switched', (e) => {
+    on('state_changed', (e) => log(`State: ${e.from} -> ${e.to}`));
+    on('quality_switched', (e) => {
         log(`Quality: ${e.fromTrackName} -> ${e.toTrackName} (${e.reason})`);
-        if (player) buildTrackSelector(player);
+        buildTrackSelector(p);
     });
 
     // Collect jitter + latency for sparkline graphs
-    player.on('media_object', (e) => {
+    on('media_object', (e) => {
         // Liveness watchdog: ANY media object (audio included) proves the data
         // path is alive — stamp before the video-only sparkline filter.
         noteMediaArrival();
@@ -1290,29 +1397,41 @@ async function startPlayback(): Promise<void> {
     // Expose player on window for console inspection (dev only)
     (window as any).__player = player;
 
-    const p = player; // local ref: the global may be swapped while load() is in flight
-    await p.load();
-    if (epoch !== playEpoch) {
-        // This attempt was timed out / cancelled while load() was pending. The
-        // reconnect loop (or a user Stop) has already torn down and moved on —
-        // a late completion must not resurrect old player/UI state.
-        try { await p.destroy(); } catch { /* best effort */ }
-        return;
+    const output = outputSignal ? waitForOutput(p, outputSignal) : undefined;
+    void output?.promise.catch(() => {});
+    try {
+        await p.load();
+        if (epoch !== playEpoch) {
+            // A late completion must not resurrect a stopped player.
+            try { await p.destroy(); } catch { /* best effort */ }
+            return;
+        }
+        // The MSE adapter owns startup positioning and playback.
+        p.play();
+        attemptRenderer.start();
+        await output?.promise;
+        if (epoch !== playEpoch) return;
+
+        loadingSpinner.style.display = 'none';
+        controls.style.display = '';
+        isPlaying = true;
+        setControlIcon(true);
+        showPlayerControls();
+    } finally {
+        output?.dispose();
     }
-    // play() declares playback intent; the MSE adapter owns the startup
-    // positioning/play sequence from there. A second videoEl.play() here would
-    // be a competing owner that can play into an unresolved startup seek.
-    p.play();
+}
 
-    // Start the rendering loop (rAF-driven frame presentation)
-    renderer.start();
-
-    // Show controls, hide spinner; reflect playing state on the Stop/Play control.
-    loadingSpinner.style.display = 'none';
-    controls.style.display = '';
-    isPlaying = true;
-    setControlIcon(true);
-    showPlayerControls();
+function waitForOutput(p: MoqtPlayer, signal: AbortSignal) {
+    let complete!: () => void;
+    let fail!: (error: unknown) => void;
+    const promise = new Promise<void>((resolve, reject) => { complete = resolve; fail = reject; });
+    const offFrame = p.on('first_frame', complete);
+    const offError = p.on('error', e => { if (e.error.severity === 'fatal') fail(new Error(e.error.message)); });
+    const aborted = () => fail(signal.reason);
+    signal.addEventListener('abort', aborted, { once: true });
+    if (signal.aborted) aborted();
+    return { promise, dispose() { offFrame(); offError(); signal.removeEventListener('abort', aborted); } };
 }
 
 // ─── Track Dropdowns ─────────────────────────────────────────────────
@@ -1335,6 +1454,16 @@ audioTrackBtn.addEventListener('click', (e) => {
 
 function buildTrackSelector(p: MoqtPlayer): void {
     const videoTracks = p.availableVideoTracks;
+    const groups = p.availableVideoGroups;
+    viewControl.hidden = groups.length < 2;
+    viewSelect.replaceChildren(...groups.map(group => {
+        const option = document.createElement('option');
+        option.value = String(group.altGroup);
+        option.textContent = group.tracks[0]?.label ?? `View ${group.altGroup}`;
+        return option;
+    }));
+    const group = currentVideoGroup(p);
+    if (group !== undefined) viewSelect.value = String(group);
     const currentRes = p.stats.currentResolution;
 
     // Video dropdown
@@ -1425,4 +1554,9 @@ function buildTrackSelector(p: MoqtPlayer): void {
             }
         }
     }
+}
+
+function currentVideoGroup(p: MoqtPlayer): number | undefined {
+    const name = p.availableVideoTracks[0]?.name;
+    return p.availableVideoGroups.find(group => group.tracks.some(track => track.name === name))?.altGroup;
 }
