@@ -19,6 +19,7 @@ export type {
     LocExtensionValue,
     LocTrackContext,
     LocVersion,
+    SourceTimestamp,
     VideoChunkInit,
     AudioChunkInit,
 } from './types.js';

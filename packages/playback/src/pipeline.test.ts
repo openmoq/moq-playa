@@ -123,6 +123,24 @@ function createPipeline(opts: {
 // ─── Tests ────────────────────────────────────────────────────────────
 
 describe('PlaybackPipeline', () => {
+    it.each(['video', 'audio'] as const)('preserves exact %s source time on the emitted decode command', (mediaType) => {
+        const clock = new MockClock();
+        const { pipeline, commands } = createPipeline({ mediaType, clock });
+        if (mediaType === 'audio') pipeline.configure(new Uint8Array([1]));
+        pipeline.pushObject(makeData(0, 0), {
+            ...videoHeaders(1_000_011n, true, new Uint8Array([1, 100])),
+            timestamp: 90_001n,
+            timescale: 90_000n,
+            timestampIsWallClock: false,
+        });
+        pipeline.tick();
+        const decode = commands.find(c => c.type === 'decode_video' || c.type === 'decode_audio');
+        expect(decode).toBeDefined();
+        if (decode?.type !== 'decode_video' && decode?.type !== 'decode_audio') throw new Error('decode missing');
+        expect(decode.chunk.sourceTimestamp).toEqual({ ticks: 90_001n, ticksPerSecond: 90_000n, domain: 'media' });
+        expect(decode.chunk.timestamp).toBe(1_000_011);
+    });
+
     it('sequential group, 3 video objects → configure + 3 decode commands (§4.2)', () => {
         const clock = new MockClock();
         clock.set(5_000_000);

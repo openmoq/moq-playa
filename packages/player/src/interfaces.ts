@@ -14,7 +14,7 @@
  * @module
  */
 
-import type { VideoChunkInit, AudioChunkInit } from '@openmoq/loc';
+import type { VideoChunkInit, AudioChunkInit, SourceTimestamp } from '@openmoq/loc';
 
 // ─── Layer 3: Decoder Backend (Swappable) ────────────────────────────
 
@@ -64,8 +64,12 @@ export interface VideoDecoderLike {
    */
   readonly queueDepth: number;
 
-  /** Callback: decoded frame ready for rendering. */
-  onFrame: ((frame: unknown, renderTimeUs: number) => void) | null;
+  /**
+   * Callback: decoded frame ready for rendering. Optional source time belongs to
+   * this output's decode input; null/omitted means unavailable, never guessed from
+   * the latest input or catalog. It is not a render observation or track identity.
+   */
+  onFrame: ((frame: unknown, renderTimeUs: number, sourceTimestamp?: SourceTimestamp | null) => void) | null;
 
   /** Callback: decode error occurred. */
   onError: ((error: Error) => void) | null;

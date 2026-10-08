@@ -210,6 +210,10 @@ describe('LOCMAF frame-path regressions', () => {
         [context.timescale + 900, context.timescale + 3001 - 450, context.timescale + 3001 + 4507 + 1350]
           .map((time) => Number(ticksToMicros(BigInt(time), context.timescale))),
       );
+      expect(delivered.map(frame => frame.sourceTimestamp)).toEqual(
+        [context.timescale + 900, context.timescale + 3001 - 450, context.timescale + 3001 + 4507 + 1350]
+          .map(time => ({ ticks: BigInt(time), ticksPerSecond: BigInt(context.timescale), domain: 'media' })),
+      );
       expect(h.errors).toEqual([]);
     } finally {
       await h.player.destroy();
@@ -508,6 +512,12 @@ describe('LOCMAF frame path (draft-einarsson-moq-locmaf-01 §16) — locmafDecod
     const headers = pushed.find((h) => h?.captureTimestamp !== undefined)!;
     expect(headers).toBeDefined();
     expect(headers.timestampIsWallClock).toBe(false);
+    expect(headers.timestamp).toBe(BigInt(samples[0]!.decodeTime));
+    expect(headers.timescale).toBe(90000n);
+    const chunks = videoDecoder.decode.mock.calls.map((c: any[]) => c[0] as VideoChunkInit);
+    expect(chunks.map(c => c.sourceTimestamp)).toEqual(samples.map(s => ({
+      ticks: BigInt(s.decodeTime), ticksPerSecond: 90000n, domain: 'media',
+    })));
     await player.destroy();
   });
 

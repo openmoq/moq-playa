@@ -225,6 +225,10 @@ try {
       caseResult.assessment = assessPlayback(observed.samples, scenario.expected);
       caseResult.presentationFailures = assessVideoPresentation(observed.samples);
       assert.deepEqual(caseResult.presentationFailures, [], 'Public video draw observation');
+      if (scenario.expected?.outputKind === 'canvas') {
+        assert.ok(observed.decodedSource?.matched > 0, 'No decoded source timestamp evidence');
+        assert.deepEqual(observed.decodedSource.failures, [], 'Decoded source timestamp correlation');
+      } else assert.equal(observed.decodedSource, null, 'MSE must not claim WebCodecs output evidence');
       if (scenario.locmaf) assert.deepEqual(observed.locmafFailures, [], 'Browser did not receive the required LOCMAF catalog/full/delta/group mapping');
       if (scenario.alternatives) {
         assert.deepEqual(observed.levels.map((level) => level.trackName), ['video-1080', 'video-720', 'video-360']);

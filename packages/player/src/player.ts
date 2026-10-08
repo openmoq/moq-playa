@@ -1601,6 +1601,8 @@ export class MoqtPlayer {
         // CMAF presentation time is media time, never wall clock, so
         // wall-clock latency features must stay off for this path.
         captureTimestamp: ticksToMicros(frame.presentationTime, timescale),
+        timestamp: frame.presentationTime,
+        timescale: BigInt(timescale),
         duration: Number(ticksToMicros(BigInt(frame.duration), timescale)),
         timestampIsWallClock: false,
         ...(mediaType === 'video'

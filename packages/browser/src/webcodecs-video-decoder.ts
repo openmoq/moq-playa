@@ -19,7 +19,7 @@
  */
 
 import type { VideoDecoderLike } from '@openmoq/player';
-import type { VideoChunkInit } from '@openmoq/loc';
+import type { VideoChunkInit, SourceTimestamp } from '@openmoq/loc';
 import { createCodecStrategy } from './codec-strategy.js';
 import type { CodecStrategy } from './codec-strategy.js';
 
@@ -32,6 +32,16 @@ import type { CodecStrategy } from './codec-strategy.js';
 const MAX_DECODE_QUEUE_SIZE = 16;
 const MAX_CHUNK_HISTORY = 8;
 const HEX_PREVIEW_BYTES = 24;
+const MAX_SOURCE_TIMESTAMPS = 256;
+const MAX_DECODER_OWNERS = 2; // Current decoder plus one draining predecessor.
+
+interface DecoderOwner {
+  readonly decoder: VideoDecoder;
+  readonly renderTimes: Map<number, number>;
+  readonly sourceTimes: Map<number, SourceTimestamp | null>;
+  retiredTimestampFloor: number;
+  active: boolean;
+}
 
 /**
  * Wraps the browser's VideoDecoder API behind VideoDecoderLike.
@@ -59,6 +69,10 @@ export interface WebCodecsVideoDecoderConfig {
 
 export class WebCodecsVideoDecoder implements VideoDecoderLike {
   private decoder: VideoDecoder | null = null;
+  private owner: DecoderOwner | null = null;
+  private readonly owners = new Set<DecoderOwner>();
+  private destroyed = false;
+  private lifecycleRevision = 0;
   private readonly preferSoftwareDecoder: boolean;
 
   constructor(config?: WebCodecsVideoDecoderConfig) {
@@ -107,17 +121,9 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
   private lastSubmittedKeyChunkBytes: Uint8Array | null = null;
   private lastSubmittedChunkBytes: Uint8Array | null = null;
 
-  /**
-   * Map from chunk timestamp → renderTimeUs.
-   * Keyed by EncodedVideoChunk.timestamp so that B-frame reordering
-   * in the browser's VideoDecoder doesn't scramble the render times.
-   * (Decode order ≠ output/presentation order for H.264 B-frames.)
-   */
-  private readonly renderTimeMap = new Map<number, number>();
-
   // ─── Callbacks ──────────────────────────────────────────────────
 
-  onFrame: ((frame: unknown, renderTimeUs: number) => void) | null = null;
+  onFrame: ((frame: unknown, renderTimeUs: number, sourceTimestamp?: SourceTimestamp | null) => void) | null = null;
   onError: ((error: Error) => void) | null = null;
 
   // ─── VideoDecoderLike ───────────────────────────────────────────
@@ -140,6 +146,8 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
    * @see draft-ietf-moq-msf-00 §5.1.24 (codec string)
    */
   configure(config: Uint8Array, codec: string, width?: number, height?: number): void {
+    if (this.destroyed) return;
+    const revision = ++this.lifecycleRevision;
     const codecChanged = codec !== this.lastCodec;
     this.lastCodec = codec;
     this.lastWidth = width;
@@ -174,21 +182,20 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
     // @see draft-ietf-moq-msf-00 §4.2 (seamless switch at group boundaries)
     if (codecChanged && this.decoder && this.decoder.state === 'configured') {
       const dyingDecoder = this.decoder;
+      const dyingOwner = this.owner!;
       this.decoder = null; // prevent createDecoder() from closing it
-      this.renderTimeMap.clear();
+      this.owner = null;
 
       dyingDecoder.flush().then(() => {
-        if (dyingDecoder.state !== 'closed') dyingDecoder.close();
+        this.retireOwner(dyingOwner);
       }, () => {
-        if (dyingDecoder.state !== 'closed') dyingDecoder.close();
+        this.retireOwner(dyingOwner);
       });
     }
 
-    this.createDecoder();
+    if (!this.createDecoder(revision)) return;
     this.applyConfig();
-    if (codecChanged) {
-      this.checkConfigSupport();
-    }
+    if (revision === this.lifecycleRevision) this.checkConfigSupport();
   }
 
   /**
@@ -202,13 +209,16 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
    * @see draft-ietf-moq-loc-01 §2 (LOC payload = EncodedVideoChunk.data)
    */
   decode(chunk: VideoChunkInit, renderTimeUs: number): void {
-    if (!this.lastCodec || !this.decoder || this.decoder.state !== 'configured') return;
+    const owner = this.owner;
+    if (this.destroyed || !owner?.active || !this.lastCodec || owner.decoder.state !== 'configured') return;
 
     // Backpressure: if decoder queue is full, reset and wait for the
     // next keyframe. Continuing would break the reference chain — later
     // deltas without their reference produce blocky artifacts.
-    if (this.decoder.decodeQueueSize >= MAX_DECODE_QUEUE_SIZE) {
+    if (owner.decoder.decodeQueueSize >= MAX_DECODE_QUEUE_SIZE) {
+      const revision = this.lifecycleRevision;
       this.reset(); // full reset preserving description/codedSize/optimizeForLatency
+      if (this.destroyed || this.lifecycleRevision !== revision + 1) return;
       this.onError?.(new Error('decode queue overflow — reset to keyframe'));
       return;
     }
@@ -257,14 +267,29 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
       this.lastSubmittedKeyChunkBytes = data.slice();
     }
 
-    this.renderTimeMap.set(chunk.timestamp, renderTimeUs);
-
+    let submittedTimestamp: number | undefined;
     try {
-      this.decoder.decode(new EncodedVideoChunk({
-        ...chunk,
+      const encoded = new EncodedVideoChunk({
+        type: chunk.type,
+        timestamp: chunk.timestamp,
+        ...(chunk.duration !== undefined ? { duration: chunk.duration } : {}),
         data,
-      }));
+      });
+      const source = copySourceTimestamp(chunk, encoded.timestamp);
+      if (!owner.active || this.owner !== owner) return;
+      this.rememberSource(owner, encoded.timestamp, source);
+      if (!owner.renderTimes.has(encoded.timestamp) && owner.renderTimes.size >= MAX_SOURCE_TIMESTAMPS) {
+        owner.renderTimes.delete(owner.renderTimes.keys().next().value!);
+      }
+      owner.renderTimes.set(encoded.timestamp, renderTimeUs);
+      submittedTimestamp = encoded.timestamp;
+      owner.decoder.decode(encoded);
     } catch (err) {
+      // A throwing submit has no proven output ownership. Keep the tombstone.
+      if (submittedTimestamp !== undefined && owner.active) {
+        if (owner.sourceTimes.has(submittedTimestamp)) owner.sourceTimes.set(submittedTimestamp, null);
+        owner.renderTimes.delete(submittedTimestamp);
+      }
       throw this.enrichError(
         err,
         `Video decode submit failed (${this.describeDecoderContext()})`,
@@ -286,16 +311,14 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
    */
   reset(): void {
     if (!this.lastCodec) return; // Not yet configured — nothing to reset
-    this.renderTimeMap.clear();
+    if (this.destroyed) return;
+    const revision = ++this.lifecycleRevision;
     this.awaitingKeyframe = this.strategy.gatesAfterReset;
-    if (this.decoder && this.decoder.state === 'configured') {
-      this.decoder.reset();
-    }
-    // Decoder may be closed after an error — recreate it
-    if (!this.decoder || this.decoder.state === 'closed') {
-      this.createDecoder();
-    }
+    // A fresh callback owner prevents pre-reset output from binding to reused PTS.
+    this.retireAllOwners();
+    if (!this.createDecoder(revision)) return;
     this.applyConfig();
+    if (revision === this.lifecycleRevision) this.checkConfigSupport();
   }
 
   /**
@@ -308,43 +331,57 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
 
   /** Release all resources. */
   destroy(): void {
-    this.renderTimeMap.clear();
-    if (this.decoder && this.decoder.state !== 'closed') {
-      this.decoder.close();
-    }
-    this.decoder = null;
+    this.destroyed = true;
+    this.lifecycleRevision++;
     this.onFrame = null;
     this.onError = null;
+    this.retireAllOwners();
   }
 
   // ─── Internal ──────────────────────────────────────────────────
 
-  private createDecoder(): void {
-    if (this.decoder && this.decoder.state !== 'closed') {
-      this.decoder.close();
-    }
+  private createDecoder(revision: number): boolean {
+    if (this.destroyed || revision !== this.lifecycleRevision) return false;
+    if (this.owner) this.retireOwner(this.owner);
+    if (this.destroyed || revision !== this.lifecycleRevision) return false;
+    let owner: DecoderOwner;
 
-    this.decoder = new VideoDecoder({
+    const decoder = new VideoDecoder({
       output: (frame: VideoFrame) => {
-        if (!this.onFrame) {
+        if (!owner?.active || this.destroyed) {
           // No consumer wired — MUST close to release GPU memory.
           // VideoFrame holds ~8MB GPU memory outside JS GC.
           frame.close();
           return;
         }
-        const renderTimeUs = this.renderTimeMap.get(frame.timestamp) ?? 0;
-        this.renderTimeMap.delete(frame.timestamp);
-        this.onFrame(frame, renderTimeUs);
+        const timestamp = frame.timestamp;
+        if (!owner.active || this.destroyed) {
+          frame.close();
+          return;
+        }
+        const renderTimeUs = owner.renderTimes.get(timestamp) ?? 0;
+        owner.renderTimes.delete(timestamp);
+        const source = owner.sourceTimes.get(timestamp) ?? null;
+        if (owner.sourceTimes.has(timestamp)) owner.sourceTimes.set(timestamp, null);
+        if (!this.onFrame) {
+          frame.close();
+          return;
+        }
+        this.onFrame(frame, renderTimeUs, source);
       },
       error: (err: DOMException) => {
+        if (!owner?.active || this.destroyed) return;
+        if (this.owner !== owner) {
+          this.retireOwner(owner);
+          return;
+        }
         // If isConfigSupported() said unsupported AND we get a decode error,
         // the codec is genuinely unsupported — close decoder, fire clear error,
         // don't attempt recovery (which would loop forever).
         if (this.configLikelyUnsupported) {
-          if (this.decoder && this.decoder.state !== 'closed') {
-            this.decoder.close();
-          }
-          this.decoder = null;
+          const revision = this.lifecycleRevision;
+          this.retireOwner(owner);
+          if (this.destroyed || revision !== this.lifecycleRevision) return;
           this.onError?.(new Error(
             `Codec not supported: ${this.lastCodec} (${this.lastWidth ?? '?'}x${this.lastHeight ?? '?'}). ` +
             `VideoDecoder.isConfigSupported() returned false and decode failed.`,
@@ -352,13 +389,58 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
           return;
         }
         this.publishDebugBundle();
-        this.recoverAfterDecodeError();
+        if (!this.recoverAfterDecodeError()) return;
         this.onError?.(this.enrichError(
           err,
           `Video decoder error: ${err.message} (${this.describeDecoderContext()})`,
         ));
       },
     });
+    owner = { decoder, renderTimes: new Map(), sourceTimes: new Map(), retiredTimestampFloor: -Infinity, active: true };
+    if (this.destroyed || revision !== this.lifecycleRevision) {
+      owner.active = false;
+      if (decoder.state !== 'closed') decoder.close();
+      return false;
+    }
+    this.owners.add(owner);
+    this.owner = owner;
+    this.decoder = decoder;
+    while (this.owners.size > MAX_DECODER_OWNERS) this.retireOwner(this.owners.values().next().value!);
+    return !this.destroyed && revision === this.lifecycleRevision;
+  }
+
+  private rememberSource(owner: DecoderOwner, timestamp: number, source: SourceTimestamp | null): void {
+    if (owner.sourceTimes.has(timestamp)) {
+      // Repeated PTS cannot identify an input, even after its first output.
+      owner.sourceTimes.set(timestamp, null);
+      return;
+    }
+    if (timestamp <= owner.retiredTimestampFloor) return;
+    if (owner.sourceTimes.size >= MAX_SOURCE_TIMESTAMPS) {
+      const oldest = owner.sourceTimes.keys().next().value!;
+      owner.retiredTimestampFloor = Math.max(owner.retiredTimestampFloor, oldest);
+      owner.sourceTimes.delete(oldest);
+    }
+    owner.sourceTimes.set(timestamp, source);
+  }
+
+  private retireOwner(owner: DecoderOwner): void {
+    owner.active = false;
+    owner.sourceTimes.clear();
+    owner.renderTimes.clear();
+    this.owners.delete(owner);
+    if (this.owner === owner) {
+      this.owner = null;
+      this.decoder = null;
+    }
+    if (owner.decoder.state !== 'closed') owner.decoder.close();
+  }
+
+  private retireAllOwners(): void {
+    const owners = [...this.owners];
+    // Fence every callback before invoking fallible native cleanup.
+    for (const owner of owners) owner.active = false;
+    for (const owner of owners) this.retireOwner(owner);
   }
 
   /** Build the VideoDecoderConfig from current state + strategy. */
@@ -408,16 +490,20 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
    * a working decoder that was reconfigured in the meantime.
    */
   private checkConfigSupport(): void {
-    if (!this.lastCodec) return;
+    const owner = this.owner;
+    if (!this.lastCodec || !owner?.active || this.destroyed) return;
     this.strategy.checkSupport(this.lastCodec, this.lastWidth, this.lastHeight, this.lastDescription).then((supported) => {
+      if (!owner?.active || this.owner !== owner || this.destroyed) return;
       if (!supported) {
         this.configLikelyUnsupported = true;
       }
     });
   }
 
-  private recoverAfterDecodeError(): void {
-    this.renderTimeMap.clear();
+  private recoverAfterDecodeError(): boolean {
+    const revision = ++this.lifecycleRevision;
+    this.retireAllOwners();
+    if (this.destroyed || revision !== this.lifecycleRevision) return false;
     this.awaitingKeyframe = this.strategy.gatesAfterReset;
     // WebCodecs decoder is terminally closed after an error — reset()
     // cannot revive it. Destroy and recreate with the same config.
@@ -426,8 +512,11 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
     // decoder will hit the same error — that's an encode-side fix.
     if (this.debug) console.warn('[VideoDecoder] decode error → recreating decoder (%s %dx%d)',
       this.lastCodec, this.lastWidth ?? 0, this.lastHeight ?? 0);
-    this.createDecoder();
+    if (!this.createDecoder(revision)) return false;
     this.applyConfig();
+    if (this.destroyed || revision !== this.lifecycleRevision) return false;
+    this.checkConfigSupport();
+    return true;
   }
 
   private describeDecoderContext(): string {
@@ -475,6 +564,24 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
 }
 
 // ─── Diagnostic helpers ─────────────────────────────────────────────
+
+function copySourceTimestamp(chunk: VideoChunkInit, submittedTimestamp: number): SourceTimestamp | null {
+  if (!Number.isSafeInteger(submittedTimestamp)) return null;
+  try {
+    const source = chunk.sourceTimestamp;
+    if (!source) return null;
+    const { ticks, ticksPerSecond, domain } = source;
+    if (typeof ticks !== 'bigint' || typeof ticksPerSecond !== 'bigint' || ticksPerSecond <= 0n
+        || !['unix', 'media', 'unknown'].includes(domain)) return null;
+    const scaled = ticks * 1_000_000n;
+    const micros = BigInt(submittedTimestamp);
+    const rounded = (scaled + (scaled >= 0n ? ticksPerSecond / 2n : -(ticksPerSecond / 2n))) / ticksPerSecond;
+    if (micros !== scaled / ticksPerSecond && micros !== rounded) return null;
+    return Object.freeze({ ticks, ticksPerSecond, domain });
+  } catch {
+    return null;
+  }
+}
 
 function hexPreview(data: Uint8Array): string {
   const preview = Array.from(data.subarray(0, HEX_PREVIEW_BYTES), (b) =>

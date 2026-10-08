@@ -1,9 +1,10 @@
 import { Player } from '@openmoq/playa';
-import { createWebTransport } from '@openmoq/browser';
+import { createWebTransport, WebCodecsVideoDecoder } from '@openmoq/browser';
 import { MoqtConnection, type WebTransportLike } from '@openmoq/webtransport';
 import type { PlaybackSample } from '../../../scripts/player-acceptance/assessment.mjs';
 import { observeAudio, observeCanvas } from './sinks.js';
 import { observeLocmafDelivery, assessLocmafDelivery, observeConnectionObjects } from './received.js';
+import { observeDecodedSource } from './decoded.js';
 
 const video = document.querySelector<HTMLVideoElement>('#video')!;
 const canvas = document.querySelector<HTMLCanvasElement>('#canvas')!;
@@ -14,6 +15,7 @@ canvas.width = 640;
 canvas.height = 360;
 const canvasObserver = frameOutput ? observeCanvas(canvas) : undefined;
 const audioObserver = frameOutput ? observeAudio() : undefined;
+const decodedSource = frameOutput ? observeDecodedSource() : undefined;
 const pinHex = params.get('hash')!;
 if (!/^[a-f0-9]{64}$/.test(pinHex)) throw new Error('Missing local certificate pin');
 const pin = Uint8Array.from(pinHex.match(/../g)!, (byte) => parseInt(byte, 16)).buffer;
@@ -43,6 +45,7 @@ const player = new Player(null, {
     logLevel: params.has('debug') ? 'debug' : 'none',
     locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',
     audioConstraints: { lang: params.get('lang') ?? 'en' },
+    ...(decodedSource ? { createVideoDecoder: () => decodedSource.wrap(new WebCodecsVideoDecoder()) } : {}),
     createConnection: () => {
       const connection = new MoqtConnection(18);
       if (locmafObserver) {
@@ -180,6 +183,7 @@ const acceptance = {
     clearInterval(timer);
     const locmafDelivery = locmafObserver?.snapshot();
     return { samples: [...samples], events: [...events], startupError,
+      decodedSource: decodedSource?.snapshot() ?? null,
       ...(locmafDelivery ? { locmafDelivery, locmafFailures: assessLocmafDelivery(locmafDelivery) } : {}),
       levels: player.levels, audioTracks: player.audioTracks };
   },
