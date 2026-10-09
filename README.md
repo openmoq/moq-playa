@@ -58,19 +58,24 @@ import { MoqtPlayer } from '@openmoq/player';
 import { MoqtConnection } from '@openmoq/webtransport';
 import {
   createWebTransport, WebCodecsVideoDecoder, CanvasRenderer,
-  WebCodecsAudioDecoder, WebAudioOutput,
+  WebCodecsAudioDecoder, WebAudioOutput, MseMediaSource,
 } from '@openmoq/browser';
+
+// Run from a user gesture so browser audio can start.
+const audioContext = new AudioContext();
+await audioContext.resume();
 
 const player = new MoqtPlayer({
   url: 'https://relay.example.com/moq',
   namespace: 'live/broadcast',
   draftVersion: 16,
-  createTransport: createWebTransport(),
+  createTransport: createWebTransport({ draftVersion: 16 }),
   createConnection: () => new MoqtConnection(16),
   createVideoDecoder: () => new WebCodecsVideoDecoder(),
   createRenderer: () => new CanvasRenderer(canvas),
   createAudioDecoder: () => new WebCodecsAudioDecoder(),
-  createAudioOutput: () => new WebAudioOutput(),
+  createAudioOutput: () => new WebAudioOutput(audioContext),
+  createMediaSource: () => new MseMediaSource(video),
 });
 
 player.on('catalog_received', ({ catalog }) => { /* inspect tracks */ });
@@ -81,22 +86,34 @@ await player.load();
 player.play();
 ```
 
+`canvas` and `video` are application-owned elements. Close the application-owned
+`AudioContext` after `await player.destroy()` when playback is no longer needed.
+
 ---
 
 ## Browser & Codec Support
 
-| Browser | H.264 | HEVC | AV1 | MSE/CMAF |
-|---------|-------|------|-----|----------|
-| Chrome 120+ | ✅ | ✅ (hardware) | ✅ | ✅ |
-| Firefox 120+ | ✅ | ❌ | ✅ | ✅ |
-| Safari 26.4+ | ✅ | ✅ | ❌ | ✅ |
-| Edge 120+ | ✅ | ✅ | ✅ | ✅ |
+Browser playback requires WebTransport in a secure context. The selected media
+path also needs these APIs:
 
-`VideoDecoder.isConfigSupported()` is checked before configuring each codec. When a codec is unsupported the decoder shuts down cleanly — no decode-error loops, no frozen frames.
+| Path | Required browser APIs |
+|------|-----------------------|
+| LOC or LOCMAF frame mode | WebCodecs (`VideoDecoder` / `AudioDecoder` for the selected tracks), Canvas, Web Audio |
+| CMAF or LOCMAF MSE mode | Media Source Extensions and an HTML video element |
+
+H.264, HEVC and AV1 decoding depends on the browser, OS, hardware and codec
+configuration. A browser version alone is not a codec-support guarantee.
+The WebCodecs adapter probes `VideoDecoder.isConfigSupported()`; MSE checks the
+selected codec's MIME type. Browser autoplay policy may require a user gesture
+to start audio. `Player` exposes `audioActivation: 'gesture'` and
+`prepareAudio()` / `unmute()` for application-controlled activation.
 
 **Decode paths:**
 - **LOC (Low Overhead Container)** — WebCodecs direct path, lowest latency. H.264, HEVC, AV1. Parses LOC-04 and LOC-01 properties; preserves LOC-01 output unless `locVersion: 4` is selected.
 - **CMAF (fragmented MP4)** — MSE + `<video>` path, broader compatibility.
+- **LOCMAF (Low Overhead CMAF)** - reconstructs CMAF chunks for MSE by default,
+  or extracts coded samples for WebCodecs with `locmafDecoding: 'frame'` in
+  `MoqtPlayer` config (`moqtPlayerConfig` on `Player`).
 
 ---
 
@@ -104,15 +121,16 @@ player.play();
 
 ```
 packages/
-  transport/      @openmoq/transport     — Sans-I/O protocol core (draft-14 / -16 / -18)
+  transport/      @openmoq/transport     — Sans-I/O protocol core (draft-14 / -16 / -18 / -22)
   webtransport/   @openmoq/webtransport  — MoQT connection adapter and WebTransport binding
-  quic/           @openmoq/quic          — Experimental native QUIC binding for Node.js (draft-18)
+  quic/           @openmoq/quic          — Experimental native QUIC binding for Node.js (draft-18 / -22)
   loc/            @openmoq/loc           — Low Overhead Container (CaptureTimestamp, VideoFrameMarking)
+  locmaf/         @openmoq/locmaf        - LOCMAF object encoding, CMAF reconstruction and coded-frame extraction
   msf/            @openmoq/msf           — MSF catalog parsing, track selection, timeline
   playback/       @openmoq/playback      — Jitter buffer, A/V sync, decoder state, gap detection
   player/         @openmoq/player        — Player orchestrator (connect, catalog, subscribe, decode, render)
   browser/        @openmoq/browser       — Browser adapters (WebCodecs, Canvas, WebAudio, MSE)
-  playa/          @openmoq/playa       — Batteries-included player with simple API
+  playa/          @openmoq/playa         — Batteries-included player with simple API
 ```
 
 ### Architecture
@@ -141,21 +159,21 @@ const player = new Player(container, options);
 await player.load();        // connect, subscribe to catalog, subscribe to tracks
 player.play();              // start rendering
 player.pause();             // pause rendering
-await player.seek(30_000);  // seek to 30s (VOD only, requires timeline track)
-player.destroy();           // tear down connection and clean up
+await player.seek(30_000);  // seek to 30s when a media timeline is loaded
+await player.destroy();     // tear down connection and clean up
 
 // State
 player.state          // 'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'error'
 player.currentTime    // ms
-player.duration       // ms, undefined for live
-player.seekable       // true when timeline track is available
+player.duration       // known timeline duration in ms, otherwise undefined
+player.seekable       // true when media timeline entries are loaded
 player.volume         // 0–1
 player.muted          // boolean
 player.levels         // available video quality levels
 player.videoGroups    // catalog video altGroups, each with its track metadata
 player.audioTracks    // available audio tracks
 player.currentLevel   // active level index
-player.activeMediaType  // 'canvas' | 'video' — which element is rendering
+player.activeMediaType  // 'canvas' | 'video' | null (before track selection)
 
 // Quality (async — resolves when switch commits)
 await player.setQuality(index);  // manual quality switch (disables ABR)
@@ -163,16 +181,19 @@ await player.setQuality('auto'); // re-enable ABR
 player.levels;                   // available quality levels
 
 // Events
-player.on('ready',          ({ levels, audioTracks }) => { ... });
-player.on('timeupdate',     ({ currentTime }) => { ... });
-player.on('durationchange', ({ duration }) => { ... });
-player.on('seeking',        ({ targetTime }) => { ... });
-player.on('seeked',         ({ actualTime }) => { ... });
-player.on('qualitychange',  ({ level }) => { ... });
-player.on('stall',          ({ duration }) => { ... });
-player.on('error',          ({ error }) => { ... });
-player.on('statechange',    ({ from, to }) => { ... });
+player.on('ready',          ({ levels, audioTracks }) => console.log(levels, audioTracks));
+player.on('timeupdate',     ({ currentTime }) => console.log(currentTime));
+player.on('durationchange', ({ duration }) => console.log(duration));
+player.on('seeking',        ({ targetTime }) => console.log(targetTime));
+player.on('seeked',         ({ currentTime }) => console.log(currentTime));
+player.on('qualitychange',  ({ level, auto }) => console.log(level, auto));
+player.on('stall',          ({ durationMs }) => console.log(durationMs));
+player.on('error',          ({ severity, code, message }) => console.error(severity, code, message));
+player.on('statechange',    ({ state }) => console.log(state));
 ```
+
+Register event listeners before `load()` to observe startup events. The lifecycle,
+state and event lines above illustrate separate API calls, not a playback script.
 
 ### Options
 
@@ -180,11 +201,13 @@ player.on('statechange',    ({ from, to }) => { ... });
 |--------|------|---------|-------------|
 | `url` | string | — | WebTransport relay URL |
 | `namespace` | string | — | Track namespace (e.g. `live/broadcast`) |
-| `draftVersion` | 14 \| 16 \| 18 | 16 | MOQT draft version |
+| `draftVersion` | 14 \| 16 \| 18 \| 22 | 16 | MOQT draft version |
 | `certHash` | ArrayBuffer | — | SHA-256 hash for self-signed certs |
+| `authorization` | credential provider | — | Opt-in CAT4MOQ token acquisition; see [authorization](docs/authorization.md) |
 | `autoplay` | boolean | false | Start playback after load |
 | `volume` | number | 1 | Initial volume 0–1 |
 | `muted` | boolean | false | Start muted |
+| `audioActivation` | 'auto' \| 'gesture' | 'auto' | Defer Web Audio activation until a user gesture when set to 'gesture' |
 | `targetLatencyMs` | number | — | Live edge target latency |
 | `autoQuality` | boolean | true | Enable ABR |
 | `startLevel` | number \| 'auto' \| 'lowest' | 'auto' | Initial quality level |
@@ -192,6 +215,7 @@ player.on('statechange',    ({ from, to }) => { ... });
 | `maxResolution` | `{width, height}` | — | Cap video quality |
 | `canvas` | HTMLCanvasElement | — | Caller-owned canvas (framework mode) |
 | `video` | HTMLVideoElement | — | Caller-owned video element (framework mode) |
+| `moqtPlayerConfig` | `Partial<MoqtPlayerConfig>` | — | Advanced overrides, including `locmafDecoding` and `catalogBootstrap` |
 
 ### Video Views
 
@@ -226,42 +250,49 @@ an in-progress retune. `videoAltGroup` cannot be combined with the catalog-free
 ## `@openmoq/player` MoqtPlayer API
 
 ```ts
-// Hooks — intercept and override decisions
-player.hooks.beforeSubscribe.use(async (intent, next) => {
-  if (shouldSkip(intent.trackName)) return; // cancel
-  return next(intent); // or return next(modifiedIntent);
+// Hooks run synchronously: return the intent to proceed, or null to cancel.
+player.hooks.beforeSubscribe.add((intent) => {
+  if (shouldSkip(intent.trackName)) return null;
+  return intent;
 });
 
-player.hooks.beforeQualitySwitch.use(async (intent, next) => {
-  if (networkIsBad()) return; // suppress switch
-  return next(intent);
+player.hooks.beforeQualitySwitch.add((intent) => {
+  if (networkIsBad()) return null;
+  return intent;
 });
 
-player.hooks.onRecovery.use(async (action, next) => {
-  if (action.type === 'quality_down') return; // suppress quality drop
-  return next(action);
+player.hooks.onRecovery.add((action) => {
+  if (action.type === 'reduce_quality') return null;
+  return action;
 });
 
 // Extension points
-player.on('media_object', ({ mediaType, groupId, objectId, payload }) => { ... });
-player.on('decoder_command', ({ command }) => { ... }); // every WebCodecs command
-player.on('namespace_discovered', ({ namespaceSuffix }) => { ... });
-player.on('sap_event', ({ entries }) => { ... }); // CMAF seek points
-player.on('catch_up_changed', ({ active, rate, latencyMs }) => { ... });
+player.on('media_object', ({ mediaType, groupId, objectId, payload }) => console.log(mediaType, groupId, objectId, payload));
+player.on('decoder_command', ({ command }) => console.log(command));
+player.on('namespace_discovered', ({ namespaceSuffix }) => console.log(namespaceSuffix));
+player.on('sap_event', ({ entries }) => console.log(entries));
+player.on('catch_up_changed', ({ active, rate, latencyMs }) => console.log(active, rate, latencyMs));
 ```
+
+`shouldSkip` and `networkIsBad` are application policy functions. Remove a hook
+with `.remove(theSameFunction)`. `MoqtPlayer` errors carry a structured `error`
+object; the higher-level `Player` instead emits `severity`, `code` and `message`.
 
 ### Key config options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `draftVersion` | 14 \| 16 \| 18 \| 22 | 16 | Protocol version; select the draft supported by your relay |
-| `maxRequestId` | number | 100 | Initial MOQT MAX_REQUEST_ID (auto-replenished) |
+| `maxRequestId` | number | 10,000 | Initial MOQT MAX_REQUEST_ID on legacy drafts (auto-replenished) |
 | `knownTracks` | object | — | Pre-known codec metadata for TTFF optimization |
 | `catalog` | `{tracks}` | — | Inject catalog externally, skip catalog subscription |
 | `targetLatencyMs` | number | — | Live catch-up target |
 | `maxCatchUpRate` | number | 1.0 | Max playback rate for catch-up |
 | `authority` | string | — | CLIENT_SETUP AUTHORITY for tenant-routed relays (interop override; spec prohibits it over WebTransport) |
-| `warmStartCurrentGroup` | boolean | false | Join live LOC tracks mid-group via joining FETCH (§9.16.2); non-fatal if the relay refuses |
+| `warmStartCurrentGroup` | boolean | false | Join live LOC tracks mid-group via Joining FETCH on drafts 14/16/18, or a fill on draft 22; non-fatal if refused |
+| `catalogBootstrap` | 'auto' \| 'joining-fetch' \| 'strict' \| 'subscribe' | 'auto' | Catalog bootstrap policy; draft 22 uses fills rather than Joining FETCH |
+| `locmafDecoding` | 'mse' \| 'frame' | 'mse' | Reconstruct CMAF for MSE or decode LOCMAF samples through WebCodecs |
+| `authorization` | credential provider | — | Opt-in token acquisition for SETUP and authorized requests |
 | `objectTransform` | function | — | Per-object transform (e.g. decryption) |
 | `extensionParser` | function | — | Custom LOC extension parser |
 | `onQlogEvent` | function | — | qlog event stream |
@@ -276,9 +307,17 @@ player.on('catch_up_changed', ({ active, rate, latencyMs }) => { ... });
 - **draft-ietf-moq-transport-16** — default supported transport draft
 - **draft-ietf-moq-transport-14** — Red5/moq-rs interop (`draftVersion: 14`)
 - **draft-ietf-moq-msf-00** — Catalog, track selection, ABR (`altGroup`), timeline
+- **draft-ietf-moq-msf-01** - Independent catalogs, op-array deltas and referenced initialization data; catalog bootstrap uses Joining FETCH on drafts 14/16/18 and fills on draft 22
 - **draft-ietf-moq-loc-04** — Low Overhead Container (Timestamp + Timescale, Video Frame Marking, Audio Config); `locVersion: 4` to emit
 - **draft-ietf-moq-loc-01** — Low Overhead Container (CaptureTimestamp, VideoFrameMarking); auto-detected on parse, default on encode
 - **draft-ietf-moq-cmsf-00** — CMAF Streaming Format (moof+mdat, MSE path)
+- **draft-ietf-moq-cmsf-01** - CMAF catalogs with MSF-01 initialization references and SAP event timelines
+- **draft-einarsson-moq-locmaf-01** - LOCMAF object reconstruction, MSE and coded-frame interfaces, including event-only tracks
+
+CAT4MOQ bearer-token carriage is opt-in, not required for anonymous playback or
+broadcast. The application obtains credentials; the relay enforces permissions.
+DPoP signing is not built in. See [authorization](docs/authorization.md) for the
+supported profiles and security boundaries.
 
 ### Draft version selection
 
@@ -298,7 +337,13 @@ Browser WebTransport may expose `transport.protocol`, enabling automatic draft d
 - `moqt-16` → draft 16
 - `moq-00` → draft 14
 
-When `protocol` is undefined (Node/polyfill WebTransport) or no supported token is negotiated, the connection **defaults to draft 16** for backwards compatibility. Opt into draft 18 explicitly with `draftVersion: 18` (or `?v=18` in the examples); the transport factory then offers `["moqt-18"]`. An explicit `new MoqtConnection(18)` always wins over the negotiated protocol.
+Without an explicit draft, a recognized `transport.protocol` selects the wire
+codec; otherwise the adapter defaults to draft 16. An explicit
+`new MoqtConnection(18)` selects draft 18. Keep that choice and the transport
+factory's `draftVersion` aligned. The browser factory offers `["moqt-16"]` by
+default, not every supported draft. Opt into 18 or 22 explicitly (or use
+`?v=18` / `?v=22` in the examples). Draft 22 requires a readable negotiated
+`moqt-22` protocol and does not retry without the protocol offer.
 
 draft-18 is an architectural change, not just a wire bump: the control stream becomes a **unidirectional pair**, each request rides its **own bidirectional stream** (responses correlate by stream, not Request ID), and integers use the full-uint64 `vi64` encoding.
 
@@ -310,7 +355,8 @@ const conn = new MoqtConnection(14); // required — CLIENT_SETUP is draft-speci
 
 `MoqtConnection` auto-detects the draft from **any** `WebTransportLike` whose `protocol` exposes a supported token (`moqt-22`, `moqt-18`, `moqt-16`, or `moq-00`) — there's nothing factory-specific about detection. The browser transport factory is just the convenience that sets the WebTransport `protocols` offer for you. If you construct your own `WebTransport`, pass the appropriate `protocols` option yourself and make sure `transport.protocol` is readable; Playa reads it the same way. Some Node/polyfill transports may not support `protocols` yet.
 
-Node applications can use the experimental native QUIC binding for draft 18:
+Node applications can use the experimental native QUIC binding for drafts 18
+and 22. Draft 18 is the default:
 
 ```ts
 import { connectQuic } from '@openmoq/quic';
@@ -321,7 +367,7 @@ const connection = new MoqtConnection(18);
 await connection.connect(transport);
 ```
 
-`@openmoq/quic` requires a Node build configured and launched with
+`@openmoq/quic` requires Node >=26.8.1 built with QUIC support and launched with
 `--experimental-quic`. It offers `moqt-18` by default, or `moqt-22` with
 `{ draft: 22 }`, requires QUIC
 DATAGRAM negotiation, disables 0-RTT, and does not fall back to WebTransport.
@@ -370,9 +416,9 @@ Do not use a fixed sleep. If `onClose` fires before acceptance, treat the operat
 
 ### Transport robustness
 
-- **MAX_REQUEST_ID sliding window** — auto-replenishes as subscriptions are consumed; starts at 100, extends by 1000 per window
+- **Legacy MAX_REQUEST_ID sliding window** - the player advertises 10,000 initially and replenishes credit in increments of 1,000. Drafts 18/22 use QUIC request-stream limits instead.
 - **Stream limit handling** — `createUnidirectionalStream()` failures caught and surfaced as non-fatal `MoqtConnectionError` (relevant to relays with WT_MAX_STREAMS limits)
-- **REQUESTS_BLOCKED** — handled; peer notified via MAX_REQUEST_ID when blocked
+- **Legacy REQUESTS_BLOCKED** - peer notified via MAX_REQUEST_ID when blocked
 
 ---
 
@@ -393,20 +439,22 @@ Example pages:
 
 | Path | Description |
 |------|-------------|
-| `/player/` | Full-featured player with stats overlay, quality selector, settings |
+| `/player/` | Player with stats, video-view and quality selectors, and settings |
 | `/simple/` | Minimal player — connect, play, done |
 | `/connect/` | Protocol explorer — raw message log |
 | `/catalog/` | Catalog browser |
-| `/broadcast/` | Publisher example |
+| `/broadcast/` | Camera/screen publisher example with opt-in CAT4MOQ |
 | `/video/` | Video-only player |
 
 The `/player/` page takes URL parameters: `?url=` (relay), `?ns=` / `?nsField=`
-(namespace), `?hash=` (cert hash), `?v=14|16|18` (draft), `?authority=`
+(namespace), `?hash=` (cert hash), `?v=14|16|18|22` (draft), `?authority=`
 (tenant-routed relays), `?warmStart=1` (join live LOC tracks mid-group via
-joining FETCH — needs `isLive: true` in the catalog and a relay that serves
-joining FETCH; degrades to a normal live join otherwise), `?log=info|debug`
-(player logs on the console), `?catalog=<base64 JSON>` (inject a catalog), and
-`?fetchCatalog=1` (FETCH the catalog instead of subscribing).
+Joining FETCH or draft-22 fills; needs `isLive: true` in the catalog and relay
+support; degrades to a normal live join otherwise), `?log=info|debug`
+(player logs on the console), `?catalog=<base64 JSON>` (inject a catalog),
+`?fetchCatalog=1` (FETCH the catalog before injecting it into the player),
+`?catalogBootstrap=auto|joining-fetch|strict|subscribe` (bootstrap policy),
+`?altGroup=0` (initial video view), and `?locmaf=mse|frame` (LOCMAF decode path).
 
 `?url=` is the complete WebTransport endpoint, including its deployment-specific
 path. For example, use `?url=https%3A%2F%2Frelay.example.com%3A4433%2Fmoq-relay`
@@ -423,15 +471,31 @@ relay endpoint and should configure the complete URL.
 ## Testing
 
 ```bash
-# Run all tests (3,300+ tests across all packages)
+# Run unit, loopback, codec-property and scenario tests
 pnpm test
 
 # Watch mode
 pnpm test:watch
 
-# Type check
-npx tsc --noEmit -p packages/browser/tsconfig.json
+# Typecheck test sources
+pnpm typecheck:tests
+
+# Check published exports and legacy compatibility wrappers (build first)
+pnpm build
+pnpm smoke:exports
+
+# Browser playback acceptance (requires ffmpeg and installed Google Chrome)
+pnpm test:player:browser
 ```
+
+Browser acceptance runs against a private local WebTransport relay with generated
+media. It checks moving video, browser audio-output samples, quality/view
+selection, LOC timing domains, mixed packaging, and both LOCMAF paths. Frozen
+picture and missing-audio controls must be detected as failures. JSON evidence,
+screenshots and logs are written under `reports/player-acceptance/`; this does
+not claim physical-speaker output or interoperability with every remote relay.
+Set `PLAYER_TEST_BROWSER=chromium` to use an installed Playwright Chromium build
+instead of Google Chrome.
 
 ---
 
@@ -440,6 +504,9 @@ npx tsc --noEmit -p packages/browser/tsconfig.json
 - [Simulation](docs/simulation.md) — Deterministic protocol-confidence harness (golden vectors, codec property tests, seeded scenario runner) for MoQT drafts 14/16/18
 - [Catalog Testing](docs/catalog-testing.md) — Integration harness for validating catalog subscription against a live relay
 - [Authorization](docs/authorization.md) — CAT4MOQ credential providers for players and connections
+- [Package Compatibility](docs/package-compatibility.md) - Legacy package re-exports and release ordering
+- [Draft Development](docs/draft-development.md) - Draft-22 support and compatibility policy
+- [Playout Trace](docs/playout-trace.md) - Bounded qlog recorder, event design and instrumentation status
 
 ---
 
