@@ -134,6 +134,383 @@ async function deliverFetchObject(
     await flush();
 }
 
+describe('catalog failure state and pending delivery', () => {
+    const players: MoqtPlayer[] = [];
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(async () => {
+        for (const player of players.splice(0)) await player.destroy();
+        vi.useRealTimers();
+    });
+
+    async function playing(cfg?: Partial<MoqtPlayerConfig>) {
+        const adapter = createMockAdapter();
+        const loaded = await loadPlayer(adapter, cfg);
+        players.push(loaded.player);
+        loaded.player.play();
+        return { adapter, ...loaded };
+    }
+
+    function done(adapter: ReturnType<typeof createMockAdapter>, statusCode = 2n) {
+        adapter._triggerMessage({ type: 'PUBLISH_DONE', requestId: 1n,
+            statusCode, streamCount: 1n, errorReason: '' } as ControlMessage);
+    }
+
+    function liveBase(adapter: ReturnType<typeof createMockAdapter>) {
+        adapter._triggerObject(100n, { kind: 'data', trackAlias: 1n, groupId: 0n,
+            subgroupId: 0n, objectId: 0n, publisherPriority: 128, payload: enc(CATALOG),
+        } as MoqtObject);
+    }
+
+    it('strict bootstrap failure commits ERROR before notifying the application and cannot revive', async () => {
+        const { adapter, player, events, errors } = await playing({ catalogBootstrap: 'strict' });
+        const observed: string[] = [];
+        player.on('error', () => observed.push(player.state));
+        adapter._triggerMessage({ type: 'REQUEST_ERROR', requestId: 3n, errorCode: 1n,
+            retryInterval: 0n, errorReason: 'no joining fetch' } as ControlMessage);
+        expect(player.state).toBe('error');
+        expect(observed).toEqual(['error']);
+        expect(errors).toHaveLength(1);
+        expect((player as unknown as { tickInterval: unknown }).tickInterval).toBeNull();
+        expect((player as unknown as { playbackIntent: boolean }).playbackIntent).toBe(false);
+        ackCatalog(adapter);
+        liveBase(adapter);
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(events).toEqual([]);
+        expect(errors).toHaveLength(1);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+        expect(adapter.close).not.toHaveBeenCalled();
+    });
+
+    it('a terminal catalog without a base fails only AFTER the delivery drain', async () => {
+        const { adapter, player, errors } = await playing({ catalogBootstrap: 'subscribe' });
+        ackCatalog(adapter);
+        done(adapter);
+        expect(player.state).toBe('playing');
+        expect(errors).toEqual([]);
+        adapter.subscribe.mock.calls[0]![2].onDrained(1n);
+        expect(player.state).toBe('error');
+        expect(errors).toHaveLength(1);
+    });
+
+    it('a catalog arriving after DONE but before drain still starts playback', async () => {
+        const { adapter, player, errors, events } = await playing({ catalogBootstrap: 'subscribe' });
+        ackCatalog(adapter);
+        done(adapter);
+        liveBase(adapter);
+        adapter.subscribe.mock.calls[0]![2].onDrained(1n);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(player.state).toBe('playing');
+        expect(events).toEqual(['catalog_received']);
+        expect(errors).toEqual([]);
+    });
+
+    it.each(['listener', 'filter', 'suppressed'] as const)('terminal cleanup survives an error %s', async (kind) => {
+        const { adapter, player } = await playing({ catalogBootstrap: 'strict',
+            ...(kind === 'filter' ? { errorFilter: () => { throw new Error('filter failed'); } }
+                : kind === 'suppressed' ? { errorFilter: () => null } : {}),
+        });
+        const stateChanges: string[] = [];
+        player.on('state_changed', e => stateChanges.push(e.to));
+        if (kind === 'listener') player.on('error', () => { throw new Error('listener failed'); });
+        const fail = () => adapter._triggerMessage({ type: 'REQUEST_ERROR', requestId: 3n,
+            errorCode: 1n, retryInterval: 0n, errorReason: 'no joining fetch' } as ControlMessage);
+        if (kind === 'suppressed') fail();
+        else expect(fail).toThrow(`${kind} failed`);
+        expect(player.state).toBe('error');
+        expect(stateChanges).toEqual(['error']);
+        expect((player as unknown as { tickInterval: unknown }).tickInterval).toBeNull();
+        expect(adapter.unsubscribe).toHaveBeenCalledWith(1n);
+    });
+
+    it('a stalled catalog emits one nonfatal diagnostic and a delayed catalog can still converge', async () => {
+        const { adapter, player, errors, events } = await playing();
+        ackCatalog(adapter);
+        // Progress keeps the joining attempt alive beyond the diagnostic deadline.
+        adapter._triggerDataStream(100n, { type: 'fetch', header: { requestId: 3n } } as DataStreamHeader);
+        adapter._triggerMessage({ type: 'FETCH_OK', requestId: 3n, endOfTrack: 0,
+            endLocation: { group: 0n, object: 2n }, parameters: new Map(), trackExtensions: [],
+        } as ControlMessage);
+        for (let i = 0; i < 3; i++) {
+            await vi.advanceTimersByTimeAsync(4000);
+            const payload = i === 0 ? CATALOG : { deltaUpdate: [{ op: 'add', tracks: [{
+                name: `caption-${i}`, packaging: 'loc', renderGroup: 1, isLive: true, role: 'caption', codec: 'wvtt',
+            }] }] };
+            adapter._triggerObject(100n, { kind: 'data', trackAlias: 0n, groupId: 0n,
+                subgroupId: 0n, objectId: BigInt(i), publisherPriority: 128, payload: enc(payload),
+            } as MoqtObject);
+        }
+        expect(player.state).toBe('playing');
+        expect(errors).toEqual([expect.objectContaining({ severity: 'transient', source: 'catalog', code: 0x1204 })]);
+        adapter._triggerStreamClosed(100n);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(events).toEqual(['catalog_received']);
+        expect(player.state).toBe('playing');
+        expect(errors).toHaveLength(1);
+    });
+
+    it('an empty track can wait for its first catalog without a timeout error', async () => {
+        const { adapter, player, errors, events } = await playing();
+        ackCatalog(adapter);
+        adapter._triggerMessage({ type: 'REQUEST_ERROR', requestId: 3n, errorCode: 0x11n,
+            retryInterval: 0n, errorReason: 'empty' } as ControlMessage);
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(errors).toEqual([]);
+        liveBase(adapter);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(events).toEqual(['catalog_received']);
+        expect(player.state).toBe('playing');
+    });
+
+    it('initial malformed legacy catalog is terminal, while a malformed delta preserves playback', async () => {
+        for (const hasBase of [false, true]) {
+            const { adapter, player, events, errors } = await playing({ catalogBootstrap: 'subscribe' });
+            ackCatalog(adapter);
+            if (hasBase) { liveBase(adapter); await vi.advanceTimersByTimeAsync(0); }
+            adapter._triggerObject(101n, { kind: 'data', trackAlias: 1n, groupId: 1n,
+                subgroupId: 0n, objectId: 0n, publisherPriority: 128, payload: enc({ version: null }),
+            } as MoqtObject);
+            expect(player.state).toBe(hasBase ? 'playing' : 'error');
+            expect(errors).toEqual([expect.objectContaining({ severity: hasBase ? 'degraded' : 'fatal' })]);
+            if (!hasBase) {
+                liveBase(adapter);
+                await vi.advanceTimersByTimeAsync(0);
+                expect(events).toEqual([]);
+            }
+        }
+    });
+
+    it('a catalog refusal on a borrowed connection stops only the player subscriptions', async () => {
+        const adapter = createMockAdapter();
+        const player = makePlayer(adapter, { connection: adapter as unknown as MoqtConnection,
+            knownTracks: { video: { name: 'video', codec: 'av01.0.08M.10', width: 1920, height: 1080 } },
+        });
+        players.push(player);
+        await player.load();
+        player.play();
+        adapter._triggerMessage({ type: 'REQUEST_ERROR', requestId: 1n, errorCode: 0x10n,
+            retryInterval: 0n, errorReason: 'not published' } as ControlMessage);
+        expect(player.state).toBe('error');
+        expect(adapter.unsubscribe).toHaveBeenCalledWith(3n);
+        expect(adapter.close).not.toHaveBeenCalled();
+        expect(adapter.connect).not.toHaveBeenCalled();
+    });
+
+    it.each(['subscribe', 'strict'] as const)('media subscription failure after a valid %s catalog commits ERROR', async (mode) => {
+        const { adapter, player, errors } = await playing({ catalogBootstrap: mode });
+        ackCatalog(adapter);
+        adapter.subscribe.mockRejectedValueOnce(new Error('media stream unavailable'));
+        if (mode === 'subscribe') liveBase(adapter);
+        else {
+            adapter._triggerDataStream(100n, { type: 'fetch', header: { requestId: 3n } } as DataStreamHeader);
+            adapter._triggerObject(100n, { kind: 'data', trackAlias: 0n, groupId: 0n,
+                subgroupId: 0n, objectId: 0n, publisherPriority: 128, payload: enc(CATALOG),
+            } as MoqtObject);
+            adapter._triggerMessage({ type: 'FETCH_OK', requestId: 3n, endOfTrack: 0,
+                endLocation: { group: 0n, object: 1n }, parameters: new Map(), trackExtensions: [],
+            } as ControlMessage);
+            adapter._triggerStreamClosed(100n);
+        }
+        await vi.advanceTimersByTimeAsync(0);
+        expect(player.state).toBe('error');
+        expect(errors).toEqual([expect.objectContaining({ severity: 'fatal', message: expect.stringContaining('media stream unavailable') })]);
+    });
+
+    it.each([true, false])('a pending known-track send cannot survive catalog failure (preallocated=%s)', async (preallocated) => {
+        const adapter = createMockAdapter();
+        const subscribe = adapter.subscribe.getMockImplementation()!;
+        let finish!: () => void;
+        adapter.subscribe.mockImplementation(async (ns: unknown, name: Uint8Array, opts?: { onRequestId?: (id: bigint) => void }) => {
+            const id = await subscribe(ns, name, preallocated ? opts : undefined);
+            if (new TextDecoder().decode(name) === 'video') await new Promise<void>(resolve => { finish = resolve; });
+            return id;
+        });
+        const player = makePlayer(adapter, { connection: adapter as unknown as MoqtConnection,
+            knownTracks: { video: { name: 'video', codec: 'av01.0.08M.10', width: 1920, height: 1080 } },
+        });
+        players.push(player);
+        const tracks: string[] = [];
+        player.on('track_subscribed', e => tracks.push(e.trackName));
+        const loading = player.load();
+        await vi.advanceTimersByTimeAsync(0);
+        adapter._triggerMessage({ type: 'REQUEST_ERROR', requestId: 1n, errorCode: 0x10n,
+            retryInterval: 0n, errorReason: 'not published' } as ControlMessage);
+        finish();
+        await loading;
+        expect(player.state).toBe('error');
+        expect(tracks).toEqual([]);
+        expect((player as unknown as { activeSubscriptions: Map<bigint, unknown> }).activeSubscriptions.size).toBe(0);
+        expect(adapter.unsubscribe).toHaveBeenCalledWith(3n);
+        expect(adapter.close).not.toHaveBeenCalled();
+    });
+
+    it.each([true, false])('a delayed media send cannot revive a failed catalog (preallocated=%s)', async (preallocated) => {
+        const { adapter, player } = await playing({ catalogBootstrap: 'subscribe' });
+        ackCatalog(adapter);
+        const subscribe = adapter.subscribe.getMockImplementation()!;
+        const finishes: Array<() => void> = [];
+        adapter.subscribe.mockImplementation(async (ns: unknown, name: Uint8Array, opts?: { onRequestId?: (id: bigint) => void }) => {
+            const id = await subscribe(ns, name, preallocated ? opts : undefined);
+            await new Promise<void>(resolve => { finishes.push(resolve); });
+            return id;
+        });
+        const tracks = vi.fn();
+        player.on('track_subscribed', tracks);
+        liveBase(adapter);
+        await vi.advanceTimersByTimeAsync(0);
+        adapter._triggerMessage({ type: 'PUBLISH_DONE', requestId: 1n,
+            statusCode: 1n, streamCount: 0n, errorReason: 'unauthorized',
+        } as ControlMessage);
+        for (const finish of finishes) finish();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(player.state).toBe('error');
+        expect(tracks).not.toHaveBeenCalled();
+        expect((player as unknown as { activeSubscriptions: Map<bigint, unknown> }).activeSubscriptions.size).toBe(0);
+        expect(adapter.unsubscribe).toHaveBeenCalledWith(3n);
+    });
+
+    it('catalog_received re-entry cannot start media after a fatal catalog terminal', async () => {
+        const { adapter, player } = await playing({ catalogBootstrap: 'subscribe' });
+        ackCatalog(adapter);
+        player.on('catalog_received', () => adapter._triggerMessage({ type: 'PUBLISH_DONE',
+            requestId: 1n, statusCode: 1n, streamCount: 0n, errorReason: 'unauthorized',
+        } as ControlMessage));
+        liveBase(adapter);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(player.state).toBe('error');
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['subscribe', 'strict'] as const)('fatal re-entry during %s catalog_raw cannot publish readiness or subscribe media', async (mode) => {
+        const { adapter, player, events, errors } = await playing({ catalogBootstrap: mode });
+        ackCatalog(adapter);
+        player.on('catalog_raw', () => adapter._triggerMessage({ type: 'PUBLISH_DONE',
+            requestId: 1n, statusCode: 1n, streamCount: 1n, errorReason: 'unauthorized',
+        } as ControlMessage));
+        liveBase(adapter);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(player.state).toBe('error');
+        expect(events).toEqual([]);
+        expect(errors).toHaveLength(1);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it('throwing output cleanup does not censor either terminal publication', async () => {
+        const { adapter, player, errors } = await playing({ catalogBootstrap: 'strict' });
+        const transitions: string[] = [];
+        player.on('state_changed', e => transitions.push(e.to));
+        (player as unknown as { commandDispatcher: unknown }).commandDispatcher = {
+            flush: () => { throw new Error('flush failed'); }, destroy: vi.fn(),
+        };
+        expect(() => adapter._triggerMessage({ type: 'REQUEST_ERROR', requestId: 3n,
+            errorCode: 1n, retryInterval: 0n, errorReason: 'no joining fetch',
+        } as ControlMessage)).toThrow('flush failed');
+        expect(player.state).toBe('error');
+        expect(transitions).toEqual(['error']);
+        expect(errors).toHaveLength(1);
+    });
+
+    it('fatal catalog failure cancels a migration awaiting its transport factory', async () => {
+        let resolveTransport!: (value: never) => void;
+        const transport = { close: vi.fn() };
+        let creates = 0;
+        const { adapter, player } = await playing({ catalogBootstrap: 'strict',
+            createTransport: async () => ++creates === 1 ? {} as never
+                : new Promise<never>(resolve => { resolveTransport = resolve; }),
+        });
+        const candidate = createMockAdapter();
+        const migrated = vi.fn();
+        player.on('session_migrated', migrated);
+        const migration = player.migrate(candidate as unknown as MoqtConnection).then(() => null, err => err);
+        adapter._triggerMessage({ type: 'REQUEST_ERROR', requestId: 3n,
+            errorCode: 1n, retryInterval: 0n, errorReason: 'no joining fetch',
+        } as ControlMessage);
+        resolveTransport(transport as never);
+        await vi.advanceTimersByTimeAsync(0);
+        // Let the old behavior finish too, so the test distinguishes a false
+        // successful commit rather than timing out on the mock handshake.
+        candidate._connectResolve?.();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(await migration).toBeInstanceOf(Error);
+        expect(player.state).toBe('error');
+        expect(candidate.connect).not.toHaveBeenCalled();
+        expect(transport.close).toHaveBeenCalledOnce();
+        expect(candidate.close).toHaveBeenCalled();
+        expect(migrated).not.toHaveBeenCalled();
+    });
+
+    it.each((['main', 'recovery'] as const).flatMap(path =>
+        (['callback-less', 'delayed-allocation', 'preallocated'] as const).map(allocation => ({ path, allocation }))))(
+        '$path catalog ownership is retired after terminal failure ($allocation)', async ({ path, allocation }) => {
+            const { adapter, player } = await playing({ catalogBootstrap: 'subscribe' });
+            ackCatalog(adapter);
+            liveBase(adapter);
+            await vi.advanceTimersByTimeAsync(0);
+            const subscribe = adapter.subscribe.getMockImplementation()!;
+            let finish!: () => void;
+            let emitted = false;
+            let allocatedId: bigint | undefined;
+            adapter.subscribe.mockImplementationOnce(async (ns: unknown, name: Uint8Array, opts?: { onRequestId?: (id: bigint) => void }) => {
+                const gate = new Promise<void>(resolve => { finish = resolve; });
+                if (allocation === 'delayed-allocation') await gate;
+                const id = await subscribe(ns, name, allocation === 'callback-less' ? undefined : opts);
+                emitted = true;
+                allocatedId = BigInt(id);
+                if (allocation !== 'delayed-allocation') await gate;
+                return id;
+            });
+            const internals = player as unknown as {
+                subscribeCatalog(conn: MoqtConnection): Promise<void>;
+                beginCatalogRecovery(conn: MoqtConnection): void;
+                catalogRequestId: bigint;
+                catalogRecovery: unknown;
+            };
+            const pending = path === 'main'
+                ? internals.subscribeCatalog(adapter as unknown as MoqtConnection).catch(err => err)
+                : (internals.beginCatalogRecovery(adapter as unknown as MoqtConnection), Promise.resolve());
+            await vi.advanceTimersByTimeAsync(0);
+            adapter._triggerMessage({ type: 'PUBLISH_DONE', requestId: internals.catalogRequestId,
+                statusCode: 1n, streamCount: 0n, errorReason: 'unauthorized',
+            } as ControlMessage);
+            finish();
+            await pending;
+            await vi.advanceTimersByTimeAsync(0);
+            expect(player.state).toBe('error');
+            if (allocation === 'delayed-allocation') expect(emitted).toBe(false);
+            else expect(adapter.unsubscribe.mock.calls.filter(([id]: [bigint]) => id === allocatedId)).toHaveLength(1);
+            expect(internals.catalogRecovery).toBeNull();
+            expect(adapter.close).not.toHaveBeenCalled();
+        });
+
+    it('recovery adoption before send completion preserves the promoted subscription', async () => {
+        const { adapter, player, events, errors } = await playing({ catalogBootstrap: 'subscribe' });
+        ackCatalog(adapter);
+        liveBase(adapter);
+        await vi.advanceTimersByTimeAsync(0);
+        const subscribe = adapter.subscribe.getMockImplementation()!;
+        let finish!: () => void;
+        let candidateId!: bigint;
+        adapter.subscribe.mockImplementationOnce(async (ns: unknown, name: Uint8Array, opts?: { onRequestId?: (id: bigint) => void }) => {
+            candidateId = BigInt(await subscribe(ns, name, opts));
+            await new Promise<void>(resolve => { finish = resolve; });
+            return candidateId;
+        });
+        done(adapter, 0x6n);
+        adapter.subscribe.mock.calls[0]![2].onDrained(1n);
+        await vi.advanceTimersByTimeAsync(0);
+        ackCatalog(adapter, candidateId, 9n);
+        adapter._triggerObject(400n, { kind: 'data', trackAlias: 9n, groupId: 10n,
+            subgroupId: 0n, objectId: 0n, publisherPriority: 128, payload: enc(CATALOG),
+        } as MoqtObject);
+        expect(events).toEqual(['catalog_received', 'catalog_updated']);
+        finish();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(player.state).toBe('playing');
+        expect(errors).toEqual([]);
+        expect(adapter.unsubscribe).not.toHaveBeenCalledWith(candidateId);
+        expect((player as unknown as { catalogRequestId: bigint }).catalogRequestId).toBe(candidateId);
+    });
+});
+
 describe('catalog retry with Joining FETCH', () => {
     const players: MoqtPlayer[] = [];
     beforeEach(() => vi.useFakeTimers());
@@ -200,7 +577,38 @@ describe('catalog retry with Joining FETCH', () => {
         expect(adapter.subscribe).toHaveBeenCalledTimes(1);
         expect(adapter.joiningFetch).toHaveBeenCalledTimes(1);
         expect(adapter.fetch).not.toHaveBeenCalled();
+        expect(errors).toEqual([expect.objectContaining({ severity: 'fatal', source: 'catalog' })]);
+        expect(player.state).toBe('error');
+    });
+
+    it('a peer-directed retry longer than the watchdog deadline remains pending and can succeed', async () => {
+        const adapter = createMockAdapter();
+        const { player, events, errors } = await loadPlayer(adapter);
+        players.push(player);
+        player.play();
+        rejectCatalog(adapter, 1n, 15_001n);
+        await vi.advanceTimersByTimeAsync(14_999);
+        expect(adapter.subscribe).toHaveBeenCalledTimes(1);
+        expect(player.state).toBe('playing');
         expect(errors).toEqual([]);
+        await vi.advanceTimersByTimeAsync(1);
+        ackCatalog(adapter, 5n, 40n);
+        completeFetch(adapter, 7n);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(events).toEqual(['catalog_received']);
+        expect(errors).toEqual([]);
+    });
+
+    it('a local send failure on the retry is terminal rather than silently waiting forever', async () => {
+        const adapter = createMockAdapter();
+        const { player, errors } = await loadPlayer(adapter);
+        players.push(player);
+        player.play();
+        rejectCatalog(adapter, 1n, 1001n);
+        adapter.subscribe.mockRejectedValueOnce(new Error('request stream unavailable'));
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(player.state).toBe('error');
+        expect(errors).toEqual([expect.objectContaining({ severity: 'fatal', message: expect.stringContaining('request stream unavailable') })]);
     });
 
     const lateSendCases = (['catalog-first', 'known-tracks'] as const).flatMap((mode) =>
@@ -872,6 +1280,50 @@ describe('catalog bootstrap wiring — staged-recovery races (F1/F2/F4/F5/F6)', 
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
     }
+
+    it.each([true, false])('recovery fatal terminates playback only after adoption (adopted=%s)', async (adopted) => {
+        const adapter = createMockAdapter();
+        const { player, errors, candSubReqId, candFetchReqId } = await toCandidate(adapter);
+        try {
+            if (adopted) await adoptCandidate(adapter, candSubReqId, candFetchReqId, 9n);
+            player.play();
+            adapter._triggerMessage({ type: 'PUBLISH_DONE', requestId: varint(candSubReqId),
+                statusCode: varint(1n), streamCount: varint(0n), errorReason: 'unauthorized',
+            } as ControlMessage);
+            expect(player.state).toBe(adopted ? 'error' : 'playing');
+            expect(errors).toEqual([expect.objectContaining({ severity: adopted ? 'fatal' : 'degraded' })]);
+        } finally { await player.destroy(); }
+    });
+
+    it('a ready recovery candidate cannot adopt after a pending media send fails', async () => {
+        const adapter = createMockAdapter();
+        const subscribe = adapter.subscribe.getMockImplementation()!;
+        let rejectMedia!: (reason: Error) => void;
+        adapter.subscribe.mockImplementation(async (ns: unknown, name: Uint8Array, opts?: { onRequestId?: (id: bigint) => void }) => {
+            const id = await subscribe(ns, name, opts);
+            if (new TextDecoder().decode(name) === 'video') await new Promise<void>((_, reject) => { rejectMedia = reject; });
+            return id;
+        });
+        const { player, events, errors, candSubReqId, candFetchReqId } = await toCandidate(adapter);
+        try {
+            await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
+            adapter._triggerMessage({ type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
+                endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            } as unknown as ControlMessage);
+            adapter._triggerStreamClosed(500n);
+            await flush();
+            rejectMedia(new Error('media send failed'));
+            await flush();
+            expect(player.state).toBe('error');
+            ackCatalog(adapter, candSubReqId, 9n);
+            await flush();
+            expect(events).toEqual(['catalog_received']);
+            expect(errors).toEqual([expect.objectContaining({ severity: 'fatal' })]);
+            expect((player as unknown as { catalogRecovery: unknown }).catalogRecovery).toBeNull();
+            expect(adapter.unsubscribe).toHaveBeenCalledWith(candSubReqId);
+            expect(adapter.close).not.toHaveBeenCalled();
+        } finally { await player.destroy(); }
+    });
 
     it('the ADOPTED coordinator stays live — post-adoption deltas update state; a further retriable DONE degrades (one per generation)', async () => {
         const adapter = createMockAdapter(16);

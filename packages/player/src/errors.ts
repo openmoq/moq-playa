@@ -108,6 +108,8 @@ export const PlayerErrorCode = {
    * Fatal.
    */
   CMAF_INIT_TIMEOUT: 0x1203,
+  /** Catalog delivery is still pending after the diagnostic deadline; nonfatal. */
+  CATALOG_WAIT_TIMEOUT: 0x1204,
 
   // ── Playback (0x1300) ────────────────────────────────────
   /** Seek failed — timeline lookup or REQUEST_UPDATE error. @see MSF §7 */

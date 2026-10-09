@@ -7299,7 +7299,7 @@ describe('MoqtPlayer', () => {
       const onTimeout = (wd as { onTimeout?: (e: unknown) => void }).onTimeout
         ?? ((wd as { config?: { onTimeout?: (e: unknown) => void } }).config?.onTimeout);
       expect(typeof onTimeout).toBe('function');
-      onTimeout!({ event: 'catalog_received', elapsedMs: 10_000, timeoutMs: 10_000 });
+      onTimeout!({ event: 'first_media_object', elapsedMs: 20_000, timeoutMs: 20_000 });
 
       expect(seenA).toEqual(seenB);
       expect(seenA).toEqual([PlayerState.PLAYING, PlayerState.PAUSED]);
