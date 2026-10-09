@@ -1,6 +1,6 @@
 {
   "name": "@openmoq/browser",
-  "version": "0.5.9",
+  "version": "0.6.0",
   "description": "Browser adapters for @openmoq/player: WebCodecs decoding, Canvas and WebAudio rendering, and MSE/CMAF playback, implementing the player's swappable interfaces.",
   "license": "Apache-2.0",
   "author": "OpenMOQ (https://github.com/openmoq)",

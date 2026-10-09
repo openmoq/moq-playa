@@ -1,6 +1,6 @@
 {
   "name": "@openmoq/playa",
-  "version": "0.5.9",
+  "version": "0.6.0",
   "description": "Batteries-included Media over QUIC (MoQ) media player for the browser.",
   "license": "Apache-2.0",
   "author": "OpenMOQ (https://github.com/openmoq)",

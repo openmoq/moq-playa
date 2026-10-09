@@ -1,6 +1,6 @@
 {
   "name": "@moqt/playback",
-  "version": "0.5.9",
+  "version": "0.6.0",
   "description": "Compatibility re-export of @openmoq/playback. Use @openmoq/playback for new integrations.",
   "license": "Apache-2.0",
   "author": "OpenMOQ (https://github.com/openmoq)",
