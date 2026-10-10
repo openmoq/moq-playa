@@ -1,4 +1,8 @@
 /**
+ * Deterministic video-only timing tests. The fake browser boundary does not
+ * model codec fidelity, audio synchronization, or real network/backend behaviour.
+ * Synthetic comparisons are regression evidence, not a production-policy verdict.
+ *
  * Real-class playout composition.
  *
  * The sibling `playout-schedule.sim.test.ts` is a POLICY simulator: it uses the
@@ -50,6 +54,46 @@ class SimClock implements ClockSource {
   set(us: number): void { this._nowUs = us; }
 }
 
+/** Same-time order: arrivals, pipeline tick, decoder output, renderer tick. */
+class SimEventLoop {
+  private readonly queue: { at: number; pri: number; seq: number; run: () => void }[] = [];
+  private sequence = 0;
+
+  constructor(private readonly clock: SimClock) {}
+
+  schedule = (at: number, pri: number, run: () => void): void => {
+    if (!Number.isFinite(at) || at < this.clock.now()) throw new Error('invalid simulation event time');
+    const event = { at, pri, seq: this.sequence++, run };
+    let lo = 0, hi = this.queue.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const other = this.queue[mid]!;
+      if (other.at < at || (other.at === at && (other.pri < pri || (other.pri === pri && other.seq < event.seq)))) lo = mid + 1;
+      else hi = mid;
+    }
+    this.queue.splice(lo, 0, event);
+  };
+
+  drain(minimumEndUs: number, tick: () => void, render: () => void, pending: () => boolean): void {
+    const horizonUs = minimumEndUs + 120_000_000;
+    const scheduleTick = (at: number) => {
+      this.schedule(at, 1, tick);
+      this.schedule(at, 3, () => {
+        render();
+        if (at < minimumEndUs || this.queue.length > 0 || pending()) scheduleTick(at + TICK_US);
+      });
+    };
+    scheduleTick(0);
+    while (this.queue.length > 0) {
+      const event = this.queue.shift()!;
+      if (event.at > horizonUs) throw new Error('simulation did not reach quiescence');
+      this.clock.set(event.at);
+      event.run();
+    }
+    if (pending()) throw new Error('simulation ended with pending work');
+  }
+}
+
 interface SourceFrame { index: number; captureUs: number; bytes: number; key: boolean; }
 interface Arrival extends SourceFrame { completionUs: number; }
 
@@ -58,6 +102,10 @@ function freezeTrace(opts: {
   capacityMbps: number; seconds: number;
   keyBytes?: number; deltaBytes?: number;
   jitterUs?: (i: number) => number;
+  /** Piecewise-constant capacity, integrated across boundaries. */
+  capacitySchedule?: readonly { readonly fromUs: number; readonly bps: number }[];
+  /** Per-frame payload override, for post-anchor source steps. */
+  bytesFor?: (i: number) => number;
 }): readonly Arrival[] {
   const keyBytes = opts.keyBytes ?? 400_000;
   const deltaBytes = opts.deltaBytes ?? 15_000;
@@ -65,7 +113,7 @@ function freezeTrace(opts: {
   const frames: SourceFrame[] = Array.from({ length: count }, (_, i) => ({
     index: i,
     captureUs: Math.round(i * (1_000_000 / FPS)),
-    bytes: i % GOP === 0 ? keyBytes : deltaBytes,
+    bytes: opts.bytesFor?.(i) ?? (i % GOP === 0 ? keyBytes : deltaBytes),
     key: i % GOP === 0,
   }));
   const link = new SerializedLinkModel({
@@ -73,6 +121,7 @@ function freezeTrace(opts: {
     capacityBps: MBPS(opts.capacityMbps),
     pathDelayUs: 20_000,
     ...(opts.jitterUs ? { jitterUs: opts.jitterUs } : {}),
+    ...(opts.capacitySchedule ? { capacitySchedule: opts.capacitySchedule } : {}),
   });
   // One subgroup stream per GOP, matching what `videoObject()` claims on the
   // wire. With a single shared stream identity a jittered object would hold
@@ -150,6 +199,8 @@ interface Presentation {
 
 interface RunResult {
   presentations: Presentation[];
+  /** Arrivals whose group was already behind the pipeline's consumed group. */
+  staleAtArrival: Set<number>;
   events: PlaybackEvent[];
   commands: DecoderCommand[];
   gapTimeoutSamples: number[];
@@ -173,8 +224,12 @@ interface RunResult {
  * these; the fake must not silently accept them.
  */
   dependencyViolations: number[];
-  /** Normalized fuse/recovery event sequence, for cross-arm comparison. */
-  gapSequence: string[];
+  /**
+   * One chronological sequence of playout DECISIONS across both channels —
+   * gap/fuse events, recovery actions, and reset commands — so cross-arm
+   * comparison pins their interleaving, which per-channel comparisons cannot.
+   */
+  decisionSequence: string[];
   /**
  * Production event-bridge output and recovery-hook actions. Without recording
  * these the handler's `recovery` branch is observationally inert: deleting it
@@ -182,6 +237,11 @@ interface RunResult {
  */
   bridgeEvents: string[];
   recoveryActions: string[];
+  /**
+   * Every decode submission in order, so MULTIPLICITY is checkable. The terminal
+   * Sets cannot see a frame decoded or presented twice.
+   */
+  decodeSubmissions: number[];
   /**
  * One record per skip-forward reaching the handler. Timestamped so the
  * separate-tick question is settled directly rather than inferred from
@@ -203,6 +263,8 @@ interface HarnessConfig {
   maxBufferDepth: number;
   /** SyncController late-frame drop threshold. */
   dropThresholdUs: number;
+  /** Decoder service time; a function models a post-anchor slowdown. */
+  decodeServiceUs?: number | ((bytes: number, captureUs: number) => number);
 }
 
 /**
@@ -261,10 +323,11 @@ function runRealPath(
   const gapTimeoutSamples: number[] = [];
   const cushionSamples: number[] = [];
   const presentations: Presentation[] = [];
-  const gapSequence: string[] = [];
+  const decisionSequence: string[] = [];
   const bridgeEvents: string[] = [];
   const recoveryActions: string[] = [];
   const skipRecords: RunResult['skipRecords'] = [];
+  const decodeSubmissions: number[] = [];
   let syncResetThisTick = false;
   // Count ACTUAL SyncController.reset() calls, so `didReset` reflects the call
   // rather than the guard's permission.
@@ -279,7 +342,9 @@ function runRealPath(
     rendererFlushDiscarded: new Set<number>(),
     neverDecoded: new Set<number>(),
   };
+  const staleAtArrival = new Set<number>();
   const indexOfCapture = new Map<number, number>(trace.map((a) => [a.captureUs, a.index]));
+  const bytesOfCapture = new Map<number, number>(trace.map((a) => [a.captureUs, a.bytes]));
   const dependencyViolations: number[] = [];
   /** GOPs whose independent anchor has been submitted to the decoder. */
   const anchoredGops = new Set<number>();
@@ -294,22 +359,8 @@ function runRealPath(
     adaptiveTolerance: true,
   };
 
-  // ── deterministic event queue, supporting dynamic insertion ─────────────
-  // Same-time order: arrival(0) < pipeline tick(1) < decode output(2) < render tick(3).
-  type Ev = { at: number; pri: number; seq: number; run: () => void };
-  const queue: Ev[] = [];
-  let seq = 0;
-  const schedule = (at: number, pri: number, run: () => void): void => {
-    const ev = { at, pri, seq: seq++, run };
-    let lo = 0, hi = queue.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      const m = queue[mid]!;
-      if (m.at < ev.at || (m.at === ev.at && (m.pri < ev.pri || (m.pri === ev.pri && m.seq < ev.seq)))) lo = mid + 1;
-      else hi = mid;
-    }
-    queue.splice(lo, 0, ev);
-  };
+  const loop = new SimEventLoop(clock);
+  const schedule = loop.schedule;
 
   // ── fake browser boundary: decoder ──────────────────────────────────────
   // Serial, dependency-preserving, and its outputs are REAL scheduled events at
@@ -326,8 +377,10 @@ function runRealPath(
     decode(chunk, renderTimeUs) {
       const timestampUs = Number((chunk as { timestamp: number | bigint }).timestamp);
       const frameIndex = indexOfCapture.get(timestampUs);
+      const chunkBytes = bytesOfCapture.get(timestampUs) ?? 0;
       if (frameIndex !== undefined) {
         accounting.decodeSubmitted.add(frameIndex);
+        decodeSubmissions.push(frameIndex);
         // Enforce the source trace's declared dependency contract: this fixture
         // marks every frame non-discardable, so a GOP is only decodable once its
         // independent object 0 has been submitted.
@@ -337,7 +390,10 @@ function runRealPath(
       }
       const opId = nextDecodeOpId++;
       const startUs = Math.max(clock.now(), decoderFreeUs);
-      const readyUs = startUs + 5_000;
+      const serviceUs = typeof harness.decodeServiceUs === 'function'
+        ? harness.decodeServiceUs(chunkBytes, timestampUs)
+        : (harness.decodeServiceUs ?? 5_000);
+      const readyUs = startUs + serviceUs;
       decoderFreeUs = readyUs;
       pendingOps.set(opId, frameIndex ?? -1);
       schedule(readyUs, 2, () => {
@@ -426,10 +482,11 @@ function runRealPath(
     }),
     onCommand: (cmd) => {
       commands.push(cmd);
-      // Reset carries a `reason` naming the escalation that produced it;
-      // record it so decision equality covers WHY the decoder was reset.
+      // Reset joins the same chronological sequence as the events above, so
+      // its position RELATIVE to them is compared, not just its presence in the
+      // command list.
       if (cmd.type === 'reset') {
-        gapSequence.push(JSON.stringify({ type: 'reset', reason: (cmd as { reason?: string }).reason }));
+        decisionSequence.push(JSON.stringify({ type: 'reset', reason: cmd.reason }));
       }
       dispatcher.dispatch(cmd);
     },
@@ -441,10 +498,12 @@ function runRealPath(
       if (evt.type === 'skip_forward' || evt.type === 'partial_group_abandoned'
         || evt.type === 'backlog_shed' || evt.type === 'keyframe_waiting'
         || evt.type === 'gap_detected' || evt.type === 'track_ended'
-        // `recovery` carries the escalation decision itself; omitting it let two
-        // arms choose different recovery and still compare equal.
+        // Include recovery in the combined sequence so its ordering relative to
+        // reset commands is observable across arms. (Recovery payloads are
+        // already covered by the full event comparison; what this adds is
+        // cross-channel ordering.)
         || evt.type === 'recovery') {
-        gapSequence.push(detail);
+        decisionSequence.push(detail);
       }
       // Route through the SAME production handler the factory arm uses, so the
       // event-bridge implementation is factored OUT of the comparison and
@@ -484,10 +543,13 @@ function runRealPath(
   const dispatcherRendered = renderer.onFrameRendered;
 
   // ── seed the queue ──────────────────────────────────────────────────────
-  const lastUs = trace[trace.length - 1]!.completionUs + 5_000_000;
+  const lastUs = Math.max(...trace.map((a) => a.completionUs)) + 5_000_000;
   for (const a of trace) {
     if (droppedGroups?.has(Math.floor(a.index / GOP))) continue;
-    schedule(a.completionUs, 0, () => { pipeline.pushObject(videoObject(a), videoHeaders(a)); });
+    schedule(a.completionUs, 0, () => {
+      if (BigInt(Math.floor(a.index / GOP)) < pipeline.currentGroupId) staleAtArrival.add(a.index);
+      pipeline.pushObject(videoObject(a), videoHeaders(a));
+    });
   }
   for (const eog of endOfGroupEntries(trace)) {
     if (droppedGroups?.has(eog.groupId)) continue;
@@ -496,47 +558,35 @@ function runRealPath(
     const atUs = eog.atUs + (eogDelay?.(eog.groupId) ?? 0);
     schedule(atUs, 0, () => { pipeline.pushObject(endOfGroupObject(eog.groupId, eog.lastObjectId)); });
   }
-  for (let t = 0; t <= lastUs; t += TICK_US) {
-    schedule(t, 1, () => {
-      // `MoqtPlayer.tick()` clears this at the start of every tick. A previous
-      // attempt patched a loop shape that no longer existed, so the guard
-      // latched permanently and produced a false manual/factory divergence.
-      syncResetThisTick = false;
-      pipeline.tick();
-    });
-    schedule(t, 3, () => {
-      while (rqueue.length > 0 && rqueue[0]!.renderTimeUs <= clock.now()) {
-        const q = rqueue.shift()!;
-        const idx = indexOfCapture.get(q.timestampUs);
-        if (idx !== undefined) accounting.presented.add(idx);
-        presentations.push({
-          frame: idx ?? -1,
-          captureUs: q.timestampUs,
-          decodeOutUs: q.decodeOutUs,
-          scheduledUs: q.renderTimeUs,
-          actualUs: clock.now(),
-        });
-        // The exact queued schedule is the authority for presentation-schedule
-        // drift; omitting it would exercise the suppression path instead.
-        (renderer.onFrameRendered ?? dispatcherRendered)?.(BigInt(q.timestampUs), clock.now(), q.renderTimeUs);
-      }
-    });
-  }
-
-  while (queue.length > 0) {
-    const ev = queue.shift()!;
-    clock.set(ev.at);
-    ev.run();
-  }
+  loop.drain(lastUs, () => {
+    syncResetThisTick = false;
+    pipeline.tick();
+  }, () => {
+    while (rqueue.length > 0 && rqueue[0]!.renderTimeUs <= clock.now()) {
+      const q = rqueue.shift()!;
+      const idx = indexOfCapture.get(q.timestampUs);
+      if (idx !== undefined) accounting.presented.add(idx);
+      presentations.push({
+        frame: idx ?? -1, captureUs: q.timestampUs, decodeOutUs: q.decodeOutUs,
+        scheduledUs: q.renderTimeUs, actualUs: clock.now(),
+      });
+      (renderer.onFrameRendered ?? dispatcherRendered)?.(BigInt(q.timestampUs), clock.now(), q.renderTimeUs);
+    }
+  }, () => pendingOps.size > 0 || rqueue.length > 0 || pipeline.bufferedGroupCount > 0);
 
   for (const a of trace) {
     if (!accounting.decodeSubmitted.has(a.index)) accounting.neverDecoded.add(a.index);
+    else if (!accounting.presented.has(a.index)
+      && !accounting.decoderResetDiscarded.has(a.index)
+      && !accounting.rendererFlushDiscarded.has(a.index)) {
+      throw new Error(`submitted frame ${a.index} has no terminal outcome`);
+    }
   }
 
   return {
-    presentations, events, commands, gapTimeoutSamples, cushionSamples,
-    accounting, gapSequence, dependencyViolations,
-    bridgeEvents, recoveryActions, skipRecords,
+    presentations, staleAtArrival, events, commands, gapTimeoutSamples, cushionSamples,
+    accounting, decisionSequence, dependencyViolations,
+    bridgeEvents, recoveryActions, skipRecords, decodeSubmissions,
   };
 }
 
@@ -576,6 +626,17 @@ function assertTerminalPartition(trace: readonly Arrival[], r: RunResult): void 
   const union = [...new Set(terminals.flatMap((t) => [...t]))].sort((a, b) => a - b);
   expect(union).toEqual(trace.map((a) => a.index));
   expect(r.dependencyViolations).toEqual([]);
+
+  // MULTIPLICITY: the Sets above cannot see a frame presented or decoded twice,
+  // so duplicates are checked directly. Every surviving identity must appear at
+  // most once in each channel.
+  const countBy = (xs: readonly number[]) => {
+    const m = new Map<number, number>();
+    for (const x of xs) m.set(x, (m.get(x) ?? 0) + 1);
+    return m;
+  };
+  for (const [, n] of countBy(r.presentations.map((p) => p.frame))) expect(n).toBe(1);
+  for (const [, n] of countBy(r.decodeSubmissions)) expect(n).toBe(1);
 }
 
 /**
@@ -598,15 +659,15 @@ function assertLosslessRun(trace: readonly Arrival[], r: RunResult): void {
   expect(r.accounting.neverDecoded.size).toBe(0);
   expect(r.accounting.decoderResetDiscarded.size).toBe(0);
   expect(r.accounting.rendererFlushDiscarded.size).toBe(0);
-  expect(r.gapSequence).toEqual([]);
+  expect(r.decisionSequence).toEqual([]);
 }
 
-/** Same exact decomposition as the policy simulator, so results are comparable. */
+/** Picture-freeze excess over the nominal source cadence, including missing frames. */
 function decompose(ps: readonly Presentation[]) {
   let totalFreezeExcessUs = 0, starvationUs = 0, holdUs = 0, tickUs = 0, maxFreezeUs = 0;
   for (let i = 1; i < ps.length; i++) {
     const prev = ps[i - 1]!, cur = ps[i]!;
-    const expectedUs = prev.actualUs + (cur.captureUs - prev.captureUs);
+    const expectedUs = prev.actualUs + 1_000_000 / FPS;
     const endUs = cur.actualUs;
     maxFreezeUs = Math.max(maxFreezeUs, endUs - prev.actualUs);
     if (endUs <= expectedUs) continue;
@@ -629,13 +690,87 @@ const fmt = (d: ReturnType<typeof decompose>) =>
   + ` (starve=${(d.starvationUs / 1000).toFixed(0)} hold=${(d.holdUs / 1000).toFixed(0)} tick=${(d.tickUs / 1000).toFixed(0)})`
   + ` max=${(d.maxFreezeUs / 1000).toFixed(0).padStart(4)}ms lat50=${(d.latencyP50Us / 1000).toFixed(0)}ms`;
 
+/**
+ * Readiness-only counterfactual on a source-clock schedule. This is not a player
+ * arm: it reuses observed decode outputs, adds no sync baseline, and cannot
+ * recover frames the pipeline discarded or predict feedback from another policy.
+ */
+function fixedReadinessSchedule(
+  presentations: readonly Presentation[],
+  offsetUs: number | ((captureUs: number) => number),
+): Presentation[] {
+  let previousActualUs = 0;
+  return presentations.map((p) => {
+    const scheduledUs = p.captureUs + (typeof offsetUs === 'function' ? offsetUs(p.captureUs) : offsetUs);
+    const actualUs = Math.ceil(Math.max(scheduledUs, p.decodeOutUs, previousActualUs) / TICK_US) * TICK_US;
+    previousActualUs = actualUs;
+    return { ...p, scheduledUs, actualUs };
+  });
+}
+
+describe('simulation driver and scoring', () => {
+  it('bounds a driver that cannot drain instead of accepting unfinished work', () => {
+    const loop = new SimEventLoop(new SimClock());
+    expect(() => loop.drain(0, () => {}, () => {}, () => true)).toThrow('quiescence');
+  });
+
+  it('uses a total source-clock offset, including for outputs the player considered late', () => {
+    const result = runRealPath(freezeTrace({ capacityMbps: 3, seconds: 8 }), 'floor');
+    const offsetUs = Math.max(...result.presentations.map((p) => p.decodeOutUs - p.captureUs));
+    const scheduled = fixedReadinessSchedule(result.presentations, offsetUs);
+    expect(offsetUs).toBeGreaterThan(1_000_000);
+    for (const p of scheduled) {
+      expect(p.scheduledUs).toBe(p.captureUs + offsetUs);
+      expect(p.decodeOutUs).toBeLessThanOrEqual(p.scheduledUs);
+      expect(p.actualUs - p.scheduledUs).toBeLessThan(TICK_US);
+    }
+    expect(decompose(scheduled).totalFreezeExcessUs).toBeLessThan(TICK_US);
+  });
+
+  it('detects both inadequate headroom and a feasible post-anchor schedule', () => {
+    const input = Array.from({ length: 180 }, (_, frame) => {
+      const captureUs = Math.round(frame * 1_000_000 / FPS);
+      return { frame, captureUs, decodeOutUs: captureUs + (frame < 60 ? 50_000 : 300_000), scheduledUs: 0, actualUs: 0 };
+    });
+    const insufficient = fixedReadinessSchedule(input, 100_000);
+    const stepped = fixedReadinessSchedule(input, (captureUs) => captureUs < 2_000_000 ? 100_000 : 350_000);
+    expect(insufficient.filter((p) => p.decodeOutUs > p.scheduledUs)).toHaveLength(120);
+    expect(stepped.filter((p) => p.decodeOutUs > p.scheduledUs)).toHaveLength(0);
+    // Raising latency has a visible one-time picture hold, not free protection.
+    expect(decompose(stepped).totalFreezeExcessUs).toBeGreaterThan(200_000);
+    expect(decompose(stepped).holdUs).toBeGreaterThan(0);
+    expect(decompose(stepped.slice(60)).totalFreezeExcessUs).toBeLessThan(TICK_US);
+  });
+  it('keeps rendering while a slow decoder drains past the initial tick horizon', () => {
+    const trace = freezeTrace({ capacityMbps: 50, seconds: 1 });
+    const config = { ...TUNED_CONFIG, decodeServiceUs: 500_000, dropThresholdUs: 60_000_000 };
+    for (const result of [runRealPath(trace, 'floor', config), runFactoryPath(trace, config)]) {
+      assertTerminalPartition(trace, result);
+      const tail = result.presentations.filter((p) => p.decodeOutUs > trace.at(-1)!.completionUs + 5_000_000);
+      expect(tail.length).toBeGreaterThan(0);
+      for (const p of tail) {
+        expect(p.actualUs - Math.max(p.decodeOutUs, p.scheduledUs)).toBeLessThan(TICK_US);
+      }
+    }
+  });
+
+  it('counts a lost GOP as a picture freeze rather than expected source cadence', () => {
+    const result = decompose([
+      { frame: 0, captureUs: 0, decodeOutUs: 0, scheduledUs: 0, actualUs: 0 },
+      { frame: 60, captureUs: 2_000_000, decodeOutUs: 2_000_000, scheduledUs: 2_000_000, actualUs: 2_000_000 },
+    ]);
+    expect(result.totalFreezeExcessUs).toBeCloseTo(2_000_000 - 1_000_000 / FPS);
+    expect(result.starvationUs + result.holdUs + result.tickUs).toBeCloseTo(result.totalFreezeExcessUs);
+  });
+});
+
 describe('real-class playout composition — canonical regimes', () => {
   it('regime 1: floor-feasible periodic keyframe burst', () => {
     const trace = freezeTrace({ capacityMbps: 8, seconds: 20 });
     const adaptive = runRealPath(trace, 'adaptive');
     const floor = runRealPath(trace, 'floor');
     const dA = decompose(adaptive.presentations), dF = decompose(floor.presentations);
-    const acct = (r: RunResult) => `presented=${r.accounting.presented.size}/${trace.length} resetDrop=${r.accounting.decoderResetDiscarded.size} flushDrop=${r.accounting.rendererFlushDiscarded.size} neverDecoded=${r.accounting.neverDecoded.size} fuse=${r.gapSequence.length}`;
+    const acct = (r: RunResult) => `presented=${r.accounting.presented.size}/${trace.length} resetDrop=${r.accounting.decoderResetDiscarded.size} flushDrop=${r.accounting.rendererFlushDiscarded.size} neverDecoded=${r.accounting.neverDecoded.size} decisions=${r.decisionSequence.length}`;
     console.log(`\nREAL regime 1 (8Mbps keyframe burst):\n    floor     ${fmt(dF)}\n              ${acct(floor)}\n    adaptive  ${fmt(dA)}\n              ${acct(adaptive)}\n`);
 
     // Gap-fuse inputs must be identical across render-policy arms: the render
@@ -644,7 +779,7 @@ describe('real-class playout composition — canonical regimes', () => {
     expect(adaptive.commands.length).toBe(floor.commands.length);
 
     // Decisions must be identical across render-policy arms.
-    expect(adaptive.gapSequence).toEqual(floor.gapSequence);
+    expect(adaptive.decisionSequence).toEqual(floor.decisionSequence);
     for (const arm of [floor, adaptive]) assertLosslessRun(trace, arm);
 
     // REGIME 1 through production wiring: the fixed floor delivers every frame
@@ -652,7 +787,7 @@ describe('real-class playout composition — canonical regimes', () => {
     // charges latency for headroom that was never needed. Complete accounting
     // and zero fuse activity confirm nothing else is in play.
     expect(floor.accounting.presented.size).toBe(trace.length);
-    expect(floor.gapSequence).toEqual([]);
+    expect(floor.decisionSequence).toEqual([]);
     // Floor freeze is sub-tick residue; adaptive's is an order of magnitude
     // larger and is manufactured entirely by cushion movement.
     expect(dF.totalFreezeExcessUs).toBeLessThan(TICK_US);
@@ -720,7 +855,7 @@ describe('real-class playout composition — clean path', () => {
     expect(r.presentations.length).toBe(trace.length);
 
     // 3. no fuse activity, no discards, nothing unclassified
-    expect(r.gapSequence).toEqual([]);
+    expect(r.decisionSequence).toEqual([]);
     expect(r.accounting.decoderResetDiscarded.size).toBe(0);
     expect(r.accounting.rendererFlushDiscarded.size).toBe(0);
     expect(r.accounting.neverDecoded.size).toBe(0);
@@ -873,7 +1008,7 @@ function runFactoryPath(
   const gapTimeoutSamples: number[] = [];
   const cushionSamples: number[] = [];
   const presentations: Presentation[] = [];
-  const gapSequence: string[] = [];
+  const decisionSequence: string[] = [];
   const dependencyViolations: number[] = [];
   const anchoredGops = new Set<number>();
   const accounting = {
@@ -881,22 +1016,12 @@ function runFactoryPath(
     decoderResetDiscarded: new Set<number>(), rendererFlushDiscarded: new Set<number>(),
     neverDecoded: new Set<number>(),
   };
+  const staleAtArrival = new Set<number>();
   const indexOfCapture = new Map<number, number>(trace.map((a) => [a.captureUs, a.index]));
+  const bytesOfCapture = new Map<number, number>(trace.map((a) => [a.captureUs, a.bytes]));
 
-  type Ev = { at: number; pri: number; seq: number; run: () => void };
-  const queue: Ev[] = [];
-  let seq = 0;
-  const schedule = (at: number, pri: number, run: () => void): void => {
-    const ev = { at, pri, seq: seq++, run };
-    let lo = 0, hi = queue.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      const m = queue[mid]!;
-      if (m.at < ev.at || (m.at === ev.at && (m.pri < ev.pri || (m.pri === ev.pri && m.seq < ev.seq)))) lo = mid + 1;
-      else hi = mid;
-    }
-    queue.splice(lo, 0, ev);
-  };
+  const loop = new SimEventLoop(clock);
+  const schedule = loop.schedule;
 
   let decoderFreeUs = 0, nextOpId = 0;
   const pendingOps = new Map<number, number>();
@@ -905,14 +1030,19 @@ function runFactoryPath(
     decode(chunk, renderTimeUs) {
       const timestampUs = Number((chunk as { timestamp: number | bigint }).timestamp);
       const frameIndex = indexOfCapture.get(timestampUs);
+      const chunkBytes = bytesOfCapture.get(timestampUs) ?? 0;
       if (frameIndex !== undefined) {
         accounting.decodeSubmitted.add(frameIndex);
+        decodeSubmissions.push(frameIndex);
         const gop = Math.floor(frameIndex / GOP);
         if (frameIndex % GOP === 0) anchoredGops.add(gop);
         else if (!anchoredGops.has(gop)) dependencyViolations.push(frameIndex);
       }
       const opId = nextOpId++;
-      const readyUs = Math.max(clock.now(), decoderFreeUs) + 5_000;
+      const serviceUs = typeof harness.decodeServiceUs === 'function'
+        ? harness.decodeServiceUs(chunkBytes, timestampUs)
+        : (harness.decodeServiceUs ?? 5_000);
+      const readyUs = Math.max(clock.now(), decoderFreeUs) + serviceUs;
       decoderFreeUs = readyUs;
       pendingOps.set(opId, frameIndex ?? -1);
       schedule(readyUs, 2, () => {
@@ -981,6 +1111,7 @@ function runFactoryPath(
   const bridgeEvents: string[] = [];
   const recoveryActions: string[] = [];
   const skipRecords: RunResult['skipRecords'] = [];
+  const decodeSubmissions: number[] = [];
   pipelines = createPipelines(config, clock, trackInfo, {
     onFirstFrame: () => {},
     onStall: () => {},
@@ -990,7 +1121,7 @@ function runFactoryPath(
     onCommand: (cmd) => {
       commands.push(cmd);
       if (cmd.type === 'reset') {
-        gapSequence.push(JSON.stringify({ type: 'reset', reason: (cmd as { reason?: string }).reason }));
+        decisionSequence.push(JSON.stringify({ type: 'reset', reason: cmd.reason }));
       }
       // Production path, rather than dispatching directly.
       handlePipelineCommand(cmd, undefined, pipelines.commandDispatcher, pipelines.mediaSource, () => {});
@@ -1001,10 +1132,12 @@ function runFactoryPath(
       if (evt.type === 'skip_forward' || evt.type === 'partial_group_abandoned'
         || evt.type === 'backlog_shed' || evt.type === 'keyframe_waiting'
         || evt.type === 'gap_detected' || evt.type === 'track_ended'
-        // `recovery` carries the escalation decision itself; omitting it let two
-        // arms choose different recovery and still compare equal.
+        // Include recovery in the combined sequence so its ordering relative to
+        // reset commands is observable across arms. (Recovery payloads are
+        // already covered by the full event comparison; what this adds is
+        // cross-channel ordering.)
         || evt.type === 'recovery') {
-        gapSequence.push(detail);
+        decisionSequence.push(detail);
       }
       const guardBefore = syncResetThisTick;
       const resetsBefore = syncResetCalls;
@@ -1036,50 +1169,48 @@ function runFactoryPath(
 
   const pipeline = pipelines.videoPipeline!;
 
-  const lastUs = trace[trace.length - 1]!.completionUs + 5_000_000;
+  const lastUs = Math.max(...trace.map((a) => a.completionUs)) + 5_000_000;
   for (const a of trace) {
     if (droppedGroups?.has(Math.floor(a.index / GOP))) continue;
-    schedule(a.completionUs, 0, () => { pipeline.pushObject(videoObject(a), videoHeaders(a)); });
+    schedule(a.completionUs, 0, () => {
+      if (BigInt(Math.floor(a.index / GOP)) < pipeline.currentGroupId) staleAtArrival.add(a.index);
+      pipeline.pushObject(videoObject(a), videoHeaders(a));
+    });
   }
   for (const eog of endOfGroupEntries(trace)) {
     if (droppedGroups?.has(eog.groupId)) continue;
     const atUs = eog.atUs + (eogDelay?.(eog.groupId) ?? 0);
     schedule(atUs, 0, () => { pipeline.pushObject(endOfGroupObject(eog.groupId, eog.lastObjectId)); });
   }
-  for (let t = 0; t <= lastUs; t += TICK_US) {
-    schedule(t, 1, () => {
-      // `MoqtPlayer.tick()` clears this at the start of every tick; without
-      // it the first skip_forward would suppress sync resets forever.
-      syncResetThisTick = false;
-      pipeline.tick();
-    });
-    schedule(t, 3, () => {
-      while (rqueue.length > 0 && rqueue[0]!.renderTimeUs <= clock.now()) {
-        const q = rqueue.shift()!;
-        const idx = indexOfCapture.get(q.timestampUs);
-        if (idx !== undefined) accounting.presented.add(idx);
-        presentations.push({
-          frame: idx ?? -1, captureUs: q.timestampUs, decodeOutUs: q.decodeOutUs,
-          scheduledUs: q.renderTimeUs, actualUs: clock.now(),
-        });
-        // The dispatcher installs this; without invoking it the feedback loop
-        // and `sync_drift` diagnostics are inert and parity cannot see them.
-        renderer.onFrameRendered?.(BigInt(q.timestampUs), clock.now(), q.renderTimeUs);
-      }
-    });
-  }
+  loop.drain(lastUs, () => {
+    syncResetThisTick = false;
+    pipeline.tick();
+  }, () => {
+    while (rqueue.length > 0 && rqueue[0]!.renderTimeUs <= clock.now()) {
+      const q = rqueue.shift()!;
+      const idx = indexOfCapture.get(q.timestampUs);
+      if (idx !== undefined) accounting.presented.add(idx);
+      presentations.push({
+        frame: idx ?? -1, captureUs: q.timestampUs, decodeOutUs: q.decodeOutUs,
+        scheduledUs: q.renderTimeUs, actualUs: clock.now(),
+      });
+      renderer.onFrameRendered?.(BigInt(q.timestampUs), clock.now(), q.renderTimeUs);
+    }
+  }, () => pendingOps.size > 0 || rqueue.length > 0 || pipeline.bufferedGroupCount > 0);
 
-  while (queue.length > 0) {
-    const ev = queue.shift()!;
-    clock.set(ev.at);
-    ev.run();
+  for (const a of trace) {
+    if (!accounting.decodeSubmitted.has(a.index)) accounting.neverDecoded.add(a.index);
+    else if (!accounting.presented.has(a.index)
+      && !accounting.decoderResetDiscarded.has(a.index)
+      && !accounting.rendererFlushDiscarded.has(a.index)) {
+      throw new Error(`submitted frame ${a.index} has no terminal outcome`);
+    }
   }
-  for (const a of trace) if (!accounting.decodeSubmitted.has(a.index)) accounting.neverDecoded.add(a.index);
 
   const result: RunResult = {
-    presentations, events, commands, gapTimeoutSamples, cushionSamples,
-    accounting, gapSequence, dependencyViolations,
-    bridgeEvents, recoveryActions, skipRecords,
+    presentations, staleAtArrival, events, commands, gapTimeoutSamples, cushionSamples,
+    accounting, decisionSequence, dependencyViolations,
+    bridgeEvents, recoveryActions, skipRecords, decodeSubmissions,
   };
   return result;
 }
@@ -1297,7 +1428,7 @@ describe('real-class playout composition — behavioural factory parity', () => 
       .toEqual(manual.presentations.map((p) => [p.frame, p.scheduledUs, p.actualUs]));
 
     // Fuse/recovery decisions and terminal accounting.
-    expect(factory.gapSequence).toEqual(manual.gapSequence);
+    expect(factory.decisionSequence).toEqual(manual.decisionSequence);
     expect([...factory.accounting.presented].sort((a, b) => a - b))
       .toEqual([...manual.accounting.presented].sort((a, b) => a - b));
     expect(factory.dependencyViolations).toEqual(manual.dependencyViolations);
@@ -1324,7 +1455,7 @@ describe('real-class playout composition — delayed FIN control', () => {
  */
   const lostGroups: DroppedGroups = new Set([4, 8]);
 
-  it('produces real fuse activity, not an empty sequence', () => {
+  it('produces real playout decisions, not an empty sequence', () => {
     const trace = freezeTrace({ capacityMbps: 20, seconds: 24 });
     const r = runRealPath(trace, 'adaptive', TUNED_CONFIG, lateFin, lostGroups);
 
@@ -1347,28 +1478,32 @@ describe('real-class playout composition — delayed FIN control', () => {
     expect(r.skipRecords.every((k) => !k.guardBefore)).toBe(true);
 
     // The control must actually be eventful, or it controls nothing.
-    expect(r.gapSequence.length).toBeGreaterThan(0);
-    // And the recorded decisions must carry identity and REASONS, not just type
-    // names: two arms could otherwise choose different recovery or reset for the
-    // same event and still compare equal.
-    expect(r.gapSequence.some((e) => e.includes('groupId') || e.includes('fromGroupId'))).toBe(true);
-    expect(r.gapSequence.some((e) => e.includes('"type":"recovery"'))).toBe(true);
-    expect(r.gapSequence.some((e) => e.includes('"type":"reset"') && e.includes('"reason"'))).toBe(true);
+    expect(r.decisionSequence.length).toBeGreaterThan(0);
+    // Payload checks keep the combined chronological record meaningful — a
+    // sequence of bare type names would compare equal while saying nothing. The
+    // cross-arm equality assertion below is what pins the interleaving.
+    expect(r.decisionSequence.some((e) => e.includes('groupId') || e.includes('fromGroupId'))).toBe(true);
+    const decisions = r.decisionSequence.map((e) => JSON.parse(e) as { type: string; reason?: string });
+    expect(decisions.some((d) => d.type === 'recovery')).toBe(true);
+    const resets = decisions.filter((d) => d.type === 'reset');
+    expect(resets.length).toBeGreaterThan(0);
+    // A real reason string, not merely the presence of the key.
+    expect(resets.every((d) => typeof d.reason === 'string' && d.reason.length > 0)).toBe(true);
     const types = r.events.reduce<Record<string, number>>((acc, e) => {
       acc[e.type] = (acc[e.type] ?? 0) + 1; return acc;
     }, {});
-    console.log(`\ndelayed-FIN control: ${r.gapSequence.length} fuse decisions; event types: `
+    console.log(`\ndelayed-FIN control: ${r.decisionSequence.length} playout decisions; event types: `
       + Object.entries(types).map(([k, v]) => `${k}=${v}`).join(' ') + '\n');
   });
 
-  it('manual and factory arms agree on fuse decisions and terminal outcomes', () => {
+  it('manual and factory arms agree on playout decisions and terminal outcomes', () => {
     const trace = freezeTrace({ capacityMbps: 20, seconds: 24 });
     const manual = runRealPath(trace, 'adaptive', TUNED_CONFIG, lateFin, lostGroups);
     const factory = runFactoryPath(trace, TUNED_CONFIG, lateFin, lostGroups);
 
     // Non-empty by construction — this is what the canonical traces could not do.
-    expect(manual.gapSequence.length).toBeGreaterThan(0);
-    expect(factory.gapSequence).toEqual(manual.gapSequence);
+    expect(manual.decisionSequence.length).toBeGreaterThan(0);
+    expect(factory.decisionSequence).toEqual(manual.decisionSequence);
 
     // Complete command and event parity through the fuse paths.
     expect(factory.commands).toEqual(manual.commands);
@@ -1405,5 +1540,349 @@ describe('real-class playout composition — delayed FIN control', () => {
     expect(factory.recoveryActions).toHaveLength(2);
     expect(factory.bridgeEvents.some((e) => e.includes('skip_forward'))).toBe(true);
     expect(factory.bridgeEvents.some((e) => e.includes('recovery_action'))).toBe(true);
+  });
+});
+
+/**
+ * Real-class adverse matrix at shipping defaults.
+ *
+ * These synthetic traces exercise the production factory at shipping defaults;
+ * they do not reproduce a particular customer capture.
+ *
+ * Arms: the current adaptive policy (factory-built) against a fixed-floor
+ * counterfactual (manual, because production has no floor policy to construct).
+ * Every scenario asserts complete terminal accounting and dependency safety, so
+ * no row's timing numbers can hide unaccounted loss or duplicated frames.
+ */
+describe('real-class adverse matrix — shipping defaults', () => {
+  const MB = (n: number) => n * 1_000_000;
+
+  interface Row {
+    name: string;
+    opts: Parameters<typeof freezeTrace>[0];
+    /** Extra harness overrides, e.g. a post-anchor decoder slowdown. */
+    harness?: Partial<HarnessConfig>;
+    /** Groups the receiver never sees, for deliberate-loss rows. */
+    lostGroups?: DroppedGroups;
+    /** Require the trace to actually contain a cross-stream completion inversion. */
+    expectInversion?: boolean;
+    /**
+     * Every row pins a meaningful outcome in addition to shared safety checks.
+     */
+    gate: (m: {
+      a: ReturnType<typeof score>; f: ReturnType<typeof score>; o: ReturnType<typeof score>;
+    }) => void;
+  }
+
+  const rows: Row[] = [
+    {
+      name: 'floor-feasible periodic keyframe burst',
+      opts: { capacityMbps: 8, seconds: 20 },
+      gate: ({ a, f }) => {
+        // The floor holds cadence outright; the adaptive cushion manufactures
+        // freeze and charges latency for headroom nothing needed.
+        expect(f.freeze).toBeLessThan(TICK_US);
+        expect(a.freeze).toBeGreaterThan(100_000);
+        expect(a.hold).toBeGreaterThan(0);
+        expect(a.latP50).toBeGreaterThan(f.latP50 + 100_000);
+      },
+    },
+    {
+      name: 'repeated supra-floor delay episodes',
+      opts: {
+        capacityMbps: 20, seconds: 40,
+        jitterUs: (i) => (i >= 180 && i % 90 === 0 ? 500_000 : 0),
+      },
+      gate: ({ a, f }) => {
+        // Stimulus is real...
+        expect(f.freeze).toBeGreaterThan(1_000_000);
+        // ...adaptation genuinely cuts starvation...
+        expect(a.starve).toBeLessThan(f.starve / 2);
+        // ...but converts it into hold, so total and worst freeze get WORSE,
+        // quarter-second freezes multiply, and latency rises.
+        expect(a.hold).toBeGreaterThan(f.hold);
+        expect(a.freeze).toBeGreaterThan(f.freeze);
+        expect(a.maxFreeze).toBeGreaterThan(f.maxFreeze);
+        expect(a.over250).toBeGreaterThan(f.over250);
+        expect(a.latP50).toBeGreaterThan(f.latP50);
+      },
+    },
+    {
+      name: 'post-anchor capacity step 50 -> 7 -> 50 Mbps',
+      opts: {
+        capacityMbps: 50, seconds: 30,
+        capacitySchedule: [
+          { fromUs: 0, bps: MB(50) },
+          { fromUs: 8_000_000, bps: MB(7) },
+          { fromUs: 20_000_000, bps: MB(50) },
+        ],
+      },
+      gate: ({ f, o }) => {
+        expect(f.freeze).toBeGreaterThan(500_000);
+        expect(f.readinessMisses).toBeGreaterThan(0);
+        expect(o.freeze).toBeLessThan(TICK_US);
+      },
+    },
+    {
+      name: 'post-anchor source step (small first GOPs, then 400KB keys)',
+      opts: {
+        capacityMbps: 8, seconds: 24,
+        bytesFor: (i) => (i % GOP === 0 ? (i < 120 ? 60_000 : 400_000) : 15_000),
+      },
+      gate: ({ f, o }) => {
+        expect(f.starve).toBeGreaterThan(1_000_000);
+        expect(f.readinessMisses).toBeGreaterThan(0);
+        expect(o.freeze).toBeLessThan(TICK_US);
+      },
+    },
+    {
+      name: 'post-anchor decoder stress after 8s (service > cadence)',
+      opts: { capacityMbps: 50, seconds: 24 },
+      harness: {
+        // 45ms per frame against a 33.3ms cadence: the decoder genuinely falls
+        // behind, unlike a gentler step the floor simply absorbs.
+        decodeServiceUs: (bytes, captureUs) =>
+          (captureUs < 8_000_000 ? 5_000 : (bytes > 100_000 ? 120_000 : 45_000)),
+      },
+      gate: ({ a, f, o }) => {
+        expect(f.freeze).toBeGreaterThan(5_000_000);
+        expect(f.latP95).toBeGreaterThan(5_000_000);
+        expect(a.freeze).toBe(f.freeze);
+        expect(o.freeze).toBeLessThan(TICK_US);
+        expect(o.latP50).toBeGreaterThan(5_000_000);
+      },
+    },
+    {
+      name: 'floor-absorbed decoder step (inert control)',
+      opts: { capacityMbps: 50, seconds: 16 },
+      harness: {
+        decodeServiceUs: (bytes) => (bytes > 100_000 ? 90_000 : 20_000),
+      },
+      gate: ({ a, f }) => {
+        expect(a.freeze).toBeLessThan(TICK_US);
+        expect(f.freeze).toBeLessThan(TICK_US);
+        expect(f.readinessMisses).toBe(0);
+      },
+    },
+    {
+      name: 'cross-subgroup completion reordering',
+      opts: {
+        capacityMbps: 30, seconds: 24,
+        // Delay the TAIL of each subgroup enough that the next subgroup's
+        // objects, on their own stream, complete first.
+        jitterUs: (i) => (i % GOP >= GOP - 3 ? 900_000 : 0),
+      },
+      expectInversion: true,
+      gate: ({ f, o }) => {
+        expect(f.presented).toBe(687);
+        expect(f.freeze).toBeGreaterThan(1_000_000);
+        expect(o.freeze).toBeGreaterThanOrEqual(33 * 1_000_000 / FPS);
+      },
+    },
+    {
+      name: 'repeated whole-group loss',
+      opts: { capacityMbps: 30, seconds: 30 },
+      lostGroups: new Set([3, 7, 11]),
+      gate: ({ a, f, o }) => {
+        for (const m of [a, f, o]) {
+          expect(m.presented).toBe(720);
+          expect(m.freeze).toBeGreaterThanOrEqual(6_000_000);
+          expect(m.over250).toBe(3);
+        }
+      },
+    },
+    {
+      name: 'bounded path jitter 0..20ms',
+      opts: { capacityMbps: 20, seconds: 24, jitterUs: (i) => (i * 7919) % 20_000 },
+      gate: ({ a, f }) => {
+        expect(a.freeze).toBeLessThan(TICK_US);
+        expect(f.freeze).toBeLessThan(TICK_US);
+        expect(f.readinessMisses).toBe(0);
+      },
+    },
+    {
+      name: 'sustained overload 5.1Mbps media on 3Mbps link (control)',
+      opts: { capacityMbps: 3, seconds: 24 },
+      gate: ({ a, f, o }) => {
+        expect(f.freeze).toBeGreaterThan(10_000_000);
+        expect(f.latP95).toBeGreaterThan(10_000_000);
+        expect(a.freeze).toBe(f.freeze);
+        expect(o.freeze).toBeLessThan(TICK_US);
+        // A finite offline readiness bound cannot promise sustainable live playout.
+        expect(o.latP50).toBeGreaterThan(10_000_000);
+      },
+    },
+  ];
+
+  /**
+   * Policy-independent readiness reference: the FIXED-FLOOR schedule for each
+   * source frame. Counting `decodeOutUs > scheduledUs` per arm is not a common
+   * baseline — raising the cushion moves that arm's own target later, so an arm
+   * can "improve" readiness purely by deferring its deadline.
+   */
+  function floorReference(floorArm: RunResult): Map<number, number> {
+    // Extrapolated arithmetically from the first frame's anchor at the STATIC
+    // floor: `first.scheduled + (capture - first.capture)`. Reading each frame's
+    // actual scheduled time instead would not be policy-independent — a frame
+    // the pipeline judged late is scheduled at `clock.now()`, i.e. "present
+    // immediately", which trivially satisfies any readiness test.
+    const first = floorArm.presentations[0];
+    if (first === undefined) return new Map();
+    return new Map(floorArm.presentations.map((p) => [
+      p.frame, first.scheduledUs + (p.captureUs - first.captureUs),
+    ]));
+  }
+
+  /**
+   * Score a set of presentations. `presentations` may be a phase window, in
+   * which case every metric — including the frame count — derives from that
+   * window rather than from whole-run accounting.
+   */
+  function score(
+    presentations: readonly Presentation[],
+    reference: Map<number, number>,
+  ) {
+    const d = decompose(presentations);
+    const ps = presentations;
+    let over100 = 0, over250 = 0;
+    for (let i = 1; i < ps.length; i++) {
+      const gap = ps[i]!.actualUs - ps[i - 1]!.actualUs;
+      if (gap > 100_000) over100++;
+      if (gap > 250_000) over250++;
+    }
+    const lat = ps.map((p) => p.actualUs - p.captureUs).sort((a, b) => a - b);
+    const at = (q: number) => lat[Math.min(lat.length - 1, Math.floor(lat.length * q))] ?? 0;
+    // Readiness shortfall against the COMMON floor reference: frames whose
+    // decode output missed the schedule a fixed-floor policy would have chosen.
+    // Neither arm can improve this by moving its own deadline.
+    const readinessMisses = ps.filter((p) => {
+      const ref = reference.get(p.frame);
+      return ref !== undefined && p.decodeOutUs > ref;
+    }).length;
+    return {
+      freeze: d.totalFreezeExcessUs, maxFreeze: d.maxFreezeUs,
+      starve: d.starvationUs, hold: d.holdUs,
+      over100, over250, readinessMisses,
+      latP50: at(0.5), latP95: at(0.95), latMax: lat[lat.length - 1] ?? 0,
+      presented: ps.length,
+    };
+  }
+
+  it('scores the current adaptive policy against a fixed floor on every adverse trace', () => {
+    const lines: string[] = [];
+    for (const { name, opts, harness, lostGroups, expectInversion, gate } of rows) {
+      const cfg: HarnessConfig = { ...PRODUCTION_DEFAULT_CONFIG, ...harness };
+      const trace = freezeTrace(opts);
+
+      if (expectInversion) {
+        // Prove the stimulus exists before scoring it: some later-indexed frame
+        // must actually complete before an earlier one (cross-stream overtake).
+        const inverted = trace.some((a, i) => trace.slice(0, i).some((b) => b.completionUs > a.completionUs));
+        expect(inverted).toBe(true);
+      }
+
+      const adaptive = runFactoryPath(trace, cfg, undefined, lostGroups);
+      const floor = runRealPath(trace, 'floor', cfg, undefined, lostGroups);
+      // Readiness-only bound for the frames this floor run actually decoded.
+      const readyOffsetUs = Math.max(
+        FLOOR_US,
+        ...floor.presentations.map((p) => p.decodeOutUs - p.captureUs),
+      );
+      const readySchedule = fixedReadinessSchedule(floor.presentations, readyOffsetUs);
+
+      for (const arm of [adaptive, floor]) {
+        // No row's numbers may rest on lost/duplicated frames or a broken
+        // reference chain.
+        assertTerminalPartition(trace, arm);
+        if (expectInversion) {
+          const tails = trace.filter((p) => p.index % GOP >= GOP - 3 && Math.floor(p.index / GOP) < 11);
+          expect([...arm.accounting.neverDecoded].sort((a, b) => a - b)).toEqual(tails.map((p) => p.index));
+          expect([...arm.staleAtArrival].sort((a, b) => a - b)).toEqual(tails.map((p) => p.index));
+        } else if (lostGroups !== undefined) {
+          const missing = trace.filter((p) => lostGroups.has(Math.floor(p.index / GOP)));
+          expect([...arm.accounting.neverDecoded].sort((a, b) => a - b)).toEqual(missing.map((p) => p.index));
+          expect(arm.staleAtArrival.size).toBe(0);
+        } else {
+          expect(arm.accounting.presented.size).toBe(trace.length);
+          expect(arm.accounting.neverDecoded.size).toBe(0);
+        }
+        expect(arm.dependencyViolations).toEqual([]);
+        // Early render is prohibited: nothing may present before it is decoded
+        // or before its scheduled time.
+        for (const p of arm.presentations) {
+          expect(p.actualUs).toBeGreaterThanOrEqual(p.decodeOutUs);
+          expect(p.actualUs).toBeGreaterThanOrEqual(p.scheduledUs);
+        }
+      }
+
+      const ref = floorReference(floor);
+      const a = score(adaptive.presentations, ref), f = score(floor.presentations, ref);
+      const o = score(readySchedule, ref);
+      expect(readySchedule.every((p) => p.decodeOutUs <= p.scheduledUs)).toBe(true);
+      expect(readySchedule.map((p) => p.frame)).toEqual(floor.presentations.map((p) => p.frame));
+      const skippedFrames = readySchedule.at(-1)!.frame - readySchedule[0]!.frame + 1 - readySchedule.length;
+      expect(Math.abs(o.freeze - skippedFrames * 1_000_000 / FPS)).toBeLessThan(TICK_US);
+      const fmt = (m: ReturnType<typeof score>) =>
+        `frames=${m.presented}/${trace.length} freeze=${(m.freeze / 1000).toFixed(0).padStart(5)}ms`
+        + ` (starve=${(m.starve / 1000).toFixed(0)} hold=${(m.hold / 1000).toFixed(0)})`
+        + ` max=${(m.maxFreeze / 1000).toFixed(0).padStart(4)}ms >100=${String(m.over100).padStart(3)} >250=${String(m.over250).padStart(3)}`
+        + ` readyMiss=${String(m.readinessMisses).padStart(4)}`
+        + ` lat p50/p95/max=${(m.latP50 / 1000).toFixed(0)}/${(m.latP95 / 1000).toFixed(0)}/${(m.latMax / 1000).toFixed(0)}ms`;
+      lines.push(`${name}\n    adaptive  ${fmt(a)}\n    floor     ${fmt(f)}\n    readiness ${fmt(o)}  (source offset ${(readyOffsetUs / 1000).toFixed(0)}ms)`);
+      gate({ a, f, o });
+    }
+    console.log('\n=== ADVERSE MATRIX (shipping defaults, factory-built adaptive) ===\n'
+      + lines.join('\n') + '\n');
+    expect(lines).toHaveLength(rows.length);
+  });
+
+  // Separate the initial impairment from repetitions to measure learned headroom.
+  it('pins the repeated-impairment tradeoff between starvation and policy hold', () => {
+    // The first impaired GOP starts at 6s and ends before 8s.
+    const FIRST_EPISODE_END_US = 8_000_000;
+    const trace = freezeTrace({
+      capacityMbps: 30, seconds: 48,
+      // 300ms episodes — above the 200ms floor, below the fuse threshold.
+      jitterUs: (i) => (i >= 180 && i % 90 === 0 ? 300_000 : 0),
+    });
+    const adaptive = runFactoryPath(trace, PRODUCTION_DEFAULT_CONFIG);
+    const floor = runRealPath(trace, 'floor', PRODUCTION_DEFAULT_CONFIG);
+
+    for (const arm of [adaptive, floor]) {
+      assertTerminalPartition(trace, arm);
+      expect(arm.dependencyViolations).toEqual([]);
+      expect(arm.decisionSequence).toEqual([]); // fuse must NOT intervene
+    }
+
+    // All timing and frame-count metrics use only the selected window.
+    const ref = floorReference(floor);
+    const window = (r: RunResult, from: number, to: number) =>
+      r.presentations.filter((p) => p.captureUs > from && p.captureUs <= to);
+    const END_US = 48_000_000;
+
+    const firstA = window(adaptive, 0, FIRST_EPISODE_END_US);
+    const firstF = window(floor, 0, FIRST_EPISODE_END_US);
+    const laterA = window(adaptive, FIRST_EPISODE_END_US, END_US);
+    const laterF = window(floor, FIRST_EPISODE_END_US, END_US);
+    // Both windows must be non-empty or the phase split is meaningless.
+    for (const w of [firstA, firstF, laterA, laterF]) expect(w.length).toBeGreaterThan(0);
+
+    const a = score(laterA, ref);
+    const f = score(laterF, ref);
+
+    const starvationSaved = f.starve - a.starve;
+    const holdAdded = Math.max(0, a.hold - f.hold);
+
+    console.log('\n=== REPEATED IMPAIRMENT (first episode excluded) ==='
+      + `\n    adaptive  freeze=${(a.freeze / 1000).toFixed(0)}ms starve=${(a.starve / 1000).toFixed(0)}ms hold=${(a.hold / 1000).toFixed(0)}ms >250=${a.over250} latP50=${(a.latP50 / 1000).toFixed(0)}ms`
+      + `\n    floor     freeze=${(f.freeze / 1000).toFixed(0)}ms starve=${(f.starve / 1000).toFixed(0)}ms hold=${(f.hold / 1000).toFixed(0)}ms >250=${f.over250} latP50=${(f.latP50 / 1000).toFixed(0)}ms`
+      + `\n    starvation saved=${(starvationSaved / 1000).toFixed(0)}ms; hold added=${(holdAdded / 1000).toFixed(0)}ms\n`);
+
+    expect(a.starve).toBeLessThan(f.starve * 0.5);
+    expect(a.hold).toBeGreaterThan(f.hold);
+    expect(a.freeze).toBeGreaterThan(f.freeze);
+    expect(a.over250).toBeGreaterThan(f.over250);
+    expect(holdAdded).toBeGreaterThan(starvationSaved);
+    expect(a.presented).toBe(f.presented);
   });
 });
