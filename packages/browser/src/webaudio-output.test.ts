@@ -157,6 +157,32 @@ describe('WebAudioOutput.playheadCaptureUs', () => {
 });
 
 describe('unified playout cushion (delay unification)', () => {
+  it('honors the first render time before the audio context clock has advanced', () => {
+    const { ctx, out } = makeOutput();
+    expect(ctx.currentTime).toBe(0);
+    out.schedule(audioData(5_000_000), 250_000);
+    expect(ctx.started[0]!.when).toBeCloseTo(0.25, 5);
+    expect(out.playheadCaptureUs()).toBeNull();
+    ctx.currentTime = 0.26;
+    expect(out.playheadCaptureUs()).toBeCloseTo(5_010_000, 0);
+  });
+
+  it('honors a standalone delay at context time zero without a render timestamp', () => {
+    const { ctx, out } = makeOutput(200);
+    out.schedule(audioData(5_000_000), 0);
+    expect(ctx.started[0]!.when).toBeCloseTo(0.2, 5);
+  });
+
+  it('chains after a real zero-time start but anchors again after flush', () => {
+    const { ctx, out } = makeOutput();
+    out.schedule(audioData(5_000_000), 0);
+    out.schedule(audioData(5_020_000), 250_000);
+    expect(ctx.started.map((entry) => entry.when)).toEqual([0, 0.02]);
+    out.flush();
+    out.schedule(audioData(6_000_000), 500_000);
+    expect(ctx.started[2]!.when).toBeCloseTo(0.5, 5);
+  });
+
   it('DEFAULT construction adds no delay of its own — the dispatcher owns the cushion', () => {
     // The documented @openmoq/player + @openmoq/browser composition wires this
     // output behind the CommandDispatcher, which already adds the shared

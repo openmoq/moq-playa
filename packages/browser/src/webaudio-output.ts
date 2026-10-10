@@ -40,7 +40,7 @@ export class WebAudioOutput implements AudioOutputLike {
    * Next scheduled playout time in AudioContext.currentTime units.
    * Tracks the end of the last scheduled buffer for seamless playback.
    */
-  private nextScheduledTime = 0;
+  private nextScheduledTime: number | null = null;
 
   /** Active source nodes — tracked for flush/destroy. */
   private readonly activeSources: AudioBufferSourceNode[] = [];
@@ -142,7 +142,7 @@ export class WebAudioOutput implements AudioOutputLike {
     // - playbackDelaySec matches the video output delay so both media
     //   types start at the same wall-clock offset.
     let startTime: number;
-    if (this.nextScheduledTime >= now) {
+    if (this.nextScheduledTime !== null && this.nextScheduledTime >= now) {
       // Normal playback — back-to-back for seamless audio
       startTime = this.nextScheduledTime;
     } else if (renderTimeUs > 0) {
@@ -233,7 +233,7 @@ export class WebAudioOutput implements AudioOutputLike {
     }
     this.activeSources.length = 0;
     this.scheduledRing.length = 0;
-    this.nextScheduledTime = 0;
+    this.nextScheduledTime = null;
   }
 
   /**
