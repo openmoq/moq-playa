@@ -11,7 +11,12 @@ import { startRelayServer } from './server.js';
 
 startRelayServer()
   .then((srv) => {
-    const shutdown = () => { srv.stop(); process.exit(0); };
+    const shutdown = () => {
+      void srv.stop().then(() => process.exit(0), (error) => {
+        console.error('[relay-server] shutdown failed:', (error as Error).message);
+        process.exit(1);
+      });
+    };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
     console.log('[relay-server] relay mode ready — Ctrl-C to stop');

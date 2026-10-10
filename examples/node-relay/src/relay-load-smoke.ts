@@ -89,7 +89,7 @@ async function run(maxConcurrentSubgroupsPerSubscription: number): Promise<numbe
     return elapsedMs;
   } finally {
     await closeAll([...viewers, ...(publisher ? [publisher] : [])]);
-    srv.stop();
+    await srv.stop();
   }
 }
 

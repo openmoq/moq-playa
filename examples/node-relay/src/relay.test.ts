@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { SessionError, type Fetch, type MoqtObjectData, type SubgroupHeader } from '@openmoq/transport';
+import { RequestError18, SessionError, type Fetch, type MoqtObjectData, type SubgroupHeader } from '@openmoq/transport';
 import { MoqtConnection, type IncomingPublish } from '@openmoq/webtransport';
 import { DEMO_NAMESPACE, DEMO_TRACK, nsBytes, te } from './demo.js';
 import { Relay } from './relay.js';
@@ -9,6 +9,8 @@ import { createLoopback, flush } from '../../../packages/webtransport/src/testki
 
 interface SubscriberHarness {
   readonly conn: MoqtConnection;
+  readonly acceptSubscribe: ReturnType<typeof vi.fn>;
+  readonly rejectSubscribe: ReturnType<typeof vi.fn>;
   readonly openSubgroup: ReturnType<typeof vi.fn>;
   readonly sendObject: ReturnType<typeof vi.fn>;
   readonly closeSubgroup: ReturnType<typeof vi.fn>;
@@ -32,9 +34,12 @@ function subscriberHarness(streamLimit: number): SubscriberHarness {
     activeStreams -= 1;
   });
   const close = vi.fn(async () => undefined);
+  const acceptSubscribe = vi.fn(async () => undefined);
+  const rejectSubscribe = vi.fn(async () => undefined);
   const conn = {
     draftVersion: 18,
-    acceptSubscribe: vi.fn(async () => undefined),
+    acceptSubscribe,
+    rejectSubscribe,
     session: {
       getIncomingSubscription: vi.fn(() => ({ remoteFilterType: 'AbsoluteStart' })),
     },
@@ -45,6 +50,8 @@ function subscriberHarness(streamLimit: number): SubscriberHarness {
   } as unknown as MoqtConnection;
   return {
     conn,
+    acceptSubscribe,
+    rejectSubscribe,
     openSubgroup,
     sendObject,
     closeSubgroup,
@@ -54,10 +61,13 @@ function subscriberHarness(streamLimit: number): SubscriberHarness {
   };
 }
 
-function incomingPublish(alias = 9n): IncomingPublish {
+function incomingPublish(
+  alias = 9n,
+  namespace: readonly string[] = DEMO_NAMESPACE,
+): IncomingPublish {
   return {
     requestId: 1n,
-    trackNamespace: nsBytes(DEMO_NAMESPACE),
+    trackNamespace: nsBytes([...namespace]),
     trackName: te(DEMO_TRACK),
     trackAlias: alias,
     onObject: null,
@@ -70,12 +80,13 @@ function object(
   groupId: bigint,
   objectId = 0n,
   properties?: Uint8Array,
+  subgroupId = 0n,
 ): MoqtObjectData {
   return {
     kind: 'data',
     trackAlias: alias,
     groupId,
-    subgroupId: 0n,
+    subgroupId,
     objectId,
     publisherPriority: 128,
     isFirstObjectInSubgroup: objectId === 0n,
@@ -85,12 +96,12 @@ function object(
   };
 }
 
-function subgroupHeader(alias: bigint, groupId: bigint): SubgroupHeader {
+function subgroupHeader(alias: bigint, groupId: bigint, subgroupId = 0n): SubgroupHeader {
   return {
     typeByte: 0x10,
     trackAlias: alias,
     groupId,
-    subgroupId: 0n,
+    subgroupId,
     publisherPriority: 128,
     hasExtensions: false,
     isEndOfGroup: false,
@@ -104,6 +115,94 @@ async function acceptPublisher(relay: Relay, publish: IncomingPublish): Promise<
 }
 
 describe('Relay subgroup lifecycle', () => {
+  it('does not treat a slash inside a namespace field as a tuple separator', async () => {
+    const relay = new Relay({ registeredNamespaces: [['game', 'player-0']] });
+    const subscriber = subscriberHarness(1);
+    await relay.handleSubscribe(subscriber.conn, 2n, nsBytes(['game/player-0']), te(DEMO_TRACK));
+    expect(subscriber.acceptSubscribe).not.toHaveBeenCalled();
+    expect(subscriber.rejectSubscribe).toHaveBeenCalledWith(2n, RequestError18.DOES_NOT_EXIST, 'unknown track');
+  });
+
+  it('compares track names byte-for-byte rather than stripping a UTF-8 BOM', async () => {
+    const relay = new Relay();
+    const subscriber = subscriberHarness(1);
+    const track = new Uint8Array([0xef, 0xbb, 0xbf, ...te(DEMO_TRACK)]);
+    await relay.handleSubscribe(subscriber.conn, 2n, nsBytes(DEMO_NAMESPACE), track);
+    expect(subscriber.acceptSubscribe).not.toHaveBeenCalled();
+    expect(subscriber.rejectSubscribe).toHaveBeenCalledWith(2n, RequestError18.DOES_NOT_EXIST, 'unknown track');
+  });
+
+  it('routes explicitly registered namespaces and rejects other namespaces', async () => {
+    const relay = new Relay({
+      registeredNamespaces: [
+        ['game', 'player-0'],
+        ['game', 'player-1'],
+      ],
+    });
+    const accepted = subscriberHarness(1);
+    const rejected = subscriberHarness(1);
+
+    await relay.handleSubscribe(
+      accepted.conn,
+      2n,
+      nsBytes(['game', 'player-1']),
+      te(DEMO_TRACK),
+    );
+    await relay.handleSubscribe(
+      rejected.conn,
+      4n,
+      nsBytes(['game', 'player-2']),
+      te(DEMO_TRACK),
+    );
+
+    expect(accepted.acceptSubscribe).toHaveBeenCalledOnce();
+    expect(accepted.rejectSubscribe).not.toHaveBeenCalled();
+    expect(rejected.acceptSubscribe).not.toHaveBeenCalled();
+    expect(rejected.rejectSubscribe).toHaveBeenCalledWith(
+      4n,
+      RequestError18.DOES_NOT_EXIST,
+      'unknown track',
+    );
+  });
+
+  it('does not cross-route objects between registered namespaces', async () => {
+    const firstNamespace = ['game', 'player-0'];
+    const secondNamespace = ['game', 'player-1'];
+    const relay = new Relay({
+      registeredNamespaces: [firstNamespace, secondNamespace],
+    });
+    const first = subscriberHarness(1);
+    const second = subscriberHarness(1);
+    await relay.handleSubscribe(first.conn, 2n, nsBytes(firstNamespace), te(DEMO_TRACK));
+    await relay.handleSubscribe(second.conn, 4n, nsBytes(secondNamespace), te(DEMO_TRACK));
+    const firstPublish = incomingPublish(9n, firstNamespace);
+    const secondPublish = incomingPublish(10n, secondNamespace);
+    await acceptPublisher(relay, firstPublish);
+    await acceptPublisher(relay, secondPublish);
+
+    const firstObject = object(firstPublish.trackAlias, 1n, 0n, undefined, 11n);
+    const secondObject = object(secondPublish.trackAlias, 2n, 0n, undefined, 22n);
+    firstPublish.onObject?.(firstObject);
+    secondPublish.onObject?.(secondObject);
+    firstPublish.onSubgroupClosed?.(subgroupHeader(firstPublish.trackAlias, 1n, 11n));
+    secondPublish.onSubgroupClosed?.(subgroupHeader(secondPublish.trackAlias, 2n, 22n));
+
+    await vi.waitFor(() => {
+      expect(first.sendObject).toHaveBeenCalledOnce();
+      expect(second.sendObject).toHaveBeenCalledOnce();
+      expect(first.closeSubgroup).toHaveBeenCalledOnce();
+      expect(second.closeSubgroup).toHaveBeenCalledOnce();
+    });
+    expect(first.sendObject.mock.calls[0]?.[1]).toBe(firstObject.objectId);
+    expect(first.sendObject.mock.calls[0]?.[2]).toBe(firstObject.payload);
+    expect(second.sendObject.mock.calls[0]?.[1]).toBe(secondObject.objectId);
+    expect(second.sendObject.mock.calls[0]?.[2]).toBe(secondObject.payload);
+    expect(first.openSubgroup.mock.calls[0]?.[1]).toBe(1n);
+    expect(first.openSubgroup.mock.calls[0]?.[2]).toBe(11n);
+    expect(second.openSubgroup.mock.calls[0]?.[1]).toBe(2n);
+    expect(second.openSubgroup.mock.calls[0]?.[2]).toBe(22n);
+  });
+
   it('drops queued forwarding on cancellation without sending FIN to an unfinished subgroup', async () => {
     const relay = new Relay();
     const sub = subscriberHarness(2);

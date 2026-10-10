@@ -131,7 +131,7 @@ async function main(): Promise<number> {
   } finally {
     await viewer.close().catch(() => { /* teardown */ });
     await pub.close().catch(() => { /* teardown */ });
-    srv.stop();
+    await srv.stop();
   }
 }
 

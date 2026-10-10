@@ -61,6 +61,10 @@ supports multiple subscriptions per viewer connection (one alias each), a tiny
 latest-group cache replayed to late joiners, and per-subscription cleanup when a
 viewer unsubscribes one track (ABR switch) without closing the connection.
 
+Namespace registration defaults to the `['demo']` tuple. An embedded relay can
+set `RelayOptions.registeredNamespaces` to accept additional exact tuples;
+namespace fields and track names are compared byte-for-byte.
+
 The relay also answers **FETCH** from the latest-group cache (§9.16 / draft-18
 §10.12): standalone FETCH serves `cache ∩ [start, end)` with proper
 `INVALID_RANGE` / `DOES_NOT_EXIST` rejections, and a **relative joining FETCH**
@@ -77,8 +81,25 @@ PORT=4433 pnpm --filter @moqt/example-node-relay relay-server
 # self-contained smokes:
 pnpm --filter @moqt/example-node-relay relay-smoke        # 1 publisher → 2 subscribers, IDs + Properties preserved
 pnpm --filter @moqt/example-node-relay relay-load-smoke   # compare 1 vs 8 downstream subgroup lanes over real QUIC
+pnpm --filter @moqt/example-node-relay relay-namespace-load-smoke # compare 1 vs 8 namespaces, one publisher + subscriber each
 pnpm --filter @moqt/example-node-relay relay-media-smoke  # multi-track fanout + late join + ABR cleanup
 pnpm --filter @moqt/example-node-relay relay-fetch-smoke  # late viewer gets the current group via joining FETCH
+```
+
+`relay-namespace-load-smoke` runs the relay in a separate process and defaults to
+10 seconds of 2 Mbps traffic at 20 groups per second for each namespace. It
+requires every expected group and subgroup FIN, rejects duplicate or cross-routed
+delivery and incomplete shutdown, and reports delivery lag, arrival gaps,
+publisher drift, and per-namespace stalls. Duplicate observation continues for one second after all
+expected FINs; configure it with `LOAD_DUPLICATE_OBSERVATION_MS`. Timing is
+diagnostic rather than a pass threshold because host capacity varies. Relay CPU
+and event-loop telemetry covers the child process's complete lifecycle, including setup and
+teardown, rather than only the publishing interval. The workload is configurable:
+
+```bash
+LOAD_PAIRS=8 LOAD_DURATION_MS=30000 LOAD_GROUPS_PER_SECOND=20 \
+LOAD_BITS_PER_SECOND=2000000 LOAD_DUPLICATE_OBSERVATION_MS=1000 \
+pnpm --filter @moqt/example-node-relay relay-namespace-load-smoke
 ```
 
 ## Use with the publisher and browser player
@@ -95,8 +116,8 @@ generate a CMAF fixture from an MP4, publish it (optionally looped) into
   of payload is treated as a slow consumer and its connection is closed rather
   than allowing latency and memory to grow without limit. This single-process
   example still runs on one Node event loop; sustained CPU saturation requires more
-  capacity or a production relay, and it is not intended for multiple concurrent
-  video publishers or production capacity testing.
+  capacity or a production relay. The namespace smoke measures a synthetic local
+  workload, not browser playback quality or production capacity.
 - **Live, latest-group cache only** — a late joiner gets the most-recent group, not
   history (no DVR, no init-segment retention policy). FETCH is served from the same
   single-group cache: ranges reaching further back truncate honestly (gaps in the

@@ -32,7 +32,8 @@ export interface StartServerOptions {
 export interface RunningServer {
   readonly port: number;
   readonly url: string;
-  stop: () => void;
+  readonly closed: Promise<void>;
+  stop: () => Promise<void>;
 }
 
 export interface StartRelayServerOptions extends Omit<StartServerOptions, 'relay'> {
@@ -60,6 +61,8 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
 
   const { cert, privKey } = loadCert();
   const server: any = new Http3Server({ port, host, secret: 'moqt-node-example', cert, privKey });
+  const closed: Promise<void> = Promise.resolve(server.closed);
+  void closed.catch(() => undefined);
   server.startServer();
   await server.ready;
 
@@ -69,7 +72,15 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Runnin
 
   void acceptLoop(server, path, opts.onEstablished, opts.relay);
 
-  return { port: boundPort, url, stop: () => { try { server.stopServer(); } catch { /* ignore */ } } };
+  let stopping: Promise<void> | undefined;
+  return {
+    port: boundPort,
+    url,
+    closed,
+    stop: () => stopping ??= Promise.resolve()
+      .then(() => server.stopServer())
+      .then(() => closed),
+  };
 }
 
 async function acceptLoop(
@@ -192,7 +203,13 @@ const isMain = process.argv[1] === fileURLToPath(import.meta.url);
 if (isMain) {
   startServer()
     .then((srv) => {
-      const shutdown = () => { log('shutting down'); srv.stop(); process.exit(0); };
+      const shutdown = () => {
+        log('shutting down');
+        void srv.stop().then(() => process.exit(0), (error) => {
+          log('shutdown failed:', (error as Error).message);
+          process.exit(1);
+        });
+      };
       process.on('SIGINT', shutdown);
       process.on('SIGTERM', shutdown);
       log('ready — connect a client (e.g. `pnpm client`), or Ctrl-C to stop');

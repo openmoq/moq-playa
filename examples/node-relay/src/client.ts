@@ -97,42 +97,108 @@ export async function subscribeAndCollect(
 export interface ClientHandle {
   readonly conn: MoqtConnection;
   readonly transport: any;
+  /** Rejects if this client fails before an intentional close begins. */
+  readonly failure: Promise<never>;
   /** Close the WebTransport session and await teardown. */
   close: () => Promise<void>;
 }
 
-export async function connectClient(url: string): Promise<ClientHandle> {
+export interface ConnectClientOptions {
+  /** Cancels connection setup and closes the adopted transport immediately. */
+  readonly signal?: AbortSignal;
+}
+
+export async function connectClient(
+  url: string,
+  options: ConnectClientOptions = {},
+): Promise<ClientHandle> {
   // Wait for the native quiche lib before constructing the transport (see server.ts).
   await quicheLoaded;
+  if (options.signal?.aborted) throw new Error('WebTransport connection aborted');
   const transport: any = new WebTransport(url, {
     serverCertificateHashes: [{ algorithm: 'sha-256', value: certSha256() }],
     protocols: ['moqt-18'],
   });
-  await transport.ready;
-  log(`WebTransport ready (protocol=${transport.protocol ?? ''})`);
-
-  const wtl = nodeSessionToWebTransportLike(transport);
-  const conn = new MoqtConnection(18);
+  const transportClosed = Promise.resolve(transport.closed);
+  void transportClosed.catch(() => undefined);
+  let transportCloseRequested = false;
   let closing = false;
-  conn.onError = (e) => log('onError:', e.message);
-  conn.onClose = (code, reason) => { if (!closing) log(`onClose: code=${code} reason=${reason ?? ''}`); };
-  conn.onMessage = (m) => log('onMessage:', m.type);
-
-  await conn.connect(wtl);
-  log(`SETUP complete — session ${conn.session.state}`);
-
-  return {
-    conn,
-    transport,
-    close: async () => {
-      closing = true;
-      // Graceful MoQT close FIRST: this transitions the session to CLOSED, so the
-      // subsequent control-stream teardown isn't surfaced as a §3.3 violation.
-      try { await conn.close(); } catch { /* ignore */ }
-      try { transport.close(); } catch { /* ignore */ }
-      try { await transport.closed; } catch { /* ignore */ }
-    },
+  const closeTransport = () => {
+    if (transportCloseRequested) return;
+    transportCloseRequested = true;
+    try { transport.close(); } catch { /* transport may already be terminal */ }
   };
+  let rejectAbort!: (error: Error) => void;
+  const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+  const onAbort = () => {
+    closing = true;
+    closeTransport();
+    rejectAbort(new Error('WebTransport connection aborted'));
+  };
+  options.signal?.addEventListener('abort', onAbort, { once: true });
+
+  try {
+    if (options.signal?.aborted) onAbort();
+    await Promise.race([transport.ready, aborted]);
+    log(`WebTransport ready (protocol=${transport.protocol ?? ''})`);
+
+    const wtl = nodeSessionToWebTransportLike(transport);
+    const conn = new MoqtConnection(18);
+    let rejectFailure!: (error: Error) => void;
+    const failure = new Promise<never>((_, reject) => { rejectFailure = reject; });
+    // Most demo callers only need close(); keep an ignored lifecycle observer
+    // from becoming an unhandled rejection while still exposing it to load tests.
+    void failure.catch(() => undefined);
+    let failureReported = false;
+    const reportFailure = (error: Error) => {
+      if (closing || failureReported) return;
+      failureReported = true;
+      rejectFailure(error);
+    };
+    conn.onError = (e) => {
+      log('onError:', e.message);
+      reportFailure(e);
+    };
+    conn.onClose = (code, reason) => {
+      if (closing) return;
+      const message = `MoQT session closed unexpectedly (code=${code ?? 'unknown'}, reason=${reason ?? ''})`;
+      log(message);
+      reportFailure(new Error(message));
+    };
+    conn.onMessage = (m) => log('onMessage:', m.type);
+
+    await Promise.race([conn.connect(wtl), aborted, failure]);
+    log(`SETUP complete — session ${conn.session.state}`);
+    let closePromise: Promise<void> | undefined;
+
+    return {
+      conn,
+      transport,
+      failure,
+      close: () => {
+        if (closePromise !== undefined) return closePromise;
+        closing = true;
+        // MoQT owns the transport close; observe both outcomes without closing twice.
+        closePromise = Promise.allSettled([
+          Promise.resolve().then(() => conn.close()),
+          transportClosed,
+        ]).then((results) => {
+          const errors = results.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+          if (errors.length > 0) {
+            const messages = errors.map((error: unknown) => error instanceof Error ? error.message : String(error));
+            throw new AggregateError(errors, `client shutdown failed: ${messages.join('; ')}`);
+          }
+        });
+        return closePromise;
+      },
+    };
+  } catch (error) {
+    closing = true;
+    closeTransport();
+    throw error;
+  } finally {
+    options.signal?.removeEventListener('abort', onAbort);
+  }
 }
 
 // ── CLI entrypoint ──────────────────────────────────────────────────────────

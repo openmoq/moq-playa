@@ -65,7 +65,7 @@ async function main(): Promise<number> {
     log('RESULT: FAIL —', (err as Error).message);
     return 1;
   } finally {
-    srv.stop();
+    await srv.stop();
   }
 }
 

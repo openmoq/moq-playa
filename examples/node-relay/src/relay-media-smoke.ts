@@ -106,7 +106,7 @@ async function main(): Promise<number> {
     await viewer1.close();
     await viewer2.close();
     await publisher.close();
-    srv.stop();
+    await srv.stop();
   }
 }
 

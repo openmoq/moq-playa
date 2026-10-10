@@ -67,7 +67,7 @@ async function main(): Promise<number> {
     await subA.close();
     await subB.close();
     await pub.close();
-    srv.stop();
+    await srv.stop();
   }
 }
 

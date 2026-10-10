@@ -30,14 +30,14 @@
  */
 import type { MoqtConnection, IncomingPublish } from '@openmoq/webtransport';
 import { MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@openmoq/transport';
-import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, nsStr, hex } from './demo.js';
+import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, te, nsStr, hex } from './demo.js';
 import { SubgroupForwarder, type ForwardLimits } from './subgroup-forwarder.js';
 import { isRequestStreamDraft } from '@openmoq/transport';
 
 const log = (...a: unknown[]) => console.log('[relay]', ...a);
 
 /** Tracks this relay will route: the simple demo track + the toy media ladder. */
-const REGISTERED_TRACKS = new Set<string>([DEMO_TRACK, ...MEDIA_TRACKS]);
+const REGISTERED_TRACKS = new Set([DEMO_TRACK, ...MEDIA_TRACKS].map((name) => hex(te(name))));
 
 interface CachedObject {
   readonly firstObject: boolean;
@@ -87,6 +87,8 @@ class Subscriber {
 }
 
 export interface RelayOptions {
+  /** Exact namespace tuples this toy relay accepts. Defaults to DEMO_NAMESPACE. */
+  readonly registeredNamespaces?: readonly (readonly string[])[];
   /** Maximum downstream subgroup streams held open by one subscription. */
   readonly maxConcurrentSubgroupsPerSubscription?: number;
   /** Disconnect a subscriber rather than retain more queued objects than this. */
@@ -110,19 +112,31 @@ interface Track {
   cacheClosedSubgroups: Set<string>;
 }
 
+/** ASCII-safe namespace key that preserves tuple-field boundaries. */
+const namespaceKeyOf = (namespace: readonly Uint8Array[]): string =>
+  namespace.map(hex).join(',');
+
+const configuredNamespaceKeyOf = (namespace: readonly string[]): string =>
+  namespaceKeyOf(namespace.map(te));
+
 /** ASCII-safe route-table key (hex of each namespace field + the track name). */
 const trackKeyOf = (namespace: Uint8Array[], trackName: Uint8Array): string =>
-  `${namespace.map(hex).join(',')}|${hex(trackName)}`;
-
-const isRegisteredTrack = (namespace: Uint8Array[], trackName: Uint8Array): boolean =>
-  nsStr(namespace) === DEMO_NAMESPACE.join('/') && REGISTERED_TRACKS.has(td(trackName));
+  `${namespaceKeyOf(namespace)}|${hex(trackName)}`;
 
 export class Relay {
   private readonly tracks = new Map<string, Track>();
   private nextAlias = 100n;
   private readonly forwardLimits: ForwardLimits;
+  private readonly registeredNamespaceKeys: ReadonlySet<string>;
 
   constructor(options: RelayOptions = {}) {
+    const registeredNamespaces = options.registeredNamespaces ?? [DEMO_NAMESPACE];
+    if (registeredNamespaces.length === 0) {
+      throw new RangeError('registeredNamespaces must contain at least one namespace');
+    }
+    this.registeredNamespaceKeys = new Set(
+      registeredNamespaces.map(configuredNamespaceKeyOf),
+    );
     this.forwardLimits = {
       maxConcurrentSubgroups: positiveInteger(
         'maxConcurrentSubgroupsPerSubscription',
@@ -153,6 +167,11 @@ export class Relay {
     return track;
   }
 
+  private isRegisteredTrack(namespace: Uint8Array[], trackName: Uint8Array): boolean {
+    return this.registeredNamespaceKeys.has(namespaceKeyOf(namespace))
+      && REGISTERED_TRACKS.has(hex(trackName));
+  }
+
   /** A subscriber's SUBSCRIBE: accept with a fresh alias, register, replay live cache. */
   async handleSubscribe(
     conn: MoqtConnection,
@@ -161,7 +180,7 @@ export class Relay {
     trackName: Uint8Array,
   ): Promise<void> {
     try {
-      if (!isRegisteredTrack(namespace, trackName)) {
+      if (!this.isRegisteredTrack(namespace, trackName)) {
         log(`SUBSCRIBE ${nsStr(namespace)}/${td(trackName)} — not registered; rejecting`);
         await conn.rejectSubscribe(requestId, RequestError18.DOES_NOT_EXIST, 'unknown track');
         return;
@@ -218,7 +237,7 @@ export class Relay {
   /** A publisher's PUBLISH: accept and forward its objects to all subscribers. */
   async handlePublish(conn: MoqtConnection, publish: IncomingPublish): Promise<void> {
     try {
-      if (!isRegisteredTrack(publish.trackNamespace, publish.trackName)) {
+      if (!this.isRegisteredTrack(publish.trackNamespace, publish.trackName)) {
         log(`PUBLISH ${nsStr(publish.trackNamespace)}/${td(publish.trackName)} — not registered; rejecting`);
         await conn.rejectSubscribe(publish.requestId, RequestError18.DOES_NOT_EXIST, 'unknown track');
         return;
@@ -298,7 +317,7 @@ export class Relay {
     try {
       if (fetch.fetch.fetchType === 0x1) {
         const sf = fetch.fetch as StandaloneFetch;
-        if (!isRegisteredTrack(sf.trackNamespace, sf.trackName)) {
+        if (!this.isRegisteredTrack(sf.trackNamespace, sf.trackName)) {
           log(`FETCH ${nsStr(sf.trackNamespace)}/${td(sf.trackName)} — not registered; rejecting`);
           await conn.rejectFetch(requestId, RequestError18.DOES_NOT_EXIST as bigint, 'unknown track');
           return;
