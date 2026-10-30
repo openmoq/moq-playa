@@ -111,6 +111,12 @@ export interface ConnectionConfig {
   readonly namespace: string | readonly string[];
 
   /**
+   * The track name for requesting catalogs. This should be
+   * 'catalog' in most cases but can be overridden here if required.
+   */
+  readonly catalogTrackName?: string;
+
+  /**
    * MAX_REQUEST_ID for the MOQT session. Default: 100.
    * Must be nonzero for subscriptions to work.
    * @see draft-ietf-moq-transport-16 §9.3.1.3

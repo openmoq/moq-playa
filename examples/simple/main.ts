@@ -6,7 +6,7 @@
  */
 
 import { Player } from '@openmoq/playa';
-import { namespace, certHash, draftVersion } from '../shared/cert.js';
+import { namespace, certHash, draftVersion, catalogTrackName } from '../shared/cert.js';
 import { resolveRelayEndpoint, onDiscoveryAttempt } from '../shared/relay-endpoint.js';
 
 // ─── DOM refs & helpers ─────────────────────────────────────────────
@@ -57,6 +57,7 @@ async function main(): Promise<void> {
   const player = new Player(playerContainer, {
     url: relayUrl,
     namespace,
+    ...(catalogTrackName ? { catalogTrackName } : {}),
     ...(certHash ? { certHash } : {}),
     ...(draftVersion ? { draftVersion } : {})
   });
