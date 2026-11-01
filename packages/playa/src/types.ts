@@ -62,6 +62,8 @@ export interface PlayerOptions {
   readonly startLevel?: number | 'lowest' | 'auto';
   /** Initial video view (catalog altGroup). Omitted: first video group. */
   readonly videoAltGroup?: number;
+  /** Initial catalog scope, alternate sets, and exact track identities. */
+  readonly selection?: MoqtPlayerConfig['selection'];
   /** Cap quality to a maximum resolution. */
   readonly maxResolution?: { readonly width: number; readonly height: number };
 

@@ -7,6 +7,7 @@
  * @module
  */
 
+import type { CatalogNamespaceContext } from './track-identity.js';
 import type { Catalog } from './types.js';
 import { parseMsfCatalog } from './catalog-msf00.js';
 import { parseCatalogFormat01 } from './catalog-cf01.js';
@@ -24,7 +25,7 @@ import { parseCatalogFormat01 } from './catalog-cf01.js';
  */
 export function parseCatalogAuto(
     json: string | Uint8Array,
-    catalogNamespace?: string,
+    catalogNamespace?: CatalogNamespaceContext,
 ): Catalog {
     const text = typeof json === 'string' ? json : new TextDecoder().decode(json);
     const raw: unknown = JSON.parse(text);

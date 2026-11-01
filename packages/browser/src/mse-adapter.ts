@@ -1248,6 +1248,16 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /**
+   * The timestamp offset in force for a SourceBuffer, or undefined when that
+   * buffer does not exist yet. Lets a caller that retains an ongoing timeline
+   * across {@link changeType} restore the offset this method reports.
+   */
+  getTimestampOffset(mediaType: 'video' | 'audio'): number | undefined {
+    const buffer = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
+    return buffer ? buffer.timestampOffset : undefined;
+  }
+
+  /**
    * Set the timestampOffset on a SourceBuffer.
    * Used by the assembler to rebase CMAF timestamps to zero so that
    * MSE 'segments' mode starts playback immediately.

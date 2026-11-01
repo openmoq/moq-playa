@@ -30,6 +30,9 @@ import { loadFixtureFromDisk, validateFixtureLayout, validateFixtureBoxes } from
 // Flags first, then [url] [fixtureDir] in either order:
 // anything starting with https:// is the url, anything else is a fixture dir.
 //   --loop | --loop-count N   repeat media as new groups (endless / N groups)
+//   --start-loop N            begin at loop iteration N (default 0), so the media
+//                             timeline starts at N x loopSpan instead of zero;
+//                             pacing still starts immediately
 //   --pace-media             pace each track from its actual CMAF decode timeline
 //   --catalog-format <fmt>    msf-00 (CMAF default) | cmsf-01 (LOCMAF default, root
 //                             initDataList, per-track initRef)
@@ -40,6 +43,7 @@ import { loadFixtureFromDisk, validateFixtureLayout, validateFixtureBoxes } from
 //   --locmaf                  alias for --packaging locmaf
 const rawArgs = process.argv.slice(2);
 let loops = 1;
+let startLoop = 0;
 let catalogFormat: CatalogFormat | undefined;
 let deltaAfterMs: number | undefined;
 let packaging: MediaPackaging = 'cmaf';
@@ -53,6 +57,10 @@ for (let i = 0; i < rawArgs.length; i++) {
     const n = Number(rawArgs[++i]);
     if (!Number.isInteger(n) || n < 1) { console.error('--loop-count requires a positive integer'); process.exit(2); }
     loops = n;
+  } else if (a === '--start-loop') {
+    const n = Number(rawArgs[++i]);
+    if (!Number.isSafeInteger(n) || n < 0) { console.error('--start-loop requires a nonnegative safe integer'); process.exit(2); }
+    startLoop = n;
   } else if (a === '--catalog-format') {
     const fmt = rawArgs[++i];
     if (fmt !== 'msf-00' && fmt !== 'cmsf-01') { console.error('--catalog-format must be msf-00 or cmsf-01'); process.exit(2); }
@@ -97,10 +105,10 @@ if (fixtureDir) {
 }
 
 const paceMs = process.env.PACE_MS !== undefined ? Number(process.env.PACE_MS) : fixture.manifest.chunkDurationMs;
-console.log(`[publish] connecting to ${url} (${paceByMediaTime ? 'pace=media-timestamps' : `paceMs=${paceMs}`}, loops=${loops === Infinity ? '∞' : loops}, catalog=${catalogFormat}, packaging=${packaging}${deltaAfterMs !== undefined ? `, delta@${deltaAfterMs}ms` : ''})`);
+console.log(`[publish] connecting to ${url} (${paceByMediaTime ? 'pace=media-timestamps' : `paceMs=${paceMs}`}, loops=${loops === Infinity ? '∞' : loops}${startLoop > 0 ? `, startLoop=${startLoop}` : ''}, catalog=${catalogFormat}, packaging=${packaging}${deltaAfterMs !== undefined ? `, delta@${deltaAfterMs}ms` : ''})`);
 connectClient(url, 'publisher')
   .then(async (h) => {
-    await publishFixture(h.conn, fixture, { paceMs, paceByMediaTime, loops, catalogFormat, packaging, ...(deltaAfterMs !== undefined ? { deltaAfterMs } : {}) });
+    await publishFixture(h.conn, fixture, { paceMs, paceByMediaTime, loops, startLoop, catalogFormat, packaging, ...(deltaAfterMs !== undefined ? { deltaAfterMs } : {}) });
     await h.close();
     process.exit(0);
   })

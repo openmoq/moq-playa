@@ -26,16 +26,21 @@ import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import { MoqtConnectionError } from '@openmoq/webtransport';
 import type { DataStreamTerminal, GoawayNotice, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
-import type { MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
+import type { DataStreamHeader, MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
 import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@openmoq/playback';
 import { BufferBasedController } from '@openmoq/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@openmoq/playback';
-import type { AltGroup, CatalogState, CatalogTrack } from '@openmoq/msf';
+import type { AltGroup, CatalogState, CatalogTrack, ResolvedTrackNamespace } from '@openmoq/msf';
+import type { SelectionIntent, TrackIdentity } from './catalog-selection.js';
+import { buildCatalogSelection, resolveSelection } from './catalog-selection.js';
+import { composeSelection } from './selection-composition.js';
+import { selectionIntentFromConfig } from './configured-selection.js';
 import type { LocHeaders } from '@openmoq/loc';
 import { LocmafFormatError, LocmafTrackDecoder, deserializeLocmafObject, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes } from '@openmoq/locmaf';
 import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@openmoq/locmaf';
-import { groupByAlt, parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@openmoq/msf';
+import { groupByAlt, parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported,
+  fieldsFromCatalogText, identityKey, namespaceFieldsOf, sameNamespaceFields } from '@openmoq/msf';
 
 import { TypedEmitter } from './emitter.js';
 import { HookChain } from './hooks.js';
@@ -54,6 +59,7 @@ import { checkSupport as detectSupport } from './support.js';
 import type { SupportReport } from './support.js';
 import { CatalogManager } from './catalog-manager.js';
 import { QualityController } from './quality-controller.js';
+import { prepareHandoverSelection, type HandoverIntent } from './player-handover-selection.js';
 import { SubscriptionManager, type TrackPackaging } from './subscription-manager.js';
 import { isMsePackaging, mediaTrackPackaging, usesMsePath } from './packaging.js';
 
@@ -141,13 +147,34 @@ function encodeNamespace(
   ns: string | readonly string[],
   enc: TextEncoder,
 ): Uint8Array[] {
-  const fields = typeof ns === 'string' ? ns.split('/') : Array.from(ns);
-  return fields.map(segment => enc.encode(segment));
+  return namespaceFields(ns).map(segment => enc.encode(segment));
 }
 
-/** Display form of a config namespace, joining tuple fields with `/`. */
-function namespaceDisplay(ns: string | readonly string[]): string {
-  return typeof ns === 'string' ? ns : ns.join('/');
+/** Stable key for a wire identity. Keeps same-name tracks in different
+ *  namespaces apart in every map that records what was requested. */
+function identityKeyOf(namespace: readonly string[], name: string): string {
+  return identityKey(namespace, name);
+}
+
+/** The ordered wire fields a config namespace denotes. */
+function namespaceFields(ns: string | readonly string[]): readonly string[] {
+  return typeof ns === 'string' ? fieldsFromCatalogText(ns) : Array.from(ns);
+}
+
+/**
+ * The namespace a TRACK is addressed in.
+ *
+ * A catalog track may declare its own namespace, which overrides the
+ * inherited one (msf-01 §5.2.2), so the request has to carry the track's
+ * fields rather than the player's configured namespace. Only a track with no
+ * namespace of its own falls back to the configured context.
+ */
+function trackNamespaceFields(
+  track: { readonly namespace?: string; readonly resolvedNamespace?: ResolvedTrackNamespace } | undefined,
+  configured: string | readonly string[],
+): readonly string[] {
+  const declared = track === undefined ? undefined : namespaceFieldsOf(track);
+  return declared ?? namespaceFields(configured);
 }
 
 /**
@@ -159,6 +186,13 @@ function namespaceDisplay(ns: string | readonly string[]): string {
  */
 function codecsCompatible(a: string, b: string): boolean {
   return a === b;
+}
+
+/** Exact byte equality — MSE initialization is compared, never approximated. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 function defaultMediaSubscriptionFilter(isLive: boolean) {
@@ -197,10 +231,19 @@ function defined(obj: Record<string, unknown>): any {
 
 // ─── Hook intent types ───────────────────────────────────────────────
 
-/** Intent to subscribe to a track — passed through beforeSubscribe hook. */
+/**
+ * Intent to subscribe to a track — passed through the beforeSubscribe hook.
+ *
+ * `namespace` is the ordered wire tuple the request will carry, which is the
+ * track's own namespace when the catalog declares one (msf-01 §5.2.2) and the
+ * configured namespace otherwise. A hook that may CANCEL a subscription has
+ * to see the identity actually being requested; a name alone cannot tell two
+ * same-name tracks apart (§5.2.3).
+ */
 export interface SubscribeIntent {
   readonly trackName: string;
-  readonly mediaType: 'video' | 'audio';
+  readonly mediaType: 'video' | 'audio' | 'init' | 'mediatimeline' | 'eventtimeline';
+  readonly namespace: readonly string[];
 }
 
 /** Result of a TRACK_STATUS query (§9.19).
@@ -269,20 +312,274 @@ function errorRetainedBytes(err: unknown, context: unknown, depth = 0): number {
  */
 interface MigrationTxn {
   readonly conn: MoqtConnection;
+  /** The endpoint this attempt is moving TO, recorded at adoption so a
+   *  replacement that sends an empty New Session URI during retirement
+   *  resolves against it rather than the configured origin. */
+  readonly target?: string;
   /** Staged events, each tagged with the live-delivery error source used to
-   *  classify a replay failure the same way live delivery would. */
-  readonly events: Array<{ readonly run: () => void; readonly source: MoqtConnectionErrorSource }>;
+   *  classify a replay failure the same way live delivery would, and — for
+   *  data — with the alias and stream it arrived on. The tag is what lets an
+   *  object retained BEFORE its alias was bound be taken back out and handled
+   *  as the evidence it turns out to be (16 §10.4.2, 18 §11.4.2, 22
+   *  §3.1.3.1 reordering), instead of
+   *  waiting for an adoption that can never happen without it. */
+  readonly events: Array<{
+    readonly run: () => void;
+    readonly source: MoqtConnectionErrorSource;
+    readonly alias?: bigint;
+    readonly streamId?: bigint;
+    readonly obj?: MoqtObject;
+  }>;
   retainedBytes: number;
   /** Candidate reached a terminal state (closed/errored) or overflowed staging. */
   aborted: boolean;
+  /** Wakes an attempt blocked on a factory, auth or connect promise that may
+   *  never settle, so abort can release the single-flight slot and cancel the
+   *  attempt timer without waiting for that promise. */
+  wake?: () => void;
+  /** The candidate's OWN catalog retrieval state. Live slots are never
+   *  swapped: evidence arriving on the candidate's connection routes here
+   *  instead, and adoption transfers this holder wholesale. */
+  slots?: CatalogSlots;
+  /** Everything the candidate has PREPARED but not yet had adopted. Each
+   *  element is readiness evidence the replacement actually produced — an
+   *  accepted request and its delivered payload — never a request we sent. */
+  prep?: CandidatePrep;
   /** Candidate has been promoted — staging is closed; further events run live. */
   committed: boolean;
   /** The committed session closed/fatally-errored DURING drain — stop replaying
    *  its events and do not report a successful migration. */
   terminated: boolean;
-  /** The candidate catalog subscription's terminal drain completed BEFORE
-   *  commit: replayed after the staged events flush (never lost). */
-  catalogDrainPending?: boolean;
+  /** Registrations the adopted session superseded, pruned once the old
+   *  session has actually been retired — never at commit, because until then
+   *  it may still be delivering the media playback is running on. */
+  superseded?: { ids: Set<bigint>; aliases: Set<bigint> } | undefined;
+  /** The session being REPLACED died while this attempt was still preparing.
+   *  Held rather than announced: a healthy replacement makes it a non-event,
+   *  and only an attempt that then fails has to report it. */
+  oldTerminal?: { kind: 'close'; error?: number; reason?: string }
+    | { kind: 'error'; error: Error; severity: ErrorSeverity; code: PlayerErrorCodeValue;
+        context?: Record<string, unknown> }
+    | undefined;
+}
+
+/**
+ * A replacement session's prepared, not-yet-adopted playback state.
+ *
+ * Readiness is EVIDENCE, not intent: a catalog that parsed, media
+ * subscriptions the replacement ACCEPTED, and initialization we actually
+ * hold. Sending a request proves nothing, so nothing here is recorded at send
+ * time — only when the peer answers (draft-22 §7.4.1, 16 §8.4.1, 18 §9.4.1:
+ * the old subscriptions may be cancelled once the new ones have succeeded).
+ *
+ * All of it is transaction-local. A candidate that fails is discarded whole
+ * and live playback never observed it; adoption transfers it in one step.
+ */
+interface CandidatePrep {
+  /** Resolves when the candidate's catalog CONVERGED through its own
+   *  configured retrieval policy (legacy subscribe, joining FETCH, or a
+   *  draft-22 fill), rejects when that retrieval failed. */
+  readonly catalog: Promise<CatalogState>;
+  resolveCatalog(state: CatalogState): void;
+  rejectCatalog(err: Error): void;
+  /** The converged catalog, and any pre-adoption delta applied to it. */
+  state: CatalogState | null;
+  /** Prepared media subscriptions by the candidate's OWN request id. Request
+   *  ids and track aliases collide freely across sessions, so these are never
+   *  mixed into the live registries until adoption. */
+  readonly media: Map<bigint, PreparedSub>;
+  /** Init tracks the selection requires, by track name. */
+  readonly initTracks: Map<string, PreparedInit>;
+  /** Required media that is still unanswered or uninitialized. Readiness is
+   *  reached when this empties — and only with a non-empty required set. */
+  readonly awaiting: Set<string>;
+  /** Settled once every required track is accepted AND initialized. */
+  readonly ready: Promise<void>;
+  resolveReady(): void;
+  rejectReady(err: Error): void;
+  /** The selection adoption applies, decided from a snapshot of live intent. */
+  selection: { readonly video: CatalogTrack | null; readonly audio: CatalogTrack | null } | null;
+  /** Immutable preparation inputs, kept apart from the latest catalog feed. */
+  snapshot?: {
+    readonly catalog: CatalogState;
+    readonly intent: HandoverIntent;
+    readonly selection: NonNullable<CandidatePrep['selection']>;
+  };
+  /** Candidate-owned selection policy state, adopted with its subscriptions. */
+  controller?: QualityController;
+  /** Retypes finished, so a later validation failure can undo them safely. */
+  reconfigurationComplete?: boolean;
+  /** Initialization the running source buffer was RETYPED to during
+   *  preparation, by media type. Adoption hands the same bytes to the
+   *  assembler so the two agree about what the buffer now holds. */
+  readonly reconfigured: Map<'video' | 'audio', Uint8Array>;
+  /** Required tracks still owing an IN-BAND initialization header, by track
+   *  name. Emptied as each one actually delivers it. */
+  readonly inbandInit: Map<string, 'video' | 'audio'>;
+  /** In-band initialization the candidate delivered, by media type. */
+  readonly inbandBytes: Map<'video' | 'audio', Uint8Array>;
+}
+
+/** One media subscription the candidate issued, and what came back. */
+interface PreparedSub {
+  readonly trackName: string;
+  /** The tuple this candidate request was ISSUED with. */
+  readonly namespace: readonly string[];
+  readonly mediaType: 'video' | 'audio';
+  readonly packaging: TrackPackaging;
+  /** Bound by the candidate's own SUBSCRIBE_OK; null while unanswered — which
+   *  is exactly why it is not readiness yet. */
+  alias: bigint | null;
+}
+
+/** One init track the candidate must hold before it can be adopted. */
+interface PreparedInit {
+  /** Name and namespace of the init track, which is the REFERENCING track's
+   *  namespace. Two media types may name their init track identically in
+   *  different namespaces, and those are different tracks. */
+  readonly name: string;
+  readonly namespace: readonly string[];
+  reqId: bigint | null;
+  alias: bigint | null;
+  bytes: Uint8Array | null;
+}
+
+/**
+ * The state one catalog retrieval owns.
+ *
+ * Held rather than spread across player fields so a handover candidate can run
+ * its own retrieval — coordinator, manager, fetch and stream bookkeeping —
+ * without touching the retrieval current playback depends on. Adoption
+ * transfers the holder; a failed candidate's holder is discarded.
+ *
+ * Stream-keyed maps live here rather than globally: two concurrent retrievals
+ * can legitimately see the same stream ID, and a candidate must not overwrite
+ * the other's FIN/reset ownership.
+ *
+ * Deliberately NOT here: `pendingAliasBinds`, shared with video switches and
+ * media subscriptions, and `bootstrapGeneration`, a cancellation token media
+ * work observes — making it catalog-scoped would reintroduce a cancellation
+ * that crosses owners and aborts unrelated media.
+ */
+interface CatalogSlots {
+  /** Pending catalog-subscribe retry timer; null when none is pending. */
+  catalogSubscribeRetryTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * FETCH/FILL streams this retrieval has seen but cannot attribute yet,
+   * because the request they name is registered a microtask later than the
+   * stream carrying its answer arrives.
+   *
+   * The live session parks these in the player's shared map, which is
+   * authoritative only for the current connection — so a preparing candidate,
+   * which is by definition not current, needs its own. Claimed by
+   * {@link MoqtPlayer.registerBootstrapFetch} as soon as the request is
+   * registered; a catalog may be a single object, so dropping them instead
+   * would simply hang the retrieval.
+   */
+  candidateFetchStreams: Map<bigint, {
+    requestId: bigint;
+    objects: MoqtObject[];
+    bytes: number;
+    terminal?: DataStreamTerminal;
+  }>;
+  /**
+   * Catalog bootstrap (MSF-01 §5 SUBSCRIBE + Joining FETCH) — one coordinator
+   * per bootstrap generation; null in legacy 'subscribe' mode or with an
+   * injected catalog. All async continuations capture {generation, conn} and
+   * are inert on mismatch.
+   */
+  catalogBootstrapCoord: CatalogBootstrap | null;
+  /** Fetch data streams belonging to the bootstrap — CONNECTION-SCOPED: an
+   *  old session's stream 0 must never be read as the new session's stream 0
+   *  during migration. */
+  readonly bootstrapFetchStreams: Map<bigint, { attempt: number; conn: MoqtConnection }>;
+  /** Deferred terminal record for the LEGACY (coordinator-less) catalog
+   *  subscription — the DECISION (recovery / fatal-no-base / quiet end) is
+   *  made only at drain completion, honoring the terminal-drain barrier: a
+   *  base may still arrive during the drain. Generation-stamped so a stale
+   *  record can never affect a later legacy subscription (cleared at
+   *  migration commit and destroy). */
+  legacyCatalogTerminal: { gen: number; reqId: bigint | null; reason: PublishDoneReason } | null;
+  /** Live data streams observed carrying catalog objects (clean-FIN tracking),
+   *  connection-scoped and tagged with the OWNING coordinator (main vs a
+   *  staged-recovery candidate) so lifecycle events reach the right one. */
+  readonly catalogLiveStreams: Map<bigint, { conn: MoqtConnection; coord: CatalogBootstrap }>;
+  /** draft-22 catalog SUBSCRIBEs whose fill stands in for the Joining FETCH:
+   *  retiring one cancels the fill, never the subscription it rides on. */
+  readonly catalogFillRequests: Set<bigint>;
+  /**
+   * Request ID returned by the catalog SUBSCRIBE.
+   * Used to match SUBSCRIBE_OK and identify catalog subscription.
+   * @see draft-ietf-moq-msf-00 §5.1.10 (catalog track)
+   */
+  catalogRequestId: bigint | null;
+  /**
+   * Server-assigned Track Alias for the catalog subscription.
+   * Set when SUBSCRIBE_OK arrives for the catalog request ID.
+   * Data objects carry trackAlias (not requestId), so this is
+   * what we match against in onObject routing.
+   * @see draft-ietf-moq-transport-16 §9.10 (SUBSCRIBE_OK assigns Track Alias)
+   */
+  catalogTrackAlias: bigint | null;
+  /** Whether the first catalog object has been received. */
+  catalogReceived: boolean;
+  catalogManager: CatalogManager | null;
+  /**
+   * Staged recovery after a post-ready retriable PUBLISH_DONE: a CANDIDATE
+   * coordinator + manager re-acquire the catalog on a fresh subscription while
+   * the ACTIVE catalog stays ready and untouched. Adopted atomically at
+   * candidate readiness; discarded wholesale on failure; one attempt per
+   * bootstrap generation (no recursion). Ownership is transaction-local: the
+   * active `catalogRequestId`/`catalogTrackAlias` are not touched pre-adoption.
+   */
+  catalogRecovery: {
+    coord: CatalogBootstrap;
+    manager: CatalogManager;
+    conn: MoqtConnection;
+    gen: number;
+    reqId: bigint | null;
+    alias: bigint | null;
+    fetch: { reqId: bigint; attempt: number } | null;
+    fetchStreams: Map<bigint, number>;
+    /** The OLD catalog alias, retired at drain. A publisher may reuse it for
+     *  the candidate; its traffic parks here (fail-closed) until the
+     *  candidate SUBSCRIBE_OK binds or refutes the reuse. */
+    retiredAlias: bigint | null;
+    parked: Array<{ streamId: bigint; obj: MoqtObject }>;
+    parkedBytes: number;
+    parkedEvents: Map<bigint, DataStreamTerminal>;
+    /** Candidate readiness held until the alias is BOUND: the joining fetch
+     *  can legally complete on a Pending subscription, and adopting before
+     *  SUBSCRIBE_OK would discard the transaction-local parked traffic. */
+    readyState: CatalogState | null;
+    /** True while parked traffic replays at SUBSCRIBE_OK: adoption is held
+     *  until the WHOLE replay is examined — a malformed parked delta after a
+     *  valid head must abort the transaction, not degrade adopted state. */
+    replaying: boolean;
+  } | null;
+  /** The coordinator's CURRENT fetch: connection-scoped ownership. */
+  bootstrapFetch: { conn: MoqtConnection; reqId: bigint; attempt: number; gen: number } | null;
+  recoveryAttempted: boolean;
+}
+
+/** A holder for a fresh retrieval, every slot at its initial value. */
+function createCatalogSlots(): CatalogSlots {
+  return {
+    catalogSubscribeRetryTimer: null,
+    candidateFetchStreams: new Map(),
+    catalogBootstrapCoord: null,
+    bootstrapFetchStreams: new Map<bigint, { attempt: number; conn: MoqtConnection }>(),
+    legacyCatalogTerminal: null,
+    catalogLiveStreams: new Map<bigint, { conn: MoqtConnection; coord: CatalogBootstrap }>(),
+    catalogFillRequests: new Set<bigint>(),
+    catalogRequestId: null,
+    catalogTrackAlias: null,
+    catalogReceived: false,
+    catalogManager: null,
+    catalogRecovery: null,
+    bootstrapFetch: null,
+    recoveryAttempted: false,
+  };
 }
 
 // ─── MoqtPlayer ──────────────────────────────────────────────────────
@@ -316,7 +613,6 @@ export class MoqtPlayer {
 
   private connection: MoqtConnection | null = null;
   private _adapterOwned = true;
-  private catalogManager: CatalogManager | null = null;
   private qualityController: QualityController | null = null;
   private bandwidthEstimator: BandwidthEstimator | null = null;
   private bufferAbrController: BufferBasedController | null = null;
@@ -357,7 +653,7 @@ export class MoqtPlayer {
    */
   private mediaSource: MediaSourceLike | null = null;
   /**
-   * Per-track LOCMAF reconstruction state, keyed by track name: each decoder is
+   * Per-track LOCMAF reconstruction state, keyed by issued namespace and name: each decoder is
    * seeded from that track's CMAF Header and turns LOCMAF Objects back into
    * canonical CMAF chunks for the assembler.
    * @see draft-einarsson-moq-locmaf-01 §6, §15
@@ -450,7 +746,7 @@ export class MoqtPlayer {
 
   /**
    * Init segment bytes received from each subscribed init track, keyed
-   * by init track name. Populated as `onInitObject` fires; consulted on
+   * by namespace fields and track name. Populated as `onInitObject` fires; consulted on
    * track switch when the new track's codec differs from the SourceBuffer's
    * current codec, so we can call `mediaSource.changeType()` immediately
    * instead of re-subscribing.
@@ -458,14 +754,14 @@ export class MoqtPlayer {
   private readonly initSegmentByTrack = new Map<string, Uint8Array>();
 
   /**
-   * Pending lazy init-track subscriptions, keyed by init track name.
+   * Pending lazy init-track subscriptions, keyed by namespace fields and name.
    * Resolved when the first init object for that track arrives.
    * Used by `selectVideoTrack` to await init bytes before initiating a
    * codec-changing switch.
    */
   private readonly pendingInitTrackSubs = new Map<
     string,
-    { promise: Promise<Uint8Array>; resolve: (data: Uint8Array) => void; reject: (err: Error) => void }
+    { connection: MoqtConnection; promise: Promise<Uint8Array>; resolve: (data: Uint8Array) => void; reject: (err: Error) => void }
   >();
   /** Init track subscription requestIds — for unsubscribe after first object. */
   private readonly initTrackRequestIds = new Map<string, bigint>();
@@ -478,6 +774,62 @@ export class MoqtPlayer {
    * catalogs — the codec is the canonical canary either way.
    */
   private currentVideoCodec: string | null = null;
+  /**
+   * Media types whose source buffer is being RETYPED for a replacement right
+   * now. While a type is in here no segment is appended for it: MSE queues
+   * appends across `changeType` and drains them afterwards, so anything handed
+   * over mid-retype would be interpreted against the wrong initialization.
+   */
+  private readonly retypingMedia = new Set<'video' | 'audio'>();
+  /**
+   * Source-buffer retypes that have been STARTED and not yet settled, with the
+   * initialization to put back if they do not end in an adoption.
+   *
+   * Owned by the player rather than by the transaction, because the mutation
+   * outlives the attempt that began it: `changeType` can still be in flight
+   * when the attempt times out or is abandoned, and whoever cleans up must
+   * know what the buffer held before. While this map is non-empty the media
+   * source is not in a known state, so no attempt may adopt it.
+   */
+  /**
+   * The routes a retired session still owns while it is being closed.
+   *
+   * Media registrations are keyed by track alias, and aliases belong to a
+   * SESSION: the replacement is free to reuse one for a different track, or
+   * to leave one of the old session's aliases unused entirely. So between
+   * adoption and the old session's close — a window that exists precisely so
+   * playback does not gap — an object has to be matched on its SOURCE as well
+   * as its alias:
+   *
+   * - the old session's own objects still route, which is the continuity this
+   *   overlap is for, but only on aliases the replacement did not take over,
+   *   and not for a media type whose buffer was reconfigured for the
+   *   replacement (old-format bytes cannot be appended to a retyped buffer);
+   * - the current session's objects never inherit one of these routes, so an
+   *   alias it has not bound cannot deliver through a retired track.
+   *
+   * Cleared when the old session is actually retired.
+   */
+  private supersededRouting: {
+    readonly conn: MoqtConnection;
+    readonly aliases: Set<bigint>;
+    readonly reconfigured: Set<'video' | 'audio'>;
+  } | null = null;
+
+  /**
+   * Connections a handover has replaced.
+   *
+   * Membership is permanent: a session that has been superseded never
+   * delivers media again, however late its data arrives — an async object
+   * transform can begin before a handover and resolve after the session it
+   * came from is closed, and those bytes belong to no track. A connection
+   * that has simply never been current is NOT in here; it has its own route
+   * until something replaces it.
+   */
+  private readonly supersededConns = new WeakSet<MoqtConnection>();
+
+  private readonly pendingRetypes = new Map<'video' | 'audio',
+    { codec: string; previous: Uint8Array; offset: number | undefined }>();
 
   /**
    * Buffer for objects that arrive before SUBSCRIBE_OK resolves the alias.
@@ -529,6 +881,23 @@ export class MoqtPlayer {
    * overflow; `committed` stops staging once the candidate is authoritative.
    */
   private currentMigration: MigrationTxn | null = null;
+
+  /** The catalog retrieval current playback depends on. */
+  private catalogSlots: CatalogSlots = createCatalogSlots();
+
+  /**
+   * The endpoint this session is actually connected to.
+   *
+   * Starts at `config.url` and advances on every successful handover. A GOAWAY
+   * with a zero-length New Session URI means "reuse the CURRENT session URI"
+   * (draft-16 §9.4, draft-18 §10.4, draft-22 §9.2) — after A→B that is B, not
+   * the originally configured A, which is where `config.url` would send it.
+   *
+   * Deliberately separate from the credential trust anchor: `config.url` remains
+   * the origin authorization was granted against, so moving the endpoint never
+   * widens where credentials may be sent.
+   */
+  private activeEndpoint: string;
   /** A GOAWAY received from a session WHILE a handoff was in flight — acted on
    *  once the handoff finishes, but ONLY if its source is still the current
    *  session (see {@link processPendingGoaway}). The source matters: during
@@ -561,34 +930,8 @@ export class MoqtPlayer {
   /** QUIC handshake RTT — used for startup buffer network classification. */
   private _handshakeRttMs: number | undefined;
 
-  /**
-   * Request ID returned by the catalog SUBSCRIBE.
-   * Used to match SUBSCRIBE_OK and identify catalog subscription.
-   * @see draft-ietf-moq-msf-00 §5.1.10 (catalog track)
-   */
-  private catalogRequestId: bigint | null = null;
 
-  /**
-   * Catalog bootstrap (MSF-01 §5 SUBSCRIBE + Joining FETCH) — one coordinator
-   * per bootstrap generation; null in legacy 'subscribe' mode or with an
-   * injected catalog. All async continuations capture {generation, conn} and
-   * are inert on mismatch.
-   */
-  private catalogBootstrapCoord: CatalogBootstrap | null = null;
   private bootstrapGeneration = 0;
-  /** The coordinator's CURRENT fetch: connection-scoped ownership. */
-  private bootstrapFetch: { conn: MoqtConnection; reqId: bigint; attempt: number; gen: number } | null = null;
-  /** draft-22 catalog SUBSCRIBEs whose fill stands in for the Joining FETCH:
-   *  retiring one cancels the fill, never the subscription it rides on. */
-  private readonly catalogFillRequests = new Set<bigint>();
-  /** Fetch data streams belonging to the bootstrap — CONNECTION-SCOPED: an
-   *  old session's stream 0 must never be read as the new session's stream 0
-   *  during migration. */
-  private readonly bootstrapFetchStreams = new Map<bigint, { attempt: number; conn: MoqtConnection }>();
-  /** Live data streams observed carrying catalog objects (clean-FIN tracking),
-   *  connection-scoped and tagged with the OWNING coordinator (main vs a
-   *  staged-recovery candidate) so lifecycle events reach the right one. */
-  private readonly catalogLiveStreams = new Map<bigint, { conn: MoqtConnection; coord: CatalogBootstrap }>();
   /**
    * SUBSCRIBE requests issued on the CURRENT session that have not yet been
    * answered (SUBSCRIBE_OK / REQUEST_ERROR). Unknown-alias data may only be
@@ -610,45 +953,11 @@ export class MoqtPlayer {
    *  are removed when the tagging session closes the stream. */
   private readonly staleFetchStreams = new Map<bigint, MoqtConnection>();
 
-  /**
-   * Staged recovery after a post-ready retriable PUBLISH_DONE: a CANDIDATE
-   * coordinator + manager re-acquire the catalog on a fresh subscription while
-   * the ACTIVE catalog stays ready and untouched. Adopted atomically at
-   * candidate readiness; discarded wholesale on failure; one attempt per
-   * bootstrap generation (no recursion). Ownership is transaction-local: the
-   * active `catalogRequestId`/`catalogTrackAlias` are not touched pre-adoption.
-   */
-  private catalogRecovery: {
-    coord: CatalogBootstrap;
-    manager: CatalogManager;
-    conn: MoqtConnection;
-    gen: number;
-    reqId: bigint | null;
-    alias: bigint | null;
-    fetch: { reqId: bigint; attempt: number } | null;
-    fetchStreams: Map<bigint, number>;
-    /** The OLD catalog alias, retired at drain. A publisher may reuse it for
-     *  the candidate; its traffic parks here (fail-closed) until the
-     *  candidate SUBSCRIBE_OK binds or refutes the reuse. */
-    retiredAlias: bigint | null;
-    parked: Array<{ streamId: bigint; obj: MoqtObject }>;
-    parkedBytes: number;
-    parkedEvents: Map<bigint, DataStreamTerminal>;
-    /** Candidate readiness held until the alias is BOUND: the joining fetch
-     *  can legally complete on a Pending subscription, and adopting before
-     *  SUBSCRIBE_OK would discard the transaction-local parked traffic. */
-    readyState: CatalogState | null;
-    /** True while parked traffic replays at SUBSCRIBE_OK: adoption is held
-     *  until the WHOLE replay is examined — a malformed parked delta after a
-     *  valid head must abort the transaction, not degrade adopted state. */
-    replaying: boolean;
-  } | null = null;
   /** Fail-closed recovery-parking bounds (objects / bytes / lifecycle). */
   private static readonly MAX_RECOVERY_PARKED_OBJECTS = 256;
   private static readonly MAX_RECOVERY_PARKED_BYTES = 4 * 1024 * 1024;
   private static readonly MAX_RECOVERY_PARKED_EVENTS = 64;
   private static readonly MAX_RECOVERY_PARKED_ALIASES = 64;
-  private recoveryAttempted = false;
 
   /**
    * FAIL-CLOSED pre-alias stream lifecycle record: close events for streams
@@ -672,20 +981,8 @@ export class MoqtPlayer {
    *  commits, so inertness must not rely on the generation guard. */
   private readonly catalogQuarantinedConns = new WeakSet<MoqtConnection>();
 
-  /**
-   * Server-assigned Track Alias for the catalog subscription.
-   * Set when SUBSCRIBE_OK arrives for the catalog request ID.
-   * Data objects carry trackAlias (not requestId), so this is
-   * what we match against in onObject routing.
-   * @see draft-ietf-moq-transport-16 §9.10 (SUBSCRIBE_OK assigns Track Alias)
-   */
-  private catalogTrackAlias: bigint | null = null;
 
-  /** Whether the first catalog object has been received. */
-  private catalogReceived = false;
 
-  /** Pending catalog-subscribe retry timer; null when none is pending. */
-  private catalogSubscribeRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Delay before re-issuing a catalog SUBSCRIBE refused with DOES_NOT_EXIST. */
   private static readonly CATALOG_SUBSCRIBE_RETRY_MS = 1_000;
@@ -776,9 +1073,23 @@ export class MoqtPlayer {
    * Used by play()/pause() to send REQUEST_UPDATE.
    * @see draft-ietf-moq-transport-16 §9.11 (REQUEST_UPDATE)
    */
+  /**
+   * Live subscriptions by request id.
+   *
+   * `namespace` is the tuple the request was actually ISSUED with, retained
+   * because it is the only record of which track owns this subscription: a
+   * name is unique only per namespace (§5.2.3), so reconstructing the
+   * identity later from a catalog would take whichever declaration happens
+   * to come first rather than the one that is playing.
+   */
   private readonly activeSubscriptions = new Map<
     bigint,
-    { trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; trackAlias: bigint | null }
+    {
+      trackName: string;
+      mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline';
+      trackAlias: bigint | null;
+      namespace?: readonly string[];
+    }
   >();
 
   /**
@@ -981,6 +1292,7 @@ export class MoqtPlayer {
     // Validate + merge defaults — bad config fails fast, not 30 seconds into a stream.
     validateConfig(config);
     this.config = { ...DEFAULT_PLAYER_CONFIG, ...config };
+    this.activeEndpoint = this.config.url;
     // Default clock: performance.now() in microseconds.
     // Must match the CanvasRenderer's rAF-driven renderTick(performance.now() * 1000)
     // to ensure render time domains are consistent.
@@ -1004,13 +1316,13 @@ export class MoqtPlayer {
           // An empty track and the peer's retry delay are intentional waits,
           // not failed delivery. A deadline alone cannot reject a valid
           // progressing fetch or replace the MSF-01 bootstrap procedure.
-          if (this._destroyed || this.isTerminalState() || this.catalogReceived
-              || this.catalogSubscribeRetryTimer !== null
-              || this.catalogBootstrapCoord?.phase === 'empty-wait') return;
+          if (this._destroyed || this.isTerminalState() || this.catalogSlots.catalogReceived
+              || this.catalogSlots.catalogSubscribeRetryTimer !== null
+              || this.catalogSlots.catalogBootstrapCoord?.phase === 'empty-wait') return;
           this.emitError(createPlayerError(
             'transient', 'catalog', PlayerErrorCode.CATALOG_WAIT_TIMEOUT,
             `Still waiting for a complete catalog after ${e.elapsedMs}ms`,
-            { context: { bootstrapPhase: this.catalogBootstrapCoord?.phase ?? 'subscribe', elapsedMs: e.elapsedMs } },
+            { context: { bootstrapPhase: this.catalogSlots.catalogBootstrapCoord?.phase ?? 'subscribe', elapsedMs: e.elapsedMs } },
           ));
           return;
         }
@@ -1119,7 +1431,7 @@ export class MoqtPlayer {
    */
   get readyState(): number {
     if (this._stats.snapshot().objectsReceived > 0) return 2; // HAVE_MEDIA
-    if (this.catalogReceived) return 1; // HAVE_CATALOG
+    if (this.catalogSlots.catalogReceived) return 1; // HAVE_CATALOG
     return 0; // HAVE_NOTHING
   }
 
@@ -1230,10 +1542,16 @@ export class MoqtPlayer {
    * a dangling `initRef` is already rejected by the catalog parser, so the root
    * lookup here resolves or the reference simply yields no inline data.
    */
-  private resolveInlineInitData(track: CatalogTrack): string | undefined {
+  private resolveInlineInitData(track: CatalogTrack, catalog?: CatalogState): string | undefined {
     if (track.initData !== undefined) return track.initData;
     if (track.initRef !== undefined) {
-      const entry = this._catalogState?.initDataList?.find((e) => e.id === track.initRef);
+      // An initRef names an entry in the root of the catalog THIS TRACK came
+      // from. A replacement's track resolved against the live catalog would
+      // validate the wrong bytes — or silently pass because the live root
+      // happens to carry an entry of that id — so the owning catalog is
+      // explicit wherever the track is not the live session's own.
+      const root = catalog ?? this._catalogState;
+      const entry = root?.initDataList?.find((e) => e.id === track.initRef);
       if (entry?.type === 'inline') return entry.data;
     }
     return undefined;
@@ -1307,7 +1625,7 @@ export class MoqtPlayer {
     // Gate: nothing reaches MSE before initialization. An in-band CMAF Header
     // (as rawBoxes) is an init source, exactly like a CMAF in-band ftyp+moov.
     if (!this.cmafInitialized) {
-      this.handlePreInitCmafObject(mediaType, trackName, rawBoxes ?? obj.payload);
+      this.handlePreInitCmafObject(mediaType, trackName, rawBoxes ?? obj.payload, BigInt(obj.trackAlias));
       return;
     }
 
@@ -1322,7 +1640,7 @@ export class MoqtPlayer {
 
     // A later in-band CMAF Header re-seeds this track's reconstruction (§6, §9.3).
     if (rawBoxes && MoqtPlayer.looksLikeCmafInitSegment(rawBoxes)) {
-      this.noteLocmafInBandHeader(trackName, rawBoxes);
+      this.noteLocmafInBandHeader(trackName, rawBoxes, BigInt(obj.trackAlias));
       return;
     }
 
@@ -1376,10 +1694,11 @@ export class MoqtPlayer {
     objectId: bigint,
     error: LocmafFormatError | null,
   ): void {
-    let health = this.locmafHealth.get(trackName);
+    const key = this.mediaKey(trackName, mediaType, trackAlias);
+    let health = this.locmafHealth.get(key);
     if (!health) {
       health = { groups: new Map(), failedGroups: 0 };
-      this.locmafHealth.set(trackName, health);
+      this.locmafHealth.set(key, health);
     }
     let group = health.groups.get(groupId);
     if (!group) {
@@ -1393,8 +1712,8 @@ export class MoqtPlayer {
 
     if (error !== null) {
       this._stats.recordLocmafObjectRejected();
-      if (!this.locmafWarned.has(`rejected:${trackName}`)) {
-        this.locmafWarned.add(`rejected:${trackName}`);
+      if (!this.locmafWarned.has(`rejected:${key}`)) {
+        this.locmafWarned.add(`rejected:${key}`);
         this.log.warn('[LOCMAF] "%s" (%s): object g=%s o=%s rejected: %s',
           trackName, mediaType, String(groupId), String(objectId), error.message);
       }
@@ -1402,9 +1721,9 @@ export class MoqtPlayer {
         group.counted = true;
         health.failedGroups++;
         if (health.failedGroups >= MoqtPlayer.LOCMAF_MAX_FAILED_GROUPS) {
-          this.locmafDecoders.delete(trackName);
-          this.locmafDecoderInit.delete(trackName);
-          this.locmafHealth.delete(trackName);
+          this.locmafDecoders.delete(key);
+          this.locmafDecoderInit.delete(key);
+          this.locmafHealth.delete(key);
           this.handleMalformedTrack(trackAlias, trackName, error);
         }
       }
@@ -1503,11 +1822,31 @@ export class MoqtPlayer {
     }
   }
 
+  private createSelectedPipelines(selected: {
+    readonly video: CatalogTrack | null | undefined;
+    readonly audio: CatalogTrack | null | undefined;
+  }): void {
+    this.createPipelinesFromTrackInfo({
+      video: selected.video ? defined({
+        codec: selected.video.codec, width: selected.video.width, height: selected.video.height,
+        initData: this.pipelineInitData(selected.video), initTrack: selected.video.initTrack,
+        packaging: mediaTrackPackaging(selected.video.packaging),
+      }) : undefined,
+      audio: selected.audio ? defined({
+        codec: selected.audio.codec, samplerate: selected.audio.samplerate,
+        channels: selected.audio.channelConfig ? Number(selected.audio.channelConfig) : undefined,
+        initData: this.pipelineInitData(selected.audio), initTrack: selected.audio.initTrack,
+        packaging: mediaTrackPackaging(selected.audio.packaging),
+      }) : undefined,
+      isLive: selected.video?.isLive === true || selected.audio?.isLive === true,
+    });
+  }
+
   /** The codec description of a LOCMAF track's current CMAF Header, cached per Header. */
-  private locmafDescription(trackName: string): Uint8Array | null {
-    const init = this.locmafDecoderInit.get(trackName);
+  private locmafDescription(key: string): Uint8Array | null {
+    const init = this.locmafDecoderInit.get(key);
     if (!init) return null;
-    const cached = this.locmafDescriptions.get(trackName);
+    const cached = this.locmafDescriptions.get(key);
     if (cached && cached.init === init) return cached.description;
     let description: Uint8Array | null = null;
     try {
@@ -1515,16 +1854,16 @@ export class MoqtPlayer {
     } catch {
       description = null;
     }
-    this.locmafDescriptions.set(trackName, { init, description });
+    this.locmafDescriptions.set(key, { init, description });
     return description;
   }
 
   /** Next synthetic pipeline object id for `count` frames of a LOCMAF track's group. */
-  private nextLocmafFrameId(trackName: string, groupId: bigint, count: number): bigint {
-    let groups = this.locmafFrameIds.get(trackName);
+  private nextLocmafFrameId(key: string, groupId: bigint, count: number): bigint {
+    let groups = this.locmafFrameIds.get(key);
     if (!groups) {
       groups = new Map();
-      this.locmafFrameIds.set(trackName, groups);
+      this.locmafFrameIds.set(key, groups);
     }
     const next = groups.get(groupId) ?? 0n;
     groups.set(groupId, next + BigInt(count));
@@ -1535,20 +1874,31 @@ export class MoqtPlayer {
     return next;
   }
 
+  /** Resolve switch cleanup while the retiring request still owns its identity. */
+  private clearLocmafDecoderForRequest(requestId: bigint): void {
+    const sub = this.activeSubscriptions.get(requestId);
+    if (!sub) return;
+    const key = this.mediaKey(sub.trackName, sub.mediaType, sub.trackAlias ?? undefined);
+    this.locmafDecoders.delete(key);
+    this.locmafDecoderInit.delete(key);
+    this.locmafHealth.delete(key);
+  }
+
   /**
    * An in-band CMAF Header on a LOCMAF track (rawBoxes, §9): remember it and
    * re-seed the decoder if it changed. A different header re-seeds
    * reconstruction; repeating the same one must not discard the in-flight
    * groups' references.
    */
-  private noteLocmafInBandHeader(trackName: string, header: Uint8Array): void {
-    this.initSegmentByTrack.set(trackName, header);
-    const current = this.locmafDecoderInit.get(trackName);
+  private noteLocmafInBandHeader(trackName: string, header: Uint8Array, alias?: bigint): void {
+    const key = this.mediaKey(trackName, undefined, alias);
+    this.initSegmentByTrack.set(key, header);
+    const current = this.locmafDecoderInit.get(key);
     if (!current || !MoqtPlayer.sameBytes(current, header)) {
-      this.locmafDecoders.delete(trackName);
-      this.locmafDecoderInit.delete(trackName);
-      this.locmafBadInit.delete(trackName);
-      this.locmafFrameIds.delete(trackName);
+      this.locmafDecoders.delete(key);
+      this.locmafDecoderInit.delete(key);
+      this.locmafBadInit.delete(key);
+      this.locmafFrameIds.delete(key);
     }
   }
 
@@ -1567,26 +1917,27 @@ export class MoqtPlayer {
     rawBoxes: Uint8Array | null,
   ): void {
     if (rawBoxes && isCmafHeader(rawBoxes)) {
-      this.noteLocmafInBandHeader(trackName, rawBoxes);
+      this.noteLocmafInBandHeader(trackName, rawBoxes, BigInt(obj.trackAlias));
       return;
     }
+    const key = this.mediaKey(trackName, mediaType, BigInt(obj.trackAlias));
     const groupId = BigInt(obj.groupId);
     const decoded = this.decodeLocmafObject(mediaType, trackName, BigInt(obj.trackAlias), groupId,
       BigInt(obj.objectId), obj.payload);
     if (!decoded) return;
     if (!decoded.chunk) {
       this._stats.recordLocmafObjectRejected();
-      if (!this.locmafWarned.has(`raw:${trackName}`)) {
-        this.locmafWarned.add(`raw:${trackName}`);
+      if (!this.locmafWarned.has(`raw:${key}`)) {
+        this.locmafWarned.add(`raw:${key}`);
         this.log.warn('[LOCMAF] "%s" (%s): rawBoxes object g=%s o=%s carries no decodable chunk; dropped on the frame path: %s',
           trackName, mediaType, String(groupId), String(obj.objectId), decoded.rawError ?? 'unknown');
       }
       return;
     }
-    const decoder = this.locmafDecoders.get(trackName);
+    const decoder = this.locmafDecoders.get(key);
     if (decoder?.context.isProtected) {
-      if (!this.locmafWarned.has(`protected:${trackName}`)) {
-        this.locmafWarned.add(`protected:${trackName}`);
+      if (!this.locmafWarned.has(`protected:${key}`)) {
+        this.locmafWarned.add(`protected:${key}`);
         this.log.warn('[LOCMAF] "%s" (%s): protected track (%s) cannot be decrypted on the frame path — dropping objects; use locmafDecoding "mse"',
           trackName, mediaType, decoder.context.schemeType ?? 'cenc');
       }
@@ -1597,17 +1948,17 @@ export class MoqtPlayer {
       frames = sliceFrames(decoded.chunk.effective, decoded.chunk.mdat);
     } catch (err) {
       this._stats.recordLocmafObjectRejected();
-      if (!this.locmafWarned.has(`frames:${trackName}`)) {
-        this.locmafWarned.add(`frames:${trackName}`);
+      if (!this.locmafWarned.has(`frames:${key}`)) {
+        this.locmafWarned.add(`frames:${key}`);
         this.log.warn('[LOCMAF] "%s" (%s): object g=%s o=%s cannot be sliced into frames: %s',
           trackName, mediaType, String(groupId), String(obj.objectId), err instanceof Error ? err.message : String(err));
       }
       return;
     }
     if (frames.length === 0) return;
-    const description = mediaType === 'video' ? this.locmafDescription(trackName) : null;
+    const description = mediaType === 'video' ? this.locmafDescription(key) : null;
     const timescale = decoded.chunk.timescale;
-    const firstId = this.nextLocmafFrameId(trackName, groupId, frames.length);
+    const firstId = this.nextLocmafFrameId(key, groupId, frames.length);
     for (const frame of frames) {
       const synthetic: MoqtObject = {
         kind: 'data',
@@ -1684,7 +2035,7 @@ export class MoqtPlayer {
     const rawBoxes = this.locmafRawBoxes('eventtimeline', trackName, obj);
     if (rawBoxes === undefined) return;
     if (rawBoxes && isCmafHeader(rawBoxes)) {
-      this.noteLocmafInBandHeader(trackName, rawBoxes);
+      this.noteLocmafInBandHeader(trackName, rawBoxes, BigInt(obj.trackAlias));
       return;
     }
     const groupId = BigInt(obj.groupId);
@@ -1712,25 +2063,26 @@ export class MoqtPlayer {
 
   /** The track's LOCMAF decoder, created from its CMAF Header on first use. */
   private locmafDecoderFor(mediaType: 'video' | 'audio' | 'eventtimeline', trackName: string, trackAlias: bigint): LocmafTrackDecoder | null {
-    const existing = this.locmafDecoders.get(trackName);
+    const key = this.mediaKey(trackName, mediaType, trackAlias);
+    const existing = this.locmafDecoders.get(key);
     if (existing) return existing;
-    if (this.locmafBadInit.has(trackName)) return null;
-    const init = this.locmafInitBytes(trackName);
+    if (this.locmafBadInit.has(key)) return null;
+    const init = this.locmafInitBytes(trackName, trackAlias, mediaType);
     if (!init) {
-      if (!this.locmafWarned.has(`noinit:${trackName}`)) {
-        this.locmafWarned.add(`noinit:${trackName}`);
+      if (!this.locmafWarned.has(`noinit:${key}`)) {
+        this.locmafWarned.add(`noinit:${key}`);
         this.log.warn('[LOCMAF] "%s" (%s): no CMAF Header to reconstruct against — dropping objects', trackName, mediaType);
       }
       return null;
     }
     try {
       const decoder = new LocmafTrackDecoder(init);
-      this.locmafDecoders.set(trackName, decoder);
-      this.locmafDecoderInit.set(trackName, init);
+      this.locmafDecoders.set(key, decoder);
+      this.locmafDecoderInit.set(key, init);
       return decoder;
     } catch (err) {
       if (err instanceof LocmafFormatError) {
-        this.locmafBadInit.add(trackName);
+        this.locmafBadInit.add(key);
         this.handleMalformedTrack(trackAlias, trackName, err);
         return null;
       }
@@ -1744,10 +2096,11 @@ export class MoqtPlayer {
    * Never another rendition's header: its timescale and trex defaults would
    * silently skew this track's durations and decode times.
    */
-  private locmafInitBytes(trackName: string): Uint8Array | undefined {
-    const inBand = this.initSegmentByTrack.get(trackName);
+  private locmafInitBytes(trackName: string, alias?: bigint, mediaType?: string): Uint8Array | undefined {
+    const key = this.mediaKey(trackName, mediaType, alias);
+    const inBand = this.initSegmentByTrack.get(key);
     if (inBand) return inBand;
-    const track = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === trackName);
+    const track = this._catalogState?.tracks.find(t => this.initKey(t) === key);
     if (track) {
       try {
         const inline = this.decodeResolvedInlineInitData(track);
@@ -1756,7 +2109,7 @@ export class MoqtPlayer {
         // Invalid inline init was already surfaced at selection time.
       }
       if (track.initTrack) {
-        const fromInitTrack = this.initSegmentByTrack.get(track.initTrack);
+        const fromInitTrack = this.initSegmentByTrack.get(this.initKey(track, track.initTrack));
         if (fromInitTrack) return fromInitTrack;
       }
     }
@@ -1786,7 +2139,7 @@ export class MoqtPlayer {
     const groupId = BigInt(obj.groupId);
     // Even a repeated in-band Header ends this group's delta chain (§9.3).
     this.subscriptionManager?.invalidateLocmafGroup(BigInt(obj.trackAlias), groupId, this.connection);
-    this.locmafDecoders.get(trackName)?.resetGroup(groupId);
+    this.locmafDecoders.get(this.mediaKey(trackName, mediaType, BigInt(obj.trackAlias)))?.resetGroup(groupId);
     try {
       const object = deserializeLocmafObject(payload);
       return object.kind === 'rawBoxes' ? object.boxes : null;
@@ -1797,8 +2150,8 @@ export class MoqtPlayer {
     }
   }
 
-  private decodeResolvedInlineInitData(track: CatalogTrack): Uint8Array | undefined {
-    const initB64 = this.resolveInlineInitData(track);
+  private decodeResolvedInlineInitData(track: CatalogTrack, catalog?: CatalogState): Uint8Array | undefined {
+    const initB64 = this.resolveInlineInitData(track, catalog);
     if (initB64 === undefined) return undefined;
     let bytes: Uint8Array;
     try {
@@ -1812,6 +2165,56 @@ export class MoqtPlayer {
     return bytes;
   }
 
+  private catalogTrackFor(
+    name: string, namespace: readonly string[], role?: string,
+  ): CatalogTrack | undefined {
+    return this._catalogState?.tracks.find(track => track.name === name
+      && (role === undefined || track.role === role)
+      && sameNamespaceFields(trackNamespaceFields(track, this.config.namespace), namespace));
+  }
+
+  private uniqueCatalogTrack(name: string): CatalogTrack | undefined {
+    const tracks = this._catalogState?.tracks.filter(track => track.name === name) ?? [];
+    if (tracks.length > 1) throw new Error(`Ambiguous track name "${name}": a namespace is required`);
+    return tracks[0];
+  }
+
+  private subscribedTrack(mediaType: 'video' | 'audio'): CatalogTrack | undefined {
+    for (const sub of this.activeSubscriptions.values()) {
+      if (sub.mediaType !== mediaType) continue;
+      if (sub.trackAlias !== null && this.supersededRouting?.aliases.has(sub.trackAlias)) continue;
+      const track = this.catalogTrackFor(sub.trackName,
+        sub.namespace ?? namespaceFields(this.config.namespace), mediaType);
+      if (track !== undefined) return track;
+    }
+    return undefined;
+  }
+
+  private initKey(track: CatalogTrack, name: string = track.name): string {
+    return identityKey(trackNamespaceFields(track, this.config.namespace), name);
+  }
+
+  private mediaKey(name: string, mediaType?: string, alias?: bigint): string {
+    const issued = [...this.activeSubscriptions.values()].find(sub => sub.trackName === name
+      && (mediaType === undefined || sub.mediaType === mediaType)
+      && (alias === undefined || sub.trackAlias === alias));
+    if (issued !== undefined) return identityKey(issued.namespace ?? namespaceFields(this.config.namespace), name);
+    const tracks = this._catalogState?.tracks.filter(track => track.name === name
+      && (mediaType === undefined || track.role === mediaType)) ?? [];
+    if (tracks.length > 1) throw new Error(`Ambiguous track name "${name}": use its resolved identity`);
+    return tracks[0] !== undefined ? this.initKey(tracks[0])
+      : identityKey(namespaceFields(this.config.namespace), name);
+  }
+
+  private activeVideoSet(): readonly CatalogTrack[] {
+    const active = this.subscribedTrack('video');
+    if (!active || !this._catalogState) return [];
+    const model = buildCatalogSelection(this._catalogState, { catalogNamespace: this.config.namespace });
+    const resolved = resolveSelection(model, { disableAudio: true,
+      videoTrack: { name: active.name, namespaceFields: trackNamespaceFields(active, this.config.namespace) } });
+    return resolved.ok ? resolved.video?.set.tracks.map(track => track.track) ?? [] : [];
+  }
+
   /**
    * Ensure init bytes for `initTrackName` are cached, lazy-subscribing
    * to the init track if necessary.
@@ -1823,13 +2226,22 @@ export class MoqtPlayer {
    * `mediaSource.changeType()` synchronously between unsubscribing the
    * old track and flushing staged new-track segments.
    */
-  private async ensureInitTrack(initTrackName: string): Promise<Uint8Array> {
-    const cached = this.initSegmentByTrack.get(initTrackName);
+  private async ensureInitTrack(
+    initTrackName: string, namespace: readonly string[] = namespaceFields(this.config.namespace),
+  ): Promise<Uint8Array> {
+    const connection = this.connection;
+    if (!connection) throw new Error('ensureInitTrack: player not loaded');
+    const key = identityKey(namespace, initTrackName);
+    const cached = this.initSegmentByTrack.get(key);
     if (cached) return cached;
 
     // Coalesce concurrent waiters for the same init track.
-    const existing = this.pendingInitTrackSubs.get(initTrackName);
-    if (existing) return existing.promise;
+    const existing = this.pendingInitTrackSubs.get(key);
+    if (existing?.connection === connection) return existing.promise;
+    if (existing) {
+      this.pendingInitTrackSubs.delete(key);
+      existing.reject(new Error('Init source session retired'));
+    }
 
     let resolveInit!: (data: Uint8Array) => void;
     let rejectInit!: (err: Error) => void;
@@ -1839,20 +2251,20 @@ export class MoqtPlayer {
     // cannot leave an internal rejection unobserved, and an unsettled entry
     // cannot strand later waiters. Failure also removes the entry (retry ok);
     // destroy() rejects whatever is still pending.
-    this.pendingInitTrackSubs.set(initTrackName, { promise, resolve: resolveInit, reject: rejectInit });
+    this.pendingInitTrackSubs.set(key, { connection, promise, resolve: resolveInit, reject: rejectInit });
     const failInitTrack = (err: Error): void => {
-      if (this.pendingInitTrackSubs.get(initTrackName)?.promise === promise) {
-        this.pendingInitTrackSubs.delete(initTrackName);
+      if (this.pendingInitTrackSubs.get(key)?.promise === promise) {
+        this.pendingInitTrackSubs.delete(key);
       }
       rejectInit(err);
     };
 
     void (async () => {
       try {
-        if (!this.connection || !this.subscriptionManager) {
+        if (this.connection !== connection || !this.subscriptionManager) {
           throw new Error('ensureInitTrack: player not loaded');
         }
-        const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+        const nsBytes = namespace.map(field => this.enc.encode(field));
         const nameBytes = this.enc.encode(initTrackName);
         const subscribeOptions = {
           subscriptionFilter: {
@@ -1863,10 +2275,11 @@ export class MoqtPlayer {
         };
         // Pre-send ownership (§9.10) — mediaType 'video' is a placeholder,
         // routing is driven by the 'init' packaging.
-        await this.subscribeAuxTrackOwned(nsBytes, nameBytes, subscribeOptions, {
+        const requestId = await this.subscribeAuxTrackOwned(nsBytes, nameBytes, subscribeOptions, {
           trackName: initTrackName, mediaType: 'video', packaging: 'init',
-        }, (id) => { this.initTrackRequestIds.set(initTrackName, id); },
-        (id) => { if (this.initTrackRequestIds.get(initTrackName) === id) this.initTrackRequestIds.delete(initTrackName); });
+        }, (id) => { this.initTrackRequestIds.set(key, id); },
+        (id) => { if (this.connection === connection && this.initTrackRequestIds.get(key) === id) this.initTrackRequestIds.delete(key); });
+        if (requestId === undefined) throw new Error(`Init subscription "${initTrackName}" cancelled by beforeSubscribe`);
       } catch (err) {
         failInitTrack(err instanceof Error ? err : new Error(String(err)));
       }
@@ -1895,11 +2308,16 @@ export class MoqtPlayer {
     if (!this._catalogState || !this.connection || !this.subscriptionManager) {
       throw new Error('Cannot switch track: player not loaded');
     }
+    const switchConn = this.connection;
+    const generation = this.bootstrapGeneration;
+    const live = (): boolean => !this._destroyed && !this.isTerminalState()
+      && this.connection === switchConn && this.bootstrapGeneration === generation;
 
-    // Find the target track in the catalog
-    const targetTrack = this._catalogState.tracks.find(
-      (t: CatalogTrack) => t.name === trackName && t.role === 'video',
-    );
+    const eligible = this.qualityController?.eligibleLadder(this.activeVideoSet()) ?? [];
+    const candidates = eligible.filter(t => t.name === trackName);
+    if (candidates.length > 1) throw new Error(`Ambiguous video track: "${trackName}"`);
+    const catalogMatches = this._catalogState.tracks.filter(t => t.name === trackName && t.role === 'video');
+    const targetTrack = candidates[0] ?? (catalogMatches.length === 1 ? catalogMatches[0] : undefined);
     if (!targetTrack) {
       throw new Error(`Unknown video track: "${trackName}"`);
     }
@@ -1921,9 +2339,9 @@ export class MoqtPlayer {
       }
     }
 
-    const currentTrack = this._catalogState.tracks.find(t => t.role === 'video' && t.name === currentVideoTrackName);
+    const currentTrack = this.subscribedTrack('video');
     if (!currentTrack) throw new Error('Cannot switch track: video selection not ready');
-    if (currentTrack.altGroup !== targetTrack.altGroup) {
+    if (!candidates.includes(targetTrack)) {
       throw new Error(`Cannot switch to "${trackName}": different video altGroup; select that view at tune-in with videoAltGroup`);
     }
 
@@ -1975,7 +2393,7 @@ export class MoqtPlayer {
         this.currentVideoCodec ?? '(unknown)', targetTrack.codec);
       if (!inlineInit && targetTrack.initTrack) {
         try {
-          await this.ensureInitTrack(targetTrack.initTrack);
+          await this.ensureInitTrack(targetTrack.initTrack, trackNamespaceFields(targetTrack, this.config.namespace));
         } catch (err) {
           this.log.warn('[SWITCH] init prefetch failed: %s',
             err instanceof Error ? err.message : String(err));
@@ -1997,7 +2415,7 @@ export class MoqtPlayer {
       if (!inlineInit) {
         this.log.info('[SWITCH] locmaf "%s" → "%s": prefetching CMAF Header from init track "%s"',
           currentVideoTrackName, trackName, targetTrack.initTrack);
-        await this.ensureInitTrack(targetTrack.initTrack);
+        await this.ensureInitTrack(targetTrack.initTrack, trackNamespaceFields(targetTrack, this.config.namespace));
       }
     }
 
@@ -2006,7 +2424,11 @@ export class MoqtPlayer {
     // Using AbsoluteStart at currentGroup+1 avoids replaying the current
     // group (which was already rendered in the old resolution), preventing
     // visual backtrack and A/V desync from past-timestamp bursts.
-    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+    const targetNamespace = trackNamespaceFields(targetTrack, this.config.namespace);
+    if (!live()) throw new Error('Video switch retired while awaiting initialization');
+    if (this.hooks.beforeSubscribe.run({ trackName, mediaType: 'video', namespace: targetNamespace }) === null) return;
+    if (!live()) throw new Error('Video switch retired before subscription');
+    const nsBytes = targetNamespace.map(field => this.enc.encode(field));
     const nameBytes = this.enc.encode(trackName);
     const currentGroup = this.videoPipeline?.currentGroupId ?? -1n;
     const nextGroup = currentGroup >= 0n ? currentGroup + 1n : undefined;
@@ -2027,19 +2449,18 @@ export class MoqtPlayer {
     // activeSubscriptions record are installed inside onRequestId so a
     // same-tick SUBSCRIBE_OK cannot miss them. Only SUBSCRIBE_OK binds
     // routing; objects arriving before it remain parked by their wire alias.
-    const switchConn = this.connection;
     let switchRegisteredId: bigint | null = null;
     const registerSwitchSub = (id: bigint): void => {
       if (switchRegisteredId !== null) return;
       switchRegisteredId = id;
-      if (!this.subscriptionManager || this.connection !== switchConn) return;
+      if (!this.subscriptionManager || !live()) throw new Error('Video switch retired before emission');
       this.pendingAliasBinds.add(id);
-      this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null });
+      this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null, namespace: targetNamespace });
       this.pendingMediaSubs.set(id, { trackName, mediaType: 'video', packaging });
     };
     let reqIdBigInt: bigint;
     try {
-      const reqId = await this.connection.subscribe(nsBytes, nameBytes,
+      const reqId = await switchConn.subscribe(nsBytes, nameBytes,
         { ...subscribeOptions, onRequestId: (id: bigint) => registerSwitchSub(BigInt(id)) } as never);
       reqIdBigInt = BigInt(reqId);
       registerSwitchSub(reqIdBigInt);
@@ -2050,7 +2471,10 @@ export class MoqtPlayer {
       throw err;
     }
 
-    if (!this.subscriptionManager) return; // destroyed during await
+    if (!this.subscriptionManager || !live()) {
+      void switchConn.unsubscribe(varint(reqIdBigInt)).catch(() => {});
+      return;
+    }
 
     this.log.info('[SWITCH] start: "%s" → "%s" (newReqId=%s, oldReqId=%s)',
       currentVideoTrackName, trackName, reqIdBigInt, currentVideoRequestId);
@@ -2117,9 +2541,9 @@ export class MoqtPlayer {
       return;
     }
 
-    const newTrack = this._catalogState?.tracks.find(
-      (t: CatalogTrack) => t.name === sw.newTrackName && t.role === 'video',
-    );
+    const issued = this.activeSubscriptions.get(sw.newRequestId);
+    const newTrack = issued === undefined ? undefined : this.catalogTrackFor(sw.newTrackName,
+      issued.namespace ?? namespaceFields(this.config.namespace), 'video');
 
     // CMAF path: if the new track has a different codec than the
     // SourceBuffer was created with, ask the adapter to retype it
@@ -2141,7 +2565,7 @@ export class MoqtPlayer {
       let initData: Uint8Array | undefined;
       try {
         initData = this.decodeResolvedInlineInitData(newTrack)
-          ?? (newTrack.initTrack ? this.initSegmentByTrack.get(newTrack.initTrack) : undefined);
+          ?? (newTrack.initTrack ? this.initSegmentByTrack.get(this.initKey(newTrack, newTrack.initTrack)) : undefined);
       } catch (err) {
         this.abortPendingVideoSwitch(sw, err instanceof Error ? err : new Error(String(err)));
         return;
@@ -2260,6 +2684,7 @@ export class MoqtPlayer {
    */
   private unsubscribeOldVideoTrack(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
     if (!this.connection || !this.subscriptionManager) return;
+    this.clearLocmafDecoderForRequest(sw.oldRequestId);
     this.retireMediaSubscription(sw.oldRequestId, this.connection);
     this.connection.unsubscribe(varint(sw.oldRequestId));
   }
@@ -2276,9 +2701,6 @@ export class MoqtPlayer {
     // bytes so a late object from the retired stream cannot switch the
     // assembler back after this commit.
     this.cmafAssembler?.selectTrack?.('video', sw.newTrackName);
-    this.locmafDecoders.delete(sw.oldTrackName);
-    this.locmafDecoderInit.delete(sw.oldTrackName);
-    this.locmafHealth.delete(sw.oldTrackName);
     const cmafStaged = this.cmafSwitchStagingBuffer;
     this.cmafSwitchStagingBuffer = [];
     for (const { trackName: stagedTrack, mediaType: stagedMt, groupId, payload } of cmafStaged) {
@@ -2294,9 +2716,9 @@ export class MoqtPlayer {
     // Switch is now committed — commit controllers, record stat, fire event.
     // All mutation is deferred to this point. ABR/recovery initiation paths
     // use non-mutating peeks so abort leaves state unchanged.
-    const newTrack = this._catalogState?.tracks.find(
-      (t: CatalogTrack) => t.name === sw.newTrackName && t.role === 'video',
-    );
+    const issued = this.activeSubscriptions.get(sw.newRequestId);
+    const newTrack = issued === undefined ? undefined : this.catalogTrackFor(sw.newTrackName,
+      issued.namespace ?? namespaceFields(this.config.namespace), 'video');
     if (newTrack) {
       this._stats.recordQualitySwitch(defined({
         codec: newTrack.codec,
@@ -2306,7 +2728,16 @@ export class MoqtPlayer {
       }));
     }
     // Commit QualityController to the new track index.
-    this.qualityController?.commitVideoTrack(sw.newTrackName);
+    if (newTrack && this._catalogState && this.qualityController) {
+      const wasAuto = this.qualityController.isAutoQuality;
+      composeSelection(this._catalogState, {
+        catalogNamespace: this.config.namespace, controller: this.qualityController,
+        intent: { videoTrack: { name: newTrack.name,
+          namespaceFields: trackNamespaceFields(newTrack, this.config.namespace) }, disableAudio: true },
+      });
+      if (wasAuto) this.qualityController.unlockAuto();
+      this.qualityController.commitVideoTrackRef(newTrack);
+    }
     this.syncBufferAbrController();
     this.emitter.emit('quality_switched', {
       type: 'quality_switched',
@@ -2327,15 +2758,13 @@ export class MoqtPlayer {
     sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>,
     cause: Error,
   ): void {
+    this.clearLocmafDecoderForRequest(sw.newRequestId);
     if (this.connection && this.subscriptionManager) {
       this.retireMediaSubscription(sw.newRequestId, this.connection);
       try { this.connection.unsubscribe(varint(sw.newRequestId)); } catch { /* ignore */ }
     }
     this.cmafSwitchStagingBuffer = [];
     this.switchStagingBuffer = [];
-    this.locmafDecoders.delete(sw.newTrackName);
-    this.locmafDecoderInit.delete(sw.newTrackName);
-    this.locmafHealth.delete(sw.newTrackName);
     this.pendingVideoSwitch = null;
     this.switchInProgress = false;
     this.emitter.emit('quality_switch_failed', {
@@ -2417,7 +2846,7 @@ export class MoqtPlayer {
     this.wireConnection(conn);
 
     // Initialize managers
-    this.catalogManager = new CatalogManager(namespaceDisplay(this.config.namespace));
+    this.catalogSlots.catalogManager = new CatalogManager(this.config.namespace);
     this.qualityController = new QualityController({
       autoQuality: this.config.autoQuality!,
       startLevel: this.config.startLevel!,
@@ -2436,6 +2865,15 @@ export class MoqtPlayer {
     }
 
     // Apply object transform from config
+    // Ownership has to survive the await inside an async object transform: a
+    // transform that began before a handover can resolve after the replacement
+    // has been adopted and the old session retired, and its bytes belong to
+    // neither. `sourceConnection` is the connection the object arrived on
+    // (routeObject types it `unknown` so the manager stays adapter-agnostic).
+    this.subscriptionManager.routeStillValid = (source, alias) =>
+      source === undefined || source === null
+        ? true
+        : this.mediaRouteBelongsTo(source as MoqtConnection, alias);
     if (this.config.objectTransform) {
       this.subscriptionManager.objectTransform = this.config.objectTransform;
     }
@@ -2594,7 +3032,7 @@ export class MoqtPlayer {
       // source; moof/mdat is dropped loudly and arms the bootstrap
       // deadline (no more silent pre-init drops).
       if (!this.cmafInitialized) {
-        this.handlePreInitCmafObject(mediaType, trackName, obj.payload);
+        this.handlePreInitCmafObject(mediaType, trackName, obj.payload, BigInt(obj.trackAlias));
         return;
       }
 
@@ -2720,8 +3158,9 @@ export class MoqtPlayer {
       if (obj.kind !== 'data' || !obj.payload) return;
 
       // Look up the catalog track to determine the eventType
-      const catalog = this.catalogManager?.currentState;
-      const catalogTrack = catalog?.tracks.find((t: CatalogTrack) => t.name === trackName);
+      const catalog = this.catalogSlots.catalogManager?.currentState;
+      const key = this.mediaKey(trackName, undefined, BigInt(obj.trackAlias));
+      const catalogTrack = catalog?.tracks.find(track => this.initKey(track) === key);
       const eventType = catalogTrack?.eventType ?? '';
 
       try {
@@ -2752,39 +3191,45 @@ export class MoqtPlayer {
     };
 
     // §3.1: Init track object delivery → initialize MediaSource with ftyp+moov
-    this.subscriptionManager.onInitObject = (trackName, obj) => {
+    this.subscriptionManager.onInitObject = (trackName, obj, source) => {
       this.log.debug('[INIT] onInitObject: track=%s kind=%s payloadLen=%d mediaSource=%s',
         trackName, obj.kind, obj.kind === 'data' && obj.payload ? obj.payload.byteLength : 0,
         this.mediaSource ? 'exists' : 'null');
       if (obj.kind !== 'data' || !obj.payload) return;
+      if (source !== undefined && source !== this.connection) return;
 
       // Find which catalog tracks reference this initTrack
-      const catalog = this.catalogManager?.currentState;
+      const catalog = this.catalogSlots.catalogManager?.currentState;
       if (!catalog) return;
 
-      const videoTrack = catalog.tracks.find(
-        (t: CatalogTrack) => t.role === 'video' && t.initTrack === trackName,
-      );
-      const audioTrack = catalog.tracks.find(
-        (t: CatalogTrack) => t.role === 'audio' && t.initTrack === trackName,
-      );
+      const issued = [...this.activeSubscriptions.values()].find(sub =>
+        sub.trackAlias === BigInt(obj.trackAlias) && sub.trackName === trackName);
+      if (issued === undefined) return;
+      const key = identityKey(issued.namespace ?? namespaceFields(this.config.namespace), trackName);
+      const references = (mediaType: 'video' | 'audio'): CatalogTrack | undefined => {
+        const selected = this.subscribedTrack(mediaType);
+        return selected?.initTrack === trackName && this.initKey(selected, trackName) === key
+          ? selected : undefined;
+      };
+      const videoTrack = references('video');
+      const audioTrack = references('audio');
 
       // Cache the init bytes so future codec-changing track switches
       // can call mediaSource.changeType() immediately instead of
       // re-fetching. Resolves any pending lazy-subscribe waiter.
-      this.initSegmentByTrack.set(trackName, obj.payload);
-      const pending = this.pendingInitTrackSubs.get(trackName);
-      if (pending) {
-        this.pendingInitTrackSubs.delete(trackName);
+      this.initSegmentByTrack.set(key, obj.payload);
+      const pending = this.pendingInitTrackSubs.get(key);
+      if (pending?.connection === this.connection) {
+        this.pendingInitTrackSubs.delete(key);
         pending.resolve(obj.payload);
       }
 
       // Unsubscribe and clean all bookkeeping — init track only needs one object.
       // Without cleanup, seek/recovery paths can send REQUEST_UPDATE to
       // a subscription that was already unsubscribed.
-      const initReqId = this.initTrackRequestIds.get(trackName);
+      const initReqId = this.initTrackRequestIds.get(key);
       if (initReqId !== undefined) {
-        this.initTrackRequestIds.delete(trackName);
+        this.initTrackRequestIds.delete(key);
         if (this.connection) this.retireMediaSubscription(initReqId, this.connection);
         this.connection?.unsubscribe(varint(initReqId)).catch(() => {});
       }
@@ -2895,7 +3340,7 @@ export class MoqtPlayer {
       };
 
       // Emit catalog_received so the app knows tracks are available
-      this.catalogReceived = true;
+      this.catalogSlots.catalogReceived = true;
       this._catalogState = catalogState;
       this._stats.recordCatalogReceived();
       this.emitter.emit('catalog_received', {
@@ -2954,7 +3399,11 @@ export class MoqtPlayer {
       ] as const) {
         if (!track) continue;
         promises.push((async () => {
-          const intent = this.hooks.beforeSubscribe.run({ trackName: track.name, mediaType });
+          // The catalog-free path has no declared namespace to honor, so the
+          // configured one is the identity.
+          const intent = this.hooks.beforeSubscribe.run({
+            trackName: track.name, mediaType, namespace: namespaceFields(this.config.namespace),
+          });
           if (!intent) return;
           this._mediaSubsExpected++;
           const knownTrackOptions = subscribeOptions ?? defaultMediaSubscriptionFilter(true);
@@ -2975,7 +3424,7 @@ export class MoqtPlayer {
             this.pendingMediaSubs.set(reqIdBigInt, { trackName: track.name, mediaType });
             // Authorization may delay this registration until after the catalog
             // arrives. Adopt the registered view before ABR can use its ladder.
-            if (mediaType === 'video' && this.catalogReceived && this._catalogState) {
+            if (mediaType === 'video' && this.catalogSlots.catalogReceived && this._catalogState) {
               this.selectCatalogTracks(this._catalogState);
             }
             this.log.info('Subscribe %s "%s" requestId=%s (pre-known)', mediaType, track.name, reqIdBigInt);
@@ -3048,6 +3497,17 @@ export class MoqtPlayer {
       if (live()) {
         // The pre-send callback may have registered the bind — settle it.
         if (allocatedId !== null) this.settleParkedOwnership(allocatedId, null, conn);
+        const preparing = this.currentMigration;
+        if (preparing !== null && !preparing.committed && !preparing.aborted) {
+          // A replacement for THIS session is already being prepared and will
+          // bring its own catalog retrieval. Failing playback here would
+          // discard a healthy candidate over a request on the session we are
+          // leaving; if the candidate fails, its own failure is reported and
+          // the old session's state is what it was.
+          this.log.info('[handover] catalog subscribe failed on the session being replaced — held: %s',
+            err instanceof Error ? err.message : String(err));
+          throw err;
+        }
         this.failCatalogPlayback(createPlayerError(
           'fatal', 'catalog', PlayerErrorCode.LOAD_FAILED,
           `Catalog subscription failed to send: ${err instanceof Error ? err.message : String(err)}`,
@@ -3062,8 +3522,8 @@ export class MoqtPlayer {
     // A response can precede send completion. Only callback-less adapters
     // still need registration here; never restore an already-retired request.
     if (allocatedId === null) {
-      this.catalogRequestId = BigInt(reqId);
-      if (this.catalogTrackAlias === null) this.pendingAliasBinds.add(BigInt(reqId));
+      this.catalogSlots.catalogRequestId = BigInt(reqId);
+      if (this.catalogSlots.catalogTrackAlias === null) this.pendingAliasBinds.add(BigInt(reqId));
     }
     coord?.start();
   }
@@ -3076,10 +3536,10 @@ export class MoqtPlayer {
     if (retryInterval <= 0n) return;
     const gen = this.bootstrapGeneration;
     const live = (): boolean => !this._destroyed && !this.isTerminalState() && this.connection === conn
-      && gen === this.bootstrapGeneration && !this.catalogReceived
+      && gen === this.bootstrapGeneration && !this.catalogSlots.catalogReceived
       && !this.catalogQuarantinedConns.has(conn);
     if (!live()) return;
-    if (this.catalogSubscribeRetryTimer !== null) return;
+    if (this.catalogSlots.catalogSubscribeRetryTimer !== null) return;
     let remaining = retryInterval - 1n;
     const backoff = BigInt(MoqtPlayer.CATALOG_SUBSCRIBE_RETRY_MS);
     if (remaining < backoff) remaining = backoff;
@@ -3087,8 +3547,8 @@ export class MoqtPlayer {
       // Wire intervals can be uint64; platform timers are signed 32-bit.
       const delay = Number(remaining > 0x7fffffffn ? 0x7fffffffn : remaining);
       const timer = setTimeout(() => {
-        if (this.catalogSubscribeRetryTimer !== timer) return;
-        this.catalogSubscribeRetryTimer = null;
+        if (this.catalogSlots.catalogSubscribeRetryTimer !== timer) return;
+        this.catalogSlots.catalogSubscribeRetryTimer = null;
         if (!live()) return;
         remaining -= BigInt(delay);
         if (remaining > 0n) { arm(); return; }
@@ -3100,7 +3560,7 @@ export class MoqtPlayer {
             err instanceof Error ? err.message : String(err));
         });
       }, delay);
-      this.catalogSubscribeRetryTimer = timer;
+      this.catalogSlots.catalogSubscribeRetryTimer = timer;
     };
     arm();
   }
@@ -3108,12 +3568,12 @@ export class MoqtPlayer {
   /** Retire bootstrap work and invalidate its outstanding async callbacks. */
   private cancelCatalogBootstrap(): void {
     this.bootstrapGeneration += 1;
-    if (this.catalogSubscribeRetryTimer !== null) {
-      clearTimeout(this.catalogSubscribeRetryTimer);
-      this.catalogSubscribeRetryTimer = null;
+    if (this.catalogSlots.catalogSubscribeRetryTimer !== null) {
+      clearTimeout(this.catalogSlots.catalogSubscribeRetryTimer);
+      this.catalogSlots.catalogSubscribeRetryTimer = null;
     }
-    this.catalogBootstrapCoord?.abort();
-    this.catalogBootstrapCoord = null;
+    this.catalogSlots.catalogBootstrapCoord?.abort();
+    this.catalogSlots.catalogBootstrapCoord = null;
   }
 
   /**
@@ -3350,6 +3810,58 @@ export class MoqtPlayer {
   }
 
   /**
+   * Which catalog retrieval owns evidence arriving on `conn` — or `null` when
+   * nothing does.
+   *
+   * Three outcomes, all explicit: the live session's holder, a preparing
+   * candidate's own holder, or no owner at all. "No owner" is the important
+   * one: a superseded or unknown connection must not inherit live ownership
+   * just because the live holder happens to be installed, which is the
+   * connection authority the coordinator's liveness check relies on.
+   */
+  private slotsFor(conn: MoqtConnection): CatalogSlots | null {
+    const txn = this.currentMigration;
+    // `aborted` matters as much as `committed`: the deadline marks a candidate
+    // aborted synchronously, and its asynchronous cleanup runs later. In that
+    // window the candidate must already own nothing.
+    if (txn?.slots && txn.conn === conn && !txn.committed && !txn.aborted) return txn.slots;
+    // After adoption the transferred holder IS the live one, so callbacks the
+    // adopted coordinator captured stay valid once `currentMigration` clears.
+    if (this.connection === conn) return this.catalogSlots;
+    return null;
+  }
+
+  /**
+   * One deadline for a whole handover attempt — factory, auth, connect and
+   * readiness — so a promise that never settles cannot hold the single-flight
+   * slot. Marking the transaction aborted makes a late completion inert.
+   *
+   * This is our local `connectionTimeoutMs` budget. A peer's GOAWAY Timeout is a
+   * hint and never authorizes terminating a healthy session.
+   */
+  private armHandoverDeadline(txn: MigrationTxn): { timedOut: Promise<'timeout'>; cancel: () => void } {
+    const ms = this.config.connectionTimeoutMs;
+    if (!ms) {
+      return {
+        timedOut: new Promise<'timeout'>(() => { /* never */ }),
+        cancel: () => { /* nothing armed */ },
+      };
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // RESOLVES rather than rejects. A rejecting signal is only consumed by the
+    // phase that happens to race it, so every other phase leaves it unowned and
+    // an expiry surfaces as an unhandled rejection. The terminal outcome is
+    // therefore a value, and only the awaiting operation turns it into a throw.
+    const timedOut = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => {
+        txn.aborted = true; // a late factory/connect completion cannot resurrect it
+        resolve('timeout');
+      }, ms);
+    });
+    return { timedOut, cancel: () => { if (timer !== undefined) clearTimeout(timer); } };
+  }
+
+  /**
    * Run one migration as a single-flight transaction. The single-flight slot is
    * reserved BEFORE the transport is created (so a concurrent migration can't
    * spin up an orphaned WebTransport). Establishment (transport + connect +
@@ -3363,75 +3875,138 @@ export class MoqtPlayer {
     newConnection: MoqtConnection,
     makeTransport: () => Promise<WebTransportLike>,
     setupOptions: ReturnType<typeof buildSetupOptions>,
+    target?: string,
   ): Promise<void> {
     if (this._destroyed) throw new Error('Cannot migrate: player is destroyed');
     if (this.isTerminalState()) throw new Error('Cannot migrate: playback has terminated');
     if (this.currentMigration) throw new Error('Cannot migrate: a migration is already in progress');
+    // A previous attempt's `changeType` has not settled, so the media source
+    // is not in a known state. Adopting a replacement onto a buffer another
+    // attempt can still mutate would hand it an initialization that is about
+    // to change under it, so this attempt does not start at all.
+    if (this.pendingRetypes.size > 0) {
+      throw new Error('Cannot migrate: a previous replacement\'s media reconfiguration is still in progress');
+    }
 
     const oldConnection = this.connection;
-    const txn: MigrationTxn = { conn: newConnection, events: [], retainedBytes: 0, aborted: false, committed: false, terminated: false };
+    const txn: MigrationTxn = {
+      conn: newConnection, events: [], retainedBytes: 0,
+      aborted: false, committed: false, terminated: false,
+      ...(target !== undefined ? { target } : {}),
+    };
     this.currentMigration = txn; // reserve single-flight BEFORE creating the transport
     this.wireConnection(newConnection);
 
-    let catalogReqId: bigint;
     let transport: WebTransportLike | undefined;
+    // Armed BEFORE the factory/auth phase: a transport factory or an
+    // authorization provider that never settles must not strand the handover.
+    const deadline = this.armHandoverDeadline(txn);
+    // Woken by any abort path (destroy, candidate death, fatal catalog failure)
+    // so a never-settling factory cannot hold the slot or leave the timer armed.
+    const abandoned = new Promise<'aborted'>((resolve) => {
+      txn.wake = () => resolve('aborted');
+    });
+    // Races `work` against the attempt's terminal signals. Both signals are
+    // VALUES and the only rejection is `work`'s own, so no promise is created
+    // without an owner.
+    const guard = async <T>(work: Promise<T>): Promise<T> => {
+      const outcome = await Promise.race([
+        work.then((v) => ({ ok: true as const, v }), (e: unknown) => ({ ok: false as const, e })),
+        deadline.timedOut,
+        abandoned,
+      ]);
+      if (outcome === 'timeout') {
+        throw new Error(`Handover timeout after ${this.config.connectionTimeoutMs}ms`);
+      }
+      if (outcome === 'aborted') throw new Error('Handover aborted during establishment');
+      if (!outcome.ok) throw outcome.e;
+      return outcome.v;
+    };
+    // `connect()` takes the transport AT ENTRY, including on authorization and
+    // preflight failures, and closing the adapter closes it. Only a transport
+    // connect never acquired is ours to dispose — the close-once flag below
+    // cannot see `adapter.close()`.
+    let adapterOwnsTransport = false;
+    // Close-once owner for a transport that is still OURS, shared by the losing
+    // branches and the establishment catch so none can double-close.
+    let orphanClosed = false;
+    const closeOrphan = (late: WebTransportLike): void => {
+      if (orphanClosed) return;
+      orphanClosed = true;
+      try { late.close(); } catch { /* already closing/closed */ }
+    };
     try {
-      transport = await makeTransport();
+      // The transport's owner follows the branch actually taken, never a flag
+      // set by a side reaction: a derived promise reaches the race a job later
+      // than the raw factory promise, so such a flag can be set while the
+      // factory still wins, and both paths then close. Only a losing branch
+      // attaches disposal, so the healthy path cannot close a transport it is
+      // about to use.
+      const settled = makeTransport().then(
+        (t) => ({ ok: true as const, t }),
+        (e: unknown) => ({ ok: false as const, e }),
+      );
+      const outcome = await Promise.race([settled, deadline.timedOut, abandoned]);
+      if (outcome === 'timeout' || outcome === 'aborted') {
+        // We own nothing yet; dispose of whatever the factory eventually yields.
+        void settled.then((r) => { if (r.ok) closeOrphan(r.t); });
+        throw new Error(outcome === 'timeout'
+          ? `Handover timeout after ${this.config.connectionTimeoutMs}ms`
+          : 'Handover aborted before its transport settled');
+      }
+      if (!outcome.ok) throw outcome.e;
+      transport = outcome.t;
       this.assertMigrationLive(txn); // destroyed/aborted during transport creation?
-      await newConnection.connect(transport, setupOptions);
+      // Recorded only once connect is about to be entered: set any earlier, a
+      // resolved transport is stranded when abort wins in between, because the
+      // adapter never took it.
+      adapterOwnsTransport = true;
+      await guard(newConnection.connect(transport, setupOptions));
       this.assertMigrationLive(txn);
-      const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-      const nameBytes = this.enc.encode(catalogTrackName());
-      // Candidate ownership is TRANSACTION-LOCAL: the active session's
-      // catalogRequestId must not be touched until commit. Bootstrap mode
-      // needs the LargestObject filter chosen here, atomically with the
-      // joining fetch that commitMigration's coordinator will issue —
-      // pairing it with AbsoluteStart would be session-fatal on d16 (§9.16.2).
-      const candidateMode = this.resolvedCatalogMode(newConnection);
-      let candidateReqId: bigint | null = null;
-      // Unified terminal lifecycle for the candidate catalog subscription on
-      // BOTH modes: a drain completing BEFORE commit is buffered on the
-      // transaction and replayed after the staged events flush (never lost);
-      // after commit it dispatches normally, including feedEnded retirement.
-      const candidateDrained = (id: bigint): void => {
-        if (this.connection !== newConnection) {
-          if (!txn.aborted) txn.catalogDrainPending = true;
-          return;
-        }
-        if (id !== this.catalogRequestId) return;
-        this.deliverCatalogDrained();
-      };
-      const candidateOptions = candidateMode === 'joining-fetch'
-        ? {
-            subscriptionFilter: { type: 'LargestObject' as const },
-            onRequestId: (id: bigint) => { candidateReqId = id; },
-            terminalDelivery: 'drain' as const,
-            onDrained: candidateDrained,
-          }
-        : {
-            subscriptionFilter: { type: 'AbsoluteStart' as const, startGroup: varint(0n), startObject: varint(0n) },
-            onRequestId: (id: bigint) => { candidateReqId = id; },
-            terminalDelivery: 'drain' as const,
-            onDrained: candidateDrained,
-          };
-      const reqId = await newConnection.subscribe(nsBytes, nameBytes, candidateOptions as never);
+      // ── Preparation (§7.4.1 / 16 §8.4.1 / 18 §9.4.1) ──────────────────
+      // Establish a USABLE replacement before anything is retired: its own
+      // catalog retrieval must converge, its required tracks must be ACCEPTED,
+      // and initialization must be in hand. Every request below is issued
+      // against candidate-owned state — request ids and track aliases collide
+      // freely between sessions, so none of it touches live playback, and a
+      // candidate that fails here leaves the old session exactly as it was.
+      txn.slots = createCatalogSlots();
+      txn.prep = this.createCandidatePrep();
+      const candidateCatalog = await guard(this.prepareCandidateCatalog(txn, newConnection));
+      this.assertMigrationLive(txn);
+      txn.prep.state = candidateCatalog;
+      await guard(this.prepareCandidateMedia(txn, newConnection, candidateCatalog));
       this.assertMigrationLive(txn); // validate immediately before the atomic commit
-      catalogReqId = candidateReqId ?? BigInt(reqId);
+      this.revalidateCandidateSelection(txn.prep);
+      if (txn.slots.catalogRequestId === null) throw new Error('Handover prepared no catalog subscription');
     } catch (err) {
       // ESTABLISHMENT rollback — nothing committed, old session untouched. Discard
       // the candidate and close any orphaned transport (idempotent with the
       // candidate close, which closes an attached transport).
-      if (this.currentMigration === txn) this.currentMigration = null;
-      this.abandonCandidate(txn);
-      if (transport) { try { transport.close(); } catch { /* already closing/closed */ } }
+      deadline.cancel();
+      try {
+        if (txn.prep?.reconfigurationComplete && txn.prep.reconfigured.size) await this.restorePendingRetypes();
+      } finally {
+        if (this.currentMigration === txn) this.currentMigration = null;
+        this.abandonCandidate(txn);
+      }
+      // Only a transport the adapter never took is disposed here; once connect
+      // was entered, closing the candidate adapter closes it. A late one is
+      // disposed by the losing branch above, where it really is an orphan.
+      if (transport && !adapterOwnsTransport) closeOrphan(transport);
+      // A terminal event on the replaced session was held while this attempt
+      // looked like it would succeed. It did not, so there is no longer a
+      // session to be transparent about: report it now, as the outcome it
+      // actually is. Rollback is NOT claimed — there is nothing to roll back to.
+      this.reportHeldOldTerminal(txn);
       // The old session was never disturbed and is still current — a GOAWAY it
       // sent while this (failed) handoff held the slot can now be acted on.
       this.processPendingGoaway();
       throw err;
     }
 
+    deadline.cancel();
     // ── Point of no return: the candidate is validated. Commit atomically. ──
-    this.commitMigration(txn, newConnection, catalogReqId);
     // POST-commit: drain staged events, THEN retire the old session — with the
     // transaction kept REGISTERED (currentMigration === txn) through BOTH, so a
     // new-session close/fatal-error while the old close() is pending can still
@@ -3439,23 +4014,21 @@ export class MoqtPlayer {
     // stranded transaction would leave a permanent "migration in progress" lock.
     // (drainStagedCandidate never throws; retireMigratedSession never throws.)
     try {
+      this.commitMigration(txn, newConnection);
       this.drainStagedCandidate(txn);
-      // A catalog drain that completed pre-commit replays now — AFTER the
-      // staged PUBLISH_DONE reached the (new) coordinator, so the stored
-      // reason is in place when drained finalizes it.
-      if (txn.catalogDrainPending) {
-        txn.catalogDrainPending = false;
-        this.deliverCatalogDrained();
-      }
-      await this.retireMigratedSession(oldConnection);
     } finally {
-      if (this.currentMigration === txn) this.currentMigration = null;
+      try {
+        await this.retireMigratedSession(oldConnection);
+        this.pruneSupersededSubscriptions(txn);
+      } finally {
+        if (this.currentMigration === txn) this.currentMigration = null;
+        this.processPendingGoaway();
+      }
     }
     // The single-flight slot is now released — a GOAWAY queued during drain or
     // retirement can be acted on (a fresh migration to its target). Done before
     // the termination check so a GOAWAY that raced a dying session still drives
     // recovery to the new relay.
-    this.processPendingGoaway();
     // The replacement may have died during drain OR during old-session
     // retirement, or the player was destroyed. In any of these the handoff did
     // not yield a usable session (session_closed/error was already surfaced), so
@@ -3470,6 +4043,792 @@ export class MoqtPlayer {
    * await, so a deferred candidate cannot resurrect a destroyed player or commit
    * a dead session.
    */
+  /** A fresh prepared-candidate record. Nothing in it is readiness yet. */
+  private createCandidatePrep(): CandidatePrep {
+    let resolveCatalog!: (state: CatalogState) => void;
+    let rejectCatalog!: (err: Error) => void;
+    const catalog = new Promise<CatalogState>((res, rej) => { resolveCatalog = res; rejectCatalog = rej; });
+    let resolveReady!: () => void;
+    let rejectReady!: (err: Error) => void;
+    const ready = new Promise<void>((res, rej) => { resolveReady = res; rejectReady = rej; });
+    // Readiness has two faces and the attempt awaits them in sequence, so a
+    // failure settles BOTH — whichever one is currently awaited must reject,
+    // and the other must not be left unsettled to strand the attempt. Each
+    // therefore carries its own handler: without it the face nobody is waiting
+    // on rejects into no owner, which surfaces as an unhandled rejection even
+    // though the attempt itself was failed correctly.
+    void catalog.catch(() => { /* owned by whichever stage awaits it */ });
+    void ready.catch(() => { /* idem */ });
+    return {
+      catalog, resolveCatalog, rejectCatalog, state: null,
+      media: new Map(), initTracks: new Map(), awaiting: new Set(), reconfigured: new Map(),
+      inbandInit: new Map(), inbandBytes: new Map(),
+      ready, resolveReady, rejectReady, selection: null,
+    };
+  }
+
+  /**
+   * Run the candidate's catalog retrieval and wait for it to CONVERGE.
+   *
+   * Deliberately the real configured policy — the same mode resolution,
+   * SUBSCRIBE options, coordinator and joining FETCH / draft-22 fill the live
+   * session uses — against the candidate's OWN holder. A handover that
+   * retrieved its catalog by some simplified path would prove nothing about
+   * the retrieval playback then depends on.
+   *
+   * Convergence is the peer's answer plus a parsed catalog, never our sent
+   * request: §7.4.1 (16 §8.4.1, 18 §9.4.1) lets the old subscriptions go only
+   * once the replacement's have succeeded.
+   */
+  private async prepareCandidateCatalog(txn: MigrationTxn, conn: MoqtConnection): Promise<CatalogState> {
+    const slots = txn.slots!;
+    slots.catalogManager = new CatalogManager(this.config.namespace);
+    await this.issueCandidateCatalogSubscribe(txn, conn);
+    return txn.prep!.catalog;
+  }
+
+  /**
+   * Send (or re-send) the candidate's catalog SUBSCRIBE.
+   *
+   * Separate from {@link prepareCandidateCatalog} because a replacement may
+   * answer "not published yet, retry in N" — the same retriable refusal the
+   * initial subscribe honors at startup. Within a handover that is not a
+   * failure worth discarding the replacement for: the old session keeps
+   * playing throughout and the attempt's own deadline bounds the waiting.
+   */
+  private async issueCandidateCatalogSubscribe(txn: MigrationTxn, conn: MoqtConnection): Promise<void> {
+    const slots = txn.slots!;
+    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+    const nameBytes = this.enc.encode(catalogTrackName());
+    // Mode is resolved per CONNECTION: a replacement may negotiate a different
+    // draft, and draft-22 retrieves its fill on the SUBSCRIBE itself.
+    const startedCoord = slots.catalogBootstrapCoord !== null;
+    const coord = slots.catalogBootstrapCoord ?? (this.resolvedCatalogMode(conn) === 'joining-fetch'
+      ? this.createCatalogBootstrap(conn, slots) : null);
+    const options = this.catalogSubscribeOptions(conn, slots);
+    const register = options.onRequestId as (id: bigint) => void;
+    let allocatedId: bigint | null = null;
+    try {
+      const reqId = await conn.subscribe(nsBytes, nameBytes, {
+        ...options,
+        onRequestId: (id: bigint) => {
+          // Refuse emission rather than returning quietly: an aborted
+          // candidate must not put an unowned request on the wire.
+          if (txn.aborted || txn.committed) throw new Error('Handover catalog subscribe retired before emission');
+          allocatedId = id;
+          register(id);
+        },
+      } as never);
+      // Callback-less adapters register after the await; a response can
+      // precede send completion, so never restore an already-retired request.
+      if (allocatedId === null && !txn.aborted) {
+        slots.catalogRequestId = BigInt(reqId);
+        this.pendingAliasBinds.add(BigInt(reqId));
+      }
+    } catch (err) {
+      if (allocatedId !== null) this.settleParkedOwnership(allocatedId, null, conn);
+      throw err;
+    }
+    // Started once per coordinator: a retry re-sends the SUBSCRIBE against the
+    // coordinator that is already running its ladder.
+    if (coord !== null && !startedCoord) coord.start();
+  }
+
+  /**
+   * Honor a replacement's retry guidance for a catalog that is not published
+   * yet, without failing the attempt.
+   *
+   * Scoped entirely to the transaction: the timer is cleared when the attempt
+   * ends, the re-send is refused once the candidate is aborted or committed,
+   * and the attempt deadline — not this timer — decides how long the whole
+   * thing may take.
+   */
+  private scheduleCandidateCatalogRetry(txn: MigrationTxn, conn: MoqtConnection, retryInterval: bigint): void {
+    const slots = txn.slots;
+    if (slots === undefined || retryInterval <= 0n) {
+      this.failCandidateCatalog(conn, 'replacement catalog is not published and gave no retry interval');
+      return;
+    }
+    if (slots.catalogSubscribeRetryTimer !== null) return;
+    // Draft-16 §9.8 / draft-18 §10.6.2 encode the minimum delay plus one.
+    let remaining = retryInterval - 1n;
+    const backoff = BigInt(MoqtPlayer.CATALOG_SUBSCRIBE_RETRY_MS);
+    if (remaining < backoff) remaining = backoff;
+    const live = (): boolean => !this._destroyed && !txn.aborted && !txn.committed
+      && this.currentMigration === txn && !slots.catalogReceived;
+    const arm = (): void => {
+      // Wire intervals can be uint64; platform timers are signed 32-bit.
+      const delay = Number(remaining > 0x7fffffffn ? 0x7fffffffn : remaining);
+      const timer = setTimeout(() => {
+        if (slots.catalogSubscribeRetryTimer !== timer) return;
+        slots.catalogSubscribeRetryTimer = null;
+        if (!live()) return;
+        remaining -= BigInt(delay);
+        if (remaining > 0n) { arm(); return; }
+        this.log.info('[handover] retrying the replacement catalog subscribe (not published yet)');
+        this.issueCandidateCatalogSubscribe(txn, conn).catch((err: unknown) => {
+          if (!live()) return;
+          this.failCandidateCatalog(conn, `replacement catalog retry failed to send: ${
+            err instanceof Error ? err.message : String(err)}`);
+        });
+      }, delay);
+      slots.catalogSubscribeRetryTimer = timer;
+    };
+    arm();
+  }
+
+  /**
+   * Snapshot of the intent a replacement selection must honor.
+   *
+   * Taken rather than read live because selection on the live quality
+   * controller would commit a track and rebuild the buffer ABR ladder for a
+   * candidate that may never be adopted — mutating playback to evaluate a
+   * replacement. The snapshot also carries what is PLAYING, so the
+   * replacement prefers an equivalent track over re-choosing a view.
+   */
+  private captureHandoverIntent(): HandoverIntent {
+    // The established outputs, taken from the SUBSCRIPTIONS that own them.
+    // Not reconstructed from the catalog: a name is unique only per namespace
+    // (§5.2.3), so a `find` by role and name would capture whichever
+    // declaration comes first rather than the one that is playing.
+    let activeVideoTrack: TrackIdentity | null = null;
+    let activeAudioTrack: TrackIdentity | null = null;
+    for (const sub of this.activeSubscriptions.values()) {
+      if (sub.trackAlias !== null && this.supersededRouting?.aliases.has(sub.trackAlias)) continue;
+      if (this._catalogState !== null && this.catalogTrackFor(sub.trackName,
+        sub.namespace ?? namespaceFields(this.config.namespace), sub.mediaType) === undefined) continue;
+      const identity: TrackIdentity = {
+        namespaceFields: sub.namespace ?? namespaceFields(this.config.namespace),
+        name: sub.trackName,
+      };
+      if (sub.mediaType === 'video' && activeVideoTrack === null) activeVideoTrack = identity;
+      if (sub.mediaType === 'audio' && activeAudioTrack === null) activeAudioTrack = identity;
+    }
+    const establishedVideo = activeVideoTrack !== null;
+    const configured = this.selectionIntent();
+    activeVideoTrack ??= configured?.videoTrack ?? null;
+    activeAudioTrack ??= configured?.audioTrack ?? null;
+    // The CURRENT view, not the configured default: if the replacement's
+    // catalog no longer carries the active track, selection must fail rather
+    // than quietly switch the viewer to another angle. The live catalog is the
+    // authority for which altGroup the active track belongs to.
+    const activeVideo = activeVideoTrack !== null
+      ? this._catalogState?.tracks.find(t => t.role === 'video'
+        && t.name === activeVideoTrack!.name
+        && sameNamespaceFields(trackNamespaceFields(t, this.config.namespace),
+          activeVideoTrack!.namespaceFields))
+      : undefined;
+    // `null` and `undefined` are DIFFERENT intents: null means the established
+    // view is ungrouped, undefined means there is no established view at all.
+    // Collapsing them would let an ungrouped active view be replaced by some
+    // grouped view once its own track disappears.
+    const altGroup = activeVideo ? activeVideo.altGroup ?? null
+      : this.config.videoAltGroup ?? this.config.selection?.videoAltGroup;
+    const activeAudio = this.subscribedTrack('audio');
+    const alternates = (track: CatalogTrack | undefined): readonly TrackIdentity[] => {
+      if (track === undefined) return [];
+      return (this._catalogState?.tracks.filter(other => other.role === track.role
+        && other.renderGroup === track.renderGroup
+        && (track.altGroup === undefined ? other === track : other.altGroup === track.altGroup)) ?? [])
+        .map(other => ({ name: other.name, namespaceFields: [...trackNamespaceFields(other, this.config.namespace)] }));
+    };
+    const activeScope = activeVideo ?? activeAudio;
+    return {
+      // The LIVE mode, not the configured one: selectVideoTrack() and
+      // unlockAuto() change auto quality at runtime.
+      autoQuality: this.qualityController?.isAutoQuality ?? this.config.autoQuality !== false,
+      startLevel: this.config.startLevel ?? 'auto',
+      ...(this.config.capLevelToResolution !== undefined
+        ? { capLevelToResolution: this.config.capLevelToResolution } : {}),
+      qualitySwitchCooldownMs: this.config.qualitySwitchCooldownMs ?? 0,
+      // Indexes allAlternatives: currentIndex is local to the codec family's
+      // ladder, so it does not identify a level across catalogs.
+      manualLevel: this.qualityController && !this.qualityController.isAutoQuality
+        ? this.qualityController.allAlternatives.findIndex(t => activeVideoTrack !== null
+          && this.initKey(t) === identityKey(activeVideoTrack.namespaceFields, activeVideoTrack.name))
+        : null,
+      catalogNamespace: this.config.namespace,
+      // The scope this presentation belongs to: configured, else the one the
+      // established video was declared in.
+      ...(this.config.selection?.renderGroup !== undefined
+        ? { scope: this.config.selection.renderGroup }
+        : activeScope !== undefined ? { scope: activeScope.renderGroup ?? null } : {}),
+      activeVideoTrack, activeAudioTrack,
+      videoAlternates: alternates(activeVideo), audioAlternates: alternates(activeAudio),
+      // A pin is an EXPLICIT choice: configured here, or made at runtime by
+      // `selectVideoTrack()`, which is what leaving automatic mode records.
+      pinnedVideo: establishedVideo && this.qualityController !== null
+        ? !this.qualityController.isAutoQuality : configured?.videoTrack !== undefined,
+      pinnedAudio: this.config.selection?.audioTrack !== undefined,
+      disableVideo: this.config.disableVideo === true,
+      disableAudio: this.config.disableAudio === true,
+      ...(altGroup !== undefined ? { videoAltGroup: altGroup } : {}),
+      ...(activeAudio?.altGroup !== undefined ? { audioAltGroup: activeAudio.altGroup }
+        : this.config.selection?.audioAltGroup !== undefined
+          ? { audioAltGroup: this.config.selection.audioAltGroup } : {}),
+      ...(this.config.videoConstraints !== undefined ? { videoConstraints: this.config.videoConstraints } : {}),
+      ...(this.config.audioConstraints !== undefined ? { audioConstraints: this.config.audioConstraints } : {}),
+    };
+  }
+
+  /**
+   * Prepare the replacement's media: select, validate initialization, issue
+   * the real SUBSCRIBEs, and wait for the peer to ACCEPT every required track
+   * and for initialization we can actually use.
+   *
+   * The subscriptions issued here are the ones adoption binds to the existing
+   * pipelines — adoption never subscribes again.
+   */
+  private async prepareCandidateMedia(
+    txn: MigrationTxn, conn: MoqtConnection, catalog: CatalogState,
+  ): Promise<void> {
+    const prep = txn.prep!;
+    catalog = structuredClone(catalog);
+    const intent = structuredClone(this.captureHandoverIntent());
+    const chosen = prepareHandoverSelection(catalog, intent, this.clock);
+    if (!chosen.ok) throw new Error(`replacement selection failed: ${chosen.reason}`);
+    const required: Array<{ track: CatalogTrack; mediaType: 'video' | 'audio' }> = [];
+    if (chosen.video) required.push({ track: chosen.video, mediaType: 'video' });
+    if (chosen.audio) required.push({ track: chosen.audio, mediaType: 'audio' });
+    // An empty required set is NOT success: there would be nothing to play on
+    // the replacement, and adopting it would silence playback that still works.
+    if (required.length === 0) throw new Error('replacement offers no enabled media track');
+    prep.selection = { video: chosen.video ?? null, audio: chosen.audio ?? null };
+
+    // Initialization is validated BEFORE any media SUBSCRIBE, exactly as the
+    // live path does: a CMAF track with no codec or undecodable inline init
+    // can never configure MSE, and must fail the candidate rather than
+    // retire working playback in favor of a silent one.
+    for (const { track, mediaType } of required) {
+      if (!isMsePackaging(track.packaging)) continue;
+      if (!track.codec) {
+        throw new Error(`replacement CMAF track "${track.name}" (${mediaType}): no codec string — cannot configure MSE`);
+      }
+      if (track.initRef !== undefined
+          && catalog.initDataList?.some(e => e.id === track.initRef) !== true) {
+        throw new Error(`replacement CMAF track "${track.name}" (${mediaType}): initRef "${
+          track.initRef}" is not in the replacement catalog — cannot configure MSE`);
+      }
+      try {
+        // Resolved against the REPLACEMENT's own root: an initRef naming an
+        // entry the live catalog happens to carry would otherwise validate
+        // bytes this session will never send.
+        this.decodeResolvedInlineInitData(track, catalog);
+      } catch (err) {
+        throw new Error(`replacement CMAF track "${track.name}" (${mediaType}): ${
+          err instanceof Error ? err.message : String(err)} — cannot configure MSE`);
+      }
+    }
+
+    // A handover keeps the RUNNING decoders: the pipelines, their MSE source
+    // buffers and their configuration all survive it, which is what makes
+    // playback continue across the move. A replacement that would need a
+    // different decoder configuration therefore cannot simply be adopted — and
+    // the place to find that out is HERE, before anything is retired, not
+    // after the old session is gone. Changing codec mid-session is a separate
+    // mechanism (the track-switch path's staged flush + `changeType`); until
+    // adoption can drive it, such a replacement is declined with the old
+    // session still playing.
+    for (const { track, mediaType } of required) {
+      const reason = this.unadoptableTransition(track, mediaType);
+      if (reason !== null) throw new Error(`replacement ${mediaType} track "${track.name}": ${reason}`);
+    }
+
+    // §5.1: the application's own subscribe policy applies to a replacement
+    // exactly as it does to a first subscribe — a hook that cancels a track
+    // must not be bypassed just because this session is a handover. A
+    // cancelled track stops being REQUIRED (the application declined it), and
+    // if that leaves nothing to play the replacement is declined rather than
+    // adopted silent.
+    const wanted = required.filter(({ track, mediaType }) =>
+      this.hooks.beforeSubscribe.run({
+        trackName: track.name, mediaType,
+        namespace: trackNamespaceFields(track, this.config.namespace),
+      }) !== null);
+    if (wanted.length === 0) {
+      throw new Error('replacement has no subscribable media track (all cancelled by beforeSubscribe)');
+    }
+    required.length = 0;
+    required.push(...wanted);
+    prep.selection = {
+      video: required.find(r => r.mediaType === 'video')?.track ?? null,
+      audio: required.find(r => r.mediaType === 'audio')?.track ?? null,
+    };
+    prep.snapshot = {
+      catalog,
+      intent: {
+        ...intent,
+        scope: (chosen.video ?? chosen.audio)!.renderGroup ?? null,
+        disableVideo: prep.selection.video === null,
+        disableAudio: prep.selection.audio === null,
+      },
+      selection: prep.selection,
+    };
+    prep.controller = chosen.controller;
+
+    const subscribeOptions = buildSubscribeOptions(this.config);
+    // The candidate addresses each track by the identity the CATALOG gives
+    // it, exactly as startup does — a request computed once from config would
+    // send one namespace while the hook, the credentials and the selection
+    // all describe another.
+    const nsOf = (track: CatalogTrack): readonly string[] =>
+      trackNamespaceFields(track, this.config.namespace);
+    const keyOf = (track: CatalogTrack): string => identityKeyOf(nsOf(track), track.name);
+    // Every required track, and every init track it needs, must be answered
+    // before readiness. Recorded up front so an acceptance arriving while we
+    // are still sending the next SUBSCRIBE finds its expectation in place.
+    // Keyed by identity: two media types may name their tracks the same in
+    // different namespaces, and those are different expectations.
+    for (const { track } of required) prep.awaiting.add(keyOf(track));
+    for (const { track, mediaType } of required) {
+      if (!isMsePackaging(track.packaging) || track.initTrack !== undefined) continue;
+      if (this.resolveInlineInitData(track, catalog) !== undefined) continue;
+      // Neither inline nor an init track: initialization can still arrive
+      // IN BAND as an ftyp+moov object, which is how an ordinary startup is
+      // allowed to initialize too. So the replacement is not ready on
+      // acceptance alone — it is ready once it has actually delivered that
+      // header. Reusing the live session's initialization instead would adopt
+      // on the strength of bytes this session never sent, and refusing
+      // outright would reject a perfectly ordinary publisher.
+      prep.awaiting.add(`in-band:${keyOf(track)}`);
+      prep.inbandInit.set(keyOf(track), mediaType);
+    }
+    for (const { track } of required) {
+      if (track.initTrack === undefined) continue;
+      // Deliberately NOT short-circuited by the live init cache. A track name
+      // is shared across sessions; its CONTENT is not. Reusing the old
+      // session's cached init would adopt a replacement on the strength of
+      // bytes the replacement never sent — and would hide the case where its
+      // own init is missing, refused or different.
+      // LIBRARY POLICY (cf01 §3.2.16 is silent; §3.2.18 states it for
+      // `depends`): an init track belongs to the namespace of the track that
+      // references it.
+      const initNamespace = nsOf(track);
+      prep.initTracks.set(identityKeyOf(initNamespace, track.initTrack), {
+        name: track.initTrack, namespace: initNamespace,
+        reqId: null, alias: null, bytes: null,
+      });
+      prep.awaiting.add(identityKeyOf(initNamespace, track.initTrack));
+    }
+
+    const issue = async (
+      name: string, namespace: readonly string[], mediaType: 'video' | 'audio',
+      packaging: TrackPackaging, isLive: boolean, initKey: string | null,
+    ): Promise<void> => {
+      if (initKey !== null && this.hooks.beforeSubscribe.run({
+        trackName: name, namespace, mediaType: 'init',
+      }) === null) throw new Error(`replacement init subscription "${name}" cancelled by beforeSubscribe`);
+      const options = initKey !== null
+        ? { subscriptionFilter: { type: 'AbsoluteStart' as const, startGroup: varint(0n), startObject: varint(0n) } }
+        : (subscribeOptions ?? defaultMediaSubscriptionFilter(isLive));
+      let allocated: bigint | null = null;
+      const claim = (id: bigint): void => {
+        if (txn.aborted || txn.committed) throw new Error('Handover media subscribe retired before emission');
+        allocated = id;
+        // Candidate-owned: request ids collide across sessions, so this never
+        // reaches activeSubscriptions / pendingMediaSubs before adoption.
+        if (initKey !== null) prep.initTracks.get(initKey)!.reqId = id;
+        else prep.media.set(id, { trackName: name, namespace, mediaType, packaging, alias: null });
+      };
+      const reqId = await conn.subscribe(namespace.map(field => this.enc.encode(field)), this.enc.encode(name),
+        { ...options, onRequestId: claim } as never);
+      if (allocated === null) claim(BigInt(reqId));
+    };
+
+    for (const { track, mediaType } of required) {
+      await issue(track.name, nsOf(track), mediaType,
+        mediaTrackPackaging(track.packaging), track.isLive === true, null);
+    }
+    for (const [initKey, init] of prep.initTracks) {
+      // mediaType is a placeholder — init routing is driven by packaging.
+      await issue(init.name, init.namespace, 'video', 'init', false, initKey);
+    }
+    await prep.ready;
+    this.revalidateCandidateSelection(prep);
+
+    // ── Changed initialization: reconfigure, or decline ─────────────────
+    // Initialization can only be compared once it is in hand, which for an
+    // init track is after acceptance. Still BEFORE commit, so the old session
+    // is intact for either outcome: the running source buffer is retyped to
+    // the replacement's initialization, and only a media adapter that cannot
+    // do that makes the replacement unusable.
+    // Decided for EVERY required track before anything is mutated, so a
+    // replacement that cannot be reconfigured is declined without having
+    // touched the source buffers that are still playing.
+    const retypes: Array<{ mediaType: 'video' | 'audio'; codec: string; next: Uint8Array; previous: Uint8Array }> = [];
+    for (const { track, mediaType } of required) {
+      if (!this.cmafInitialized || !this.usesMse(track.packaging)) continue;
+      const delivered = this.preparedInitBytes(prep, track, catalog);
+      if (track.initTrack !== undefined && delivered === undefined) {
+        // Readiness cannot have resolved without these bytes; the check keeps
+        // that invariant local rather than assuming it.
+        throw new Error(`replacement ${mediaType} track "${track.name}": initialization was never delivered`);
+      }
+      const running = this.runningInitBytes(mediaType);
+      if (delivered === undefined || running === undefined || bytesEqual(running, delivered)) continue;
+      // The codec is unchanged here (a changed codec was declined above), but
+      // the initialization is not: a source buffer's init segment must match
+      // the media appended against it.
+      if (this.mediaSource?.changeType === undefined) {
+        throw new Error(`replacement ${mediaType} track "${track.name}": initialization changed and this media adapter cannot reconfigure (no changeType)`);
+      }
+      retypes.push({ mediaType, codec: track.codec ?? '', next: delivered, previous: running });
+    }
+    if (retypes.length > 0) await this.retypeForReplacement(txn, prep, retypes);
+    prep.reconfigurationComplete = true;
+  }
+
+  /** Validate readiness against the latest catalog without changing playback. */
+  private revalidateCandidateSelection(prep: CandidatePrep): void {
+    const snapshot = prep.snapshot;
+    if (snapshot === undefined || prep.state === null || prep.awaiting.size !== 0) {
+      throw new Error('replacement selection has no complete preparation');
+    }
+    const latest = prepareHandoverSelection(prep.state, {
+      ...snapshot.intent,
+      ...this.captureHandoverIntent(),
+      // A hook may have declined an output for this attempt. Revalidation
+      // must not recreate that request, even when the old session has it.
+      disableVideo: snapshot.intent.disableVideo,
+      disableAudio: snapshot.intent.disableAudio,
+    }, this.clock);
+    if (!latest.ok) throw new Error(`replacement selection changed during preparation: ${latest.reason}`);
+    for (const mediaType of ['video', 'audio'] as const) {
+      const prepared = snapshot.selection[mediaType];
+      const track = latest[mediaType];
+      if (prepared === null && track === null) continue;
+      if (prepared === null || track === null || this.initKey(prepared) !== this.initKey(track)) {
+        throw new Error(`replacement ${mediaType} selected identity changed during preparation`);
+      }
+      // Decoder and subscription semantics must still describe the request
+      // already accepted. Labels and unrelated catalog additions may change.
+      const fields = ['role', 'packaging', 'codec', 'mimeType', 'locmafVersion', 'renderGroup',
+        'altGroup', 'isLive', 'width', 'height', 'samplerate', 'channelConfig', 'timescale', 'initTrack'] as const;
+      if (fields.some(field => prepared[field] !== track[field])) {
+        throw new Error(`replacement ${mediaType} selection configuration changed during preparation`);
+      }
+      const subscribed = [...prep.media.values()].some(sub => sub.mediaType === mediaType
+        && sub.alias !== null && sub.trackName === track.name
+        && sameNamespaceFields(sub.namespace, trackNamespaceFields(track, this.config.namespace))
+        && sub.packaging === mediaTrackPackaging(track.packaging));
+      if (!subscribed) throw new Error(`replacement ${mediaType} selection has no accepted prepared subscription`);
+      if (!isMsePackaging(track.packaging)) continue;
+      if (track.initRef !== undefined && prep.state.initDataList?.some(e => e.id === track.initRef) !== true) {
+        throw new Error(`replacement ${mediaType} initialization reference changed during preparation`);
+      }
+      const before = this.decodeResolvedInlineInitData(prepared, snapshot.catalog);
+      const after = this.decodeResolvedInlineInitData(track, prep.state);
+      if ((before === undefined) !== (after === undefined)
+          || (before !== undefined && after !== undefined && !bytesEqual(before, after))) {
+        throw new Error(`replacement ${mediaType} initialization changed during preparation`);
+      }
+      if (track.initTrack !== undefined) {
+        const init = prep.initTracks.get(identityKeyOf(trackNamespaceFields(track, this.config.namespace), track.initTrack));
+        if (init?.alias == null || init.bytes === null) {
+          throw new Error(`replacement ${mediaType} initialization has no accepted prepared init subscription`);
+        }
+      }
+      if (this.preparedInitBytes(prep, track, prep.state) === undefined) {
+        throw new Error(`replacement ${mediaType} initialization was not prepared`);
+      }
+    }
+    prep.selection = { video: latest.video, audio: latest.audio };
+    prep.controller = latest.controller;
+  }
+
+  /**
+   * Retype the running source buffers to the replacement's initialization.
+   *
+   * This is the one step of preparation that MUTATES live playback, so it
+   * carries its own fence and its own undo:
+   *
+   * - each type is fenced before its retype starts, because MSE queues appends
+   *   across `changeType` and drains them against the NEW initialization;
+   * - the retypes run one at a time, so a failure has a known prefix;
+   * - a failure UNDOES the retypes that already succeeded, because declining
+   *   the candidate means the old session keeps playing and its media must
+   *   still match its buffers. A video retype followed by an audio refusal
+   *   must not leave video on the replacement's initialization.
+   *
+   * If the undo itself fails the buffer no longer matches either session, and
+   * that is reported as what it is — a fatal playback fault — rather than
+   * described as a successful rollback.
+   */
+  private async retypeForReplacement(
+    txn: MigrationTxn, prep: CandidatePrep,
+    retypes: Array<{ mediaType: 'video' | 'audio'; codec: string; next: Uint8Array; previous: Uint8Array }>,
+  ): Promise<void> {
+    const source = this.mediaSource!;
+    const changeType = source.changeType!;
+    // EVERY offset is read before anything is fenced or mutated. A handover
+    // keeps the assembler and its epoch, so the replacement's media is already
+    // on the running timeline; `changeType` rebases to the playback position
+    // for its other caller, and leaving that in place would push the
+    // replacement a whole playback position into the future. Read per
+    // iteration instead, an accessor that throws on the SECOND type would
+    // leave the first one retyped and fenced with no offset to undo it by.
+    const offsets = new Map<'video' | 'audio', number | undefined>();
+    for (const { mediaType } of retypes) {
+      // Nothing is fenced or mutated yet, so a throw here needs no undo.
+      offsets.set(mediaType, source.getTimestampOffset?.(mediaType));
+    }
+    for (const { mediaType, codec, next, previous } of retypes) {
+      this.log.info('[handover] reconfiguring %s for the replacement initialization', mediaType);
+      const offset = offsets.get(mediaType);
+      // Fence and record BEFORE the call. A `changeType` that throws may
+      // already have changed the buffer, and one that never settles still
+      // owns it, so both have to be recoverable from here.
+      this.retypingMedia.add(mediaType);
+      this.pendingRetypes.set(mediaType, { codec, previous, offset });
+      try {
+        await changeType.call(source, mediaType, codec, next);
+        // Part of the reconfiguration, not a cosmetic follow-up: without the
+        // original offset the replacement's media lands a playback position
+        // into the future and the element never reaches it. A failure here
+        // therefore fails the reconfiguration.
+        this.restoreTimestampOffset(mediaType, offset);
+      } catch (err) {
+        await this.restorePendingRetypes();
+        throw err;
+      }
+      prep.reconfigured.set(mediaType, next);
+      // Checked AFTER the mutation is recorded: a retype that completes late —
+      // past the attempt deadline, or after the attempt was abandoned — has
+      // still changed the buffer the OLD session is playing through, and
+      // restoring it is the only thing that makes that session usable again.
+      if (this._destroyed || txn.aborted || txn.committed || this.currentMigration !== txn) {
+        await this.restorePendingRetypes();
+        throw new Error('Handover aborted during media reconfiguration');
+      }
+    }
+  }
+
+  /**
+   * Put back the initialization of every buffer an unfinished handover
+   * retyped, and lift its fence.
+   *
+   * Reached when the attempt will not be adopted: declined, timed out,
+   * abandoned, or destroyed. If the media source is gone there is nothing to
+   * restore and nothing to protect, so the records are simply dropped — a
+   * destroyed source must never be reconfigured. If a restore itself fails the
+   * buffer matches neither session, which is reported as the fatal fault it is
+   * rather than described as a successful rollback.
+   */
+  private async restorePendingRetypes(): Promise<void> {
+    const source = this.mediaSource;
+    const changeType = source?.changeType;
+    for (const [mediaType, record] of [...this.pendingRetypes].reverse()) {
+      if (this._destroyed || source === null || source === undefined || changeType === undefined) {
+        // Nothing to restore and nothing to protect: a destroyed source must
+        // never be reconfigured.
+        this.pendingRetypes.delete(mediaType);
+        this.retypingMedia.delete(mediaType);
+        continue;
+      }
+      try {
+        // The record stays in place ACROSS the undo, so the migrate guard
+        // cannot admit a successor onto a source this restore is still
+        // mutating; it is released below, and only if it is still ours.
+        await changeType.call(source, mediaType, record.codec, record.previous);
+        // The old session's own media is on the original timeline, so putting
+        // the initialization back without the offset would leave it
+        // unplayable — which is why this failure is fatal below rather than
+        // logged.
+        this.restoreTimestampOffset(mediaType, record.offset);
+      } catch (undoErr) {
+        // A rejected `changeType` is NOT a promise that nothing changed —
+        // there is no such guarantee in the interface, and a call that mutates
+        // and then fails is exactly how this path is reached. So a buffer we
+        // could not put back matches neither session, and that is reported as
+        // the fatal fault it is rather than described as a rollback.
+        this.failCatalogPlayback(createPlayerError(
+          'fatal', 'player', PlayerErrorCode.CMAF_INIT_INVALID,
+          `Could not restore ${mediaType} initialization after an abandoned handover reconfiguration: ${
+            undoErr instanceof Error ? undoErr.message : String(undoErr)}`,
+          undoErr instanceof Error ? { cause: undoErr } : {},
+        ));
+      } finally {
+        // Identity-safe release: a later attempt may legitimately have
+        // recorded its OWN retype for this type while the undo was awaited,
+        // and that one is not finished.
+        if (this.pendingRetypes.get(mediaType) === record) this.pendingRetypes.delete(mediaType);
+        this.retypingMedia.delete(mediaType);
+      }
+    }
+  }
+
+  /**
+   * Put a source buffer's timestamp offset back after a retype.
+   *
+   * A handover retains the ongoing timeline, so the offset that was in force
+   * before the retype is still the right one. Skipped when the adapter cannot
+   * report or set it, in which case nothing here can improve on its choice.
+   */
+  private restoreTimestampOffset(mediaType: 'video' | 'audio', offset: number | undefined): void {
+    // Nothing to put back: an adapter that cannot report its offset was never
+    // rebased by us, and one that cannot set it has no offset to speak of.
+    if (offset === undefined) return;
+    const source = this.mediaSource;
+    if (source === null || source === undefined || source.setTimestampOffset === undefined) return;
+    // Deliberately NOT swallowed. A buffer left on the retype's rebased offset
+    // places the media it is about to receive a playback position away from
+    // the timeline it is on, and the caller treats that as the failed
+    // reconfiguration it is.
+    source.setTimestampOffset(mediaType, offset);
+    // "Did not throw" is NOT evidence that it took. A real MSE adapter cannot
+    // write `timestampOffset` while its SourceBuffer is updating and declines
+    // silently rather than failing, and an adapter may also catch its own
+    // error. So the value is read back: a buffer still sitting on the retype's
+    // rebased offset fails the reconfiguration instead of being adopted, and
+    // fails the undo loudly instead of hiding it.
+    const readback = source.getTimestampOffset?.(mediaType);
+    if (readback !== undefined && readback !== offset) {
+      throw new Error(`the ${mediaType} timestamp offset is ${readback} after being set to ${offset}`);
+    }
+  }
+
+  /**
+   * The initialization the REPLACEMENT will use for `track` — inline, resolved
+   * through its own root, or delivered on its own init track.
+   */
+  private preparedInitBytes(
+    prep: CandidatePrep, track: CatalogTrack, catalog: CatalogState,
+  ): Uint8Array | undefined {
+    if (track.initTrack !== undefined) {
+      // The init track of THIS track, in THIS track's namespace.
+      const key = identityKeyOf(trackNamespaceFields(track, this.config.namespace), track.initTrack);
+      return prep.initTracks.get(key)?.bytes ?? undefined;
+    }
+    try {
+      const inline = this.decodeResolvedInlineInitData(track, catalog);
+      if (inline !== undefined) return inline;
+    } catch {
+      return undefined; // validated separately, before any media request
+    }
+    // Declared nowhere, delivered in band.
+    for (const sub of prep.media.values()) {
+      if (sub.trackName === track.name && sameNamespaceFields(sub.namespace,
+        trackNamespaceFields(track, this.config.namespace))) return prep.inbandBytes.get(sub.mediaType);
+    }
+    return undefined;
+  }
+
+  /**
+   * Why `track` cannot replace what `mediaType` is playing, or null if it can.
+   *
+   * Compares against the LIVE selection rather than a cached codec string, so
+   * video and audio are checked the same way and the comparison is against
+   * what the pipelines were actually built from.
+   */
+  private unadoptableTransition(track: CatalogTrack, mediaType: 'video' | 'audio'): string | null {
+    if (!this.pipelinesCreated) return null; // nothing configured yet
+    const running = this.subscribedTrack(mediaType);
+    if (running === undefined) return null; // nothing to compare against
+    if (mediaTrackPackaging(running.packaging) !== mediaTrackPackaging(track.packaging)) {
+      return `packaging changes from "${running.packaging ?? ''}" to "${track.packaging ?? ''}"`;
+    }
+    if (this.cmafInitialized && this.usesMse(track.packaging) && !codecsCompatible(running.codec ?? '', track.codec ?? '')) {
+      return `codec changes from "${running.codec ?? ''}" to "${track.codec ?? ''}"`;
+    }
+    // Changed INITIALIZATION is not decided here: it is handled after the
+    // replacement has delivered it, by retyping the running source buffer, and
+    // only an adapter that cannot retype declines. Deciding it here would also
+    // be premature for an init track, whose bytes have not arrived yet.
+    return null;
+  }
+
+  /** The initialization the running pipeline for `mediaType` was built from. */
+  private runningInitBytes(mediaType: 'video' | 'audio'): Uint8Array | undefined {
+    const running = this.subscribedTrack(mediaType);
+    if (running === undefined) return undefined;
+    if (running.initTrack !== undefined) return this.initSegmentByTrack.get(this.initKey(running, running.initTrack));
+    const inBand = this.initSegmentByTrack.get(this.initKey(running));
+    if (inBand !== undefined) return inBand;
+    try { return this.decodeResolvedInlineInitData(running); } catch { return undefined; }
+  }
+
+  /** Record a candidate media acceptance; readiness may now be complete. */
+  private onCandidateSubscribeAccepted(txn: MigrationTxn, reqId: bigint, alias: bigint): void {
+    const prep = txn.prep;
+    if (!prep) return;
+    const sub = prep.media.get(reqId);
+    if (sub) {
+      sub.alias = alias;
+      // Media retained before this acceptance deliberately STAYS retained: it
+      // is payload, not evidence, and must reach playback exactly once —
+      // after adoption, through the ordinary replay, never into the session
+      // that is still playing.
+      // An accepted required track still needs initialization; the init track
+      // (when the catalog uses one) clears separately.
+      prep.awaiting.delete(identityKeyOf(sub.namespace, sub.trackName));
+      this.checkCandidateReady(txn);
+      return;
+    }
+    for (const init of prep.initTracks.values()) {
+      if (init.reqId !== reqId) continue;
+      init.alias = alias;
+      // An init track is a single object too, and it may well have arrived
+      // before this acceptance.
+      this.releaseEarlyCandidateData(txn, alias, (_streamId, obj) => {
+        if (obj.kind === 'data') this.onCandidateInitBytes(txn, alias, obj.payload);
+      });
+      return;
+    }
+  }
+
+  /**
+   * Note that a retained candidate media object carries the track's in-band
+   * initialization.
+   *
+   * The object is still PAYLOAD and stays retained for the ordinary post
+   * adoption replay — this only observes that the evidence exists. Handling it
+   * here instead would deliver media into a session nobody is playing yet, and
+   * then replay the same object again after adoption.
+   */
+  private noteCandidateInbandInit(txn: MigrationTxn, alias: bigint, obj: MoqtObject): void {
+    const prep = txn.prep;
+    if (prep === undefined || prep.inbandInit.size === 0 || obj.kind !== 'data') return;
+    let trackKey: string | null = null;
+    for (const sub of prep.media.values()) {
+      const key = identityKeyOf(sub.namespace, sub.trackName);
+      if (sub.alias === alias && prep.inbandInit.has(key)) { trackKey = key; break; }
+    }
+    if (trackKey === null) return;
+    if (!isCmafHeader(obj.payload)) return;
+    const mediaType = prep.inbandInit.get(trackKey)!;
+    prep.inbandInit.delete(trackKey);
+    prep.inbandBytes.set(mediaType, obj.payload);
+    prep.awaiting.delete(`in-band:${trackKey}`);
+    this.log.info('[handover] replacement delivered in-band %s initialization', mediaType);
+    this.checkCandidateReady(txn);
+  }
+
+  /** Record delivered init bytes for a candidate init track. */
+  private onCandidateInitBytes(txn: MigrationTxn, alias: bigint, bytes: Uint8Array): boolean {
+    const prep = txn.prep;
+    if (!prep) return false;
+    for (const [name, init] of prep.initTracks) {
+      if (init.alias !== alias) continue;
+      if (init.bytes === null && bytes.byteLength > 0) {
+        init.bytes = bytes;
+        prep.awaiting.delete(name);
+        this.checkCandidateReady(txn);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /** Readiness barrier: every required track accepted AND initialized. */
+  private checkCandidateReady(txn: MigrationTxn): void {
+    const prep = txn.prep;
+    if (!prep || txn.aborted || txn.committed) return;
+    if (prep.awaiting.size > 0) return;
+    if (prep.media.size === 0) return;
+    for (const sub of prep.media.values()) if (sub.alias === null) return;
+    prep.resolveReady();
+  }
+
   private assertMigrationLive(txn: MigrationTxn): void {
     if (this._destroyed) throw new Error('Migration aborted: player destroyed during establishment');
     if (this.isTerminalState()) throw new Error('Migration aborted: playback terminated during establishment');
@@ -3482,13 +4841,102 @@ export class MoqtPlayer {
    * possibly-essential event. Shared by the callback staging wrapper and the
    * deferred degraded-error diagnostic.
    */
-  private stageMigrationEvent(txn: MigrationTxn, run: () => void, bytes: number, source: MoqtConnectionErrorSource): void {
+  private stageMigrationEvent(
+    txn: MigrationTxn, run: () => void, bytes: number, source: MoqtConnectionErrorSource,
+    tag?: { alias?: bigint; streamId?: bigint; obj?: MoqtObject },
+  ): void {
     if (txn.events.length >= MoqtPlayer.MAX_STAGED_EVENTS || txn.retainedBytes + bytes > MoqtPlayer.MAX_STAGED_BYTES) {
       this.abortMigration(txn);
       return;
     }
     txn.retainedBytes += bytes;
-    txn.events.push({ run, source });
+    txn.events.push({ run, source, ...(tag ?? {}) });
+  }
+
+  /**
+   * Take back the data a candidate retained for `alias` before that alias was
+   * bound, now that binding says what it is.
+   *
+   * Draft-16 §10.4.2, draft-18 §11.4.2 and draft-22 §3.1.3.1 all permit data
+   * to precede the message that establishes the track
+   * alias, and for a catalog or an init track that data may be the ONLY object
+   * there will ever be — so dropping it, or leaving it retained until an
+   * adoption that depends on it, both deadlock the handover. Entries are
+   * returned in arrival order and removed from the queue, so nothing is both
+   * handled now and replayed again after adoption.
+   */
+  private takeStagedForAlias(txn: MigrationTxn, alias: bigint): Array<{ streamId: bigint; obj: MoqtObject }> {
+    const taken: Array<{ streamId: bigint; obj: MoqtObject }> = [];
+    const kept: MigrationTxn['events'][number][] = [];
+    for (const event of txn.events) {
+      if (event.alias === alias && event.obj !== undefined && event.streamId !== undefined) {
+        taken.push({ streamId: event.streamId, obj: event.obj });
+        txn.retainedBytes -= MoqtPlayer.STAGED_EVENT_BASE_BYTES
+          + (event.obj.kind === 'data' ? event.obj.payload.byteLength : 0);
+        continue;
+      }
+      kept.push(event);
+    }
+    if (taken.length === 0) return taken;
+    txn.events.length = 0;
+    txn.events.push(...kept);
+    if (txn.retainedBytes < 0) txn.retainedBytes = 0;
+    return taken;
+  }
+
+  /**
+   * Take the retained LIFECYCLE events (FIN, reset, header) belonging to
+   * `streams`, so they can be delivered after their objects.
+   *
+   * A terminal names a stream, not an alias, so it is reclaimed by stream once
+   * that stream's objects turn out to be evidence. Delivered AFTER all of
+   * them, exactly once: a multi-object stream must never see its terminal
+   * between its own objects, which would corrupt the clean-chain evidence a
+   * valid independent-plus-delta sequence depends on.
+   */
+  private takeStagedLifecycle(txn: MigrationTxn, streams: Set<bigint>): Array<() => void> {
+    const taken: Array<() => void> = [];
+    const kept: MigrationTxn['events'][number][] = [];
+    for (const event of txn.events) {
+      if (event.obj === undefined && event.streamId !== undefined && streams.has(event.streamId)) {
+        taken.push(event.run);
+        txn.retainedBytes -= MoqtPlayer.STAGED_EVENT_BASE_BYTES;
+        continue;
+      }
+      kept.push(event);
+    }
+    if (taken.length === 0) return taken;
+    txn.events.length = 0;
+    txn.events.push(...kept);
+    if (txn.retainedBytes < 0) txn.retainedBytes = 0;
+    return taken;
+  }
+
+  /**
+   * Deliver everything the candidate retained for an alias it has just bound.
+   *
+   * Objects first and in arrival order, then each affected stream's terminal.
+   * `handle` decides what the data IS — a catalog object, or an init track's
+   * bytes — because only the binding knew.
+   */
+  private releaseEarlyCandidateData(
+    txn: MigrationTxn, alias: bigint, handle: (streamId: bigint, obj: MoqtObject) => void,
+  ): void {
+    const early = this.takeStagedForAlias(txn, alias);
+    if (early.length === 0) return;
+    const streams = new Set<bigint>();
+    for (const { streamId, obj } of early) {
+      streams.add(streamId);
+      handle(streamId, obj);
+    }
+    for (const run of this.takeStagedLifecycle(txn, streams)) {
+      try {
+        run();
+      } catch (err) {
+        this.log.warn('[handover] retained stream lifecycle failed on release: %s',
+          err instanceof Error ? err.message : String(err));
+      }
+    }
   }
 
   /**
@@ -3501,6 +4949,7 @@ export class MoqtPlayer {
   private abortMigration(txn: MigrationTxn): void {
     if (txn.aborted) return;
     txn.aborted = true;
+    txn.wake?.();
     txn.committed = true; // stop staging
     txn.events.length = 0;
     txn.retainedBytes = 0;
@@ -3515,9 +4964,21 @@ export class MoqtPlayer {
    * {@link abortMigration}.
    */
   private abandonCandidate(txn: MigrationTxn): void {
+    // A fence guarding an UNSETTLED retype stays up: its `changeType` may
+    // still complete and change the buffer, and appending the old session's
+    // media in between is exactly what the fence exists to prevent. Only
+    // fences with no outstanding mutation come down here.
+    for (const mediaType of [...this.retypingMedia]) {
+      if (!this.pendingRetypes.has(mediaType)) this.retypingMedia.delete(mediaType);
+    }
+    if (txn.slots?.catalogSubscribeRetryTimer != null) {
+      clearTimeout(txn.slots.catalogSubscribeRetryTimer);
+      txn.slots.catalogSubscribeRetryTimer = null;
+    }
     // Mark the transaction terminal so any callback reference captured before
     // detachment is permanently inert (see the owning-txn check in stageable).
     txn.aborted = true;
+    txn.wake?.();
     txn.committed = true;
     txn.events.length = 0;
     txn.retainedBytes = 0;
@@ -3583,62 +5044,263 @@ export class MoqtPlayer {
    * `newConnection` is authoritative and its catalog SUBSCRIBE_OK (a later
    * network event) resolves against a consistent state.
    */
-  private commitMigration(txn: MigrationTxn, newConnection: MoqtConnection, catalogReqId: bigint): void {
+  private commitMigration(txn: MigrationTxn, newConnection: MoqtConnection): void {
+    // The session being retired, captured BEFORE `this.connection` moves: the
+    // retained-route ownership below is about that connection, and reading it
+    // afterwards would name the replacement as its own predecessor.
+    const retiring = this.connection;
     txn.committed = true; // staging closed — further candidate events run live on the now-current session
+    // Record the endpoint HERE, not after the transaction resolves: the staged
+    // drain and the queued-GOAWAY processing that follow can both act on an
+    // empty New Session URI from the replacement, and they must resolve it
+    // against the endpoint we just adopted.
+    if (txn.target !== undefined) this.activeEndpoint = txn.target;
     // The superseded session's catalog delivery is quarantined for BOTH
-    // migration flavors (GOAWAY installs it earlier; manual migration only
-    // here): if old and new sessions reuse an alias, late old-session catalog
-    // data must never reach the new coordinator through the global alias route.
+    // migration flavors: if old and new sessions reuse an alias, late
+    // old-session catalog data must never reach the new coordinator.
     if (this.connection) {
       this.catalogQuarantinedConns.add(this.connection);
-      // F6: remember the OLD session's catalog alias so a cross-role reuse of
-      // that alias on the NEW session can never route late old catalog bytes
-      // into the media pipeline.
-      if (this.catalogTrackAlias !== null) {
-        this.quarantinedCatalogAliases.set(this.connection, this.catalogTrackAlias);
+      if (this.catalogSlots.catalogTrackAlias !== null) {
+        this.quarantinedCatalogAliases.set(this.connection, this.catalogSlots.catalogTrackAlias);
       }
     }
-    // Old-session request ids are dead; the candidate's catalog subscribe may
-    // still be awaiting SUBSCRIBE_OK (its staged response replays after this).
-    this.pendingAliasBinds.clear();
-    this.pendingAliasBinds.add(catalogReqId);
     this.connection = newConnection;
     if (this.subscriptionManager) this.subscriptionManager.draftVersion = newConnection.draftVersion;
 
-    // Reset catalog state for the new session
-    this.catalogReceived = false;
-    this.catalogTrackAlias = null;
-    this.catalogRequestId = catalogReqId;
-    this.legacyCatalogTerminal = null;
-    // Catalog bootstrap: the old coordinator is superseded wholesale; a fresh
-    // one (new generation) binds to the committed session. Its joining fetch
-    // fires immediately (Pending/Established association both legal on 16/18).
-    this.cancelCatalogBootstrap();
-    this.catalogRecovery?.coord.abort();
-    this.catalogRecovery = null;
-    this.recoveryAttempted = false; // new session, fresh recovery budget
-    this.bootstrapFetch = null;
-    this.bootstrapFetchStreams.clear();
-    this.catalogManager?.reset();
+    // ── Adopt what the candidate PREPARED ───────────────────────────────
+    // The replacement's catalog has already converged and its required tracks
+    // are already accepted and initialized, so there is nothing to retrieve
+    // again: adoption installs that work rather than restarting it. A second
+    // catalog retrieval or a second SUBSCRIBE here would discard the evidence
+    // the handover was granted on and re-race what it already settled.
+    const prep = txn.prep;
+    const prepared = txn.slots;
+    if (prep !== undefined && prepared !== undefined) {
+      // The OLD retrieval's in-flight work stops, WITHOUT bumping the
+      // bootstrap generation: that token is captured by the candidate's own
+      // coordinator, and invalidating it here would silence the live catalog
+      // feed we are adopting.
+      this.retireCatalogHolder(this.catalogSlots);
+      // Whether the player had a catalog AT ALL before this handover decides
+      // whether the adopted one is an update or a first arrival.
+      const hadCatalog = this.catalogSlots.catalogReceived;
+      this.catalogSlots = prepared;
+      // Live playback's view of the catalog becomes the replacement's, with no
+      // second `catalog_received` — the session changed, the broadcast did not.
+      if (prep.state !== null) this._catalogState = prep.state;
+      if (!hadCatalog && prep.state !== null) {
+        // ...unless there was no catalog before: then this IS the player's
+        // first one, and everything waiting on that — the watchdog, the
+        // stats, the application — must hear it exactly as on a first load.
+        this._stats.recordCatalogReceived();
+        this.watchdog.fulfill('catalog_received');
+        this.watchdog.expect('first_media_object', 20_000);
+        this.emitter.emit('catalog_received', { type: 'catalog_received', catalog: prep.state });
+        if (this._destroyed || this.connection !== newConnection || this.isTerminalState()) {
+          txn.terminated = true;
+          return;
+        }
+      }
+      // Initialization the candidate actually received enters the live cache
+      // only now; a candidate that was never adopted must not populate it.
+      if (!this.pipelinesCreated && prep.selection !== null) this.createSelectedPipelines(prep.selection);
+      this.initSegmentByTrack.clear();
+      this.initTrackRequestIds.clear();
+      for (const [name, init] of prep.initTracks) {
+        if (init.bytes !== null) this.initSegmentByTrack.set(name, init.bytes);
+      }
+      // All retained initialization now belongs to the adopted session. This
+      // also completes startup when the original source never delivered init.
+      // Replace partial old-source bytes rather than mixing the two sessions.
+      this.cmafPendingInit = {};
+      for (const mediaType of ['video', 'audio'] as const) {
+        const track = prep.selection?.[mediaType];
+        if (!track || prep.state === null || !isMsePackaging(track.packaging)) continue;
+        const bytes = this.preparedInitBytes(prep, track, prep.state);
+        if (bytes === undefined || !track.codec) continue;
+        this.initSegmentByTrack.set(this.initKey(track), bytes);
+        if (this.usesMse(track.packaging)) this.cmafPendingInit[mediaType] = { codec: track.codec, bytes };
+      }
+      this.maybeApplyCmafInit();
+      if (this._destroyed || this.connection !== newConnection || this.isTerminalState()) {
+        txn.terminated = true;
+        return;
+      }
+      if (!this.cmafInitialized && (this.cmafPendingInit?.video || this.cmafPendingInit?.audio)) {
+        txn.terminated = true;
+        this.failCatalogPlayback(createPlayerError('fatal', 'catalog', PlayerErrorCode.CMAF_INIT_INVALID,
+          'Replacement initialization was rejected by the media adapter'));
+        return;
+      }
+      // The source buffer was retyped during preparation; the assembler has to
+      // agree, or it would keep prepending the old initialization to segments
+      // the buffer no longer accepts. The fence comes down here — from now on
+      // the media reaching this buffer is the replacement's.
+      for (const [mediaType, bytes] of prep.reconfigured) {
+        this.cmafAssembler?.setInitSegment?.(mediaType, bytes);
+        if (mediaType === 'video') this.currentVideoCodec = prep.selection?.video?.codec ?? this.currentVideoCodec;
+        // Adopted: the retype is no longer outstanding, and the buffer now
+        // holds the initialization of the session that is about to play. The
+        // fence comes down with it — from here the per-source routing gate is
+        // what keeps the retiring session's old-format media out of this
+        // buffer, which a type-wide fence could not do without also blocking
+        // the replacement's own media during retirement.
+        this.pendingRetypes.delete(mediaType);
+        this.retypingMedia.delete(mediaType);
+      }
+      // The old session's registrations are SUPERSEDED, not deleted. Until its
+      // close completes it may still be delivering media, and that media is
+      // what playback is running on — dropping it at the instant of commit
+      // would open exactly the gap this handover exists to avoid. Each object
+      // carries its own connection and draft through routing, so old and new
+      // deliveries stay distinguishable; what the replacement reuses it
+      // overwrites, and the rest is pruned once the old session is retired.
+      const preparedIds = new Set(prep.media.keys());
+      const preparedAliases = new Set<bigint>();
+      for (const sub of prep.media.values()) if (sub.alias !== null) preparedAliases.add(sub.alias);
+      const supersededIds = new Set<bigint>();
+      const supersededAliases = new Set<bigint>();
+      for (const [reqId, sub] of this.activeSubscriptions) {
+        // The ALIAS is collected even when the replacement reuses this entry's
+        // request id: ids and aliases are independent namespaces, and an old
+        // alias left registered because its id happened to be reused would
+        // keep delivering through a retired track forever.
+        if (sub.trackAlias !== null && !preparedAliases.has(sub.trackAlias)) {
+          supersededAliases.add(sub.trackAlias);
+        }
+        if (preparedIds.has(reqId)) continue;
+        supersededIds.add(reqId);
+      }
+      for (const reqId of this.pendingMediaSubs.keys()) if (!preparedIds.has(reqId)) supersededIds.add(reqId);
+      txn.superseded = { ids: supersededIds, aliases: supersededAliases };
+      // Source identity for those retained routes. The old connection is still
+      // `this.connection` at this point in the commit.
+      // Recorded whenever there IS a session being retired, even with no
+      // retained aliases: the gate's other half — that the retiring session
+      // may not deliver on an alias the replacement took over — is exactly
+      // what matters when the replacement reused every one of them.
+      if (retiring !== null && retiring !== newConnection) this.supersededConns.add(retiring);
+      this.supersededRouting = retiring !== null && retiring !== newConnection
+        ? { conn: retiring, aliases: new Set(supersededAliases), reconfigured: new Set(prep.reconfigured.keys()) }
+        : null;
+      this.pendingAliasBinds.clear();
+      for (const [reqId, sub] of prep.media) {
+        // Exactly what SUBSCRIBE_OK installs for a live subscription — the
+        // alias the replacement itself assigned, bound to the pipeline owner
+        // that is already running. A colliding old request id or alias is
+        // overwritten here: the replacement is authoritative for it now.
+        this.pendingMediaSubs.delete(reqId);
+        this.activeSubscriptions.set(reqId, {
+          trackName: sub.trackName, mediaType: sub.mediaType, trackAlias: sub.alias,
+          ...(sub.namespace !== undefined ? { namespace: sub.namespace } : {}),
+        });
+        if (sub.alias !== null) {
+          this.subscriptionManager?.registerTrack(sub.alias, sub.trackName, sub.mediaType, sub.packaging);
+        }
+      }
+      this._mediaSubsExpected = prep.media.size;
+      this._mediaSubsOk = prep.media.size;
+      this._mediaSubsFailed = 0;
+      // A catalog subscription still awaiting its alias keeps its ownership of
+      // anything parked for it.
+      if (prepared.catalogTrackAlias === null && prepared.catalogRequestId !== null) {
+        this.pendingAliasBinds.add(prepared.catalogRequestId);
+      }
+      // ABR must ladder on the REPLACEMENT's catalog. Left alone, the live
+      // quality controller would keep the retired session's alternatives and
+      // could switch playback to a track that no longer exists; its view of
+      // what is playing comes from the adopted subscriptions registered above,
+      // so the committed track and both ABR ladders stay consistent.
+      if (prep.controller !== undefined) {
+        this.qualityController = prep.controller;
+        this.syncBufferAbrController();
+      }
+      // Anything the preparation path parked for a now-bound alias belongs to
+      // this session and is delivered through the ordinary replay, before the
+      // staged media drain adds to it.
+      for (const sub of prep.media.values()) {
+        if (sub.alias !== null) this.replayPendingObjects(sub.alias, newConnection);
+      }
+      if (prepared.catalogTrackAlias !== null) {
+        this.replayPendingObjects(prepared.catalogTrackAlias, newConnection);
+      }
+    }
 
-    // Clear fetch state (fetches are per-session) and reject any in-flight
-    // fetchCatalog promises — their request IDs/stream IDs belong to the old
-    // adapter and won't match new-session traffic.
+    // Fetch bookkeeping is per-session and keyed by bare ids the replacement
+    // reuses; the candidate's own fetch state travels in its holder.
     this.activeFetches.clear();
     this.fetchStreamAliases.clear();
     this.fetchStreamRequestIds.clear();
     this.pendingFetchStreams.clear();
-    this.catalogFillRequests.clear();
     this.refusedFetchRequests.clear();
     this.quarantinedFetchRequests.clear();
     this.droppedFetchStreams.clear();
     this.rejectPendingCatalogFetches('Session migrated — fetchCatalog cancelled');
+  }
 
-    // Re-bootstrap on the committed session. (The candidate's catalog
-    // subscribe already used this mode's options — see runMigrationTransaction.)
-    if (this.resolvedCatalogMode(newConnection) === 'joining-fetch') {
-      this.createCatalogBootstrap(newConnection).start();
+  /**
+   * Stop one catalog retrieval's outstanding work without touching another's.
+   *
+   * Deliberately NOT {@link cancelCatalogBootstrap}: that bumps the shared
+   * bootstrap generation, which an adopted candidate's coordinator captured
+   * and which unrelated media work also observes.
+   */
+  private retireCatalogHolder(slots: CatalogSlots): void {
+    if (slots.catalogSubscribeRetryTimer !== null) {
+      clearTimeout(slots.catalogSubscribeRetryTimer);
+      slots.catalogSubscribeRetryTimer = null;
     }
+    slots.catalogBootstrapCoord?.abort();
+    slots.catalogBootstrapCoord = null;
+    slots.catalogRecovery?.coord.abort();
+    slots.catalogRecovery = null;
+  }
+
+  /**
+   * Drop the registrations the adopted session superseded, now that the old
+   * session is actually closed.
+   *
+   * Deferred to here rather than done at commit so the old session's in-flight
+   * media keeps reaching playback for as long as it is still arriving. Only
+   * the entries recorded at adoption are removed, so a subscription made
+   * AFTER it — a quality switch, an init track — is never caught by this.
+   */
+  private pruneSupersededSubscriptions(txn: MigrationTxn): void {
+    const superseded = txn.superseded;
+    if (superseded === undefined) return;
+    txn.superseded = undefined;
+    // The overlap is over, so the retained routes go with it.
+    this.supersededRouting = null;
+    for (const reqId of superseded.ids) {
+      this.activeSubscriptions.delete(reqId);
+      this.pendingMediaSubs.delete(reqId);
+    }
+    for (const alias of superseded.aliases) this.subscriptionManager?.unregisterTrack(alias);
+  }
+
+  /**
+   * Announce a terminal event on the replaced session that was held during a
+   * now-failed attempt.
+   *
+   * Held events are only ever deferred, never dropped: while a replacement
+   * looked likely the closure was about to become irrelevant, but once the
+   * attempt fails it is the session's real outcome and the application has to
+   * hear it.
+   */
+  private reportHeldOldTerminal(txn: MigrationTxn): void {
+    const held = txn.oldTerminal;
+    if (held === undefined) return;
+    txn.oldTerminal = undefined;
+    if (held.kind === 'close') {
+      this.emitter.emit('session_closed', defined({
+        type: 'session_closed' as const, error: held.error, reason: held.reason,
+      }));
+      return;
+    }
+    this.emitError(createPlayerError(
+      held.severity, 'connection', held.code, held.error.message,
+      defined({ cause: held.error, context: held.context }),
+    ));
   }
 
   /**
@@ -3649,8 +5311,26 @@ export class MoqtPlayer {
    */
   private async retireMigratedSession(oldConnection: MoqtConnection | null): Promise<void> {
     if (!oldConnection) return;
+    this.retireInitWaiters(oldConnection);
     try {
-      await oldConnection.close();
+      // BOUNDED. The replacement is already authoritative and playing, so the
+      // old session's close is cleanup — and a relay that never answers it
+      // must not hold `session_migrated`, the single-flight slot, or the end of
+      // the overlap hostage. Past the bound the close is left running
+      // detached (its own rejection stays handled) and retirement proceeds;
+      // the reclamation in `finally` does not depend on it finishing.
+      const closing = oldConnection.close();
+      let bound: ReturnType<typeof setTimeout> | undefined;
+      const bounded = new Promise<'bound'>((resolve) => {
+        bound = setTimeout(() => resolve('bound'), this.config.connectionTimeoutMs ?? 10_000);
+      });
+      void closing.catch(() => { /* reported below or already detached */ });
+      const outcome = await Promise.race([closing.then(() => 'closed' as const), bounded]);
+      if (bound !== undefined) clearTimeout(bound);
+      if (outcome === 'bound') {
+        this.log.warn('Old session close did not complete within %dms — continuing, cleanup detached',
+          this.config.connectionTimeoutMs ?? 10_000);
+      }
     } catch (err) {
       // The handoff already committed — the replacement is authoritative and
       // usable, so a failure closing the OLD session is non-fatal. Log and finish
@@ -3662,6 +5342,14 @@ export class MoqtPlayer {
       } catch { /* logger threw — swallow, retirement is best-effort */ }
     } finally {
       this.purgePendingForConnection(oldConnection);
+    }
+  }
+
+  private retireInitWaiters(connection: MoqtConnection): void {
+    for (const [key, pending] of this.pendingInitTrackSubs) {
+      if (pending.connection !== connection) continue;
+      this.pendingInitTrackSubs.delete(key);
+      pending.reject(new Error('Init source session retired'));
     }
   }
 
@@ -3723,7 +5411,9 @@ export class MoqtPlayer {
   private async migrateToUrl(newConnection: MoqtConnection, url: string): Promise<void> {
     const createTransport = this.config.createTransport!;
     const setupOptions = buildSetupOptions(this.config, url);
-    await this.runMigrationTransaction(newConnection, () => createTransport(buildConnectUrl(this.config, url)), setupOptions);
+    await this.runMigrationTransaction(
+      newConnection, () => createTransport(buildConnectUrl(this.config, url)), setupOptions, url,
+    );
 
     this._stats.recordReconnect();
     this.log.info('Session migrated to %s', url);
@@ -3750,7 +5440,9 @@ export class MoqtPlayer {
     if (!this.connection) throw new Error('Player not loaded');
     const connAtCall = this.connection;
 
-    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+    const target = this.uniqueCatalogTrack(trackName);
+    const nsFields = trackNamespaceFields(target, this.config.namespace);
+    const nsBytes = nsFields.map(field => this.enc.encode(field));
     const nameBytes = this.enc.encode(trackName);
 
     const fetchOptions = {
@@ -3765,7 +5457,8 @@ export class MoqtPlayer {
     let mediaType: 'video' | 'audio' = 'video';
     let subscriptionRequestId: bigint | null = null;
     for (const [requestId, sub] of this.activeSubscriptions) {
-      if (sub.trackName === trackName &&
+      if (sub.trackName === trackName && sameNamespaceFields(
+          sub.namespace ?? namespaceFields(this.config.namespace), nsFields) &&
           sub.mediaType !== 'mediatimeline' &&
           sub.mediaType !== 'eventtimeline') {
         mediaType = sub.mediaType;
@@ -4008,8 +5701,8 @@ export class MoqtPlayer {
       return;
     }
     try {
-      // Fresh per-call manager — doesn't read or mutate this.catalogManager.
-      const oneShot = new CatalogManager(namespaceDisplay(this.config.namespace));
+      // Fresh per-call manager — doesn't read or mutate this.catalogSlots.catalogManager.
+      const oneShot = new CatalogManager(this.config.namespace);
       const state = oneShot.processCatalogObject(obj.payload);
       this.settleCatalogFetch(reqId, { ok: true, state });
     } catch (err) {
@@ -4068,8 +5761,9 @@ export class MoqtPlayer {
 
   /** Draft-aware FETCH INVALID_RANGE code: d14 uses 0x5 (§9.18); 16/18 use
    *  the common table's 0x11. */
-  private invalidRangeCode(): bigint {
-    return (this.connection?.draftVersion ?? this.config.draftVersion ?? 16) === 14 ? 0x5n : 0x11n;
+  private invalidRangeCode(draftVersion?: DraftVersion): bigint {
+    const draft = draftVersion ?? this.connection?.draftVersion ?? this.config.draftVersion ?? 16;
+    return draft === 14 ? 0x5n : 0x11n;
   }
 
   /** STRICT standards mode: fallbacks off the joining path are fatal. */
@@ -4087,7 +5781,9 @@ export class MoqtPlayer {
    * + `onDrained` opt the subscription into the adapter's terminal drain so a
    * one-shot catalog's late delta survives PUBLISH_DONE.
    */
-  private catalogSubscribeOptions(conn: MoqtConnection): Record<string, unknown> {
+  private catalogSubscribeOptions(
+    conn: MoqtConnection, slots: CatalogSlots = this.catalogSlots,
+  ): Record<string, unknown> {
     if (this.resolvedCatalogMode(conn) === 'subscribe') {
       // Legacy escape hatch — today's exact WIRE options, byte-identical
       // (onRequestId is an adapter-local concern, stripped before Session):
@@ -4102,7 +5798,7 @@ export class MoqtPlayer {
         },
         onRequestId: (id: bigint) => {
           if (legacyGen !== this.bootstrapGeneration) return;
-          this.catalogRequestId = id;
+          slots.catalogRequestId = id;
           this.pendingAliasBinds.add(id);
         },
         // Terminal-drain semantics apply on EVERY draft, including 14 and the
@@ -4112,8 +5808,8 @@ export class MoqtPlayer {
         terminalDelivery: 'drain' as const,
         onDrained: (id: bigint) => {
           if (legacyGen !== this.bootstrapGeneration) return;
-          if (id !== this.catalogRequestId) return;
-          this.deliverCatalogDrained();
+          if (id !== slots.catalogRequestId) return;
+          this.deliverCatalogDrained(slots);
         },
       };
     }
@@ -4123,18 +5819,18 @@ export class MoqtPlayer {
       ...(this.usesCatalogFill(conn) ? { fill: CATALOG_FILL } : {}),
       onRequestId: (id: bigint) => {
         if (gen !== this.bootstrapGeneration) return;
-        this.catalogRequestId = id;
+        slots.catalogRequestId = id;
         this.pendingAliasBinds.add(id);
       },
       terminalDelivery: 'drain' as const,
       onDrained: (id: bigint) => {
         if (gen !== this.bootstrapGeneration) return;
-        if (id !== this.catalogRequestId) return;
-        const coord = this.catalogBootstrapCoord;
+        if (id !== slots.catalogRequestId) return;
+        const coord = slots.catalogBootstrapCoord;
         coord?.onSubscriptionDrained();
         // A drained 'ended' feed is OVER: retire the route so late objects
         // stop applying (retriable retirement happens in staged recovery).
-        if (coord?.feedEnded) this.retireCatalogAliasRoute();
+        if (coord?.feedEnded) this.retireCatalogAliasRoute(slots);
       },
     };
   }
@@ -4147,7 +5843,7 @@ export class MoqtPlayer {
    * caller invokes `.start()` once the subscribe has been issued (the
    * coordinator buffers everything that arrives in between).
    */
-  private createCatalogBootstrap(conn: MoqtConnection): CatalogBootstrap {
+  private createCatalogBootstrap(conn: MoqtConnection, slots: CatalogSlots = this.catalogSlots): CatalogBootstrap {
     const gen = this.bootstrapGeneration;
     // Liveness is OPERATION-LOCAL, not just session-local. `abort()` stops the
     // coordinator's future work but cannot revoke an async call already in
@@ -4156,42 +5852,45 @@ export class MoqtPlayer {
     // neither the generation nor the connection can tell a retired coordinator's
     // late continuation from a live one. The installed-coordinator identity can:
     // retirement clears the slot, so every continuation below becomes inert.
-    const live = (): boolean => gen === this.bootstrapGeneration && this.connection === conn
-      && this.catalogBootstrapCoord === coord;
+    // Captured holder + coordinator identity: reading the player's current
+    // slots late would let a retired candidate's continuation act on whichever
+    // retrieval happens to be installed by then.
+    const live = (): boolean => gen === this.bootstrapGeneration
+      && this.slotsFor(conn) === slots && slots.catalogBootstrapCoord === coord;
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(catalogTrackName());
     let pendingAttempt: number | null = null;
 
     const coord: CatalogBootstrap = new CatalogBootstrap({
-      applyAt: (loc, payload, opts) => this.catalogManager!.processCatalogObjectAt(loc, payload, opts),
-      resetManager: () => this.catalogManager?.reset(),
-      currentState: () => this.catalogManager?.currentState ?? null,
+      applyAt: (loc, payload, opts) => slots.catalogManager!.processCatalogObjectAt(loc, payload, opts),
+      resetManager: () => slots.catalogManager?.reset(),
+      currentState: () => slots.catalogManager?.currentState ?? null,
       issueJoiningFetch: (attempt) => {
         pendingAttempt = attempt;
         if (this.usesCatalogFill(conn)) {
           void Promise.resolve().then(() => {
             if (!live()) return;
-            const subReqId = this.catalogRequestId;
+            const subReqId = slots.catalogRequestId;
             if (subReqId === null) { coord.onFetchError(attempt, 'refused'); return; }
-            this.catalogFillRequests.add(subReqId);
+            slots.catalogFillRequests.add(subReqId);
             coord.onFetchOk(attempt, { group: 0n, object: 0n }, false);
-            this.registerBootstrapFetch(conn, subReqId, attempt, gen);
+            this.registerBootstrapFetch(slots, conn, subReqId, attempt, gen);
           });
           return;
         }
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
-            if (!live() || this.catalogRequestId === null) throw new Error('no catalog subscription');
+            if (!live() || slots.catalogRequestId === null) throw new Error('no catalog subscription');
             await conn.joiningFetch({
               joiningFetchType: 'relative',
-              joiningRequestId: this.catalogRequestId,
+              joiningRequestId: slots.catalogRequestId,
               joiningStart: 0n,
               groupOrder: varint(0x1n), // ascending — explicit on every bootstrap fetch
               onRequestId: (id: bigint) => {
                 if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
                 myFetchReqId = id;
-                this.registerBootstrapFetch(conn, id, attempt, gen);
+                this.registerBootstrapFetch(slots, conn, id, attempt, gen);
               },
             } as never);
           } catch (err) {
@@ -4201,9 +5900,9 @@ export class MoqtPlayer {
             // RETIRE only THIS call's allocation — a rejection settling late
             // must never cancel a newer ladder attempt's request/streams.
             if (myFetchReqId !== null) {
-              this.retireBootstrapFetch(conn, myFetchReqId, { attempt });
-              if (this.bootstrapFetch?.reqId === myFetchReqId && this.bootstrapFetch.conn === conn) {
-                this.bootstrapFetch = null;
+              this.retireBootstrapFetch(slots, conn, myFetchReqId, { attempt });
+              if (slots.bootstrapFetch?.reqId === myFetchReqId && slots.bootstrapFetch.conn === conn) {
+                slots.bootstrapFetch = null;
               }
             }
             coord.onFetchError(attempt, 'refused');
@@ -4229,7 +5928,7 @@ export class MoqtPlayer {
               onRequestId: (id: bigint) => {
                 if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
                 myFetchReqId = id;
-                this.registerBootstrapFetch(conn, id, attempt, gen);
+                this.registerBootstrapFetch(slots, conn, id, attempt, gen);
               },
             } as never);
           } catch (err) {
@@ -4238,9 +5937,9 @@ export class MoqtPlayer {
               err instanceof Error ? err.message : String(err));
             // RETIRE only THIS call's allocation — never a newer attempt's.
             if (myFetchReqId !== null) {
-              this.retireBootstrapFetch(conn, myFetchReqId, { attempt });
-              if (this.bootstrapFetch?.reqId === myFetchReqId && this.bootstrapFetch.conn === conn) {
-                this.bootstrapFetch = null;
+              this.retireBootstrapFetch(slots, conn, myFetchReqId, { attempt });
+              if (slots.bootstrapFetch?.reqId === myFetchReqId && slots.bootstrapFetch.conn === conn) {
+                slots.bootstrapFetch = null;
               }
             }
             coord.onFetchError(attempt, 'refused');
@@ -4249,25 +5948,44 @@ export class MoqtPlayer {
       },
       cancelFetch: () => {
         pendingAttempt = null;
-        const fetch = this.bootstrapFetch;
-        this.bootstrapFetch = null;
-        if (fetch) this.retireBootstrapFetch(fetch.conn, fetch.reqId, { attempt: fetch.attempt });
+        const fetch = slots.bootstrapFetch;
+        slots.bootstrapFetch = null;
+        if (fetch) this.retireBootstrapFetch(slots, fetch.conn, fetch.reqId, { attempt: fetch.attempt });
       },
       onReady: (state) => {
         if (!live()) return;
+        // A PREPARING candidate's coordinator reaching readiness is the
+        // convergence the handover is waiting for — it is not a catalog for
+        // playback, so it resolves the attempt instead of publishing state
+        // and subscribing live media.
+        const candidate = this.candidateTxnFor(slots);
+        if (candidate !== null) {
+          slots.catalogReceived = true;
+          candidate.prep!.state = state;
+          this.log.info('[handover] replacement catalog bootstrap converged: %d tracks', state.tracks.length);
+          candidate.prep!.resolveCatalog(state);
+          return;
+        }
         this.onCatalogBootstrapReady(state);
       },
       onUpdated: (state) => {
         if (!live()) return;
+        const candidate = this.candidateTxnFor(slots);
+        if (candidate !== null) {
+          // Kept, not announced: the delta belongs to a session nobody is
+          // playing yet. Adoption publishes the converged state once.
+          candidate.prep!.state = state;
+          return;
+        }
         this._catalogState = state;
         this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
       },
       requestLegacyResubscribe: () => {
         void (async () => {
           if (!live()) return;
-          const oldReqId = this.catalogRequestId;
-          this.catalogRequestId = null;
-          this.catalogTrackAlias = null;
+          const oldReqId = slots.catalogRequestId;
+          slots.catalogRequestId = null;
+          slots.catalogTrackAlias = null;
           if (oldReqId !== null) {
             // Cancellation settles like a response: the dead request stops
             // owning parked data and stops enabling parking.
@@ -4295,21 +6013,21 @@ export class MoqtPlayer {
                 // before any bytes go out (the hook's documented contract).
                 if (!live()) throw new Error('catalog bootstrap fallback retired before emission');
                 callbackFired = true;
-                this.catalogRequestId = id;
+                slots.catalogRequestId = id;
                 this.pendingAliasBinds.add(id);
               },
               terminalDelivery: 'drain',
               onDrained: (id: bigint) => {
                 if (!live()) return;
-                if (id !== this.catalogRequestId) return;
-                const drainCoord = this.catalogBootstrapCoord;
+                if (id !== slots.catalogRequestId) return;
+                const drainCoord = slots.catalogBootstrapCoord;
                 drainCoord?.onSubscriptionDrained();
                 if (drainCoord?.feedEnded) this.retireCatalogAliasRoute();
               },
             } as never);
             if (!live()) return;
             if (!callbackFired) {
-              this.catalogRequestId = BigInt(reqId); // callback-less adapter fallback
+              slots.catalogRequestId = BigInt(reqId); // callback-less adapter fallback
               this.pendingAliasBinds.add(BigInt(reqId));
             }
           } catch (err) {
@@ -4317,7 +6035,7 @@ export class MoqtPlayer {
             // not settle parked ownership or raise a fatal error for a request
             // that is no longer ours.
             if (!live()) return;
-            if (this.catalogRequestId !== null) this.settleParkedOwnership(this.catalogRequestId, null, conn);
+            if (slots.catalogRequestId !== null) this.settleParkedOwnership(slots.catalogRequestId, null, conn);
             this.failCatalogPlayback(createPlayerError(
               'fatal', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
               `catalog bootstrap fallback resubscribe failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -4327,6 +6045,13 @@ export class MoqtPlayer {
       },
       onFatal: (reason) => {
         if (!live()) return;
+        // Terminal for the CANDIDATE only: its own ladder bottoming out is
+        // final for the attempt and invisible to live playback.
+        const candidate = this.candidateTxnFor(slots);
+        if (candidate !== null) {
+          this.failCandidateCatalog(candidate.conn, `replacement catalog bootstrap failed: ${reason}`);
+          return;
+        }
         this.failCatalogPlayback(createPlayerError(
           'fatal', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
           `catalog bootstrap failed: ${reason}`,
@@ -4334,6 +6059,13 @@ export class MoqtPlayer {
       },
       onDegraded: (reason) => {
         if (!live()) return;
+        const candidate = this.candidateTxnFor(slots);
+        if (candidate !== null) {
+          // Pre-adoption there is nothing to degrade: decline the candidate
+          // rather than adopt a replacement with a known-bad catalog feed.
+          this.failCandidateCatalog(candidate.conn, `replacement catalog update rejected: ${reason}`);
+          return;
+        }
         // Post-readiness catalog faults match the legacy severity model:
         // degraded, never silent.
         this.emitError(createPlayerError(
@@ -4343,6 +6075,14 @@ export class MoqtPlayer {
       },
       requestStagedRecovery: () => {
         if (!live()) return;
+        // Staged recovery is a mechanism for the LIVE retrieval. A candidate
+        // that needs it has failed: we already hold a working session, so the
+        // attempt is declined rather than nested inside another recovery.
+        const candidate = this.candidateTxnFor(slots);
+        if (candidate !== null) {
+          this.failCandidateCatalog(candidate.conn, 'replacement catalog needed staged recovery');
+          return;
+        }
         this.beginCatalogRecovery(conn);
       },
       log: (msg, ...args) => this.log.debug(msg, ...args),
@@ -4351,30 +6091,56 @@ export class MoqtPlayer {
       strict: this.strictCatalogMode(),
     });
 
-    this.catalogBootstrapCoord = coord;
+    slots.catalogBootstrapCoord = coord;
     return coord;
   }
 
   /** Pre-send bootstrap fetch ownership; claims any parked streams. */
-  private registerBootstrapFetch(conn: MoqtConnection, reqId: bigint, attempt: number, gen: number): void {
+  private registerBootstrapFetch(
+    slots: CatalogSlots, conn: MoqtConnection, reqId: bigint, attempt: number, gen: number,
+  ): void {
     if (gen !== this.bootstrapGeneration) return;
-    this.bootstrapFetch = { conn, reqId, attempt, gen };
+    slots.bootstrapFetch = { conn, reqId, attempt, gen };
     // Claim any stream parked by the defensive fallback at the onDataStream
     // site — a FETCH header whose request had no owner yet. Registration is
     // pre-send and synchronous, so this should find nothing.
+    //
+    // `pendingFetchStreams` is keyed by bare stream ID and is authoritative
+    // ONLY for the current connection, exactly as the object router treats it.
+    // A candidate must not claim an old session's park that happens to share a
+    // request ID; its own pre-registration evidence never lands here, because
+    // the router buffers non-current connections separately.
+    // A candidate claims from its OWN parking; the shared map below belongs to
+    // the current session.
+    if (conn !== this.connection) {
+      for (const [streamId, parked] of [...slots.candidateFetchStreams]) {
+        if (parked.requestId !== reqId) continue;
+        slots.candidateFetchStreams.delete(streamId);
+        slots.bootstrapFetchStreams.set(streamId, { attempt, conn });
+        for (const obj of parked.objects) {
+          if (!this.emitCatalogRaw(obj)) return;
+          slots.catalogBootstrapCoord?.onFetchObject(attempt, this.toCatalogEvent(obj));
+        }
+        if (parked.terminal !== undefined) {
+          slots.bootstrapFetchStreams.delete(streamId);
+          slots.catalogBootstrapCoord?.onFetchStreamClosed(attempt, parked.terminal === 'fin');
+        }
+      }
+      return;
+    }
     for (const [streamId, parked] of [...this.pendingFetchStreams]) {
       if (parked.requestId === reqId) {
         this.pendingFetchStreams.delete(streamId);
-        this.bootstrapFetchStreams.set(streamId, { attempt, conn });
+        slots.bootstrapFetchStreams.set(streamId, { attempt, conn });
         for (const obj of parked.objects) {
           if (!this.emitCatalogRaw(obj)) return;
-          this.catalogBootstrapCoord?.onFetchObject(attempt, this.toCatalogEvent(obj));
+          slots.catalogBootstrapCoord?.onFetchObject(attempt, this.toCatalogEvent(obj));
         }
         if (parked.terminal !== undefined) {
           // The stream ended before registration. Only a peer FIN completes the
           // attempt — a reset, our own discard, and a read failure are all
           // recorded here too, and none of them finished the fetch.
-          this.catalogBootstrapCoord?.onFetchStreamClosed(attempt, parked.terminal === 'fin');
+          slots.catalogBootstrapCoord?.onFetchStreamClosed(attempt, parked.terminal === 'fin');
         }
       }
     }
@@ -4383,7 +6149,7 @@ export class MoqtPlayer {
   /** A recovery candidate's draft-22 fill stream can arrive before the
    *  coordinator asks for it (the fill rides on the SUBSCRIBE): claim it. */
   private claimParkedRecoveryFill(
-    recovery: NonNullable<MoqtPlayer['catalogRecovery']>, reqId: bigint, attempt: number,
+    recovery: NonNullable<CatalogSlots['catalogRecovery']>, reqId: bigint, attempt: number,
   ): void {
     for (const [streamId, parked] of [...this.pendingFetchStreams]) {
       if (parked.requestId !== reqId) continue;
@@ -4400,13 +6166,13 @@ export class MoqtPlayer {
     if (obj.kind !== 'data') return true;
     const conn = this.connection;
     const gen = this.bootstrapGeneration;
-    const coord = this.catalogBootstrapCoord;
-    const recovery = this.catalogRecovery;
+    const coord = this.catalogSlots.catalogBootstrapCoord;
+    const recovery = this.catalogSlots.catalogRecovery;
     let text: string | undefined;
     try { text = new TextDecoder().decode(obj.payload); } catch { /* binary */ }
     this.emitter.emit('catalog_raw', { type: 'catalog_raw', payload: obj.payload, text: text ?? '' });
     return !this._destroyed && !this.isTerminalState() && this.connection === conn
-      && this.bootstrapGeneration === gen && this.catalogBootstrapCoord === coord && this.catalogRecovery === recovery;
+      && this.bootstrapGeneration === gen && this.catalogSlots.catalogBootstrapCoord === coord && this.catalogSlots.catalogRecovery === recovery;
   }
 
   /** MoqtObject → coordinator event (status-aware gap classification). */
@@ -4424,10 +6190,10 @@ export class MoqtPlayer {
 
   /** Readiness: today's first-catalog block, run once with the converged state. */
   private onCatalogBootstrapReady(catalogState: CatalogState): void {
-    if (this._destroyed || this.isTerminalState() || this.catalogReceived) return;
+    if (this._destroyed || this.isTerminalState() || this.catalogSlots.catalogReceived) return;
     const conn = this.connection;
     const gen = this.bootstrapGeneration;
-    this.catalogReceived = true;
+    this.catalogSlots.catalogReceived = true;
     this._catalogState = catalogState;
     this._stats.recordCatalogReceived();
     this.watchdog.fulfill('catalog_received');
@@ -4470,30 +6236,23 @@ export class MoqtPlayer {
    * including its own fallback ladder bottoming out — is FINAL: discard,
    * degraded diagnostic, never a second candidate.
    */
-  /** Deferred terminal record for the LEGACY (coordinator-less) catalog
-   *  subscription — the DECISION (recovery / fatal-no-base / quiet end) is
-   *  made only at drain completion, honoring the terminal-drain barrier: a
-   *  base may still arrive during the drain. Generation-stamped so a stale
-   *  record can never affect a later legacy subscription (cleared at
-   *  migration commit and destroy). */
-  private legacyCatalogTerminal: { gen: number; reqId: bigint | null; reason: PublishDoneReason } | null = null;
 
   /** Dispatch a completed catalog terminal drain against the CURRENT catalog
    *  machinery: coordinator mode finalizes the deferred DONE (and retires the
    *  route for an ended feed); legacy mode retires the route and THEN applies
    *  the deferred status policy (retriable → staged recovery). */
-  private deliverCatalogDrained(): void {
-    const coord = this.catalogBootstrapCoord;
+  private deliverCatalogDrained(slots: CatalogSlots = this.catalogSlots): void {
+    const coord = slots.catalogBootstrapCoord;
     if (coord) {
       coord.onSubscriptionDrained();
-      if (coord.feedEnded) this.retireCatalogAliasRoute();
+      if (coord.feedEnded) this.retireCatalogAliasRoute(slots);
       return;
     }
-    const t = this.legacyCatalogTerminal;
-    this.legacyCatalogTerminal = null;
-    this.retireCatalogAliasRoute();
+    const t = slots.legacyCatalogTerminal;
+    slots.legacyCatalogTerminal = null;
+    this.retireCatalogAliasRoute(slots);
     if (!t || t.gen !== this.bootstrapGeneration) return;
-    if (!this.catalogReceived) {
+    if (!slots.catalogReceived) {
       // Ended OR retriable and still no base after the whole drain window:
       // nothing further can arrive.
       this.failCatalogPlayback(createPlayerError(
@@ -4513,23 +6272,34 @@ export class MoqtPlayer {
    * unowned), and tombstone its already-known streams. The ONE path for
    * supersession, rung transitions, and candidate teardown.
    */
-  private retireBootstrapFetch(conn: MoqtConnection, reqId: bigint, opts?: { attempt?: number; extraStreams?: Iterable<bigint> }): void {
-    if (this.catalogFillRequests.delete(reqId)) {
+  private retireBootstrapFetch(
+    slots: CatalogSlots, conn: MoqtConnection, reqId: bigint,
+    opts?: { attempt?: number; extraStreams?: Iterable<bigint> },
+  ): void {
+    if (slots.catalogFillRequests.delete(reqId)) {
       void conn.cancelFill(reqId).catch(() => { /* gone */ });
     } else {
       void conn.fetchCancel(varint(reqId)).catch(() => { /* gone */ });
     }
-    this.quarantineFetchRequest(reqId);
-    for (const [sid, entry] of this.bootstrapFetchStreams) {
+    // The media-fetch registries (`activeFetches`, the stream→request and
+    // stream→alias routes, the quarantine set) describe the LIVE session. A
+    // candidate's bootstrap fetch has no entry in them, and touching them by
+    // bare ID would retire a live fetch that merely shares an ID.
+    const live = conn === this.connection;
+    if (live) this.quarantineFetchRequest(reqId);
+    for (const [sid, entry] of slots.bootstrapFetchStreams) {
       // Attempt-scoped: retiring attempt A must never sweep streams that a
       // NEWER attempt B (started while A's rejection was still settling)
       // already owns on the same connection.
       if (entry.conn === conn && (opts?.attempt === undefined || entry.attempt === opts.attempt)) {
-        this.bootstrapFetchStreams.delete(sid);
-        this.droppedFetchStreams.add(sid);
+        slots.bootstrapFetchStreams.delete(sid);
+        // Tombstones are read through the same current-connection authority, so
+        // recording a candidate's stream IDs here would only risk swallowing a
+        // live stream that reuses the ID.
+        if (live) this.droppedFetchStreams.add(sid);
       }
     }
-    if (opts?.extraStreams) {
+    if (opts?.extraStreams && live) {
       for (const sid of opts.extraStreams) this.droppedFetchStreams.add(sid);
     }
   }
@@ -4538,13 +6308,13 @@ export class MoqtPlayer {
    *  must not keep applying late objects through the global alias match.
    *  Post-drain traffic on the alias parks in the ordinary pre-SUBSCRIBE_OK
    *  buffer and belongs to whichever request next binds it. */
-  private retireCatalogAliasRoute(): void {
-    this.catalogTrackAlias = null;
+  private retireCatalogAliasRoute(slots: CatalogSlots = this.catalogSlots): void {
+    slots.catalogTrackAlias = null;
   }
 
   private beginCatalogRecovery(conn: MoqtConnection): void {
     if (this._destroyed || this.isTerminalState() || this.connection !== conn) return;
-    if (this.recoveryAttempted || this.catalogRecovery !== null) {
+    if (this.catalogSlots.recoveryAttempted || this.catalogSlots.catalogRecovery !== null) {
       // Recovery declined: the feed is over for good — retire the route so a
       // late post-drain object cannot keep mutating the frozen catalog.
       this.retireCatalogAliasRoute();
@@ -4554,20 +6324,20 @@ export class MoqtPlayer {
       ));
       return;
     }
-    this.recoveryAttempted = true;
+    this.catalogSlots.recoveryAttempted = true;
     const gen = this.bootstrapGeneration;
     // Role-aware ownership: pre-adoption this coordinator lives in the
     // catalogRecovery slot; ADOPTION moves it into the main slot, after which
     // its callbacks keep working (deltas, DONE, further recovery requests) —
     // ownership follows the coordinator, not the transaction slot.
     const ownedAsCandidate = (): boolean =>
-      gen === this.bootstrapGeneration && this.connection === conn && this.catalogRecovery?.coord === coord;
+      gen === this.bootstrapGeneration && this.connection === conn && this.catalogSlots.catalogRecovery?.coord === coord;
     const ownedAsMain = (): boolean =>
-      gen === this.bootstrapGeneration && this.connection === conn && this.catalogBootstrapCoord === coord;
+      gen === this.bootstrapGeneration && this.connection === conn && this.catalogSlots.catalogBootstrapCoord === coord;
     const live = (): boolean => ownedAsCandidate() || ownedAsMain();
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(catalogTrackName());
-    const manager = new CatalogManager(namespaceDisplay(this.config.namespace));
+    const manager = new CatalogManager(this.config.namespace);
     let pendingAttempt: number | null = null;
 
     const failCandidate = (reason: string): void => {
@@ -4584,15 +6354,15 @@ export class MoqtPlayer {
         if (this.usesCatalogFill(conn)) {
           void Promise.resolve().then(() => {
             if (!live()) return;
-            const subReqId = ownedAsCandidate() ? this.catalogRecovery!.reqId : this.catalogRequestId;
+            const subReqId = ownedAsCandidate() ? this.catalogSlots.catalogRecovery!.reqId : this.catalogSlots.catalogRequestId;
             if (subReqId == null) { coord.onFetchError(attempt, 'refused'); return; }
-            this.catalogFillRequests.add(subReqId);
+            this.catalogSlots.catalogFillRequests.add(subReqId);
             coord.onFetchOk(attempt, { group: 0n, object: 0n }, false);
             if (ownedAsCandidate()) {
-              this.catalogRecovery!.fetch = { reqId: subReqId, attempt };
-              this.claimParkedRecoveryFill(this.catalogRecovery!, subReqId, attempt);
+              this.catalogSlots.catalogRecovery!.fetch = { reqId: subReqId, attempt };
+              this.claimParkedRecoveryFill(this.catalogSlots.catalogRecovery!, subReqId, attempt);
             } else if (ownedAsMain()) {
-              this.registerBootstrapFetch(conn, subReqId, attempt, this.bootstrapGeneration);
+              this.registerBootstrapFetch(this.catalogSlots, conn, subReqId, attempt, this.bootstrapGeneration);
             }
           });
           return;
@@ -4600,7 +6370,7 @@ export class MoqtPlayer {
         void (async () => {
           let myFetchReqId: bigint | null = null;
           try {
-            const subReqId = ownedAsCandidate() ? this.catalogRecovery!.reqId : this.catalogRequestId;
+            const subReqId = ownedAsCandidate() ? this.catalogSlots.catalogRecovery!.reqId : this.catalogSlots.catalogRequestId;
             if (!live() || subReqId == null) throw new Error('no candidate subscription');
             await conn.joiningFetch({
               joiningFetchType: 'relative',
@@ -4611,9 +6381,9 @@ export class MoqtPlayer {
                 if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
                 myFetchReqId = id;
                 if (ownedAsCandidate()) {
-                  this.catalogRecovery!.fetch = { reqId: id, attempt };
+                  this.catalogSlots.catalogRecovery!.fetch = { reqId: id, attempt };
                 } else if (ownedAsMain()) {
-                  this.registerBootstrapFetch(conn, id, attempt, this.bootstrapGeneration);
+                  this.registerBootstrapFetch(this.catalogSlots, conn, id, attempt, this.bootstrapGeneration);
                 }
               },
             } as never);
@@ -4624,17 +6394,17 @@ export class MoqtPlayer {
             // ladder attempt's request or sweep its streams.
             if (myFetchReqId !== null) {
               if (ownedAsCandidate()) {
-                const r = this.catalogRecovery!;
+                const r = this.catalogSlots.catalogRecovery!;
                 const mine: bigint[] = [];
                 for (const [sid, a] of r.fetchStreams) {
                   if (a === attempt) { mine.push(sid); r.fetchStreams.delete(sid); }
                 }
-                this.retireBootstrapFetch(conn, myFetchReqId, { attempt, extraStreams: mine });
+                this.retireBootstrapFetch(this.catalogSlots, conn, myFetchReqId, { attempt, extraStreams: mine });
                 if (r.fetch?.reqId === myFetchReqId) r.fetch = null;
               } else {
-                this.retireBootstrapFetch(conn, myFetchReqId, { attempt });
-                if (this.bootstrapFetch?.reqId === myFetchReqId && this.bootstrapFetch.conn === conn) {
-                  this.bootstrapFetch = null;
+                this.retireBootstrapFetch(this.catalogSlots, conn, myFetchReqId, { attempt });
+                if (this.catalogSlots.bootstrapFetch?.reqId === myFetchReqId && this.catalogSlots.bootstrapFetch.conn === conn) {
+                  this.catalogSlots.bootstrapFetch = null;
                 }
               }
             }
@@ -4657,9 +6427,9 @@ export class MoqtPlayer {
                 if (!live() || pendingAttempt !== attempt) throw new Error('catalog fetch attempt retired');
                 myFetchReqId = id;
                 if (ownedAsCandidate()) {
-                  this.catalogRecovery!.fetch = { reqId: id, attempt };
+                  this.catalogSlots.catalogRecovery!.fetch = { reqId: id, attempt };
                 } else if (ownedAsMain()) {
-                  this.registerBootstrapFetch(conn, id, attempt, this.bootstrapGeneration);
+                  this.registerBootstrapFetch(this.catalogSlots, conn, id, attempt, this.bootstrapGeneration);
                 }
               },
             } as never);
@@ -4670,17 +6440,17 @@ export class MoqtPlayer {
             // ladder attempt's request or sweep its streams.
             if (myFetchReqId !== null) {
               if (ownedAsCandidate()) {
-                const r = this.catalogRecovery!;
+                const r = this.catalogSlots.catalogRecovery!;
                 const mine: bigint[] = [];
                 for (const [sid, a] of r.fetchStreams) {
                   if (a === attempt) { mine.push(sid); r.fetchStreams.delete(sid); }
                 }
-                this.retireBootstrapFetch(conn, myFetchReqId, { attempt, extraStreams: mine });
+                this.retireBootstrapFetch(this.catalogSlots, conn, myFetchReqId, { attempt, extraStreams: mine });
                 if (r.fetch?.reqId === myFetchReqId) r.fetch = null;
               } else {
-                this.retireBootstrapFetch(conn, myFetchReqId, { attempt });
-                if (this.bootstrapFetch?.reqId === myFetchReqId && this.bootstrapFetch.conn === conn) {
-                  this.bootstrapFetch = null;
+                this.retireBootstrapFetch(this.catalogSlots, conn, myFetchReqId, { attempt });
+                if (this.catalogSlots.bootstrapFetch?.reqId === myFetchReqId && this.catalogSlots.bootstrapFetch.conn === conn) {
+                  this.catalogSlots.bootstrapFetch = null;
                 }
               }
             }
@@ -4691,7 +6461,7 @@ export class MoqtPlayer {
       cancelFetch: () => {
         pendingAttempt = null;
         if (ownedAsCandidate()) {
-          const r = this.catalogRecovery!;
+          const r = this.catalogSlots.catalogRecovery!;
           if (r.fetch) {
             const cancelled = r.fetch;
             r.fetch = null;
@@ -4699,14 +6469,14 @@ export class MoqtPlayer {
             for (const [sid, a] of r.fetchStreams) {
               if (a === cancelled.attempt) { mine.push(sid); r.fetchStreams.delete(sid); }
             }
-            this.retireBootstrapFetch(conn, cancelled.reqId, { attempt: cancelled.attempt, extraStreams: mine });
+            this.retireBootstrapFetch(this.catalogSlots, conn, cancelled.reqId, { attempt: cancelled.attempt, extraStreams: mine });
           }
           return;
         }
-        const fetch = this.bootstrapFetch;
+        const fetch = this.catalogSlots.bootstrapFetch;
         if (fetch?.conn === conn) {
-          this.bootstrapFetch = null;
-          this.retireBootstrapFetch(conn, fetch.reqId, { attempt: fetch.attempt });
+          this.catalogSlots.bootstrapFetch = null;
+          this.retireBootstrapFetch(this.catalogSlots, conn, fetch.reqId, { attempt: fetch.attempt });
         }
       },
       onReady: (state) => {
@@ -4716,7 +6486,7 @@ export class MoqtPlayer {
         // so a malformed entry aborts the transaction, never the adopted
         // state. The joining fetch can complete while the subscription is
         // still Pending, so the alias half of the barrier matters too.
-        this.catalogRecovery!.readyState = state;
+        this.catalogSlots.catalogRecovery!.readyState = state;
       },
       onReadySettled: () => {
         if (ownedAsCandidate()) this.maybeAdoptCatalogRecovery();
@@ -4726,7 +6496,7 @@ export class MoqtPlayer {
           // Pre-adoption candidate updates (replayed parked objects after the
           // held readiness) refresh the pending snapshot — the ACTIVE catalog
           // is never mutated by a candidate.
-          const r = this.catalogRecovery!;
+          const r = this.catalogSlots.catalogRecovery!;
           if (r.readyState !== null) r.readyState = state;
           return;
         }
@@ -4775,10 +6545,10 @@ export class MoqtPlayer {
       strict: this.strictCatalogMode(),
     });
 
-    this.catalogRecovery = {
+    this.catalogSlots.catalogRecovery = {
       coord, manager, conn, gen, reqId: null, alias: null, fetch: null,
       fetchStreams: new Map(),
-      retiredAlias: this.catalogTrackAlias,
+      retiredAlias: this.catalogSlots.catalogTrackAlias,
       parked: [], parkedBytes: 0, parkedEvents: new Map(),
       readyState: null, replaying: false,
     };
@@ -4802,7 +6572,7 @@ export class MoqtPlayer {
           subscriptionFilter: candidateFilter,
           ...(candidateFilter.type === 'LargestObject' && this.usesCatalogFill(conn) ? { fill: CATALOG_FILL } : {}),
           onRequestId: (id: bigint) => {
-            const r = this.catalogRecovery;
+            const r = this.catalogSlots.catalogRecovery;
             if (!ownedAsCandidate() || !r || this._destroyed || this.isTerminalState()) {
               throw new Error('Catalog recovery retired before emission');
             }
@@ -4813,14 +6583,14 @@ export class MoqtPlayer {
           terminalDelivery: 'drain',
           onDrained: (id: bigint) => {
             const matches = ownedAsCandidate()
-              ? this.catalogRecovery!.reqId === id
-              : (ownedAsMain() && this.catalogRequestId === id);
+              ? this.catalogSlots.catalogRecovery!.reqId === id
+              : (ownedAsMain() && this.catalogSlots.catalogRequestId === id);
             if (!matches) return;
             coord.onSubscriptionDrained();
             if (ownedAsMain() && coord.feedEnded) this.retireCatalogAliasRoute();
           },
         } as never);
-        const r = this.catalogRecovery;
+        const r = this.catalogSlots.catalogRecovery;
         if (!ownedAsCandidate() || !r) {
           if (allocatedId === null && !ownedAsMain()) {
             void conn.unsubscribe(varint(BigInt(reqId))).catch(() => { /* best effort */ });
@@ -4849,9 +6619,9 @@ export class MoqtPlayer {
 
   /** Retire candidate-owned requests without publishing a second diagnostic. */
   private retireCatalogRecovery(): boolean {
-    const recovery = this.catalogRecovery;
+    const recovery = this.catalogSlots.catalogRecovery;
     if (!recovery) return false;
-    this.catalogRecovery = null;
+    this.catalogSlots.catalogRecovery = null;
     recovery.coord.abort();
     // The candidate's SUBSCRIBE ownership settles like any other failed
     // request: entries it owned exclusively drop; an entry ALSO owned by a
@@ -4862,7 +6632,7 @@ export class MoqtPlayer {
     // The candidate's FETCH ownership is retired EXPLICITLY — the
     // coordinator's cancelFetch callback is inert once the slot is cleared.
     if (recovery.fetch) {
-      this.retireBootstrapFetch(recovery.conn, recovery.fetch.reqId,
+      this.retireBootstrapFetch(this.catalogSlots, recovery.conn, recovery.fetch.reqId,
         { attempt: recovery.fetch.attempt, extraStreams: recovery.fetchStreams.keys() });
     } else {
       for (const sid of recovery.fetchStreams.keys()) this.droppedFetchStreams.add(sid);
@@ -4886,7 +6656,7 @@ export class MoqtPlayer {
     let objects = 0;
     let bytes = 0;
     const aliases = new Set<bigint>();
-    const r = this.catalogRecovery;
+    const r = this.catalogSlots.catalogRecovery;
     if (r && r.conn === conn) {
       objects += r.parked.length;
       bytes += r.parkedBytes;
@@ -4964,14 +6734,14 @@ export class MoqtPlayer {
    *  while it is still awaiting SUBSCRIBE_OK (its pre-alias evidence is just
    *  as fail-closed as a candidate's). */
   private activeCatalogTransactionReqId(conn: MoqtConnection): bigint | null {
-    const r = this.catalogRecovery;
+    const r = this.catalogSlots.catalogRecovery;
     if (r && r.conn === conn && r.reqId !== null) return r.reqId;
     // EVERY unanswered catalog SUBSCRIBE is a live transaction — the
     // coordinator modes AND the coordinator-less legacy retrieval (explicit
     // 'subscribe' mode) and the rung-2 AbsoluteStart resubscribe alike.
     if (conn === this.connection
-        && this.catalogRequestId !== null && this.catalogTrackAlias === null) {
-      return this.catalogRequestId;
+        && this.catalogSlots.catalogRequestId !== null && this.catalogSlots.catalogTrackAlias === null) {
+      return this.catalogSlots.catalogRequestId;
     }
     return null;
   }
@@ -4997,7 +6767,7 @@ export class MoqtPlayer {
    *  transaction-owned generic records — split stores share the limit. */
   private catalogOwnedStreamEventCount(conn: MoqtConnection): number {
     let n = 0;
-    const r = this.catalogRecovery;
+    const r = this.catalogSlots.catalogRecovery;
     if (r && r.conn === conn) n += r.parkedEvents.size;
     const perConn = this.pendingStreamEvents.get(conn);
     if (perConn) {
@@ -5035,7 +6805,7 @@ export class MoqtPlayer {
 
   /** Adoption barrier: candidate readiness AND a bound alias (SUBSCRIBE_OK). */
   private maybeAdoptCatalogRecovery(): void {
-    const recovery = this.catalogRecovery;
+    const recovery = this.catalogSlots.catalogRecovery;
     if (!recovery || recovery.readyState === null || recovery.alias === null) return;
     if (this._destroyed || this.isTerminalState() || recovery.gen !== this.bootstrapGeneration
         || recovery.conn !== this.connection) return;
@@ -5050,12 +6820,12 @@ export class MoqtPlayer {
    * drop that could bless an incomplete delta chain.
    */
   private onCatalogParkingOverflow(conn: MoqtConnection): void {
-    const r = this.catalogRecovery;
+    const r = this.catalogSlots.catalogRecovery;
     if (r && r.conn === conn) {
       this.failCatalogRecovery('pre-alias parking overflow');
       return;
     }
-    const coord = this.catalogBootstrapCoord;
+    const coord = this.catalogSlots.catalogBootstrapCoord;
     if (coord && this.connection === conn) {
       if (coord.phase === 'fallback-legacy') {
         // FINAL rung, pre-ready: no further fallback exists — a truncated
@@ -5065,7 +6835,7 @@ export class MoqtPlayer {
         // coordinator's fatal below, preserving the listener exception
         // contract) can never leave the terminal request or its parking
         // ownership live.
-        this.terminateCatalogRetrieval(conn, this.catalogRequestId, null);
+        this.terminateCatalogRetrieval(conn, this.catalogSlots.catalogRequestId, null);
         coord.onParkingOverflow();   // → fatal → onFatal surfaces the error
         return;
       }
@@ -5076,8 +6846,8 @@ export class MoqtPlayer {
     // a pre-ready overflow is terminal. A dropped pre-alias object could be a
     // load-bearing delta — accepting a truncated catalog is worse than
     // failing loudly.
-    if (this.connection === conn && this.catalogRequestId !== null && !this.catalogReceived) {
-      this.terminateCatalogRetrieval(conn, this.catalogRequestId,
+    if (this.connection === conn && this.catalogSlots.catalogRequestId !== null && !this.catalogSlots.catalogReceived) {
+      this.terminateCatalogRetrieval(conn, this.catalogSlots.catalogRequestId,
         'catalog pre-alias parking overflow during legacy retrieval — a truncated catalog cannot be accepted');
     }
   }
@@ -5093,10 +6863,10 @@ export class MoqtPlayer {
    * when the caller has not already surfaced one.
    */
   private terminateCatalogRetrieval(conn: MoqtConnection, terminatingReqId: bigint | null, fatalReason: string | null): void {
-    if (terminatingReqId !== null && this.catalogRequestId === terminatingReqId) {
-      this.catalogRequestId = null;
+    if (terminatingReqId !== null && this.catalogSlots.catalogRequestId === terminatingReqId) {
+      this.catalogSlots.catalogRequestId = null;
       this.retireCatalogAliasRoute();
-      this.legacyCatalogTerminal = null;
+      this.catalogSlots.legacyCatalogTerminal = null;
     }
     if (terminatingReqId !== null) {
       this.settleParkedOwnership(terminatingReqId, null, conn);
@@ -5128,10 +6898,10 @@ export class MoqtPlayer {
       if (!this.currentMigration.committed) attempt(() => this.abortMigration(this.currentMigration!));
     }
     const conn = this.connection;
-    const requestId = this.catalogRequestId;
+    const requestId = this.catalogSlots.catalogRequestId;
     if (conn) {
       this.catalogQuarantinedConns.add(conn);
-      if (this.catalogTrackAlias !== null) this.quarantinedCatalogAliases.set(conn, this.catalogTrackAlias);
+      if (this.catalogSlots.catalogTrackAlias !== null) this.quarantinedCatalogAliases.set(conn, this.catalogSlots.catalogTrackAlias);
     }
     attempt(() => this.retireCatalogRecovery());
     attempt(() => this.cancelCatalogBootstrap());
@@ -5154,25 +6924,25 @@ export class MoqtPlayer {
 
   /** Atomic adoption: the candidate becomes the active catalog machinery. */
   private adoptCatalogRecovery(state: CatalogState): void {
-    const recovery = this.catalogRecovery;
+    const recovery = this.catalogSlots.catalogRecovery;
     if (!recovery || this._destroyed || this.isTerminalState() || recovery.gen !== this.bootstrapGeneration
         || recovery.conn !== this.connection) return;
-    this.catalogRecovery = null;
+    this.catalogSlots.catalogRecovery = null;
     // Retire the OLD catalog machinery (its subscription already ended).
-    this.catalogBootstrapCoord?.abort();
-    this.catalogBootstrapCoord = recovery.coord;
-    this.catalogManager = recovery.manager;
-    this.catalogRequestId = recovery.reqId;
+    this.catalogSlots.catalogBootstrapCoord?.abort();
+    this.catalogSlots.catalogBootstrapCoord = recovery.coord;
+    this.catalogSlots.catalogManager = recovery.manager;
+    this.catalogSlots.catalogRequestId = recovery.reqId;
     // A candidate whose feed already ENDED (drained while awaiting the
     // SUBSCRIBE_OK barrier) is adopted for its CONTENT — the dead alias must
     // not become routable again.
-    this.catalogTrackAlias = recovery.coord.feedEnded ? null : recovery.alias;
+    this.catalogSlots.catalogTrackAlias = recovery.coord.feedEnded ? null : recovery.alias;
     // Migrate any live bootstrap fetch-stream tagging.
     for (const [sid, attempt] of recovery.fetchStreams) {
-      this.bootstrapFetchStreams.set(sid, { attempt, conn: recovery.conn });
+      this.catalogSlots.bootstrapFetchStreams.set(sid, { attempt, conn: recovery.conn });
     }
     if (recovery.fetch) {
-      this.bootstrapFetch = { conn: recovery.conn, reqId: recovery.fetch.reqId, attempt: recovery.fetch.attempt, gen: this.bootstrapGeneration };
+      this.catalogSlots.bootstrapFetch = { conn: recovery.conn, reqId: recovery.fetch.reqId, attempt: recovery.fetch.attempt, gen: this.bootstrapGeneration };
     }
     // Adoption is an ordinary catalog update: no second catalog_received, no
     // media churn (documented limitation: a removed currently-active track
@@ -5187,10 +6957,12 @@ export class MoqtPlayer {
    * 0x12). Total: unknown/future codes degrade to 'retriable' + diagnostic —
    * never silently fatal.
    */
-  private normalizePublishDoneStatus(code: bigint): PublishDoneReason {
+  private normalizePublishDoneStatus(code: bigint, draftVersion?: DraftVersion): PublishDoneReason {
     // NEGOTIATED draft: the status tables differ per draft, and the session's
-    // actual draft can diverge from configuration under auto-negotiation.
-    const draft = this.connection?.draftVersion ?? this.config.draftVersion ?? 16;
+    // actual draft can diverge from configuration under auto-negotiation. An
+    // explicit version is passed when the DELIVERING session is not the live
+    // one, as during a cross-draft handover.
+    const draft = draftVersion ?? this.connection?.draftVersion ?? this.config.draftVersion ?? 16;
     if (code === 0x2n) return 'ended';                            // TRACK_ENDED
     if (code === 0x3n && !isDraft22(draft)) return 'ended';            // SUBSCRIPTION_ENDED (gone in draft 22)
     if (code === 0x4n) return 'going-away';                       // GOING_AWAY
@@ -5288,7 +7060,8 @@ export class MoqtPlayer {
   async queryTrackStatus(trackName: string): Promise<TrackStatusResult> {
     if (!this.connection) throw new Error('Player not loaded');
 
-    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+    const nsBytes = trackNamespaceFields(this.uniqueCatalogTrack(trackName), this.config.namespace)
+      .map(field => this.enc.encode(field));
     const nameBytes = this.enc.encode(trackName);
 
     const conn = this.connection;
@@ -5529,6 +7302,9 @@ export class MoqtPlayer {
       const txn = this.currentMigration;
       this.currentMigration = null;
       txn.aborted = true;
+      // Wake a pending attempt so its timer is cancelled and the slot released
+      // even if the transport factory never settles.
+      txn.wake?.();
       txn.committed = true;
       txn.events.length = 0;
       this.detachConnectionCallbacks(txn.conn);
@@ -5546,7 +7322,7 @@ export class MoqtPlayer {
     this.fetchStreamAliases.clear();
     this.fetchStreamRequestIds.clear();
     this.pendingFetchStreams.clear();
-    this.catalogFillRequests.clear();
+    this.catalogSlots.catalogFillRequests.clear();
     this.refusedFetchRequests.clear();
     this.quarantinedFetchRequests.clear();
     this.droppedFetchStreams.clear();
@@ -5569,10 +7345,10 @@ export class MoqtPlayer {
     }
     this.pendingTrackStatuses.clear();
     this.cancelCatalogBootstrap();
-    this.catalogRecovery?.coord.abort();
-    this.catalogRecovery = null;
-    this.bootstrapFetch = null;
-    this.bootstrapFetchStreams.clear();
+    this.catalogSlots.catalogRecovery?.coord.abort();
+    this.catalogSlots.catalogRecovery = null;
+    this.catalogSlots.bootstrapFetch = null;
+    this.catalogSlots.bootstrapFetchStreams.clear();
     this.rejectPendingCatalogFetches('Player destroyed');
     for (const [name, pending] of this.pendingInitTrackSubs) {
       pending.reject(new Error(`Player destroyed while awaiting init track "${name}"`));
@@ -5607,7 +7383,7 @@ export class MoqtPlayer {
     this.pipelinesCreated = false;
     this.subscriptionManager?.clear();
     this.subscriptionManager = null;
-    this.catalogManager = null;
+    this.catalogSlots.catalogManager = null;
     this.qualityController = null;
     this.bandwidthEstimator = null;
     if (this.connection) {
@@ -5627,8 +7403,8 @@ export class MoqtPlayer {
           try { await this.connection.unsubscribe(varint(requestId)); } catch { /* ignore */ }
         }
         // Catalog subscription tracked separately
-        if (this.catalogRequestId !== null) {
-          try { await this.connection.unsubscribe(varint(this.catalogRequestId)); } catch { /* ignore */ }
+        if (this.catalogSlots.catalogRequestId !== null) {
+          try { await this.connection.unsubscribe(varint(this.catalogSlots.catalogRequestId)); } catch { /* ignore */ }
         }
         this.detachConnectionCallbacks(this.connection);
       }
@@ -5675,8 +7451,9 @@ export class MoqtPlayer {
   requestSubscribe(
     trackName: string,
     mediaType: 'video' | 'audio',
+    namespace: string | readonly string[] = this.config.namespace,
   ): SubscribeIntent | null {
-    const intent: SubscribeIntent = { trackName, mediaType };
+    const intent: SubscribeIntent = { trackName, mediaType, namespace: namespaceFields(namespace) };
     return this.hooks.beforeSubscribe.run(intent);
   }
 
@@ -5907,10 +7684,18 @@ export class MoqtPlayer {
     // `cost` receives the raw args array (typed `unknown[]` so it does not drive
     // A-inference — A is fixed by the wrapped callback's contextual signature).
     // `source` is the live-delivery error source used to classify a replay failure.
-    const stageable = <A extends unknown[]>(fn: (...a: A) => void, source: MoqtConnectionErrorSource, cost?: (args: unknown[]) => number) => (...args: A): void => {
+    const stageable = <A extends unknown[]>(
+      fn: (...a: A) => void, source: MoqtConnectionErrorSource,
+      cost?: (args: unknown[]) => number,
+      /** Whether THIS event is payload to buffer rather than readiness
+       *  evidence to act on. Defaults to buffering everything. Typed
+       *  `unknown[]` for the same reason as `cost`: it must not drive
+       *  A-inference, which is fixed by the wrapped callback's signature. */
+      buffer?: (args: unknown[]) => boolean,
+    ) => (...args: A): void => {
       if (owningTxn) {
         if (owningTxn.aborted) return; // abandoned candidate — permanently dead
-        if (!owningTxn.committed) {
+        if (!owningTxn.committed && (buffer === undefined || buffer(args))) {
           // Every staged event carries a base cost (its closure) plus its actual
           // retained bytes, so the byte budget is enforced for ALL event kinds.
           const bytes = MoqtPlayer.STAGED_EVENT_BASE_BYTES + (cost ? cost(args) : 0);
@@ -5920,6 +7705,108 @@ export class MoqtPlayer {
         // committed → the candidate is now the current session; run live.
       }
       fn(...args);
+    };
+    // ── Preparation: evidence dispatches, payload buffers ───────────────
+    // A candidate must be EVALUATED before it is adopted, so the things that
+    // decide readiness — its catalog retrieval, the acceptance of its
+    // subscriptions, the initialization it delivers — have to be acted on
+    // while it is still only a candidate. Its MEDIA, by contrast, is payload:
+    // buffering it is what keeps a prepared-but-unadopted replacement from
+    // emitting objects into playback the old session is still serving, and
+    // replaying it once at adoption is what keeps every object delivered
+    // exactly once (never processed now and replayed as new later).
+    //
+    // Classification is by the candidate's OWN bound aliases: a prepared media
+    // alias, or a stream already seen carrying one. Anything else on the
+    // candidate is evidence and runs against candidate-owned state.
+    // Every candidate stream carrying EVIDENCE we have already identified:
+    // its catalog retrieval's fetch/fill streams, and subgroup streams on an
+    // alias the candidate itself has had bound. Lifecycle events are matched
+    // by stream, since a FIN names no alias.
+    const evidenceStreams = new Set<bigint>();
+    const candidatePrep = (): CandidatePrep | undefined =>
+      owningTxn !== null && !owningTxn.committed && !owningTxn.aborted ? owningTxn.prep : undefined;
+    /** An alias the candidate has bound for its catalog or an init track. */
+    const isCandidateEvidenceAlias = (alias: bigint): boolean => {
+      const slots = owningTxn?.slots;
+      if (slots !== undefined && slots.catalogTrackAlias === alias) return true;
+      const prep = candidatePrep();
+      if (prep === undefined) return false;
+      for (const init of prep.initTracks.values()) if (init.alias === alias) return true;
+      return false;
+    };
+    // The rule, and it is a rule about OWNERSHIP rather than about aliases: a
+    // candidate's object may be acted on only when the candidate itself has
+    // told us what that alias is. An alias it has not bound is UNKNOWN on this
+    // connection — and must never be looked up in the live routing tables,
+    // which hold the other session's registrations and would hand a
+    // replacement's catalog, init or media to the pipelines that are still
+    // playing the old session. Unknown data is therefore retained under the
+    // transaction's existing count and byte bounds, in arrival order, and
+    // taken back out when binding finally says what it was (16 §10.4.2,
+    // 18 §11.4.2, 22 §3.1.3.1).
+    const bufferObject = (args: unknown[]): boolean => {
+      const streamId = args[0] as bigint;
+      const obj = args[1] as MoqtObject;
+      if (evidenceStreams.has(streamId)) return false;
+      if (isCandidateEvidenceAlias(BigInt(obj.trackAlias))) {
+        evidenceStreams.add(streamId);
+        return false;
+      }
+      if (owningTxn?.slots?.bootstrapFetchStreams.has(streamId) === true
+          || owningTxn?.slots?.candidateFetchStreams.has(streamId) === true) {
+        evidenceStreams.add(streamId);
+        return false;
+      }
+      // Retained either way — but a required track owing its initialization
+      // in band has just supplied it, and readiness has to notice.
+      if (owningTxn !== null) this.noteCandidateInbandInit(owningTxn, BigInt(obj.trackAlias), obj);
+      return true;
+    };
+    const bufferStream = (args: unknown[]): boolean => !evidenceStreams.has(args[0] as bigint);
+    const bufferDataStream = (args: unknown[]): boolean => {
+      const streamId = args[0] as bigint;
+      const header = args[1] as DataStreamHeader;
+      if (evidenceStreams.has(streamId)) return false;
+      if (header.type === 'subgroup' && isCandidateEvidenceAlias(BigInt(header.header.trackAlias))) {
+        evidenceStreams.add(streamId);
+        return false;
+      }
+      // A FETCH/FILL header names a request, not a track. On a candidate every
+      // such request belongs to its own catalog retrieval — media is not
+      // fetched during preparation — so its own bootstrap request is evidence
+      // and anything else is not ours to route.
+      // A candidate's FETCH/FILL header is always evidence: either it names
+      // the bootstrap request, or it arrived before that request registered
+      // and the holder parks it until it does.
+      if (header.type === 'fetch' && owningTxn?.slots !== undefined) {
+        evidenceStreams.add(streamId);
+        return false;
+      }
+      return true;
+    };
+    const bufferDatagram = (args: unknown[]): boolean => {
+      const dg = args[0] as ObjectDatagram;
+      return !isCandidateEvidenceAlias(dg.trackAlias === undefined ? 0n : BigInt(dg.trackAlias));
+    };
+    /** As {@link stageable}, but records WHAT was retained so a later binding
+     *  can take it back out as evidence instead of only replaying it. */
+    const stageableObject = (
+      fn: (streamId: bigint, obj: MoqtObject) => void,
+      source: MoqtConnectionErrorSource,
+      cost: (args: unknown[]) => number,
+      buffer: (args: unknown[]) => boolean,
+    ) => (streamId: bigint, obj: MoqtObject): void => {
+      if (owningTxn) {
+        if (owningTxn.aborted) return;
+        if (!owningTxn.committed && buffer([streamId, obj])) {
+          this.stageMigrationEvent(owningTxn, () => fn(streamId, obj),
+            MoqtPlayer.STAGED_EVENT_BASE_BYTES + cost([streamId, obj]), source,
+            { alias: BigInt(obj.trackAlias), streamId, obj });
+          return;
+        }
+      }
+      fn(streamId, obj);
     };
     const objBytes = (a: unknown[]): number => {
       const obj = a[1] as MoqtObject;
@@ -5931,7 +7818,11 @@ export class MoqtPlayer {
     };
     const msgBytes = (a: unknown[]): number => estimateRetainedBytes(a);
     wireConnectionCallbacks(conn, {
-      onControlMessage: stageable((msg) => this.handleControlMessage(msg, conn), 'control', msgBytes),
+      // Never buffered: a candidate's acceptances and refusals ARE its
+      // readiness, and buffering them would make the attempt wait for an
+      // answer it had already been given.
+      onControlMessage: stageable((msg) => this.handleControlMessage(msg, conn), 'control', msgBytes,
+        () => false),
 
       // Staged like any other candidate event: a GOAWAY the candidate
       // receives before promotion must not act on the still-current session,
@@ -5948,6 +7839,7 @@ export class MoqtPlayer {
       ),
 
       onClose: (error, reason) => {
+        this.retireInitWaiters(conn);
         this.log.info('[SESSION] closed: error=0x%s reason=%s',
           error?.toString(16) ?? 'none', reason ?? 'clean');
         // A candidate that closes BEFORE promotion must ABORT its migration — it
@@ -5970,6 +7862,23 @@ export class MoqtPlayer {
         // active session as closed. Only the current connection may do so.
         if (conn !== this.connection) {
           this.log.info('[SESSION] superseded session closed — not affecting the current session');
+          return;
+        }
+        // A replacement is already being prepared for THIS session, so its
+        // closure is not a playback failure yet: migration is meant to be
+        // transparent to the application (§3.5 / 18 §3.6 / 22 §6.6.1), and a
+        // relay that drops right after telling us to move must not abort a
+        // healthy candidate. The event is held — announced only if the attempt
+        // then fails, where it is the real outcome.
+        const preparing = this.currentMigration;
+        if (preparing !== null && !preparing.committed && !preparing.aborted) {
+          this.log.info('[SESSION] replaced session closed while its replacement prepares — held');
+          preparing.oldTerminal = { kind: 'close', ...defined({ error, reason }) };
+          // NOT cancelCatalogBootstrap(): that bumps the shared generation,
+          // which the preparing candidate's own coordinator captured.
+          this.retireCatalogHolder(this.catalogSlots);
+          this.rejectPendingCatalogFetches(reason !== undefined
+            ? `Session closed: ${reason}` : 'Session closed');
           return;
         }
         this.cancelCatalogBootstrap();
@@ -6024,6 +7933,21 @@ export class MoqtPlayer {
           this.log.info('[SESSION] error on a superseded session — ignored: %s', error.message);
           return;
         }
+        // As in onClose: a fatal fault on the session we are already replacing
+        // is held while its replacement is still being prepared, so a dying
+        // old relay cannot fail playback that is about to be handed over.
+        const preparingErr = this.currentMigration;
+        if (classified.severity === 'fatal' && preparingErr !== null
+            && !preparingErr.committed && !preparingErr.aborted) {
+          this.log.info('[SESSION] replaced session errored while its replacement prepares — held: %s',
+            error.message);
+          preparingErr.oldTerminal = {
+            kind: 'error', error, severity: classified.severity, code: classified.code,
+            ...defined({ context: classified.context }),
+          };
+          this.retireCatalogHolder(this.catalogSlots);
+          return;
+        }
         if (classified.severity === 'fatal') this.cancelCatalogBootstrap();
         this.emitError(createPlayerError(
           classified.severity, 'connection', classified.code, error.message,
@@ -6031,7 +7955,11 @@ export class MoqtPlayer {
         ));
       },
 
-      onObject: stageable((streamId, obj) => {
+      onObject: stageableObject((streamId, obj) => {
+        // The catalog retrieval that owns evidence on THIS connection, or null
+        // when none does. Media evidence below is not catalog-owned, so this is
+        // a value to test, never an early return.
+        const slots = this.slotsFor(conn);
         if (this._destroyed || this.isTerminalState()) return;
         // §10.4.2 FIRST_OBJECT: the subgroup id is the first object's id, known
         // only here. Record it so a later reset still reports a real value.
@@ -6055,6 +7983,37 @@ export class MoqtPlayer {
         // carry wire alias 0 and must never enter a current route.
         if (this.staleFetchStreams.get(streamId) === conn) return;
 
+        // A candidate's parked fetch stream: accumulate under its own holder
+        // until the request it answers is registered.
+        if (slots !== null && slots !== this.catalogSlots) {
+          const parkedCandidate = slots.candidateFetchStreams.get(streamId);
+          if (parkedCandidate !== undefined) {
+            const bytes = obj.kind === 'data' ? obj.payload.byteLength : 0;
+            if (parkedCandidate.objects.length >= MoqtPlayer.MAX_PENDING_PER_ALIAS
+                || parkedCandidate.bytes + bytes > MoqtPlayer.MAX_PENDING_FETCH_BYTES) {
+              slots.candidateFetchStreams.delete(streamId);
+              this.failCandidateCatalog(conn, 'replacement catalog fetch exceeded its buffer limit');
+              return;
+            }
+            parkedCandidate.objects.push(obj);
+            parkedCandidate.bytes += bytes;
+            return;
+          }
+        }
+
+        // A PREPARING candidate's initialization track. Initialization is
+        // readiness evidence, so it is routed here — before any live media
+        // or catalog routing can see an alias that collides with one of
+        // theirs — and held on the transaction instead of in the live init
+        // cache, which a candidate that is never adopted must not populate.
+        if (slots !== null && slots !== this.catalogSlots && obj.kind === 'data') {
+          const prepTxn = this.candidateTxnFor(slots);
+          if (prepTxn !== null
+              && this.onCandidateInitBytes(prepTxn, BigInt(obj.trackAlias), obj.payload)) {
+            return;
+          }
+        }
+
         const catalogReqId = fetchMapsAuthoritative ? this.catalogFetchStreams.get(streamId) : undefined;
         if (catalogReqId !== undefined) {
           this.handleCatalogFetchObject(catalogReqId, obj);
@@ -6062,7 +8021,7 @@ export class MoqtPlayer {
         }
 
         // Staged-recovery candidate fetch stream.
-        const recoveryForFetch = this.catalogRecovery;
+        const recoveryForFetch = slots?.catalogRecovery;
         if (recoveryForFetch && recoveryForFetch.conn === conn) {
           const rAttempt = recoveryForFetch.fetchStreams.get(streamId);
           if (rAttempt !== undefined) {
@@ -6074,10 +8033,10 @@ export class MoqtPlayer {
 
         // Catalog-bootstrap fetch stream: attempt-tagged, coordinator-owned,
         // and CONNECTION-scoped (stream IDs collide across sessions).
-        const bootstrapEntry = this.bootstrapFetchStreams.get(streamId);
+        const bootstrapEntry = slots?.bootstrapFetchStreams.get(streamId);
         if (bootstrapEntry !== undefined && bootstrapEntry.conn === conn) {
           if (!this.emitCatalogRaw(obj)) return;
-          this.catalogBootstrapCoord?.onFetchObject(bootstrapEntry.attempt, this.toCatalogEvent(obj));
+          slots?.catalogBootstrapCoord?.onFetchObject(bootstrapEntry.attempt, this.toCatalogEvent(obj));
           return;
         }
 
@@ -6117,6 +8076,25 @@ export class MoqtPlayer {
         // session's late catalog bytes must never enter the media pipeline.
         if (this.quarantinedCatalogAliases.get(conn) === alias) return;
 
+        // A PREPARING candidate's CATALOG alias is classified before the media
+        // lookup below. Track aliases are per-session, so a replacement is free
+        // to use for its catalog the very alias the live session uses for
+        // video, and the subscription manager — which holds only the live
+        // session's registrations and carries no connection authority — would
+        // then route the replacement's catalog bytes straight into the running
+        // video pipeline. Ownership decides first; the alias is only a key.
+        if (slots !== null && slots !== this.catalogSlots && alias === slots.catalogTrackAlias
+            && this.candidateTxnFor(slots) !== null) {
+          this.dispatchCatalogObject(obj, streamId, conn, slots);
+          return;
+        }
+
+        // Source identity for a route that is still shared between the
+        // adopted session and the one being retired. The manager is keyed by
+        // alias alone, so without this an alias means different things to the
+        // two sessions and either one could deliver through the other's track.
+        if (!this.mediaRouteBelongsTo(conn, alias)) return;
+
         // Route media objects first — SubscriptionManager is authoritative.
         // For track switches: data may arrive before SUBSCRIBE_OK (§10.4.2).
         // Unknown aliases get buffered in pendingObjectsByAlias, then replayed
@@ -6138,11 +8116,11 @@ export class MoqtPlayer {
         // buffered below and replayed when the alias is resolved.
         // Staged-recovery candidate: its alias routes into the CANDIDATE
         // coordinator only — the active catalog machinery never sees it.
-        const recoveryForLive = this.catalogRecovery;
+        const recoveryForLive = slots?.catalogRecovery;
         if (recoveryForLive && recoveryForLive.conn === conn
             && recoveryForLive.alias !== null && alias === recoveryForLive.alias) {
           if (!this.emitCatalogRaw(obj)) return;
-          this.catalogLiveStreams.set(streamId, { conn, coord: recoveryForLive.coord });
+          slots?.catalogLiveStreams.set(streamId, { conn, coord: recoveryForLive.coord });
           recoveryForLive.coord.onLiveStreamEvent(streamId, 'header');
           recoveryForLive.coord.onLiveCatalogObject(this.toCatalogEvent(obj), streamId);
           return;
@@ -6152,7 +8130,7 @@ export class MoqtPlayer {
         // the candidate: its traffic parks in the transaction-local
         // fail-closed buffer (bounded objects/bytes/lifecycle; overflow aborts
         // the candidate) until the candidate SUBSCRIBE_OK binds or refutes it.
-        const recoveryPark = this.catalogRecovery;
+        const recoveryPark = slots?.catalogRecovery;
         if (recoveryPark && recoveryPark.conn === conn
             && recoveryPark.retiredAlias !== null && alias === recoveryPark.retiredAlias
             && recoveryPark.alias === null) {
@@ -6164,19 +8142,8 @@ export class MoqtPlayer {
           return;
         }
 
-        if (this.catalogTrackAlias !== null && alias === this.catalogTrackAlias) {
-          // GOAWAY quarantine: the old session's catalog delivery is dropped
-          // unconditionally (the old generation may still be authoritative
-          // until migration commits, so this cannot rely on generation checks).
-          if (this.catalogQuarantinedConns.has(conn)) return;
-          if (this.catalogBootstrapCoord) {
-            if (!this.emitCatalogRaw(obj)) return;
-            this.catalogLiveStreams.set(streamId, { conn, coord: this.catalogBootstrapCoord });
-            this.catalogBootstrapCoord.onLiveStreamEvent(streamId, 'header');
-            this.catalogBootstrapCoord.onLiveCatalogObject(this.toCatalogEvent(obj), streamId);
-            return;
-          }
-          this.handleCatalogObject(obj);
+        if (slots !== null && slots.catalogTrackAlias !== null && alias === slots.catalogTrackAlias) {
+          this.dispatchCatalogObject(obj, streamId, conn, slots);
           return;
         }
 
@@ -6235,15 +8202,25 @@ export class MoqtPlayer {
           // Unrelated media overflow follows the generic drop policy only.
           this.onCatalogParkingOverflow(conn);
         }
-      }, 'data', objBytes),
+      }, 'data', objBytes, bufferObject),
 
       // §10.4: Stream reset vs FIN
       onStreamClosed: stageable((streamId, error, terminal) => {
+        const slots = this.slotsFor(conn);
+        // A candidate's parked fetch stream ended before its request was
+        // registered: remember HOW, since only a peer FIN completes a fetch.
+        if (slots !== null && slots !== this.catalogSlots) {
+          const parkedCandidate = slots.candidateFetchStreams.get(streamId);
+          if (parkedCandidate !== undefined) {
+            parkedCandidate.terminal = terminal;
+            return;
+          }
+        }
         // If a pending catalog-fetch's stream closed without delivering
         // an object, reject — otherwise the promise hangs until timeout.
         // (If onObject already settled, the reqId is gone from
         // catalogFetchStreams — this is a no-op.)
-        const recoveryClose = this.catalogRecovery;
+        const recoveryClose = slots?.catalogRecovery;
         if (recoveryClose && recoveryClose.conn === conn) {
           const rAttempt = recoveryClose.fetchStreams.get(streamId);
           if (rAttempt !== undefined) {
@@ -6259,16 +8236,16 @@ export class MoqtPlayer {
             }
           }
         }
-        const bootstrapEntry2 = this.bootstrapFetchStreams.get(streamId);
+        const bootstrapEntry2 = slots?.bootstrapFetchStreams.get(streamId);
         if (bootstrapEntry2 !== undefined && bootstrapEntry2.conn === conn) {
-          this.bootstrapFetchStreams.delete(streamId);
-          this.catalogBootstrapCoord?.onFetchStreamClosed(bootstrapEntry2.attempt, terminal === 'fin');
+          slots?.bootstrapFetchStreams.delete(streamId);
+          slots?.catalogBootstrapCoord?.onFetchStreamClosed(bootstrapEntry2.attempt, terminal === 'fin');
         }
         // Live catalog stream lifecycle → retained-chain clean-FIN tracking,
         // dispatched to the OWNING coordinator (main or candidate).
-        const liveEntry = this.catalogLiveStreams.get(streamId);
+        const liveEntry = slots?.catalogLiveStreams.get(streamId);
         if (liveEntry !== undefined && liveEntry.conn === conn) {
-          this.catalogLiveStreams.delete(streamId);
+          slots?.catalogLiveStreams.delete(streamId);
           liveEntry.coord.onLiveStreamEvent(streamId, terminal);
         }
         // The legacy fetch registries below are keyed by BARE stream ID and are
@@ -6317,7 +8294,7 @@ export class MoqtPlayer {
         // pre-alias, so the coordinator's clean-FIN evidence survives the
         // alias-resolution replay (bounded; eviction is fail-closed — it only
         // removes POSITIVE evidence).
-        if (this.catalogBootstrapCoord || this.catalogRecovery) {
+        if (slots?.catalogBootstrapCoord || slots?.catalogRecovery) {
           // Close-to-object correlation matches BOTH stream id and the
           // delivering connection — a colliding stream id on another session
           // must not fabricate lifecycle evidence here.
@@ -6363,7 +8340,7 @@ export class MoqtPlayer {
             this.subscriptionManager?.invalidateLocmafGroup(subgroup.trackAlias, subgroup.groupId, conn);
             for (const subscription of this.activeSubscriptions.values()) {
               if (subscription.trackAlias === subgroup.trackAlias) {
-                this.locmafDecoders.get(subscription.trackName)?.resetGroup(subgroup.groupId);
+                this.locmafDecoders.get(this.mediaKey(subscription.trackName, subscription.mediaType, subgroup.trackAlias))?.resetGroup(subgroup.groupId);
               }
             }
           }
@@ -6401,7 +8378,7 @@ export class MoqtPlayer {
             });
           }
         }
-      }, 'data'),
+      }, 'data', undefined, bufferStream),
 
       // §10.4.4: Fetch data stream headers for object routing
       onSubgroupFin: stageable((streamId: bigint, header: SubgroupHeader) => {
@@ -6411,9 +8388,10 @@ export class MoqtPlayer {
         // The header handed back here has its FIRST_OBJECT subgroup id
         // resolved; the one captured at open may still be a placeholder.
         emitSubgroupLifecycle(lifecycle, streamId, header.subgroupId, { terminal: 'fin' });
-      }, 'data'),
+      }, 'data', undefined, bufferStream),
 
       onDataStream: stageable((streamId, header) => {
+        const slots = this.slotsFor(conn);
         // Liveness: remember which track each SUBGROUP stream belongs to so
         // a reset can shorten that track's liveness fuse. Subgroup streams
         // only — fetch streams have their own request lifecycle and must
@@ -6444,6 +8422,33 @@ export class MoqtPlayer {
           return;
         }
         if (header.type === 'fetch') {
+          const fetchReqId = BigInt(header.header.requestId);
+          // Catalog ownership is classified BEFORE the stale-session tag. A
+          // PREPARING candidate is not stale — it is not current yet — and the
+          // joining FETCH (or draft-22 fill) carrying its catalog IS the
+          // evidence the handover is waiting for. Tagging it stale first would
+          // discard the candidate's own catalog and hang its retrieval.
+          if (slots !== null && slots !== this.catalogSlots && this.candidateTxnFor(slots) !== null) {
+            const candidateFetch = slots.bootstrapFetch;
+            if (candidateFetch !== null && candidateFetch.reqId === fetchReqId
+                && candidateFetch.conn === conn && candidateFetch.gen === this.bootstrapGeneration) {
+              slots.bootstrapFetchStreams.set(streamId, { attempt: candidateFetch.attempt, conn });
+              return;
+            }
+            // The request this stream answers is registered a microtask after
+            // the coordinator issues it, so the stream can legitimately
+            // arrive first. Park it under the candidate's OWN holder — the
+            // shared map is authoritative for the current connection only —
+            // and let registration claim it.
+            if (slots.candidateFetchStreams.size < MoqtPlayer.MAX_PENDING_FETCH_STREAMS) {
+              slots.candidateFetchStreams.set(streamId, { requestId: fetchReqId, objects: [], bytes: 0 });
+              return;
+            }
+            // Beyond the bound it is not evidence we can hold: tombstone it
+            // rather than grow without limit.
+            this.staleFetchStreams.set(streamId, conn);
+            return;
+          }
           // See onObject: the fetch registries are current-connection only. A
           // STALE session's fetch stream is tagged so its objects (which carry
           // wire alias 0) are discarded instead of falling through to a real
@@ -6452,7 +8457,7 @@ export class MoqtPlayer {
             this.staleFetchStreams.set(streamId, conn);
             return;
           }
-          const reqId = BigInt(header.header.requestId);
+          const reqId = fetchReqId;
           // Catalog-fetch dispatch: map streamId → reqId so the
           // matching object reaches the pending fetchCatalog promise.
           // Kept separate from fetchStreamAliases because catalog
@@ -6462,7 +8467,7 @@ export class MoqtPlayer {
             return;
           }
           // Staged-recovery candidate fetch.
-          const recovery = this.catalogRecovery;
+          const recovery = slots?.catalogRecovery;
           if (recovery && recovery.conn === conn
               && recovery.fetch && recovery.fetch.reqId === reqId) {
             recovery.fetchStreams.set(streamId, recovery.fetch.attempt);
@@ -6470,10 +8475,10 @@ export class MoqtPlayer {
           }
 
           // Catalog-bootstrap fetch: connection-scoped ownership, attempt-tagged.
-          const bootstrap = this.bootstrapFetch;
+          const bootstrap = slots?.bootstrapFetch;
           if (bootstrap && bootstrap.reqId === reqId
               && bootstrap.conn === conn && bootstrap.gen === this.bootstrapGeneration) {
-            this.bootstrapFetchStreams.set(streamId, { attempt: bootstrap.attempt, conn });
+            slots?.bootstrapFetchStreams.set(streamId, { attempt: bootstrap.attempt, conn });
             return;
           }
           // A cancelled, refused, or discarded request's late streams are
@@ -6501,7 +8506,7 @@ export class MoqtPlayer {
             this.pendingFetchStreams.set(streamId, { requestId: reqId, objects: [], bytes: 0 });
           }
         }
-      }, 'data'),
+      }, 'data', undefined, bufferDataStream),
 
       // §6.1: Namespace discovery messages (bidi-stream NAMESPACE / NAMESPACE_DONE)
       // §6.2: Control-stream PUBLISH_NAMESPACE / PUBLISH_NAMESPACE_DONE
@@ -6570,7 +8575,7 @@ export class MoqtPlayer {
             };
 
         this.subscriptionManager.routeObject(0n, obj, conn.draftVersion, conn);
-      }, 'datagram', dgBytes),
+      }, 'datagram', dgBytes, bufferDatagram),
 
       // §draft-pardue-moq-qlog-moq-events-06: qlog tracing
       ...(this.config.onQlogEvent ? { onQlogEvent: this.config.onQlogEvent } : {}),
@@ -6665,12 +8670,15 @@ export class MoqtPlayer {
    */
   private handleSessionGoaway(newSessionUri: string, conn: MoqtConnection): void {
     this.log.info('GOAWAY received, uri=%s', newSessionUri || '(none)');
-    // §9.4 SHOULD: "A subscriber SHOULD individually UNSUBSCRIBE for each
-    // existing subscription".
-    for (const [requestId] of this.activeSubscriptions) {
-      this.connection?.unsubscribe(varint(requestId));
-    }
-    this.activeSubscriptions.clear();
+    // Established media is deliberately NOT cancelled here. Graceful switchover
+    // orders the replacement's successful responses BEFORE cancellation:
+    // "The new relay will send a response to the subscribes and if they are
+    // successful, the subscriptions to the old relay can be cancelled"
+    // (draft-16 §8.4.1, draft-18 §9.4.1, draft-22 §7.4.1). Cancelling on receipt
+    // tore down playback while the replacement was still being established —
+    // sometimes before its transport even existed. The session is already
+    // refused new local requests by DRAINING, so retirement belongs to the
+    // handover, not to the notice.
     this.emitter.emit('session_goaway', { type: 'session_goaway', newSessionUri });
 
     if (!this.config.createConnection) return;
@@ -6679,10 +8687,12 @@ export class MoqtPlayer {
     // until the migration commits — and the migration may roll back — so
     // late old-session catalog data must never mutate state from here on.
     this.catalogQuarantinedConns.add(conn);
-    if (this.catalogTrackAlias !== null) {
-      this.quarantinedCatalogAliases.set(conn, this.catalogTrackAlias);
+    if (this.catalogSlots.catalogTrackAlias !== null) {
+      this.quarantinedCatalogAliases.set(conn, this.catalogSlots.catalogTrackAlias);
     }
-    const uri = newSessionUri || this.config.url;
+    // §9.4 / §10.4 / §9.2: an empty New Session URI reuses the CURRENT session
+    // URI — the endpoint we are actually on, not the configured origin.
+    const uri = newSessionUri || this.activeEndpoint;
     if (this.currentMigration) {
       // A handoff is in flight (staged-event drain or old-session retirement
       // still holds the single-flight slot). Starting a migration now would be
@@ -6727,11 +8737,11 @@ export class MoqtPlayer {
     this.retireOwnedRequest(requestId);
     // The catalog's retrieval is addressed either through its SUBSCRIBE or
     // through the bootstrap FETCH/FILL that feeds it.
-    const isCatalogSubscribe = this.catalogRequestId === requestId;
-    const isBootstrapFetch = this.bootstrapFetch?.reqId === requestId;
+    const isCatalogSubscribe = this.catalogSlots.catalogRequestId === requestId;
+    const isBootstrapFetch = this.catalogSlots.bootstrapFetch?.reqId === requestId;
     // A staged recovery candidate carries its OWN request identity, separate
     // from the active catalog's, and has its own retirement lifecycle.
-    const recovery = this.catalogRecovery;
+    const recovery = this.catalogSlots.catalogRecovery;
     if (recovery && (recovery.reqId === requestId || recovery.fetch?.reqId === requestId)) {
       this.retireCatalogRecovery();
     }
@@ -6740,8 +8750,8 @@ export class MoqtPlayer {
         // The wire route is dead: nothing is served on this request any more,
         // and a retained alias would keep an authoritative routing identity for
         // a subscription the peer is migrating away.
-        this.catalogRequestId = null;
-        this.catalogTrackAlias = null;
+        this.catalogSlots.catalogRequestId = null;
+        this.catalogSlots.catalogTrackAlias = null;
       }
       // Retire the RETRIEVAL too, not just its identity. The coordinator owns an
       // inactivity timer and a legacy-resubscribe fallback: left running, it
@@ -6754,14 +8764,14 @@ export class MoqtPlayer {
       // subscribeAuxTrackOwned, so using it here would abort unrelated pending
       // media and init-track work. This signal is scoped to one request
       // (§10.4 / §9.2), so the retirement is scoped to the catalog's own owners.
-      if (this.catalogSubscribeRetryTimer !== null) {
-        clearTimeout(this.catalogSubscribeRetryTimer);
-        this.catalogSubscribeRetryTimer = null;
+      if (this.catalogSlots.catalogSubscribeRetryTimer !== null) {
+        clearTimeout(this.catalogSlots.catalogSubscribeRetryTimer);
+        this.catalogSlots.catalogSubscribeRetryTimer = null;
       }
-      this.catalogBootstrapCoord?.abort();
-      this.catalogBootstrapCoord = null;
-      this.bootstrapFetch = null;
-      this.bootstrapFetchStreams.clear();
+      this.catalogSlots.catalogBootstrapCoord?.abort();
+      this.catalogSlots.catalogBootstrapCoord = null;
+      this.catalogSlots.bootstrapFetch = null;
+      this.catalogSlots.bootstrapFetchStreams.clear();
       this.retireCatalogRecovery();
       // The PARSED catalog is left intact — tracks, codecs and selection stay
       // valid; only the dead route and its retrieval machinery go.
@@ -6787,7 +8797,174 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-transport-16 §9.7 (REQUEST_OK)
    * @see draft-ietf-moq-transport-16 §9.8 (REQUEST_ERROR)
    */
+  /**
+   * Control evidence for a handover candidate's own catalog retrieval.
+   *
+   * Goes through the SAME dispatch as the live session so message parsing is
+   * never duplicated, but with a candidate-owned context: its catalog identity
+   * and coordinator, and empty media collaborators. A candidate is not current,
+   * so nothing here may reach `activeSubscriptions`, `pendingMediaSubs`, the
+   * track registrations, any live route, or the event channel. Media readiness
+   * is a separate stage and deliberately inert at this point.
+   *
+   * @see draft-ietf-moq-transport-22 §7.4.1 (successful replacement responses
+   *      precede cancelling the old subscriptions)
+   */
+  /**
+   * Control messages from a PREPARING candidate.
+   *
+   * Two kinds of readiness evidence arrive here and nothing else may: the
+   * candidate's own catalog retrieval, and the acceptance or refusal of the
+   * media it prepared. Live media bookkeeping is deliberately out of reach —
+   * request ids collide between sessions, so answering a candidate's request
+   * against the live maps would settle a current track's subscription.
+   */
+  private handleCandidateControl(
+    msg: ControlMessage, conn: MoqtConnection, slots: CatalogSlots,
+  ): void {
+    const txn = this.currentMigration;
+    const prep = txn && txn.conn === conn && !txn.committed && !txn.aborted ? txn.prep : undefined;
+    if (prep !== undefined && 'requestId' in msg) {
+      const reqId = BigInt((msg as { requestId: bigint | number }).requestId);
+      const sub = prep.media.get(reqId);
+      let initName: string | null = null;
+      for (const [name, init] of prep.initTracks) if (init.reqId === reqId) initName = name;
+      if (sub !== undefined || initName !== null) {
+        if (msg.type === 'SUBSCRIBE_OK' && 'trackAlias' in msg) {
+          // ACCEPTANCE — the §7.4.1 precondition for retiring the old
+          // subscriptions. Sending the request proved nothing.
+          this.onCandidateSubscribeAccepted(txn!, reqId, BigInt((msg as { trackAlias: bigint | number }).trackAlias));
+        } else if (msg.type === 'REQUEST_ERROR') {
+          const what = sub !== undefined ? `track "${sub.trackName}"` : `init track "${initName!}"`;
+          this.failCandidateMedia(conn, `replacement refused required ${what}: ${
+            (msg as { errorReason?: string }).errorReason ?? ''}`);
+        } else if (msg.type === 'PUBLISH_DONE') {
+          // The replacement ended a required track before we could adopt it:
+          // it cannot carry playback, and the old session still can.
+          const what = sub !== undefined ? `track "${sub.trackName}"` : `init track "${initName!}"`;
+          this.failCandidateMedia(conn, `replacement ended required ${what} before adoption`);
+        }
+        return;
+      }
+    }
+    doControlMessage(msg, {
+      adapter: conn,
+      // Candidate-owned and empty: media acceptance is a later stage, and a
+      // non-current session must not be able to touch the live maps.
+      activeSubscriptions: new Map(),
+      pendingMediaSubs: new Map(),
+      removeSubscription: () => undefined,
+      pendingTrackStatuses: new Map(),
+      catalogRequestId: slots.catalogRequestId,
+      catalogTrackAlias: slots.catalogTrackAlias,
+      subscriptionManager: null,
+      log: this.log,
+      // A candidate publishes nothing: its catalog is not authoritative until
+      // adoption, so no player event may be emitted from this path.
+      emitEvent: () => { /* candidate state is not published */ },
+      setCatalogTrackAlias: (alias) => {
+        slots.catalogTrackAlias = alias;
+        // Data may precede the message that establishes the track alias
+        // (draft-16 §10.4.2, draft-18 §11.4.2, draft-22 §3.1.3.1), and for a
+        // candidate that is not an edge case: a relay with the catalog in hand
+        // sends it immediately. A catalog may also be a SINGLE object, so
+        // dropping what arrived early, or leaving it retained until an
+        // adoption that depends on it, both deadlock the handover. Released
+        // here, where binding has finally said what that alias is.
+        if (txn !== null) {
+          this.releaseEarlyCandidateData(txn, alias,
+            (streamId, obj) => { this.dispatchCatalogObject(obj, streamId, conn, slots); });
+        }
+        this.replayPendingObjects(alias, conn);
+      },
+      clearCatalogState: () => { slots.catalogTrackAlias = null; slots.catalogRequestId = null; },
+      onCatalogSubscribeOk: (largest) => {
+        // Acceptance of the catalog subscription — distinct from receiving an
+        // early catalog object, and a precondition of readiness.
+        slots.catalogBootstrapCoord?.onSubscribeOk(largest);
+      },
+      onCatalogSubscribeError: (errorCode, reason, retryInterval) => {
+        // "Not published yet" is retriable, exactly as at startup; everything
+        // else is a real refusal and the replacement is declined.
+        if (txn !== null && errorCode === BigInt(RequestError.DOES_NOT_EXIST) && retryInterval !== 0n) {
+          this.scheduleCandidateCatalogRetry(txn, conn, retryInterval ?? 0n);
+          return;
+        }
+        this.failCandidateCatalog(conn, `candidate catalog subscribe refused: ${reason}`);
+      },
+      onCatalogBootstrapFetchOk: (requestId, endLocation, endOfTrack) => {
+        const fetch = slots.bootstrapFetch;
+        if (!fetch || fetch.conn !== conn || fetch.reqId !== requestId) return;
+        slots.catalogBootstrapCoord?.onFetchOk(fetch.attempt, endLocation, endOfTrack);
+      },
+      onCatalogBootstrapFetchError: (requestId, errorCode) => {
+        const fetch = slots.bootstrapFetch;
+        if (!fetch || fetch.conn !== conn || fetch.reqId !== requestId) return;
+        slots.bootstrapFetch = null;
+        // invalid-range and refusal are distinguished per the DELIVERING draft.
+        slots.catalogBootstrapCoord?.onFetchError(fetch.attempt,
+          errorCode === this.invalidRangeCode(conn.draftVersion) ? 'invalid-range' : 'refused');
+      },
+      onCatalogPublishDone: (statusCode) => {
+        // Classified by the DELIVERING draft, which a cross-draft replacement
+        // does not share with the live session.
+        const reason = this.normalizePublishDoneStatus(statusCode, conn.draftVersion);
+        if (reason === 'going-away') {
+          // A replacement that is itself going away cannot be adopted; the
+          // old session is still playing, so this is the candidate's failure.
+          this.failCandidateCatalog(conn, 'replacement session is going away');
+          return;
+        }
+        // Coordinator modes take the status through the ladder, exactly as the
+        // live retrieval does — its drain is what retires an ended feed's
+        // route, and adoption carries that holder across.
+        const coord = slots.catalogBootstrapCoord;
+        if (coord) {
+          coord.onPublishDone(reason);
+          return;
+        }
+        // Legacy 'subscribe' mode has no coordinator: defer the status until
+        // the drain completes, as the live retrieval does.
+        slots.legacyCatalogTerminal = {
+          gen: this.bootstrapGeneration,
+          reqId: slots.catalogRequestId,
+          reason,
+        };
+      },
+    });
+  }
+
+  /** Fail a candidate's catalog retrieval WITHOUT failing live playback. */
+  private failCandidateCatalog(conn: MoqtConnection, reason: string): void {
+    const txn = this.currentMigration;
+    if (!txn || txn.conn !== conn || txn.committed) return;
+    this.log.info('[handover] candidate catalog failed: %s', reason);
+    const err = new Error(reason);
+    // Both faces are settled: whichever stage is being awaited rejects, and
+    // the other can never strand the attempt. Settling twice is a no-op.
+    txn.prep?.rejectCatalog(err);
+    txn.prep?.rejectReady(err);
+  }
+
+  /**
+   * Fail a candidate's MEDIA preparation without failing live playback.
+   *
+   * A refused or ended replacement track is the candidate's problem, not the
+   * session's: the old relay may still be delivering perfectly well, and
+   * §7.4.1 only permits cancelling its subscriptions once the replacement's
+   * have succeeded. So this rejects the attempt and leaves playback alone.
+   */
+  private failCandidateMedia(conn: MoqtConnection, reason: string): void {
+    const txn = this.currentMigration;
+    if (!txn || txn.conn !== conn || txn.committed) return;
+    this.log.info('[handover] candidate media failed: %s', reason);
+    const err = new Error(reason);
+    txn.prep?.rejectReady(err);
+    txn.prep?.rejectCatalog(err);
+  }
+
   private handleControlMessage(msg: ControlMessage, conn: MoqtConnection): void {
+    const slots = this.slotsFor(conn);
     // Ignore control messages from a SUPERSEDED session. After a migration
     // `this.connection`, `activeSubscriptions`, `pendingMediaSubs`, the track
     // registrations, and the catalog alias all belong to the NEW session; a
@@ -6796,6 +8973,14 @@ export class MoqtPlayer {
     // current request, or send UNSUBSCRIBE/GOAWAY on the replacement adapter. The
     // old session is closing — its control state is not retained per session.
     if (conn !== this.connection) {
+      // A PREPARING candidate is not superseded — it is not current yet. Its
+      // catalog and FETCH/FILL evidence belongs to its own retrieval, and is
+      // the only thing a non-current session may be heard on. Live media
+      // bookkeeping is deliberately out of reach here.
+      if (slots !== null && slots !== this.catalogSlots) {
+        this.handleCandidateControl(msg, conn, slots);
+        return;
+      }
       this.log.info('Ignoring control message from a superseded session: %s', msg.type);
       return;
     }
@@ -6805,22 +8990,26 @@ export class MoqtPlayer {
         ? BigInt((msg as { trackAlias: bigint | number }).trackAlias) : null;
       this.settleParkedOwnership(answeredReqId, boundAlias, conn);
     }
+    const completedSub = msg.type === 'PUBLISH_DONE'
+      ? this.activeSubscriptions.get(BigInt(msg.requestId)) : undefined;
+    const completedTrack = completedSub === undefined ? undefined : this.catalogTrackFor(
+      completedSub.trackName, completedSub.namespace ?? namespaceFields(this.config.namespace), completedSub.mediaType);
     doControlMessage(msg, {
       adapter: this.connection,
       activeSubscriptions: this.activeSubscriptions,
       pendingMediaSubs: this.pendingMediaSubs,
       removeSubscription: (requestId) => this.retireMediaSubscription(requestId, conn),
       pendingTrackStatuses: this.pendingTrackStatuses,
-      catalogRequestId: this.catalogRequestId,
-      catalogTrackAlias: this.catalogTrackAlias,
+      catalogRequestId: slots?.catalogRequestId ?? null,
+      catalogTrackAlias: slots?.catalogTrackAlias ?? null,
       subscriptionManager: this.subscriptionManager,
       log: this.log,
       emitEvent: (event) => this.emitter.emit(event.type as any, event as any),
       setCatalogTrackAlias: (alias) => {
-        this.catalogTrackAlias = alias;
+        if (slots) slots.catalogTrackAlias = alias;
         this.replayPendingObjects(alias, conn);
       },
-      clearCatalogState: () => { this.catalogTrackAlias = null; this.catalogRequestId = null; },
+      clearCatalogState: () => { if (slots) { slots.catalogTrackAlias = null; slots.catalogRequestId = null; } },
       onAliasResolved: (alias) => { this.replayPendingObjects(alias, conn); },
       onPublishDone: (_requestId, trackName, _trackAlias, statusCode, errorReason) => {
         // TOO_FAR_BEHIND means the subscriber fell behind the live edge —
@@ -6834,7 +9023,7 @@ export class MoqtPlayer {
           : PublishDoneCode.TOO_FAR_BEHIND;
         if (statusCode === BigInt(tooFarBehind)) {
           this.log.warn('PUBLISH_DONE(TOO_FAR_BEHIND) "%s": resubscribing from live edge', trackName);
-          this.replaceSubscription(trackName, 'too_far_behind');
+          this.replaceSubscription(trackName, 'too_far_behind', completedTrack);
           return;
         }
 
@@ -6864,7 +9053,7 @@ export class MoqtPlayer {
         }
       },
       onCatalogSubscribeOk: (largest) => {
-        this.catalogBootstrapCoord?.onSubscribeOk(largest);
+        slots?.catalogBootstrapCoord?.onSubscribeOk(largest);
       },
       onCatalogSubscribeError: (errorCode, reason, retryInterval) => {
         if (conn !== this.connection) return;
@@ -6880,7 +9069,7 @@ export class MoqtPlayer {
         this.scheduleCatalogSubscribeRetry(conn, retryInterval);
       },
       onRecoveryCatalogSubscribeOk: (reqId, alias, largest) => {
-        const r = this.catalogRecovery;
+        const r = slots?.catalogRecovery;
         if (!r || r.reqId !== reqId) return false;
         if (this._destroyed || this.isTerminalState() || r.gen !== this.bootstrapGeneration || r.conn !== conn) return true;
         r.alias = alias;
@@ -6897,12 +9086,12 @@ export class MoqtPlayer {
           const events = r.parkedEvents; r.parkedEvents = new Map();
           for (const entry of parked) {
             if (!this.emitCatalogRaw(entry.obj)) return true;
-            this.catalogLiveStreams.set(entry.streamId, { conn: r.conn, coord: r.coord });
+            slots?.catalogLiveStreams.set(entry.streamId, { conn: r.conn, coord: r.coord });
             r.coord.onLiveStreamEvent(entry.streamId, 'header');
             r.coord.onLiveCatalogObject(this.toCatalogEvent(entry.obj), entry.streamId);
           }
           for (const [sid, kind] of events) {
-            this.catalogLiveStreams.delete(sid);
+            slots?.catalogLiveStreams.delete(sid);
             r.coord.onLiveStreamEvent(sid, kind);
           }
         } else {
@@ -6916,45 +9105,45 @@ export class MoqtPlayer {
         // complete on a Pending subscription) — adopt now that the alias is
         // bound and the parked traffic has FULLY replayed. The recovery slot
         // may already be gone if the replay failed the transaction.
-        if (this.catalogRecovery === r) {
+        if (slots?.catalogRecovery === r) {
           r.replaying = false;
           this.maybeAdoptCatalogRecovery();
         }
         return true;
       },
       onCatalogBootstrapFetchOk: (requestId, endLocation, endOfTrack) => {
-        const r = this.catalogRecovery;
+        const r = slots?.catalogRecovery;
         if (r?.fetch && r.fetch.reqId === requestId) {
           r.coord.onFetchOk(r.fetch.attempt, endLocation, endOfTrack);
           return;
         }
-        const fetch = this.bootstrapFetch;
+        const fetch = slots?.bootstrapFetch;
         if (!fetch || fetch.reqId !== requestId || fetch.gen !== this.bootstrapGeneration) return;
-        this.catalogBootstrapCoord?.onFetchOk(fetch.attempt, endLocation, endOfTrack);
+        slots?.catalogBootstrapCoord?.onFetchOk(fetch.attempt, endLocation, endOfTrack);
       },
       onCatalogBootstrapFetchError: (requestId, errorCode) => {
-        const r = this.catalogRecovery;
+        const r = slots?.catalogRecovery;
         if (r?.fetch && r.fetch.reqId === requestId) {
           const attempt = r.fetch.attempt;
           r.fetch = null;
           r.coord.onFetchError(attempt, errorCode === this.invalidRangeCode() ? 'invalid-range' : 'refused');
           return;
         }
-        const fetch = this.bootstrapFetch;
+        const fetch = slots?.bootstrapFetch;
         if (!fetch || fetch.reqId !== requestId || fetch.gen !== this.bootstrapGeneration) return;
-        this.bootstrapFetch = null;
+        if (slots) slots.bootstrapFetch = null;
         // INVALID_RANGE (0x11) = track empty; anything else = refusal → ladder.
-        this.catalogBootstrapCoord?.onFetchError(fetch.attempt,
+        slots?.catalogBootstrapCoord?.onFetchError(fetch.attempt,
           errorCode === this.invalidRangeCode() ? 'invalid-range' : 'refused');
       },
       onRecoveryCatalogRequestError: (reqId) => {
-        const r = this.catalogRecovery;
+        const r = slots?.catalogRecovery;
         if (!r || r.reqId !== reqId) return false;
         this.failCatalogRecovery('candidate catalog subscription refused');
         return true;
       },
       onRecoveryCatalogPublishDone: (reqId, statusCode) => {
-        const r = this.catalogRecovery;
+        const r = slots?.catalogRecovery;
         if (!r || r.reqId !== reqId) return false;
         const reason = this.normalizePublishDoneStatus(statusCode);
         if (reason === 'going-away') {
@@ -6978,12 +9167,15 @@ export class MoqtPlayer {
           // active snapshot remains, degraded, with no automatic recovery.
           if (this.connection) {
             this.catalogQuarantinedConns.add(this.connection);
-            if (this.catalogTrackAlias !== null) {
-              this.quarantinedCatalogAliases.set(this.connection, this.catalogTrackAlias);
+            if (slots?.catalogTrackAlias !== null) {
+              const quarantinedAlias = slots?.catalogTrackAlias;
+              if (quarantinedAlias !== null && quarantinedAlias !== undefined) {
+                this.quarantinedCatalogAliases.set(this.connection, quarantinedAlias);
+              }
             }
           }
         }
-        const coord = this.catalogBootstrapCoord;
+        const coord = slots?.catalogBootstrapCoord;
         if (coord) {
           coord.onPublishDone(reason);
           return;
@@ -6999,8 +9191,11 @@ export class MoqtPlayer {
           // that reuses it.
           if (this.connection) {
             this.catalogQuarantinedConns.add(this.connection);
-            if (this.catalogTrackAlias !== null) {
-              this.quarantinedCatalogAliases.set(this.connection, this.catalogTrackAlias);
+            if (slots?.catalogTrackAlias !== null) {
+              const quarantinedAlias = slots?.catalogTrackAlias;
+              if (quarantinedAlias !== null && quarantinedAlias !== undefined) {
+                this.quarantinedCatalogAliases.set(this.connection, quarantinedAlias);
+              }
             }
           }
           this.retireCatalogAliasRoute();
@@ -7017,9 +9212,9 @@ export class MoqtPlayer {
           // retriable+base → staged recovery (legacy candidate = fresh
           // AbsoluteStart subscribe); no base after the drain → fatal;
           // ended+base → quiet one-shot completion.
-          this.legacyCatalogTerminal = {
+          if (slots) slots.legacyCatalogTerminal = {
             gen: this.bootstrapGeneration,
-            reqId: this.catalogRequestId,
+            reqId: slots?.catalogRequestId,
             reason,
           };
         }
@@ -7055,6 +9250,10 @@ export class MoqtPlayer {
           requestId, fetchInfo.trackName, errorReason, errorCode.toString(16));
       },
       onMediaAliasBound: (requestId, alias) => {
+        // The current session has bound this alias, so it is no longer a
+        // retired session's route — whatever that session still sends on it
+        // belongs to nobody.
+        this.supersededRouting?.aliases.delete(alias);
         // FETCH ownership follows the associated subscription, never a
         // coincidentally equal Request ID or another track's numeric alias.
         for (const [fetchId, info] of this.activeFetches) {
@@ -7137,7 +9336,7 @@ export class MoqtPlayer {
       this.subscriptionManager?.invalidateLocmafGroup(alias, groupId, resolvingConnection);
       for (const subscription of this.activeSubscriptions.values()) {
         if (subscription.trackAlias === alias) {
-          this.locmafDecoders.get(subscription.trackName)?.resetGroup(groupId);
+          this.locmafDecoders.get(this.mediaKey(subscription.trackName, subscription.mediaType, alias))?.resetGroup(groupId);
         }
       }
       appliedResetByGroup.set(groupId, ordinal);
@@ -7151,30 +9350,42 @@ export class MoqtPlayer {
           && this.quarantinedCatalogAliases.get(sourceConnection) === resolvedAlias) {
         continue; // a quarantined session's catalog alias — never re-attributed
       }
+      // The retrieval that OWNS this entry, which for a preparing candidate is
+      // its own holder. Classified BEFORE the media lookup for the same reason
+      // as in onObject: the subscription manager holds only the live session's
+      // registrations, so a replacement whose catalog reuses a live media alias
+      // would otherwise have its catalog replayed into the running pipeline.
+      const owner = sourceConnection !== undefined ? this.slotsFor(sourceConnection) : null;
+      if (owner !== null && owner !== this.catalogSlots && sourceConnection !== undefined
+          && resolvedAlias === owner.catalogTrackAlias && this.candidateTxnFor(owner) !== null) {
+        this.dispatchCatalogObject(obj, streamId, sourceConnection, owner);
+        terminalTargets.set(streamId, owner.catalogBootstrapCoord);
+        continue;
+      }
       if (this.subscriptionManager?.getMediaType(resolvedAlias) !== undefined) {
         mediaReplayed = true;
         applyLocmafReset(BigInt(obj.groupId), locmafResetBeforeOrdinal);
         // Route with the delivering session's own draft + connection.
         this.subscriptionManager.routeObject(streamId, obj, sourceDraft, sourceConnection);
         if (!terminalTargets.has(streamId)) terminalTargets.set(streamId, null);
-      } else if (this.catalogRecovery !== null
-          && this.catalogRecovery.alias !== null
-          && resolvedAlias === this.catalogRecovery.alias
-          && this.catalogRecovery.conn === sourceConnection) {
-        const rec = this.catalogRecovery;
+      } else if (this.catalogSlots.catalogRecovery !== null
+          && this.catalogSlots.catalogRecovery.alias !== null
+          && resolvedAlias === this.catalogSlots.catalogRecovery.alias
+          && this.catalogSlots.catalogRecovery.conn === sourceConnection) {
+        const rec = this.catalogSlots.catalogRecovery;
         if (!this.emitCatalogRaw(obj)) return;
-        this.catalogLiveStreams.set(streamId, { conn: rec.conn, coord: rec.coord });
+        this.catalogSlots.catalogLiveStreams.set(streamId, { conn: rec.conn, coord: rec.coord });
         rec.coord.onLiveStreamEvent(streamId, 'header');
         rec.coord.onLiveCatalogObject(this.toCatalogEvent(obj), streamId);
         terminalTargets.set(streamId, rec.coord);
-      } else if (this.catalogTrackAlias !== null && resolvedAlias === this.catalogTrackAlias) {
+      } else if (this.catalogSlots.catalogTrackAlias !== null && resolvedAlias === this.catalogSlots.catalogTrackAlias) {
         if (sourceConnection !== undefined && this.catalogQuarantinedConns.has(sourceConnection)) continue;
-        if (this.catalogBootstrapCoord) {
+        if (this.catalogSlots.catalogBootstrapCoord) {
           if (!this.emitCatalogRaw(obj)) return;
-          if (sourceConnection !== undefined) this.catalogLiveStreams.set(streamId, { conn: sourceConnection, coord: this.catalogBootstrapCoord });
-          this.catalogBootstrapCoord.onLiveStreamEvent(streamId, 'header');
-          this.catalogBootstrapCoord.onLiveCatalogObject(this.toCatalogEvent(obj), streamId);
-          terminalTargets.set(streamId, this.catalogBootstrapCoord);
+          if (sourceConnection !== undefined) this.catalogSlots.catalogLiveStreams.set(streamId, { conn: sourceConnection, coord: this.catalogSlots.catalogBootstrapCoord });
+          this.catalogSlots.catalogBootstrapCoord.onLiveStreamEvent(streamId, 'header');
+          this.catalogSlots.catalogBootstrapCoord.onLiveCatalogObject(this.toCatalogEvent(obj), streamId);
+          terminalTargets.set(streamId, this.catalogSlots.catalogBootstrapCoord);
         } else {
           this.handleCatalogObject(obj);
           if (!terminalTargets.has(streamId)) terminalTargets.set(streamId, null);
@@ -7197,7 +9408,7 @@ export class MoqtPlayer {
         if (closed === undefined) continue;
         perConn.delete(streamId);
         if (coord) {
-          this.catalogLiveStreams.delete(streamId);
+          this.catalogSlots.catalogLiveStreams.delete(streamId);
           coord.onLiveStreamEvent(streamId, closed.terminal);
         }
       }
@@ -7205,8 +9416,108 @@ export class MoqtPlayer {
     }
   }
 
-  private handleCatalogObject(obj: MoqtObject): void {
+  /**
+   * Whether `conn` may deliver media on `alias` right now.
+   *
+   * Only ever false during the overlap between adopting a replacement and
+   * closing the session it replaced, which is the one time two sessions share
+   * the alias-keyed routing table:
+   *
+   * - the retiring session keeps the aliases the replacement did not take
+   *   over, so its in-flight media still reaches playback — except for a
+   *   media type whose buffer was retyped for the replacement, where its
+   *   bytes are in the old format and no longer appendable;
+   * - the current session may not deliver on one of those retained aliases,
+   *   because it has not bound it: that data would otherwise be relabelled as
+   *   whatever track the retiring session had there.
+   */
+  private mediaRouteBelongsTo(conn: MoqtConnection, alias: bigint): boolean {
+    const retained = this.supersededRouting;
+    if (conn === this.connection) {
+      // The current session: a retained alias is not its to deliver on, since
+      // it has not bound it.
+      return retained === null || !retained.aliases.has(alias);
+    }
+    if (retained !== null && conn === retained.conn) {
+      // The session being retired, during the overlap: its own aliases still
+      // deliver, except where the replacement took the alias over or the
+      // buffer was retyped and its bytes are the wrong format now.
+      if (!retained.aliases.has(alias)) return false;
+      const mediaType = this.subscriptionManager?.getMediaType(alias);
+      return mediaType === undefined
+        || !retained.reconfigured.has(mediaType as 'video' | 'audio');
+    }
+    // A session a handover has REPLACED has no route, however late its data
+    // arrives: this is the part that has to outlive the overlap, since an
+    // async object transform can begin before a handover and resolve long
+    // after the session it came from is closed.
+    return !this.supersededConns.has(conn);
+  }
+
+  /**
+   * Deliver a catalog object to the retrieval that OWNS it — coordinator or
+   * legacy manager. One path, shared by the ordinary alias route and by the
+   * candidate classification that has to run before the live media lookup.
+   */
+  private dispatchCatalogObject(
+    obj: MoqtObject, streamId: bigint, conn: MoqtConnection, slots: CatalogSlots,
+  ): void {
+    // GOAWAY quarantine: the old session's catalog delivery is dropped
+    // unconditionally (the old generation may still be authoritative until
+    // migration commits, so this cannot rely on generation checks).
+    if (this.catalogQuarantinedConns.has(conn)) return;
+    if (slots.catalogBootstrapCoord) {
+      if (!this.emitCatalogRaw(obj)) return;
+      slots.catalogLiveStreams.set(streamId, { conn, coord: slots.catalogBootstrapCoord });
+      slots.catalogBootstrapCoord.onLiveStreamEvent(streamId, 'header');
+      slots.catalogBootstrapCoord.onLiveCatalogObject(this.toCatalogEvent(obj), streamId);
+      return;
+    }
+    this.handleCatalogObject(obj, slots);
+  }
+
+  /** The transaction that owns `slots` while still PREPARING, else null. */
+  private candidateTxnFor(slots: CatalogSlots): MigrationTxn | null {
+    const txn = this.currentMigration;
+    return txn !== null && txn.slots === slots && slots !== this.catalogSlots
+      && !txn.committed && !txn.aborted ? txn : null;
+  }
+
+  /**
+   * A preparing candidate's catalog object: parse it into the candidate's own
+   * manager and let convergence decide readiness.
+   *
+   * Nothing is published — no `catalog_raw`, no `catalog_received`, no
+   * `catalog_updated` — because this catalog describes a session that is not
+   * authoritative and may never be. A malformed object fails the CANDIDATE,
+   * never live playback: the old session's catalog is untouched and still good.
+   */
+  private handleCandidateCatalogObject(obj: MoqtObject, slots: CatalogSlots, txn: MigrationTxn): void {
+    if (obj.kind === 'gap') return; // re-sent on the next group, as live
+    try {
+      const state = slots.catalogManager!.processCatalogObject(obj.payload);
+      txn.prep!.state = state;
+      if (!slots.catalogReceived) {
+        slots.catalogReceived = true;
+        this.log.info('[handover] replacement catalog converged: %d tracks', state.tracks.length);
+        txn.prep!.resolveCatalog(state);
+      }
+    } catch (err) {
+      // Even a late delta failure fails the candidate rather than degrading:
+      // a replacement whose catalog feed is producing garbage must not be
+      // adopted, and declining it costs nothing while the old session works.
+      this.failCandidateCatalog(txn.conn, `replacement catalog rejected: ${
+        err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private handleCatalogObject(obj: MoqtObject, slots: CatalogSlots = this.catalogSlots): void {
     if (this._destroyed || this.isTerminalState()) return;
+    // A PREPARING candidate's catalog is evidence about a replacement, not the
+    // catalog playback is running on: it converges its own retrieval and
+    // publishes nothing until adoption.
+    const candidate = this.candidateTxnFor(slots);
+    if (candidate !== null) { this.handleCandidateCatalogObject(obj, slots, candidate); return; }
     const conn = this.connection;
     const gen = this.bootstrapGeneration;
     const live = (): boolean => !this._destroyed && !this.isTerminalState()
@@ -7228,10 +9539,10 @@ export class MoqtPlayer {
     }
 
     try {
-      const catalogState = this.catalogManager!.processCatalogObject(obj.payload);
+      const catalogState = this.catalogSlots.catalogManager!.processCatalogObject(obj.payload);
 
-      if (!this.catalogReceived) {
-        this.catalogReceived = true;
+      if (!this.catalogSlots.catalogReceived) {
+        this.catalogSlots.catalogReceived = true;
         this._catalogState = catalogState;
         this._stats.recordCatalogReceived();
         this.watchdog.fulfill('catalog_received');
@@ -7281,8 +9592,8 @@ export class MoqtPlayer {
     } catch (err) {
       // First catalog failure = fatal (can't proceed without catalog).
       // Subsequent catalog failures = degraded (delta update failed, old catalog still valid).
-      const severity: ErrorSeverity = this.catalogReceived ? 'degraded' : 'fatal';
-      const code = this.catalogReceived
+      const severity: ErrorSeverity = this.catalogSlots.catalogReceived ? 'degraded' : 'fatal';
+      const code = this.catalogSlots.catalogReceived
         ? PlayerErrorCode.CATALOG_DELTA_ERROR
         : PlayerErrorCode.CATALOG_PARSE_ERROR;
       const cause = err instanceof Error ? err : new Error(String(err));
@@ -7671,7 +9982,10 @@ export class MoqtPlayer {
     // (which map to fatal player errors), and stayed un-latched. The player
     // must NOT mark CMAF initialized or build the assembler on failure —
     // the bootstrap deadline remains the backstop if no fatal fired.
-    if (this.mediaSource.initialize(msConfig) === false) {
+    const source = this.mediaSource;
+    const initialized = source.initialize(msConfig);
+    if (this._destroyed || this.mediaSource !== source || this.isTerminalState()) return;
+    if (initialized === false) {
       this.log.warn('CMAF initialize rejected by the media source adapter — not marking initialized');
       return;
     }
@@ -7828,6 +10142,16 @@ export class MoqtPlayer {
             (ms as { setTimestampOffset: (t: string, o: number) => void }).setTimestampOffset(mediaType, 0);
           }
         }
+        // A retype of this source buffer is in flight. Real MSE QUEUES appends
+        // and drains them after the new initialization is installed, so an
+        // old-session segment handed over now would be decoded against the
+        // replacement's init — the one corruption the retype exists to avoid.
+        // The old session is about to be replaced for this track anyway, so
+        // the segment is dropped rather than queued.
+        if (this.retypingMedia.has(mediaType)) {
+          this.log.debug('[handover] dropped a %s segment arriving during the source-buffer retype', mediaType);
+          return;
+        }
         ms.appendChunk(mediaType, segment, segTrackName, groupId);
         this.renewCmafFirstFrameDeadline(mediaType);
       },
@@ -7909,12 +10233,13 @@ export class MoqtPlayer {
     mediaType: 'video' | 'audio',
     trackName: string,
     payload: Uint8Array,
+    alias?: bigint,
   ): void {
     if (MoqtPlayer.looksLikeCmafInitSegment(payload)) {
       this.log.info('[CMAF] in-band init segment on "%s" (%s, %dB)',
         trackName, mediaType, payload.byteLength);
       // Cache for codec-changing switches, same as initTrack deliveries.
-      this.initSegmentByTrack.set(trackName, payload);
+      this.initSegmentByTrack.set(this.mediaKey(trackName, mediaType, alias), payload);
       this.supplyCmafInitBytes(mediaType, payload);
       return;
     }
@@ -7934,24 +10259,88 @@ export class MoqtPlayer {
     }
   }
 
+  /**
+   * The explicit selection this config asks for, as the model's intent.
+   *
+   * `undefined` when nothing is named, which is what keeps the documented
+   * defaults in force. A selector for DISABLED media is dropped here rather
+   * than resolved: disabling is the stronger statement.
+   */
+  private selectionIntent(): SelectionIntent | undefined {
+    return selectionIntentFromConfig(this.config);
+  }
+
   /** Select a catalog switching set, or adopt an already-active known track. */
   private selectCatalogTracks(catalog: CatalogState) {
-    const activeSubscription = [...this.activeSubscriptions.values()].find(sub => sub.mediaType === 'video');
-    const activeVideo = activeSubscription && catalog.tracks.find(t => t.role === 'video' && t.name === activeSubscription.trackName);
+    const activeSubscription = [...this.activeSubscriptions.values()].find(sub => sub.mediaType === 'video'
+      && !(sub.trackAlias !== null && this.supersededRouting?.aliases.has(sub.trackAlias)));
+    const activeVideo = activeSubscription && catalog.tracks.find(t => t.role === 'video'
+      && t.name === activeSubscription.trackName && sameNamespaceFields(
+        trackNamespaceFields(t, this.config.namespace),
+        activeSubscription.namespace ?? namespaceFields(this.config.namespace)));
+    const activeAudioSubscription = [...this.activeSubscriptions.values()].find(sub => sub.mediaType === 'audio'
+      && !(sub.trackAlias !== null && this.supersededRouting?.aliases.has(sub.trackAlias)));
+    const activeAudio = activeAudioSubscription && catalog.tracks.find(t => t.role === 'audio'
+      && t.name === activeAudioSubscription.trackName && sameNamespaceFields(
+        trackNamespaceFields(t, this.config.namespace),
+        activeAudioSubscription.namespace ?? namespaceFields(this.config.namespace)));
     // Pre-known subscriptions are already active: catalog arrival must describe
     // their switching set, not choose another view behind their back.
-    const selectionCatalog = activeVideo ? {
-      ...catalog, tracks: catalog.tracks.filter(t => t.role !== 'video' || t.altGroup === activeVideo.altGroup),
-    } : catalog;
-    const selected = this.qualityController!.selectInitialTracks(selectionCatalog, defined({
-      videoAltGroup: this.config.videoAltGroup,
-      videoConstraints: this.config.videoConstraints,
-      audioConstraints: this.config.audioConstraints,
-      ...(this.config.disableVideo ? { disableVideo: true } : {}),
-      ...(this.config.disableAudio ? { disableAudio: true } : {}),
-    }));
-    if (activeVideo) {
-      this.qualityController!.commitVideoTrack(activeVideo.name);
+    // ONE selection policy, shared with candidate preparation: scope first,
+    // then the alternate set inside it, then the member inside that. An
+    // explicit selector is honored or reported — never substituted.
+    const configuredIntent = this.selectionIntent();
+    let intent: SelectionIntent | undefined = activeVideo && configuredIntent?.videoTrack === undefined ? {
+      ...configuredIntent,
+      scope: configuredIntent?.scope ?? (activeVideo.renderGroup === undefined
+        ? { kind: 'unassigned' } : { kind: 'render-group', renderGroup: activeVideo.renderGroup }),
+      ...(activeVideo.altGroup !== undefined ? { videoAltGroup: activeVideo.altGroup }
+        : { videoTrack: { name: activeVideo.name, namespaceFields: trackNamespaceFields(activeVideo, this.config.namespace) } }),
+    } : configuredIntent;
+    if (activeAudio && configuredIntent?.audioTrack === undefined) {
+      intent = {
+        ...intent,
+        scope: intent?.scope ?? (activeAudio.renderGroup === undefined
+          ? { kind: 'unassigned' } : { kind: 'render-group', renderGroup: activeAudio.renderGroup }),
+        audioTrack: { name: activeAudio.name, namespaceFields: trackNamespaceFields(activeAudio, this.config.namespace) },
+      };
+    }
+    const wasAuto = this.qualityController!.isAutoQuality;
+    const composed = composeSelection(catalog, {
+      catalogNamespace: this.config.namespace,
+      ...(intent !== undefined ? { intent } : {}),
+      controller: this.qualityController!,
+      ...(this.config.videoConstraints !== undefined
+        ? { videoConstraints: this.config.videoConstraints } : {}),
+      ...(this.config.audioConstraints !== undefined
+        ? { audioConstraints: this.config.audioConstraints } : {}),
+    });
+    if (!composed.ok) {
+      // A named scope, set or track that the catalog cannot satisfy. Reported
+      // rather than quietly replaced with something else to play.
+      throw new Error(`selection cannot be satisfied: ${composed.reason}`);
+    }
+    const outcome = (side: 'video' | 'audio'): CatalogTrack | undefined => {
+      const result = side === 'video' ? composed.video : composed.audio;
+      if (result.state === 'selected') return result.track.track;
+      if (result.state === 'unsatisfied') {
+        // Tracks existed and a constraint or the resolution cap matched none.
+        // Never widened to another scope, and never silently dropped.
+        this.emitError(createPlayerError(
+          'degraded', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
+          `no ${side} track satisfies the selection: ${result.reason}`));
+      }
+      if (result.state === 'excluded') {
+        this.emitError(createPlayerError(
+          'degraded', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR,
+          `${side} tracks were excluded from selection: ${result.excluded.map(track => track.reason).join(', ')}`));
+      }
+      return undefined;
+    };
+    const selected = { video: outcome('video'), audio: outcome('audio') };
+    if (configuredIntent?.videoTrack === undefined && wasAuto) this.qualityController!.unlockAuto();
+    if (activeVideo && this.qualityController!.allAlternatives.includes(activeVideo)) {
+      this.qualityController!.commitVideoTrackRef(activeVideo);
       this.syncBufferAbrController();
       return { ...selected, video: activeVideo };
     }
@@ -8041,25 +10430,7 @@ export class MoqtPlayer {
     const videoPackaging: TrackPackaging = mediaTrackPackaging(selected.video?.packaging);
     const audioPackaging: TrackPackaging = mediaTrackPackaging(selected.audio?.packaging);
 
-    this.createPipelinesFromTrackInfo({
-      video: selected.video ? defined({
-        codec: selected.video.codec,
-        width: selected.video.width,
-        height: selected.video.height,
-        initData: this.pipelineInitData(selected.video),
-        initTrack: selected.video.initTrack,
-        packaging: videoPackaging,
-      }) : undefined,
-      audio: selected.audio ? defined({
-        codec: selected.audio.codec,
-        samplerate: selected.audio.samplerate,
-        channels: selected.audio.channelConfig ? Number(selected.audio.channelConfig) : undefined,
-        initData: this.pipelineInitData(selected.audio),
-        initTrack: selected.audio.initTrack,
-        packaging: audioPackaging,
-      }) : undefined,
-      isLive: selected.video?.isLive === true || selected.audio?.isLive === true,
-    });
+    this.createSelectedPipelines(selected);
 
     // ── Subscribe to selected tracks (parallel) ──────────────────
     // §9.5: Multiple SUBSCRIBEs can be in-flight simultaneously.
@@ -8072,12 +10443,19 @@ export class MoqtPlayer {
       // Guard: if destroyed during async subscription, bail out
       if (!live()) return;
 
+      // The identity this request will carry: the track's own namespace when
+      // the catalog declares one (msf-01 §5.2.2), the configured one
+      // otherwise. Computed BEFORE the hook, because the hook may cancel and
+      // must see what would actually be sent.
+      const selectedTrack = mediaType === 'video' ? selected.video : selected.audio;
+      const nsFields = trackNamespaceFields(selectedTrack, this.config.namespace);
+
       // §5.1: Run through beforeSubscribe hook — null cancels the subscription
-      const intent = this.hooks.beforeSubscribe.run({ trackName: name, mediaType });
+      const intent = this.hooks.beforeSubscribe.run({ trackName: name, mediaType, namespace: nsFields });
       if (!intent || !live()) return;
       this._mediaSubsExpected++;
 
-      const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+      const nsBytes = nsFields.map(field => this.enc.encode(field));
       const nameBytes = this.enc.encode(name);
       // Live media defaults to NextGroupStart (start at keyframe boundary).
       // Non-live/VOD defaults to AbsoluteStart {0,0} (start from beginning).
@@ -8116,7 +10494,9 @@ export class MoqtPlayer {
         subRegistered = true;
         if (!live()) throw new Error('Media subscription retired before emission');
         this.pendingAliasBinds.add(reqIdBigInt);
-        this.activeSubscriptions.set(reqIdBigInt, { trackName: name, mediaType, trackAlias: null });
+        this.activeSubscriptions.set(reqIdBigInt, {
+          trackName: name, mediaType, trackAlias: null, namespace: nsFields,
+        });
         this.pendingMediaSubs.set(reqIdBigInt, { trackName: name, mediaType, packaging });
       };
       let registeredId: bigint | null = null;
@@ -8222,13 +10602,17 @@ export class MoqtPlayer {
     // ── Auto-subscribe to mediatimeline track (§7.2) ──────────────
     // §7: A mediatimeline track provides PTS→location mapping for seek.
     // §7.2: MUST have depends, mimeType "application/json".
+    const selectedIdentities = new Set([selected.video, selected.audio]
+      .filter((track): track is CatalogTrack => track !== undefined).map(track => this.initKey(track)));
+    const dependsOnSelected = (track: CatalogTrack): boolean => track.depends?.some(name =>
+      selectedIdentities.has(this.initKey(track, name))) === true;
     const timelineTrack = catalog.tracks.find(
-      (t: CatalogTrack) => t.packaging === 'mediatimeline',
+      (t: CatalogTrack) => t.packaging === 'mediatimeline' && dependsOnSelected(t),
     );
     if (timelineTrack && this.connection && this.subscriptionManager) {
       this.timelineState = createTimelineState(timelineTrack);
 
-      const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+      const nsBytes = trackNamespaceFields(timelineTrack, this.config.namespace).map(field => this.enc.encode(field));
       const nameBytes = this.enc.encode(timelineTrack.name);
       // §9.10 + pre-send ownership: registration (incl. pendingMediaSubs for
       // the SUBSCRIBE_OK alias remap) happens inside onRequestId.
@@ -8242,14 +10626,24 @@ export class MoqtPlayer {
     // ── Auto-subscribe to init tracks (CMSF §3.1) ──────────────
     // Init tracks deliver ftyp+moov initialization segments for CMAF-packaged media.
     // @see draft-ietf-moq-catalogformat-01 §3.2.16 (initTrack field)
-    const initTrackNames = new Set<string>();
-    if (selected.video?.initTrack) initTrackNames.add(selected.video.initTrack);
-    if (selected.audio?.initTrack) initTrackNames.add(selected.audio.initTrack);
+    //
+    // LIBRARY POLICY: an `initTrack` is resolved in the namespace of the
+    // track that REFERENCES it. cf01 §3.2.18 states that resolution for
+    // `depends`; §3.2.16 does not say, and a reference that silently crossed
+    // namespaces would defeat the identity it belongs to. Keyed by identity,
+    // so two same-name init tracks in different namespaces stay distinct.
+    const initTracks = new Map<string, { name: string; namespace: readonly string[] }>();
+    for (const track of [selected.video, selected.audio]) {
+      if (!track?.initTrack) continue;
+      const namespace = trackNamespaceFields(track, this.config.namespace);
+      initTracks.set(JSON.stringify([namespace, track.initTrack]),
+        { name: track.initTrack, namespace });
+    }
 
-    for (const initName of initTrackNames) {
+    for (const { name: initName, namespace: initNamespace } of initTracks.values()) {
       if (!live()) break;
 
-      const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+      const nsBytes = initNamespace.map(field => this.enc.encode(field));
       const nameBytes = this.enc.encode(initName);
       const initOptions = {
         subscriptionFilter: {
@@ -8259,10 +10653,11 @@ export class MoqtPlayer {
         },
       };
       // mediaType 'video' is a placeholder — routing is driven by packaging.
+      const key = identityKey(initNamespace, initName);
       const reqIdBigInt = await this.subscribeAuxTrackOwned(nsBytes, nameBytes, initOptions, {
         trackName: initName, mediaType: 'video', packaging: 'init',
-      }, (id) => { this.initTrackRequestIds.set(initName, id); },
-      (id) => { if (this.initTrackRequestIds.get(initName) === id) this.initTrackRequestIds.delete(initName); });
+      }, (id) => { this.initTrackRequestIds.set(key, id); },
+      (id) => { if (this.connection === conn && this.initTrackRequestIds.get(key) === id) this.initTrackRequestIds.delete(key); });
       this.log.info('Subscribe init track "%s" requestId=%s', initName, reqIdBigInt);
     }
 
@@ -8274,21 +10669,16 @@ export class MoqtPlayer {
     // knows to begin delivery and so the player can receive SAP metadata.
     // @see draft-ietf-moq-msf-00 §8.2 (Event Timeline Catalog requirements)
     // @see draft-ietf-moq-cmsf-00 §3.6.1 (SAP Type Timeline)
-    const selectedNames = new Set<string>();
-    if (selected.video) selectedNames.add(selected.video.name);
-    if (selected.audio) selectedNames.add(selected.audio.name);
-
     const eventTimelineTracks = catalog.tracks.filter(
       (t: CatalogTrack) =>
         t.packaging === 'eventtimeline' &&
-        Array.isArray(t.depends) &&
-        t.depends.some((dep: string) => selectedNames.has(dep)),
+        dependsOnSelected(t),
     );
 
     for (const evtTrack of eventTimelineTracks) {
       if (!live()) break;
 
-      const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+      const nsBytes = trackNamespaceFields(evtTrack, this.config.namespace).map(field => this.enc.encode(field));
       const nameBytes = this.enc.encode(evtTrack.name);
       // Eventtimeline objects are typically small JSON payloads; LargestObject
       // ensures we get recent events without waiting for the next group start.
@@ -8309,12 +10699,11 @@ export class MoqtPlayer {
         t.packaging === 'locmaf' &&
         t.role !== 'video' && t.role !== 'audio' &&
         isTrackPackagingSupported(t) &&
-        Array.isArray(t.depends) &&
-        t.depends.some((dep: string) => selectedNames.has(dep)),
+        dependsOnSelected(t),
     );
     for (const evtTrack of locmafEventTracks) {
-      if (!this.connection || !this.subscriptionManager) break;
-      const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+      if (!live()) break;
+      const nsBytes = trackNamespaceFields(evtTrack, this.config.namespace).map(field => this.enc.encode(field));
       const nameBytes = this.enc.encode(evtTrack.name);
       const eventOptions = subscribeOptions ?? { subscriptionFilter: { type: 'LargestObject' as const } };
       const reqIdBigInt = await this.subscribeAuxTrackOwned(nsBytes, nameBytes, eventOptions, {
@@ -8340,13 +10729,18 @@ export class MoqtPlayer {
     info: { trackName: string; mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline'; packaging: TrackPackaging },
     onRegistered?: (reqId: bigint) => void,
     onRolledBack?: (reqId: bigint) => void,
-  ): Promise<bigint> {
+  ): Promise<bigint | undefined> {
     const conn = this.connection;
     if (!conn) throw new Error('subscribeAuxTrackOwned: no connection');
     const gen = this.bootstrapGeneration;
     const live = (): boolean => !this._destroyed && !this.isTerminalState()
       && this.subscriptionManager !== null && this.connection === conn && this.bootstrapGeneration === gen;
     if (!live()) throw new Error('Auxiliary subscription retired before emission');
+    if (this.hooks.beforeSubscribe.run({
+      trackName: info.trackName, namespace: nsBytes.map(field => new TextDecoder().decode(field)),
+      mediaType: info.packaging === 'init' ? 'init' : info.mediaType,
+    }) === null) return undefined;
+    if (!live()) throw new Error('Auxiliary subscription retired by beforeSubscribe');
     let registered: bigint | null = null;
     const register = (reqId: bigint): void => {
       if (registered !== null) return;
@@ -8355,6 +10749,7 @@ export class MoqtPlayer {
       this.pendingAliasBinds.add(reqId);
       this.activeSubscriptions.set(reqId, {
         trackName: info.trackName, mediaType: info.mediaType, trackAlias: null,
+        namespace: nsBytes.map(field => new TextDecoder().decode(field)),
       });
       this.pendingMediaSubs.set(reqId, {
         trackName: info.trackName, mediaType: info.mediaType, packaging: info.packaging,
@@ -8550,7 +10945,7 @@ export class MoqtPlayer {
     for (const [requestId, sub] of this.activeSubscriptions) {
       if (sub.mediaType !== 'video' && sub.mediaType !== 'audio') continue;
       if (sub.trackAlias === null) continue;
-      if (requestId === this.catalogRequestId || requestId === this.timelineRequestId) continue;
+      if (requestId === this.catalogSlots.catalogRequestId || requestId === this.timelineRequestId) continue;
       if (initRequestIds.has(requestId)) continue;
       out.push({
         requestId,
@@ -8706,8 +11101,8 @@ export class MoqtPlayer {
     const catalogTrack = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === track.trackName);
     // LOCMAF on either path: drop the in-group reference; the restarted delivery begins at a full header.
     if (catalogTrack?.packaging === 'locmaf') {
-      this.locmafDecoders.get(track.trackName)?.reset();
-      this.locmafFrameIds.delete(track.trackName);
+      this.locmafDecoders.get(this.mediaKey(track.trackName, track.mediaType, track.trackAlias))?.reset();
+      this.locmafFrameIds.delete(this.mediaKey(track.trackName, track.mediaType, track.trackAlias));
     }
     if (this.usesMse(catalogTrack?.packaging)) {
       // CMAF bypasses the LOC pipelines: re-arm the wait-for-keyframe gate
@@ -8763,14 +11158,20 @@ export class MoqtPlayer {
    */
   private fullResubscribeForLiveness(track: LivenessTrack): void {
     if (!this.connection || !this.subscriptionManager) return;
+    const issued = this.activeSubscriptions.get(track.requestId);
+    const catalogTrack = issued === undefined ? undefined : this.catalogTrackFor(track.trackName,
+      issued.namespace ?? namespaceFields(this.config.namespace), track.mediaType);
     for (const [requestId, sub] of [...this.activeSubscriptions.entries()]) {
-      if (sub.trackName !== track.trackName || sub.mediaType !== track.mediaType) continue;
+      if (sub.trackName !== track.trackName || sub.mediaType !== track.mediaType
+        || (issued !== undefined && !sameNamespaceFields(
+          sub.namespace ?? namespaceFields(this.config.namespace),
+          issued.namespace ?? namespaceFields(this.config.namespace)))) continue;
       this.retireMediaSubscription(requestId, this.connection);
       // Async — a sync try/catch would let the rejection escape. Best-effort:
       // the request stream may have died with the delivery path.
       void this.connection.unsubscribe(varint(requestId)).catch(() => { /* gone */ });
     }
-    this.replaceSubscription(track.trackName, 'liveness');
+    this.replaceSubscription(track.trackName, 'liveness', catalogTrack);
   }
 
   /**
@@ -8788,8 +11189,13 @@ export class MoqtPlayer {
   private replaceSubscription(
     trackName: string,
     cause: 'too_far_behind' | 'liveness',
+    issuedTrack?: CatalogTrack,
   ): void {
     if (!this.connection || !this.subscriptionManager || !this._catalogState) return;
+    const operationConn = this.connection;
+    const generation = this.bootstrapGeneration;
+    const live = (): boolean => this.connection === operationConn && this.bootstrapGeneration === generation
+      && !this._destroyed && !this.isTerminalState() && this.subscriptionManager !== null;
 
     // Don't resurrect the OLD track during a make-before-break switch —
     // that would fight the switch by resubscribing to a track we're
@@ -8800,7 +11206,8 @@ export class MoqtPlayer {
       return;
     }
 
-    const track = this._catalogState.tracks.find((t: CatalogTrack) => t.name === trackName);
+    const matches = this._catalogState.tracks.filter(t => t.name === trackName);
+    const track = issuedTrack ?? (matches.length === 1 ? matches[0] : undefined);
     if (!track) {
       this.log.warn('Cannot resubscribe "%s": track not found in catalog', trackName);
       return;
@@ -8821,20 +11228,23 @@ export class MoqtPlayer {
     }
     this.syncController?.reset();
 
-    const nsBytes = encodeNamespace(this.config.namespace, this.enc);
+    const ns = trackNamespaceFields(track, this.config.namespace);
+    if (this.hooks.beforeSubscribe.run({ trackName, mediaType, namespace: ns }) === null) return;
+    if (!live()) return;
+    const nsBytes = ns.map(field => this.enc.encode(field));
     const nameBytes = this.enc.encode(trackName);
     const filter = defaultMediaSubscriptionFilter(isLive);
 
     // Pre-send ownership (§9.10): a same-tick SUBSCRIBE_OK must find the
     // pending entry; the EVENT still waits for the send to succeed.
-    const resubConn = this.connection;
+    const resubConn = operationConn;
     let resubRegisteredId: bigint | null = null;
     const registerResub = (id: bigint): void => {
       if (resubRegisteredId !== null) return;
       resubRegisteredId = id;
-      if (!this.subscriptionManager || this.connection !== resubConn) return;
+      if (!live()) throw new Error('Recovery subscription retired before emission');
       this.pendingAliasBinds.add(id);
-      this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null });
+      this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null, namespace: ns });
       this.pendingMediaSubs.set(id, { trackName, mediaType, packaging });
     };
     // Start through the CAPTURED connection and attach both observers before
@@ -8845,7 +11255,7 @@ export class MoqtPlayer {
       { ...(filter ?? {}), onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
     ).then((reqId) => {
       const reqIdBigInt = BigInt(reqId);
-      if (!this.subscriptionManager) return;
+      if (!live()) return;
       registerResub(reqIdBigInt);
 
       this.log.info('Resubscribed %s "%s" requestId=%s after %s',

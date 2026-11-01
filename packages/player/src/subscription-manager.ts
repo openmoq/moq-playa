@@ -62,6 +62,18 @@ export class SubscriptionManager {
   objectTransform: ((obj: MoqtObject) => MoqtObject | null | Promise<MoqtObject | null>) | null = null;
 
   /**
+   * Whether a source may still deliver on a track alias.
+   *
+   * Consulted again AFTER an async {@link objectTransform}, because the route
+   * can stop being that source's during the await: a session handover adopts a
+   * replacement, which may reuse the alias for another track or retype the
+   * buffer the object was headed for. Without the re-check a transform that
+   * started before the handover completes after it and appends into whatever
+   * now owns the alias. Unset means every route stays valid.
+   */
+  routeStillValid: ((sourceConnection: unknown, alias: bigint) => boolean) | null = null;
+
+  /**
    * Draft version — selects the LOC property wire profile for extension headers.
    *
    * Draft-14 §1.4.2: absolute QUIC-varint type IDs.
@@ -164,6 +176,7 @@ export class SubscriptionManager {
     | ((
         trackName: string,
         obj: MoqtObject,
+        sourceConnection?: unknown,
       ) => void)
     | null = null;
 
@@ -311,7 +324,8 @@ export class SubscriptionManager {
       // §3.1: Init track objects bypass E2EE transform — init segments are not encrypted.
       // Route directly to onInitObject with raw ftyp+moov payload.
       if (info.packaging === 'init') {
-        this.onInitObject?.(info.trackName, obj);
+        if (source === undefined) this.onInitObject?.(info.trackName, obj);
+        else this.onInitObject?.(info.trackName, obj, source);
         return;
       }
 
@@ -337,6 +351,8 @@ export class SubscriptionManager {
         transformed = result instanceof Promise ? await result : result;
         if (pendingTransform && !pendingTransform.valid) return;
         if (!transformed) return; // Transform dropped the object
+        // The route may have changed hands while the transform was awaited.
+        if (this.routeStillValid !== null && !this.routeStillValid(source, alias)) return;
       }
 
       if (info.packaging === 'cmaf') {

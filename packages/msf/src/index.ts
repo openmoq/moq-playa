@@ -66,6 +66,12 @@ export { parseDeltaUpdate, applyCatalogUpdate } from './delta.js';
 // ─── Track selection ─────────────────────────────────────────────────
 
 export { groupByRender, groupByAlt, selectVideoAltGroup, selectTrack, resolveDependencies, isTrackPackagingSupported } from './selection.js';
+export {
+    fieldsFromCatalogText, namespaceDisplay, contextFields, resolveTrackNamespace,
+    identityKey, trackIdentityKey, namespaceFieldsOf, sameNamespaceFields,
+    referenceIdentityKey, assertUtf8EncodableIdentity, assertUtf8EncodableIdentityText,
+} from './track-identity.js';
+export type { ResolvedTrackNamespace, CatalogNamespaceContext } from './track-identity.js';
 
 // ─── Timeline parsing ────────────────────────────────────────────────
 

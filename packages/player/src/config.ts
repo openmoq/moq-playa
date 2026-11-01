@@ -15,6 +15,7 @@
 import type { MoqtConnection, WebTransportLike, ConnectionAuthorization } from '@openmoq/webtransport';
 import type { QlogEvent, MoqtObject, DraftVersion } from '@openmoq/transport';
 import type { TrackConstraints, CatalogTrack, CatalogState } from '@openmoq/msf';
+import { assertUtf8EncodableIdentity, contextFields } from '@openmoq/msf';
 import type { ClockSource, DecoderCommand, RecoveryController } from '@openmoq/playback';
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike, MediaSourceLike, CmafAssemblerLike } from './interfaces.js';
 import type { PlayerError } from './errors.js';
@@ -416,10 +417,53 @@ export interface QualityConfig {
    */
   readonly audioConstraints?: TrackConstraints;
 
+  /**
+   * An explicit presentation choice, resolved against the catalog.
+   *
+   * Every field omitted means "apply the documented default", so this changes
+   * nothing until something is named. A selector that cannot be satisfied is
+   * reported, never substituted: a caller who names a render group, an
+   * alternate group or a track gets that or an error.
+   *
+   * @see draft-ietf-moq-msf-01 §4.2, §5.2.12 (alternate groups)
+   * @see draft-ietf-moq-msf-01 §5.6.15 (render groups)
+   */
+  readonly selection?: SelectionConfig;
+
   /** Never select a video track, regardless of catalog contents. Default: false. */
   readonly disableVideo?: boolean;
   /** Never select an audio track, regardless of catalog contents. Default: false. */
   readonly disableAudio?: boolean;
+}
+
+/**
+ * A track as a CONFIG author names it.
+ *
+ * `namespace` omitted means the namespace the catalog was retrieved under,
+ * which msf-01 §5.2.2 makes the inherited namespace of any track declaring
+ * none. A string is catalog TEXT, canonicalized by this library's
+ * split-on-slash convention; an array is the wire tuple, used verbatim — the
+ * only way to name a track whose single namespace field contains a slash.
+ *
+ * @see draft-ietf-moq-transport-22 §2.4.1 (namespace is an ordered field set)
+ */
+export interface TrackRefConfig {
+  readonly name: string;
+  readonly namespace?: string | readonly string[];
+}
+
+/**
+ * An explicit presentation choice.
+ *
+ * `renderGroup: null` names the tracks that declare no render group, so "no
+ * render group" is a choice rather than a missing field.
+ */
+export interface SelectionConfig {
+  readonly renderGroup?: number | null;
+  readonly videoAltGroup?: number;
+  readonly videoTrack?: TrackRefConfig;
+  readonly audioAltGroup?: number;
+  readonly audioTrack?: TrackRefConfig;
 }
 
 /** Recovery options. */
@@ -755,11 +799,74 @@ export const DEFAULT_PLAYER_CONFIG = {
 // ─── Validation ──────────────────────────────────────────────────────
 
 /**
- * Validate player configuration. Throws on invalid values.
+ * Validate `selection`, before anything is requested.
  *
- * Called at construction time — bad config fails fast, not 30 seconds
- * into a stream.
+ * Two rules, both about refusing rather than guessing. A selector that
+ * contradicts an ENABLED shorthand is an error, because a caller who wrote
+ * both meant something; and a selector the catalog-free `knownTracks` path
+ * cannot express is an error, because that path subscribes without a catalog
+ * and has nothing to resolve a render group or an identity against. A
+ * selector for media that is DISABLED is ignored, which is the reviewed
+ * ignored-selector rule — disabling is the stronger statement.
  */
+function validateSelection(config: MoqtPlayerConfig): void {
+  const selection = config.selection;
+  if (selection === undefined) return;
+  if (typeof selection !== 'object' || selection === null) {
+    throw new TypeError('selection must be an object');
+  }
+  if (selection.renderGroup !== undefined && selection.renderGroup !== null
+    && !Number.isSafeInteger(selection.renderGroup)) {
+    throw new RangeError('selection.renderGroup must be a safe integer or null');
+  }
+  for (const field of ['videoAltGroup', 'audioAltGroup'] as const) {
+    const value = selection[field];
+    if (value !== undefined && !Number.isSafeInteger(value)) {
+      throw new RangeError(`selection.${field} must be a safe integer`);
+    }
+  }
+  for (const [field, disabled] of [
+    ['videoTrack', config.disableVideo], ['audioTrack', config.disableAudio],
+  ] as const) {
+    const track = selection[field];
+    if (track === undefined || disabled) continue;
+    if (typeof track !== 'object' || track === null || typeof track.name !== 'string') {
+      throw new TypeError(`selection.${field} must be a track reference with a name`);
+    }
+    // The same byte contract the catalog package enforces, through its own
+    // validator rather than a second scanner here.
+    assertUtf8EncodableIdentity(contextFields(track.namespace), track.name);
+  }
+  // A contradiction between the shorthand and the selector is refused, not
+  // resolved by precedence. Only when video is actually enabled: with video
+  // disabled neither selector means anything.
+  if (!config.disableVideo && config.videoAltGroup !== undefined
+    && selection.videoAltGroup !== undefined
+    && config.videoAltGroup !== selection.videoAltGroup) {
+    throw new TypeError(
+      `videoAltGroup ${config.videoAltGroup} contradicts selection.videoAltGroup `
+      + `${selection.videoAltGroup}; specify one`,
+    );
+  }
+  if (!config.knownTracks || config.catalog) return;
+  // The catalog-free fast path cannot express any of these.
+  const unsupported = ([
+    ['renderGroup', selection.renderGroup !== undefined && !(config.disableVideo && config.disableAudio)],
+    ['videoAltGroup', selection.videoAltGroup !== undefined && !config.disableVideo],
+    ['videoTrack', selection.videoTrack !== undefined && !config.disableVideo],
+    ['audioAltGroup', selection.audioAltGroup !== undefined && !config.disableAudio],
+    ['audioTrack', selection.audioTrack !== undefined && !config.disableAudio],
+  ] as const).filter(([, present]) => present).map(([field]) => field);
+  if (unsupported.length > 0) {
+    throw new TypeError(
+      `selection.${unsupported.join(', selection.')} cannot be combined with knownTracks: `
+      + 'that path subscribes without a catalog and has nothing to resolve the selection against. '
+      + 'Supply a catalog, or drop the selection.',
+    );
+  }
+}
+
+/** Validate configuration before opening a connection. */
 export function validateConfig(config: MoqtPlayerConfig): void {
   if (config.videoAltGroup !== undefined) {
     if (!Number.isSafeInteger(config.videoAltGroup)) {
@@ -769,6 +876,7 @@ export function validateConfig(config: MoqtPlayerConfig): void {
       throw new TypeError('videoAltGroup cannot be combined with knownTracks; select from the catalog');
     }
   }
+  validateSelection(config);
   if (config.authorization !== undefined && (!config.authorization || typeof config.authorization.getTokens !== 'function')) {
     throw new TypeError('Invalid authorization configuration');
   }

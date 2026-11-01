@@ -76,18 +76,36 @@ export function buildSetupOptions(config: MoqtPlayerConfig, urlOverride?: string
     options.authority = config.authority;
   }
 
+  // URL.origin is "null" for moqt URLs; preserve the actual authority.
+  const origin = (url: string) => {
+    const parsed = new URL(url);
+    return `${parsed.protocol}//${parsed.host}`;
+  };
+
   if (config.authTokens) {
+    // Static tokens were minted for the ORIGINAL origin. A GOAWAY destination
+    // is peer-supplied, so forwarding them to a different origin would hand a
+    // relay's credentials to whatever host it names. They are not silently
+    // dropped either — an anonymous retry is not what the caller configured —
+    // so the move fails explicitly. A destination that genuinely should receive
+    // credentials belongs on the scoped `authorization` provider, which obtains
+    // them per destination.
+    // NONEMPTY only: an empty list carries no credentials, so an anonymous
+    // cross-origin move must stay allowed. (`[]` is truthy, so the outer check
+    // does not distinguish it.)
+    if (config.authTokens.length > 0
+        && urlOverride !== undefined && origin(urlOverride) !== origin(config.url)) {
+      throw new AuthorizationError(
+        'Static authTokens cannot be forwarded to a different origin; '
+        + 'use the authorization provider to obtain credentials for the destination',
+      );
+    }
     options.authTokens = config.authTokens;
   }
 
   if (config.authorization) {
     if (config.authTokens !== undefined) throw new AuthorizationError('Specify authorization or authTokens, not both');
     const relayUrl = buildConnectUrl(config, urlOverride);
-    // URL.origin is "null" for moqt URLs; preserve the actual authority.
-    const origin = (url: string) => {
-      const parsed = new URL(url);
-      return `${parsed.protocol}//${parsed.host}`;
-    };
     const originalOrigin = origin(config.url);
     const destinationOrigin = origin(relayUrl);
     if (destinationOrigin !== originalOrigin && !config.authorization.allowedRelayOrigins?.includes(destinationOrigin)) {

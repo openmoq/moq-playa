@@ -34,14 +34,14 @@ describe('player credential integration', () => {
     const player = new MoqtPlayer({ url: 'https://relay.example/moq', namespace: 'live', connection: client });
     const internal = player as any;
     internal.connection = client;
-    internal.catalogRequestId = sub.requestId;
+    internal.catalogSlots.catalogRequestId = sub.requestId;
     try {
       if (role === 'candidate') {
         await client.unsubscribe(sub.requestId);
         await flush();
         internal.beginCatalogRecovery(client);
       }
-      const coord = role === 'main' ? internal.createCatalogBootstrap(client) : internal.catalogRecovery.coord;
+      const coord = role === 'main' ? internal.createCatalogBootstrap(client) : internal.catalogSlots.catalogRecovery.coord;
       await flush();
       coord.start();
       coord.onSubscribeOk({ group: 0n, object: 0n });
@@ -56,7 +56,7 @@ describe('player credential integration', () => {
         coord.onFetchError(2, 'timeout');
         await flush();
       }
-      const owner = () => role === 'main' ? internal.bootstrapFetch : internal.catalogRecovery?.fetch ?? null;
+      const owner = () => role === 'main' ? internal.catalogSlots.bootstrapFetch : internal.catalogSlots.catalogRecovery?.fetch ?? null;
       const current = owner();
       if (heldAttempt === 1) expect(current?.attempt).toBe(2);
       else {

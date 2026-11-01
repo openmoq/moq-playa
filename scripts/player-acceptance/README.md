@@ -28,13 +28,18 @@ uses those timestamps, not the manifest's nominal chunk duration, for pacing.
 CMAF and LOC use one stream per object (MSF section 6). LOCMAF keeps all
 objects of a group on one ordered subgroup stream (LOCMAF section 3).
 
-Twenty-seven scenarios are mandatory:
+The following scenarios are mandatory:
 
 | Scenario | Required result |
 | --- | --- |
 | Moving picture and 440 Hz audio | Healthy output for at least five seconds, including the fixture loop |
 | Frozen picture, advancing timestamps and healthy audio | Only `picture-frozen` fails |
 | Moving picture, output gain set to zero | Only `audio-missing` fails |
+| CMAF and LOC relay handover | Old picture and audio continue while replacement media acceptance is held; accepted replacement plays without duplicate subscriptions |
+| CMAF relay handover with changed video initialization | A replacement muxed at 60000 Hz instead of 12288 Hz keeps the ongoing presentation timeline and continuous audio |
+| CMAF relay handover from a nonzero media origin with changed video initialization | Both publishers start at loop 3 (~18 s of media), and the replacement's 60000 Hz initialization keeps one buffered range, a forward playhead inside it and advancing buffered end |
+| CMAF relay handover with a refused audio subscription | One recoverable diagnostic; the candidate closes and old picture/audio continue |
+| CMAF relay handover after catalog retrieval times out | Subscription-only fallback cannot admit a CMSF-01 catalog; the candidate closes and old playback continues |
 | 360p, 720p and 1080p, each with both language signals | Correct decoded dimensions, moving pixels, and 440 Hz (`en`) or 880 Hz (`es`) PCM |
 | LOC-01 wall-clock, LOC-04 wall-clock and LOC-04 media time | Moving canvas output, decoded H.264 dimensions, 440 Hz Opus PCM, correct timestamp domain and progress across a loop |
 | LOC-04 media time with a frozen picture | Only `picture-frozen` fails |
@@ -52,6 +57,40 @@ uncaught browser/player errors including during destruction, and graceful
 termination of owned processes. Unexpected nonzero exits fail the campaign;
 requested SIGTERM, including wrapper exit 143, is accepted.
 No decoding/rendering implementation is replaced by a test double.
+
+The nonzero-origin case exists because every other scenario starts at decode
+time zero: the relay replays its cached group 0 to the first subscriber, so a
+retained media origin of zero rescales to zero and cannot discriminate a
+timescale conversion. `--start-loop 3` begins BOTH publishers at loop
+iteration 3, so each presentation starts near 18 seconds in its own timescale
+(221184 ticks at 12288 Hz, 1080000 at 60000 Hz) while wall-clock pacing still
+starts immediately — `loops` counts iterations to send, not a terminal group
+number. Each publisher records the first decode time it emits, read back from
+the bytes it is about to send, and the run retains those as `mediaOrigin`.
+An origin is refused before the catalog is published when its rebased decode
+times would not fit the fixture's tfdt fields, and an endless loop stops rather
+than repeating a group number past exact integer range.
+Its added assertions are forward media time, a single buffered range that
+keeps extending, and a playhead inside what is buffered. The buffered START is
+deliberately not asserted: normal back-buffer eviction advances it.
+
+Handover cases run two independent local relays, each fed by a separate looping
+publisher. Most use the same fixture on both sides; the reconfiguration case
+uses FFmpeg to mux the replacement video at a different timescale, with both
+the initialization and media timing changed consistently. Successful candidates retrieve their catalog
+with SUBSCRIBE plus Joining FETCH before the target holds required media
+acceptances for at least five seconds. The browser must keep displaying
+moving pictures and producing PCM from the source throughout that interval;
+the source must not see an unsubscribe. After release, successful adoption must
+close the original transport, retain the replacement and continue output for
+another seven seconds. A required audio rejection must instead close the
+replacement, preserve the original and continue output. A separate negative
+case holds catalog retrieval through its five-second timeout: the subsequent
+subscription-only fallback must reject CMSF-01 rather than weaken its bootstrap
+requirement. Per-relay request and
+object counts, original transport close times and both output windows are
+retained. These checks cover draft-18 handover and output continuity, not exact
+sample alignment between the two publisher processes or arbitrary codec changes.
 
 The video alternatives encode the same deterministic 1080p source at three
 resolutions, with the marker applied before scaling and a shared `altGroup`.
@@ -151,4 +190,4 @@ artifacts for fourteen days. A local macOS result is not a Linux CI result.
 
 For a diagnostic rerun, add `--case loc-4-media` to select one exact scenario.
 The retained result records this selection; a selected-case pass is not a pass
-for the full twenty-seven-case campaign.
+for the full thirty-case campaign.

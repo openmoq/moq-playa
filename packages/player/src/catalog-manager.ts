@@ -20,6 +20,7 @@
  */
 
 import type { CatalogState } from '@openmoq/msf';
+import type { CatalogNamespaceContext } from '@openmoq/msf';
 import {
     parseMsfCatalog,
     parseDeltaUpdate,
@@ -35,10 +36,13 @@ import {
  */
 export class CatalogManager {
     /**
-     * Catalog namespace — used for namespace inheritance (§5.1.10).
-     * Tracks without explicit namespace inherit this value.
+     * The namespace this catalog was retrieved under, as the CONTEXT the
+     * parsers resolve against (§5.1.10 / msf-01 §5.2.2): a tuple is used
+     * verbatim, a string is catalog text. Joining a tuple into text here
+     * would re-split `['live/show']` into two fields and make it a different
+     * wire namespace from the one the player subscribes on.
      */
-    private readonly catalogNamespace: string;
+    private readonly catalogNamespace: CatalogNamespaceContext;
 
     /** Current materialized catalog state. Null until first catalog received. */
     private state: CatalogState | null = null;
@@ -65,7 +69,7 @@ export class CatalogManager {
     /** Last applied location (location-aware path only). */
     private _lastApplied: { group: bigint; object: bigint } | null = null;
 
-    constructor(catalogNamespace: string) {
+    constructor(catalogNamespace: CatalogNamespaceContext) {
         this.catalogNamespace = catalogNamespace;
     }
 

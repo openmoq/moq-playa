@@ -13,6 +13,7 @@ import { assessVideoPresentation } from './presentation.mjs';
 import { prepareFixture } from './fixture.mjs';
 import { stopProcess as stop } from './shutdown.mjs';
 import { checkExampleViews } from './view-ui.mjs';
+import { checkHandover } from './handover.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
@@ -35,6 +36,19 @@ function bounded(promise, ms, label, interruptible = true) {
     if (interruptible && abort.signal.aborted) cancelled();
     promise.then((value) => settle(res, value), (error) => settle(rej, error));
   });
+}
+
+/**
+ * Per-track first emitted decode time, parsed from a publisher's own output.
+ * Empty when the publisher reports none (a non-CMAF fixture).
+ */
+function mediaOrigins(publisher) {
+  return [...publisher.text.matchAll(
+    /\[publisher\] (\S+): first group (\d+) tfdt (\d+) ticks @(\d+) Hz \(([\d.]+)s\)/g)]
+    .map(([, track, group, ticks, timescale, seconds]) => ({
+      track, group: Number(group), tfdtTicks: Number(ticks),
+      timescale: Number(timescale), seconds: Number(seconds),
+    }));
 }
 
 function launch(name, command, args, env = {}, cwd = root) {
@@ -133,6 +147,10 @@ try {
   result.fixtures.loc = await prepareFixture(join(artifacts, 'loc'), namespace, false, abort.signal, false, 'opus');
   result.fixtures.locViews = await prepareFixture(join(artifacts, 'locViews'), namespace, false, abort.signal, false, 'opus', true);
   result.fixtures.locFrozen = await prepareFixture(join(artifacts, 'locFrozen'), namespace, true, abort.signal, false, 'opus');
+  result.fixtures.retimed = await prepareFixture(join(artifacts, 'retimed'), namespace, false, abort.signal, false, 'aac', false,
+    { videoTimescale: 60000 });
+  assert.notEqual(result.fixtures.moving.timing['video-360'].timescale, result.fixtures.retimed.timing['video-360'].timescale,
+    'Replacement video must exercise a different initialization timescale');
   browser = await chromium.launch({ channel: process.env.PLAYER_TEST_BROWSER ?? 'chrome' });
   result.platform.browser = browser.version();
   const vite = launch('vite', process.execPath, ['_tests/player-acceptance/serve.mjs'], {}, join(root, 'examples'));
@@ -141,6 +159,14 @@ try {
     { name: 'moving-video-and-audio', fixture: 'moving', silent: false, expectedFailure: null },
     { name: 'frozen-picture-control', fixture: 'frozen', silent: false, expectedFailure: 'picture-frozen' },
     { name: 'missing-audio-control', fixture: 'moving', silent: true, expectedFailure: 'audio-missing' },
+    { name: 'cmaf-handover', fixture: 'moving', handover: 'accept', silent: false, expectedFailure: null },
+    { name: 'cmaf-handover-reconfigured', fixture: 'moving', replacementFixture: 'retimed', handover: 'accept', silent: false, expectedFailure: null },
+    { name: 'cmaf-handover-nonzero-epoch', fixture: 'moving', replacementFixture: 'retimed', startLoop: 3,
+      handover: 'accept', silent: false, expectedFailure: null },
+    { name: 'cmaf-handover-refused', fixture: 'moving', handover: 'reject', silent: false, expectedFailure: null },
+    { name: 'cmaf-handover-catalog-timeout', fixture: 'moving', handover: 'catalog-timeout', silent: false, expectedFailure: null },
+    { name: 'loc-handover', fixture: 'loc', handover: 'accept', version: 4, mode: 'media', silent: false, expectedFailure: null,
+      expected: { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24, outputKind: 'canvas' } },
     { name: 'default-video-view', fixture: 'views', view: 1, silent: false, expectedFailure: null,
       expected: { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24 } },
     { name: 'portrait-video-view', fixture: 'views', view: 0, altGroup: 0, silent: false, expectedFailure: null,
@@ -179,21 +205,35 @@ try {
   if (caseArg >= 0 && !scenarios.some((s) => s.name === selectedCase)) throw new Error(`Unknown playback case: ${selectedCase}`);
   result.selectedCase = selectedCase;
   for (const scenario of scenarios.filter((s) => selectedCase === null || s.name === selectedCase)) {
-    const relay = launch(`${scenario.name}-relay`, 'pnpm', ['--filter', '@moqt/example-node-relay', 'relay-server'],
+    const relay = launch(`${scenario.name}-relay`, 'pnpm', scenario.handover
+      ? ['--filter', '@moqt/example-node-relay', 'exec', 'tsx', '../../scripts/player-acceptance/handover-relays.ts',
+          ...(scenario.handover === 'reject' ? ['--reject-audio'] : []),
+          ...(scenario.handover === 'catalog-timeout' ? ['--hold-catalog'] : [])]
+      : ['--filter', '@moqt/example-node-relay', 'relay-server'],
       { HOST: '127.0.0.1', PORT: '0', DEMO_NAMESPACE: namespace, RELAY_CERT: relayCert, RELAY_KEY: relayKey,
         ...(scenario.view !== undefined || scenario.exampleViews ? { DEMO_TRACK: 'video-portrait' } : {}) });
-    const relayUrl = await waitForLine(relay, /listening on (https:\/\/127\.0\.0\.1:\d+\/moq)/);
-    const publisher = scenario.mixed ? launch(`${scenario.name}-publisher`, process.execPath, [
+    const handover = scenario.handover ? JSON.parse(await waitForLine(relay, /handover-ready: (.+)/)) : null;
+    const relayUrl = handover?.source ?? await waitForLine(relay, /listening on (https:\/\/127\.0\.0\.1:\d+\/moq)/);
+    // `startLoop` applies to BOTH publishers: a later media origin is a
+    // property of the presentation, not of one relay. Offsetting only the
+    // source would also put the replacement's live point 18 s behind, which
+    // is a second condition and would stop the case isolating anything.
+    const startLoopArgs = scenario.startLoop ? ['--start-loop', String(scenario.startLoop)] : [];
+    const startPublisher = (name, relayUrl, fixture = scenario.fixture) => scenario.mixed ? launch(name, process.execPath, [
       'scripts/player-acceptance/mixed-publisher.mjs', relayUrl, join(artifacts, 'moving'), join(artifacts, 'loc'), scenario.mixed,
-    ], { RELAY_CERT: relayCert }) : launch(`${scenario.name}-publisher`, 'pnpm', scenario.version ? [
+    ], { RELAY_CERT: relayCert }) : launch(name, 'pnpm', scenario.version ? [
       '--filter', '@moqt/example-node-publisher', 'exec', 'tsx', 'src/publish-loc.ts',
-      relayUrl, join(artifacts, scenario.fixture), String(scenario.version), scenario.mode,
+      relayUrl, join(artifacts, fixture), String(scenario.version), scenario.mode,
     ] : [
       '--filter', '@moqt/example-node-publisher', 'publish-fixture', '--loop', '--pace-media', '--catalog-format', 'cmsf-01',
-      ...(scenario.locmaf ? ['--packaging', 'locmaf'] : []),
-      relayUrl, join(artifacts, scenario.fixture),
+      ...(scenario.locmaf ? ['--packaging', 'locmaf'] : []), ...startLoopArgs,
+      relayUrl, join(artifacts, fixture),
     ], { RELAY_CERT: relayCert });
+    const publisher = startPublisher(`${scenario.name}-publisher`, relayUrl);
+    const replacementPublisher = handover
+      ? startPublisher(`${scenario.name}-replacement-publisher`, handover.target, scenario.replacementFixture ?? scenario.fixture) : null;
     await waitForLine(publisher, /loop mode: (\d+ tracks established)/);
+    if (replacementPublisher) await waitForLine(replacementPublisher, /loop mode: (\d+ tracks established)/);
     if ((scenario.version || scenario.mixed === 'audio') && scenario.expected) {
       const epochUs = await waitForLine(publisher, /epoch_us=(\d+)/);
       scenario.expected.timestampDomain = scenario.mode ?? 'media';
@@ -210,6 +250,17 @@ try {
     page.on('pageerror', (error) => pageErrors.push(error.message));
     page.on('console', (message) => consoleLines.push({ type: message.type(), text: message.text() }));
     const caseResult = { name: scenario.name, expectedFailure: scenario.expectedFailure, relayUrl, passed: false };
+    // The decode time each publisher actually emits FIRST, read back from the
+    // bytes it is about to send. A relay's group-replay log identifies the
+    // iteration; this is the media timing that goes with it, which is what a
+    // nonzero-origin case has to establish.
+    if (scenario.startLoop !== undefined) {
+      caseResult.startLoop = scenario.startLoop;
+      caseResult.mediaOrigin = {
+        source: mediaOrigins(publisher),
+        ...(replacementPublisher ? { replacement: mediaOrigins(replacementPublisher) } : {}),
+      };
+    }
     caseResult.media = scenario.version ? { packaging: 'loc', version: scenario.version, timestamps: scenario.mode,
       video: 'H.264', audio: 'Opus', output: 'canvas/Web Audio', properties: 'd18-delta-vi64' }
       : { packaging: scenario.locmaf ? 'locmaf' : 'cmaf', video: 'H.264', audio: 'AAC',
@@ -218,6 +269,7 @@ try {
     result.cases.push(caseResult);
     try {
       const query = new URLSearchParams({ url: relayUrl, ns: namespace, hash: pin });
+      if (scenario.handover) query.set('debug', 'handover');
       if (scenario.version) { query.set('output', 'canvas'); query.set('debug', 'render'); }
       if (scenario.mixed) {
         query.set('audio', scenario.mixed === 'video' ? 'webcodecs' : 'mse');
@@ -248,9 +300,17 @@ try {
           return state?.presentedFrames >= 8 && state.currentTime > 0.1 && state.audioRms > 0.015;
         }, null, { timeout: 20000 });
         caseResult.outputReadyAfterMs = performance.now() - startupStart;
-        await page.evaluate((silent) => window.playerAcceptance.begin(silent), scenario.silent);
-        await page.waitForTimeout(7250);
-        const observed = await page.evaluate(() => window.playerAcceptance.finish());
+        let observed;
+        if (handover) {
+          caseResult.handover = {};
+          await checkHandover(page, handover.control, scenario.expected, scenario.handover, caseResult.handover,
+            { timelineContinuity: scenario.startLoop !== undefined });
+          observed = caseResult.handover.after;
+        } else {
+          await page.evaluate((silent) => window.playerAcceptance.begin(silent), scenario.silent);
+          await page.waitForTimeout(7250);
+          observed = await page.evaluate(() => window.playerAcceptance.finish());
+        }
         caseResult.observed = observed;
         caseResult.assessment = assessPlayback(observed.samples, scenario.expected);
         caseResult.presentationFailures = assessVideoPresentation(observed.samples);
@@ -317,15 +377,20 @@ try {
         }
         await page.screenshot({ path: join(artifacts, `${scenario.name}.png`) });
         caseResult.teardown = await bounded(page.evaluate(() => window.playerAcceptance.destroy()), 5000, 'player teardown');
-        assert.equal(caseResult.teardown.transports, 1, 'Expected one established transport');
+        assert.equal(caseResult.teardown.transports, handover ? 2 : 1, 'Unexpected established transport count');
         assert.ok(caseResult.teardown.transportOutcomes.every((outcome) => outcome.status === 'closed'), 'Transport did not close cleanly');
         assert.equal(caseResult.teardown.audioState, 'closed', 'Observer AudioContext leaked');
         assert.ok(!caseResult.teardown.videoSource, 'MediaSource URL remained attached');
         assert.equal(caseResult.teardown.state, 'idle', 'Player did not return to idle');
       }
       assert.deepEqual(pageErrors, [], 'Uncaught browser error');
-      if (!scenario.exampleViews) assert.ok(!caseResult.teardown.events.some((event) => event.type === 'error'), 'Player emitted an error, including during teardown');
-      assert.ok(!relay.exited && !publisher.exited, 'Media process exited before test teardown');
+      if (!scenario.exampleViews) {
+        const errors = caseResult.teardown.events.filter(event => event.type === 'error');
+        if (scenario.handover && scenario.handover !== 'accept') {
+          assert.deepEqual(errors, caseResult.handover.after.events.filter(event => event.type === 'error'), 'Additional error during teardown');
+        } else assert.deepEqual(errors, [], 'Player emitted an error, including during teardown');
+      }
+      assert.ok(!relay.exited && !publisher.exited && !replacementPublisher?.exited, 'Media process exited before test teardown');
       if (scenario.expectedFailure) {
         assert.deepEqual(caseResult.assessment.failures, [scenario.expectedFailure], 'Control must fail only its intended output check');
       } else assert.equal(caseResult.assessment.passed, true, `Playback failed: ${caseResult.assessment.failures.join(', ')}`);
@@ -341,6 +406,7 @@ try {
         await bounded(context.close(), 5000, 'browser context close', false);
         assert.deepEqual(pageErrors, [], 'Uncaught browser error during context shutdown');
         await stop(publisher);
+        if (replacementPublisher) await stop(replacementPublisher);
         await stop(relay);
       } catch (error) {
         caseResult.error ??= error.message;

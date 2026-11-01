@@ -75,8 +75,21 @@ export interface RequestGoawayEvent {
 
 /**
  * Session migrated to a new relay after GOAWAY.
+ *
+ * Emitted ONCE, after the replacement has been adopted — meaning its catalog
+ * converged through its own retrieval, the required playback set was ACCEPTED
+ * by the new relay, usable initialization is in hand, and it is now the
+ * authoritative session. The replacement is established before the old
+ * session's subscriptions are cancelled, so this is not a gap announcement.
+ *
+ * It is not evidence of rendered output: it says the session was replaced
+ * without interrupting playback, not that a frame has been presented since.
+ * A failed attempt emits nothing — playback simply continues on the old
+ * session, and the failure is reported through the error channel.
+ *
  * @see draft-ietf-moq-transport-16 §3.5 (Migration)
  * @see draft-ietf-moq-transport-16 §8.4.1 (Graceful Subscriber Relay Switchover)
+ * @see draft-ietf-moq-transport-22 §7.4.1 (new subscriptions succeed, then the old are cancelled)
  */
 export interface SessionMigratedEvent {
   readonly type: 'session_migrated';

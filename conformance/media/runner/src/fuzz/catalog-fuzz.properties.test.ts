@@ -131,14 +131,16 @@ describe('Catalog crash fuzz — parseCatalogAuto', () => {
     expect(t['spatialId']).toBe('0');
   });
 
-  it('catalogProjection projects EVERY normalized CatalogTrack field (complete-field coverage)', () => {
+  it('catalogProjection covers every catalog field and excludes runtime namespace provenance', () => {
     // `satisfies Required<CatalogTrack>` forces EVERY current field to be present
     // — a future CatalogTrack field is a COMPILE error here until it is both set
-    // in this fixture and projected. Fields that individually conflict at parse
+    // in this fixture and projected, or explicitly excluded as runtime metadata.
+    // Fields that individually conflict at parse
     // time (targetLatency vs trackDuration, eventType) are fine here because this
     // projects a hand-built track, not a parsed one.
     const track = {
       name: 'n', packaging: 'loc', isLive: true, namespace: 'ns', role: 'video',
+      resolvedNamespace: { fields: ['ns'], source: 'declared' },
       renderGroup: 1, altGroup: 2, codec: 'av01', mimeType: 'video/mp4',
       framerate: 30, timescale: 90000, bitrate: 1_000_000, width: 1920, height: 1080,
       samplerate: 48000, channelConfig: '2', displayWidth: 1920, displayHeight: 1080,
@@ -154,9 +156,10 @@ describe('Catalog crash fuzz — parseCatalogAuto', () => {
 
     const proj = catalogProjection(cat) as { tracks: Record<string, unknown>[] };
     const t = proj.tracks[0]!;
-    // The projected key set must exactly match the CatalogTrack field set, with
-    // no fields silently dropped or accidentally added.
-    expect(Object.keys(t).sort()).toEqual(Object.keys(track).sort());
+    // Namespace provenance is a library annotation, not a catalog format field.
+    // Every other field remains covered, including any future additions.
+    expect(Object.keys(t).sort()).toEqual(Object.keys(track).filter(key => key !== 'resolvedNamespace').sort());
+    expect(t).not.toHaveProperty('resolvedNamespace');
     // A spot-check of the string-rendered numerics and the array field.
     expect(t['displayWidth']).toBe('1920');
     expect(t['depends']).toEqual(['x']);

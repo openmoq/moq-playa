@@ -35,6 +35,7 @@
 
 import {
   MoqtPlayer, QualityController, TypedEmitter, checkSupport, usesMsePath,
+  composeSelection, selectionIntentFromConfig,
 } from '@openmoq/player';
 import type { LocmafDecoding, MoqtPlayerConfig, SupportReport, VideoPresentation } from '@openmoq/player';
 import { MoqtConnection } from '@openmoq/webtransport';
@@ -58,6 +59,7 @@ import { mapLevels, mapAudioTracks } from './level-mapper.js';
 import type { PlayerOptions, Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
 import type { PlayerEventMap } from './events.js';
 import type { AltGroup } from '@openmoq/msf';
+import { contextFields, namespaceFieldsOf, sameNamespaceFields } from '@openmoq/msf';
 
 /** Default player options, merged with user-provided options. */
 const DEFAULTS = {
@@ -580,6 +582,9 @@ export class Player {
     if (opts.maxResolution) {
       (base as unknown as Record<string, unknown>).capLevelToResolution = opts.maxResolution;
     }
+    if (opts.selection !== undefined) {
+      Object.assign(base, { selection: opts.selection });
+    }
     if (opts.videoAltGroup !== undefined) {
       Object.assign(base, { videoAltGroup: opts.videoAltGroup });
     }
@@ -608,11 +613,6 @@ export class Player {
       // Catalog events precede subscription selection. A missing requested
       // group is reported by the engine, not thrown from an event listener.
       const config = this.selectionConfig;
-      const knownVideo = !config.catalog && !config.disableVideo ? config.knownTracks?.video : undefined;
-      const activeVideo = knownVideo && e.catalog.tracks.find(t => t.role === 'video' && t.name === knownVideo.name);
-      const selectionCatalog = activeVideo ? {
-        ...e.catalog, tracks: e.catalog.tracks.filter(t => t.role !== 'video' || t.altGroup === activeVideo.altGroup),
-      } : e.catalog;
       const selector = new QualityController({
         autoQuality: config.autoQuality ?? true,
         startLevel: config.startLevel ?? 'auto',
@@ -620,23 +620,74 @@ export class Player {
         qualitySwitchCooldownMs: config.qualitySwitchCooldownMs ?? 5000,
         clock: this.audioClock,
       });
-      let selected;
+      let composed;
       try {
-        selected = selector.selectInitialTracks(selectionCatalog, config);
-        if (activeVideo) {
-          selector.commitVideoTrack(activeVideo.name);
-          selected = { ...selected, video: activeVideo };
+        const configuredIntent = selectionIntentFromConfig(config);
+        const knownVideo = !config.catalog && !config.disableVideo ? config.knownTracks?.video : undefined;
+        const knownAudio = !config.catalog && !config.disableAudio ? config.knownTracks?.audio : undefined;
+        const namespace = contextFields(config.namespace)!;
+        const activeVideo = knownVideo && e.catalog.tracks.find(t => t.role === 'video'
+          && t.name === knownVideo.name
+          && sameNamespaceFields(namespaceFieldsOf(t) ?? namespace, namespace));
+        const activeAudio = knownAudio && e.catalog.tracks.find(t => t.role === 'audio'
+          && t.name === knownAudio.name
+          && sameNamespaceFields(namespaceFieldsOf(t) ?? namespace, namespace));
+        // A known subscription already names the playing identity. Its catalog
+        // declaration bounds the scope and set, exactly as for engine adoption.
+        let intent = activeVideo && configuredIntent?.videoTrack === undefined ? {
+          ...configuredIntent,
+          scope: configuredIntent?.scope ?? (activeVideo.renderGroup === undefined
+            ? { kind: 'unassigned' as const }
+            : { kind: 'render-group' as const, renderGroup: activeVideo.renderGroup }),
+          ...(activeVideo.altGroup !== undefined ? { videoAltGroup: activeVideo.altGroup }
+            : { videoTrack: { name: activeVideo.name, namespaceFields: namespace } }),
+        } : configuredIntent;
+        if (activeAudio && configuredIntent?.audioTrack === undefined) {
+          intent = {
+            ...intent,
+            scope: intent?.scope ?? (activeAudio.renderGroup === undefined
+              ? { kind: 'unassigned' } : { kind: 'render-group', renderGroup: activeAudio.renderGroup }),
+            audioTrack: { name: activeAudio.name, namespaceFields: namespace },
+          };
         }
+        composed = composeSelection(e.catalog, {
+          catalogNamespace: config.namespace,
+          controller: selector,
+          ...(intent !== undefined ? { intent } : {}),
+          ...(config.videoConstraints !== undefined ? { videoConstraints: config.videoConstraints } : {}),
+          ...(config.audioConstraints !== undefined ? { audioConstraints: config.audioConstraints } : {}),
+        });
+        if (!composed.ok) {
+          this._levels = [];
+          this._audioTracks = [];
+          return;
+        }
+        if (activeVideo && configuredIntent?.videoTrack === undefined && selector.allAlternatives.includes(activeVideo)) {
+          selector.commitVideoTrackRef(activeVideo);
+        }
+        if (configuredIntent?.videoTrack === undefined && config.autoQuality !== false) selector.unlockAuto();
+        this._autoQuality = selector.isAutoQuality;
       } catch {
         this._levels = [];
+        this._audioTracks = [];
         return;
       }
       this._levels = mapLevels({ ...e.catalog, tracks: [...selector.allAlternatives] });
-      this._audioTracks = mapAudioTracks(e.catalog);
+      this._audioTracks = mapAudioTracks({ ...e.catalog, tracks: composed.audio.state === 'selected'
+        ? composed.audio.considered.map(t => t.track) : [] });
+      const selected = {
+        video: composed.video.state === 'selected' ? selector.currentVideoTrack ?? undefined : undefined,
+        audio: composed.audio.state === 'selected' ? composed.audio.track.track : undefined,
+      };
       // cmaf renders through MSE into the <video> element, as does locmaf
       // unless the engine decodes it frame by frame onto the canvas.
       const sinkTrack = selected.video ?? selected.audio;
-      const hasCmaf = sinkTrack !== undefined && usesMsePath(sinkTrack.packaging, this.locmafDecoding);
+      if (sinkTrack === undefined) {
+        this._activeMediaType = null;
+        this.webAudioRequired = false;
+        return;
+      }
+      const hasCmaf = usesMsePath(sinkTrack.packaging, this.locmafDecoding);
 
       // Record which element is the active render sink so callers can react.
       this._activeMediaType = hasCmaf ? 'video' : 'canvas';

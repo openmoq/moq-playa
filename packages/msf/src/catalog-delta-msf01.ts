@@ -19,6 +19,8 @@
  * @module
  */
 
+import { namespaceDisplay, referenceIdentityKey, resolveTrackNamespace, trackIdentityKey } from './track-identity.js';
+import type { CatalogNamespaceContext } from './track-identity.js';
 import type { CatalogTrack, CatalogState, Msf01Delta, Msf01DeltaOp, Msf01DeltaOpKind } from './types.js';
 import { extractRecognizedOptionalFields, validateLocmafVersion, validateReferences } from './catalog-msf00.js';
 import { assertFiniteMsf01Delta, assertFiniteCatalogNumbers } from './catalog-validate.js';
@@ -125,9 +127,9 @@ function parseOpTrack(raw: unknown, opIndex: number, trackIndex: number): Partia
 
 // ─── Application (stateful) ───────────────────────────────────────────
 
-/** Namespace-qualified track identity (§5.1.11). */
-function trackKey(t: { readonly name: string; readonly namespace?: string }): string {
-    return `${t.namespace ?? ''}\0${t.name}`;
+/** Namespace-qualified track identity (§5.1.11), on resolved wire fields. */
+function trackKey(t: Parameters<typeof trackIdentityKey>[0]): string {
+    return trackIdentityKey(t);
 }
 
 /**
@@ -135,17 +137,26 @@ function trackKey(t: { readonly name: string; readonly namespace?: string }): st
  * supply the MSF-00 defaults for the required triple and inherit the catalog
  * namespace (§5.1.10) when the track omits one.
  */
-function materializeAddTrack(t: Partial<CatalogTrack>, catalogNamespace?: string): CatalogTrack {
+function materializeAddTrack(
+    t: Partial<CatalogTrack>, catalogNamespace?: CatalogNamespaceContext,
+): CatalogTrack {
     const track = {
         ...t,
         name: t.name!,
         packaging: t.packaging ?? 'loc',
         isLive: t.isLive ?? true,
     } as CatalogTrack;
-    if (track.namespace === undefined && catalogNamespace !== undefined) {
-        return { ...track, namespace: catalogNamespace };
-    }
-    return track;
+    // Resolution is computed here, never carried from the operation's JSON:
+    // a delta entry declares `namespace` text at most.
+    const resolvedNamespace = resolveTrackNamespace(track.namespace, catalogNamespace);
+    const inheritedText = track.namespace ?? (typeof catalogNamespace === 'string'
+        ? catalogNamespace
+        : resolvedNamespace !== undefined ? namespaceDisplay(resolvedNamespace.fields) : undefined);
+    return {
+        ...track,
+        ...(inheritedText !== undefined ? { namespace: inheritedText } : {}),
+        ...(resolvedNamespace !== undefined ? { resolvedNamespace } : {}),
+    };
 }
 
 /**
@@ -154,21 +165,49 @@ function materializeAddTrack(t: Partial<CatalogTrack>, catalogNamespace?: string
  * parent's attributes and apply the clone's overrides. The clone-instruction
  * fields (parentName/parentNamespace) are stripped from the resulting track.
  */
-function applyCloneOp(t: Partial<CatalogTrack>, tracks: readonly CatalogTrack[], catalogNamespace?: string): CatalogTrack {
+function applyCloneOp(
+    t: Partial<CatalogTrack>, tracks: readonly CatalogTrack[],
+    catalogNamespace?: CatalogNamespaceContext,
+): CatalogTrack {
     const parentName = t.parentName;
     if (parentName === undefined) {
         throw new Error(`Clone operation for track "${t.name ?? ''}" requires parentName (§5.3)`);
     }
-    const parent = tracks.find((x) => x.name === parentName
-        && (t.parentNamespace === undefined || x.namespace === t.parentNamespace));
+    // §5.2.34: "If this field is missing from a clone operation, then the
+    // namespace of the catalog is assumed." Matching any same-name track
+    // instead would clone whichever one happened to come first.
+    const parentKey = referenceIdentityKey(
+        { name: parentName, ...(t.parentNamespace !== undefined ? { namespace: t.parentNamespace } : {}) },
+        catalogNamespace);
+    const parent = tracks.find((x) => trackKey(x) === parentKey);
     if (!parent) {
         const ns = t.parentNamespace !== undefined ? ` in namespace "${t.parentNamespace}"` : '';
         throw new Error(`Cannot clone track "${t.name ?? ''}": parent track "${parentName}"${ns} not found in the current catalog (§5.3)`);
     }
     const { parentName: _pn, parentNamespace: _pns, ...overrides } = t;
     const cloned = { ...parent, ...overrides, name: t.name! } as CatalogTrack;
-    if (cloned.namespace === undefined && catalogNamespace !== undefined) {
-        return { ...cloned, namespace: catalogNamespace };
+    // A clone that DECLARES its own namespace must not keep the parent's
+    // resolution: the spread would carry wire fields describing a namespace
+    // this track no longer claims. One that declares none inherits the
+    // parent's attributes, resolution included, which is the same namespace.
+    if (overrides.namespace !== undefined) {
+        const resolvedNamespace = resolveTrackNamespace(overrides.namespace, catalogNamespace);
+        const { resolvedNamespace: _stale, ...withoutParentResolution } = cloned;
+        return {
+            ...withoutParentResolution,
+            ...(resolvedNamespace !== undefined ? { resolvedNamespace } : {}),
+        };
+    }
+    if (cloned.namespace === undefined) {
+        const resolvedNamespace = resolveTrackNamespace(undefined, catalogNamespace);
+        const inheritedText = typeof catalogNamespace === 'string'
+            ? catalogNamespace
+            : resolvedNamespace !== undefined ? namespaceDisplay(resolvedNamespace.fields) : undefined;
+        return {
+            ...cloned,
+            ...(inheritedText !== undefined ? { namespace: inheritedText } : {}),
+            ...(resolvedNamespace !== undefined ? { resolvedNamespace } : {}),
+        };
     }
     return cloned;
 }
@@ -192,7 +231,7 @@ function applyCloneOp(t: Partial<CatalogTrack>, tracks: readonly CatalogTrack[],
 export function applyMsf01Delta(
     state: CatalogState,
     delta: Msf01Delta,
-    catalogNamespace?: string,
+    catalogNamespace?: CatalogNamespaceContext,
 ): CatalogState {
     let tracks: CatalogTrack[] = [...state.tracks];
 
@@ -207,8 +246,10 @@ export function applyMsf01Delta(
             }
         } else if (op.op === 'remove') {
             for (const raw of op.tracks) {
-                const ns = raw.namespace ?? catalogNamespace ?? '';
-                const key = `${ns}\0${raw.name!}`;
+                const ns = raw.namespace ?? (typeof catalogNamespace === 'string' ? catalogNamespace : '');
+                const key = referenceIdentityKey(
+                    { name: raw.name!, ...(raw.namespace !== undefined ? { namespace: raw.namespace } : {}) },
+                    catalogNamespace);
                 if (!tracks.some((x) => trackKey(x) === key)) {
                     throw new Error(`Cannot remove track "${raw.name}" in namespace "${ns}": track not found in the current catalog (§5.3)`);
                 }

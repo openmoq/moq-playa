@@ -302,6 +302,33 @@ export interface MediaSourceLike {
   ): Promise<void>;
 
   /**
+   * The timestamp offset currently in force for a SourceBuffer.
+   *
+   * Exists so a caller that must RETAIN an ongoing media timeline across
+   * {@link changeType} can put the offset back afterwards. `changeType`
+   * rebases to the current playback position, which is right for a track
+   * switch — the new track's segments are rebased to ~0 by a fresh per-track
+   * epoch — and wrong for a session handover, where the same assembler and
+   * the same epoch continue and the replacement's media is already on the
+   * running timeline. Adding the playback position there would place the
+   * replacement's first segment a full playback position into the future,
+   * leaving a gap the element never crosses.
+   *
+   * Optional: an adapter that does not expose it simply cannot be corrected
+   * this way, and the caller leaves the offset alone.
+   */
+  getTimestampOffset?(mediaType: 'video' | 'audio'): number | undefined;
+
+  /**
+   * Rebase a SourceBuffer's media timeline by `offset` seconds.
+   *
+   * Declared here because the player both establishes the initial offset and
+   * must restore it after a {@link changeType} that retains an ongoing
+   * timeline. Optional, like the accessor above.
+   */
+  setTimestampOffset?(mediaType: 'video' | 'audio', offset: number): void;
+
+  /**
    * Signal end of stream. Called on live→ended or destroy().
    */
   endOfStream(): void;

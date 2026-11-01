@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 
 const exec = promisify(execFile);
 
-export async function prepareFixture(directory, namespace, frozen = false, signal, alternatives = false, audioCodec = 'aac', views = false) {
+export async function prepareFixture(directory, namespace, frozen = false, signal, alternatives = false, audioCodec = 'aac', views = false, mux = {}) {
   const commands = [];
   const timing = {};
   const tracks = [];
@@ -55,6 +55,7 @@ export async function prepareFixture(directory, namespace, frozen = false, signa
     await mkdir(trackDir, { recursive: true });
     const args = ['-y', '-v', 'error', '-f', 'lavfi', '-i', track.source, '-t', String(duration),
       ...track.encoding, '-f', 'dash', '-dash_segment_type', 'mp4', '-seg_duration', '0.5',
+      ...(track.role === 'video' && mux.videoTimescale ? ['-format_options', `video_track_timescale=${mux.videoTimescale}`] : []),
       '-frag_duration', '0.5', '-use_template', '1', '-use_timeline', '0',
       '-init_seg_name', 'init.mp4', '-media_seg_name', 'chunk-$Number%03d$.m4s', join(trackDir, 'manifest.mpd')];
     await exec('ffmpeg', args, { timeout: 60000, signal });
@@ -90,7 +91,7 @@ export async function prepareFixture(directory, namespace, frozen = false, signa
   }
   const provenance = { generator: 'player-acceptance', source: 'FFmpeg synthetic testsrc2 and sine signals',
     sourceRights: 'Synthetic test signals; no third-party media', ffmpeg, durationS: duration,
-    frozen, alternatives, views, audioCodec, commands, sha256: hashes, timing, alignment,
+    frozen, alternatives, views, audioCodec, mux, commands, sha256: hashes, timing, alignment,
     ...(locmaf ? { locmaf, locmafProof: 'local encoder/decoder equality, not an independent conformance oracle' } : {}),
     ...(elementaryLoc ? { elementaryLoc, opusTiming: 'single-frame 20ms packets; MP4 final trim not carried into LOC' } : {}),
     expected: { videoMarker: 'green top-left square covering 7.5% of width', videoFps: 24,

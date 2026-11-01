@@ -262,15 +262,52 @@ export class CmafAssembler {
     // track's rebase epoch from the shared cross-track epoch. Overwrites on
     // every init for the same reason as the trex below.
     const timescale = readMdhdTimescale(initBytes);
+    const previous = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
     if (mediaType === 'video') {
       this.videoTimescale = timescale;
     } else {
       this.audioTimescale = timescale;
     }
+    // A REPLACEMENT initialization can carry a different timescale for the
+    // same continuing track — a session handover to a relay whose publisher
+    // remuxed at another rate. Everything this assembler retains for the
+    // track is in TICKS of its timescale, so leaving those values alone would
+    // compare and subtract the new fragments' decode times against the old
+    // rate. A live stream's epoch is its first fragment's decode time, so it
+    // is normally far from zero and the error is correspondingly large.
+    if (previous !== null && timescale !== null && timescale !== previous && previous > 0) {
+      this.rescaleTrackTicks(mediaType, previous, timescale);
+    }
     const trexMap = readTrexDefaults(initBytes);
     const trex = trexMap.size > 0 ? trexMap.values().next().value! : null;
     if (mediaType === 'video') this.videoTrex = trex;
     else this.audioTrex = trex;
+  }
+
+  /**
+   * Convert everything retained for one track from `from` ticks to `to` ticks.
+   *
+   * Proportional, with floor division: the residual is under one tick, which
+   * is microseconds at any realistic media timescale. The SHARED epoch is
+   * deliberately untouched — it carries its own timescale and each track
+   * derives from it, so rescaling it here would move the other track too.
+   */
+  private rescaleTrackTicks(mediaType: 'video' | 'audio', from: number, to: number): void {
+    const convert = (value: bigint | null): bigint | null =>
+      value === null ? null : (value * BigInt(to)) / BigInt(from);
+    if (mediaType === 'video') {
+      this.videoEpoch = convert(this.videoEpoch);
+      this.lastVideoBmd = convert(this.lastVideoBmd);
+      this.videoOutputOffset = convert(this.videoOutputOffset) ?? 0n;
+      this.lastVideoOutputBmd = convert(this.lastVideoOutputBmd);
+      this.lastVideoOutputEnd = convert(this.lastVideoOutputEnd);
+    } else {
+      this.audioEpoch = convert(this.audioEpoch);
+      this.lastAudioBmd = convert(this.lastAudioBmd);
+      this.audioOutputOffset = convert(this.audioOutputOffset) ?? 0n;
+      this.lastAudioOutputBmd = convert(this.lastAudioOutputBmd);
+      this.lastAudioOutputEnd = convert(this.lastAudioOutputEnd);
+    }
   }
 
   /**

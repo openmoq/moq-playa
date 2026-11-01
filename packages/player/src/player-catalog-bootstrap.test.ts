@@ -133,6 +133,35 @@ function ackCatalog(adapter: ReturnType<typeof createMockAdapter>, reqId = 1n, a
 }
 
 /** Deliver a fetch-stream catalog object for the given fetch reqId. */
+/**
+ * Answer a candidate's required media so a graceful handover can adopt it.
+ *
+ * Readiness is EVIDENCE: the replacement's catalog has to converge through its
+ * own retrieval and every required track has to be accepted before the old
+ * session is retired (draft-22 §7.4.1, 16 §8.4.1, 18 §9.4.1). Before graceful
+ * handover these fixtures could deliver the replacement's catalog after
+ * `migrate()` resolved, because the old session was retired as soon as the
+ * catalog SUBSCRIBE had been SENT; now it comes first.
+ *
+ * This adapter numbers requests 1, 3, 5, … so a candidate's catalog is 1, its
+ * joining FETCH 3, and its media 5 and 7.
+ */
+async function acceptCandidateMedia(
+    adapter: ReturnType<typeof createMockAdapter>,
+    tracks: Array<{ requestId: bigint; trackAlias: bigint }> = [
+        { requestId: 5n, trackAlias: 50n }, { requestId: 7n, trackAlias: 70n },
+    ],
+): Promise<void> {
+    for (const { requestId, trackAlias } of tracks) {
+        await flush();
+        adapter._triggerMessage({
+            type: 'SUBSCRIBE_OK', requestId: varint(requestId), trackAlias: varint(trackAlias),
+            parameters: new Map(), trackExtensions: [],
+        } as unknown as ControlMessage);
+    }
+    await flush(); await flush();
+}
+
 async function deliverFetchObject(
     adapter: ReturnType<typeof createMockAdapter>,
     fetchReqId: bigint, streamId: bigint, groupId: bigint, objectId: bigint, payload: Uint8Array,
@@ -469,17 +498,12 @@ describe('catalog failure state and pending delivery', () => {
                 if (allocation !== 'delayed-allocation') await gate;
                 return id;
             });
-            const internals = player as unknown as {
-                subscribeCatalog(conn: MoqtConnection): Promise<void>;
-                beginCatalogRecovery(conn: MoqtConnection): void;
-                catalogRequestId: bigint;
-                catalogRecovery: unknown;
-            };
+            const internals = player as unknown as { subscribeCatalog(conn: MoqtConnection): Promise<void>; beginCatalogRecovery(conn: MoqtConnection): void; catalogSlots: { catalogRequestId: bigint; catalogRecovery: unknown } };
             const pending = path === 'main'
                 ? internals.subscribeCatalog(adapter as unknown as MoqtConnection).catch(err => err)
                 : (internals.beginCatalogRecovery(adapter as unknown as MoqtConnection), Promise.resolve());
             await vi.advanceTimersByTimeAsync(0);
-            adapter._triggerMessage({ type: 'PUBLISH_DONE', requestId: internals.catalogRequestId,
+            adapter._triggerMessage({ type: 'PUBLISH_DONE', requestId: internals.catalogSlots.catalogRequestId,
                 statusCode: 1n, streamCount: 0n, errorReason: 'unauthorized',
             } as ControlMessage);
             finish();
@@ -488,7 +512,7 @@ describe('catalog failure state and pending delivery', () => {
             expect(player.state).toBe('error');
             if (allocation === 'delayed-allocation') expect(emitted).toBe(false);
             else expect(adapter.unsubscribe.mock.calls.filter(([id]: [bigint]) => id === allocatedId)).toHaveLength(1);
-            expect(internals.catalogRecovery).toBeNull();
+            expect(internals.catalogSlots.catalogRecovery).toBeNull();
             expect(adapter.close).not.toHaveBeenCalled();
         });
 
@@ -518,7 +542,7 @@ describe('catalog failure state and pending delivery', () => {
         expect(player.state).toBe('playing');
         expect(errors).toEqual([]);
         expect(adapter.unsubscribe).not.toHaveBeenCalledWith(candidateId);
-        expect((player as unknown as { catalogRequestId: bigint }).catalogRequestId).toBe(candidateId);
+        expect((player as unknown as { catalogSlots: { catalogRequestId: bigint } }).catalogSlots.catalogRequestId).toBe(candidateId);
     });
 });
 
@@ -1194,15 +1218,17 @@ describe('catalog bootstrap wiring — staged-recovery races (F1/F2/F4/F5/F6)', 
      * Diagnosis by Paul Gregoire (openmoq/moq-playa#7).
      */
     type RecoveryInternals = {
-        catalogRecovery: {
-            coord: { onFetchStreamClosed(attempt: unknown, cleanFin: boolean): void };
-            parkedEvents: Map<bigint, DataStreamTerminal>;
-        } | null;
+        catalogSlots: {
+            catalogRecovery: {
+                coord: { onFetchStreamClosed(attempt: unknown, cleanFin: boolean): void };
+                parkedEvents: Map<bigint, DataStreamTerminal>;
+            } | null;
+        };
     };
 
     /** Replace the candidate coordinator's callback with a recording stub. */
     function captureFetchCloses(player: unknown): Array<boolean> {
-        const recovery = (player as RecoveryInternals).catalogRecovery;
+        const recovery = (player as RecoveryInternals).catalogSlots.catalogRecovery;
         if (recovery === null) throw new Error('no catalogRecovery transaction staged');
         const seen: boolean[] = [];
         const inner = recovery.coord.onFetchStreamClosed.bind(recovery.coord);
@@ -1253,7 +1279,7 @@ describe('catalog bootstrap wiring — staged-recovery races (F1/F2/F4/F5/F6)', 
             await flush();
 
             // Recorded verbatim: not FIN, and not falsely attributed to the peer.
-            const events = (player as RecoveryInternals).catalogRecovery?.parkedEvents;
+            const events = (player as RecoveryInternals).catalogSlots.catalogRecovery?.parkedEvents;
             expect(events?.get(701n)).toBe(terminal);
         });
     }
@@ -1270,7 +1296,7 @@ describe('catalog bootstrap wiring — staged-recovery races (F1/F2/F4/F5/F6)', 
         adapter._triggerStreamClosed(700n, undefined, 'fin');
         await flush();
 
-        const events = (player as RecoveryInternals).catalogRecovery?.parkedEvents;
+        const events = (player as RecoveryInternals).catalogSlots.catalogRecovery?.parkedEvents;
         expect(events?.get(700n)).toBe('fin');
     });
 
@@ -1330,7 +1356,7 @@ describe('catalog bootstrap wiring — staged-recovery races (F1/F2/F4/F5/F6)', 
             await flush();
             expect(events).toEqual(['catalog_received']);
             expect(errors).toEqual([expect.objectContaining({ severity: 'fatal' })]);
-            expect((player as unknown as { catalogRecovery: unknown }).catalogRecovery).toBeNull();
+            expect((player as unknown as { catalogSlots: { catalogRecovery: unknown } }).catalogSlots.catalogRecovery).toBeNull();
             expect(adapter.unsubscribe).toHaveBeenCalledWith(candSubReqId);
             expect(adapter.close).not.toHaveBeenCalled();
         } finally { await player.destroy(); }
@@ -2107,7 +2133,9 @@ describe('catalog bootstrap wiring — terminal drain and shared parking budgets
         const m = player.migrate(second as unknown as MoqtConnection);
         await vi.waitFor(() => expect(second.connect).toHaveBeenCalled());
         second._connectResolve?.();
-        await m;
+        // The candidate issues its OWN catalog subscribe once connect resolves;
+        // nothing can answer it before it has been sent.
+        await vi.waitFor(() => expect(second.subscribe).toHaveBeenCalled());
 
         // The NEW session's catalog binds the SAME alias (1n) the old one used.
         second._triggerMessage({
@@ -2121,6 +2149,8 @@ describe('catalog bootstrap wiring — terminal drain and shared parking budgets
         } as unknown as ControlMessage);
         second._triggerStreamClosed(100n);
         await flush(); await flush();
+        await acceptCandidateMedia(second);
+        await m;
         const afterMigration = [...events];
         expect(afterMigration).toContain('catalog_received');
 
@@ -2374,7 +2404,7 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         expect(r2.errors.some((e) => (e as { severity?: string }).severity === 'fatal')).toBe(true);
     });
 
-    it('a candidate catalog drain completing BEFORE commit is replayed after the staged events — never lost', async () => {
+    it('a candidate catalog drain completing BEFORE adoption retires its ended route', async () => {
         const adapter = createMockAdapter(16);
         const { player, events } = await loadPlayer(adapter);
         await flush();
@@ -2391,7 +2421,19 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         const second = createMockAdapter(16);
         let releaseSub: ((id: bigint) => void) | null = null;
         let candOpts: { onDrained?: (id: bigint) => void } | undefined;
-        second.subscribe = vi.fn((_ns: unknown, _name: unknown, options?: { onRequestId?: (id: bigint) => void }) => {
+        // The CATALOG subscribe is held so pre-adoption events are observable;
+        // the media subscribes that follow it are answered normally, because a
+        // graceful handover is adopted only once its required tracks are
+        // accepted and there is nothing to hold about them here.
+        let nextMediaId = 31n;
+        const mediaIds: bigint[] = [];
+        second.subscribe = vi.fn((_ns: unknown, name: unknown, options?: { onRequestId?: (id: bigint) => void }) => {
+            if (new TextDecoder().decode(name as Uint8Array) !== 'catalog') {
+                const id = nextMediaId; nextMediaId += 2n;
+                mediaIds.push(id);
+                options?.onRequestId?.(id);
+                return Promise.resolve(varint(id));
+            }
             candOpts = options as never;
             return new Promise((resolve) => { releaseSub = (id) => { options?.onRequestId?.(id); resolve(varint(id)); }; });
         });
@@ -2400,23 +2442,34 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         second._connectResolve?.();
         await vi.waitFor(() => expect(second.subscribe).toHaveBeenCalled());
 
-        // PRE-COMMIT: the candidate catalog gets OK + ended DONE (staged) and
-        // its drain COMPLETES (the buffered event under test).
+        // PRE-ADOPTION: the candidate's catalog is accepted and DELIVERED (its
+        // retrieval has to converge before the old session is retired), then
+        // its feed ENDS and its drain completes — all while it is still only a
+        // candidate, acting on its own retrieval rather than on live playback.
+        releaseSub!(21n);
+        await flush();
         second._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(21n), trackAlias: varint(1n),
             parameters: new Map(), trackExtensions: [],
         } as unknown as ControlMessage);
+        second._triggerObject(300n, {
+            kind: 'data', trackAlias: varint(1n), groupId: varint(0n), subgroupId: varint(0n),
+            objectId: varint(0n), publisherPriority: 128, extensions: undefined, payload: enc(CATALOG),
+        } as unknown as MoqtObject);
+        await flush();
         second._triggerMessage({
             type: 'PUBLISH_DONE', requestId: varint(21n), statusCode: varint(0x2n),
             streamCount: varint(0n), errorReason: 'ended',
         } as unknown as ControlMessage);
         candOpts!.onDrained!(21n);
-        releaseSub!(21n);
+        await flush();
+        await acceptCandidateMedia(second, mediaIds.map((requestId, i) => ({ requestId, trackAlias: 40n + BigInt(i) })));
         await m;
         await flush();
-        // The buffered drain replayed post-commit: an ENDED feed's route is
-        // retired — a late object on the new session's catalog alias is inert.
-        expect((player as unknown as { catalogTrackAlias: bigint | null }).catalogTrackAlias).toBeNull();
+        // The drain was its own retrieval's: an ENDED feed's route is retired,
+        // and adoption carries that holder across — so a late object on the
+        // adopted catalog alias is inert.
+        expect((player as unknown as { catalogSlots: { catalogTrackAlias: bigint | null } }).catalogSlots.catalogTrackAlias).toBeNull();
         const before = [...events];
         second._triggerObject(300n, {
             kind: 'data', trackAlias: varint(1n), groupId: varint(9n), subgroupId: varint(0n),
@@ -2455,7 +2508,7 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         await flush();
         expect(events).toEqual(['catalog_received', 'catalog_updated']);   // adopted for content
         // …but the DEAD alias is not routable.
-        expect((player as unknown as { catalogTrackAlias: bigint | null }).catalogTrackAlias).toBeNull();
+        expect((player as unknown as { catalogSlots: { catalogTrackAlias: bigint | null } }).catalogSlots.catalogTrackAlias).toBeNull();
         adapter._triggerObject(800n, {
             kind: 'data', trackAlias: varint(9n), groupId: varint(12n), subgroupId: varint(0n),
             objectId: varint(0n), publisherPriority: 128, extensions: undefined, payload: rogue(),
@@ -2518,9 +2571,11 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         const m = player.migrate(second as unknown as MoqtConnection);
         await vi.waitFor(() => expect(second.connect).toHaveBeenCalled());
         second._connectResolve?.();
-        await m;
+        await vi.waitFor(() => expect(second.subscribe).toHaveBeenCalled());
         // New session: catalog on a DIFFERENT alias; the OLD catalog alias
-        // (1n) is reused for the VIDEO media track.
+        // (1n) is reused for the VIDEO media track. All of it is delivered
+        // BEFORE adoption, because a graceful handover waits for the
+        // replacement's catalog and media to be usable.
         second._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(40n),
             parameters: new Map(), trackExtensions: [],
@@ -2536,6 +2591,8 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
             type: 'SUBSCRIBE_OK', requestId: varint(5n), trackAlias: varint(1n),   // video ← old catalog alias
             parameters: new Map(), trackExtensions: [],
         } as unknown as ControlMessage);
+        await acceptCandidateMedia(second, [{ requestId: 7n, trackAlias: 70n }]);
+        await m;
         await flush();
         const sm = (player as unknown as { subscriptionManager: { getMediaType(a: bigint): unknown; routeObject: (...a: unknown[]) => unknown } }).subscriptionManager;
         expect(sm.getMediaType(1n)).toBe('video');
@@ -2977,8 +3034,8 @@ describe('catalog bootstrap wiring — legacy terminal deferral and owner-scoped
         const m = player.migrate(second as unknown as MoqtConnection);
         await vi.waitFor(() => expect(second.connect).toHaveBeenCalled());
         second._connectResolve?.();
-        await m;
-        // New session's catalog loads…
+        await vi.waitFor(() => expect(second.subscribe).toHaveBeenCalled());
+        // New session's catalog loads… before adoption, which now waits for it.
         second._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n),
             parameters: new Map(), trackExtensions: [],
@@ -2988,6 +3045,12 @@ describe('catalog bootstrap wiring — legacy terminal deferral and owner-scoped
             objectId: varint(0n), publisherPriority: 128, extensions: undefined, payload: enc(CATALOG),
         } as unknown as MoqtObject);
         await flush();
+        // Legacy 'subscribe' mode issues no joining FETCH, so the candidate's
+        // media requests are 3 and 5.
+        await acceptCandidateMedia(second, [
+            { requestId: 3n, trackAlias: 30n }, { requestId: 5n, trackAlias: 50n },
+        ]);
+        await m;
         // …and a NEW-session drain must not act on the OLD retriable record:
         // no spurious recovery subscribe.
         const before = second.subscribe.mock.calls.length;
@@ -3180,7 +3243,7 @@ describe('catalog bootstrap wiring — anchor-before-replay and lifecycle owners
         adapter._triggerStreamClosed(300n);
         await flush();
         // Spy the coordinator's delivery ORDER through the replay.
-        const coord = (player as unknown as { catalogBootstrapCoord: { onLiveCatalogObject: (...a: never[]) => void; onLiveStreamEvent: (...a: never[]) => void } }).catalogBootstrapCoord;
+        const coord = (player as unknown as { catalogSlots: { catalogBootstrapCoord: { onLiveCatalogObject: (...a: never[]) => void; onLiveStreamEvent: (...a: never[]) => void } } }).catalogSlots.catalogBootstrapCoord;
         const sequence: string[] = [];
         vi.spyOn(coord, 'onLiveCatalogObject').mockImplementation(() => { sequence.push('obj'); });
         vi.spyOn(coord, 'onLiveStreamEvent').mockImplementation(((_sid: bigint, kind: string) => { sequence.push(kind); }) as never);
@@ -3249,13 +3312,9 @@ describe('catalog bootstrap wiring — anchor-before-replay and lifecycle owners
         });
         const { player, events } = await loadPlayer(adapter);
         await flush(); await flush();
-        const internals = player as unknown as {
-            quarantinedFetchRequests: Set<bigint>;
-            bootstrapFetchStreams: Map<bigint, unknown>;
-            droppedFetchStreams: Set<bigint>;
-        };
+        const internals = player as unknown as { quarantinedFetchRequests: Set<bigint>; droppedFetchStreams: Set<bigint>; catalogSlots: { bootstrapFetchStreams: Map<bigint, unknown> } };
         expect(internals.quarantinedFetchRequests.has(3n)).toBe(true);
-        expect(internals.bootstrapFetchStreams.size).toBe(0);
+        expect(internals.catalogSlots.bootstrapFetchStreams.size).toBe(0);
         expect(internals.droppedFetchStreams.has(100n)).toBe(true);
         // A late object on the observed stream is swallowed — never applied.
         adapter._triggerObject(100n, {
@@ -3289,12 +3348,9 @@ describe('catalog bootstrap wiring — attempt identity and lifecycle evidence s
         // A's AMBIGUOUS send rejection settles LATE — it must retire only A.
         rejectJoin!(new Error('request stream write failed'));
         await flush(); await flush();
-        const internals = player as unknown as {
-            quarantinedFetchRequests: Set<bigint>;
-            bootstrapFetch: { reqId: bigint } | null;
-        };
+        const internals = player as unknown as { quarantinedFetchRequests: Set<bigint>; catalogSlots: { bootstrapFetch: { reqId: bigint } | null } };
         expect(internals.quarantinedFetchRequests.has(bReqId)).toBe(false);
-        expect(internals.bootstrapFetch?.reqId).toBe(bReqId);   // B still owned
+        expect(internals.catalogSlots.bootstrapFetch?.reqId).toBe(bReqId);   // B still owned
         // B completes: cf01 independent history → readiness.
         await deliverFetchObject(adapter, bReqId, 200n, 0n, 0n, enc({
             version: 1, streamingFormat: 1, streamingFormatVersion: '0.2', supportsDeltaUpdates: true,
@@ -3387,9 +3443,31 @@ describe('catalog bootstrap wiring — attempt identity and lifecycle evidence s
         const m = player.migrate(second as unknown as MoqtConnection);
         await vi.waitFor(() => expect(second.connect).toHaveBeenCalled());
         second._connectResolve?.();
+        await vi.waitFor(() => expect(second.subscribe).toHaveBeenCalled());
+        // The replacement's own retrieval converges first — a graceful handover
+        // is adopted only once it is usable.
+        second._triggerMessage({
+            type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n),
+            parameters: new Map(), trackExtensions: [],
+        } as unknown as ControlMessage);
+        await deliverFetchObject(second, 3n, 101n, 5n, 0n, enc(CATALOG));
+        second._triggerMessage({
+            type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+        } as unknown as ControlMessage);
+        second._triggerStreamClosed(101n);
+        await flush(); await flush();
+        // Aliases well clear of the 70n this test parks on, so the object it
+        // parks cannot be routed as media instead.
+        await acceptCandidateMedia(second, [
+            { requestId: 5n, trackAlias: 500n }, { requestId: 7n, trackAlias: 700n },
+        ]);
         await m;
-        // The NEW session parks an object on stream 910 (its catalog subscribe
-        // is still awaiting SUBSCRIBE_OK — a plausible owner exists).
+        // Parking requires a plausible owner: some request on the delivering
+        // session still awaiting its SUBSCRIBE_OK. The adopted session's own
+        // requests are all answered, so this stands in for one that is not.
+        (player as unknown as { pendingAliasBinds: Set<bigint> }).pendingAliasBinds.add(909n);
+        // The NEW session parks an object on stream 910.
         second._triggerObject(910n, {
             kind: 'data', trackAlias: varint(70n), groupId: varint(0n), subgroupId: varint(0n),
             objectId: varint(0n), publisherPriority: 128, extensions: undefined, payload: new Uint8Array(1),
@@ -3716,8 +3794,8 @@ describe('catalog bootstrap wiring — final-rung overflow terminals', () => {
         expect(errors.some((e) => (e as { severity?: string }).severity === 'fatal')).toBe(true);
         expect(events).toEqual([]);                        // NOTHING accepted
         // Cleanup is complete: dead request, no binds, no revival.
-        const internals = player as unknown as { catalogRequestId: bigint | null; pendingAliasBinds: Set<bigint> };
-        expect(internals.catalogRequestId).toBeNull();
+        const internals = player as unknown as { pendingAliasBinds: Set<bigint>; catalogSlots: { catalogRequestId: bigint | null } };
+        expect(internals.catalogSlots.catalogRequestId).toBeNull();
         expect(internals.pendingAliasBinds.size).toBe(0);
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(rung2ReqId), trackAlias: varint(2n),
@@ -3744,8 +3822,8 @@ describe('catalog bootstrap wiring — final-rung overflow terminals', () => {
             await flush();
             expect(errors.some((e) => (e as { severity?: string }).severity === 'fatal')).toBe(true);
             expect(events).toEqual([]);
-            const internals = player as unknown as { catalogRequestId: bigint | null; pendingAliasBinds: Set<bigint> };
-            expect(internals.catalogRequestId).toBeNull();
+            const internals = player as unknown as { pendingAliasBinds: Set<bigint>; catalogSlots: { catalogRequestId: bigint | null } };
+            expect(internals.catalogSlots.catalogRequestId).toBeNull();
             expect(internals.pendingAliasBinds.size).toBe(0);
             // A late SUBSCRIBE_OK + object must not revive the retrieval.
             ackCatalog(adapter);
@@ -3801,7 +3879,7 @@ describe('catalog bootstrap wiring — exception-safe terminal cleanup', () => {
             pendingObjectsByAlias: Map<bigint, unknown[]>;
             pendingStreamEvents: Map<unknown, Map<bigint, unknown>>;
         };
-        expect(internals.catalogRequestId).toBeNull();
+        expect(internals.catalogSlots.catalogRequestId).toBeNull();
         expect(internals.pendingAliasBinds.size).toBe(0);
         expect(internals.pendingObjectsByAlias.get(1n)).toBeUndefined();   // txn-owned objects reclaimed
         expect(internals.pendingStreamEvents.get(adapter) ?? new Map()).toEqual(new Map());
@@ -4008,9 +4086,13 @@ describe('catalog bootstrap wiring — MSF-01 fallback conformance', () => {
  */
 describe('catalog bootstrap wiring — a pre-registration terminal is not completion', () => {
     type PendingInternals = {
+        // Session-level: parked streams are not owned by one catalog retrieval.
         pendingFetchStreams: Map<bigint, { requestId: bigint; terminal?: DataStreamTerminal }>;
-        catalogBootstrapCoord?: { onFetchStreamClosed(attempt: unknown, cleanFin: boolean): void };
-        registerBootstrapFetch(conn: unknown, reqId: bigint, attempt: number, gen: number): void;
+        catalogSlots: { catalogBootstrapCoord?: { onFetchStreamClosed(attempt: unknown, cleanFin: boolean): void } };
+        // The holder travels with the operation, so it is the first argument.
+        registerBootstrapFetch(
+            slots: unknown, conn: unknown, reqId: bigint, attempt: number, gen: number,
+        ): void;
         bootstrapGeneration: number;
     };
 
@@ -4032,13 +4114,13 @@ describe('catalog bootstrap wiring — a pre-registration terminal is not comple
             adapter._triggerStreamClosed(900n, terminal === 'reset' ? 0x2a : undefined, terminal);
             await flush();
 
-            const coord = internals.catalogBootstrapCoord!;
+            const coord = internals.catalogSlots.catalogBootstrapCoord!;
             const closes: boolean[] = [];
             const inner = coord.onFetchStreamClosed.bind(coord);
             coord.onFetchStreamClosed = (attempt, cleanFin) => { closes.push(cleanFin); inner(attempt, cleanFin); };
 
             // Registration now claims the parked stream and replays its terminal.
-            internals.registerBootstrapFetch(adapter, unownedReqId, 1, internals.bootstrapGeneration);
+            internals.registerBootstrapFetch(internals.catalogSlots, adapter, unownedReqId, 1, internals.bootstrapGeneration);
             await flush();
 
             expect(closes).toEqual([clean]);
@@ -4056,10 +4138,12 @@ describe('catalog bootstrap wiring — a pre-registration terminal is not comple
  */
 describe('catalog bootstrap wiring — terminal evidence requires a peer FIN', () => {
     type BootstrapInternals = {
-        catalogBootstrapCoord?: { onFetchStreamClosed(attempt: unknown, cleanFin: boolean): void };
-        catalogLiveStreams: Map<bigint, {
-            coord: { onLiveStreamEvent(sid: bigint, kind: 'header' | DataStreamTerminal): void };
-        }>;
+        catalogSlots: {
+            catalogBootstrapCoord?: { onFetchStreamClosed(attempt: unknown, cleanFin: boolean): void };
+            catalogLiveStreams: Map<bigint, {
+                coord: { onLiveStreamEvent(sid: bigint, kind: 'header' | DataStreamTerminal): void };
+            }>;
+        };
     };
 
     /** Stage a real bootstrap fetch stream and record its completion verdict. */
@@ -4068,7 +4152,7 @@ describe('catalog bootstrap wiring — terminal evidence requires a peer FIN', (
         await flush();
         ackCatalog(adapter);
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
-        const coord = (player as unknown as BootstrapInternals).catalogBootstrapCoord;
+        const coord = (player as unknown as BootstrapInternals).catalogSlots.catalogBootstrapCoord;
         if (coord === undefined) throw new Error('no bootstrap coordinator staged');
         const closes: boolean[] = [];
         const inner = coord.onFetchStreamClosed.bind(coord);
@@ -4120,7 +4204,7 @@ describe('catalog bootstrap wiring — terminal evidence requires a peer FIN', (
             payload: enc(CATALOG),
         } as unknown as MoqtObject);
         await flush();
-        const live = (player as unknown as BootstrapInternals).catalogLiveStreams.get(800n);
+        const live = (player as unknown as BootstrapInternals).catalogSlots.catalogLiveStreams.get(800n);
         if (live === undefined) throw new Error('no live catalog stream registered');
         const kinds: string[] = [];
         const inner = live.coord.onLiveStreamEvent.bind(live.coord);

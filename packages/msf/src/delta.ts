@@ -5,6 +5,8 @@
  * @module
  */
 
+import { namespaceDisplay, referenceIdentityKey, resolveTrackNamespace, trackIdentityKey } from './track-identity.js';
+import type { CatalogNamespaceContext } from './track-identity.js';
 import type { CatalogDelta, CatalogState, CatalogTrack, RemoveTrackRef } from './types.js';
 import { assertFiniteCatalogDelta, assertFiniteCatalogNumbers } from './catalog-validate.js';
 import { validateLocmafVersion } from './catalog-msf00.js';
@@ -121,7 +123,7 @@ export function parseDeltaUpdate(
 export function applyCatalogUpdate(
     state: CatalogState,
     delta: CatalogDelta,
-    catalogNamespace?: string,
+    catalogNamespace?: CatalogNamespaceContext,
 ): CatalogState {
     // Work on a mutable copy of tracks
     let tracks = [...state.tracks];
@@ -147,8 +149,8 @@ export function applyCatalogUpdate(
     // 2. Remove tracks
     if (delta.removeTracks) {
         for (const ref of delta.removeTracks) {
-            const ns = ref.namespace ?? catalogNamespace ?? '';
-            const key = `${ns}\0${ref.name}`;
+            const ns = ref.namespace ?? (typeof catalogNamespace === 'string' ? catalogNamespace : '');
+            const key = referenceIdentityKey(ref, catalogNamespace);
             // §5.2: "Remove a track that has been previously declared"
             if (!tracks.some(t => trackKey(t) === key)) {
                 throw new Error(
@@ -164,12 +166,29 @@ export function applyCatalogUpdate(
     if (delta.cloneTracks) {
         for (const clone of delta.cloneTracks) {
             const parentName = clone.parentName!;
-            const parent = tracks.find(t => t.name === parentName);
-            if (!parent) {
+            // §5.1.36 identifies the parent by NAME ONLY, and §5.1.11 makes a
+            // name unique only per namespace. This dialect has no
+            // parentNamespace field, and msf-01 §5.2.34's default cannot be
+            // imported as normative text here, so a name that matches parents
+            // in two namespaces is genuinely ambiguous. Fail rather than take
+            // the first: picking by document order would silently clone from a
+            // namespace the publisher never named.
+            const parents = tracks.filter(t => t.name === parentName);
+            if (parents.length === 0) {
                 throw new Error(
                     `Cannot clone track "${clone.name}": parent track "${parentName}" not found (§5.1.5)`,
                 );
             }
+            if (parents.length > 1) {
+                throw new Error(
+                    `Cannot clone track "${clone.name}": parent name "${parentName}" is ambiguous — ` +
+                    `it exists in namespaces ` +
+                    `${parents.map(p => `"${p.namespace ?? '(inherited)'}"`).join(', ')}. ` +
+                    `§5.1.36 identifies a parent by name alone and §5.1.11 makes names unique only ` +
+                    `per namespace, so this delta does not say which track to clone (§5.1.5).`,
+                );
+            }
+            const parent = parents[0]!;
 
             // §5.2: Cloned track inherits all attributes except name;
             // redefined attributes overwrite inherited values
@@ -214,17 +233,31 @@ export function applyCatalogUpdate(
 
 // ─── Internal helpers ────────────────────────────────────────────────
 
-function trackKey(track: { name: string; namespace?: string }): string {
-    return `${track.namespace ?? ''}\0${track.name}`;
+function trackKey(track: Parameters<typeof trackIdentityKey>[0]): string {
+    return trackIdentityKey(track);
 }
 
 function applyNamespaceInheritance(
     track: CatalogTrack,
-    catalogNamespace?: string,
+    catalogNamespace?: CatalogNamespaceContext,
 ): CatalogTrack {
-    if (track.namespace !== undefined) return track;
+    if (track.namespace !== undefined) {
+        // Declared text: resolve it so the identity is field-aware even when
+        // the track arrived without a resolution of its own.
+        if (track.resolvedNamespace !== undefined) return track;
+        const resolvedNamespace = resolveTrackNamespace(track.namespace, catalogNamespace);
+        return resolvedNamespace === undefined ? track : { ...track, resolvedNamespace };
+    }
     if (catalogNamespace === undefined) return track;
-    return { ...track, namespace: catalogNamespace };
+    const resolvedNamespace = resolveTrackNamespace(undefined, catalogNamespace);
+    const namespace = typeof catalogNamespace === 'string'
+        ? catalogNamespace
+        : resolvedNamespace !== undefined ? namespaceDisplay(resolvedNamespace.fields) : undefined;
+    return {
+        ...track,
+        ...(namespace !== undefined ? { namespace } : {}),
+        ...(resolvedNamespace !== undefined ? { resolvedNamespace } : {}),
+    };
 }
 
 /**
@@ -347,7 +380,7 @@ function parseTrackFromRaw(
 function cloneTrack(
     parent: CatalogTrack,
     overrides: CatalogTrack,
-    catalogNamespace?: string,
+    catalogNamespace?: CatalogNamespaceContext,
 ): CatalogTrack {
     // Start with all parent attributes
     const cloned: CatalogTrack = { ...parent };
@@ -363,6 +396,11 @@ function cloneTrack(
 
     // Apply explicit overrides
     if (overrides.namespace !== undefined) result['namespace'] = overrides.namespace;
+    // A declared namespace is a NEW identity, so the parent's resolution is
+    // stale the moment it is overridden. Dropping it here lets the single
+    // resolution below own the field; carrying it forward would leave the
+    // clone addressing the parent's namespace under its own text.
+    if (overrides.namespace !== undefined) delete result['resolvedNamespace'];
     if (overrides.packaging !== undefined) result['packaging'] = overrides.packaging;
     if (overrides.isLive !== undefined) result['isLive'] = overrides.isLive;
     if (overrides.role !== undefined) result['role'] = overrides.role;
@@ -390,9 +428,24 @@ function cloneTrack(
     if (overrides.eventType !== undefined) result['eventType'] = overrides.eventType;
     if (overrides.locmafVersion !== undefined) result['locmafVersion'] = overrides.locmafVersion;
 
-    // Apply namespace inheritance if needed
-    if (result['namespace'] === undefined && catalogNamespace !== undefined) {
-        result['namespace'] = catalogNamespace;
+    // Resolve the clone's own namespace. With an override this is the declared
+    // text; with none the parent's inherited identity carries over, and only a
+    // parent that had none at all falls back to the catalog context. The
+    // display text is derived from the same resolution so the two can never
+    // disagree — assigning the context directly would put a tuple in a field
+    // the format declares as a string.
+    if (result['namespace'] === undefined && result['resolvedNamespace'] === undefined
+        && catalogNamespace !== undefined) {
+        const inherited = resolveTrackNamespace(undefined, catalogNamespace);
+        if (inherited !== undefined) {
+            result['namespace'] = typeof catalogNamespace === 'string'
+                ? catalogNamespace
+                : namespaceDisplay(inherited.fields);
+            result['resolvedNamespace'] = inherited;
+        }
+    } else if (result['resolvedNamespace'] === undefined && typeof result['namespace'] === 'string') {
+        const declared = resolveTrackNamespace(result['namespace'], catalogNamespace);
+        if (declared !== undefined) result['resolvedNamespace'] = declared;
     }
 
     return result as unknown as CatalogTrack;

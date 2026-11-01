@@ -6,6 +6,8 @@
  */
 
 import { MSF_VERSION } from './types.js';
+import { namespaceDisplay, resolveTrackNamespace, trackIdentityKey } from './track-identity.js';
+import type { CatalogNamespaceContext } from './track-identity.js';
 import type {
     Catalog, CatalogDelta, CatalogObject, CatalogTrack, Packaging,
     MsfMediaTemplate, MsfInitDataEntry, CmsfContentProtection, CmsfDrmSystem, CmsfUrlRef,
@@ -65,7 +67,7 @@ const VALID_PACKAGING = new Set<string>(['loc', 'mediatimeline', 'eventtimeline'
  */
 export function parseMsfCatalog(
     json: string | Uint8Array,
-    catalogNamespace?: string,
+    catalogNamespace?: CatalogNamespaceContext,
 ): Catalog {
     const text = typeof json === 'string' ? json : new TextDecoder().decode(json);
     const raw: unknown = JSON.parse(text);
@@ -290,7 +292,7 @@ export function validateLocmafVersion(track: {
 function parseTrack(
     raw: unknown,
     index: number,
-    catalogNamespace: string | undefined,
+    catalogNamespace: CatalogNamespaceContext,
     legacyMsf00: boolean,
 ): CatalogTrack {
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -399,10 +401,15 @@ function parseTrack(
         );
     }
 
-    // §5.1.10: Namespace inheritance — if absent, inherit catalog namespace
-    const namespace = typeof obj['namespace'] === 'string'
-        ? obj['namespace']
-        : catalogNamespace;
+    // §5.1.10: Namespace inheritance — if absent, inherit catalog namespace.
+    // The declared TEXT is preserved as-is for existing consumers; the wire
+    // fields and their provenance travel beside it, because the two can be
+    // identical text and still be different namespaces.
+    const declared = typeof obj['namespace'] === 'string' ? obj['namespace'] : undefined;
+    const resolvedNamespace = resolveTrackNamespace(declared, catalogNamespace);
+    const namespace = declared ?? (typeof catalogNamespace === 'string'
+        ? catalogNamespace
+        : resolvedNamespace !== undefined ? namespaceDisplay(resolvedNamespace.fields) : undefined);
 
     // Build track with only known fields (§5.1: ignore unknown). The required
     // triple (name/packaging/isLive) plus the inherited namespace, then the
@@ -414,6 +421,7 @@ function parseTrack(
         packaging,
         isLive,
         ...(namespace !== undefined ? { namespace } : {}),
+        ...(resolvedNamespace !== undefined ? { resolvedNamespace } : {}),
         ...extractRecognizedOptionalFields(obj, name),
     };
 
@@ -553,9 +561,11 @@ function isValidBcp47(tag: string): boolean {
  * @see draft-ietf-moq-msf-00 §5.1.11
  */
 function validateTrackUniqueness(tracks: CatalogTrack[]): void {
+    // Keyed on RESOLVED identity: §5.1.11 scopes names per namespace, and two
+    // namespaces can print the same while differing in field structure.
     const seen = new Set<string>();
     for (const track of tracks) {
-        const key = `${track.namespace ?? ''}\0${track.name}`;
+        const key = trackIdentityKey(track);
         if (seen.has(key)) {
             throw new Error(
                 `Duplicate track name "${track.name}" in namespace "${track.namespace ?? '(inherited)'}" (§5.1.11)`,

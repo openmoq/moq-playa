@@ -89,7 +89,7 @@ export type { PlayerStateValue } from './state.js';
 
 // ─── Config ──────────────────────────────────────────────────────────
 
-export type { MoqtPlayerConfig } from './config.js';
+export type { MoqtPlayerConfig, SelectionConfig, TrackRefConfig } from './config.js';
 export type { PlayerAuthorization } from './config.js';
 export { catToken, AuthorizationError } from '@openmoq/webtransport';
 export type { AuthorizationToken, AuthorizationContext, AuthorizationProvider, AuthorizationOperation } from '@openmoq/webtransport';
@@ -145,6 +145,10 @@ export type { PlayerStats, TTFFBreakdown } from './stats.js';
 export { CatalogManager } from './catalog-manager.js';
 /** @experimental Advanced API — may change between minor versions. */
 export { QualityController } from './quality-controller.js';
+/** @experimental Advanced API — may change between minor versions. */
+export { composeSelection } from './selection-composition.js';
+/** @experimental Advanced API — may change between minor versions. */
+export { selectionIntentFromConfig } from './configured-selection.js';
 /** @experimental Advanced API — may change between minor versions. */
 export type { QualityControllerConfig, SelectionConstraints, SelectedTracks } from './quality-controller.js';
 /** @experimental Advanced API — may change between minor versions. */

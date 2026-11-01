@@ -19,6 +19,6 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src/**/*.ts"],
+  "include": ["src/**/*.ts", "../../scripts/player-acceptance/handover-relays.ts"],
   "exclude": ["node_modules"]
 }

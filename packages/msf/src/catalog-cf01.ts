@@ -8,6 +8,10 @@
  * @module
  */
 
+import {
+    namespaceDisplay, namespaceFieldsOf, resolveTrackNamespace, sameNamespaceFields, trackIdentityKey,
+} from './track-identity.js';
+import type { CatalogNamespaceContext } from './track-identity.js';
 import fjp from 'fast-json-patch';
 const { applyPatch, validate } = fjp;
 import type { Catalog, CatalogTrack, Packaging } from './types.js';
@@ -46,7 +50,7 @@ const AUDIO_CODEC_PREFIXES = ['mp4a', 'opus', 'fLaC', 'Opus'];
  */
 export function parseCatalogFormat01(
     json: string | Uint8Array,
-    catalogNamespace?: string,
+    catalogNamespace?: CatalogNamespaceContext,
     options?: { strict?: boolean },
 ): Cf01ParseResult {
     const text = typeof json === 'string' ? json : new TextDecoder().decode(json);
@@ -74,7 +78,7 @@ export function parseCatalogFormat01(
 export function applyCf01Patch(
     previousRaw: Record<string, unknown>,
     patchOps: unknown[],
-    catalogNamespace?: string,
+    catalogNamespace?: CatalogNamespaceContext,
     options?: { strict?: boolean },
 ): Cf01ParseResult {
     const ops = patchOps as Parameters<typeof applyPatch>[1];
@@ -86,7 +90,7 @@ export function applyCf01Patch(
     }
 
     // §3.3: Reject operations that directly target name or namespace
-    rejectForbiddenPaths(ops, previousRaw);
+    rejectForbiddenPaths(ops, previousRaw, catalogNamespace);
 
     // Parse pre-patch through normalizer to get EFFECTIVE track state
     // (with commonTrackFields inheritance + catalogNamespace resolved)
@@ -114,7 +118,7 @@ export function applyCf01Patch(
 
 function parseCf01Object(
     obj: Record<string, unknown>,
-    catalogNamespace?: string,
+    catalogNamespace?: CatalogNamespaceContext,
     options?: { strict?: boolean },
 ): Cf01ParseResult {
     // §3.2.6: catalogs-mode check (before anything else)
@@ -196,7 +200,7 @@ function parseCf01Track(
     index: number,
     commonFields: Record<string, unknown>,
     rootFields: Record<string, unknown>,
-    catalogNamespace?: string,
+    catalogNamespace?: CatalogNamespaceContext,
     options?: { strict?: boolean },
 ): CatalogTrack {
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -239,10 +243,16 @@ function parseCf01Track(
     }
     const name = merged['name'] as string;
 
-    // Namespace inheritance: track > commonTrackFields > catalogNamespace
-    const namespace = typeof merged['namespace'] === 'string'
-        ? merged['namespace'] as string
-        : catalogNamespace;
+    // §3.2.9 inheritance: track > commonTrackFields > catalog object >
+    // catalog context. Anything the document declared is TEXT; the resolved
+    // wire fields travel beside it because identical text can still be a
+    // different namespace.
+    const declaredNs = typeof merged['namespace'] === 'string'
+        ? merged['namespace'] as string : undefined;
+    const resolvedNamespace = resolveTrackNamespace(declaredNs, catalogNamespace);
+    const namespace = declaredNs ?? (typeof catalogNamespace === 'string'
+        ? catalogNamespace
+        : resolvedNamespace !== undefined ? namespaceDisplay(resolvedNamespace.fields) : undefined);
 
     // Packaging (§3.2.11: required, location TF)
     let packaging: Packaging;
@@ -285,6 +295,7 @@ function parseCf01Track(
         packaging,
         isLive,
         ...(namespace !== undefined ? { namespace } : {}),
+        ...(resolvedNamespace !== undefined ? { resolvedNamespace } : {}),
         ...(role !== undefined ? { role } : {}),
         ...(typeof merged['renderGroup'] === 'number' ? { renderGroup: merged['renderGroup'] as number } : {}),
         ...(typeof merged['altGroup'] === 'number' ? { altGroup: merged['altGroup'] as number } : {}),
@@ -344,7 +355,7 @@ function inferRole(sp?: Record<string, unknown>): string | undefined {
 function validateTrackUniqueness(tracks: CatalogTrack[]): void {
     const seen = new Set<string>();
     for (const track of tracks) {
-        const key = `${track.namespace ?? ''}\0${track.name}`;
+        const key = trackIdentityKey(track);
         if (seen.has(key)) {
             throw new Error(
                 `Duplicate track name "${track.name}" in namespace ` +
@@ -394,8 +405,14 @@ const COMMON_TRACK_FIELDS_RE = /^\/commonTrackFields$/;
 function rejectForbiddenPaths(
     ops: readonly { path?: string; op?: string; value?: unknown }[],
     previousRaw: Record<string, unknown>,
+    catalogNamespace?: CatalogNamespaceContext,
 ): void {
     const tracks = Array.isArray(previousRaw['tracks']) ? previousRaw['tracks'] as unknown[] : [];
+    // The layer a track inherits its namespace from when it declares none
+    // (§3.2.9: track > commonTrackFields > catalog object > retrieval context).
+    // Both sides of a whole-track comparison sit under the same layer, because
+    // every path that could change it is rejected above.
+    const trackNamespaceContext = inheritedNamespaceContext(previousRaw, catalogNamespace);
 
     for (const op of ops) {
         if (!op.path) continue;
@@ -485,9 +502,20 @@ function rejectForbiddenPaths(
                         `Remove the track and add a new one instead.`,
                     );
                 }
-                const existingNs = existing['namespace'] ?? '';
-                const replacementNs = replacement['namespace'] ?? '';
-                if (String(existingNs) !== String(replacementNs)) {
+                // Compare RESOLVED FIELDS, not display text. With a zero-field
+                // catalog context, an omitted namespace and a declared '' both
+                // print as '' while denoting zero fields and one empty field —
+                // different wire namespaces, so a replacement that introduces
+                // the field is the prohibited change §3.3 forbids.
+                const existingNsText = typeof existing['namespace'] === 'string'
+                    ? existing['namespace'] : undefined;
+                const replacementNsText = typeof replacement['namespace'] === 'string'
+                    ? replacement['namespace'] : undefined;
+                const existingResolved = resolveTrackNamespace(existingNsText, trackNamespaceContext);
+                const replacementResolved = resolveTrackNamespace(replacementNsText, trackNamespaceContext);
+                if (!sameNamespaceFields(existingResolved?.fields, replacementResolved?.fields)) {
+                    const existingNs = existingNsText ?? namespaceDisplay(existingResolved?.fields ?? []);
+                    const replacementNs = replacementNsText ?? namespaceDisplay(replacementResolved?.fields ?? []);
                     throw new Error(
                         `Patch replaces whole track at ${op.path} with different namespace ` +
                         `("${String(existingNs)}" → "${String(replacementNs)}") ` +
@@ -510,6 +538,13 @@ const SELECTION_FIELDS: readonly (keyof CatalogTrack)[] = [
 
 interface EffectiveSnapshot {
     name: string;
+    /** The identity key this snapshot was stored under. Carried rather than
+     *  recomputed: a snapshot is not a track, and re-deriving a key from its
+     *  display text would re-split an inherited one-field namespace. */
+    key: string;
+    /** Resolved wire fields, or undefined when the namespace is unresolved. */
+    namespaceFields: readonly string[] | undefined;
+    /** Display text, for messages only. Never compared. */
     namespace: string;
     /** Deterministic serialization of effective selection properties. */
     selectionJson: string;
@@ -517,16 +552,16 @@ interface EffectiveSnapshot {
 
 /**
  * Build effective snapshots from NORMALIZED CatalogTrack[] (post-inheritance).
- * Keyed by namespace + '\0' + name so same-name tracks in different
- * namespaces are correctly distinguished (§3.2.10).
+ * Keyed by the shared track identity (resolved namespace fields + name) so
+ * same-name tracks in different namespaces are distinguished (§3.2.10) and
+ * display text that collides across namespaces does not merge them.
  */
 function buildEffectiveSnapshots(
     tracks: readonly CatalogTrack[],
 ): Map<string, EffectiveSnapshot> {
     const result = new Map<string, EffectiveSnapshot>();
     for (const t of tracks) {
-        const ns = t.namespace ?? '';
-        const key = `${ns}\0${t.name}`;
+        const key = trackIdentityKey(t);
         // Build a deterministic JSON of effective selection properties
         const sel: Record<string, unknown> = {};
         for (const f of SELECTION_FIELDS) {
@@ -534,7 +569,9 @@ function buildEffectiveSnapshots(
         }
         result.set(key, {
             name: t.name,
-            namespace: ns,
+            key,
+            namespaceFields: namespaceFieldsOf(t),
+            namespace: t.namespace ?? '',
             selectionJson: JSON.stringify(sel, Object.keys(sel).sort()),
         });
     }
@@ -601,10 +638,13 @@ function validatePatchInvariants(
         const postMatches = postByName.get(pre.name);
         if (postMatches) {
             for (const post of postMatches) {
-                if (post.namespace !== pre.namespace) {
-                    const postKey = `${post.namespace}\0${post.name}`;
-                    // Only flag if this post-track is NEW (not already in pre)
-                    if (!preEffective.has(postKey)) {
+                if (!sameNamespaceFields(post.namespaceFields, pre.namespaceFields)) {
+                    // Only flag if this post-track is NEW (not already in pre).
+                    // Its own stored key is authoritative; recomputing one from
+                    // the snapshot's display text would invent a different
+                    // namespace for an inherited multi-word one and report a
+                    // change that never happened.
+                    if (!preEffective.has(post.key)) {
                         throw new Error(
                             `Patch effectively changed namespace of track "${pre.name}" ` +
                             `from "${pre.namespace || '(none)'}" to "${post.namespace || '(none)'}" ` +
@@ -616,4 +656,22 @@ function validatePatchInvariants(
             }
         }
     }
+}
+
+/**
+ * The namespace context a track inherits when it declares none: the
+ * commonTrackFields namespace, else the catalog object's, else the namespace
+ * the catalog was retrieved under (§3.2.9).
+ */
+function inheritedNamespaceContext(
+    raw: Record<string, unknown>,
+    catalogNamespace?: CatalogNamespaceContext,
+): CatalogNamespaceContext {
+    const common = (typeof raw['commonTrackFields'] === 'object' && raw['commonTrackFields'] !== null
+        && !Array.isArray(raw['commonTrackFields']))
+        ? raw['commonTrackFields'] as Record<string, unknown>
+        : {};
+    if (typeof common['namespace'] === 'string') return common['namespace'];
+    if (typeof raw['namespace'] === 'string') return raw['namespace'];
+    return catalogNamespace;
 }

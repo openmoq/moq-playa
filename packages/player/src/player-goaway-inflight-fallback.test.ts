@@ -67,12 +67,8 @@ describe('catalog fallback send completion after request retirement', () => {
         expect(requests).toHaveLength(2);
         expect(errors).toEqual([]);
         const fallbackId = requests[1]!;
-        const state = player as unknown as {
-          catalogRequestId: bigint | null;
-          pendingAliasBinds: Set<bigint>;
-          catalogBootstrapCoord: { phase: string } | null;
-        };
-        expect(state.catalogRequestId).toBe(fallbackId);
+        const state = player as unknown as { pendingAliasBinds: Set<bigint>; catalogSlots: { catalogRequestId: bigint | null; catalogBootstrapCoord: { phase: string } | null } };
+        expect(state.catalogSlots.catalogRequestId).toBe(fallbackId);
         if (redirect) {
           const contexts = (pair.server as unknown as {
             inboundRequestContexts: Map<bigint, { writeMessage(message: unknown): Promise<void> }>;
@@ -82,19 +78,19 @@ describe('catalog fallback send completion after request retirement', () => {
           });
           await flush(64);
           expect(notices).toEqual([fallbackId]);
-          expect(state.catalogRequestId).toBeNull();
-          expect(state.catalogBootstrapCoord).toBeNull();
+          expect(state.catalogSlots.catalogRequestId).toBeNull();
+          expect(state.catalogSlots.catalogBootstrapCoord).toBeNull();
           expect(state.pendingAliasBinds.has(fallbackId)).toBe(false);
         }
         if (completion === 'resolve') gate.resolve();
         else gate.reject(new Error('late fallback send failure'));
         await flush(128);
         if (redirect) {
-          expect(state.catalogRequestId).toBeNull();
+          expect(state.catalogSlots.catalogRequestId).toBeNull();
           expect(state.pendingAliasBinds.has(fallbackId)).toBe(false);
           expect(errors).toEqual([]);
         } else if (completion === 'resolve') {
-          expect(state.catalogRequestId).toBe(fallbackId);
+          expect(state.catalogSlots.catalogRequestId).toBe(fallbackId);
           expect(errors).toEqual([]);
         } else {
           expect(errors).toHaveLength(1);

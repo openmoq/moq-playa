@@ -164,20 +164,16 @@ describe.each([18, 22] as const)('draft-%i request-stream GOAWAY scope', (draft)
     // catalog is kept — only the dead wire route is cleared.
     const h = await boot(draft);
     try {
-      const player = h.player as unknown as {
-        catalogRequestId: bigint | null;
-        catalogTrackAlias: bigint | null;
-        _catalogState?: unknown;
-      };
-      expect(player.catalogRequestId).not.toBeNull();
+      const player = h.player as unknown as { _catalogState?: unknown; catalogSlots: { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null } };
+      expect(player.catalogSlots.catalogRequestId).not.toBeNull();
 
       await requestStream(h.server, h.catalogReq)
         .writeMessage({ type: 'GOAWAY', newSessionUri: '', timeout: 0n });
       await flush();
       await flush();
 
-      expect(player.catalogRequestId).toBeNull();
-      expect(player.catalogTrackAlias).toBeNull();
+      expect(player.catalogSlots.catalogRequestId).toBeNull();
+      expect(player.catalogSlots.catalogTrackAlias).toBeNull();
       // Unrelated media is untouched and still delivering.
       expect(h.closedByClient).not.toContain(h.audioReq);
       await h.send(h.audioAlias, Uint8Array.of(9), 3n);

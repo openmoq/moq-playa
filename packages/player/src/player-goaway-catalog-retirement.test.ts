@@ -68,15 +68,11 @@ describe.each([18, 22] as const)('draft-%i catalog retirement boundaries', (draf
       expect(h.client.session.state).toBe(SessionState.ESTABLISHED);
       await vi.advanceTimersByTimeAsync(CATALOG_BOOTSTRAP_INACTIVITY_MS + 1);
       await flush(64);
-      const state = h.player as unknown as {
-        catalogRequestId: bigint | null;
-        catalogBootstrapCoord: { phase: string } | null;
-        bootstrapFetch: unknown;
-      };
+      const state = h.player as unknown as { catalogSlots: { catalogRequestId: bigint | null; catalogBootstrapCoord: { phase: string } | null; bootstrapFetch: unknown } };
       expect(h.catalogIds).toEqual([id]);
-      expect(state.catalogRequestId).toBeNull();
-      expect(state.bootstrapFetch === null).toBe(true);
-      expect(state.catalogBootstrapCoord === null || state.catalogBootstrapCoord.phase === 'aborted').toBe(true);
+      expect(state.catalogSlots.catalogRequestId).toBeNull();
+      expect(state.catalogSlots.bootstrapFetch === null).toBe(true);
+      expect(state.catalogSlots.catalogBootstrapCoord === null || state.catalogSlots.catalogBootstrapCoord.phase === 'aborted').toBe(true);
     } finally { await h.destroy(); vi.useRealTimers(); }
   });
 
@@ -107,14 +103,11 @@ describe.each([18, 22] as const)('draft-%i catalog retirement boundaries', (draf
       await vi.advanceTimersByTimeAsync(CATALOG_BOOTSTRAP_INACTIVITY_MS + 1);
       await flush(64);
 
-      const state = h.player as unknown as {
-        catalogBootstrapCoord: { phase: string } | null;
-        bootstrapFetch: unknown;
-      };
+      const state = h.player as unknown as { catalogSlots: { catalogBootstrapCoord: { phase: string } | null; bootstrapFetch: unknown } };
       // No reissue on the old session, and the retrieval machinery is gone.
       expect(h.catalogIds).toEqual([subId]);
-      expect(state.catalogBootstrapCoord).toBeNull();
-      expect(state.bootstrapFetch).toBeNull();
+      expect(state.catalogSlots.catalogBootstrapCoord).toBeNull();
+      expect(state.catalogSlots.bootstrapFetch).toBeNull();
       expect(h.client.session.state).toBe(SessionState.ESTABLISHED);
     } finally { vi.useRealTimers(); await h.destroy(); }
   });

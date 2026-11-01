@@ -14,6 +14,19 @@ import { QualityController } from './quality-controller.js';
 import type { CatalogTrack, CatalogState } from '@openmoq/msf';
 import type { ClockSource } from '@openmoq/playback';
 
+it('refuses an ambiguous legacy commit without changing the selected identity', () => {
+  const base = createTestCatalog().tracks[0]!;
+  const first = { ...base, name: 'video', namespace: 'first' };
+  const second = { ...base, name: 'video', namespace: 'second' };
+  const controller = new QualityController();
+  controller.selectEligibleMembers({ videoLadder: [first, second], audioCandidates: [] }, { videoPin: second });
+  expect(controller.currentVideoTrack).toBe(second);
+  expect(() => controller.commitVideoTrack('video')).toThrow(/ambiguous/i);
+  expect(controller.currentVideoTrack).toBe(second);
+  controller.commitVideoTrackRef(first);
+  expect(controller.currentVideoTrack).toBe(first);
+});
+
 class MockClock implements ClockSource {
   private _now = 0;
   now(): number { return this._now; }

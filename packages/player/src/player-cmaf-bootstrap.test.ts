@@ -619,16 +619,17 @@ describe('LOCMAF bootstrap (draft-einarsson-moq-locmaf-01 §5, §6) — same CMA
     it.each(malformedRawInits(locmafInit))('rejects %s before MSE initialization or append', async (_name, boxes) => {
       const h = await bootLocmaf(initialized);
       try {
-        const previousInit = (h.player as any).initSegmentByTrack.get('video');
+        const initKey = JSON.stringify([['live', 'broadcast'], 'video']);
+        const previousInit = (h.player as any).initSegmentByTrack.get(initKey);
         h.mockMs.initialize.mockClear();
         sendLocmaf(h.adapter, h.alias, 4, 0, concat(vi64(4), boxes));
         expect(h.mockMs.initialize).not.toHaveBeenCalled();
         expect(h.mockMs.appendChunk).not.toHaveBeenCalled();
         expect(h.assembler.push).not.toHaveBeenCalled();
-        expect((h.player as any).initSegmentByTrack.get('video')).toBe(previousInit);
+        expect((h.player as any).initSegmentByTrack.get(initKey)).toBe(previousInit);
         expect((h.player as any)._stats.snapshot().locmafObjectsRejected).toBe(1);
         sendLocmaf(h.adapter, h.alias, 4, 1, concat(vi64(4), locmafInit));
-        expect((h.player as any).initSegmentByTrack.get('video')).toEqual(locmafInit);
+        expect((h.player as any).initSegmentByTrack.get(initKey)).toEqual(locmafInit);
         sendLocmaf(h.adapter, h.alias, 4, 2, locmafGroup(90000, 1)[0]!);
         expect(h.assembler.push).toHaveBeenCalledTimes(1);
       } finally {
@@ -1397,7 +1398,7 @@ describe('MSF-01 op-array delta reaches the player (delta-added track usable)', 
     adapter._triggerObject(0n, {
       kind: 'data', trackAlias: catalogReqId, groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       payload: new TextEncoder().encode(JSON.stringify({
-        deltaUpdate: [{ op: 'add', tracks: [{ name: 'v-hevc', packaging: 'cmaf', isLive: true, role: 'video', altGroup: 1, codec: 'hvc1.1.6.L93.90', initRef: 'i1' }] }],
+        deltaUpdate: [{ op: 'add', tracks: [{ name: 'v-hevc', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1, altGroup: 1, codec: 'hvc1.1.6.L93.90', initRef: 'i1' }] }],
       })),
     } as MoqtObject);
     await sleep(10);

@@ -106,7 +106,7 @@ describe.each([18, 22] as const)('draft-%i remaining catalog ownership', (draft)
       await flush(128);
       const state = h.player as unknown as { pendingInitTrackSubs: Map<string, unknown> };
       expect(outcome).toBe('pending');
-      expect(state.pendingInitTrackSubs.has('init-hevc')).toBe(true);
+      expect(state.pendingInitTrackSubs.has(JSON.stringify([['review'], 'init-hevc']))).toBe(true);
       expect(h.client.session.getSubscription(h.videoId)).toBeDefined();
       expect(h.client.session.getSubscription(initId)).toBeDefined();
     } finally {
@@ -125,13 +125,11 @@ describe.each([18, 22] as const)('draft-%i remaining catalog ownership', (draft)
       const catalogs = h.requests.filter(r => r.name === 'catalog');
       expect(catalogs).toHaveLength(2);
       const candidateId = catalogs[1]!.id;
-      const state = h.player as unknown as {
-        catalogRecovery: { reqId: bigint; coord: { phase: string } } | null;
-      };
-      expect(state.catalogRecovery?.reqId).toBe(candidateId);
+      const state = h.player as unknown as { catalogSlots: { catalogRecovery: { reqId: bigint; coord: { phase: string } } | null } };
+      expect(state.catalogSlots.catalogRecovery?.reqId).toBe(candidateId);
       await h.goaway(candidateId);
       expect(h.client.session.getSubscription(candidateId)).toBeUndefined();
-      expect(state.catalogRecovery === null).toBe(true);
+      expect(state.catalogSlots.catalogRecovery === null).toBe(true);
       expect(h.client.session.getSubscription(h.videoId)).toBeDefined();
     } finally { await h.destroy(); }
   });
@@ -152,6 +150,38 @@ function statusAdapter() {
     }),
   };
   return adapter;
+}
+
+/** A minimal LOC catalog, enough for a replacement to be adoptable. */
+const STATUS_CATALOG = new TextEncoder().encode(JSON.stringify({
+  version: 1,
+  tracks: [
+    { name: 'video', packaging: 'loc', role: 'video', renderGroup: 1, isLive: true,
+      codec: 'av01.0.08M.10', width: 640, height: 360, bitrate: 500_000 },
+    { name: 'audio', packaging: 'loc', role: 'audio', renderGroup: 1, isLive: true,
+      codec: 'opus', samplerate: 48000, channelConfig: '2', bitrate: 32_000 },
+  ],
+}));
+
+/**
+ * Carry a replacement to adoptable: its catalog accepted and delivered, then
+ * its required media accepted. A graceful handover retires the old session
+ * only once the replacement is usable, so a migration cannot be awaited until
+ * this has happened. This adapter numbers requests 0, 2, 4, … so the catalog
+ * is 0 and the media that follows is 2 and 4.
+ */
+async function acceptStatusReplacement(adapter: ReturnType<typeof statusAdapter>): Promise<void> {
+  await flush(64);
+  adapter.onMessage({ type: 'SUBSCRIBE_OK', requestId: 0n, trackAlias: 100n, parameters: new Map() });
+  adapter.onObject?.(0n, {
+    kind: 'data', trackAlias: 100n, groupId: 0n, subgroupId: 0n, objectId: 0n,
+    publisherPriority: 128, extensions: undefined, payload: STATUS_CATALOG,
+  });
+  await flush(64);
+  for (const [requestId, trackAlias] of [[2n, 102n], [4n, 104n]] as const) {
+    adapter.onMessage({ type: 'SUBSCRIBE_OK', requestId, trackAlias, parameters: new Map() });
+    await flush(64);
+  }
 }
 
 async function statusPlayer(adapter: ReturnType<typeof statusAdapter>) {
@@ -183,7 +213,12 @@ describe('TRACK_STATUS settlement ownership', () => {
     );
     try {
       await flush(64);
-      await player.migrate(newer);
+      const migrating = player.migrate(newer);
+      await acceptStatusReplacement(newer);
+      await migrating;
+      // The replacement's own catalog and media consumed requests 0, 2 and 4,
+      // so this query is the next id it allocates.
+      const statusId = 6n;
       void player.queryTrackStatus('new').then(
         () => { newOutcome = 'resolved'; }, () => { newOutcome = 'rejected'; },
       );
@@ -192,7 +227,7 @@ describe('TRACK_STATUS settlement ownership', () => {
       else gate.reject(new Error('old send failed'));
       await flush(64);
       expect(oldOutcome).toBe('rejected');
-      newer.onMessage({ type: 'REQUEST_OK', requestId: 2n, parameters: new Map() });
+      newer.onMessage({ type: 'REQUEST_OK', requestId: statusId, parameters: new Map() });
       await flush(64);
       expect(newOutcome).toBe('resolved');
     } finally { gate.resolve(); await flush(64); await player.destroy(); }

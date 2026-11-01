@@ -10,8 +10,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Player } from './player.js';
 import { mapLevels } from './level-mapper.js';
-import type { Level } from './types.js';
-import type { CatalogState } from '@openmoq/msf';
+import type { Level, PlayerOptions } from './types.js';
+import type { MoqtPlayerConfig, PlayerEventMap, TypedEmitter } from '@openmoq/player';
+import type { CatalogState, CatalogTrack } from '@openmoq/msf';
 
 // ─── DOM / global mocks ──────────────────────────────────────────────
 
@@ -403,4 +404,192 @@ describe('Player sink choice (MSE <video> vs <canvas>)', () => {
   it('a LOC-only catalog keeps the <canvas> sink', () => {
     expect((receiveCatalog('loc') as any)._activeMediaType).toBe('canvas');
   });
+});
+
+describe('facade composed catalog selection', () => {
+  function preview(options: PlayerOptions, tracks: CatalogState['tracks']) {
+    const player = new Player(mockElement(), options);
+    const engine = (player as unknown as { engine: {
+      config: MoqtPlayerConfig;
+      emitter: TypedEmitter<PlayerEventMap>;
+    } }).engine;
+    const ready = vi.fn();
+    player.on('ready', ready);
+    engine.emitter.emit('catalog_received', { type: 'catalog_received', catalog: { version: 1, tracks } });
+    return { player, engine, ready };
+  }
+  const video = (name: string, extra: Partial<CatalogTrack> = {}): CatalogTrack => ({
+    name, role: 'video', packaging: 'loc', codec: 'avc1.640028', isLive: true, ...extra,
+  });
+  const audio = (name: string, extra: Partial<CatalogTrack> = {}): CatalogTrack => ({
+    name, role: 'audio', packaging: 'loc', codec: 'opus', isLive: true, ...extra,
+  });
+  const base = { url: 'https://relay.example/moq', namespace: 'live/show' };
+
+  it('forwards first-class selection to the engine and previews its scope and alternate set', async () => {
+    const selection = { renderGroup: 2, videoAltGroup: 0 };
+    const h = preview({ ...base, selection }, [
+      video('other', { renderGroup: 1, altGroup: 0, packaging: 'cmaf' }),
+      video('selected', { renderGroup: 2, altGroup: 0 }),
+      video('other-set', { renderGroup: 2, altGroup: 1, packaging: 'cmaf' }),
+    ]);
+    try {
+      expect(h.engine.config.selection).toEqual(selection);
+      expect(h.player.levels.map(l => l.trackName)).toEqual(['selected']);
+      expect(h.player.activeMediaType).toBe('canvas');
+      expect(h.ready).toHaveBeenCalledTimes(1);
+    } finally { await h.player.destroy(); }
+  });
+
+  it('uses the effective escape-hatch selection rather than the first render group', async () => {
+    const h = preview({ ...base, moqtPlayerConfig: { selection: { renderGroup: 2 } } }, [
+      video('other', { renderGroup: 1, altGroup: 1, packaging: 'cmaf' }),
+      video('selected', { renderGroup: 2, altGroup: 1 }),
+    ]);
+    try {
+      expect(h.player.levels.map(l => l.trackName)).toEqual(['selected']);
+      expect(h.player.activeMediaType).toBe('canvas');
+    } finally { await h.player.destroy(); }
+  });
+
+  it('pins a full identity when two tracks share a name', async () => {
+    const h = preview({ ...base, moqtPlayerConfig: {
+      selection: { videoTrack: { name: 'camera', namespace: ['other', 'show'] } },
+    } }, [
+      video('camera', { namespace: 'live/show', altGroup: 1, packaging: 'cmaf', width: 1920 }),
+      video('camera', { namespace: 'other/show', altGroup: 2, width: 640 }),
+    ]);
+    try {
+      expect(h.player.levels.map(l => l.width)).toEqual([640]);
+      expect(h.player.activeMediaType).toBe('canvas');
+    } finally { await h.player.destroy(); }
+  });
+
+  it('discovers the first singleton without laddering unrelated video', async () => {
+    const h = preview(base, [
+      video('singleton'), video('ladder', { altGroup: 1, packaging: 'cmaf' }),
+    ]);
+    try {
+      expect(h.player.levels.map(l => l.trackName)).toEqual(['singleton']);
+      expect(h.player.activeMediaType).toBe('canvas');
+    } finally { await h.player.destroy(); }
+  });
+
+  it('renders selected audio when the scoped video cannot satisfy the cap', async () => {
+    const h = preview({ ...base, moqtPlayerConfig: {
+      selection: { renderGroup: 2 }, capLevelToResolution: { width: 640, height: 360 },
+    } }, [
+      video('unrelated', { renderGroup: 1, altGroup: 1, packaging: 'cmaf', width: 640, height: 360 }),
+      video('too-large', { renderGroup: 2, altGroup: 1, width: 1920, height: 1080 }),
+      audio('selected-audio', { renderGroup: 2 }),
+    ]);
+    try {
+      expect(h.player.levels).toEqual([]);
+      expect(h.player.activeMediaType).toBe('canvas');
+      expect(h.ready).toHaveBeenCalledTimes(1);
+    } finally { await h.player.destroy(); }
+  });
+
+  it('does not announce a render sink when no output was selected', async () => {
+    const h = preview({ ...base, moqtPlayerConfig: { videoConstraints: { codec: 'av01' } } }, [video('video')]);
+    try {
+      expect(h.player.activeMediaType).toBeNull();
+      expect(h.ready).not.toHaveBeenCalled();
+    } finally { await h.player.destroy(); }
+  });
+
+  it('resolves a known active video by its namespace tuple and preserves its eligible member', async () => {
+    const h = preview({ ...base, moqtPlayerConfig: {
+      namespace: ['live/show'],
+      knownTracks: { video: { name: 'camera', codec: 'avc1.640028' } },
+      startLevel: 0,
+    } }, [
+      video('camera', { namespace: 'live/show', renderGroup: 1, altGroup: 9, packaging: 'cmaf' }),
+      video('camera', { renderGroup: 2, altGroup: 0, bitrate: 100 }),
+      video('higher', { renderGroup: 2, altGroup: 0, packaging: 'cmaf', bitrate: 1000 }),
+    ]);
+    try {
+      expect(h.player.levels.map(l => l.trackName)).toEqual(['higher', 'camera']);
+      expect(h.player.activeMediaType).toBe('canvas');
+    } finally { await h.player.destroy(); }
+  });
+
+  it('uses the last engine override when first-class selection is also supplied', async () => {
+    const h = preview({ ...base, selection: { renderGroup: 1 },
+      moqtPlayerConfig: { selection: { renderGroup: 2 } },
+    }, [video('other', { renderGroup: 1 }), video('selected', { renderGroup: 2, packaging: 'cmaf' })]);
+    try {
+      expect(h.engine.config.selection).toEqual({ renderGroup: 2 });
+      expect(h.player.levels.map(l => l.trackName)).toEqual(['selected']);
+      expect(h.player.activeMediaType).toBe('video');
+    } finally { await h.player.destroy(); }
+  });
+
+  it('does not render a known video excluded by the controller resolution cap', async () => {
+    const h = preview({ ...base, moqtPlayerConfig: {
+      knownTracks: { video: { name: 'known', codec: 'avc1.640028' } },
+      capLevelToResolution: { width: 640, height: 360 },
+    } }, [
+      video('known', { altGroup: 0, packaging: 'cmaf', width: 1920, height: 1080 }),
+      video('eligible', { altGroup: 0, width: 640, height: 360 }),
+    ]);
+    try {
+      expect(h.player.levels.map(l => l.trackName)).toEqual(['eligible']);
+      expect(h.player.activeMediaType).toBe('canvas');
+      expect(h.ready).toHaveBeenCalledTimes(1);
+    } finally { await h.player.destroy(); }
+  });
+
+  it('ignores a disabled video pin and renders the explicitly selected audio', async () => {
+    const h = preview({ ...base, selection: { videoTrack: { name: 'missing' }, audioTrack: { name: 'selected' } },
+      moqtPlayerConfig: { disableVideo: true },
+    }, [audio('other'), audio('selected', { packaging: 'cmaf', codec: 'mp4a.40.2' })]);
+    try {
+      expect(h.player.levels).toEqual([]);
+      expect(h.player.activeMediaType).toBe('video');
+      expect(h.ready).toHaveBeenCalledTimes(1);
+    } finally { await h.player.destroy(); }
+  });
+
+  it('keeps the sink on the actual known audio subscription by full namespace identity', async () => {
+    const h = preview({ ...base, audioActivation: 'gesture', moqtPlayerConfig: {
+      namespace: ['live/show'], disableVideo: true,
+      knownTracks: { audio: { name: 'known', codec: 'opus' } },
+    } }, [
+      audio('unsubscribed', { packaging: 'cmaf', codec: 'mp4a.40.2' }),
+      audio('known', { namespace: 'live/show', packaging: 'cmaf', codec: 'mp4a.40.2' }),
+      audio('known'),
+    ]);
+    try {
+      expect(h.player.activeMediaType).toBe('canvas');
+      expect((h.player as unknown as { webAudioRequired: boolean }).webAudioRequired).toBe(true);
+      expect(h.player.levels).toEqual([]);
+    } finally { await h.player.destroy(); }
+  });
+
+  it('reports manual quality for a configured video pin and permits unlocking it', async () => {
+    const h = preview({ ...base, selection: { videoTrack: { name: 'pinned' } } }, [
+      video('pinned', { altGroup: 1 }), video('alternate', { altGroup: 1 }),
+    ]);
+    try {
+      expect(h.player.levels).toHaveLength(2);
+      expect(h.player.autoQuality).toBe(false);
+      await h.player.setQuality('auto');
+      expect(h.player.autoQuality).toBe(true);
+    } finally { await h.player.destroy(); }
+  });
+
+  it('uses exact audio constraints across singletons inside the chosen scope', async () => {
+    const h = preview({ ...base, selection: { renderGroup: 2 },
+      moqtPlayerConfig: { disableVideo: true, audioConstraints: { lang: 'fr' } },
+    }, [audio('unrelated', { renderGroup: 1, lang: 'fr' }),
+      audio('english', { renderGroup: 2, lang: 'en' }),
+      audio('french', { renderGroup: 2, lang: 'fr', packaging: 'cmaf', codec: 'mp4a.40.2' })]);
+    try {
+      expect(h.player.levels).toEqual([]);
+      expect(h.player.activeMediaType).toBe('video');
+      expect(h.ready).toHaveBeenCalledTimes(1);
+    } finally { await h.player.destroy(); }
+  });
+
 });

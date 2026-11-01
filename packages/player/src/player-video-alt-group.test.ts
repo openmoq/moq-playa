@@ -201,7 +201,10 @@ describe('player video alternate groups', () => {
   it('fails an unknown group before sending any media subscription', async () => {
     const h = makePlayer({ videoAltGroup: 99 });
     try {
-      await expect(h.player.load()).rejects.toThrow('Unknown video altGroup: 99');
+      // The composed selection owns this refusal now and names the scope it
+      // searched; what matters is unchanged — it fails, naming the group, and
+      // nothing is subscribed.
+      await expect(h.player.load()).rejects.toThrow(/selection cannot be satisfied.*alternate group 99/);
       expect(h.subscribed()).toEqual([]);
     } finally { await h.player.destroy(); }
   });
@@ -253,7 +256,7 @@ describe('player video alternate groups', () => {
       void callbackSwitch.catch(() => {});
     });
     try {
-      await expect(h.player.load()).rejects.toThrow('Unknown video altGroup');
+      await expect(h.player.load()).rejects.toThrow(/selection cannot be satisfied.*alternate group 99/);
       await expect(callbackSwitch).rejects.toThrow('video selection not ready');
       expect(h.subscribed()).toEqual([]);
     } finally { await h.player.destroy(); }

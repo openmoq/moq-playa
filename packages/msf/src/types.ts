@@ -8,6 +8,8 @@
  * @module
  */
 
+import type { ResolvedTrackNamespace } from './track-identity.js';
+
 /**
  * Allowed packaging values.
  * @see draft-ietf-moq-msf-00 §5.1.12 Table 3
@@ -111,6 +113,35 @@ export interface CatalogTrack {
     readonly isLive: boolean;
     /** @see draft-ietf-moq-msf-00 §5.1.10 — Optional; inherits catalog namespace if absent */
     readonly namespace?: string;
+    /**
+     * Resolved wire namespace — ordered fields plus how they were determined.
+     *
+     * LIBRARY-PRODUCED and never read from catalog JSON: the formats declare
+     * only the `namespace` string, so accepting this from the wire would let a
+     * publisher assert a resolution the syntax cannot express. Parsers set it
+     * from the catalog context; an application supplying normalized tracks may
+     * set it on that explicit entry path.
+     *
+     * Absent means UNRESOLVED — parsed without catalog context — not "no
+     * namespace". `namespace` keeps its declared/inherited text unchanged.
+     *
+     * ENUMERABLE ON PURPOSE. It is normalized application state, so it must
+     * survive the spread-based clone and state operations this library and its
+     * callers use; hiding it would silently drop identity at the first `{...t}`.
+     * The consequence is that it is visible to `JSON.stringify` and to deep
+     * equality, which makes the serialization boundary explicit rather than
+     * incidental:
+     *
+     * - PROTOCOL serialization must project only the format's own fields.
+     *   The catalog builders emit a fixed field set and never this annotation.
+     * - APPLICATION serialization and cloning may keep it, and that is the
+     *   supported way to hand an already-normalized track to this library.
+     * - `JSON.stringify` of normalized state is NOT a catalog-wire serializer.
+     *   Re-parsing that output as raw protocol JSON deliberately ignores the
+     *   annotation, and text that was inherited would be re-read as declared,
+     *   so that round trip is not supported.
+     */
+    readonly resolvedNamespace?: ResolvedTrackNamespace;
     /** @see draft-ietf-moq-msf-00 §5.1.14 */
     readonly role?: TrackRole;
     /** @see draft-ietf-moq-msf-00 §5.1.18 */
@@ -299,6 +330,8 @@ export interface CatalogState {
     /** @see draft-ietf-moq-msf-01 §5.1.5 — publish (reverse-direction) track objects */
     readonly publishTracks?: readonly CatalogTrack[];
 }
+
+export type { ResolvedTrackNamespace } from './track-identity.js';
 
 // ─── Selection types ──────────────────────────────────────────────────
 

@@ -1,5 +1,5 @@
 import { Player } from '@openmoq/playa';
-import { createWebTransport, WebCodecsVideoDecoder } from '@openmoq/browser';
+import { createWebTransport, MseMediaSource, WebCodecsVideoDecoder } from '@openmoq/browser';
 import { MoqtConnection, type WebTransportLike } from '@openmoq/webtransport';
 import type { PlaybackSample } from '../../../scripts/player-acceptance/assessment.mjs';
 import { observeAudio, observeCanvas } from './sinks.js';
@@ -23,6 +23,7 @@ const pin = Uint8Array.from(pinHex.match(/../g)!, (byte) => parseInt(byte, 16)).
 const createTransport = createWebTransport({ certHash: pin, draftVersion: 18 });
 const transports: WebTransportLike[] = [];
 const transportOutcomes: Promise<{ status: string; reason?: string }>[] = [];
+const transportState: Array<{ url: string; openedAtMs: number; closedAtMs: number | null }> = [];
 const events: { timeMs: number; type: string; data: unknown }[] = [];
 const samples: PlaybackSample[] = [];
 let startupError: string | null = null;
@@ -48,6 +49,11 @@ const player = new Player(null, {
     logLevel: params.has('debug') ? 'debug' : 'none',
     locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',
     audioConstraints: { lang: params.get('lang') ?? 'en' },
+    ...(params.get('debug') === 'handover' ? { createMediaSource: () => {
+      const source = new MseMediaSource(video);
+      source.debug = true;
+      return source;
+    } } : {}),
     ...(decodedSource ? { createVideoDecoder: () => decodedSource.wrap(new WebCodecsVideoDecoder()) } : {}),
     createConnection: () => {
       const connection = new MoqtConnection(18);
@@ -59,9 +65,11 @@ const player = new Player(null, {
     createTransport: async (url) => {
       const transport = await createTransport(url);
       transports.push(transport);
+      const state = { url, openedAtMs: performance.now(), closedAtMs: null as number | null };
+      transportState.push(state);
       transportOutcomes.push(transport.closed!.then(
-        () => ({ status: 'closed' }),
-        (error: unknown) => ({ status: 'rejected', reason: String(error) }),
+        () => { state.closedAtMs = performance.now(); return { status: 'closed' }; },
+        (error: unknown) => { state.closedAtMs = performance.now(); return { status: 'rejected', reason: String(error) }; },
       ));
       return transport;
     },
@@ -173,6 +181,8 @@ const acceptance = {
   get presentedFrames() { return canvasObserver?.frames ?? presentedFrames; },
   get currentTime() { return frameOutput ? player.currentTime / 1000 : video.currentTime; },
   get audioRms() { return audioRms(); },
+  get transportState() { return transportState.map(state => ({ ...state })); },
+  get errors() { return events.filter(event => event.type === 'error'); },
   begin(silent: boolean): void {
     if (webAudioOutput) { if (silent) player.mute(); }
     else gain!.gain.value = silent ? 0 : 1;
@@ -186,7 +196,7 @@ const acceptance = {
     recording = false;
     clearInterval(timer);
     const locmafDelivery = locmafObserver?.snapshot();
-    return { samples: [...samples], events: [...events], startupError,
+    return { samples: [...samples], events: [...events], startupError, transportState: [...transportState],
       outputState: { presentedFrames: canvasObserver?.frames ?? presentedFrames,
         currentTime: player.currentTime, audioRms: audioRms(), audioContext: audioContext?.state,
         videoPaused: video.paused, videoTime: video.currentTime, videoReadyState: video.readyState,

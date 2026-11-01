@@ -12,9 +12,12 @@
  * continuous stream (what a real live encoder would produce).
  *
  * Toy limitations (documented, loud):
- * - tfdt version 0 (32-bit) overflows after ~2^32 ticks; rebasing throws
- *   rather than wrapping (regenerate fixtures with v1 tfdt for multi-day
- *   loops — the fixture generator already emits v1 for new fixtures).
+ * - A rebased decode time must fit the tfdt version's unsigned field: 2^32
+ *   for version 0, 2^64 for version 1. Rebasing throws rather than wrapping
+ *   at EITHER width — `setBigUint64` wraps modulo 2^64 silently, which would
+ *   publish an overflowed origin as a plausible small timestamp. Regenerate
+ *   fixtures with v1 tfdt for multi-day loops; the fixture generator already
+ *   emits v1 for new fixtures.
  * - Duration comes from trun per-sample durations or the tfhd default;
  *   fragments relying on trex-only defaults are rejected by analyze (the
  *   fixture validator enforces self-contained fragments).
@@ -22,6 +25,11 @@
  * @module
  */
 import { parseLocmafTrackContext, parseCmafChunk } from '@openmoq/locmaf';
+
+/** Largest value a version-0 (32-bit) tfdt can carry. */
+const U32_MAX = 0xffff_ffffn;
+/** Largest value a version-1 (64-bit) tfdt can carry. */
+const U64_MAX = 0xffff_ffff_ffff_ffffn;
 
 /** Big-endian u32 at `off`. */
 const u32At = (b: Uint8Array, off: number): number =>
@@ -137,6 +145,20 @@ export function analyzeLoopSpan(chunks: readonly Uint8Array[]): bigint | null {
   return last.bmd + last.durationTicks - first.bmd;
 }
 
+/**
+ * Absolute `tfdt` baseMediaDecodeTime of the FIRST fragment, in the track's
+ * timescale, or null when the chunks are not parseable CMAF.
+ *
+ * `analyzeCmafTimeline` reports offsets RELATIVE to the first fragment, which
+ * is what pacing needs and exactly what hides a nonzero media origin. This
+ * reports the absolute value, so a run can record the decode time a subscriber
+ * actually receives first rather than inferring it from a group number.
+ */
+export function firstFragmentBmd(chunks: readonly Uint8Array[]): bigint | null {
+  if (chunks.length === 0) return null;
+  return fragmentTiming(chunks[0]!)?.bmd ?? null;
+}
+
 export interface CmafTimeline {
   readonly timescale: number;
   readonly offsetsMs: readonly number[];
@@ -178,8 +200,12 @@ export function analyzeCmafTimeline(init: Uint8Array, chunks: readonly Uint8Arra
  * `deltaTicks`. The input is never mutated (loop iterations all rebase from
  * the ORIGINAL bytes, so offsets never compound).
  *
- * @throws {Error} when the chunk has no parseable moof/tfdt, or when a
- *   version-0 (32-bit) tfdt would overflow.
+ * @throws {Error} when the chunk has no parseable moof/tfdt, or when the
+ *   resulting decode time does not fit the tfdt version's unsigned field.
+ *   Both widths are checked: `DataView.setBigUint64` wraps modulo 2^64 rather
+ *   than refusing, so an out-of-range 64-bit value would otherwise be
+ *   published as a plausible small timestamp. A NEGATIVE delta is fine as
+ *   long as the resulting decode time is still representable.
  */
 export function rebaseTfdtCopy(chunk: Uint8Array, deltaTicks: bigint): Uint8Array {
   const out = new Uint8Array(chunk);
@@ -191,15 +217,19 @@ export function rebaseTfdtCopy(chunk: Uint8Array, deltaTicks: bigint): Uint8Arra
       const t = parseTraf(out, child);
       if (!t) throw new Error('rebaseTfdtCopy: traf without parseable tfdt/durations');
       const newBmd = t.bmd + deltaTicks;
+      const limit = t.tfdtVersion === 1 ? U64_MAX : U32_MAX;
+      if (newBmd < 0n || newBmd > limit) {
+        throw new Error(
+          `rebaseTfdtCopy: version-${t.tfdtVersion} tfdt out of range `
+          + `(${newBmd} outside 0..${limit})`
+          + (t.tfdtVersion === 0 && newBmd > limit
+            ? ' — regenerate the fixture with 64-bit tfdt for long loops' : ''),
+        );
+      }
       const dv = new DataView(out.buffer, out.byteOffset);
       if (t.tfdtVersion === 1) {
         dv.setBigUint64(t.tfdtPayloadOff, newBmd);
       } else {
-        if (newBmd > 0xffff_ffffn) {
-          throw new Error(
-            `rebaseTfdtCopy: version-0 tfdt overflow (${newBmd} > u32) — regenerate the fixture with 64-bit tfdt for long loops`,
-          );
-        }
         dv.setUint32(t.tfdtPayloadOff, Number(newBmd));
       }
       patched++;

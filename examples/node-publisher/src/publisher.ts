@@ -14,7 +14,7 @@ import { LOCMAF_VERSION } from '@openmoq/locmaf';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { LoadedFixture, LoadedTrack } from './fixture.js';
 import { TrackObjectSource, type MediaPackaging } from './track-packager.js';
-import { analyzeCmafTimeline, type CmafTimeline } from './cmaf-loop-rebase.js';
+import { analyzeCmafTimeline, firstFragmentBmd, type CmafTimeline } from './cmaf-loop-rebase.js';
 
 export type { MediaPackaging } from './track-packager.js';
 
@@ -182,6 +182,18 @@ export function buildFixtureDelta(fixture: LoadedFixture): Uint8Array | null {
 }
 
 /**
+ * Stop an endless loop before it reaches a group number that floating-point
+ * arithmetic can no longer represent exactly — repeating a rounded group
+ * would silently republish one number forever.
+ */
+function assertExactGroup(group: number): number {
+  if (!Number.isSafeInteger(group)) {
+    throw new Error(`loop reached group ${group}, beyond exact integer range — stopping`);
+  }
+  return group;
+}
+
+/**
  * Publish the whole fixture: catalog first, then every media track.
  *
  * `loops` (default 1) repeats the media chunks as a LIVE loop: catalog is published
@@ -189,6 +201,15 @@ export function buildFixtureDelta(fixture: LoadedFixture): Uint8Array | null {
  * track's chunks as a NEW group (groupId 0, 1, 2, …; object IDs 0..N-1 within each
  * group) — never a replay of group 0, so the relay's latest-group cache and the
  * player timeline stay sane. `Infinity` loops until killed.
+ *
+ * `startLoop` (default 0) is the iteration the loop BEGINS at, not an extra
+ * count: the run still sends `loops` groups, numbered `startLoop …
+ * startLoop + loops - 1`, with each iteration's tfdt rebased by
+ * `iteration × loopSpan` as usual. A nonzero value therefore starts the whole
+ * presentation at a real media origin far from zero — what a subscriber
+ * joining an encoder that has been up for a while actually receives — while
+ * WALL-CLOCK pacing still begins immediately, because pacing counts
+ * iterations since launch rather than group numbers.
  *
  * `packaging` (default `cmaf`) selects the media Object format for every track;
  * `locmaf` sends each (rebased) CMAF chunk as one LOCMAF Object with the same
@@ -198,10 +219,22 @@ export function buildFixtureDelta(fixture: LoadedFixture): Uint8Array | null {
 export async function publishFixture(
   conn: MoqtConnection,
   fixture: LoadedFixture,
-  opts: { paceMs?: number; paceByMediaTime?: boolean; loops?: number; catalogFormat?: CatalogFormat; deltaAfterMs?: number; packaging?: MediaPackaging } = {},
+  opts: { paceMs?: number; paceByMediaTime?: boolean; loops?: number; startLoop?: number; catalogFormat?: CatalogFormat; deltaAfterMs?: number; packaging?: MediaPackaging } = {},
 ): Promise<void> {
   const paceMs = opts.paceMs ?? 0;
   const loops = opts.loops ?? 1;
+  // Rejected BEFORE the catalog is published: a bad origin would otherwise be
+  // discovered as NaN group IDs partway through a live publish.
+  const startLoop = opts.startLoop ?? 0;
+  if (!Number.isSafeInteger(startLoop) || startLoop < 0) {
+    throw new Error(`startLoop must be a nonnegative safe integer, got ${String(opts.startLoop)}`);
+  }
+  // `loops` is a COUNT: a positive integer, or Infinity for an endless run.
+  // Checked here so the exact last-group arithmetic below has integers to
+  // convert rather than something that silently becomes a BigInt error.
+  if (loops !== Infinity && (!Number.isSafeInteger(loops) || loops < 1)) {
+    throw new Error(`loops must be a positive safe integer or Infinity, got ${String(opts.loops)}`);
+  }
   const packaging = opts.packaging ?? 'cmaf';
   const catalogFormat = opts.catalogFormat ?? (packaging === 'locmaf' ? 'cmsf-01' : 'msf-00');
   const ns = fixture.manifest.namespace;
@@ -214,6 +247,37 @@ export async function publishFixture(
   const sources = fixture.tracks.map((t) => new TrackObjectSource(t, packaging));
   const timelines = opts.paceByMediaTime ? fixture.tracks.map((t) => analyzeCmafTimeline(t.initData, t.chunks)) : null;
   if (timelines?.some((t) => t === null)) throw new Error('Media-time pacing requires valid CMAF timing for every track');
+
+  // An origin is only usable if the decode times it produces still FIT the
+  // fixture's tfdt fields. Rebasing one group proves that for the whole run's
+  // first group, and doing it here means an unsupported origin is refused
+  // before a catalog or any media reaches the wire, rather than after a
+  // subscriber has started believing a wrapped timeline.
+  for (const s of sources) {
+    try {
+      s.cmafChunksForGroup(startLoop);
+    } catch (e) {
+      throw new Error(
+        `startLoop ${startLoop} is not publishable for track ${s.name}: ${(e as Error).message}`,
+      );
+    }
+  }
+  // Group numbers must stay exact. A finite run's LAST group is known now; an
+  // endless one is checked per iteration below, because it has no last group.
+  //
+  // In BigInt, because the sum is the very thing in question: evaluating
+  // `startLoop + loops - 1` as a Number can ROUND back into safe range —
+  // MAX_SAFE_INTEGER + 2 - 1 is MAX_SAFE_INTEGER — so testing that result
+  // would ask whether the rounded answer is safe, not the real one.
+  if (loops !== Infinity) {
+    const lastGroup = BigInt(startLoop) + BigInt(loops) - 1n;
+    if (lastGroup > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error(
+        `startLoop ${startLoop} with ${loops} loops would end at group `
+        + `${lastGroup}, beyond exact integer range`,
+      );
+    }
+  }
 
   const catalogBytes = buildFixtureCatalog(fixture, catalogFormat, packaging);
   log(`catalog built: ${catalogBytes.byteLength} bytes, ${fixture.tracks.length} tracks (${catalogFormat}, ${packaging})`);
@@ -236,7 +300,7 @@ export async function publishFixture(
     for (const s of sources) {
       const a = alias++;
       await establishTrack(conn, ns, s.name, a);
-      await sendGroup(conn, a, 0n, s.objectsForGroup(0), paceMs, { packaging });
+      await sendGroup(conn, a, BigInt(startLoop), s.objectsForGroup(startLoop), paceMs, { packaging });
     }
     if (deltaTask) await deltaTask; // finite run: don't exit before the delta lands
     log('fixture fully published');
@@ -250,13 +314,22 @@ export async function publishFixture(
   // players at the seam — the timeline-overlap dropper discards replays).
   let alias = 11n;
   const handles: { alias: bigint; source: TrackObjectSource }[] = [];
-  for (const s of sources) {
+  for (const [index, s] of sources.entries()) {
     const a = alias++;
     await establishTrack(conn, ns, s.name, a);
     if (s.spanTicks === null) {
       log(`NOTE: ${s.name} chunks are not parseable CMAF (synthetic fixture?) — loop will replay timestamps`);
     } else {
       log(`${s.name}: loop span ${s.spanTicks} ticks — tfdt rebased per iteration`);
+    }
+    // The decode time a subscriber receives FIRST, read back from the bytes
+    // about to be sent rather than computed from the group number — the group
+    // identifies the iteration, this is the media timing that goes with it.
+    const firstBmd = firstFragmentBmd(s.cmafChunksForGroup(startLoop));
+    if (firstBmd !== null) {
+      const timescale = timelines?.[index]?.timescale;
+      log(`${s.name}: first group ${startLoop} tfdt ${firstBmd} ticks`
+        + (timescale ? ` @${timescale} Hz (${(Number(firstBmd) / timescale).toFixed(3)}s)` : ''));
     }
     handles.push({ alias: a, source: s });
   }
@@ -268,15 +341,20 @@ export async function publishFixture(
     await Promise.all(handles.map(async (h, index) => {
       const timeline = timelines[index]!;
       if (!timeline) throw new Error('Missing track timing');
-      for (let g = 0; g < loops; g++) {
+      // `i` is iterations since launch and `g` is the media/group number.
+      // Pacing must use `i`: scheduling by `g` would hold the FIRST group back
+      // by startLoop × durationMs and start the stream minutes late.
+      for (let i = 0; i < loops; i++) {
+        const g = assertExactGroup(startLoop + i);
         await sendGroup(conn, h.alias, BigInt(g), h.source.objectsForGroup(g), 0, {
-          timeline, startMs: startMs + g * timeline.durationMs,
+          timeline, startMs: startMs + i * timeline.durationMs,
           packaging,
         });
       }
     }));
   } else {
-    for (let g = 0; g < loops; g++) {
+    for (let i = 0; i < loops; i++) {
+      const g = assertExactGroup(startLoop + i);
       await Promise.all(handles.map((h) => sendGroup(conn, h.alias, BigInt(g), h.source.objectsForGroup(g), paceMs, { packaging })));
       log(`group ${g} sent on ${handles.length} track(s)`);
     }

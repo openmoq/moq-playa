@@ -192,6 +192,58 @@ async function resolveConnect(adapter: ReturnType<typeof createMockAdapter>): Pr
 }
 
 /**
+ * Make a migration candidate ADOPTABLE, the way a real relay does.
+ *
+ * Readiness is evidence, not intent: the replacement's catalog subscribe is
+ * answered, its catalog delivered, and each required media subscribe accepted.
+ * Before graceful handover existed these fixtures only had to let `connect()`
+ * resolve, because the old session was retired as soon as the catalog
+ * SUBSCRIBE had been SENT. That is no longer a handover — the player now
+ * waits for the replacement to be usable (§7.4.1) — so the mock peer has to
+ * answer. The alternative would be a shortcut in production that accepts a
+ * replacement nobody answered, which is the behavior these fixtures were
+ * written to pin down in the first place.
+ *
+ * Request ids double as track aliases here, so a fresh adapter reuses the old
+ * session's aliases exactly as a real second relay may.
+ */
+async function acceptReplacement(
+  adapter: ReturnType<typeof createMockAdapter>,
+  catalogJson: string = CATALOG_JSON,
+): Promise<void> {
+  const decode = new TextDecoder();
+  const subscribeIdFor = async (trackName: string): Promise<bigint> => {
+    let index = -1;
+    await vi.waitFor(() => {
+      index = (adapter.subscribe as any).mock.calls.findIndex(
+        (call: unknown[]) => decode.decode(call[1] as Uint8Array) === trackName);
+      expect(index, `replacement subscribed ${trackName}`).toBeGreaterThanOrEqual(0);
+    });
+    return BigInt(await (adapter.subscribe as any).mock.results[index]!.value);
+  };
+  const accept = (id: bigint): void => {
+    adapter._triggerMessage({
+      type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(id), parameters: new Map(),
+    } as unknown as ControlMessage);
+  };
+  const catalogId = await subscribeIdFor('catalog');
+  accept(catalogId);
+  adapter._triggerObject(0n, {
+    kind: 'data',
+    trackAlias: varint(catalogId),
+    groupId: varint(0),
+    subgroupId: varint(0),
+    objectId: varint(0),
+    payload: new TextEncoder().encode(catalogJson),
+  } as MoqtObject);
+  const tracks = (JSON.parse(catalogJson) as { tracks: Array<{ name: string; role?: string }> }).tracks;
+  for (const track of tracks) {
+    if (track.role !== 'video' && track.role !== 'audio') continue;
+    accept(await subscribeIdFor(track.name));
+  }
+}
+
+/**
  * Send SUBSCRIBE_OK for the catalog subscription.
  *
  * §10.4.2: data may arrive before SUBSCRIBE_OK. The player buffers unknown
@@ -234,6 +286,23 @@ describe('catalog subscribe retry intervals and ownership', () => {
     await resolveConnect(adapter);
     await loading;
     return { adapter, player };
+  }
+
+  /**
+   * Accept the two media tracks a replacement asks for after its catalog.
+   *
+   * Fake timers here, so registration is flushed with `advanceTimersByTimeAsync(0)`
+   * rather than `vi.waitFor`. A fresh mock adapter numbers its requests from 1,
+   * so the catalog is 1 and the media that follows is 2 and 3.
+   */
+  async function acceptReplacementMedia(adapter: ReturnType<typeof createMockAdapter>) {
+    for (const id of [2n, 3n]) {
+      await vi.advanceTimersByTimeAsync(0);
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(id), parameters: new Map(),
+      } as ControlMessage);
+    }
+    await vi.advanceTimersByTimeAsync(0);
   }
 
   function rejectCatalog(adapter: ReturnType<typeof createMockAdapter>, retryInterval = 1n) {
@@ -320,14 +389,22 @@ describe('catalog subscribe retry intervals and ownership', () => {
 
   it('does not let a superseded timer suppress the replacement session retry', async () => {
     const { adapter, player } = await loaded();
-    rejectCatalog(adapter);
+    rejectCatalog(adapter); // the old session arms a retry of its own
     const replacement = createMockAdapter();
-    const migrating = player.migrate(replacement);
+    // The replacement's retry now happens INSIDE the handover: a graceful
+    // handover waits for the replacement to be usable, so its own retriable
+    // refusal is retried under the attempt rather than after adoption.
+    const migrating = player.migrate(replacement).catch(() => undefined);
     await resolveConnect(replacement);
-    await migrating;
+    await vi.advanceTimersByTimeAsync(0);
     rejectCatalog(replacement);
     await vi.advanceTimersByTimeAsync(2000);
     expect(replacement.subscribe).toHaveBeenCalledTimes(2);
+    // The attempt is bounded by its own deadline, not by the retry: once it
+    // expires the OLD session is still the current one.
+    await vi.advanceTimersByTimeAsync(11_000);
+    await migrating;
+    expect((player as unknown as { connection: unknown }).connection).toBe(adapter);
   });
 
   it('does not let a completed old retry overwrite the replacement catalog request', async () => {
@@ -343,7 +420,9 @@ describe('catalog subscribe retry intervals and ownership', () => {
     const replacement = createMockAdapter();
     const migrating = player.migrate(replacement);
     await resolveConnect(replacement);
-    await migrating;
+    await vi.advanceTimersByTimeAsync(0);
+    // The OLD session's retry completes LATE, with its own request id, while
+    // the replacement's catalog request is still the pending one.
     finishRetry(varint(2));
     await vi.advanceTimersByTimeAsync(0);
 
@@ -355,6 +434,8 @@ describe('catalog subscribe retry intervals and ownership', () => {
       subgroupId: varint(0), objectId: varint(0),
       payload: new TextEncoder().encode(CATALOG_JSON),
     } as MoqtObject);
+    await acceptReplacementMedia(replacement);
+    await migrating;
     expect(received).toHaveBeenCalledTimes(1);
   });
 
@@ -370,12 +451,14 @@ describe('catalog subscribe retry intervals and ownership', () => {
     const replacement = createMockAdapter();
     const migrating = player.migrate(replacement);
     await resolveConnect(replacement);
-    await migrating;
+    await vi.advanceTimersByTimeAsync(0);
     failRetry(new Error('Old stream closed'));
     await vi.advanceTimersByTimeAsync(0);
 
     const received = vi.fn();
     player.on('catalog_received', received);
+    // The replacement's catalog arrives BEFORE its SUBSCRIBE_OK, so it is held
+    // under the pending request the failed old retry must not have reclaimed.
     replacement._triggerObject(0n, {
       kind: 'data', trackAlias: varint(40), groupId: varint(0),
       subgroupId: varint(0), objectId: varint(0),
@@ -384,6 +467,10 @@ describe('catalog subscribe retry intervals and ownership', () => {
     replacement._triggerMessage({
       type: 'SUBSCRIBE_OK', requestId: varint(1), trackAlias: varint(40), parameters: new Map(),
     } as ControlMessage);
+    await acceptReplacementMedia(replacement);
+    await migrating;
+    // The player had no catalog before this handover, so the adopted one is
+    // its FIRST — announced exactly once.
     expect(received).toHaveBeenCalledTimes(1);
   });
 });
@@ -1477,7 +1564,7 @@ describe('MoqtPlayer', () => {
       );
     });
 
-    it('UNSUBSCRIBES all active subscriptions on GOAWAY (§9.4 SHOULD)', async () => {
+    it('does NOT unsubscribe active subscriptions on GOAWAY receipt (§8.4.1 ordering)', async () => {
       // §9.4: "A subscriber SHOULD individually UNSUBSCRIBE for each
       // existing subscription"
       const adapter = createMockAdapter();
@@ -1522,8 +1609,13 @@ describe('MoqtPlayer', () => {
       // Receive GOAWAY
       adapter._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://new-relay.example.com/moq' });
 
-      // §9.4 SHOULD: UNSUBSCRIBE called for each active media subscription
-      expect(adapter.unsubscribe).toHaveBeenCalledTimes(2);
+      // §9.4's "a subscriber SHOULD individually UNSUBSCRIBE" is ORDERED by
+      // graceful switchover (§8.4.1 / §9.4.1 / §7.4.1): the replacement's
+      // responses come first, "and if they are successful, the subscriptions to
+      // the old relay can be cancelled". Cancelling on receipt tore playback
+      // down while the replacement was still being established. Retirement now
+      // belongs to the handover, so nothing is cancelled here.
+      expect(adapter.unsubscribe).not.toHaveBeenCalled();
     });
 
     it('clears active subscriptions after GOAWAY UNSUBSCRIBE', async () => {
@@ -3922,6 +4014,9 @@ describe('MoqtPlayer', () => {
       const newAdapter = createMockAdapter();
       const migratePromise = player.migrate(newAdapter);
       await resolveConnect(newAdapter);
+      // The replacement answers as soon as it can, which is what makes it
+      // adoptable; the handover then proceeds on its own.
+      await acceptReplacement(newAdapter);
       await migratePromise;
 
       const err = await settled;
@@ -3988,6 +4083,9 @@ describe('MoqtPlayer', () => {
       const newAdapter = createMockAdapter();
       const migratePromise = player.migrate(newAdapter);
       await resolveConnect(newAdapter);
+      // The replacement answers as soon as it can, which is what makes it
+      // adoptable; the handover then proceeds on its own.
+      await acceptReplacement(newAdapter);
       await migratePromise;
 
       // New adapter should have connect called
@@ -4011,6 +4109,9 @@ describe('MoqtPlayer', () => {
       const newAdapter = createMockAdapter();
       const migratePromise = player.migrate(newAdapter);
       await resolveConnect(newAdapter);
+      // The replacement answers as soon as it can, which is what makes it
+      // adoptable; the handover then proceeds on its own.
+      await acceptReplacement(newAdapter);
       await migratePromise;
 
       // Old adapter should be closed
@@ -4026,6 +4127,9 @@ describe('MoqtPlayer', () => {
       const newAdapter = createMockAdapter();
       const migratePromise = player.migrate(newAdapter);
       await resolveConnect(newAdapter);
+      // The replacement answers as soon as it can, which is what makes it
+      // adoptable; the handover then proceeds on its own.
+      await acceptReplacement(newAdapter);
       await migratePromise;
 
       expect(fn).toHaveBeenCalledWith(
@@ -4299,6 +4403,146 @@ describe('MoqtPlayer', () => {
       expect(uriErrors).toHaveLength(1);
     });
   });
+
+  // ─── Graceful handover: prepare the replacement before retiring playback ───
+  //
+  // 16 §3.5 / §8.4.1, 18 §3.6 / §9.4.1, 22 §6.6.1 / §7.4.1: a subscriber that
+  // migrates "starts the process of connecting to a new relay and sending the
+  // SUBSCRIBE requests for all Established subscriptions to the new relay. The
+  // new relay will send a response to the subscribes and IF THEY ARE
+  // SUCCESSFUL, the subscriptions to the old relay can be cancelled."
+  // Response first, then cancel. These pin that ordering.
+  describe('graceful handover readiness (§8.4.1 / §9.4.1 / §7.4.1)', () => {
+    async function loadWithCandidate() {
+      const oldAdapter = createMockAdapter();
+      const newAdapter = createMockAdapter();
+      const createTransport = vi.fn(async () => ({}) as never);
+      let n = 0;
+      const createConnection = vi.fn(() =>
+        (n++ === 0 ? oldAdapter : newAdapter) as unknown as MoqtConnection);
+      const player = new MoqtPlayer({
+        url: 'https://old.example.com/moq',
+        namespace: 'live/broadcast',
+        createConnection,
+        createTransport,
+        catalogBootstrap: 'subscribe',
+      } as MoqtPlayerConfig);
+      const loadPromise = player.load();
+      await resolveConnect(oldAdapter);
+      await loadPromise;
+
+      // Establish the catalog and its media subscriptions on the old session.
+      const catalogReqId = await (oldAdapter.subscribe as never as {
+        mock: { results: Array<{ value: Promise<bigint> }> };
+      }).mock.results[0]!.value;
+      ackCatalog(oldAdapter, BigInt(catalogReqId));
+      oldAdapter._triggerObject(0n, {
+        kind: 'data', trackAlias: catalogReqId,
+        groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        payload: new TextEncoder().encode(CATALOG_JSON),
+      } as MoqtObject);
+      await ackMedia(oldAdapter);
+      const mediaIds = await Promise.all(
+        vi.mocked(oldAdapter.subscribe).mock.results.slice(1).map((r) => r.value),
+      );
+      expect(mediaIds.length).toBeGreaterThan(0);
+      vi.mocked(oldAdapter.unsubscribe).mockClear();
+      return {
+        player, oldAdapter, newAdapter, createTransport, mediaIds,
+        current: () => (player as unknown as { connection: unknown }).connection,
+      };
+    }
+
+    it('does not cancel established media on GOAWAY before the replacement is usable', async () => {
+      const h = await loadWithCandidate();
+      // Park the candidate at its catalog subscribe, so the replacement is
+      // provably not usable yet.
+      const parked = new Promise<never>(() => {});
+      h.newAdapter.subscribe = vi.fn(() => parked as never);
+
+      h.oldAdapter._triggerGoawayNotice({
+        scope: 'session', newSessionUri: 'https://new.example.com/moq',
+      });
+      // Let the candidate genuinely reach its parked catalog subscribe, so the
+      // schedule under test is "replacement in progress", not "never started".
+      await resolveConnect(h.newAdapter);
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+
+      // §8.4.1: old subscriptions are cancelled only after the NEW relay's
+      // responses succeed. Nothing is usable yet, so nothing may be cancelled.
+      expect(vi.mocked(h.oldAdapter.unsubscribe).mock.calls).toEqual([]);
+      await h.player.destroy();
+    });
+
+    it('does not adopt the replacement until its catalog subscribe is answered', async () => {
+      const h = await loadWithCandidate();
+      // The send completes, but the peer never answers: no SUBSCRIBE_OK and no
+      // catalog object. A local write is not a successful response.
+      h.newAdapter.subscribe = vi.fn(async () => varint(0n));
+
+      h.oldAdapter._triggerGoawayNotice({
+        scope: 'session', newSessionUri: 'https://new.example.com/moq',
+      });
+      await resolveConnect(h.newAdapter);
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+
+      // The subscribe was genuinely sent; only the RESPONSE is missing.
+      expect(h.newAdapter.subscribe).toHaveBeenCalled();
+      expect(h.current()).toBe(h.oldAdapter);
+      await h.player.destroy();
+    });
+
+    it('keeps the old session when the replacement refuses the catalog subscribe', async () => {
+      const h = await loadWithCandidate();
+      h.newAdapter.subscribe = vi.fn(async () => {
+        const id = varint(0n);
+        queueMicrotask(() => {
+          h.newAdapter._triggerMessage({
+            type: 'REQUEST_ERROR', requestId: id, errorCode: varint(0x4n),
+            errorReason: 'track not found', parameters: new Map(),
+          } as unknown as ControlMessage);
+        });
+        return id;
+      });
+
+      h.oldAdapter._triggerGoawayNotice({
+        scope: 'session', newSessionUri: 'https://new.example.com/moq',
+      });
+      await resolveConnect(h.newAdapter);
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+
+      // A refused candidate is not a migration: the old peer is still usable.
+      expect(h.current()).toBe(h.oldAdapter);
+      expect(vi.mocked(h.oldAdapter.unsubscribe).mock.calls).toEqual([]);
+      await h.player.destroy();
+    });
+
+    it('reuses the CURRENT endpoint for an empty New Session URI after A to B', async () => {
+      const h = await loadWithCandidate();
+      // A -> B.
+      h.oldAdapter._triggerGoawayNotice({
+        scope: 'session', newSessionUri: 'https://b.example.com/moq',
+      });
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+      await resolveConnect(h.newAdapter);
+      // B becomes the current session only once it is usable, which is what
+      // makes its own New Session URI the one to reuse.
+      await acceptReplacement(h.newAdapter);
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+
+      const afterFirst = h.createTransport.mock.calls.length;
+      // An empty URI on B means "reuse the CURRENT session URI" (§9.4 / §10.4 /
+      // §9.2) — which is B, not the originally configured A.
+      h.newAdapter._triggerGoawayNotice({ scope: 'session', newSessionUri: '' });
+      for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
+
+      const targets = h.createTransport.mock.calls.slice(afterFirst).map((c) => String(c[0]));
+      expect(targets.length).toBeGreaterThan(0);
+      expect(targets.every((t) => t.includes('b.example.com'))).toBe(true);
+      await h.player.destroy();
+    });
+  });
+
 
   // ─── SUBSCRIBE_NAMESPACE (§6.1, §9.25) ─────────────────────────
 
@@ -10283,6 +10527,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await migratePromise;
 
     expect(managerDraft(player)).toBe(18);
@@ -10322,9 +10569,14 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await resolveConnect(a1);
     await loadPromise;
 
-    // Observe the DECODED headers the manager produces.
+    // Observe the DECODED headers the manager produces. The subscription is
+    // registered the way the session owns it — a manager entry alone is a
+    // route no session claims, and the player routes per SOURCE connection so
+    // that it cannot deliver through another session's track.
     const mgr = mgrOf(player);
     mgr.registerTrack(77n, 'video', 'video');
+    (player as unknown as { activeSubscriptions: Map<bigint, { trackAlias: bigint; trackName: string; mediaType: string }> })
+      .activeSubscriptions.set(1177n, { trackAlias: 77n, trackName: 'video', mediaType: 'video' });
     let decoded: { captureTimestamp?: bigint } | undefined;
     mgr.onObject = (_mt, _tn, _obj, headers) => { decoded = headers; };
 
@@ -10333,6 +10585,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await vi.waitFor(() => expect(a1.close).toHaveBeenCalled());
     expect(managerDraft(player)).toBe(18);      // shared manager already migrated
     expect(releaseClose).not.toBeNull();        // migrate is parked on the close
@@ -10393,6 +10648,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await migratePromise;
 
     const mgr = mgrOf(player);
@@ -10421,9 +10679,18 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await migratePromise;
 
-    // The NEW session (a2, now current) buffers an object for an unresolved alias.
+    // The NEW session (a2, now current) buffers an object for an unresolved
+    // alias. Parking only happens while some request on that session is still
+    // awaiting its SUBSCRIBE_OK — with none outstanding nothing could ever
+    // bind the alias, so the data is dropped rather than retained for a future
+    // unrelated request. The adopted session's own requests are all answered
+    // by now, so this stands in for one that is not.
+    (player as unknown as { pendingAliasBinds: Set<bigint> }).pendingAliasBinds.add(4242n);
     a2._triggerObject(7n, locObject(88n, 7n, 'd18-delta-vi64'));
 
     const mgr = mgrOf(player);
@@ -10466,6 +10733,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await vi.waitFor(() => expect(a1.close).toHaveBeenCalled());
     (a2.unsubscribe as ReturnType<typeof vi.fn>).mockClear();
 
@@ -10500,7 +10770,17 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     const a2 = createMockAdapter();
     a2.draftVersion = 18;
     let firedDuringSubscribe = false;
-    a2.subscribe = vi.fn(async () => {
+    let nextMediaId = 8n;
+    a2.subscribe = vi.fn(async (...args: unknown[]) => {
+      const name = new TextDecoder().decode(args[1] as Uint8Array);
+      const options = args[2] as { onRequestId?: (id: bigint) => void } | undefined;
+      if (name !== 'catalog') {
+        const id = nextMediaId;
+        nextMediaId += 2n;
+        options?.onRequestId?.(id);
+        return varint(id);
+      }
+      options?.onRequestId?.(7n);
       // Fast peer: the catalog SUBSCRIBE_OK (reqId 7 → alias 50) arrives DURING
       // subscribe(), before it resolves — must be staged, not dropped by the guard.
       a2.onMessage?.({
@@ -10519,11 +10799,27 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    await vi.waitFor(() => expect(firedDuringSubscribe).toBe(true));
+    a2._triggerObject(0n, {
+      kind: 'data', trackAlias: varint(50n), groupId: varint(0),
+      subgroupId: varint(0), objectId: varint(0),
+      payload: new TextEncoder().encode(CATALOG_JSON),
+    } as MoqtObject);
+    for (const name of ['video', 'audio']) {
+      let index = -1;
+      await vi.waitFor(() => {
+        index = (a2.subscribe as any).mock.calls.findIndex((call: unknown[]) =>
+          new TextDecoder().decode(call[1] as Uint8Array) === name);
+        expect(index).toBeGreaterThanOrEqual(0);
+      });
+      const id = BigInt(await a2.subscribe.mock.results[index]!.value);
+      a2._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(id), parameters: new Map() } as ControlMessage);
+    }
     await migratePromise;
 
     expect(firedDuringSubscribe).toBe(true);
     // The staged SUBSCRIBE_OK was drained after commit → catalog alias resolved.
-    expect((player as unknown as { catalogTrackAlias: bigint | null }).catalogTrackAlias).toBe(50n);
+    expect((player as unknown as { catalogSlots: { catalogTrackAlias: bigint | null } }).catalogSlots.catalogTrackAlias).toBe(50n);
     // The staged object was drained under the NEW session — where no request
     // is outstanding for it, so per request/generation ownership it is
     // DROPPED (unownable), never routed through old-session state.
@@ -10547,6 +10843,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
 
     // The handoff already committed — an old-session close failure is non-fatal.
     await expect(migratePromise).resolves.toBeUndefined();
@@ -10577,7 +10876,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
       } as unknown as ControlMessage);
     });
 
-    await player.migrate(a2 as unknown as MoqtConnection);
+    const wiring = player.migrate(a2 as unknown as MoqtConnection);
+    await acceptReplacement(a2);
+    await wiring;
     expect(handlersAtConnect).toBe(true);
     await player.destroy();
   });
@@ -10602,13 +10903,13 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     expect((player as unknown as { connection: unknown }).connection).toBe(a1);
     expect(a2.close).toHaveBeenCalled();
     // And the old session still processes its control messages.
-    const internal = player as unknown as { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null };
-    internal.catalogRequestId = 3n;
-    internal.catalogTrackAlias = null;
+    const internal = player as unknown as { catalogSlots: { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null } };
+    internal.catalogSlots.catalogRequestId = 3n;
+    internal.catalogSlots.catalogTrackAlias = null;
     a1._triggerMessage({
       type: 'SUBSCRIBE_OK', requestId: varint(3n), trackAlias: varint(9n), parameters: new Map(),
     } as unknown as ControlMessage);
-    expect(internal.catalogTrackAlias).toBe(9n);
+    expect(internal.catalogSlots.catalogTrackAlias).toBe(9n);
     await player.destroy();
   });
 
@@ -10654,13 +10955,13 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // The old session was never superseded — it is still current and still
     // processes its control messages.
     expect((player as unknown as { connection: unknown }).connection).toBe(a1);
-    const internal = player as unknown as { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null };
-    internal.catalogRequestId = 7n;
-    internal.catalogTrackAlias = null;
+    const internal = player as unknown as { catalogSlots: { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null } };
+    internal.catalogSlots.catalogRequestId = 7n;
+    internal.catalogSlots.catalogTrackAlias = null;
     a1._triggerMessage({
       type: 'SUBSCRIBE_OK', requestId: varint(7n), trackAlias: varint(55n), parameters: new Map(),
     } as unknown as ControlMessage);
-    expect(internal.catalogTrackAlias).toBe(55n); // old session STILL authoritative
+    expect(internal.catalogSlots.catalogTrackAlias).toBe(55n); // old session STILL authoritative
     await player.destroy();
   });
 
@@ -10686,6 +10987,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await vi.waitFor(() => expect(a1.close).toHaveBeenCalled());
 
     // The OLD relay drops REMOTELY during the overlap (fires onClose + onError).
@@ -10715,13 +11019,16 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.draftVersion = 18;
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await migratePromise;
 
     // Arrange current state so a MATCHING SUBSCRIBE_OK would resolve the catalog
     // alias — making the mutation observable if the stale message were processed.
-    const internal = player as unknown as { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null };
-    internal.catalogRequestId = 42n;
-    internal.catalogTrackAlias = null;
+    const internal = player as unknown as { catalogSlots: { catalogRequestId: bigint | null; catalogTrackAlias: bigint | null } };
+    internal.catalogSlots.catalogRequestId = 42n;
+    internal.catalogSlots.catalogTrackAlias = null;
 
     // A DELAYED old-session (a1) SUBSCRIBE_OK for that requestId arrives.
     a1._triggerMessage({
@@ -10729,7 +11036,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     } as unknown as ControlMessage);
 
     // The superseded session must not set the current catalog alias.
-    expect(internal.catalogTrackAlias).toBeNull();
+    expect(internal.catalogSlots.catalogTrackAlias).toBeNull();
     await player.destroy();
   });
 
@@ -10753,6 +11060,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     expect(a1.close).not.toHaveBeenCalled();
     const migratePromise = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    // The replacement answers as soon as it can, which is what makes it
+    // adoptable; the handover then proceeds on its own.
+    await acceptReplacement(a2);
     await migratePromise;
 
     expect(a1.close).toHaveBeenCalled();
@@ -10825,6 +11135,58 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     return box;
   };
 
+  /** Let the awaited continuation of a released subscribe register its request. */
+  const settleRegistration = async (): Promise<void> => {
+    for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  };
+
+  /**
+   * Carry a HELD replacement all the way to adoptable.
+   *
+   * `holdSubscribe` parks each request the candidate sends, which used to be
+   * the whole of establishment: releasing the catalog subscribe was enough,
+   * because the old session was retired as soon as that request had been sent.
+   * Graceful handover waits for the replacement to be USABLE, so every held
+   * request now has to be released AND answered: the catalog accepted and
+   * delivered, then each required media track accepted. Ids are assigned from
+   * `firstReqId` upward in the order the candidate asks.
+   */
+  const completeHeldReplacement = async (
+    adapter: ReturnType<typeof createMockAdapter>,
+    held: { release: (r: bigint) => void },
+    firstReqId: bigint,
+  ): Promise<void> => {
+    const calls = (): number => (adapter.subscribe as any).mock.calls.length;
+    const accept = (id: bigint): void => {
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(id), parameters: new Map(),
+      } as unknown as ControlMessage);
+    };
+    let nextId = firstReqId;
+    const issued = calls();
+    held.release(nextId);
+    await settleRegistration();
+    accept(nextId);
+    adapter._triggerObject(0n, {
+      kind: 'data',
+      trackAlias: varint(nextId),
+      groupId: varint(0),
+      subgroupId: varint(0),
+      objectId: varint(0),
+      payload: new TextEncoder().encode(CATALOG_JSON),
+    } as MoqtObject);
+    // CATALOG_JSON selects one video and one audio track; each is requested in
+    // turn, so each is released only once the candidate has asked for it.
+    for (let i = 0; i < 2; i += 1) {
+      nextId += 1n;
+      await vi.waitFor(() => expect(calls()).toBeGreaterThan(issued + i));
+      held.release(nextId);
+      await settleRegistration();
+      accept(nextId);
+    }
+    await settleRegistration();
+  };
+
   it('lifecycle-1: destroy() during an in-flight migration cancels the candidate (no resurrection)', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
@@ -10872,7 +11234,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     expect(a3.connect).not.toHaveBeenCalled();
 
     // The first migration still completes normally.
-    sub.release(9n);
+    await completeHeldReplacement(a2, sub, 9n);
     await m1;
     expect((player as unknown as { connection: unknown }).connection).toBe(a2);
     await player.destroy();
@@ -10994,9 +11356,11 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // Stage an object that will route on drain, and make routing THROW.
     const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
-    mgr.registerTrack(88n, 'video', 'video');
+    // Staged on the alias the REPLACEMENT binds for video (its catalog is 7,
+    // video 8): adoption installs the prepared registrations and drops the
+    // retired session's, so an old-session alias would no longer route.
     a2.onObject?.(9n, {
-      kind: 'data', trackAlias: varint(88n),
+      kind: 'data', trackAlias: varint(8n),
       groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
     } as MoqtObject);
@@ -11005,7 +11369,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // Commit + drain: the staged event throws but is isolated per-event — the
     // now-authoritative session must NOT be rolled back, AND the failure must be
     // surfaced (not silently swallowed).
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await expect(m).resolves.toBeUndefined();
     expect((player as unknown as { connection: unknown }).connection).toBe(a2);
     expect(errorFn).toHaveBeenCalled(); // replay failure routed through the error channel
@@ -11038,10 +11402,12 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // Invoking the SAVED (pre-detach) callback must be inert — never route live.
     const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
-    mgr.registerTrack(88n, 'video', 'video');
+    // Staged on the alias the REPLACEMENT binds for video (its catalog is 7,
+    // video 8): adoption installs the prepared registrations and drops the
+    // retired session's, so an old-session alias would no longer route.
     const routeSpy = vi.spyOn(mgr, 'routeObject');
     savedOnObject?.(9n, {
-      kind: 'data', trackAlias: varint(88n),
+      kind: 'data', trackAlias: varint(8n),
       groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
     } as MoqtObject);
@@ -11077,7 +11443,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     expect(createTransport.mock.calls.length).toBe(callsBefore); // no orphaned transport
     expect(a3.connect).not.toHaveBeenCalled();
 
-    sub.release(9n);
+    await completeHeldReplacement(a2, sub, 9n);
     await m1;
     await player.destroy();
   });
@@ -11106,7 +11472,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2._triggerError(new MoqtConnectionError('subgroup reset during establishment', { errorSource: 'data' }));
     expect(errorFn).not.toHaveBeenCalled(); // deferred, not emitted during establishment
 
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await expect(m).resolves.toBeUndefined();
     expect((player as unknown as { connection: unknown }).connection).toBe(a2);
     expect(errorFn).toHaveBeenCalled(); // the staged diagnostic emits AFTER commit
@@ -11152,7 +11518,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await player.destroy();
   });
 
-  it('control-message parameter bytes count toward the byte limit below the event cap', async () => {
+  it('dispatches a candidate\'s control messages instead of charging them to the buffer', async () => {
     const a1 = createMockAdapter();
     a1.draftVersion = 16;
     const player = new MoqtPlayer(createConfig(a1));
@@ -11168,11 +11534,14 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     await resolveConnect(a2);
     await vi.waitFor(() => expect(a2.subscribe).toHaveBeenCalled());
 
-    // Control messages retaining large parameter byte arrays (no payload at all —
-    // this is what the old flat 1 KiB charge missed): 4 × 64 KiB = 256 KiB each,
-    // so the 8 MiB cap trips after ~32 messages, far below the 512-event cap.
-    // DISTINCT buffers per parameter so the accounting reflects REAL retention,
-    // not a single shared buffer counted many times.
+    // Control messages are no longer RETAINED for a candidate: they are its
+    // readiness evidence — the acceptances and refusals the handover is
+    // waiting on — so they are dispatched against candidate-owned state as
+    // they arrive, and buffering them would make the attempt wait for answers
+    // it had already been given. Nothing is retained, so no amount of them
+    // trips the retained-byte cap, and the candidate stays alive. The cap
+    // still protects against candidate DATA, which is what the byte-limit and
+    // event-cap cases above exercise.
     let sent = 0;
     for (let i = 0; i < 512; i++) {
       if (!a2.onMessage) break; // detached once staging overflows
@@ -11183,14 +11552,18 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
       } as unknown as ControlMessage);
       sent++;
     }
-    expect(sent).toBeGreaterThan(0);
-    expect(sent).toBeLessThan(200); // byte cap from parameters, NOT the 512 event cap
-    expect(a2.close).toHaveBeenCalled();
+    expect(sent).toBe(512);                  // every one dispatched, none retained
+    expect(a2.close).not.toHaveBeenCalled(); // so nothing overflowed the buffer
 
-    sub.release(7n);
-    await expect(m).rejects.toThrow();
+    // None of them answered the candidate's catalog request, so the attempt is
+    // still unfinished and the old session is still the current one.
     expect((player as unknown as { connection: unknown }).connection).toBe(a1);
+    sub.release(7n);
+    // Releasing the request is not an answer to it: nothing accepted the
+    // catalog, so the attempt only ends when it is abandoned. Destroy does
+    // that here rather than waiting out its deadline.
     await player.destroy();
+    await expect(m).rejects.toThrow();
   });
 
   it('a reentrant close during drain terminates without a spurious candidate abort', async () => {
@@ -11218,18 +11591,20 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // must not re-buffer for the closed connection), and migration must NOT be
     // reported successful.
     const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
-    mgr.registerTrack(88n, 'video', 'video');
+    // Staged on the alias the REPLACEMENT binds for video (its catalog is 7,
+    // video 8): adoption installs the prepared registrations and drops the
+    // retired session's, so an old-session alias would no longer route.
     const obj = (alias: bigint): MoqtObject => ({
       kind: 'data', trackAlias: varint(alias),
       groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
     } as MoqtObject);
-    a2.onObject?.(9n, obj(88n));
+    a2.onObject?.(9n, obj(8n));
     a2.onObject?.(10n, obj(999n)); // unknown alias — would re-buffer if drain continued
     let routeCalls = 0;
     vi.spyOn(mgr, 'routeObject').mockImplementation(() => { routeCalls++; a2._triggerClose(0x1, 'reentrant during drain'); });
 
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     // The committed session died during handoff → migration is NOT reported success.
     await expect(m).rejects.toThrow(/session closed during handoff/);
     expect(migrated).not.toHaveBeenCalled();
@@ -11261,9 +11636,11 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // A staged event throws on replay; the error listener ALSO throws.
     const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
-    mgr.registerTrack(88n, 'video', 'video');
+    // Staged on the alias the REPLACEMENT binds for video (its catalog is 7,
+    // video 8): adoption installs the prepared registrations and drops the
+    // retired session's, so an old-session alias would no longer route.
     a2.onObject?.(9n, {
-      kind: 'data', trackAlias: varint(88n),
+      kind: 'data', trackAlias: varint(8n),
       groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
     } as MoqtObject);
@@ -11272,7 +11649,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
 
     // Neither exception may escape: migration completes and the transaction lock
     // is released, so a subsequent migration is not permanently blocked.
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await expect(m).resolves.toBeUndefined();
     expect((player as unknown as { currentMigration: unknown }).currentMigration).toBeNull();
 
@@ -11280,6 +11657,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a3.draftVersion = 18;
     const m3 = player.migrate(a3 as unknown as MoqtConnection); // not locked out
     await resolveConnect(a3);
+    await acceptReplacement(a3);
     await m3;
     expect((player as unknown as { connection: unknown }).connection).toBe(a3);
     await player.destroy();
@@ -11307,15 +11685,17 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // A staged OBJECT (data source) whose replay throws → data-source code, not a
     // generic CONNECTION_LOST.
     const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
-    mgr.registerTrack(88n, 'video', 'video');
+    // Staged on the alias the REPLACEMENT binds for video (its catalog is 7,
+    // video 8): adoption installs the prepared registrations and drops the
+    // retired session's, so an old-session alias would no longer route.
     a2.onObject?.(9n, {
-      kind: 'data', trackAlias: varint(88n),
+      kind: 'data', trackAlias: varint(8n),
       groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
     } as MoqtObject);
     vi.spyOn(mgr, 'routeObject').mockImplementation(() => { throw new Error('data replay boom'); });
 
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await expect(m).resolves.toBeUndefined();
     expect(errors.some((e) => e.code === PlayerErrorCode.DATA_STREAM_RESET)).toBe(true);
     await player.destroy();
@@ -11336,7 +11716,9 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.close = vi.fn(async () => {});
     const m = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
-    // subscribe resolves → commit → drain → retire, which parks on the held a1.close.
+    // The replacement becomes usable → commit → drain → retire, which parks on
+    // the held a1.close.
+    await acceptReplacement(a2);
     await vi.waitFor(() => expect(a1.close).toHaveBeenCalled());
 
     const migrated = vi.fn();
@@ -11379,9 +11761,11 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // Staged event throws on replay; the error listener ALSO throws (emitError
     // throws), so drain falls to log.warn — whose custom logger ALSO throws.
     const mgr = mgrOf(player) as unknown as { registerTrack: (a: bigint, n: string, t: string) => void; routeObject: (...a: unknown[]) => unknown };
-    mgr.registerTrack(88n, 'video', 'video');
+    // Staged on the alias the REPLACEMENT binds for video (its catalog is 7,
+    // video 8): adoption installs the prepared registrations and drops the
+    // retired session's, so an old-session alias would no longer route.
     a2.onObject?.(9n, {
-      kind: 'data', trackAlias: varint(88n),
+      kind: 'data', trackAlias: varint(8n),
       groupId: varint(1), subgroupId: varint(0), objectId: varint(0),
       extensions: new Uint8Array(0), payload: new Uint8Array([0x00]),
     } as MoqtObject);
@@ -11389,7 +11773,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     player.on('session_error', () => { throw new Error('listener boom'); });
 
     // No exception (from the callback, the error listener, or the logger) escapes.
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await expect(m).resolves.toBeUndefined();
     expect((player as unknown as { connection: unknown }).connection).toBe(a2);
     await player.destroy();
@@ -11422,10 +11806,12 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // message, replayed during drain (when the slot is still held).
     a2._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://goaway-target.example.com/moq' });
 
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await m; // first handoff completes → processes the queued GOAWAY
 
     await resolveConnect(a3);
+    // The second replacement must be usable too before it is adopted.
+    await acceptReplacement(a3);
     await vi.waitFor(() => expect((player as unknown as { connection: unknown }).connection).toBe(a3));
     expect(createTransport.mock.calls.some((c) => String(c[0]).includes('goaway-target'))).toBe(true);
     await player.destroy();
@@ -11464,7 +11850,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://goaway-target.example.com/moq' });
     expect(getterReads).toBe(0);
 
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await m;
     expect(getterReads).toBe(0);
     await player.destroy();
@@ -11493,6 +11879,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     a2.close = vi.fn(async () => {});
     const m = player.migrate(a2 as unknown as MoqtConnection);
     await resolveConnect(a2);
+    await acceptReplacement(a2);
     await vi.waitFor(() => expect(a1.close).toHaveBeenCalled()); // parked in retirement
 
     // A LIVE GOAWAY from the committed session while the old close is pending.
@@ -11502,6 +11889,8 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     releaseOldClose!(); // retirement finishes → the queued GOAWAY is processed
     await m;
     await resolveConnect(a3);
+    // The second replacement must be usable too before it is adopted.
+    await acceptReplacement(a3);
     await vi.waitFor(() => expect((player as unknown as { connection: unknown }).connection).toBe(a3));
     expect(cc).toBe(2); // a3 created only when the queued GOAWAY was acted on
     await player.destroy();
@@ -11533,7 +11922,7 @@ describe('MoqtPlayer — LOC wire profile follows the NEGOTIATED draft, not conf
     // it passes the ownership guard and is queued, but its source is a1.
     a1._triggerGoawayNotice({ scope: 'session', newSessionUri: 'https://unwanted-target.example.com/moq' });
 
-    sub.release(7n);
+    await completeHeldReplacement(a2, sub, 7n);
     await m;
     expect((player as unknown as { connection: unknown }).connection).toBe(a2); // caller's replacement kept
 
