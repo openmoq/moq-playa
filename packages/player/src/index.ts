@@ -124,6 +124,10 @@ export type {
   VideoPresentation,
   AudioOutputLike,
   MediaSourceLike,
+  MediaAppendToken,
+  MediaAppendReason,
+  MediaAppendObservation,
+  MediaAppendObserver,
 } from './interfaces.js';
 
 // ─── Command Dispatcher ──────────────────────────────────────────────
@@ -153,6 +157,7 @@ export { selectionIntentFromConfig } from './configured-selection.js';
 export type { QualityControllerConfig, SelectionConstraints, SelectedTracks } from './quality-controller.js';
 /** @experimental Advanced API — may change between minor versions. */
 export { SubscriptionManager } from './subscription-manager.js';
+export type { ObjectRoutingContext, ObjectRoutingProvenance } from './subscription-manager.js';
 export type { TrackPackaging } from './subscription-manager.js';
 export { isMsePackaging, usesMsePath } from './packaging.js';
 export type { LocmafDecoding } from './packaging.js';
@@ -173,3 +178,13 @@ export {
   formatLogMessage,
 } from './trace-recorder.js';
 export type { TraceLimits, TraceLane, TraceRecorderOptions } from './trace-recorder.js';
+
+export type { PlayerDiagnosticConnection, PlayerConnectionObservation, PlayerDiagnosticSnapshot, PlayerDiagnosticTrack, PlayerDiagnosticSubscription, PlayerDiagnosticSource, PlayerDiagnosticFacade } from './diagnostics.js';
+
+export type { CmafAssemblyDiscardReason } from './interfaces.js';
+
+export type { MediaStageObservation, MediaStageObserver, MediaDiagnosticsFactory } from './media-diagnostic-types.js';
+
+export type { VideoFrameObservation, VideoFrameObserver, VideoFrameReason } from './interfaces.js';
+
+export type { AudioScheduleObservation, AudioScheduleObserver, AudioScheduleReason } from './interfaces.js';

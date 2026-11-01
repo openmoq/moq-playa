@@ -19,7 +19,7 @@ describe('legacy package compatibility', () => {
     for (const [subpath, entry] of Object.entries(legacy.exports) as Array<[string, Record<string, string>]>) {
       const target = `${canonical.name}${subpath === '.' ? '' : subpath.slice(1)}`;
       expect(readFileSync(resolve(path, entry.import!), 'utf8')).toBe(`export * from '${target}';\n`);
-      const typesTarget = canonical.name;
+      const typesTarget = subpath === './browser' ? canonical.name : target;
       expect(readFileSync(resolve(path, entry.types!), 'utf8')).toBe(`export * from '${typesTarget}';\n`);
     }
   });

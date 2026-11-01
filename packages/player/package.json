@@ -18,6 +18,10 @@
     "./browser": {
       "import": "./dist/browser/index.js",
       "default": "./dist/browser/index.js"
+    },
+    "./diagnostics": {
+      "types": "./dist/media-diagnostics.d.ts",
+      "import": "./dist/media-diagnostics.js"
     }
   },
   "files": [
@@ -58,5 +62,12 @@
   "scripts": {
     "build": "tsc && tsup",
     "build:browser": "tsup"
+  },
+  "typesVersions": {
+    "*": {
+      "diagnostics": [
+        "./dist/media-diagnostics.d.ts"
+      ]
+    }
   }
 }

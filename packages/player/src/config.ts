@@ -625,7 +625,8 @@ export interface FactoryConfig {
    * @see draft-ietf-moq-cmsf-00 §3.3 (Object Packaging)
    */
   readonly createCmafAssembler?: (options: {
-    onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string, groupId: bigint) => void;
+    onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, trackName: string, groupId: bigint, inputs?: readonly (object | undefined)[]) => void;
+    onDiscard?: (input: object, reason: import('./interfaces.js').CmafAssemblyDiscardReason) => void;
     onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string) => void;
   }) => CmafAssemblerLike;
 

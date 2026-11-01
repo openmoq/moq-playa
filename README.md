@@ -507,6 +507,9 @@ instead of Google Chrome.
 - [Package Compatibility](docs/package-compatibility.md) - Legacy package re-exports and release ordering
 - [Draft Development](docs/draft-development.md) - Draft-22 support and compatibility policy
 - [Playout Trace](docs/playout-trace.md) - Bounded qlog recorder, event design and instrumentation status
+- [Optional Player Diagnostics](packages/devtools/PLAYER.md) - Explicit development or production exposure, bounded capture, and recording
+- [Diagnostic Probe](packages/devtools-probe/PROBE.md) - Owner-local WebTransport probes, protocol policy, and lifecycle
+- [DevTools Extension](tools/devtools-extension/README.md) - Build and load the workspace Chrome panel; inspect an opted-in player or start a separate Probe
 
 ---
 

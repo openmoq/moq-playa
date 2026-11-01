@@ -16,6 +16,8 @@
  * @module
  */
 
+import type { CmafAssemblyDiscardReason } from '@openmoq/player';
+
 import {
   boxType,
   boxSize,
@@ -65,6 +67,7 @@ export interface CmafAssemblerOptions {
     segment: Uint8Array,
     trackName: string,
     groupId: bigint,
+    inputs?: readonly (object | undefined)[],
   ) => void;
   /**
    * Called when a decode-time discontinuity is detected (bmd went
@@ -72,6 +75,8 @@ export interface CmafAssemblerOptions {
    * the assembler maps the new epoch after the prior emitted epoch so MSE
    * still sees one monotonic presentation timeline.
    */
+  /** Optional input outcomes; never carries payloads or affects media delivery. */
+  readonly onDiscard?: (input: object, reason: CmafAssemblyDiscardReason) => void | Promise<void>;
   readonly onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string) => void;
   /**
    * DIAGNOSTIC ONLY — rebase epoch mode; see `CmafAssembler.epochMode`.
@@ -96,6 +101,8 @@ export interface CmafAssemblerOptions {
  */
 export class CmafAssembler {
   private readonly onSegment: CmafAssemblerOptions['onSegment'];
+  private readonly onDiscard: CmafAssemblerOptions['onDiscard'];
+  private pendingInputs: WeakMap<Uint8Array, object> | undefined;
   private readonly onDiscontinuity: CmafAssemblerOptions['onDiscontinuity'];
 
   /**
@@ -241,6 +248,7 @@ export class CmafAssembler {
 
   constructor(options: CmafAssemblerOptions) {
     this.onSegment = options.onSegment;
+    this.onDiscard = options.onDiscard;
     this.onDiscontinuity = options.onDiscontinuity;
     this.epochMode = options.epochMode ?? 'shared';
   }
@@ -345,12 +353,13 @@ export class CmafAssembler {
     trackName: string,
     groupId: bigint,
     payload: Uint8Array,
+    input?: object,
   ): void {
     const selectedTrackName = mediaType === 'video'
       ? this.selectedVideoTrackName
       : this.selectedAudioTrackName;
-    if (selectedTrackName !== null && trackName !== selectedTrackName) return;
-    if (payload.byteLength < 8) return;
+    if (selectedTrackName !== null && trackName !== selectedTrackName) { this.discardInput(input, 'track superseded'); return; }
+    if (payload.byteLength < 8) { this.discardInput(input, 'invalid media'); return; }
 
     // CMAF segments may have prefix boxes before the moof: styp (Segment Type),
     // sidx (Segment Index), etc. Skip past all non-moof/non-mdat boxes to find
@@ -379,6 +388,7 @@ export class CmafAssembler {
           + `(${payload.byteLength}B, first box "${boxType(payload, 0)}") — `
           + `in-band init segments must be handled before the assembler`);
       }
+      this.discardInput(input, 'invalid media');
       return;
     }
     const type = boxType(payload, moofOffset);
@@ -401,11 +411,11 @@ export class CmafAssembler {
           if (size < 8 || pos + size > segment.byteLength) break;
           if (boxType(segment, pos) === 'moof') {
             const chunkMoof = segment.subarray(pos, pos + size);
-            if (!this.patchEpoch(mediaType, trackName, chunkMoof, groupId)) return;
+            if (!this.patchEpoch(mediaType, trackName, chunkMoof, groupId)) { this.discardInput(input, 'epoch refused'); return; }
           }
           pos += size;
         }
-        this.emitSegment(mediaType, segment, trackName, groupId);
+        this.emitSegment(mediaType, segment, trackName, groupId, input === undefined ? undefined : [input]);
         this.flushStartupGeometry();
         return;
       }
@@ -415,26 +425,35 @@ export class CmafAssembler {
       // QUIC stream data. In-place tfdt patching would corrupt it.
       const copy = new Uint8Array(payload.byteLength);
       copy.set(payload);
+      const previous = this.pendingMoofs.get(key);
+      if (input !== undefined) (this.pendingInputs ??= new WeakMap()).set(copy, input);
       this.pendingMoofs.set(key, copy);
+      if (previous) this.discardPending(previous, 'superseded pending moof');
       return;
     }
 
     if (type === 'mdat') {
       const pending = this.pendingMoofs.get(key);
-      if (!pending) return; // Orphaned mdat — drop
+      if (!pending) { this.discardInput(input, 'orphaned media'); return; }
       this.pendingMoofs.delete(key);
 
-      if (!this.patchEpoch(mediaType, trackName, pending, groupId)) return;
+      const priorInput = this.pendingInputs?.get(pending);
+      this.pendingInputs?.delete(pending);
+      if (!this.patchEpoch(mediaType, trackName, pending, groupId)) {
+        this.discardInput(priorInput, 'epoch refused'); this.discardInput(input, 'epoch refused'); return;
+      }
 
       // Concatenate moof + mdat
       const segment = concatBuffers(pending, payload);
-      this.emitSegment(mediaType, segment, trackName, groupId);
+      this.emitSegment(mediaType, segment, trackName, groupId,
+        priorInput === undefined && input === undefined ? undefined : [priorInput, input]);
       this.flushStartupGeometry();
       return;
     }
 
     // Unknown box type — pass through as-is.
-    this.onSegment(mediaType, payload, trackName, groupId);
+    if (input === undefined) this.onSegment(mediaType, payload, trackName, groupId);
+    else this.onSegment(mediaType, payload, trackName, groupId, [input]);
   }
 
   /**
@@ -526,11 +545,13 @@ export class CmafAssembler {
     segment: Uint8Array,
     trackName: string,
     groupId: bigint,
+    inputs?: readonly (object | undefined)[],
   ): void {
     const output = this.maybeStripRaslSamples(mediaType, segment);
     const trex = mediaType === 'video' ? this.videoTrex : this.audioTrex;
     const ranges = readSegmentTimeRanges(output, trex ?? undefined);
-    this.onSegment(mediaType, output, trackName, groupId);
+    if (inputs === undefined) this.onSegment(mediaType, output, trackName, groupId);
+    else this.onSegment(mediaType, output, trackName, groupId, inputs);
     if (ranges !== null && ranges.length > 0) {
       const end = ranges.reduce(
         (max, range) => range.endTime > max ? range.endTime : max,
@@ -556,13 +577,26 @@ export class CmafAssembler {
    * and the other media type are untouched — this is NOT a full reset().
    */
   clearPending(mediaType: 'video' | 'audio'): void {
-    for (const key of [...this.pendingMoofs.keys()]) {
-      if (key.startsWith(`${mediaType}:`)) this.pendingMoofs.delete(key);
+    const removed: Uint8Array[] | undefined = this.pendingInputs ? [] : undefined;
+    for (const [key, bytes] of this.pendingMoofs) {
+      if (key.startsWith(`${mediaType}:`)) { this.pendingMoofs.delete(key); removed?.push(bytes); }
     }
+    if (removed) for (const bytes of removed) this.discardPending(bytes, 'decoder reset');
+  }
+
+  private discardInput(input: object | undefined, reason: CmafAssemblyDiscardReason): void {
+    if (input === undefined || !this.onDiscard) return;
+    try { const pending = this.onDiscard(input, reason); if (pending) void Promise.resolve(pending).catch(() => {}); } catch { /* Optional outcomes never affect reconstruction. */ }
+  }
+
+  private discardPending(bytes: Uint8Array, reason: CmafAssemblyDiscardReason): void {
+    const input = this.pendingInputs?.get(bytes); this.pendingInputs?.delete(bytes);
+    this.discardInput(input, reason);
   }
 
   /** Clear all pending moofs, epoch state, and parsed init defaults. */
   reset(): void {
+    const removed = this.pendingInputs ? [...this.pendingMoofs.values()] : undefined;
     this.pendingMoofs.clear();
     this.videoEpoch = null;
     this.audioEpoch = null;
@@ -597,6 +631,7 @@ export class CmafAssembler {
     this.startupGeometryReported = false;
     this.videoEpochGen = 0;
     this.audioEpochGen = 0;
+    if (removed) for (const bytes of removed) this.discardPending(bytes, 'decoder reset');
   }
 
   /** Release all resources. */

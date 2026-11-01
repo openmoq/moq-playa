@@ -12,6 +12,12 @@ export default defineConfig({
     // covered separately by `smoke:exports`.
     // Mirrors the list in `examples/vite.config.ts`.
     alias: {
+      '@openmoq/devtools-probe': resolve(__dirname, 'packages/devtools-probe/src/index.ts'),
+      '@openmoq/devtools-protocol/fixtures': resolve(__dirname, 'packages/devtools-protocol/src/fixtures.ts'),
+      '@openmoq/devtools-protocol': resolve(__dirname, 'packages/devtools-protocol/src/index.ts'),
+      '@openmoq/devtools/player': resolve(__dirname, 'packages/devtools/src/player.ts'),
+      '@openmoq/devtools': resolve(__dirname, 'packages/devtools/src/index.ts'),
+      '@openmoq/transport/trace-recorder': resolve(__dirname, 'packages/transport/src/qlog/trace-recorder.ts'),
       '@openmoq/transport': resolve(__dirname, 'packages/transport/src/index.ts'),
       '@openmoq/webtransport': resolve(__dirname, 'packages/webtransport/src/index.ts'),
       '@openmoq/quic': resolve(__dirname, 'packages/quic/src/index.ts'),
@@ -19,6 +25,7 @@ export default defineConfig({
       '@openmoq/loc': resolve(__dirname, 'packages/loc/src/index.ts'),
       '@openmoq/locmaf': resolve(__dirname, 'packages/locmaf/src/index.ts'),
       '@openmoq/playback': resolve(__dirname, 'packages/playback/src/index.ts'),
+      '@openmoq/player/diagnostics': resolve(__dirname, 'packages/player/src/media-diagnostics.ts'),
       '@openmoq/player': resolve(__dirname, 'packages/player/src/index.ts'),
       '@openmoq/browser': resolve(__dirname, 'packages/browser/src/index.ts'),
       '@openmoq/playa': resolve(__dirname, 'packages/playa/src/index.ts'),
@@ -27,6 +34,7 @@ export default defineConfig({
   test: {
     include: [
       'packages/*/src/**/*.test.ts',
+      'tools/devtools-extension/src/**/*.test.ts',
       'conformance/media/runner/src/**/*.test.ts',
       'examples/node-relay/src/**/*.test.ts',
       'examples/node-publisher/src/**/*.test.ts',

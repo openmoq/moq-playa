@@ -132,6 +132,10 @@ export class UniPairTopology {
    *  acts on the result (transition to DRAINING, or close on a violation). */
   onControlMessage?: (message: DecodedControlMessage) => void | Promise<void>;
 
+  /** Initial SETUP observation; separate from the post-SETUP control channel. */
+  onSetupCreated?: (message: ControlMessage, length: number) => void;
+  onSetupParsed?: (message: DecodedControlMessage) => void;
+
   /** Called when the control stream violates its draft-18 lifecycle AFTER SETUP:
    *  a message assigned to a Request stream (§3.3; §10 Table 5), a decode failure,
    *  or a FIN/close (the control stream MUST stay open for the session, §3.3). The owner
@@ -283,7 +287,12 @@ export class UniPairTopology {
       this.controlWriter = writer;
       for (const action of actions) {
         if (action.type === 'send_control') {
-          await writer.write(this.codec.encode(action.message));
+          const encoded = this.codec.encode(action.message);
+          this.onSetupCreated?.(action.message, encoded.byteLength);
+          if (this.controlOpenInvalid(epoch)) {
+            throw new Error('UniPairTopology: connection closed during SETUP observation');
+          }
+          await writer.write(encoded);
           if (this.controlOpenInvalid(epoch)) {
             throw new Error('UniPairTopology: SETUP write crossed session termination');
           }
@@ -352,6 +361,10 @@ export class UniPairTopology {
               throw new Error(`UniPairTopology: expected SETUP on the control stream, got ${message.type}`);
             }
             sawSetup = true;
+            this.onSetupParsed?.(message);
+            if (this.controlOpenInvalid(epoch)) {
+              throw new Error('UniPairTopology: connection closed during SETUP observation');
+            }
             const actions = this.session.handleControlMessage(message);
             const closeAction = actions.find(
               (action): action is CloseConnectionAction => action.type === 'close_connection',

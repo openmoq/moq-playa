@@ -9,6 +9,8 @@ packages:
   - examples/node-relay
   # Node media-origin publisher example (fixture-based; pairs with node-relay)
   - examples/node-publisher
+  # Browser extension tooling is private and outside the npm package release set.
+  - tools/devtools-extension
 
 # pnpm blocks dependency build scripts by default. Allow ONLY the example's native
 # WebTransport backend to run its install script, so a plain `pnpm install` fetches

@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Playa</title>
+<link rel="stylesheet" href="panel.css">
+</head>
+<body>
+<div class="root">
+
+  <!-- Header: instance picker · Attach/Probe · Pause · Record · hook stats -->
+  <div class="bar">
+    <div class="picker" id="picker">
+      <span class="dot" id="pickerDot"></span>
+      <span id="pickerName">—</span>
+      <span class="dim" id="pickerMeta"></span>
+      <span class="dimmer">▾</span>
+    </div>
+    <div class="seg">
+      <span class="segBtn" id="btnAttach">Attach</span>
+      <span class="segBtn" id="btnProbe">Probe</span>
+    </div>
+    <span class="btn" id="btnPause">❚❚ Pause</span>
+    <span class="btn" id="btnRec"><span class="recDot" id="recDot"></span><span id="recLabel">Record .moqtrace</span></span>
+    <span class="btn muted" id="btnDev">—</span>
+    <span class="mockTag" id="mockTag" title="Every value on this panel is generated locally. No page or relay has been observed.">MOCK DATA</span>
+    <div class="grow"></div>
+    <span class="stats mono" id="hookStats">—</span>
+  </div>
+  <div class="notice mono hidden" id="resnap"></div>
+  <div class="notice mono hidden" id="ended"></div>
+  <div class="notice mono hidden host" id="hostLine"></div>
+  <div class="pickList hidden" id="pickList"></div>
+
+  <!-- Probe strip: an explicit, owner-local session. -->
+  <div class="probe hidden" id="probeStrip">
+    <span class="probeTag mono">PROBE</span>
+    <input class="field mono wide" id="probeUrl" spellcheck="false" placeholder="https://relay.example:4433/path" title="WebTransport URL (https:// or moqt://). Credentials and fragments are refused.">
+    <input class="field mono" id="probeNs" spellcheck="false" placeholder="namespace fields or JSON array" title="Namespace tuple: comma-separated fields or a JSON string array. Whitespace and empty fields are preserved. Blank = no fields; use JSON for a literal comma or opening bracket.">
+    <input class="field mono" id="probeTracks" spellcheck="false" placeholder="track names (optional, ≤4)" title="Explicit track names: comma-separated or a JSON string array. Whitespace and empty names are preserved. Blank = session setup only; use JSON for a literal comma or opening bracket.">
+    <select class="field mono" id="probeDraft" title="MoQT draft to offer as the WebTransport subprotocol. No auto-detection.">
+      <option value="22" selected>draft 22</option><option value="18">draft 18</option><option value="16">draft 16</option>
+    </select>
+    <label class="probeNote mono" title="Strict refuses a relay that does not confirm the moqt-N subprotocol before SETUP. Compatibility accepts a MISSING observation and is labelled as such."><input type="checkbox" id="probePolicy"> compatibility</label>
+    <span class="go" id="probeGo">Start</span>
+    <span class="btn muted" id="probePresetsBtn" title="Fetch a channels.json from the URL field's origin (/player/channels.json) or from the presets URL you enter. An explicit action; nothing is fetched otherwise.">Presets…</span>
+    <input class="field mono wide hidden" id="probePresetsUrl" spellcheck="false" placeholder="https://host/player/channels.json">
+    <span class="probeStatus mono" id="probeStatus"></span>
+    <div class="presetList hidden" id="probePresetList"></div>
+    <span class="probeNote">This is its own session, so it won't see what the page sees, and it adds load on the relay.</span>
+  </div>
+
+  <!-- Disabled-exposure state -->
+  <div class="empty hidden" id="emptyState">
+    <span class="emptyTitle" id="emptyTitle">No exposed Playa sources found on this page.</span>
+    <span class="emptyBody hidden" id="emptyProbeBody">A probe is your own MoQT session to a relay: enter the WebTransport URL, the namespace tuple, optionally up to four track names, choose the draft, and press Start. Nothing is dialled until you do.</span>
+    <span class="emptyBody" id="emptyBody">A page exposes its player to this tab only when the application installs the optional diagnostics explicitly — <span class="mono light">installPlayerDiagnostics(player, { registry, exposure })</span> from <span class="mono light">@openmoq/devtools/player</span> plus <span class="mono light">installDiagnosticBridge(registry)</span>; nothing is included or collected otherwise. Attach asks for access to this page's origin, then injects a relay into its top frame only; frames and workers report separately. To check a relay without the page, switch to Probe.</span>
+  </div>
+
+  <!-- Attached body -->
+  <div class="body hidden" id="body">
+
+    <div class="bar sub">
+      <div class="seg" id="trackTabs"></div>
+      <span class="stats mono" id="ring">—</span>
+      <div class="grow"></div>
+      <div class="legend mono" id="legend">
+        <span><i class="sw key"></i><span id="legendKey">first object · SAP expected</span></span>
+        <span><i class="sw fast"></i>offset &lt;35 ms</span>
+        <span><i class="sw mid"></i>35–120</span>
+        <span><i class="sw slow"></i>&gt;120</span>
+        <span><i class="sw miss"></i>discarded (stage)</span>
+        <span><i class="sw none"></i>not observed</span>
+        <span id="legendNote" class="note hidden"></span>
+      </div>
+    </div>
+
+    <div class="cols">
+
+      <!-- Left column -->
+      <div class="left">
+        <section>
+          <h4>On this page</h4>
+          <div id="instances"></div>
+        </section>
+        <section>
+          <h4>Session</h4>
+          <div class="kv mono" id="session"></div>
+        </section>
+        <section>
+          <h4>Requests</h4>
+          <div class="reqs mono" id="requests"></div>
+        </section>
+        <section>
+          <h4>Decoder</h4>
+          <div class="kv mono" id="decoder"></div>
+        </section>
+      </div>
+
+      <!-- Center: group/object grid + selected object -->
+      <div class="center">
+        <div class="gridHead mono"><span>group</span><span id="colHeader">—</span><span class="ta-right">retained · offset p50 (retained)</span></div>
+        <div id="rows"></div>
+        <div class="selected mono" id="selected"></div>
+        <span class="hint mono">Click a cell to inspect it. This is a bounded view: each row shows its own window of object ids, an empty cell is simply not observed, and source-supplied group summaries are shown when present.</span>
+      </div>
+
+      <!-- Right: charts + coalesced events -->
+      <div class="right">
+        <div id="sparks"></div>
+        <div class="events">
+          <h4>Events · coalesced</h4>
+          <div id="events"></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+<script type="module" src="panel.js"></script>
+</body>
+</html>

@@ -24,6 +24,8 @@ import { DecoderStateMachine } from './decoder-state.js';
 import { SyncController } from './sync.js';
 import { AdaptiveToleranceController, DEFAULT_TOLERANCE_CONFIG } from './adaptive-tolerance.js';
 import type { RecoveryController } from './recovery.js';
+import { PipelineInputs } from './pipeline-inputs.js';
+import type { PlaybackInputObserver } from './types.js';
 import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig, DecoderFeedback } from './types.js';
 
 // ─── Pipeline ────────────────────────────────────────────────────────
@@ -65,6 +67,25 @@ export class PlaybackPipeline {
 
     /** Headers stored alongside objects, keyed by "groupId:objectId". */
     private readonly headerMap = new Map<string, LocHeaders>();
+
+    private inputState: PipelineInputs | undefined;
+    private playbackRevision = 0;
+    /** Refused diagnostic associations, not rejected media or missing Objects. */
+    get inputEvidenceLossCount(): number { return this.inputState?.lossCount ?? 0; }
+    /**
+     * Each assignment begins a new evidence lifetime without changing buffered
+     * media. Ending observation forgets buffered identities without inventing
+     * media discards; a successor observes only newly admitted identities.
+     */
+    get inputObserver(): PlaybackInputObserver | undefined { return this.inputState?.observer; }
+    set inputObserver(observer: PlaybackInputObserver | undefined) {
+        if (observer !== undefined && typeof observer !== 'function') throw new TypeError('Expected a pipeline input observer');
+        this.inputState?.clear();
+        if (!observer) { this.inputState = undefined; return; }
+        let state: PipelineInputs;
+        state = new PipelineInputs(observer, () => this.inputState === state);
+        this.inputState = state;
+    }
 
     /** Group reference counts in the jitter buffer. */
     private readonly bufferedGroupCounts = new Map<bigint, number>();
@@ -287,7 +308,9 @@ export class PlaybackPipeline {
  * @param obj The MoqtObject (data or gap)
  * @param headers Parsed LocHeaders (only meaningful for data objects)
  */
-    pushObject(obj: MoqtObject, headers?: LocHeaders): void {
+    pushObject(obj: MoqtObject, headers?: LocHeaders, input?: object): void {
+        const inputs = this.inputState;
+        const token = inputs ? input : undefined;
         if (obj.kind === 'gap') {
             // Gap signals — notify gap detector
             if (obj.status === ObjectStatus.END_OF_GROUP) {
@@ -303,34 +326,41 @@ export class PlaybackPipeline {
         // from groups already consumed during normal forward progress.
         // Late-arriving old groups from QUIC reordering can poison decode
         // order and cause blockiness.
-        if (obj.groupId < this.minAcceptGroupId) return;
-        if (this.lastConsumedGroupId >= 0n && obj.groupId < this.lastConsumedGroupId) return;
+        if (obj.groupId < this.minAcceptGroupId) { inputs?.report(token, 'stale group'); return; }
+        if (this.lastConsumedGroupId >= 0n && obj.groupId < this.lastConsumedGroupId) { inputs?.report(token, 'stale group'); return; }
         // Reject already-consumed objects from the current group.
-        if (obj.groupId === this.lastConsumedGroupId && obj.objectId < this.nextExpectedObjectId) return;
+        if (obj.groupId === this.lastConsumedGroupId && obj.objectId < this.nextExpectedObjectId) { inputs?.report(token, 'treated as a replay'); return; }
 
         // Dedup: reject if this (groupId, objectId) is already buffered.
         const key = `${obj.groupId}:${obj.objectId}`;
-        if (this.headerMap.has(key)) return;
+        if (this.headerMap.has(key)) { inputs?.report(token, 'treated as a replay'); return; }
 
+        let discarded: object[] | undefined, refused = false;
         // Data object — try to buffer it
         if (this.buffer.insert(obj)) {
             this.headerMap.set(key, headers ?? {});
+            inputs?.remember(key, token);
             const count = this.bufferedGroupCounts.get(obj.groupId) ?? 0;
             this.bufferedGroupCounts.set(obj.groupId, count + 1);
         } else if (obj.publisherPriority !== undefined) {
             // Buffer full — try priority-aware eviction (§7)
-            if (!this.tryEvictAndInsert(obj, headers) && this.recovery) {
+            if (inputs) discarded = [];
+            refused = !this.tryEvictAndInsert(obj, headers, inputs, token, discarded);
+            if (refused && this.recovery) {
                 this.onEvent({
                     type: 'recovery',
                     action: this.recovery.evaluate({ type: 'buffer_overflow' }),
                 });
             }
-        } else if (this.recovery) {
-            // No priority info, can't evict — notify recovery
-            this.onEvent({
-                type: 'recovery',
-                action: this.recovery.evaluate({ type: 'buffer_overflow' }),
-            });
+        } else {
+            refused = true;
+            if (this.recovery) {
+                // No priority info, can't evict — notify recovery
+                this.onEvent({
+                    type: 'recovery',
+                    action: this.recovery.evaluate({ type: 'buffer_overflow' }),
+                });
+            }
         }
 
         // Interarrival jitter uses transit differences, so the timestamp epoch
@@ -343,6 +373,8 @@ export class PlaybackPipeline {
 
         // Observe group for gap timeout tracking
         this.gapDetector.observeGroup(obj.groupId);
+        inputs?.reportAll(discarded, 'buffer eviction');
+        if (refused) inputs?.report(token, 'buffer full');
     }
 
     /**
@@ -375,6 +407,8 @@ export class PlaybackPipeline {
  *   see a gap and trigger skip_forward (which would reset sync).
  */
     resetForTrackSwitch(firstGroupId: bigint): void {
+        this.playbackRevision++;
+        const inputs = this.inputState, dropped = inputs?.clear();
         // Clear the jitter buffer — old-track encoded objects must not
         // survive into the new decoder configuration. Without this,
         // stale P-frames from the old track drain under the new codec
@@ -394,9 +428,12 @@ export class PlaybackPipeline {
         // from a mid-stream subscription are skipped, not decoded.
         const decision = this.decoderState.notifyGap();
         this.emitFsmDecision(decision);
+        inputs?.reportAll(dropped, 'track superseded');
     }
 
     reset(targetGroupId?: bigint): void {
+        this.playbackRevision++;
+        const inputs = this.inputState, dropped = inputs?.clear();
         this.buffer.clear();
         this.headerMap.clear();
         this.bufferedGroupCounts.clear();
@@ -413,6 +450,7 @@ export class PlaybackPipeline {
         this.adaptiveTolerance?.reset();
         const decision = this.decoderState.notifyGap();
         this.emitFsmDecision(decision);
+        inputs?.reportAll(dropped, 'decoder reset');
     }
 
     /**
@@ -421,6 +459,7 @@ export class PlaybackPipeline {
  * Call this on a regular interval (e.g., requestAnimationFrame or timer).
  */
     tick(): void {
+        const revision = this.playbackRevision;
         // Update adaptive tolerance → push auto-calibrated thresholds to gap detector and sync
         if (this.adaptiveTolerance) {
             const nowMs = this.clock.now() / 1000;
@@ -442,6 +481,8 @@ export class PlaybackPipeline {
             if (top.objectId !== 0n) {
                 this.buffer.extract();
                 this.decrementGroupCount(top.groupId);
+                const key = `${top.groupId}:${top.objectId}`; this.headerMap.delete(key);
+                this.inputState?.report(this.inputState.take(key), 'awaiting keyframe');
                 return; // wait for a keyframe-starting group
             }
             this.lastConsumedGroupId = top.groupId - 1n;
@@ -501,6 +542,7 @@ export class PlaybackPipeline {
 
             // Discard old groups from buffer
             this.discardBefore(target);
+            if (revision !== this.playbackRevision) return;
 
             // NOTE: Sync reset is NOT done here. When two pipelines (audio + video)
             // share a SyncController, both would call reset() during skip_forward,
@@ -526,6 +568,7 @@ export class PlaybackPipeline {
         // point earlier."
         if (this.maxBacklogGroups > 0 && this.bufferedGroupCounts.size > this.maxBacklogGroups) {
             this.shedBacklog();
+            if (revision !== this.playbackRevision) return;
         }
 
         // 4. Throttle: if decoder queue is deep, skip draining.
@@ -612,10 +655,13 @@ export class PlaybackPipeline {
                 // Discard remaining objects in this group — they can't
                 // decode correctly without the missing reference.
                 const skipGroupId = top.groupId;
+                const inputs = this.inputState, dropped: object[] | undefined = inputs ? [] : undefined;
                 while (this.buffer.size > 0) {
                     const peek = this.buffer.peek();
                     if (!peek || peek.groupId !== skipGroupId) break;
                     this.buffer.extract();
+                    const key = `${peek.groupId}:${peek.objectId}`; this.headerMap.delete(key);
+                    const input = inputs?.take(key); if (input) dropped?.push(input);
                     this.decrementGroupCount(skipGroupId);
                 }
                 this.lastConsumedGroupId = skipGroupId;
@@ -623,6 +669,7 @@ export class PlaybackPipeline {
                 // Let decoder know it needs a fresh keyframe
                 const decision = this.decoderState.notifyGap();
                 this.emitFsmDecision(decision);
+                inputs?.reportAll(dropped, 'skipped');
                 break;
             }
 
@@ -631,6 +678,7 @@ export class PlaybackPipeline {
 
             if (obj.kind === 'data') {
                 this.processDataObject(obj);
+                if (revision !== this.playbackRevision) return;
             }
 
             this.nextExpectedObjectId = obj.objectId + 1n;
@@ -651,6 +699,7 @@ export class PlaybackPipeline {
  * After shedding, notifies decoder that a gap occurred (needs keyframe).
  */
     private shedBacklog(): void {
+        const inputs = this.inputState, dropped: object[] | undefined = inputs ? [] : undefined;
         const groupIds = [...this.bufferedGroupCounts.keys()].sort((a, b) =>
             a < b ? -1 : a > b ? 1 : 0,
         );
@@ -666,7 +715,7 @@ export class PlaybackPipeline {
         // Clean up leaked header entries for shed groups
         for (const key of this.headerMap.keys()) {
             const groupId = BigInt(key.split(':')[0]!);
-            if (groupId < cutoff) this.headerMap.delete(key);
+            if (groupId < cutoff) { this.headerMap.delete(key); const input = inputs?.take(key); if (input) dropped?.push(input); }
         }
 
         // Advance consumed position past shed groups
@@ -686,6 +735,7 @@ export class PlaybackPipeline {
             remainingGroups: this.bufferedGroupCounts.size,
             reason: `backlog exceeded ${this.maxBacklogGroups} groups`,
         });
+        inputs?.reportAll(dropped, 'backlog shed');
     }
 
     /**
@@ -715,7 +765,7 @@ export class PlaybackPipeline {
  * @returns true if the incoming object was inserted.
  * @see draft-ietf-moq-transport-16 §7 (Priority-based dropping)
  */
-    private tryEvictAndInsert(obj: MoqtObjectData, headers?: LocHeaders): boolean {
+    private tryEvictAndInsert(obj: MoqtObjectData, headers?: LocHeaders, inputs?: PipelineInputs, token?: object, dropped?: object[]): boolean {
         const evicted = this.buffer.evictLowestImportance();
         if (!evicted) return false; // No evictable candidate
 
@@ -724,10 +774,12 @@ export class PlaybackPipeline {
             this.decrementGroupCount(evicted.groupId);
             const evictedKey = `${evicted.groupId}:${evicted.objectId}`;
             this.headerMap.delete(evictedKey);
+            const evictedInput = inputs?.take(evictedKey); if (evictedInput) dropped?.push(evictedInput);
 
             this.buffer.insert(obj);
             const key = `${obj.groupId}:${obj.objectId}`;
             this.headerMap.set(key, headers ?? {});
+            inputs?.remember(key, token);
             const count = this.bufferedGroupCounts.get(obj.groupId) ?? 0;
             this.bufferedGroupCounts.set(obj.groupId, count + 1);
             return true;
@@ -742,6 +794,7 @@ export class PlaybackPipeline {
         const key = `${obj.groupId}:${obj.objectId}`;
         const headers = this.headerMap.get(key) ?? {};
         this.headerMap.delete(key);
+        const inputs = this.inputState, input = inputs?.take(key), revision = this.playbackRevision;
 
         // 1. Configure decoder if the object carries codec config for this
         //    media type. DecoderStateMachine.configure dedupes equal bytes.
@@ -757,6 +810,8 @@ export class PlaybackPipeline {
                 });
             }
         }
+
+        if (revision !== this.playbackRevision) { inputs?.report(input, 'decoder reset'); return; }
 
         // 2. Establish sync reference.
         //    Audio-master: first audio sample sets the reference (ONCE).
@@ -804,6 +859,7 @@ export class PlaybackPipeline {
                     // drops sufficiently late frames while keeping the newest.
                     renderTimeUs = this.clock.now();
                 } else {
+                    inputs?.report(input, 'late frame');
                     return; // Genuinely late and safe to discard — skip
                 }
             } else if (timing.offsetUs > 5_000_000) {
@@ -826,6 +882,8 @@ export class PlaybackPipeline {
                 this.onCommand({ type: 'set_playback_rate', rate: catchUp.currentRate });
             }
         }
+
+        if (revision !== this.playbackRevision) { inputs?.report(input, 'decoder reset'); return; }
 
         // 4. Create chunk init and feed through decoder FSM
         if (this.mediaType === 'video') {
@@ -870,6 +928,7 @@ export class PlaybackPipeline {
             if (decision.action === 'decode') {
                 this.onCommand({
                     type: 'decode_video',
+                    ...(input && inputs === this.inputState ? { inputToken: input } : {}),
                     chunk: decision.chunk as typeof chunk,
                     renderTimeUs,
                     ...(headers.captureTimestamp !== undefined
@@ -877,6 +936,7 @@ export class PlaybackPipeline {
                         : {}),
                 });
             } else if (decision.action === 'skip') {
+                inputs?.report(input, decision.reason === 'waiting for keyframe' ? 'awaiting keyframe' : 'decoder policy');
                 // Emit keyframe_waiting once per group (avoid per-object spam)
                 if (decision.reason === 'waiting for keyframe' && obj.groupId !== this.lastKeyframeWaitingGroupId) {
                     this.lastKeyframeWaitingGroupId = obj.groupId;
@@ -890,10 +950,11 @@ export class PlaybackPipeline {
             if (decision.action === 'decode') {
                 this.onCommand({
                     type: 'decode_audio',
+                    ...(input && inputs === this.inputState ? { inputToken: input } : {}),
                     chunk: decision.chunk as typeof chunk,
                     renderTimeUs,
                 });
-            }
+            } else { inputs?.report(input, 'decoder policy'); }
         }
     }
 
@@ -913,6 +974,7 @@ export class PlaybackPipeline {
     }
 
     private discardBefore(groupId: bigint): void {
+        const inputs = this.inputState, dropped: object[] | undefined = inputs ? [] : undefined;
         // Remove from buffer
         this.buffer.discardBefore(groupId);
 
@@ -929,8 +991,10 @@ export class PlaybackPipeline {
             const gid = BigInt(key.slice(0, colonIdx));
             if (gid < groupId) {
                 this.headerMap.delete(key);
+                const input = inputs?.take(key); if (input) dropped?.push(input);
             }
         }
+        inputs?.reportAll(dropped, 'skipped');
     }
 
     private decrementGroupCount(groupId: bigint): void {

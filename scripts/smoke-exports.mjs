@@ -13,7 +13,7 @@
  * respects "exports" maps on symlinked packages.
  */
 
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, symlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -40,6 +40,9 @@ const packages = [
   ['player',       '@openmoq/player'],
   ['browser',      '@openmoq/browser'],
   ['playa',        '@openmoq/playa'],
+  ['devtools-protocol', '@openmoq/devtools-protocol'],
+  ['devtools', '@openmoq/devtools'],
+  ['devtools-probe', '@openmoq/devtools-probe'],
 ];
 
 const nm = join(consumerDir, 'node_modules');
@@ -91,7 +94,7 @@ writeFileSync(join(consumerDir, 'package.json'), JSON.stringify({
 
 function testImport(description, code, shouldSucceed = true) {
   try {
-    execSync(`node --input-type=module -e ${JSON.stringify(code)}`, {
+    execFileSync(process.execPath, ['--input-type=module', '-e', code], {
       cwd: consumerDir,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -130,10 +133,49 @@ testImport('@openmoq/playback',        `import '@openmoq/playback'`);
 testImport('@openmoq/player',          `import '@openmoq/player'`);
 testImport('@openmoq/browser resolves', `import.meta.resolve('@openmoq/browser')`);
 testImport('@openmoq/playa resolves', `import.meta.resolve('@openmoq/playa')`);
+testImport('@openmoq/devtools-protocol', `import '@openmoq/devtools-protocol'`);
+testImport('@openmoq/devtools-probe', `import { createProbeRunner } from '@openmoq/devtools-probe'; if (typeof createProbeRunner !== 'function') throw new Error('Missing Probe factory');`);
+testImport('DevTools capture lease', `
+  import { DiagnosticCapture } from '@openmoq/devtools';
+  import { decodeMessage } from '@openmoq/devtools-protocol';
+  import { fixtureSource } from '@openmoq/devtools-protocol/fixtures';
+  const source = new DiagnosticCapture({ source: fixtureSource, clock: { id: 'smoke', now: () => 1 } });
+  const { lease } = source.attach('smoke-owner', 'attach');
+  source.dispose();
+  const frame = decodeMessage(lease.pull());
+  if (!frame.ok || frame.message.kind !== 'batch' || frame.message.events[0]?.fact.kind !== 'source_state') throw new Error('Missing terminal capture fact');
+  lease.close();
+`);
+testImport('DevTools registry and carrier', `
+  import { DiagnosticCapture, DiagnosticRegistry, DiagnosticCarrier, installDiagnosticBridge } from '@openmoq/devtools';
+  import { decodeCarrierReply, encodeCarrierRequest, encodeMessage, PROTOCOL_VERSION } from '@openmoq/devtools-protocol';
+  import { fixtureSource } from '@openmoq/devtools-protocol/fixtures';
+  const registry = new DiagnosticRegistry();
+  registry.register(new DiagnosticCapture({ source: { ...fixtureSource, kind: 'attached' }, clock: { id: 'clock', now: () => 1 } }));
+  const carrier = new DiagnosticCarrier(registry.open('smoke'), { now: () => 1 });
+  const reply = decodeCarrierReply(carrier.start(encodeMessage({ channel: 'openmoq-devtools', version: PROTOCOL_VERSION,
+    kind: 'discover', ownerId: 'smoke', requestId: 'discover' })));
+  if (!reply.ok || reply.packet.kind !== 'reply' || reply.packet.frames.length !== 1) throw new Error('Missing registry reply');
+  const closed = decodeCarrierReply(carrier.receive(encodeCarrierRequest({ kind: 'close' })));
+  if (!closed.ok || closed.packet.kind !== 'closed' || closed.packet.reason !== 'owner-closed') throw new Error('Missing carrier close');
+  if (typeof installDiagnosticBridge !== 'function') throw new Error('Missing opt-in page endpoint');
+  registry.dispose();
+`);
+testImport('@openmoq/devtools/player', `import { installPlayerDiagnostics } from '@openmoq/devtools/player'; if (typeof installPlayerDiagnostics !== 'function') throw new Error('Missing optional player adapter');`);
+
+testImport('@openmoq/player/diagnostics', `import { createMediaDiagnostics } from '@openmoq/player/diagnostics'; void createMediaDiagnostics`);
+testImport('@openmoq/transport/trace-recorder', `import '@openmoq/transport/trace-recorder'`);
+testImport('player and standalone recorder share one implementation', `
+  import { TraceRecorder as playerRecorder, formatLogMessage as playerFormat } from '@openmoq/player';
+  import { TraceRecorder, formatLogMessage } from '@openmoq/transport/trace-recorder';
+  if (playerRecorder !== TraceRecorder || playerFormat !== formatLogMessage) throw new Error('recorder implementation duplicated');
+`);
 
 // ── Named exports (must succeed) ─────────────────────────────────────
 
 console.log('\nNamed exports from roots (must succeed):');
+
+testImport('DevTools protocol fixtures and cursor', `import { decodeMessage, encodeMessage, cursorFromSnapshot, advanceCursor } from '@openmoq/devtools-protocol'; import { snapshotFixture, batchFixture } from '@openmoq/devtools-protocol/fixtures'; const s = decodeMessage(encodeMessage(snapshotFixture)); const b = decodeMessage(encodeMessage(batchFixture)); if (!s.ok || s.message.kind !== 'snapshot' || !b.ok || b.message.kind !== 'batch') throw 1; const result = advanceCursor(cursorFromSnapshot(s.message), b.message); if (result.kind !== 'accept' || result.lost || result.cursor.watermark !== '6') throw 1;`);
 
 testImport('MoqtConnection',     `import { MoqtConnection } from '@openmoq/webtransport'; if (!MoqtConnection) throw 1;`);
 testImport('MoqtConnectionError', `import { MoqtConnectionError } from '@openmoq/webtransport'; if (!MoqtConnectionError) throw 1;`);
@@ -171,6 +213,7 @@ testImport('@openmoq/browser/dist/mse-adapter.js',          `import '@openmoq/br
 testImport('@openmoq/player/dist/player.js',                `import '@openmoq/player/dist/player.js'`, false);
 testImport('@openmoq/webtransport/dist/adapter.js',         `import '@openmoq/webtransport/dist/adapter.js'`, false);
 testImport('@openmoq/quic/dist/connect.js',                  `import '@openmoq/quic/dist/connect.js'`, false);
+testImport('@openmoq/devtools-protocol/dist/model.js',       `import '@openmoq/devtools-protocol/dist/model.js'`, false);
 testImport('@openmoq/transport/dist/session/session.js',    `import '@openmoq/transport/dist/session/session.js'`, false);
 testImport('@openmoq/browser/dist/codec-strategy-h264.js',  `import '@openmoq/browser/dist/codec-strategy-h264.js'`, false);
 testImport('@openmoq/playback/dist/pipeline.js',            `import '@openmoq/playback/dist/pipeline.js'`, false);

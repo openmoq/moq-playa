@@ -1522,11 +1522,11 @@ export class Session {
     if (isDraft22(this._draftVersion)) {
       const properties = msg.trackProperties ?? msg.trackExtensions;
       if (properties instanceof Map) sub.publisherGroupOrder = properties.get(0x22n)?.[0] === 2n ? 'descending' : 'ascending';
-      sub.locationWindow = subscriptionWindow(
-        sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, 22),
-        this.extractLargestObjectParam(msg.parameters) ?? undefined,
-      );
     }
+    sub.locationWindow = subscriptionWindow(
+      sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, this._draftVersion),
+      this.extractLargestObjectParam(msg.parameters) ?? undefined,
+    );
 
     // Register track alias - §9.10/§10.1: duplicate alias must close connection
     const trackInfo = this.subscriptionTracks.get(msg.requestId as bigint);
@@ -1813,7 +1813,7 @@ export class Session {
         if (sub && sub.state !== SubscriptionState.TERMINATED) {
           sub.currentFilter = pending.subscriptionFilter;
           sub.locationWindow = subscriptionWindow(
-            decodeSubscriptionFilter(pending.subscriptionFilter, 22),
+            decodeSubscriptionFilter(pending.subscriptionFilter, this._draftVersion),
             this.extractLargestObjectParam(msg.parameters) ?? undefined,
           );
         }
@@ -3380,6 +3380,9 @@ export class Session {
       if (requestedForward !== undefined) {
         sub.updateForwardState(requestedForward);
       }
+      if (options.subscriptionFilter !== undefined) {
+        sub.locationWindow = subscriptionWindow(options.subscriptionFilter, undefined);
+      }
       if (options.objectDeliveryTimeout !== undefined) {
         sub.requestedDeliveryTimeoutMs = Number(options.objectDeliveryTimeout);
       }
@@ -3396,7 +3399,7 @@ export class Session {
       }
       if (options.objectDeliveryTimeout !== undefined) pending.objectDeliveryTimeoutMs = Number(options.objectDeliveryTimeout);
       if (options.subgroupDeliveryTimeout !== undefined) pending.subgroupDeliveryTimeoutMs = Number(options.subgroupDeliveryTimeout);
-      if (isDraft22(this._draftVersion) && options.subscriptionFilter !== undefined) {
+      if (options.subscriptionFilter !== undefined) {
         pending.subscriptionFilter = parameters.get(MessageParam.SUBSCRIPTION_FILTER)![0] as Uint8Array;
       }
       this.pendingUpdates.set(requestId as bigint, pending);

@@ -1,0 +1,36 @@
+{
+  "name": "playa-devtools-extension",
+  "private": true,
+  "description": "Chrome DevTools panel for Playa. Private: built to dist/, loaded unpacked, never published.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "cd ../.. && vitest run tools/devtools-extension/src",
+    "test:browser": "node test/real-panel.mjs",
+    "test:browser:negative": "node test/real-panel.mjs --mutate-row-cache",
+    "test:browser:slow-frontend": "node test/real-panel.mjs --control=slow-frontend",
+    "test:browser:tab": "node test/real-tab.mjs",
+    "test:owner": "node test/owner-path.mjs",
+    "test:readiness": "node --test test/devtools-frontend.test.mjs",
+    "test:trace": "node --test test/trace-facts.test.mjs",
+    "test:element-metrics": "node --test test/element-metrics.test.mjs",
+    "test:fact-counter": "node --test test/fact-counter.test.mjs",
+    "test:object-wait": "node --test test/probe-object-wait.test.mjs",
+    "test:browser:probe": "node test/real-tab-probe.mjs",
+    "test:browser:live": "node test/real-tab-live.mjs",
+    "test:typecheck:live": "tsc --noEmit -p test/live-page/tsconfig.json",
+    "test:browser:live:production": "node test/real-tab-live.mjs --production",
+    "test:browser:live:negatives": "node test/real-tab-live-negatives.mjs",
+    "test:typecheck:negatives": "tsc --noEmit -p test/tsconfig.silent-publisher.json"
+  },
+  "dependencies": {
+    "@openmoq/devtools": "workspace:*",
+    "@openmoq/devtools-probe": "workspace:*",
+    "@openmoq/devtools-protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1",
+    "vitest": "^3.2.0",
+    "@openmoq/playa": "workspace:*"
+  }
+}

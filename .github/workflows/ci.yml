@@ -1,6 +1,6 @@
 # PR gate. The main package checks are hermetic; the separate native QUIC image
 # job compiles the pinned experimental Node runtime and runs its native smoke.
-# Soaks, fuzz, browser, and differential lanes live in nightly.yml.
+# The DevTools renderer has a local browser gate; expensive media lanes remain separate.
 name: ci
 
 on:
@@ -45,7 +45,7 @@ jobs:
       - name: Typecheck (per package)
         run: |
           set -euo pipefail
-          for p in transport webtransport quic playback loc player browser msf playa; do
+          for p in transport webtransport quic playback loc player browser msf playa devtools-protocol devtools devtools-probe; do
             echo "── tsc: packages/$p"
             pnpm --dir "packages/$p" exec tsc --noEmit
           done
@@ -100,6 +100,134 @@ jobs:
             git diff | head -100
             exit 1
           fi
+
+  devtools-browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+      - name: Build diagnostic capture and extension
+        run: pnpm --filter @openmoq/devtools-probe... --filter playa-devtools-extension... --filter @moqt/example-node-publisher... --filter @moqt/example-node-relay... build
+      - name: Verify the local relay native backend
+        run: pnpm --filter @moqt/example-node-relay exec node --input-type=module -e 'import { quicheLoaded } from "@fails-components/webtransport"; await quicheLoaded; console.log("WebTransport native backend loaded");'
+      - name: Typecheck the live-player application page
+        run: pnpm --filter playa-devtools-extension test:typecheck:live
+      - name: Typecheck the silent-track publisher fixture
+        run: pnpm --filter playa-devtools-extension test:typecheck:negatives
+      - name: Verify frontend readiness deadlines
+        run: pnpm --filter playa-devtools-extension test:readiness
+      - name: Verify Probe object deadlines on read completion
+        run: pnpm --filter playa-devtools-extension test:object-wait
+      - name: Verify parsed recording associations
+        run: pnpm --filter playa-devtools-extension test:trace
+      - name: Verify media-element metric classification
+        run: pnpm --filter playa-devtools-extension test:element-metrics
+      - name: Verify monotonic post-detach fact counting
+        run: pnpm --filter playa-devtools-extension test:fact-counter
+      - name: Verify owner and relay boundaries
+        env:
+          TMPDIR: ${{ runner.temp }}/playa-devtools
+        run: |
+          mkdir -p "$TMPDIR"
+          pnpm --filter playa-devtools-extension test:owner
+      - name: Install pinned Playwright Chromium and display dependencies
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Exercise the page bridge over real MessageChannels
+        env:
+          TMPDIR: ${{ runner.temp }}/playa-devtools
+        run: |
+          mkdir -p "$TMPDIR"
+          pnpm --filter @openmoq/devtools test:browser
+      - name: Render the real DevTools panel
+        env:
+          TMPDIR: ${{ runner.temp }}/playa-devtools
+        run: |
+          mkdir -p "$TMPDIR"
+          xvfb-run -a pnpm --filter playa-devtools-extension test:browser
+      - name: Verify the panel waits for frontend bootstrap
+        env:
+          TMPDIR: ${{ runner.temp }}/playa-devtools
+        run: xvfb-run -a pnpm --filter playa-devtools-extension test:browser:slow-frontend
+      - name: Verify the renderer regression is detected
+        env:
+          TMPDIR: ${{ runner.temp }}/playa-devtools
+        run: xvfb-run -a pnpm --filter playa-devtools-extension test:browser:negative
+      - name: Exercise inspected-tab attachment and navigation
+        env:
+          TMPDIR: ${{ runner.temp }}/playa-devtools
+        run: xvfb-run -a pnpm --filter playa-devtools-extension test:browser:tab
+      - name: Install pinned Chrome for Testing for WebTransport and media playback
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/playa-chrome-linux64.zip"
+          curl --fail --location --silent --show-error --retry 3 \
+            https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.34/linux64/chrome-linux64.zip \
+            --output "$archive"
+          echo "ae8736ac28bc69278551500f219fc749575648263c43ec5990749eff43b9fcf8  $archive" | sha256sum --check --strict
+          unzip -q "$archive" -d "$RUNNER_TEMP/playa-live-browser"
+          echo "PLAYA_DEVTOOLS_LIVE_BROWSER=$RUNNER_TEMP/playa-live-browser/chrome-linux64/chrome" >> "$GITHUB_ENV"
+          echo "PLAYA_DEVTOOLS_PROBE_BROWSER=$RUNNER_TEMP/playa-live-browser/chrome-linux64/chrome" >> "$GITHUB_ENV"
+      - name: Observe Probe objects through a local relay
+        env:
+          TMPDIR: ${{ runner.temp }}/playa-devtools
+        run: xvfb-run -a pnpm --filter playa-devtools-extension test:browser:probe
+      - name: Verify a displaced Probe control fails the browser gate
+        env:
+          TMPDIR: ${{ runner.temp }}/playa-devtools
+        run: xvfb-run -a pnpm --filter playa-devtools-extension exec node test/real-tab-probe.mjs --control=moved-start
+      - name: Install the local media fixture encoder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg unzip
+      - name: Observe live player playback and recording
+        env:
+          TMPDIR: ${{ runner.temp }}/playa-devtools
+        run: xvfb-run -a pnpm --filter playa-devtools-extension test:browser:live
+      - name: Observe a minified production player with explicit diagnostics
+        env:
+          TMPDIR: ${{ runner.temp }}/playa-devtools
+        run: xvfb-run -a pnpm --filter playa-devtools-extension test:browser:live:production
+      - name: Verify player opt-out, source isolation and stalled-media observations
+        env:
+          TMPDIR: ${{ runner.temp }}/playa-devtools
+        run: xvfb-run -a pnpm --filter playa-devtools-extension exec node test/real-tab-live-negatives.mjs
+      - name: Verify the live-player negative controls are discriminating
+        env:
+          TMPDIR: ${{ runner.temp }}/playa-devtools
+        run: |
+          set -euo pipefail
+          for control in discoverable-plain swap-identity objects-on-silent no-pause; do
+            xvfb-run -a pnpm --filter playa-devtools-extension exec node test/real-tab-live-negatives.mjs --control="$control"
+          done
+      - name: Retain browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devtools-browser
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/playa-devtools/playa-devtools-real-panel-*/report.json
+            ${{ runner.temp }}/playa-devtools/playa-devtools-real-panel-*/actual-devtools.png
+            ${{ runner.temp }}/playa-devtools/playa-devtools-real-panel-*/actual-devtools-*.png
+            ${{ runner.temp }}/playa-devtools/playa-devtools-page-bridge-*/report.json
+            ${{ runner.temp }}/playa-devtools/playa-devtools-owner-path-*/report.json
+            ${{ runner.temp }}/playa-devtools/playa-devtools-real-tab-*/report.json
+            ${{ runner.temp }}/playa-devtools/playa-devtools-real-tab-*/devtools.png
+            ${{ runner.temp }}/playa-devtools/playa-devtools-probe-objects-*/report.json
+            ${{ runner.temp }}/playa-devtools/playa-devtools-probe-objects-*/devtools.png
+            ${{ runner.temp }}/playa-devtools/playa-devtools-live-*/report.json
+            ${{ runner.temp }}/playa-devtools/playa-devtools-live-*/devtools.png
+            ${{ runner.temp }}/playa-devtools/playa-devtools-live-prod-*/report.json
+            ${{ runner.temp }}/playa-devtools/playa-devtools-live-prod-*/devtools.png
+            ${{ runner.temp }}/playa-devtools/playa-devtools-live-negatives-*/report.json
+            ${{ runner.temp }}/playa-devtools/playa-devtools-live-negatives-*/*.png
 
   native-quic-image:
     # Main pushes build this exact image in publish-interop-client.yml. Running

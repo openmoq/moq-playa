@@ -39,6 +39,8 @@ interface DecoderOwner {
   readonly decoder: VideoDecoder;
   readonly renderTimes: Map<number, number>;
   readonly sourceTimes: Map<number, SourceTimestamp | null>;
+  /** Lazy identity metadata, bounded by sourceTimes eviction (256 entries). */
+  inputTokens?: Map<number, object>;
   retiredTimestampFloor: number;
   active: boolean;
 }
@@ -123,7 +125,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
 
   // ─── Callbacks ──────────────────────────────────────────────────
 
-  onFrame: ((frame: unknown, renderTimeUs: number, sourceTimestamp?: SourceTimestamp | null) => void) | null = null;
+  onFrame: ((frame: unknown, renderTimeUs: number, sourceTimestamp?: SourceTimestamp | null, inputToken?: object) => void) | null = null;
   onError: ((error: Error) => void) | null = null;
 
   // ─── VideoDecoderLike ───────────────────────────────────────────
@@ -208,7 +210,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
    *
    * @see draft-ietf-moq-loc-01 §2 (LOC payload = EncodedVideoChunk.data)
    */
-  decode(chunk: VideoChunkInit, renderTimeUs: number): void {
+  decode(chunk: VideoChunkInit, renderTimeUs: number, inputToken?: object): void {
     const owner = this.owner;
     if (this.destroyed || !owner?.active || !this.lastCodec || owner.decoder.state !== 'configured') return;
 
@@ -277,7 +279,10 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
       });
       const source = copySourceTimestamp(chunk, encoded.timestamp);
       if (!owner.active || this.owner !== owner) return;
-      this.rememberSource(owner, encoded.timestamp, source);
+      const unique = this.rememberSource(owner, encoded.timestamp, source);
+      if (inputToken && unique && Number.isSafeInteger(encoded.timestamp)) {
+        (owner.inputTokens ??= new Map()).set(encoded.timestamp, inputToken);
+      }
       if (!owner.renderTimes.has(encoded.timestamp) && owner.renderTimes.size >= MAX_SOURCE_TIMESTAMPS) {
         owner.renderTimes.delete(owner.renderTimes.keys().next().value!);
       }
@@ -289,6 +294,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
       if (submittedTimestamp !== undefined && owner.active) {
         if (owner.sourceTimes.has(submittedTimestamp)) owner.sourceTimes.set(submittedTimestamp, null);
         owner.renderTimes.delete(submittedTimestamp);
+        owner.inputTokens?.delete(submittedTimestamp);
       }
       throw this.enrichError(
         err,
@@ -363,11 +369,14 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
         owner.renderTimes.delete(timestamp);
         const source = owner.sourceTimes.get(timestamp) ?? null;
         if (owner.sourceTimes.has(timestamp)) owner.sourceTimes.set(timestamp, null);
+        const inputToken = owner.inputTokens?.get(timestamp);
+        owner.inputTokens?.delete(timestamp);
         if (!this.onFrame) {
           frame.close();
           return;
         }
-        this.onFrame(frame, renderTimeUs, source);
+        if (inputToken === undefined) this.onFrame(frame, renderTimeUs, source);
+        else this.onFrame(frame, renderTimeUs, source, inputToken);
       },
       error: (err: DOMException) => {
         if (!owner?.active || this.destroyed) return;
@@ -409,25 +418,30 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
     return !this.destroyed && revision === this.lifecycleRevision;
   }
 
-  private rememberSource(owner: DecoderOwner, timestamp: number, source: SourceTimestamp | null): void {
+  private rememberSource(owner: DecoderOwner, timestamp: number, source: SourceTimestamp | null): boolean {
     if (owner.sourceTimes.has(timestamp)) {
       // Repeated PTS cannot identify an input, even after its first output.
       owner.sourceTimes.set(timestamp, null);
-      return;
+      owner.inputTokens?.delete(timestamp);
+      return false;
     }
-    if (timestamp <= owner.retiredTimestampFloor) return;
+    if (timestamp <= owner.retiredTimestampFloor) return false;
     if (owner.sourceTimes.size >= MAX_SOURCE_TIMESTAMPS) {
       const oldest = owner.sourceTimes.keys().next().value!;
       owner.retiredTimestampFloor = Math.max(owner.retiredTimestampFloor, oldest);
       owner.sourceTimes.delete(oldest);
+      owner.inputTokens?.delete(oldest);
     }
     owner.sourceTimes.set(timestamp, source);
+    return true;
   }
 
   private retireOwner(owner: DecoderOwner): void {
     owner.active = false;
     owner.sourceTimes.clear();
     owner.renderTimes.clear();
+    owner.inputTokens?.clear();
+    delete owner.inputTokens;
     this.owners.delete(owner);
     if (this.owner === owner) {
       this.owner = null;

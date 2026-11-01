@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Playa live diagnostics gate</title>
+    <link rel="icon" href="data:,">
+    <style>
+      body { margin: 24px; background: #202020; color: white; font: 16px sans-serif; }
+      video, canvas { display: block; width: 640px; max-width: 100%; aspect-ratio: 16 / 9; background: black; }
+      [hidden] { display: none; }
+      button { margin-top: 16px; font-size: 18px; padding: 8px 18px; }
+      pre { font: 12px monospace; color: #9ad; }
+    </style>
+  </head>
+  <body>
+    <h1>Real Playa player with explicitly installed diagnostics</h1>
+    <video id="video" playsinline muted></video>
+    <canvas id="canvas" hidden></canvas>
+    <button id="start" type="button">Start playback</button>
+    <pre id="status">idle</pre>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

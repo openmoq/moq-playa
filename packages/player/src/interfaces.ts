@@ -47,7 +47,7 @@ export interface VideoDecoderLike {
    * Decode a video chunk. Frames are delivered via the onFrame callback.
    * @see draft-ietf-moq-loc-01 §2 (LOC payload = EncodedVideoChunk.data)
    */
-  decode(chunk: VideoChunkInit, renderTimeUs: number): void;
+  decode(chunk: VideoChunkInit, renderTimeUs: number, inputToken?: object): void;
 
   /** Flush pending frames. Resolves when all pending frames are decoded. */
   flush(): Promise<void>;
@@ -69,7 +69,7 @@ export interface VideoDecoderLike {
    * this output's decode input; null/omitted means unavailable, never guessed from
    * the latest input or catalog. It is not a render observation or track identity.
    */
-  onFrame: ((frame: unknown, renderTimeUs: number, sourceTimestamp?: SourceTimestamp | null) => void) | null;
+  onFrame: ((frame: unknown, renderTimeUs: number, sourceTimestamp?: SourceTimestamp | null, inputToken?: object) => void) | null;
 
   /** Callback: decode error occurred. */
   onError: ((error: Error) => void) | null;
@@ -103,7 +103,7 @@ export interface AudioDecoderLike {
    * Decode an audio chunk. Data is delivered via the onData callback.
    * @see draft-ietf-moq-loc-01 §2 (LOC payload = EncodedAudioChunk.data)
    */
-  decode(chunk: AudioChunkInit, renderTimeUs: number): void;
+  decode(chunk: AudioChunkInit, renderTimeUs: number, inputToken?: object): void;
 
   /** Flush pending audio data. */
   flush(): Promise<void>;
@@ -115,7 +115,7 @@ export interface AudioDecoderLike {
   readonly queueDepth: number;
 
   /** Callback: decoded audio data ready for playout. */
-  onData: ((data: unknown, renderTimeUs: number) => void) | null;
+  onData: ((data: unknown, renderTimeUs: number, inputToken?: object) => void) | null;
 
   /** Callback: decode error occurred. */
   onError: ((error: Error) => void) | null;
@@ -142,12 +142,23 @@ export interface VideoPresentation {
  * Implementations: Canvas2D, WebGL, OffscreenCanvas.
  * MUST call frame.close() after rendering (GPU memory management).
  */
+export type VideoFrameReason = 'destroyed' | 'flushed' | 'late frame' | 'draw failed' | 'completion unproven';
+export interface VideoFrameObservation {
+  readonly token: object;
+  readonly state: 'scheduled' | 'presented' | 'discarded' | 'unavailable';
+  readonly reason: VideoFrameReason | null;
+}
+export type VideoFrameObserver = (event: VideoFrameObservation) => void | Promise<void>;
+
 export interface VideoRendererLike {
   /** Most recent successful render observation; null when draw order or timing is unavailable. */
   readonly videoPresentation?: VideoPresentation | null;
 
   /** Enqueue a decoded frame for presentation at the specified time. */
-  enqueue(frame: unknown, renderTimeUs: number): void;
+  enqueue(frame: unknown, renderTimeUs: number, token?: object): void;
+
+  /** Optional real queue/draw outcomes. No token or event history is retained without observation. */
+  observeFrames?(observer: VideoFrameObserver): () => void;
 
   /** Discard all queued frames. MUST close() all held frames. */
   flush(): void;
@@ -179,9 +190,20 @@ export interface VideoRendererLike {
  *
  * Implementations: WebAudio AudioContext, MediaRecorder, NullOutput.
  */
+export type AudioScheduleReason = 'destroyed' | 'flushed' | 'schedule failed';
+export interface AudioScheduleObservation {
+  readonly token: object;
+  readonly state: 'scheduled' | 'discarded' | 'released';
+  readonly reason: AudioScheduleReason | null;
+}
+export type AudioScheduleObserver = (event: AudioScheduleObservation) => void | Promise<void>;
+
 export interface AudioOutputLike {
   /** Schedule an audio chunk for playout. */
-  schedule(data: unknown, renderTimeUs: number): void;
+  schedule(data: unknown, renderTimeUs: number, token?: object): void;
+
+  /** Optional scheduling evidence. Released ends ownership, not proof of audible output. */
+  observeSchedules?(observer: AudioScheduleObserver): () => void;
 
   /** Cancel all scheduled audio. */
   flush(): void;
@@ -215,6 +237,17 @@ export interface AudioOutputLike {
 }
 
 // ─── Layer 5: MediaSource (CMAF/MSE Fallback) ─────────────────────────
+
+/** Caller-owned opaque identity for one append; use a fresh object for every call. */
+export type MediaAppendToken = object;
+export type MediaAppendReason = 'destroyed' | 'not attached' | 'stale group' | 'treated as a replay' | 'append error' | 'retype' | 'flushed' | 'decoder reset' | 'append aborted' | 'completion unproven';
+/** A terminal observation; unavailable does not assert a media discard or success. */
+export interface MediaAppendObservation {
+  readonly token: MediaAppendToken;
+  readonly state: 'appended' | 'discarded' | 'unavailable';
+  readonly reason: MediaAppendReason | null;
+}
+export type MediaAppendObserver = (event: MediaAppendObservation) => void | Promise<void>;
 
 /**
  * MediaSource adapter interface for CMAF-packaged tracks.
@@ -275,7 +308,18 @@ export interface MediaSourceLike {
     data: Uint8Array,
     trackName: string,
     groupId?: bigint,
+    token?: MediaAppendToken,
   ): void;
+
+  /**
+   * Optional actual append completion/policy outcomes. Each token belongs to
+   * one append. No outcome history is replayed on attachment. If no listener
+   * exists at submission, the token is not retained. Last-listener detach
+   * suppresses events while detached; existing media operations continue.
+   * A newly attached listener may observe a later completion of an already
+   * token-bearing operation, but no past terminal is replayed.
+   */
+  observeAppends?(observer: MediaAppendObserver): () => void;
 
   /**
    * Re-initialize a SourceBuffer for a new codec / init segment.
@@ -433,12 +477,15 @@ export interface MediaSourceLike {
  *
  * @see draft-ietf-moq-cmsf-01 §3.3 (Object Packaging — moof+mdat)
  */
+export type CmafAssemblyDiscardReason = 'track superseded' | 'invalid media' | 'orphaned media' | 'epoch refused' | 'superseded pending moof' | 'decoder reset';
+
 export interface CmafAssemblerLike {
   push(
     mediaType: 'video' | 'audio',
     trackName: string,
     groupId: bigint,
     payload: Uint8Array,
+    input?: object,
   ): void;
   /**
    * Hand the assembler an init segment so it can extract trex defaults

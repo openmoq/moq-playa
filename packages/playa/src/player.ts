@@ -96,6 +96,9 @@ export class Player {
 
   // ─── Internals ───────────────────────────────────────────────────
 
+  /** App-side observation target; one facade and its engine are one diagnostic source. */
+  get diagnosticSource(): MoqtPlayer { return this.engine; }
+
   private readonly engine: MoqtPlayer;
   private presentationRetired = false;
   private readonly emitter = new TypedEmitter<PlayerEventMap>();

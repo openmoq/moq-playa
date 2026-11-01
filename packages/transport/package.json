@@ -10,10 +10,19 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "trace-recorder": ["./dist/qlog/trace-recorder.d.ts"]
+    }
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./trace-recorder": {
+      "types": "./dist/qlog/trace-recorder.d.ts",
+      "import": "./dist/qlog/trace-recorder.js"
     },
     "./browser": {
       "import": "./dist/browser/index.js",

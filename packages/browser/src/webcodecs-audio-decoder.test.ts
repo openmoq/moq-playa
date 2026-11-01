@@ -21,7 +21,7 @@ describe('WebCodecsAudioDecoder', () => {
     decodeQueueSize: number;
     output: (data: unknown) => void;
     error: (error: DOMException) => void;
-    lastConfig?: AudioDecoderConfig;
+    lastConfig?: AudioDecoderConfig | undefined;
     decoded: unknown[];
   }>;
 
@@ -30,7 +30,7 @@ describe('WebCodecsAudioDecoder', () => {
     createdDecoders = [];
 
     class MockAudioDecoder {
-      state: AudioDecoderState = 'unconfigured';
+      state: AudioDecoder['state'] = 'unconfigured';
       decodeQueueSize = 0;
       readonly output: (data: unknown) => void;
       readonly error: (error: DOMException) => void;
@@ -80,7 +80,7 @@ describe('WebCodecsAudioDecoder', () => {
     return { type: 'key', timestamp, duration: 20_000, data: new Uint8Array([1, 2, 3]) };
   }
 
-  it('pairs each decoder output with its submitted render time (FIFO)', () => {
+  it('pairs each decoder output with its submitted timestamp and render time', () => {
     const decoder = configuredDecoder();
     const received: number[] = [];
     decoder.onData = (_data, renderTimeUs) => received.push(renderTimeUs);
@@ -90,13 +90,41 @@ describe('WebCodecsAudioDecoder', () => {
     decoder.decode(chunk(3), 300);
 
     const mock = createdDecoders[0]!;
-    mock.output({});
-    mock.output({});
-    mock.output({});
+    mock.output({ timestamp: 1 });
+    mock.output({ timestamp: 2 });
+    mock.output({ timestamp: 3 });
 
     expect(received).toEqual([100, 200, 300]);
   });
 
+  it('does not shift later render times when priming consumes the first input without an output', () => {
+    const decoder = configuredDecoder('mp4a.40.2'), times: number[] = [];
+    decoder.onData = (_data, time) => { times.push(time); };
+    decoder.decode(chunk(0), 100_000); decoder.decode(chunk(20_000), 120_000); decoder.decode(chunk(40_000), 140_000);
+    createdDecoders[0]!.output({ timestamp: 20_000 }); createdDecoders[0]!.output({ timestamp: 40_000 });
+    expect(times).toEqual([120_000, 140_000]); decoder.destroy();
+  });
+  it('does not consume the next input timing when one chunk yields multiple outputs', () => {
+    const decoder = configuredDecoder(), times: number[] = [];
+    decoder.onData = (_data, time) => { times.push(time); };
+    decoder.decode(chunk(0), 100_000); decoder.decode(chunk(20_000), 120_000);
+    createdDecoders[0]!.output({ timestamp: 0 }); createdDecoders[0]!.output({ timestamp: 0 });
+    createdDecoders[0]!.output({ timestamp: 20_000 });
+    expect(times).toEqual([100_000, 100_000, 120_000]); decoder.destroy();
+  });
+  it('advances the render time by the native priming-trim timestamp offset', () => {
+    const decoder = configuredDecoder(), times: number[] = [];
+    decoder.onData = (_data, time) => { times.push(time); };
+    decoder.decode(chunk(0), 100_000); createdDecoders[0]!.output({ timestamp: 5_000 });
+    expect(times).toEqual([105_000]); decoder.destroy();
+  });
+  it('does not invent a render time when repeated PTS have conflicting schedules', () => {
+    const decoder = configuredDecoder(), times: number[] = [];
+    decoder.onData = (_data, time) => { times.push(time); };
+    decoder.decode(chunk(0), 100_000); decoder.decode(chunk(0), 200_000);
+    createdDecoders[0]!.output({ timestamp: 0 });
+    expect(times).toEqual([0]); decoder.destroy();
+  });
   it('clears queued render times on decode error — outputs after recovery use fresh times', () => {
     const decoder = configuredDecoder();
     const received: number[] = [];
@@ -108,7 +136,7 @@ describe('WebCodecsAudioDecoder', () => {
     decoder.decode(chunk(1), 100);
     decoder.decode(chunk(2), 200);
     decoder.decode(chunk(3), 300);
-    createdDecoders[0]!.output({});
+    createdDecoders[0]!.output({ timestamp: 1 });
     expect(received).toEqual([100]);
 
     // Decoder dies — chunks 2 and 3 die with it. Their queued render
@@ -119,7 +147,7 @@ describe('WebCodecsAudioDecoder', () => {
     expect(createdDecoders).toHaveLength(2); // recreated
 
     decoder.decode(chunk(4), 999);
-    createdDecoders[1]!.output({});
+    createdDecoders[1]!.output({ timestamp: 4 });
 
     expect(received).toEqual([100, 999]);
   });
@@ -152,11 +180,11 @@ describe('WebCodecsAudioDecoder', () => {
     decoder.onData = (_data, renderTimeUs) => received.push(renderTimeUs);
     decoder.decode(chunk(0), 100_000);
     decoder.decode(chunk(20_000), 120_000);
-    createdDecoders[0]!.output({});
+    createdDecoders[0]!.output({ timestamp: 0 });
 
     decoder.configure(Uint8Array.from([0x11, 0x90]), 'mp4a.40.2', 48000, 2);
     decoder.decode(chunk(40_000), 140_000);
-    createdDecoders[1]!.output({});
+    createdDecoders[1]!.output({ timestamp: 40_000 });
 
     expect(received).toEqual([100_000, 140_000]);
     decoder.destroy();
@@ -176,7 +204,7 @@ describe('WebCodecsAudioDecoder', () => {
     expect(retiredData.close).toHaveBeenCalledOnce();
     expect(onError).not.toHaveBeenCalled();
     expect(createdDecoders).toHaveLength(2);
-    createdDecoders[1]!.output({});
+    createdDecoders[1]!.output({ timestamp: 20_000 });
     expect(received).toEqual([120_000]);
     decoder.destroy();
   });
@@ -230,8 +258,40 @@ describe('WebCodecsAudioDecoder', () => {
     // Recovery is immediate — the next frame decodes with a fresh render time.
     decoder.decode(chunk(2), 200);
     expect(decodeSpy).toHaveBeenCalledOnce();
-    createdDecoders[1]!.output({});
+    createdDecoders[1]!.output({ timestamp: 2 });
     expect(received).toEqual([200]);
+  });
+
+  it('registers timing before a synchronous native output', () => {
+    const decoder = configuredDecoder(), times: number[] = [];
+    decoder.onData = (_data, time) => { times.push(time); };
+    decodeSpy.mockImplementation((encoded: { timestamp: number }) => { createdDecoders[0]!.output({ timestamp: encoded.timestamp }); });
+    decoder.decode(chunk(0), 100_000); expect(times).toEqual([100_000]); decoder.destroy();
+  });
+  it('poisons timing when native submission throws instead of claiming a later output', () => {
+    const decoder = configuredDecoder(), times: number[] = [];
+    decoder.onData = (_data, time) => { times.push(time); };
+    decodeSpy.mockImplementationOnce(() => { throw Error('native submit'); });
+    expect(() => decoder.decode(chunk(0), 100_000)).toThrow('native submit');
+    createdDecoders[0]!.output({ timestamp: 0 }); expect(times).toEqual([0]); decoder.destroy();
+  });
+  it('does not submit to a decoder replaced by the encoded-chunk constructor', () => {
+    const decoder = configuredDecoder(), times: number[] = []; let reentered = false;
+    decoder.onData = (_data, time) => { times.push(time); };
+    vi.stubGlobal('EncodedAudioChunk', class extends MockEncodedAudioChunk {
+      constructor(init: ConstructorParameters<typeof MockEncodedAudioChunk>[0]) {
+        super(init); if (!reentered) { reentered = true; decoder.configure(new Uint8Array(), 'opus', 48000, 2); }
+      }
+    });
+    decoder.decode(chunk(0), 100_000); expect(decodeSpy).not.toHaveBeenCalled();
+    decoder.decode(chunk(20_000), 120_000); createdDecoders[1]!.output({ timestamp: 20_000 });
+    expect(times).toEqual([120_000]); decoder.destroy();
+  });
+  it('closes output whose timestamp accessor replaces the current decoder', () => {
+    const decoder = configuredDecoder(), output = vi.fn(); decoder.onData = output;
+    decoder.decode(chunk(0), 100_000);
+    const late = { get timestamp() { decoder.configure(new Uint8Array(), 'opus', 48000, 2); return 0; }, close: vi.fn() };
+    createdDecoders[0]!.output(late); expect(late.close).toHaveBeenCalledOnce(); expect(output).not.toHaveBeenCalled(); decoder.destroy();
   });
 
   describe('WebCodecsAudioDecoder — Audio Config description', () => {

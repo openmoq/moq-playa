@@ -1,0 +1,60 @@
+{
+  "name": "@openmoq/devtools",
+  "version": "0.6.1",
+  "description": "Opt-in bounded diagnostics for Playa developer tools.",
+  "license": "Apache-2.0",
+  "author": "OpenMOQ (https://github.com/openmoq)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./player": {
+      "types": "./dist/player.d.ts",
+      "import": "./dist/player.js"
+    }
+  },
+  "files": [
+    "dist",
+    "CAPTURE.md",
+    "PLAYER.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openmoq/moq-playa.git",
+    "directory": "packages/devtools"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test:browser": "node test/page-bridge.mjs"
+  },
+  "dependencies": {
+    "@openmoq/devtools-protocol": "workspace:*",
+    "@openmoq/transport": "workspace:*"
+  },
+  "typesVersions": {
+    "*": {
+      "player": [
+        "dist/player.d.ts"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@openmoq/player": "workspace:*"
+  },
+  "peerDependenciesMeta": {
+    "@openmoq/player": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@openmoq/player": "workspace:*",
+    "@openmoq/webtransport": "workspace:*"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "extends": "../../../examples/node-publisher/tsconfig.json",
+  "compilerOptions": { "noEmit": true, "rootDir": "../../..", "composite": false, "declaration": false, "declarationMap": false, "sourceMap": false, "incremental": false },
+  "include": ["silent-publisher.ts"]
+}

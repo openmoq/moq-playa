@@ -12,6 +12,10 @@
       "types": "./index.d.ts",
       "import": "./index.js"
     },
+    "./trace-recorder": {
+      "types": "./trace-recorder.d.ts",
+      "import": "./trace-recorder.js"
+    },
     "./browser": {
       "types": "./browser.d.ts",
       "import": "./browser.js",

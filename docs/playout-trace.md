@@ -41,6 +41,15 @@ than a parallel format with its own clock and tooling, MOQ Playout Trace defines
 new event namespaces inside a qlog file, sharing one monotonic clock with the
 transport events.
 
+The bounded recorder is available independently of the player as
+`@openmoq/transport/trace-recorder`. `@openmoq/player` continues to export the
+same `TraceRecorder`, formatter and recorder options. The standalone entry
+point has no player, browser, DOM or DevTools dependency; moving its code does
+not change the event schemas or the serialized trace format.
+The `playa:*` schema URI remains `https://openmoq.org/082026/playa`.
+The leaf's `TraceLogger` type has the same structural contract as the player's
+`LoggerLike`; existing loggers can be passed directly.
+
 | Namespace | Content | Status |
 |---|---|---|
 | `moqt:*` | Transport observations | Implemented (draft-pardue-moq-qlog-moq-events-06) |

@@ -53,6 +53,8 @@ export interface DecodeVideoCommand {
     readonly type: 'decode_video';
     readonly chunk: VideoChunkInit;
     readonly renderTimeUs: number;
+    /** Optional application-local identity; never a wire field or payload. */
+    readonly inputToken?: object;
     /**
      * CaptureTimestamp in microseconds — for PTS-anchored render scheduling.
      * The renderer should use this (via RenderScheduler) instead of renderTimeUs
@@ -67,6 +69,8 @@ export interface DecodeAudioCommand {
     readonly type: 'decode_audio';
     readonly chunk: AudioChunkInit;
     readonly renderTimeUs: number;
+    /** Optional application-local identity; never a wire field or payload. */
+    readonly inputToken?: object;
 }
 
 /** Flush the decoder (drain pending frames). */
@@ -291,3 +295,8 @@ export interface PlaybackConfig {
      */
     readonly handshakeRttMs?: number;
 }
+
+/** Actual local pipeline rejection; no publisher age or missing-object inference. */
+export type PlaybackInputDiscardReason = 'treated as a replay' | 'stale group' | 'decoder reset' | 'skipped'
+    | 'track superseded' | 'buffer full' | 'buffer eviction' | 'backlog shed' | 'awaiting keyframe' | 'late frame' | 'decoder policy';
+export type PlaybackInputObserver = (input: object, reason: PlaybackInputDiscardReason) => void | Promise<void>;

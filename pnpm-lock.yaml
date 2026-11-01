@@ -224,6 +224,39 @@ importers:
         specifier: workspace:*
         version: link:../webtransport
 
+  packages/devtools:
+    dependencies:
+      '@openmoq/devtools-protocol':
+        specifier: workspace:*
+        version: link:../devtools-protocol
+      '@openmoq/transport':
+        specifier: workspace:*
+        version: link:../transport
+    devDependencies:
+      '@openmoq/player':
+        specifier: workspace:*
+        version: link:../player
+      '@openmoq/webtransport':
+        specifier: workspace:*
+        version: link:../webtransport
+
+  packages/devtools-probe:
+    dependencies:
+      '@openmoq/devtools':
+        specifier: workspace:*
+        version: link:../devtools
+      '@openmoq/devtools-protocol':
+        specifier: workspace:*
+        version: link:../devtools-protocol
+      '@openmoq/transport':
+        specifier: workspace:*
+        version: link:../transport
+      '@openmoq/webtransport':
+        specifier: workspace:*
+        version: link:../webtransport
+
+  packages/devtools-protocol: {}
+
   packages/loc:
     dependencies:
       '@openmoq/transport':
@@ -296,6 +329,28 @@ importers:
       '@openmoq/transport':
         specifier: workspace:*
         version: link:../transport
+
+  tools/devtools-extension:
+    dependencies:
+      '@openmoq/devtools':
+        specifier: workspace:*
+        version: link:../../packages/devtools
+      '@openmoq/devtools-probe':
+        specifier: workspace:*
+        version: link:../../packages/devtools-probe
+      '@openmoq/devtools-protocol':
+        specifier: workspace:*
+        version: link:../../packages/devtools-protocol
+    devDependencies:
+      '@openmoq/playa':
+        specifier: workspace:*
+        version: link:../../packages/playa
+      esbuild:
+        specifier: 0.28.1
+        version: 0.28.1
+      vitest:
+        specifier: ^3.2.0
+        version: 3.2.7(@types/debug@4.1.13)(@types/node@22.19.13)(tsx@4.23.13)
 
 packages:
 

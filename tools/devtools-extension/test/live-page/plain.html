@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Playa plain player (no diagnostics)</title>
+    <link rel="icon" href="data:,">
+    <style>
+      body { margin: 24px; background: #202020; color: white; font: 16px sans-serif; }
+      video { display: block; width: 640px; max-width: 100%; aspect-ratio: 16 / 9; background: black; }
+      button { margin-top: 16px; font-size: 18px; padding: 8px 18px; }
+      pre { font: 12px monospace; color: #9ad; }
+    </style>
+  </head>
+  <body>
+    <h1>Real Playa player, no diagnostics installed</h1>
+    <video id="video" playsinline muted></video>
+    <button id="start" type="button">Start playback</button>
+    <pre id="status">idle</pre>
+    <script type="module" src="./plain.ts"></script>
+  </body>
+</html>

@@ -17,6 +17,7 @@
 
 import type { AudioDecoderLike } from '@openmoq/player';
 import type { AudioChunkInit } from '@openmoq/loc';
+import { type AudioTimingInput, AudioOutputTiming } from './audio-output-timing.js';
 
 /** Maximum audio decode queue depth before dropping frames. */
 const MAX_AUDIO_DECODE_QUEUE_SIZE = 32;
@@ -34,7 +35,7 @@ const ADTS_FREQ_INDEX: Record<number, number> = {
  * - Maps configure() with catalog metadata → AudioDecoderConfig
  * - ADTS wrapping for AAC: prepends 7-byte header to raw access units
  * - Error recovery: recreates decoder on 'closed' state (each frame independently decodable)
- * - Tracks render time via FIFO queue
+ * - Tracks render time by native output timestamp within its decoder generation
  *
  * @see draft-ietf-moq-loc-01 §4.1 (audio independently decodable)
  */
@@ -50,15 +51,16 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
   /** Whether the codec is AAC (needs ADTS wrapping). */
   private isAAC = false;
 
-  /** FIFO queue: renderTimeUs values awaiting output data. */
-  private readonly renderTimeQueue: number[] = [];
+  /** Scalar timing state belongs to the current native decoder, never to output order. */
+  private timing: AudioOutputTiming | null = null;
+  private inputTokens: WeakMap<AudioTimingInput, object> | undefined;
 
   /** Error count — limit logging. */
   private errorCount = 0;
 
   // ─── Callbacks ──────────────────────────────────────────────────
 
-  onData: ((data: unknown, renderTimeUs: number) => void) | null = null;
+  onData: ((data: unknown, renderTimeUs: number, inputToken?: object) => void) | null = null;
   onError: ((error: Error) => void) | null = null;
 
   // ─── AudioDecoderLike ───────────────────────────────────────────
@@ -102,7 +104,7 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
    * @see draft-ietf-moq-loc-01 §4.1 (each audio object independently decodable)
    * @see draft-ietf-moq-loc-01 §2.2 (LOC payload = EncodedAudioChunk.data)
    */
-  decode(chunk: AudioChunkInit, renderTimeUs: number): void {
+  decode(chunk: AudioChunkInit, renderTimeUs: number, inputToken?: object): void {
     if (!this.lastCodec || !this.decoder || this.decoder.state !== 'configured') return;
 
     // Backpressure: a queue this deep means the decoder stopped keeping up
@@ -126,15 +128,20 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
       data = wrapInADTS(data, this.lastSampleRate, this.lastChannels);
     }
 
-    this.renderTimeQueue.push(renderTimeUs);
-
     const chunkInit: EncodedAudioChunkInit = {
       type: chunk.type,
       timestamp: chunk.timestamp,
       data,
     };
     if (chunk.duration !== undefined) chunkInit.duration = chunk.duration;
-    this.decoder.decode(new EncodedAudioChunk(chunkInit));
+    const decoder = this.decoder, timing = this.timing;
+    const encoded = new EncodedAudioChunk(chunkInit);
+    if (this.decoder !== decoder || !timing || this.timing !== timing) return;
+    const input = timing.remember(encoded.timestamp, encoded.duration, renderTimeUs);
+    if (inputToken && input) (this.inputTokens ??= new WeakMap()).set(input, inputToken);
+    const tokens = this.inputTokens;
+    try { decoder.decode(encoded); }
+    catch (error) { timing.poison(encoded.timestamp); if (input) tokens?.delete(input); throw error; }
   }
 
   /** Flush pending audio data. */
@@ -145,7 +152,7 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
 
   /** Reset the decoder — recreate and reconfigure. No-op if never configured. */
   reset(): void {
-    this.renderTimeQueue.length = 0;
+    this.timing?.clear();
     if (!this.lastCodec) return; // Not yet configured — nothing to reset
     this.createDecoder();
   }
@@ -157,10 +164,12 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
 
   /** Release all resources. */
   destroy(): void {
-    this.renderTimeQueue.length = 0;
+    this.timing?.clear();
     const decoder = this.decoder;
     this.decoder = null;
     if (decoder && decoder.state !== 'closed') decoder.close();
+    this.timing = null;
+    this.inputTokens = undefined;
     this.onData = null;
     this.onError = null;
   }
@@ -170,27 +179,37 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
   private createDecoder(): void {
     const previous = this.decoder;
     this.decoder = null;
-    this.renderTimeQueue.length = 0;
+    this.timing?.clear();
+    this.inputTokens = undefined;
     if (previous && previous.state !== 'closed') previous.close();
 
+    // AAC/Opus registration §5 limits priming to the initial prefix. Unknown
+    // registrations keep conservative matching if later priming is possible.
+    const timing = new AudioOutputTiming(256, this.lastCodec === 'opus' || this.lastCodec.startsWith('mp4a.'));
     const decoder = new AudioDecoder({
       output: (audioData: AudioData) => {
-        if (this.decoder !== decoder || !this.onData) {
-          // No consumer wired — MUST close to release native memory.
+        if (this.decoder !== decoder) {
+          // Retired decoder output cannot acquire the replacement's timing.
           audioData.close();
           return;
         }
-        const renderTimeUs = this.renderTimeQueue.shift() ?? 0;
-        this.onData(audioData, renderTimeUs);
+        const timestamp = audioData.timestamp;
+        if (this.decoder !== decoder) { audioData.close(); return; }
+        const result = timing.resolve(timestamp);
+        if (!this.onData) { audioData.close(); return; }
+        // Zero is the existing no-timing sentinel; it never proves input identity.
+        const inputToken = result.input ? this.inputTokens?.get(result.input) : undefined;
+        if (inputToken === undefined) this.onData(audioData, result.renderTimeUs);
+        else this.onData(audioData, result.renderTimeUs, inputToken);
       },
       error: (err: DOMException) => {
         if (this.decoder !== decoder) return;
         this.errorCount++;
 
         // Chunks in flight died with the failed decoder — discard their
-        // queued render times. Leaving them would pair every later output
-        // with a stale entry, drifting audio permanently behind (A/V desync).
-        this.renderTimeQueue.length = 0;
+        // timing ownership before a callback can install a replacement.
+        this.timing?.clear();
+        this.inputTokens = undefined;
         this.onError?.(new Error(err.message));
 
         // Decoder enters 'closed' state on error — recreate.
@@ -200,6 +219,7 @@ export class WebCodecsAudioDecoder implements AudioDecoderLike {
       },
     });
     this.decoder = decoder;
+    this.timing = timing;
 
     // AAC with an Audio Config description runs in raw mode via `description`
     // (payload is raw access units); AAC without one uses ADTS framing.

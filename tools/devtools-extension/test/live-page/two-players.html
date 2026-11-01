@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Playa two players (one diagnostic registry)</title>
+    <link rel="icon" href="data:,">
+    <style>
+      body { margin: 24px; background: #202020; color: white; font: 16px sans-serif; }
+      .pair { display: flex; gap: 16px; flex-wrap: wrap; }
+      video { display: block; width: 480px; max-width: 100%; aspect-ratio: 16 / 9; background: black; }
+      button { margin-top: 16px; font-size: 18px; padding: 8px 18px; }
+      pre { font: 12px monospace; color: #9ad; }
+    </style>
+  </head>
+  <body>
+    <h1>Two real Playa players, one diagnostic registry</h1>
+    <div class="pair">
+      <div><video id="video-a" playsinline muted></video><pre id="status-a">idle</pre></div>
+      <div><video id="video-b" playsinline muted></video><pre id="status-b">idle</pre></div>
+    </div>
+    <button id="start" type="button">Start both</button>
+    <script type="module" src="./two-players.ts"></script>
+  </body>
+</html>

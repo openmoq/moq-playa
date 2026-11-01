@@ -12,6 +12,8 @@
 // ─── Types ───────────────────────────────────────────────────────────
 
 export type {
+    PlaybackInputObserver,
+    PlaybackInputDiscardReason,
     ClockSource,
     DecoderCommand,
     ConfigureCommand,

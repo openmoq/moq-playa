@@ -15,7 +15,7 @@
  * @module
  */
 
-import type { MediaSourceLike } from '@openmoq/player';
+import type { MediaSourceLike, MediaAppendToken, MediaAppendReason, MediaAppendObserver } from '@openmoq/player';
 import {
   filterInitSegment,
   describeBoxes,
@@ -26,6 +26,8 @@ import {
   type TrexDefaults,
 } from './mp4-box.js';
 import { TimelineIndex } from './timeline-index.js';
+
+interface AppendEntry { data: Uint8Array; trackName: string; groupId?: bigint; token?: MediaAppendToken }
 
 // ─── Diagnostic ring buffer ──────────────────────────────────────────
 
@@ -585,8 +587,8 @@ export class MseMediaSource implements MediaSourceLike {
    * Each entry preserves its source `trackName` so the timeline check
    * runs against the right per-track index when the queue drains.
    */
-  private readonly videoQueue: Array<{ data: Uint8Array; trackName: string; groupId?: bigint }> = [];
-  private readonly audioQueue: Array<{ data: Uint8Array; trackName: string; groupId?: bigint }> = [];
+  private readonly videoQueue: AppendEntry[] = [];
+  private readonly audioQueue: AppendEntry[] = [];
 
   /** Per-(mediaType:trackName) committed group high-water mark. */
   private readonly committedGroupFloor = new Map<string, bigint>();
@@ -781,8 +783,8 @@ export class MseMediaSource implements MediaSourceLike {
   private bufferGen = 0;
   /** In-flight op per media type — a SourceBuffer serializes to at most one. */
   private readonly inFlightOp: {
-    video: { id: number; cause: BufferOpCause; errored?: boolean } | null;
-    audio: { id: number; cause: BufferOpCause; errored?: boolean } | null;
+    video: { id: number; cause: BufferOpCause; errored?: boolean; aborted?: boolean; succeeded?: boolean; token?: MediaAppendToken } | null;
+    audio: { id: number; cause: BufferOpCause; errored?: boolean; aborted?: boolean; succeeded?: boolean; token?: MediaAppendToken } | null;
   } = { video: null, audio: null };
   /** Most recently completed op id per media type, for after-the-fact context. */
   private readonly lastCompletedOp: { video: number | null; audio: number | null } =
@@ -1056,6 +1058,53 @@ export class MseMediaSource implements MediaSourceLike {
     return true;
   }
 
+  private appendObservers: Set<MediaAppendObserver> | undefined;
+
+  /** Outcomes are future observations only; callers own the returned unsubscribe. */
+  observeAppends(observer: MediaAppendObserver): () => void {
+    if (typeof observer !== 'function') throw new TypeError('Expected an append observer');
+    const observers = this.appendObservers ??= new Set();
+    observers.add(observer);
+    return () => {
+      observers.delete(observer);
+      if (this.appendObservers === observers && observers.size === 0) this.appendObservers = undefined;
+    };
+  }
+
+  private appendOutcome(token: MediaAppendToken | undefined, state: 'appended' | 'discarded' | 'unavailable', reason: MediaAppendReason | null): void {
+    const observers = this.appendObservers;
+    if (!token || !observers) return;
+    for (const observer of [...observers]) {
+      if (!observers.has(observer)) continue;
+      try {
+        const result = observer({ token, state, reason });
+        if (result) void Promise.resolve(result).catch(() => {});
+      } catch { /* Optional observations cannot break media playback. */ }
+    }
+  }
+
+  private appendEntry(data: Uint8Array, trackName: string, groupId: bigint | undefined, token: MediaAppendToken | undefined): AppendEntry {
+    const entry: AppendEntry = groupId === undefined ? { data, trackName } : { data, trackName, groupId };
+    if (token !== undefined) entry.token = token;
+    return entry;
+  }
+
+  private queuedTokens(queue: readonly AppendEntry[], tokens?: Set<MediaAppendToken>): Set<MediaAppendToken> | undefined {
+    if (!this.appendObservers) return tokens;
+    for (const entry of queue) if (entry.token) (tokens ??= new Set()).add(entry.token);
+    return tokens;
+  }
+
+  private discardTokens(tokens: Set<MediaAppendToken> | undefined, reason: MediaAppendReason): void {
+    if (tokens) for (const token of tokens) this.appendOutcome(token, 'discarded', reason);
+  }
+
+  private discardQueue(queue: AppendEntry[], reason: MediaAppendReason): void {
+    const tokens = this.queuedTokens(queue);
+    queue.length = 0; // Relinquish ownership before a listener can reenter.
+    this.discardTokens(tokens, reason);
+  }
+
   /**
    * Append a complete CMAF segment (moof+mdat) to the SourceBuffer.
    *
@@ -1066,8 +1115,10 @@ export class MseMediaSource implements MediaSourceLike {
    *
    * MseMediaSource handles only SourceBuffer back-pressure (updateend queue).
    */
-  appendChunk(mediaType: 'video' | 'audio', data: Uint8Array, trackName: string, groupId?: bigint): void {
-    if (this.destroyed) return;
+  appendChunk(mediaType: 'video' | 'audio', data: Uint8Array, trackName: string, groupId?: bigint, token?: MediaAppendToken): void {
+    if (this.destroyed) { this.appendOutcome(token, 'discarded', 'destroyed'); return; }
+    // Without observers, never add diagnostic ownership to a normal queue entry.
+    if (!this.appendObservers) token = undefined;
 
     const buffer = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
     if (!buffer) {
@@ -1083,6 +1134,7 @@ export class MseMediaSource implements MediaSourceLike {
           + 'document.visibilityState=%s) — waiting for sourceopen; further drops not logged',
           mediaType, String(this.initialized), this.ms.readyState, doc?.visibilityState ?? 'n/a');
       }
+      this.appendOutcome(token, 'discarded', 'not attached');
       return;
     }
 
@@ -1093,6 +1145,7 @@ export class MseMediaSource implements MediaSourceLike {
       const key = `${mediaType}:${trackName}`;
       const floor = this.committedGroupFloor.get(key);
       if (floor !== undefined && groupId < floor) {
+        this.appendOutcome(token, 'discarded', 'stale group');
         return;
       }
     }
@@ -1100,13 +1153,13 @@ export class MseMediaSource implements MediaSourceLike {
     const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
 
     if (this.changingType[mediaType] || buffer.updating || queue.length > 0) {
-      queue.push(groupId !== undefined ? { data, trackName, groupId } : { data, trackName });
+      queue.push(this.appendEntry(data, trackName, groupId, token));
     } else if (this.maybeEvictBackBuffer(mediaType, buffer)) {
       // An eviction remove() is now in flight (it sets `updating`); park the
       // chunk — its updateend re-enters drainQueue and dispatches it.
-      queue.push(groupId !== undefined ? { data, trackName, groupId } : { data, trackName });
+      queue.push(this.appendEntry(data, trackName, groupId, token));
     } else {
-      this.doAppend(mediaType, buffer, data, trackName, groupId);
+      this.doAppend(mediaType, buffer, data, trackName, groupId, token);
     }
   }
 
@@ -1145,6 +1198,7 @@ export class MseMediaSource implements MediaSourceLike {
     initData: Uint8Array,
   ): Promise<void> {
     if (this.destroyed) return;
+    const generation = this.bufferGen;
     const buffer = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
     if (!buffer) {
       throw new Error(`MseMediaSource.changeType: ${mediaType} SourceBuffer not initialized`);
@@ -1164,13 +1218,15 @@ export class MseMediaSource implements MediaSourceLike {
       // *after* the new init segment, ahead of new-codec media. The
       // player has staged the new-track segments separately and will
       // re-deliver them after this resolves.
-      queue.length = 0;
+      this.discardQueue(queue, 'retype');
+      if (this.destroyed || generation !== this.bufferGen) return;
 
       // Wait for any in-flight appendBuffer to settle. Use the buffer's
       // own updateend event — this is the only signal the MSE spec
       // gives us for "now is safe to mutate".
       while (buffer.updating) {
         await this.waitForBufferEvent(buffer);
+        if (this.destroyed || generation !== this.bufferGen) return;
       }
 
       // Pivot the parser to the new codec.
@@ -1185,6 +1241,7 @@ export class MseMediaSource implements MediaSourceLike {
       // must skip the timeline-overlap path.
       this.runMutation(mediaType, 'init-append', () => buffer.appendBuffer(filtered.buffer as ArrayBuffer));
       await this.waitForBufferEvent(buffer);
+      if (this.destroyed || generation !== this.bufferGen) return;
 
       // Refresh trex defaults — codec family change generally means a
       // different default_sample_duration in the new init.
@@ -1214,7 +1271,7 @@ export class MseMediaSource implements MediaSourceLike {
       const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
       timelines.clear();
     } finally {
-      this.changingType[mediaType] = false;
+      if (generation === this.bufferGen) this.changingType[mediaType] = false;
     }
 
     // Resume normal append flow for anything queued during the change.
@@ -1333,7 +1390,9 @@ export class MseMediaSource implements MediaSourceLike {
     // New session: stale facts must never join a later summary.
     this.startupFacts = { session: this.bufferGen, startPosition: null, seekOutcome: null, playTimeSec: null };
     this.startupReported = false;
-    this.cancelBufferOps('reset');
+    let tokens = this.cancelBufferOps('reset');
+    tokens = this.queuedTokens(this.videoQueue, tokens);
+    tokens = this.queuedTokens(this.audioQueue, tokens);
     try {
       if (this.videoBuffer && !this.videoBuffer.updating) {
         this.ms.removeSourceBuffer(this.videoBuffer);
@@ -1376,6 +1435,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.gapEpisodeTicks = 0;
     this.retireGapLanding();
     this.lastGapJumpAtMs = Number.NEGATIVE_INFINITY;
+    this.discardTokens(tokens, this.destroyed ? 'destroyed' : 'decoder reset');
   }
 
   destroy(): void {
@@ -1551,6 +1611,7 @@ export class MseMediaSource implements MediaSourceLike {
 
   /** Drain queued chunks after SourceBuffer updateend. */
   private drainQueue(mediaType: 'video' | 'audio'): void {
+    const generation = this.bufferGen;
     const buffer = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
     const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
 
@@ -1597,6 +1658,8 @@ export class MseMediaSource implements MediaSourceLike {
         const floor = this.committedGroupFloor.get(floorKey);
         if (floor !== undefined && peek.groupId < floor) {
           queue.shift();
+          this.appendOutcome(peek.token, 'discarded', 'stale group');
+          if (this.destroyed || generation !== this.bufferGen) return;
           continue;
         }
       }
@@ -1610,7 +1673,7 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.maybeEvictBackBuffer(mediaType, buffer)) return;
 
     const next = queue.shift()!;
-    this.doAppend(mediaType, buffer, next.data, next.trackName, next.groupId);
+    this.doAppend(mediaType, buffer, next.data, next.trackName, next.groupId, next.token);
   }
 
   /**
@@ -1654,9 +1717,9 @@ export class MseMediaSource implements MediaSourceLike {
    * This asserts only that we began the operation — NOT that any particular
    * later event belongs to it.
    */
-  private markBufferOp(mediaType: 'video' | 'audio', cause: BufferOpCause): number {
+  private markBufferOp(mediaType: 'video' | 'audio', cause: BufferOpCause, token?: MediaAppendToken): number {
     const id = ++this.opSeq;
-    this.inFlightOp[mediaType] = { id, cause };
+    this.inFlightOp[mediaType] = token === undefined ? { id, cause } : { id, cause, token };
     this.diag('mutation-start op=%d %s %s', id, mediaType, cause);
     return id;
   }
@@ -1676,9 +1739,9 @@ export class MseMediaSource implements MediaSourceLike {
    * evict/retry, error surfacing) behave exactly as before.
    */
   private runMutation(
-    mediaType: 'video' | 'audio', cause: BufferOpCause, mutate: () => void,
+    mediaType: 'video' | 'audio', cause: BufferOpCause, mutate: () => void, token?: MediaAppendToken,
   ): number {
-    const id = this.markBufferOp(mediaType, cause);
+    const id = this.markBufferOp(mediaType, cause, token);
     try {
       mutate();
     } catch (err) {
@@ -1694,13 +1757,16 @@ export class MseMediaSource implements MediaSourceLike {
    * arrives with no current operation — without this record the chronology
    * would show an operation that simply stops.
    */
-  private cancelBufferOps(reason: string): void {
+  private cancelBufferOps(reason: string): Set<MediaAppendToken> | undefined {
+    let tokens: Set<MediaAppendToken> | undefined;
     for (const mediaType of ['video', 'audio'] as const) {
       const op = this.inFlightOp[mediaType];
       if (!op) continue;
       this.inFlightOp[mediaType] = null;
+      if (op.token && this.appendObservers) (tokens ??= new Set()).add(op.token);
       this.diag('mutation-cancelled op=%d %s %s reason=%s', op.id, mediaType, op.cause, reason);
     }
+    return tokens;
   }
 
   /** Record that a mutation threw synchronously, so no completion will follow. */
@@ -1756,6 +1822,23 @@ export class MseMediaSource implements MediaSourceLike {
     const gen = this.bufferGen;
     // error, updateend and bufferedchange are wired together so identity and
     // generation handling cannot drift apart between them.
+    buffer.addEventListener('update', () => {
+      if (this.isSuperseded(mediaType, buffer, gen)) return;
+      const operation = this.inFlightOp[mediaType];
+      // This bit also protects normal replay bookkeeping: an ended operation
+      // without positive success evidence must not manufacture committed media.
+      if (operation) operation.succeeded = true;
+    });
+    buffer.addEventListener('abort', () => {
+      if (this.isSuperseded(mediaType, buffer, gen)) return;
+      const operation = this.inFlightOp[mediaType];
+      if (operation) operation.aborted = true;
+      // MSE §5.2 / §5.4: abort also queues updateend. Its pending ranges were
+      // not a completed append and must not become replay-suppression knowledge.
+      this.appendErrored[mediaType] = true;
+      if (mediaType === 'video') this.pendingVideoRanges = [];
+      else this.pendingAudioRanges = [];
+    });
     buffer.addEventListener('error', () => {
       if (this.isSuperseded(mediaType, buffer, gen)) {
         this.diag('sourcebuffer-error %s SUPERSEDED (gen %d, current %d) — ignored',
@@ -2543,6 +2626,7 @@ export class MseMediaSource implements MediaSourceLike {
     data: Uint8Array,
     trackName: string,
     groupId?: bigint,
+    token?: MediaAppendToken,
   ): void {
     // ── Step 1: parse + tri-state decide ─────────────────────────
     const trex = mediaType === 'video' ? this.videoTrex : this.audioTrex;
@@ -2588,6 +2672,7 @@ export class MseMediaSource implements MediaSourceLike {
             .join(',')} all contained in `
           + `timeline=${timeline.toString()} buffered=[${fmtRanges(safeBuffered(buffer))}]`,
         );
+        this.appendOutcome(token, 'discarded', 'treated as a replay');
         return;
       }
 
@@ -2648,7 +2733,7 @@ export class MseMediaSource implements MediaSourceLike {
     }
 
     try {
-      this.runMutation(mediaType, 'append', () => buffer.appendBuffer(data.buffer as ArrayBuffer));
+      this.runMutation(mediaType, 'append', () => buffer.appendBuffer(data.buffer as ArrayBuffer), token);
     } catch (err) {
       // runMutation already recorded mutation-sync-failure.
       // Synchronous throw — the append never happened. Clear pending
@@ -2663,9 +2748,11 @@ export class MseMediaSource implements MediaSourceLike {
       // QuotaExceededError is RECOVERABLE (evict + retry, escalating to
       // flush-and-rejoin) — handle it without surfacing an error event.
       if ((err as Error)?.name === 'QuotaExceededError') {
-        this.handleQuotaExceeded(mediaType, buffer, data, trackName, groupId);
+        this.handleQuotaExceeded(mediaType, buffer, data, trackName, groupId, token);
         return;
       }
+      this.appendOutcome(token, 'discarded', 'append error');
+      if (this.destroyed) return;
       this.dumpRingOnFailure(`appendBuffer throw on ${mediaType}`, err);
       this.onError?.(err instanceof Error ? err : new Error(String(err)));
     }
@@ -2698,6 +2785,7 @@ export class MseMediaSource implements MediaSourceLike {
     data: Uint8Array,
     trackName: string,
     groupId?: bigint,
+    token?: MediaAppendToken,
   ): void {
     const ct = this.video.currentTime;
 
@@ -2711,7 +2799,7 @@ export class MseMediaSource implements MediaSourceLike {
       if (start !== null && evictBefore > start) {
         this.quotaRetried[mediaType] = true;
         const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
-        queue.unshift(groupId !== undefined ? { data, trackName, groupId } : { data, trackName });
+        queue.unshift(this.appendEntry(data, trackName, groupId, token));
         try {
           this.logWarn('[MSE] quota exceeded (%s) — evicting [%s, %s) and retrying', mediaType, start.toFixed(2), evictBefore.toFixed(2));
           // updateend → drainQueue → retry
@@ -2724,12 +2812,20 @@ export class MseMediaSource implements MediaSourceLike {
     // ── Stage 2: flush both buffers and rejoin at the next appended media ──
     if (this.quotaFlushInFlight) {
       // Flush already in progress and quota STILL exceeded — genuine failure.
+      // A failed eviction may have already enqueued this retry. It still owns
+      // the token until that entry appends or is discarded by reset/flush.
+      const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
+      if (token && !queue.some(entry => entry.token === token)) this.appendOutcome(token, 'discarded', 'append error');
+      if (this.destroyed) return;
       this.dumpRingOnFailure(`appendBuffer quota on ${mediaType} during flush`, new Error('QuotaExceededError'));
       this.onError?.(new Error('MSE quota exceeded and flush recovery failed'));
       return;
     }
     this.quotaFlushInFlight = true;
     this.logWarn('[MSE] quota exceeded (%s) with nothing evictable — flushing buffers and rejoining live', mediaType);
+    let tokens = this.queuedTokens(this.videoQueue);
+    tokens = this.queuedTokens(this.audioQueue, tokens);
+    if (token && this.appendObservers) (tokens ??= new Set()).add(token);
     this.videoQueue.length = 0;
     this.audioQueue.length = 0;
     this.videoTimelines.clear();
@@ -2737,6 +2833,8 @@ export class MseMediaSource implements MediaSourceLike {
     this.quotaRetried.video = false;
     this.quotaRetried.audio = false;
     this.chaseAfterFlush = true;
+    this.discardTokens(tokens, 'flushed');
+    if (this.destroyed) return;
     for (const [b, label] of [[this.videoBuffer, 'video'], [this.audioBuffer, 'audio']] as const) {
       if (!b) continue;
       try {
@@ -2758,6 +2856,7 @@ export class MseMediaSource implements MediaSourceLike {
     // Chronology record: which operation just completed. Deliberately does NOT
     // claim ownership of any bufferedchange — the two events are queued
     // independently and may arrive in either order.
+    const generation = this.bufferGen;
     const completing = this.inFlightOp[mediaType];
     if (completing) {
       this.inFlightOp[mediaType] = null;
@@ -2789,7 +2888,8 @@ export class MseMediaSource implements MediaSourceLike {
       }
     }
 
-    if (!this.appendErrored[mediaType]) {
+    if (completing?.cause === 'append' && completing.succeeded === true
+        && !completing.errored && !completing.aborted && !this.appendErrored[mediaType]) {
       const pending =
         mediaType === 'video' ? this.pendingVideoRanges : this.pendingAudioRanges;
       const pendingTrack =
@@ -2845,7 +2945,15 @@ export class MseMediaSource implements MediaSourceLike {
       this.pendingAudioTrackName = null;
       this.pendingAudioGroupId = undefined;
     }
+    const appendFailed = this.appendErrored[mediaType] || completing?.errored === true;
     this.appendErrored[mediaType] = false;
+    if (completing?.cause === 'append') {
+      if (completing.aborted) this.appendOutcome(completing.token, 'discarded', 'append aborted');
+      else if (appendFailed) this.appendOutcome(completing.token, 'discarded', 'append error');
+      else if (completing.succeeded) this.appendOutcome(completing.token, 'appended', null);
+      else this.appendOutcome(completing.token, 'unavailable', 'completion unproven');
+    }
+    if (this.destroyed || generation !== this.bufferGen) return;
     // Behind-live cap: act on fresh data arrival (post-startup only).
     this.maybeChaseLiveEdge();
     this.drainQueue(mediaType);

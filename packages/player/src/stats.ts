@@ -84,7 +84,7 @@ export interface PlayerStats {
   readonly qualitySwitchCount: number;
 
   // ── Frames ──────────────────────────────────────────────────
-  /** Number of frames decoded. */
+  /** Emitted video decode commands after transforms, before native dispatch. Legacy name; not decoded output. */
   readonly framesDecoded: number;
   /** Number of frames dropped. 0 until Item 7. */
   readonly framesDropped: number;

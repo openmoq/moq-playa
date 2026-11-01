@@ -16,6 +16,10 @@
       "types": "./browser.d.ts",
       "import": "./browser.js",
       "default": "./browser.js"
+    },
+    "./diagnostics": {
+      "types": "./diagnostics.d.ts",
+      "import": "./diagnostics.js"
     }
   },
   "files": [
@@ -32,5 +36,12 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "typesVersions": {
+    "*": {
+      "diagnostics": [
+        "./diagnostics.d.ts"
+      ]
+    }
   }
 }

@@ -37,12 +37,16 @@ export default defineConfig({
   },
   resolve: {
     alias: {
+      '@openmoq/transport/trace-recorder': resolve(__dirname, '../packages/transport/src/qlog/trace-recorder.ts'),
       '@openmoq/transport': resolve(__dirname, '../packages/transport/src/index.ts'),
       '@openmoq/webtransport': resolve(__dirname, '../packages/webtransport/src/index.ts'),
       '@openmoq/msf': resolve(__dirname, '../packages/msf/src/index.ts'),
       '@openmoq/loc': resolve(__dirname, '../packages/loc/src/index.ts'),
       '@openmoq/locmaf': resolve(__dirname, '../packages/locmaf/src/index.ts'),
       '@openmoq/playback': resolve(__dirname, '../packages/playback/src/index.ts'),
+      '@openmoq/devtools/player': resolve(__dirname, '../packages/devtools/src/player.ts'),
+      '@openmoq/devtools': resolve(__dirname, '../packages/devtools/src/index.ts'),
+      '@openmoq/player/diagnostics': resolve(__dirname, '../packages/player/src/media-diagnostics.ts'),
       '@openmoq/player': resolve(__dirname, '../packages/player/src/index.ts'),
       '@openmoq/browser': resolve(__dirname, '../packages/browser/src/index.ts'),
       '@openmoq/playa': resolve(__dirname, '../packages/playa/src/index.ts'),

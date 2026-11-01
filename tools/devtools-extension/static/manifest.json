@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Playa DevTools",
+  "version": "0.0.1",
+  "description": "Observe a Playa instance that explicitly exposes diagnostics on the inspected page, or probe a relay directly from DevTools. Attach injects a relay into the top frame only after you grant that origin; nothing runs on any page otherwise. Probe dials the relay you name from the DevTools document itself and never touches the page.",
+  "devtools_page": "devtools.html",
+  "permissions": [
+    "scripting"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "host_permissions": []
+}

@@ -23,6 +23,15 @@
 import type { DecoderCommand, DecoderFeedback } from '@openmoq/playback';
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike, VideoPresentation } from './interfaces.js';
 
+/** Optional engine-owned unit creation at actual native output, before target submission. */
+export type DispatcherOutputReason = 'hold queue overflow' | 'decoder reset' | 'flushed' | 'destroyed' | 'output failed';
+export interface DispatcherOutputObserver {
+  decoded(mediaType: 'video' | 'audio', input: object | undefined, target: VideoRendererLike | AudioOutputLike): object | undefined;
+  discarded(unit: object, reason: DispatcherOutputReason): void | Promise<void>;
+}
+interface OutputOwnership { readonly observer: DispatcherOutputObserver; readonly token: object }
+interface HeldVideo { readonly frame: unknown; readonly captureTimestampUs: bigint; observation?: OutputOwnership }
+
 // ─── Queue pressure hysteresis thresholds ─────────────────────────────
 
 /** Emit queue_pressure when depth rises to this level. @see draft-ietf-moq-transport-16 §7 */
@@ -128,7 +137,45 @@ export class CommandDispatcher {
   private renderFeedbackRetired = false;
 
   /** Hold queue for video frames decoded before sync reference exists. */
-  private readonly videoHoldQueue: Array<{ frame: unknown; captureTimestampUs: bigint }> = [];
+  private readonly videoHoldQueue: HeldVideo[] = [];
+  private _outputObserver: DispatcherOutputObserver | undefined;
+  private outputRevision = 0;
+  private audioOutputRevision = 0;
+  private outputRetirementReason: DispatcherOutputReason = 'flushed';
+  private audioRetirementReason: DispatcherOutputReason = 'flushed';
+
+  /** Reassignment ends evidence, not playback; no old unit passes into a new observer lifetime. */
+  set outputObserver(observer: DispatcherOutputObserver | undefined) {
+    this._outputObserver = observer;
+    for (const held of this.videoHoldQueue) delete held.observation;
+  }
+
+  private decodedOutput(mediaType: 'video' | 'audio', input: object | undefined,
+      target: VideoRendererLike | AudioOutputLike): OutputOwnership | undefined {
+    const observer = this._outputObserver;
+    if (!observer) return;
+    try {
+      const token = observer.decoded(mediaType, input, target);
+      return token !== undefined ? { observer, token } : undefined;
+    } catch { /* Optional metadata cannot prevent decode output. */ }
+  }
+
+  private discardOutput(ownership: OutputOwnership | undefined, reason: DispatcherOutputReason): void {
+    if (!ownership) return;
+    try { const pending = ownership.observer.discarded(ownership.token, reason); if (pending) void Promise.resolve(pending).catch(() => {}); }
+    catch { /* Optional metadata cannot interrupt cleanup. */ }
+  }
+
+  private releaseOutputFrame(frame: unknown, ownership: OutputOwnership | undefined, reason: DispatcherOutputReason): void {
+    try { (frame as { close?: () => void }).close?.(); }
+    finally { this.discardOutput(ownership, reason); }
+  }
+
+  private releaseHeld(held: HeldVideo, reason: DispatcherOutputReason): void {
+    const ownership = held.observation;
+    delete held.observation;
+    this.releaseOutputFrame(held.frame, ownership, reason);
+  }
   private static readonly MAX_HOLD_QUEUE = 30; // 1 GOP at 30fps
   private readonly _hasSyncReference: (() => boolean) | undefined;
   private readonly _recomputeVideoRenderTime: ((captureTimestampUs: bigint) => number) | undefined;
@@ -160,53 +207,71 @@ export class CommandDispatcher {
       const renderer = this.renderer;
       const vd = this.videoDecoder;
       const recompute = opts.recomputeVideoRenderTime;
-      this.videoDecoder.onFrame = (frame, renderTimeUs) => {
-        const captureTs = BigInt((frame as any).timestamp);
-        const syncReady = this._hasSyncReference?.() ?? true;
-
+      this.videoDecoder.onFrame = (frame, renderTimeUs, _sourceTimestamp, inputToken) => {
+        if (this.renderFeedbackRetired) { (frame as { close?: () => void }).close?.(); return; }
+        const revision = this.outputRevision;
+        const captureTs = BigInt((frame as { timestamp: number }).timestamp);
+        const observation = this.decodedOutput('video', inputToken, renderer);
+        if (this.renderFeedbackRetired || this.outputRevision !== revision) {
+          this.releaseOutputFrame(frame, observation, this.outputRetirementReason); return;
+        }
+        let syncReady: boolean;
+        try { syncReady = this._hasSyncReference?.() ?? true; }
+        catch (error) { this.releaseOutputFrame(frame, observation, 'output failed'); throw error; }
+        if (this.renderFeedbackRetired || this.outputRevision !== revision) {
+          this.releaseOutputFrame(frame, observation, this.outputRetirementReason); return;
+        }
         if (!syncReady) {
-          // No sync reference yet — hold frame, decode eagerly but don't render.
-          // @see Chromium: VideoRendererAlgorithm only starts after OnTimeProgressing()
-          if (this.videoHoldQueue.length >= CommandDispatcher.MAX_HOLD_QUEUE) {
-            // Cap at 1 GOP — close oldest to prevent GPU memory leak
-            const oldest = this.videoHoldQueue.shift()!;
-            (oldest.frame as any).close?.();
-          }
-          this.videoHoldQueue.push({ frame, captureTimestampUs: captureTs });
-          this.checkQueuePressure('video', vd);
+          // Admission precedes overflow reporting, so a reentrant reset owns the new entry too.
+          const oldest = this.videoHoldQueue.length >= CommandDispatcher.MAX_HOLD_QUEUE ? this.videoHoldQueue.shift() : undefined;
+          this.videoHoldQueue.push({ frame, captureTimestampUs: captureTs, ...(observation ? { observation } : {}) });
+          if (oldest) this.releaseHeld(oldest, 'hold queue overflow');
+          if (!this.renderFeedbackRetired && this.outputRevision === revision) this.checkQueuePressure('video', vd);
           return;
         }
-
-        // Drain any held frames first (reference just became ready)
-        this.drainVideoHoldQueue(renderer);
-
-        // Recompute render time at decode OUTPUT for correct pacing.
-        const actualRenderTime = recompute
-          ? recompute(captureTs)
-          : renderTimeUs;
-        renderer.enqueue(frame, actualRenderTime);
-        this.checkQueuePressure('video', vd);
+        try { this.drainVideoHoldQueue(renderer, revision); }
+        catch (error) { this.releaseOutputFrame(frame, observation, 'output failed'); throw error; }
+        if (this.renderFeedbackRetired || this.outputRevision !== revision) {
+          this.releaseOutputFrame(frame, observation, this.outputRetirementReason); return;
+        }
+        let actualRenderTime: number;
+        try { actualRenderTime = recompute ? recompute(captureTs) : renderTimeUs; }
+        catch (error) { this.releaseOutputFrame(frame, observation, 'output failed'); throw error; }
+        if (this.renderFeedbackRetired || this.outputRevision !== revision) {
+          this.releaseOutputFrame(frame, observation, this.outputRetirementReason); return;
+        }
+        this.enqueueVideo(renderer, frame, observation, actualRenderTime);
+        if (!this.renderFeedbackRetired && this.outputRevision === revision) this.checkQueuePressure('video', vd);
       };
     }
 
-    // Wire audio decoder → audio output (same un-throttle path as video)
+    // Wire audio decoder → audio output (same un-throttle path as video).
     if (this.audioDecoder && this.audioOutput) {
       const audioOutput = this.audioOutput;
       const ad = this.audioDecoder;
-      this.audioDecoder.onData = (data, renderTimeUs) => {
-        // Delay unification: audio receives THE SAME playout cushion as the
-        // video render-time recompute (getPlaybackDelayUs — adaptive gap
-        // timeout with a static floor), applied here so the cushion arrives
-        // inside renderTimeUs. Integrated audio outputs are constructed with
-        // playbackDelayMs 0 and add no delay of their own. NOTE the adoption
-        // boundary: WebAudioOutput intentionally ignores renderTimeUs while
-        // its chain is healthy, so audio adopts a changed cushion at the
-        // next anchor/underrun — video adopts per-frame. One policy source;
-        // any divergence from a changed cushion persists until the next
-        // audio anchor/underrun/reset (pinned in webaudio-output.test.ts).
-        const cushionUs = this._getPlaybackDelayUs?.() ?? 0;
-        audioOutput.schedule(data, renderTimeUs + cushionUs);
-        this.checkQueuePressure('audio', ad);
+      this.audioDecoder.onData = (data, renderTimeUs, inputToken) => {
+        if (this.renderFeedbackRetired) { (data as { close?: () => void }).close?.(); return; }
+        const revision = this.audioOutputRevision;
+        const observation = this.decodedOutput('audio', inputToken, audioOutput);
+        let cushionUs: number;
+        try { cushionUs = this._getPlaybackDelayUs?.() ?? 0; }
+        catch (error) {
+          try { (data as { close?: () => void }).close?.(); }
+          finally { this.discardOutput(observation, 'output failed'); }
+          throw error;
+        }
+        if (this.renderFeedbackRetired || this.audioOutputRevision !== revision) {
+          try { (data as { close?: () => void }).close?.(); }
+          finally { this.discardOutput(observation, this.audioRetirementReason); }
+          return;
+        }
+        // The shared cushion reaches WebAudioOutput at its next anchor/underrun;
+        // a healthy chain remains back-to-back, as before.
+        try {
+          if (observation) audioOutput.schedule(data, renderTimeUs + cushionUs, observation.token);
+          else audioOutput.schedule(data, renderTimeUs + cushionUs);
+        } catch (error) { this.discardOutput(observation, 'output failed'); throw error; }
+        if (!this.renderFeedbackRetired && this.audioOutputRevision === revision) this.checkQueuePressure('audio', ad);
       };
     }
 
@@ -264,6 +329,13 @@ export class CommandDispatcher {
     }
   }
 
+  /** Whether this dispatcher actually owns that decoder-to-output callback. */
+  canObserveDecodedOutputs(mediaType: 'video' | 'audio'): boolean {
+    return !this.renderFeedbackRetired && (mediaType === 'video'
+      ? this.videoDecoder !== undefined && this.renderer !== undefined
+      : this.audioDecoder !== undefined && this.audioOutput !== undefined);
+  }
+
   /** Historical draw evidence; unavailable without the optional renderer hook. */
   get videoPresentation(): VideoPresentation | null {
     if (this.renderFeedbackRetired) return null;
@@ -310,7 +382,8 @@ export class CommandDispatcher {
 
       case 'decode_video':
         try {
-          this.videoDecoder?.decode(cmd.chunk, cmd.renderTimeUs);
+          if (cmd.inputToken !== undefined) this.videoDecoder?.decode(cmd.chunk, cmd.renderTimeUs, cmd.inputToken);
+          else this.videoDecoder?.decode(cmd.chunk, cmd.renderTimeUs);
         } catch (err) {
           const e = err instanceof Error ? err : new Error(String(err));
           this.onError?.('video', e);
@@ -321,7 +394,8 @@ export class CommandDispatcher {
 
       case 'decode_audio':
         try {
-          this.audioDecoder?.decode(cmd.chunk, cmd.renderTimeUs);
+          if (cmd.inputToken !== undefined) this.audioDecoder?.decode(cmd.chunk, cmd.renderTimeUs, cmd.inputToken);
+          else this.audioDecoder?.decode(cmd.chunk, cmd.renderTimeUs);
         } catch (err) {
           const e = err instanceof Error ? err : new Error(String(err));
           this.onError?.('audio', e);
@@ -342,11 +416,15 @@ export class CommandDispatcher {
 
       case 'reset':
         if (cmd.mediaType === 'video') {
-          this.closeVideoHoldQueue();
+          this.outputRevision++;
+          this.outputRetirementReason = 'decoder reset';
+          this.closeVideoHoldQueue('decoder reset');
           this.renderer?.flush();
           this.videoDecoder?.reset();
           this.videoQueuePressureHigh = false;
         } else {
+          this.audioOutputRevision++;
+          this.audioRetirementReason = 'decoder reset';
           this.audioDecoder?.reset();
           this.audioOutput?.flush?.();
           this.audioQueuePressureHigh = false;
@@ -396,23 +474,33 @@ export class CommandDispatcher {
     }
   }
 
-  /** Drain held video frames to renderer with recomputed render times. */
-  private drainVideoHoldQueue(renderer: VideoRendererLike): void {
-    for (const held of this.videoHoldQueue) {
-      const renderTimeUs = this._recomputeVideoRenderTime
-        ? this._recomputeVideoRenderTime(held.captureTimestampUs)
-        : 0;
-      renderer.enqueue(held.frame, renderTimeUs);
-    }
-    this.videoHoldQueue.length = 0;
+  private enqueueVideo(renderer: VideoRendererLike, frame: unknown, observation: OutputOwnership | undefined, renderTimeUs: number): void {
+    try {
+      if (observation) renderer.enqueue(frame, renderTimeUs, observation.token);
+      else renderer.enqueue(frame, renderTimeUs);
+    } catch (error) { this.discardOutput(observation, 'output failed'); throw error; }
   }
 
-  /** Close all held video frames (GPU memory!). */
-  private closeVideoHoldQueue(): void {
-    for (const held of this.videoHoldQueue) {
-      (held.frame as any).close?.();
+  /** Remove before delivery so reentrant flush owns only the not-yet-submitted entries. */
+  private drainVideoHoldQueue(renderer: VideoRendererLike, revision: number): void {
+    while (this.videoHoldQueue.length && !this.renderFeedbackRetired && this.outputRevision === revision) {
+      const held = this.videoHoldQueue.shift()!;
+      let renderTimeUs: number;
+      try { renderTimeUs = this._recomputeVideoRenderTime ? this._recomputeVideoRenderTime(held.captureTimestampUs) : 0; }
+      catch (error) { this.releaseHeld(held, 'output failed'); throw error; }
+      if (this.renderFeedbackRetired || this.outputRevision !== revision) {
+        this.releaseHeld(held, this.outputRetirementReason); return;
+      }
+      const observation = held.observation;
+      delete held.observation;
+      this.enqueueVideo(renderer, held.frame, observation, renderTimeUs);
     }
-    this.videoHoldQueue.length = 0;
+  }
+
+  /** Detach before cleanup so observer reentry cannot close a frame twice. */
+  private closeVideoHoldQueue(reason: DispatcherOutputReason): void {
+    const held = this.videoHoldQueue.splice(0);
+    for (const entry of held) this.releaseHeld(entry, reason);
   }
 
   /**
@@ -425,10 +513,14 @@ export class CommandDispatcher {
    * rendered frame.
    */
   flush(): void {
+    this.outputRevision++;
+    this.outputRetirementReason = 'flushed';
+    this.audioOutputRevision++;
+    this.audioRetirementReason = 'flushed';
     // Cancel BEFORE the fallible flush: a custom renderer whose flush throws
     // would otherwise leave the episode live across an intentional pause.
     this.renderer?.cancelStallEpisode?.();
-    this.closeVideoHoldQueue();
+    this.closeVideoHoldQueue('flushed');
     this.renderer?.flush();
     this.audioOutput?.flush();
   }
@@ -437,7 +529,11 @@ export class CommandDispatcher {
   destroy(): void {
     // Retire before fallible cleanup; custom adapters may retain callbacks.
     this.renderFeedbackRetired = true;
-    this.closeVideoHoldQueue();
+    this.outputRevision++;
+    this.outputRetirementReason = 'destroyed';
+    this.audioOutputRevision++;
+    this.audioRetirementReason = 'destroyed';
+    this.closeVideoHoldQueue('destroyed');
     this.videoDecoder?.destroy();
     this.audioDecoder?.destroy();
     this.renderer?.destroy();

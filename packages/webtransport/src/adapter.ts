@@ -88,6 +88,8 @@ import { createUniPairTopology, PeerSetupRejectedError, RequestCancelledError, R
 import { IncomingUniRouter, type RoutedIncomingUniStream } from './topology/incoming-uni.js';
 import { InboundRequestStreamContext } from './topology/inbound-request.js';
 import { MoqtConnectionError } from './adapter-error.js';
+import { ObjectReceiptObservers } from './object-receipts.js';
+import type { ObjectReceipt, ObjectReceiptObservation, ObjectReceiptDiscard } from './object-receipts.js';
 import type { WebTransportLike, WebTransportBidirectionalStream, MoqtSetupRouting } from './types.js';
 import { isDraft22, isRequestStreamDraft, isWiredDraft } from '@openmoq/transport';
 
@@ -391,6 +393,11 @@ export class MoqtConnection {
   /** Draft version this connection was created with. */
   get draftVersion(): DraftVersion {
     return this.session.draftVersion;
+  }
+
+  /** Observed binding metadata only; no transport handle or credentials. */
+  get transportInfo(): { readonly kind: 'webtransport' | 'quic'; readonly protocol: string | null } | null {
+    return this.transport ? { kind: this.transportKind, protocol: this.transport.protocol || null } : null;
   }
 
   /** Wire format codec for the active negotiated draft version. Set by {@link configureForVersion}. */
@@ -745,6 +752,8 @@ export class MoqtConnection {
    * owned by the connection outlives the terminal shutdown.
    */
   private clearTerminalState(): void {
+    this.objectReceiptObservers = undefined;
+    this.reboundSubscribers = undefined;
     this.authorization?.close();
     this.authorizationUpdateTails.clear();
     const incomingUniRouter = this.incomingUniRouter;
@@ -958,7 +967,11 @@ export class MoqtConnection {
   /** Called when a data stream header is decoded (§10.4). */
   onDataStream?: (streamId: bigint, header: DataStreamHeader) => void;
 
-  /** Called for each object decoded from a data stream (§10.4.2, §10.4.4). */
+  /**
+   * Called for each eligible object receipt (§10.4.2, §10.4.4). Same-track
+   * alias reuse may deliver an immutable object more than once; consumers must
+   * suppress replays by their own location/timeline state.
+   */
   onObject?: (streamId: bigint, object: MoqtObject) => void;
 
   /**
@@ -991,7 +1004,10 @@ export class MoqtConnection {
    */
   onSubgroupFin?: (streamId: bigint, header: SubgroupHeader) => void;
 
-  /** Called for each decoded datagram (§10.3). */
+  /**
+   * Called for each eligible datagram receipt (§10.3), including repeated copies
+   * of the same immutable object. This is not an exactly-once delivery API.
+   */
   onDatagram?: (datagram: ObjectDatagram) => void;
 
   /** Called for each message on a namespace discovery stream (§6.1). */
@@ -1096,6 +1112,73 @@ export class MoqtConnection {
    * @see draft-pardue-moq-qlog-moq-events-06
    */
   onQlogEvent?: (event: QlogEvent) => void;
+
+  private qlogObservers: Set<(event: QlogEvent) => void | Promise<void>> | undefined;
+  private objectReceiptObservers: ObjectReceiptObservers | undefined;
+
+  /**
+   * Observe copied scalar receipt metadata without replacing application data
+   * callbacks. Tokens identify actual callback objects, never equal-numbered
+   * wire locations. No receipt state is allocated without this explicit opt-in.
+   */
+  observeObjectReceipts(listener: (event: ObjectReceiptObservation) => void | Promise<void>): () => void {
+    if (typeof listener !== 'function') throw new TypeError('Expected an object receipt observer');
+    const observers = this.objectReceiptObservers ??= new ObjectReceiptObservers();
+    const remove = observers.observe(listener);
+    return () => {
+      remove();
+      if (this.objectReceiptObservers === observers && observers.empty) this.objectReceiptObservers = undefined;
+    };
+  }
+
+  /** Explicit policy discards, correlated to their receipt without retaining media. */
+  observeObjectDiscards(listener: (event: ObjectReceiptDiscard) => void | Promise<void>): () => void {
+    if (typeof listener !== 'function') throw new TypeError('Expected an object discard observer');
+    const observers = this.objectReceiptObservers ??= new ObjectReceiptObservers();
+    const remove = observers.observeDiscards(listener);
+    return () => {
+      remove();
+      if (this.objectReceiptObservers === observers && observers.empty) this.objectReceiptObservers = undefined;
+    };
+  }
+
+  /** Exact object identity only; unobserved objects have no receipt or invented history. */
+  objectReceiptFor(object: object): ObjectReceipt | undefined {
+    return this.objectReceiptObservers?.receiptFor(object);
+  }
+
+  /**
+   * Add an independent observation channel without replacing application qlog
+   * callbacks. Each listener receives its own copy; failure cannot affect the
+   * protocol. No detailed events are constructed when both channels are absent.
+   * The returned unsubscribe is idempotent and releases the listener immediately.
+   */
+  observeQlogEvents(listener: (event: QlogEvent) => void | Promise<void>): () => void {
+    if (typeof listener !== 'function') throw new TypeError('Expected a qlog observer');
+    const observers = this.qlogObservers ??= new Set();
+    observers.add(listener);
+    return () => {
+      observers.delete(listener);
+      if (this.qlogObservers === observers && observers.size === 0) this.qlogObservers = undefined;
+    };
+  }
+
+  private get observedQlogEvent(): ((event: QlogEvent) => void) | undefined {
+    return this.qlogObservers ? this.dispatchObservedQlog : this.onQlogEvent;
+  }
+
+  private dispatchObservedQlog(event: QlogEvent): void {
+    const observers = this.qlogObservers;
+    if (observers) for (const listener of [...observers]) {
+      if (!observers.has(listener)) continue;
+      try {
+        const pending = listener(structuredClone(event));
+        if (pending) void Promise.resolve(pending).catch(() => {});
+      } catch { /* Optional diagnostics cannot affect protocol processing. */ }
+    }
+    this.onQlogEvent?.(event);
+  }
+
 
   /**
    * Synthetic stream ID for the control stream in qlog events.
@@ -1242,14 +1325,13 @@ export class MoqtConnection {
     cancelTimer: () => void;
     /**
      * STRICT tombstones come from a PUBLISH_DONE Stream Count; NON-strict ones
-     * are ordinary-unsubscribe / peer-close TTL-only guards. Both REFUSE alias
-     * reuse while live (see {@link aliasReuseSafe}) — §11.1 permits late objects
-     * after cancellation, so reusing an alias with any guard risks misdelivering
-     * an old stream to the new track. The only reuse-safe state is a COMPLETE
-     * strict tombstone (remaining 0: its generation finished). The `strict` flag
-     * distinguishes the two for that check and for count-driven clearing.
+     * are ordinary-unsubscribe / peer-close TTL-only guards. Ordinary guards permit proven same-track reuse;
+     * conflicting or unknown identities remain guarded (§11.1). Strict guards
+     * permit reuse only when their old stream count is complete.
      */
     strict: boolean;
+    /** Full track identity from our request; null means unknown or conflicting. */
+    trackKey: string | null;
   }>();
   /**
    * Terminal-alias-guard lifetime (constructor option, default 10s). §10.11: a late
@@ -1377,6 +1459,14 @@ export class MoqtConnection {
       this.framer = new ControlStreamFramer(this.codec);
       this.dataCodec = createDataCodec(version);
       this.uniPair = createUniPairTopology(this.session);
+      this.uniPair.onSetupCreated = (message, length) => this.containObserver(() => this.observedQlogEvent?.({
+        type: 'control_message_created', stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
+        message: structuredClone(message), length,
+      }));
+      this.uniPair.onSetupParsed = message => this.containObserver(() => this.observedQlogEvent?.({
+        type: 'control_message_parsed', stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
+        message: structuredClone(message) as ControlMessage,
+      }));
       // Surface request-stream failures (unsolicited/wrong-typed response) at once,
       // de-duped against the response-consumer path (same Error instance).
       this.uniPair.onStreamError = (err) => this.reportStreamError(err);
@@ -1602,6 +1692,9 @@ export class MoqtConnection {
         if (rDone) throw new ProtocolViolationError('Control stream closed before CLIENT_SETUP');
         this.framer.push(value);
         for (const { message } of this.framer.drain()) {
+          this.containObserver(() => this.observedQlogEvent?.({ type: 'control_message_parsed',
+            stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID, message: structuredClone(message) as ControlMessage }));
+          if (this._terminated) throw new Error('Connection closed during setup observation');
           await this.executeActions(this.session.handleControlMessage(message));
           if (message.type === 'CLIENT_SETUP') clientSetupSeen = true;
         }
@@ -1619,6 +1712,9 @@ export class MoqtConnection {
         if (done) throw new ProtocolViolationError('Control stream closed before setup complete');
         this.framer.push(value);
         for (const { message } of this.framer.drain()) {
+          this.containObserver(() => this.observedQlogEvent?.({ type: 'control_message_parsed',
+            stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID, message: structuredClone(message) as ControlMessage }));
+          if (this._terminated) throw new Error('Connection closed during setup observation');
           await this.executeActions(this.session.handleControlMessage(message));
         }
       }
@@ -1739,7 +1835,7 @@ export class MoqtConnection {
         throw new Error('PUBLISH produced an unexpected outbound action');
       }
       bytes = this.codec.encode(send.message);
-      this.onQlogEvent?.({
+      this.observedQlogEvent?.({
         type: 'control_message_created',
         stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
         length: bytes.byteLength,
@@ -2148,7 +2244,7 @@ export class MoqtConnection {
     // (track-property fault, session reject, guarded-alias refuse, crossed-response
     // drop) so every parsed response is observed even when it is not surfaced to
     // the application via onMessage.
-    this.onQlogEvent?.({
+    this.observedQlogEvent?.({
       type: 'control_message_parsed',
       stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
       message: stamped,
@@ -2252,7 +2348,7 @@ export class MoqtConnection {
     // is still live, reusing the alias risks misdelivering an old stream to this
     // new track — refuse (per-track, non-fatal) via the draft-specific cancel.
     const alias = BigInt((message as { trackAlias: bigint }).trackAlias);
-    if (!this.aliasReuseSafe(alias)) {
+    if (!this.aliasReuseSafe(alias, requestId)) {
       await this.refuseAliasReuse(requestId, alias,
         `track alias ${alias} is still guarded by a terminating prior subscription (§11.1) — reuse refused`);
       return;
@@ -2260,6 +2356,9 @@ export class MoqtConnection {
     // (3) Accepted — bind routing, resolve, surface, and run replenish actions.
     const stampedOk = { ...message, requestId } as ControlMessage;
     // The old generation's complete guard (if any) is safe to clear now.
+    if (this.terminatedAliases.get(alias)?.strict === false) {
+      (this.reboundSubscribers ??= new WeakSet()).add(this.session.getSubscription(requestId)!);
+    }
     this.clearTerminatedAlias(alias);
     const suppress = this.handleRawSubControlMessage(stampedOk);
     if (!suppress) {
@@ -2281,6 +2380,7 @@ export class MoqtConnection {
    * touched on draft-18 (it does not exist on draft-14/16).
    */
   private async refuseAliasReuse(requestId: bigint, alias: bigint, reason: string): Promise<void> {
+    this.poisonConflictingAlias(alias, requestId);
     const err = new MoqtConnectionError(reason, { errorSource: 'control', isFatal: false });
     const raw = this.rawSubscriptions.get(requestId);
     if (raw) {
@@ -2305,17 +2405,31 @@ export class MoqtConnection {
    * Whether Track Alias `alias` is safe to (re)bind to a new subscription.
    * Unsafe while a prior terminal guard is still live and could route a late old
    * stream to the new track (§11.1): an incomplete or unknown-count STRICT
-   * tombstone, or any NON-strict ordinary-teardown guard. Safe when there is no
-   * tombstone, or a COMPLETE strict one (remaining 0 — its generation finished).
+   * tombstone, or an ordinary guard without matching full-track identity. Safe when there
+   * is no guard, a complete strict guard, or a proven ordinary same-track retry.
    */
-  private aliasReuseSafe(alias: bigint): boolean {
+  private aliasReuseSafe(alias: bigint, requestId?: bigint): boolean {
     if (this.drainingAliases.has(alias)) return false; // drain window in progress
     const live = this.session.getSubscriberRequestsForAlias(alias);
     for (const { sub } of this.terminalSubscribers.values()) {
       if (sub.trackAlias === alias && !live.some((owner) => owner.trackKey === sub.trackKey)) return false;
     }
     const t = this.terminatedAliases.get(alias);
-    return !t || (t.strict && t.remaining === 0n);
+    if (!t) return true;
+    if (t.strict) return t.remaining === 0n;
+    const successor = requestId === undefined ? undefined
+      : this.session.getSubscription(requestId) ?? this.session.getIncomingSubscription(requestId);
+    return t.trackKey !== null && successor?.trackKey === t.trackKey;
+  }
+
+  /** A refused, proven different track can already have put data on the alias. */
+  private poisonConflictingAlias(alias: bigint, requestId: bigint): void {
+    const guard = this.terminatedAliases.get(alias);
+    const successor = this.session.getSubscription(requestId) ?? this.session.getIncomingSubscription(requestId);
+    if (guard && !guard.strict && guard.trackKey !== null
+        && successor?.trackKey !== undefined && successor.trackKey !== guard.trackKey) {
+      guard.trackKey = null;
+    }
   }
 
   /**
@@ -2524,9 +2638,7 @@ export class MoqtConnection {
     const raw = this.rawSubscriptions.get(requestId);
     // A subscription sharing its alias leaves it to the others (draft-22 §3.1).
     if (raw) this.detachSharedAlias(raw);
-    const alias = isDraft22(this.session.draftVersion)
-      ? this.session.getSubscription(requestId)?.trackAlias ?? raw?.trackAlias
-      : raw?.trackAlias;
+    const alias = this.session.getSubscription(requestId)?.trackAlias ?? raw?.trackAlias;
     const retained = this.terminalSubscribers.has(requestId);
     if (alias != null && this.session.getSubscription(requestId)) this.recordSubscriberTerminal(alias, null);
     const teardownAlias = !retained && alias != null
@@ -2623,9 +2735,9 @@ export class MoqtConnection {
    * notice that follows.
    */
   private qlogGoaway(goaway: Goaway): void {
-    if (!this.onQlogEvent) return;
+    if (!this.observedQlogEvent) return;
     const snapshot: Goaway = { ...goaway };
-    this.containObserver(() => this.onQlogEvent?.({
+    this.containObserver(() => this.observedQlogEvent?.({
       type: 'control_message_parsed',
       stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
       message: snapshot as ControlMessage,
@@ -2875,8 +2987,29 @@ export class MoqtConnection {
     return true;
   }
 
+  // Reusing an alias can admit late copies from the same immutable track. Raw
+  // callbacks remain per receipt; consumers own replay suppression. The new
+  // subscription's range and Forward State still delimit eligible receipts.
+  // The fence lasts for that state machine's lifetime; unfenced raw subscriptions
+  // retain their existing per-receipt behavior. No history or timer is retained
+  // after the owner is reclaimed.
+  private reboundSubscribers: WeakSet<SubscriptionStateMachine> | undefined;
+
+  private reboundAllowsObject(alias: bigint, group: bigint, object: bigint): boolean {
+    const rebound = this.reboundSubscribers;
+    if (!rebound) return true;
+    const owners = this.session.getSubscriberRequestsForAlias(alias);
+    if (!owners.some(owner => rebound.has(owner))) return true;
+    return owners.some(owner => owner.isActive
+      && (!owner.locationWindow || windowContains(owner.locationWindow, group, object)));
+  }
+
   private routeToTrackSubscription(streamId: bigint, obj: MoqtObject): boolean {
     const alias = BigInt(obj.trackAlias);
+    if (!this.reboundAllowsObject(alias, obj.groupId, obj.objectId)) {
+      this.objectReceiptObservers?.discard(obj, 'subscription policy');
+      return true;
+    }
     const replay = this.pendingAliasReplays.get(alias);
     if (replay) {
       return this.appendPendingAliasReplay(replay, {
@@ -2928,7 +3061,10 @@ export class MoqtConnection {
     //
     // Ahead of the Session fallback below: a live tombstone is authoritative,
     // and a legitimately reused alias has already cleared it before binding.
-    if (this.terminatedAliases.has(alias)) return true;
+    if (this.terminatedAliases.has(alias)) {
+      this.objectReceiptObservers?.discard(obj, 'late');
+      return true;
+    }
     // An established generic subscribe() intentionally uses the connection-wide
     // onObject callback. A pending raw subscription elsewhere must not steal it.
     if (this.session.getTrackByAlias(alias) !== undefined) return false;
@@ -3207,6 +3343,10 @@ export class MoqtConnection {
         replay.bytes -= bytes;
         this.pendingAliasTotalBytes -= bytes;
         if (event.kind === 'object') {
+          if (!this.reboundAllowsObject(alias, event.object.groupId, event.object.objectId)) {
+            this.objectReceiptObservers?.discard(event.object, 'subscription policy');
+            continue;
+          }
           if (replay.raw) replay.raw.sub.onObject?.(event.object);
           else this.onObject?.(event.streamId, event.object);
         } else if (replay.raw) {
@@ -3287,7 +3427,7 @@ export class MoqtConnection {
    */
   private armSubscriberAliasTeardown(alias: bigint): void {
     this.refreshAliasDeliveryTimeout(alias); // §8: reflect any accepted REQUEST_UPDATE before arming
-    this.armTerminatedAlias(alias, null, /* strict */ false); // TTL-only; refuses reuse until it expires
+    this.armTerminatedAlias(alias, null, /* strict */ false); // TTL-only, with same-track identity proof
     this.rawAliasMaps.delete(alias);
     this.sharedAliasSubs.delete(alias);
   }
@@ -3338,8 +3478,7 @@ export class MoqtConnection {
    * already covered. `remaining` counts expected late streams (bigint), or
    * `null` when the count is unknown (2^62-1 sentinel) — then only the TTL clears
    * it. `strict` marks a PUBLISH_DONE Stream-Count tombstone vs an
-   * ordinary-teardown guard; both REFUSE alias reuse while live (only a COMPLETE
-   * strict tombstone is reuse-safe — see {@link aliasReuseSafe}) — the flag only
+   * ordinary-teardown guard; see {@link aliasReuseSafe} for same-track reuse. The flag
    * governs count-driven clearing and the no-downgrade rule below. A tombstone
    * always carries a TTL so it is bounded regardless.
    */
@@ -3364,7 +3503,12 @@ export class MoqtConnection {
     // Chunked so a huge (but valid) timeout cannot overflow setTimeout to ~1 ms.
     const ttlMs = Math.max(this.terminatedAliasTtlMs, this.aliasDeliveryTimeoutMs.get(alias) ?? 0);
     const cancelTimer = this.armGuardTimer(ttlMs, () => this.clearTerminatedAlias(alias));
-    this.terminatedAliases.set(alias, { remaining, cancelTimer, strict });
+    const owners = this.session.getSubscriberRequestsForAlias(alias);
+    const key = owners[0]?.trackKey;
+    const currentKey = key !== undefined && owners.every(owner => owner.trackKey === key) ? key : null;
+    const trackKey = existing === undefined ? currentKey
+      : existing.trackKey !== null && existing.trackKey === currentKey ? currentKey : null;
+    this.terminatedAliases.set(alias, { remaining, cancelTimer, strict, trackKey });
   }
 
   /**
@@ -3718,9 +3862,7 @@ export class MoqtConnection {
     // direct API, the TrackSubscription wrapper, and the peer-close path all
     // arm at the same point and cannot diverge.
     const raw = this.rawSubscriptions.get(requestId);
-    const alias = isDraft22(this.session.draftVersion)
-      ? this.session.getSubscription(requestId)?.trackAlias ?? raw?.trackAlias
-      : raw?.trackAlias;
+    const alias = this.session.getSubscription(requestId)?.trackAlias ?? raw?.trackAlias;
     // A subscription sharing its alias leaves it to the others (draft-22 §3.1).
     const aliasStillShared = alias != null && isDraft22(this.session.draftVersion)
       && this.deliverySubscribers22(alias).some((sub) => sub.requestId !== requestId);
@@ -5881,7 +6023,7 @@ export class MoqtConnection {
       switch (action.type) {
         case 'send_control': {
           const bytes = this.codec.encode(action.message);
-          this.onQlogEvent?.({
+          this.observedQlogEvent?.({
             type: 'control_message_created',
             stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
             length: bytes.byteLength,
@@ -6008,7 +6150,7 @@ export class MoqtConnection {
           // (the raw channel) before the ordered handling, since `continue` skips
           // the generic qlog below and handleSubscribeOkOrdered no longer emits.
           if (message.type === 'SUBSCRIBE_OK') {
-            this.onQlogEvent?.({
+            this.observedQlogEvent?.({
               type: 'control_message_parsed',
               stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
               message,
@@ -6025,7 +6167,7 @@ export class MoqtConnection {
             await this.handleSessionGoawayOrdered(message);
             continue;
           }
-          this.onQlogEvent?.({
+          this.observedQlogEvent?.({
             type: 'control_message_parsed',
             stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
             message,
@@ -6275,7 +6417,7 @@ export class MoqtConnection {
           if (this.terminatedAliases.has(datagram.trackAlias as bigint)) {
             continue;
           }
-          this.onQlogEvent?.({
+          this.observedQlogEvent?.({
             type: 'object_datagram_parsed',
             track_alias: datagram.trackAlias as bigint,
             group_id: datagram.groupId as bigint,
@@ -6294,6 +6436,17 @@ export class MoqtConnection {
           // checks above and this delivery.
           if (this._terminated) break;
           if (this.terminatedAliases.has(datagram.trackAlias as bigint)) continue;
+          const receipts = this.objectReceiptObservers;
+          receipts?.receive(datagram, 'datagram');
+          if (this._terminated) { receipts?.discard(datagram, 'late'); break; }
+          if (this.terminatedAliases.has(datagram.trackAlias as bigint)) {
+            receipts?.discard(datagram, 'late');
+            continue;
+          }
+          if (!this.reboundAllowsObject(datagram.trackAlias, datagram.groupId, datagram.objectId)) {
+            this.objectReceiptObservers?.discard(datagram, 'subscription policy');
+            continue;
+          }
           this.onDatagram?.(datagram);
         } catch (err) {
           // §10.3.1, §10: Protocol violations (invalid flags, zero-length
@@ -6753,7 +6906,8 @@ export class MoqtConnection {
     // late stream to this new track. Reject with REQUEST_ERROR (not a session
     // close): the request, not the connection, is at fault.
     const pubAlias = pub.trackAlias as bigint;
-    if (!this.aliasReuseSafe(pubAlias)) {
+    if (!this.aliasReuseSafe(pubAlias, requestId)) {
+      this.poisonConflictingAlias(pubAlias, requestId);
       const actions = this.session.rejectSubscribe(
         requestId, RequestError18.DUPLICATE_SUBSCRIPTION as bigint,
         `track alias ${pubAlias} is still guarded by a terminating prior subscription (§11.1)`,
@@ -6762,6 +6916,9 @@ export class MoqtConnection {
       return;
     }
     // The old generation's complete guard (if any) is safe to clear now.
+    if (this.terminatedAliases.get(pubAlias)?.strict === false) {
+      (this.reboundSubscribers ??= new WeakSet()).add(this.session.getIncomingSubscription(requestId)!);
+    }
     this.clearTerminatedAlias(pubAlias);
     const incoming: IncomingPublish = {
       requestId,
@@ -7182,7 +7339,7 @@ export class MoqtConnection {
         }
         this.incomingSubgroupAliases.set(streamId, subgroupAlias);
         // Header decoded — route objects below
-        this.onQlogEvent?.({
+        this.observedQlogEvent?.({
           type: 'stream_type_set',
           owner: 'remote',
           stream_id: streamId,
@@ -7193,7 +7350,7 @@ export class MoqtConnection {
           this.onStreamClosed?.(streamId, undefined, 'local-discard');
           return;
         }
-        this.onQlogEvent?.({
+        this.observedQlogEvent?.({
           type: 'subgroup_header_parsed',
           stream_id: streamId,
           track_alias: header.trackAlias as bigint,
@@ -7241,8 +7398,8 @@ export class MoqtConnection {
             }
           }
           this.fillStreams.set(fetchReqId, { streamId, subscriptionId: fillSub.requestId as bigint, groupOrder: fillOrder! });
-          this.onQlogEvent?.({ type: 'stream_type_set', owner: 'remote', stream_id: streamId, stream_type: 'fetch_header' });
-          this.onQlogEvent?.({ type: 'fetch_header_parsed', stream_id: streamId, request_id: fetchReqId });
+          this.observedQlogEvent?.({ type: 'stream_type_set', owner: 'remote', stream_id: streamId, stream_type: 'fetch_header' });
+          this.observedQlogEvent?.({ type: 'fetch_header_parsed', stream_id: streamId, request_id: fetchReqId });
           if (this.locallyDiscardedReaders.has(reader)) {
             this.onStreamClosed?.(streamId, undefined, 'local-discard');
             return;
@@ -7278,7 +7435,7 @@ export class MoqtConnection {
         }
         // §10.4.4: Track fetch requestId → streamId for STOP_SENDING on cancel
         this.fetchStreams.set(fetchReqId, streamId);
-        this.onQlogEvent?.({
+        this.observedQlogEvent?.({
           type: 'stream_type_set',
           owner: 'remote',
           stream_id: streamId,
@@ -7289,7 +7446,7 @@ export class MoqtConnection {
           this.onStreamClosed?.(streamId, undefined, 'local-discard');
           return;
         }
-        this.onQlogEvent?.({
+        this.observedQlogEvent?.({
           type: 'fetch_header_parsed',
           stream_id: streamId,
           request_id: header.requestId as bigint,
@@ -7561,7 +7718,7 @@ export class MoqtConnection {
           const objectIdDelta = isFirstObject
             ? (object.objectId as bigint)
             : ((object.objectId as bigint) - (previousObjectId as bigint) - 1n);
-          this.onQlogEvent?.({
+          this.observedQlogEvent?.({
             type: 'subgroup_object_parsed',
             stream_id: streamId,
             object_id_delta: objectIdDelta,
@@ -7572,6 +7729,12 @@ export class MoqtConnection {
           });
           // Gate: the qlog callback above may have torn this stream down.
           if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
+          const receipts = this.objectReceiptObservers;
+          receipts?.receive(delivered, 'subgroup');
+          if (this._terminated || this.locallyDiscardedReaders.has(reader)) {
+            receipts?.discard(delivered, 'late');
+            return 'local-discard';
+          }
           if (!this.routeToTrackSubscription(streamId, delivered)) {
             this.onObject?.(streamId, delivered);
           }
@@ -7610,6 +7773,12 @@ export class MoqtConnection {
             objectId: previousObjectId + 1n, // raw bigint — object IDs are semantic now
             status: ObjectStatus.END_OF_GROUP,
           };
+          const receipts = this.objectReceiptObservers;
+          receipts?.receive(eogGap, 'group-end', isFirstObject ? null : previousObjectId);
+          if (this._terminated || this.locallyDiscardedReaders.has(reader)) {
+            receipts?.discard(eogGap, 'late');
+            return 'local-discard';
+          }
           if (!this.routeToTrackSubscription(streamId, eogGap)) {
             this.onObject?.(streamId, eogGap);
           }
@@ -7647,7 +7816,7 @@ export class MoqtConnection {
           if ('payload' in item) {
             // FetchObject
             // -06 §4.13: fetch object with flag bools and optional fields
-            this.onQlogEvent?.({
+            this.observedQlogEvent?.({
               type: 'fetch_object_parsed',
               stream_id: streamId,
               datagram: item.isDatagram ?? false,
@@ -7790,7 +7959,7 @@ export class MoqtConnection {
           isFirstObject = false;
 
           if ('payload' in item) {
-            this.onQlogEvent?.({
+            this.observedQlogEvent?.({
               type: 'fetch_object_parsed',
               stream_id: streamId,
               datagram: item.isDatagram ?? false,

@@ -1,0 +1,31 @@
+{
+  "name": "@openmoq/devtools-protocol",
+  "version": "0.6.1",
+  "description": "Validated diagnostic messages and fixtures shared by Playa instrumentation and developer tools.",
+  "license": "Apache-2.0",
+  "author": "OpenMOQ (https://github.com/openmoq)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": { "fixtures": ["./dist/fixtures.d.ts"] }
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./fixtures": {
+      "types": "./dist/fixtures.d.ts",
+      "import": "./dist/fixtures.js"
+    }
+  },
+  "files": ["dist", "PROTOCOL.md", "CARRIER.md"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openmoq/moq-playa.git",
+    "directory": "packages/devtools-protocol"
+  },
+  "publishConfig": { "access": "public" },
+  "scripts": { "build": "tsc" }
+}

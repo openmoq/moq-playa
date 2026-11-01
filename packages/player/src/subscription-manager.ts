@@ -15,7 +15,7 @@
  * @module
  */
 
-import type { MoqtObject } from '@openmoq/transport';
+import type { MoqtObject, ObjectDatagram } from '@openmoq/transport';
 import type { LocHeaders, LocHeaderOptions } from '@openmoq/loc';
 import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
@@ -43,6 +43,15 @@ interface PendingLocmafTransform {
   valid: boolean;
 }
 
+/** Application-local input identity. The object/source arguments never enter a diagnostic export. */
+export type ObjectRoutingContext = object & { readonly then?: never };
+export type ObjectRoutingDiscardReason = 'transform cancelled' | 'dropped by transform' | 'route retired' | 'object processing failed'
+  | import('./interfaces.js').CmafAssemblyDiscardReason | 'paused' | 'awaiting init' | 'awaiting keyframe' | 'not attached' | 'stale group';
+export interface ObjectRoutingProvenance {
+  capture(sourceConnection: unknown, input: MoqtObject | ObjectDatagram): ObjectRoutingContext | undefined;
+  discarded(context: ObjectRoutingContext, reason: ObjectRoutingDiscardReason): void | Promise<void>;
+}
+
 /**
  * Manages track alias → pipeline routing.
  */
@@ -53,6 +62,29 @@ export class SubscriptionManager {
   private pendingLocmafTransformBytes = 0;
   private static readonly MAX_LOCMAF_TRANSFORMS = 256;
   private static readonly MAX_LOCMAF_TRANSFORM_BYTES = 8 * 1024 * 1024;
+
+  private provenanceObserver: ObjectRoutingProvenance | null = null;
+  private provenanceGeneration = 0;
+
+  /** Optional synchronous capture before transformation; every assignment starts a new observation lifetime. */
+  get objectProvenance(): ObjectRoutingProvenance | null { return this.provenanceObserver; }
+  set objectProvenance(observer: ObjectRoutingProvenance | null) {
+    this.provenanceObserver = observer;
+    this.provenanceGeneration++;
+  }
+
+  private activeContext(context: ObjectRoutingContext | undefined, observer: ObjectRoutingProvenance | null, generation: number): ObjectRoutingContext | undefined {
+    return this.provenanceObserver === observer && this.provenanceGeneration === generation ? context : undefined;
+  }
+
+  private discardContext(context: ObjectRoutingContext | undefined, observer: ObjectRoutingProvenance | null, generation: number,
+    reason: Parameters<ObjectRoutingProvenance['discarded']>[1]): void {
+    if (this.activeContext(context, observer, generation) === undefined || !observer) return;
+    try {
+      const result = observer.discarded(context!, reason);
+      if (result) void Promise.resolve(result).catch(() => {});
+    } catch { /* Diagnostic outcomes cannot make a track malformed. */ }
+  }
 
   /**
    * Object transform: applied to every MoqtObject before routing.
@@ -106,6 +138,7 @@ export class SubscriptionManager {
         trackName: string,
         obj: MoqtObject,
         headers: LocHeaders,
+        context?: object,
       ) => void)
     | null = null;
 
@@ -119,6 +152,7 @@ export class SubscriptionManager {
         mediaType: 'video' | 'audio',
         trackName: string,
         obj: MoqtObject,
+        context?: object,
       ) => void)
     | null = null;
 
@@ -133,6 +167,7 @@ export class SubscriptionManager {
         mediaType: 'video' | 'audio' | 'eventtimeline',
         trackName: string,
         obj: MoqtObject,
+        context?: object,
       ) => void)
     | null = null;
 
@@ -287,7 +322,7 @@ export class SubscriptionManager {
    * @see draft-ietf-moq-cmsf-00 §3.3 (CMAF Object Packaging)
    * @see draft-ietf-moq-msf-00 §8 (Event Timeline track)
    */
-  async routeObject(_streamId: bigint, obj: MoqtObject, sourceDraft?: DraftVersion, sourceConnection?: unknown): Promise<void> {
+  async routeObject(_streamId: bigint, obj: MoqtObject, sourceDraft?: DraftVersion, sourceConnection?: unknown, receiptInput?: MoqtObject | ObjectDatagram): Promise<void> {
     const alias = BigInt(obj.trackAlias);
     const info = this.tracks.get(alias);
     if (!info) return; // Unknown track alias — silently ignore
@@ -303,6 +338,9 @@ export class SubscriptionManager {
     const draft = sourceDraft ?? this.draftVersion;
     const source = sourceConnection;
     let pendingTransform: PendingLocmafTransform | undefined;
+    let provenance: ObjectRoutingProvenance | null = null;
+    let provenanceGeneration = 0;
+    let context: ObjectRoutingContext | undefined;
 
     try {
       // §7: Mediatimeline objects bypass E2EE transform — metadata is not encrypted.
@@ -333,6 +371,24 @@ export class SubscriptionManager {
       // mediaType is narrowed to 'video' | 'audio'.
       const mediaType = info.mediaType as 'video' | 'audio';
 
+      provenance = this.provenanceObserver;
+      if (provenance) {
+        provenanceGeneration = this.provenanceGeneration;
+        try {
+          const captured = provenance.capture(source, receiptInput ?? obj);
+          // Capture is synchronous. A JavaScript caller's accidental promise
+          // cannot delay media or become an opaque input identity.
+          if (captured && typeof Reflect.get(captured, 'then') === 'function') {
+            void Promise.resolve(captured).catch(() => {});
+          } else context = captured;
+        } catch { /* Capture is optional evidence, not media processing. */ }
+        // Capture is application code and can retire the route synchronously.
+        if (this.routeStillValid !== null && !this.routeStillValid(source, alias)) {
+          this.discardContext(context, provenance, provenanceGeneration, 'route retired');
+          return;
+        }
+      }
+
       // Apply object transform (E2EE decryption, recording, filtering)
       // Supports both sync and async transforms (crypto.subtle.decrypt is async)
       let transformed: MoqtObject | null = obj;
@@ -349,23 +405,36 @@ export class SubscriptionManager {
         }
         const result = this.objectTransform(obj);
         transformed = result instanceof Promise ? await result : result;
-        if (pendingTransform && !pendingTransform.valid) return;
-        if (!transformed) return; // Transform dropped the object
+        if (pendingTransform && !pendingTransform.valid) {
+          this.discardContext(context, provenance, provenanceGeneration, 'transform cancelled');
+          return;
+        }
+        if (!transformed) {
+          this.discardContext(context, provenance, provenanceGeneration, 'dropped by transform');
+          return;
+        }
         // The route may have changed hands while the transform was awaited.
-        if (this.routeStillValid !== null && !this.routeStillValid(source, alias)) return;
+        if (this.routeStillValid !== null && !this.routeStillValid(source, alias)) {
+          this.discardContext(context, provenance, provenanceGeneration, 'route retired');
+          return;
+        }
       }
 
       if (info.packaging === 'cmaf') {
         // CMAF path: skip LOC header parsing, route directly to MediaSource
         // §3.3: payload contains moof+mdat pairs
-        this.onCmafObject?.(mediaType, info.trackName, transformed);
+        const input = this.activeContext(context, provenance, provenanceGeneration);
+        if (input === undefined) this.onCmafObject?.(mediaType, info.trackName, transformed);
+        else this.onCmafObject?.(mediaType, info.trackName, transformed, input);
       } else if (info.packaging === 'locmaf') {
         // LOCMAF path: skip LOC header parsing; the payload is a LOCMAF Object.
         // An event-only track (§14) is registered as 'eventtimeline' and takes
         // the same path; the player dispatches on the media type.
         // that reconstructs to a CMAF chunk (moof+mdat).
         // @see draft-einarsson-moq-locmaf-01 §7, §15
-        this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed);
+        const input = this.activeContext(context, provenance, provenanceGeneration);
+        if (input === undefined) this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed);
+        else this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed, input);
       } else {
         // LOC path: parse extension headers and route to PlaybackPipeline
         const extensions = transformed.kind === 'data' ? transformed.extensions : undefined;
@@ -384,10 +453,16 @@ export class SubscriptionManager {
         const parse = this.extensionParser
           ?? ((ext: Uint8Array | undefined) => parseLocHeaders(ext, opts));
         const headers = parse(extensions);
-        this.onObject?.(mediaType, info.trackName, transformed, headers);
+        const input = this.activeContext(context, provenance, provenanceGeneration);
+        if (input === undefined) this.onObject?.(mediaType, info.trackName, transformed, headers);
+        else this.onObject?.(mediaType, info.trackName, transformed, headers, input);
       }
     } catch (error) {
-      if (pendingTransform && !pendingTransform.valid) return;
+      if (pendingTransform && !pendingTransform.valid) {
+        this.discardContext(context, provenance, provenanceGeneration, 'transform cancelled');
+        return;
+      }
+      this.discardContext(context, provenance, provenanceGeneration, 'object processing failed');
       // §2.4.2: Malformed Track — signal to player for UNSUBSCRIBE, tagged with
       // the source session so recovery does not cancel a request on another.
       this.onMalformedTrack?.(
