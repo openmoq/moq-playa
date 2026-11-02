@@ -8328,6 +8328,80 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
+    describe('a selection while a switch is pending', () => {
+      const lastSubName = (adapter: ReturnType<typeof createMockAdapter>) =>
+        new TextDecoder().decode((adapter.subscribe as any).mock.calls.at(-1)[1]);
+      const unsubIds = (adapter: ReturnType<typeof createMockAdapter>) =>
+        (adapter.unsubscribe as any).mock.calls.map((c: unknown[]) => BigInt(c[0] as bigint));
+
+      it('unsubscribes the superseded target and stages only the newest one', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadMultitrack(adapter);
+        const failedFn = vi.fn();
+        player.on('quality_switch_failed', failedFn);
+
+        await player.selectVideoTrack('video-2');
+        const supersededReqId = BigInt(await (adapter.subscribe as any).mock.results.at(-1)!.value);
+        await player.selectVideoTrack('video-0');
+
+        expect(lastSubName(adapter)).toBe('video-0');
+        // The superseded target is gone: otherwise its objects, no longer
+        // staged, would reach the sink as ordinary media.
+        expect(unsubIds(adapter)).toEqual([supersededReqId]);
+        expect((player as any).pendingVideoSwitch.newTrackName).toBe('video-0');
+        expect((player as any).pendingVideoSwitch.oldTrackName).toBe('video-1');
+        expect(failedFn).toHaveBeenCalledTimes(1);
+        expect(failedFn.mock.calls[0][0]).toMatchObject({ fromTrackName: 'video-1', toTrackName: 'video-2' });
+
+        await player.destroy();
+      });
+
+      it('repeating the pending target is a no-op', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadMultitrack(adapter);
+
+        await player.selectVideoTrack('video-2');
+        const subCount = (adapter.subscribe as any).mock.calls.length;
+        await player.selectVideoTrack('video-2');
+
+        expect((adapter.subscribe as any).mock.calls.length).toBe(subCount);
+        expect(adapter.unsubscribe).not.toHaveBeenCalled();
+
+        await player.destroy();
+      });
+
+      it('selecting the current track cancels the pending switch', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadMultitrack(adapter);
+
+        await player.selectVideoTrack('video-2');
+        const pendingReqId = BigInt(await (adapter.subscribe as any).mock.results.at(-1)!.value);
+        const subCount = (adapter.subscribe as any).mock.calls.length;
+        await player.selectVideoTrack('video-1');
+
+        expect((adapter.subscribe as any).mock.calls.length).toBe(subCount);
+        expect(unsubIds(adapter)).toEqual([pendingReqId]);
+        expect((player as any).pendingVideoSwitch).toBeNull();
+
+        await player.destroy();
+      });
+
+      it('rejects while the pending switch is committing', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadMultitrack(adapter);
+
+        await player.selectVideoTrack('video-2');
+        (player as any).switchInProgress = true;
+
+        await expect(player.selectVideoTrack('video-0')).rejects.toThrow(/is committing/);
+        expect((player as any).pendingVideoSwitch.newTrackName).toBe('video-2');
+        expect(adapter.unsubscribe).not.toHaveBeenCalled();
+
+        (player as any).switchInProgress = false;
+        await player.destroy();
+      });
+    });
+
     it('selects middle quality video track by default from altGroup', async () => {
       const adapter = createMockAdapter();
       const player = await loadMultitrack(adapter);

@@ -1930,6 +1930,14 @@ export class MoqtPlayer {
     // A rejected selection must not change the active group's ABR policy.
     if (reason === 'manual') this.qualityController?.lockManual();
 
+    // A pending switch is either the request being repeated (no-op), or
+    // being replaced. Replace it before anything else: once a newer target
+    // is chosen, the older pending track is no longer staged, so its
+    // objects would otherwise reach the sink as ordinary media.
+    const pending = this.pendingVideoSwitch;
+    if (pending?.newTrackName === trackName) return;
+    if (pending) this.supersedePendingVideoSwitch(pending, trackName);
+
     // No-op if already on the target track
     if (currentVideoTrackName === trackName) return;
 
@@ -2051,6 +2059,21 @@ export class MoqtPlayer {
     }
 
     if (!this.subscriptionManager) return; // destroyed during await
+
+    // Another selection may have started a switch while this one awaited
+    // its init prefetch or SUBSCRIBE; the latest request wins.
+    const raced = this.pendingVideoSwitch;
+    if (raced) {
+      try {
+        this.supersedePendingVideoSwitch(raced, trackName);
+      } catch (err) {
+        if (this.connection) {
+          this.retireMediaSubscription(reqIdBigInt, this.connection);
+          try { this.connection.unsubscribe(varint(reqIdBigInt)); } catch { /* ignore */ }
+        }
+        throw err;
+      }
+    }
 
     this.log.info('[SWITCH] start: "%s" → "%s" (newReqId=%s, oldReqId=%s)',
       currentVideoTrackName, trackName, reqIdBigInt, currentVideoRequestId);
@@ -2327,17 +2350,7 @@ export class MoqtPlayer {
     sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>,
     cause: Error,
   ): void {
-    if (this.connection && this.subscriptionManager) {
-      this.retireMediaSubscription(sw.newRequestId, this.connection);
-      try { this.connection.unsubscribe(varint(sw.newRequestId)); } catch { /* ignore */ }
-    }
-    this.cmafSwitchStagingBuffer = [];
-    this.switchStagingBuffer = [];
-    this.locmafDecoders.delete(sw.newTrackName);
-    this.locmafDecoderInit.delete(sw.newTrackName);
-    this.locmafHealth.delete(sw.newTrackName);
-    this.pendingVideoSwitch = null;
-    this.switchInProgress = false;
+    this.discardPendingVideoSwitch(sw);
     this.emitter.emit('quality_switch_failed', {
       type: 'quality_switch_failed',
       fromTrackName: sw.oldTrackName,
@@ -2352,6 +2365,53 @@ export class MoqtPlayer {
       `Track switch to "${sw.newTrackName}" failed: ${cause.message}`,
       { cause, context: { newTrackName: sw.newTrackName, oldTrackName: sw.oldTrackName } },
     ));
+  }
+
+  /**
+   * Replace a pending switch that has not started committing. The pending
+   * target is unsubscribed and its staged objects dropped; the old track
+   * keeps playing until the replacement commits. A switch that is already
+   * committing (re-initializing the sink) cannot be unwound, so the new
+   * request is rejected instead.
+   */
+  private supersedePendingVideoSwitch(
+    sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>,
+    nextTrackName: string,
+  ): void {
+    if (this.switchInProgress) {
+      throw new Error(
+        `Cannot switch to "${nextTrackName}": switch to "${sw.newTrackName}" is committing`,
+      );
+    }
+    this.log.info('[SWITCH] superseded: "%s" → "%s" replaced by "%s"',
+      sw.oldTrackName, sw.newTrackName, nextTrackName);
+    this.discardPendingVideoSwitch(sw);
+    this.emitter.emit('quality_switch_failed', {
+      type: 'quality_switch_failed',
+      fromTrackName: sw.oldTrackName,
+      toTrackName: sw.newTrackName,
+      reason: sw.reason,
+      error: new Error(`Superseded by switch to "${nextTrackName}"`),
+    });
+  }
+
+  /** Unsubscribe a pending switch's target and drop everything staged for it. */
+  private discardPendingVideoSwitch(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
+    if (this.switchStagingTimeout !== null) {
+      clearTimeout(this.switchStagingTimeout);
+      this.switchStagingTimeout = null;
+    }
+    if (this.connection && this.subscriptionManager) {
+      this.retireMediaSubscription(sw.newRequestId, this.connection);
+      try { this.connection.unsubscribe(varint(sw.newRequestId)); } catch { /* ignore */ }
+    }
+    this.cmafSwitchStagingBuffer = [];
+    this.switchStagingBuffer = [];
+    this.locmafDecoders.delete(sw.newTrackName);
+    this.locmafDecoderInit.delete(sw.newTrackName);
+    this.locmafHealth.delete(sw.newTrackName);
+    this.pendingVideoSwitch = null;
+    this.switchInProgress = false;
   }
 
   // ─── Event API ──────────────────────────────────────────
