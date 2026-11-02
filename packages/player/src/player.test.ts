@@ -29,6 +29,7 @@ import { varint, ObjectStatus } from '@openmoq/transport';
 import { encodeLocHeaders } from '@openmoq/loc';
 import type { ClockSource } from '@openmoq/playback';
 import type { DataStreamTerminal, GoawayNotice } from '@openmoq/webtransport';
+import { NON_SYNC_FLAGS, SYNC_FLAGS, buildChunk, videoInit } from '../../locmaf/test-support/cmaf.js';
 
 // ─── Mock Adapter ────────────────────────────────────────────────────
 
@@ -8906,6 +8907,86 @@ describe('MoqtPlayer', () => {
       // private state; the negative assertion is sharp enough — the
       // NEW track must NOT have been unsubscribed (rollback path).
       expect(unsubReqIds).not.toContain(Number(newReqId));
+
+      await player.destroy();
+    });
+
+    /**
+     * The switch splices on the new track's first sync sample, read from
+     * the fragment's own sample flags, not merely on objectId 0: a group
+     * that opens with a delta frame would leave a gap at the playhead.
+     */
+    it('commits a CMAF switch on the first sync sample, not a non-sync object 0', async () => {
+      const init = btoa(String.fromCharCode(...videoInit()));
+      const catalog = JSON.stringify({
+        version: 1,
+        tracks: [
+          { name: 'video_hi', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1,
+            altGroup: 1, codec: 'avc1.4D401F', width: 1280, height: 720, bitrate: 2_500_000, initData: init },
+          { name: 'video_lo', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1,
+            altGroup: 1, codec: 'avc1.4D401F', width: 854, height: 480, bitrate: 1_200_000, initData: init },
+        ],
+      });
+      const adapter = createMockAdapter();
+      const mockMs = {
+        initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
+        mediaElement: null,
+        onFirstFrame: null as (() => void) | null,
+        onError: null as ((error: Error) => void) | null,
+        onStall: null as ((durationMs: number) => void) | null,
+      };
+      const pushed: bigint[] = [];
+      const assembler = {
+        push: vi.fn((_mt: 'video' | 'audio', trackName: string, groupId: bigint) => {
+          if (trackName === 'video_lo') pushed.push(groupId);
+        }),
+        selectTrack: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
+      };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter), startLevel: 0,
+        createMediaSource: () => mockMs, createCmafAssembler: () => assembler,
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+      ackCatalog(adapter);
+      adapter._triggerObject(0n, {
+        kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
+        objectId: varint(0), payload: new TextEncoder().encode(catalog),
+      } as MoqtObject);
+      await new Promise(r => setTimeout(r, 10));
+
+      const switchedFn = vi.fn();
+      player.on('quality_switched', switchedFn);
+      await player.selectVideoTrack('video_lo');
+      const newReqId = await (adapter.subscribe as any).mock.results.at(-1)!.value;
+      const newAlias = BigInt(newReqId) + 100n;
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(newReqId), trackAlias: varint(newAlias),
+        parameters: new Map(),
+      } as unknown as ControlMessage);
+      const deliver = (groupId: number, objectId: number, flags: number) => {
+        adapter._triggerObject(newAlias, {
+          kind: 'data', trackAlias: varint(newAlias), groupId: varint(groupId), subgroupId: varint(0),
+          objectId: varint(objectId),
+          payload: buildChunk({ bmdt: 3000 * (groupId * 30 + objectId), samples: [{ duration: 3000, size: 4, flags }] }),
+        } as MoqtObject);
+      };
+
+      // Object 0 of a group that opens on a delta frame: not a splice point.
+      deliver(7, 0, NON_SYNC_FLAGS);
+      deliver(7, 1, NON_SYNC_FLAGS);
+      await new Promise(r => setTimeout(r, 10));
+      expect(switchedFn).not.toHaveBeenCalled();
+      expect(pushed).toEqual([]);
+
+      // The next sync sample commits; the delta frames staged ahead of it
+      // are dropped rather than appended after the new init.
+      deliver(8, 0, SYNC_FLAGS);
+      await new Promise(r => setTimeout(r, 10));
+      expect(switchedFn).toHaveBeenCalledTimes(1);
+      expect(pushed).toEqual([8n]);
 
       await player.destroy();
     });

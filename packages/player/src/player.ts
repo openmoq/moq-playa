@@ -33,8 +33,8 @@ import { BufferBasedController } from '@openmoq/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback } from '@openmoq/playback';
 import type { AltGroup, CatalogState, CatalogTrack } from '@openmoq/msf';
 import type { LocHeaders } from '@openmoq/loc';
-import { LocmafFormatError, LocmafTrackDecoder, deserializeLocmafObject, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes } from '@openmoq/locmaf';
-import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@openmoq/locmaf';
+import { LocmafFormatError, LocmafTrackDecoder, deserializeLocmafObject, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes, parseLocmafTrackContext } from '@openmoq/locmaf';
+import type { EmsgEvent, LocmafEffectiveSamples, GenBox, LocmafTrackContext } from '@openmoq/locmaf';
 import { groupByAlt, parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@openmoq/msf';
 
 import { TypedEmitter } from './emitter.js';
@@ -738,7 +738,16 @@ export class MoqtPlayer {
     mediaType: 'video' | 'audio';
     groupId: bigint;
     payload: Uint8Array;
+    /** First sample is a sync sample; undefined when unknown. */
+    sync?: boolean;
   }> = [];
+
+  /**
+   * Track context per CMAF switch target, for reading staged fragments'
+   * sample flags. `null` when the track's init is unavailable or not a
+   * single-track CMAF Header.
+   */
+  private readonly cmafSwitchContexts = new Map<string, LocmafTrackContext | null>();
 
   /** Timeout for keyframe arrival during make-before-break switch. */
   private switchStagingTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -1341,7 +1350,7 @@ export class MoqtPlayer {
     // Make-before-break: stage the new track's chunks until a sync chunk, as for CMAF.
     if (this.pendingVideoSwitch && mediaType === 'video'
         && trackName === this.pendingVideoSwitch.newTrackName) {
-      this.cmafSwitchStagingBuffer.push({ trackName, mediaType, groupId, payload: decoded.bytes });
+      this.cmafSwitchStagingBuffer.push({ trackName, mediaType, groupId, payload: decoded.bytes, sync: decoded.sync });
       if (this.switchStagingTimeout === null) {
         this.switchStagingTimeout = setTimeout(() => {
           this.log.warn('[SWITCH] LOCMAF keyframe timeout — force-completing after %dms', SWITCH_STAGING_TIMEOUT_MS);
@@ -1475,6 +1484,33 @@ export class MoqtPlayer {
   }
 
   /** Whether a track of this packaging plays through MSE in this player (LOCMAF may take the frame path). */
+  /**
+   * Whether a CMAF fragment's first sample is a sync sample, read from its
+   * trun/tfhd/trex sample flags against the track's own init. `undefined`
+   * when that cannot be determined (no init, legacy moof-only object,
+   * unreadable fragment) — callers fall back to the group-boundary rule.
+   */
+  private cmafFirstSampleSync(trackName: string, payload: Uint8Array): boolean | undefined {
+    let context = this.cmafSwitchContexts.get(trackName);
+    if (context === undefined) {
+      context = null;
+      const track = this._catalogState?.tracks.find(t => t.name === trackName);
+      try {
+        const init = track && (this.decodeResolvedInlineInitData(track)
+          ?? (track.initTrack ? this.initSegmentByTrack.get(track.initTrack) : undefined));
+        if (init) context = parseLocmafTrackContext(init);
+      } catch { /* no usable init: fall back */ }
+      this.cmafSwitchContexts.set(trackName, context);
+    }
+    if (!context) return undefined;
+    try {
+      const first = readCmafChunkSamples(payload, context).effective.flags[0];
+      return first === undefined ? undefined : isSyncSampleFlags(first);
+    } catch {
+      return undefined;
+    }
+  }
+
   private usesMse(packaging: string | undefined): boolean {
     return usesMsePath(packaging, this.config.locmafDecoding);
   }
@@ -2114,6 +2150,7 @@ export class MoqtPlayer {
       this.switchInProgress = false;
       this.switchStagingBuffer = [];
       this.cmafSwitchStagingBuffer = [];
+      this.cmafSwitchContexts.clear();
       return;
     }
 
@@ -2279,8 +2316,14 @@ export class MoqtPlayer {
     this.locmafDecoders.delete(sw.oldTrackName);
     this.locmafDecoderInit.delete(sw.oldTrackName);
     this.locmafHealth.delete(sw.oldTrackName);
-    const cmafStaged = this.cmafSwitchStagingBuffer;
+    const staged = this.cmafSwitchStagingBuffer;
     this.cmafSwitchStagingBuffer = [];
+    this.cmafSwitchContexts.clear();
+    // Drop staged chunks ahead of the first sync sample (the tail of a group
+    // the subscription joined mid-way): they have no reference picture in
+    // the new track, and MSE would discard them anyway.
+    const syncIdx = staged.findIndex(e => e.sync === true);
+    const cmafStaged = syncIdx > 0 ? staged.slice(syncIdx) : staged;
     for (const { trackName: stagedTrack, mediaType: stagedMt, groupId, payload } of cmafStaged) {
       this.cmafAssembler?.push(stagedMt, stagedTrack, groupId, payload);
     }
@@ -2332,6 +2375,7 @@ export class MoqtPlayer {
       try { this.connection.unsubscribe(varint(sw.newRequestId)); } catch { /* ignore */ }
     }
     this.cmafSwitchStagingBuffer = [];
+    this.cmafSwitchContexts.clear();
     this.switchStagingBuffer = [];
     this.locmafDecoders.delete(sw.newTrackName);
     this.locmafDecoderInit.delete(sw.newTrackName);
@@ -2634,11 +2678,13 @@ export class MoqtPlayer {
       // evicting decoder reference frames.
       if (this.pendingVideoSwitch && mediaType === 'video'
           && trackName === this.pendingVideoSwitch.newTrackName) {
+        const sync = this.cmafFirstSampleSync(trackName, obj.payload);
         this.cmafSwitchStagingBuffer.push({
           trackName,
           mediaType,
           groupId: BigInt(obj.groupId),
           payload: obj.payload,
+          ...(sync !== undefined ? { sync } : {}),
         });
 
         if (this.switchStagingTimeout === null) {
@@ -2648,9 +2694,15 @@ export class MoqtPlayer {
           }, SWITCH_STAGING_TIMEOUT_MS);
         }
 
-        // CMAF: groupId boundary = keyframe. objectId 0 of a new group
-        // is the moof of a fresh GOP, suitable as a splice point.
-        if (BigInt(obj.objectId) === 0n) {
+        // Splice on a sync sample: the fragment's own sample flags when
+        // readable, else the group boundary (objectId 0 starts a GOP).
+        // Group boundaries alone are not enough: a group whose first
+        // sample is not a sync sample would put a delta frame right after
+        // the new init, and MSE drops frames until the next random access
+        // point, leaving a gap at the playhead.
+        // @see ISO/IEC 14496-12 §8.8.3.1 (sample_is_non_sync_sample)
+        // @see https://www.w3.org/TR/media-source-2/#sourcebuffer-coded-frame-processing
+        if (sync ?? BigInt(obj.objectId) === 0n) {
           this.completePendingVideoSwitch();
         } else if (this.cmafSwitchStagingBuffer.length >= SWITCH_STAGING_MAX_OBJECTS) {
           this.log.warn('[SWITCH] CMAF staging overflow (%d objects) — force-completing',
@@ -5559,6 +5611,7 @@ export class MoqtPlayer {
     this.switchInProgress = false;
     this.switchStagingBuffer = [];
     this.cmafSwitchStagingBuffer = [];
+    this.cmafSwitchContexts.clear();
     if (this.switchStagingTimeout !== null) {
       clearTimeout(this.switchStagingTimeout);
       this.switchStagingTimeout = null;
