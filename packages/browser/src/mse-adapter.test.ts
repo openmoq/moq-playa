@@ -986,6 +986,19 @@ describe('MseMediaSource — changeType', () => {
         expect(vsb.appendedPayloads.length).toBe(initCountBefore + 1);
     });
 
+    it('keeps timestampOffset: switching-set tracks share one media timeline', async () => {
+        const { adapter, video, vsb } = await makeReadyAdapter();
+        // Playback is well under way when the switch happens.
+        (video as unknown as { currentTime: number }).currentTime = 12.5;
+        vsb.timestampOffset = 0;
+
+        await adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(1, 100));
+
+        // The assembler's shared epoch already continues the old track's
+        // decode times; adding currentTime would shift video by 12.5s.
+        expect(vsb.timestampOffset).toBe(0);
+    });
+
     it('throws if the SourceBuffer is not initialized', async () => {
         const video = new MockVideoElement();
         const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
