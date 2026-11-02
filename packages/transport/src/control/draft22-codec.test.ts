@@ -134,6 +134,37 @@ describe('draft-22 LOCATION_FILTER mapping (§9.20.9)', () => {
     expect(() => decodeFillParameters(new Uint8Array([0x01, 0x21, 0x01, 0x01, 0x00]))).toThrow(/length/);
   });
 
+  it('keeps the published draft-22 outer Length and the following parameter', () => {
+    // Two outer parameters: FILL_PARAMETERS (Length 4, one LOCATION_FILTER),
+    // then INCLUDE_PROPERTIES (Type Delta 0x12, value 0). §9.20 / §9.20.15.
+    const bytes = Uint8Array.from([2, 0x23, 4, 1, 0x21, 1, 1, 0x12, 0]);
+    const { params, bytesRead } = decodeMessageParams18(bytes, 0, DRAFT22_MESSAGE_PARAM_REGISTRY);
+    expect(bytesRead).toBe(bytes.length);
+    expect(params.get(0x35n)).toEqual([{ kind: 'uint8', value: 0 }]);
+    const fill = params.get(0x23n)![0]!;
+    expect(fill.kind).toBe('bytes');
+    if (fill.kind !== 'bytes') throw new Error('Missing fill');
+    expect(decodeFillParameters(fill.value).filter).toEqual({ type: 'RelativeStart', groups: 1n });
+    expect(encodeMessageParams18(params, DRAFT22_MESSAGE_PARAM_REGISTRY)).toEqual(bytes);
+  });
+
+  it('counts every nested occurrence, including a repeatable parameter', () => {
+    // Two SUBGROUP_FILTERs, each with a one-byte empty ranges value (§3.3.2).
+    const bytes = Uint8Array.from([2, 0x25, 1, 0, 0, 1, 0]);
+    expect(decodeFillParameters(bytes).parameters.get(0x25n)).toEqual([
+      { kind: 'bytes', value: new Uint8Array([0]) },
+      { kind: 'bytes', value: new Uint8Array([0]) },
+    ]);
+  });
+
+  it('resets nested Type Delta without losing the second fill parameter', () => {
+    const bytes = Uint8Array.from([2, 0x21, 5, 1, 2]);
+    expect(decodeFillParameters(bytes)).toMatchObject({
+      filter: { type: 'LargestObject' }, groupOrder: 'descending',
+    });
+    expect(encodeFillParameters({ type: 'LargestObject' }, 'descending')).toEqual(bytes);
+  });
+
   it('frames the filter by its type, so a following parameter decodes', () => {
     const params = new Map<bigint, readonly MessageParamValue[]>([
       [0x21n, [{ kind: 'locationFilter', value: encodeSubscriptionFilter({ type: 'LargestObject' }, 22) }]],

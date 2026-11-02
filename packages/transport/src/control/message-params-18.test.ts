@@ -79,6 +79,15 @@ describe('round-trip via the default registry', () => {
     expect(out.bytesRead).toBe(bytes.length);
   });
 
+  it('stops at the declared count before a following field at a non-zero offset', () => {
+    // Prefix, one SUBSCRIBER_PRIORITY=9, then the next field in the message.
+    const framed = new Uint8Array([0xaa, 0xbb, 1, 0x20, 9, 0xff]);
+    const out = decodeMessageParams18(framed, 2, DEFAULT_MESSAGE_PARAM_REGISTRY);
+    expect(out.params).toEqual(new Map([[0x20n, [{ kind: 'uint8', value: 9 }]]]));
+    expect(out.bytesRead).toBe(3);
+    expect(framed[2 + out.bytesRead]).toBe(0xff);
+  });
+
   it('reads at a non-zero offset', () => {
     const params: MessageParams18 = new Map([[0x20n, [{ kind: 'uint8', value: 9 } as const]]]);
     const bytes = encodeMessageParams18(params);

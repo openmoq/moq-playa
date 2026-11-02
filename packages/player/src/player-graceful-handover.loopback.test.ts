@@ -78,7 +78,7 @@ function peer(draft: Draft) {
       const request = requests.find(r => r.name === 'catalog')!;
       let complete: () => Promise<void>;
       if (draft === 22) {
-        expect(request.parameters?.get(0x23n)?.[0]).toEqual(Uint8Array.of(0x21, 1, 1));
+        expect(request.parameters?.get(0x23n)?.[0]).toEqual(Uint8Array.of(1, 0x21, 1, 1));
         expect(fetches).toEqual([]);
         const stream = await server.openFillStream(request.id);
         await server.sendFetchObject(stream, { groupId: 5n, subgroupId: 0n, objectId: 0n,
