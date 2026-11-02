@@ -9823,6 +9823,73 @@ describe('MoqtPlayer', () => {
 
   // ─── CMAF ABR ──────────────────────────────────────────────────────
 
+  describe('CMAF video group boundary ordering', () => {
+    /**
+     * Each group is its own stream, so group N's last objects can arrive
+     * after group N+1's object 0. MSE cannot take that tail late (its decode
+     * time precedes the newer keyframe), so it must reach the sink first.
+     */
+    it("delivers a group's late tail ahead of the next group's head", async () => {
+      const catalog = JSON.stringify({
+        version: 1,
+        tracks: [{
+          name: 'video', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1,
+          codec: 'avc1.4D401F', width: 1280, height: 720, bitrate: 2_500_000,
+          initData: btoa(String.fromCharCode(0x00, 0x01, 0x02, 0x03)),
+        }],
+      });
+      const adapter = createMockAdapter();
+      const mockMs = {
+        initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
+        mediaElement: null,
+        onFirstFrame: null as (() => void) | null,
+        onError: null as ((error: Error) => void) | null,
+        onStall: null as ((durationMs: number) => void) | null,
+      };
+      const pushed: string[] = [];
+      const assembler = {
+        push: vi.fn((_mt: 'video' | 'audio', _track: string, groupId: bigint, payload: Uint8Array) => {
+          pushed.push(`${groupId}:${payload[0]}`);
+        }),
+        getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
+      };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        createMediaSource: () => mockMs, createCmafAssembler: () => assembler,
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+      ackCatalog(adapter);
+      adapter._triggerObject(0n, {
+        kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
+        objectId: varint(0), payload: new TextEncoder().encode(catalog),
+      } as MoqtObject);
+      await new Promise(r => setTimeout(r, 10));
+      await ackMedia(adapter);
+      const alias = BigInt(await (adapter.subscribe as any).mock.results[1]!.value);
+      // Payload byte 0 tags the object id so the delivery order is visible.
+      const obj = (group: number, object: number) => adapter._triggerObject(alias, {
+        kind: 'data', trackAlias: varint(alias), groupId: varint(group), subgroupId: varint(0),
+        objectId: varint(object), payload: new Uint8Array([object, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]),
+      } as MoqtObject);
+      const end = (group: number, object: number) => adapter._triggerObject(alias, {
+        kind: 'gap', trackAlias: varint(alias), groupId: varint(group), subgroupId: varint(0),
+        objectId: varint(object), status: ObjectStatus.END_OF_GROUP,
+      } as MoqtObject);
+
+      obj(1, 0); obj(1, 1); end(1, 2);
+      obj(2, 0);
+      obj(3, 0); // next group's head, ahead of group 2's tail
+      obj(2, 1);
+      end(2, 2);
+
+      expect(pushed).toEqual(['1:0', '1:1', '2:0', '2:1', '3:0']);
+      await player.destroy();
+    });
+  });
+
   describe('CMAF ABR (buffer-based quality switching)', () => {
     const CMAF_ABR_CATALOG = JSON.stringify({
       version: 1,
