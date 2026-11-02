@@ -1357,6 +1357,9 @@ export class MoqtPlayer {
       return;
     }
 
+    // Once the switch commits, the retired track must not reach MSE (see onCmafObject).
+    if (this.isRetiredVideoTrack(mediaType, trackName)) return;
+
     // Early stale-group drop, as for CMAF.
     if (this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
       const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
@@ -1475,6 +1478,12 @@ export class MoqtPlayer {
   }
 
   /** Whether a track of this packaging plays through MSE in this player (LOCMAF may take the frame path). */
+  /** True for an old-track video object after a pending switch has started committing. */
+  private isRetiredVideoTrack(mediaType: 'video' | 'audio', trackName: string): boolean {
+    return this.switchInProgress && this.pendingVideoSwitch !== null
+      && mediaType === 'video' && trackName === this.pendingVideoSwitch.oldTrackName;
+  }
+
   private usesMse(packaging: string | undefined): boolean {
     return usesMsePath(packaging, this.config.locmafDecoding);
   }
@@ -1983,10 +1992,13 @@ export class MoqtPlayer {
         }
       }
       // Inline init bytes — nothing to await.
-    } else if (targetTrack.packaging === 'locmaf' && targetTrack.initTrack) {
+    } else if ((targetTrack.packaging === 'locmaf' || this.usesMse(targetTrack.packaging))
+        && targetTrack.initTrack) {
       // LOCMAF reconstructs against the target's OWN CMAF Header (track_ID,
-      // timescale, trex defaults feed durations and decode times), so even a
-      // same-codec switch needs that header in hand before its objects arrive.
+      // timescale, trex defaults feed durations and decode times), and an
+      // MSE SourceBuffer must receive the target's own init before its media
+      // (completePendingVideoSwitch), so even a same-codec switch needs that
+      // header in hand before its objects arrive.
       // @see draft-einarsson-moq-locmaf-01 §6, §15.1
       let inlineInit: Uint8Array | undefined;
       try {
@@ -1995,7 +2007,7 @@ export class MoqtPlayer {
         throw new Error(`Cannot switch to "${trackName}": ${err instanceof Error ? err.message : String(err)}`);
       }
       if (!inlineInit) {
-        this.log.info('[SWITCH] locmaf "%s" → "%s": prefetching CMAF Header from init track "%s"',
+        this.log.info('[SWITCH] "%s" → "%s": prefetching CMAF Header from init track "%s"',
           currentVideoTrackName, trackName, targetTrack.initTrack);
         await this.ensureInitTrack(targetTrack.initTrack);
       }
@@ -2121,24 +2133,30 @@ export class MoqtPlayer {
       (t: CatalogTrack) => t.name === sw.newTrackName && t.role === 'video',
     );
 
-    // CMAF path: if the new track has a different codec than the
-    // SourceBuffer was created with, ask the adapter to retype it
-    // BEFORE the old track is unsubscribed. If the retype fails (or
-    // the init bytes are missing), the switch is aborted cleanly
-    // — old track keeps playing, new track is unsubscribed, staged
-    // bytes are dropped — and the user sees an error event. Without
-    // this, a failed pivot tears down the only known-good subscription
-    // and strands playback in an unrecoverable state.
-    const needsChangeType = newTrack !== undefined && this.usesMse(newTrack.packaging)
-      && newTrack.codec !== undefined
+    // MSE path: every track in a switching set has its own init segment
+    // (track_ID, sample entry with its own SPS/PPS, trex defaults), so the
+    // new track's media is only parseable once that init has been appended
+    // — even when the codec string matches. Ask the adapter to re-initialize
+    // the SourceBuffer (with `changeType()` when the codec differs) BEFORE
+    // the old track is unsubscribed. If that fails (or the init bytes are
+    // missing for a codec change), the switch is aborted cleanly — old
+    // track keeps playing, new track is unsubscribed, staged bytes are
+    // dropped — and the user sees an error event. Without this, a failed
+    // pivot tears down the only known-good subscription and strands
+    // playback in an unrecoverable state.
+    // @see ISO/IEC 23000-19 §7.3.4 (CMAF switching sets: per-track headers)
+    // @see https://www.w3.org/TR/media-source-2/#sourcebuffer-init-segment-received
+    const reinitMse = newTrack !== undefined && this.usesMse(newTrack.packaging)
+      && newTrack.codec !== undefined;
+    const needsChangeType = reinitMse && newTrack !== undefined
       && (this.currentVideoCodec === null
-          || !codecsCompatible(newTrack.codec, this.currentVideoCodec));
+          || !codecsCompatible(newTrack.codec!, this.currentVideoCodec));
 
-    if (needsChangeType && newTrack && this.mediaSource?.changeType) {
-      // Inline init (`initData` or an `initRef` → root inline entry) is Base64
-      // (CatalogTrack §5.1.20 / MSF-01 §5.1.7); decode it. initTrack-delivered
-      // cache holds raw Uint8Array.
-      let initData: Uint8Array | undefined;
+    // Inline init (`initData` or an `initRef` → root inline entry) is Base64
+    // (CatalogTrack §5.1.20 / MSF-01 §5.1.7); decode it. initTrack-delivered
+    // cache holds raw Uint8Array.
+    let initData: Uint8Array | undefined;
+    if (reinitMse && newTrack && this.mediaSource?.changeType) {
       try {
         initData = this.decodeResolvedInlineInitData(newTrack)
           ?? (newTrack.initTrack ? this.initSegmentByTrack.get(newTrack.initTrack) : undefined);
@@ -2146,26 +2164,30 @@ export class MoqtPlayer {
         this.abortPendingVideoSwitch(sw, err instanceof Error ? err : new Error(String(err)));
         return;
       }
-      if (!initData) {
-        // selectVideoTrack should have pre-fetched this. Hitting here
-        // means the catalog has neither inline initData nor an
-        // initTrack for the target codec — abort, don't touch old.
-        this.log.warn(
-          '[SWITCH] init bytes missing for codec change → "%s" — aborting switch, old track stays active',
-          newTrack.codec,
-        );
-        this.abortPendingVideoSwitch(sw, new Error(
-          `Cannot switch to "${sw.newTrackName}": init bytes missing for codec "${newTrack.codec ?? ''}"`,
-        ));
-        return;
-      }
-      this.log.info('[SWITCH] codec change → calling MSE changeType: "%s" → "%s"',
-        this.currentVideoCodec ?? '(unknown)', newTrack.codec);
+    }
+
+    if (needsChangeType && newTrack && this.mediaSource?.changeType && !initData) {
+      // selectVideoTrack should have pre-fetched this. Hitting here
+      // means the catalog has neither inline initData nor an
+      // initTrack for the target codec — abort, don't touch old.
+      this.log.warn(
+        '[SWITCH] init bytes missing for codec change → "%s" — aborting switch, old track stays active',
+        newTrack.codec,
+      );
+      this.abortPendingVideoSwitch(sw, new Error(
+        `Cannot switch to "${sw.newTrackName}": init bytes missing for codec "${newTrack.codec ?? ''}"`,
+      ));
+      return;
+    }
+
+    if (initData && newTrack && this.mediaSource?.changeType) {
+      this.log.info('[SWITCH] re-initializing MSE for "%s": "%s" → "%s"',
+        sw.newTrackName, this.currentVideoCodec ?? '(unknown)', newTrack.codec);
       this.mediaSource.changeType('video', newTrack.codec ?? '', initData)
         .then(() => {
           // Pivot succeeded. NOW it's safe to tear down the old track
-          // and flush the staged new-track segments into the retyped
-          // SourceBuffer.
+          // and flush the staged new-track segments into the
+          // re-initialized SourceBuffer.
           this.unsubscribeOldVideoTrack(sw);
           this.currentVideoCodec = newTrack.codec ?? null;
           this.flushCmafStagedBuffer(sw);
@@ -2659,6 +2681,14 @@ export class MoqtPlayer {
         }
         return;
       }
+
+      // After the switch commits (switchInProgress), drop old-track
+      // segments. The commit re-initializes the SourceBuffer with the new
+      // track's init; an old-track moof queued behind that init names a
+      // track_ID the new moov lacks and fails the append parser, which
+      // errors the whole MediaSource.
+      // @see https://www.w3.org/TR/media-source-2/#sourcebuffer-segment-parser-loop
+      if (this.isRetiredVideoTrack(mediaType, trackName)) return;
 
       // Early stale-group drop: skip objects from groups older than what
       // MSE has already committed. Prevents late-arriving old groups from

@@ -790,6 +790,9 @@ export class MseMediaSource implements MediaSourceLike {
 
   /** trex defaults from the init segment, per media type. */
   private videoTrex: TrexDefaults | undefined;
+  /** Mime type each SourceBuffer currently parses (creation or last `changeType`). */
+  private readonly bufferMime: { video: string | null; audio: string | null } =
+    { video: null, audio: null };
   private audioTrex: TrexDefaults | undefined;
 
   /**
@@ -999,6 +1002,7 @@ export class MseMediaSource implements MediaSourceLike {
           const mimeType = `video/mp4; codecs="${config.video.codec}"`;
           this.logDebug('[MSE] Creating video SourceBuffer:', mimeType);
           this.videoBuffer = this.ms.addSourceBuffer(mimeType);
+          this.bufferMime.video = mimeType;
           this.videoBuffer.mode = 'segments';
           this.wireBufferLifecycle('video', this.videoBuffer);
           if (config.video.initData.byteLength > 0) {
@@ -1023,6 +1027,7 @@ export class MseMediaSource implements MediaSourceLike {
           const mimeType = `audio/mp4; codecs="${config.audio.codec}"`;
           this.logDebug('[MSE] Creating audio SourceBuffer:', mimeType);
           this.audioBuffer = this.ms.addSourceBuffer(mimeType);
+          this.bufferMime.audio = mimeType;
           this.audioBuffer.mode = 'segments';
           this.wireBufferLifecycle('audio', this.audioBuffer);
           if (config.audio.initData.byteLength > 0) {
@@ -1113,17 +1118,19 @@ export class MseMediaSource implements MediaSourceLike {
   /**
    * Re-initialize a SourceBuffer for a new codec/init segment.
    *
-   * Used when the player switches to a track in a different codec
-   * family (e.g., AVC → HEVC). The MSE spec lets a SourceBuffer parse
-   * a new mime type via `changeType()`, after which the next append
-   * MUST be the init segment for that codec.
+   * Used on every CMAF track switch. Each track carries its own init
+   * segment (track_ID, sample entry, trex defaults), so the new track's
+   * media can only be parsed after its init has been appended. When the
+   * codec differs (e.g., AVC → HEVC) the MSE spec also requires
+   * `changeType()` before that init; when the mime type is unchanged the
+   * init alone is enough (init segment received algorithm).
    *
    * Borrowed from the WebCodecs path: serialize state-mutating ops
    * with data appends. Concretely:
    *   1. Drop any queued media — those are old-codec bytes that would
    *      land *after* the new init and corrupt the splice.
    *   2. Wait for the in-flight `appendBuffer` to settle.
-   *   3. `sourceBuffer.changeType(newMime)`.
+   *   3. `sourceBuffer.changeType(newMime)`, if the mime type changes.
    *   4. Append the new init segment, await `updateend`.
    *   5. Refresh the trex cache from the new init (per-sample-duration
    *      defaults change with the codec family).
@@ -1134,10 +1141,12 @@ export class MseMediaSource implements MediaSourceLike {
    * @param codec Codec string for the new mime type
    *              (e.g. `"hvc1.1.6.L93.90"`).
    * @param initData Raw init segment bytes (ftyp+moov) for the new codec.
-   * @throws If the SourceBuffer is not initialized or the browser
-   *         doesn't implement `SourceBuffer.changeType()`.
+   * @throws If the SourceBuffer is not initialized, or the mime type
+   *         changes and the browser doesn't implement
+   *         `SourceBuffer.changeType()`.
    *
    * @see https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-changetype
+   * @see https://www.w3.org/TR/media-source-2/#sourcebuffer-init-segment-received
    */
   async changeType(
     mediaType: 'video' | 'audio',
@@ -1150,7 +1159,9 @@ export class MseMediaSource implements MediaSourceLike {
       throw new Error(`MseMediaSource.changeType: ${mediaType} SourceBuffer not initialized`);
     }
     const sb = buffer as SourceBuffer & { changeType?: (mime: string) => void };
-    if (typeof sb.changeType !== 'function') {
+    const mimeType = `${mediaType}/mp4; codecs="${codec}"`;
+    const retype = this.bufferMime[mediaType] !== mimeType;
+    if (retype && typeof sb.changeType !== 'function') {
       throw new Error('MseMediaSource.changeType: SourceBuffer.changeType not supported');
     }
     if (this.changingType[mediaType]) {
@@ -1173,12 +1184,15 @@ export class MseMediaSource implements MediaSourceLike {
         await this.waitForBufferEvent(buffer);
       }
 
-      // Pivot the parser to the new codec.
+      // Pivot the parser to the new codec, if it changes.
       const handler = mediaType === 'video' ? 'vide' : 'soun';
       const filtered = filterInitSegment(initData, handler);
-      const mimeType = `${mediaType}/mp4; codecs="${codec}"`;
-      this.logDebug('[MSE] changeType %s → %s (init=%dB)', mediaType, mimeType, filtered.byteLength);
-      sb.changeType(mimeType);
+      this.logDebug('[MSE] changeType %s → %s (init=%dB, retype=%s)',
+        mediaType, mimeType, filtered.byteLength, retype);
+      if (retype) {
+        sb.changeType!(mimeType);
+        this.bufferMime[mediaType] = mimeType;
+      }
 
       // Append the new init segment and wait for it to commit. Done
       // outside doAppend because init segments carry no tfdt/trun and
@@ -1334,6 +1348,8 @@ export class MseMediaSource implements MediaSourceLike {
     } catch { /* MediaSource may be closed */ }
     this.videoBuffer = null;
     this.audioBuffer = null;
+    this.bufferMime.video = null;
+    this.bufferMime.audio = null;
     this.videoQueue.length = 0;
     this.audioQueue.length = 0;
     this.initialized = false;
