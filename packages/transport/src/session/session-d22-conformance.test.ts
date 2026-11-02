@@ -190,12 +190,14 @@ describe('draft-22 fill parameter scope (9.20.15)', () => {
     expect(session.fillSubscriptionFor(requestId)).toBeUndefined();
   });
   it.each([
-    { description: 'FORWARD is not a fill parameter', bytes: [0x10, 1] },
-    { description: 'recursive FILL_PARAMETERS is forbidden', bytes: [0x23, 0] },
-    { description: 'GROUP_ORDER must be 1 or 2', bytes: [0x22, 3] },
-    { description: 'duplicate GROUP_ORDER is forbidden', bytes: [0x22, 1, 0, 2] },
-    { description: 'truncated GROUP_ORDER is malformed', bytes: [0x22] },
-    { description: 'Next Object filter has no fields', bytes: [0x21, 5, 0, 0, 0, 0, 0] },
+    { description: 'FORWARD is not a fill parameter', bytes: [1, 0x10, 1] },
+    { description: 'recursive FILL_PARAMETERS is forbidden', bytes: [1, 0x23, 0] },
+    { description: 'GROUP_ORDER must be 1 or 2', bytes: [1, 0x22, 3] },
+    { description: 'duplicate GROUP_ORDER is forbidden', bytes: [2, 0x22, 1, 0, 2] },
+    { description: 'truncated GROUP_ORDER is malformed', bytes: [1, 0x22] },
+    { description: 'Next Object filter has no fields', bytes: [1, 0x21, 5, 0, 0, 0, 0, 0] },
+    { description: 'a fill without its Number of Parameters is malformed', bytes: [0x21, 1, 1] },
+    { description: 'bytes past the counted fill parameters are malformed', bytes: [1, 0x22, 1, 0] },
   ])('$description', ({ bytes }) => {
     const session = established();
     const actions = session.handleControlMessage({
@@ -211,7 +213,7 @@ describe('draft-22 fill parameter scope (9.20.15)', () => {
     const parameters: Parameters = new Map([
       [0x21n, [new Uint8Array([0])]],
       [0x22n, [1n]],
-      [0x23n, [new Uint8Array([0x21, 0, 1, 2])]],
+      [0x23n, [new Uint8Array([2, 0x21, 0, 1, 2])]],
     ]);
     expect(session.handleControlMessage({
       type: 'SUBSCRIBE', requestId: varint(1n), trackNamespace: namespace, trackName: name, parameters,
@@ -257,7 +259,7 @@ describe('draft-22 filter updates', () => {
     const session = established();
     session.handleControlMessage({ type: 'PUBLISH_NAMESPACE', requestId: 1n, trackNamespace: namespace, parameters: new Map() });
     const actions = session.handleControlMessage({ type: 'REQUEST_UPDATE', requestId: 3n, existingRequestId: 1n,
-      parameters: new Map([[0x23n, [new Uint8Array()]]]),
+      parameters: new Map([[0x23n, [new Uint8Array([0])]]]),
     });
     expect(actions).toContainEqual(expect.objectContaining({ type: 'close_connection', error: 3n }));
   });
@@ -292,7 +294,7 @@ describe('draft-22 filter updates', () => {
     session.setLargestLocationProvider(() => null);
     const actions = session.handleControlMessage({
       type: 'REQUEST_UPDATE', requestId: varint(3n), existingRequestId: 1n,
-      parameters: new Map([[0x10n, [0n]], [0x23n, [new Uint8Array([0x25, 2, 0, 0])]]]),
+      parameters: new Map([[0x10n, [0n]], [0x23n, [new Uint8Array([1, 0x25, 2, 0, 0])]]]),
     });
     expect(actions).toContainEqual(expect.objectContaining({ type: 'send_control', message: expect.objectContaining({
       type: 'REQUEST_ERROR', requestId: 3n, errorCode: 0x36n,

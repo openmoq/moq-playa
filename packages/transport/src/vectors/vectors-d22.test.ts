@@ -79,8 +79,8 @@ describe('draft-22 wire vectors (shared with red5-moq-relay and moqxr)', () => {
   it('SUBSCRIBE that joins the current group with a fill (the catalog recipe)', () => {
     const sub = decode<Subscribe>('subscribe_join_current_group_with_fill_include_properties_0');
     expect(bytesToHex(sub.parameters.get(LOCATION_FILTER)![0] as Uint8Array)).toBe('05'); // the Next Object
-    // FILL_PARAMETERS: a bare parameter sequence holding LOCATION_FILTER type 1, StartGroup 1 (the current group).
-    expect(bytesToHex(sub.parameters.get(FILL_PARAMETERS)![0] as Uint8Array)).toBe('210101');
+    // FILL_PARAMETERS: one parameter (9.20.15 counts them as for a separate message), LOCATION_FILTER type 1, StartGroup 1 (the current group).
+    expect(bytesToHex(sub.parameters.get(FILL_PARAMETERS)![0] as Uint8Array)).toBe('01210101');
     expect(sub.parameters.get(INCLUDE_PROPERTIES)).toEqual([0n]);
   });
 

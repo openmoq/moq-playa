@@ -250,7 +250,7 @@ describe('draft-22 fill cancellation (3.4.1)', () => {
     const { conn, sim } = await simulated();
     const request = sim.pushIncomingBidi();
     request.push(codec.encode({ type: 'SUBSCRIBE', requestId: 1n, trackNamespace: ns, trackName: name,
-      parameters: new Map([[0x23n, [new Uint8Array()]]]) }));
+      parameters: new Map([[0x23n, [new Uint8Array([0])]]]) }));
     await settle();
     await conn.acceptSubscribe(1n, 50n, { parameters: largest });
     let controller!: WritableStreamDefaultController;
@@ -268,7 +268,7 @@ describe('draft-22 fill cancellation (3.4.1)', () => {
     const { conn, sim } = await simulated();
     const request = sim.pushIncomingBidi();
     request.push(codec.encode({ type: 'SUBSCRIBE', requestId: 1n, trackNamespace: ns, trackName: name,
-      parameters: new Map([[0x23n, [new Uint8Array()]]]) }));
+      parameters: new Map([[0x23n, [new Uint8Array([0])]]]) }));
     await settle();
     await conn.acceptSubscribe(1n, 50n, { parameters: largest });
     let aborted = false;

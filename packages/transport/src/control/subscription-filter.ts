@@ -224,9 +224,10 @@ function filterFromTypedLocationFilter(bytes: Uint8Array): SubscriptionFilter {
 }
 
 /**
- * The FILL_PARAMETERS value (draft-22 §9.20.15) for a fill over `filter`: a bare
- * parameter sequence (no count, bounded by the Length) holding its
- * LOCATION_FILTER. An omitted filter inherits the subscription's filter.
+ * The FILL_PARAMETERS value (draft-22 §9.20.15) for a fill over `filter`: its
+ * parameters encoded as for a separate message (Number of Parameters, then the
+ * parameters) holding its LOCATION_FILTER. An omitted filter inherits the
+ * subscription's filter.
  */
 export function encodeFillParameters(filter?: SubscriptionFilter, groupOrder?: GroupOrder): Uint8Array {
   const params = new Map<bigint, MessageParamValue[]>();
@@ -235,9 +236,7 @@ export function encodeFillParameters(filter?: SubscriptionFilter, groupOrder?: G
     if (groupOrder !== 'ascending' && groupOrder !== 'descending') throw new RangeError('Invalid fill Group Order');
     params.set(0x22n, [{ kind: 'uint8', value: groupOrder === 'descending' ? 2 : 1 }]);
   }
-  const block = encodeMessageParams18(params, DRAFT22_MESSAGE_PARAM_REGISTRY);
-  // The enclosing FILL_PARAMETERS length replaces the message parameter count.
-  return block.slice(vi64EncodingLength(BigInt(params.size)));
+  return encodeMessageParams18(params, DRAFT22_MESSAGE_PARAM_REGISTRY);
 }
 
 /**

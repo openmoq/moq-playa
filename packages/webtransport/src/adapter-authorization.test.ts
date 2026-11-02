@@ -479,7 +479,7 @@ it('preserves draft-22 authorization alongside fills and typed location filters'
     if (update.type !== 'REQUEST_UPDATE') throw new Error('Missing update');
     expect(decodeSubscriptionFilter(update.parameters.get(0x21n)![0] as Uint8Array, 22))
       .toEqual({ type: 'AbsoluteStart', startGroup: 128n, startObject: 0n });
-    expect(update.parameters.get(0x23n)).toEqual([new Uint8Array([0x22, 2])]);
+    expect(update.parameters.get(0x23n)).toEqual([new Uint8Array([1, 0x22, 2])]);
   } finally { await p.client.close(); await p.server.close(); }
 });
 

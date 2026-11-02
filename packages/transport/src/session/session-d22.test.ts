@@ -43,7 +43,7 @@ describe('draft-22 SUBSCRIBE with a fill', () => {
       fill: { filter: { type: 'RelativeStart', groups: 1n } },
     });
     const msg = (actions[0] as SendControlAction).message as Subscribe;
-    expect(bytesToHex(msg.parameters.get(FILL_PARAMETERS)![0] as Uint8Array)).toBe('210101');
+    expect(bytesToHex(msg.parameters.get(FILL_PARAMETERS)![0] as Uint8Array)).toBe('01210101');
     expect(bytesToHex(msg.parameters.get(0x21n)![0] as Uint8Array)).toBe('05'); // the Next Object
     expect(session.getSubscription(requestId)!.fillRequested).toBe(true);
   });

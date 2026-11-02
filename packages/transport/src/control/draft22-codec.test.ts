@@ -122,10 +122,16 @@ describe('draft-22 LOCATION_FILTER mapping (§9.20.9)', () => {
       { type: 'AbsoluteRange', startGroup: 1n, startObject: 0n, endGroup: 2n, endObject: 3n }, 18)).toThrow(RangeError);
   });
 
-  it('FILL_PARAMETERS nests a typed LOCATION_FILTER with no Length', () => {
-    expect(bytesToHex(encodeFillParameters({ type: 'RelativeStart', groups: 1n }))).toBe('210101');
-    expect(bytesToHex(encodeFillParameters({ type: 'LargestObject' }))).toBe('2105');
-    expect(encodeFillParameters().length).toBe(0);
+  it('FILL_PARAMETERS counts its parameters and nests a typed LOCATION_FILTER with no Length', () => {
+    expect(bytesToHex(encodeFillParameters({ type: 'RelativeStart', groups: 1n }))).toBe('01210101');
+    expect(bytesToHex(encodeFillParameters({ type: 'LargestObject' }))).toBe('012105');
+    expect(bytesToHex(encodeFillParameters())).toBe('00');
+  });
+
+  it('a FILL_PARAMETERS value must be exactly its counted parameters (9.20.15)', () => {
+    expect(decodeFillParameters(new Uint8Array([0])).parameters.size).toBe(0);
+    expect(() => decodeFillParameters(new Uint8Array([0x21, 0x01, 0x01]))).toThrow();
+    expect(() => decodeFillParameters(new Uint8Array([0x01, 0x21, 0x01, 0x01, 0x00]))).toThrow(/length/);
   });
 
   it('frames the filter by its type, so a following parameter decodes', () => {
@@ -159,14 +165,14 @@ describe('draft-22 LOCATION_FILTER mapping (§9.20.9)', () => {
       endGroup: MAX_VI64, endObject: MAX_VI64,
     };
     const bytes = encodeFillParameters(filter, 'descending');
-    expect(bytesToHex(bytes)).toBe('2104fffffffffffffffffeffffffffffffffffff01ffffffffffffffffff0102');
+    expect(bytesToHex(bytes)).toBe('022104fffffffffffffffffeffffffffffffffffff01ffffffffffffffffff0102');
     expect(decodeFillParameters(bytes)).toMatchObject({ filter, groupOrder: 'descending' });
   });
 
   it('rejects an overflowing absolute group range even when each field fits vi64', () => {
     const bytes = Uint8Array.from(Buffer.from('03ffffffffffffffffff0001', 'hex'));
     expect(validateSubscriptionFilter(bytes, 22)).toMatch(/overflows uint64/);
-    expect(() => decodeFillParameters(new Uint8Array([0x21, ...bytes]))).toThrow(/overflows uint64/);
+    expect(() => decodeFillParameters(new Uint8Array([1, 0x21, ...bytes]))).toThrow(/overflows uint64/);
   });
 
   it.each([0, 1, 2, 3, 4, 5])('never consumes a following Group Order parameter as part of filter type %s', type => {

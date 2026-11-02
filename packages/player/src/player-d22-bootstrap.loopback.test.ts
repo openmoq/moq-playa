@@ -102,8 +102,8 @@ describe('d22 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
         await player.load();
         await settle();
 
-        // FILL_PARAMETERS = LOCATION_FILTER [1]: the current group.
-        expect(state.catalogFill && Array.from(state.catalogFill)).toEqual([0x21, 0x01, 0x01]);
+        // FILL_PARAMETERS = one parameter, LOCATION_FILTER [1]: the current group.
+        expect(state.catalogFill && Array.from(state.catalogFill)).toEqual([0x01, 0x21, 0x01, 0x01]);
         expect(state.fetches).toBe(0);
         expect(events).toEqual(['received']);
         expect(received[0]).toEqual(['video', 'audio']);

@@ -1,4 +1,4 @@
-import { decodeParameterSequence, DRAFT22_MESSAGE_PARAM_REGISTRY, type MessageParams18 } from './message-params-18.js';
+import { decodeMessageParams18, DRAFT22_MESSAGE_PARAM_REGISTRY, type MessageParams18 } from './message-params-18.js';
 import { decodeSubscriptionFilter, subscriptionWindow, type SubscriptionFilter, type SubscriptionWindow } from './subscription-filter.js';
 import type { GroupOrder } from '../data/types.js';
 import { ProtocolViolationError } from '../errors.js';
@@ -12,8 +12,14 @@ export interface FillOptions {
 const allowed = new Set([0x0an, 0x20n, 0x21n, 0x22n, 0x25n, 0x26n, 0x27n, 0x28n]);
 const repeatable = new Set([0x25n, 0x26n, 0x27n, 0x28n]);
 
+/**
+ * Decode a FILL_PARAMETERS value: parameters encoded as for a separate message
+ * (9.20.15), so a Number of Parameters precedes them and must account for
+ * every byte of the value.
+ */
 export function decodeFillParameters(bytes: Uint8Array): FillOptions & { parameters: MessageParams18 } {
-  const parameters = decodeParameterSequence(bytes, DRAFT22_MESSAGE_PARAM_REGISTRY);
+  const { params: parameters, bytesRead } = decodeMessageParams18(bytes, 0, DRAFT22_MESSAGE_PARAM_REGISTRY);
+  if (bytesRead !== bytes.length) throw new ProtocolViolationError('FILL_PARAMETERS length does not match its parameters (9.20.15)');
   const result: { filter?: SubscriptionFilter; groupOrder?: GroupOrder; parameters: MessageParams18 } = { parameters };
   for (const [type, values] of parameters) {
     if (!allowed.has(type)) throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} is not allowed in FILL_PARAMETERS (9.20.15)`);
