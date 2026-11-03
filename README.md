@@ -121,9 +121,9 @@ to start audio. `Player` exposes `audioActivation: 'gesture'` and
 
 ```
 packages/
-  transport/      @openmoq/transport     — Sans-I/O protocol core (draft-14 / -16 / -18 / -22)
+  transport/      @openmoq/transport     — Sans-I/O protocol core (draft-14 / -16 / -18 / -22 / -23)
   webtransport/   @openmoq/webtransport  — MoQT connection adapter and WebTransport binding
-  quic/           @openmoq/quic          — Experimental native QUIC binding for Node.js (draft-18 / -22)
+  quic/           @openmoq/quic          — Experimental native QUIC binding for Node.js (draft-18 / -22 / -23)
   loc/            @openmoq/loc           — Low Overhead Container (CaptureTimestamp, VideoFrameMarking)
   locmaf/         @openmoq/locmaf        - LOCMAF object encoding, CMAF reconstruction and coded-frame extraction
   msf/            @openmoq/msf           — MSF catalog parsing, track selection, timeline
@@ -211,7 +211,7 @@ state and event lines above illustrate separate API calls, not a playback script
 |--------|------|---------|-------------|
 | `url` | string | — | WebTransport relay URL |
 | `namespace` | string | — | Track namespace (e.g. `live/broadcast`) |
-| `draftVersion` | 14 \| 16 \| 18 \| 22 | 16 | MOQT draft version |
+| `draftVersion` | 14 \| 16 \| 18 \| 22 \| 23 | 16 | MOQT draft version |
 | `certHash` | ArrayBuffer | — | SHA-256 hash for self-signed certs |
 | `authorization` | credential provider | — | Opt-in CAT4MOQ token acquisition; see [authorization](docs/authorization.md) |
 | `autoplay` | boolean | false | Start playback after load |
@@ -326,15 +326,15 @@ object; the higher-level `Player` instead emits `severity`, `code` and `message`
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `draftVersion` | 14 \| 16 \| 18 \| 22 | 16 | Protocol version; select the draft supported by your relay |
+| `draftVersion` | 14 \| 16 \| 18 \| 22 \| 23 | 16 | Protocol version; select the draft supported by your relay |
 | `maxRequestId` | number | 10,000 | Initial MOQT MAX_REQUEST_ID on legacy drafts (auto-replenished) |
 | `knownTracks` | object | — | Pre-known codec metadata for TTFF optimization |
 | `catalog` | `{tracks}` | — | Inject catalog externally, skip catalog subscription |
 | `targetLatencyMs` | number | — | Live catch-up target |
 | `maxCatchUpRate` | number | 1.0 | Max playback rate for catch-up |
 | `authority` | string | — | CLIENT_SETUP AUTHORITY for tenant-routed relays (interop override; spec prohibits it over WebTransport) |
-| `warmStartCurrentGroup` | boolean | false | Join live LOC/CMAF/LOCMAF tracks mid-group via Joining FETCH on drafts 14/16/18, or a fill on draft 22; non-fatal if refused |
-| `catalogBootstrap` | 'auto' \| 'joining-fetch' \| 'strict' \| 'subscribe' | 'auto' | Catalog bootstrap policy; draft 22 uses fills rather than Joining FETCH |
+| `warmStartCurrentGroup` | boolean | false | Join live LOC/CMAF/LOCMAF tracks mid-group via Joining FETCH on drafts 14/16/18, or a fill on drafts 22/23; non-fatal if refused |
+| `catalogBootstrap` | 'auto' \| 'joining-fetch' \| 'strict' \| 'subscribe' | 'auto' | Catalog bootstrap policy; drafts 22/23 use fills rather than Joining FETCH |
 | `locmafDecoding` | 'mse' \| 'frame' | 'mse' | Reconstruct CMAF for MSE or decode LOCMAF samples through WebCodecs |
 | `authorization` | credential provider | — | Opt-in token acquisition for SETUP and authorized requests |
 | `objectTransform` | function | — | Per-object transform (e.g. decryption) |
@@ -346,12 +346,13 @@ object; the higher-level `Player` instead emits `severity`, `code` and `message`
 
 ## Protocol Support
 
+- **draft-ietf-moq-transport-23** - opt-in (`draftVersion: 23` / `moqt-23`)
 - **draft-ietf-moq-transport-22** - opt-in (`draftVersion: 22` / `moqt-22`)
 - **draft-ietf-moq-transport-18** — uni control-stream pair + per-request bidi streams (`draftVersion: 18` / `moqt-18`)
 - **draft-ietf-moq-transport-16** — default supported transport draft
 - **draft-ietf-moq-transport-14** — Red5/moq-rs interop (`draftVersion: 14`)
 - **draft-ietf-moq-msf-00** — Catalog, track selection, ABR (`altGroup`), timeline
-- **draft-ietf-moq-msf-01** - Independent catalogs, op-array deltas and referenced initialization data; catalog bootstrap uses Joining FETCH on drafts 14/16/18 and fills on draft 22
+- **draft-ietf-moq-msf-01** - Independent catalogs, op-array deltas and referenced initialization data; catalog bootstrap uses Joining FETCH on drafts 14/16/18 and fills on drafts 22/23
 - **draft-ietf-moq-loc-04** — Low Overhead Container (Timestamp + Timescale, Video Frame Marking, Audio Config); `locVersion: 4` to emit
 - **draft-ietf-moq-loc-01** — Low Overhead Container (CaptureTimestamp, VideoFrameMarking); auto-detected on parse, default on encode
 - **draft-ietf-moq-cmsf-00** — CMAF Streaming Format (moof+mdat, MSE path)
@@ -376,6 +377,7 @@ are not implemented. Callers with track-scoped defaults can pass `track` to
 
 Browser WebTransport may expose `transport.protocol`, enabling automatic draft detection from the negotiated `WT-Available-Protocols`:
 
+- `moqt-23` → draft 23
 - `moqt-22` → draft 22
 - `moqt-18` → draft 18
 - `moqt-16` → draft 16
@@ -385,9 +387,10 @@ Without an explicit draft, a recognized `transport.protocol` selects the wire
 codec; otherwise the adapter defaults to draft 16. An explicit
 `new MoqtConnection(18)` selects draft 18. Keep that choice and the transport
 factory's `draftVersion` aligned. The browser factory offers `["moqt-16"]` by
-default, not every supported draft. Opt into 18 or 22 explicitly (or use
-`?v=18` / `?v=22` in the examples). Draft 22 requires a readable negotiated
-`moqt-22` protocol and does not retry without the protocol offer.
+default, not every supported draft. Opt into 18, 22 or 23 explicitly (or use
+`?v=18` / `?v=22` / `?v=23` in the examples). Drafts 22 and 23 require a
+readable negotiated `moqt-22` / `moqt-23` protocol and do not retry without the
+protocol offer.
 
 draft-18 is an architectural change, not just a wire bump: the control stream becomes a **unidirectional pair**, each request rides its **own bidirectional stream** (responses correlate by stream, not Request ID), and integers use the full-uint64 `vi64` encoding.
 
@@ -397,10 +400,10 @@ For **draft-14 relays** (moq-rs, Red5, moqtail), you must explicitly specify the
 const conn = new MoqtConnection(14); // required — CLIENT_SETUP is draft-specific
 ```
 
-`MoqtConnection` auto-detects the draft from **any** `WebTransportLike` whose `protocol` exposes a supported token (`moqt-22`, `moqt-18`, `moqt-16`, or `moq-00`) — there's nothing factory-specific about detection. The browser transport factory is just the convenience that sets the WebTransport `protocols` offer for you. If you construct your own `WebTransport`, pass the appropriate `protocols` option yourself and make sure `transport.protocol` is readable; Playa reads it the same way. Some Node/polyfill transports may not support `protocols` yet.
+`MoqtConnection` auto-detects the draft from **any** `WebTransportLike` whose `protocol` exposes a supported token (`moqt-23`, `moqt-22`, `moqt-18`, `moqt-16`, or `moq-00`) — there's nothing factory-specific about detection. The browser transport factory is just the convenience that sets the WebTransport `protocols` offer for you. If you construct your own `WebTransport`, pass the appropriate `protocols` option yourself and make sure `transport.protocol` is readable; Playa reads it the same way. Some Node/polyfill transports may not support `protocols` yet.
 
-Node applications can use the experimental native QUIC binding for drafts 18
-and 22. Draft 18 is the default:
+Node applications can use the experimental native QUIC binding for drafts 18,
+22 and 23. Draft 18 is the default:
 
 ```ts
 import { connectQuic } from '@openmoq/quic';
@@ -412,9 +415,24 @@ await connection.connect(transport);
 ```
 
 `@openmoq/quic` requires Node >=26.8.1 built with QUIC support and launched with
-`--experimental-quic`. It offers `moqt-18` by default, or `moqt-22` with
-`{ draft: 22 }`, requires QUIC
+`--experimental-quic`. It offers `moqt-18` by default, or `moqt-22` / `moqt-23`
+with `{ draft: 22 }` / `{ draft: 23 }`, requires QUIC
 DATAGRAM negotiation, disables 0-RTT, and does not fall back to WebTransport.
+
+#### draft 23
+
+Draft 23 (`new MoqtConnection(23)`, `draftVersion: 23`, ALPN/WT protocol `moqt-23`) is opt-in. It keeps the draft-22 model, so everything in the draft-22 section below also applies, and changes the wire and behaviour as follows. Draft 22 and draft 23 are not wire-compatible.
+
+- **Framing.** A control message Length is a varint. This endpoint advertises, and never sends more than, the default MAX_CONTROL_MESSAGE_SIZE of 65535; a longer incoming message closes the session with FIELD_LENGTH_EXCEEDED before it is buffered.
+- **FETCH responses.** A FETCH is answered with REQUEST_OK; FETCH_OK (0x18) is reserved. The connection still surfaces a `FETCH_OK` to `onMessage`, whose End Location is LARGEST_OBJECT when the publisher sent it and the requested end otherwise. `acceptFetch()` sends LARGEST_OBJECT when the new `largestObject` option falls inside the requested range (draft 23 requires it there); `endLocation` is not used. `endOfTrack` has no draft-23 field and is refused: call `sendFetchEndMarker(streamId, 'end-of-track')` after the last Object instead.
+- **FETCH stream.** Object ID deltas within a group, delta-coded End of Range markers, End of Gone Range (`0x40C`), End of Group (`0x80`) and End of Track (`0x81`). `sendFetchEndOfRange()` takes a range kind (`'non-existent'`, `'unknown'`, `'timed-out'`, `'gone'`) as well as the old boolean. End of Group and End of Track reach `onObject` as END_OF_GROUP and END_OF_TRACK gaps on the last Object; a Gone range is reported like an Unknown one. `sendFetchEndMarker()` writes nothing on earlier drafts.
+- **PAUSED.** FORWARD becomes PAUSED (0x11) with the value inverted. The codec translates, so the `forward` options and the FORWARD parameter keep their meaning on every draft.
+- **Parameters.** FILL_PARAMETERS is counted instead of length-prefixed. A PUBLISH answering a SUBSCRIBE_TRACKS carries SUBSCRIBE_TRACKS_ID. NAMESPACE carries an (empty) Parameters block.
+- **REQUEST_ERROR.** The Redirect becomes a REDIRECT Error Detail; UNSUPPORTED_PROPERTY details appear as `unsupportedProperties`, and every received detail as `errorDetails`.
+- **Namespaces.** Overlapping SUBSCRIBE_NAMESPACE and SUBSCRIBE_TRACKS prefixes are allowed (no PREFIX_OVERLAP), and an announced namespace reaches every matching namespace subscription.
+- **Errors.** Violations close with the specific draft-23 codes (MALFORMED_MESSAGE, INVALID_PARAMETER, UNEXPECTED_MESSAGE, MALFORMED_OBJECT, TRUNCATED_OBJECT, …) on draft-23 sessions only; earlier drafts still close with PROTOCOL_VIOLATION. A Track Name must be at least one byte.
+
+Not implemented yet: the malformed-track rule for an Object that conflicts with a recorded non-existence (§12.1), Property multiplicity and scope checks, and fills requested through a PUBLISH.
 
 #### draft 22
 
@@ -433,7 +451,7 @@ Range Filters beyond LOCATION_FILTER are not implemented. The endpoint advertise
 the default MAX_FILTER_RANGES=0 and rejects requests that exceed it with
 INVALID_FILTER rather than ignoring the filter.
 
-Draft 22 does not change the default version or the framing of drafts 14/16/18.
+Draft 22 does not change the framing of drafts 14/16/18.
 See [draft development](docs/draft-development.md) for compatibility policy and
 the unresolved FETCH End-of-Range framing question.
 
@@ -491,7 +509,7 @@ Example pages:
 | `/video/` | Video-only player |
 
 The `/player/` page takes URL parameters: `?url=` (relay), `?ns=` / `?nsField=`
-(namespace), `?hash=` (cert hash), `?v=14|16|18|22` (draft), `?authority=`
+(namespace), `?hash=` (cert hash), `?v=14|16|18|22|23` (draft), `?authority=`
 (tenant-routed relays), `?warmStart=1` (join live LOC/CMAF/LOCMAF tracks mid-group via
 Joining FETCH or draft-22 fills; needs `isLive: true` in the catalog and relay
 support; degrades to a normal live join otherwise), `?log=info|debug`
@@ -549,7 +567,7 @@ instead of Google Chrome.
 - [Catalog Testing](docs/catalog-testing.md) — Integration harness for validating catalog subscription against a live relay
 - [Authorization](docs/authorization.md) — CAT4MOQ credential providers for players and connections
 - [Package Compatibility](docs/package-compatibility.md) - Legacy package re-exports and release ordering
-- [Draft Development](docs/draft-development.md) - Draft-22 support and compatibility policy
+- [Draft Development](docs/draft-development.md) - Draft-22 and draft-23 support and compatibility policy
 - [Playout Trace](docs/playout-trace.md) - Bounded qlog recorder, event design and instrumentation status
 - [Optional Player Diagnostics](packages/devtools/PLAYER.md) - Explicit development or production exposure, bounded capture, and recording
 - [Diagnostic Probe](packages/devtools-probe/PROBE.md) - Owner-local WebTransport probes, protocol policy, and lifecycle
