@@ -541,6 +541,7 @@ export class Player {
     const base: MoqtPlayerConfig = {
       url: opts.url,
       namespace: opts.namespace,
+      catalogTrackName: opts.catalogTrackName,
       draftVersion,
       autoQuality: opts.autoQuality ?? DEFAULTS.autoQuality,
       startLevel: opts.startLevel ?? DEFAULTS.startLevel,

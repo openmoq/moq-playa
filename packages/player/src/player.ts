@@ -121,8 +121,8 @@ const SWITCH_STAGING_TIMEOUT_MS = 3_000;
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 /** Catalog track name per MSF §5.1.10. */
-function catalogTrackName(): string {
-  return 'catalog';
+function catalogTrackName(trackName: string | undefined): string {
+  return trackName ?? 'catalog';
 }
 
 /**
@@ -3529,7 +3529,7 @@ export class MoqtPlayer {
       const dec = new TextDecoder();
       const nsTuple = nsBytes.map(b => `"${dec.decode(b)}"(${b.length}b)`).join(', ');
       this.log.info('Subscribe: namespace fields=[%s], catalog track="%s"',
-        nsTuple, catalogTrackName());
+        nsTuple, catalogTrackName(this.config.catalogTrackName));
     }
 
     if (this.config.catalog) {
@@ -3686,7 +3686,7 @@ export class MoqtPlayer {
       && gen === this.bootstrapGeneration && !this.catalogQuarantinedConns.has(conn);
     if (!live()) return;
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(catalogTrackName());
+    const nameBytes = this.enc.encode(catalogTrackName(this.config.catalogTrackName));
     const coord = this.resolvedCatalogMode(conn) === 'joining-fetch'
       ? this.createCatalogBootstrap(conn) : null;
     const options = this.catalogSubscribeOptions(conn);
@@ -4311,7 +4311,7 @@ export class MoqtPlayer {
   private async issueCandidateCatalogSubscribe(txn: MigrationTxn, conn: MoqtConnection): Promise<void> {
     const slots = txn.slots!;
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(catalogTrackName());
+    const nameBytes = this.enc.encode(catalogTrackName(this.config.catalogTrackName));
     // Mode is resolved per CONNECTION: a replacement may negotiate a different
     // draft, and draft-22 retrieves its fill on the SUBSCRIBE itself.
     const startedCoord = slots.catalogBootstrapCoord !== null;
@@ -5844,7 +5844,7 @@ export class MoqtPlayer {
     const timeoutMs = opts?.timeoutMs ?? 5_000;
 
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(catalogTrackName());
+    const nameBytes = this.enc.encode(catalogTrackName(this.config.catalogTrackName));
     const fetchOptions = {
       startGroup: varint(group),
       startObject: varint(object),
@@ -6071,7 +6071,7 @@ export class MoqtPlayer {
     const live = (): boolean => gen === this.bootstrapGeneration
       && this.slotsFor(conn) === slots && slots.catalogBootstrapCoord === coord;
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(catalogTrackName());
+    const nameBytes = this.enc.encode(catalogTrackName(this.config.catalogTrackName));
     let pendingAttempt: number | null = null;
 
     const coord: CatalogBootstrap = new CatalogBootstrap({
@@ -6549,7 +6549,7 @@ export class MoqtPlayer {
       gen === this.bootstrapGeneration && this.connection === conn && this.catalogSlots.catalogBootstrapCoord === coord;
     const live = (): boolean => ownedAsCandidate() || ownedAsMain();
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(catalogTrackName());
+    const nameBytes = this.enc.encode(catalogTrackName(this.config.catalogTrackName));
     const manager = new CatalogManager(this.config.namespace);
     let pendingAttempt: number | null = null;
 
