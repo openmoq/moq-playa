@@ -3794,6 +3794,8 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-transport-16 §9.2.2.8 (FORWARD parameter)
    */
   play(): void {
+    // Idempotent while playing, as HTMLMediaElement.play() is.
+    if (this.stateMachine.state === PlayerState.PLAYING) return;
     this.log.info('play()');
     // ONE transaction. The transition is validated first (an invalid one throws
     // having changed nothing), then state, playback intent, adapter intent and

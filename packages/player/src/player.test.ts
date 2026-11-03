@@ -957,6 +957,20 @@ describe('MoqtPlayer', () => {
     expect(player.state).toBe(PlayerState.PLAYING);
   });
 
+  it('play() while playing is a no-op', async () => {
+    const adapter = createMockAdapter();
+    const player = new MoqtPlayer(createConfig(adapter));
+    player.load();
+    await resolveConnect(adapter);
+    player.play();
+    const changes: unknown[] = [];
+    player.on('state_changed', (e) => changes.push(e));
+
+    expect(() => player.play()).not.toThrow();
+    expect(player.state).toBe(PlayerState.PLAYING);
+    expect(changes).toEqual([]);
+  });
+
   // ─── Catalog subscription (§9.9, MSF §9.1) ─────────────────
 
   describe('catalog subscription (MSF §9.1)', () => {

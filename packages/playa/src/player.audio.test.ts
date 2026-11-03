@@ -256,3 +256,16 @@ describe('Player — audio activation', () => {
     });
   });
 });
+
+describe('Player — play()', () => {
+  it('is a no-op while already playing', async () => {
+    const p = new Player(mockElement() as HTMLElement, { url: 'x', namespace: 'y' });
+    await p.load();
+    const plays: unknown[] = [];
+    p.on('play', (e) => plays.push(e));
+    p.play();
+    p.play();
+    expect(plays).toHaveLength(1);
+    expect(p.state).toBe('playing');
+  });
+});
