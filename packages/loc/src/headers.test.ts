@@ -77,6 +77,7 @@ describe('locWireProfileForDraft', () => {
     expect(locWireProfileForDraft(18)).toBe('d18-delta-vi64');
     // draft 22 keeps draft 18's vi64 Object Properties encoding
     expect(locWireProfileForDraft(22)).toBe('d18-delta-vi64');
+    expect(locWireProfileForDraft(23)).toBe('d18-delta-vi64');
   });
 });
 

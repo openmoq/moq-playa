@@ -1,6 +1,6 @@
 /**
- * Catalog bootstrap over the in-memory draft-22 loopback: a REAL MoqtPlayer
- * drives a REAL MoqtConnection(22) client against a REAL server connection
+ * Catalog bootstrap over the in-memory draft-22 and draft-23 loopbacks: a REAL
+ * MoqtPlayer drives a REAL MoqtConnection(22 or 23) client against a REAL server connection
  * acting as a minimal catalog publisher. Draft 22 has no Joining FETCH: the
  * catalog SUBSCRIBE carries FILL_PARAMETERS for the current group and the
  * publisher answers on a fill fetch stream (no FETCH_OK; the FIN completes it).
@@ -87,9 +87,9 @@ function newPlayer(client: unknown): MoqtPlayer {
     });
 }
 
-describe('d22 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
+describe.each([22, 23] as const)('d%i loopback — catalog bootstrap from a SUBSCRIBE fill', (draft) => {
     it('the fill supplies head + delta, no FETCH is sent, and the live tail applies after readiness', async () => {
-        const { client, server, errors } = await connectedPair(22);
+        const { client, server, errors } = await connectedPair(draft);
         const state = wireServer(server as unknown as MoqtConnection);
         const player = newPlayer(client);
         const events: string[] = [];
@@ -128,11 +128,13 @@ describe('d22 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
         expect(done.normalizePublishDoneStatus(0x2n)).toBe('ended');
         expect(done.normalizePublishDoneStatus(0x3n)).toBe('retriable');
         expect(done.normalizePublishDoneStatus(0x12n)).toBe('fatal-track');
+        // draft 23 adds EXPIRED_AUTH_TOKEN (0x7): fatal, not retried with the same token.
+        expect(done.normalizePublishDoneStatus(0x7n)).toBe(draft === 23 ? 'fatal-track' : 'retriable');
         await player.destroy();
     });
 
     it('an empty track opens no fill: the first live catalog object completes the bootstrap', async () => {
-        const { client, server, errors } = await connectedPair(22);
+        const { client, server, errors } = await connectedPair(draft);
         const state = wireServer(server as unknown as MoqtConnection, { empty: true });
         let catalogSubs = 0;
         const orig = server.onSubscribe!;
@@ -162,7 +164,7 @@ describe('d22 loopback — catalog bootstrap from a SUBSCRIBE fill', () => {
     });
 
     it.each([1, 'draft-01'] as const)('a reset fill discards its prefix; version %s follows its fallback policy', async (version) => {
-        const { client, server, errors } = await connectedPair(22);
+        const { client, server, errors } = await connectedPair(draft);
         const state = wireServer(server as unknown as MoqtConnection, { resetFill: true, version });
         let catalogSubs = 0;
         const orig = server.onSubscribe!;

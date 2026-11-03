@@ -36,7 +36,7 @@ import { ReceivedPayloadRate } from './received-payload-rate.js';
  */
 
 import type { ControlMessage, Parameters, DraftVersion } from '@openmoq/transport';
-import { varint, PublishDoneCode, PublishDoneCode18, RequestError, ObjectStatus, SessionState } from '@openmoq/transport';
+import { DEFAULT_DRAFT_VERSION, isDraft23, varint, PublishDoneCode, PublishDoneCode18, RequestError, ObjectStatus, SessionState } from '@openmoq/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import { MoqtConnectionError } from '@openmoq/webtransport';
@@ -8843,7 +8843,7 @@ export class MoqtPlayer {
   /** Draft-aware FETCH INVALID_RANGE code: d14 uses 0x5 (§9.18); 16/18 use
    *  the common table's 0x11. */
   private invalidRangeCode(draftVersion?: DraftVersion): bigint {
-    const draft = draftVersion ?? this.connection?.draftVersion ?? this.config.draftVersion ?? 16;
+    const draft = draftVersion ?? this.connection?.draftVersion ?? this.config.draftVersion ?? DEFAULT_DRAFT_VERSION;
     return draft === 14 ? 0x5n : 0x11n;
   }
 
@@ -9169,7 +9169,7 @@ export class MoqtPlayer {
       },
       log: (msg, ...args) => this.log.debug(msg, ...args),
     }, {
-      draft: (conn.draftVersion ?? this.config.draftVersion ?? 16) as 14 | 16 | 18 | 22,
+      draft: (conn.draftVersion ?? this.config.draftVersion ?? DEFAULT_DRAFT_VERSION) as DraftVersion,
       strict: this.strictCatalogMode(),
     });
 
@@ -9621,7 +9621,7 @@ export class MoqtPlayer {
       },
       log: (msg, ...args) => this.log.debug(msg, ...args),
     }, {
-      draft: (conn.draftVersion ?? this.config.draftVersion ?? 16) as 14 | 16 | 18 | 22,
+      draft: (conn.draftVersion ?? this.config.draftVersion ?? DEFAULT_DRAFT_VERSION) as DraftVersion,
       // Legacy catalog mode (the explicit 'subscribe' compatibility option):
       // the candidate is a fresh AbsoluteStart subscribe — subscription-only
       // retrieval, ready on the first acceptable base; NEVER a Joining FETCH.
@@ -10051,12 +10051,14 @@ export class MoqtPlayer {
     // actual draft can diverge from configuration under auto-negotiation. An
     // explicit version is passed when the DELIVERING session is not the live
     // one, as during a cross-draft handover.
-    const draft = draftVersion ?? this.connection?.draftVersion ?? this.config.draftVersion ?? 16;
+    const draft = draftVersion ?? this.connection?.draftVersion ?? this.config.draftVersion ?? DEFAULT_DRAFT_VERSION;
     if (code === 0x2n) return 'ended';                            // TRACK_ENDED
     if (code === 0x3n && !isDraft22(draft)) return 'ended';            // SUBSCRIPTION_ENDED (gone in draft 22)
     if (code === 0x4n) return 'going-away';                       // GOING_AWAY
     if (code === 0x1n) return 'fatal-track';                      // UNAUTHORIZED
     if (draft === 14 && code === 0x7n) return 'fatal-track';      // d14 MALFORMED_TRACK
+    // d23 EXPIRED_AUTH_TOKEN (§12.4): retrying with the same token cannot help.
+    if (isDraft23(draft) && code === 0x7n) return 'fatal-track';
     if (draft !== 14 && code === 0x12n) return 'fatal-track';     // d16+ MALFORMED_TRACK
     // INTERNAL_ERROR(0x0), EXPIRED/TOO_FAR_BEHIND (0x5/0x6, either draft
     // orientation), UPDATE_FAILED(0x8), d18/22 EXCESSIVE_LOAD(0x9), unknown.

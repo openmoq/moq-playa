@@ -40,17 +40,21 @@ export interface WebTransportFactoryOptions {
    * sends the `WT-Available-Protocols` header to the server. The server
    * selects a protocol and the result is available on `transport.protocol`.
    *
+   * - 23 → `["moqt-23"]`
    * - 22 → `["moqt-22"]`
    * - 18 → `["moqt-18"]`
    * - 16 → `["moqt-16"]`
    * - 14 → no protocols sent (h3 ALPN fallback, in-band CLIENT_SETUP negotiation)
-   * - undefined → `["moqt-16"]` (default, kept for backward compatibility)
+   * - undefined → `["moqt-16"]` (the default draft, {@link DEFAULT_DRAFT_VERSION})
    *
    * @see draft-ietf-moq-transport-16 §3.1 (version negotiation)
    * @see W3C WebTransport §3.3 (WT-Available-Protocols)
    */
-  readonly draftVersion?: 14 | 16 | 18 | 22;
+  readonly draftVersion?: 14 | 16 | 18 | 22 | 23;
 }
+
+/** The draft offered when the caller names none. */
+const DEFAULT_DRAFT_VERSION = 16;
 
 /**
  * Create a `createTransport` factory for the player config.
@@ -69,6 +73,7 @@ export function createWebTransport(
     // §3.1: WT-Available-Protocols for MOQT version negotiation.
     // Default: offer ['moqt-16']. Draft-14 does not send protocols —
     // it relies on h3 ALPN with in-band CLIENT_SETUP version list.
+    const draftVersion = options?.draftVersion ?? DEFAULT_DRAFT_VERSION;
     const buildOpts = (withProtocols: boolean): any => {
       const opts: any = {};
       if (options?.certHash) {
@@ -83,13 +88,8 @@ export function createWebTransport(
       // the protocol string isn't recognized by servers. Draft-14 falls back to
       // plain h3 ALPN with in-band version negotiation in CLIENT_SETUP (§9.3).
       // Draft-15+ use "moqt-{N}" which servers recognize over WebTransport.
-      if (options?.draftVersion && options.draftVersion >= 15) {
-        opts.protocols = [`moqt-${options.draftVersion}`];
-      } else if (!options?.draftVersion) {
-        // Auto-negotiate: offer draft-16 protocol string.
-        // Don't offer moq-00/moqt-14 — servers reject unknown protocol strings.
-        opts.protocols = ['moqt-16'];
-      }
+      // Don't offer moq-00/moqt-14 — servers reject unknown protocol strings.
+      if (draftVersion >= 15) opts.protocols = [`moqt-${draftVersion}`];
       // draft-14: no protocols sent — h3 ALPN fallback with CLIENT_SETUP version list
       return opts;
     };
@@ -129,9 +129,10 @@ export function createWebTransport(
       } else {
         await transport.ready;
       }
-      if (options?.draftVersion === 22 && (transport as unknown as { protocol?: string }).protocol !== 'moqt-22') {
+      const required = draftVersion >= 22 ? draftVersion : undefined;
+      if (required !== undefined && (transport as unknown as { protocol?: string }).protocol !== `moqt-${required}`) {
         transport.close();
-        throw new Error('WebTransport did not negotiate moqt-22 (draft-22 section 6.2.1)');
+        throw new Error(`WebTransport did not negotiate moqt-${required} (draft-${required} section 6.2.1)`);
       }
       return { transport, handshakeRttMs: performance.now() - connectStart };
     };
@@ -143,17 +144,12 @@ export function createWebTransport(
     } catch (err) {
       if (options?.signal?.aborted) throw options.signal.reason;
       const detail = failureDetail(err, firstOpts.protocols);
-      if (!firstOpts.protocols || options?.draftVersion === 22) {
+      if (!firstOpts.protocols || draftVersion >= 22) {
         throw new Error(`WebTransport connection failed: ${detail}`);
       }
       // Preserve the older-draft compatibility retry for deployed endpoints
-      // without WT subprotocol negotiation. Draft 22 requires negotiation and
-      // cannot use this fallback; SETUP does not carry a version list.
-      //
-      // In auto mode, the fallback has no transport.protocol, so the adapter
-      // uses its default draft unless the caller passed draftVersion
-      // explicitly. Callers that need deterministic draft selection should
-      // pass draftVersion.
+      // without WT subprotocol negotiation. Drafts 22 and 23 require negotiation
+      // and cannot use this fallback; SETUP does not carry a version list.
       try {
         connected = await attempt(false);
       } catch (retryErr) {
