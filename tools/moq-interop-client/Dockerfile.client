@@ -97,6 +97,8 @@ RUN node dist-test/test/teardown.test.js \
       /tmp/native-quic-smoke/key.pem /tmp/native-quic-smoke/cert.pem \
  && node --experimental-quic --no-warnings /local/packages/quic/test/native-smoke.mjs \
       /tmp/native-quic-smoke/key.pem /tmp/native-quic-smoke/cert.pem 22 \
+ && node --experimental-quic --no-warnings /local/packages/quic/test/native-smoke.mjs \
+      /tmp/native-quic-smoke/key.pem /tmp/native-quic-smoke/cert.pem 23 \
  && touch /app/.tests-passed
 
 FROM node-quic

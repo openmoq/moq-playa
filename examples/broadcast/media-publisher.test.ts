@@ -441,8 +441,8 @@ describe('MediaPublisher — broadcast generations', () => {
 });
 
 describe('MediaPublisher — negotiated-draft wire binding', () => {
-  it('draft-18 and 22 subgroup opens set FIRST_OBJECT on video AND audio; 16/14 do not', async () => {
-    for (const draft of [14, 16, 18, 22] as const) {
+  it('draft-18, 22 and 23 subgroup opens set FIRST_OBJECT on video AND audio; 16/14 do not', async () => {
+    for (const draft of [14, 16, 18, 22, 23] as const) {
       const conn = recordingConnection();
       const pub = makePublisher(conn, { draft });
       pub.setVideoAlias(2n);

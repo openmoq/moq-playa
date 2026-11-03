@@ -30,7 +30,7 @@ import type { MoqtConnection, IncomingPublish } from '@openmoq/webtransport';
 import { decodeTrackProperties18, windowContains, MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@openmoq/transport';
 import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, te, nsStr, hex } from './demo.js';
 import { SubgroupForwarder, type ForwardLimits } from './subgroup-forwarder.js';
-import { isRequestStreamDraft, decodeSubscriptionFilter, resolveFillWindow, MAX_VI64 } from '@openmoq/transport';
+import { isDraft22, isDraft23, isRequestStreamDraft, decodeSubscriptionFilter, resolveFillWindow, MAX_VI64 } from '@openmoq/transport';
 import { HistoryCache, type HistoryLimits } from './history-cache.js';
 
 const log = (...a: unknown[]) => console.log('[relay]', ...a);
@@ -357,7 +357,8 @@ export class Relay {
       const largest = track && this.trackHead(track);
       if (!track || !largest) throw new Error('no published head');
       const head = { group: largest.groupId, object: largest.objectId };
-      if (conn.draftVersion !== 22) end = { group: end.group, object: end.object === 0n ? MAX_VI64 : end.object - 1n };
+      // Draft 22 and later carry an inclusive End; earlier drafts one past it.
+      if (!isDraft22(conn.draftVersion)) end = { group: end.group, object: end.object === 0n ? MAX_VI64 : end.object - 1n };
       const filter = fetch.parameters.get(0x21n)?.[0];
       if (conn.draftVersion === 22 && filter instanceof Uint8Array) {
         const window = resolveFillWindow(decodeSubscriptionFilter(filter, 22), head);
@@ -370,8 +371,10 @@ export class Relay {
       if (fetch.parameters.get(0x22n)?.[0] === 2n) rows.sort((a, b) => a.groupId === b.groupId ? 0 : a.groupId > b.groupId ? -1 : 1);
       this.fetchTracks.set(owner!, track);
       response = { conn, requestId, track, malformed: false }; this.historyResponses.add(response);
-      const endLocation = conn.draftVersion === 22 ? end : { group: end.group, object: end.object === MAX_VI64 ? 0n : end.object + 1n };
-      await conn.acceptFetch(requestId, { endLocation });
+      const endLocation = isDraft22(conn.draftVersion) ? end : { group: end.group, object: end.object === MAX_VI64 ? 0n : end.object + 1n };
+      // draft-23 §3.2: name the Largest Object; the session sends it when it is
+      // inside the requested range. Earlier drafts ignore it.
+      await conn.acceptFetch(requestId, { endLocation, ...(isDraft23(conn.draftVersion) ? { largestObject: head } : {}) });
       if (response.malformed) { await conn.abortIncomingFetch(requestId, { streamErrorCode: 0x12 }); return; }
       const sid = await conn.openFetchStream(requestId);
       for (const row of rows) {

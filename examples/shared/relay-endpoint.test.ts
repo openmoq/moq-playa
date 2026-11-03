@@ -67,7 +67,7 @@ async function flush(): Promise<void> {
 }
 
 describe('explicit ?url=', () => {
-  it.each([14, 16, 18, 22])('preserves ?v=%s during discovery', async (draft) => {
+  it.each([14, 16, 18, 22, 23])('preserves ?v=%s during discovery', async (draft) => {
     const resolver = makeResolver(`?v=${draft}`);
     const resolution = resolver.resolve();
     await flush();
