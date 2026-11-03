@@ -124,6 +124,26 @@ export class PlaybackPipeline {
 
     /** True once track_ended has been emitted — prevents re-emission on every tick. */
     private _trackEnded = false;
+    private trackEndHolds = 0;
+
+    /** Terminal delivery is draining, or EOT has been observed; absence of new frames is not a live stall. */
+    get isEnding(): boolean { return this.trackEndHolds > 0 || this.gapDetector.isTrackEnded || this._trackEnded; }
+
+    /** A known terminal delivery window may still supply media below the EOT boundary. Reset retires the hold. */
+    holdTrackEnd(): (completeTrack?: boolean) => void {
+        const revision = this.playbackRevision;
+        this.trackEndHolds++;
+        let released = false;
+        return (completeTrack = false) => {
+            if (released) return;
+            released = true;
+            if (this.playbackRevision === revision) {
+                this.trackEndHolds--;
+                // Application-level completion after a publisher's TRACK_ENDED drain. No Object Location is invented.
+                if (completeTrack) this.gapDetector.observeEndOfTrack();
+            }
+        };
+    }
 
     /** Last emitted playback rate — dedup to avoid spamming commands. */
     private _lastEmittedRate = 1.0;
@@ -408,6 +428,8 @@ export class PlaybackPipeline {
  */
     resetForTrackSwitch(firstGroupId: bigint): void {
         this.playbackRevision++;
+        this.trackEndHolds = 0;
+        this._trackEnded = false;
         const inputs = this.inputState, dropped = inputs?.clear();
         // Clear the jitter buffer — old-track encoded objects must not
         // survive into the new decoder configuration. Without this,
@@ -444,6 +466,7 @@ export class PlaybackPipeline {
         this.resetPending = true;
         this._throttled = false;
         this._trackEnded = false;
+        this.trackEndHolds = 0;
         this.endedGroups.clear();
         this.activeGroupWaitStartUs = null;
         this.gapDetector.reset();
@@ -495,7 +518,8 @@ export class PlaybackPipeline {
         const gapDecision = this.gapDetector.evaluate(this.lastConsumedGroupId, availableGroupIds);
 
         // 2. Handle gap decision
-        if (gapDecision.action === GapAction.TRACK_ENDED) {
+        if (gapDecision.action === GapAction.TRACK_ENDED && this.buffer.size === 0) {
+            if (this.trackEndHolds > 0) return;
             if (!this._trackEnded) {
                 this._trackEnded = true;
                 const decision = this.decoderState.notifyTrackEnded();

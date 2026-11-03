@@ -254,8 +254,10 @@ export interface KeyframeWaitingEvent {
 }
 
 /**
- * Track has ended (PUBLISH_DONE with TRACK_ENDED received).
- * @see draft-ietf-moq-transport-16 §9.15 (PUBLISH_DONE status 0x2)
+ * The track ended after an observed END_OF_TRACK or drained TRACK_ENDED publication.
+ * PUBLISH_DONE receipt alone is not a data-delivery barrier; filter completion does not assert track completion.
+ * This does not assert that all frames were presented or that the shared MSE media element has ended.
+ * @see draft-ietf-moq-transport-16 §10.2.1.1, §9.15
  */
 export interface TrackEndedEvent {
   readonly type: 'track_ended';

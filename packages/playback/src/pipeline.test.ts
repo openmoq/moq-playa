@@ -12,7 +12,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { PlaybackPipeline } from './pipeline.js';
 import { SyncController } from './sync.js';
 import { DefaultRecoveryController } from './recovery.js';
-import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig, DecoderFeedback } from './types.js';
+import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig } from './types.js';
 import type { MoqtObjectData, MoqtObjectGap } from '@openmoq/transport';
 import { varint, ObjectStatus } from '@openmoq/transport';
 import type { LocHeaders } from '@openmoq/loc';
@@ -114,7 +114,7 @@ function createPipeline(opts: {
         sync,
         onCommand: (cmd) => commands.push(cmd),
         onEvent: (evt) => events.push(evt),
-        recovery: opts.recovery,
+        ...(opts.recovery !== undefined ? { recovery: opts.recovery } : {}),
     });
 
     return { pipeline, commands, events, sync };
@@ -290,7 +290,7 @@ describe('PlaybackPipeline', () => {
     it('keyframe recovery after gap → decode resumes (§2.3.2.2)', () => {
         const clock = new MockClock();
         clock.set(5_000_000);
-        const { pipeline, commands, events, sync } = createPipeline({ mediaType: 'video', clock });
+        const { pipeline, commands, sync } = createPipeline({ mediaType: 'video', clock });
         sync.setAudioReference(1_000_000_000n);
 
         // Consume group 0
@@ -347,10 +347,52 @@ describe('PlaybackPipeline', () => {
         expect(flushCmd).toBeDefined();
     });
 
+    it('consumes buffered video before the EOT flush', () => {
+        const clock = new MockClock(); clock.set(5_000_000);
+        const { pipeline, commands, events, sync } = createPipeline({ mediaType: 'video', clock });
+        sync.setAudioReference(1_000_000_000n);
+        pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([1])));
+        pipeline.pushObject(makeGap(0, 1, ObjectStatus.END_OF_TRACK));
+        commands.length = 0;
+        pipeline.tick();
+        expect(commands.some(command => command.type === 'decode_video')).toBe(true);
+        pipeline.tick();
+        expect(events.filter(event => event.type === 'track_ended')).toHaveLength(1);
+        expect(commands.findIndex(command => command.type === 'flush')).toBeGreaterThan(
+            commands.findIndex(command => command.type === 'decode_video'));
+    });
+
+    it('resolves a missing group while draining buffered video toward EOT', () => {
+        const clock = new MockClock(); clock.set(5_000_000);
+        const { pipeline, commands, events, sync } = createPipeline({ mediaType: 'video', clock });
+        sync.setAudioReference(1_000_000_000n);
+        pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([1])));
+        pipeline.tick();
+        pipeline.pushObject(makeData(2, 0), videoHeaders(1_000_100_000n, true));
+        pipeline.pushObject(makeGap(3, 0, ObjectStatus.END_OF_TRACK));
+        for (let i = 0; i < 10; i++) { clock.advance(1_000_000); pipeline.tick(); }
+        expect(commands.filter(command => command.type === 'decode_video')).toHaveLength(2);
+        expect(events.filter(event => event.type === 'track_ended')).toHaveLength(1);
+    });
+
+    it.each(['reset', 'switch'] as const)('a retired terminal hold cannot release the successor hold after %s', reset => {
+        const clock = new MockClock(); clock.set(5_000_000);
+        const { pipeline, events, sync } = createPipeline({ mediaType: 'video', clock });
+        sync.setAudioReference(1_000_000_000n);
+        const old = pipeline.holdTrackEnd();
+        if (reset === 'reset') pipeline.reset(); else pipeline.resetForTrackSwitch(0n);
+        const current = pipeline.holdTrackEnd(); old(); old();
+        pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([1])));
+        pipeline.pushObject(makeGap(1, 0, ObjectStatus.END_OF_TRACK));
+        pipeline.tick(); pipeline.tick(); expect(events.filter(event => event.type === 'track_ended')).toEqual([]);
+        current(); current(); pipeline.tick();
+        expect(events.filter(event => event.type === 'track_ended')).toHaveLength(1);
+    });
+
     it('track_ended emits only once across multiple ticks', () => {
         const clock = new MockClock();
         clock.set(5_000_000);
-        const { pipeline, commands, events, sync } = createPipeline({ mediaType: 'video', clock });
+        const { pipeline, events, sync } = createPipeline({ mediaType: 'video', clock });
         sync.setAudioReference(1_000_000_000n);
 
         // Consume group 0
@@ -1359,6 +1401,7 @@ describe('PlaybackPipeline', () => {
             pipeline.handleFeedback({
                 type: 'frame_rendered',
                 captureTimestampUs: 1_000_400_000n,
+                mediaType: 'video',
                 scheduledRenderUs: 5_400_000,
                 actualRenderUs: 5_700_000,
             });
@@ -1404,6 +1447,7 @@ describe('PlaybackPipeline', () => {
             pipeline.handleFeedback({
                 type: 'frame_rendered',
                 captureTimestampUs: 1_000_400_000n,
+                mediaType: 'video',
                 scheduledRenderUs: 5_400_000,
                 actualRenderUs: 5_700_000,
             });
@@ -2002,7 +2046,7 @@ describe('PlaybackPipeline', () => {
         it('audio is NOT affected by video group lifecycle (independently decodable)', () => {
             const clock = new MockClock();
             clock.set(5_000_000);
-            const { pipeline, commands, sync } = createPipeline({ mediaType: 'audio', clock });
+            const { pipeline, commands } = createPipeline({ mediaType: 'audio', clock });
 
             pipeline.configure(new Uint8Array([0x01]));
 

@@ -350,10 +350,11 @@ export interface RequestOwnershipOptions {
  * late streams and datagrams, then reports `onDrained(requestId)` exactly once.
  *
  * Rules:
- * - Completion is TIMEOUT-ONLY. The announced Stream Count merely caps how many
- *   further streams are accepted; meeting it never completes the drain early
- *   (Stream Count counts streams, and datagram-only delivery legitimately
- *   reports zero).
+ * - Completion defaults to timeout-only, retaining late datagrams too.
+ *   `terminalDeliveryCompletion: 'streams'` permits earlier completion once a
+ *   positive exact Stream Count has been fully processed (§9.15/§10.11/§9.9).
+ *   Zero, unknown and unmet counts retain the timeout policy. Stream completion
+ *   is not a datagram delivery guarantee; use the default to retain datagrams.
  * - At the timeout, still-open streams are cancelled (STOP_SENDING) and their
  *   cleanup awaited before completion. If a cancellation never settles, the
  *   drain remains safely blocked — fail-closed by design.
@@ -363,6 +364,10 @@ export interface RequestOwnershipOptions {
  */
 export interface TerminalDeliveryOptions {
   terminalDelivery?: 'drain';
+  /** Drain only these PUBLISH_DONE status codes; omitted means every status. Adapter-local, never encoded. */
+  terminalDeliveryStatuses?: readonly bigint[];
+  /** Opt in to the drafts' exact processed-stream completion rule; default retains the full timeout. */
+  terminalDeliveryCompletion?: 'streams';
   onDrained?: (requestId: bigint) => void;
 }
 
@@ -373,6 +378,7 @@ interface AliasDrainState {
   acceptRemaining: bigint | null;
   cancelTimer: () => void;
   drained: boolean;
+  exactStreams: bigint | null;
 }
 
 /** Strip adapter-level ownership fields so Session never sees them. */
@@ -1356,7 +1362,13 @@ export class MoqtConnection {
   private readonly terminatedAliasTtlMs: number;
 
   /** Subscriptions opted into terminal drain, by request ID (§ terminal drain). */
-  private readonly drainConfigs = new Map<bigint, { onDrained: ((requestId: bigint) => void) | null }>();
+  private readonly drainConfigs = new Map<bigint, { onDrained: ((requestId: bigint) => void) | null; statuses: ReadonlySet<bigint> | null;
+    completion: 'streams' | undefined }>();
+
+  private terminalDrainSelected(requestId: bigint, status: bigint): boolean {
+    const cfg = this.drainConfigs.get(requestId);
+    return cfg !== undefined && (cfg.statuses === null || cfg.statuses.has(BigInt(status)));
+  }
   /** Live per-alias drain state; presence also blocks alias reuse. */
   private readonly drainingAliases = new Map<bigint, AliasDrainState>();
   /**
@@ -1798,22 +1810,32 @@ export class MoqtConnection {
   ): Promise<bigint> {
     // Terminal-delivery validation runs BEFORE any allocation or emission:
     // silently ignoring a dangling onDrained would hide bugs.
-    if (options?.onDrained && options.terminalDelivery !== 'drain') {
-      throw new Error("onDrained requires terminalDelivery: 'drain'");
+    if ((options?.onDrained || options?.terminalDeliveryStatuses !== undefined || options?.terminalDeliveryCompletion !== undefined)
+        && options.terminalDelivery !== 'drain') {
+      throw new Error("terminal delivery options require terminalDelivery: 'drain'");
     }
+    if (options?.terminalDeliveryCompletion !== undefined && options.terminalDeliveryCompletion !== 'streams') {
+      throw new TypeError('terminalDeliveryCompletion must be streams when supplied');
+    }
+    const statuses = options?.terminalDeliveryStatuses;
+    if (statuses !== undefined && (!Array.isArray(statuses) || statuses.length > 32
+        || statuses.some(code => typeof code !== 'bigint' || code < 0n))) {
+      throw new TypeError('terminalDeliveryStatuses must be an array of at most 32 unsigned bigint codes');
+    }
+    const statusSet = statuses === undefined ? null : new Set(statuses);
     if (this.authorization) {
       namespace = namespace.map(field => Uint8Array.from(field));
       name = Uint8Array.from(name);
       options = await this.authorize({ operation: 'SUBSCRIBE', namespace, trackName: name }, options);
     }
     const { sessionOptions, onRequestId } = splitOwnership(options);
-    const { terminalDelivery, onDrained, ...restSession } =
+    const { terminalDelivery, terminalDeliveryStatuses: _statuses, terminalDeliveryCompletion, onDrained, ...restSession } =
       (sessionOptions ?? {}) as SubscribeOptions & TerminalDeliveryOptions;
     const { requestId, actions } = this.session.subscribe(namespace, name, restSession as SubscribeOptions);
     this.pendingGenericSubscriptions.add(requestId);
     this.registerPendingSubscription(requestId);
     if (terminalDelivery === 'drain') {
-      this.drainConfigs.set(requestId, { onDrained: onDrained ?? null });
+      this.drainConfigs.set(requestId, { onDrained: onDrained ?? null, statuses: statusSet, completion: terminalDeliveryCompletion });
     }
     try {
       this.invokeOwnershipCallback(requestId, onRequestId);
@@ -2412,7 +2434,7 @@ export class MoqtConnection {
     if (this.terminatedAliases.get(alias)?.strict === false) {
       (this.reboundSubscribers ??= new WeakSet()).add(this.session.getSubscription(requestId)!);
     }
-    this.clearTerminatedAlias(alias);
+    this.clearTerminatedAlias(alias, true);
     const suppress = this.handleRawSubControlMessage(stampedOk);
     if (!suppress) {
       this.pendingGenericSubscriptions.delete(requestId);
@@ -2575,7 +2597,8 @@ export class MoqtConnection {
       const stampedDone = { ...message, requestId: originalRequestId } as ControlMessage;
       // Terminal drain: arm SYNCHRONOUSLY, BEFORE the application callback —
       // no callback may observe a DONE'd subscription without the drain pending.
-      const draining = this.drainConfigs.has(originalRequestId) && alias !== undefined;
+      const draining = this.terminalDrainSelected(originalRequestId, BigInt(message.statusCode)) && alias !== undefined;
+      if (!draining) this.drainConfigs.delete(originalRequestId);
       if (draining && subscription) this.retainTerminalSubscriber(subscription);
       const cancelFills = draining ? Promise.resolve() : this.cancelFill(originalRequestId);
       const aliasDraining = draining || (doneAlias !== undefined && [...this.terminalSubscribers.values()].some(({ sub }) => sub.trackAlias === doneAlias));
@@ -2974,7 +2997,13 @@ export class MoqtConnection {
   private retainTerminalSubscriber(sub: SubscriptionStateMachine): void {
     if (!isDraft22(this.session.draftVersion) || this.terminalSubscribers.has(sub.requestId)) return;
     const ttl = Math.max(this.terminatedAliasTtlMs, this.aliasDeliveryTimeoutMs.get(sub.trackAlias!) ?? 0);
-    const cancelTimer = this.armGuardTimer(ttl, () => { void this.finishTerminalSubscriber(sub.requestId); });
+    const cancelTimer = this.armGuardTimer(ttl, () => {
+      // An alias drain owns its deadline and all stream cancellation. An older
+      // member's timer must neither rush that deadline nor notify independently.
+      const alias = sub.trackAlias;
+      if (alias !== undefined && this.drainingAliases.has(alias)) return;
+      void this.finishTerminalSubscriber(sub.requestId);
+    });
     this.terminalSubscribers.set(sub.requestId, { sub, cancelTimer });
   }
 
@@ -3492,12 +3521,12 @@ export class MoqtConnection {
     }
   }
 
-  /** Clear an alias tombstone (cancel its TTL timer) and its seen-count. */
-  private clearTerminatedAlias(alias: bigint): void {
+  /** Clear a retired generation. Binding a fresh alias must retain streams that overtook its response. */
+  private clearTerminatedAlias(alias: bigint, binding = false): void {
     const t = this.terminatedAliases.get(alias);
     if (t) { t.cancelTimer(); this.terminatedAliases.delete(alias); }
     if (!t && isDraft22(this.session.draftVersion) && this.deliverySubscribers22(alias).length > 1) return;
-    this.aliasStreamsSeen.delete(alias);
+    if (!binding || t) this.aliasStreamsSeen.delete(alias);
     this.aliasTerminalTotals.delete(alias);
     this.aliasDeliveryTimeoutMs.delete(alias);
     this.aliasPublisherTimeout.delete(alias);
@@ -3577,7 +3606,7 @@ export class MoqtConnection {
   /**
    * Arm the terminal DRAIN for `alias` (§ terminal drain): keep routing alive,
    * cap further stream acceptance at the announced Stream Count, and complete
-   * only at the effective timeout. Synchronous — armed before any application
+   * at the effective timeout or opted-in exact stream completion. Armed before any application
    * callback observes the PUBLISH_DONE.
    */
   private applyTerminalDrain(alias: bigint, streamCount: bigint, owningRequestId: bigint): void {
@@ -3593,12 +3622,27 @@ export class MoqtConnection {
       ? null
       : (streamCount > seen ? streamCount - seen : 0n);
     const ttlMs = Math.max(this.terminatedAliasTtlMs, this.aliasDeliveryTimeoutMs.get(alias) ?? 0);
-    const state: AliasDrainState = { requestId: owningRequestId, acceptRemaining, cancelTimer: () => { /* set below */ }, drained: false };
+    const state: AliasDrainState = { requestId: owningRequestId, acceptRemaining, cancelTimer: () => { /* set below */ }, drained: false,
+      exactStreams: streamCount > 0n && streamCount !== UNKNOWN_COUNT ? streamCount : null };
     state.cancelTimer = this.armGuardTimer(ttlMs, () => { void this.completeDrain(alias); });
     this.drainingAliases.set(alias, state);
+    // Let the DONE callback install the application's hold before releasing it.
+    queueMicrotask(() => this.maybeCompleteStreamDrain(alias));
   }
 
-  /** Timeout-only drain completion: sweep, notify exactly once. */
+  private maybeCompleteStreamDrain(alias: bigint): void {
+    const state = this.drainingAliases.get(alias);
+    if (!state || state.drained || state.exactStreams === null
+        || this.drainConfigs.get(state.requestId)?.completion !== 'streams'
+        || this.aliasStreamsSeen.get(alias) !== state.exactStreams) return;
+    // Counting headers is insufficient: every accepted stream must finish processing.
+    if ([...this.incomingSubgroupAliases.values()].includes(alias)) return;
+    if ([...this.terminalSubscribers.values()].some(({ sub }) => sub.trackAlias === alias
+        && this.drainConfigs.get(sub.requestId)?.completion !== 'streams')) return;
+    void this.completeDrain(alias);
+  }
+
+  /** Sweep and notify exactly once, after the timeout or exact processed-stream evidence. */
   private async completeDrain(alias: bigint): Promise<void> {
     const state = this.drainingAliases.get(alias);
     if (!state || state.drained) return;
@@ -6244,7 +6288,8 @@ export class MoqtConnection {
           const doneReqId = message.type === 'PUBLISH_DONE'
             ? (message as { requestId: bigint }).requestId : undefined;
           const doneDraining = doneReqId !== undefined
-            && this.drainConfigs.has(doneReqId) && doneAlias !== undefined;
+            && this.terminalDrainSelected(doneReqId, BigInt((message as { statusCode: bigint }).statusCode)) && doneAlias !== undefined;
+          if (doneReqId !== undefined && !doneDraining) this.drainConfigs.delete(doneReqId);
           if (doneDraining) {
             this.applyTerminalDrain(doneAlias!,
               BigInt((message as { streamCount?: bigint }).streamCount ?? 0n), doneReqId!);
@@ -6864,7 +6909,8 @@ export class MoqtConnection {
       const ownCount = (message as { streamCount?: bigint }).streamCount ?? 0n;
       const streamCount = alias === undefined ? ownCount : this.recordSubscriberTerminal(alias, ownCount);
       const stamped = { ...message, requestId: originalId } as ControlMessage;
-      const pubDraining = this.drainConfigs.has(originalId) && doneAlias !== undefined;
+      const pubDraining = this.terminalDrainSelected(originalId, BigInt(message.statusCode)) && doneAlias !== undefined;
+      if (!pubDraining) this.drainConfigs.delete(originalId);
       const aliasDraining = pubDraining || (doneAlias !== undefined && [...this.terminalSubscribers.values()].some(({ sub }) => sub.trackAlias === doneAlias));
       if (aliasDraining && doneAlias !== undefined) this.applyTerminalDrain(doneAlias, BigInt(streamCount), originalId);
       const cancelledFills = pubDraining ? Promise.resolve() : this.cancelFill(originalId);
@@ -7049,7 +7095,7 @@ export class MoqtConnection {
     if (this.terminatedAliases.get(pubAlias)?.strict === false) {
       (this.reboundSubscribers ??= new WeakSet()).add(this.session.getIncomingSubscription(requestId)!);
     }
-    this.clearTerminatedAlias(pubAlias);
+    this.clearTerminatedAlias(pubAlias, true);
     const incoming: IncomingPublish = {
       requestId,
       trackNamespace: pub.trackNamespace,
@@ -7526,6 +7572,7 @@ export class MoqtConnection {
               this.onStreamClosed?.(streamId, undefined, 'local-discard');
               return;
             }
+            this.incomingSubgroupAliases.set(streamId, fillSub.trackAlias);
           }
           this.fillStreams.set(fetchReqId, { streamId, subscriptionId: fillSub.requestId as bigint, groupOrder: fillOrder! });
           this.observedQlogEvent?.({ type: 'stream_type_set', owner: 'remote', stream_id: streamId, stream_type: 'fetch_header' });
@@ -7642,6 +7689,7 @@ export class MoqtConnection {
       );
     } finally {
       this.dataStreamReaders.delete(streamId);
+      const completedAlias = this.incomingSubgroupAliases.get(streamId);
       this.incomingSubgroupAliases.delete(streamId);
       // Clean up fetch stream association (and any draft-18 group-order state), and
       // RECLAIM the completed outgoing fetch in the Session (§5.2: the fetch ends on
@@ -7667,6 +7715,7 @@ export class MoqtConnection {
           break;
         }
       }
+      if (completedAlias !== undefined) this.maybeCompleteStreamDrain(completedAlias);
     }
   }
 

@@ -113,8 +113,9 @@ export class GapDetector {
      * @returns Decision: WAIT, SKIP_FORWARD, or TRACK_ENDED
      */
     evaluate(lastConsumedGroupId: bigint, availableGroupIds: bigint[]): GapDecision {
-        // Track ended → always report
-        if (this.trackEnded) {
+        // EOT is an upper bound, not evidence that missing earlier groups arrived. Keep resolving gaps
+        // while buffered groups remain; only an empty buffer can complete playback.
+        if (this.trackEnded && availableGroupIds.length === 0) {
             return { action: GapAction.TRACK_ENDED };
         }
 

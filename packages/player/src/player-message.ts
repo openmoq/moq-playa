@@ -23,6 +23,7 @@ import type { TrackPackaging } from './subscription-manager.js';
 /** Active subscription info stored per requestId. */
 export interface ActiveSubscription {
   trackName: string;
+  namespace?: readonly string[];
   /** Unknown until SUBSCRIBE_OK; a Request ID is never an alias. */
   trackAlias: bigint | null;
 }
@@ -48,7 +49,8 @@ export interface MessageAdapter {
 /** Minimal subscription manager interface. */
 export interface MessageSubscriptionManager {
   unregisterTrack(trackAlias: bigint): void;
-  registerTrack(trackAlias: bigint, trackName: string, mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline', packaging?: TrackPackaging): void;
+  registerTrack(trackAlias: bigint, trackName: string, mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline', packaging?: TrackPackaging,
+    identity?: { readonly sourceConnection: unknown; readonly namespace: readonly string[] }): void;
   /** Check if a track alias is already registered. */
   getMediaType(trackAlias: bigint): 'video' | 'audio' | 'mediatimeline' | 'eventtimeline' | undefined;
 }
@@ -77,6 +79,8 @@ function extractLargestLocation(parameters: Parameters | undefined): { group: bi
 }
 
 export interface ControlMessageContext {
+  sourceConnection?: unknown;
+  namespace?: readonly string[];
   /** Catalog bootstrap: SUBSCRIBE_OK largest for the catalog subscription
    *  (null = SUBSCRIBE_OK carried no LARGEST_OBJECT → track empty). */
   onCatalogSubscribeOk?: (largest: { group: bigint; object: bigint } | null) => void;
@@ -115,6 +119,8 @@ export interface ControlMessageContext {
   onMediaSubscribeError?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', reason: string, errorCode: bigint) => void;
   /** Called when PUBLISH_DONE arrives — player can re-subscribe if needed. */
   onPublishDone?: (requestId: bigint, trackName: string, trackAlias: bigint | null, statusCode: bigint, errorReason: string) => void;
+  /** Consume a media terminal while its accepted data is still draining. No default retirement/event when true. */
+  onMediaTerminalDrain?: (requestId: bigint, sub: ActiveSubscription, statusCode: bigint, reason: string) => boolean;
   /**
    * Called when REQUEST_ERROR matches a pending fetchCatalog. The
    * player layer dispatches the error to the right pending promise.
@@ -230,7 +236,10 @@ export function handleControlMessage(
       if (pending && active) {
         ctx.pendingMediaSubs.delete(okReqId);
         active.trackAlias = alias;
-        ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging);
+        if (ctx.sourceConnection !== undefined && (active.namespace ?? ctx.namespace) !== undefined) {
+          ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging,
+            { sourceConnection: ctx.sourceConnection, namespace: (active.namespace ?? ctx.namespace)! });
+        } else ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging);
         if (pending.mediaType === 'video' || pending.mediaType === 'audio') {
           ctx.onMediaSubscribeOk?.(okReqId, pending.trackName, pending.mediaType);
         }
@@ -277,6 +286,7 @@ export function handleControlMessage(
       ctx.log.debug('PUBLISH_DONE reqId=%s sub=%s', doneReqId, sub ? sub.trackName : '(none)');
       if (sub) {
         ctx.log.info('PUBLISH_DONE "%s": %s', sub.trackName, msg.errorReason ?? '(no reason)');
+        if (ctx.onMediaTerminalDrain?.(doneReqId, sub, BigInt(msg.statusCode), msg.errorReason ?? '')) break;
         ctx.removeSubscription(doneReqId);
 
         // Let the player re-subscribe if this is a track we still want
