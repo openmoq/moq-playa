@@ -16,6 +16,8 @@ import { checkExampleViews } from './view-ui.mjs';
 import { checkHandover } from './handover.mjs';
 import { assessWarmStart } from './warm-start.mjs';
 import { checkRenditionSwitch } from './rendition-switch.mjs';
+import { checkAudioLanguageSwitch } from './audio-switch.mjs';
+import { prepareAudioSwitchVariant } from './audio-switch.fixture.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
@@ -147,10 +149,21 @@ try {
     result.fixtures[name] = await prepareFixture(join(artifacts, name), namespace, frozen, abort.signal);
   }
   result.fixtures.alternatives = await prepareFixture(join(artifacts, 'alternatives'), namespace, false, abort.signal, true);
+  if (selectedCase === 'cmaf-audio-language-switch-same-set' || selectedCase === 'cmaf-audio-language-switch-reference-map') {
+    const sameSet = selectedCase === 'cmaf-audio-language-switch-same-set';
+    const variant = sameSet ? 'audioSwitchSameSet' : 'audioSwitchMapped';
+    result.fixtures[variant] = await prepareAudioSwitchVariant(join(artifacts, 'alternatives'), join(artifacts, variant),
+      result.fixtures.alternatives, sameSet);
+  }
   result.fixtures.views = await prepareFixture(join(artifacts, 'views'), namespace, false, abort.signal, false, 'aac', true);
   result.fixtures.loc = await prepareFixture(join(artifacts, 'loc'), namespace, false, abort.signal, false, 'opus');
   result.fixtures.locViews = await prepareFixture(join(artifacts, 'locViews'), namespace, false, abort.signal, false, 'opus', true);
   result.fixtures.locFrozen = await prepareFixture(join(artifacts, 'locFrozen'), namespace, true, abort.signal, false, 'opus');
+  if (selectedCase === 'loc-audio-language-switch-same-set') {
+    result.fixtures.locAlternatives = await prepareFixture(join(artifacts, 'locAlternatives'), namespace, false, abort.signal, true, 'opus');
+    result.fixtures.locAudioSwitchSameSet = await prepareAudioSwitchVariant(join(artifacts, 'locAlternatives'),
+      join(artifacts, 'locAudioSwitchSameSet'), result.fixtures.locAlternatives, true);
+  }
   result.fixtures.retimed = await prepareFixture(join(artifacts, 'retimed'), namespace, false, abort.signal, false, 'aac', false,
     { videoTimescale: 60000 });
   assert.notEqual(result.fixtures.moving.timing['video-360'].timescale, result.fixtures.retimed.timing['video-360'].timescale,
@@ -180,6 +193,20 @@ try {
   const webUrl = await waitForLine(vite, /Acceptance page: (http:\/\/127\.0\.0\.1:\d+\/)/);
   const scenarios = [
     { name: 'moving-video-and-audio', fixture: 'moving', silent: false, expectedFailure: null },
+    // Explicit-only until each policy is qualified. The original distinct-set
+    // fixture is now a refusal control; its recorded index-only red is retained.
+    ...[
+      { name: 'cmaf-audio-language-switch', fixture: 'alternatives', audioSwitchMode: 'unmapped-refusal', audioHz: 440 },
+      { name: 'cmaf-audio-language-switch-same-set', fixture: 'audioSwitchSameSet', audioSwitchMode: 'same-set', audioHz: 880 },
+      { name: 'cmaf-audio-language-switch-reference-map', fixture: 'audioSwitchMapped', audioSwitchMode: 'reference-map', audioHz: 880 },
+      { name: 'cmaf-audio-language-switch-live-resync', fixture: 'alternatives', audioSwitchMode: 'live-resync', audioHz: 880 },
+      { name: 'loc-audio-language-switch-same-set', fixture: 'locAudioSwitchSameSet', audioSwitchMode: 'same-set', audioHz: 880,
+        version: 4, mode: 'media' },
+    ].filter(scenario => scenario.name === selectedCase).map(scenario => ({ ...scenario,
+      audioSwitch: true, alternatives: true, level: 2, lang: 'en', silent: false, expectedFailure: null,
+      expected: { videoWidth: 640, videoHeight: 360, audioHz: scenario.audioHz, videoFps: 24,
+        outputKind: scenario.version ? 'canvas' : 'video' },
+    })),
     ...[
       { name: 'warm-start-cmaf', fixture: 'moving' },
       { name: 'warm-start-loc', fixture: 'loc', version: 4, mode: 'media',
@@ -355,6 +382,7 @@ try {
         caseResult.expected = scenario.expected;
       }
       if (scenario.alternatives) { query.set('level', String(scenario.level)); query.set('lang', scenario.lang); }
+      if (scenario.audioSwitch) query.set('runtimeAudio', '1');
       if (scenario.altGroup !== undefined) query.set('altGroup', String(scenario.altGroup));
       if (scenario.exampleViews) {
         caseResult.observed = await checkExampleViews(page, webUrl, query, artifacts, scenario.name, Boolean(scenario.version));
@@ -403,6 +431,15 @@ try {
         if (scenario.manualSwitch) {
           caseResult.renditionSwitch = {};
           observed = await checkRenditionSwitch(page, caseResult.renditionSwitch, bounded, Boolean(scenario.nativeRetypes));
+        } else if (scenario.audioSwitch) {
+          caseResult.audioSwitch = {};
+          const variant = result.fixtures[scenario.fixture].audioSelectionVariant;
+          caseResult.audioFixture = variant ?? { originalDistinctSets: true };
+          observed = await checkAudioLanguageSwitch(page, caseResult.audioSwitch, bounded, {
+            mode: scenario.audioSwitchMode,
+            expected: scenario.expected,
+            ...(scenario.audioSwitchMode === 'reference-map' ? variant.referenceMap : {}),
+          });
         } else if (handover) {
           caseResult.handover = {};
           await checkHandover(page, handover.control, scenario.expected, scenario.handover, caseResult.handover,
@@ -423,7 +460,8 @@ try {
         }
         caseResult.playbackQuality = assessPlaybackQuality(observed.playbackQuality, scenario.expected?.outputKind !== 'canvas');
         assert.deepEqual(caseResult.playbackQuality.failures, [], 'Public playback quality must match its owned native video source');
-        caseResult.assessment = scenario.manualSwitch ? caseResult.renditionSwitch.continuity : assessPlayback(observed.samples, scenario.expected);
+        caseResult.assessment = scenario.manualSwitch ? caseResult.renditionSwitch.continuity
+          : scenario.audioSwitch ? caseResult.audioSwitch.assessment : assessPlayback(observed.samples, scenario.expected);
         caseResult.presentationFailures = assessVideoPresentation(observed.samples);
         assert.deepEqual(caseResult.presentationFailures, [], 'Public video draw observation');
         if (scenario.expected?.outputKind === 'canvas') {
@@ -442,12 +480,15 @@ try {
         if (scenario.alternatives) {
           assert.deepEqual(observed.levels.map((level) => level.trackName), ['video-1080', 'video-720', 'video-360']);
           assert.deepEqual(observed.audioTracks.map((track) => track.language), ['en', 'es']);
+          const identitySamples = scenario.audioSwitch
+            ? observed.samples.filter(sample => sample.wallMs >= caseResult.audioSwitch.targetWindow.fromMs
+              && sample.wallMs <= caseResult.audioSwitch.targetWindow.untilMs) : observed.samples;
           const wrongVideo = { ...scenario.expected, videoHeight: scenario.expected.videoHeight === 360 ? 720 : 360,
             videoWidth: scenario.expected.videoHeight === 360 ? 1280 : 640 };
           const wrongAudio = { ...scenario.expected, audioHz: scenario.expected.audioHz === 440 ? 880 : 440 };
           caseResult.identityControls = {
-            wrongVideo: assessPlayback(observed.samples, wrongVideo),
-            wrongAudio: assessPlayback(observed.samples, wrongAudio),
+            wrongVideo: assessPlayback(identitySamples, wrongVideo),
+            wrongAudio: assessPlayback(identitySamples, wrongAudio),
           };
           assert.deepEqual(caseResult.identityControls.wrongVideo.failures, ['video-identity']);
           assert.deepEqual(caseResult.identityControls.wrongAudio.failures, ['audio-identity']);

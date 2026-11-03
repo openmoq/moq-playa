@@ -20,6 +20,7 @@ import type { ClockSource, DecoderCommand, RecoveryController } from '@openmoq/p
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike, MediaSourceLike, CmafAssemblerLike } from './interfaces.js';
 import type { PlayerError } from './errors.js';
 import type { LogLevel, LoggerLike } from './logger.js';
+import { preferredLanguage } from './language-preference.js';
 
 // ─── Known Track Metadata (TTFF optimization) ────────────────────────
 
@@ -426,6 +427,14 @@ export interface QualityConfig {
    * @see draft-ietf-moq-msf-00 §5.1.19 (altGroup)
    */
   readonly audioConstraints?: TrackConstraints;
+
+  /**
+   * Ordered basic language ranges for automatic audio choice within the chosen
+   * scope. Exact tags precede regional variants; unmatched preferences retain
+   * the scope-local default. Explicit track pins and audioConstraints still
+   * apply. Omitted: catalog order, unchanged.
+   */
+  readonly audioLanguages?: readonly string[];
 
   /**
    * An explicit presentation choice, resolved against the catalog.
@@ -892,6 +901,12 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     }
   }
   validateSelection(config);
+  if (config.audioLanguages !== undefined && !config.disableAudio) {
+    if (!Array.isArray(config.audioLanguages) || !config.audioLanguages.every(range => typeof range === 'string')) {
+      throw new TypeError('audioLanguages must be an ordered array of basic language ranges');
+    }
+    preferredLanguage([], config.audioLanguages);
+  }
   if (config.authorization !== undefined && (!config.authorization || typeof config.authorization.getTokens !== 'function')) {
     throw new TypeError('Invalid authorization configuration');
   }

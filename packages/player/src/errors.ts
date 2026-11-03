@@ -121,6 +121,8 @@ export const PlayerErrorCode = {
   SUBSCRIPTION_REFUSED: 0x1302,
   /** All media track subscriptions refused — no playable content. @see §9.8 */
   ALL_TRACKS_REFUSED: 0x1303,
+  /** An explicit application selection could not be adopted. */
+  SELECTION_FAILED: 0x1304,
   // 0x1400 reserved: BUFFER_OVERFLOW (when pipeline backpressure lands)
 } as const;
 

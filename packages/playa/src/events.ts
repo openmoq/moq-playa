@@ -40,6 +40,10 @@ export interface PlayerEventMap {
   'levelsloaded': LevelsloadedEvent;
   /** Quality level switched (ABR or manual). */
   'qualitychange': QualitychangeEvent;
+  /** Audio output selection was adopted. */
+  'audiochange': AudiochangeEvent;
+  /** Audio selection rejected. An unrecoverable restore also reports a fatal playback error. */
+  'audiochangefailed': AudiochangefailedEvent;
 
   /** Playback stalled (buffering). */
   'stall': StallEvent;
@@ -90,6 +94,15 @@ export interface LevelsloadedEvent {
 export interface QualitychangeEvent {
   readonly level: Level;
   readonly auto: boolean;
+}
+
+export interface AudiochangeEvent {
+  readonly track: AudioTrack;
+}
+
+export interface AudiochangefailedEvent {
+  readonly trackId: string;
+  readonly message: string;
 }
 
 export interface StallEvent {

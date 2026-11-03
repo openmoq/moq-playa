@@ -62,6 +62,8 @@ export interface HandoverIntent {
   /** Startup preferences; an eligible active video track remains preferred. */
   readonly videoConstraints?: TrackConstraints;
   readonly audioConstraints?: TrackConstraints;
+  /** Ordered preferences; surviving eligible audio and explicit pins take precedence. */
+  readonly audioLanguages?: readonly string[];
 }
 
 export type HandoverSelection =
@@ -142,6 +144,7 @@ export function prepareHandoverSelection(
     controller,
     ...(intent.videoConstraints !== undefined ? { videoConstraints: intent.videoConstraints } : {}),
     ...(intent.audioConstraints !== undefined ? { audioConstraints: intent.audioConstraints } : {}),
+    ...(intent.audioLanguages !== undefined ? { audioLanguages: intent.audioLanguages } : {}),
   };
   let selected = composeSelection(catalog, { ...options, intent: selectors });
   if (!selected.ok) {

@@ -498,6 +498,10 @@ export interface MediaSourceLike {
  */
 export type CmafAssemblyDiscardReason = 'track superseded' | 'invalid media' | 'orphaned media' | 'epoch refused' | 'superseded pending moof' | 'decoder reset';
 
+export type CmafSourceReceipt =
+  | { readonly state: 'emitted'; readonly sourcePresentationTimeUs: bigint }
+  | { readonly state: 'partial' | 'refused' | 'unavailable' };
+
 export interface CmafAssemblerLike {
   push(
     mediaType: 'video' | 'audio',
@@ -505,7 +509,8 @@ export interface CmafAssemblerLike {
     groupId: bigint,
     payload: Uint8Array,
     input?: object,
-  ): void;
+    sourceTiming?: true,
+  ): void | CmafSourceReceipt;
   /**
    * Hand the assembler an init segment so it can extract trex defaults
    * (default_sample_duration / size / flags). Required for streams that
@@ -524,6 +529,15 @@ export interface CmafAssemblerLike {
    * cross-object track state.
    */
   selectTrack?(mediaType: 'video' | 'audio', trackName: string): void;
+  /**
+   * Map raw audio DTS (and therefore PTS, retaining composition offsets) into
+   * the continuing reference domain before epoch/discontinuity processing.
+   * Microseconds are bigint; null restores default switching behavior.
+   * Video and shared epoch state are unchanged.
+   */
+  setAudioPresentationOffsetUs?(offsetUs: bigint | null): void;
+  /** Stable mapped-domain witness; null after a refused restart or without an active map. */
+  getAudioPresentationMappingWitness?(): object | null;
   getEpoch(mediaType: 'video' | 'audio'): bigint | null;
   /**
    * Drop pending half-pairs (moof without mdat) for one media type, leaving

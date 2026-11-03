@@ -16,7 +16,7 @@
  * @module
  */
 
-import type { CmafAssemblyDiscardReason } from '@openmoq/player';
+import type { CmafAssemblyDiscardReason, CmafSourceReceipt } from '@openmoq/player';
 
 import {
   boxType,
@@ -31,9 +31,14 @@ import {
   readMdhdTimescale,
   readTrexDefaults,
   readSegmentTimeRanges,
+  readFirstSamplePresentationTime,
   type TrexDefaults,
   type TrunSample,
 } from './mp4-box.js';
+
+const SOURCE_PARTIAL = Object.freeze({ state: 'partial' as const });
+const SOURCE_REFUSED = Object.freeze({ state: 'refused' as const });
+const SOURCE_UNAVAILABLE = Object.freeze({ state: 'unavailable' as const });
 
 /**
  * Startup geometry: what the rebase produced for each track's FIRST fragment,
@@ -149,6 +154,10 @@ export class CmafAssembler {
   private sharedOutputOffsetTimescale: number | null = null;
   private videoOutputOffset = 0n;
   private audioOutputOffset = 0n;
+  /** Explicit source-to-reference mapping; null preserves ordinary rebase policy. */
+  private audioPresentationOffsetUs: bigint | null = null;
+  private audioMappingReplaced = false;
+  private audioPresentationMappingWitness: object | null = null;
 
   /** High-water marks of bytes actually emitted to MSE, in track ticks. */
   private lastVideoOutputBmd: bigint | null = null;
@@ -333,6 +342,26 @@ export class CmafAssembler {
   }
 
   /**
+   * Map replacement audio into the retained audio reference domain before
+   * rebasing. The engine owns the application-supplied relationship and changes
+   * it only at adoption. Decode and presentation times receive the same shift,
+   * so composition offsets are preserved. Null restores ordinary switching.
+   */
+  setAudioPresentationOffsetUs(offsetUs: bigint | null): void {
+    if (offsetUs !== null) {
+      if (typeof offsetUs !== 'bigint') throw new TypeError('Audio presentation offset must be bigint microseconds');
+      if (this.audioEpoch === null) throw new Error('An audio reference epoch is required for presentation mapping');
+      if (this.audioTimescale === null) throw new Error('An audio timescale is required for presentation mapping');
+    }
+    this.audioPresentationOffsetUs = offsetUs;
+    this.audioMappingReplaced = offsetUs !== null;
+    this.audioPresentationMappingWitness = offsetUs === null ? null : Object.freeze({});
+  }
+
+  /** Identity of an active mapping; a refused source restart invalidates it. */
+  getAudioPresentationMappingWitness(): object | null { return this.audioPresentationMappingWitness; }
+
+  /**
    * Push a CMAF MoQ object payload (moof or mdat).
    *
    * If it's a moof, buffer it keyed by (mediaType, trackName, groupId).
@@ -347,6 +376,9 @@ export class CmafAssembler {
    * @param groupId MoQ group ID — ensures moof+mdat from different groups
    *                don't cross-contaminate when streams interleave
    * @param payload Raw MoQ object payload (moof, mdat, or combined CMAF chunks)
+   * @param sourceTiming Request a raw source-PTS receipt after assembler
+   * delivery. Multi-chunk objects report the last moof's first sample. This is
+   * not append or presentation evidence. Omitted: no timing read or receipt.
    */
   push(
     mediaType: 'video' | 'audio',
@@ -354,12 +386,13 @@ export class CmafAssembler {
     groupId: bigint,
     payload: Uint8Array,
     input?: object,
-  ): void {
+    sourceTiming?: true,
+  ): void | CmafSourceReceipt {
     const selectedTrackName = mediaType === 'video'
       ? this.selectedVideoTrackName
       : this.selectedAudioTrackName;
-    if (selectedTrackName !== null && trackName !== selectedTrackName) { this.discardInput(input, 'track superseded'); return; }
-    if (payload.byteLength < 8) { this.discardInput(input, 'invalid media'); return; }
+    if (selectedTrackName !== null && trackName !== selectedTrackName) { this.discardInput(input, 'track superseded'); return sourceTiming ? SOURCE_REFUSED : undefined; }
+    if (payload.byteLength < 8) { this.discardInput(input, 'invalid media'); return sourceTiming ? SOURCE_REFUSED : undefined; }
 
     // CMAF segments may have prefix boxes before the moof: styp (Segment Type),
     // sidx (Segment Index), etc. Skip past all non-moof/non-mdat boxes to find
@@ -389,7 +422,7 @@ export class CmafAssembler {
           + `in-band init segments must be handled before the assembler`);
       }
       this.discardInput(input, 'invalid media');
-      return;
+      return sourceTiming ? SOURCE_REFUSED : undefined;
     }
     const type = boxType(payload, moofOffset);
     const key = `${mediaType}:${trackName}:${groupId}`;
@@ -406,18 +439,27 @@ export class CmafAssembler {
         const segment = new Uint8Array(payload.byteLength);
         segment.set(payload);
         let pos = moofOffset;
+        let sourcePresentationTimeUs: bigint | null = null;
+        let sourceTimingAvailable = true;
         while (pos + 8 <= segment.byteLength) {
           const size = boxSize(segment, pos);
           if (size < 8 || pos + size > segment.byteLength) break;
           if (boxType(segment, pos) === 'moof') {
             const chunkMoof = segment.subarray(pos, pos + size);
-            if (!this.patchEpoch(mediaType, trackName, chunkMoof, groupId)) { this.discardInput(input, 'epoch refused'); return; }
+            if (sourceTiming) {
+              const ticks = readFirstSamplePresentationTime(chunkMoof);
+              const timescale = mediaType === 'audio' ? this.audioTimescale : this.videoTimescale;
+              if (ticks === null || timescale === null) sourceTimingAvailable = false;
+              else sourcePresentationTimeUs = ticks * 1_000_000n / BigInt(timescale);
+            }
+            if (!this.patchEpoch(mediaType, trackName, chunkMoof, groupId)) { this.discardInput(input, 'epoch refused'); return sourceTiming ? SOURCE_REFUSED : undefined; }
           }
           pos += size;
         }
         this.emitSegment(mediaType, segment, trackName, groupId, input === undefined ? undefined : [input]);
         this.flushStartupGeometry();
-        return;
+        return sourceTiming ? sourceTimingAvailable && sourcePresentationTimeUs !== null
+          ? { state: 'emitted', sourcePresentationTimeUs } : SOURCE_UNAVAILABLE : undefined;
       }
 
       // Legacy: moof-only object — buffer and wait for a separate mdat.
@@ -429,18 +471,24 @@ export class CmafAssembler {
       if (input !== undefined) (this.pendingInputs ??= new WeakMap()).set(copy, input);
       this.pendingMoofs.set(key, copy);
       if (previous) this.discardPending(previous, 'superseded pending moof');
-      return;
+      return sourceTiming ? SOURCE_PARTIAL : undefined;
     }
 
     if (type === 'mdat') {
       const pending = this.pendingMoofs.get(key);
-      if (!pending) { this.discardInput(input, 'orphaned media'); return; }
+      if (!pending) { this.discardInput(input, 'orphaned media'); return sourceTiming ? SOURCE_REFUSED : undefined; }
       this.pendingMoofs.delete(key);
 
       const priorInput = this.pendingInputs?.get(pending);
       this.pendingInputs?.delete(pending);
+      let sourcePresentationTimeUs: bigint | null = null;
+      if (sourceTiming) {
+        const ticks = readFirstSamplePresentationTime(pending);
+        const timescale = mediaType === 'audio' ? this.audioTimescale : this.videoTimescale;
+        if (ticks !== null && timescale !== null) sourcePresentationTimeUs = ticks * 1_000_000n / BigInt(timescale);
+      }
       if (!this.patchEpoch(mediaType, trackName, pending, groupId)) {
-        this.discardInput(priorInput, 'epoch refused'); this.discardInput(input, 'epoch refused'); return;
+        this.discardInput(priorInput, 'epoch refused'); this.discardInput(input, 'epoch refused'); return sourceTiming ? SOURCE_REFUSED : undefined;
       }
 
       // Concatenate moof + mdat
@@ -448,12 +496,14 @@ export class CmafAssembler {
       this.emitSegment(mediaType, segment, trackName, groupId,
         priorInput === undefined && input === undefined ? undefined : [priorInput, input]);
       this.flushStartupGeometry();
-      return;
+      return sourceTiming ? sourcePresentationTimeUs !== null
+        ? { state: 'emitted', sourcePresentationTimeUs } : SOURCE_UNAVAILABLE : undefined;
     }
 
     // Unknown box type — pass through as-is.
     if (input === undefined) this.onSegment(mediaType, payload, trackName, groupId);
     else this.onSegment(mediaType, payload, trackName, groupId, [input]);
+    return sourceTiming ? SOURCE_UNAVAILABLE : undefined;
   }
 
   /**
@@ -621,6 +671,9 @@ export class CmafAssembler {
     this.sharedOutputOffsetTimescale = null;
     this.videoOutputOffset = 0n;
     this.audioOutputOffset = 0n;
+    this.audioPresentationOffsetUs = null;
+    this.audioMappingReplaced = false;
+    this.audioPresentationMappingWitness = null;
     this.lastVideoOutputBmd = null;
     this.lastAudioOutputBmd = null;
     this.lastVideoOutputEnd = null;
@@ -805,15 +858,19 @@ export class CmafAssembler {
     moof: Uint8Array,
     groupId: bigint,
   ): boolean {
-    const bmd = readBaseMediaDecodeTime(moof);
-    if (bmd === null) return true;
+    const rawBmd = readBaseMediaDecodeTime(moof);
+    if (rawBmd === null) return true;
+    const mappedAudio = mediaType === 'audio' && this.audioPresentationOffsetUs !== null;
+    if (mappedAudio && (this.audioTimescale === null || this.audioEpoch === null)) return false;
+    const bmd = rawBmd + (mappedAudio
+      ? this.audioPresentationOffsetUs! * BigInt(this.audioTimescale!) / 1_000_000n : 0n);
 
     const currentTrackName = mediaType === 'video' ? this.videoTrackName : this.audioTrackName;
     const isTrackSwitch = currentTrackName !== null && currentTrackName !== trackName;
     const epochGroupFloor = mediaType === 'video'
       ? this.videoEpochGroupFloor
       : this.audioEpochGroupFloor;
-    if (!isTrackSwitch && epochGroupFloor !== null && groupId < epochGroupFloor) {
+    if (!isTrackSwitch && !(mappedAudio && this.audioMappingReplaced) && epochGroupFloor !== null && groupId < epochGroupFloor) {
       if (this.debug) {
         console.warn(
           '[CMAF] ignored late %s segment on "%s": group=%s belongs to epoch before group=%s',
@@ -828,7 +885,24 @@ export class CmafAssembler {
     const lastBmd = mediaType === 'video' ? this.lastVideoBmd : this.lastAudioBmd;
     const epoch = mediaType === 'video' ? this.videoEpoch : this.audioEpoch;
 
-    if (isTrackSwitch) {
+    if (mappedAudio) {
+      // An explicit map fixes the output position. Neither a new source's Group
+      // IDs nor the previous buffered end can redefine that relationship.
+      if (isTrackSwitch || this.audioMappingReplaced) {
+        this.audioTrackName = trackName;
+        this.lastAudioBmd = null;
+        this.highestAudioGroupId = null;
+        this.audioEpochGroupFloor = null;
+        this.audioMappingReplaced = false;
+      } else if (lastBmd !== null && bmd < lastBmd
+          && lastBmd - bmd > BigInt(this.audioTimescale!)
+          && (this.highestAudioGroupId === null || groupId > this.highestAudioGroupId)) {
+        // A new source epoch needs a new application map. It cannot reset the
+        // shared A/V clock merely because this audio source restarted.
+        this.audioPresentationMappingWitness = null;
+        return false;
+      }
+    } else if (isTrackSwitch) {
       // Track switch (ABR splice): variants in a switching set are media-time
       // aligned. Keep the shared raw/output epochs so a switch cannot jump
       // back to presentation time zero after a source restart.
@@ -931,7 +1005,7 @@ export class CmafAssembler {
     } else if (this.lastAudioOutputBmd === null || patchedBmd > this.lastAudioOutputBmd) {
       this.lastAudioOutputBmd = patchedBmd;
     }
-    this.recordStartupGeometry(mediaType, bmd, patchedBmd);
+    this.recordStartupGeometry(mediaType, rawBmd, patchedBmd);
 
     // Startup timing diagnostic (debug-only, first N fragments per media type).
     // These numbers describe DECODE-time rebasing only: raw bmd, the chosen

@@ -366,7 +366,7 @@ export class CommandDispatcher {
    * @see draft-ietf-moq-loc-01 §4.1 (decode_audio)
    * @see draft-ietf-moq-loc-01 §2.3.2.1 (configure video)
    */
-  dispatch(cmd: DecoderCommand): void {
+  dispatch(cmd: DecoderCommand, options?: { readonly preserveDecoder?: boolean }): void {
     switch (cmd.type) {
       case 'configure':
         if (cmd.mediaType === 'video') {
@@ -420,12 +420,12 @@ export class CommandDispatcher {
           this.outputRetirementReason = 'decoder reset';
           this.closeVideoHoldQueue('decoder reset');
           this.renderer?.flush();
-          this.videoDecoder?.reset();
+          if (!options?.preserveDecoder) this.videoDecoder?.reset();
           this.videoQueuePressureHigh = false;
         } else {
           this.audioOutputRevision++;
           this.audioRetirementReason = 'decoder reset';
-          this.audioDecoder?.reset();
+          if (!options?.preserveDecoder) this.audioDecoder?.reset();
           this.audioOutput?.flush?.();
           this.audioQueuePressureHigh = false;
         }

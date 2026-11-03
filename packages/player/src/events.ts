@@ -19,6 +19,15 @@ import type { RecoveryAction, DecoderCommand } from '@openmoq/playback';
 import type { CatalogState, SapTimelineEntry, EventTimelineRecord } from '@openmoq/msf';
 import type { EmsgEvent } from '@openmoq/locmaf';
 import type { PlayerError } from './errors.js';
+import type { MediaSelectionSnapshot } from './player-selection-state.js';
+
+/** The engine's accepted/adopted output selection or available choices changed. */
+export interface SelectionChangedEvent {
+  readonly type: 'selection_changed';
+  readonly selection: MediaSelectionSnapshot;
+  /** A defensive copy from the same adopted context as the selection. */
+  readonly catalog: CatalogState | null;
+}
 
 // ─── Session Events ──────────────────────────────────────────────────
 
@@ -674,6 +683,7 @@ export interface StateChangedEvent {
  * Used as the type parameter for TypedEmitter<PlayerEventMap>.
  */
 export interface PlayerEventMap {
+  selection_changed: SelectionChangedEvent;
   // Session
   session_connecting: SessionConnectingEvent;
   session_established: SessionEstablishedEvent;

@@ -172,6 +172,9 @@ player.muted          // boolean
 player.levels         // available video quality levels
 player.videoGroups    // catalog video altGroups, each with its track metadata
 player.audioTracks    // available audio tracks
+player.currentAudioTrack // adopted audio index, or -1 while unknown
+player.programs       // catalog render groups, with unassigned tracks kept separate
+player.views          // views in the adopted program, including singleton tracks
 player.currentLevel   // active level index
 player.activeMediaType  // 'canvas' | 'video' | null (before track selection)
 
@@ -180,6 +183,11 @@ await player.setQuality(index);  // manual quality switch (disables ABR)
 await player.setQuality('auto'); // re-enable ABR
 player.levels;                   // available quality levels
 
+// Audio (stable identity, resolves after adoption)
+const spanish = player.audioTracks.find(track => track.language === 'es');
+if (spanish?.id) await player.selectAudioTrack(spanish.id);
+player.setAudioTrack(index);     // compatibility wrapper; handles rejection
+
 // Events
 player.on('ready',          ({ levels, audioTracks }) => console.log(levels, audioTracks));
 player.on('timeupdate',     ({ currentTime }) => console.log(currentTime));
@@ -187,6 +195,8 @@ player.on('durationchange', ({ duration }) => console.log(duration));
 player.on('seeking',        ({ targetTime }) => console.log(targetTime));
 player.on('seeked',         ({ currentTime }) => console.log(currentTime));
 player.on('qualitychange',  ({ level, auto }) => console.log(level, auto));
+player.on('audiochange',    ({ track }) => console.log(track));
+player.on('audiochangefailed', ({ trackId, message }) => console.warn(trackId, message));
 player.on('stall',          ({ durationMs }) => console.log(durationMs));
 player.on('error',          ({ severity, code, message }) => console.error(severity, code, message));
 player.on('statechange',    ({ state }) => console.log(state));
@@ -212,6 +222,8 @@ state and event lines above illustrate separate API calls, not a playback script
 | `autoQuality` | boolean | true | Enable ABR |
 | `startLevel` | number \| 'auto' \| 'lowest' | 'auto' | Initial quality level |
 | `videoAltGroup` | number | first video group | Initial video view; quality and ABR stay within it |
+| `selection` | catalog selectors | — | Initial render group, alternate sets or exact namespace/name identities |
+| `audioLanguages` | readonly string[] | catalog order | Ordered language preferences within the selected program |
 | `maxResolution` | `{width, height}` | — | Cap video quality |
 | `canvas` | HTMLCanvasElement | — | Caller-owned canvas (framework mode) |
 | `video` | HTMLVideoElement | — | Caller-owned video element (framework mode) |
@@ -244,6 +256,38 @@ Group IDs. The player example's View selector stops and creates a fresh player
 for the requested group; `?altGroup=0` selects its initial view. Stop also cancels
 an in-progress retune. `videoAltGroup` cannot be combined with the catalog-free
 `knownTracks` fast path when video is enabled.
+
+### Audio selection
+
+Audio menus carry stable `id` values and ordered namespace fields. The selected
+index changes after the target is accepted, initialized and has usable media.
+A refused target keeps the previous selection; failure to restore an output
+after reconfiguration is a fatal playback error. The legacy `setAudioTrack(index)` method
+returns immediately and reports failure through events; use `selectAudioTrack(id)`
+when the caller needs to await adoption or handle rejection.
+After the current request drains, switching also requires a current output
+position witness; adapters without one refuse the change and retain playback.
+
+The default switch stays in the same declared audio alternate set. Independent
+sets need an explicit timeline relationship; equal Group IDs or timestamps do
+not establish one. Advanced callers can supply a `reference-map` with bigint
+microsecond anchors and the opaque token from `audioTimelineReference`. Reading
+that property arms source-time collection for the current load; it can remain
+null until subsequent accepted audio supplies evidence. Its timestamp is raw
+source metadata, not the output playhead. Tokens become invalid when their
+owner, configuration or clock changes. A custom adapter without timing evidence
+cannot supply a reference.
+
+Explicit `live-resync` uses a current Web Audio graph position to place live
+replacement audio on the continuing schedule. It does not establish content
+alignment. Finite tracks, silent outputs and MSE adapters without an inverse
+source-time mapping are refused; the default setter never enables this policy.
+
+`audioLanguages` tries preferences in order, preferring an exact tag and then
+regional variants in catalog order, with RFC 4647 singleton-aware fallback.
+This is the player's preference policy, rather than strict RFC 4647 Lookup.
+No match keeps the existing scope-local default. Explicit track pins win, and
+`audioConstraints.lang` retains exact matching.
 
 ---
 

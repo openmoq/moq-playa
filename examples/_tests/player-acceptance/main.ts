@@ -57,7 +57,7 @@ const player = new Player(null, {
     logLevel: params.has('debug') ? 'debug' : 'none',
     ...(warmObserver ? { warmStartCurrentGroup: params.get('warm') === '1', objectTransform: warmObserver.transform } : {}),
     locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',
-    audioConstraints: { lang: params.get('lang') ?? 'en' },
+    ...(params.get('runtimeAudio') === '1' ? {} : { audioConstraints: { lang: params.get('lang') ?? 'en' } }),
     ...(params.get('debug') === 'handover' || nativeMse ? { createMediaSource: () => {
       const source = new MseMediaSource(video, nativeMse ? { mseImplementation: 'standard' } : {});
       source.debug = params.has('debug');
@@ -89,7 +89,7 @@ const player = new Player(null, {
   },
 });
 
-for (const type of ['ready', 'playing', 'statechange', 'error', 'stall', 'qualitychange'] as const) {
+for (const type of ['ready', 'playing', 'statechange', 'error', 'stall', 'qualitychange', 'audiochange', 'audiochangefailed'] as const) {
   player.on(type, (data) => events.push({ timeMs: performance.now(), type, data }));
 }
 for (const type of ['error', 'waiting', 'stalled']) {
@@ -237,8 +237,31 @@ const acceptance = {
   get errors() { return events.filter(event => event.type === 'error'); },
   get latestSample() { return samples.at(-1); },
   get selection() { return { levels: player.levels, currentLevel: player.currentLevel, autoQuality: player.autoQuality,
-    currentAudioTrack: player.currentAudioTrack, audioTracks: player.audioTracks }; },
+    currentAudioTrack: player.currentAudioTrack, currentAudioTrackId: player.audioTracks[player.currentAudioTrack]?.id ?? null,
+    audioTracks: player.audioTracks }; },
   async setQuality(index: number) { await player.setQuality(index); },
+  async setAudioTrack(index: number) { await player.setAudioTrack(index); },
+  async selectAudioTrack(id: string, options?: Parameters<Player['selectAudioTrack']>[1]) {
+    await player.selectAudioTrack(id, options);
+  },
+  async selectAudioTrackMapped(id: string, sourceTimeUs: string, referenceTimeUs: string) {
+    // First access may only arm source-time collection. Wait for actual
+    // continuing audio to publish a reference; elapsed time is not an anchor.
+    let reference = player.audioTimelineReference;
+    const deadline = performance.now() + 5_000;
+    while (reference === null && performance.now() < deadline) {
+      await new Promise<void>(resolve => { setTimeout(resolve, 50); });
+      reference = player.audioTimelineReference;
+    }
+    if (performance.now() >= deadline) throw new Error('Audio timeline reference readiness exceeded the 5s deadline');
+    if (reference === null) throw new Error('Current audio has no adopted raw timeline reference');
+    // The opaque owner token stays in this realm. Only application anchors
+    // and descriptive evidence cross the Playwright boundary.
+    await player.selectAudioTrack(id, { timeline: { kind: 'reference-map', referenceToken: reference.token,
+      sourceTimeUs: BigInt(sourceTimeUs), referenceTimeUs: BigInt(referenceTimeUs) } });
+    return { track: reference.track, domain: reference.domain, observedSourceTimeUs: String(reference.observedSourceTimeUs),
+      sourceTimeUs, referenceTimeUs };
+  },
   snapshot,
   begin(silent: boolean): void {
     if (webAudioOutput) { if (silent) player.mute(); }

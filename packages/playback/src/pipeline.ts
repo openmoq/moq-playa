@@ -57,6 +57,7 @@ export class PlaybackPipeline {
     private readonly mediaType: 'video' | 'audio';
     private readonly clock: ClockSource;
     private readonly sync: SyncController;
+    private audioTimingSource: Pick<SyncController, 'computeAudioRenderTime'>;
     private readonly onCommand: (cmd: DecoderCommand) => void;
     private readonly onEvent: (evt: PlaybackEvent) => void;
     private readonly recovery: RecoveryController | undefined;
@@ -173,6 +174,7 @@ export class PlaybackPipeline {
         this.mediaType = opts.mediaType;
         this.clock = opts.clock;
         this.sync = opts.sync;
+        this.audioTimingSource = opts.sync;
         this.onCommand = opts.onCommand;
         this.onEvent = opts.onEvent;
         this.recovery = opts.recovery;
@@ -212,6 +214,23 @@ export class PlaybackPipeline {
  */
     setCodec(codec: string): void {
         this._videoCodec = codec;
+    }
+
+    /**
+     * Install engine-owned audio timing without changing raw decoder timestamps.
+     * A provider distinct from shared sync uses a mapped source domain, so it
+     * cannot control the shared reference, capture age, catch-up or drift
+     * threshold. Undefined restores the original timeline. The engine owns mapping composition and
+     * must drain or retire buffered inputs before replacing this provider.
+     * Emitted commands retain their already captured absolute render times.
+     */
+    setAudioTimingSource(source: Pick<SyncController, 'computeAudioRenderTime'> | undefined): void {
+        if (this.mediaType !== 'audio') throw new Error('Audio timing requires an audio pipeline');
+        const next = source ?? this.sync;
+        if (next === this.audioTimingSource) return;
+        this.audioTimingSource = next;
+        // Transit differences cancel one epoch, not a transition between epochs.
+        this.adaptiveTolerance?.reset();
     }
 
     /**
@@ -423,11 +442,10 @@ export class PlaybackPipeline {
  *   update was processed."
  */
     /**
- * Reset for a track switch — clears jitter buffer (old-track objects
- * use the same groupIds as new-track per altGroup alignment), resets
- * gap detector and group tracking. Does NOT reset decoder state or
- * emit flush/reset commands — already-decoded frames in the renderer
- * queue play out naturally for seamless visual transition.
+ * Start a different track: clear old encoded inputs and group tracking,
+ * then reset the decoder gate while retaining its codec configuration.
+ * Video waits for an independent frame; audio may decode immediately,
+ * including after the previous track ended. The shared clock is retained.
  *
  * @param firstGroupId The first group ID from the new track — sets
  *   lastConsumedGroupId to firstGroupId-1 so the gap detector doesn't
@@ -456,7 +474,7 @@ export class PlaybackPipeline {
         this.gapDetector.reset();
         // Force decoder back to NEEDS_KEYFRAME so partial-group deltas
         // from a mid-stream subscription are skipped, not decoded.
-        const decision = this.decoderState.notifyGap();
+        const decision = this.decoderState.notifyTrackSwitch();
         this.emitFsmDecision(decision);
         inputs?.reportAll(dropped, 'track superseded');
     }
@@ -497,7 +515,9 @@ export class PlaybackPipeline {
             const nowMs = this.clock.now() / 1000;
             this.adaptiveTolerance.tick(nowMs);
             this.gapDetector.gapTimeoutUs = this.adaptiveTolerance.effectiveGapTimeoutMs * 1000;
-            this.sync.driftThresholdUs = this.adaptiveTolerance.effectiveDriftThresholdMs * 1000;
+            if (this.audioTimingSource === this.sync) {
+                this.sync.driftThresholdUs = this.adaptiveTolerance.effectiveDriftThresholdMs * 1000;
+            }
         }
 
         // After reset (pause→resume, jump-to-live), sync up to the first
@@ -857,7 +877,8 @@ export class PlaybackPipeline {
         // 2. Establish sync reference.
         //    Audio-master: first audio sample sets the reference (ONCE).
         //    Video-only: first video CaptureTimestamp sets the reference.
-        if (headers.captureTimestamp !== undefined && !this.sync.hasReference) {
+        const originalTimeline = this.audioTimingSource === this.sync;
+        if (originalTimeline && headers.captureTimestamp !== undefined && !this.sync.hasReference) {
             if (this.mediaType === 'audio') {
                 this.sync.setAudioReference(headers.captureTimestamp);
             } else if (this._videoOnly) {
@@ -881,14 +902,17 @@ export class PlaybackPipeline {
         if (headers.captureTimestamp !== undefined) {
             const timing = this.mediaType === 'video'
                 ? this.sync.computeVideoRenderTime(headers.captureTimestamp)
-                : this.sync.computeAudioRenderTime(headers.captureTimestamp);
+                : this.audioTimingSource.computeAudioRenderTime(headers.captureTimestamp);
 
             if (timing === null) {
+                // Mapped audio has no output-side timing recomputation. An
+                // unavailable mapping cannot become a speculative "play now".
+                if (!originalTimeline) { inputs?.report(input, 'decoder policy'); return; }
                 // No reference yet — use placeholder. CommandDispatcher will
                 // hold this frame and recompute when the reference is ready.
                 renderTimeUs = 0;
             } else if (timing.shouldDrop) {
-                if (timing.offsetUs < -5_000_000) {
+                if (originalTimeline && timing.offsetUs < -5_000_000) {
                     renderTimeUs = this.clock.now();
                 } else if (this.mediaType === 'video' && !this.isPreDecodeDroppable(videoMarking)) {
                     // Late, but the sender has not asserted this frame can be
@@ -903,12 +927,13 @@ export class PlaybackPipeline {
                     inputs?.report(input, 'late frame');
                     return; // Genuinely late and safe to discard — skip
                 }
-            } else if (timing.offsetUs > 5_000_000) {
+            } else if (originalTimeline && timing.offsetUs > 5_000_000) {
                 renderTimeUs = this.clock.now();
             } else {
                 renderTimeUs = timing.renderTimeUs;
             }
         } else {
+            if (!originalTimeline) { inputs?.report(input, 'decoder policy'); return; }
             renderTimeUs = this.clock.now();
         }
 
@@ -917,7 +942,7 @@ export class PlaybackPipeline {
         // Evaluate live catch-up from CaptureTimestamp
         // @see draft-ietf-moq-loc-01 §2.3.1.1 (latency measurement)
         // @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
-        if (!backfill && headers.captureTimestamp !== undefined) {
+        if (originalTimeline && !backfill && headers.captureTimestamp !== undefined) {
             const catchUp = this.sync.evaluateCatchUp(headers.captureTimestamp, headers.timestampIsWallClock);
             if (catchUp !== null && catchUp.currentRate !== this._lastEmittedRate) {
                 this._lastEmittedRate = catchUp.currentRate;

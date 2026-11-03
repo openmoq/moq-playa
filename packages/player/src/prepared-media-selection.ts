@@ -1,5 +1,6 @@
 /** Internal prepared media state, independent of catalog/session retrieval. */
 import type { CatalogState, CatalogTrack } from '@openmoq/msf';
+import { identityKey } from '@openmoq/msf';
 import type { QualityController } from './quality-controller.js';
 import type { HandoverIntent } from './player-handover-selection.js';
 import type { TrackPackaging } from './subscription-manager.js';
@@ -51,6 +52,13 @@ export interface PreparedSub {
   /** Bound by the candidate's own SUBSCRIBE_OK; null while unanswered — which
    *  is exactly why it is not readiness yet. */
   alias: bigint | null;
+  /** Stable terminal/routing owner, installed in the live registry only at adoption. */
+  subscription?: {
+    trackName: string;
+    namespace: readonly string[];
+    mediaType: 'video' | 'audio';
+    trackAlias: bigint | null;
+  };
 }
 
 /** One init track the candidate must hold before it can be adopted. */
@@ -77,4 +85,29 @@ export function createPreparedMediaSelection(): PreparedMediaSelection {
     inbandInit: new Map(), inbandBytes: new Map(),
     ready, resolveReady, rejectReady, selection: null,
   };
+}
+
+/** Readiness always describes answered requests and delivered initialization. */
+export function checkPreparedMediaReady(prep: PreparedMediaSelection): void {
+  if (prep.awaiting.size || !prep.media.size) return;
+  for (const sub of prep.media.values()) if (sub.alias === null) return;
+  prep.resolveReady();
+}
+
+export function acceptPreparedMedia(prep: PreparedMediaSelection, requestId: bigint, alias: bigint): boolean {
+  const media = prep.media.get(requestId);
+  if (media) {
+    media.alias = alias;
+    media.subscription ??= { trackName: media.trackName, namespace: media.namespace,
+      mediaType: media.mediaType, trackAlias: alias };
+    media.subscription.trackAlias = alias;
+    prep.awaiting.delete(identityKey(media.namespace, media.trackName));
+    checkPreparedMediaReady(prep);
+    return true;
+  }
+  for (const init of prep.initTracks.values()) if (init.reqId === requestId) {
+    init.alias = alias;
+    return true;
+  }
+  return false;
 }

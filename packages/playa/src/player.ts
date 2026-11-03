@@ -35,9 +35,9 @@
 
 import {
   MoqtPlayer, QualityController, TypedEmitter, checkSupport, usesMsePath,
-  composeSelection, selectionIntentFromConfig,
+  composeSelection, selectionIntentFromConfig, PlayerErrorCode, buildCatalogSelection,
 } from '@openmoq/player';
-import type { LocmafDecoding, MoqtPlayerConfig, SupportReport, VideoPresentation } from '@openmoq/player';
+import type { AudioSelectionOptions, AudioTimelineReference, LocmafDecoding, MediaSelectionSnapshot, MoqtPlayerConfig, SupportReport, TrackIdentity, VideoPresentation } from '@openmoq/player';
 import { MoqtConnection } from '@openmoq/webtransport';
 import {
   AudioAlignedClock,
@@ -56,10 +56,12 @@ import type { DecoderStrategy } from './auto-detect.js';
 import { VolumeController } from './volume-controller.js';
 import { TimeController } from './time-controller.js';
 import { mapLevels, mapAudioTracks } from './level-mapper.js';
-import type { PlayerOptions, Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
+import { selectionMenu } from './selection-menu.js';
+import { programMenu } from './program-menu.js';
+import type { PlayerOptions, Level, AudioTrack, PlayerStats, PlayerState, Program, View } from './types.js';
 import type { PlayerEventMap } from './events.js';
-import type { AltGroup } from '@openmoq/msf';
-import { contextFields, namespaceFieldsOf, sameNamespaceFields } from '@openmoq/msf';
+import type { AltGroup, CatalogState, CatalogTrack } from '@openmoq/msf';
+import { contextFields, identityKey, namespaceFieldsOf, sameNamespaceFields } from '@openmoq/msf';
 
 /** Default player options, merged with user-provided options. */
 const DEFAULTS = {
@@ -138,7 +140,11 @@ export class Player {
   private _levels: Level[] = [];
   private _audioTracks: AudioTrack[] = [];
   private _currentLevel = -1;
-  private _currentAudioTrack = 0;
+  private _currentAudioTrack = -1;
+  private latestCatalog: CatalogState | null = null;
+  private adoptedSelection: MediaSelectionSnapshot | null = null;
+  private audioReferences = new Map<string, TrackIdentity>();
+  private audioIndexes: readonly (string | null)[] = [];
   private _autoQuality: boolean;
   private _volume: number;
   private _muted: boolean;
@@ -281,6 +287,21 @@ export class Player {
   /** Available catalog video views; select one with videoAltGroup at tune-in. */
   get videoGroups(): readonly AltGroup[] { return this.engine.availableVideoGroups; }
 
+  /** Catalog programs, including a separate pool for tracks without a render group. */
+  get programs(): readonly Program[] { return this.programChoices().programs; }
+
+  /** Stable id of the adopted program, or null before acceptance. */
+  get currentProgram(): string | null { return this.programChoices().currentProgram; }
+
+  /** Views within the adopted program, including ungrouped singleton tracks. */
+  get views(): readonly View[] {
+    const menu = this.programChoices();
+    return menu.programs.find(program => program.id === menu.currentProgram)?.views ?? [];
+  }
+
+  /** Stable id of the adopted video view, or null while unknown. */
+  get currentView(): string | null { return this.programChoices().currentView; }
+
   /** Current quality level index, or -1 if unknown. */
   get currentLevel(): number { return this._currentLevel; }
 
@@ -290,8 +311,13 @@ export class Player {
   /** Available audio tracks. */
   get audioTracks(): readonly AudioTrack[] { return this._audioTracks; }
 
-  /** Current audio track index. */
+  /** Current adopted audio track index, or -1 while unknown. */
   get currentAudioTrack(): number { return this._currentAudioTrack; }
+
+  /** Arms source-time collection; may be null until subsequent accepted audio. Not the output playhead. */
+  get audioTimelineReference(): AudioTimelineReference | null {
+    return this.presentationRetired ? null : this.engine.audioTimelineReference;
+  }
 
   /** Simplified stats for UI display. */
   get stats(): PlayerStats {
@@ -390,9 +416,33 @@ export class Player {
 
   /** Set audio track by index. */
   setAudioTrack(index: number): void {
-    if (index >= 0 && index < this._audioTracks.length) {
-      this._currentAudioTrack = index;
-      // TODO: route to engine audio track switch when API is available
+    const id = this.audioIndexes[index];
+    if (id === undefined || id === null) return;
+    void this.selectAudioTrack(id).catch(error => {
+      if (this.presentationRetired || this._state === 'error') return;
+      try {
+        this.emitter.emit('error', { severity: 'recoverable', code: PlayerErrorCode.SELECTION_FAILED,
+          message: `Audio selection failed: ${error instanceof Error ? error.message : String(error)}` });
+      } catch { /* A void compatibility method must own its rejection. */ }
+    });
+  }
+
+  /** Select an audioTracks entry by stable id; resolves after engine adoption. */
+  async selectAudioTrack(id: string, options?: AudioSelectionOptions): Promise<void> {
+    try {
+      if (this.presentationRetired) throw new Error('Cannot select audio after player destruction');
+      const reference = this.audioReferences.get(id);
+      if (reference === undefined) throw new RangeError('Unknown audio track identity');
+      await this.engine.selectAudioTrack({ name: reference.name,
+        namespace: [...reference.namespaceFields] }, options);
+    } catch (error) {
+      if (!this.presentationRetired) {
+        try {
+          this.emitter.emit('audiochangefailed', { trackId: id,
+            message: error instanceof Error ? error.message : String(error) });
+        } catch { /* Observer failure does not change the selection outcome. */ }
+      }
+      throw error;
     }
   }
 
@@ -520,6 +570,13 @@ export class Player {
     }
     this.audioClock.detachAudioContext();
     await this.engine.destroy();
+    this.adoptedSelection = null;
+    this.latestCatalog = null;
+    this._currentAudioTrack = -1;
+    this._currentLevel = -1;
+    this._audioTracks = [];
+    this._levels = [];
+    this.indexAudioReferences();
 
     // Remove owned DOM elements (never touch caller-provided elements).
     // ownsCanvas/ownsVideo are only true when container was non-null (invariant),
@@ -597,6 +654,9 @@ export class Player {
     if (opts.selection !== undefined) {
       Object.assign(base, { selection: opts.selection });
     }
+    if (opts.audioLanguages !== undefined) {
+      Object.assign(base, { audioLanguages: [...opts.audioLanguages] });
+    }
     if (opts.videoAltGroup !== undefined) {
       Object.assign(base, { videoAltGroup: opts.videoAltGroup });
     }
@@ -620,8 +680,81 @@ export class Player {
 
   // ─── Private: Event Bridging ─────────────────────────────────────
 
+  private indexAudioReferences(): void {
+    this.audioReferences.clear();
+    this.audioIndexes = this._audioTracks.map(track => {
+      if (track.id === undefined || track.namespace === undefined || track.trackName === undefined) return null;
+      this.audioReferences.set(track.id, { name: track.trackName, namespaceFields: [...track.namespace] });
+      return track.id;
+    });
+  }
+
+  private setRenderSelection(video: CatalogTrack | undefined, audio: CatalogTrack | undefined, pendingAudio = false): void {
+    const sink = video ?? audio;
+    if (sink === undefined) {
+      this._activeMediaType = null;
+      if (!pendingAudio) this.webAudioRequired = false;
+      return;
+    }
+    const mse = usesMsePath(sink.packaging, this.locmafDecoding);
+    this._activeMediaType = mse ? 'video' : 'canvas';
+    if (audio !== undefined) this.webAudioRequired = !usesMsePath(audio.packaging, this.locmafDecoding);
+    else if (!pendingAudio) this.webAudioRequired = false;
+    this.applyVolumeState();
+    if (this.ownsCanvas && this.canvas) this.canvas.hidden = mse;
+    if (this.ownsVideo && this.videoElement) this.videoElement.hidden = !mse;
+  }
+
+  private applySelection(selection: MediaSelectionSnapshot, catalog: CatalogState | null, updateOutput: boolean): void {
+    const previous = this.adoptedSelection?.audio;
+    this.adoptedSelection = selection;
+    this._autoQuality = selection.autoQuality;
+    if (catalog === null) return;
+    const menu = selectionMenu(catalog, selection, this.selectionConfig.namespace);
+    this._levels = menu.levels;
+    this._audioTracks = menu.audioTracks;
+    this._currentLevel = menu.currentLevel;
+    this._currentAudioTrack = menu.currentAudioTrack;
+    this.indexAudioReferences();
+    if (updateOutput) {
+      const previousAudioOutput = this.webAudioRequired;
+      if (menu.audio !== undefined) this.webAudioRequired = !usesMsePath(menu.audio.packaging, this.locmafDecoding);
+      else if (selection.audioChoices.length === 0) this.webAudioRequired = false;
+      // Audio acceptance can precede video. Prepare its output independently,
+      // keeping the preview surface until that video is accepted too.
+      if (menu.video !== undefined || selection.videoAlternatives.length === 0) {
+        this.setRenderSelection(menu.video, menu.audio, selection.audio === null && selection.audioChoices.length > 0);
+      } else if (this.webAudioRequired !== previousAudioOutput) this.applyVolumeState();
+    }
+    if (updateOutput && selection.audio !== null && this._currentAudioTrack >= 0
+        && (previous === undefined || previous === null
+          || identityKey(previous.namespaceFields, previous.name) !== identityKey(selection.audio.namespaceFields, selection.audio.name))) {
+      this.emitter.emit('audiochange', { track: this._audioTracks[this._currentAudioTrack]! });
+    }
+  }
+
+  private programChoices(): ReturnType<typeof programMenu> {
+    if (this.latestCatalog === null || this.presentationRetired) {
+      return { programs: [], currentProgram: null, currentView: null };
+    }
+    const model = buildCatalogSelection(this.latestCatalog, { catalogNamespace: this.selectionConfig.namespace });
+    return programMenu(model, this.adoptedSelection);
+  }
+
+  private emitCatalogReady(): void {
+    this.emitter.emit('ready', { levels: this._levels, audioTracks: this._audioTracks, duration: this._duration });
+    this.emitter.emit('levelsloaded', { levels: this._levels });
+    if (this.options.autoplay ?? DEFAULTS.autoplay) this.play();
+  }
+
   private wireEngineEvents(): void {
     this.engine.on('catalog_received', (e) => {
+      this.latestCatalog = e.catalog;
+      if (this.adoptedSelection?.video || this.adoptedSelection?.audio) {
+        this.applySelection(this.adoptedSelection, e.catalog, false);
+        this.emitCatalogReady();
+        return;
+      }
       // Catalog events precede subscription selection. A missing requested
       // group is reported by the engine, not thrown from an event listener.
       const config = this.selectionConfig;
@@ -668,10 +801,12 @@ export class Player {
           ...(intent !== undefined ? { intent } : {}),
           ...(config.videoConstraints !== undefined ? { videoConstraints: config.videoConstraints } : {}),
           ...(config.audioConstraints !== undefined ? { audioConstraints: config.audioConstraints } : {}),
+          ...(config.audioLanguages !== undefined ? { audioLanguages: config.audioLanguages } : {}),
         });
         if (!composed.ok) {
           this._levels = [];
           this._audioTracks = [];
+          this.indexAudioReferences();
           return;
         }
         if (activeVideo && configuredIntent?.videoTrack === undefined && selector.allAlternatives.includes(activeVideo)) {
@@ -682,41 +817,32 @@ export class Player {
       } catch {
         this._levels = [];
         this._audioTracks = [];
+        this.indexAudioReferences();
         return;
       }
-      this._levels = mapLevels({ ...e.catalog, tracks: [...selector.allAlternatives] });
+      this._levels = mapLevels({ ...e.catalog, tracks: [...selector.allAlternatives] }, undefined, config.namespace);
       this._audioTracks = mapAudioTracks({ ...e.catalog, tracks: composed.audio.state === 'selected'
-        ? composed.audio.considered.map(t => t.track) : [] });
+        ? composed.audio.considered.map(t => t.track) : [] }, config.namespace);
+      this.indexAudioReferences();
       const selected = {
         video: composed.video.state === 'selected' ? selector.currentVideoTrack ?? undefined : undefined,
         audio: composed.audio.state === 'selected' ? composed.audio.track.track : undefined,
       };
-      // cmaf renders through MSE into the <video> element, as does locmaf
-      // unless the engine decodes it frame by frame onto the canvas.
-      const sinkTrack = selected.video ?? selected.audio;
-      if (sinkTrack === undefined) {
-        this._activeMediaType = null;
-        this.webAudioRequired = false;
-        return;
+      this.setRenderSelection(selected.video, selected.audio);
+      if (selected.video !== undefined || selected.audio !== undefined) this.emitCatalogReady();
+    });
+
+    this.engine.on('catalog_updated', e => {
+      this.latestCatalog = e.catalog;
+      if (this.adoptedSelection?.video || this.adoptedSelection?.audio) {
+        this.applySelection(this.adoptedSelection, e.catalog, false);
       }
-      const hasCmaf = usesMsePath(sinkTrack.packaging, this.locmafDecoding);
+    });
 
-      // Record which element is the active render sink so callers can react.
-      this._activeMediaType = hasCmaf ? 'video' : 'canvas';
-      this.webAudioRequired = selected.audio !== undefined && !usesMsePath(selected.audio.packaging, this.locmafDecoding);
-      this.applyVolumeState();
-
-      // Only toggle visibility on elements the Player created itself.
-      // Caller-provided (borrowed) elements are never mutated.
-      if (this.ownsCanvas && this.canvas) this.canvas.hidden = hasCmaf;
-      if (this.ownsVideo && this.videoElement) this.videoElement.hidden = !hasCmaf;
-      this.emitter.emit('ready', {
-        levels: this._levels,
-        audioTracks: this._audioTracks,
-        duration: this._duration,
-      });
-      this.emitter.emit('levelsloaded', { levels: this._levels });
-      if (this.options.autoplay ?? DEFAULTS.autoplay) this.play();
+    this.engine.on('selection_changed', e => {
+      if (this.presentationRetired) return;
+      if (e.catalog !== null) this.latestCatalog = e.catalog;
+      this.applySelection(e.selection, e.catalog ?? this.latestCatalog, true);
     });
 
     this.engine.on('first_frame', () => {
@@ -737,7 +863,9 @@ export class Player {
     });
 
     this.engine.on('quality_switched', (e) => {
-      const level = this._levels.find(l => l.trackName === e.toTrackName);
+      const selected = this.adoptedSelection?.video;
+      const level = selected ? this._levels.find(l => l.id === identityKey(selected.namespaceFields, selected.name))
+        : this._levels.find(l => l.trackName === e.toTrackName);
       if (level) {
         this._currentLevel = level.index;
         this.emitter.emit('qualitychange', { level, auto: this._autoQuality });

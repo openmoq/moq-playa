@@ -167,6 +167,13 @@ export class DecoderStateMachine {
         return { action: 'reset', reason: 'gap detected' };
     }
 
+    /** Start a different track without reconfiguring identical codec bytes. */
+    notifyTrackSwitch(): FrameDecision {
+        this._state = this.lastConfig === null ? DecoderState.IDLE
+            : this._mediaType === 'audio' ? DecoderState.DECODING : DecoderState.NEEDS_KEYFRAME;
+        return { action: 'reset', reason: 'track changed' };
+    }
+
     /**
      * Signal track ended.
      * @see draft-ietf-moq-transport-16 §10.2.1.1

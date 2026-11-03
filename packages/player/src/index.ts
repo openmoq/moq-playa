@@ -15,6 +15,10 @@
 
 export { MoqtPlayer } from './player.js';
 export type { SubscribeIntent, QualitySwitchIntent } from './player.js';
+export type { MediaSelectionSnapshot, AudioSelectionOptions, AudioTimelineReference } from './player-selection-state.js';
+export type { TrackIdentity, ScopeId } from './catalog-selection.js';
+export { buildCatalogSelection } from './catalog-selection.js';
+export type { CatalogSelection, SelectionScope, AlternateSet, SelectableTrack } from './catalog-selection.js';
 
 // ─── Capability Detection ─────────────────────────────────────────────
 
@@ -25,6 +29,7 @@ export type { SupportReport } from './support.js';
 
 export type {
   PlayerEventMap,
+  SelectionChangedEvent,
   PlayerEvent,
   SessionConnectingEvent,
   SessionEstablishedEvent,
@@ -124,6 +129,7 @@ export type {
   VideoPresentation,
   AudioOutputLike,
   MediaSourceLike,
+  CmafSourceReceipt,
   VideoPlaybackQualityStats,
   MediaAppendToken,
   MediaAppendReason,

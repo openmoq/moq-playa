@@ -5,9 +5,16 @@
  * @module
  */
 
-import type { CatalogState } from '@openmoq/msf';
-import { isTrackPackagingSupported, selectVideoAltGroup } from '@openmoq/msf';
+import type { CatalogNamespaceContext, CatalogState, CatalogTrack } from '@openmoq/msf';
+import { contextFields, identityKey, isTrackPackagingSupported, namespaceFieldsOf, selectVideoAltGroup } from '@openmoq/msf';
 import type { Level, AudioTrack } from './types.js';
+
+type MenuCatalog = Omit<CatalogState, 'tracks'> & { readonly tracks: readonly CatalogTrack[] };
+
+function menuIdentity(track: CatalogTrack, context: CatalogNamespaceContext): Pick<Level, 'id' | 'namespace'> {
+  const fields = namespaceFieldsOf(track) ?? contextFields(context);
+  return fields === undefined ? {} : { id: identityKey(fields, track.name), namespace: [...fields] };
+}
 
 /**
  * Generate a human-readable resolution label from track metadata.
@@ -36,7 +43,7 @@ function resolutionLabel(track: { height?: number; bitrate?: number; name: strin
  *
  * @see draft-ietf-moq-msf-01 §5.2.12 (altGroup)
  */
-export function mapLevels(catalog: CatalogState, videoAltGroup?: number): Level[] {
+export function mapLevels(catalog: MenuCatalog, videoAltGroup?: number, namespace?: CatalogNamespaceContext): Level[] {
   const videoTracks = catalog.tracks.filter(
     t => isTrackPackagingSupported(t) && t.codec && (
       t.codec.startsWith('avc1') ||
@@ -60,6 +67,7 @@ export function mapLevels(catalog: CatalogState, videoAltGroup?: number): Level[
     width: track.width ?? 0,
     height: track.height ?? 0,
     bitrate: track.bitrate ?? 0,
+    ...menuIdentity(track, namespace),
   }));
 }
 
@@ -68,7 +76,7 @@ export function mapLevels(catalog: CatalogState, videoAltGroup?: number): Level[
  *
  * @see draft-ietf-moq-msf-00 §5.1.35 (language)
  */
-export function mapAudioTracks(catalog: CatalogState): AudioTrack[] {
+export function mapAudioTracks(catalog: MenuCatalog, namespace?: CatalogNamespaceContext): AudioTrack[] {
   const audioTracks = catalog.tracks.filter(
     t => t.codec && (
       t.codec.startsWith('mp4a') ||
@@ -81,11 +89,13 @@ export function mapAudioTracks(catalog: CatalogState): AudioTrack[] {
 
   return audioTracks.map((track, index) => {
     const lang = track.lang;
+    const identity = menuIdentity(track, namespace);
     return {
       index,
       label: track.label ?? lang ?? `Audio ${index + 1}`,
       language: lang,
       codec: track.codec ?? 'unknown',
+      ...(identity.id === undefined ? {} : { ...identity, trackName: track.name }),
     };
   });
 }

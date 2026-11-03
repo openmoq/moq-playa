@@ -400,14 +400,20 @@ export function handlePipelineCommand(
   dispatcher: CommandDispatcher | null,
   _mediaSource: MediaSourceLike | null,
   emitEvent: (event: Record<string, unknown>) => void,
+  preparedDecoder?: 'video' | 'audio',
+  isLive?: () => boolean,
 ): void {
+  if (isLive && !isLive()) return;
   const transformed = commandTransform ? commandTransform(cmd) : cmd;
-  if (transformed) {
+  if (transformed && (!isLive || isLive())) {
     emitEvent({
       type: 'decoder_command',
       command: transformed,
     });
-    dispatcher?.dispatch(transformed);
+    if (isLive && !isLive()) return;
+    if (transformed.type === 'reset' && transformed.mediaType === preparedDecoder) {
+      dispatcher?.dispatch(transformed, { preserveDecoder: true });
+    } else dispatcher?.dispatch(transformed);
   }
 }
 

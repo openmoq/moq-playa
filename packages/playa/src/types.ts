@@ -2,7 +2,8 @@
  * Public types for @openmoq/playa.
  *
  * UI-friendly types that abstract away protocol internals.
- * Designed for developer ergonomics — no bigints, no spec jargon.
+ * Playback menus use stable string identities; advanced timeline maps retain
+ * exact microsecond values from the engine.
  *
  * @module
  */
@@ -66,6 +67,8 @@ export interface PlayerOptions {
   readonly videoAltGroup?: number;
   /** Initial catalog scope, alternate sets, and exact track identities. */
   readonly selection?: MoqtPlayerConfig['selection'];
+  /** Ordered preferred audio languages within the chosen program; omitted keeps catalog order. */
+  readonly audioLanguages?: readonly string[];
   /** Cap quality to a maximum resolution. */
   readonly maxResolution?: { readonly width: number; readonly height: number };
 
@@ -109,6 +112,10 @@ export interface Level {
   readonly index: number;
   /** MoQ track name — used by selectVideoTrack for switching. */
   readonly trackName: string;
+  /** Stable track identity, available when the catalog namespace is resolved. */
+  readonly id?: string;
+  /** Ordered namespace fields; never a flattened display string. */
+  readonly namespace?: readonly string[];
   /** Human-readable label (e.g., "1080p", "720p", "4K"). */
   readonly label: string;
   /** Codec string (e.g., "avc1.640028"). */
@@ -125,12 +132,37 @@ export interface Level {
 export interface AudioTrack {
   /** Index in the audioTracks array. */
   readonly index: number;
+  /** Stable track identity for selectAudioTrack(), independent of menu order. */
+  readonly id?: string;
+  /** MoQ track name, available with a resolved identity. */
+  readonly trackName?: string;
+  /** Ordered namespace fields; never a flattened display string. */
+  readonly namespace?: readonly string[];
   /** Human-readable label (e.g., "English", "Audio 1"). */
   readonly label: string;
   /** BCP 47 language tag (e.g., "en", "es"). */
   readonly language?: string | undefined;
   /** Codec string (e.g., "mp4a.40.2", "opus"). */
   readonly codec: string;
+}
+
+/** A video alternate set, or one track that declares no alternate group. */
+export interface View {
+  readonly id: string;
+  readonly label: string;
+  /** Absent for a singleton; zero is a valid declared group. */
+  readonly altGroup?: number;
+  readonly levels: readonly Level[];
+}
+
+/** A declared render group, or the separate pool of unassigned tracks. */
+export interface Program {
+  readonly id: string;
+  readonly label: string;
+  /** Null means no render group was declared. */
+  readonly renderGroup: number | null;
+  readonly views: readonly View[];
+  readonly audioTracks: readonly AudioTrack[];
 }
 
 /** Simplified stats for UI display. */

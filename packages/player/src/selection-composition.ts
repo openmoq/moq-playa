@@ -17,6 +17,7 @@
 import type { CatalogNamespaceContext, CatalogState, CatalogTrack, TrackConstraints } from '@openmoq/msf';
 import { selectTrack } from '@openmoq/msf';
 import type { QualityController } from './quality-controller.js';
+import { preferredLanguage } from './language-preference.js';
 import {
   buildCatalogSelection,
   resolveSelection,
@@ -93,10 +94,10 @@ export interface CompositionOptions {
    *  starting member inside the eligible ladder and is NOT a persistent
    *  restriction — that is `capLevelToResolution`, owned by the controller. */
   readonly videoConstraints?: TrackConstraints;
-  /** Exact audio filtering (`config.audioConstraints`), applied across the
-   *  chosen scope's audio in catalog order. RFC 4647 preference lookup is a
-   *  separate contract and is not performed here. */
+  /** Exact audio filtering (`config.audioConstraints`), applied before language preferences. */
   readonly audioConstraints?: TrackConstraints;
+  /** Ordered basic language ranges. A pin wins; no match keeps the scope-local default. */
+  readonly audioLanguages?: readonly string[];
 }
 
 /*
@@ -139,6 +140,8 @@ export function composeResolvedSelection(
   const { scope } = resolved;
   const wantVideo = intent.disableVideo !== true;
   const wantAudio = intent.disableAudio !== true;
+  // Validate even an unmatched lower-priority range before controller adoption.
+  if (wantAudio && options.audioLanguages !== undefined) preferredLanguage([], options.audioLanguages);
   // A selector for a disabled output is ignored here exactly as the model
   // ignores it, so a stale pin cannot re-enter through the composition.
   const videoPinned = wantVideo && intent.videoTrack !== undefined;
@@ -206,6 +209,11 @@ export function composeResolvedSelection(
     }
   }
 
+  const preferredAudio = wantAudio && audioPin === undefined && options.audioLanguages !== undefined
+    ? preferredLanguage(audioCandidates.map(member => member.track).filter(track => options.audioConstraints === undefined
+      || selectTrack([track], options.audioConstraints) !== undefined), options.audioLanguages)
+    : undefined;
+
   // ── Adopt ────────────────────────────────────────────────────────────
   const chosen = controller.selectEligibleMembers({
     videoLadder: videoLadder,
@@ -216,7 +224,8 @@ export function composeResolvedSelection(
     // An explicit identity pins the member outright; the start level and the
     // startup preference choose only when nothing was pinned.
     ...(videoPin !== undefined ? { videoPin: videoPin.track } : {}),
-    ...(audioPin !== undefined ? { audioPin: audioPin.track } : {}),
+    ...(audioPin !== undefined ? { audioPin: audioPin.track }
+      : preferredAudio !== undefined ? { audioPin: preferredAudio } : {}),
   });
 
   // A pin decides which track plays, so quality must not move off it until

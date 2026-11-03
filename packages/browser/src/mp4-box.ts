@@ -311,6 +311,90 @@ export function readBaseMediaDecodeTime(moof: Uint8Array): bigint | null {
 }
 
 /**
+ * First sample's raw presentation time in TRACK TICKS, not microseconds.
+ * Accepts one moof with optional bounded prefix/suffix boxes. Multiple moofs
+ * or trafs are ambiguous. Empty runs contribute no sample; later samples are
+ * never searched for a minimum PTS. This does not prove native presentation.
+ */
+export function readFirstSamplePresentationTime(moof: Uint8Array): bigint | null {
+  let root: BoundedBox | undefined;
+  let end = 0;
+  for (const box of boundedBoxes(moof, 0, moof.byteLength)) {
+    end = box.end;
+    if (box.type !== 'moof') continue;
+    if (root) return null;
+    root = box;
+  }
+  if (!root || end !== moof.byteLength) return null;
+
+  let traf: BoundedBox | undefined;
+  end = root.bodyStart;
+  for (const box of boundedBoxes(moof, root.bodyStart, root.end)) {
+    end = box.end;
+    if (box.type !== 'traf') continue;
+    if (traf) return null;
+    traf = box;
+  }
+  if (!traf || end !== root.end) return null;
+
+  const view = new DataView(moof.buffer, moof.byteOffset, moof.byteLength);
+  let decodeTime: bigint | null = null;
+  let firstOffset: bigint | undefined;
+  let hasHeader = false, durationIsEmpty = false;
+  end = traf.bodyStart;
+  for (const box of boundedBoxes(moof, traf.bodyStart, traf.end)) {
+    end = box.end;
+    if (box.type !== 'tfhd' && box.type !== 'tfdt' && box.type !== 'trun') continue;
+    if (box.size < 12) return null;
+    const version = moof[box.bodyStart]!;
+    const flags = readU32(moof, box.bodyStart) & 0xffffff;
+    if (box.type === 'tfhd') {
+      const knownFlags = TFHD_FLAG_BASE_DATA_OFFSET | TFHD_FLAG_SAMPLE_DESCRIPTION_INDEX
+        | TFHD_FLAG_DEFAULT_SAMPLE_DURATION | TFHD_FLAG_DEFAULT_SAMPLE_SIZE | TFHD_FLAG_DEFAULT_SAMPLE_FLAGS
+        | 0x010000 /* duration-is-empty */ | 0x020000 /* default-base-is-moof */;
+      if (hasHeader || version !== 0 || flags & ~knownFlags || box.size < 16) return null;
+      let size = 16;
+      if (flags & TFHD_FLAG_BASE_DATA_OFFSET) size += 8;
+      if (flags & TFHD_FLAG_SAMPLE_DESCRIPTION_INDEX) size += 4;
+      if (flags & TFHD_FLAG_DEFAULT_SAMPLE_DURATION) size += 4;
+      if (flags & TFHD_FLAG_DEFAULT_SAMPLE_SIZE) size += 4;
+      if (flags & TFHD_FLAG_DEFAULT_SAMPLE_FLAGS) size += 4;
+      if (box.size !== size || view.getUint32(box.start + 12) === 0) return null;
+      hasHeader = true;
+      durationIsEmpty = (flags & 0x010000) !== 0;
+    } else if (box.type === 'tfdt') {
+      if (decodeTime !== null || flags !== 0 || version > 1 || box.size !== (version === 0 ? 16 : 20)) return null;
+      decodeTime = version === 0 ? BigInt(view.getUint32(box.start + 12)) : view.getBigUint64(box.start + 12);
+    } else {
+      const knownFlags = TRUN_FLAG_DATA_OFFSET | TRUN_FLAG_FIRST_SAMPLE_FLAGS | TRUN_FLAG_SAMPLE_DURATION
+        | TRUN_FLAG_SAMPLE_SIZE | TRUN_FLAG_SAMPLE_FLAGS | TRUN_FLAG_SAMPLE_CTO;
+      if (version > 1 || flags & ~knownFlags || box.size < 16
+          || (flags & TRUN_FLAG_FIRST_SAMPLE_FLAGS) && (flags & TRUN_FLAG_SAMPLE_FLAGS)) return null;
+      const count = view.getUint32(box.start + 12);
+      let samples = box.start + 16;
+      if (flags & TRUN_FLAG_DATA_OFFSET) samples += 4;
+      if (flags & TRUN_FLAG_FIRST_SAMPLE_FLAGS) samples += 4;
+      let stride = 0;
+      if (flags & TRUN_FLAG_SAMPLE_DURATION) stride += 4;
+      if (flags & TRUN_FLAG_SAMPLE_SIZE) stride += 4;
+      if (flags & TRUN_FLAG_SAMPLE_FLAGS) stride += 4;
+      if (flags & TRUN_FLAG_SAMPLE_CTO) stride += 4;
+      // Bound the WHOLE declared table, even though only sample zero is read.
+      if (samples + count * stride !== box.end) return null;
+      if (count && firstOffset === undefined) {
+        if (flags & TRUN_FLAG_SAMPLE_DURATION) samples += 4;
+        if (flags & TRUN_FLAG_SAMPLE_SIZE) samples += 4;
+        if (flags & TRUN_FLAG_SAMPLE_FLAGS) samples += 4;
+        firstOffset = flags & TRUN_FLAG_SAMPLE_CTO
+          ? BigInt(version === 1 ? view.getInt32(samples) : view.getUint32(samples)) : 0n;
+      }
+    }
+  }
+  if (end !== traf.end || !hasHeader || durationIsEmpty || decodeTime === null || firstOffset === undefined) return null;
+  return decodeTime + firstOffset;
+}
+
+/**
  * Patch baseMediaDecodeTime in-place inside a moof's tfdt box.
  * Zero-copy — modifies the existing Uint8Array via DataView.
  *

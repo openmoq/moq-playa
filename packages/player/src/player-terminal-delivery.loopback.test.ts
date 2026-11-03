@@ -243,9 +243,11 @@ describe('finite media terminal delivery through the real player', () => {
     const failures: unknown[] = [];
     h.server.onSubscribe = id => { void h.server.acceptSubscribe(id, 202n).catch(error => { failures.push(error); }); };
     try {
+      const selected = h.player.selection.video;
       const other = await internal.subscribeAuxTrackOwned([new TextEncoder().encode('finite')], new TextEncoder().encode('other-rendition'), {},
         { trackName: 'other-rendition', mediaType: 'video', packaging: 'cmaf' });
       expect(other).toBeDefined(); await flush(256);
+      expect(h.player.selection.video).toEqual(selected);
       if (order === 'track-first') await h.done();
       else await h.server.publishDone(other!, varint(3n), 'filter');
       await vi.waitFor(() => expect(h.unsubscribed).toHaveLength(1)); expect(h.ended).toEqual([]);
