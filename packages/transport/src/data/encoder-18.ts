@@ -14,9 +14,10 @@
 import { writeVi64, vi64EncodingLength, MAX_VI64 } from '../primitives/vi64.js';
 import { DatagramFlags18, SubgroupFlags18, subgroupIdMode18 } from './codes-18.js';
 import { FetchFlags, FetchSpecialFlags, FetchSubgroupMode } from './codes.js';
-import type { SubgroupHeader, SubgroupObject, ObjectDatagram, GroupOrder } from './types.js';
+import type { SubgroupHeader, SubgroupObject, ObjectDatagram, GroupOrder, FetchRangeKind } from './types.js';
 import type { FetchObjectPrior18 } from './decoder-18.js';
 import { StreamType18 } from './codes-18.js';
+import type { RequestStreamDraft } from '../versions.js';
 
 /** Subgroup-ID mode 0b10: an explicit Subgroup ID field is present (§11.4.2). */
 const SUBGROUP_ID_MODE_EXPLICIT = 0b10;
@@ -198,16 +199,18 @@ export function encodeFetchObject18(
   prior: FetchObjectPrior18 | undefined,
   isFirstObject: boolean,
   groupOrder: GroupOrder,
+  version: RequestStreamDraft = 18,
 ): { bytes: Uint8Array; nextPrior: FetchObjectPrior18 } {
   const { groupId, subgroupId, objectId, publisherPriority, extensions, payload } = fields;
   const newGroup = isFirstObject || groupId !== prior!.groupId;
 
-  // Subgroup ID explicit (mode 0b11), Object ID Delta + Priority always present.
+  // Subgroup ID explicit (mode 0b11), Object ID Delta + Priority always present
+  // (draft 23 omits the delta for the next Object, which it cannot encode).
   let flags = FetchSubgroupMode.EXPLICIT | FetchFlags.OBJECT_ID | FetchFlags.PRIORITY;
   if (extensions !== undefined) flags |= FetchFlags.EXTENSIONS;
 
   let groupDelta: bigint | undefined;
-  let objDelta: bigint;
+  let objDelta: bigint | undefined;
   if (newGroup) {
     flags |= FetchFlags.GROUP_ID;
     if (isFirstObject) {
@@ -221,6 +224,14 @@ export function encodeFetchObject18(
       throw new Error(`fetch Group ID Delta out of range for ${groupOrder} order`);
     }
     objDelta = objectId; // group present → object delta is absolute
+  } else if (version === 23) {
+    // draft-23 §11.4.1.1: an absent delta is prior + 1; a present one prior + delta + 2.
+    if (objectId <= prior!.objectId) throw new Error('fetch Object ID must increase within a group');
+    if (objectId === prior!.objectId + 1n) {
+      flags &= ~FetchFlags.OBJECT_ID;
+    } else {
+      objDelta = objectId - prior!.objectId - 2n;
+    }
   } else {
     objDelta = objectId - prior!.objectId; // group absent → prior + delta
     if (objDelta < 0n) throw new Error('fetch Object ID must not decrease within a group');
@@ -230,7 +241,7 @@ export function encodeFetchObject18(
   let size = vi64EncodingLength(BigInt(flags));
   if (groupDelta !== undefined) size += vi64EncodingLength(groupDelta);
   size += vi64EncodingLength(subgroupId);
-  size += vi64EncodingLength(objDelta);
+  if (objDelta !== undefined) size += vi64EncodingLength(objDelta);
   size += 1; // priority
   if (extensions !== undefined) {
     size += vi64EncodingLength(BigInt(extensions.length)) + extensions.length;
@@ -242,7 +253,7 @@ export function encodeFetchObject18(
   let p = writeVi64(BigInt(flags), buf, 0);
   if (groupDelta !== undefined) p += writeVi64(groupDelta, buf, p);
   p += writeVi64(subgroupId, buf, p);
-  p += writeVi64(objDelta, buf, p);
+  if (objDelta !== undefined) p += writeVi64(objDelta, buf, p);
   buf[p++] = publisherPriority;
   if (extensions !== undefined) {
     p += writeVi64(BigInt(extensions.length), buf, p);
@@ -260,25 +271,56 @@ export function encodeFetchObject18(
   return { bytes: buf, nextPrior };
 }
 
+/** The End of Range flags value for each {@link FetchRangeKind}. */
+const RANGE_FLAGS: Record<FetchRangeKind, number> = {
+  'non-existent': FetchSpecialFlags.END_NON_EXISTENT,
+  unknown: FetchSpecialFlags.END_UNKNOWN,
+  'timed-out': FetchSpecialFlags.END_TIMED_OUT,
+  gone: FetchSpecialFlags.END_GONE,
+};
+
 /**
- * Encode an End-of-Range marker: Serialization Flags 0x8C (non-existent) or
- * 0x10C (unknown), Group ID and Object ID. Draft 18 retains its zero Payload
- * Length field; the draft-22 form omits it. Position prior advances to the
- * marker; field priors are unchanged.
+ * Encode an End-of-Range marker: Serialization Flags 0x8C (non-existent),
+ * 0x10C (unknown), 0x20C (timed out, draft 22+) or 0x40C (gone, draft 23),
+ * then Group ID and Object ID. Draft 18 retains its zero Payload Length field;
+ * the draft-22 form omits it. Drafts 18 and 22 write absolute IDs; draft 23
+ * writes them relative to `prior` unless this is the stream's first entry
+ * (§11.4.2.1). Position prior advances to the marker; field priors are unchanged.
+ *
+ * @param kind The range kind, or the legacy boolean (true = non-existent,
+ *   false = unknown).
+ * @param prior The prior entry, or undefined for the first entry after the
+ *   FETCH_HEADER.
  */
 export function encodeFetchEndOfRange18(
-  nonExistent: boolean,
+  kind: FetchRangeKind | boolean,
   groupId: bigint,
   objectId: bigint,
   prior: FetchObjectPrior18 | undefined,
-  version: 18 | 22 = 18,
+  version: RequestStreamDraft = 18,
+  groupOrder: GroupOrder = 'ascending',
 ): { bytes: Uint8Array; nextPrior: FetchObjectPrior18 } {
-  const flags = BigInt(nonExistent ? FetchSpecialFlags.END_NON_EXISTENT : FetchSpecialFlags.END_UNKNOWN);
-  const size = vi64EncodingLength(flags) + vi64EncodingLength(groupId) + vi64EncodingLength(objectId) + (version === 18 ? 1 : 0);
+  const rangeKind: FetchRangeKind = kind === true ? 'non-existent' : kind === false ? 'unknown' : kind;
+  if ((rangeKind === 'timed-out' && version === 18) || (rangeKind === 'gone' && version !== 23)) {
+    throw new Error(`draft ${version} has no ${rangeKind} End of Range`);
+  }
+  const flags = BigInt(RANGE_FLAGS[rangeKind]);
+  let gField = groupId;
+  let oField = objectId;
+  if (version === 23 && prior !== undefined) {
+    const gd = groupOrder === 'ascending' ? groupId - prior.groupId : prior.groupId - groupId;
+    if (gd < 0n) throw new Error(`End of Range Group ${groupId} is behind the prior entry for ${groupOrder} order`);
+    gField = gd;
+    if (gd === 0n) {
+      if (objectId <= prior.objectId) throw new Error('End of Range must follow the prior entry within its Group');
+      oField = objectId - prior.objectId - 1n;
+    }
+  }
+  const size = vi64EncodingLength(flags) + vi64EncodingLength(gField) + vi64EncodingLength(oField) + (version === 18 ? 1 : 0);
   const buf = new Uint8Array(size);
   let p = writeVi64(flags, buf, 0);
-  p += writeVi64(groupId, buf, p);
-  p += writeVi64(objectId, buf, p);
+  p += writeVi64(gField, buf, p);
+  p += writeVi64(oField, buf, p);
   if (version === 18) writeVi64(0n, buf, p);
   const nextPrior: FetchObjectPrior18 = {
     groupId, objectId,
@@ -286,4 +328,21 @@ export function encodeFetchEndOfRange18(
     lastObjectPriority: prior?.lastObjectPriority,
   };
   return { bytes: buf, nextPrior };
+}
+
+/**
+ * Encode a draft-23 End of Group (0x80) or End of Track (0x81) marker, which
+ * has no fields (§11.4.2.2). The prior Object is the last in its Group (or the
+ * Track); the prior Object ID becomes 2^64-1, so the next entry must start a
+ * new Group.
+ */
+export function encodeFetchEndMarker23(
+  marker: 'end-of-group' | 'end-of-track',
+  prior: FetchObjectPrior18 | undefined,
+): { bytes: Uint8Array; nextPrior: FetchObjectPrior18 } {
+  if (prior === undefined) throw new Error(`fetch ${marker} needs a prior Object`);
+  const flags = BigInt(marker === 'end-of-group' ? FetchSpecialFlags.END_OF_GROUP : FetchSpecialFlags.END_OF_TRACK);
+  const buf = new Uint8Array(vi64EncodingLength(flags));
+  writeVi64(flags, buf, 0);
+  return { bytes: buf, nextPrior: { ...prior, objectId: MAX_VI64 } };
 }

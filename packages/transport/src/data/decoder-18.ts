@@ -19,7 +19,7 @@
 import { readVi64, MAX_VI64 } from '../primitives/vi64.js';
 import { readUint8 } from '../primitives/bytes.js';
 import { varint } from '../primitives/varint.js';
-import { ProtocolViolationError } from '../errors.js';
+import { ProtocolViolationError, SessionError } from '../errors.js';
 import {
   SubgroupFlags18,
   DatagramFlags18,
@@ -31,7 +31,9 @@ import {
 } from './codes-18.js';
 import { StreamType18 } from './codes-18.js';
 import { FetchFlags, FetchSubgroupMode, FetchSpecialFlags } from './codes.js';
-import type { SubgroupHeader, SubgroupObject, ObjectDatagram, FetchHeader, FetchObject, FetchEndOfRange, GroupOrder } from './types.js';
+import type {
+  SubgroupHeader, SubgroupObject, ObjectDatagram, FetchHeader, FetchObject, FetchEndOfRange, FetchEndMarker, FetchRangeKind, GroupOrder,
+} from './types.js';
 import type { DecodedFetchItem } from './decoder.js';
 import type { RequestStreamDraft } from '../versions.js';
 
@@ -306,26 +308,68 @@ export function decodeFetchHeader18(
   return { header: { requestId: rid.value }, bytesRead: pos - offset };
 }
 
-/** draft-22 §11.4: End of Timed-Out Range, the objects' delivery timeout expired. */
-const END_TIMED_OUT_22 = 0x20cn;
+/** The kind of an End of Range flags value on `version`, or undefined. */
+function rangeKind18(flags: bigint, version: RequestStreamDraft): FetchRangeKind | undefined {
+  switch (Number(flags)) {
+    case FetchSpecialFlags.END_NON_EXISTENT: return 'non-existent';
+    case FetchSpecialFlags.END_UNKNOWN: return 'unknown';
+    // draft-22 §11.4: End of Timed-Out Range, the objects' delivery timeout expired.
+    case FetchSpecialFlags.END_TIMED_OUT: return version !== 18 ? 'timed-out' : undefined;
+    // draft-23 §11.4.2: End of Gone Range.
+    case FetchSpecialFlags.END_GONE: return version === 23 ? 'gone' : undefined;
+    default: return undefined;
+  }
+}
 
-/** Whether a Serialization Flags value is an End-of-Range marker on `version`. */
-function isEndOfRange18(flags: bigint, version: RequestStreamDraft = 18): boolean {
-  return flags === BigInt(FetchSpecialFlags.END_NON_EXISTENT) || flags === BigInt(FetchSpecialFlags.END_UNKNOWN)
-    || (version === 22 && flags === END_TIMED_OUT_22);
+/** draft-23 §11.4.2.2: End of Group (0x80) / End of Track (0x81), no fields. */
+function endMarker23(flags: bigint, version: RequestStreamDraft): FetchEndMarker['marker'] | undefined {
+  if (version !== 23) return undefined;
+  if (flags === BigInt(FetchSpecialFlags.END_OF_GROUP)) return 'end-of-group';
+  if (flags === BigInt(FetchSpecialFlags.END_OF_TRACK)) return 'end-of-track';
+  return undefined;
 }
 
 /**
- * Validate Serialization Flags: 0x00–0x7F, 0x8C, 0x10C, and on draft 22 0x20C;
- * else PROTOCOL_VIOLATION.
+ * Validate Serialization Flags: 0x00–0x7F, 0x8C, 0x10C, from draft 22 0x20C,
+ * and on draft 23 0x40C, 0x80 and 0x81; else PROTOCOL_VIOLATION
+ * (MALFORMED_OBJECT on draft 23, §11.4.1).
  */
 function validateFetchFlags18(flags: bigint, version: RequestStreamDraft = 18): void {
-  if (isEndOfRange18(flags, version)) return;
+  if (rangeKind18(flags, version) !== undefined || endMarker23(flags, version) !== undefined) return;
   if (flags >= 0n && flags <= 0x7fn) return;
+  const allowed = version === 23 ? ', 0x20C, 0x40C, 0x80, 0x81' : version !== 18 ? ', 0x20C' : '';
   throw new ProtocolViolationError(
-    `Invalid draft-${version} fetch Serialization Flags 0x${flags.toString(16)} (allowed: 0x00-0x7F, 0x8C, 0x10C`
-      + `${version === 22 ? ', 0x20C' : ''})`,
+    `Invalid draft-${version} fetch Serialization Flags 0x${flags.toString(16)} (allowed: 0x00-0x7F, 0x8C, 0x10C${allowed})`,
+    MALFORMED_OBJECT,
   );
+}
+
+const MALFORMED_OBJECT = Number(SessionError.MALFORMED_OBJECT);
+const DELTA_ENCODING_OVERFLOW = Number(SessionError.DELTA_ENCODING_OVERFLOW);
+
+/**
+ * draft-23 §11.4.2.1: an End of Range's Location. The first entry after the
+ * FETCH_HEADER carries absolute IDs. Later ones step the Group by the delta in
+ * Group Order with no +1, so 0 is the prior entry's Group; within that Group the
+ * Object is prior + delta + 1, and in a new Group the Object ID is absolute.
+ */
+function decodeEndOfRange23(
+  gd: bigint,
+  od: bigint,
+  prior: FetchObjectPrior18 | undefined,
+  isFirstObject: boolean,
+  groupOrder: GroupOrder,
+): { groupId: bigint; objectId: bigint } {
+  if (isFirstObject) return { groupId: gd, objectId: od };
+  if (prior === undefined) {
+    throw new ProtocolViolationError('End of Range requires prior-entry context', MALFORMED_OBJECT);
+  }
+  const groupId = groupOrder === 'ascending' ? prior.groupId + gd : prior.groupId - gd;
+  const objectId = gd === 0n ? prior.objectId + od + 1n : od;
+  if (groupId < 0n || groupId > MAX_VI64 || objectId > MAX_VI64) {
+    throw new ProtocolViolationError(`End of Range Location overflows: ${groupId}/${objectId}`, DELTA_ENCODING_OVERFLOW);
+  }
+  return { groupId, objectId };
 }
 
 /**
@@ -336,6 +380,8 @@ function validateFetchFlags18(flags: bigint, version: RequestStreamDraft = 18): 
  * Ascending by default when the request omitted GROUP_ORDER (§11.4.4.1).
  *
  * @see draft-ietf-moq-transport-18 §11.4.4
+ * @see draft-ietf-moq-transport-23 §11.4 (the +2 Object ID Delta, delta-coded
+ *   End of Range, End of Gone Range, End of Group and End of Track)
  */
 export function decodeFetchObject18(
   buf: Uint8Array,
@@ -350,12 +396,27 @@ export function decodeFetchObject18(
   const flags = fl.value;
   validateFetchFlags18(flags, version);
 
+  // ── End of Group / End of Track (draft-23 §11.4.2.2) ─────────────────
+  const marker = endMarker23(flags, version);
+  if (marker !== undefined) {
+    // §11.4.2.2 defines these markers by "the prior Object" and does not say
+    // what one means as the first entry. With no prior Object there is nothing
+    // to mark, so treat it like any reference to a missing prior Object.
+    if (isFirstObject || prior === undefined) {
+      throw new ProtocolViolationError(`Fetch ${marker} has no prior Object`, MALFORMED_OBJECT);
+    }
+    const item: FetchEndMarker = { flags: varint(flags), marker, groupId: prior.groupId, objectId: prior.objectId };
+    // The next entry must carry a Group ID Delta: no Object follows 2^64-1.
+    return { item, bytesRead: pos - offset, nextPrior: { ...prior, objectId: MAX_VI64 } };
+  }
+
   // ── End-of-Range marker (§11.4.4.2) ──────────────────────────────────
   // A draft-22 End of Timed-Out Range (0x20C) is, like 0x10C, a range of unknown
   // status: the objects may exist but will not be delivered.
-  if (isEndOfRange18(flags, version)) {
-    const gid = readVi64(buf, pos); pos += gid.bytesRead;
-    const oid = readVi64(buf, pos); pos += oid.bytesRead;
+  const kind = rangeKind18(flags, version);
+  if (kind !== undefined) {
+    const gd = readVi64(buf, pos); pos += gd.bytesRead;
+    const od = readVi64(buf, pos); pos += od.bytesRead;
     // Keep the established draft-18 framing separate from the draft-22
     // marker-only form. Never guess the form from the following byte.
     if (version === 18) {
@@ -364,16 +425,21 @@ export function decodeFetchObject18(
         throw new ProtocolViolationError(`End-of-Range marker has a non-zero payload length (${pl.value})`);
       }
     }
+    // Drafts 18 and 22 carry absolute IDs; draft 23 delta-codes them.
+    const { groupId, objectId } = version === 23
+      ? decodeEndOfRange23(gd.value, od.value, prior, isFirstObject, groupOrder)
+      : { groupId: gd.value, objectId: od.value };
     const item: FetchEndOfRange = {
       flags: varint(flags),
-      groupId: gid.value,
-      objectId: oid.value,
-      nonExistent: flags === BigInt(FetchSpecialFlags.END_NON_EXISTENT),
+      groupId,
+      objectId,
+      nonExistent: kind === 'non-existent',
+      kind,
     };
     // Position prior comes from the marker; field priors are UNCHANGED.
     const nextPrior: FetchObjectPrior18 = {
-      groupId: gid.value,
-      objectId: oid.value,
+      groupId,
+      objectId,
       lastObjectSubgroupId: prior?.lastObjectSubgroupId,
       lastObjectPriority: prior?.lastObjectPriority,
     };
@@ -393,19 +459,19 @@ export function decodeFetchObject18(
     // §11.4.4: the first object MUST carry absolute Group/Object deltas and MUST
     // NOT reference any prior-object field.
     if (!groupPresent || !objectPresent) {
-      throw new ProtocolViolationError('First fetch object must include Group ID Delta and Object ID Delta');
+      throw new ProtocolViolationError('First fetch object must include Group ID Delta and Object ID Delta', MALFORMED_OBJECT);
     }
     if (!priorityPresent) {
-      throw new ProtocolViolationError('First fetch object cannot inherit Priority from a prior object');
+      throw new ProtocolViolationError('First fetch object cannot inherit Priority from a prior object', MALFORMED_OBJECT);
     }
     if (!isDatagram && (subgroupMode === FetchSubgroupMode.PRIOR || subgroupMode === FetchSubgroupMode.PRIOR_PLUS_ONE)) {
-      throw new ProtocolViolationError('First fetch object cannot inherit Subgroup ID from a prior object');
+      throw new ProtocolViolationError('First fetch object cannot inherit Subgroup ID from a prior object', MALFORMED_OBJECT);
     }
   } else if (prior === undefined) {
     // A non-first object derives Group/Object/Subgroup/Priority from the prior
     // object; without one there is nothing to derive from. Fail cleanly rather
     // than dereferencing an undefined prior.
-    throw new ProtocolViolationError('Non-first fetch object requires prior-object context');
+    throw new ProtocolViolationError('Non-first fetch object requires prior-object context', MALFORMED_OBJECT);
   }
 
   // Group ID
@@ -417,12 +483,12 @@ export function decodeFetchObject18(
     } else if (groupOrder === 'ascending') {
       groupId = prior!.groupId + gd.value + 1n;
       if (groupId > MAX_VI64) {
-        throw new ProtocolViolationError(`Fetch Group ID overflow (ascending): ${groupId} > 2^64-1`);
+        throw new ProtocolViolationError(`Fetch Group ID overflow (ascending): ${groupId} > 2^64-1`, DELTA_ENCODING_OVERFLOW);
       }
     } else {
       const step = gd.value + 1n;
       if (step > prior!.groupId) {
-        throw new ProtocolViolationError(`Fetch Group ID underflow (descending): ${prior!.groupId} - ${step} < 0`);
+        throw new ProtocolViolationError(`Fetch Group ID underflow (descending): ${prior!.groupId} - ${step} < 0`, DELTA_ENCODING_OVERFLOW);
       }
       groupId = prior!.groupId - step;
     }
@@ -442,7 +508,7 @@ export function decodeFetchObject18(
       case FetchSubgroupMode.PRIOR:
       case FetchSubgroupMode.PRIOR_PLUS_ONE: {
         if (prior?.lastObjectSubgroupId === undefined) {
-          throw new ProtocolViolationError('Fetch object references prior Subgroup ID but no prior actual object exists');
+          throw new ProtocolViolationError('Fetch object references prior Subgroup ID but no prior actual object exists', MALFORMED_OBJECT);
         }
         if (subgroupMode === FetchSubgroupMode.PRIOR_PLUS_ONE) {
           subgroupId = prior.lastObjectSubgroupId + 1n;
@@ -469,12 +535,18 @@ export function decodeFetchObject18(
     if (isFirstObject || groupPresent) {
       objectId = od.value; // absolute (first object, or first in a new group)
     } else {
-      objectId = prior!.objectId + od.value;
-      if (objectId > MAX_VI64) throw new ProtocolViolationError(`Fetch Object ID overflow: ${objectId} > 2^64-1`);
+      // draft-23 §11.4.1.1: within a Group the delta skips at least one Object
+      // (prior + 1 is the absent-delta case), so it is prior + delta + 2.
+      objectId = prior!.objectId + od.value + (version === 23 ? 2n : 0n);
+      if (objectId > MAX_VI64) {
+        throw new ProtocolViolationError(`Fetch Object ID overflow: ${objectId} > 2^64-1`, DELTA_ENCODING_OVERFLOW);
+      }
     }
   } else {
     objectId = prior!.objectId + 1n;
-    if (objectId > MAX_VI64) throw new ProtocolViolationError(`Fetch Object ID overflow: ${objectId} > 2^64-1`);
+    if (objectId > MAX_VI64) {
+      throw new ProtocolViolationError(`Fetch Object ID overflow: ${objectId} > 2^64-1`, DELTA_ENCODING_OVERFLOW);
+    }
   }
 
   // Priority
@@ -484,7 +556,7 @@ export function decodeFetchObject18(
     pos += 1;
   } else {
     if (prior?.lastObjectPriority === undefined) {
-      throw new ProtocolViolationError('Fetch object references prior Priority but no prior actual object exists');
+      throw new ProtocolViolationError('Fetch object references prior Priority but no prior actual object exists', MALFORMED_OBJECT);
     }
     publisherPriority = prior.lastObjectPriority;
   }
