@@ -166,7 +166,8 @@ The shared outcome vocabulary currently contains:
 - Buffered playback: `skipped`, `buffer full`, `buffer eviction`, `backlog shed`,
   `late frame`, `decoder policy` (shared reasons above retain the same meaning).
 - MSE: `destroyed`, `not attached`, `stale group`, `treated as a replay`,
-  `append error`, `append aborted`, `retype`, `flushed`, `decoder reset`.
+  `append error`, `append aborted`, `retype`, `flushed`, `decoder reset`,
+  `queue capacity`, `late segment`.
 - Dispatcher: `hold queue overflow`, `output failed` (plus shared reset/flush/destroy reasons).
 - Canvas: `draw failed` (plus shared `late frame`, `flushed`, `destroyed`).
 - Audio scheduling: `schedule failed` (plus shared `flushed`, `destroyed`).

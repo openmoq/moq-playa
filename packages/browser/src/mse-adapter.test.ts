@@ -21,6 +21,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { format } from 'node:util';
 import { MseMediaSource } from './mse-adapter.js';
+import { CmafAssembler } from './cmaf-assembler.js';
 import type { DrmConfig, MseStartupReport, MseMediaSourceOptions } from './mse-adapter.js';
 
 // ─── Shared byte-building helpers (subset from mp4-box.test.ts) ──
@@ -355,13 +356,13 @@ afterEach(() => {
 
 // ─── Test harness helper ─────────────────────────────────────────
 
-async function makeReadyAdapter(): Promise<{
+async function makeReadyAdapter(options: ConstructorParameters<typeof MseMediaSource>[1] = {}): Promise<{
     adapter: MseMediaSource;
     video: MockVideoElement;
     vsb: MockSourceBuffer;
 }> {
     const video = new MockVideoElement();
-    const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+    const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, options);
     adapter.debug = true; // Enable diagnostic logging for tests
     const initData = makeInit(1, 100); // trex default_sample_duration=100
     adapter.initialize({ video: { codec: 'avc1.42c01e', initData } });
@@ -1542,7 +1543,7 @@ describe('MseMediaSource — live-buffer management', () => {
         video: MockVideoElement;
         vsb: MockSourceBuffer;
     }> {
-        const ctx = await makeReadyAdapter();
+        const ctx = await makeReadyAdapter({ reorderWindowMs: 0 });
         // Reaching playTriggered: drainQueue triggers play() once video.buffered
         // is non-empty during an idle drain. Seed a buffered range and append.
         ctx.video.buffered = makeTimeRanges([[0, 1]]);
@@ -2735,7 +2736,7 @@ describe('MseMediaSource — buffer-change chronology', () => {
 
     /** Replacement buffer holding REAL in-flight state: pending append + queued payload. */
     async function replacementWithPendingWork() {
-        const { adapter, vsb: oldSb } = await makeReadyAdapter();
+        const { adapter, vsb: oldSb } = await makeReadyAdapter({ reorderWindowMs: 0 });
         adapter.debug = true;
         adapter.appendChunk('video', seg(0), 'track1'); // in flight on the OLD buffer
         adapter.reset();
@@ -4534,4 +4535,277 @@ describe('SourceBuffer mutation terminal ownership', () => {
       await expect(changing).resolves.toBeUndefined();
     } finally { adapter.destroy(); }
   });
+});
+
+describe.each(['audio', 'video'] as const)('MSE %s append scheduling', mediaType => {
+    const ready = async (options: ConstructorParameters<typeof MseMediaSource>[1] = {}) => {
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, options);
+        adapter.setPlaybackIntent(false);
+        adapter.initialize({ [mediaType]: { codec: mediaType === 'video' ? 'avc1.42c01e' : 'mp4a.40.2',
+            initData: makeInit(1, 100, mediaType === 'video' ? 'vide' : 'soun') } });
+        currentMs.open(); await flush();
+        const buffer = mediaType === 'video' ? currentMs.videoBuffer : currentMs.audioBuffer;
+        return { adapter, video, buffer, initial: buffer.appendedPayloads.length };
+    };
+    it('retains the restart SAP when the real assembler clears its prior timeline', async () => {
+        const h = await ready();
+        const assembler = new CmafAssembler({
+            onSegment: (type, bytes, name, group) => h.adapter.appendChunk(type, bytes, name, group),
+            onDiscontinuity: (type, name) => h.adapter.clearTimeline(type, name),
+        });
+        assembler.setInitSegment(mediaType, makeInit(1, 100, mediaType === 'video' ? 'vide' : 'soun'));
+        try {
+            h.buffer.autoComplete = false;
+            assembler.push(mediaType, 'track', 1n, makeSegment({ bmd: 100000, sampleCount: 1 }));
+            assembler.push(mediaType, 'track', 2n, makeSegment({ bmd: 0, sampleCount: 1 }));
+            h.buffer.autoComplete = true; h.buffer.updating = false;
+            h.buffer.fire('update'); h.buffer.fire('updateend'); await flush(); await flush();
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toHaveLength(2);
+            expect(h.adapter.getCommittedGroupFloor(mediaType, 'track')).toBe(2n);
+        } finally { assembler.destroy(); h.adapter.destroy(); }
+    });
+    it('holds a timestamp hole until its older group tail fills it', async () => {
+        const h = await ready();
+        const prefix = makeSegment({ bmd: 0, sampleCount: 1 });
+        const tail = makeSegment({ bmd: 100, sampleCount: 1 });
+        const head = makeSegment({ bmd: 200, sampleCount: 1 });
+        try {
+            h.adapter.appendChunk(mediaType, prefix, 'track', 1n); await flush();
+            h.adapter.appendChunk(mediaType, head, 'track', 2n); await flush();
+            expect.soft(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix]);
+            h.adapter.appendChunk(mediaType, tail, 'track', 1n); await flush(); await flush();
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix, tail, head]);
+            expect(h.adapter.getCommittedGroupFloor(mediaType, 'track')).toBe(2n);
+        } finally { h.adapter.destroy(); }
+    });
+    it('chooses the older queued tail when the previous native append finishes', async () => {
+        const h = await ready();
+        const prefix = makeSegment({ bmd: 0, sampleCount: 1 });
+        const tail = makeSegment({ bmd: 100, sampleCount: 1 });
+        const head = makeSegment({ bmd: 200, sampleCount: 1 });
+        try {
+            h.buffer.autoComplete = false;
+            h.adapter.appendChunk(mediaType, prefix, 'track', 1n);
+            h.adapter.appendChunk(mediaType, head, 'track', 2n);
+            h.adapter.appendChunk(mediaType, tail, 'track', 1n);
+            h.buffer.updating = false; h.buffer.fire('update'); h.buffer.fire('updateend');
+            expect.soft(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix, tail]);
+            h.buffer.updating = false; h.buffer.fire('update'); h.buffer.fire('updateend');
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix, tail, head]);
+            h.buffer.updating = false; h.buffer.fire('update'); h.buffer.fire('updateend');
+        } finally { h.adapter.destroy(); }
+    });
+    it('expires a missing tail without later appending it backwards', async () => {
+        vi.useFakeTimers(); const h = await ready();
+        const prefix = makeSegment({ bmd: 0, sampleCount: 1 });
+        const tail = makeSegment({ bmd: 100, sampleCount: 1 });
+        const head = makeSegment({ bmd: 200, sampleCount: 1 });
+        const events: unknown[] = []; const token = {};
+        h.adapter.observeAppends(event => { events.push(event); });
+        try {
+            h.adapter.appendChunk(mediaType, prefix, 'track', 1n); await flush();
+            h.adapter.appendChunk(mediaType, head, 'track', 2n); await flush();
+            vi.advanceTimersByTime(249); await flush();
+            expect.soft(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix]);
+            vi.advanceTimersByTime(1); await flush();
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix, head]);
+            h.adapter.appendChunk(mediaType, tail, 'track', 1n, token); await flush();
+            expect(events).toEqual([{ token, state: 'discarded', reason: 'stale group' }]);
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix, head]);
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
+    it('adds no wait to timestamp-contiguous groups', async () => {
+        const h = await ready();
+        const prefix = makeSegment({ bmd: 0, sampleCount: 1 });
+        const head = makeSegment({ bmd: 100, sampleCount: 1 });
+        try {
+            h.adapter.appendChunk(mediaType, prefix, 'track', 1n); await flush();
+            h.adapter.appendChunk(mediaType, head, 'track', 2n); await flush();
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix, head]);
+        } finally { h.adapter.destroy(); }
+    });
+    it.each([undefined, 1n])('rejects an expired repair even without a different group id: %s', async group => {
+        vi.useFakeTimers(); const h = await ready(); const events: unknown[] = []; const token = {};
+        h.adapter.observeAppends(event => { events.push(event); });
+        const prefix = makeSegment({ bmd: 0, sampleCount: 1 });
+        const head = makeSegment({ bmd: 300, sampleCount: 1 });
+        try {
+            h.adapter.appendChunk(mediaType, prefix, 'track', group); await flush();
+            h.adapter.appendChunk(mediaType, head, 'track', group); await flush();
+            vi.advanceTimersByTime(100);
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 200, sampleCount: 1 }), 'track', group); await flush();
+            vi.advanceTimersByTime(149); await flush();
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix]);
+            vi.advanceTimersByTime(1); await flush(); await flush();
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toHaveLength(3);
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 100, sampleCount: 1 }), 'track', group, token); await flush();
+            expect(events).toEqual([{ token, state: 'discarded', reason: 'late segment' }]);
+            // Extending seam overlaps are still accepted after an expired gap.
+            const seam = makeSegment({ bmd: 350, sampleCount: 2 });
+            h.adapter.appendChunk(mediaType, seam, 'track', group); await flush();
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(seam);
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
+    it.each(['retype', 'reset', 'destroy'] as const)('retires a held append once on %s', async action => {
+        vi.useFakeTimers(); const h = await ready(); const token = {}; const events: unknown[] = [];
+        h.adapter.observeAppends(event => { events.push(event); });
+        try {
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 0, sampleCount: 1 }), 'track', 1n); await flush();
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 200, sampleCount: 1 }), 'track', 2n, token); await flush();
+            expect(events).toEqual([]);
+            const timersWithHold = vi.getTimerCount();
+            if (action === 'retype') await h.adapter.changeType(mediaType,
+                mediaType === 'video' ? 'avc1.42c01e' : 'mp4a.40.2', makeInit(1, 200, mediaType === 'video' ? 'vide' : 'soun'));
+            else h.adapter[action]();
+            expect(vi.getTimerCount()).toBeLessThan(timersWithHold);
+            const count = h.buffer.appendedPayloads.length;
+            vi.advanceTimersByTime(1000); await flush();
+            expect(h.buffer.appendedPayloads).toHaveLength(count);
+            expect(events).toEqual([{ token, state: 'discarded', reason: action === 'destroy' ? 'destroyed'
+                : action === 'retype' ? 'retype' : 'decoder reset' }]);
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
+    it('clears a gap wait without discarding accepted rebased media', async () => {
+        vi.useFakeTimers(); const h = await ready(); const token = {}, events: unknown[] = [];
+        h.adapter.observeAppends(event => { events.push(event); });
+        try {
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 0, sampleCount: 1 }), 'track', 1n); await flush();
+            const head = makeSegment({ bmd: 200, sampleCount: 1 });
+            h.adapter.appendChunk(mediaType, head, 'track', 2n, token); await flush();
+            const count = vi.getTimerCount();
+            h.adapter.clearTimeline(mediaType, 'track'); await flush();
+            expect(vi.getTimerCount()).toBeLessThan(count);
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(head);
+            vi.advanceTimersByTime(1000); await flush();
+            expect(events).toEqual([{ token, state: 'appended', reason: null }]);
+            expect(h.adapter.getCommittedGroupFloor(mediaType, 'track')).toBe(2n);
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
+    it.each(['chunks','bytes'] as const)('bounds queued %s with one refusal outcome', async bound => {
+        const segment = makeSegment({ bmd: 100, sampleCount: 1 });
+        const h = await ready(bound === 'chunks' ? { maxQueuedChunks: 2 } : { maxQueuedBytes: 2 * segment.byteLength });
+        const events: unknown[] = [], token = {}; h.adapter.observeAppends(event => { events.push(event); });
+        try {
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 0, sampleCount: 1 }), 'track'); await flush();
+            h.buffer.autoComplete = false;
+            h.adapter.appendChunk(mediaType, segment, 'track');
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 200, sampleCount: 1 }), 'track');
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 300, sampleCount: 1 }), 'track');
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 400, sampleCount: 1 }), 'track', undefined, token);
+            expect(events).toEqual([{ token, state: 'discarded', reason: 'queue capacity' }]);
+            expect(h.buffer.appendedPayloads).toHaveLength(h.initial + 2);
+        } finally { h.adapter.destroy(); }
+    });
+    it('keeps a partial view within its retained bytes and native append', async () => {
+        const h = await ready(); const segment = makeSegment({ bmd: 0, sampleCount: 1 });
+        const backing = new Uint8Array(segment.length + 1024); backing.fill(0x5a); backing.set(segment, 512);
+        try {
+            h.adapter.appendChunk(mediaType, backing.subarray(512, 512 + segment.length), 'track'); await flush();
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([segment]);
+        } finally { h.adapter.destroy(); }
+    });
+    it('ends native media only after accepted gap-held data drains', async () => {
+        const h = await ready(); const end = vi.spyOn(currentMs, 'endOfStream');
+        try {
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 0, sampleCount: 1 }), 'track'); await flush();
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 200, sampleCount: 1 }), 'track'); await flush();
+            h.adapter.endOfStream(); expect(end).not.toHaveBeenCalled();
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 100, sampleCount: 1 }), 'track'); await flush(); await flush();
+            expect(end).toHaveBeenCalledTimes(1);
+        } finally { h.adapter.destroy(); }
+    });
+
+    it('does not extend the reorder deadline when the wall clock moves backwards', async () => {
+        vi.useFakeTimers(); const h = await ready();
+        try {
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 0, sampleCount: 1 }), 'track'); await flush();
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 200, sampleCount: 1 }), 'track'); await flush();
+            vi.setSystemTime(Date.now() - 100000);
+            vi.advanceTimersByTime(250); await flush();
+            expect(h.buffer.appendedPayloads).toHaveLength(h.initial + 2);
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
+
+    it('rearms an early timer wake until the monotonic deadline', async () => {
+        vi.useFakeTimers(); let clock = 0;
+        const now = vi.spyOn(performance, 'now').mockImplementation(() => clock);
+        const h = await ready();
+        try {
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 0, sampleCount: 1 }), 'track'); await flush();
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 200, sampleCount: 1 }), 'track'); await flush();
+            vi.advanceTimersByTime(250); await flush();
+            expect(h.buffer.appendedPayloads).toHaveLength(h.initial + 1);
+            clock = 250; vi.advanceTimersByTime(250); await flush();
+            expect(h.buffer.appendedPayloads).toHaveLength(h.initial + 2);
+        } finally { h.adapter.destroy(); now.mockRestore(); vi.useRealTimers(); }
+    });
+
+    it('does not renew an expired gap when native quota eviction retries its append', async () => {
+        vi.useFakeTimers(); const h = await ready(); const token = {}, events: unknown[] = [];
+        h.adapter.observeAppends(event => { events.push(event); });
+        const head = makeSegment({ bmd: 200, sampleCount: 1 });
+        try {
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 0, sampleCount: 1 }), 'track'); await flush();
+            h.video.currentTime = 10; h.buffer.buffered = makeTimeRanges([[0, 20]]);
+            const quota = new Error('full'); quota.name = 'QuotaExceededError'; h.buffer.throwNextAppend = quota;
+            h.adapter.appendChunk(mediaType, head, 'track', undefined, token); await flush();
+            vi.advanceTimersByTime(250); await flush(); await flush();
+            expect(h.buffer.removeCalls).toContainEqual([0, 9]);
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(head);
+            expect(events).toEqual([{ token, state: 'appended', reason: null }]);
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
+    it.each(['clear', 'retype'] as const)('cancels an old pending end on %s', async action => {
+        const h = await ready(); const end = vi.spyOn(currentMs, 'endOfStream');
+        try {
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 0, sampleCount: 1 }), 'track'); await flush();
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: 200, sampleCount: 1 }), 'track'); await flush();
+            h.adapter.endOfStream(); expect(end).not.toHaveBeenCalled();
+            if (action === 'clear') h.adapter.clearTimeline(mediaType, 'track');
+            else await h.adapter.changeType(mediaType, mediaType === 'video' ? 'avc1.42c01e' : 'mp4a.40.2',
+                makeInit(1, 100, mediaType === 'video' ? 'vide' : 'soun'));
+            await flush();
+            expect(end).not.toHaveBeenCalled();
+            h.adapter.appendChunk(mediaType, makeSegment({ bmd: action === 'clear' ? 300 : 500, sampleCount: 1 }), 'track'); await flush();
+            h.adapter.endOfStream(); expect(end).toHaveBeenCalledTimes(1);
+        } finally { h.adapter.destroy(); }
+    });
+
+});
+
+
+describe('MSE append scheduling options', () => {
+    it.each([
+        ['reorderWindowMs', -1], ['reorderWindowMs', NaN], ['reorderWindowMs', Infinity],
+        ['reorderWindowMs', 1.5], ['reorderWindowMs', 0x80000000],
+        ['maxQueuedChunks', 0], ['maxQueuedChunks', NaN], ['maxQueuedChunks', Infinity],
+        ['maxQueuedChunks', 1.5], ['maxQueuedBytes', 0], ['maxQueuedBytes', -1],
+        ['maxQueuedBytes', NaN], ['maxQueuedBytes', Infinity], ['maxQueuedBytes', 1.5],
+    ])('refuses invalid %s=%s before creating native media', (name, value) => {
+        const previous = currentMs;
+        expect(() => new MseMediaSource(new MockVideoElement() as unknown as HTMLVideoElement,
+            { [name as string]: value })).toThrow();
+        expect(currentMs).toBe(previous);
+    });
+});
+
+
+it('waits for the in-flight main range before positioning startup', async () => {
+    const { adapter, video, vsb } = await makeReadyAdapter();
+    try {
+        video.modelSeekLifecycle = true;
+        const play = vi.spyOn(video, 'play');
+        video.buffered = makeTimeRanges([[0, 0.07]]);
+        vsb.autoComplete = false;
+        adapter.appendChunk('video', makeSegment({ bmd: 0, sampleCount: 1 }), 'track');
+        adapter.appendChunk('video', makeSegment({ bmd: 100, sampleCount: 1 }), 'track');
+        await flush();
+        expect.soft(play).not.toHaveBeenCalled();
+        video.buffered = makeTimeRanges([[0, 0.07], [1.5, 11.6]]);
+        vsb.autoComplete = true; vsb.updating = false; vsb.fire('update'); vsb.fire('updateend');
+        for (let i = 0; i < 40; i++) await Promise.resolve();
+        expect(play).toHaveBeenCalledTimes(1);
+        expect(video.currentTime).toBe(1.5);
+    } finally { adapter.destroy(); }
 });

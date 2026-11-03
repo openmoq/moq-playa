@@ -240,7 +240,7 @@ export interface AudioOutputLike {
 
 /** Caller-owned opaque identity for one append; use a fresh object for every call. */
 export type MediaAppendToken = object;
-export type MediaAppendReason = 'destroyed' | 'not attached' | 'stale group' | 'treated as a replay' | 'append error' | 'retype' | 'flushed' | 'decoder reset' | 'append aborted' | 'completion unproven';
+export type MediaAppendReason = 'destroyed' | 'not attached' | 'stale group' | 'treated as a replay' | 'append error' | 'retype' | 'flushed' | 'decoder reset' | 'append aborted' | 'completion unproven' | 'queue capacity' | 'late segment';
 /** A terminal observation; unavailable does not assert a media discard or success. */
 export interface MediaAppendObservation {
   readonly token: MediaAppendToken;
