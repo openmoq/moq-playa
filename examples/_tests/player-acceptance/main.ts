@@ -5,6 +5,7 @@ import type { PlaybackSample } from '../../../scripts/player-acceptance/assessme
 import { observeAudio, observeCanvas } from './sinks.js';
 import { observeLocmafDelivery, assessLocmafDelivery, observeConnectionObjects } from './received.js';
 import { observeDecodedSource } from './decoded.js';
+import { observeWarmStart } from './warm-start.js';
 import { observeNativeMse } from './native-mse.js';
 
 const video = document.querySelector<HTMLVideoElement>('#video')!;
@@ -12,6 +13,7 @@ const canvas = document.querySelector<HTMLCanvasElement>('#canvas')!;
 const params = new URLSearchParams(location.search);
 const frameOutput = params.get('output') === 'canvas';
 const webAudioOutput = params.has('audio') ? params.get('audio') === 'webcodecs' : frameOutput;
+const warmObserver = params.has('warm') ? observeWarmStart() : undefined;
 const locmafObserver = params.has('locmaf') ? observeLocmafDelivery() : undefined;
 canvas.width = 640;
 canvas.height = 360;
@@ -53,6 +55,7 @@ const player = new Player(null, {
   ...(params.has('altGroup') ? { videoAltGroup: Number(params.get('altGroup')) } : {}),
   moqtPlayerConfig: {
     logLevel: params.has('debug') ? 'debug' : 'none',
+    ...(warmObserver ? { warmStartCurrentGroup: params.get('warm') === '1', objectTransform: warmObserver.transform } : {}),
     locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',
     audioConstraints: { lang: params.get('lang') ?? 'en' },
     ...(params.get('debug') === 'handover' || nativeMse ? { createMediaSource: () => {
@@ -63,8 +66,12 @@ const player = new Player(null, {
     ...(decodedSource ? { createVideoDecoder: () => decodedSource.wrap(new WebCodecsVideoDecoder()) } : {}),
     createConnection: () => {
       const connection = new MoqtConnection(18);
-      if (locmafObserver) {
-        observeConnectionObjects(connection, locmafObserver.record);
+      warmObserver?.connection(connection);
+      if (warmObserver || locmafObserver) {
+        observeConnectionObjects(connection, (stream, object) => {
+          const source = warmObserver?.record(connection, stream, object);
+          locmafObserver?.record(stream, object, source !== 'fetch');
+        });
       }
       return connection;
     },
@@ -209,6 +216,7 @@ function snapshot() {
   return { samples: [...samples], events: [...events], startupError, transportState: [...transportState],
     nativeEvents: [...nativeEvents], nativeError: video.error ? { code: video.error.code, message: video.error.message } : null,
     nativeMse: nativeMse?.snapshot() ?? null,
+    warmStart: warmObserver?.snapshot() ?? null,
     playbackQuality: playbackQuality(),
     outputState: { presentedFrames: canvasObserver?.frames ?? presentedFrames,
       currentTime: player.currentTime, audioRms: audioRms(), audioContext: audioContext?.state,
@@ -221,6 +229,7 @@ function snapshot() {
 
 const acceptance = {
   get startupError() { return startupError; },
+  get warmReceipts() { return warmObserver?.snapshot().received ?? []; },
   get presentedFrames() { return canvasObserver?.frames ?? presentedFrames; },
   get currentTime() { return frameOutput ? player.currentTime / 1000 : video.currentTime; },
   get audioRms() { return audioRms(); },

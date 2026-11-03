@@ -14,6 +14,7 @@ import { prepareFixture } from './fixture.mjs';
 import { stopProcess as stop } from './shutdown.mjs';
 import { checkExampleViews } from './view-ui.mjs';
 import { checkHandover } from './handover.mjs';
+import { assessWarmStart } from './warm-start.mjs';
 import { checkRenditionSwitch } from './rendition-switch.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
@@ -179,6 +180,14 @@ try {
   const webUrl = await waitForLine(vite, /Acceptance page: (http:\/\/127\.0\.0\.1:\d+\/)/);
   const scenarios = [
     { name: 'moving-video-and-audio', fixture: 'moving', silent: false, expectedFailure: null },
+    ...[
+      { name: 'warm-start-cmaf', fixture: 'moving' },
+      { name: 'warm-start-loc', fixture: 'loc', version: 4, mode: 'media',
+        expected: { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24, outputKind: 'canvas' } },
+      ...['mse', 'frame'].map(locmaf => ({ name: `warm-start-locmaf-${locmaf}`, fixture: 'moving', locmaf,
+        expected: { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24, outputKind: locmaf === 'frame' ? 'canvas' : 'video' } })),
+    ].map(scenario => ({ ...scenario, warm: true, silent: false, expectedFailure: null })),
+    { name: 'warm-start-disabled', fixture: 'moving', warm: false, silent: false, expectedFailure: null },
     { name: 'cmaf-manual-rendition-switch', fixture: 'switching', startLoop: 3, manualSwitch: true,
       silent: false, expectedFailure: null },
     { name: 'cmaf-manual-avc-level-switch', fixture: 'retyping', startLoop: 3, manualSwitch: true, nativeRetypes: true,
@@ -233,11 +242,14 @@ try {
       ? ['--filter', '@moqt/example-node-relay', 'exec', 'tsx', '../../scripts/player-acceptance/handover-relays.ts',
           ...(scenario.handover === 'reject' ? ['--reject-audio'] : []),
           ...(scenario.handover === 'catalog-timeout' ? ['--hold-catalog'] : [])]
-      : ['--filter', '@moqt/example-node-relay', 'relay-server'],
+      : scenario.warm !== undefined
+        ? ['--filter', '@moqt/example-node-relay', 'exec', 'tsx', '../../scripts/player-acceptance/warm-start-relay.ts']
+        : ['--filter', '@moqt/example-node-relay', 'relay-server'],
       { HOST: '127.0.0.1', PORT: '0', DEMO_NAMESPACE: namespace, RELAY_CERT: relayCert, RELAY_KEY: relayKey,
         ...(scenario.view !== undefined || scenario.exampleViews ? { DEMO_TRACK: 'video-portrait' } : {}) });
     const handover = scenario.handover ? JSON.parse(await waitForLine(relay, /handover-ready: (.+)/)) : null;
-    const relayUrl = handover?.source ?? await waitForLine(relay, /listening on (https:\/\/127\.0\.0\.1:\d+\/moq)/);
+    const warmPeer = scenario.warm !== undefined ? JSON.parse(await waitForLine(relay, /warm-start-ready: (.+)/)) : null;
+    const relayUrl = warmPeer?.source ?? handover?.source ?? await waitForLine(relay, /listening on (https:\/\/127\.0\.0\.1:\d+\/moq)/);
     // `startLoop` applies to BOTH publishers: a later media origin is a
     // property of the presentation, not of one relay. Offsetting only the
     // source would also put the replacement's live point 18 s behind, which
@@ -258,6 +270,19 @@ try {
       ? startPublisher(`${scenario.name}-replacement-publisher`, handover.target, scenario.replacementFixture ?? scenario.fixture) : null;
     await waitForLine(publisher, /loop mode: (\d+ tracks established)/);
     if (replacementPublisher) await waitForLine(replacementPublisher, /loop mode: (\d+ tracks established)/);
+    if (warmPeer) {
+      // Observe publication before dialing; never spend the player's warm
+      // deadline waiting for this test's setup to manufacture a longer prefix.
+      const deadline = performance.now() + 5000;
+      for (;;) {
+        const response = await bounded(fetch(warmPeer.control), 3000, 'warm publisher status');
+        assert.ok(response.ok, 'Warm publisher status response');
+        const status = await bounded(response.json(), 3000, 'warm publisher status body');
+        if (performance.now() >= deadline) throw new Error('Warm publisher readiness deadline');
+        if (status.videoPublished) break;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+    }
     if ((scenario.version || scenario.mixed === 'audio') && scenario.expected) {
       const epochUs = await waitForLine(publisher, /epoch_us=(\d+)/);
       scenario.expected.timestampDomain = scenario.mode ?? 'media';
@@ -308,6 +333,7 @@ try {
         }
       }
       const query = new URLSearchParams({ url: relayUrl, ns: namespace, hash: pin });
+      if (scenario.warm !== undefined) query.set('warm', scenario.warm ? '1' : '0');
       if (scenario.manualSwitch) {
         query.set('nativeMse', '1');
         if (process.argv.includes('--debug')) query.set('debug', 'mse');
@@ -336,6 +362,29 @@ try {
       } else {
         await page.goto(`${webUrl}_tests/player-acceptance/?${query}`, { waitUntil: 'domcontentloaded' });
         await page.locator('#start').click();
+        if (scenario.warm) {
+          let accepted;
+          const deadline = performance.now() + 5000;
+          while (!accepted) {
+            const response = await bounded(fetch(warmPeer.control), 1000, 'warm video acceptance');
+            const status = await bounded(response.json(), 1000, 'warm video acceptance body');
+            if (performance.now() >= deadline) throw new Error('Warm video acceptance deadline');
+            accepted = status.events.find(event => event.type === 'accepted' && event.name === 'video-360');
+            if (!accepted) await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          const handle = await page.waitForFunction(alias => window.playerAcceptance.warmReceipts.find(
+            receipt => receipt.source === 'live' && receipt.alias === alias), accepted.alias, { polling: 10, timeout: 1000 });
+          const witness = await handle.jsonValue(); await handle.dispose();
+          caseResult.warmReleaseWitness = witness;
+          const release = new URL('/release-prefix', warmPeer.control);
+          for (const [key, value] of Object.entries({ alias: witness.alias, group: witness.group, object: witness.object, receiptSeq: witness.seq })) {
+            release.searchParams.set(key, String(value));
+          }
+          const response = await bounded(fetch(release, { method: 'POST' }), 1000, 'warm prefix release');
+          assert.ok(response.ok, 'Peer refused the browser receipt witness');
+          const acknowledged = await bounded(response.json(), 1000, 'warm prefix release body');
+          assert.equal(acknowledged.receiverAcknowledged, true);
+        }
         const startupStart = performance.now();
         await page.waitForFunction(() => {
           const state = window.playerAcceptance;
@@ -343,6 +392,13 @@ try {
           return state?.presentedFrames >= 8 && state.currentTime > 0.1 && state.audioRms > 0.015;
         }, null, { timeout: 20000 });
         caseResult.outputReadyAfterMs = performance.now() - startupStart;
+        if (scenario.warm && scenario.locmaf) {
+          const liveGroupsStart = performance.now();
+          await page.waitForFunction(() => window.playerAcceptance.snapshot().locmafFailures.length === 0,
+            null, { polling: 100, timeout: 20000 });
+          caseResult.locmafLiveGroupsReadyAfterMs = performance.now() - liveGroupsStart;
+          assert.ok(caseResult.locmafLiveGroupsReadyAfterMs < 20000, 'LOCMAF live-group readiness deadline');
+        }
         let observed;
         if (scenario.manualSwitch) {
           caseResult.renditionSwitch = {};
@@ -358,6 +414,13 @@ try {
           observed = await page.evaluate(() => window.playerAcceptance.finish());
         }
         caseResult.observed = observed;
+        if (warmPeer) {
+          const response = await bounded(fetch(warmPeer.control), 3000, 'warm peer status');
+          assert.ok(response.ok, 'Warm peer status response');
+          caseResult.warmPeer = await bounded(response.json(), 3000, 'warm peer status body');
+          caseResult.warmStart = assessWarmStart(observed.warmStart, caseResult.warmPeer, scenario.warm);
+          assert.deepEqual(caseResult.warmStart.failures, [], 'Warm prefix processing and overtaking receipt evidence');
+        }
         caseResult.playbackQuality = assessPlaybackQuality(observed.playbackQuality, scenario.expected?.outputKind !== 'canvas');
         assert.deepEqual(caseResult.playbackQuality.failures, [], 'Public playback quality must match its owned native video source');
         caseResult.assessment = scenario.manualSwitch ? caseResult.renditionSwitch.continuity : assessPlayback(observed.samples, scenario.expected);

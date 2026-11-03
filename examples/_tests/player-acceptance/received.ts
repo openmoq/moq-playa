@@ -35,7 +35,7 @@ export function observeLocmafDelivery() {
   const groups = new Map<string, { alias: string; group: string; full: number; delta: number; streams: Set<string> }>();
   const errors: string[] = [];
   return {
-    record(streamId: bigint, object: MoqtObject) {
+    record(streamId: bigint, object: MoqtObject, media = true) {
       if (object.kind !== 'data' || !object.payload.length) return;
       const payload = object.payload;
       if (payload[0] === 123) {
@@ -51,6 +51,8 @@ export function observeLocmafDelivery() {
           }
         } catch { /* Not a catalog. Validate it as a media Object below. */ }
       }
+      // FETCH has no media alias/subgroup identity, but can carry the catalog.
+      if (!media) return;
       try {
         const decoded = deserializeLocmafObject(payload);
         if (decoded.kind !== 'moof') throw new Error(`Expected full/delta moof, got ${decoded.kind}`);

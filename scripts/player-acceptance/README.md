@@ -252,3 +252,20 @@ native `getVideoPlaybackQuality()` reads. MSE video must report valid counters
 within that native interval; canvas output must report null. Displayed frames
 are the derived `totalVideoFrames - droppedVideoFrames`, not decoder output or
 physical display evidence. This check does not change legacy frame counters.
+
+Warm-start cases (`warm-start-cmaf`, `warm-start-loc`,
+`warm-start-locmaf-mse`, `warm-start-locmaf-frame`) use an owned local
+relay that holds the video Joining FETCH until the browser observes a live
+video receipt and the driver acknowledges that exact witness. Send completion
+alone is not treated as receipt evidence across independent QUIC streams.
+The browser witnesses raw receipt order separately from the application's
+contiguous processing of the saved prefix and subsequent live tail. Each
+case also passes the normal moving-picture and audible-output assessment.
+For LOCMAF, the full/delta format witness covers two complete live groups;
+FETCH media is excluded because its stream carries a request id, not a track
+alias. After initial output is ready, these cases wait at most 20 seconds for
+that live-group evidence, report the wait separately, then run the normal
+7.25-second playback window. Prefix ordering is witnessed independently.
+`warm-start-disabled` verifies that the default path issues no media FETCH.
+These runs demonstrate initial ordering and playback; they do not measure
+physical A/V synchronization or certify a remote relay.
