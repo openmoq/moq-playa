@@ -100,7 +100,7 @@ export interface MediaPublisherOptions {
 }
 
 /** Drafts whose wire behavior this publisher implements explicitly. */
-const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18, 22];
+const SUPPORTED_DRAFTS: readonly DraftVersion[] = [14, 16, 18, 22, 23];
 
 /** Validate a queue bound: NaN/Infinity would disable backpressure entirely
  *  and a non-positive or fractional cap has no coherent meaning. */

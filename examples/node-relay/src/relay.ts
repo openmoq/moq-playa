@@ -464,7 +464,12 @@ async function serveFetchFromCache(
     ? { group: last.groupId, object: last.objectId + 1n }
     : { group: start.group, object: start.object }; // empty range: end == start is legal (§9.16.3)
 
-  await conn.acceptFetch(requestId, { endLocation });
+  // draft-23 §3.2: name the Largest Object; the session sends it when it is
+  // inside the requested range. Earlier drafts ignore it.
+  const newest = track.cache[track.cache.length - 1];
+  const largestObject = newest && atOrAfterStart(newest.groupId, newest.objectId)
+    ? { group: newest.groupId, object: newest.objectId } : undefined;
+  await conn.acceptFetch(requestId, { endLocation, ...(largestObject ? { largestObject } : {}) });
   const sid = await conn.openFetchStream(requestId);
   for (const c of servable) {
     await conn.sendFetchObject(sid, {

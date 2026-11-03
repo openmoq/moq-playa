@@ -13,7 +13,7 @@
     "types": ["node"]
   },
   // Scoped to simulation suites, test-support helpers, repository scripts,
-  // and draft-22 conformance tests. The wider
+  // and draft-22 / draft-23 conformance tests. The wider
   // `*.test.ts` corpus predates any typecheck gate and does not compile clean
   // under these options; widening this include is a separate cleanup.
   "include": [
@@ -80,6 +80,11 @@
     "packages/webtransport/src/adapter-d22-lifecycle.test.ts",
     "packages/webtransport/src/topology/inbound-request.test.ts",
     "packages/player/src/player-d22-bootstrap.loopback.test.ts",
+    "packages/transport/src/control/draft23-codec.test.ts",
+    "packages/transport/src/data/fetch-stream-23.test.ts",
+    "packages/transport/src/session/session-d23.test.ts",
+    "packages/transport/src/vectors/vectors-d23.test.ts",
+    "packages/webtransport/src/adapter-d23.test.ts",
     "packages/webtransport/src/adapter-goaway-notice.test.ts",
     "packages/webtransport/src/adapter-goaway-diagnostics.test.ts",
     "packages/player/src/player-goaway-request-owners.test.ts",
