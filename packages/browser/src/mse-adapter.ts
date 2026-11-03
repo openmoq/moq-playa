@@ -1256,18 +1256,16 @@ export class MseMediaSource implements MediaSourceLike {
       if (mediaType === 'video') this.videoInitSummary = summary;
       else this.audioInitSummary = summary;
 
-      // Set timestampOffset so the new track's segments (rebased to ~0
-      // by the assembler's per-track epoch) land at the current playback
-      // position. Only video changes — audio stays on its original offset
-      // since the audio track doesn't switch.
-      if (!buffer.updating) {
-        buffer.timestampOffset = this.video.currentTime;
-        this.logDebug('[MSE] changeType timestampOffset set to %.2f', this.video.currentTime);
-      }
+      // timestampOffset is deliberately left alone. Tracks in a switching
+      // set share one media timeline, and the assembler keeps its shared
+      // epoch across a track switch, so the new track's segments already
+      // carry decode times that continue the old track's. Re-basing them
+      // to currentTime would shift video later by the playback position:
+      // a gap at the playhead (stall) and a fixed offset against audio.
+      // @see ISO/IEC 23000-19 §7.3.4 (switching set tracks are time-aligned)
 
-      // Clear all video timeline entries — the overlap index records raw
-      // tfdt values, but timestampOffset has changed. Old entries would
-      // cause false overlap drops on the new track's segments.
+      // Drop the per-track overlap indexes; the retired track's entries are
+      // dead weight, and a later switch back to it starts a fresh index.
       const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
       timelines.clear();
     } finally {
