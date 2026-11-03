@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 function observer(errorOnDestroy: boolean, webAudio = false) {
   class Player {
     state = 'idle';
+    readonly stats = { videoPlaybackQuality: null };
     handlers = new Map<string, (data: unknown) => void>();
     on(type: string, callback: (data: unknown) => void) { this.handlers.set(type, callback); }
     async destroy() {

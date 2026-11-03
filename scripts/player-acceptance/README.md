@@ -245,3 +245,10 @@ that every browser must reproduce a particular loss. The media workflow runs the
 mandatory gate and zero-window control. FFmpeg and Chrome are required; browser
 selection uses the same `PLAYER_TEST_BROWSER` convention as the playback runner.
 Reports and raw PCM are retained under `reports/player-acceptance/`.
+
+
+Each player snapshot brackets the public `videoPlaybackQuality` read with two
+native `getVideoPlaybackQuality()` reads. MSE video must report valid counters
+within that native interval; canvas output must report null. Displayed frames
+are the derived `totalVideoFrames - droppedVideoFrames`, not decoder output or
+physical display evidence. This check does not change legacy frame counters.

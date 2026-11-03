@@ -75,3 +75,27 @@ export function assessPlayback(samples, expected = { videoWidth: 640, videoHeigh
   }
   return { passed: failures.size === 0, failures: [...failures], samples: samples.length, durationMs };
 }
+
+/** Compare a public snapshot to native samples bracketing that same read. */
+export function assessPlaybackQuality(measurement, hasMseVideo) {
+  const failures = [];
+  const { before, reported, after } = measurement ?? {};
+  if (!hasMseVideo) {
+    if (reported !== null) failures.push('quality-without-mse-video');
+    return { passed: failures.length === 0, failures };
+  }
+  const valid = value => value && Number.isSafeInteger(value.totalVideoFrames)
+    && value.totalVideoFrames >= 0 && value.totalVideoFrames <= 0xffffffff
+    && Number.isSafeInteger(value.droppedVideoFrames) && value.droppedVideoFrames >= 0
+    && value.droppedVideoFrames <= value.totalVideoFrames
+    && value.displayedVideoFrames === value.totalVideoFrames - value.droppedVideoFrames
+    && Number.isFinite(value.creationTimeMs) && value.creationTimeMs >= 0;
+  if (![before, reported, after].every(valid)) failures.push('invalid-or-unavailable-quality');
+  else {
+    for (const field of ['totalVideoFrames', 'droppedVideoFrames', 'displayedVideoFrames', 'creationTimeMs']) {
+      if (reported[field] < before[field] || reported[field] > after[field]) failures.push(`quality-outside-native-${field}`);
+    }
+    if (after.totalVideoFrames === 0) failures.push('native-quality-never-progressed');
+  }
+  return { passed: failures.length === 0, failures };
+}

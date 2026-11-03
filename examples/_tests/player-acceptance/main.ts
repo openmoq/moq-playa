@@ -193,11 +193,23 @@ document.querySelector('#start')!.addEventListener('click', () => {
   })().catch((error: unknown) => { startupError = String(error); });
 }, { once: true });
 
+function playbackQuality() {
+  const native = () => {
+    const value = video.getVideoPlaybackQuality?.();
+    return value ? { totalVideoFrames: value.totalVideoFrames, droppedVideoFrames: value.droppedVideoFrames,
+      displayedVideoFrames: value.totalVideoFrames - value.droppedVideoFrames, creationTimeMs: value.creationTime } : null;
+  };
+  const before = native();
+  const reported = player.stats.videoPlaybackQuality ?? null;
+  return { before, reported, after: native() };
+}
+
 function snapshot() {
   const locmafDelivery = locmafObserver?.snapshot();
   return { samples: [...samples], events: [...events], startupError, transportState: [...transportState],
     nativeEvents: [...nativeEvents], nativeError: video.error ? { code: video.error.code, message: video.error.message } : null,
     nativeMse: nativeMse?.snapshot() ?? null,
+    playbackQuality: playbackQuality(),
     outputState: { presentedFrames: canvasObserver?.frames ?? presentedFrames,
       currentTime: player.currentTime, audioRms: audioRms(), audioContext: audioContext?.state,
       videoPaused: video.paused, videoTime: video.currentTime, videoReadyState: video.readyState,

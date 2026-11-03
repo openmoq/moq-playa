@@ -8,7 +8,7 @@ import { resolve, join } from 'node:path';
 import { randomUUID, X509Certificate, createHash } from 'node:crypto';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright';
-import { assessPlayback } from './assessment.mjs';
+import { assessPlayback, assessPlaybackQuality } from './assessment.mjs';
 import { assessVideoPresentation } from './presentation.mjs';
 import { prepareFixture } from './fixture.mjs';
 import { stopProcess as stop } from './shutdown.mjs';
@@ -358,6 +358,8 @@ try {
           observed = await page.evaluate(() => window.playerAcceptance.finish());
         }
         caseResult.observed = observed;
+        caseResult.playbackQuality = assessPlaybackQuality(observed.playbackQuality, scenario.expected?.outputKind !== 'canvas');
+        assert.deepEqual(caseResult.playbackQuality.failures, [], 'Public playback quality must match its owned native video source');
         caseResult.assessment = scenario.manualSwitch ? caseResult.renditionSwitch.continuity : assessPlayback(observed.samples, scenario.expected);
         caseResult.presentationFailures = assessVideoPresentation(observed.samples);
         assert.deepEqual(caseResult.presentationFailures, [], 'Public video draw observation');

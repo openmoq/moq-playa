@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { assessPlayback } from './assessment.mjs';
+import { assessPlayback, assessPlaybackQuality } from './assessment.mjs';
 
 function healthySamples() {
   return Array.from({ length: 29 }, (_, i) => ({
@@ -167,4 +167,37 @@ describe('browser playback acceptance', () => {
   it('rejects impossible presentation-time progress despite normal frame counts', () => {
     expect(assessPlayback(canvasSamples().map((s) => ({ ...s, presentedMediaTimeS: s.presentedMediaTimeS * 1000 })), canvasExpected).failures).toContain('presentation-clock');
   });
+});
+
+
+describe('native playback-quality observation', () => {
+  const counts = (total: number, dropped: number, time: number) => ({ totalVideoFrames: total,
+    droppedVideoFrames: dropped, displayedVideoFrames: total - dropped, creationTimeMs: time });
+  const measurement = () => ({ before: counts(300, 3, 10), reported: counts(301, 3, 11), after: counts(302, 4, 12) });
+  it('allows actual native progress between the two bracketing reads', () => {
+    expect(assessPlaybackQuality(measurement(), true).passed).toBe(true);
+  });
+  it.each(['totalVideoFrames', 'droppedVideoFrames', 'creationTimeMs'] as const)('refuses reported %s outside the native bracket', field => {
+    const sample = measurement(); sample.reported[field] = sample.after[field] + 1;
+    sample.reported.displayedVideoFrames = sample.reported.totalVideoFrames - sample.reported.droppedVideoFrames;
+    expect(assessPlaybackQuality(sample, true).passed).toBe(false);
+  });
+  it('requires observed output, complete fields and exact derived arithmetic', () => {
+    expect(assessPlaybackQuality({ before: counts(0, 0, 1), reported: counts(0, 0, 2), after: counts(0, 0, 3) }, true).passed).toBe(false);
+    const sample = measurement(); sample.reported.displayedVideoFrames++;
+    expect(assessPlaybackQuality(sample, true).passed).toBe(false);
+    expect(assessPlaybackQuality({ ...measurement(), reported: null }, true).passed).toBe(false);
+  });
+  it('does not attribute hidden element totals to a canvas player', () => {
+    const sample = measurement();
+    expect(assessPlaybackQuality(sample, false).failures).toEqual(['quality-without-mse-video']);
+    expect(assessPlaybackQuality({ ...sample, reported: null }, false).passed).toBe(true);
+  });
+});
+
+it.each([[300, 4], [302, 3]])('refuses impossible derived displayed totals: total %s, dropped %s', (total, dropped) => {
+  const counts = (t: number, d: number, time: number) => ({ totalVideoFrames: t, droppedVideoFrames: d,
+    displayedVideoFrames: t - d, creationTimeMs: time });
+  expect(assessPlaybackQuality({ before: counts(300, 3, 10), reported: counts(total!, dropped!, 11),
+    after: counts(302, 4, 12) }, true).failures).toContain('quality-outside-native-displayedVideoFrames');
 });

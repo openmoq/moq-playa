@@ -44,3 +44,19 @@ export function assessPlayback(samples: readonly PlaybackSample[], expected?: Ex
   samples: number;
   durationMs: number;
 };
+
+export interface PlaybackQualityCounts {
+  readonly totalVideoFrames: number;
+  readonly droppedVideoFrames: number;
+  readonly displayedVideoFrames: number;
+  readonly creationTimeMs: number;
+}
+export interface PlaybackQualityMeasurement {
+  readonly before: PlaybackQualityCounts | null;
+  readonly reported: PlaybackQualityCounts | null;
+  readonly after: PlaybackQualityCounts | null;
+}
+export function assessPlaybackQuality(measurement: PlaybackQualityMeasurement, hasMseVideo: boolean): {
+  passed: boolean;
+  failures: string[];
+};
