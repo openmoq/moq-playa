@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { CatalogState } from '@openmoq/msf';
 import type { MoqtConnection } from '@openmoq/webtransport';
-import { varint } from '@openmoq/transport';
+import { varint, type ControlMessage, type MoqtObject } from '@openmoq/transport';
 import { MoqtPlayer } from './player.js';
 import type { MoqtPlayerConfig } from './config.js';
 import type { QualityController } from './quality-controller.js';
@@ -36,6 +36,20 @@ function makePlayer(options: Partial<MoqtPlayerConfig> = {}, wireCatalog = false
   });
   const subscribed = () => connection.subscribe.mock.calls.map(call => new TextDecoder().decode(call[1]));
   return { player, connection, subscribed };
+}
+
+/** Accept and deliver a target keyframe through the public adapter callbacks. */
+async function deliverTarget(h: ReturnType<typeof makePlayer>) {
+  const connection = h.connection as unknown as MoqtConnection;
+  const requestId = await h.connection.subscribe.mock.results.at(-1)!.value;
+  const alias = varint(BigInt(requestId) + 100n);
+  connection.onMessage?.({ type: 'SUBSCRIBE_OK', requestId, trackAlias: alias, parameters: new Map() } as ControlMessage);
+  const send = () => connection.onObject?.(0n, {
+    kind: 'data', publisherPriority: 128, trackAlias: alias, groupId: varint(1n), subgroupId: varint(0n), objectId: varint(0n),
+    payload: new Uint8Array([1]),
+  } as MoqtObject);
+  send();
+  return send;
 }
 
 describe('player video alternate groups', () => {
@@ -74,15 +88,15 @@ describe('player video alternate groups', () => {
       expect(p.bufferAbrController).toBeNull();
       await h.player.selectVideoTrack('hevc-high');
       expect(p.bufferAbrController).toBeNull(); // Staged, not committed.
-      p.completePendingVideoSwitch();
+      await deliverTarget(h);
       h.player.setAutoQuality(true);
       expect(p.bufferAbrController?.currentTrack.name).toBe('hevc-high');
       expect(p.bufferAbrController.evaluate({ bufferDepthUs: 0, bandwidthEstimateKbps: 0 })).toEqual({ action: 'downshift', targetIndex: 1 });
       await h.player.selectVideoTrack('hevc-low');
-      p.completePendingVideoSwitch();
+      await deliverTarget(h);
       expect(p.bufferAbrController.currentTrack.name).toBe('hevc-low');
       await h.player.selectVideoTrack('avc-low');
-      p.completePendingVideoSwitch();
+      await deliverTarget(h);
       expect(p.bufferAbrController).toBeNull();
     } finally { await h.player.destroy(); }
   });
@@ -105,10 +119,10 @@ describe('player video alternate groups', () => {
       await h.player.load();
       await h.player.selectVideoTrack('hevc-low', 'abr', 'downshift');
       expect(p.bufferAbrController.currentTrack.name).toBe('hevc-high');
-      p.completePendingVideoSwitch();
+      const repeat = await deliverTarget(h);
       expect(p.bufferAbrController.currentTrack.name).toBe('hevc-low');
       expect(p.bufferAbrController.index).toBe(1);
-      p.completePendingVideoSwitch();
+      repeat();
       expect(p.bufferAbrController.index).toBe(1);
     } finally { await h.player.destroy(); }
   });

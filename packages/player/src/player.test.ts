@@ -29,6 +29,7 @@ import { varint, ObjectStatus } from '@openmoq/transport';
 import { encodeLocHeaders } from '@openmoq/loc';
 import type { ClockSource } from '@openmoq/playback';
 import type { DataStreamTerminal, GoawayNotice } from '@openmoq/webtransport';
+import { NON_SYNC_FLAGS, SYNC_FLAGS, buildChunk, videoInit } from '../../locmaf/test-support/cmaf.js';
 
 // ─── Mock Adapter ────────────────────────────────────────────────────
 
@@ -8586,6 +8587,80 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
+    describe('a selection while a switch is pending', () => {
+      const lastSubName = (adapter: ReturnType<typeof createMockAdapter>) =>
+        new TextDecoder().decode((adapter.subscribe as any).mock.calls.at(-1)[1]);
+      const unsubIds = (adapter: ReturnType<typeof createMockAdapter>) =>
+        (adapter.unsubscribe as any).mock.calls.map((c: unknown[]) => BigInt(c[0] as bigint));
+
+      it('unsubscribes the superseded target and stages only the newest one', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadMultitrack(adapter);
+        const failedFn = vi.fn();
+        player.on('quality_switch_failed', failedFn);
+
+        await player.selectVideoTrack('video-2');
+        const supersededReqId = BigInt(await (adapter.subscribe as any).mock.results.at(-1)!.value);
+        await player.selectVideoTrack('video-0');
+
+        expect(lastSubName(adapter)).toBe('video-0');
+        // The superseded target is gone: otherwise its objects, no longer
+        // staged, would reach the sink as ordinary media.
+        expect(unsubIds(adapter)).toEqual([supersededReqId]);
+        expect((player as any).pendingVideoSwitch.newTrackName).toBe('video-0');
+        expect((player as any).pendingVideoSwitch.oldTrackName).toBe('video-1');
+        expect(failedFn).toHaveBeenCalledTimes(1);
+        expect(failedFn.mock.calls[0][0]).toMatchObject({ fromTrackName: 'video-1', toTrackName: 'video-2' });
+
+        await player.destroy();
+      });
+
+      it('repeating the pending target is a no-op', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadMultitrack(adapter);
+
+        await player.selectVideoTrack('video-2');
+        const subCount = (adapter.subscribe as any).mock.calls.length;
+        await player.selectVideoTrack('video-2');
+
+        expect((adapter.subscribe as any).mock.calls.length).toBe(subCount);
+        expect(adapter.unsubscribe).not.toHaveBeenCalled();
+
+        await player.destroy();
+      });
+
+      it('selecting the current track cancels the pending switch', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadMultitrack(adapter);
+
+        await player.selectVideoTrack('video-2');
+        const pendingReqId = BigInt(await (adapter.subscribe as any).mock.results.at(-1)!.value);
+        const subCount = (adapter.subscribe as any).mock.calls.length;
+        await player.selectVideoTrack('video-1');
+
+        expect((adapter.subscribe as any).mock.calls.length).toBe(subCount);
+        expect(unsubIds(adapter)).toEqual([pendingReqId]);
+        expect((player as any).pendingVideoSwitch).toBeNull();
+
+        await player.destroy();
+      });
+
+      it('rejects while the pending switch is committing', async () => {
+        const adapter = createMockAdapter();
+        const player = await loadMultitrack(adapter);
+
+        await player.selectVideoTrack('video-2');
+        (player as any).switchInProgress = true;
+
+        await expect(player.selectVideoTrack('video-0')).rejects.toThrow(/is committing/);
+        expect((player as any).pendingVideoSwitch.newTrackName).toBe('video-2');
+        expect(adapter.unsubscribe).not.toHaveBeenCalled();
+
+        (player as any).switchInProgress = false;
+        await player.destroy();
+      });
+    });
+
     it('selects middle quality video track by default from altGroup', async () => {
       const adapter = createMockAdapter();
       const player = await loadMultitrack(adapter);
@@ -8848,7 +8923,7 @@ describe('MoqtPlayer', () => {
         onStall: null as ((durationMs: number) => void) | null,
         // changeType always rejects — simulates the browser saying the
         // new codec isn't supported (or any other MSE-level failure).
-        changeType: vi.fn(() => Promise.reject(new Error('mock changeType rejected'))),
+        changeType: vi.fn().mockRejectedValueOnce(new Error('mock changeType rejected')).mockResolvedValue(undefined),
       };
       const selectCmafTrack = vi.fn();
       const cmafAssemblerFactory = (
@@ -8960,8 +9035,11 @@ describe('MoqtPlayer', () => {
       await new Promise(r => setTimeout(r, 10));
       await new Promise(r => setTimeout(r, 10));
 
-      // changeType was called and rejected; rollback fired.
-      expect(mockMs.changeType).toHaveBeenCalledTimes(1);
+      // A rejected retype can have mutated the source, so restoration is explicit.
+      expect(mockMs.changeType).toHaveBeenCalledTimes(2);
+      expect(mockMs.changeType.mock.calls[1]).toEqual([
+        'video', 'avc1.4D401F', new Uint8Array([0x00, 0x01, 0x02, 0x03]),
+      ]);
       expect(failedFn).toHaveBeenCalledTimes(1);
       expect(failedFn.mock.calls[0][0]).toMatchObject({
         type: 'quality_switch_failed',
@@ -9169,6 +9247,86 @@ describe('MoqtPlayer', () => {
     });
 
     /**
+     * The switch splices on the new track's first sync sample, read from
+     * the fragment's own sample flags, not merely on objectId 0: a group
+     * that opens with a delta frame would leave a gap at the playhead.
+     */
+    it('commits a CMAF switch on the first sync sample, not a non-sync object 0', async () => {
+      const init = btoa(String.fromCharCode(...videoInit()));
+      const catalog = JSON.stringify({
+        version: 1,
+        tracks: [
+          { name: 'video_hi', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1,
+            altGroup: 1, codec: 'avc1.4D401F', width: 1280, height: 720, bitrate: 2_500_000, initData: init },
+          { name: 'video_lo', packaging: 'cmaf', isLive: true, role: 'video', renderGroup: 1,
+            altGroup: 1, codec: 'avc1.4D401F', width: 854, height: 480, bitrate: 1_200_000, initData: init },
+        ],
+      });
+      const adapter = createMockAdapter();
+      const mockMs = {
+        initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
+        mediaElement: null,
+        onFirstFrame: null as (() => void) | null,
+        onError: null as ((error: Error) => void) | null,
+        onStall: null as ((durationMs: number) => void) | null,
+      };
+      const pushed: bigint[] = [];
+      const assembler = {
+        push: vi.fn((_mt: 'video' | 'audio', trackName: string, groupId: bigint) => {
+          if (trackName === 'video_lo') pushed.push(groupId);
+        }),
+        selectTrack: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
+      };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter), startLevel: 0,
+        createMediaSource: () => mockMs, createCmafAssembler: () => assembler,
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+      ackCatalog(adapter);
+      adapter._triggerObject(0n, {
+        kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
+        objectId: varint(0), payload: new TextEncoder().encode(catalog),
+      } as MoqtObject);
+      await new Promise(r => setTimeout(r, 10));
+
+      const switchedFn = vi.fn();
+      player.on('quality_switched', switchedFn);
+      await player.selectVideoTrack('video_lo');
+      const newReqId = await (adapter.subscribe as any).mock.results.at(-1)!.value;
+      const newAlias = BigInt(newReqId) + 100n;
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(newReqId), trackAlias: varint(newAlias),
+        parameters: new Map(),
+      } as unknown as ControlMessage);
+      const deliver = (groupId: number, objectId: number, flags: number) => {
+        adapter._triggerObject(newAlias, {
+          kind: 'data', trackAlias: varint(newAlias), groupId: varint(groupId), subgroupId: varint(0),
+          objectId: varint(objectId),
+          payload: buildChunk({ bmdt: 3000 * (groupId * 30 + objectId), samples: [{ duration: 3000, size: 4, flags }] }),
+        } as MoqtObject);
+      };
+
+      // Object 0 of a group that opens on a delta frame: not a splice point.
+      deliver(7, 0, NON_SYNC_FLAGS);
+      deliver(7, 1, NON_SYNC_FLAGS);
+      await new Promise(r => setTimeout(r, 10));
+      expect(switchedFn).not.toHaveBeenCalled();
+      expect(pushed).toEqual([]);
+
+      // The next sync sample commits; the delta frames staged ahead of it
+      // are dropped rather than appended after the new init.
+      deliver(8, 0, SYNC_FLAGS);
+      await new Promise(r => setTimeout(r, 10));
+      expect(switchedFn).toHaveBeenCalledTimes(1);
+      expect(pushed).toEqual([8n]);
+
+      await player.destroy();
+    });
+
+    /**
      * Up-front validation: a CMAF codec switch needs init bytes (inline
      * `initData` or a separate `initTrack`). If the catalog provides
      * neither, `selectVideoTrack` must reject BEFORE mutating any
@@ -9323,6 +9481,154 @@ describe('MoqtPlayer', () => {
 
       await player.destroy();
     });
+  });
+
+  // ─── CMAF switch: per-track init and retired-track isolation ─────
+
+  describe('CMAF switch re-initializes MSE with the target track init', () => {
+    /**
+     * Each CMAF track carries its own init (track_ID, sample entry, trex),
+     * so a rendition switch must append the target's init even when the
+     * codec string is unchanged, and no retired-track segment may reach
+     * MSE once that re-init starts.
+     */
+    const moof = new Uint8Array([0, 0, 0, 8, 0x6d, 0x6f, 0x6f, 0x66]);
+    const mdat = new Uint8Array([0, 0, 0, 8, 0x6d, 0x64, 0x61, 0x74]);
+
+    async function setup(
+      targetCodec: string,
+      changeType: () => Promise<void>,
+    ) {
+      const catalog = JSON.stringify({
+        version: 1,
+        tracks: [
+          {
+            name: 'video_720', packaging: 'cmaf', isLive: true, role: 'video',
+            renderGroup: 1, altGroup: 1, codec: 'avc1.4D401F', width: 1280, height: 720,
+            bitrate: 2_500_000, initData: btoa(String.fromCharCode(0x00, 0x01, 0x02, 0x03)),
+          },
+          {
+            name: 'video_480', packaging: 'cmaf', isLive: true, role: 'video',
+            renderGroup: 1, altGroup: 1, codec: targetCodec, width: 854, height: 480,
+            bitrate: 1_200_000, initData: btoa(String.fromCharCode(0x10, 0x11, 0x12, 0x13)),
+          },
+        ],
+      });
+      const adapter = createMockAdapter();
+      const mockMs = {
+        initialize: vi.fn(),
+        appendChunk: vi.fn(),
+        endOfStream: vi.fn(),
+        reset: vi.fn(),
+        destroy: vi.fn(),
+        mediaElement: null,
+        onFirstFrame: null as (() => void) | null,
+        onError: null as ((error: Error) => void) | null,
+        onStall: null as ((durationMs: number) => void) | null,
+        changeType: vi.fn(changeType),
+      };
+      const pushed: Array<{ trackName: string; groupId: bigint }> = [];
+      const assembler = {
+        push: vi.fn((_mt: 'video' | 'audio', trackName: string, groupId: bigint) => {
+          pushed.push({ trackName, groupId });
+        }),
+        selectTrack: vi.fn(),
+        getEpoch: () => null,
+        reset: vi.fn(),
+        destroy: vi.fn(),
+      };
+      const player = new MoqtPlayer({
+        ...createConfig(adapter),
+        startLevel: 0,
+        createMediaSource: () => mockMs,
+        createCmafAssembler: () => assembler,
+      });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+      ackCatalog(adapter);
+      adapter._triggerObject(0n, {
+        kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
+        objectId: varint(0), payload: new TextEncoder().encode(catalog),
+      } as MoqtObject);
+      await new Promise(r => setTimeout(r, 10));
+      await ackMedia(adapter);
+      const oldAlias = BigInt(await (adapter.subscribe as any).mock.results[1]!.value);
+
+      const deliver = (alias: bigint, groupId: number, objectId: number, payload: Uint8Array) => {
+        adapter._triggerObject(alias, {
+          kind: 'data', trackAlias: varint(alias), groupId: varint(groupId),
+          subgroupId: varint(0), objectId: varint(objectId), payload,
+        } as MoqtObject);
+      };
+
+      await player.selectVideoTrack('video_480');
+      const newReqId = await (adapter.subscribe as any).mock.results.at(-1)!.value;
+      const newAlias = BigInt(newReqId) + 100n;
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: varint(newReqId), trackAlias: varint(newAlias),
+        parameters: new Map(),
+      } as unknown as ControlMessage);
+      return { player, mockMs, assembler, pushed, deliver, oldAlias, newAlias };
+    }
+
+    it('same-codec switch appends the target init before its media', async () => {
+      const { player, mockMs, pushed, deliver, newAlias } = await setup(
+        'avc1.4D401F', () => Promise.resolve());
+      const switchedFn = vi.fn();
+      player.on('quality_switched', switchedFn);
+
+      deliver(newAlias, 5, 0, moof);
+      await new Promise(r => setTimeout(r, 10));
+
+      expect(mockMs.changeType).toHaveBeenCalledTimes(1);
+      const [mt, codec, init] = mockMs.changeType.mock.calls[0]! as unknown as [string, string, Uint8Array];
+      expect(mt).toBe('video');
+      expect(codec).toBe('avc1.4D401F');
+      expect(Array.from(init)).toEqual([0x10, 0x11, 0x12, 0x13]);
+      // Staged new-track media reached the assembler only after the re-init.
+      expect(pushed).toEqual([{ trackName: 'video_480', groupId: 5n }]);
+      expect(switchedFn).toHaveBeenCalledTimes(1);
+
+      await player.destroy();
+    });
+
+    it('drops retired-track segments that arrive while the re-init is in flight', async () => {
+      let finish!: () => void;
+      const { player, pushed, deliver, oldAlias, newAlias } = await setup(
+        'avc1.4D401E', () => new Promise<void>(r => { finish = r; }));
+
+      // Old track plays until the switch commits.
+      deliver(oldAlias, 4, 0, moof);
+      deliver(oldAlias, 4, 0, mdat);
+      expect(pushed.filter(p => p.trackName === 'video_720')).toHaveLength(2);
+
+      // New keyframe starts the commit; the old track's next group lands
+      // while changeType is still pending.
+      deliver(newAlias, 5, 0, moof);
+      deliver(oldAlias, 5, 0, moof);
+      deliver(oldAlias, 5, 0, mdat);
+      expect(pushed.filter(p => p.trackName === 'video_720')).toHaveLength(2);
+
+      finish();
+      await new Promise(r => setTimeout(r, 10));
+      expect(pushed.at(-1)).toEqual({ trackName: 'video_480', groupId: 5n });
+      expect(pushed.filter(p => p.trackName === 'video_720')).toHaveLength(2);
+
+      await player.destroy();
+    });
+    it('keeps the committed assembler target when a quality observer throws', async () => {
+      const { player, assembler, deliver, newAlias } = await setup('avc1.4D401F', () => Promise.resolve());
+      try {
+        player.on('quality_switched', () => { throw new Error('quality observer failed'); });
+        deliver(newAlias, 5, 0, moof);
+        await new Promise(resolve => setTimeout(resolve, 10));
+        expect(assembler.selectTrack).toHaveBeenLastCalledWith('video', 'video_480');
+        expect(player.stats.qualitySwitchCount).toBe(1);
+      } finally { await player.destroy(); }
+    });
+
   });
 
   // ─── External Adapter Mode ────────────────────────────────────────

@@ -414,9 +414,9 @@ export interface GapJumpEvent {
 
 /**
  * Quality switch initiated (ABR) — `selectVideoTrack` accepted the
- * request and started subscribing to the new track. The switch is NOT
- * yet committed; expect either `quality_switched` (success) or
- * `quality_switch_failed` (rollback) to follow.
+ * request and started preparing the new track. The switch is NOT yet
+ * committed; expect `quality_switched` (success), `quality_switch_failed`
+ * (rollback), or a fatal error if the running source cannot be restored.
  *
  * UI affordance: render a "switching to ..." spinner here.
  *
