@@ -541,7 +541,6 @@ export class Player {
     const base: MoqtPlayerConfig = {
       url: opts.url,
       namespace: opts.namespace,
-      catalogTrackName: opts.catalogTrackName,
       draftVersion,
       autoQuality: opts.autoQuality ?? DEFAULTS.autoQuality,
       startLevel: opts.startLevel ?? DEFAULTS.startLevel,
@@ -552,6 +551,10 @@ export class Player {
       }),
       createConnection: () => new MoqtConnection(draftVersion),
     };
+
+    if (opts.catalogTrackName !== undefined) {
+      Object.assign(base, { catalogTrackName: opts.catalogTrackName });
+    }
 
     if (this.strategy === 'webcodecs') {
       Object.assign(base, {

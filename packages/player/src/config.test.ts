@@ -12,6 +12,20 @@ function minConfig(overrides?: Partial<MoqtPlayerConfig>): MoqtPlayerConfig {
   return { url: 'https://relay.example.com/moq', namespace: 'live', ...overrides };
 }
 
+describe('catalog track name configuration', () => {
+  it.each(['.catalog', '', 'catálogo'])('accepts a lossless UTF-8 name %j', catalogTrackName => {
+    expect(() => validateConfig(minConfig({ catalogTrackName }))).not.toThrow();
+  });
+
+  it.each(['\ud800', '\udfff'])('rejects an ill-formed name %j before connecting', catalogTrackName => {
+    expect(() => validateConfig(minConfig({ catalogTrackName }))).toThrow(/UTF-8|surrogate/);
+  });
+
+  it('rejects a non-string name from an untyped caller', () => {
+    expect(() => validateConfig(minConfig({ catalogTrackName: 42 as unknown as string }))).toThrow(/catalogTrackName/);
+  });
+});
+
 describe('video altGroup configuration', () => {
   it.each([0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('rejects invalid group ID %s', (videoAltGroup) => {
     expect(() => validateConfig(minConfig({ videoAltGroup }))).toThrow('videoAltGroup');

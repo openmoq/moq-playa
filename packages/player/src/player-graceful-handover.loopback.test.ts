@@ -23,7 +23,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function peer(draft: Draft) {
+function peer(draft: Draft, catalogName = 'catalog') {
   const { a, b } = createLoopback();
   const client = new MoqtConnection(draft);
   const server = new MoqtConnection(draft, { role: 'server' });
@@ -74,8 +74,8 @@ function peer(draft: Draft) {
       await flush(128);
     },
     async bootstrap(payload: Uint8Array, finish = true) {
-      await this.accept('catalog', 100n, { group: 5n, object: 0n });
-      const request = requests.find(r => r.name === 'catalog')!;
+      await this.accept(catalogName, 100n, { group: 5n, object: 0n });
+      const request = requests.find(r => r.name === catalogName)!;
       let complete: () => Promise<void>;
       if (draft === 22) {
         expect(request.parameters?.get(0x23n)?.[0]).toEqual(Uint8Array.of(1, 0x21, 1, 1));
@@ -185,9 +185,10 @@ async function fixture(draft: Draft, options: {
   oldSeparateInit?: boolean;
   config?: Partial<MoqtPlayerConfig>;
 } = {}) {
-  const old = peer(draft);
-  const next = peer(draft);
-  const third = peer(draft);
+  const catalogName = options.config?.catalogTrackName ?? 'catalog';
+  const old = peer(draft, catalogName);
+  const next = peer(draft, catalogName);
+  const third = peer(draft, catalogName);
   const transportGate = deferred<typeof next.transport>();
   const transportCalls: string[] = [];
   const received: Array<{ name: string; group: bigint }> = [];
@@ -242,8 +243,8 @@ async function fixture(draft: Draft, options: {
     await player.load();
     if (options.defaultBootstrap) await old.bootstrap(catalog(options.oldSeparateInit, 'draft-01'));
     else {
-      await old.accept('catalog', 100n);
-      await old.send('catalog', catalog(options.oldSeparateInit));
+      await old.accept(catalogName, 100n);
+      await old.send(catalogName, catalog(options.oldSeparateInit));
     }
     if (options.oldSeparateInit) {
       await old.accept('init-video', 202n);
@@ -279,6 +280,24 @@ async function fixture(draft: Draft, options: {
 }
 
 describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft => {
+  it.each([undefined, '.catalog'])('keeps catalog name %s through default-bootstrap handover', async name => {
+    const h = await fixture(draft, { defaultBootstrap: true,
+      config: name === undefined ? {} : { catalogTrackName: name } });
+    try {
+      await h.old.goaway();
+      await h.next.bootstrap(catalog(false, 'draft-01'));
+      await h.next.accept('video', 200n);
+      await h.next.accept('audio', 201n);
+      await flush(256);
+      expect(h.migrated).toHaveBeenCalledTimes(1);
+      expect(h.old.requests[0]!.name).toBe(name ?? 'catalog');
+      expect(h.next.requests[0]!.name).toBe(name ?? 'catalog');
+      expect(h.errors).toEqual([]);
+      await h.next.send('video', chunk('video', 3n), 3n);
+      expect(h.received).toContainEqual({ name: 'video', group: 3n });
+    } finally { await h.destroy(); }
+  });
+
   it('continues established media while the replacement transport is pending', async () => {
     const h = await fixture(draft, { holdTransport: true });
     try {

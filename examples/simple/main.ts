@@ -57,7 +57,7 @@ async function main(): Promise<void> {
   const player = new Player(playerContainer, {
     url: relayUrl,
     namespace,
-    ...(catalogTrackName ? { catalogTrackName } : {}),
+    catalogTrackName,
     ...(certHash ? { certHash } : {}),
     ...(draftVersion ? { draftVersion } : {})
   });

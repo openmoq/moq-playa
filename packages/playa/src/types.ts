@@ -23,8 +23,8 @@ export interface PlayerOptions {
   readonly url: string;
   /** Track namespace for the broadcast (e.g., `live/stream`). */
   readonly namespace: string;
-  /** Catalog track name, if it differs from default (e.g., `.catalog`). */
-  readonly catalogTrackName: string;
+  /** Compatibility override for nonstandard catalog names. Default: `catalog` (MSF-01 §5). */
+  readonly catalogTrackName?: string;
 
   // ── Connection ──
 

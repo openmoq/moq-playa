@@ -174,6 +174,34 @@ async function deliverFetchObject(
     await flush();
 }
 
+describe.each([14, 16, 18] as const)('draft %i catalog track naming', draft => {
+    it.each([undefined, '.catalog'])('subscribes to %s without changing the namespace', async name => {
+        const adapter = createMockAdapter(draft);
+        const { player } = await loadPlayer(adapter, name === undefined ? {} : { catalogTrackName: name });
+        try {
+            const [namespace, track] = adapter.subscribe.mock.calls[0]!;
+            expect((namespace as Uint8Array[]).map(field => new TextDecoder().decode(field))).toEqual(['live', 'broadcast']);
+            expect(new TextDecoder().decode(track as Uint8Array)).toBe(name ?? 'catalog');
+        } finally { await player.destroy(); }
+    });
+
+    it.each([undefined, '.catalog'])('fetchCatalog uses %s and still parses its result', async name => {
+        const adapter = createMockAdapter(draft);
+        const { player } = await loadPlayer(adapter, name === undefined ? {} : { catalogTrackName: name });
+        try {
+            const snapshot = player.fetchCatalog();
+            const result = snapshot.then(value => ({ value }), error => ({ error }));
+            await flush();
+            const [namespace, track] = adapter.fetch.mock.calls[0]!;
+            const id = BigInt(await adapter.fetch.mock.results[0]!.value);
+            await deliverFetchObject(adapter, id, 400n, 0n, 0n, enc(CATALOG));
+            expect(await result).toMatchObject({ value: { tracks: expect.any(Array) } });
+            expect((namespace as Uint8Array[]).map(field => new TextDecoder().decode(field))).toEqual(['live', 'broadcast']);
+            expect(new TextDecoder().decode(track as Uint8Array)).toBe(name ?? 'catalog');
+        } finally { await player.destroy(); }
+    });
+});
+
 describe('catalog failure state and pending delivery', () => {
     const players: MoqtPlayer[] = [];
     beforeEach(() => vi.useFakeTimers());
@@ -574,9 +602,10 @@ describe('catalog retry with Joining FETCH', () => {
         adapter._triggerStreamClosed(100n);
     }
 
-    it.each([16, 18] as const)('draft %i: retries with a new subscription and matching Joining FETCH', async (draft) => {
+    it.each(([16, 18] as const).flatMap(draft => [undefined, '.catalog'].map(name => ({ draft, name }))))(
+      'draft $draft: retries $name with a new subscription and matching Joining FETCH', async ({ draft, name }) => {
         const adapter = createMockAdapter(draft);
-        const { player, events, errors } = await loadPlayer(adapter);
+        const { player, events, errors } = await loadPlayer(adapter, name === undefined ? {} : { catalogTrackName: name });
         players.push(player);
         rejectCatalog(adapter, 1n, 2001n);
         expect(adapter.fetchCancel).toHaveBeenCalledWith(3n);
@@ -584,6 +613,7 @@ describe('catalog retry with Joining FETCH', () => {
         expect(adapter.subscribe).toHaveBeenCalledTimes(1);
         await vi.advanceTimersByTimeAsync(1);
         expect(adapter.subscribe).toHaveBeenCalledTimes(2);
+        expect(new TextDecoder().decode(adapter.subscribe.mock.calls[1]![1] as Uint8Array)).toBe(name ?? 'catalog');
         expect(adapter.subscribe.mock.calls[1]![2]).toMatchObject({
             subscriptionFilter: { type: 'LargestObject' }, terminalDelivery: 'drain',
         });
@@ -1064,9 +1094,9 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
         expect(adapter.joiningFetch).toHaveBeenCalledTimes(1);
     });
 
-    it('retriable DONE post-ready → staged recovery: candidate adopts atomically, active untouched until then', async () => {
+    it.each([undefined, '.catalog'])('catalog %s: retriable DONE stages recovery without changing the active catalog', async name => {
         const adapter = createMockAdapter(16);
-        const { events } = await loadPlayer(adapter);
+        const { events } = await loadPlayer(adapter, name === undefined ? {} : { catalogTrackName: name });
         await flush();
         ackCatalog(adapter);
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
@@ -1092,6 +1122,7 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
         const catalogSubs = adapter.subscribe.mock.calls.filter(
             (c: unknown[]) => (c[2] as { subscriptionFilter?: { type?: string } })?.subscriptionFilter?.type === 'LargestObject');
         expect(catalogSubs).toHaveLength(2);
+        expect(new TextDecoder().decode(catalogSubs[1]![1] as Uint8Array)).toBe(name ?? 'catalog');
         const candOpts = catalogSubs[1]![2];
         expect(candOpts.subscriptionFilter.type).toBe('LargestObject');
         expect(candOpts.terminalDelivery).toBe('drain');
@@ -4036,8 +4067,9 @@ describe('catalog bootstrap wiring — strict mode and draft boundaries', () => 
 
 describe('catalog bootstrap wiring — MSF-01 fallback conformance', () => {
     /** Refuse the join (largest KNOWN) so rung-1 emulation serves the prefix. */
-    async function viaEmulation(adapter: ReturnType<typeof createMockAdapter>, payload: Uint8Array) {
-        const loaded = await loadPlayer(adapter);
+    async function viaEmulation(adapter: ReturnType<typeof createMockAdapter>, payload: Uint8Array,
+        cfg?: Partial<MoqtPlayerConfig>) {
+        const loaded = await loadPlayer(adapter, cfg);
         await flush();
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n),
@@ -4067,11 +4099,14 @@ describe('catalog bootstrap wiring — MSF-01 fallback conformance', () => {
         expect(errors.some((e) => (e as { severity?: string }).severity === 'fatal')).toBe(true);
     });
 
-    it('an MSF-00 catalog through the SAME fallback path is accepted — no joining MUST exists for it', async () => {
+    it.each([undefined, '.catalog'])('catalog %s: accepts MSF-00 through fallback on the same track', async name => {
         const adapter = createMockAdapter(16);
-        const { events, errors } = await viaEmulation(adapter, enc({ ...CATALOG, version: 1 }));
+        const { events, errors, player } = await viaEmulation(adapter, enc({ ...CATALOG, version: 1 }),
+            name === undefined ? {} : { catalogTrackName: name });
         expect(events).toEqual(['catalog_received']);
         expect(errors).toEqual([]);
+        expect(new TextDecoder().decode(adapter.fetch.mock.calls[0]![1] as Uint8Array)).toBe(name ?? 'catalog');
+        await player.destroy();
     });
 });
 

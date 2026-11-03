@@ -120,7 +120,7 @@ const SWITCH_STAGING_TIMEOUT_MS = 3_000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-/** Catalog track name per MSF §5.1.10. */
+/** MSF-01 §5 defaults to 'catalog'; other names are explicit compatibility overrides. */
 function catalogTrackName(trackName: string | undefined): string {
   return trackName ?? 'catalog';
 }

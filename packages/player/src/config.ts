@@ -112,8 +112,8 @@ export interface ConnectionConfig {
   readonly namespace: string | readonly string[];
 
   /**
-   * The track name for requesting catalogs. This should be
-   * 'catalog' in most cases but can be overridden here if required.
+   * Compatibility override for nonstandard catalog track names.
+   * Default: 'catalog', as required by MSF-01 §5.
    */
   readonly catalogTrackName?: string;
 
@@ -875,6 +875,10 @@ function validateSelection(config: MoqtPlayerConfig): void {
 
 /** Validate configuration before opening a connection. */
 export function validateConfig(config: MoqtPlayerConfig): void {
+  if (config.catalogTrackName !== undefined) {
+    if (typeof config.catalogTrackName !== 'string') throw new TypeError('catalogTrackName must be a string');
+    assertUtf8EncodableIdentity(undefined, config.catalogTrackName);
+  }
   if (config.videoAltGroup !== undefined) {
     if (!Number.isSafeInteger(config.videoAltGroup)) {
       throw new RangeError('videoAltGroup must be a safe integer');

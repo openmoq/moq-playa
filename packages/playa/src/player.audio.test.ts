@@ -80,12 +80,14 @@ function mockElement(): any {
 
 // Engine stub — captures the audioOutput factory so we can assert what was passed
 let capturedAudioOutputFactory: (() => unknown) | undefined;
+let capturedCatalogTrackName: string | undefined;
 
 vi.mock('@openmoq/player', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@openmoq/player')>();
   class MockEngine {
     constructor(config: any) {
       capturedAudioOutputFactory = config.createAudioOutput;
+      capturedCatalogTrackName = config.catalogTrackName;
     }
     async load(): Promise<void> {}
     play(): void {}
@@ -106,6 +108,16 @@ vi.mock('@openmoq/player', async (importOriginal) => {
 
 // Import AFTER mocks are set up
 const { Player } = await import('./player.js');
+
+describe('Player catalog track name', () => {
+  it.each([undefined, '.catalog'])('passes the optional name %s to the engine', async catalogTrackName => {
+    const player = new Player(mockElement() as HTMLElement, {
+      url: 'x', namespace: 'y', ...(catalogTrackName === undefined ? {} : { catalogTrackName }),
+    });
+    expect(capturedCatalogTrackName).toBe(catalogTrackName);
+    await player.destroy();
+  });
+});
 
 describe('Player — audio activation', () => {
   beforeEach(() => {
