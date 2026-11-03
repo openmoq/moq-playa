@@ -2851,19 +2851,13 @@ describe('Session', () => {
         expect(close.error).toBe(SessionErrorCode.INVALID_REQUEST_ID);
       });
 
-      it('validates incoming request IDs are sequential', () => {
-        // First request OK: ID=0
-        session.handleControlMessage(incomingSubscribe(0n));
-
-        // Second request should be ID=2, not ID=4
-        const actions = session.handleControlMessage({
-          ...incomingSubscribe(4n),
-          requestId: varint(4n),
-        });
-
-        expect(actions.length).toBe(1);
-        const close = actions[0] as CloseConnectionAction;
-        expect(close.error).toBe(SessionErrorCode.INVALID_REQUEST_ID);
+      it('accepts reordered incoming request IDs but rejects reuse', () => {
+        for (const id of [0n, 4n, 2n]) {
+          expect(session.handleControlMessage(incomingSubscribe(id))).not.toContainEqual(
+            expect.objectContaining({ type: 'close_connection' }));
+        }
+        expect(session.handleControlMessage(incomingSubscribe(4n))).toContainEqual(
+          expect.objectContaining({ type: 'close_connection', error: SessionErrorCode.INVALID_REQUEST_ID }));
       });
 
       it('rejects request ID exceeding our MAX_REQUEST_ID', () => {

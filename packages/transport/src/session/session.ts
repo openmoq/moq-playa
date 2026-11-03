@@ -79,7 +79,7 @@ import {
   type NotifyNamespaceAction,
 } from './types.js';
 import { SetupGate, SetupError } from './setup.js';
-import { RequestIdAllocator, RequestIdError } from './request-id.js';
+import { RequestIdAllocator, RequestIdError, RequestIdTrackingLimitError } from './request-id.js';
 import { getProtocolProfile, type ProtocolProfile } from '../profile.js';
 import type { RequestEndpoint } from './request-endpoint.js';
 import { SubscriptionStateMachine } from './subscription.js';
@@ -1025,6 +1025,10 @@ export class Session {
           if (isRequestStreamDraft(this._draftVersion)) {
             return this.handleIncomingSubscribeNamespace(msg as SubscribeNamespace);
           }
+          if (this._draftVersion === 16) {
+            return this.closeWithError(SessionErrorCode.PROTOCOL_VIOLATION,
+              'SUBSCRIBE_NAMESPACE must begin its own bidirectional stream (3.3 / 6.1)');
+          }
           return this.handleUnsupportedControlMessage(msg);
         case 'SUBSCRIBE_TRACKS':
           // draft-18 only: inbound SUBSCRIBE_TRACKS is a publisher-side continuing
@@ -1471,6 +1475,9 @@ export class Session {
     try {
       this.requestIdAllocator.validateIncoming(requestId);
     } catch (e) {
+      if (e instanceof RequestIdTrackingLimitError) {
+        return { error: this.closeWithError(SessionErrorCode.INTERNAL_ERROR, e.message) };
+      }
       if (e instanceof RequestIdError) {
         const errorCode = e.code === 'TOO_MANY_REQUESTS'
           ? SessionErrorCode.TOO_MANY_REQUESTS
@@ -1489,6 +1496,7 @@ export class Session {
     if (this.requestIdAllocator.getOurMaxRequestId() === 0n) return [];
 
     const newMax = this.requestIdAllocator.nextReplenishValue();
+    if (newMax <= this.requestIdAllocator.getOurMaxRequestId()) return [];
     this.requestIdAllocator.commitReplenish();
 
     return [{
@@ -4227,6 +4235,29 @@ export class Session {
     }
     this.namespaceSubscriptions.delete(requestId as bigint);
     return [];
+  }
+
+  /** Admit a draft-16 namespace opener and reject unsupported serving (§4 / §6.1). */
+  handleNamespaceStreamRequest(msg: SubscribeNamespace): SessionOutboundAction[] {
+    if (this._draftVersion !== 16
+        || (this._state !== SessionState.ESTABLISHED && this._state !== SessionState.DRAINING)
+        || msg.type !== 'SUBSCRIBE_NAMESPACE') {
+      return this.closeWithError(SessionErrorCode.PROTOCOL_VIOLATION, 'Invalid namespace stream opener');
+    }
+    const paramError = this.validateControlMessageParams(msg);
+    if (paramError) return this.closeWithError(paramError.error, paramError.reason);
+    if (msg.subscribeOptions !== 0n && msg.subscribeOptions !== 1n && msg.subscribeOptions !== 2n) {
+      return this.closeWithError(SessionErrorCode.PROTOCOL_VIOLATION, 'Invalid SUBSCRIBE_NAMESPACE Subscribe Options (9.24)');
+    }
+    const validated = this.validateAndReplenish(msg.requestId);
+    if (validated.error) return validated.error;
+    try {
+      validateTrackNamespacePrefix(msg.trackNamespacePrefix);
+    } catch (error) {
+      return this.closeWithError(SessionErrorCode.PROTOCOL_VIOLATION,
+        error instanceof Error ? error.message : 'Malformed namespace prefix');
+    }
+    return [...this.handleUnsupportedControlMessage(msg), ...(validated.replenish ?? [])];
   }
 
   handleNamespaceStreamMessage(

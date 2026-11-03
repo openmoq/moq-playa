@@ -20,7 +20,7 @@
  * @module
  */
 
-import { ProtocolViolationError, type ControlCodec, type ControlMessage, type DecodedControlMessage } from '@openmoq/transport';
+import { MessageType, ProtocolViolationError, readVarint, type ControlCodec, type ControlMessage, type DecodedControlMessage } from '@openmoq/transport';
 import { ControlStreamFramer } from '../framer.js';
 import type { WebTransportBidirectionalStream } from '../types.js';
 
@@ -74,6 +74,7 @@ export class InboundRequestStreamContext {
   private readFinished = false;
   private failed = false;
   private finishing: Promise<void> | null = null;
+  private draft16Opener: { bytes: Uint8Array; used: number } | undefined;
 
   /** The peer has FINed its sending direction; our response side may remain open. */
   get peerFinished(): boolean { return this.readFinished; }
@@ -89,6 +90,8 @@ export class InboundRequestStreamContext {
     this.writer = stream.writable.getWriter();
     this.reader = stream.readable.getReader();
     this.framer = new ControlStreamFramer(codec);
+    // Draft-16 uses additional bidi streams only for namespace requests (§3.3).
+    if (codec.version === 16) this.draft16Opener = { bytes: new Uint8Array(8), used: 0 };
     if (codec.version === 22) {
       // STOP_SENDING can arrive after the peer has FINed its other direction.
       // The read loop is then over, so cancellation must also observe writes.
@@ -187,19 +190,48 @@ export class InboundRequestStreamContext {
     this.handlers.onFailure(err, this);
   }
 
+  private drainFrames() {
+    try {
+      return this.framer.drain();
+    } catch (error) {
+      // The legacy codec uses RangeError for malformed complete frames. Keep
+      // those protocol errors distinct from a peer cancelling its stream.
+      if (this.codec.version === 16 && !(error instanceof ProtocolViolationError)) {
+        throw new ProtocolViolationError(error instanceof Error ? error.message : String(error));
+      }
+      throw error;
+    }
+  }
+
+  private validateOpener(chunk: Uint8Array): void {
+    const opener = this.draft16Opener;
+    if (!opener || chunk.length === 0) return;
+    const count = Math.min(opener.bytes.length - opener.used, chunk.length);
+    opener.bytes.set(chunk.subarray(0, count), opener.used);
+    opener.used += count;
+    if (opener.used < 1 << (opener.bytes[0]! >> 6)) return;
+    if (readVarint(opener.bytes, 0).value !== MessageType.SUBSCRIBE_NAMESPACE) {
+      throw new ProtocolViolationError('Additional draft-16 bidi streams must begin with SUBSCRIBE_NAMESPACE (3.3)');
+    }
+    this.draft16Opener = undefined;
+  }
+
   private async readLoop(): Promise<void> {
     try {
       for (;;) {
-        for (const { message } of this.framer.drain()) {
+        for (const { message } of this.drainFrames()) {
           if (this.aborted || this.failed) return;
           await this.dispatch(message);
         }
         if (this.aborted || this.failed) return;
         const { value, done } = await this.reader.read();
         if (this.aborted || this.failed) return;
-        if (value) this.framer.push(value);
+        if (value) {
+          this.validateOpener(value);
+          this.framer.push(value);
+        }
         if (done) {
-          for (const { message } of this.framer.drain()) await this.dispatch(message);
+          for (const { message } of this.drainFrames()) await this.dispatch(message);
           if (this.codec.version === 22 && this.framer.bufferedBytes !== 0) {
             throw new ProtocolViolationError('inbound request stream FIN with a truncated control message');
           }

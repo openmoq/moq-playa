@@ -84,6 +84,7 @@ import type { SetupOptions, AuthorizationOptions, SubscribeOptions, RequestUpdat
 import { AuthorizationSession, AuthorizationError, type ConnectionAuthorization, type AuthorizationContext } from './authorization.js';
 import { ControlStreamFramer } from './framer.js';
 import { createBidiControlTopology } from './topology/bidi-control.js';
+import { Draft16ControlAcceptor } from './topology/draft16-control-acceptor.js';
 import { createUniPairTopology, PeerSetupRejectedError, RequestCancelledError, RequestGoawayError, type UniPairTopology, type RequestStream } from './topology/uni-pair.js';
 import { IncomingUniRouter, type RoutedIncomingUniStream } from './topology/incoming-uni.js';
 import { InboundRequestStreamContext } from './topology/inbound-request.js';
@@ -529,6 +530,9 @@ export class MoqtConnection {
 
   /** Inbound PUBLISH (draft-18 §10.10) stream contexts, keyed by Request ID. */
   private inboundRequestContexts = new Map<bigint, InboundRequestStreamContext>();
+  private draft16ControlAcceptor: Draft16ControlAcceptor | null = null;
+  private draft16NamespaceReader: ReadableStreamDefaultReader<WebTransportBidirectionalStream> | null = null;
+  private readonly draft16NamespaceContexts = new Set<InboundRequestStreamContext>();
   /** Inbound PUBLISH tracks by Track Alias, for routing data objects. */
   private publishAliasMaps = new Map<bigint, IncomingPublish[]>();
   private subscriberObjectHistory = new WeakMap<SubscriptionStateMachine, Set<string>>();
@@ -752,6 +756,14 @@ export class MoqtConnection {
    * owned by the connection outlives the terminal shutdown.
    */
   private clearTerminalState(): void {
+    this.draft16ControlAcceptor?.retire(new Error('Connection closed during setup'));
+    this.draft16ControlAcceptor = null;
+    const namespaceReader = this.draft16NamespaceReader;
+    this.draft16NamespaceReader = null;
+    // The transport closes its aggregate source; release only our read ownership.
+    try { namespaceReader?.releaseLock(); } catch { /* already released */ }
+    for (const ctx of this.draft16NamespaceContexts) this.swallow(() => ctx.abort());
+    this.draft16NamespaceContexts.clear();
     this.objectReceiptObservers = undefined;
     this.reboundSubscribers = undefined;
     this.authorization?.close();
@@ -1677,29 +1689,69 @@ export class MoqtConnection {
       if (!incoming) {
         throw new ProtocolViolationError('server connect: transport has no incomingBidirectionalStreams');
       }
-      const incomingReader = incoming.getReader();
-      const { value: bidiStream, done } = await incomingReader.read();
-      incomingReader.releaseLock();
-      if (done || !bidiStream) {
-        throw new ProtocolViolationError('server connect: no control stream from client');
-      }
-      this.controlWriter = bidiStream.writable.getWriter();
-      reader = bidiStream.readable.getReader();
-      // Read until CLIENT_SETUP is processed, then reply with SERVER_SETUP.
-      let clientSetupSeen = false;
-      while (!clientSetupSeen) {
-        const { value, done: rDone } = await reader.read();
-        if (rDone) throw new ProtocolViolationError('Control stream closed before CLIENT_SETUP');
-        this.framer.push(value);
-        for (const { message } of this.framer.drain()) {
-          this.containObserver(() => this.observedQlogEvent?.({ type: 'control_message_parsed',
-            stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID, message: structuredClone(message) as ControlMessage }));
-          if (this._terminated) throw new Error('Connection closed during setup observation');
-          await this.executeActions(this.session.handleControlMessage(message));
-          if (message.type === 'CLIENT_SETUP') clientSetupSeen = true;
+      if (this.session.draftVersion === 16) {
+        const acceptor = new Draft16ControlAcceptor();
+        this.draft16ControlAcceptor = acceptor;
+        try {
+          const control = await acceptor.start(incoming);
+          if (this._terminated) {
+            this.swallow(() => control.reader.cancel());
+            this.swallow(() => control.stream.writable.abort());
+            throw new Error('Connection closed during setup');
+          }
+          this.controlWriter = control.stream.writable.getWriter();
+          reader = control.reader;
+          for (const chunk of control.prefix) this.framer.push(chunk);
+        } catch (error) {
+          if (!this._terminated) {
+            if (error instanceof ProtocolViolationError) this.closeSessionFatal(error.message);
+            else this.closeSessionInternalError(error instanceof Error ? error.message : String(error));
+          }
+          throw error;
+        } finally {
+          if (this.draft16ControlAcceptor === acceptor) this.draft16ControlAcceptor = null;
         }
+      } else {
+        const incomingReader = incoming.getReader();
+        const { value: bidiStream, done } = await incomingReader.read();
+        incomingReader.releaseLock();
+        if (done || !bidiStream) throw new ProtocolViolationError('server connect: no control stream from client');
+        this.controlWriter = bidiStream.writable.getWriter();
+        reader = bidiStream.readable.getReader();
       }
-      await this.executeActions(this.session.completeSetup(cleanOptions));
+      let replying = false;
+      try {
+        // Read until CLIENT_SETUP is processed, then reply with SERVER_SETUP.
+        let clientSetupSeen = false;
+        while (!clientSetupSeen) {
+          let frames = this.framer.drain();
+          if (frames.length === 0) {
+            const { value, done: rDone } = await reader.read();
+            if (rDone) throw new ProtocolViolationError('Control stream closed before CLIENT_SETUP');
+            this.framer.push(value);
+            frames = this.framer.drain();
+          }
+          for (const { message } of frames) {
+            this.containObserver(() => this.observedQlogEvent?.({ type: 'control_message_parsed',
+              stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID, message: structuredClone(message) as ControlMessage }));
+            if (this._terminated) throw new Error('Connection closed during setup observation');
+            await this.executeActions(this.session.handleControlMessage(message));
+            if (message.type === 'CLIENT_SETUP') clientSetupSeen = true;
+          }
+        }
+        replying = true;
+        await this.executeActions(this.session.completeSetup(cleanOptions));
+      } catch (error) {
+        if (this.session.draftVersion === 16) {
+          this.containObserver(() => {
+            if (replying) this.closeSessionInternalError(`SERVER_SETUP failed: ${error instanceof Error ? error.message : String(error)}`);
+            else this.closeSessionFatal(`CLIENT_SETUP failed: ${error instanceof Error ? error.message : String(error)}`);
+          });
+          this.swallow(() => reader.cancel());
+          try { reader.releaseLock(); } catch { /* already released */ }
+        }
+        throw error;
+      }
     } else {
       // Open control stream (first client-initiated bidirectional stream).
       const bidiStream = await transport.createBidirectionalStream();
@@ -1729,6 +1781,7 @@ export class MoqtConnection {
 
     // Start background loops
     this.runControlReadLoop(reader);
+    if (this.session.draftVersion === 16) void this.runDraft16NamespaceLoop(transport);
     this.runIncomingStreamLoop(transport);
     this.runDatagramLoop(transport);
   }
@@ -6475,6 +6528,83 @@ export class MoqtConnection {
         err instanceof Error ? err.message : String(err),
         { errorSource: 'transport', ...(err instanceof Error ? { cause: err } : {}) },
       ));
+    }
+  }
+
+  /** Draft-16 permits only SUBSCRIBE_NAMESPACE on additional bidi streams (§3.3). */
+  private async runDraft16NamespaceLoop(transport: WebTransportLike): Promise<void> {
+    const source = transport.incomingBidirectionalStreams;
+    if (!source || this._terminated) return;
+    let reader: ReadableStreamDefaultReader<WebTransportBidirectionalStream> | undefined;
+    try {
+      reader = source.getReader();
+      this.draft16NamespaceReader = reader;
+      while (!this._terminated) {
+        const { value: stream, done } = await reader.read();
+        if (done) break;
+        if (this._terminated || this.draft16NamespaceContexts.size >= 128) {
+          this.swallow(() => stream.readable.cancel());
+          this.swallow(() => stream.writable.abort());
+          if (!this._terminated) this.containObserver(() => this.closeSessionInternalError('Pending namespace stream capacity exhausted'));
+          break;
+        }
+        const ctx = new InboundRequestStreamContext(stream, this.codec, {
+          onMessage: (message, context) => this.rejectDraft16Namespace(message, context),
+          onFailure: (error, context) => {
+            this.draft16NamespaceContexts.delete(context);
+            this.swallow(() => context.abort());
+            if (error instanceof ProtocolViolationError) this.containObserver(() => this.closeSessionFatal(error.message));
+          },
+          onClosed: context => {
+            this.draft16NamespaceContexts.delete(context);
+            this.swallow(() => context.terminate());
+          },
+        });
+        this.draft16NamespaceContexts.add(ctx);
+        ctx.start();
+      }
+    } catch (error) {
+      if (!this._terminated) this.containObserver(() => this.closeSessionInternalError(error instanceof Error ? error.message : String(error)));
+    } finally {
+      if (reader && this.draft16NamespaceReader === reader) this.draft16NamespaceReader = null;
+      try { reader?.releaseLock(); } catch { /* terminal shutdown released it */ }
+    }
+  }
+
+  private async rejectDraft16Namespace(message: DecodedControlMessage, ctx: InboundRequestStreamContext): Promise<void> {
+    if (this._terminated || ctx.cancelled) return;
+    if (message.type !== 'SUBSCRIBE_NAMESPACE') {
+      throw new ProtocolViolationError('Additional draft-16 bidi streams must begin with SUBSCRIBE_NAMESPACE (3.3)');
+    }
+    this.containObserver(() => this.onMessage?.(structuredClone(message)));
+    if (this._terminated || ctx.cancelled) return;
+    try {
+      const actions = this.session.handleNamespaceStreamRequest(message);
+      const close = actions.find(action => action.type === 'close_connection');
+      if (close) {
+        await this.executeActions(actions);
+        await ctx.abort();
+        return;
+      }
+      const response = actions.find(action => action.type === 'send_control'
+        && action.message.type === 'REQUEST_ERROR' && action.message.requestId === message.requestId);
+      if (!response || response.type !== 'send_control') {
+        this.closeSessionInternalError('Namespace request produced no response');
+        return;
+      }
+      // Credit is already committed in the Session; a cancelled response stream
+      // must not prevent advertising that grant on the independent control stream.
+      try {
+        await this.executeActions(actions.filter(action => action !== response));
+      } catch (error) {
+        this.closeSessionInternalError(`Namespace credit write failed: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+      if (this._terminated || ctx.cancelled) return;
+      await ctx.writeMessage(response.message);
+      await ctx.terminate(); // REQUEST_ERROR and FIN belong to this bidi (§9.25).
+    } finally {
+      this.draft16NamespaceContexts.delete(ctx);
     }
   }
 

@@ -11,7 +11,7 @@
  * @module
  */
 
-import { varint, type Varint } from '../primitives/varint.js';
+import { MAX_VARINT, varint, type Varint } from '../primitives/varint.js';
 import { EndpointRole, type EndpointRoleValue } from './types.js';
 import type { RequestPolicy } from './request-policy.js';
 
@@ -50,6 +50,11 @@ export class RequestIdError extends Error {
  */
 /** Default window size for MAX_REQUEST_ID auto-replenishment. */
 const DEFAULT_WINDOW_SIZE = 1000;
+/** Bound sparse receive history when a peer leaves request-ID holes. */
+const MAX_INCOMING_ID_RANGES = 1024;
+
+/** Local tracking capacity was exhausted; the peer's ID need not be invalid. */
+export class RequestIdTrackingLimitError extends Error {}
 
 /** Configuration for RequestIdAllocator. */
 export interface RequestIdAllocatorConfig {
@@ -57,7 +62,7 @@ export interface RequestIdAllocatorConfig {
    * Window size for MAX_REQUEST_ID auto-replenishment.
    * When the peer consumes past 50% of the current window,
    * shouldReplenish() returns true and nextReplenishValue()
-   * returns ourMaxRequestId + windowSize.
+   * returns ourMaxRequestId + windowSize, capped at the wire integer limit.
    *
    * @see draft-ietf-moq-transport-16 §9.5 (similar to MAX_STREAMS in RFC 9000 §4.6)
    */
@@ -90,13 +95,13 @@ export class RequestIdAllocator {
    */
   private readonly hasCredit: boolean;
 
-  /** Inbound validation mode (§10.1). 'strict-sequence' for draft-14/16 (credit
-   *  window + exactly-next-in-sequence); 'parity-and-duplicate' for draft-18
-   *  (no credit window; reject only wrong parity / duplicate Request IDs). */
+  /** Arrival-order validation, independent of the per-draft credit rule. */
   private readonly inboundValidation: 'strict-sequence' | 'parity-and-duplicate';
 
   /** Request IDs already seen from the peer — duplicate tracker for draft-18. */
   private readonly seenIncoming = new Set<bigint>();
+  private incomingPrefix: bigint;
+  private readonly incomingRanges: Array<{ start: bigint; end: bigint }> = [];
 
   constructor(
     private readonly role: EndpointRoleValue,
@@ -113,6 +118,7 @@ export class RequestIdAllocator {
     // First expected = highestIncomingId + 2, so highestIncomingId = peerStart - 2
     const peerStartId = role === EndpointRole.CLIENT ? 1n : 0n;
     this.highestIncomingId = peerStartId - 2n;
+    this.incomingPrefix = peerStartId - 2n;
 
     this.windowSize = BigInt(config?.windowSize ?? DEFAULT_WINDOW_SIZE);
   }
@@ -256,7 +262,7 @@ export class RequestIdAllocator {
    * Rules per §9.1:
    * - Must have correct parity (peer's parity bit)
    * - Must be < our MAX_REQUEST_ID
-   * - Must be exactly next in sequence (+2 from previous)
+   * - Must be exactly next in sequence for strict profiles; otherwise unique
    *
    * @param requestId The incoming request ID
    * @throws {RequestIdError} If validation fails
@@ -271,25 +277,26 @@ export class RequestIdAllocator {
       );
     }
 
-    if (this.inboundValidation === 'parity-and-duplicate') {
-      // draft-18 §10.1: each request rides its own stream, so requests can arrive
-      // out of order. QUIC stream limits replace the MAX_REQUEST_ID window, so we
-      // only reject a wrong parity (above) or a DUPLICATE Request ID.
-      if (this.seenIncoming.has(requestId)) {
-        throw new RequestIdError(`Duplicate incoming Request ID ${requestId}`, 'INVALID_REQUEST_ID');
-      }
-      this.seenIncoming.add(requestId);
-      if (requestId > this.highestIncomingId) this.highestIncomingId = requestId;
-      return;
-    }
-
-    // strict-sequence (draft-14/16): credit window + exactly-next-in-sequence.
     // §9.5: receiving a request ID >= our MAX_REQUEST_ID is TOO_MANY_REQUESTS
-    if (requestId >= this.ourMaxRequestId) {
+    if (this.hasCredit && requestId >= this.ourMaxRequestId) {
       throw new RequestIdError(
         `Request ID ${requestId} exceeds our MAX_REQUEST_ID ${this.ourMaxRequestId}`,
         'TOO_MANY_REQUESTS',
       );
+    }
+
+    if (this.inboundValidation === 'parity-and-duplicate') {
+      if (this.hasCredit) {
+        this.rememberCreditedIncoming(requestId);
+      } else {
+        // Draft-18+ uses QUIC stream limits rather than request credit.
+        if (this.seenIncoming.has(requestId)) {
+          throw new RequestIdError(`Duplicate incoming Request ID ${requestId}`, 'INVALID_REQUEST_ID');
+        }
+        this.seenIncoming.add(requestId);
+      }
+      if (requestId > this.highestIncomingId) this.highestIncomingId = requestId;
+      return;
     }
 
     // Check next in sequence: must be exactly +2 from previous (§9.1)
@@ -302,6 +309,42 @@ export class RequestIdAllocator {
     }
 
     this.highestIncomingId = requestId;
+  }
+
+  /** Compact completed prefixes and adjacent IDs; retain bounded sparse ranges. */
+  private rememberCreditedIncoming(requestId: bigint): void {
+    if (requestId <= this.incomingPrefix) {
+      throw new RequestIdError(`Duplicate incoming Request ID ${requestId}`, 'INVALID_REQUEST_ID');
+    }
+    if (requestId === this.incomingPrefix + 2n) {
+      this.incomingPrefix = requestId;
+      const first = this.incomingRanges[0];
+      if (first?.start === this.incomingPrefix + 2n) {
+        this.incomingPrefix = first.end;
+        this.incomingRanges.shift();
+      }
+      return;
+    }
+    let i = 0;
+    while (i < this.incomingRanges.length && this.incomingRanges[i]!.end < requestId - 2n) i++;
+    const range = this.incomingRanges[i];
+    if (range && range.start <= requestId && requestId <= range.end) {
+      throw new RequestIdError(`Duplicate incoming Request ID ${requestId}`, 'INVALID_REQUEST_ID');
+    }
+    if (range && requestId >= range.start - 2n) {
+      range.start = requestId < range.start ? requestId : range.start;
+      range.end = requestId > range.end ? requestId : range.end;
+      const next = this.incomingRanges[i + 1];
+      if (next && next.start === range.end + 2n) {
+        range.end = next.end;
+        this.incomingRanges.splice(i + 1, 1);
+      }
+    } else {
+      if (this.incomingRanges.length === MAX_INCOMING_ID_RANGES) {
+        throw new RequestIdTrackingLimitError('Incoming Request ID tracking capacity exhausted');
+      }
+      this.incomingRanges.splice(i, 0, { start: requestId, end: requestId });
+    }
   }
 
   /**
@@ -355,7 +398,7 @@ export class RequestIdAllocator {
    * @see draft-ietf-moq-transport-16 §9.5
    */
   shouldReplenish(): boolean {
-    if (this.ourMaxRequestId === 0n) return false;
+    if (this.ourMaxRequestId === 0n || this.ourMaxRequestId === MAX_VARINT) return false;
     // The peer's usable window runs from 0 (or previous max) up to ourMaxRequestId.
     // Trigger replenishment when they've consumed past the midpoint.
     const threshold = this.ourMaxRequestId / 2n;
@@ -364,10 +407,11 @@ export class RequestIdAllocator {
 
   /**
    * Get the next MAX_REQUEST_ID value to send to the peer.
-   * Extends the window by windowSize from the current ourMaxRequestId.
+   * Extends the window by windowSize, capped at the wire integer limit.
    */
   nextReplenishValue(): Varint {
-    return varint(this.ourMaxRequestId + this.windowSize);
+    const next = this.ourMaxRequestId + this.windowSize;
+    return varint(next > MAX_VARINT ? MAX_VARINT : next);
   }
 
   /**
@@ -375,7 +419,6 @@ export class RequestIdAllocator {
    * the replenish base. Call this after sending MAX_REQUEST_ID.
    */
   commitReplenish(): void {
-    const newMax = this.ourMaxRequestId + this.windowSize;
-    this.ourMaxRequestId = newMax;
+    this.ourMaxRequestId = this.nextReplenishValue();
   }
 }
