@@ -1021,6 +1021,267 @@ describe('MseMediaSource — changeType', () => {
     });
 });
 
+describe.each(['video', 'audio'] as const)('MseMediaSource — %s reconfiguration', (mediaType) => {
+    const codec = mediaType === 'video' ? 'avc1.42c01e' : 'mp4a.40.2';
+    const otherCodec = mediaType === 'video' ? 'hvc1.1.6.L93.90' : 'mp4a.40.5';
+    const handler = mediaType === 'video' ? 'vide' : 'soun';
+    const mime = (value: string) => `${mediaType}/mp4; codecs="${value}"`;
+    let adapter: MseMediaSource;
+    let video: MockVideoElement;
+    let sb: MockSourceBuffer;
+
+    beforeEach(async () => {
+        video = new MockVideoElement();
+        adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.initialize({
+            video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) },
+            audio: { codec: 'mp4a.40.2', initData: makeInit(1, 100, 'soun') },
+        });
+        currentMs.open();
+        await flush();
+        sb = mediaType === 'video' ? currentMs.videoBuffer : currentMs.audioBuffer;
+    });
+    afterEach(() => adapter.destroy());
+
+    it.each([true, false])('appends each same-MIME target init (native changeType present: %s)', async (native) => {
+        if (!native) (sb as unknown as { changeType?: unknown }).changeType = undefined;
+        const first = makeInit(7, 200, handler);
+        const second = makeInit(9, 300, handler);
+        await adapter.changeType(mediaType, codec, first);
+        await adapter.changeType(mediaType, codec, second);
+        expect(sb.changeTypeCalls).toEqual([]);
+        expect(sb.appendedPayloads.slice(1)).toEqual([first, second]);
+
+        const events: unknown[] = [], accepted = {}, replay = {};
+        const off = adapter.observeAppends(event => { events.push(event); });
+        adapter.appendChunk(mediaType, makeSegment({ trackId: 9, bmd: 0, sampleCount: 1 }), 'target', undefined, accepted);
+        await flush();
+        adapter.appendChunk(mediaType, makeSegment({ trackId: 9, bmd: 150, defaultDur: 50, sampleCount: 1 }), 'target', undefined, replay);
+        off();
+        expect(events).toEqual([
+            { token: accepted, state: 'appended', reason: null },
+            { token: replay, state: 'discarded', reason: 'treated as a replay' },
+        ]); // The latest trex duration covers [0, 300), rather than [0, 100).
+    });
+
+    it('tracks the last native MIME through repeated reconfigurations and a switch back', async () => {
+        await adapter.changeType(mediaType, otherCodec, makeInit(7, 200, handler));
+        await adapter.changeType(mediaType, otherCodec, makeInit(8, 300, handler));
+        await adapter.changeType(mediaType, codec, makeInit(1, 100, handler));
+        expect(sb.changeTypeCalls).toEqual([mime(otherCodec), mime(codec)]);
+        expect(sb.appendedPayloads).toHaveLength(4);
+    });
+
+    it('keeps the old MIME when native changeType throws', async () => {
+        const native = vi.spyOn(sb, 'changeType').mockImplementationOnce(() => { throw new Error('unsupported target'); });
+        await expect(adapter.changeType(mediaType, otherCodec, makeInit(7, 200, handler))).rejects.toThrow('unsupported target');
+        expect(sb.appendedPayloads).toHaveLength(1);
+        await adapter.changeType(mediaType, codec, makeInit(1, 100, handler));
+        expect(native).toHaveBeenCalledTimes(1);
+        await adapter.changeType(mediaType, otherCodec, makeInit(7, 200, handler));
+        expect(native).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps a successful native retype when the init append throws', async () => {
+        sb.throwNextAppend = new Error('init rejected');
+        await expect(adapter.changeType(mediaType, otherCodec, makeInit(7, 200, handler))).rejects.toThrow('init rejected');
+        await adapter.changeType(mediaType, otherCodec, makeInit(7, 200, handler));
+        expect(sb.changeTypeCalls).toEqual([mime(otherCodec)]);
+        expect(sb.appendedPayloads).toHaveLength(2);
+    });
+
+    it('uses the replacement buffer MIME after reset', async () => {
+        await adapter.changeType(mediaType, otherCodec, makeInit(7, 200, handler));
+        adapter.reset();
+        expect(adapter.getTimestampOffset(mediaType)).toBeUndefined();
+        adapter.initialize({ [mediaType]: { codec, initData: makeInit(1, 100, handler) } });
+        await flush();
+        const replacement = mediaType === 'video' ? currentMs.videoBuffer : currentMs.audioBuffer;
+        (replacement as unknown as { changeType?: unknown }).changeType = undefined;
+        await adapter.changeType(mediaType, codec, makeInit(9, 300, handler));
+        expect(replacement.appendedPayloads).toHaveLength(2);
+        expect(sb.appendedPayloads).toHaveLength(2);
+    });
+
+    it('serializes same-MIME init behind an append and preserves terminal token observations', async () => {
+        sb.autoComplete = false;
+        const events: unknown[] = [], inFlight = {}, stale = {}, target = {};
+        adapter.observeAppends(event => { events.push(event); });
+        adapter.appendChunk(mediaType, makeSegment({ bmd: 0, sampleCount: 1 }), 'old', 1n, inFlight);
+        adapter.appendChunk(mediaType, makeSegment({ bmd: 100, sampleCount: 1 }), 'old', 2n, stale);
+        const init = makeInit(7, 200, handler);
+        const changing = adapter.changeType(mediaType, codec, init);
+        const segment = makeSegment({ trackId: 7, bmd: 200, sampleCount: 1 });
+        adapter.appendChunk(mediaType, segment, 'target', 3n, target);
+        expect(events).toEqual([{ token: stale, state: 'discarded', reason: 'retype' }]);
+        expect(sb.appendedPayloads).toHaveLength(2);
+        sb.updating = false; sb.fire('update'); sb.fire('updateend');
+        await flush();
+        expect(sb.appendedPayloads.at(-1)).toEqual(init);
+        expect(events).toHaveLength(2);
+        sb.autoComplete = true;
+        sb.updating = false; sb.fire('update'); sb.fire('updateend');
+        await changing;
+        await flush();
+        expect(sb.appendedPayloads.at(-1)).toEqual(segment);
+        expect(sb.changeTypeCalls).toEqual([]);
+        expect(events).toEqual([
+            { token: stale, state: 'discarded', reason: 'retype' },
+            { token: inFlight, state: 'appended', reason: null },
+            { token: target, state: 'appended', reason: null },
+        ]);
+    });
+
+    it('rejects overlapping reconfigurations while the target init is pending', async () => {
+        sb.autoComplete = false;
+        const changing = adapter.changeType(mediaType, codec, makeInit(7, 200, handler));
+        await expect(adapter.changeType(mediaType, otherCodec, makeInit(8, 300, handler))).rejects.toThrow(/already in changing-type/);
+        sb.updating = false; sb.fire('update'); sb.fire('updateend');
+        await changing;
+        expect(sb.appendedPayloads).toHaveLength(2);
+        expect(sb.changeTypeCalls).toEqual([]);
+    });
+
+    it.each(['error', 'abort', 'no update'] as const)('rejects a target init ending with %s without draining queued media', async (outcome) => {
+        sb.autoComplete = false;
+        const events: unknown[] = [], token = {}, errors: Error[] = [];
+        const listenerCounts = ['update', 'updateend', 'error', 'abort'].map(type => sb.listenerCount(type));
+        adapter.onError = error => { errors.push(error); };
+        adapter.observeAppends(event => { events.push(event); });
+        const changing = adapter.changeType(mediaType, otherCodec, makeInit(7, 200, handler));
+        const rejected = expect(changing).rejects.toThrow(/SourceBuffer.*(error|abort|success)/i);
+        let settled = false;
+        void changing.then(() => { settled = true; }, () => { settled = true; });
+        adapter.appendChunk(mediaType, makeSegment({ trackId: 7, bmd: 0, sampleCount: 1 }), 'target', 1n, token);
+        sb.updating = false;
+        if (outcome !== 'no update') sb.fire(outcome);
+        await flush();
+        expect(settled).toBe(false);
+        sb.fire('updateend');
+        await rejected;
+        await flush();
+        expect(sb.appendedPayloads).toHaveLength(2); // initial init + failed target init
+        expect(events).toEqual([]);
+        expect(errors).toHaveLength(outcome === 'error' ? 1 : 0);
+        expect(['update', 'updateend', 'error', 'abort'].map(type => sb.listenerCount(type))).toEqual(listenerCounts);
+        adapter.reset();
+        expect(events).toEqual([{ token, state: 'discarded', reason: 'decoder reset' }]);
+    });
+
+    it.each(['reset', 'destroy'] as const)('ignores late completion after %s while waiting for the old append', async (action) => {
+        sb.autoComplete = false;
+        adapter.appendChunk(mediaType, makeSegment({ bmd: 0, sampleCount: 1 }), 'old');
+        const changing = adapter.changeType(mediaType, otherCodec, makeInit(7, 200, handler));
+        adapter[action]();
+        sb.updating = false; sb.fire('update'); sb.fire('updateend');
+        await changing;
+        expect(sb.changeTypeCalls).toEqual([]);
+        expect(sb.appendedPayloads).toHaveLength(2);
+        expect(adapter.getTimestampOffset(mediaType)).toBeUndefined();
+    });
+
+    it('does not let a superseded init completion unlock a replacement reconfiguration', async () => {
+        sb.autoComplete = false;
+        const oldChange = adapter.changeType(mediaType, otherCodec, makeInit(7, 200, handler));
+        adapter.reset();
+        adapter.initialize({ [mediaType]: { codec, initData: makeInit(1, 100, handler) } });
+        await flush();
+        const replacement = mediaType === 'video' ? currentMs.videoBuffer : currentMs.audioBuffer;
+        replacement.autoComplete = false;
+        const newChange = adapter.changeType(mediaType, codec, makeInit(9, 300, handler));
+        sb.updating = false; sb.fire('update'); sb.fire('updateend');
+        await oldChange;
+        await expect(adapter.changeType(mediaType, codec, makeInit(10, 400, handler))).rejects.toThrow(/already in changing-type/);
+        replacement.updating = false; replacement.fire('update'); replacement.fire('updateend');
+        await newChange;
+        expect(replacement.appendedPayloads).toHaveLength(2);
+    });
+
+    it.each(['before update', 'after update'])('retains media ownership and delays native retype until its terminal: %s', async (timing) => {
+        sb.autoComplete = false;
+        const events: unknown[] = [], first = {}, stale = {}, target = {};
+        adapter.observeAppends(event => { events.push(event); });
+        adapter.appendChunk(mediaType, makeSegment({ bmd: 0, sampleCount: 1 }), 'old', 1n, first);
+        sb.updating = false;
+        if (timing === 'after update') sb.fire('update');
+        adapter.appendChunk(mediaType, makeSegment({ bmd: 100, sampleCount: 1 }), 'old', 2n, stale);
+        expect(sb.appendedPayloads).toHaveLength(2);
+        const changing = adapter.changeType(mediaType, otherCodec, makeInit(7, 200, handler));
+        let settled = false;
+        void changing.then(() => { settled = true; }, () => { settled = true; });
+        adapter.appendChunk(mediaType, makeSegment({ trackId: 7, bmd: 200, sampleCount: 1 }), 'target', 3n, target);
+        expect(sb.changeTypeCalls).toEqual([]);
+        expect(events).toEqual([{ token: stale, state: 'discarded', reason: 'retype' }]);
+        if (timing === 'before update') sb.fire('update');
+        sb.fire('updateend');
+        await flush();
+        expect(settled).toBe(false);
+        expect(sb.changeTypeCalls).toEqual([mime(otherCodec)]);
+        expect(sb.appendedPayloads).toHaveLength(3);
+        expect(adapter.getCommittedGroupFloor(mediaType, 'old')).toBe(1n);
+        sb.autoComplete = true;
+        sb.updating = false; sb.fire('update'); sb.fire('updateend');
+        await changing;
+        await flush();
+        expect(events).toEqual([
+            { token: stale, state: 'discarded', reason: 'retype' },
+            { token: first, state: 'appended', reason: null },
+            { token: target, state: 'appended', reason: null },
+        ]);
+        expect(sb.appendedPayloads).toHaveLength(4);
+    });
+
+    it.each(['error', 'abort', 'no update'] as const)('preserves an old operation outcome already observed before reconfiguration: %s', async (outcome) => {
+        sb.autoComplete = false;
+        const events: unknown[] = [], token = {};
+        adapter.observeAppends(event => { events.push(event); });
+        adapter.appendChunk(mediaType, makeSegment({ bmd: 0, sampleCount: 1 }), 'old', 1n, token);
+        sb.updating = false;
+        if (outcome !== 'no update') sb.fire(outcome);
+        const changing = adapter.changeType(mediaType, otherCodec, makeInit(7, 200, handler));
+        const rejected = expect(changing).rejects.toThrow(/SourceBuffer.*(error|abort|success)/i);
+        expect(sb.changeTypeCalls).toEqual([]);
+        sb.fire('updateend');
+        await rejected;
+        expect(sb.appendedPayloads).toHaveLength(2);
+        expect(sb.changeTypeCalls).toEqual([]);
+        expect(events).toEqual([{ token,
+            state: outcome === 'no update' ? 'unavailable' : 'discarded',
+            reason: outcome === 'error' ? 'append error' : outcome === 'abort' ? 'append aborted' : 'completion unproven' }]);
+    });
+
+    it.each([
+        { retype: false, offset: 0 }, { retype: true, offset: 0 },
+        { retype: false, offset: -2.25 }, { retype: true, offset: 3.75 },
+    ])('preserves caller timeline placement through init and media ($retype, offset=$offset)', async ({ retype, offset }) => {
+        const peer = mediaType === 'video' ? currentMs.audioBuffer : currentMs.videoBuffer;
+        adapter.setTimestampOffset(mediaType, offset);
+        peer.timestampOffset = 6.5;
+        video.currentTime = 12.5;
+        let effectiveOffset = offset;
+        const offsetWrite = vi.fn((value: number) => { effectiveOffset = value; });
+        Object.defineProperty(sb, 'timestampOffset', {
+            configurable: true, get: () => effectiveOffset, set: offsetWrite,
+        });
+        const init = makeInit(7, 200, handler);
+        const change = adapter.changeType(mediaType, retype ? otherCodec : codec, init);
+        expect(sb.appendedPayloads.at(-1)).toEqual(init);
+        const events: unknown[] = [], token = {};
+        adapter.observeAppends(event => { events.push(event); });
+        const segment = makeSegment({ trackId: 7, bmd: 12_500, sampleCount: 1 });
+        adapter.appendChunk(mediaType, segment, 'target', 1n, token);
+        await change;
+        await flush();
+        expect(sb.appendedPayloads.slice(1)).toEqual([init, segment]);
+        expect(events).toEqual([{ token, state: 'appended', reason: null }]);
+        expect(adapter.getTimestampOffset(mediaType)).toBe(offset);
+        expect(peer.timestampOffset).toBe(6.5);
+        expect(offsetWrite).not.toHaveBeenCalled();
+        expect(video.currentTime).toBe(12.5);
+        expect(sb.changeTypeCalls).toEqual(retype ? [mime(otherCodec)] : []);
+    });
+});
+
 // ─── Autoplay startup-seek (longest buffered range) ────────────────────
 
 describe('MseMediaSource — autoplay startup seek', () => {
@@ -4245,4 +4506,32 @@ it('does not create replay-suppression knowledge from an unproven completion eve
         vsb.autoComplete = true; adapter.appendChunk('video', bytes, 'video', 1n); await flush();
         expect(vsb.appendedPayloads).toHaveLength(3); // init + first attempt + real retry
     } finally { adapter.destroy(); }
+});
+
+describe('SourceBuffer mutation terminal ownership', () => {
+  it.each(['before update', 'after update'])('does not use the old append terminal for the new init: %s', async timing => {
+    const { adapter, vsb } = await makeReadyAdapter();
+    try {
+      vsb.autoComplete = false;
+      adapter.appendChunk('video', makeSegment({ bmd: 0, sampleCount: 1 }), 'old', 1n);
+      // MSE buffer-append sets updating=false, then queues update and updateend
+      // as distinct tasks. A new selection can run before either queued task,
+      // or after update and before updateend. No failure occurred.
+      vsb.updating = false;
+      if (timing === 'after update') vsb.fire('update');
+      let state = 'pending';
+      const changing = adapter.changeType('video', 'avc1.42c01e', makeInit(7, 200));
+      void changing.then(() => { state = 'resolved'; }, e => { state = 'rejected:' + e.message; });
+      if (timing === 'before update') vsb.fire('update');
+      vsb.fire('updateend'); // old append's queued terminal, new init still updating
+      await flush();
+      await flush();
+      console.log(JSON.stringify({ timing, state, newInitStillUpdating: vsb.updating }));
+      expect.soft(state, 'the old terminal cannot settle the new init').toBe('pending');
+      vsb.updating = false;
+      vsb.fire('update');
+      vsb.fire('updateend');
+      await expect(changing).resolves.toBeUndefined();
+    } finally { adapter.destroy(); }
+  });
 });

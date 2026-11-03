@@ -373,6 +373,16 @@ export interface MseStartupReport {
 
 /** What app-initiated operation mutated a SourceBuffer. */
 type BufferOpCause = 'append' | 'init-append' | 'back-buffer-remove' | 'quota-remove' | 'quota-flush';
+interface BufferOperation {
+  id: number;
+  cause: BufferOpCause;
+  errored?: boolean;
+  aborted?: boolean;
+  succeeded?: boolean;
+  token?: MediaAppendToken;
+  ended?: boolean;
+  terminalWaiters?: Set<() => void>;
+}
 
 /** Render a TimeRanges as "a-b,c-d" for diagnostics; never throws. */
 function fmtRanges(ranges: TimeRanges | undefined | null): string {
@@ -583,7 +593,7 @@ export class MseMediaSource implements MediaSourceLike {
   private diagAudioAppends = 0;
 
   /**
-   * Back-pressure queues — only for SourceBuffer.updating serialization.
+   * Back-pressure queues — serialized through each mutation's updateend.
    * Each entry preserves its source `trackName` so the timeline check
    * runs against the right per-track index when the queue drains.
    */
@@ -781,10 +791,10 @@ export class MseMediaSource implements MediaSourceLike {
   private opSeq = 0;
   /** Generation of the current SourceBuffer set; bumped on reset/destroy. */
   private bufferGen = 0;
-  /** In-flight op per media type — a SourceBuffer serializes to at most one. */
+  /** Ownership lasts through updateend, including the updating=false interval. */
   private readonly inFlightOp: {
-    video: { id: number; cause: BufferOpCause; errored?: boolean; aborted?: boolean; succeeded?: boolean; token?: MediaAppendToken } | null;
-    audio: { id: number; cause: BufferOpCause; errored?: boolean; aborted?: boolean; succeeded?: boolean; token?: MediaAppendToken } | null;
+    video: BufferOperation | null;
+    audio: BufferOperation | null;
   } = { video: null, audio: null };
   /** Most recently completed op id per media type, for after-the-fact context. */
   private readonly lastCompletedOp: { video: number | null; audio: number | null } =
@@ -793,12 +803,14 @@ export class MseMediaSource implements MediaSourceLike {
   /** trex defaults from the init segment, per media type. */
   private videoTrex: TrexDefaults | undefined;
   private audioTrex: TrexDefaults | undefined;
+  /** MIME selected at SourceBuffer creation or by the last successful retype. */
+  private readonly bufferMime: { video: string | null; audio: string | null } =
+    { video: null, audio: null };
 
   /**
    * Ranges for the in-flight appendBuffer, per media type, with the
    * source trackName so updateend commits into the right per-track
-   * index. Single-entry sufficient because `buffer.updating` guards
-   * against concurrent appends on the same SourceBuffer.
+   * index. The owned operation prevents concurrent appends until updateend.
    */
   private pendingVideoRanges: readonly SegmentTimeRange[] = [];
   private pendingAudioRanges: readonly SegmentTimeRange[] = [];
@@ -1001,6 +1013,7 @@ export class MseMediaSource implements MediaSourceLike {
           const mimeType = `video/mp4; codecs="${config.video.codec}"`;
           this.logDebug('[MSE] Creating video SourceBuffer:', mimeType);
           this.videoBuffer = this.ms.addSourceBuffer(mimeType);
+          this.bufferMime.video = mimeType;
           this.videoBuffer.mode = 'segments';
           this.wireBufferLifecycle('video', this.videoBuffer);
           if (config.video.initData.byteLength > 0) {
@@ -1025,6 +1038,7 @@ export class MseMediaSource implements MediaSourceLike {
           const mimeType = `audio/mp4; codecs="${config.audio.codec}"`;
           this.logDebug('[MSE] Creating audio SourceBuffer:', mimeType);
           this.audioBuffer = this.ms.addSourceBuffer(mimeType);
+          this.bufferMime.audio = mimeType;
           this.audioBuffer.mode = 'segments';
           this.wireBufferLifecycle('audio', this.audioBuffer);
           if (config.audio.initData.byteLength > 0) {
@@ -1152,7 +1166,7 @@ export class MseMediaSource implements MediaSourceLike {
 
     const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
 
-    if (this.changingType[mediaType] || buffer.updating || queue.length > 0) {
+    if (this.changingType[mediaType] || this.bufferBusy(mediaType, buffer) || queue.length > 0) {
       queue.push(this.appendEntry(data, trackName, groupId, token));
     } else if (this.maybeEvictBackBuffer(mediaType, buffer)) {
       // An eviction remove() is now in flight (it sets `updating`); park the
@@ -1164,33 +1178,24 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /**
-   * Re-initialize a SourceBuffer for a new codec/init segment.
+   * Append the target init for every requested track reconfiguration.
    *
-   * Used when the player switches to a track in a different codec
-   * family (e.g., AVC → HEVC). The MSE spec lets a SourceBuffer parse
-   * a new mime type via `changeType()`, after which the next append
-   * MUST be the init segment for that codec.
+   * Matching MIME does not imply matching track initialization. Compatible
+   * subsequent inits are handled by MSE's initialization-segment algorithm;
+   * retype only when the MIME changes, then append the required init.
    *
-   * Borrowed from the WebCodecs path: serialize state-mutating ops
-   * with data appends. Concretely:
-   *   1. Drop any queued media — those are old-codec bytes that would
-   *      land *after* the new init and corrupt the splice.
-   *   2. Wait for the in-flight `appendBuffer` to settle.
-   *   3. `sourceBuffer.changeType(newMime)`.
-   *   4. Append the new init segment, await `updateend`.
-   *   5. Refresh the trex cache from the new init (per-sample-duration
-   *      defaults change with the codec family).
-   *   6. Resume normal append flow — anything queued during the change
-   *      drains immediately.
+   * Discard queued media, wait for the current mutation, and hold new appends
+   * until the init succeeds. The caller owns track selection and rollback.
    *
    * @param mediaType Which SourceBuffer to retype.
    * @param codec Codec string for the new mime type
    *              (e.g. `"hvc1.1.6.L93.90"`).
    * @param initData Raw init segment bytes (ftyp+moov) for the new codec.
-   * @throws If the SourceBuffer is not initialized or the browser
-   *         doesn't implement `SourceBuffer.changeType()`.
+   * @throws If the SourceBuffer is not initialized, the reconfiguration fails,
+   *         or a MIME change requires unavailable `SourceBuffer.changeType()`.
    *
    * @see https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-changetype
+   * @see https://www.w3.org/TR/media-source-2/#sourcebuffer-init-segment-received
    */
   async changeType(
     mediaType: 'video' | 'audio',
@@ -1204,7 +1209,9 @@ export class MseMediaSource implements MediaSourceLike {
       throw new Error(`MseMediaSource.changeType: ${mediaType} SourceBuffer not initialized`);
     }
     const sb = buffer as SourceBuffer & { changeType?: (mime: string) => void };
-    if (typeof sb.changeType !== 'function') {
+    const mimeType = `${mediaType}/mp4; codecs="${codec}"`;
+    const retype = this.bufferMime[mediaType] !== mimeType;
+    if (retype && typeof sb.changeType !== 'function') {
       throw new Error('MseMediaSource.changeType: SourceBuffer.changeType not supported');
     }
     if (this.changingType[mediaType]) {
@@ -1214,37 +1221,35 @@ export class MseMediaSource implements MediaSourceLike {
     this.changingType[mediaType] = true;
     try {
       const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
-      // Drop any queued media — old-codec bytes that would be appended
-      // *after* the new init segment, ahead of new-codec media. The
-      // player has staged the new-track segments separately and will
-      // re-deliver them after this resolves.
+      // Discard queued media from the previous configuration before its
+      // replacement init. The caller stages and re-delivers the target media.
       this.discardQueue(queue, 'retype');
       if (this.destroyed || generation !== this.bufferGen) return;
 
-      // Wait for any in-flight appendBuffer to settle. Use the buffer's
-      // own updateend event — this is the only signal the MSE spec
-      // gives us for "now is safe to mutate".
-      while (buffer.updating) {
-        await this.waitForBufferEvent(buffer);
+      // Wait for the in-flight mutation's terminal event before reconfiguring.
+      while (this.bufferBusy(mediaType, buffer)) {
+        await this.waitForBufferEvent(buffer, this.inFlightOp[mediaType]);
         if (this.destroyed || generation !== this.bufferGen) return;
       }
 
-      // Pivot the parser to the new codec.
+      // A same-MIME target still needs its init, without a native retype.
       const handler = mediaType === 'video' ? 'vide' : 'soun';
       const filtered = filterInitSegment(initData, handler);
-      const mimeType = `${mediaType}/mp4; codecs="${codec}"`;
-      this.logDebug('[MSE] changeType %s → %s (init=%dB)', mediaType, mimeType, filtered.byteLength);
-      sb.changeType(mimeType);
+      this.logDebug('[MSE] changeType %s → %s (init=%dB, retype=%s)',
+        mediaType, mimeType, filtered.byteLength, retype);
+      if (retype) {
+        sb.changeType!(mimeType);
+        this.bufferMime[mediaType] = mimeType;
+      }
 
       // Append the new init segment and wait for it to commit. Done
       // outside doAppend because init segments carry no tfdt/trun and
       // must skip the timeline-overlap path.
-      this.runMutation(mediaType, 'init-append', () => buffer.appendBuffer(filtered.buffer as ArrayBuffer));
-      await this.waitForBufferEvent(buffer);
+      const init = this.runMutation(mediaType, 'init-append', () => buffer.appendBuffer(filtered.buffer as ArrayBuffer));
+      await this.waitForBufferEvent(buffer, init);
       if (this.destroyed || generation !== this.bufferGen) return;
 
-      // Refresh trex defaults — codec family change generally means a
-      // different default_sample_duration in the new init.
+      // Init defaults can differ even when the MIME is unchanged.
       const trexMap = readTrexDefaults(filtered);
       const trex = Array.from(trexMap.values())[0];
       if (mediaType === 'video') this.videoTrex = trex;
@@ -1256,13 +1261,8 @@ export class MseMediaSource implements MediaSourceLike {
       if (mediaType === 'video') this.videoInitSummary = summary;
       else this.audioInitSummary = summary;
 
-      // timestampOffset is deliberately left alone. Tracks in a switching
-      // set share one media timeline, and the assembler keeps its shared
-      // epoch across a track switch, so the new track's segments already
-      // carry decode times that continue the old track's. Re-basing them
-      // to currentTime would shift video later by the playback position:
-      // a gap at the playhead (stall) and a fixed offset against audio.
-      // @see ISO/IEC 23000-19 §7.3.4 (switching set tracks are time-aligned)
+      // Preserve timestampOffset: the caller owns timeline placement, including
+      // any rebasing needed by a custom pipeline or a discontinuity.
 
       // Drop the per-track overlap indexes; the retired track's entries are
       // dead weight, and a later switch back to it starts a fresh index.
@@ -1282,23 +1282,44 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /**
-   * Wait for the next `updateend` (success) or `error` event on a
-   * SourceBuffer. Resolves on either, with `error` rejecting.
+   * Wait for the mutation to end; only `update` witnesses successful completion.
+   * Error and abort also terminate with `updateend` (MSE §5.4).
    */
-  private waitForBufferEvent(buffer: SourceBuffer): Promise<void> {
+  private waitForBufferEvent(buffer: SourceBuffer, operation: BufferOperation | null): Promise<void> {
+    if (operation) {
+      const generation = this.bufferGen;
+      return new Promise<void>((resolve, reject) => {
+        const onTerminal = () => {
+          if (this.destroyed || generation !== this.bufferGen) resolve();
+          else if (operation.errored) reject(new Error('SourceBuffer error during changeType'));
+          else if (operation.aborted) reject(new Error('SourceBuffer abort during changeType'));
+          else if (!operation.succeeded) reject(new Error('SourceBuffer ended without success during changeType'));
+          else resolve();
+        };
+        if (operation.ended) onTerminal();
+        else (operation.terminalWaiters ??= new Set()).add(onTerminal);
+      });
+    }
+    // External native mutations have no adapter-owned operation.
     return new Promise<void>((resolve, reject) => {
+      let succeeded = false;
+      let failure: Error | undefined;
+      const onUpdate = () => { succeeded = true; };
+      const onErr = () => { failure = new Error('SourceBuffer error during changeType'); };
+      const onAbort = () => { failure = new Error('SourceBuffer abort during changeType'); };
       const onEnd = () => {
+        buffer.removeEventListener('update', onUpdate);
         buffer.removeEventListener('updateend', onEnd);
         buffer.removeEventListener('error', onErr);
-        resolve();
+        buffer.removeEventListener('abort', onAbort);
+        if (failure) reject(failure);
+        else if (!succeeded) reject(new Error('SourceBuffer ended without success during changeType'));
+        else resolve();
       };
-      const onErr = () => {
-        buffer.removeEventListener('updateend', onEnd);
-        buffer.removeEventListener('error', onErr);
-        reject(new Error('SourceBuffer error during changeType'));
-      };
+      buffer.addEventListener('update', onUpdate);
       buffer.addEventListener('updateend', onEnd);
       buffer.addEventListener('error', onErr);
+      buffer.addEventListener('abort', onAbort);
     });
   }
 
@@ -1321,7 +1342,7 @@ export class MseMediaSource implements MediaSourceLike {
     const buffer = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
     if (!buffer) return;
     try {
-      if (!buffer.updating) {
+      if (!this.bufferBusy(mediaType, buffer)) {
         buffer.timestampOffset = offset;
       }
     } catch (err) {
@@ -1401,6 +1422,8 @@ export class MseMediaSource implements MediaSourceLike {
     } catch { /* MediaSource may be closed */ }
     this.videoBuffer = null;
     this.audioBuffer = null;
+    this.bufferMime.video = null;
+    this.bufferMime.audio = null;
     this.videoQueue.length = 0;
     this.audioQueue.length = 0;
     this.initialized = false;
@@ -1618,7 +1641,7 @@ export class MseMediaSource implements MediaSourceLike {
     // once the format-change + init append is committed.
     if (this.changingType[mediaType]) return;
 
-    if (!buffer || buffer.updating || queue.length === 0) {
+    if (!buffer || this.bufferBusy(mediaType, buffer) || queue.length === 0) {
       // Trigger play after the first relevant media data is buffered.
       // Seek into the LONGEST buffered range, not just buffered.start(0):
       // when we tune into a stream at a CRA-led entry whose leading
@@ -1710,16 +1733,17 @@ export class MseMediaSource implements MediaSourceLike {
     this.logDebug(`[MSE] #%d ${msg}`, ++this.diagSeq, ...args);
   }
 
-  /**
-   * Record the START of an app-initiated mutation. Returns the operation id.
-   * This asserts only that we began the operation — NOT that any particular
-   * later event belongs to it.
-   */
-  private markBufferOp(mediaType: 'video' | 'audio', cause: BufferOpCause, token?: MediaAppendToken): number {
+  private bufferBusy(mediaType: 'video' | 'audio', buffer: SourceBuffer): boolean {
+    return buffer.updating || this.inFlightOp[mediaType] !== null;
+  }
+
+  /** Record a mutation's start; completion is observed by the buffer lifecycle. */
+  private markBufferOp(mediaType: 'video' | 'audio', cause: BufferOpCause, token?: MediaAppendToken): BufferOperation {
     const id = ++this.opSeq;
-    this.inFlightOp[mediaType] = token === undefined ? { id, cause } : { id, cause, token };
+    const operation: BufferOperation = token === undefined ? { id, cause } : { id, cause, token };
+    this.inFlightOp[mediaType] = operation;
     this.diag('mutation-start op=%d %s %s', id, mediaType, cause);
-    return id;
+    return operation;
   }
 
   /**
@@ -1738,15 +1762,22 @@ export class MseMediaSource implements MediaSourceLike {
    */
   private runMutation(
     mediaType: 'video' | 'audio', cause: BufferOpCause, mutate: () => void, token?: MediaAppendToken,
-  ): number {
-    const id = this.markBufferOp(mediaType, cause, token);
+  ): BufferOperation {
+    const operation = this.markBufferOp(mediaType, cause, token);
     try {
       mutate();
     } catch (err) {
-      this.failBufferOp(mediaType, id, err);
+      this.failBufferOp(mediaType, operation, err);
       throw err;
     }
-    return id;
+    return operation;
+  }
+
+  private finishBufferOp(operation: BufferOperation): void {
+    operation.ended = true;
+    const waiters = operation.terminalWaiters;
+    delete operation.terminalWaiters;
+    if (waiters) for (const waiter of waiters) waiter();
   }
 
   /**
@@ -1761,6 +1792,7 @@ export class MseMediaSource implements MediaSourceLike {
       const op = this.inFlightOp[mediaType];
       if (!op) continue;
       this.inFlightOp[mediaType] = null;
+      this.finishBufferOp(op);
       if (op.token && this.appendObservers) (tokens ??= new Set()).add(op.token);
       this.diag('mutation-cancelled op=%d %s %s reason=%s', op.id, mediaType, op.cause, reason);
     }
@@ -1768,9 +1800,11 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /** Record that a mutation threw synchronously, so no completion will follow. */
-  private failBufferOp(mediaType: 'video' | 'audio', id: number, err: unknown): void {
-    if (this.inFlightOp[mediaType]?.id === id) this.inFlightOp[mediaType] = null;
-    this.diag('mutation-sync-failure op=%d %s: %s', id, mediaType,
+  private failBufferOp(mediaType: 'video' | 'audio', operation: BufferOperation, err: unknown): void {
+    if (this.inFlightOp[mediaType] === operation) this.inFlightOp[mediaType] = null;
+    operation.errored = true;
+    this.finishBufferOp(operation);
+    this.diag('mutation-sync-failure op=%d %s: %s', operation.id, mediaType,
       err instanceof Error ? err.message : String(err));
   }
 
@@ -2836,7 +2870,7 @@ export class MseMediaSource implements MediaSourceLike {
     for (const [b, label] of [[this.videoBuffer, 'video'], [this.audioBuffer, 'audio']] as const) {
       if (!b) continue;
       try {
-        if (b.updating || b.buffered.length === 0) continue;
+        if (this.changingType[label] || this.bufferBusy(label, b) || b.buffered.length === 0) continue;
         // FINITE range: first buffered start → last buffered end.
         this.runMutation(label, 'quota-flush',
           () => b.remove(b.buffered.start(0), b.buffered.end(b.buffered.length - 1)));
@@ -2859,6 +2893,7 @@ export class MseMediaSource implements MediaSourceLike {
     if (completing) {
       this.inFlightOp[mediaType] = null;
       this.lastCompletedOp[mediaType] = completing.id;
+      this.finishBufferOp(completing);
     }
     // `updateend` is the terminal event even for a failed append (MSE §5.5.3
     // queues error then updateend), so the id survives and the outcome is
