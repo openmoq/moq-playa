@@ -744,6 +744,9 @@ export class MoqtPlayer {
   /** Per video track: orders objects across group boundaries on the MSE paths. */
   private readonly videoGroupOrders = new Map<string, GroupBoundaryOrder>();
 
+  /** Per track: the last CMAF group reported dropped below the committed floor. */
+  private readonly cmafStaleDropLogged = new Map<string, bigint>();
+
   /** Timeout for keyframe arrival during make-before-break switch. */
   private switchStagingTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -2697,7 +2700,15 @@ export class MoqtPlayer {
       if (this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
         const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
           .getCommittedGroupFloor(mediaType, trackName);
-        if (floor !== undefined && groupId < floor) return;
+        if (floor !== undefined && groupId < floor) {
+          // The drop leaves a hole; say so once per group.
+          if (this.cmafStaleDropLogged.get(trackName) !== groupId) {
+            this.cmafStaleDropLogged.set(trackName, groupId);
+            this.log.debug('[CMAF] dropping late %s group %s on "%s": below committed group %s',
+              mediaType, String(groupId), trackName, String(floor));
+          }
+          return;
+        }
       }
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
@@ -5884,6 +5895,8 @@ export class MoqtPlayer {
     const subgroupLifecycle = new Map<bigint, {
       groupId: bigint;
       endOfGroup: boolean;
+      /** The video track the stream belongs to, when known at open. */
+      trackName: string | undefined;
       /**
        * Authoritative for ZERO and EXPLICIT modes from the header; undefined
        * for FIRST_OBJECT until an object supplies it (§10.4.2).
@@ -6438,6 +6451,11 @@ export class MoqtPlayer {
               terminal: 'reset',
               reset_code: `0x${error!.toString(16)}`,
             });
+            // The stream that would end this group is gone, so its tail is
+            // lost: stop holding that track's later groups behind it.
+            if (lifecycle.endOfGroup && lifecycle.trackName !== undefined) {
+              this.videoGroupOrders.get(lifecycle.trackName)?.abandon(lifecycle.groupId);
+            }
           }
         }
       }, 'data'),
@@ -6478,6 +6496,7 @@ export class MoqtPlayer {
           subgroupLifecycle.set(streamId, {
             groupId: sub.groupId,
             endOfGroup: sub.isEndOfGroup,
+            trackName: this.subscriptionManager?.getTrackName(alias),
             subgroupId: mode === SubgroupIdMode.FIRST_OBJECT ? undefined : sub.subgroupId,
           });
           return;

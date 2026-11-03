@@ -256,6 +256,14 @@ export class SubscriptionManager {
   }
 
   /**
+   * Get the track name for a track alias.
+   * Returns undefined if the alias is not registered.
+   */
+  getTrackName(trackAlias: bigint): string | undefined {
+    return this.tracks.get(trackAlias)?.trackName;
+  }
+
+  /**
    * Route a MoqtObject to the correct pipeline.
    *
    * 1. Look up the track alias

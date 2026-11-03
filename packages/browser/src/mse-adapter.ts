@@ -1093,6 +1093,7 @@ export class MseMediaSource implements MediaSourceLike {
       const key = `${mediaType}:${trackName}`;
       const floor = this.committedGroupFloor.get(key);
       if (floor !== undefined && groupId < floor) {
+        this.logStaleGroupDrop(mediaType, trackName, groupId, floor);
         return;
       }
     }
@@ -1296,6 +1297,21 @@ export class MseMediaSource implements MediaSourceLike {
     return this.committedGroupFloor.get(`${mediaType}:${trackName}`);
   }
 
+  /** Last group reported by {@link logStaleGroupDrop}, per track: one line per dropped group. */
+  private readonly staleDropLogged = new Map<string, bigint>();
+
+  /**
+   * Note media dropped for arriving below the committed group floor. Such a
+   * drop leaves a hole, so it is worth a line, but only one per group.
+   */
+  private logStaleGroupDrop(mediaType: 'video' | 'audio', trackName: string, groupId: bigint, floor: bigint): void {
+    const key = `${mediaType}:${trackName}`;
+    if (this.staleDropLogged.get(key) === groupId) return;
+    this.staleDropLogged.set(key, groupId);
+    this.logDebug('[MSE] dropping late %s group %s on "%s": below committed group %s',
+      mediaType, String(groupId), trackName, String(floor));
+  }
+
   /**
    * Clear a specific track's timeline index.
    * Called on decode-time discontinuity so old ranges don't cause
@@ -1343,6 +1359,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.videoTimelines.clear();
     this.audioTimelines.clear();
     this.committedGroupFloor.clear();
+    this.staleDropLogged.clear();
     this.pendingVideoRanges = [];
     this.pendingAudioRanges = [];
     this.pendingVideoTrackName = null;
@@ -1586,6 +1603,7 @@ export class MseMediaSource implements MediaSourceLike {
         const floorKey = `${mediaType}:${peek.trackName}`;
         const floor = this.committedGroupFloor.get(floorKey);
         if (floor !== undefined && peek.groupId < floor) {
+          this.logStaleGroupDrop(mediaType, peek.trackName, peek.groupId, floor);
           queue.shift();
           continue;
         }
