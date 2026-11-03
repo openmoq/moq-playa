@@ -49,6 +49,8 @@ jobs:
           pnpm exec playwright install --with-deps chrome
       - name: Media playback and negative controls
         run: pnpm test:player:browser
+      - name: Preserve reordered native audio output
+        run: pnpm test:player:audio-order --zero-window-control
       - name: Retain playback evidence
         if: always()
         uses: actions/upload-artifact@v4

@@ -21,7 +21,8 @@
     "smoke:exports": "node scripts/smoke-exports.mjs && node scripts/smoke-compatibility.mjs && node scripts/smoke-trace-recorder.mjs && node scripts/smoke-probe.mjs && node scripts/smoke-devtools.mjs",
     "release": "node scripts/release.mjs",
     "release:dry": "node scripts/release.mjs",
-    "test:corpus:diff": "vitest run --config vitest.diff.config.ts"
+    "test:corpus:diff": "vitest run --config vitest.diff.config.ts",
+    "test:player:audio-order": "node scripts/player-acceptance/mse-audio-order.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

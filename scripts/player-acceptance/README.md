@@ -223,3 +223,25 @@ artifacts for fourteen days. A local macOS result is not a Linux CI result.
 For a diagnostic rerun, add `--case loc-4-media` to select one exact scenario.
 The retained result records this selection; a selected-case pass is not a pass
 for the full campaign.
+
+
+`pnpm test:player:audio-order` checks native audio samples when a later group's
+head arrives before the preceding group's tail. It generates AAC-LC at 8 kHz,
+with exact 1024-sample packet timing, and prepares four fresh browser contexts:
+in-order twice, the real adapter receiving head then tail, and an omitted-tail
+negative control. Actual native append bytes identify the packet order; append
+observations must terminate exactly once. AudioWorklet captures every quantum,
+including silence, through at least 4096 context-clock samples after media ends.
+The candidate's active PCM span must match the healthy repeat within 16 samples,
+while omission must lose one 1024-sample packet within that tolerance. Buffered
+ranges are retained only as diagnostics because they can conceal missing audio.
+This constrained fixture establishes output duration and native append ordering,
+not arbitrary-codec fidelity, exact packet identity from decoded PCM or A/V sync.
+
+`--zero-window-control` also tests the adapter with reordering disabled: its
+committed-group guard discards the old tail and must show the expected deficit.
+`--native-diagnostic` records raw MSE receiving reordered packets without assuming
+that every browser must reproduce a particular loss. The media workflow runs the
+mandatory gate and zero-window control. FFmpeg and Chrome are required; browser
+selection uses the same `PLAYER_TEST_BROWSER` convention as the playback runner.
+Reports and raw PCM are retained under `reports/player-acceptance/`.
