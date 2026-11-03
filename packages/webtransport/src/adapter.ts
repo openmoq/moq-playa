@@ -32,6 +32,7 @@ import {
   encodeFetchHeader18,
   encodeFetchObject18,
   encodeFetchEndOfRange18,
+  encodeFetchEndMarker23,
   createDataCodec,
   supportedPropertyFault,
   decodePropertyBlock,
@@ -46,7 +47,7 @@ import {
   resolveFillWindow,
   readLocation,
 } from '@openmoq/transport';
-import type { FillOptions, SubscriptionWindow } from '@openmoq/transport';
+import type { FillOptions, RequestOk, SubscriptionWindow } from '@openmoq/transport';
 import type {
   EndpointRoleValue,
   ControlMessage,
@@ -101,8 +102,8 @@ import type { ObjectReceipt, ObjectReceiptObservation, ObjectReceiptDiscard } fr
 import { ObjectReceptionObservers, type ReceptionCarrier } from './object-reception.js';
 import type { ObjectReception, ObjectReceptionEvent, ObjectReceptionOptions } from './object-reception.js';
 import type { WebTransportLike, WebTransportBidirectionalStream, MoqtSetupRouting } from './types.js';
-import { isDraft22, isRequestStreamDraft, isWiredDraft } from '@openmoq/transport';
-import type { FetchOk } from '@openmoq/transport';
+import { DEFAULT_DRAFT_VERSION, isDraft22, isDraft23, isRequestStreamDraft, isWiredDraft, requestStreamDraftOf } from '@openmoq/transport';
+import type { FetchOk, FetchRangeKind, RequestStreamDraft } from '@openmoq/transport';
 
 
 
@@ -352,7 +353,7 @@ export interface IncomingPublish {
  * than trying to construct a codec for an unwired draft.
  *
  * @see draft-ietf-moq-transport-16 §3.1
- * - 'moqt-22' → 22, 'moqt-18' → 18, 'moqt-16' → 16
+ * - 'moqt-23' → 23, 'moqt-22' → 22, 'moqt-18' → 18, 'moqt-16' → 16
  * - 'moq-00' → 14 (pre-15 convention)
  * - '' / undefined / unsupported token → undefined (use constructor version)
  */
@@ -988,6 +989,19 @@ export class MoqtConnection {
     try { void Promise.resolve(fn()).catch(() => { /* teardown races are expected */ }); } catch { /* sync throw */ }
   }
 
+  /** The request-stream draft (18, 22 or 23) of the current session's wire rules. */
+  private requestStreamDraft(): RequestStreamDraft {
+    return requestStreamDraftOf(this.session.draftVersion);
+  }
+
+  /**
+   * The session close code for a violation: draft 23's more specific code when
+   * the detector supplied one (§12.2), else PROTOCOL_VIOLATION (0x3).
+   */
+  private violationCode(code: number | undefined): number {
+    return code !== undefined && isDraft23(this.session.draftVersion) ? code : 0x3;
+  }
+
   /**
    * A fatal violation this endpoint detected (control-stream, request-stream,
    * data-stream, or datagram). Closes the local session and runs the one-shot
@@ -1082,7 +1096,7 @@ export class MoqtConnection {
     // centralized cleanup as every other fatal path, so unrelated pending
     // promises are rejected rather than left hanging.
     if (error instanceof ProtocolViolationError) {
-      this.closeSessionFatal(error.message);
+      this.closeSessionFatal(error.message, this.violationCode(error.code));
     }
   }
 
@@ -1610,7 +1624,8 @@ export class MoqtConnection {
    *   - Browser WebTransport may expose `transport.protocol`, allowing
    *     draft auto-detection ('moqt-16' → 16, 'moq-00' → 14).
    *   - Node/headless/polyfill WebTransport often has `protocol` undefined.
-   *   - When `protocol` is undefined, the connection defaults to draft 16.
+   *   - When `protocol` is undefined, the connection defaults to draft 16
+   *     (`DEFAULT_DRAFT_VERSION`).
    *   - **v14 callers MUST pass `new MoqtConnection(14)`**, because the first
    *     CLIENT_SETUP bytes are draft-specific and cannot be retried.
    * @param options.role Endpoint role (default `'client'`). The role sets
@@ -1632,9 +1647,9 @@ export class MoqtConnection {
     this.joiningFetchTimeoutMs = options?.joiningFetchTimeoutMs ?? 10_000;
     this.terminatedAliasTtlMs = options?.terminatedAliasTtlMs ?? 10_000;
     this.closeReportFallbackMs = options?.closeReportFallbackMs ?? 2_000;
-    // Initialize with the requested version (or default 16). May be reconfigured
+    // Initialize with the requested version (or the default, 16). May be reconfigured
     // in connect() if WT protocol negotiation selects a different draft.
-    this.configureForVersion(version ?? 16);
+    this.configureForVersion(version ?? DEFAULT_DRAFT_VERSION);
   }
 
   /**
@@ -1699,7 +1714,7 @@ export class MoqtConnection {
       // A post-SETUP control-stream lifecycle violation (wrong-stream message,
       // decode failure, or FIN, §3.3 and §10 Table 5) is fatal: close with
       // PROTOCOL_VIOLATION.
-      this.uniPair.onControlStreamViolation = (reason) => this.handleControlStreamViolation(reason);
+      this.uniPair.onControlStreamViolation = (reason, code) => this.handleControlStreamViolation(reason, code);
     } else {
       const topology = createBidiControlTopology(version);
       this.codec = topology.control;
@@ -1768,10 +1783,11 @@ export class MoqtConnection {
       // Native QUIC support starts at draft 18. Unlike the historical
       // WebTransport fallback, ALPN is mandatory and must identify the exact
       // wire draft before any MOQT stream is opened.
-      const nativeDraft = transport.protocol === 'moqt-18' ? 18 : transport.protocol === 'moqt-22' ? 22 : undefined;
+      const negotiated = protocolToDraftVersion(transport.protocol);
+      const nativeDraft = negotiated !== undefined && isRequestStreamDraft(negotiated) ? negotiated : undefined;
       if (nativeDraft === undefined) {
         throw new ProtocolViolationError(
-          `native QUIC negotiated ALPN ${JSON.stringify(transport.protocol ?? '')}; expected "moqt-18" or "moqt-22"`,
+          `native QUIC negotiated ALPN ${JSON.stringify(transport.protocol ?? '')}; expected "moqt-18", "moqt-22" or "moqt-23"`,
         );
       }
       if (this._requestedVersion !== undefined && this._requestedVersion !== nativeDraft) {
@@ -2554,7 +2570,12 @@ export class MoqtConnection {
     }
   }
 
-  private async deliverRequestResponse(message: DecodedControlMessage, requestId: bigint): Promise<void> {
+  private async deliverRequestResponse(received: DecodedControlMessage, requestId: bigint): Promise<void> {
+    // draft-23 §9.3: a FETCH is answered with REQUEST_OK. Hand the rest of the
+    // stack (and the application) the FETCH_OK it stands for.
+    const message: DecodedControlMessage = received.type === 'REQUEST_OK'
+      ? this.session.fetchOkFromRequestOk(requestId, { ...received, requestId } as RequestOk) ?? received
+      : received;
     // Stamp the stream-derived Request ID (codec leaves it absent on responses).
     const stamped = { ...message, requestId } as ControlMessage;
     // qlog is the RAW observation channel — emit BEFORE any semantic handling
@@ -3113,9 +3134,9 @@ export class MoqtConnection {
    * onClose. No-op if the session is already closed (e.g. a local close FIN'd
    * the stream first), so we never double-close.
    */
-  private handleControlStreamViolation(reason: string): void {
+  private handleControlStreamViolation(reason: string, code?: number): void {
     if (this.session.state === SessionState.CLOSED) return;
-    this.closeSessionFatal(reason); // centralized: close + reject pending + onClose
+    this.closeSessionFatal(reason, this.violationCode(code)); // centralized: close + reject pending + onClose
   }
 
   /**
@@ -4756,7 +4777,7 @@ export class MoqtConnection {
       await closed;
     } catch (err) {
       if (err instanceof ProtocolViolationError) {
-        this.closeSessionFatal(err.message);
+        this.closeSessionFatal(err.message, this.violationCode(err.code));
         return;
       }
       this.onError?.(new MoqtConnectionError(
@@ -4813,7 +4834,7 @@ export class MoqtConnection {
       await this.executeActions(this.session.handleSubscribeTracksStreamClosed(requestId));
     } catch (err) {
       if (err instanceof ProtocolViolationError) {
-        this.closeSessionFatal(err.message);
+        this.closeSessionFatal(err.message, this.violationCode(err.code));
         return;
       }
       this.onError?.(new MoqtConnectionError(
@@ -7047,25 +7068,50 @@ export class MoqtConnection {
       throw new MoqtConnectionError(`Object ${fields.groupId}/${fields.objectId} is outside the fill range`, { errorSource: 'data' });
     }
     this.assertLocalObjectProperties(fields.extensions);
-    const { bytes, nextPrior } = encodeFetchObject18(fields, state.prior, state.isFirstObject, state.groupOrder);
+    const { bytes, nextPrior } = encodeFetchObject18(fields, state.prior, state.isFirstObject, state.groupOrder,
+      this.requestStreamDraft());
     await this.writeFetchStream(streamId, () => state.writer.write(bytes));
     state.prior = nextPrior;
     state.isFirstObject = false;
   }
 
-  /** Send an End-of-Range marker on a FETCH response stream (§11.4.4.2). */
-  async sendFetchEndOfRange(streamId: bigint, nonExistent: boolean, groupId: bigint, objectId: bigint): Promise<void> {
+  /**
+   * Send an End-of-Range marker on a FETCH response stream (§11.4.4.2).
+   * @param kind The range kind (`'timed-out'` needs draft 22+, `'gone'` draft 23),
+   *   or `true` for non-existent and `false` for unknown.
+   */
+  async sendFetchEndOfRange(streamId: bigint, kind: FetchRangeKind | boolean, groupId: bigint, objectId: bigint): Promise<void> {
     const state = this.fetchOutgoingStreams.get(streamId);
     if (!state) throw new MoqtConnectionError(`Unknown fetch stream ${streamId}`, { errorSource: 'data' });
     if (state.closing) throw new MoqtConnectionError(`Fetch stream ${streamId} is closing`, { errorSource: 'data' });
     if (state.fillWindow && !windowContains(state.fillWindow, groupId, objectId)) {
       throw new MoqtConnectionError(`Range end ${groupId}/${objectId} is outside the fill range`, { errorSource: 'data' });
     }
-    const { bytes, nextPrior } = encodeFetchEndOfRange18(nonExistent, groupId, objectId, state.prior,
-      isDraft22(this.session.draftVersion) ? 22 : 18);
+    const { bytes, nextPrior } = encodeFetchEndOfRange18(kind, groupId, objectId,
+      state.isFirstObject ? undefined : state.prior, this.requestStreamDraft(), state.groupOrder);
     await this.writeFetchStream(streamId, () => state.writer.write(bytes));
     state.prior = nextPrior;
     state.isFirstObject = false;
+  }
+
+  /**
+   * Mark the last Object sent as the end of its Group or of the Track
+   * (draft-23 §11.4.2.2). Draft 23 requires End of Track after an Object known
+   * to end the Track, and End of Group after a response's last Object if it is
+   * known to end its Group (§3.2.2). Earlier drafts have no such marker, so this
+   * writes nothing there.
+   */
+  async sendFetchEndMarker(streamId: bigint, marker: 'end-of-group' | 'end-of-track'): Promise<void> {
+    const state = this.fetchOutgoingStreams.get(streamId);
+    if (!state) throw new MoqtConnectionError(`Unknown fetch stream ${streamId}`, { errorSource: 'data' });
+    if (state.closing) throw new MoqtConnectionError(`Fetch stream ${streamId} is closing`, { errorSource: 'data' });
+    if (!isDraft23(this.session.draftVersion)) return;
+    if (state.isFirstObject) {
+      throw new MoqtConnectionError(`Fetch stream ${streamId} has no Object to mark as ${marker}`, { errorSource: 'data' });
+    }
+    const { bytes, nextPrior } = encodeFetchEndMarker23(marker, state.prior);
+    await this.writeFetchStream(streamId, () => state.writer.write(bytes));
+    state.prior = nextPrior;
   }
 
   /**
@@ -7618,7 +7664,7 @@ export class MoqtConnection {
       this.notifyClose(error.closeAction, 'peer SETUP rejected');
       return;
     }
-    this.handleControlStreamViolation(reason);
+    this.handleControlStreamViolation(reason, error instanceof ProtocolViolationError ? error.code : undefined);
   }
 
   /**
@@ -7700,7 +7746,7 @@ export class MoqtConnection {
           // §10.3.1, §10: Protocol violations (invalid flags, zero-length
           // extensions, extensions on status datagrams) MUST close the session.
           if (err instanceof ProtocolViolationError) {
-            this.closeSessionFatal(err.message);
+            this.closeSessionFatal(err.message, this.violationCode(err.code));
             return;
           }
           // RangeError = truncated/malformed datagram (e.g. stray H3 capsule
@@ -7981,7 +8027,7 @@ export class MoqtConnection {
   /** Close the session on a PUBLISH-stream protocol violation; else surface it. */
   private async failInboundRequest(err: Error): Promise<void> {
     if (err instanceof ProtocolViolationError) {
-      this.closeSessionFatal(err.message); // centralized: also rejects pending promises
+      this.closeSessionFatal(err.message, this.violationCode(err.code)); // centralized: also rejects pending promises
       return;
     }
     this.onError?.(new MoqtConnectionError(
@@ -8825,7 +8871,7 @@ export class MoqtConnection {
       // streams MUST close the session with PROTOCOL_VIOLATION.
       if (err instanceof ProtocolViolationError) {
         this.objectReception?.interrupt(reader, 'protocol-violation');
-        this.closeSessionFatal(err.message);
+        this.closeSessionFatal(err.message, this.violationCode(err.code));
         return;
       }
 
@@ -8988,6 +9034,7 @@ export class MoqtConnection {
           // Complete but unrecognized stream type (e.g. SETUP on a data stream).
           throw new ProtocolViolationError(
             `Unknown data stream type (leading byte 0x${firstByte.toString(16)}) — expected SUBGROUP_HEADER or FETCH_HEADER (0x05)`,
+            Number(SessionError.INVALID_STREAM_HEADER),
           );
         }
         // streamClass === undefined → incomplete type, fall through to read more
@@ -9005,7 +9052,7 @@ export class MoqtConnection {
         // centralized catch closes the session AND no normal terminal is
         // published on the way out.
         if (buf.length > 0) {
-          throw new ProtocolViolationError('Stream FIN received mid-header');
+          throw new ProtocolViolationError('Stream FIN received mid-header', Number(SessionError.TRUNCATED_OBJECT));
         }
         return { type: 'terminal', terminal: 'peer-fin' };
       }
@@ -9165,7 +9212,7 @@ export class MoqtConnection {
         // §10.4: "If a stream ends gracefully in the middle of a serialized
         // Object, the session SHOULD be closed with a PROTOCOL_VIOLATION."
         if (buf.length > 0) {
-          throw new ProtocolViolationError('Stream FIN received mid-object');
+          throw new ProtocolViolationError('Stream FIN received mid-object', Number(SessionError.TRUNCATED_OBJECT));
         }
 
         // §10.4.2: Subgroup header's END_OF_GROUP flag means this subgroup
@@ -9283,8 +9330,9 @@ export class MoqtConnection {
               objectId: item.objectId as bigint,
               ...(item.publisherPriority !== undefined ? { priority: item.publisherPriority } : {}),
             };
-          } else {
-            // FetchEndOfRange — emit as gap
+          } else if (!('marker' in item)) {
+            // FetchEndOfRange — emit as gap (End of Group / End of Track markers
+            // exist only on the draft-23 decoder)
             // Use rawStatus when available (draft-14 preserves exact status code),
             // otherwise derive from nonExistent boolean (draft-16).
             const gapStatus = item.rawStatus
@@ -9330,7 +9378,7 @@ export class MoqtConnection {
         if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
         // §10.4: mid-object FIN → SHOULD close with PROTOCOL_VIOLATION
         if (buf.length > 0) {
-          throw new ProtocolViolationError('Fetch stream FIN received mid-object');
+          throw new ProtocolViolationError('Fetch stream FIN received mid-object', Number(SessionError.TRUNCATED_OBJECT));
         }
         return 'peer-fin';
       }
@@ -9456,15 +9504,23 @@ export class MoqtConnection {
               if (!await this.receiveFetchObject(receiver, delivered)) return 'local-discard';
             } else this.onObject?.(streamId, delivered); // no alias routing for fetch
           } else {
-            // End-of-Range indicators describe ranges, never receive attempts.
+            // End-of-Range and draft-23 end markers describe no Object, so never a receive attempt.
             this.objectReception?.skip(reader, buf.length);
+            // draft-23 End of Group / End of Track follow the last Object of its
+            // Group or the Track. Report them as END_OF_GROUP / END_OF_TRACK
+            // status just after it, like the synthetic END_OF_GROUP of a
+            // subgroup FIN. An End of Range keeps the draft-18 mapping: a Gone
+            // range, like an Unknown one, is never non-existence (§2.1.2).
+            const objectId = 'marker' in item && item.objectId < 0xffffffffffffffffn ? item.objectId + 1n : item.objectId;
             const delivered: MoqtObjectGap = {
               kind: 'gap',
               trackAlias: 0n,
               groupId: item.groupId,
               subgroupId: 0n,
-              objectId: item.objectId,
-              status: fetchRangeGapStatus(item.nonExistent),
+              objectId,
+              status: 'marker' in item
+                ? (item.marker === 'end-of-track' ? ObjectStatus.END_OF_TRACK : ObjectStatus.END_OF_GROUP)
+                : fetchRangeGapStatus(item.nonExistent),
             };
             if (!this.observeFetchObject(header.requestId, streamId, delivered, reader, receiver)) return 'local-discard';
             if (receiver) {
@@ -9489,7 +9545,7 @@ export class MoqtConnection {
       if (done) {
         if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
         if (buf.length > 0) {
-          throw new ProtocolViolationError('Fetch stream FIN received mid-object');
+          throw new ProtocolViolationError('Fetch stream FIN received mid-object', Number(SessionError.TRUNCATED_OBJECT));
         }
         return 'peer-fin';
       }
