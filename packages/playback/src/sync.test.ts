@@ -530,18 +530,19 @@ describe('SyncController', () => {
 
     describe('SyncController — media-time timestamps', () => {
         it('measureLatency returns null when the timestamp is not wall clock', () => {
-            const sync = new SyncController({ wallClock: { now: () => 5_000_000 } });
+            const sync = new SyncController({ clock: new MockClock(), driftThresholdUs: DRIFT_THRESHOLD, wallClock: { now: () => 5_000_000 } });
             expect(sync.measureLatency(1_000_000n)).toBe(4_000_000);
             expect(sync.measureLatency(1_000_000n, true)).toBe(4_000_000);
             expect(sync.measureLatency(1_000_000n, false)).toBeNull();
         });
 
-        it('evaluateCatchUp returns null and leaves latency untouched for media time', () => {
-            const sync = new SyncController({ wallClock: { now: () => 5_000_000 }, targetLatencyMs: 100, maxCatchUpRate: 1.5 });
+        it('evaluateCatchUp returns null and invalidates capture age for media time', () => {
+            const sync = new SyncController({ clock: new MockClock(), driftThresholdUs: DRIFT_THRESHOLD, wallClock: { now: () => 5_000_000 }, targetLatencyMs: 100, maxCatchUpRate: 1.5 });
             sync.evaluateCatchUp(1_000_000n);
-            const before = sync.latencyUs;
+            expect(sync.captureTimestampAgeUs).toBe(4_000_000);
             expect(sync.evaluateCatchUp(2_000_000n, false)).toBeNull();
-            expect(sync.latencyUs).toBe(before);
+            expect(sync.latencyUs).toBe(0);
+            expect(sync.captureTimestampAgeUs).toBeNull();
         });
     });
 });

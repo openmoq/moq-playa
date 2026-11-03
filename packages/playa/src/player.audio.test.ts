@@ -170,7 +170,7 @@ describe('Player — audio activation', () => {
       const p = new Player(mockElement() as HTMLElement, {
         url: 'x', namespace: 'y', audioActivation: 'gesture',
       });
-      const [a, b, c] = await Promise.all([
+      await Promise.all([
         p.prepareAudio(),
         p.prepareAudio(),
         p.prepareAudio(),
@@ -279,5 +279,25 @@ describe('Player — play()', () => {
     p.play();
     expect(plays).toHaveLength(1);
     expect(p.state).toBe('playing');
+  });
+});
+
+
+describe('Player stats measurement mapping', () => {
+  it.each([250, 0, -5])('forwards legacy age and nullable observations without changing frame semantics: %s', age => {
+    const player = new Player(mockElement() as HTMLElement, { url: 'x', namespace: 'y' });
+    const quality = { totalVideoFrames: 300, droppedVideoFrames: 3, displayedVideoFrames: 297, creationTimeMs: 10 };
+    (player as unknown as { engine: { stats: object } }).engine.stats = {
+      currentLatencyMs: age, captureTimestampAgeMs: age, videoPlaybackQuality: quality,
+      framesDecoded: 7, framesRendered: 4, framesDropped: 1,
+    };
+    expect(player.stats).toMatchObject({ latencyMs: age, captureTimestampAgeMs: age, videoPlaybackQuality: quality,
+      framesDecoded: 7, framesRendered: 4, framesDropped: 1 });
+  });
+
+  it('maps absent optional observations to null rather than measured zero', () => {
+    const player = new Player(mockElement() as HTMLElement, { url: 'x', namespace: 'y' });
+    (player as unknown as { engine: { stats: object } }).engine.stats = { currentLatencyMs: 0 };
+    expect(player.stats).toMatchObject({ latencyMs: 0, captureTimestampAgeMs: null, videoPlaybackQuality: null });
   });
 });

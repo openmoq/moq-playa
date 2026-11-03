@@ -249,6 +249,19 @@ export interface MediaAppendObservation {
 }
 export type MediaAppendObserver = (event: MediaAppendObservation) => void | Promise<void>;
 
+/** Native playback-quality counters, scoped to the media element's load.
+ * They reset on the HTML media-element load algorithm, not on engine counters
+ * or each SourceBuffer reconfiguration. Counts do not identify decoded output.
+ */
+export interface VideoPlaybackQualityStats {
+  readonly totalVideoFrames: number;
+  readonly droppedVideoFrames: number;
+  /** Derived total minus dropped; not the engine's render-callback counter. */
+  readonly displayedVideoFrames: number;
+  /** Snapshot creation time in the source realm's performance-clock milliseconds. */
+  readonly creationTimeMs: number;
+}
+
 /**
  * MediaSource adapter interface for CMAF-packaged tracks.
  *
@@ -398,6 +411,12 @@ export interface MediaSourceLike {
    * currentTime now outside all buffered ranges).
    */
   getBufferAheadUs?(): number | null;
+
+  /** Native element-load-scoped video counters, or null without owned video,
+   * support, or valid measurements. A supported all-zero snapshot is observed
+   * zero, not unavailable. Optional for existing/custom media adapters.
+   */
+  getVideoPlaybackQuality?(): Readonly<VideoPlaybackQualityStats> | null;
 
   /**
    * Whether the media element has attached the MediaSource (MSE

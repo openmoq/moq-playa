@@ -124,6 +124,7 @@ export type {
   VideoPresentation,
   AudioOutputLike,
   MediaSourceLike,
+  VideoPlaybackQualityStats,
   MediaAppendToken,
   MediaAppendReason,
   MediaAppendObservation,

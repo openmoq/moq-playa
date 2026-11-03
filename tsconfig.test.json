@@ -17,6 +17,10 @@
   // `*.test.ts` corpus predates any typecheck gate and does not compile clean
   // under these options; widening this include is a separate cleanup.
   "include": [
+    "packages/player/src/player-stats.test.ts",
+    "packages/playback/src/sync-stats.test.ts",
+    "packages/playback/src/sync.test.ts",
+    "packages/playa/src/player.audio.test.ts",
     "packages/player/src/player-video-switch-ownership.loopback.test.ts",
     "packages/browser/src/mse-adapter.test.ts",
     "packages/playback/src/pipeline-inputs.test.ts",

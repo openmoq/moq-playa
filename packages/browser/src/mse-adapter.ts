@@ -15,7 +15,7 @@
  * @module
  */
 
-import type { MediaSourceLike, MediaAppendToken, MediaAppendReason, MediaAppendObserver } from '@openmoq/player';
+import type { MediaSourceLike, MediaAppendToken, MediaAppendReason, MediaAppendObserver, VideoPlaybackQualityStats } from '@openmoq/player';
 import {
   filterInitSegment,
   describeBoxes,
@@ -1470,6 +1470,31 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.ms.readyState !== 'open') return;
     this.endRequested = true;
     this.finishEndOfStream();
+  }
+
+  getVideoPlaybackQuality(): Readonly<VideoPlaybackQualityStats> | null {
+    if (this.destroyed || !this._attached || !this.videoBuffer) return null;
+    try {
+      // A latched sourceopen does not prove the element still belongs to us.
+      if (this.ms.readyState === 'closed') return null;
+      if (this.selectedAttachment === 'src-object') {
+        if (this.video.srcObject !== this.ms) return null;
+      } else if (this.video.srcObject != null || this.video.src !== this.objectUrl
+          || (this.video.currentSrc && this.video.currentSrc !== this.objectUrl)) return null;
+      let ownsVideo = false;
+      for (let i = 0; i < this.ms.sourceBuffers.length; i++) {
+        if (this.ms.sourceBuffers[i] === this.videoBuffer) { ownsVideo = true; break; }
+      }
+      if (!ownsVideo) return null;
+      const quality = this.video.getVideoPlaybackQuality?.();
+      if (!quality) return null;
+      const { totalVideoFrames, droppedVideoFrames, creationTime } = quality;
+      if (!Number.isSafeInteger(totalVideoFrames) || totalVideoFrames < 0 || totalVideoFrames > 0xffffffff
+          || !Number.isSafeInteger(droppedVideoFrames) || droppedVideoFrames < 0 || droppedVideoFrames > totalVideoFrames
+          || !Number.isFinite(creationTime) || creationTime < 0) return null;
+      return Object.freeze({ totalVideoFrames, droppedVideoFrames,
+        displayedVideoFrames: totalVideoFrames - droppedVideoFrames, creationTimeMs: creationTime });
+    } catch { return null; }
   }
 
   getBufferAheadUs(): number | null {

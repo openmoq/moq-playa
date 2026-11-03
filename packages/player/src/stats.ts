@@ -16,6 +16,8 @@
  * @module
  */
 
+import type { VideoPlaybackQualityStats } from './interfaces.js';
+
 // ─── TTFF Breakdown ──────────────────────────────────────────────────
 
 /**
@@ -48,9 +50,9 @@ export interface TTFFBreakdown {
 /**
  * Aggregate player statistics — polled snapshot of QoE metrics.
  *
- * Returned by player.stats as a plain frozen object. Deferred fields
- * (currentLatencyMs, buffer depths, framesDropped) default to 0 until
- * their dependencies (Items 7, 8) are built.
+ * Returned by player.stats as a plain frozen object. Deferred buffer depths and drop counters retain their numeric defaults.
+ * Capture timestamp age is nullable; its legacy numeric alias uses zero
+ * when unavailable.
  *
  * @see draft-jennings-moq-metrics-02 (informational)
  * @see draft-ietf-moq-transport-16 §10.2.1.1 (Object Status)
@@ -62,8 +64,15 @@ export interface PlayerStats {
   readonly timeToFirstFrameMs: number | null;
   /** Detailed TTFF breakdown. null before load() is called. */
   readonly ttffBreakdown: TTFFBreakdown | null;
-  /** Current end-to-end latency (ms). 0 until Item 8. */
+  /** Legacy numeric capture-timestamp age; 0 also means unavailable.
+   * Use captureTimestampAgeMs to distinguish unavailable from measured zero.
+   * Neither field establishes synchronized clocks or presentation latency.
+   */
   readonly currentLatencyMs: number;
+  /** Latest uncorrected receiver-wall-clock minus LOC wall-clock timestamp.
+   * May be negative. Null without a measurement; not end-to-end latency.
+   */
+  readonly captureTimestampAgeMs?: number | null;
   /** Target latency from MSF catalog (ms). @see draft-ietf-moq-msf-00 §5.1.16 */
   readonly targetLatencyMs: number;
   /** Cumulative active playback time (ms). Excludes paused/stalled time. */
@@ -86,19 +95,23 @@ export interface PlayerStats {
   // ── Frames ──────────────────────────────────────────────────
   /** Emitted video decode commands after transforms, before native dispatch. Legacy name; not decoded output. */
   readonly framesDecoded: number;
-  /** Number of frames dropped. 0 until Item 7. */
+  /** Video drops reported by the playback pipeline. */
   readonly framesDropped: number;
-  /** Number of frames rendered to the display surface. */
+  /** Recorded renderer callbacks, not physical display measurements. */
   readonly framesRendered: number;
   /** Ratio of dropped to (decoded + dropped). 0 when none dropped. */
   readonly dropRatio: number;
+  /** Separate media-element-load counters; null when unavailable. Legacy
+   * frame fields retain their engine/pipeline scopes and are not overwritten.
+   */
+  readonly videoPlaybackQuality?: Readonly<VideoPlaybackQualityStats> | null;
 
   // ── Buffer ──────────────────────────────────────────────────
-  /** Video buffer depth (seconds). 0 until Item 7. */
+  /** Latest reported video buffer depth (seconds). */
   readonly videoBufferDepth: number;
-  /** Audio buffer depth (seconds). 0 until Item 7. */
+  /** Latest reported audio buffer depth (seconds). */
   readonly audioBufferDepth: number;
-  /** Video decoder queue depth (frames). 0 until Item 7. */
+  /** Latest reported video decoder queue depth (frames). */
   readonly videoDecoderQueueDepth: number;
 
   // ── Network (§10.2.1.1 Object Status) ──────────────────────
@@ -262,7 +275,7 @@ export class StatsAccumulator {
   private _avSkewEwmaMs: number | null = null;
 
   // ── Latency (Item 8) ──────────────────────────────────────
-  private _currentLatencyMs = 0;
+  private _captureTimestampAgeMs: number | null = null;
 
   // ── Playback duration tracking ─────────────────────────────
   /** Whether currently in an active playback segment. */
@@ -480,12 +493,12 @@ export class StatsAccumulator {
   // ── Latency ──────────────────────────────────────────────
 
   /**
-   * Record current end-to-end latency.
-   * @param ms Latency in milliseconds (from CaptureTimestamp comparison)
+   * Record the legacy capture-timestamp clock-difference measurement.
+   * @param ms Uncorrected receiver-wall-clock minus capture timestamp (ms).
    * @see draft-ietf-moq-loc-01 §2.3.1.1
    */
   recordLatency(ms: number): void {
-    this._currentLatencyMs = ms;
+    this._captureTimestampAgeMs = ms;
   }
 
   // ── Playback duration ──────────────────────────────────────
@@ -552,7 +565,8 @@ export class StatsAccumulator {
       // Timing
       timeToFirstFrameMs: relativeMs(this._firstFrameRenderedMs),
       ttffBreakdown,
-      currentLatencyMs: this._currentLatencyMs,
+      currentLatencyMs: this._captureTimestampAgeMs ?? 0,
+      captureTimestampAgeMs: this._captureTimestampAgeMs,
       targetLatencyMs: this._targetLatencyMs,
       playbackDurationMs,
       sessionAgeMs,

@@ -1496,7 +1496,22 @@ export class MoqtPlayer {
       videoEffectiveGapTimeoutMs: gapUs / 1000, // raw adaptive fuse
       renderCushionMs: (this.getRenderCushionUs?.() ?? computePlaybackDelayUs(gapUs, this._handshakeRttMs)) / 1000,
     } : undefined;
-    return Object.freeze(this._stats.snapshot(locGauges));
+    const ageUs = this.syncController?.captureTimestampAgeUs ?? null;
+    const captureTimestampAgeMs = ageUs === null ? null : ageUs / 1000;
+    let videoPlaybackQuality: PlayerStats['videoPlaybackQuality'] = null;
+    try {
+      const quality = this.mediaSource?.getVideoPlaybackQuality?.();
+      if (quality) videoPlaybackQuality = Object.freeze({
+        totalVideoFrames: quality.totalVideoFrames, droppedVideoFrames: quality.droppedVideoFrames,
+        displayedVideoFrames: quality.displayedVideoFrames, creationTimeMs: quality.creationTimeMs,
+      });
+    } catch { /* Optional adapter measurements cannot break the stats getter. */ }
+    return Object.freeze({
+      ...this._stats.snapshot(locGauges),
+      currentLatencyMs: captureTimestampAgeMs ?? 0,
+      captureTimestampAgeMs,
+      videoPlaybackQuality,
+    });
   }
 
   /**

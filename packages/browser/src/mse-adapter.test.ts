@@ -231,13 +231,18 @@ class MockMediaSource extends MockEventTarget {
     audioBuffer = new MockSourceBuffer();
     /** Mime types passed to addSourceBuffer, for created-nothing assertions. */
     readonly addSourceBufferCalls: string[] = [];
+    readonly sourceBuffers: MockSourceBuffer[] = [];
     addSourceBuffer(mimeType: string): MockSourceBuffer {
         this.addSourceBufferCalls.push(mimeType);
         const sb = new MockSourceBuffer();
+        this.sourceBuffers.push(sb);
         if (mimeType.startsWith('video/')) this.videoBuffer = sb; else this.audioBuffer = sb;
         return sb;
     }
-    removeSourceBuffer(_sb: unknown): void { /* no-op */ }
+    removeSourceBuffer(sb: unknown): void {
+        const index = this.sourceBuffers.indexOf(sb as MockSourceBuffer);
+        if (index >= 0) this.sourceBuffers.splice(index, 1);
+    }
     endOfStream(): void { this.readyState = 'ended'; }
     open(): void {
         this.readyState = 'open';
@@ -4808,4 +4813,101 @@ it('waits for the in-flight main range before positioning startup', async () => 
         expect(play).toHaveBeenCalledTimes(1);
         expect(video.currentTime).toBe(1.5);
     } finally { adapter.destroy(); }
+});
+
+
+describe('MSE video playback quality semantics', () => {
+    it('reports element-load totals and derived displayed frames, including observed zero', async () => {
+        const { adapter, video } = await makeReadyAdapter();
+        try {
+            let quality = { totalVideoFrames: 300, droppedVideoFrames: 3, creationTime: 12.5 };
+            Object.assign(video, { getVideoPlaybackQuality() { expect(this).toBe(video); return quality; } });
+            expect(adapter.getVideoPlaybackQuality()).toEqual({ totalVideoFrames: 300, droppedVideoFrames: 3, displayedVideoFrames: 297, creationTimeMs: 12.5 });
+            quality = { totalVideoFrames: 0, droppedVideoFrames: 0, creationTime: 13 };
+            expect(adapter.getVideoPlaybackQuality()).toEqual({ totalVideoFrames: 0, droppedVideoFrames: 0, displayedVideoFrames: 0, creationTimeMs: 13 });
+            adapter.reset();
+            expect(adapter.getVideoPlaybackQuality()).toBeNull();
+        } finally { adapter.destroy(); }
+    });
+
+    it('returns null for unsupported getters or a throwing getter', async () => {
+        const { adapter, video } = await makeReadyAdapter();
+        const inheritedGetter = vi.spyOn(video, 'getVideoPlaybackQuality');
+        const otherNativeCalls = [vi.spyOn(video, 'play'), vi.spyOn(video, 'pause'), vi.spyOn(video, 'load')];
+        try {
+            Object.assign(video, { getVideoPlaybackQuality: undefined });
+            expect(video.getVideoPlaybackQuality).toBeUndefined();
+            expect(adapter.getVideoPlaybackQuality()).toBeNull();
+            expect(inheritedGetter).not.toHaveBeenCalled();
+            const throwingGetter = vi.fn(() => { throw new Error('native getter unavailable'); });
+            Object.assign(video, { getVideoPlaybackQuality: throwingGetter });
+            expect(adapter.getVideoPlaybackQuality()).toBeNull();
+            expect(throwingGetter).toHaveBeenCalledTimes(1);
+            for (const call of otherNativeCalls) expect(call).not.toHaveBeenCalled();
+        } finally {
+            inheritedGetter.mockRestore();
+            for (const call of otherNativeCalls) call.mockRestore();
+            adapter.destroy();
+        }
+    });
+
+    it('returns null for audio-only MSE without sampling unrelated element video', async () => {
+        const video = new MockVideoElement();
+        const getter = vi.fn(() => ({ totalVideoFrames: 300, droppedVideoFrames: 3, creationTime: 12.5 }));
+        Object.assign(video, { getVideoPlaybackQuality: getter });
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        try {
+            adapter.initialize({ audio: { codec: 'mp4a.40.2', initData: makeInit(1, 1024, 'soun') } });
+            currentMs.open(); await flush();
+            expect(adapter.getVideoPlaybackQuality()).toBeNull();
+            expect(getter).not.toHaveBeenCalled();
+        } finally { adapter.destroy(); }
+    });
+
+    it.each([
+        { totalVideoFrames: -1, droppedVideoFrames: 0, creationTime: 0 },
+        { totalVideoFrames: 1.5, droppedVideoFrames: 0, creationTime: 0 },
+        { totalVideoFrames: Infinity, droppedVideoFrames: 0, creationTime: 0 },
+        { totalVideoFrames: 1, droppedVideoFrames: 2, creationTime: 0 },
+        { totalVideoFrames: 1, droppedVideoFrames: -1, creationTime: 0 },
+        { totalVideoFrames: 1, droppedVideoFrames: 0, creationTime: NaN },
+        { totalVideoFrames: 1, droppedVideoFrames: 0, creationTime: -1 },
+    ])('does not invent counters from invalid native values: %j', async quality => {
+        const { adapter, video } = await makeReadyAdapter();
+        try {
+            Object.assign(video, { getVideoPlaybackQuality: () => quality });
+            expect(adapter.getVideoPlaybackQuality()).toBeNull();
+        } finally { adapter.destroy(); }
+    });
+});
+
+
+describe('MSE playback-quality attachment ownership', () => {
+    it.each(['src', 'srcObject', 'detached', 'buffer removed', 'different currentSrc'] as const)('does not attribute foreign element counts after %s', async transition => {
+        const { adapter, video, vsb } = await makeReadyAdapter();
+        const getter = vi.fn(() => ({ totalVideoFrames: 300, droppedVideoFrames: 3, creationTime: 10 }));
+        Object.assign(video, { getVideoPlaybackQuality: getter });
+        try {
+            expect(adapter.getVideoPlaybackQuality()?.totalVideoFrames).toBe(300); getter.mockClear();
+            if (transition === 'src') video.src = 'https://other.example/movie.mp4';
+            else if (transition === 'srcObject') video.srcObject = {};
+            else if (transition === 'detached') currentMs.readyState = 'closed';
+            else if (transition === 'buffer removed') currentMs.removeSourceBuffer(vsb);
+            else Object.assign(video, { currentSrc: 'https://other.example/movie.mp4' });
+            expect(adapter.getVideoPlaybackQuality()).toBeNull();
+            expect(getter).not.toHaveBeenCalled();
+        } finally { adapter.destroy(); }
+    });
+    it.each(['object-url', 'src-object'] as const)('keeps owned ended counters with %s attachment', async attachment => {
+        const { adapter, video } = await makeReadyAdapter({ mseAttachment: attachment });
+        Object.assign(video, { getVideoPlaybackQuality: () => ({ totalVideoFrames: 300, droppedVideoFrames: 3, creationTime: 10 }) });
+        try {
+            currentMs.endOfStream();
+            expect(adapter.getVideoPlaybackQuality()).toEqual({ totalVideoFrames: 300, droppedVideoFrames: 3, displayedVideoFrames: 297, creationTimeMs: 10 });
+            if (attachment === 'src-object') {
+                video.srcObject = null;
+                expect(adapter.getVideoPlaybackQuality()).toBeNull();
+            }
+        } finally { adapter.destroy(); }
+    });
 });

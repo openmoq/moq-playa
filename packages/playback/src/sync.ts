@@ -13,8 +13,8 @@
  * The reference is set once to avoid audio glitching from re-anchor jumps.
  * In practice, gap recovery (skip_forward) and seek/pause naturally re-anchor.
  *
- * Live catch-up: measures end-to-end latency by comparing CaptureTimestamp
- * (publisher wall-clock) to subscriber wall-clock. When latency exceeds
+ * Live catch-up: uses the uncorrected age of CaptureTimestamp against the
+ * subscriber wall-clock, assuming comparable clocks. When that age exceeds
  * targetLatency + threshold, activates catch-up (playback rate > 1.0).
  * Hysteresis prevents oscillation near the threshold boundary.
  *
@@ -122,7 +122,7 @@ export class SyncController {
 
     private _catchUpActive = false;
     private _currentRate = 1.0;
-    private _lastLatencyUs = 0;
+    private _captureTimestampAgeUs: number | null = null;
 
     constructor(config: SyncControllerConfig) {
         this._driftThresholdUs = config.driftThresholdUs;
@@ -186,12 +186,20 @@ export class SyncController {
     }
 
     /**
-     * Last measured latency in microseconds.
-     * 0 before first measurement.
+     * Legacy numeric alias for captureTimestampAgeUs; 0 also means unavailable.
+     * This uncorrected clock difference is not verified presentation latency.
      * @see draft-ietf-moq-loc-01 §2.3.1.1
      */
     get latencyUs(): number {
-        return this._lastLatencyUs;
+        return this._captureTimestampAgeUs ?? 0;
+    }
+
+    /** Latest receiver-wall-clock minus capture timestamp, in microseconds.
+     * Null before a wall-clock observation and after reset/domain invalidation.
+     * May be zero or negative; no sender/receiver clock correction is implied.
+     */
+    get captureTimestampAgeUs(): number | null {
+        return this._captureTimestampAgeUs;
     }
 
     /**
@@ -331,7 +339,7 @@ export class SyncController {
     // ─── Live Catch-Up ──────────────────────────────────────────────
 
     /**
-     * Measure end-to-end latency from a wall-clock timestamp.
+     * Measure uncorrected receiver-wall-clock minus capture timestamp.
      *
      * Compares the publisher's wall-clock timestamp to the subscriber's
      * wall clock, both in Unix epoch microseconds. A media-time timestamp
@@ -340,13 +348,15 @@ export class SyncController {
      *
      * @param captureTimestampUs Timestamp in microseconds
      * @param isWallClock False when the timestamp is media time. Undefined means wall clock.
-     * @returns Latency in microseconds, or null if unmeasurable
+     * @returns Signed clock difference in microseconds, or null if unmeasurable.
+     * This does not measure presentation or establish clock synchronization.
      * @see draft-ietf-moq-loc-01 §2.3.1.1
      * @see draft-ietf-moq-loc-04 §2.3.1.2
      */
     measureLatency(captureTimestampUs: bigint, isWallClock?: boolean): number | null {
         if (captureTimestampUs === 0n || isWallClock === false) return null;
-        return this.wallClock.now() - Number(captureTimestampUs);
+        const ageUs = this.wallClock.now() - Number(captureTimestampUs);
+        return Number.isFinite(ageUs) ? ageUs : null;
     }
 
     /**
@@ -364,9 +374,8 @@ export class SyncController {
     evaluateCatchUp(captureTimestampUs: bigint, isWallClock?: boolean): CatchUpState | null {
         // Measure latency
         const latencyUs = this.measureLatency(captureTimestampUs, isWallClock);
+        this._captureTimestampAgeUs = latencyUs;
         if (latencyUs === null) return null;
-
-        this._lastLatencyUs = latencyUs;
 
         // Catch-up disabled?
         if (this.targetLatencyMs === undefined || this.maxCatchUpRate <= 1.0) return null;
@@ -406,6 +415,7 @@ export class SyncController {
      * Reset the sync reference (e.g., after a skip-forward).
      */
     reset(): void {
+        this._captureTimestampAgeUs = null;
         this.localBaselineUs = undefined;
         this.captureBaselineUs = undefined;
         this._currentDriftUs = 0;

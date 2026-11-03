@@ -13,7 +13,7 @@
 
 export { Player } from './player.js';
 export { catToken, AuthorizationError } from '@openmoq/player';
-export type { PlayerAuthorization, AuthorizationToken, AuthorizationProvider, AuthorizationContext, AuthorizationOperation, VideoPresentation } from '@openmoq/player';
+export type { PlayerAuthorization, AuthorizationToken, AuthorizationProvider, AuthorizationContext, AuthorizationOperation, VideoPresentation, VideoPlaybackQualityStats } from '@openmoq/player';
 export type { PlayerOptions, Level, AudioTrack, PlayerStats, PlayerState } from './types.js';
 export type {
   PlayerEventMap,

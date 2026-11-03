@@ -7,7 +7,7 @@
  * @module
  */
 
-import type { MoqtPlayerConfig } from '@openmoq/player';
+import type { MoqtPlayerConfig, VideoPlaybackQualityStats } from '@openmoq/player';
 
 /** Player state machine values. */
 export type PlayerState = 'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'error';
@@ -139,7 +139,14 @@ export interface PlayerStats {
   readonly framesRendered: number;
   readonly framesDropped: number;
   readonly bitrate: number;
+  /** Legacy numeric capture age; zero also represents unavailable. */
   readonly latencyMs: number;
+  /** Latest uncorrected wall-clock capture age; null when unmeasurable.
+   * May be zero/negative. Not a synchronized end-to-end latency measurement.
+   */
+  readonly captureTimestampAgeMs?: number | null;
+  /** Native media-element-load counters, separate from legacy engine fields. */
+  readonly videoPlaybackQuality?: Readonly<VideoPlaybackQualityStats> | null;
   readonly stallCount: number;
   readonly timeToFirstFrameMs: number | null;
   readonly resolution: { readonly width: number; readonly height: number } | null;

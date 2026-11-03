@@ -301,7 +301,9 @@ export class Player {
       framesRendered: s.framesRendered,
       framesDropped: s.framesDropped,
       bitrate: s.currentBitrate,
-      latencyMs: 0, // TODO: derive from sync controller
+      latencyMs: s.currentLatencyMs,
+      captureTimestampAgeMs: s.captureTimestampAgeMs ?? null,
+      videoPlaybackQuality: s.videoPlaybackQuality ?? null,
       stallCount: s.stallCount,
       timeToFirstFrameMs: s.timeToFirstFrameMs,
       resolution: s.currentResolution ?? null,
