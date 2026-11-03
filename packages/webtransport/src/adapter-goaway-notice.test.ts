@@ -148,7 +148,7 @@ describe.each([16, 18, 22] as const)('draft-%i session-scope GOAWAY notice', (ve
   });
 });
 
-describe.each([18, 22] as const)('draft-%i request-scope GOAWAY notice', (version) => {
+describe.each([18, 22, 23] as const)('draft-%i request-scope GOAWAY notice', (version) => {
   it('scopes the notice to the addressed request and leaves the session established', async () => {
     const { client, server, errors } = await connectedPair(version);
     const seen = observe(client);
