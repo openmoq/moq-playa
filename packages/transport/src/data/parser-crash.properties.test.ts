@@ -58,7 +58,7 @@ const fetchPrior18: fc.Arbitrary<FetchObjectPrior18 | undefined> = fc.option(
 );
 const groupOrder: fc.Arbitrary<GroupOrder> = fc.constantFrom('ascending', 'descending');
 
-const VERSIONS: DraftVersion[] = [14, 16, 18];
+const VERSIONS: DraftVersion[] = [14, 16, 18, 22, 23];
 
 for (const version of VERSIONS) {
   const codec = createDataCodec(version);
@@ -124,7 +124,7 @@ for (const version of VERSIONS) {
       );
     });
 
-    if (version === 18) {
+    if (version === 18 || version === 22 || version === 23) {
       it('decodeFetchObject18 never hard-crashes (random prior / isFirst / groupOrder)', () => {
         fc.assert(
           fc.property(fuzzBytes, fetchPrior18, fc.boolean(), groupOrder, (buf, prior, isFirst, order) => {

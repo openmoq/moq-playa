@@ -25,7 +25,7 @@ import { createControlCodec, type ControlCodec } from './control/codec.js';
 import { createDataCodec, type DataCodec } from './data/data-codec.js';
 import { getRequestPolicy, type RequestPolicy } from './session/request-policy.js';
 import type { DraftVersion } from './versions.js';
-import { isRequestStreamDraft } from './versions.js';
+import { DEFAULT_DRAFT_VERSION, isRequestStreamDraft } from './versions.js';
 
 /**
  * Coarse, session/adapter-facing per-draft semantic facts.
@@ -103,9 +103,9 @@ function getCapabilities(version: DraftVersion): ProfileCapabilities {
 
 /**
  * Resolve the {@link ProtocolProfile} for a draft version.
- * @param version Draft version (default: 16). Drafts 14, 16, and 18 are wired.
+ * @param version Draft version (default: {@link DEFAULT_DRAFT_VERSION}). Drafts 14, 16, 18, 22 and 23 are wired.
  */
-export function getProtocolProfile(version: DraftVersion = 16): ProtocolProfile {
+export function getProtocolProfile(version: DraftVersion = DEFAULT_DRAFT_VERSION): ProtocolProfile {
   return {
     version,
     control: createControlCodec(version),

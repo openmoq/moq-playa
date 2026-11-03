@@ -28,6 +28,7 @@ import type {
   FetchHeader,
   FetchObject,
   FetchEndOfRange,
+  FetchEndMarker,
   ObjectDatagram,
   ObjectHeaderLayout,
 } from './types.js';
@@ -317,10 +318,11 @@ export interface FetchPriorContext {
 }
 
 /**
- * Discriminated result type for fetch object decoding.
- * Either a normal FetchObject or a FetchEndOfRange marker.
+ * Discriminated result type for fetch object decoding: a normal FetchObject
+ * (has `payload`), a FetchEndOfRange marker, or (draft 23) a FetchEndMarker
+ * (has `marker`).
  */
-export type DecodedFetchItem = FetchObject | FetchEndOfRange;
+export type DecodedFetchItem = FetchObject | FetchEndOfRange | FetchEndMarker;
 
 /**
  * Check if serialization flags represent an End of Range marker.
