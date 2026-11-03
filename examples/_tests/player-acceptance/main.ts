@@ -5,6 +5,7 @@ import type { PlaybackSample } from '../../../scripts/player-acceptance/assessme
 import { observeAudio, observeCanvas } from './sinks.js';
 import { observeLocmafDelivery, assessLocmafDelivery, observeConnectionObjects } from './received.js';
 import { observeDecodedSource } from './decoded.js';
+import { observeNativeMse } from './native-mse.js';
 
 const video = document.querySelector<HTMLVideoElement>('#video')!;
 const canvas = document.querySelector<HTMLCanvasElement>('#canvas')!;
@@ -20,15 +21,20 @@ const decodedSource = frameOutput ? observeDecodedSource() : undefined;
 const pinHex = params.get('hash')!;
 if (!/^[a-f0-9]{64}$/.test(pinHex)) throw new Error('Missing local certificate pin');
 const pin = Uint8Array.from(pinHex.match(/../g)!, (byte) => parseInt(byte, 16)).buffer;
+const nativeMse = params.has('nativeMse') ? observeNativeMse() : undefined;
 const createTransport = createWebTransport({ certHash: pin, draftVersion: 18 });
 const transports: WebTransportLike[] = [];
 const transportOutcomes: Promise<{ status: string; reason?: string }>[] = [];
 const transportState: Array<{ url: string; openedAtMs: number; closedAtMs: number | null }> = [];
 const events: { timeMs: number; type: string; data: unknown }[] = [];
+const nativeEvents: { timeMs: number; type: string }[] = [];
 const samples: PlaybackSample[] = [];
 let startupError: string | null = null;
 let presentedFrames = 0;
 let presentedMediaTimeS = 0;
+let nativeFrameWidth = 0;
+let nativeFrameHeight = 0;
+let nativeFrameAtMs = 0;
 let callbackHandle = 0;
 let timer: ReturnType<typeof setInterval> | undefined;
 let recording = false;
@@ -49,9 +55,9 @@ const player = new Player(null, {
     logLevel: params.has('debug') ? 'debug' : 'none',
     locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',
     audioConstraints: { lang: params.get('lang') ?? 'en' },
-    ...(params.get('debug') === 'handover' ? { createMediaSource: () => {
-      const source = new MseMediaSource(video);
-      source.debug = true;
+    ...(params.get('debug') === 'handover' || nativeMse ? { createMediaSource: () => {
+      const source = new MseMediaSource(video, nativeMse ? { mseImplementation: 'standard' } : {});
+      source.debug = params.has('debug');
       return source;
     } } : {}),
     ...(decodedSource ? { createVideoDecoder: () => decodedSource.wrap(new WebCodecsVideoDecoder()) } : {}),
@@ -76,8 +82,13 @@ const player = new Player(null, {
   },
 });
 
-for (const type of ['ready', 'playing', 'statechange', 'error', 'stall'] as const) {
+for (const type of ['ready', 'playing', 'statechange', 'error', 'stall', 'qualitychange'] as const) {
   player.on(type, (data) => events.push({ timeMs: performance.now(), type, data }));
+}
+for (const type of ['error', 'waiting', 'stalled']) {
+  video.addEventListener(type, () => {
+    if (recording) nativeEvents.push({ timeMs: performance.now(), type });
+  });
 }
 player.on('ready', () => {
   const expectedOutput = frameOutput ? 'canvas' : 'video';
@@ -96,6 +107,9 @@ const probe = probeCanvas.getContext('2d', { willReadFrequently: true })!;
 function observeFrame(_time: number, metadata: VideoFrameCallbackMetadata): void {
   presentedFrames = metadata.presentedFrames;
   presentedMediaTimeS = metadata.mediaTime;
+  nativeFrameWidth = metadata.width;
+  nativeFrameHeight = metadata.height;
+  nativeFrameAtMs = performance.now();
   callbackHandle = video.requestVideoFrameCallback(observeFrame);
 }
 if (!frameOutput) callbackHandle = video.requestVideoFrameCallback(observeFrame);
@@ -139,6 +153,9 @@ function sample(): void {
     presentedMediaTimeS, presentedFrames, pictureDigest: (hash >>> 0).toString(16),
     pictureChange: difference / (64 * 36 * 3), markerRgb,
     videoWidth: canvasObserver?.width ?? video.videoWidth, videoHeight: canvasObserver?.height ?? video.videoHeight,
+    ...(!frameOutput ? { nativeFrameWidth, nativeFrameHeight, nativeFrameAtMs } : {}),
+    audioContextTimeS: audioContext!.currentTime,
+    ...(nativeMse ? { nativeTimestampOffsets: nativeMse.snapshot().buffers.map(buffer => buffer.offset) } : {}),
     ...(canvasObserver ? { frameTimestampUs: canvasObserver.timestampUs } : {}),
     ...(canvasObserver?.lastDrawTimestampUs !== undefined ? { nativeDrawTimestampUs: canvasObserver.lastDrawTimestampUs } : {}),
     ...(canvasObserver?.lastDrawTimeMs !== undefined ? { nativeDrawTimeMs: canvasObserver.lastDrawTimeMs } : {}),
@@ -176,6 +193,20 @@ document.querySelector('#start')!.addEventListener('click', () => {
   })().catch((error: unknown) => { startupError = String(error); });
 }, { once: true });
 
+function snapshot() {
+  const locmafDelivery = locmafObserver?.snapshot();
+  return { samples: [...samples], events: [...events], startupError, transportState: [...transportState],
+    nativeEvents: [...nativeEvents], nativeError: video.error ? { code: video.error.code, message: video.error.message } : null,
+    nativeMse: nativeMse?.snapshot() ?? null,
+    outputState: { presentedFrames: canvasObserver?.frames ?? presentedFrames,
+      currentTime: player.currentTime, audioRms: audioRms(), audioContext: audioContext?.state,
+      videoPaused: video.paused, videoTime: video.currentTime, videoReadyState: video.readyState,
+      buffered: Array.from({ length: video.buffered.length }, (_, i) => [video.buffered.start(i), video.buffered.end(i)]) },
+    decodedSource: decodedSource?.snapshot() ?? null,
+    ...(locmafDelivery ? { locmafDelivery, locmafFailures: assessLocmafDelivery(locmafDelivery) } : {}),
+    levels: player.levels, videoGroups: player.videoGroups, audioTracks: player.audioTracks };
+}
+
 const acceptance = {
   get startupError() { return startupError; },
   get presentedFrames() { return canvasObserver?.frames ?? presentedFrames; },
@@ -183,10 +214,16 @@ const acceptance = {
   get audioRms() { return audioRms(); },
   get transportState() { return transportState.map(state => ({ ...state })); },
   get errors() { return events.filter(event => event.type === 'error'); },
+  get latestSample() { return samples.at(-1); },
+  get selection() { return { levels: player.levels, currentLevel: player.currentLevel, autoQuality: player.autoQuality,
+    currentAudioTrack: player.currentAudioTrack, audioTracks: player.audioTracks }; },
+  async setQuality(index: number) { await player.setQuality(index); },
+  snapshot,
   begin(silent: boolean): void {
     if (webAudioOutput) { if (silent) player.mute(); }
     else gain!.gain.value = silent ? 0 : 1;
     samples.length = 0;
+    nativeEvents.length = 0;
     previousPixels = undefined;
     recording = true;
     sample();
@@ -195,15 +232,7 @@ const acceptance = {
   finish() {
     recording = false;
     clearInterval(timer);
-    const locmafDelivery = locmafObserver?.snapshot();
-    return { samples: [...samples], events: [...events], startupError, transportState: [...transportState],
-      outputState: { presentedFrames: canvasObserver?.frames ?? presentedFrames,
-        currentTime: player.currentTime, audioRms: audioRms(), audioContext: audioContext?.state,
-        videoPaused: video.paused, videoTime: video.currentTime, videoReadyState: video.readyState,
-        buffered: Array.from({ length: video.buffered.length }, (_, i) => [video.buffered.start(i), video.buffered.end(i)]) },
-      decodedSource: decodedSource?.snapshot() ?? null,
-      ...(locmafDelivery ? { locmafDelivery, locmafFailures: assessLocmafDelivery(locmafDelivery) } : {}),
-      levels: player.levels, videoGroups: player.videoGroups, audioTracks: player.audioTracks };
+    return snapshot();
   },
   setVolume(value: number) { player.setVolume(value); },
   async setMuted(value: boolean) { if (value) player.mute(); else await player.unmute(); },
@@ -212,6 +241,7 @@ const acceptance = {
     clearInterval(timer);
     video.cancelVideoFrameCallback(callbackHandle);
     await player.destroy();
+    nativeMse?.restore();
     source?.disconnect();
     gain?.disconnect();
     analyser?.disconnect();

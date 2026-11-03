@@ -41,6 +41,8 @@ The following scenarios are mandatory:
 | CMAF relay handover with a refused audio subscription | One recoverable diagnostic; the candidate closes and old picture/audio continue |
 | CMAF relay handover after catalog retrieval times out | Subscription-only fallback cannot admit a CMSF-01 catalog; the candidate closes and old playback continues |
 | 360p, 720p and 1080p, each with both language signals | Correct decoded dimensions, moving pixels, and 440 Hz (`en`) or 880 Hz (`es`) PCM |
+| CMAF manual rendition switches from a nonzero origin | Native 1080p → 720p → 360p → 720p → 1080p frames with continuing 440 Hz audio and one advancing timeline |
+| CMAF manual AVC-level retypes | The same sequence crosses levels 4.0 → 3.0 → 4.0 with two actual native retypes and preserved nonzero offsets |
 | LOC-01 wall-clock, LOC-04 wall-clock and LOC-04 media time | Moving canvas output, decoded H.264 dimensions, 440 Hz Opus PCM, correct timestamp domain and progress across a loop |
 | LOC-04 media time with a frozen picture | Only `picture-frozen` fails |
 | LOC-04 media time with muted output | Only `audio-missing` fails |
@@ -109,6 +111,36 @@ its expected dimensions/tone, then fail with exactly `video-identity` or
 `audio-identity` when reassessed against the other output identity. These
 counterfactual checks prove the detector rejects unchanged/wrong output; they do
 not request or establish a live track switch. Catalog labels alone cannot pass.
+
+`cmaf-manual-rendition-switch` keeps one real Player and audio selection while
+calling public `setQuality(1/2/1/0)`. Its three videos share codec/`altGroup`, but
+their actual headers/fragments use IDs 1/3/4 and timescales 12288/60000/90000.
+The publisher starts at loop 3. Parsed-field ID rewrites include tkhd, trex,
+tfhd, sidx and mvhd's next ID; sample timing and coded bytes are read back.
+Continuous native frame callbacks, decoded dimensions, playhead, PCM and audio
+clock observations span every switch; each target then sustains a five-second
+output window. Errors, stalls, split buffers and accumulated timeline drift fail.
+This same-MIME arm requires zero actual native `SourceBuffer.changeType` calls.
+`cmaf-manual-avc-level-switch` uses the same fixture pipeline, with 360p encoded
+at baseline level 3.0 (`avc1.42c01e`) and 720p/1080p at baseline level 4.0
+(`avc1.42c028`). Encoder level and expected codec are declared together; parsed
+avcC read-back must match. This arm requires exactly two successful native calls,
+to level 3.0 then level 4.0, on the original video buffer.
+The observer never writes offsets. Both arms capture actual audio/video offsets
+after startup (zero for this fixture) and require them unchanged during native
+calls, playback and final read-back. Nonzero offset preservation remains covered
+by units. Native error/waiting/stalled events are
+recorded only between begin/finish, with one recording spanning all transitions.
+This checks manual switching for this fixture, not the ABR selection algorithm.
+Console evidence includes message locations; up to 32 HTTP errors retain URL and
+status plus a total/truncated count. All HTTP errors, including 404, remain failures.
+Add `--debug` only for diagnosis to enable existing engine/MSE logging; default is off.
+After building the required packages, select either arm with:
+
+```bash
+PLAYER_TEST_BROWSER=chrome node scripts/player-acceptance/run.mjs --skip-build --case cmaf-manual-rendition-switch
+PLAYER_TEST_BROWSER=chrome node scripts/player-acceptance/run.mjs --skip-build --case cmaf-manual-avc-level-switch
+```
 
 The LOC publisher extracts no-B-frame H.264 and single-frame 20 ms Opus packets
 from the generated fixtures. Video groups follow keyframes; audio groups carry
@@ -190,4 +222,4 @@ artifacts for fourteen days. A local macOS result is not a Linux CI result.
 
 For a diagnostic rerun, add `--case loc-4-media` to select one exact scenario.
 The retained result records this selection; a selected-case pass is not a pass
-for the full thirty-case campaign.
+for the full campaign.

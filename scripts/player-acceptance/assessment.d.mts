@@ -19,6 +19,11 @@ export interface PlaybackSample {
   frameTimestampUs?: number;
   nativeDrawTimestampUs?: number;
   nativeDrawTimeMs?: number;
+  nativeFrameWidth?: number;
+  nativeFrameHeight?: number;
+  nativeFrameAtMs?: number;
+  audioContextTimeS?: number;
+  nativeTimestampOffsets?: readonly number[];
   videoPresentation?: { frameTimestampUs: string | null; timestampDomain: 'unknown'; renderedAtUs: number } | null;
 }
 
@@ -30,6 +35,7 @@ export interface ExpectedPlayback {
   videoHeight: number;
   audioHz: number;
   videoFps: number;
+  videoSizes?: readonly { width: number; height: number }[];
 }
 
 export function assessPlayback(samples: readonly PlaybackSample[], expected?: ExpectedPlayback): {

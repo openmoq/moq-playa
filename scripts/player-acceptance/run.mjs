@@ -14,6 +14,7 @@ import { prepareFixture } from './fixture.mjs';
 import { stopProcess as stop } from './shutdown.mjs';
 import { checkExampleViews } from './view-ui.mjs';
 import { checkHandover } from './handover.mjs';
+import { checkRenditionSwitch } from './rendition-switch.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
@@ -22,6 +23,8 @@ const namespace = `acceptance-${randomUUID().slice(0, 8)}`;
 const children = new Set();
 const logs = [];
 const abort = new AbortController();
+const caseArg = process.argv.indexOf('--case');
+const selectedCase = caseArg < 0 ? null : process.argv[caseArg + 1];
 const onInterrupt = () => abort.abort(new Error('Playback test interrupted'));
 process.once('SIGINT', onInterrupt);
 process.once('SIGTERM', onInterrupt);
@@ -151,12 +154,35 @@ try {
     { videoTimescale: 60000 });
   assert.notEqual(result.fixtures.moving.timing['video-360'].timescale, result.fixtures.retimed.timing['video-360'].timescale,
     'Replacement video must exercise a different initialization timescale');
+  for (const [name, caseName, lowLevel, lowCodec] of [
+    ['switching', 'cmaf-manual-rendition-switch', '4.0', 'avc1.42c028'],
+    ['retyping', 'cmaf-manual-avc-level-switch', '3.0', 'avc1.42c01e'],
+  ]) {
+    if (selectedCase !== null && selectedCase !== caseName) continue;
+    result.fixtures[name] = await prepareFixture(join(artifacts, name), namespace, false, abort.signal, true, 'aac', false,
+      { tracks: { 'video-360': { trackId: 1, videoTimescale: 12288, videoLevel: lowLevel, expectedCodec: lowCodec },
+        'video-720': { trackId: 3, videoTimescale: 60000, videoLevel: '4.0', expectedCodec: 'avc1.42c028' },
+        'video-1080': { trackId: 4, videoTimescale: 90000, videoLevel: '4.0', expectedCodec: 'avc1.42c028' } } });
+    const fixture = result.fixtures[name];
+    assert.deepEqual(['video-360', 'video-720', 'video-1080'].map(name => fixture.headers[name]), [
+      { trackId: 1, timescale: 12288, codecFourcc: 'avc1', codec: lowCodec },
+      { trackId: 3, timescale: 60000, codecFourcc: 'avc1', codec: 'avc1.42c028' },
+      { trackId: 4, timescale: 90000, codecFourcc: 'avc1', codec: 'avc1.42c028' },
+    ]);
+    assert.equal(new Set(['video-360', 'video-720', 'video-1080'].map(name => fixture.sha256[`${name}/init.mp4`])).size, 3,
+      'Renditions must have distinct actual initialization bytes');
+    assert.deepEqual(fixture.expected.videos.map(track => track.altGroup), [1, 1, 1]);
+  }
   browser = await chromium.launch({ channel: process.env.PLAYER_TEST_BROWSER ?? 'chrome' });
   result.platform.browser = browser.version();
   const vite = launch('vite', process.execPath, ['_tests/player-acceptance/serve.mjs'], {}, join(root, 'examples'));
   const webUrl = await waitForLine(vite, /Acceptance page: (http:\/\/127\.0\.0\.1:\d+\/)/);
   const scenarios = [
     { name: 'moving-video-and-audio', fixture: 'moving', silent: false, expectedFailure: null },
+    { name: 'cmaf-manual-rendition-switch', fixture: 'switching', startLoop: 3, manualSwitch: true,
+      silent: false, expectedFailure: null },
+    { name: 'cmaf-manual-avc-level-switch', fixture: 'retyping', startLoop: 3, manualSwitch: true, nativeRetypes: true,
+      silent: false, expectedFailure: null },
     { name: 'frozen-picture-control', fixture: 'frozen', silent: false, expectedFailure: 'picture-frozen' },
     { name: 'missing-audio-control', fixture: 'moving', silent: true, expectedFailure: 'audio-missing' },
     { name: 'cmaf-handover', fixture: 'moving', handover: 'accept', silent: false, expectedFailure: null },
@@ -200,8 +226,6 @@ try {
       expected: { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24, outputKind: decoding === 'frame' ? 'canvas' : 'video' },
     }))),
   ];
-  const caseArg = process.argv.indexOf('--case');
-  const selectedCase = caseArg < 0 ? null : process.argv[caseArg + 1];
   if (caseArg >= 0 && !scenarios.some((s) => s.name === selectedCase)) throw new Error(`Unknown playback case: ${selectedCase}`);
   result.selectedCase = selectedCase;
   for (const scenario of scenarios.filter((s) => selectedCase === null || s.name === selectedCase)) {
@@ -247,8 +271,15 @@ try {
     const page = await context.newPage();
     const pageErrors = [];
     const consoleLines = [];
+    const httpErrors = [];
+    let httpErrorCount = 0;
     page.on('pageerror', (error) => pageErrors.push(error.message));
-    page.on('console', (message) => consoleLines.push({ type: message.type(), text: message.text() }));
+    page.on('console', (message) => consoleLines.push({ type: message.type(), text: message.text(), location: message.location() }));
+    page.on('response', (response) => {
+      if (response.status() < 400) return;
+      httpErrorCount++;
+      if (httpErrors.length < 32) httpErrors.push({ url: response.url(), status: response.status() });
+    });
     const caseResult = { name: scenario.name, expectedFailure: scenario.expectedFailure, relayUrl, passed: false };
     // The decode time each publisher actually emits FIRST, read back from the
     // bytes it is about to send. A relay's group-replay log identifies the
@@ -268,7 +299,19 @@ try {
           ...(scenario.locmaf ? { locmafVersion: '0.3', decoding: scenario.locmaf } : {}) };
     result.cases.push(caseResult);
     try {
+      if (scenario.manualSwitch) {
+        const origins = caseResult.mediaOrigin.source;
+        for (const track of ['video-360', 'video-720', 'video-1080', 'audio-en']) {
+          const origin = origins.find(origin => origin.track === track);
+          assert.ok(origin?.seconds >= 18 && origin.group === 3, `${track}: missing nonzero emitted media origin`);
+          assert.equal(origin.timescale, result.fixtures[scenario.fixture].headers[track].timescale, `${track}: published timescale changed`);
+        }
+      }
       const query = new URLSearchParams({ url: relayUrl, ns: namespace, hash: pin });
+      if (scenario.manualSwitch) {
+        query.set('nativeMse', '1');
+        if (process.argv.includes('--debug')) query.set('debug', 'mse');
+      }
       if (scenario.handover) query.set('debug', 'handover');
       if (scenario.version) { query.set('output', 'canvas'); query.set('debug', 'render'); }
       if (scenario.mixed) {
@@ -301,7 +344,10 @@ try {
         }, null, { timeout: 20000 });
         caseResult.outputReadyAfterMs = performance.now() - startupStart;
         let observed;
-        if (handover) {
+        if (scenario.manualSwitch) {
+          caseResult.renditionSwitch = {};
+          observed = await checkRenditionSwitch(page, caseResult.renditionSwitch, bounded, Boolean(scenario.nativeRetypes));
+        } else if (handover) {
           caseResult.handover = {};
           await checkHandover(page, handover.control, scenario.expected, scenario.handover, caseResult.handover,
             { timelineContinuity: scenario.startLoop !== undefined });
@@ -312,7 +358,7 @@ try {
           observed = await page.evaluate(() => window.playerAcceptance.finish());
         }
         caseResult.observed = observed;
-        caseResult.assessment = assessPlayback(observed.samples, scenario.expected);
+        caseResult.assessment = scenario.manualSwitch ? caseResult.renditionSwitch.continuity : assessPlayback(observed.samples, scenario.expected);
         caseResult.presentationFailures = assessVideoPresentation(observed.samples);
         assert.deepEqual(caseResult.presentationFailures, [], 'Public video draw observation');
         if (scenario.expected?.outputKind === 'canvas') {
@@ -384,6 +430,10 @@ try {
         assert.equal(caseResult.teardown.state, 'idle', 'Player did not return to idle');
       }
       assert.deepEqual(pageErrors, [], 'Uncaught browser error');
+      if (scenario.manualSwitch) {
+        assert.deepEqual(consoleLines.filter(line => line.type === 'error'), [], 'Native Chrome console error');
+        assert.equal(httpErrorCount, 0, `HTTP errors: ${JSON.stringify(httpErrors)}`);
+      }
       if (!scenario.exampleViews) {
         const errors = caseResult.teardown.events.filter(event => event.type === 'error');
         if (scenario.handover && scenario.handover !== 'accept') {
@@ -401,6 +451,7 @@ try {
       throw error;
     } finally {
       caseResult.pageErrors = pageErrors;
+      caseResult.httpErrors = { total: httpErrorCount, responses: httpErrors, truncated: Math.max(0, httpErrorCount - httpErrors.length) };
       await writeFile(join(artifacts, `${scenario.name}-console.json`), JSON.stringify(consoleLines, null, 2));
       try {
         await bounded(context.close(), 5000, 'browser context close', false);

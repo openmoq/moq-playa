@@ -10,21 +10,27 @@ const exec = promisify(execFile);
 export async function prepareFixture(directory, namespace, frozen = false, signal, alternatives = false, audioCodec = 'aac', views = false, mux = {}) {
   const commands = [];
   const timing = {};
+  const headers = {};
   const tracks = [];
   const duration = 6;
   const videoDefinitions = alternatives
     ? [[640, 360, 800000], [1280, 720, 1800000], [1920, 1080, 3500000]]
     : [[640, 360, 800000]];
-  const definitions = videoDefinitions.map(([width, height, bitrate]) => ({
-    name: `video-${height}`, role: 'video', codec: alternatives ? 'avc1.42c028' : 'avc1.42c01e',
-    source: frozen
-      ? 'testsrc2=size=640x360:rate=24,trim=end_frame=1,loop=loop=-1:size=1:start=0,setpts=N/(24*TB)'
-      : `testsrc2=size=${alternatives ? '1920x1080' : '640x360'}:rate=24`,
-    encoding: ['-an', '-vf', `drawbox=x=0:y=0:w=${alternatives ? 144 : 48}:h=${alternatives ? 144 : 48}:color=0x00ff00:t=fill,scale=${width}:${height}`,
-      '-c:v', 'libx264', '-profile:v', 'baseline', '-level:v', alternatives ? '4.0' : '3.0', '-pix_fmt', 'yuv420p',
-      '-preset', 'veryfast', '-b:v', String(bitrate), '-g', '12', '-keyint_min', '12', '-sc_threshold', '0', '-bf', '0'],
-    metadata: { width, height, framerate: 24, bitrate, altGroup: 1, label: `${height}p synthetic video` },
-  }));
+  const { tsImport } = createRequire(new URL('../../examples/node-publisher/package.json', import.meta.url))('tsx/esm/api');
+  const { fixtureVideoConfig, validateFixtureAvc } = await tsImport('./video-config.ts', import.meta.url);
+  const definitions = videoDefinitions.map(([width, height, bitrate]) => {
+    const config = fixtureVideoConfig(alternatives, mux.tracks?.[`video-${height}`]);
+    return {
+      name: `video-${height}`, role: 'video', codec: config.codec,
+      source: frozen
+        ? 'testsrc2=size=640x360:rate=24,trim=end_frame=1,loop=loop=-1:size=1:start=0,setpts=N/(24*TB)'
+        : `testsrc2=size=${alternatives ? '1920x1080' : '640x360'}:rate=24`,
+      encoding: ['-an', '-vf', `drawbox=x=0:y=0:w=${alternatives ? 144 : 48}:h=${alternatives ? 144 : 48}:color=0x00ff00:t=fill,scale=${width}:${height}`,
+        '-c:v', 'libx264', '-profile:v', 'baseline', '-level:v', config.level, '-pix_fmt', 'yuv420p',
+        '-preset', 'veryfast', '-b:v', String(bitrate), '-g', '12', '-keyint_min', '12', '-sc_threshold', '0', '-bf', '0'],
+      metadata: { width, height, framerate: 24, bitrate, altGroup: 1, label: `${height}p synthetic video` },
+    };
+  });
   if (views) definitions.push({
     name: 'video-portrait', role: 'video', codec: 'avc1.42c01e',
     source: 'testsrc2=size=360x640:rate=24',
@@ -46,27 +52,51 @@ export async function prepareFixture(directory, namespace, frozen = false, signa
   }
   const hashes = {};
   const loaded = [];
-  const { tsImport } = createRequire(new URL('../../examples/node-publisher/package.json', import.meta.url))('tsx/esm/api');
   const { analyzeCmafTimeline } = await tsImport('../../examples/node-publisher/src/cmaf-loop-rebase.ts', import.meta.url);
   const { inspectAlternatives } = await tsImport('./alignment.ts', import.meta.url);
   const { inspectLocmafTrack } = await tsImport('./locmaf.ts', import.meta.url);
+  const { rewriteTrackIds } = await tsImport('./track-ids.ts', import.meta.url);
+  const { parseLocmafTrackContext } = await tsImport('../../packages/locmaf/src/index.ts', import.meta.url);
+  for (const name of Object.keys(mux.tracks ?? {})) {
+    if (!definitions.some(track => track.name === name)) throw new Error(`Unknown fixture mux track: ${name}`);
+  }
   for (const track of definitions) {
+    const options = mux.tracks?.[track.name] ?? {};
+    const videoTimescale = options.videoTimescale ?? mux.videoTimescale;
+    if (videoTimescale !== undefined && (!Number.isInteger(videoTimescale) || videoTimescale <= 0 || videoTimescale > 0xffffffff)) {
+      throw new Error(`${track.name}: invalid video timescale`);
+    }
     const trackDir = join(directory, track.name);
     await mkdir(trackDir, { recursive: true });
     const args = ['-y', '-v', 'error', '-f', 'lavfi', '-i', track.source, '-t', String(duration),
       ...track.encoding, '-f', 'dash', '-dash_segment_type', 'mp4', '-seg_duration', '0.5',
-      ...(track.role === 'video' && mux.videoTimescale ? ['-format_options', `video_track_timescale=${mux.videoTimescale}`] : []),
+      ...(track.role === 'video' && videoTimescale ? ['-format_options', `video_track_timescale=${videoTimescale}`] : []),
       '-frag_duration', '0.5', '-use_template', '1', '-use_timeline', '0',
       '-init_seg_name', 'init.mp4', '-media_seg_name', 'chunk-$Number%03d$.m4s', join(trackDir, 'manifest.mpd')];
     await exec('ffmpeg', args, { timeout: 60000, signal });
     commands.push({ tool: 'ffmpeg', args });
     const chunks = (await readdir(trackDir)).filter((name) => /^chunk-\d+\.m4s$/.test(name)).sort();
     if (chunks.length < 4) throw new Error(`${track.name}: insufficient generated chunks`);
+    if (options.trackId !== undefined) {
+      const rewritten = rewriteTrackIds(await readFile(join(trackDir, 'init.mp4')),
+        await Promise.all(chunks.map(name => readFile(join(trackDir, name)))), options.trackId);
+      await writeFile(join(trackDir, 'init.mp4'), rewritten.initData);
+      await Promise.all(chunks.map((name, i) => writeFile(join(trackDir, name), rewritten.chunks[i])));
+    }
     for (const file of ['init.mp4', ...chunks]) {
       hashes[`${track.name}/${file}`] = createHash('sha256').update(await readFile(join(trackDir, file))).digest('hex');
     }
     const initData = await readFile(join(trackDir, 'init.mp4'));
     const chunkBytes = await Promise.all(chunks.map((name) => readFile(join(trackDir, name))));
+    const context = parseLocmafTrackContext(initData);
+    headers[track.name] = { trackId: context.trackId, timescale: context.timescale, codecFourcc: context.codecFourcc };
+    if (track.role === 'video' && context.codecFourcc === 'avc1') {
+      headers[track.name].codec = validateFixtureAvc(initData, track.codec);
+    }
+    if ((track.role === 'video' && videoTimescale !== undefined && context.timescale !== videoTimescale)
+      || (options.trackId !== undefined && context.trackId !== options.trackId)) {
+      throw new Error(`${track.name}: muxed header read-back differs from requested timing/ID`);
+    }
     timing[track.name] = analyzeCmafTimeline(initData, chunkBytes);
     if (!timing[track.name]) throw new Error(`${track.name}: missing CMAF timing`);
     tracks.push({ name: track.name, packaging: 'cmaf', role: track.role, codec: track.codec,
@@ -91,7 +121,7 @@ export async function prepareFixture(directory, namespace, frozen = false, signa
   }
   const provenance = { generator: 'player-acceptance', source: 'FFmpeg synthetic testsrc2 and sine signals',
     sourceRights: 'Synthetic test signals; no third-party media', ffmpeg, durationS: duration,
-    frozen, alternatives, views, audioCodec, mux, commands, sha256: hashes, timing, alignment,
+    frozen, alternatives, views, audioCodec, mux, commands, sha256: hashes, headers, timing, alignment,
     ...(locmaf ? { locmaf, locmafProof: 'local encoder/decoder equality, not an independent conformance oracle' } : {}),
     ...(elementaryLoc ? { elementaryLoc, opusTiming: 'single-frame 20ms packets; MP4 final trim not carried into LOC' } : {}),
     expected: { videoMarker: 'green top-left square covering 7.5% of width', videoFps: 24,

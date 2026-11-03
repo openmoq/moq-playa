@@ -28,7 +28,8 @@ export function assessPlayback(samples, expected = { videoWidth: 640, videoHeigh
   if (samples.some((s) => s.paused || s.seeking || s.visibility !== 'visible')) {
     failures.add('playback-inactive');
   }
-  if (samples.some((s) => s.videoWidth !== expected.videoWidth || s.videoHeight !== expected.videoHeight
+  const videoSizes = expected.videoSizes ?? [{ width: expected.videoWidth, height: expected.videoHeight }];
+  if (samples.some((s) => !videoSizes.some(size => s.videoWidth === size.width && s.videoHeight === size.height)
     || s.markerRgb?.length !== 3 || !s.markerRgb.every(Number.isFinite)
     || !(s.markerRgb[0] < 60 && s.markerRgb[1] > 180 && s.markerRgb[2] < 60))) failures.add('video-identity');
   if (samples.some((s) => s.outputKind === 'video' && Array.isArray(s.bufferedRanges)
