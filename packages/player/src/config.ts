@@ -304,19 +304,23 @@ export interface PlaybackTuningConfig {
   };
 
   /**
-   * Warm-start the current group at initial tune-in (§5.1.3 "Joining an
-   * Ongoing Track"): live LOC media tracks subscribe with the Largest Object
-   * filter and immediately issue a relative Joining FETCH (Joining Start 0,
-   * §9.16.2 / draft-18 §10.12.2) referencing the SUBSCRIBE, so the current
-   * group's head plays immediately instead of waiting for the next group
-   * boundary. The FETCH and the live subscription are contiguous and
-   * non-overlapping by construction (§9.16.2.1).
+   * Warm-start the current group at initial tune-in instead of waiting for
+   * the next group boundary. Drafts 14/16/18 pair a Largest Object SUBSCRIBE
+   * with a relative Joining FETCH (Joining Start 0, draft-16 §9.16.2 /
+   * draft-18 §10.12.2). Its saved Largest Location makes the two ranges
+   * contiguous and non-overlapping. Draft 22 uses a Next Object SUBSCRIBE
+   * with an initial fill for the current group (§3.4 / §3.5).
    *
-   * Scope: initial tune-in only (never ABR switches), live LOC tracks only —
-   * CMAF tracks keep their normal boundary start (MSE append ordering is not
-   * warm-start safe yet) and non-live tracks already start from group 0. A
-   * refused FETCH is non-fatal: playback continues live-only from the next
-   * group boundary.
+   * Scope: initial tune-in only (never ABR switches), live LOC, CMAF and
+   * LOCMAF tracks. Non-live tracks already start from group 0. The saved
+   * Largest Location bounds a contiguous prefix; live tail processing waits
+   * for that prefix, including asynchronous object transforms. The sequencing
+   * gate has a 100-data-object / 4 MiB budget and a one-second readiness deadline,
+   * plus one zero-byte EndOfTrack marker independent of the data budget.
+   * Expiry fences late transforms; their resources remain owned until settlement.
+   * A refused, incomplete or expired prefix falls back to a later live group
+   * start; terminal completion markers retain their separate control path.
+   * These bounds and fallback behavior are player policy, not wire rules.
    *
    * Default: off. Incompatible with an explicit `subscriptionFilter` other
    * than `'LargestObject'` — draft-16 §9.16.2 closes the session when a

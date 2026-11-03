@@ -289,7 +289,7 @@ object; the higher-level `Player` instead emits `severity`, `code` and `message`
 | `targetLatencyMs` | number | — | Live catch-up target |
 | `maxCatchUpRate` | number | 1.0 | Max playback rate for catch-up |
 | `authority` | string | — | CLIENT_SETUP AUTHORITY for tenant-routed relays (interop override; spec prohibits it over WebTransport) |
-| `warmStartCurrentGroup` | boolean | false | Join live LOC tracks mid-group via Joining FETCH on drafts 14/16/18, or a fill on draft 22; non-fatal if refused |
+| `warmStartCurrentGroup` | boolean | false | Join live LOC/CMAF/LOCMAF tracks mid-group via Joining FETCH on drafts 14/16/18, or a fill on draft 22; non-fatal if refused |
 | `catalogBootstrap` | 'auto' \| 'joining-fetch' \| 'strict' \| 'subscribe' | 'auto' | Catalog bootstrap policy; draft 22 uses fills rather than Joining FETCH |
 | `locmafDecoding` | 'mse' \| 'frame' | 'mse' | Reconstruct CMAF for MSE or decode LOCMAF samples through WebCodecs |
 | `authorization` | credential provider | — | Opt-in token acquisition for SETUP and authorized requests |
@@ -448,7 +448,7 @@ Example pages:
 
 The `/player/` page takes URL parameters: `?url=` (relay), `?ns=` / `?nsField=`
 (namespace), `?hash=` (cert hash), `?v=14|16|18|22` (draft), `?authority=`
-(tenant-routed relays), `?warmStart=1` (join live LOC tracks mid-group via
+(tenant-routed relays), `?warmStart=1` (join live LOC/CMAF/LOCMAF tracks mid-group via
 Joining FETCH or draft-22 fills; needs `isLive: true` in the catalog and relay
 support; degrades to a normal live join otherwise), `?log=info|debug`
 (player logs on the console), `?catalog=<base64 JSON>` (inject a catalog),

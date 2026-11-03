@@ -159,7 +159,7 @@ The shared outcome vocabulary currently contains:
 
 - Transport: `subscription policy`, `late`.
 - Routing: `transform cancelled`, `dropped by transform`, `route retired`,
-  `object processing failed`.
+  `object processing failed`, `warm start incomplete`.
 - Reconstruction and player policy: `track superseded`, `invalid media`,
   `orphaned media`, `epoch refused`, `superseded pending moof`, `paused`,
   `awaiting init`, `awaiting keyframe`, `not attached`, `stale group`.

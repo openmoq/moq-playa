@@ -114,7 +114,7 @@ export interface ControlMessageContext {
   /** Called when SUBSCRIBE_OK resolves an alias — replay buffered objects. */
   onAliasResolved?: (alias: bigint) => void;
   /** Called when SUBSCRIBE_OK matches a pending media subscription. @see §9.10 */
-  onMediaSubscribeOk?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio') => void;
+  onMediaSubscribeOk?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', largest: { group: bigint; object: bigint } | null) => void;
   /** Called when REQUEST_ERROR matches a pending media subscription. @see §9.8 */
   onMediaSubscribeError?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', reason: string, errorCode: bigint) => void;
   /** Called when PUBLISH_DONE arrives — player can re-subscribe if needed. */
@@ -241,7 +241,7 @@ export function handleControlMessage(
             { sourceConnection: ctx.sourceConnection, namespace: (active.namespace ?? ctx.namespace)! });
         } else ctx.subscriptionManager?.registerTrack(alias, pending.trackName, pending.mediaType, pending.packaging);
         if (pending.mediaType === 'video' || pending.mediaType === 'audio') {
-          ctx.onMediaSubscribeOk?.(okReqId, pending.trackName, pending.mediaType);
+          ctx.onMediaSubscribeOk?.(okReqId, pending.trackName, pending.mediaType, extractLargestLocation(msg.parameters as Parameters | undefined));
         }
         ctx.onMediaAliasBound?.(okReqId, alias);
         // Replay objects that arrived before this alias was resolved

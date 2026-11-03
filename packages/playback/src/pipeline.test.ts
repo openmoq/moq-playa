@@ -11,6 +11,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { PlaybackPipeline } from './pipeline.js';
 import { SyncController } from './sync.js';
+import { AdaptiveToleranceController } from './adaptive-tolerance.js';
 import { DefaultRecoveryController } from './recovery.js';
 import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig } from './types.js';
 import type { MoqtObjectData, MoqtObjectGap } from '@openmoq/transport';
@@ -2155,4 +2156,102 @@ describe('PlaybackPipeline — LOC-04 Audio Config', () => {
         pipeline.tick();
         expect(commands.filter(c => c.type === 'configure')).toHaveLength(0);
     });
+});
+
+
+it('excludes actual backfill arrivals from jitter without suppressing live arrivals', () => {
+    const arrived = vi.spyOn(AdaptiveToleranceController.prototype, 'onFrameArrived');
+    const clock = new MockClock();
+    const { pipeline } = createPipeline({ mediaType: 'video', clock,
+        config: { ...DEFAULT_CONFIG, adaptiveTolerance: true } });
+    try {
+        pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000n, true), undefined, { backfill: true });
+        expect.soft(arrived).not.toHaveBeenCalled();
+        pipeline.pushObject(makeData(0, 1), videoHeaders(1_033_333n, false));
+        expect(arrived).toHaveBeenCalledTimes(1);
+    } finally { arrived.mockRestore(); }
+});
+
+function joinedBackfill(backfill: boolean, audioFirst = true) {
+    const clock = new MockClock(); clock.set(5_000_000);
+    const sync = new SyncController({ clock, wallClock: { now: () => 1_000_250_000 },
+        driftThresholdUs: 150_000, targetLatencyMs: 250, catchUpThresholdMs: 100, maxCatchUpRate: 1.1 });
+    const audio = createPipeline({ mediaType: 'audio', clock, sync });
+    const video = createPipeline({ mediaType: 'video', clock, sync });
+    audio.pipeline.configure(new Uint8Array([1]));
+    const anchorAudio = () => { audio.pipeline.pushObject(makeData(0, 0), audioHeaders(1_000_000_000n)); audio.pipeline.tick(); };
+    if (audioFirst) anchorAudio();
+    video.pipeline.pushObject(makeData(0, 0), videoHeaders(999_500_000n, true, new Uint8Array([1])), undefined, { backfill });
+    video.pipeline.tick();
+    const ageAfterHead = sync.latencyUs;
+    const headRates = video.commands.filter(command => command.type === 'set_playback_rate');
+    if (!audioFirst) anchorAudio();
+    clock.advance(50_000);
+    audio.pipeline.pushObject(makeData(0, 1), audioHeaders(1_000_033_333n)); audio.pipeline.tick();
+    video.pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_333n, false)); video.pipeline.tick();
+    const a = audio.commands.filter(command => command.type === 'decode_audio').at(-1);
+    const v = video.commands.filter(command => command.type === 'decode_video').at(-1);
+    if (!a || !v) throw new Error('fixture did not emit both decode commands');
+    return { difference: v.renderTimeUs - a.renderTimeUs, ageAfterHead, headRates };
+}
+
+describe('backfill timing on the shared playback clock', () => {
+    it('keeps later live video aligned with same-PTS audio after audio-first backfill', () => {
+        expect(joinedBackfill(true).difference).toBe(0);
+    });
+    it('keeps video-first backfill aligned when audio establishes the reference later', () => {
+        expect(joinedBackfill(true, false).difference).toBe(0);
+    });
+    it('preserves the ordinary live-join re-anchor', () => {
+        expect(joinedBackfill(false).difference).toBe(516_000);
+    });
+    it('does not change live capture age or catch-up rate in response to older backfill', () => {
+        const head = joinedBackfill(true);
+        expect.soft(head.ageAfterHead).toBe(250_000);
+        expect(head.headRates).toEqual([]);
+        const ordinary = joinedBackfill(false);
+        expect(ordinary.ageAfterHead).toBe(750_000);
+        expect(ordinary.headRates).toHaveLength(1);
+    });
+    it.each(['reset', 'eviction'] as const)('forgets the backfill bit with buffered ownership on %s', action => {
+        const clock = new MockClock(); clock.set(5_000_000);
+        const sync = new SyncController({ clock, driftThresholdUs: 150_000 });
+        sync.setAudioReference(1_000_000_000n);
+        const { pipeline, commands } = createPipeline({ mediaType: 'video', clock, sync,
+            config: { ...DEFAULT_CONFIG, maxBufferDepth: 1 } });
+        pipeline.pushObject(makeData(0, 0, undefined, 0, 200), videoHeaders(999_500_000n, true), undefined, { backfill: true });
+        if (action === 'reset') pipeline.reset();
+        else {
+            pipeline.pushObject(makeData(0, 1, undefined, 0, 1), videoHeaders(999_533_333n, false));
+            pipeline.tick(); // A nonzero object without its anchor is discarded normally.
+        }
+        pipeline.pushObject(makeData(0, 0), videoHeaders(999_500_000n, true, new Uint8Array([1])));
+        pipeline.tick();
+        expect(commands.filter(command => command.type === 'decode_video')).toHaveLength(1);
+        expect(sync.videoJoinOffsetUs).toBe(516_000);
+    });
+});
+
+it.each([false, true])('a refused input cannot mark its reentrant replacement as backfill: %s', backfill => {
+    const clock = new MockClock(); clock.set(5_000_000);
+    const sync = new SyncController({ clock, driftThresholdUs: 150_000 });
+    sync.setAudioReference(1_000_000_000n);
+    const commands: DecoderCommand[] = [];
+    let recoveries = 0;
+    const pipeline = new PlaybackPipeline({
+        mediaType: 'video', clock, sync, config: { ...DEFAULT_CONFIG, maxBufferDepth: 1 },
+        recovery: new DefaultRecoveryController(), onCommand: command => commands.push(command),
+        onEvent: event => {
+            if (event.type !== 'recovery') return;
+            recoveries++;
+            pipeline.reset();
+            pipeline.pushObject(makeData(0, 0), videoHeaders(999_500_000n, true, new Uint8Array([1])));
+        },
+    });
+    pipeline.pushObject(makeData(1, 0), videoHeaders(1_000_000_000n, true));
+    pipeline.pushObject(makeData(0, 0), videoHeaders(999_500_000n, true), undefined, { backfill });
+    pipeline.tick();
+    expect(recoveries).toBe(1);
+    expect(commands.filter(command => command.type === 'decode_video')).toHaveLength(1);
+    expect(sync.videoJoinOffsetUs).toBe(516_000);
 });

@@ -58,10 +58,23 @@ function waitForRoute(route: PendingRoute): Promise<void> {
 /** Application-local input identity. The object/source arguments never enter a diagnostic export. */
 export type ObjectRoutingContext = object & { readonly then?: never };
 export type ObjectRoutingDiscardReason = 'transform cancelled' | 'dropped by transform' | 'route retired' | 'object processing failed'
-  | import('./interfaces.js').CmafAssemblyDiscardReason | 'paused' | 'awaiting init' | 'awaiting keyframe' | 'not attached' | 'stale group';
+  | import('./interfaces.js').CmafAssemblyDiscardReason | 'paused' | 'awaiting init' | 'awaiting keyframe' | 'not attached' | 'stale group'
+  | 'warm start incomplete' | 'buffer full' | 'treated as a replay';
 export interface ObjectRoutingProvenance {
   capture(sourceConnection: unknown, input: MoqtObject | ObjectDatagram): ObjectRoutingContext | undefined;
   discarded(context: ObjectRoutingContext, reason: ObjectRoutingDiscardReason): void | Promise<void>;
+}
+
+export type ObjectDeliveryAdmission =
+  | { readonly kind: 'deliver'; readonly isLive: () => boolean; readonly backfill: boolean }
+  | { readonly kind: 'discard'; readonly reason: ObjectRoutingDiscardReason };
+
+/** Internal processing policy, captured by the owner before asynchronous work. */
+export interface ObjectDeliveryOptions {
+  readonly isLive?: () => boolean;
+  readonly backfill?: boolean;
+  /** Register/capture now, but defer transformation until the owner admits it. */
+  readonly admission?: Promise<ObjectDeliveryAdmission>;
 }
 
 /**
@@ -106,6 +119,12 @@ export class SubscriptionManager {
       const result = observer.discarded(context!, reason);
       if (result) void Promise.resolve(result).catch(() => {});
     } catch { /* Diagnostic outcomes cannot make a track malformed. */ }
+  }
+
+  /** Opaque registration identity for an operation that may outlive this call. */
+  captureRoute(alias: bigint): (() => boolean) | null {
+    const registration = this.tracks.get(alias);
+    return registration ? () => this.tracks.get(alias) === registration : null;
   }
 
   /**
@@ -161,6 +180,7 @@ export class SubscriptionManager {
         obj: MoqtObject,
         headers: LocHeaders,
         context?: object,
+        delivery?: ObjectDeliveryOptions,
       ) => void)
     | null = null;
 
@@ -175,6 +195,7 @@ export class SubscriptionManager {
         trackName: string,
         obj: MoqtObject,
         context?: object,
+        delivery?: ObjectDeliveryOptions,
       ) => void)
     | null = null;
 
@@ -190,6 +211,7 @@ export class SubscriptionManager {
         trackName: string,
         obj: MoqtObject,
         context?: object,
+        delivery?: ObjectDeliveryOptions,
       ) => void)
     | null = null;
 
@@ -331,6 +353,11 @@ export class SubscriptionManager {
     return this.tracks.get(trackAlias)?.mediaType;
   }
 
+  private deliveryIsLive(source: unknown, alias: bigint, delivery: ObjectDeliveryOptions | undefined): boolean {
+    return delivery?.isLive?.() !== false
+      && (this.routeStillValid === null || this.routeStillValid(source, alias));
+  }
+
   /**
    * Route a MoqtObject to the correct pipeline.
    *
@@ -350,7 +377,7 @@ export class SubscriptionManager {
    * @see draft-ietf-moq-cmsf-00 §3.3 (CMAF Object Packaging)
    * @see draft-ietf-moq-msf-00 §8 (Event Timeline track)
    */
-  async routeObject(_streamId: bigint, obj: MoqtObject, sourceDraft?: DraftVersion, sourceConnection?: unknown, receiptInput?: MoqtObject | ObjectDatagram): Promise<void> {
+  async routeObject(_streamId: bigint, obj: MoqtObject, sourceDraft?: DraftVersion, sourceConnection?: unknown, receiptInput?: MoqtObject | ObjectDatagram, delivery?: ObjectDeliveryOptions): Promise<void> {
     const alias = BigInt(obj.trackAlias);
     const info = this.tracks.get(alias);
     if (!info) return; // Unknown track alias — silently ignore
@@ -409,14 +436,29 @@ export class SubscriptionManager {
         provenanceGeneration = this.provenanceGeneration;
         try {
           const captured = provenance.capture(source, receiptInput ?? obj);
-          // Capture is synchronous. A JavaScript caller's accidental promise
-          // cannot delay media or become an opaque input identity.
           if (captured && typeof Reflect.get(captured, 'then') === 'function') {
             void Promise.resolve(captured).catch(() => {});
           } else context = captured;
-        } catch { /* Capture is optional evidence, not media processing. */ }
-        // Capture is application code and can retire the route synchronously.
-        if (this.tracks.get(alias) !== info || this.routeStillValid !== null && !this.routeStillValid(source, alias)) {
+        } catch { /* Optional evidence cannot affect media. */ }
+      }
+      if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+        this.discardContext(context, provenance, provenanceGeneration, 'route retired');
+        return;
+      }
+      if (delivery?.admission) {
+        let admission: ObjectDeliveryAdmission;
+        try { admission = await delivery.admission; }
+        catch {
+          // A failed local gate is not malformed publisher data.
+          this.discardContext(context, provenance, provenanceGeneration, 'route retired');
+          return;
+        }
+        if (admission.kind === 'discard') {
+          this.discardContext(context, provenance, provenanceGeneration, admission.reason);
+          return;
+        }
+        delivery = admission;
+        if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
           this.discardContext(context, provenance, provenanceGeneration, 'route retired');
           return;
         }
@@ -424,7 +466,7 @@ export class SubscriptionManager {
 
       if (earlier.length) {
         await Promise.all(earlier.map(waitForRoute));
-        if (this.tracks.get(alias) !== info || this.routeStillValid !== null && !this.routeStillValid(source, alias)) {
+        if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
           this.discardContext(context, provenance, provenanceGeneration, 'route retired'); return;
         }
       }
@@ -453,17 +495,23 @@ export class SubscriptionManager {
           return;
         }
         // The route may have changed hands while the transform was awaited.
-        if (this.tracks.get(alias) !== info || this.routeStillValid !== null && !this.routeStillValid(source, alias)) {
+        if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
           this.discardContext(context, provenance, provenanceGeneration, 'route retired');
           return;
         }
+      }
+
+      if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+        this.discardContext(context, provenance, provenanceGeneration, 'route retired');
+        return;
       }
 
       if (info.packaging === 'cmaf') {
         // CMAF path: skip LOC header parsing, route directly to MediaSource
         // §3.3: payload contains moof+mdat pairs
         const input = this.activeContext(context, provenance, provenanceGeneration);
-        if (input === undefined) this.onCmafObject?.(mediaType, info.trackName, transformed);
+        if (delivery) this.onCmafObject?.(mediaType, info.trackName, transformed, input, delivery);
+        else if (input === undefined) this.onCmafObject?.(mediaType, info.trackName, transformed);
         else this.onCmafObject?.(mediaType, info.trackName, transformed, input);
       } else if (info.packaging === 'locmaf') {
         // LOCMAF path: skip LOC header parsing; the payload is a LOCMAF Object.
@@ -472,7 +520,8 @@ export class SubscriptionManager {
         // that reconstructs to a CMAF chunk (moof+mdat).
         // @see draft-einarsson-moq-locmaf-01 §7, §15
         const input = this.activeContext(context, provenance, provenanceGeneration);
-        if (input === undefined) this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed);
+        if (delivery) this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed, input, delivery);
+        else if (input === undefined) this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed);
         else this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed, input);
       } else {
         // LOC path: parse extension headers and route to PlaybackPipeline
@@ -492,14 +541,20 @@ export class SubscriptionManager {
         const parse = this.extensionParser
           ?? ((ext: Uint8Array | undefined) => parseLocHeaders(ext, opts));
         const headers = parse(extensions);
-        if (this.tracks.get(alias) !== info || this.routeStillValid !== null && !this.routeStillValid(source, alias)) {
-          this.discardContext(context, provenance, provenanceGeneration, 'route retired'); return;
+        if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+          this.discardContext(context, provenance, provenanceGeneration, 'route retired');
+          return;
         }
         const input = this.activeContext(context, provenance, provenanceGeneration);
-        if (input === undefined) this.onObject?.(mediaType, info.trackName, transformed, headers);
+        if (delivery) this.onObject?.(mediaType, info.trackName, transformed, headers, input, delivery);
+        else if (input === undefined) this.onObject?.(mediaType, info.trackName, transformed, headers);
         else this.onObject?.(mediaType, info.trackName, transformed, headers, input);
       }
     } catch (error) {
+      if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+        this.discardContext(context, provenance, provenanceGeneration, 'route retired');
+        return;
+      }
       if (pendingTransform && !pendingTransform.valid) {
         this.discardContext(context, provenance, provenanceGeneration, 'transform cancelled');
         return;
@@ -508,8 +563,7 @@ export class SubscriptionManager {
         this.discardContext(context, provenance, provenanceGeneration, 'route retired'); return;
       }
       this.discardContext(context, provenance, provenanceGeneration, 'object processing failed');
-      // A discard observer can replace the route synchronously; recovery still belongs only to the failed owner.
-      if (this.tracks.get(alias) !== info || this.routeStillValid !== null && !this.routeStillValid(source, alias)) return;
+      if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) return;
       // §2.4.2: Malformed Track — signal to player for UNSUBSCRIBE, tagged with
       // the source session so recovery does not cancel a request on another.
       this.onMalformedTrack?.(

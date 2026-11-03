@@ -67,6 +67,8 @@ export class PlaybackPipeline {
 
     /** Headers stored alongside objects, keyed by "groupId:objectId". */
     private readonly headerMap = new Map<string, LocHeaders>();
+    /** Allocated only for backfilled inputs; ownership follows the jitter buffer. */
+    private backfillObjects: Set<string> | undefined;
 
     private inputState: PipelineInputs | undefined;
     private playbackRevision = 0;
@@ -327,8 +329,9 @@ export class PlaybackPipeline {
  *
  * @param obj The MoqtObject (data or gap)
  * @param headers Parsed LocHeaders (only meaningful for data objects)
+ * @param delivery Backfilled objects are excluded from arrival-jitter estimation.
  */
-    pushObject(obj: MoqtObject, headers?: LocHeaders, input?: object): void {
+    pushObject(obj: MoqtObject, headers?: LocHeaders, input?: object, delivery?: { readonly backfill?: boolean }): void {
         const inputs = this.inputState;
         const token = inputs ? input : undefined;
         if (obj.kind === 'gap') {
@@ -383,9 +386,13 @@ export class PlaybackPipeline {
             }
         }
 
+        if (!refused && delivery?.backfill && this.headerMap.has(key)) {
+            (this.backfillObjects ??= new Set()).add(key);
+        }
+
         // Interarrival jitter uses transit differences, so the timestamp epoch
         // cancels out. Media time is suitable here, but not for latency/catch-up.
-        if (this.adaptiveTolerance && headers?.captureTimestamp !== undefined) {
+        if (this.adaptiveTolerance && headers?.captureTimestamp !== undefined && delivery?.backfill !== true) {
             const nowMs = this.clock.now() / 1000; // µs → ms
             const captureUs = Number(headers.captureTimestamp);
             this.adaptiveTolerance.onFrameArrived(nowMs, captureUs, nowMs);
@@ -437,6 +444,7 @@ export class PlaybackPipeline {
         // and produce decode errors.
         this.buffer.clear();
         this.headerMap.clear();
+        this.backfillObjects = undefined;
         this.bufferedGroupCounts.clear();
         this.lastConsumedGroupId = firstGroupId - 1n;
         this.endedGroups.add(this.lastConsumedGroupId);
@@ -458,6 +466,7 @@ export class PlaybackPipeline {
         const inputs = this.inputState, dropped = inputs?.clear();
         this.buffer.clear();
         this.headerMap.clear();
+        this.backfillObjects = undefined;
         this.bufferedGroupCounts.clear();
         this.lastConsumedGroupId = -1n;
         this.nextExpectedObjectId = 0n;
@@ -504,7 +513,7 @@ export class PlaybackPipeline {
             if (top.objectId !== 0n) {
                 this.buffer.extract();
                 this.decrementGroupCount(top.groupId);
-                const key = `${top.groupId}:${top.objectId}`; this.headerMap.delete(key);
+                const key = `${top.groupId}:${top.objectId}`; this.forgetHeaders(key);
                 this.inputState?.report(this.inputState.take(key), 'awaiting keyframe');
                 return; // wait for a keyframe-starting group
             }
@@ -684,7 +693,7 @@ export class PlaybackPipeline {
                     const peek = this.buffer.peek();
                     if (!peek || peek.groupId !== skipGroupId) break;
                     this.buffer.extract();
-                    const key = `${peek.groupId}:${peek.objectId}`; this.headerMap.delete(key);
+                    const key = `${peek.groupId}:${peek.objectId}`; this.forgetHeaders(key);
                     const input = inputs?.take(key); if (input) dropped?.push(input);
                     this.decrementGroupCount(skipGroupId);
                 }
@@ -739,7 +748,7 @@ export class PlaybackPipeline {
         // Clean up leaked header entries for shed groups
         for (const key of this.headerMap.keys()) {
             const groupId = BigInt(key.split(':')[0]!);
-            if (groupId < cutoff) { this.headerMap.delete(key); const input = inputs?.take(key); if (input) dropped?.push(input); }
+            if (groupId < cutoff) { this.forgetHeaders(key); const input = inputs?.take(key); if (input) dropped?.push(input); }
         }
 
         // Advance consumed position past shed groups
@@ -797,7 +806,7 @@ export class PlaybackPipeline {
             // Evicted is less important — insert incoming
             this.decrementGroupCount(evicted.groupId);
             const evictedKey = `${evicted.groupId}:${evicted.objectId}`;
-            this.headerMap.delete(evictedKey);
+            this.forgetHeaders(evictedKey);
             const evictedInput = inputs?.take(evictedKey); if (evictedInput) dropped?.push(evictedInput);
 
             this.buffer.insert(obj);
@@ -814,10 +823,18 @@ export class PlaybackPipeline {
         }
     }
 
+    private forgetHeaders(key: string): void {
+        this.headerMap.delete(key);
+        const backfill = this.backfillObjects;
+        backfill?.delete(key);
+        if (backfill?.size === 0) this.backfillObjects = undefined;
+    }
+
     private processDataObject(obj: MoqtObjectData): void {
         const key = `${obj.groupId}:${obj.objectId}`;
         const headers = this.headerMap.get(key) ?? {};
-        this.headerMap.delete(key);
+        const backfill = this.backfillObjects?.has(key) === true;
+        this.forgetHeaders(key);
         const inputs = this.inputState, input = inputs?.take(key), revision = this.playbackRevision;
 
         // 1. Configure decoder if the object carries codec config for this
@@ -895,10 +912,12 @@ export class PlaybackPipeline {
             renderTimeUs = this.clock.now();
         }
 
-        // 3b. Evaluate live catch-up from CaptureTimestamp
+        // 3b. Backfill primes decoding on the existing A/V timeline; it must
+        // not re-anchor that clock or change the live catch-up decision.
+        // Evaluate live catch-up from CaptureTimestamp
         // @see draft-ietf-moq-loc-01 §2.3.1.1 (latency measurement)
         // @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
-        if (headers.captureTimestamp !== undefined) {
+        if (!backfill && headers.captureTimestamp !== undefined) {
             const catchUp = this.sync.evaluateCatchUp(headers.captureTimestamp, headers.timestampIsWallClock);
             if (catchUp !== null && catchUp.currentRate !== this._lastEmittedRate) {
                 this._lastEmittedRate = catchUp.currentRate;
@@ -939,7 +958,7 @@ export class PlaybackPipeline {
 
             // Detect live join: NEEDS_KEYFRAME → DECODING (first keyframe decoded)
             // Apply video join re-anchor to prevent startup stutter.
-            if (prevState === 'needs_keyframe' && this.decoderState.state === 'decoding'
+            if (!backfill && prevState === 'needs_keyframe' && this.decoderState.state === 'decoding'
                 && headers.captureTimestamp !== undefined) {
                 this.sync.onVideoJoin(headers.captureTimestamp);
                 // Recompute render time with the offset applied
@@ -1014,7 +1033,7 @@ export class PlaybackPipeline {
             const colonIdx = key.indexOf(':');
             const gid = BigInt(key.slice(0, colonIdx));
             if (gid < groupId) {
-                this.headerMap.delete(key);
+                this.forgetHeaders(key);
                 const input = inputs?.take(key); if (input) dropped?.push(input);
             }
         }

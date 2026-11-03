@@ -42,8 +42,9 @@ async function boot(options: {
       return id;
     }),
   };
-  const ack = (requestId: bigint, trackAlias: bigint) => adapter.onMessage?.({
-    type: 'SUBSCRIBE_OK', requestId: varint(requestId), trackAlias: varint(trackAlias), parameters: new Map(),
+  const ack = (requestId: bigint, trackAlias: bigint, largest?: { group: bigint; object: bigint }) => adapter.onMessage?.({
+    type: 'SUBSCRIBE_OK', requestId: varint(requestId), trackAlias: varint(trackAlias),
+    parameters: new Map(largest ? [[0x09n, [largest]]] : []),
   });
   const reject = (requestId: bigint) => adapter.onMessage?.({
     type: 'REQUEST_ERROR', requestId: varint(requestId), errorCode: varint(16), errorReason: 'not found',
@@ -287,8 +288,9 @@ describe('FETCH subscription ownership', () => {
       h.send(0n, 1, 200n);
       h.adapter.onStreamClosed(200n, undefined, 'fin');
       expect(h.received).toEqual([]);
-      h.ack(videoId, 40n);
-      expect(h.received).toEqual([{ track: 'vide_1', marker: 1, alias: 40n }]);
+      // Joining FETCH answers the saved nonempty Largest Location.
+      h.ack(videoId, 40n, kind === 'joining' ? { group: 0n, object: 0n } : undefined);
+      await vi.waitFor(() => expect(h.received).toEqual([{ track: 'vide_1', marker: 1, alias: 40n }]));
       h.ack(h.ids.get('soun_2')!, 50n);
       expect(h.received).toHaveLength(1);
     } finally { await h.player.destroy(); }
