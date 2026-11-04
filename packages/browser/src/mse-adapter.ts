@@ -2388,11 +2388,85 @@ export class MseMediaSource implements MediaSourceLike {
         // Gap-jump first: the wedge detector structurally ignores the
         // at-a-hole case (aheadSec is computed only within the containing
         // range), so the two never race for the same playhead state.
+        this.checkVideoHole();
         this.checkGapJump(nowMs);
         this.checkPlayheadWedge(nowMs);
       },
       MseMediaSource.WEDGE_CHECK_INTERVAL_MS,
     );
+  }
+
+  // ─── Video-only hole ─────────────────────────────────────────────
+
+  /** Playhead at the previous video-hole check, to see a hole crossed between ticks. */
+  private videoHoleLastTime: number | null = null;
+
+  /**
+   * Recover from a hole in the VIDEO SourceBuffer that audio plays across.
+   *
+   * With audio buffered through it, the element does not stop at a video-only
+   * hole: the clock keeps running on audio while the picture freezes, and the
+   * video decoder, still waiting for frames at the hole, can wedge playback
+   * for good a little later with media buffered ahead. The buffered-hole gap
+   * jump cannot see this: it watches the element's combined ranges for a
+   * playhead frozen at a hole, and here the playhead keeps moving.
+   *
+   * Inside a hole within the gap jump's bound, seek to the next video range
+   * (as a gap jump would). Once the playhead passes a hole's end, of any size,
+   * seek to the current position, which restarts video decoding from that
+   * range's keyframe and keeps audio continuous. There is no wait: the picture is already frozen, and media
+   * for the hole will not be appended once a later group is committed.
+   */
+  private checkVideoHole(): void {
+    const v = this.video;
+    const last = this.videoHoleLastTime;
+    this.videoHoleLastTime = null;
+    if (this.destroyed || !this.playTriggered || this.gapJumpMs <= 0) return;
+    if (v.paused || v.seeking || v.error !== null || !this.playbackIntent) return;
+    const video = this.videoBuffer;
+    const audio = this.audioBuffer;
+    if (video === null || audio === null) return;
+    let vr: TimeRanges;
+    let ar: TimeRanges;
+    try {
+      vr = video.buffered;
+      ar = audio.buffered;
+    } catch {
+      return;
+    }
+    const ct = v.currentTime;
+    this.videoHoleLastTime = ct;
+    const tol = MseMediaSource.GAP_IDENTITY_TOLERANCE_SEC;
+    let audioCovers = false;
+    for (let i = 0; i < ar.length; i++) {
+      if (ct >= ar.start(i) && ct <= ar.end(i)) { audioCovers = true; break; }
+    }
+    if (!audioCovers) return;
+    for (let i = 0; i + 1 < vr.length; i++) {
+      const holeStart = vr.end(i);
+      const holeEnd = vr.start(i + 1);
+      const holeSec = holeEnd - holeStart;
+      if (holeSec <= tol) continue;
+      // Jumping forward skips audio, so it keeps the gap jump's bound; the
+      // in-place re-seek after crossing skips nothing and applies to any size.
+      const inside = ct > holeStart + tol && ct < holeEnd
+        && holeSec <= MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9;
+      const crossed = !inside && last !== null && last < holeEnd && ct >= holeEnd && ct <= vr.end(i + 1);
+      if (!inside && !crossed) continue;
+      const to = inside ? holeEnd + Math.min(0.01, (vr.end(i + 1) - holeEnd) / 2) : ct;
+      this.videoHoleLastTime = null;
+      v.currentTime = to;
+      this.noteSelfSeek();
+      const info: GapJumpInfo = { from: ct, to, holeSec, waitedMs: 0, bufferedRanges: fmtRanges(v.buffered) };
+      try {
+        this.onGapJump?.(info);
+      } catch { /* listener bug */ }
+      this.logWarn(
+        `[MSE] video-only hole ${holeStart.toFixed(2)}s-${holeEnd.toFixed(2)}s `
+        + `${inside ? 'reached' : 'crossed'} at ${ct.toFixed(2)}s with audio playing — seeking to ${to.toFixed(2)}s`,
+      );
+      return;
+    }
   }
 
   // ─── Buffered-hole gap-jump ──────────────────────────────────────

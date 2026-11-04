@@ -3358,6 +3358,98 @@ describe('MseMediaSource — terminal startup report', () => {
     });
 });
 
+// ─── Video-only hole (audio plays across it) ───────────────────────────
+//
+// A hole in the video SourceBuffer alone does not stop the element when
+// audio is buffered through it: the clock runs on audio, the picture
+// freezes, and the video decoder can wedge playback later with media ahead.
+// The adapter seeks past such a hole as soon as the playhead is inside it,
+// or re-seeks in place once a hole has been crossed between checks.
+
+describe('video-only hole', () => {
+    function holeSetup(opts?: {
+        video?: [number, number][]; audio?: [number, number][]; ct?: number; gapJumpMs?: number;
+    }) {
+        const element = new MockVideoElement();
+        element.buffered = makeTimeRanges([[0, 1], [2, 7]]);
+        element.currentTime = opts?.ct ?? 1.4;
+        const adapter = new MseMediaSource(
+            element as unknown as HTMLVideoElement,
+            opts?.gapJumpMs !== undefined ? { gapJumpMs: opts.gapJumpMs } : undefined,
+        );
+        (adapter as any).playTriggered = true;
+        (adapter as any).videoBuffer = { buffered: makeTimeRanges(opts?.video ?? [[0, 1], [2, 7]]) };
+        (adapter as any).audioBuffer = { buffered: makeTimeRanges(opts?.audio ?? [[0, 7]]) };
+        const jumps: any[] = [];
+        (adapter as any).onGapJump = (info: any) => jumps.push(info);
+        const check = () => (adapter as any).checkVideoHole();
+        element.seekCount = 0;
+        return { adapter, element, jumps, check };
+    }
+
+    it('seeks to the next video range when the playhead is inside a video-only hole', () => {
+        const { element, jumps, check } = holeSetup();
+        check();
+        expect(element.seekCount).toBe(1);
+        expect(element.currentTime).toBeCloseTo(2.01, 5);
+        expect(jumps).toHaveLength(1);
+        expect(jumps[0]).toMatchObject({ holeSec: 1, waitedMs: 0 });
+        expect(jumps[0].from).toBeCloseTo(1.4, 5);
+    });
+
+    it('re-seeks in place once a hole is crossed between checks', () => {
+        const { element, jumps, check } = holeSetup({ ct: 0.9 });
+        check();
+        expect(element.seekCount).toBe(0);
+        element.currentTime = 2.6; // the playhead ran across [1, 2] on audio
+        element.seekCount = 0;     // a manual move is not an adapter seek
+        check();
+        expect(element.seekCount).toBe(1);
+        expect(element.currentTime).toBeCloseTo(2.6, 5);
+        expect(jumps).toHaveLength(1);
+        // Handled once: the next check starts a fresh observation.
+        element.currentTime = 3.6;
+        element.seekCount = 0;
+        check();
+        expect(element.seekCount).toBe(0);
+    });
+
+    it('lets a hole over the jump bound play out, then re-seeks in place past its end', () => {
+        const { element, jumps, check } = holeSetup({ video: [[0, 1], [3.5, 7]], ct: 1.5 });
+        check(); // inside a 2.5 s hole: too wide to jump
+        expect(element.seekCount).toBe(0);
+        element.currentTime = 3.0;
+        element.seekCount = 0;
+        check(); // still inside
+        expect(element.seekCount).toBe(0);
+        element.currentTime = 3.9;
+        element.seekCount = 0;
+        check(); // past its end: restart video decoding in place
+        expect(element.seekCount).toBe(1);
+        expect(element.currentTime).toBeCloseTo(3.9, 5);
+        expect(jumps).toHaveLength(1);
+    });
+
+    it('leaves a hole that audio does not cover to the buffered-hole gap jump', () => {
+        const { element, check } = holeSetup({ audio: [[0, 1], [2, 7]] });
+        check();
+        expect(element.seekCount).toBe(0);
+    });
+
+    it('ignores contiguous video, pause, and a disabled gap jump', () => {
+        expect((() => { const h = holeSetup({ video: [[0, 7]] }); h.check(); return h.element.seekCount; })()).toBe(0);
+        expect((() => { const h = holeSetup(); h.element.paused = true; h.check(); return h.element.seekCount; })()).toBe(0);
+        expect((() => { const h = holeSetup({ gapJumpMs: 0 }); h.check(); return h.element.seekCount; })()).toBe(0);
+    });
+
+    it('needs both SourceBuffers: video alone stops at the hole and the gap jump handles it', () => {
+        const { adapter, element, check } = holeSetup();
+        (adapter as any).audioBuffer = null;
+        check();
+        expect(element.seekCount).toBe(0);
+    });
+});
+
 // ─── Buffered-hole gap-jump (defensive recovery for source holes) ──────
 //
 // Real live chains deliver streams with HOLES: media time missing either
