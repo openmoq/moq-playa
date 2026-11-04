@@ -223,24 +223,26 @@ export class Player {
 
     // Time controller for timeupdate events
     this.timeCtrl = new TimeController(() => {
-      // Use the video element's native currentTime when it is the active sink.
-      // For owned elements we check the hidden flag; for borrowed elements we
-      // rely on _activeMediaType (set after catalog_received), falling back to
-      // the capability-detected strategy before the catalog arrives.
-      let videoIsActive: boolean;
-      if (this.ownsVideo) {
-        videoIsActive = this.videoElement != null && !this.videoElement.hidden;
-      } else {
-        const effectiveType = this._activeMediaType ?? (this.strategy === 'webcodecs' ? 'canvas' : 'video');
-        videoIsActive = effectiveType === 'video';
-      }
-      if (videoIsActive && this.videoElement) {
-        this._currentTime = this.videoElement.currentTime * 1000;
-      } else {
-        this._currentTime = this.engine.stats.playbackDurationMs;
-      }
+      this._currentTime = this.readPosition();
       this.emitter.emit('timeupdate', { currentTime: this._currentTime });
     });
+  }
+
+  /** The live playback position in ms, from the active render sink. */
+  private readPosition(): number {
+    // Use the video element's native currentTime when it is the active sink.
+    // For owned elements we check the hidden flag; for borrowed elements we
+    // rely on _activeMediaType (set after catalog_received), falling back to
+    // the capability-detected strategy before the catalog arrives.
+    let videoIsActive: boolean;
+    if (this.ownsVideo) {
+      videoIsActive = this.videoElement != null && !this.videoElement.hidden;
+    } else {
+      const effectiveType = this._activeMediaType ?? (this.strategy === 'webcodecs' ? 'canvas' : 'video');
+      videoIsActive = effectiveType === 'video';
+    }
+    if (videoIsActive && this.videoElement) return this.videoElement.currentTime * 1000;
+    return this.engine.stats.playbackDurationMs;
   }
 
   // ─── Properties ──────────────────────────────────────────────────
@@ -259,8 +261,18 @@ export class Player {
    */
   get activeMediaType(): 'canvas' | 'video' | null { return this._activeMediaType; }
 
-  /** Current playback position in ms. */
-  get currentTime(): number { return this._currentTime; }
+  /**
+   * Current playback position in ms.
+   *
+   * Read live while playing: the `timeupdate` ticker runs on animation frames,
+   * which browsers pause for a hidden page, so a cached value would freeze
+   * there while playback continues. Otherwise (paused, loading, just sought)
+   * it is the last committed position.
+   */
+  get currentTime(): number {
+    if (this._state === 'playing') this._currentTime = this.readPosition();
+    return this._currentTime;
+  }
 
   /** Last video draw evidence, not content position; null for unsupported outputs. */
   get videoPresentation(): VideoPresentation | null {

@@ -89,3 +89,45 @@ describe('public video presentation', () => {
     expect(engine.videoPresentation).toBeNull();
   });
 });
+
+describe('currentTime', () => {
+  function videoPlayer() {
+    const video = { volume: 1, muted: false, currentTime: 0 } as unknown as HTMLVideoElement & { currentTime: number };
+    const player = new Player(null, {
+      url: 'https://relay.example/moq', namespace: 'test', video,
+      moqtPlayerConfig: { logLevel: 'none' },
+    });
+    const internals = player as unknown as { _state: string; _activeMediaType: string | null };
+    internals._activeMediaType = 'video';
+    return { player, video, internals };
+  }
+
+  it('tracks the video element while playing, with no timeupdate tick', async () => {
+    // A hidden page pauses animation frames, so no tick runs while the video
+    // keeps playing; the position must still advance.
+    const { player, video, internals } = videoPlayer();
+    try {
+      internals._state = 'playing';
+      video.currentTime = 4.5;
+      expect(player.currentTime).toBe(4500);
+      video.currentTime = 7.25;
+      expect(player.currentTime).toBe(7250);
+    } finally {
+      await player.destroy();
+    }
+  });
+
+  it('keeps the last committed position while not playing', async () => {
+    const { player, video, internals } = videoPlayer();
+    try {
+      internals._state = 'playing';
+      video.currentTime = 3;
+      expect(player.currentTime).toBe(3000);
+      internals._state = 'paused';
+      video.currentTime = 9;
+      expect(player.currentTime).toBe(3000);
+    } finally {
+      await player.destroy();
+    }
+  });
+});
