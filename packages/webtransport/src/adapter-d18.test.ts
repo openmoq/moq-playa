@@ -55,7 +55,10 @@ describe('MoqtConnection(18) construction + connect', () => {
     expect(transport.uniOut[0]!.writeClosed).toBe(false); // control stream stays open
   });
 
-  it('close() cancels the accepted peer control stream', async () => {
+  it('a clean close() leaves the control streams to the transport close', async () => {
+    // A control stream stopped or reset before the session close lands makes
+    // the peer end the session with an error (draft-23 §6.3), so a clean close
+    // only releases them; the transport close ends them with the session.
     const conn = new MoqtConnection(18);
     const transport = new TransportSim();
     const control = transport.openIncomingUni();
@@ -65,7 +68,22 @@ describe('MoqtConnection(18) construction + connect', () => {
     await conn.close();
     await flush();
 
+    expect(control.readCancelled).toBe(false);
+    expect(transport.uniOut[0]!.writeAborted).toBe(false);
+  });
+
+  it('close() with an error code still resets both control streams', async () => {
+    const conn = new MoqtConnection(18);
+    const transport = new TransportSim();
+    const control = transport.openIncomingUni();
+    control.push(setupBytes());
+    await conn.connect(transport);
+
+    await conn.close(varint(0x1n), 'internal error');
+    await flush();
+
     expect(control.readCancelled).toBe(true);
+    expect(transport.uniOut[0]!.writeAborted).toBe(true);
   });
 
   it('lets the exact transport passed to connect settle its caller-held closed promise', async () => {
@@ -98,8 +116,8 @@ describe('MoqtConnection(18) construction + connect', () => {
     await expect(backendClose).resolves.toBeUndefined();
     await expect(callerHeldClosed).resolves.toBeDefined();
     expect(transport.incomingUniSourceCancelled).toBe(false);
-    expect(control.readCancelled).toBe(true);
-    expect(transport.uniOut[0]!.writeAborted).toBe(true);
+    expect(control.readCancelled).toBe(false);
+    expect(transport.uniOut[0]!.writeAborted).toBe(false);
   });
 
   it('forwards setup options into SETUP, strips path, and preserves explicit authority', async () => {

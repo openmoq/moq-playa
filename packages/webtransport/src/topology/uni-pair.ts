@@ -689,24 +689,39 @@ export class UniPairTopology {
    * aggregate incoming-uni source so standalone callers release its reader lock.
    * When the same operation closes the transport, pass `transportClosing`; the
    * backend then remains the sole owner of that aggregate source's terminal
-   * transition. Fire-and-forget teardown (idempotent; safe if already torn down).
+   * transition. For a clean close (`graceful`) the control streams are released
+   * rather than reset too, so the peer sees only the session close; an error
+   * close still resets them, retiring any write in flight. Fire-and-forget
+   * teardown (idempotent; safe if already torn down).
    */
-  shutdown(options: { transportClosing?: boolean } = {}): void {
+  shutdown(options: { transportClosing?: boolean; graceful?: boolean } = {}): void {
     const reason = new Error('session terminated');
     const router = this.incomingUniRouter;
     this.incomingUniRouter = null;
     if (options.transportClosing) router?.retire(reason);
     else router?.abort(reason);
     this.controlEpoch++;
+    // The control streams must stay open for the whole session (§6.3): a peer
+    // that sees one reset or stopped closes the session with an error
+    // (CLOSED_CONTROL_STREAM on draft 23). On a clean close the transport close
+    // ends them with the session, so only release them locally; a RESET_STREAM
+    // or STOP_SENDING sent now can reach the peer first.
+    const release = options.transportClosing === true && options.graceful === true;
     const controlReader = this.controlReader;
     this.controlReader = null;
     if (controlReader) {
-      try { void controlReader.cancel(reason).catch(() => {}); } catch { /* already closed */ }
+      try {
+        if (release) controlReader.releaseLock();
+        else void controlReader.cancel(reason).catch(() => {});
+      } catch { /* already closed, or a read still pending */ }
     }
     const controlWriter = this.controlWriter;
     this.controlWriter = null;
     if (controlWriter) {
-      try { void controlWriter.abort(reason).catch(() => {}); } catch { /* already closed */ }
+      try {
+        if (release) controlWriter.releaseLock();
+        else void controlWriter.abort(reason).catch(() => {});
+      } catch { /* already closed */ }
     }
     for (const [, ctx] of this.contexts) void ctx.cancel(StreamResetCode18.CANCELLED);
     this.contexts.clear();

@@ -744,7 +744,11 @@ export class MoqtConnection {
    * readers and writers, and the topology's request-stream contexts. Nothing
    * owned by the connection outlives the terminal shutdown.
    */
-  private clearTerminalState(): void {
+  /**
+   * @param graceful A clean local close: the topology releases the control
+   *   streams instead of resetting them, so the peer sees only the session close.
+   */
+  private clearTerminalState(graceful = false): void {
     this.authorization?.close();
     this.authorizationUpdateTails.clear();
     const incomingUniRouter = this.incomingUniRouter;
@@ -826,7 +830,7 @@ export class MoqtConnection {
     for (const w of this.namespaceStreams.values()) this.swallow(() => w.abort(reason));
     this.namespaceStreams.clear();
     // Topology request-stream contexts (outbound + continuing).
-    this.uniPair?.shutdown({ transportClosing: true });
+    this.uniPair?.shutdown({ transportClosing: true, graceful });
   }
 
   /**
@@ -3771,7 +3775,9 @@ export class MoqtConnection {
     // Start transport shutdown before retiring local I/O, while still making
     // every reader and publisher inert before this method first yields.
     const transportClose = this.executeActions(actions);
-    this.clearTerminalState();
+    // No error code (or NO_ERROR) is a clean close: keep the control streams
+    // out of it, so a draft-23 peer does not see CLOSED_CONTROL_STREAM (§6.3).
+    this.clearTerminalState(error === undefined || BigInt(error) === 0n);
     await transportClose;
   }
 
