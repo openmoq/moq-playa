@@ -24,7 +24,7 @@ export interface PlayerOptions {
   /** Track namespace for the broadcast (e.g., `live/stream`). */
   readonly namespace: string;
   /** Catalog track name, if it differs from default (e.g., `.catalog`). */
-  readonly catalogTrackName: string;
+  readonly catalogTrackName?: string;
 
   // ── Connection ──
 

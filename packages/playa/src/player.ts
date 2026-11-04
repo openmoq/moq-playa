@@ -62,6 +62,7 @@ import type { AltGroup } from '@openmoq/msf';
 /** Default player options, merged with user-provided options. */
 const DEFAULTS = {
   draftVersion: 16 as const,
+  catalogTrackName: 'catalog',
   autoplay: false,
   volume: 1,
   muted: false,
@@ -533,8 +534,8 @@ export class Player {
     const base: MoqtPlayerConfig = {
       url: opts.url,
       namespace: opts.namespace,
-      catalogTrackName: opts.catalogTrackName,
       draftVersion,
+      catalogTrackName: opts.catalogTrackName ?? DEFAULTS.catalogTrackName,
       autoQuality: opts.autoQuality ?? DEFAULTS.autoQuality,
       startLevel: opts.startLevel ?? DEFAULTS.startLevel,
       clock: this.audioClock,

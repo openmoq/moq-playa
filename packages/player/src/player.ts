@@ -110,11 +110,6 @@ const SWITCH_STAGING_TIMEOUT_MS = 3_000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-/** Catalog track name per MSF §5.1.10. */
-function catalogTrackName(trackName: string | undefined): string {
-  return trackName ?? 'catalog';
-}
-
 /**
  * Encode a namespace string as a Track Namespace tuple.
  *
@@ -2875,7 +2870,7 @@ export class MoqtPlayer {
       const dec = new TextDecoder();
       const nsTuple = nsBytes.map(b => `"${dec.decode(b)}"(${b.length}b)`).join(', ');
       this.log.info('Subscribe: namespace fields=[%s], catalog track="%s"',
-        nsTuple, catalogTrackName(this.config.catalogTrackName));
+        nsTuple, this.config.catalogTrackName);
     }
 
     if (this.config.catalog) {
@@ -3028,7 +3023,7 @@ export class MoqtPlayer {
       && gen === this.bootstrapGeneration && !this.catalogQuarantinedConns.has(conn);
     if (!live()) return;
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(catalogTrackName(this.config.catalogTrackName));
+    const nameBytes = this.enc.encode(this.config.catalogTrackName);
     const coord = this.resolvedCatalogMode(conn) === 'joining-fetch'
       ? this.createCatalogBootstrap(conn) : null;
     const options = this.catalogSubscribeOptions(conn);
@@ -3381,7 +3376,7 @@ export class MoqtPlayer {
       await newConnection.connect(transport, setupOptions);
       this.assertMigrationLive(txn);
       const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-      const nameBytes = this.enc.encode(catalogTrackName(this.config.catalogTrackName));
+      const nameBytes = this.enc.encode(this.config.catalogTrackName);
       // Candidate ownership is TRANSACTION-LOCAL: the active session's
       // catalogRequestId must not be touched until commit. Bootstrap mode
       // needs the LargestObject filter chosen here, atomically with the
@@ -3938,7 +3933,7 @@ export class MoqtPlayer {
     const timeoutMs = opts?.timeoutMs ?? 5_000;
 
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(catalogTrackName(this.config.catalogTrackName));
+    const nameBytes = this.enc.encode(this.config.catalogTrackName);
     const fetchOptions = {
       startGroup: varint(group),
       startObject: varint(object),
@@ -4159,7 +4154,7 @@ export class MoqtPlayer {
     const live = (): boolean => gen === this.bootstrapGeneration && this.connection === conn
       && this.catalogBootstrapCoord === coord;
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(catalogTrackName(this.config.catalogTrackName));
+    const nameBytes = this.enc.encode(this.config.catalogTrackName);
     let pendingAttempt: number | null = null;
 
     const coord: CatalogBootstrap = new CatalogBootstrap({
@@ -4566,7 +4561,7 @@ export class MoqtPlayer {
       gen === this.bootstrapGeneration && this.connection === conn && this.catalogBootstrapCoord === coord;
     const live = (): boolean => ownedAsCandidate() || ownedAsMain();
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
-    const nameBytes = this.enc.encode(catalogTrackName(this.config.catalogTrackName));
+    const nameBytes = this.enc.encode(this.config.catalogTrackName);
     const manager = new CatalogManager(namespaceDisplay(this.config.namespace));
     let pendingAttempt: number | null = null;
 
