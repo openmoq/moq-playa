@@ -296,6 +296,29 @@ describe('MoqtConnection(22) MAX_REQUEST_UPDATES (§9.1.7)', () => {
   });
 });
 
+describe('MoqtConnection(22) clean close', () => {
+  it('a clean close reaches the peer as a session close, not a closed control stream', async () => {
+    // close() must not reset or stop the control streams on its way out: a peer
+    // that sees them closed first ends the session with an error (draft-23 §6.3
+    // CLOSED_CONTROL_STREAM; PROTOCOL_VIOLATION here) instead of NO_ERROR.
+    const { client, server, a, b } = await connectedPair22();
+    const closes: Array<{ code: bigint; reason: string | undefined }> = [];
+    server.onClose = (code, reason) => { closes.push({ code: BigInt(code as never), reason }); };
+    await client.close();
+    await flushN();
+    // Nothing from the client's teardown may end the server's session on its own…
+    expect(server.session.state).toBe(SessionState.ESTABLISHED);
+    expect(closes).toEqual([]);
+    // …it learns of the close from the transport, as over a real network (the
+    // loopback does not carry a transport close to the peer).
+    b.close(a.closeInfo);
+    await flushN();
+    expect(server.session.state).toBe(SessionState.CLOSED);
+    expect(closes).toHaveLength(1);
+    expect(closes[0]!.code).toBe(0n);
+  });
+});
+
 async function connectedPair22(opts: Parameters<typeof import('./testkit/pair.js')['connectedPair']>[1] = {}) {
   const { connectedPair } = await import('./testkit/pair.js');
   return connectedPair(22, opts);
