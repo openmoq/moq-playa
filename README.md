@@ -219,6 +219,7 @@ state and event lines above illustrate separate API calls, not a playback script
 | `muted` | boolean | false | Start muted |
 | `audioActivation` | 'auto' \| 'gesture' | 'auto' | Defer Web Audio activation until a user gesture when set to 'gesture' |
 | `targetLatencyMs` | number | — | Live edge target latency |
+| `reorderWindowMs` | number | 2000 | MSE only: wait for a delayed group tail before appending past its hole (250 ms before playback starts; 0 disables) |
 | `autoQuality` | boolean | true | Enable ABR |
 | `startLevel` | number \| 'auto' \| 'lowest' | 'auto' | Initial quality level |
 | `videoAltGroup` | number | first video group | Initial video view; quality and ABR stay within it |

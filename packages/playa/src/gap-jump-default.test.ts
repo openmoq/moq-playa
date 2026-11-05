@@ -82,3 +82,23 @@ describe('Playa default construction — gap-jump active with zero config', () =
     ms.destroy();
   });
 });
+
+describe('Playa reorder window', () => {
+  const factory = (extra: { reorderWindowMs?: number }) => {
+    const video = new StubVideo();
+    const playa = new Player(null, { url: 'https://relay.example/moq', namespace: 'ns', video: video as unknown as HTMLVideoElement, ...extra });
+    return (playa as any).buildMoqtPlayerConfig().createMediaSource() as MseMediaSource;
+  };
+
+  it('constructs the adapter with the default reorder window', () => {
+    const ms = factory({});
+    expect((ms as any).reorderWindowMs).toBe(2_000);
+    ms.destroy();
+  });
+
+  it('passes a configured reorder window to the adapter', () => {
+    const ms = factory({ reorderWindowMs: 0 });
+    expect((ms as any).reorderWindowMs).toBe(0);
+    ms.destroy();
+  });
+});

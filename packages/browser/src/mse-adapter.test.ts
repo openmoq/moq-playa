@@ -4620,6 +4620,45 @@ describe.each(['audio', 'video'] as const)('MSE %s append scheduling', mediaType
             expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix, head]);
         } finally { h.adapter.destroy(); vi.useRealTimers(); }
     });
+    it('does not hold sub-frame timestamp drift between fragments', async () => {
+        vi.useFakeTimers(); const h = await ready();
+        // 30 fps at 90 kHz with tfdt one tick past each nominal trun end.
+        const fragments = Array.from({ length: 30 }, (_, i) =>
+            makeSegment({ bmd: i * 3001, defaultDur: 3000, sampleCount: 1 }));
+        try {
+            for (const [i, fragment] of fragments.entries()) {
+                h.adapter.appendChunk(mediaType, fragment, 'track', BigInt(i)); await flush();
+            }
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual(fragments);
+            expect(vi.getTimerCount()).toBe(0);
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
+    it('treats up to half a mean sample duration as contiguous', async () => {
+        const h = await ready();
+        const first = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 4 });
+        const drift = makeSegment({ bmd: 450, defaultDur: 100, sampleCount: 4 });
+        const hole = makeSegment({ bmd: 901, defaultDur: 100, sampleCount: 4 });
+        try {
+            h.adapter.appendChunk(mediaType, first, 'track'); await flush();
+            h.adapter.appendChunk(mediaType, drift, 'track'); await flush();
+            h.adapter.appendChunk(mediaType, hole, 'track'); await flush();
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([first, drift]);
+        } finally { h.adapter.destroy(); }
+    });
+    it('still holds a one-frame hole when fragments carry tick drift', async () => {
+        vi.useFakeTimers(); const h = await ready();
+        const prefix = makeSegment({ bmd: 0, defaultDur: 3000, sampleCount: 1 });
+        const tail = makeSegment({ bmd: 3001, defaultDur: 3000, sampleCount: 1 });
+        const head = makeSegment({ bmd: 6002, defaultDur: 3000, sampleCount: 1 });
+        try {
+            h.adapter.appendChunk(mediaType, prefix, 'track', 1n); await flush();
+            h.adapter.appendChunk(mediaType, head, 'track', 2n); await flush();
+            vi.advanceTimersByTime(100); await flush();
+            expect.soft(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix]);
+            h.adapter.appendChunk(mediaType, tail, 'track', 1n); await flush(); await flush();
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix, tail, head]);
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
     it('adds no wait to timestamp-contiguous groups', async () => {
         const h = await ready();
         const prefix = makeSegment({ bmd: 0, sampleCount: 1 });
@@ -4779,6 +4818,160 @@ describe.each(['audio', 'video'] as const)('MSE %s append scheduling', mediaType
 
 });
 
+
+describe.each(['audio', 'video'] as const)('MSE %s delayed group tails after startup', mediaType => {
+    const codec = mediaType === 'video' ? 'avc1.42c01e' : 'mp4a.40.2';
+    const handler = mediaType === 'video' ? 'vide' : 'soun';
+    const settle = async (rounds = 600) => { for (let i = 0; i < rounds; i++) await Promise.resolve(); };
+    const seg = (bmd: number) => makeSegment({ bmd, sampleCount: 1 });
+    /** Adapter that has started playback on a one-segment prefix [0, 100). */
+    const playing = async (options: ConstructorParameters<typeof MseMediaSource>[1] = {}) => {
+        vi.useFakeTimers();
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, options);
+        adapter.initialize({ [mediaType]: { codec, initData: makeInit(1, 100, handler) } });
+        currentMs.open(); await flush();
+        const buffer = mediaType === 'video' ? currentMs.videoBuffer : currentMs.audioBuffer;
+        const initial = buffer.appendedPayloads.length;
+        video.buffered = makeTimeRanges([[0, 1]]); buffer.buffered = makeTimeRanges([[0, 1]]);
+        const prefix = seg(0);
+        adapter.appendChunk(mediaType, prefix, 'track', 1n); await settle();
+        expect((adapter as unknown as { playTriggered: boolean }).playTriggered).toBe(true);
+        const events: unknown[] = [];
+        adapter.observeAppends(event => { events.push(event); });
+        const appended = () => buffer.appendedPayloads.slice(initial);
+        return { adapter, video, buffer, prefix, events, appended };
+    };
+    afterEach(() => { vi.useRealTimers(); });
+
+    it.each([100, 249, 300, 1000, 1900])('keeps a group tail delayed %i ms in order', async delay => {
+        const h = await playing(); const tail = seg(100), head = seg(200);
+        try {
+            h.adapter.appendChunk(mediaType, head, 'track', 2n); await settle();
+            vi.advanceTimersByTime(delay); await settle();
+            expect.soft(h.appended()).toEqual([h.prefix]);
+            h.adapter.appendChunk(mediaType, tail, 'track', 1n); await settle();
+            expect(h.appended()).toEqual([h.prefix, tail, head]);
+            expect(h.adapter.getCommittedGroupFloor(mediaType, 'track')).toBe(2n);
+        } finally { h.adapter.destroy(); }
+    });
+    it('keeps group N+1 when N+2 arrives first and N+1 stalls for one second', async () => {
+        const h = await playing(); const next = seg(100), after = seg(200);
+        try {
+            h.adapter.appendChunk(mediaType, after, 'track', 3n); await settle();
+            vi.advanceTimersByTime(1000); await settle();
+            expect.soft(h.appended()).toEqual([h.prefix]);
+            h.adapter.appendChunk(mediaType, next, 'track', 2n); await settle();
+            expect(h.appended()).toEqual([h.prefix, next, after]);
+            expect(h.adapter.getCommittedGroupFloor(mediaType, 'track')).toBe(3n);
+        } finally { h.adapter.destroy(); }
+    });
+    it('appends past the hole once the default window expires and drops the late tail', async () => {
+        const h = await playing(); const head = seg(200), token = {};
+        try {
+            h.adapter.appendChunk(mediaType, head, 'track', 2n); await settle();
+            vi.advanceTimersByTime(1999); await settle();
+            expect.soft(h.appended()).toEqual([h.prefix]);
+            vi.advanceTimersByTime(1); await settle();
+            expect(h.appended()).toEqual([h.prefix, head]);
+            h.adapter.appendChunk(mediaType, seg(100), 'track', 1n, token); await settle();
+            expect(h.events).toEqual([{ token, state: 'discarded', reason: 'stale group' }]);
+        } finally { h.adapter.destroy(); }
+    });
+    it('honours a configured window', async () => {
+        const h = await playing({ reorderWindowMs: 500 }); const head = seg(200);
+        try {
+            h.adapter.appendChunk(mediaType, head, 'track', 2n); await settle();
+            vi.advanceTimersByTime(499); await settle();
+            expect.soft(h.appended()).toEqual([h.prefix]);
+            vi.advanceTimersByTime(1); await settle();
+            expect(h.appended()).toEqual([h.prefix, head]);
+        } finally { h.adapter.destroy(); }
+    });
+    it('retains a full window of 60 fps chunks behind a hole by default', async () => {
+        const h = await playing(); const tail = seg(100);
+        const later = Array.from({ length: 120 }, (_, i) => seg(200 + i * 100));
+        try {
+            for (const [i, chunk] of later.entries()) {
+                h.adapter.appendChunk(mediaType, chunk, 'track', BigInt(2 + i)); await settle(4);
+                vi.advanceTimersByTime(16);
+            }
+            expect.soft(h.appended()).toEqual([h.prefix]);
+            h.adapter.appendChunk(mediaType, tail, 'track', 1n); await settle();
+            expect(h.appended()).toEqual([h.prefix, tail, ...later]);
+            expect(h.events.filter(e => (e as { state: string }).state === 'discarded')).toEqual([]);
+        } finally { h.adapter.destroy(); }
+    });
+    it.each(['chunks', 'bytes'] as const)('releases the hold instead of refusing media at the %s cap', async bound => {
+        const one = seg(200).byteLength;
+        const h = await playing(bound === 'chunks' ? { maxQueuedChunks: 3 } : { maxQueuedBytes: 3 * one });
+        const later = [seg(200), seg(300), seg(400), seg(500)];
+        try {
+            for (const [i, chunk] of later.entries()) {
+                h.adapter.appendChunk(mediaType, chunk, 'track', BigInt(2 + i)); await settle();
+            }
+            expect(h.appended()).toEqual([h.prefix, ...later]);
+            expect(h.events.filter(e => (e as { state: string }).state === 'discarded')).toEqual([]);
+            expect((h.adapter as unknown as { appendGapWait: Record<string, unknown> }).appendGapWait[mediaType]).toBeNull();
+            const token = {};
+            h.adapter.appendChunk(mediaType, seg(100), 'track', 1n, token); await settle();
+            expect(h.events.at(-1)).toEqual({ token, state: 'discarded', reason: 'stale group' });
+        } finally { h.adapter.destroy(); }
+    });
+    it('still refuses media past the byte cap when the native buffer is busy', async () => {
+        const one = seg(200).byteLength;
+        const h = await playing({ maxQueuedBytes: 2 * one }); const token = {};
+        try {
+            h.buffer.autoComplete = false;
+            h.adapter.appendChunk(mediaType, seg(100), 'track', 1n);
+            h.adapter.appendChunk(mediaType, seg(300), 'track', 2n);
+            h.adapter.appendChunk(mediaType, seg(400), 'track', 2n);
+            h.adapter.appendChunk(mediaType, seg(500), 'track', 2n, token);
+            expect(h.events).toEqual([{ token, state: 'discarded', reason: 'queue capacity' }]);
+        } finally { h.adapter.destroy(); }
+    });
+    it('does not hold a track resumed after a retype', async () => {
+        const h = await playing(); const resumed = seg(5000);
+        try {
+            await h.adapter.changeType(mediaType, codec, makeInit(1, 100, handler)); await settle();
+            h.adapter.appendChunk(mediaType, resumed, 'track', 9n); await settle();
+            expect(h.appended().at(-1)).toEqual(resumed);
+            expect((h.adapter as unknown as { appendGapWait: Record<string, unknown> }).appendGapWait[mediaType]).toBeNull();
+        } finally { h.adapter.destroy(); }
+    });
+});
+
+describe('MSE reorder window before startup', () => {
+    it('caps the hold at 250 ms until playback first starts', async () => {
+        vi.useFakeTimers();
+        const video = new MockVideoElement();
+        const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.setPlaybackIntent(false);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        currentMs.open(); await flush();
+        const buffer = currentMs.videoBuffer; const initial = buffer.appendedPayloads.length;
+        const prefix = makeSegment({ bmd: 0, sampleCount: 1 }), head = makeSegment({ bmd: 200, sampleCount: 1 });
+        try {
+            adapter.appendChunk('video', prefix, 'track', 1n); await flush();
+            adapter.appendChunk('video', head, 'track', 2n); await flush();
+            vi.advanceTimersByTime(249); await flush();
+            expect.soft(buffer.appendedPayloads.slice(initial)).toEqual([prefix]);
+            vi.advanceTimersByTime(1); await flush();
+            expect(buffer.appendedPayloads.slice(initial)).toEqual([prefix, head]);
+        } finally { adapter.destroy(); vi.useRealTimers(); }
+    });
+    it('sizes the default queue for a 60 fps window', () => {
+        const adapter = (options: ConstructorParameters<typeof MseMediaSource>[1]) =>
+            new MseMediaSource(new MockVideoElement() as unknown as HTMLVideoElement, options) as unknown as
+                { reorderWindowMs: number; maxQueuedChunks: number; destroy(): void };
+        const defaults = adapter({}), zero = adapter({ reorderWindowMs: 0 }), fixed = adapter({ maxQueuedChunks: 7 });
+        try {
+            expect([defaults.reorderWindowMs, defaults.maxQueuedChunks]).toEqual([2000, 220]);
+            expect(zero.maxQueuedChunks).toBe(100);
+            expect(fixed.maxQueuedChunks).toBe(7);
+        } finally { defaults.destroy(); zero.destroy(); fixed.destroy(); }
+    });
+});
 
 describe('MSE append scheduling options', () => {
     it.each([
