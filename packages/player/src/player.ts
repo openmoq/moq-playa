@@ -632,6 +632,7 @@ export class MoqtPlayer {
     readonly output: DispatcherOutputObserver;
     refused: number;
   } | undefined;
+  private destroyObservers: Set<() => void> | undefined;
   private diagnosticConnectionListeners: Map<(event: PlayerConnectionObservation) => void | Promise<void>, Set<MoqtConnection>> | undefined;
   private readonly stateMachine = new PlayerStateMachine();
   private readonly _stats = new StatsAccumulator();
@@ -3562,6 +3563,17 @@ export class MoqtPlayer {
     }; }
     catch { /* A faulty custom diagnostics getter cannot break a player snapshot. */ }
     return { destroyed: this._destroyed, state: this.state, connections, tracks, subscriptions, ...(mediaStages ? { mediaStages } : {}) };
+  }
+
+  /**
+   * Run `listener` once when destroy() tears this player down. Unlike a
+   * state_changed for ENDED, this fires even when destroy() is re-entered
+   * from a state listener and the queued ENDED is never announced.
+   */
+  observeDestroy(listener: () => void): () => void {
+    if (this._destroyed) return () => {};
+    (this.destroyObservers ??= new Set()).add(listener);
+    return () => { this.destroyObservers?.delete(listener); };
   }
 
   /**
@@ -8884,6 +8896,11 @@ export class MoqtPlayer {
       }
       this.diagnosticConnectionListeners.clear();
       this.diagnosticConnectionListeners = undefined;
+    }
+    const destroyObservers = this.destroyObservers;
+    this.destroyObservers = undefined;
+    for (const listener of destroyObservers ?? []) {
+      try { listener(); } catch (error) { try { this.log.warn('Destroy observer failed: %s', String(error)); } catch { /* observer failure */ } }
     }
     this.emitter.removeAllListeners();
   }

@@ -44,6 +44,23 @@ describe('optional live player adapter',()=>{
     try {expect(again.source.sourceId).toBe(first.sourceId);expect(again.source.runId).not.toBe(first.runId);}
     finally {again.dispose();registry.dispose();await engine.destroy();}
   });
+  it('unregisters on destroy even when the ENDED announcement never reaches it',async()=>{
+    // destroy() called from inside a state_changed listener queues ENDED behind
+    // the in-progress announcement, then drops every listener before the queue
+    // drains: no state_changed is ever delivered after destroy.
+    const engine=player(),registry=new DiagnosticRegistry();
+    const installed=installPlayerDiagnostics(engine,{registry,exposure:'development'});
+    const owner=registry.open('owner');
+    const discover=()=>decodeMessage(owner.request(encodeMessage({...common,kind:'discover',requestId:'d',ownerId:'owner'}))[0]!);
+    let destroyed:Promise<void>|undefined;
+    engine.on('state_changed',({to})=>{if(to==='loading')destroyed=engine.destroy();});
+    try {
+      expect(discover()).toMatchObject({ok:true,message:{sources:[{sourceId:installed.source.sourceId}]}});
+      await engine.load().catch(()=>{});await destroyed;
+      expect(engine.diagnosticSnapshot().destroyed).toBe(true);
+      expect(discover()).toMatchObject({ok:true,message:{sources:[]}});
+    } finally {owner.close();installed.dispose();registry.dispose();await engine.destroy();}
+  });
   it('requires an explicit valid exposure and refuses a Probe registry',async()=>{
     const engine=player(), registry=new DiagnosticRegistry({sourceKind:'probe'});
     try {expect(()=>installPlayerDiagnostics(engine,{registry,exposure:'production'})).toThrow(/attached|Probe/);}
