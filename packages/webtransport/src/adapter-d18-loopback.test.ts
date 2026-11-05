@@ -414,7 +414,7 @@ describe('MoqtConnection(18) loopback — §5.1 pending SUBSCRIBE superseded by 
 });
 
 describe('MoqtConnection(18) loopback — outbound PUBLISH lifecycle (data + PUBLISH_DONE)', () => {
-  it.each([14, 16, 18, 22] as const)('draft %s exposes end-of-group subgroup evidence on every data object before FIN', async (draft) => {
+  it.each([14, 16, 18, 22, 23] as const)('draft %s exposes end-of-group subgroup evidence on every data object before FIN', async (draft) => {
     const { client, server, errors } = await connectedPair(draft);
     const received: MoqtObject[] = [];
     let requestId = -1n;

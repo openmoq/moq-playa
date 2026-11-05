@@ -55,7 +55,7 @@ const controlGoaway = (version: DraftVersion, uri: string, timeout?: bigint) => 
 // ("Draft14Codec cannot encode message type GOAWAY"), so no draft-14 peer can
 // be driven to send one from this harness. Legacy delivery is covered on 16,
 // which shares the legacy control read loop.
-describe.each([16, 18, 22] as const)('draft-%i session-scope GOAWAY notice', (version) => {
+describe.each([16, 18, 22, 23] as const)('draft-%i session-scope GOAWAY notice', (version) => {
   it('delivers one session notice after the state transition, onMessage first', async () => {
     const { client, server, errors } = await connectedPair(version);
     const seen = observe(client);
@@ -74,7 +74,7 @@ describe.each([16, 18, 22] as const)('draft-%i session-scope GOAWAY notice', (ve
     } finally { await client.close(); await server.close(); }
   });
 
-  it('carries the peer Timeout exactly on 18/22 and omits it on 14/16', async () => {
+  it('carries the peer Timeout exactly on 18/22/23 and omits it on 14/16', async () => {
     const huge = (1n << 62n) - 1n; // a vi64 value no Number can hold
     for (const timeout of [0n, 5_000n, huge]) {
       const { client, server } = await connectedPair(version);
@@ -84,7 +84,7 @@ describe.each([16, 18, 22] as const)('draft-%i session-scope GOAWAY notice', (ve
         await flush();
         expect(seen.notices).toHaveLength(1);
         const got = seen.notices[0]!.notice.timeoutMs;
-        if (version === 18 || version === 22) {
+        if (version >= 18) {
           expect(got).toBe(timeout); // exact bigint, never through Number
         } else {
           expect(got).toBeUndefined(); // no Timeout field exists on 14/16
@@ -343,7 +343,7 @@ describe('draft-14 GOAWAY receive', () => {
   });
 });
 
-describe.each([16, 18, 22] as const)('draft-%i GOAWAY delivery contract', (version) => {
+describe.each([16, 18, 22, 23] as const)('draft-%i GOAWAY delivery contract', (version) => {
   it('snapshots the notice before calling out, so a mutating observer cannot retarget it', async () => {
     const { client, server } = await connectedPair(version);
     const notices: GoawayNotice[] = [];
