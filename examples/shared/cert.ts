@@ -21,8 +21,11 @@ const params = new URLSearchParams(window.location.search);
 /** Namespace as a display string (`?ns=`, default "live"). */
 export const namespace: string = params.get('ns') ?? 'live';
 
-/** Catalog track name if differs from default (`?catalogTrackName=`, default "catalog"). */
-export const catalogTrackName: string = params.get('catalogTrackName') ?? 'catalog';
+/**
+ * Catalog track name if differs from default (`?catalogTrackName=`, default "catalog").
+ * An empty value (`?catalogTrackName=`) is treated as absent, not as the empty name.
+ */
+export const catalogTrackName: string = params.get('catalogTrackName') || 'catalog';
 
 /**
  * Namespace as the player config accepts it (`string | readonly string[]`).
