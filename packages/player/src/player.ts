@@ -157,6 +157,19 @@ const CATALOG_FILL = CURRENT_GROUP_FILL;
 /** Max time (ms) to wait for a keyframe during make-before-break switch. */
 const SWITCH_STAGING_TIMEOUT_MS = 3_000;
 
+/** One current route's receiving admission; no payload or group history. */
+interface ReceivingVideoOwner {
+  readonly token: object;
+  readonly alias: bigint;
+  readonly trackName: string;
+  readonly sourceKey?: string;
+  readonly manager: SubscriptionManager;
+  readonly source: MediaSourceLike;
+  readonly connection: MoqtConnection;
+  readonly retain: NonNullable<MediaSourceLike['retainReceivingGroup']>;
+  readonly isCurrent: () => boolean;
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 /**
@@ -197,6 +210,11 @@ function identityKeyOf(namespace: readonly string[], name: string): string {
 /** The ordered wire fields a config namespace denotes. */
 function namespaceFields(ns: string | readonly string[]): readonly string[] {
   return typeof ns === 'string' ? fieldsFromCatalogText(ns) : Array.from(ns);
+}
+
+/** Keep deferred stream release handles independent of their route's closure. */
+function streamRelease(release: () => void): () => void {
+  return () => { try { release(); } catch { /* Stream retirement must still finish. */ } };
 }
 
 /**
@@ -1225,7 +1243,14 @@ export class MoqtPlayer {
    * otherwise normal) and invalidate its LOCMAF reference (§3).
    * Fetch streams and datagrams never enter this map.
    */
-  private readonly subgroupStreams = new Map<bigint, { trackAlias: bigint; groupId: bigint }>();
+  private readonly subgroupStreams = new Map<bigint, {
+    connection: MoqtConnection; trackAlias: bigint; groupId: bigint;
+    receivingRegistration?: { manager: SubscriptionManager; isCurrent: () => boolean };
+    receivingOwner?: object;
+    releaseReceiving?: () => void;
+    whenIdle?: () => Promise<void> | undefined;
+  }>();
+  private readonly receivingVideoOwners = new Map<bigint, ReceivingVideoOwner>();
 
   /**
    * Restart-ladder state per track, keyed `${mediaType}:${trackName}`
@@ -1322,6 +1347,81 @@ export class MoqtPlayer {
     info.streams.set(streamId, closed);
   }
 
+  private retainCurrentVideoStreams(manager: SubscriptionManager, streamId: bigint, obj: MoqtObject,
+    sourceConnection: MoqtConnection | undefined): void {
+    const source = this.mediaSource;
+    const retain = source?.retainReceivingGroup;
+    // LOC/unsupported sources do no stream scan, subscription scan or capture.
+    if (!source || !retain || !sourceConnection || sourceConnection !== this.connection) return;
+    const inputGeneration = manager.mediaInputGeneration;
+    const alias = BigInt(obj.trackAlias);
+    if (manager.getMediaType(alias) !== 'video') return;
+    const stream = this.subgroupStreams.get(streamId);
+    // Capture at actual object receipt, including preparation. A header alone
+    // establishes neither a Group's existence nor a later alias owner's data.
+    if (stream?.connection === sourceConnection && stream.trackAlias === alias
+        && stream.groupId === BigInt(obj.groupId) && !stream.receivingRegistration) {
+      const registration = manager.captureRoute(alias);
+      if (registration) stream.receivingRegistration = { manager, isCurrent: registration };
+    }
+    const cached = this.receivingVideoOwners.get(alias);
+    if (cached?.isCurrent()) {
+      this.retainVideoStream(cached, streamId); // O(1) for every subsequent stream/object.
+      return;
+    }
+    const sub = [...this.activeSubscriptions.values()].find(s => s.trackAlias === alias && s.mediaType === 'video');
+    const registration = manager.captureRoute(alias);
+    const selection = this.mseSelection('video');
+    const key = sub && identityKey(sub.namespace ?? namespaceFields(this.config.namespace), sub.trackName);
+    if (!sub || !registration || !selection || selection.key !== key) return;
+    const keyed = this.keyedCmafIdentity;
+    const sourceKey = keyed ? manager.getSourceKey(alias) : undefined;
+    if (keyed && sourceKey === undefined) return;
+    // Prune retired routes only at an ownership transition. The cache contains
+    // current registrations, not a history of aliases or observed groups.
+    for (const [oldAlias, owner] of this.receivingVideoOwners) {
+      if (!owner.isCurrent()) this.receivingVideoOwners.delete(oldAlias);
+    }
+    const owner: ReceivingVideoOwner = {
+      token: {}, alias, trackName: sub.trackName, manager, source, connection: sourceConnection, retain,
+      ...(sourceKey === undefined ? {} : { sourceKey }),
+      isCurrent: () => !this._destroyed && this.receivingVideoOwners.get(alias) === owner
+        && this.subscriptionManager === manager && this.mediaSource === source
+        && manager.mediaInputGeneration === inputGeneration && this.keyedCmafIdentity === keyed
+        && sourceConnection === this.connection
+        && registration() && this.mediaRouteBelongsTo(sourceConnection, alias)
+        && this.mseSelection('video')?.selection === selection.selection,
+    };
+    this.receivingVideoOwners.set(alias, owner); // Reserve before capability callbacks.
+    // A preparation's SAP can adopt the track, followed immediately by a
+    // successor stream. Acquire its ALREADY observed open streams before that
+    // successor queues. Scan once per route owner, never once per new stream.
+    const observed = [...this.subgroupStreams.keys()];
+    for (const id of observed) {
+      if (!owner.isCurrent()) break;
+      this.retainVideoStream(owner, id);
+    }
+  }
+
+  private retainVideoStream(owner: ReceivingVideoOwner, streamId: bigint): void {
+    if (!owner.isCurrent()) return;
+    const stream = this.subgroupStreams.get(streamId);
+    if (stream?.connection !== owner.connection || stream.trackAlias !== owner.alias
+        || stream.receivingRegistration?.manager !== owner.manager || !stream.receivingRegistration.isCurrent()
+        || (stream.receivingOwner === owner.token && stream.releaseReceiving)) return;
+    const previous = stream.releaseReceiving;
+    stream.receivingOwner = owner.token;
+    stream.releaseReceiving = () => {}; // Reserve each stream before either callback.
+    stream.whenIdle = owner.manager.captureTrackIdle(owner.alias, streamId);
+    previous?.();
+    if (!owner.isCurrent() || this.subgroupStreams.get(streamId) !== stream) return;
+    const release = streamRelease(owner.sourceKey === undefined
+      ? owner.retain.call(owner.source, 'video', owner.trackName, stream.groupId, owner.isCurrent)
+      : owner.retain.call(owner.source, 'video', owner.trackName, stream.groupId, owner.isCurrent, owner.sourceKey));
+    if (!owner.isCurrent() || this.subgroupStreams.get(streamId) !== stream) release();
+    else stream.releaseReceiving = release;
+  }
+
   /** Capture manager work/provenance now; only its admission waits for prefix order. */
   private routeMediaObject(streamId: bigint, obj: MoqtObject, sourceDraft?: DraftVersion, sourceConnection?: MoqtConnection,
     receiptInput: MoqtObject | ObjectDatagram = obj,
@@ -1329,6 +1429,21 @@ export class MoqtPlayer {
     const manager = this.subscriptionManager;
     if (!manager) return Promise.resolve();
     const inputGeneration = manager.mediaInputGeneration;
+    // Datagram routing IDs are not stream identities. Only a real subgroup
+    // receipt may establish receiving evidence; FETCH has its own ownership.
+    if ('kind' in receiptInput && fetchInfo === undefined && sourceConnection !== undefined
+        && this.subgroupStreams.get(streamId)?.connection === sourceConnection) {
+      this.retainCurrentVideoStreams(manager, streamId, obj, sourceConnection);
+    }
+    // Receiving capabilities are external callbacks too. Preserve the input
+    // generation boundary before continuing into generic preparation/routing.
+    if (this._destroyed || this.subscriptionManager !== manager || manager.mediaInputGeneration !== inputGeneration) {
+      if (!this._destroyed && this.mediaDiagnosticRuntime) {
+        try { this.discardMediaInput(this.mediaDiagnosticRuntime.capture(sourceConnection, receiptInput), 'route retired'); }
+        catch { /* Optional receipt observations must not interrupt cancellation. */ }
+      }
+      return Promise.resolve();
+    }
     const operation = this.mediaSelection;
     const prepared = operation && !operation.committed && operation.conn === sourceConnection
       ? [...operation.prep.media.values()].find(sub => sub.alias === BigInt(obj.trackAlias)) : undefined;
@@ -9364,6 +9479,7 @@ export class MoqtPlayer {
   async destroy(): Promise<void> {
     if (this._destroyed) return;
     this._destroyed = true;
+    this.receivingVideoOwners.clear();
     this.audioOutput = null; this.lastAudioDomainOwner = null; this.lastAudioDomain = null;
     this.installedDecoderConfigurations.clear(); this.preparedDecoderConfigurations.clear();
     this.audioTimelineRecord = null; this.videoTimelineRecord = null; this.collectAudioTimeline = false; this.collectVideoTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.runtimeAudioLanguage = null; this.runtimeSelectionIntent = null; this.mappedClockOwner = null; this.videoPresentationOffsetUs = 0n; this.videoTimingMapped = false; this.videoTimingSource = undefined; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
@@ -9401,7 +9517,6 @@ export class MoqtPlayer {
     // never emit MEDIA_STARVED for an intentional teardown) and disarm.
     for (const restart of this.livenessRestarts.values()) restart.cancelled = true;
     this.livenessMonitor?.clear();
-    this.subgroupStreams.clear();
     this.pendingMediaSubs.clear();
     this.activeFetches.clear();
     this.fetchStreamAliases.clear();
@@ -9464,6 +9579,10 @@ export class MoqtPlayer {
     this.keyedCmafIdentity = false;
     this.mediaSource?.destroy();
     this.mediaSource = null;
+    // Retire the buffers before releases can re-drain accepted appends. The
+    // adapter also severs guards held by already-closed async stream work.
+    for (const stream of this.subgroupStreams.values()) stream.releaseReceiving?.();
+    this.subgroupStreams.clear();
     this.mseCompletions = null;
     this.videoPipeline = null;
     this.audioPipeline = null;
@@ -10395,7 +10514,8 @@ export class MoqtPlayer {
           // Ownership filtering may remove all records of the reset stream; frozen
           // before-arrival snapshots preserve earlier boundaries across later resets.
           let resetOrdinal: number | undefined;
-          const known = conn === this.connection ? this.subgroupStreams.get(streamId) : undefined;
+          const observed = this.subgroupStreams.get(streamId);
+          const known = observed?.connection === conn ? observed : undefined;
           for (const [alias, bucket] of this.pendingObjectsByAlias) {
             const groups = new Set<bigint>();
             if (known?.trackAlias === alias) groups.add(known.groupId);
@@ -10459,10 +10579,18 @@ export class MoqtPlayer {
           }
         }
 
-        const subgroup = closeMapsAuthoritative ? this.subgroupStreams.get(streamId) : undefined;
+        const observedSubgroup = this.subgroupStreams.get(streamId);
+        const subgroup = observedSubgroup?.connection === conn ? observedSubgroup : undefined;
         if (subgroup !== undefined) {
           this.subgroupStreams.delete(streamId); // map never outlives the stream
-          if (terminal === 'reset') {
+          // FIN/reset ends byte reception, not previously accepted transforms.
+          // Capture the ORIGINAL registration's stream-specific work now; a
+          // reused alias cannot add work to it. Reset invalidates LOCMAF below,
+          // while complete CMAF objects already accepted may still be delivered.
+          const idle = subgroup.whenIdle?.();
+          if (idle) void idle.then(subgroup.releaseReceiving, subgroup.releaseReceiving);
+          else subgroup.releaseReceiving?.();
+          if (terminal === 'reset' && conn === this.connection) {
             this.livenessMonitor?.noteStreamReset(subgroup.trackAlias, performance.now());
             this.subscriptionManager?.invalidateLocmafGroup(subgroup.trackAlias, subgroup.groupId, conn);
             for (const subscription of this.activeSubscriptions.values()) {
@@ -10528,7 +10656,8 @@ export class MoqtPlayer {
           // session's header must not overwrite a colliding current stream id.
           if (conn !== this.connection) return;
           const sub = header.header;
-          this.subgroupStreams.set(streamId, { trackAlias: BigInt(sub.trackAlias), groupId: BigInt(sub.groupId) });
+          this.subgroupStreams.get(streamId)?.releaseReceiving?.();
+          this.subgroupStreams.set(streamId, { connection: conn, trackAlias: BigInt(sub.trackAlias), groupId: BigInt(sub.groupId) });
           const alias = BigInt(sub.trackAlias);
           // Only FIRST_OBJECT defers its subgroup id; ZERO and EXPLICIT are
           // authoritative from the header, so reporting them as unknown would

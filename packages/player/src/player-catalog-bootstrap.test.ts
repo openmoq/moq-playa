@@ -1879,12 +1879,12 @@ describe('catalog bootstrap wiring — candidate adoption and ownership tombston
         await flush();
         ackCatalog(adapter);
         adapter._triggerDataStream(400n, { type: 'subgroup', header: { trackAlias: varint(5n), groupId: varint(0n), subgroupId: varint(0n), publisherPriority: 128 } } as unknown as DataStreamHeader);
-        const internals = player as unknown as { connection: unknown; subgroupStreams: Map<bigint, { trackAlias: bigint; groupId: bigint }> };
-        expect(internals.subgroupStreams.get(400n)).toEqual({ trackAlias: 5n, groupId: 0n });
+        const internals = player as unknown as { connection: unknown; subgroupStreams: Map<bigint, { connection: unknown; trackAlias: bigint; groupId: bigint }> };
         const current = internals.connection;
+        expect(internals.subgroupStreams.get(400n)).toEqual({ connection: current, trackAlias: 5n, groupId: 0n });
         internals.connection = { draftVersion: 16 };
         adapter._triggerDataStream(400n, { type: 'subgroup', header: { trackAlias: varint(9n), groupId: varint(0n), subgroupId: varint(0n), publisherPriority: 128 } } as unknown as DataStreamHeader);
-        expect(internals.subgroupStreams.get(400n)).toEqual({ trackAlias: 5n, groupId: 0n });   // NOT overwritten
+        expect(internals.subgroupStreams.get(400n)).toEqual({ connection: current, trackAlias: 5n, groupId: 0n });   // NOT overwritten
         internals.connection = current;
     });
 

@@ -48,6 +48,8 @@ interface PendingLocmafTransform {
 }
 
 interface PendingRoute {
+  /** Datagram receipts belong to the track, but never to a stream's terminal. */
+  readonly streamId: bigint | undefined;
   done: boolean;
   promise?: Promise<void>;
   resolve?: () => void;
@@ -88,12 +90,18 @@ export class SubscriptionManager {
   private readonly tracks = new Map<bigint, TrackInfo>();
   private readonly pendingRoutes = new WeakMap<TrackInfo, Set<PendingRoute>>();
 
-  /** Already-accepted asynchronous transforms must finish before terminal retirement invalidates their route. */
-  captureTrackIdle(alias: bigint): () => Promise<void> | undefined {
+  /**
+   * Capture the original registration, then snapshot its accepted work when
+   * invoked at a terminal. Optional streamId narrows a subgroup FIN/reset to
+   * that stream; the whole-track barrier also includes datagrams. An alias
+   * rebound in the meantime cannot join this barrier.
+   */
+  captureTrackIdle(alias: bigint, streamId?: bigint): () => Promise<void> | undefined {
     const info = this.tracks.get(alias);
     return () => {
       const pending = info && this.pendingRoutes.get(info);
-      return pending?.size ? Promise.all([...pending].map(waitForRoute)).then(() => {}) : undefined;
+      const routes = pending && [...pending].filter(route => streamId === undefined || route.streamId === streamId);
+      return routes?.length ? Promise.all(routes.map(waitForRoute)).then(() => {}) : undefined;
     };
   }
   private readonly pendingLocmafTransforms = new Set<PendingLocmafTransform>();
@@ -408,7 +416,7 @@ export class SubscriptionManager {
    * @see draft-ietf-moq-cmsf-00 §3.3 (CMAF Object Packaging)
    * @see draft-ietf-moq-msf-00 §8 (Event Timeline track)
    */
-  async routeObject(_streamId: bigint, obj: MoqtObject, sourceDraft?: DraftVersion, sourceConnection?: unknown, receiptInput?: MoqtObject | ObjectDatagram, delivery?: ObjectDeliveryOptions): Promise<void> {
+  async routeObject(streamId: bigint, obj: MoqtObject, sourceDraft?: DraftVersion, sourceConnection?: unknown, receiptInput?: MoqtObject | ObjectDatagram, delivery?: ObjectDeliveryOptions): Promise<void> {
     const alias = BigInt(obj.trackAlias);
     const info = this.tracks.get(alias);
     if (!info) return; // Unknown track alias — silently ignore
@@ -431,7 +439,7 @@ export class SubscriptionManager {
     if (!pending) { pending = new Set(); this.pendingRoutes.set(info, pending); }
     // Register before ALL application callbacks, including a synchronous transform that reenters with EOT.
     const earlier = obj.kind === 'gap' && obj.status === 4n ? [...pending] : [];
-    const route: PendingRoute = { done: false }; pending.add(route);
+    const route: PendingRoute = { streamId: 'kind' in (receiptInput ?? obj) ? streamId : undefined, done: false }; pending.add(route);
     let provenance: ObjectRoutingProvenance | null = null;
     let provenanceGeneration = 0;
     let context: ObjectRoutingContext | undefined;

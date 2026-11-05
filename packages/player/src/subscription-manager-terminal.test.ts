@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { varint, type MoqtObject } from '@openmoq/transport';
+import { varint, type MoqtObject, type ObjectDatagram } from '@openmoq/transport';
 import { SubscriptionManager } from './subscription-manager.js';
 
 const data = (): MoqtObject => ({ kind: 'data', trackAlias: varint(1), groupId: varint(0),
@@ -9,6 +9,32 @@ const eot = (): MoqtObject => ({ kind: 'gap', trackAlias: varint(1), groupId: va
 const settle = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
 
 describe('terminal delivery retains processing ownership', () => {
+  it.each(['datagram', 'stream'] as const)('alias-wide idle and EOT still wait for accepted %s work', async origin => {
+    const manager = new SubscriptionManager(); manager.registerTrack(1n, 'video', 'video');
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    manager.objectTransform = object => object.kind === 'data' ? gate.then(() => object) : object;
+    const delivered: string[] = [];
+    manager.onObject = (_type, _name, object) => { delivered.push(object.kind); };
+    const receipt: ObjectDatagram = { typeByte: 0, trackAlias: 1n, groupId: 0n, objectId: 0n,
+      publisherPriority: 128, isEndOfGroup: false, extensions: undefined, payload: Uint8Array.of(1), status: undefined };
+    const object = data();
+    const first = manager.routeObject(0n, object, 18, undefined, origin === 'datagram' ? receipt : object);
+    const streamIdle = manager.captureTrackIdle(1n, 0n)();
+    const trackIdle = manager.captureTrackIdle(1n)();
+    let drained = false;
+    void trackIdle?.then(() => { drained = true; });
+    const terminal = manager.routeObject(2n, eot());
+    try {
+      expect(trackIdle).toBeInstanceOf(Promise);
+      if (origin === 'datagram') expect(streamIdle).toBeUndefined();
+      else expect(streamIdle).toBeInstanceOf(Promise);
+      await settle(); expect(delivered).toEqual([]); expect(drained).toBe(false);
+    }
+    finally { release(); await Promise.all([first, terminal, trackIdle, streamIdle]); }
+    expect(drained).toBe(true); expect(delivered).toEqual(['data', 'gap']);
+  });
+
   it('does not dispatch EOT ahead of an earlier accepted transform', async () => {
     const manager = new SubscriptionManager(); manager.registerTrack(1n, 'video', 'video');
     let release!: () => void;

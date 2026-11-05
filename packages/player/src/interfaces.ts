@@ -352,6 +352,19 @@ export interface MediaSourceLike {
   observeAppends?(observer: MediaAppendObserver): () => void;
 
   /**
+   * Retain receiving evidence for one current subgroup stream, not an entire
+   * group. The caller releases it after FIN/reset AND accepted routing work
+   * settles. `isCurrent` captures the registration and source owner; it must
+   * not resolve a reused alias. An adapter may bound or decline this evidence.
+   * No payload ownership, completion, or presentation is implied. This only
+   * extends an already-known positive DTS gap, with a bounded deadline.
+   * When supplied, sourceKey is the same opaque identity used for appendChunk
+   * and clearTimeline; trackName remains the human-readable label.
+   */
+  retainReceivingGroup?(mediaType: 'video' | 'audio', trackName: string,
+    groupId: bigint, isCurrent: () => boolean, sourceKey?: string): () => void;
+
+  /**
    * Re-initialize a SourceBuffer for a new codec / init segment.
    *
    * Called by the player when a track switch crosses codec families

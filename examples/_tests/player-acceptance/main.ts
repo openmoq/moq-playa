@@ -10,6 +10,9 @@ import { observeNativeMse } from './native-mse.js';
 import { observeProgramDecodedSource } from '../../../scripts/player-acceptance/program-switch-observer.mjs';
 import { observeProgramSwitchWire } from '../../../scripts/player-acceptance/program-switch-wire-observer.mjs';
 import { observeMseProgramSwitch } from '../../../scripts/player-acceptance/mse-program-switch-observer.mjs';
+import { createGroupTailProbe } from '../../../scripts/player-acceptance/group-tail.mjs';
+import { createMediaDiagnostics } from '@openmoq/player/diagnostics';
+import type { TailCheckpoint } from '../../../scripts/player-acceptance/group-tail.mjs';
 
 const video = document.querySelector<HTMLVideoElement>('#video')!;
 const canvas = document.querySelector<HTMLCanvasElement>('#canvas')!;
@@ -29,6 +32,8 @@ const pinHex = params.get('hash')!;
 if (!/^[a-f0-9]{64}$/.test(pinHex)) throw new Error('Missing local certificate pin');
 const pin = Uint8Array.from(pinHex.match(/../g)!, (byte) => parseInt(byte, 16)).buffer;
 const nativeMse = params.has('nativeMse') ? observeNativeMse() : undefined;
+const groupTail = params.has('groupTail') ? createGroupTailProbe({ catalogIdentity: { namespace: [params.get('ns')!], name: 'catalog' } }) : undefined;
+groupTail?.installNative();
 const createTransport = createWebTransport({ certHash: pin, draftVersion: 18 });
 const transports: WebTransportLike[] = [];
 const transportOutcomes: Promise<{ status: string; reason?: string }>[] = [];
@@ -62,14 +67,15 @@ const player = new Player(null, {
   moqtPlayerConfig: {
     logLevel: params.has('debug') ? 'debug' : 'none',
     ...(warmObserver ? { warmStartCurrentGroup: params.get('warm') === '1', objectTransform: warmObserver.transform } : {}),
+    ...(groupTail ? { objectTransform: groupTail.transform } : {}),
     locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',
     ...(params.get('runtimeAudio') === '1' || runtimeMedia ? {} : { audioConstraints: { lang: params.get('lang') ?? 'en' } }),
     ...(runtimeMedia ? { selection: { renderGroup: 1, videoAltGroup: 1 } } : {}),
-    ...(params.get('debug') === 'handover' || nativeMse ? { createMediaSource: () => {
-      const source = new MseMediaSource(video, nativeMse ? { mseImplementation: 'standard' } : {});
+    ...(params.get('debug') === 'handover' || nativeMse || groupTail ? { createMediaSource: () => {
+      const source = new MseMediaSource(video, nativeMse || groupTail ? { mseImplementation: 'standard' } : {});
       source.debug = params.has('debug');
       mseProgram?.source(source);
-      return source;
+      return groupTail ? groupTail.wrapSource(source) : source;
     } } : {}),
     ...(mseProgram ? { createCmafAssembler: callbacks => mseProgram.createAssembler(callbacks) } : {}),
     ...(decodedSource ? { createVideoDecoder: () => decodedSource.wrap(new WebCodecsVideoDecoder()) } : {}),
@@ -77,6 +83,7 @@ const player = new Player(null, {
       const connection = new MoqtConnection(18);
       programWire?.connection(connection);
       warmObserver?.connection(connection);
+      groupTail?.connection(connection);
       if (warmObserver || locmafObserver) {
         observeConnectionObjects(connection, (stream, object) => {
           const source = warmObserver?.record(connection, stream, object);
@@ -98,6 +105,8 @@ const player = new Player(null, {
     },
   },
 });
+
+groupTail?.observeDiagnostics(player.diagnosticSource, createMediaDiagnostics);
 
 for (const type of ['ready', 'playing', 'statechange', 'error', 'stall', 'qualitychange', 'audiochange', 'audiochangefailed',
   'programchange', 'programchangefailed', 'viewchange', 'viewchangefailed'] as const) {
@@ -227,7 +236,7 @@ function playbackQuality() {
 
 function snapshot() {
   const locmafDelivery = locmafObserver?.snapshot();
-  return { samples: [...samples], events: [...events], startupError, transportState: [...transportState],
+  return { ...(groupTail ? { groupTail: groupTail.snapshot() } : {}), samples: [...samples], events: [...events], startupError, transportState: [...transportState],
     nativeEvents: [...nativeEvents], nativeError: video.error ? { code: video.error.code, message: video.error.message } : null,
     nativeMse: nativeMse?.snapshot() ?? null,
     warmStart: warmObserver?.snapshot() ?? null,
@@ -307,6 +316,11 @@ const acceptance = {
       observedSourceTimeUs: String(reference.observedSourceTimeUs), anchors };
   },
   snapshot,
+  get tailSnapshot() { return groupTail?.snapshot() ?? null; },
+  get tailBoundarySettled() { return groupTail?.boundarySettled() ?? false; },
+  armTail(mode: 'ordinary' | 'held') { if (!groupTail) throw new Error('Tail probe not enabled'); return groupTail.arm(mode); },
+  async settleTailHashes() { await groupTail?.settleHashes(); },
+  async settleTailObservations(checkpoint: TailCheckpoint) { await groupTail?.settleObservations(checkpoint); },
   begin(silent: boolean): void {
     if (webAudioOutput) { if (silent) player.mute(); }
     else gain!.gain.value = silent ? 0 : 1;
@@ -328,9 +342,13 @@ const acceptance = {
     recording = false;
     clearInterval(timer);
     video.cancelVideoFrameCallback(callbackHandle);
+    groupTail?.cancel();
+    await groupTail?.settleObservations('before-player-destroy');
     await player.destroy();
     mseProgram?.dispose();
     programWire?.dispose();
+    await groupTail?.settleObservations('after-player-destroy');
+    groupTail?.restore();
     nativeMse?.restore();
     source?.disconnect();
     gain?.disconnect();
@@ -343,6 +361,7 @@ const acceptance = {
       state: player.state, transports: transports.length,
       transportOutcomes: outcomes, events: [...events],
       audioState: audioContext?.state, videoSource: video.getAttribute('src'),
+      groupTail: groupTail?.snapshot() ?? null,
     };
   },
 };

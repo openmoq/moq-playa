@@ -21,16 +21,20 @@ import { prepareAudioSwitchVariant } from './audio-switch.fixture.mjs';
 import { checkProgramSwitch } from './program-switch.mjs';
 import { prepareProgramSwitchVariant } from './program-switch.fixture.mjs';
 import { mseProgramSwitchCases, checkMseProgramSwitch } from './mse-program-switch.mjs';
+import { checkGroupTail, assessTailDiagnostics } from './group-tail-check.mjs';
+import { isTailHarnessFile, isTailSupportFile } from './group-tail-cli.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
-const artifacts = resolve(root, 'reports/player-acceptance', runId);
-const namespace = `acceptance-${randomUUID().slice(0, 8)}`;
+const artifacts = resolve(process.env.PLAYER_TEST_ARTIFACTS ?? join(root, 'reports/player-acceptance'), runId);
+const namespace = process.env.PLAYER_TAIL_NAMESPACE ?? `acceptance-${randomUUID().slice(0, 8)}`;
 const children = new Set();
 const logs = [];
 const abort = new AbortController();
 const caseArg = process.argv.indexOf('--case');
 const selectedCase = caseArg < 0 ? null : process.argv[caseArg + 1];
+const tailCase = ['cmaf-group-tail-ordinary', 'cmaf-group-tail-held'].includes(selectedCase);
+const tailExpectedLoss = tailCase && selectedCase.endsWith('-held') && process.env.PLAYER_TAIL_EXPECT_LOSS === '1';
 const onInterrupt = () => abort.abort(new Error('Playback test interrupted'));
 process.once('SIGINT', onInterrupt);
 process.once('SIGTERM', onInterrupt);
@@ -108,7 +112,17 @@ async function recordSource() {
   await writeFile(join(artifacts, 'source-files.json'), manifest);
   const { stdout: patch } = await git(['diff', 'HEAD', '--binary']);
   await writeFile(join(artifacts, 'source.patch'), patch);
-  return { manifestSha256: createHash('sha256').update(manifest).digest('hex'), files: files.length };
+  const identity = { manifestSha256: createHash('sha256').update(manifest).digest('hex'), files: files.length };
+  if (tailCase) {
+    for (const [kind, selected] of [['harness', files.filter(file => isTailHarnessFile(file.path))],
+      ['support', files.filter(file => isTailSupportFile(file.path))],
+      ['production', files.filter(file => !isTailHarnessFile(file.path) && !isTailSupportFile(file.path))]]) {
+      const content = `${JSON.stringify(selected, null, 2)}\n`;
+      await writeFile(join(artifacts, `${kind}-files.json`), content);
+      identity[`${kind}ManifestSha256`] = createHash('sha256').update(content).digest('hex');
+    }
+  }
+  return identity;
 }
 
 async function waitForLine(state, pattern) {
@@ -147,77 +161,97 @@ try {
   const cert = new X509Certificate(await readFile(relayCert));
   const pin = cert.fingerprint256.replaceAll(':', '').toLowerCase();
   result.transport.serverCertificateSha256 = pin;
-  for (const frozen of [false, true]) {
-    const name = frozen ? 'frozen' : 'moving';
-    result.fixtures[name] = await prepareFixture(join(artifacts, name), namespace, frozen, abort.signal);
-  }
-  result.fixtures.alternatives = await prepareFixture(join(artifacts, 'alternatives'), namespace, false, abort.signal, true);
-  if (selectedCase === 'example-programs-cmaf') {
-    const input = join(artifacts, 'alternatives'), output = join(artifacts, 'examplePrograms');
-    await cp(input, output, { recursive: true });
-    const manifest = JSON.parse(await readFile(join(output, 'manifest.json'), 'utf8'));
-    for (const track of manifest.tracks) {
-      track.renderGroup = ['video-1080', 'audio-es'].includes(track.name) ? 2 : 1;
-      if (track.name === 'video-720') track.altGroup = 4;
+  if (tailCase) {
+    const fixtureDirectory = process.env.PLAYER_TAIL_FIXTURE ?? join(artifacts, 'moving');
+    if (process.env.PLAYER_TAIL_FIXTURE) {
+      result.fixtures.moving = JSON.parse(await readFile(join(fixtureDirectory, 'provenance.json'), 'utf8'));
+      const manifest = JSON.parse(await readFile(join(fixtureDirectory, 'manifest.json'), 'utf8'));
+      assert.deepEqual(manifest.namespace, [namespace], 'Campaign namespace differs from fixed fixture');
+      for (const [path, digest] of Object.entries(result.fixtures.moving.sha256)) {
+        assert.equal(createHash('sha256').update(await readFile(join(fixtureDirectory, path))).digest('hex'), digest, `Fixture bytes changed: ${path}`);
+      }
+    } else result.fixtures.moving = await prepareFixture(fixtureDirectory, namespace, false, abort.signal);
+    const fixtureManifest = JSON.parse(await readFile(join(fixtureDirectory, 'manifest.json'), 'utf8'));
+    assert.equal(fixtureManifest.tracks.find(track => track.name === 'video-360').chunks.length, 12, 'Tail case needs exactly 12 video objects per group');
+    result.tailFixtureDirectory = fixtureDirectory;
+    result.tailScope = 'CMAF receiving-stream and accepted-transform tail retention; native freeze recovery is not qualified by this case.';
+  } else {
+    for (const frozen of [false, true]) {
+      const name = frozen ? 'frozen' : 'moving';
+      result.fixtures[name] = await prepareFixture(join(artifacts, name), namespace, frozen, abort.signal);
     }
-    await writeFile(join(output, 'manifest.json'), JSON.stringify(manifest, null, 2));
-    for (const [file, expected] of Object.entries(result.fixtures.alternatives.sha256)) {
-      assert.equal(createHash('sha256').update(await readFile(join(output, file))).digest('hex'), expected,
-        `${file}: program menu fixture must not rewrite media`);
+    result.fixtures.alternatives = await prepareFixture(join(artifacts, 'alternatives'), namespace, false, abort.signal, true);
+    if (selectedCase === 'example-programs-cmaf') {
+      const input = join(artifacts, 'alternatives'), output = join(artifacts, 'examplePrograms');
+      await cp(input, output, { recursive: true });
+      const manifest = JSON.parse(await readFile(join(output, 'manifest.json'), 'utf8'));
+      for (const track of manifest.tracks) {
+        track.renderGroup = ['video-1080', 'audio-es'].includes(track.name) ? 2 : 1;
+        if (track.name === 'video-720') track.altGroup = 4;
+      }
+      await writeFile(join(output, 'manifest.json'), JSON.stringify(manifest, null, 2));
+      for (const [file, expected] of Object.entries(result.fixtures.alternatives.sha256)) {
+        assert.equal(createHash('sha256').update(await readFile(join(output, file))).digest('hex'), expected,
+          `${file}: program menu fixture must not rewrite media`);
+      }
+      result.fixtures.examplePrograms = { kind: 'metadata-only', source: result.fixtures.alternatives,
+        tracks: manifest.tracks.map(({ name, renderGroup, altGroup }) => ({ name, renderGroup, altGroup })) };
     }
-    result.fixtures.examplePrograms = { kind: 'metadata-only', source: result.fixtures.alternatives,
-      tracks: manifest.tracks.map(({ name, renderGroup, altGroup }) => ({ name, renderGroup, altGroup })) };
+    if (selectedCase === 'cmaf-audio-language-switch-same-set' || selectedCase === 'cmaf-audio-language-switch-reference-map') {
+      const sameSet = selectedCase === 'cmaf-audio-language-switch-same-set';
+      const variant = sameSet ? 'audioSwitchSameSet' : 'audioSwitchMapped';
+      result.fixtures[variant] = await prepareAudioSwitchVariant(join(artifacts, 'alternatives'), join(artifacts, variant),
+        result.fixtures.alternatives, sameSet);
+    }
+    result.fixtures.views = await prepareFixture(join(artifacts, 'views'), namespace, false, abort.signal, false, 'aac', true);
+    result.fixtures.loc = await prepareFixture(join(artifacts, 'loc'), namespace, false, abort.signal, false, 'opus');
+    result.fixtures.locViews = await prepareFixture(join(artifacts, 'locViews'), namespace, false, abort.signal, false, 'opus', true);
+    result.fixtures.locFrozen = await prepareFixture(join(artifacts, 'locFrozen'), namespace, true, abort.signal, false, 'opus');
+    if (selectedCase === 'loc-audio-language-switch-same-set') {
+      result.fixtures.locAlternatives = await prepareFixture(join(artifacts, 'locAlternatives'), namespace, false, abort.signal, true, 'opus');
+      result.fixtures.locAudioSwitchSameSet = await prepareAudioSwitchVariant(join(artifacts, 'locAlternatives'),
+        join(artifacts, 'locAudioSwitchSameSet'), result.fixtures.locAlternatives, true);
+    }
+    if (selectedCase === 'loc-program-switch-reference-map' || selectedCase === 'loc-view-switch-reference-map'
+        || mseProgramSwitchCases.some(item => item.name === selectedCase)) {
+      result.fixtures.locProgramAlternatives = await prepareFixture(join(artifacts, 'locProgramAlternatives'), namespace,
+        false, abort.signal, true, 'opus');
+      result.fixtures.locProgramSwitch = await prepareProgramSwitchVariant(join(artifacts, 'locProgramAlternatives'),
+        join(artifacts, 'locProgramSwitch'), result.fixtures.locProgramAlternatives);
+    }
+    result.fixtures.retimed = await prepareFixture(join(artifacts, 'retimed'), namespace, false, abort.signal, false, 'aac', false,
+      { videoTimescale: 60000 });
+    assert.notEqual(result.fixtures.moving.timing['video-360'].timescale, result.fixtures.retimed.timing['video-360'].timescale,
+      'Replacement video must exercise a different initialization timescale');
+    for (const [name, caseName, lowLevel, lowCodec] of [
+      ['switching', 'cmaf-manual-rendition-switch', '4.0', 'avc1.42c028'],
+      ['retyping', 'cmaf-manual-avc-level-switch', '3.0', 'avc1.42c01e'],
+    ]) {
+      if (selectedCase !== null && selectedCase !== caseName) continue;
+      result.fixtures[name] = await prepareFixture(join(artifacts, name), namespace, false, abort.signal, true, 'aac', false,
+        { tracks: { 'video-360': { trackId: 1, videoTimescale: 12288, videoLevel: lowLevel, expectedCodec: lowCodec },
+          'video-720': { trackId: 3, videoTimescale: 60000, videoLevel: '4.0', expectedCodec: 'avc1.42c028' },
+          'video-1080': { trackId: 4, videoTimescale: 90000, videoLevel: '4.0', expectedCodec: 'avc1.42c028' } } });
+      const fixture = result.fixtures[name];
+      assert.deepEqual(['video-360', 'video-720', 'video-1080'].map(name => fixture.headers[name]), [
+        { trackId: 1, timescale: 12288, codecFourcc: 'avc1', codec: lowCodec },
+        { trackId: 3, timescale: 60000, codecFourcc: 'avc1', codec: 'avc1.42c028' },
+        { trackId: 4, timescale: 90000, codecFourcc: 'avc1', codec: 'avc1.42c028' },
+      ]);
+      assert.equal(new Set(['video-360', 'video-720', 'video-1080'].map(name => fixture.sha256[`${name}/init.mp4`])).size, 3,
+        'Renditions must have distinct actual initialization bytes');
+      assert.deepEqual(fixture.expected.videos.map(track => track.altGroup), [1, 1, 1]);
+    }
   }
-  if (selectedCase === 'cmaf-audio-language-switch-same-set' || selectedCase === 'cmaf-audio-language-switch-reference-map') {
-    const sameSet = selectedCase === 'cmaf-audio-language-switch-same-set';
-    const variant = sameSet ? 'audioSwitchSameSet' : 'audioSwitchMapped';
-    result.fixtures[variant] = await prepareAudioSwitchVariant(join(artifacts, 'alternatives'), join(artifacts, variant),
-      result.fixtures.alternatives, sameSet);
-  }
-  result.fixtures.views = await prepareFixture(join(artifacts, 'views'), namespace, false, abort.signal, false, 'aac', true);
-  result.fixtures.loc = await prepareFixture(join(artifacts, 'loc'), namespace, false, abort.signal, false, 'opus');
-  result.fixtures.locViews = await prepareFixture(join(artifacts, 'locViews'), namespace, false, abort.signal, false, 'opus', true);
-  result.fixtures.locFrozen = await prepareFixture(join(artifacts, 'locFrozen'), namespace, true, abort.signal, false, 'opus');
-  if (selectedCase === 'loc-audio-language-switch-same-set') {
-    result.fixtures.locAlternatives = await prepareFixture(join(artifacts, 'locAlternatives'), namespace, false, abort.signal, true, 'opus');
-    result.fixtures.locAudioSwitchSameSet = await prepareAudioSwitchVariant(join(artifacts, 'locAlternatives'),
-      join(artifacts, 'locAudioSwitchSameSet'), result.fixtures.locAlternatives, true);
-  }
-  if (selectedCase === 'loc-program-switch-reference-map' || selectedCase === 'loc-view-switch-reference-map'
-      || mseProgramSwitchCases.some(item => item.name === selectedCase)) {
-    result.fixtures.locProgramAlternatives = await prepareFixture(join(artifacts, 'locProgramAlternatives'), namespace,
-      false, abort.signal, true, 'opus');
-    result.fixtures.locProgramSwitch = await prepareProgramSwitchVariant(join(artifacts, 'locProgramAlternatives'),
-      join(artifacts, 'locProgramSwitch'), result.fixtures.locProgramAlternatives);
-  }
-  result.fixtures.retimed = await prepareFixture(join(artifacts, 'retimed'), namespace, false, abort.signal, false, 'aac', false,
-    { videoTimescale: 60000 });
-  assert.notEqual(result.fixtures.moving.timing['video-360'].timescale, result.fixtures.retimed.timing['video-360'].timescale,
-    'Replacement video must exercise a different initialization timescale');
-  for (const [name, caseName, lowLevel, lowCodec] of [
-    ['switching', 'cmaf-manual-rendition-switch', '4.0', 'avc1.42c028'],
-    ['retyping', 'cmaf-manual-avc-level-switch', '3.0', 'avc1.42c01e'],
-  ]) {
-    if (selectedCase !== null && selectedCase !== caseName) continue;
-    result.fixtures[name] = await prepareFixture(join(artifacts, name), namespace, false, abort.signal, true, 'aac', false,
-      { tracks: { 'video-360': { trackId: 1, videoTimescale: 12288, videoLevel: lowLevel, expectedCodec: lowCodec },
-        'video-720': { trackId: 3, videoTimescale: 60000, videoLevel: '4.0', expectedCodec: 'avc1.42c028' },
-        'video-1080': { trackId: 4, videoTimescale: 90000, videoLevel: '4.0', expectedCodec: 'avc1.42c028' } } });
-    const fixture = result.fixtures[name];
-    assert.deepEqual(['video-360', 'video-720', 'video-1080'].map(name => fixture.headers[name]), [
-      { trackId: 1, timescale: 12288, codecFourcc: 'avc1', codec: lowCodec },
-      { trackId: 3, timescale: 60000, codecFourcc: 'avc1', codec: 'avc1.42c028' },
-      { trackId: 4, timescale: 90000, codecFourcc: 'avc1', codec: 'avc1.42c028' },
-    ]);
-    assert.equal(new Set(['video-360', 'video-720', 'video-1080'].map(name => fixture.sha256[`${name}/init.mp4`])).size, 3,
-      'Renditions must have distinct actual initialization bytes');
-    assert.deepEqual(fixture.expected.videos.map(track => track.altGroup), [1, 1, 1]);
-  }
-  browser = await chromium.launch({ channel: process.env.PLAYER_TEST_BROWSER ?? 'chrome' });
+  browser = await chromium.launch({ channel: process.env.PLAYER_TEST_BROWSER ?? 'chrome',
+    ...(tailCase ? { handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false } : {}) });
   result.platform.browser = browser.version();
   const vite = launch('vite', process.execPath, ['_tests/player-acceptance/serve.mjs'], {}, join(root, 'examples'));
   const webUrl = await waitForLine(vite, /Acceptance page: (http:\/\/127\.0\.0\.1:\d+\/)/);
   const scenarios = [
+    ...['ordinary', 'held'].map(mode => ({ name: `cmaf-group-tail-${mode}`, fixture: 'moving', tailMode: mode,
+      silent: false, expectedFailure: mode === 'held' && tailExpectedLoss ? 'tail-loss-control' : null }))
+      .filter(scenario => scenario.name === selectedCase),
     { name: 'moving-video-and-audio', fixture: 'moving', silent: false, expectedFailure: null },
     // Explicit-only until each policy is qualified. The original distinct-set
     // fixture is now a refusal control; its recorded index-only red is retained.
@@ -238,7 +272,7 @@ try {
       expected: { videoWidth: 640, videoHeight: 360, audioHz: outcome === 'adopt' && mode === 'program' ? 880 : 440,
         videoFps: 24, outputKind: 'video' },
     })),
-    // Explicit-only until the frozen candidate is qualified on native Chrome.
+    // These cases run only when explicitly selected.
     ...[
       { name: 'loc-program-switch-reference-map', programSwitch: 'program', audioHz: 880 },
       { name: 'loc-view-switch-reference-map', programSwitch: 'view', audioHz: 440 },
@@ -327,11 +361,11 @@ try {
       'scripts/player-acceptance/mixed-publisher.mjs', relayUrl, join(artifacts, 'moving'), join(artifacts, 'loc'), scenario.mixed,
     ], { RELAY_CERT: relayCert }) : launch(name, 'pnpm', scenario.version ? [
       '--filter', '@moqt/example-node-publisher', 'exec', 'tsx', 'src/publish-loc.ts',
-      relayUrl, join(artifacts, fixture), String(scenario.version), scenario.mode,
+      relayUrl, tailCase ? result.tailFixtureDirectory : join(artifacts, fixture), String(scenario.version), scenario.mode,
     ] : [
       '--filter', '@moqt/example-node-publisher', 'publish-fixture', '--loop', '--pace-media', '--catalog-format', 'cmsf-01',
       ...(scenario.locmaf ? ['--packaging', 'locmaf'] : []), ...startLoopArgs,
-      relayUrl, join(artifacts, fixture),
+      relayUrl, tailCase ? result.tailFixtureDirectory : join(artifacts, fixture),
     ], { RELAY_CERT: relayCert });
     const publisher = startPublisher(`${scenario.name}-publisher`, relayUrl);
     const replacementPublisher = handover
@@ -401,6 +435,7 @@ try {
         }
       }
       const query = new URLSearchParams({ url: relayUrl, ns: namespace, hash: pin });
+      if (scenario.tailMode) query.set('groupTail', scenario.tailMode);
       if (scenario.warm !== undefined) query.set('warm', scenario.warm ? '1' : '0');
       if (scenario.manualSwitch) {
         query.set('nativeMse', '1');
@@ -474,7 +509,12 @@ try {
           assert.ok(caseResult.locmafLiveGroupsReadyAfterMs < 20000, 'LOCMAF live-group readiness deadline');
         }
         let observed;
-        if (scenario.manualSwitch) {
+        if (scenario.tailMode) {
+          caseResult.groupTail = {};
+          observed = await bounded(checkGroupTail(page, caseResult.groupTail, scenario.tailMode), 40000, 'tail observation');
+          caseResult.assessment = tailExpectedLoss && caseResult.groupTail.retention.causalLoss
+            ? { passed: false, failures: ['tail-loss-control'] } : caseResult.groupTail.retention;
+        } else if (scenario.manualSwitch) {
           caseResult.renditionSwitch = {};
           observed = await checkRenditionSwitch(page, caseResult.renditionSwitch, bounded, Boolean(scenario.nativeRetypes));
         } else if (scenario.mseProgramSwitch) {
@@ -517,7 +557,7 @@ try {
         }
         caseResult.playbackQuality = assessPlaybackQuality(observed.playbackQuality, scenario.expected?.outputKind !== 'canvas');
         assert.deepEqual(caseResult.playbackQuality.failures, [], 'Public playback quality must match its owned native video source');
-        caseResult.assessment = scenario.manualSwitch ? caseResult.renditionSwitch.continuity
+        caseResult.assessment ??= scenario.manualSwitch ? caseResult.renditionSwitch.continuity
           : scenario.mseProgramSwitch ? caseResult.mseProgramSwitch.assessment
           : scenario.programSwitch ? caseResult.programSwitch.assessment
             : scenario.audioSwitch ? caseResult.audioSwitch.assessment : assessPlayback(observed.samples, scenario.expected);
@@ -589,13 +629,15 @@ try {
         await page.screenshot({ path: join(artifacts, `${scenario.name}.png`) });
         caseResult.teardown = await bounded(page.evaluate(() => window.playerAcceptance.destroy()), 5000, 'player teardown');
         assert.equal(caseResult.teardown.transports, handover ? 2 : 1, 'Unexpected established transport count');
+        assert.equal(caseResult.teardown.transportOutcomes.length, caseResult.teardown.transports, 'Missing caller-held closed outcome');
         assert.ok(caseResult.teardown.transportOutcomes.every((outcome) => outcome.status === 'closed'), 'Transport did not close cleanly');
         assert.equal(caseResult.teardown.audioState, 'closed', 'Observer AudioContext leaked');
         assert.ok(!caseResult.teardown.videoSource, 'MediaSource URL remained attached');
         assert.equal(caseResult.teardown.state, 'idle', 'Player did not return to idle');
+        if (scenario.tailMode) assert.deepEqual(assessTailDiagnostics(caseResult.teardown.groupTail, 'before-player-destroy').failures, [], 'Loss-free diagnostics through teardown');
       }
       assert.deepEqual(pageErrors, [], 'Uncaught browser error');
-      if (scenario.manualSwitch) {
+      if (scenario.manualSwitch || scenario.tailMode) {
         assert.deepEqual(consoleLines.filter(line => line.type === 'error'), [], 'Native Chrome console error');
         assert.equal(httpErrorCount, 0, `HTTP errors: ${JSON.stringify(httpErrors)}`);
       }
@@ -616,6 +658,18 @@ try {
       throw error;
     } finally {
       caseResult.pageErrors = pageErrors;
+      if (scenario.tailMode && !caseResult.teardown) {
+        try {
+          caseResult.teardown = await bounded(page.evaluate(() => window.playerAcceptance.destroy()), 5000, 'tail failure cleanup', false);
+          assert.equal(caseResult.teardown.transportOutcomes.length, caseResult.teardown.transports, 'Missing closed outcome during failure cleanup');
+          assert.ok(caseResult.teardown.transportOutcomes.every(outcome => outcome.status === 'closed'), 'Tail failure transport did not close cleanly');
+          assert.equal(caseResult.teardown.state, 'idle');
+          assert.ok(!caseResult.teardown.videoSource);
+          if (caseResult.teardown.audioState !== undefined) assert.equal(caseResult.teardown.audioState, 'closed');
+          assert.deepEqual(caseResult.teardown.events.filter(event => event.type === 'error'), [], 'Player error during tail cleanup');
+          assert.deepEqual(assessTailDiagnostics(caseResult.teardown.groupTail, 'before-player-destroy').failures, [], 'Diagnostic loss during tail cleanup');
+        } catch (error) { caseResult.cleanupError = error.message; result.errors.push(`Tail cleanup: ${error.message}`); process.exitCode = 1; }
+      }
       caseResult.httpErrors = { total: httpErrorCount, responses: httpErrors, truncated: Math.max(0, httpErrorCount - httpErrors.length) };
       await writeFile(join(artifacts, `${scenario.name}-console.json`), JSON.stringify(consoleLines, null, 2));
       try {
