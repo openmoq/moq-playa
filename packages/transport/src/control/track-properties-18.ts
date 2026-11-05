@@ -51,46 +51,7 @@ function asTrackViolation(err: unknown): never {
   throw err;
 }
 
-/**
- * Properties defined for data OBJECTS only — they MUST NOT apply to Tracks (§2.5).
- * The type-space is shared and their KVP/value shape is perfectly valid, so this
- * is NOT a wire-format violation: their presence in a Track Properties block is a
- * MALFORMED TRACK, handled by the semantic layer (session/adapter), not the codec.
- * They are therefore decoded normally here; {@link hasObjectOnlyTrackProperty}
- * lets the semantic layer detect them.
- */
-const OBJECT_ONLY_TRACK_PROPERTIES = new Set<bigint>([0x3cn, 0x3en]);
-
-/** Whether `props` contains a data-Object-only Property (0x3C / 0x3E) — which,
- *  in a Track Properties block, means a malformed track (§2.5). */
-export function hasObjectOnlyTrackProperty(props: TrackExtensions): boolean {
-  for (const type of props.keys()) {
-    if (OBJECT_ONLY_TRACK_PROPERTIES.has(type as bigint)) return true;
-  }
-  return false;
-}
-
-/**
- * Mandatory Track Property type range (§2.5.1): 0x4000–0x7FFF. These MUST be
- * understood or the track MUST NOT be processed/forwarded. We implement no
- * Mandatory Track Properties, so ANY type in this range is "unsupported".
- */
-const MANDATORY_TRACK_PROPERTY_MIN = 0x4000n;
-const MANDATORY_TRACK_PROPERTY_MAX = 0x7fffn;
-
-/**
- * Whether `props` contains a Mandatory Track Property (0x4000–0x7FFF) this
- * endpoint does not understand (§2.5.1). Since no Mandatory Track Property is
- * implemented, any type in the range qualifies — the request MUST be rejected
- * (PUBLISH) or cancelled (SUBSCRIBE_OK / FETCH_OK), NOT processed or forwarded.
- */
-export function hasUnsupportedMandatoryTrackProperty(props: TrackExtensions): boolean {
-  for (const type of props.keys()) {
-    const t = type as bigint;
-    if (t >= MANDATORY_TRACK_PROPERTY_MIN && t <= MANDATORY_TRACK_PROPERTY_MAX) return true;
-  }
-  return false;
-}
+export { hasObjectOnlyTrackProperty, hasUnsupportedMandatoryTrackProperty } from './property-semantics.js';
 
 /**
  * Per-Type VALUE-FORMAT validation for KNOWN Track Properties (§2.5) — enforced by

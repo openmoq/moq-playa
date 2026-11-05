@@ -345,3 +345,17 @@ describe('joining fetch state (§9.16.2)', () => {
     expect(() => fetch.setResolvedRange(0n, 0n, 1n, 0n)).toThrow('joining');
   });
 });
+
+describe('local malformed-Track termination', () => {
+  it.each(['pending', 'transferring'] as const)('terminates a %s FETCH without weakening peer response rules', phase => {
+    const fetch = FetchStateMachine.createAsFetcher(0n);
+    if (phase === 'transferring') {
+      fetch.handleFetchOk();
+      expect(() => fetch.handleRequestError(0x12n, 'peer error after OK')).toThrow();
+      expect(fetch.state).toBe(FetchState.TRANSFERRING);
+    }
+    fetch.handleMalformedTrack(0x12n, 'malformed track');
+    expect(fetch.state).toBe(FetchState.COMPLETED); expect(fetch.errorCode).toBe(0x12n);
+    expect(fetch.errorReason).toBe('malformed track');
+  });
+});

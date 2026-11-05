@@ -30,7 +30,8 @@ import {
   encodeFetchObject18,
   encodeFetchEndOfRange18,
   createDataCodec,
-  hasObjectOnlyTrackProperty,
+  supportedPropertyFault,
+  decodePropertyBlock,
   hasUnsupportedMandatoryTrackProperty,
   RequestError18,
   SubscriptionState,
@@ -2250,10 +2251,32 @@ export class MoqtConnection {
     if (hasUnsupportedMandatoryTrackProperty(props)) {
       return { code: RequestError18.UNSUPPORTED_EXTENSION, reason: 'an unsupported Mandatory Track Property (§2.5.1)' };
     }
-    if (hasObjectOnlyTrackProperty(props)) {
-      return { code: RequestError18.MALFORMED_TRACK, reason: 'a data-Object-only Property in Track Properties (§2.5)' };
-    }
+    const reason = supportedPropertyFault(props, 'track');
+    if (reason) return { code: RequestError18.MALFORMED_TRACK, reason };
     return null;
+  }
+
+  private objectPropertyFault(properties: Uint8Array | undefined): string | null {
+    if (!isRequestStreamDraft(this.session.draftVersion) || !properties?.length) return null;
+    const { entries } = decodePropertyBlock(properties, 0, { profile: 'd18-delta-vi64' });
+    const props = new Map<bigint, unknown[]>();
+    for (const { id, value } of entries) {
+      const values = props.get(id) ?? [];
+      values.push(value);
+      props.set(id, values);
+    }
+    return supportedPropertyFault(props, 'object');
+  }
+
+  private assertLocalObjectProperties(properties: Uint8Array | undefined): void {
+    const fault = this.objectPropertyFault(properties);
+    if (fault) throw new MoqtConnectionError(fault, { errorSource: 'data', isFatal: false });
+  }
+
+  private async cancelMalformedObjectOwners(reason: string, alias?: bigint, fetchId?: bigint): Promise<void> {
+    const requestId = fetchId ?? (alias === undefined ? undefined : this.session.getSubscriberRequestsForAlias(alias)[0]?.requestId);
+    if (requestId !== undefined) await this.executeActions(this.session.handleMalformedTrack(requestId));
+    this.onError?.(new MoqtConnectionError(`Malformed track: ${reason}`, { errorSource: 'data', isFatal: false }));
   }
 
   /**
@@ -2333,15 +2356,17 @@ export class MoqtConnection {
 
     // §2.4.2 / §2.5.1: a SUBSCRIBE_OK / FETCH_OK whose Track Properties carry an
     // unsupported Mandatory Track Property or a data-Object-only Property MUST NOT
-    // be processed — cancel ONLY this request (reset its stream); the session is
-    // NOT closed.
-    if (message.type === 'SUBSCRIBE_OK' || message.type === 'FETCH_OK') {
+    // be processed. Unsupported mandatory Track properties refuse only this
+    // request; malformed Track semantics cancel its corresponding exact-Track
+    // owners. Neither case closes the session.
+    if (message.type === 'SUBSCRIBE_OK' || message.type === 'FETCH_OK'
+        || message.type === 'REQUEST_OK' && this.session.getPendingTrackStatus(requestId) !== undefined) {
       const fault = this.trackPropertyFault(message);
       if (fault) {
         const alias = message.type === 'SUBSCRIBE_OK'
           ? BigInt((message as { trackAlias: bigint }).trackAlias)
           : undefined;
-        await this.failRejectedTrack(message.type, requestId, fault.reason, alias);
+        await this.failRejectedTrack(message.type, requestId, fault.reason, alias, fault.code === RequestError18.MALFORMED_TRACK);
         return;
       }
     }
@@ -2521,10 +2546,11 @@ export class MoqtConnection {
    * own bidi stream (§3.3.2). Surfaced via onError as a per-track failure.
    */
   private async failRejectedTrack(
-    type: 'SUBSCRIBE_OK' | 'FETCH_OK',
+    type: 'SUBSCRIBE_OK' | 'FETCH_OK' | 'REQUEST_OK',
     requestId: bigint,
     reason: string,
     alias?: bigint,
+    malformed = true,
   ): Promise<void> {
     const err = new MoqtConnectionError(
       `Track rejected: ${type} carried ${reason} — request reset`,
@@ -2540,9 +2566,11 @@ export class MoqtConnection {
     }
     this.pendingGenericSubscriptions.delete(requestId);
     this.settlePendingAliasOwnership(requestId, alias);
-    await this.executeActions(this.session.handleMalformedTrack(requestId)); // terminate state (no establish)
-    await this.uniPair!.cancelRequest(requestId); // §2.4.2: RESET the request stream
+    const cancelled = malformed ? this.executeActions(this.session.handleMalformedTrack(requestId)) : undefined;
+    if (!malformed) this.session.rollbackRequest(requestId, { retainCancellationProvenance: true });
     this.onError?.(err);
+    if (cancelled) await cancelled;
+    await this.uniPair!.cancelRequest(requestId); // request-local refusal or semantic cancellation
   }
 
   /**
@@ -5750,6 +5778,7 @@ export class MoqtConnection {
       this.assertPublisherLocation(sub, state.groupId, objectId);
     }
 
+    this.assertLocalObjectProperties(extensions);
     const obj = { objectId, extensions, payload, status: undefined };
     const objectBytes = isRequestStreamDraft(this.session.draftVersion)
       ? encodeSubgroupObject18(obj, state.hasExtensions, state.previousObjectId, state.isFirstObject)
@@ -6056,6 +6085,7 @@ export class MoqtConnection {
     if (state.fillWindow && !windowContains(state.fillWindow, fields.groupId, fields.objectId)) {
       throw new MoqtConnectionError(`Object ${fields.groupId}/${fields.objectId} is outside the fill range`, { errorSource: 'data' });
     }
+    this.assertLocalObjectProperties(fields.extensions);
     const { bytes, nextPrior } = encodeFetchObject18(fields, state.prior, state.isFirstObject, state.groupOrder);
     await this.writeFetchStream(streamId, () => state.writer.write(bytes));
     state.prior = nextPrior;
@@ -6139,6 +6169,40 @@ export class MoqtConnection {
   private async executeActions(
     actions: SessionOutboundAction[],
   ): Promise<void> {
+    if (actions.some(action => action.type === 'cancel_request' && action.malformedTrack)) {
+      const malformedOwners = new Set<bigint>();
+      const aliases = new Set<bigint>();
+      for (const action of actions) {
+        if (action.type !== 'cancel_request' || !action.malformedTrack) continue;
+        malformedOwners.add(action.requestId);
+        const sub = this.session.getSubscription(action.requestId) ?? this.session.getIncomingSubscription(action.requestId);
+        if (sub?.trackAlias !== undefined) aliases.add(sub.trackAlias);
+        if (this.session.getFetch(action.requestId)) this.recentlyCancelledFetches.add(action.requestId);
+        for (const id of this.session.expectedFillsOf(action.requestId)) this.recentlyCancelledFetches.add(id);
+      }
+      // Fence every already-owned reader before the first request reset can wait.
+      // These are live owner snapshots, not a historical Object ledger.
+      for (const [sid, alias] of this.incomingSubgroupAliases) {
+        if (aliases.has(alias)) {
+          const reader = this.dataStreamReaders.get(sid);
+          if (reader) this.locallyDiscardedReaders.add(reader);
+        }
+      }
+      for (const [id, sid] of this.fetchStreams) {
+        if (malformedOwners.has(id)) {
+          const reader = this.dataStreamReaders.get(sid);
+          if (reader) this.locallyDiscardedReaders.add(reader);
+        }
+      }
+      for (const [id, fill] of this.fillStreams) {
+        if (malformedOwners.has(fill.subscriptionId)) {
+          this.recentlyCancelledFetches.add(id);
+          const reader = this.dataStreamReaders.get(fill.streamId);
+          if (reader) this.locallyDiscardedReaders.add(reader);
+        }
+      }
+      for (const alias of aliases) this.armSubscriberAliasTeardown(alias);
+    }
     for (const action of actions) {
       switch (action.type) {
         case 'send_control': {
@@ -6193,10 +6257,9 @@ export class MoqtConnection {
           break;
         }
         case 'cancel_request': {
-          // §5.1: the Session cancelled a local request out of band (a PENDING
-          // SUBSCRIBE superseded by a peer PUBLISH for the same track). Reject its
-          // still-pending subscribeTrack(), drop its routing, and (draft-18) reset
-          // its request stream — the Session already tore down its own state.
+          // Out-of-band cancellation: a superseded SUBSCRIBE or a malformed
+          // exact-Track owner. Session state is already terminal. Settle callers
+          // and perform the corresponding adapter/request-stream cleanup.
           const raw = this.rawSubscriptions.get(action.requestId);
           if (raw) {
             this.removeRawSubscription(raw);
@@ -6206,6 +6269,30 @@ export class MoqtConnection {
           }
           this.pendingGenericSubscriptions.delete(action.requestId);
           this.settlePendingAliasOwnership(action.requestId);
+          if (action.malformedTrack) {
+            const sub = this.session.getSubscription(action.requestId) ?? this.session.getIncomingSubscription(action.requestId);
+            const alias = sub?.trackAlias;
+            const cancelledFills = this.cancelFill(action.requestId);
+            if (sub?.isPublishInitiated && alias !== undefined) {
+              await this.rollbackFailedAcceptance(action.requestId, alias, true);
+              // The batch already removed alias routing, so acceptance rollback
+              // cannot rediscover ownership. Finish the captured owner's readers.
+              await this.discardOpenStreamsForAlias(alias);
+            } else {
+              if (alias !== undefined) this.armSubscriberAliasTeardown(alias);
+              if (this.session.getFetch(action.requestId)) {
+                this.recentlyCancelledFetches.add(action.requestId);
+                const sid = this.fetchStreams.get(action.requestId);
+                const reader = sid === undefined ? undefined : this.dataStreamReaders.get(sid);
+                if (sid !== undefined && reader) await this.discardLocalReader(sid, reader, new Error(action.reason));
+                this.fetchStreams.delete(action.requestId);
+                this.fetchGroupOrder.delete(action.requestId);
+              }
+              this.session.rollbackRequest(action.requestId);
+              if (alias !== undefined) await this.discardOpenStreamsForAlias(alias);
+            }
+            await cancelledFills;
+          }
           if (isRequestStreamDraft(this.session.draftVersion)) await this.uniPair?.cancelRequest(action.requestId);
           break;
         }
@@ -6566,6 +6653,11 @@ export class MoqtConnection {
           }
           if (!this.reboundAllowsObject(datagram.trackAlias, datagram.groupId, datagram.objectId)) {
             this.objectReceiptObservers?.discard(datagram, 'subscription policy');
+            continue;
+          }
+          const propertyFault = this.objectPropertyFault(datagram.extensions);
+          if (propertyFault) {
+            await this.cancelMalformedObjectOwners(propertyFault, datagram.trackAlias);
             continue;
           }
           this.onDatagram?.(datagram);
@@ -7067,7 +7159,6 @@ export class MoqtConnection {
   /** Validate + bind an inbound PUBLISH (§10.10). */
   private async bindInboundPublish(pub: Publish, ctx: InboundRequestStreamContext): Promise<void> {
     const requestId = pub.requestId as bigint;
-    this.onMessage?.(pub);
     const actions = this.session.handleControlMessage(pub);
     const closeAction = actions.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
     if (closeAction) {
@@ -7100,6 +7191,11 @@ export class MoqtConnection {
       await this.writeInboundRequestResponse(requestId, actions, /* finalize */ true);
       return;
     }
+    this.onMessage?.(pub);
+    // A semantic observer may cancel this request. Let its stream notification
+    // revoke the context before publishing mutable application callbacks.
+    await Promise.resolve();
+    if (ctx.cancelled) return;
     // §11.1: refuse an inbound PUBLISH that reuses a Track Alias still guarded by
     // a terminating prior generation — binding it would risk misdelivering an old
     // late stream to this new track. Reject with REQUEST_ERROR (not a session
@@ -7165,9 +7261,11 @@ export class MoqtConnection {
     ) as SendControlAction | undefined;
     if (!reqErr) return undefined;
     return (async () => {
+      const malformed = actions.filter(a => a.type === 'cancel_request' && a.malformedTrack);
+      if (malformed.length) await this.executeActions(malformed);
       await ctx.writeMessage(reqErr.message);
       if (ctx.cancelled) return;
-      await this.executeActions(actions.filter((a) => a !== reqErr));
+      await this.executeActions(actions.filter((a) => a !== reqErr && !malformed.includes(a)));
       await ctx.finish();
       ctx.seal();
     })();
@@ -7931,6 +8029,11 @@ export class MoqtConnection {
           });
           // Gate: the qlog callback above may have torn this stream down.
           if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
+          const propertyFault = this.objectPropertyFault(object.extensions);
+          if (propertyFault) {
+            await this.cancelMalformedObjectOwners(propertyFault, header.trackAlias);
+            return 'local-discard';
+          }
           const receipts = this.objectReceiptObservers;
           receipts?.receive(delivered, 'subgroup');
           if (this._terminated || this.locallyDiscardedReaders.has(reader)) {
@@ -8186,6 +8289,12 @@ export class MoqtConnection {
               payload: item.payload,
             };
             if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
+            const propertyFault = this.objectPropertyFault(item.extensions);
+            if (propertyFault) {
+              const fillOwner = this.fillStreams.get(header.requestId)?.subscriptionId;
+              await this.cancelMalformedObjectOwners(propertyFault, undefined, fillOwner ?? header.requestId);
+              return 'local-discard';
+            }
             this.onObject?.(streamId, delivered); // no alias routing for fetch
           } else {
             const delivered: MoqtObjectGap = {

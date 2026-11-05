@@ -37,6 +37,7 @@ export class FetchStateMachine {
   private _errorReason: string | undefined;
   private _wasCanceled: boolean = false;
   private _joining: JoiningFetchState | undefined;
+  private _trackKey: string | undefined;
   // §10.13: FETCH_OK and the data stream are INDEPENDENT — "the FETCH_OK or
   // REQUEST_ERROR can come at any time relative to object delivery." A fetcher's
   // fetch is fully done only after BOTH the response (FETCH_OK) AND the data stream
@@ -63,8 +64,9 @@ export class FetchStateMachine {
     startObject?: bigint,
     endGroup?: bigint,
     endObject?: bigint,
+    trackKey?: string,
   ): FetchStateMachine {
-    return new FetchStateMachine(
+    const sm = new FetchStateMachine(
       requestId,
       false,
       startGroup,
@@ -72,6 +74,8 @@ export class FetchStateMachine {
       endGroup,
       endObject,
     );
+    sm._trackKey = trackKey;
+    return sm;
   }
 
   /**
@@ -107,11 +111,13 @@ export class FetchStateMachine {
   static createAsJoiningFetcher(
     requestId: bigint,
     joining: JoiningFetchState,
+    trackKey?: string,
   ): FetchStateMachine {
     const sm = joining.fetchType === 0x3
       ? new FetchStateMachine(requestId, false, joining.joiningStart, 0n)
       : new FetchStateMachine(requestId, false);
     sm._joining = joining;
+    sm._trackKey = trackKey;
     return sm;
   }
 
@@ -140,6 +146,9 @@ export class FetchStateMachine {
   get joining(): JoiningFetchState | undefined {
     return this._joining;
   }
+
+  /** Exact track identity retained only for this live fetch's cancellation. */
+  get trackKey(): string | undefined { return this._trackKey; }
 
   /**
    * Back-fill the publisher-side range once the application has resolved the
@@ -283,6 +292,15 @@ export class FetchStateMachine {
     this.assertNotTransferring('handleRequestError');
     this.assertNotPublisher('handleRequestError');
 
+    this._errorCode = errorCode;
+    this._errorReason = errorReason;
+    this._state = FetchState.COMPLETED;
+  }
+
+  /** Locally detected malformed Track semantics can terminate an active FETCH;
+   * unlike a peer REQUEST_ERROR, this is also valid after FETCH_OK. */
+  handleMalformedTrack(errorCode: bigint, errorReason: string): void {
+    this.assertNotPublisher('handleMalformedTrack');
     this._errorCode = errorCode;
     this._errorReason = errorReason;
     this._state = FetchState.COMPLETED;

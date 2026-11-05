@@ -57,6 +57,7 @@ export {
   hasObjectOnlyTrackProperty,
   hasUnsupportedMandatoryTrackProperty,
 } from './control/track-properties-18.js';
+export { supportedPropertyFault } from './control/property-semantics.js';
 
 export {
   readUint8, writeUint8,

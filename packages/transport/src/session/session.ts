@@ -84,6 +84,7 @@ import { getProtocolProfile, type ProtocolProfile } from '../profile.js';
 import type { RequestEndpoint } from './request-endpoint.js';
 import { SubscriptionStateMachine } from './subscription.js';
 import { FetchStateMachine } from './fetch.js';
+import { supportedPropertyFault } from '../control/property-semantics.js';
 import type { GroupOrder } from '../data/types.js';
 import { NamespaceStateMachine } from './namespace.js';
 import { TrackAliasManager } from './track-alias.js';
@@ -1510,6 +1511,10 @@ export class Session {
 
   private handleSubscribeOk(msg: SubscribeOk): SessionOutboundAction[] {
     const sub = this.subscriptions.get(msg.requestId as bigint);
+    // Semantic cancellation revokes every owner before asynchronous I/O cleanup.
+    // Its retained pending shadow still admits the one legal crossed response.
+    if (isRequestStreamDraft(this._draftVersion) && sub?.isTerminated
+        && this.toleratesCrossedOk(msg.requestId as bigint, 'subscribe')) return [];
     if (!sub) {
       // §5.1: a SUBSCRIBE_OK crossing OUR cancellation of a PENDING SUBSCRIBE (we
       // unsubscribed / it was superseded) is a legal crossed message — tolerate it
@@ -1524,6 +1529,9 @@ export class Session {
         `Unknown request ID ${msg.requestId} for SUBSCRIBE_OK`,
       );
     }
+
+    const propertyFault = this.receivedTrackPropertyFault(msg.trackProperties ?? msg.trackExtensions);
+    if (propertyFault) return this.rejectMalformedTrackResponse(msg.requestId as bigint, propertyFault);
 
     sub.handleSubscribeOk(msg.trackAlias);
     this.settleFillRequest(msg.requestId as bigint, msg.parameters);
@@ -1697,6 +1705,8 @@ export class Session {
 
   private handleFetchOk(msg: FetchOk): SessionOutboundAction[] {
     const fetch = this.fetches.get(msg.requestId as bigint);
+    if (isRequestStreamDraft(this._draftVersion) && fetch?.isCompleted
+        && this.toleratesCrossedOk(msg.requestId as bigint, 'fetch')) return [];
     if (!fetch) {
       // A FETCH_OK crossing OUR FETCH_CANCEL of a PENDING fetch is a legal crossed
       // message — tolerate it and KEEP the shadow. A duplicate FETCH_OK (shadow
@@ -1709,6 +1719,9 @@ export class Session {
         `Unknown request ID ${msg.requestId} for FETCH_OK`,
       );
     }
+
+    const propertyFault = this.receivedTrackPropertyFault(msg.trackProperties ?? msg.trackExtensions);
+    if (propertyFault) return this.rejectMalformedTrackResponse(msg.requestId as bigint, propertyFault);
 
     // §9.17: "If End Location is smaller than the Start Location in the
     // corresponding FETCH the receiver MUST close the session with a
@@ -1746,25 +1759,80 @@ export class Session {
   }
 
   /**
-   * Terminate a pending OUTGOING subscription or fetch as a malformed track
-   * (§2.4.2) — e.g. a SUBSCRIBE_OK / FETCH_OK whose Track Properties carried a
-   * data-Object-only Property (wrong scope, not a wire-format error). This is NOT
-   * a session close: only the one request is reset (the I/O layer RESETs its
-   * stream). No-op for an unknown request ID.
-   *
-   * @see draft-ietf-moq-transport-18 §2.4.2
+   * Terminate the live subscriber-side SUBSCRIBE/PUBLISH and outgoing FETCH
+   * owners of one exact resolved Track on this session (18 §2.4.2; 22 §12.1).
+   * State is revoked synchronously; cancellation actions drive adapter cleanup.
+   * A local malformed Object can terminate a transferring FETCH after FETCH_OK.
+   * `corresponding = false` restricts the operation to its initiating request.
+   * Explicit identity also covers a malformed incoming PUBLISH or Track Status
+   * response before that request acquires subscription state. Unknown unresolved
+   * identities do not match unrelated owners. Draft14/16 retain their existing
+   * request-local behavior. This never declares group or playback completion.
    */
-  handleMalformedTrack(requestId: bigint): SessionOutboundAction[] {
-    const sub = this.subscriptions.get(requestId as bigint);
-    if (sub) {
-      if (!sub.isTerminated) sub.handleRequestError(RequestErrorCode.MALFORMED_TRACK, 'malformed track');
+  handleMalformedTrack(requestId: bigint, corresponding = true, track?: { namespace: Uint8Array[]; name: Uint8Array }): SessionOutboundAction[] {
+    if (!isRequestStreamDraft(this._draftVersion)) {
+      const sub = this.subscriptions.get(requestId as bigint);
+      if (sub) {
+        if (!sub.isTerminated) sub.handleRequestError(RequestErrorCode.MALFORMED_TRACK, 'malformed track');
+        return [];
+      }
+      const fetch = this.fetches.get(requestId as bigint);
+      if (fetch && !fetch.isCompleted) {
+        fetch.handleRequestError(RequestErrorCode.MALFORMED_TRACK, 'malformed track');
+      }
       return [];
     }
-    const fetch = this.fetches.get(requestId as bigint);
-    if (fetch && !fetch.isCompleted) {
-      fetch.handleRequestError(RequestErrorCode.MALFORMED_TRACK, 'malformed track');
+    const owners = this.getTrackRequestOwners(requestId, track).filter(owner => corresponding || owner.requestId === requestId);
+    const actions = owners.map<SessionOutboundAction>(owner => {
+      const sub = this.subscriptions.get(owner.requestId) ?? this.incomingSubscriptions.get(owner.requestId);
+      if (sub && !sub.isTerminated) {
+        if (!sub.isPublishInitiated) this.recordCancellation(owner.requestId, 'subscribe', !sub.isPending);
+        // Incoming PUBLISH reuses the publisher-side state-machine role for
+        // acceptance. Its local receiver cancellation uses that role's terminal.
+        if (sub.isPublishInitiated) sub.handleUnsubscribe();
+        else sub.handleRequestError(RequestErrorCode.MALFORMED_TRACK, 'malformed track');
+      }
+      const fetch = this.fetches.get(owner.requestId);
+      if (fetch && !fetch.isCompleted) {
+        if (!fetch.responseReceived) this.recordCancellation(owner.requestId, 'fetch', false);
+        fetch.handleMalformedTrack(RequestErrorCode.MALFORMED_TRACK, 'malformed track');
+      }
+      return { type: 'cancel_request', requestId: owner.requestId, reason: 'malformed track', malformedTrack: true };
+    });
+    // Resolve corresponding owners before removing the status request's identity.
+    if (this.pendingTrackStatuses.delete(requestId)) {
+      actions.push({ type: 'cancel_request', requestId, reason: 'malformed track', malformedTrack: true });
     }
-    return [];
+    return actions;
+  }
+
+  /** Snapshot the live subscriber/fetch owners of one exact Track on this session. */
+  getTrackRequestOwners(requestId: bigint, track?: { namespace: Uint8Array[]; name: Uint8Array }): Array<{ requestId: bigint; kind: 'subscribe' | 'publish' | 'fetch'; trackAlias?: bigint }> {
+    const trigger = this.subscriptions.get(requestId) ?? this.incomingSubscriptions.get(requestId);
+    const identity = track ?? this.pendingTrackStatuses.get(requestId);
+    const key = trigger?.trackKey ?? this.fetches.get(requestId)?.trackKey
+      ?? (identity === undefined ? undefined : [...identity.namespace, identity.name].map(bytes => Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')).join('/'));
+    const owners: Array<{ requestId: bigint; kind: 'subscribe' | 'publish' | 'fetch'; trackAlias?: bigint }> = [];
+    for (const sub of [...this.subscriptions.values(), ...this.incomingSubscriptions.values()]) {
+      if ((sub.isPublisher && !sub.isPublishInitiated) || sub.isTerminated
+          || (key === undefined ? sub.requestId !== requestId : sub.trackKey !== key)) continue;
+      owners.push({ requestId: sub.requestId, kind: sub.isPublishInitiated ? 'publish' : 'subscribe',
+        ...(sub.trackAlias === undefined ? {} : { trackAlias: sub.trackAlias }) });
+    }
+    for (const fetch of this.fetches.values()) {
+      if (fetch.isCompleted || (key === undefined ? fetch.requestId !== requestId : fetch.trackKey !== key)) continue;
+      owners.push({ requestId: fetch.requestId, kind: 'fetch' });
+    }
+    return owners;
+  }
+
+  private receivedTrackPropertyFault(props: TrackProperties | undefined): string | null {
+    return isRequestStreamDraft(this._draftVersion) && props !== undefined
+      ? supportedPropertyFault(props, 'track') : null;
+  }
+
+  private rejectMalformedTrackResponse(requestId: bigint, reason: string): SessionOutboundAction[] {
+    return this.handleMalformedTrack(requestId).map(action => action.type === 'cancel_request' ? { ...action, reason } : action);
   }
 
   /**
@@ -1878,8 +1946,10 @@ export class Session {
     // §9.19: TRACK_STATUS response — REQUEST_OK with track status params
     const trackStatus = this.pendingTrackStatuses.get(msg.requestId as bigint);
     if (trackStatus) {
+      const fault = this.receivedTrackPropertyFault(msg.trackProperties ?? msg.trackExtensions);
+      const actions = fault ? this.rejectMalformedTrackResponse(msg.requestId as bigint, fault) : [];
       this.pendingTrackStatuses.delete(msg.requestId as bigint);
-      return [];
+      return actions;
     }
 
     // Draft-14: SUBSCRIBE_NAMESPACE_OK arrives as normalized REQUEST_OK
@@ -2164,6 +2234,10 @@ export class Session {
     // Validate incoming request ID and auto-replenish MAX_REQUEST_ID §9.5
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
+
+    const propertyFault = this.receivedTrackPropertyFault(msg.trackProperties ?? msg.trackExtensions);
+    if (propertyFault) return [this.buildPublishReject(msg.requestId, RequestErrorCode.MALFORMED_TRACK, propertyFault),
+      ...this.handleMalformedTrack(msg.requestId, true, { namespace: msg.trackNamespace, name: msg.trackName }), ...(validated.replenish ?? [])];
 
     // Create the subscription state machine flagged as PUBLISH-initiated (this
     // also computes its track key). NOT stored / alias NOT registered until the
@@ -3513,6 +3587,7 @@ export class Session {
       options.startObject,
       options.endGroup,
       options.endObject,
+      [...namespace, name].map(bytes => Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')).join('/'),
     );
     this.fetches.set(requestId as bigint, fetchSm);
 
@@ -3620,7 +3695,7 @@ export class Session {
       fetchType,
       joiningRequestId: options.joiningRequestId,
       joiningStart: options.joiningStart,
-    });
+    }, sub.trackKey);
     this.fetches.set(requestId as bigint, fetchSm);
 
     // No width narrowing here: the field is vi64 on draft-18 (a peer-allocated
@@ -3778,6 +3853,9 @@ export class Session {
   handleFetchStreamFinished(requestId: bigint): void {
     const fetch = this.fetches.get(requestId as bigint);
     if (!fetch) return;
+    // Malformed-Track cancellation owns the request reset. A locally discarded
+    // reader must not reclaim that state and turn the reset into a clean FIN.
+    if (isRequestStreamDraft(this._draftVersion) && fetch.isCompleted) return;
     // §10.13: the data stream ended. Reclaim only once the FETCH_OK response has
     // ALSO been seen; if it has NOT arrived yet, KEEP the fetch so a later FETCH_OK
     // is matched (not treated as an unknown-request §9.1 close). handleFetchOk
@@ -4115,6 +4193,8 @@ export class Session {
         'INVALID_STATE',
       );
     }
+    const fault = this.receivedTrackPropertyFault(props);
+    if (fault) throw new SessionError(`${context}: ${fault}`, 'INVALID_STATE');
     return props;
   }
 
