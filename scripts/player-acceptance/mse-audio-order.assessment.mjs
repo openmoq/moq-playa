@@ -14,6 +14,38 @@ export function activePcmSpan(bytes) {
   return { first, last, span: first < 0 ? 0 : last - first };
 }
 
+/** Contiguous quanta a realtime clock must deliver before measured playback may start. */
+export const CLOCK_SETTLE_QUANTA = 8;
+
+/**
+ * Gates PCM capture on a settled realtime clock. Chrome's realtime destination
+ * may advance AudioWorklet currentFrame without calling process() while its
+ * output device starts (0 -> 384 at 8 kHz on fake/headless output). Those gaps
+ * precede play(), so only paused-element silence is lost. Once armed and
+ * settled, every quantum is recorded and any gap is a measurement failure.
+ */
+export function createQuantumGate(settleQuanta = CLOCK_SETTLE_QUANTA) {
+  let previous = null, run = 0, armed = false, recording = false;
+  const preroll = { quanta: 0, discontinuities: [] };
+  return {
+    preroll,
+    get recording() { return recording; },
+    arm() { armed = true; },
+    /** 'preroll' (not measured), 'record', or 'gap' (measured discontinuity). */
+    accept(frame, length) {
+      const contiguous = previous === null || frame === previous.frame + previous.length;
+      const expectedFrame = previous === null ? null : previous.frame + previous.length;
+      previous = { frame, length };
+      if (recording) return contiguous ? 'record' : 'gap';
+      preroll.quanta++;
+      if (!contiguous) preroll.discontinuities.push({ expectedFrame, frame });
+      run = contiguous ? run + 1 : 1;
+      if (armed && run >= settleQuanta) recording = true;
+      return 'preroll';
+    },
+  };
+}
+
 export function assessAudioOrder(cases) {
   const failures = [];
   const check = (ok, name) => { if (!ok) failures.push(name); };

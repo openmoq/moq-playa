@@ -232,6 +232,10 @@ in-order twice, the real adapter receiving head then tail, and an omitted-tail
 negative control. Actual native append bytes identify the packet order; append
 observations must terminate exactly once. AudioWorklet captures every quantum,
 including silence, through at least 4096 context-clock samples after media ends.
+Capture starts only after the resumed context delivers eight contiguous quanta,
+before `play()`: Chrome may advance `currentFrame` while its output device starts
+(seen on headless CI output). Those pre-play gaps are retained as `preroll`
+diagnostics; any gap after capture starts fails the case.
 The candidate's active PCM span must match the healthy repeat within 16 samples,
 while omission must lose one 1024-sample packet within that tolerance. Buffered
 ranges are retained only as diagnostics because they can conceal missing audio.
