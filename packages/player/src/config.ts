@@ -116,7 +116,7 @@ export interface ConnectionConfig {
    * Compatibility override for nonstandard catalog track names.
    * Default: 'catalog', as required by MSF-01 §5.
    */
-  readonly catalogTrackName?: string;
+  readonly catalogTrackName: string;
 
   /**
    * MAX_REQUEST_ID for the MOQT session. Default: 100.
@@ -775,6 +775,7 @@ export const DEFAULT_PLAYER_CONFIG = {
   reconnectDelayMs: 1_000,
   reconnectBackoff: 'exponential' as const,
   moqtImplementation: 'proto-moq',
+  catalogTrackName: 'catalog',
 
   // Playback tuning
   gapTimeoutMs: 500,

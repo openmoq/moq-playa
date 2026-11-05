@@ -66,6 +66,7 @@ import { contextFields, identityKey, namespaceFieldsOf, sameNamespaceFields } fr
 /** Default player options, merged with user-provided options. */
 const DEFAULTS = {
   draftVersion: 16 as const,
+  catalogTrackName: 'catalog',
   autoplay: false,
   volume: 1,
   muted: false,
@@ -601,6 +602,7 @@ export class Player {
       url: opts.url,
       namespace: opts.namespace,
       draftVersion,
+      catalogTrackName: opts.catalogTrackName ?? DEFAULTS.catalogTrackName,
       autoQuality: opts.autoQuality ?? DEFAULTS.autoQuality,
       startLevel: opts.startLevel ?? DEFAULTS.startLevel,
       clock: this.audioClock,
@@ -610,10 +612,6 @@ export class Player {
       }),
       createConnection: () => new MoqtConnection(draftVersion),
     };
-
-    if (opts.catalogTrackName !== undefined) {
-      Object.assign(base, { catalogTrackName: opts.catalogTrackName });
-    }
 
     if (this.strategy === 'webcodecs') {
       Object.assign(base, {
