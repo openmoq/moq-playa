@@ -129,6 +129,35 @@ async function fixture(options: { draft?: 16 | 18 | 22; warm?: boolean; audio?: 
 }
 
 describe('owner-local initial warm admission', () => {
+  it.each([18, 22] as const)('draft-%i missing FETCH ranges leave the group open for later objects', async draft => {
+    const h = await fixture({ draft });
+    await h.accept(0, 70n, { group: 9n, object: 3n });
+    await h.live(4n);
+    const pipeline = (h.player as unknown as { videoPipeline: {
+      pushObject: (obj: MoqtObject) => void; endedGroups: Set<bigint>;
+    } }).videoPipeline;
+    const push = vi.spyOn(pipeline, 'pushObject');
+    const prefix = await h.openPrefix(0, { group: 9n, object: 3n });
+    await prefix.send(0n);
+    const pipe = h.b.uniOut.at(-1)!;
+    // Absolute Locations 9/1 (DNE), 9/2 (Unknown), then normal Object 9/3.
+    // Draft 18 carries a zero Payload Length on each range; 22 omits it.
+    pipe.injectRead(Uint8Array.from(draft === 18
+      ? [0x80, 0x8c, 9, 1, 0, 0x81, 0x0c, 9, 2, 0]
+      : [0x80, 0x8c, 9, 1, 0x81, 0x0c, 9, 2]));
+    pipe.injectRead(Uint8Array.of(0x10, 128, 4, 0, 3, 255, 128));
+    await prefix.fin();
+    expect(push.mock.calls.some(([obj]) => obj.kind === 'data' && obj.objectId === 3n)).toBe(true);
+    expect(h.media.some(obj => obj.object === 3n)).toBe(true);
+    expect(pipeline.endedGroups.has(9n)).toBe(false);
+    expect(h.raw.filter(obj => obj.kind === 'gap').map(obj => obj.status)).toEqual([1n, 0n]);
+    await h.status(ObjectStatus.END_OF_GROUP, 9n, 6n);
+    expect(pipeline.endedGroups.has(9n)).toBe(true);
+    await h.status(ObjectStatus.END_OF_TRACK, 10n);
+    expect(h.captured.at(-1)!.input).toMatchObject({ status: ObjectStatus.END_OF_TRACK });
+    expect(h.errors).toEqual([]);
+  });
+
   it('classifies actual data and status receipts without treating EOG or empty data as a group start', async () => {
     const h = await fixture(); await h.accept();
     const push = vi.spyOn(WarmStartHead.prototype, 'push');

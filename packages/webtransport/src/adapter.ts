@@ -5965,7 +5965,8 @@ export class MoqtConnection {
     }
     // A fill counts toward its subscription's terminal stream count. If its
     // reset cannot be proved, closing the session prevents a false clean end.
-    const reset = Promise.resolve().then(() => writer.abort(reason)).then(() => true, () => false);
+    const reset = Promise.resolve().then(() => this.transport?.resetSendStream
+      ? this.transport.resetSendStream(writer, reason) : writer.abort(reason)).then(() => true, () => false);
     if (!await this.allFulfilledWithin([reset], MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS)) {
       this.closeSessionInternalError(`Fill for subscription ${fillOf} could not be reset`);
     }
@@ -6056,7 +6057,7 @@ export class MoqtConnection {
       throw new MoqtConnectionError(`Object ${fields.groupId}/${fields.objectId} is outside the fill range`, { errorSource: 'data' });
     }
     const { bytes, nextPrior } = encodeFetchObject18(fields, state.prior, state.isFirstObject, state.groupOrder);
-    await state.writer.write(bytes);
+    await this.writeFetchStream(streamId, () => state.writer.write(bytes));
     state.prior = nextPrior;
     state.isFirstObject = false;
   }
@@ -6071,7 +6072,7 @@ export class MoqtConnection {
     }
     const { bytes, nextPrior } = encodeFetchEndOfRange18(nonExistent, groupId, objectId, state.prior,
       isDraft22(this.session.draftVersion) ? 22 : 18);
-    await state.writer.write(bytes);
+    await this.writeFetchStream(streamId, () => state.writer.write(bytes));
     state.prior = nextPrior;
     state.isFirstObject = false;
   }
@@ -6083,14 +6084,8 @@ export class MoqtConnection {
     if (state.closing) return state.closing;
     if (state.fillOf !== undefined) {
       const fin = (async () => {
-        try { await state.writer.close(); }
-        catch (err) {
-          // A peer may cancel just this fill (22 section 3.4.1). Prove the
-          // stream reset before releasing its terminal accounting; only an
-          // unproven reset requires closing the session.
-          await this.abortFetchWriter(state.writer, err instanceof Error ? err : new Error(String(err)), state.fillOf);
-          throw err;
-        } finally {
+        try { await this.writeFetchStream(streamId, () => state.writer.close()); }
+        finally {
           this.removeOutgoingFetchStream(streamId);
           this.inboundFetchGroupOrder.delete(state.requestId);
         }
@@ -6114,6 +6109,26 @@ export class MoqtConnection {
     // state across that FIN because the two streams have no delivery ordering.
     this.session.reclaimServedFetch(state.requestId);
     await this.finishServedFetchRequest22(state.requestId);
+  }
+
+  private async writeFetchStream(streamId: bigint, write: () => Promise<void>): Promise<void> {
+    const state = this.fetchOutgoingStreams.get(streamId);
+    if (!state) throw new MoqtConnectionError(`Unknown fetch stream ${streamId}`, { errorSource: 'data' });
+    try { await write(); }
+    catch (err) {
+      if (state.fillOf !== undefined && this.fetchOutgoingStreams.get(streamId) === state) {
+        // Transfer reset ownership before awaiting, so concurrent failed writes
+        // or cancellation cannot reset this writer twice. Keep PUBLISH_DONE
+        // blocked through the existing in-flight publisher-operation count.
+        const owner = state.fillOf;
+        this.pendingPublishOps.set(owner, (this.pendingPublishOps.get(owner) ?? 0) + 1);
+        this.removeOutgoingFetchStream(streamId);
+        try {
+          await this.abortFetchWriter(state.writer, err instanceof Error ? err : new Error(String(err)), owner);
+        } finally { this.endPublishOp(owner); }
+      }
+      throw err;
+    }
   }
 
   // ─── Internal ─────────────────────────────────────────────────
@@ -8179,7 +8194,7 @@ export class MoqtConnection {
               groupId: item.groupId,
               subgroupId: 0n,
               objectId: item.objectId,
-              status: varint(item.nonExistent ? 0x3 : 0x0),
+              status: varint(item.nonExistent ? 0x1 : 0x0),
             };
             this.onObject?.(streamId, delivered);
           }

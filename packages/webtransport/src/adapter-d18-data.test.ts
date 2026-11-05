@@ -453,7 +453,7 @@ describe('MoqtConnection(18) FETCH data', () => {
     expect(objs[1]!.kind).toBe('gap');
     expect(objs[1]!.groupId).toBe(1n);
     expect(objs[1]!.objectId).toBe(5n);
-    if (objs[1]!.kind === 'gap') expect(objs[1]!.status).toBe(0x3n);
+    if (objs[1]!.kind === 'gap') expect(objs[1]!.status).toBe(0x1n);
   });
 
   it('reassembles a fragmented fetch stream (header + objects across chunks)', async () => {
