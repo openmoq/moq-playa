@@ -45,6 +45,45 @@ export interface CmafChunkSamples {
 const S = '16';
 
 /**
+ * Read successive complete CMAF chunks carried by one MOQT Object (CMSF §3.3).
+ * All chunks and trailing boxes are validated before any result is returned.
+ * Null means a single bounded moof, with optional prefix boxes, is awaiting its
+ * legacy separately delivered mdat. Buffering that partial input is the caller's
+ * responsibility. An incomplete later chunk is an error, never a partial success.
+ */
+export function readCmafObjectSamples(bytes: Uint8Array, context: LocmafTrackContext): readonly CmafChunkSamples[] | null {
+    const top = childBoxes(bytes, 0, bytes.length, S);
+    const moofs: number[] = [];
+    for (let i = 0; i < top.length; i++) if (top[i]!.type === 'moof') moofs.push(i);
+    if (!moofs.length) throw new LocmafFormatError(S, 0, 'object has no moof');
+    if (top.slice(0, moofs[0]!).some(box => box.type === 'mdat')) {
+        throw new LocmafFormatError(S, 0, 'mdat precedes the first moof');
+    }
+    if (moofs.length === 1 && !top.some(box => box.type === 'mdat')) return null;
+
+    const reads: CmafChunkSamples[] = [];
+    let start = 0;
+    for (let i = 0; i < moofs.length; i++) {
+        const next = moofs[i + 1] ?? top.length;
+        let end = next;
+        if (i + 1 < moofs.length) {
+            // Boxes after this chunk's last mdat prefix the following chunk.
+            // Keep all mdats of this chunk together; runs may use several.
+            let lastMdat = -1;
+            for (let j = moofs[i]! + 1; j < next; j++) if (top[j]!.type === 'mdat') lastMdat = j;
+            if (lastMdat < 0) throw new LocmafFormatError(S, top[moofs[i]!]!.end, 'no mdat follows the moof');
+            end = lastMdat + 1;
+        }
+        // Reuse the same sample reader on the ORIGINAL object coordinates.
+        // This preserves explicit base_data_offset values while restricting
+        // sample ranges to this chunk's own mdats, never a neighbour's media.
+        reads.push(readCmafSamplesInBoxes(bytes, context, top.slice(start, end)));
+        start = end;
+    }
+    return reads;
+}
+
+/**
  * Read the samples of a verbatim CMAF chunk.
  * @throws {LocmafFormatError} when the chunk has no single moof, no mdat after
  *   it, no traf whose tfhd.track_ID is the CMAF Header's track, more than one
@@ -53,8 +92,11 @@ const S = '16';
  *   mdat payloads carry, or a tfhd, tfdt or trun of an unimplemented version.
  */
 export function readCmafChunkSamples(chunk: Uint8Array, context: LocmafTrackContext): CmafChunkSamples {
+    return readCmafSamplesInBoxes(chunk, context, childBoxes(chunk, 0, chunk.length, S));
+}
+
+function readCmafSamplesInBoxes(chunk: Uint8Array, context: LocmafTrackContext, top: readonly IsoBoxHeader[]): CmafChunkSamples {
     const view = viewOf(chunk);
-    const top = childBoxes(chunk, 0, chunk.length, S);
     const moofs = top.filter((b) => b.type === 'moof');
     if (moofs.length !== 1) throw new LocmafFormatError(S, 0, `chunk has ${moofs.length} moof boxes`);
     const moof = moofs[0]!;

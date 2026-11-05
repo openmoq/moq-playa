@@ -136,7 +136,7 @@ export function buildFixtureCatalog(
     isLive: true as const,
     role: t.meta.role,
     codec: t.meta.codec,
-    renderGroup: fixture.manifest.renderGroup,
+    renderGroup: t.meta.renderGroup ?? fixture.manifest.renderGroup,
     ...(t.meta.altGroup !== undefined ? { altGroup: t.meta.altGroup } : {}),
     ...(t.meta.lang !== undefined ? { lang: t.meta.lang } : {}),
     ...(t.meta.label !== undefined ? { label: t.meta.label } : {}),

@@ -16,6 +16,9 @@ importers:
 
   .:
     devDependencies:
+      '@openmoq/transport':
+        specifier: workspace:*
+        version: link:packages/transport
       '@types/node':
         specifier: ^22.0.0
         version: 22.19.13

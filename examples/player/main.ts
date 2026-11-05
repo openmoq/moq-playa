@@ -17,12 +17,12 @@
  * @see draft-ietf-moq-loc-01 §4.1 (audio independently decodable)
  */
 
-import { MoqtPlayer, PlayerErrorCode, usesMsePath } from '@openmoq/player';
+import { MoqtPlayer, PlayerErrorCode, usesMsePath, buildCatalogSelection } from '@openmoq/player';
 import { MoqtConnection } from '@openmoq/webtransport';
 import { QlogTrace, varint } from '@openmoq/transport';
 import { CATALOG_TRACK_NAME } from '@openmoq/msf';
 import { log } from '../shared/log.js';
-import { namespace, namespaceArg, authority, warmStart, certHash, draftVersion, catalogBootstrap } from '../shared/cert.js';
+import { namespaceArg, authority, warmStart, certHash, draftVersion, catalogBootstrap } from '../shared/cert.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
 import {
     AudioAlignedClock,
@@ -37,9 +37,11 @@ import {
     createWebTransport,
 } from '@openmoq/browser';
 
-import type { PlayerEventMap, PlayerStats, TTFFBreakdown } from '@openmoq/player';
+import type { PlayerEventMap, PlayerStats, TTFFBreakdown, CatalogSelection, SelectionConfig } from '@openmoq/player';
 import type { CatalogTrack } from '@openmoq/msf';
-import { TeardownBarrier, ViewRetuner, parseVideoAltGroup } from './view-selection.js';
+import { renderTrackMenus, playbackOwnerIsCurrent, selectionMenus, updateSelectionLink,
+    type PresentationChoice } from './selection-controls.js';
+import { TeardownBarrier, ViewRetuner, parseVideoAltGroup, waitForOutput } from './view-selection.js';
 
 // ─── Settings Modal ──────────────────────────────────────────────────
 
@@ -193,7 +195,6 @@ for (const evt of ['pause', 'play', 'playing', 'waiting', 'stalled', 'volumechan
         log(`[video] ${evt} t=${videoEl.currentTime.toFixed(2)} ready=${videoEl.readyState}${detail}`);
     });
 }
-const statsEl = document.getElementById('stats')!;
 const playerWrap = document.getElementById('player-wrap')!;
 const startBtn = document.getElementById('start') as HTMLButtonElement;
 const centerPlay = document.getElementById('center-play')!;
@@ -214,16 +215,22 @@ const sparkLatencyCanvas = document.getElementById('spark-latency') as HTMLCanva
 const sparkJitterVal = document.getElementById('spark-jitter-val')!;
 const sparkLatencyVal = document.getElementById('spark-latency-val')!;
 const videoTrackDropdown = document.getElementById('video-track-dropdown')!;
-const videoTrackBtn = document.getElementById('video-track-btn')!;
+const videoTrackBtn = document.getElementById('video-track-btn') as HTMLButtonElement;
 const videoTrackLabel = document.getElementById('video-track-label')!;
 const videoTrackMenu = document.getElementById('video-track-menu')!;
 const audioTrackDropdown = document.getElementById('audio-track-dropdown')!;
-const audioTrackBtn = document.getElementById('audio-track-btn')!;
+const audioTrackBtn = document.getElementById('audio-track-btn') as HTMLButtonElement;
 const audioTrackLabel = document.getElementById('audio-track-label')!;
 const audioTrackMenu = document.getElementById('audio-track-menu')!;
 const viewControl = document.getElementById('view-control')!;
 const viewSelect = document.getElementById('view-select') as HTMLSelectElement;
-let selectedVideoAltGroup: number | undefined;
+const selectionStatus = document.getElementById('selection-status')!;
+const programControl = document.getElementById('program-control')!;
+const programSelect = document.getElementById('program-select') as HTMLSelectElement;
+let selectedPresentation: SelectionConfig | undefined;
+let selectedAudioLanguage: string | undefined;
+let catalogSelection: CatalogSelection | null = null;
+let pendingVideoSelection: object | null = null;
 
 let player: MoqtPlayer | null = null;
 /** Adapter handle for the current session (diagnostics + playback recovery). */
@@ -391,11 +398,11 @@ function stopSparklineLoop(): void { clearInterval(sparkIntervalId); }
 
 // ─── Player chrome (auto-hide, click-to-toggle, fullscreen) ─────────
 
-// LIVE Stop/Play semantics (NOT pause/resume): this is live media, so "pause"
+// Stop/Play starts a presentation anew. For live media, "pause"
 // via REQUEST_UPDATE forward:0 is wrong for the demo — the <video> element kept
 // draining its buffer, and resume stranded currentTime behind a buffered gap
 // (permanent stall). Stop now tears the player down (unsubscribe + close);
-// Play performs a fresh tune-in (connect → catalog → subscribe → live edge).
+// Play performs a fresh tune-in (connect → catalog → subscribe → play).
 let isPlaying = false;
 let transitioning = false; // double-click guard while start/stop is in flight
 let hideTimer: ReturnType<typeof setTimeout> | null = null;
@@ -455,6 +462,7 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 async function reconnect(reason: string): Promise<void> {
     if (reconnecting || transitioning || !isPlaying) return;
     reconnecting = true;
+    refreshTrackSelector();
     reconnectCancelled = false;
     log(`⚠ ${reason} — reconnecting...`);
     try {
@@ -493,6 +501,7 @@ async function reconnect(reason: string): Promise<void> {
         }
     } finally {
         reconnecting = false;
+        refreshTrackSelector();
     }
 }
 
@@ -636,6 +645,10 @@ async function stopPlayback(strict = false): Promise<void> {
     const p = player;
     const oldExternalConnection = externalConnection;
     player = null;
+    catalogSelection = null;
+    selectionStatus.textContent = '';
+    pendingVideoSelection = null;
+    refreshTrackSelector();
     externalConnection = null;
     renderer = null;
     mediaSourceRef = null;
@@ -656,46 +669,44 @@ async function stopPlayback(strict = false): Promise<void> {
     }
     try {
         await teardownBarrier.wait();
-        log('Stopped. Press play to tune back in at the live edge.');
+        log('Stopped. Press play to start the selected presentation anew.');
     } catch (err) {
         log(`stop: ${(err as Error).message}`);
         if (strict) throw err;
     }
 }
 
-const viewRetuner = new ViewRetuner({
+const viewRetuner = new ViewRetuner<PresentationChoice>({
     stop: () => stopPlayback(true),
-    start: async (group, signal) => {
-        selectedVideoAltGroup = group;
+    start: async (choice, signal) => {
+        selectedPresentation = choice.selection;
+        if (choice.language) selectedAudioLanguage = choice.language;
         await startPlayback(signal);
     },
-});
+}, 15_000, (a, b) => a.key === b.key);
 
-viewSelect.addEventListener('change', () => {
-    const p = player;
-    if (!p || transitioning || reconnecting || viewRetuner.busy) return;
-    const group = Number(viewSelect.value);
-    const current = currentVideoGroup(p);
+function retunePresentation(p: MoqtPlayer, epoch: number, choice: PresentationChoice, choices: readonly PresentationChoice[]): void {
+    if (!playbackOwnerIsCurrent(p, epoch, player, playEpoch) || selectionBusy() || choice.active) return;
     transitioning = true;
-    viewSelect.disabled = true;
+    refreshTrackSelector();
     loadingSpinner.style.display = '';
-    void viewRetuner.change(group, p.availableVideoGroups, current).then(changed => {
+    log(`Start selected presentation anew: ${choice.label}`);
+    void viewRetuner.change(choice, choices, choices.find(item => item.active)).then(changed => {
         if (changed) {
-            params.set('altGroup', String(group));
+            updateSelectionLink(params, choice.selection);
             const url = new URL(location.href);
-            url.searchParams.set('altGroup', String(group));
+            updateSelectionLink(url.searchParams, choice.selection);
             history.replaceState(null, '', url);
         }
     }).catch((error: Error) => {
-        log(`View change failed: ${error.message}`);
+        log(`Presentation restart failed: ${error.message}`);
     }).finally(() => {
         transitioning = false;
-        viewSelect.disabled = false;
         loadingSpinner.style.display = 'none';
         if (!isPlaying) centerPlay.style.display = '';
-        if (player) buildTrackSelector(player);
+        refreshTrackSelector();
     });
-});
+}
 
 /** Stop ⇄ fresh-tune-in toggle, guarded against double clicks. */
 async function toggleStopPlay(): Promise<void> {
@@ -713,6 +724,7 @@ async function toggleStopPlay(): Promise<void> {
     }
     if (transitioning) return;
     transitioning = true;
+    refreshTrackSelector();
     pauseBtn.disabled = true;
     try {
         if (isPlaying) {
@@ -730,6 +742,7 @@ async function toggleStopPlay(): Promise<void> {
     } finally {
         transitioning = false;
         pauseBtn.disabled = false;
+        refreshTrackSelector();
     }
 }
 
@@ -1094,7 +1107,8 @@ async function startPlayback(outputSignal?: AbortSignal): Promise<void> {
 }
 
 async function startPlaybackAttempt(epoch: number, transportAbort: AbortController, outputSignal?: AbortSignal): Promise<void> {
-    const videoAltGroup = selectedVideoAltGroup ?? parseVideoAltGroup(params.get('altGroup'));
+    const legacyAltGroup = selectedPresentation === undefined ? parseVideoAltGroup(params.get('altGroup')) : undefined;
+    const selection = selectedPresentation ?? (legacyAltGroup !== undefined ? { videoAltGroup: legacyAltGroup } : undefined);
     // Stale-attempt token: a reconnect attempt that times out (withTimeout) keeps
     // running underneath — the loop's cleanup stopPlayback() bumps playEpoch, and
     // this attempt must then bail without mutating player/UI state.
@@ -1213,7 +1227,8 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
         ...(draftVersion ? { draftVersion } : {}),
         clock: audioClock,
         ...(videoConstraints ? { videoConstraints } : {}),
-        ...(videoAltGroup !== undefined ? { videoAltGroup } : {}),
+        ...(selection ? { selection } : {}),
+        ...(selectedAudioLanguage ? { audioLanguages: [selectedAudioLanguage] } : {}),
         ...(catalogFromUrl ? { catalog: catalogFromUrl } : {}),
         ...(prefetched ? { catalog: prefetched.catalog, connection: prefetched.connection } : {}),
         ...(lateMs ? { lateFrameThresholdMs: lateMs } : {}),
@@ -1284,8 +1299,7 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     if (outputSignal?.aborted) transportAbort.abort(outputSignal.reason);
     player = p;
     const on = <K extends keyof PlayerEventMap>(type: K, listener: (event: PlayerEventMap[K]) => void) =>
-        p.on(type, event => { if (player === p && epoch === playEpoch) listener(event); });
-    let catalogTracks: readonly CatalogTrack[] = [];
+        p.on(type, event => { if (playbackOwnerIsCurrent(p, epoch, player, playEpoch)) listener(event); });
     const applySurface = (track: CatalogTrack) => {
         cmafActive = usesMsePath(track.packaging, locmafDecoding);
         canvas.style.display = cmafActive ? 'none' : 'block';
@@ -1320,7 +1334,7 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     });
 
     on('catalog_received', (e) => {
-        catalogTracks = e.catalog.tracks;
+        catalogSelection = buildCatalogSelection(e.catalog, { catalogNamespace: namespaceArg });
         log(`Catalog: ${e.catalog.tracks.length} tracks`);
         for (const t of e.catalog.tracks) {
             const parts: string[] = [t.name];
@@ -1331,18 +1345,24 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
         }
 
         // Populate track selector after subscriptions are set up (next microtask)
-        setTimeout(() => { if (player === p && epoch === playEpoch) buildTrackSelector(p); }, 0);
+        setTimeout(() => { if (playbackOwnerIsCurrent(p, epoch, player, playEpoch)) buildTrackSelector(p); }, 0);
     });
 
     on('catalog_updated', (e) => {
-        catalogTracks = e.catalog.tracks;
+        catalogSelection = buildCatalogSelection(e.catalog, { catalogNamespace: namespaceArg });
         buildTrackSelector(p);
         log('Catalog updated (delta).');
     });
 
+    on('selection_changed', (e) => {
+        if (e.catalog) catalogSelection = buildCatalogSelection(e.catalog, { catalogNamespace: namespaceArg });
+        const adopted = selectionMenus(catalogSelection, e.selection);
+        const track = adopted.adoptedVideo ?? adopted.adoptedAudio;
+        if (track) applySurface(track.track);
+        buildTrackSelector(p);
+    });
+
     on('track_subscribed', (e) => {
-        const track = catalogTracks.find(track => track.name === e.trackName);
-        if (track && (e.mediaType === 'video' || (e.mediaType === 'audio' && p.availableVideoTracks.length === 0))) applySurface(track);
         buildTrackSelector(p);
         log(`Subscribed: ${e.trackName} (${e.mediaType}, reqId=${e.requestId})`);
     });
@@ -1360,7 +1380,7 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     on('keyframe_waiting', (e) => log(`Keyframe waiting: ${e.mediaType} group=${e.groupId}`));
     on('recovery_action', (e) => log(`Recovery: ${e.action.type}`));
 
-    on('state_changed', (e) => log(`State: ${e.from} -> ${e.to}`));
+    on('state_changed', (e) => { log(`State: ${e.from} -> ${e.to}`); buildTrackSelector(p); });
     on('quality_switched', (e) => {
         log(`Quality: ${e.fromTrackName} -> ${e.toTrackName} (${e.reason})`);
         buildTrackSelector(p);
@@ -1370,7 +1390,8 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     on('media_object', (e) => {
         // Liveness watchdog: ANY media object (audio included) proves the data
         // path is alive — stamp before the video-only sparkline filter.
-        noteMediaArrival();
+        const adopted = selectionMenus(catalogSelection, p.selection);
+        if (adopted.adoptedVideo?.track.isLive || adopted.adoptedAudio?.track.isLive) noteMediaArrival();
         if (e.mediaType !== 'video' || e.kind !== 'data') return;
         const nowMs = performance.now();
 
@@ -1397,20 +1418,25 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     // Expose player on window for console inspection (dev only)
     (window as any).__player = player;
 
-    const output = outputSignal ? waitForOutput(p, outputSignal) : undefined;
+    const output = outputSignal ? waitForOutput(p, outputSignal,
+        () => selectionMenus(catalogSelection, p.selection).hasVideo,
+        () => playbackOwnerIsCurrent(p, epoch, player, playEpoch)) : undefined;
     void output?.promise.catch(() => {});
     try {
         await p.load();
         if (epoch !== playEpoch) {
             // A late completion must not resurrect a stopped player.
-            try { await p.destroy(); } catch { /* best effort */ }
             return;
         }
         // The MSE adapter owns startup positioning and playback.
         p.play();
         attemptRenderer.start();
-        await output?.promise;
+        const started = await output?.promise;
         if (epoch !== playEpoch) return;
+        if (started === 'audio-accepted') {
+            selectionStatus.textContent = 'Audio selection accepted; output not verified.';
+            log(selectionStatus.textContent);
+        }
 
         loadingSpinner.style.display = 'none';
         controls.style.display = '';
@@ -1422,18 +1448,6 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     }
 }
 
-function waitForOutput(p: MoqtPlayer, signal: AbortSignal) {
-    let complete!: () => void;
-    let fail!: (error: unknown) => void;
-    const promise = new Promise<void>((resolve, reject) => { complete = resolve; fail = reject; });
-    const offFrame = p.on('first_frame', complete);
-    const offError = p.on('error', e => { if (e.error.severity === 'fatal') fail(new Error(e.error.message)); });
-    const aborted = () => fail(signal.reason);
-    signal.addEventListener('abort', aborted, { once: true });
-    if (signal.aborted) aborted();
-    return { promise, dispose() { offFrame(); offError(); signal.removeEventListener('abort', aborted); } };
-}
-
 // ─── Track Dropdowns ─────────────────────────────────────────────────
 
 // Close any open dropdown on outside click
@@ -1443,120 +1457,42 @@ document.addEventListener('click', (e) => {
 });
 videoTrackBtn.addEventListener('click', (e) => {
     e.stopPropagation();
+    if (videoTrackBtn.disabled) return;
     audioTrackDropdown.classList.remove('open');
     videoTrackDropdown.classList.toggle('open');
 });
 audioTrackBtn.addEventListener('click', (e) => {
     e.stopPropagation();
+    if (audioTrackBtn.disabled) return;
     videoTrackDropdown.classList.remove('open');
     audioTrackDropdown.classList.toggle('open');
 });
 
-function buildTrackSelector(p: MoqtPlayer): void {
-    const videoTracks = p.availableVideoTracks;
-    const groups = p.availableVideoGroups;
-    viewControl.hidden = groups.length < 2;
-    viewSelect.replaceChildren(...groups.map(group => {
-        const option = document.createElement('option');
-        option.value = String(group.altGroup);
-        option.textContent = group.tracks[0]?.label ?? `View ${group.altGroup}`;
-        return option;
-    }));
-    const group = currentVideoGroup(p);
-    if (group !== undefined) viewSelect.value = String(group);
-    const currentRes = p.stats.currentResolution;
-
-    // Video dropdown
-    if (videoTracks.length > 0) {
-        videoTrackDropdown.classList.add('visible');
-
-        // Find current
-        const current = videoTracks.find(t =>
-            currentRes && t.width === currentRes.width && t.height === currentRes.height,
-        ) ?? videoTracks[0];
-
-        // Button label: current resolution
-        const label = current?.width && current?.height
-            ? `${current.height}p`
-            : 'Video';
-        videoTrackLabel.innerHTML = label +
-            (videoTracks.length > 1 ? '' : '');
-
-        // Hide chevron if only one track
-        const chevron = videoTrackBtn.querySelector('.chevron') as HTMLElement;
-        if (chevron) chevron.style.display = videoTracks.length > 1 ? '' : 'none';
-
-        // Build menu
-        videoTrackMenu.innerHTML = '';
-        for (const t of videoTracks) {
-            const item = document.createElement('div');
-            item.className = 'track-dropdown-item';
-            if (current && t.name === current.name) item.classList.add('active');
-
-            const nameSpan = document.createElement('span');
-            nameSpan.textContent = t.width && t.height ? `${t.width}x${t.height}` : t.name;
-
-            const detailSpan = document.createElement('span');
-            detailSpan.className = 'item-detail';
-            detailSpan.textContent = t.bitrate ? `${(t.bitrate / 1000).toFixed(0)}k` : '';
-
-            item.appendChild(nameSpan);
-            item.appendChild(detailSpan);
-
-            item.addEventListener('click', (e) => {
-                e.stopPropagation();
-                videoTrackDropdown.classList.remove('open');
-                p.selectVideoTrack(t.name).then(() => {
-                    log(`Switched to ${t.name}`);
-                }).catch((err: Error) => {
-                    log(`Switch failed: ${err.message}`);
-                });
-            });
-
-            videoTrackMenu.appendChild(item);
-        }
-    } else {
-        videoTrackDropdown.classList.remove('visible');
-    }
-
-    // Audio dropdown — show codec/bitrate info (no switching yet)
-    // TODO: wire audio track switching when implemented
-    const catalog = (p as any)._catalogState;
-    if (catalog) {
-        const audioTracks = catalog.tracks.filter((t: any) => t.role === 'audio');
-        if (audioTracks.length > 0) {
-            audioTrackDropdown.classList.add('visible');
-            const current = audioTracks[0];
-            audioTrackLabel.textContent = current.codec ?? 'Audio';
-
-            const chevron = audioTrackBtn.querySelector('.chevron') as HTMLElement;
-            if (chevron) chevron.style.display = audioTracks.length > 1 ? '' : 'none';
-
-            audioTrackMenu.innerHTML = '';
-            for (const t of audioTracks) {
-                const item = document.createElement('div');
-                item.className = 'track-dropdown-item';
-                if (t === current) item.classList.add('active');
-
-                const nameSpan = document.createElement('span');
-                nameSpan.textContent = t.codec ?? t.name;
-
-                const detailSpan = document.createElement('span');
-                detailSpan.className = 'item-detail';
-                const parts: string[] = [];
-                if (t.bitrate) parts.push(`${(t.bitrate / 1000).toFixed(0)}k`);
-                if (t.samplerate) parts.push(`${t.samplerate / 1000}kHz`);
-                detailSpan.textContent = parts.join(' ');
-
-                item.appendChild(nameSpan);
-                item.appendChild(detailSpan);
-                audioTrackMenu.appendChild(item);
-            }
-        }
-    }
+function selectionBusy(): boolean {
+    return transitioning || reconnecting || viewRetuner.busy || pendingVideoSelection !== null;
 }
 
-function currentVideoGroup(p: MoqtPlayer): number | undefined {
-    const name = p.availableVideoTracks[0]?.name;
-    return p.availableVideoGroups.find(group => group.tracks.some(track => track.name === name))?.altGroup;
+function refreshTrackSelector(): void { buildTrackSelector(player); }
+
+function buildTrackSelector(p: MoqtPlayer | null): void {
+    const epoch = playEpoch;
+    renderTrackMenus(p, { programControl, programSelect, videoTrackDropdown, videoTrackBtn, videoTrackLabel, videoTrackMenu,
+        audioTrackDropdown, audioTrackBtn, audioTrackLabel, audioTrackMenu, viewControl, viewSelect }, catalogSelection, {
+        retune: (choice, choices) => { if (p) retunePresentation(p, epoch, choice, choices); },
+        video: reference => {
+            if (!p || !playbackOwnerIsCurrent(p, epoch, player, playEpoch) || selectionBusy()) return;
+            const token = {};
+            pendingVideoSelection = token;
+            refreshTrackSelector();
+            void p.selectVideoTrack(reference).then(() => {
+                if (playbackOwnerIsCurrent(p, epoch, player, playEpoch)) log(`Switched to ${reference.name}`);
+            }).catch((error: Error) => {
+                if (playbackOwnerIsCurrent(p, epoch, player, playEpoch)) log(`Switch failed: ${error.message}`);
+            }).finally(() => {
+                if (!playbackOwnerIsCurrent(p, epoch, player, playEpoch) || pendingVideoSelection !== token) return;
+                pendingVideoSelection = null;
+                refreshTrackSelector();
+            });
+        },
+    }, !p || selectionBusy() || p.state === 'error' || p.state === 'ended');
 }

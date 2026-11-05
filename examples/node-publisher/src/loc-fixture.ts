@@ -55,7 +55,8 @@ export function prepareLocTrack(track: LoadedTrack) {
   }
   if (!groups.length) throw new Error(`${track.meta.name}: no encoded samples`);
   return { name: track.meta.name, video, groups, timescale: context.timescale,
-    spanTicks: nextDecode! - firstDecode!, videoConfig };
+    spanTicks: nextDecode! - firstDecode!, videoConfig,
+    mediaOriginTicks: track.meta.preserveMediaTimeOrigin ? firstDecode! : 0n };
 }
 
 export function locFrameProperties(track: ReturnType<typeof prepareLocTrack>, frame: Pick<LocFrame, 'offsetTicks' | 'independent'>,
@@ -63,7 +64,7 @@ export function locFrameProperties(track: ReturnType<typeof prepareLocTrack>, fr
   if (version === 1 && mode === 'media') throw new Error('LOC-01 requires wall-clock timestamps');
   const ticks = frame.offsetTicks + BigInt(loop) * track.spanTicks;
   return encodeLocHeaders({
-    ...(mode === 'media' ? { timestamp: ticks, timescale: BigInt(track.timescale), timestampIsWallClock: false }
+    ...(mode === 'media' ? { timestamp: track.mediaOriginTicks + ticks, timescale: BigInt(track.timescale), timestampIsWallClock: false }
       : { captureTimestamp: epochUs + ticksToMicros(ticks, track.timescale) }),
     ...(track.video ? {
       videoFrameMarking: { independent: frame.independent, startOfFrame: true, endOfFrame: true,
@@ -79,7 +80,7 @@ export async function publishLocFixture(conn: MoqtConnection, fixture: LoadedFix
   if (version === 1 && mode === 'media') throw new Error('LOC-01 requires wall-clock timestamps');
   const tracks = fixture.tracks.map(prepareLocTrack);
   const catalog = buildCatalog({ version: '1', tracks: fixture.tracks.map(({ meta }) => ({
-    ...meta, packaging: 'loc', isLive: true, renderGroup: fixture.manifest.renderGroup,
+    ...meta, packaging: 'loc', isLive: true, renderGroup: meta.renderGroup ?? fixture.manifest.renderGroup,
   })) });
   await publishObjects(conn, fixture.manifest.namespace, 'catalog', 10n, [catalog], 0);
   for (let i = 0; i < tracks.length; i++) {

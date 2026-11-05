@@ -5,6 +5,7 @@ import type { LoadedTrack, LoadedFixture } from './fixture.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import { videoInit, buildChunk, SYNC_FLAGS, NON_SYNC_FLAGS } from '../../../packages/locmaf/test-support/cmaf.js';
 import { concat, fullBox, isoBox, u32, ascii } from '../../../packages/locmaf/test-support/bytes.js';
+import { rebaseTfdtCopy } from './cmaf-loop-rebase.js';
 
 function opusTrack(): LoadedTrack {
   const entryFields = new Uint8Array(28);
@@ -83,6 +84,7 @@ describe('prepared LOC samples', () => {
       const catalog = JSON.parse(new TextDecoder().decode(recorded.sent[0]!.payload));
       expect(catalog.version).toBe('1');
       expect(catalog.tracks.map((t: { packaging: string }) => t.packaging)).toEqual(['loc', 'loc']);
+      expect(catalog.tracks.map((t: { renderGroup: number }) => t.renderGroup)).toEqual([1, 1]);
       expect(catalog.tracks.every((t: object) => !('initRef' in t) && !('initData' in t))).toBe(true);
       const videoSent = recorded.sent.filter((s) => recorded.streams.get(s.stream)!.alias === 11n);
       const audioSent = recorded.sent.filter((s) => recorded.streams.get(s.stream)!.alias === 12n);
@@ -99,6 +101,33 @@ describe('prepared LOC samples', () => {
       expect(videoStreams.map((s) => (s.options as { endOfGroup: boolean }).endOfGroup)).toEqual([false, true, false, true, false, true, false, true]);
       expect(new Set(recorded.closed)).toEqual(new Set(recorded.streams.keys()));
     } finally { vi.useRealTimers(); }
+  });
+
+  it.each([0, 2])('retains an explicit per-track renderGroup %s and the fixture default for other tracks', async renderGroup => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      const original = video(), tracks = [{ ...original, meta: { ...original.meta, renderGroup } }, opusTrack()];
+      const fixture: LoadedFixture = { manifest: { namespace: ['test'], renderGroup: 1, chunkDurationMs: 500,
+        tracks: tracks.map(track => track.meta) }, tracks };
+      const recorded = connection(), publishing = publishLocFixture(recorded.conn, fixture, 4, 'media', 1);
+      await vi.runAllTimersAsync(); await publishing;
+      const catalog: { tracks: Array<{ renderGroup: number }> } = JSON.parse(new TextDecoder().decode(recorded.sent[0]!.payload));
+      expect(catalog.tracks.map(track => track.renderGroup)).toEqual([renderGroup, 1]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([false, true])('retains a raw media origin only with explicit opt-in: %s', preserveMediaTimeOrigin => {
+    const original = video(), delta = 90n * 90000n;
+    const shifted = { ...original, meta: { ...original.meta, preserveMediaTimeOrigin },
+      chunks: original.chunks.map(chunk => rebaseTfdtCopy(chunk, delta)) };
+    const prepared = prepareLocTrack(shifted), frame = prepared.groups[1]!.frames[0]!;
+    expect(prepared.spanTicks).toBe(15000n); expect(frame.offsetTicks).toBe(7500n);
+    const headers = parseLocHeaders(locFrameProperties(prepared, frame, 1, 4, 'media', epoch), wire);
+    expect(headers.timestamp).toBe((preserveMediaTimeOrigin ? delta : 0n) + 22500n);
+    expect(headers.captureTimestamp).toBe((preserveMediaTimeOrigin ? 90_000_000n : 0n) + 250000n);
+    // Wall-clock mode and pacing still use relative offsets, regardless of this media-time opt-in.
+    expect(parseLocHeaders(locFrameProperties(prepared, frame, 1, 4, 'wall-clock', epoch), wire).captureTimestamp)
+      .toBe(epoch + 250000n);
   });
 
   it('paces the full final Opus packet rather than carrying MP4 end trimming into LOC', () => {

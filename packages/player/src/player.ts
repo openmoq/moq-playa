@@ -30,7 +30,7 @@ import type { DataStreamHeader, MoqtObject, ObjectDatagram, SubgroupHeader } fro
 import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
 import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@openmoq/playback';
 import { BufferBasedController } from '@openmoq/playback';
-import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback, PlaybackInputObserver } from '@openmoq/playback';
+import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback, PlaybackInputObserver, AudioTimingSource, VideoTimingSource } from '@openmoq/playback';
 import type { AltGroup, CatalogState, CatalogTrack, ResolvedTrackNamespace } from '@openmoq/msf';
 import type { SelectionIntent, TrackIdentity } from './catalog-selection.js';
 import { buildCatalogSelection, resolveSelection } from './catalog-selection.js';
@@ -54,6 +54,7 @@ import {
   validateConfig,
   type MoqtPlayerConfig,
   type TrackRefConfig,
+  type SelectionConfig,
 } from './config.js';
 import { createPlayerError, PlayerErrorCode, type PlayerError, type ErrorSeverity, type PlayerErrorCodeValue } from './errors.js';
 import { createLogger, LOG_LEVELS, type LoggerLike } from './logger.js';
@@ -65,7 +66,11 @@ import { prepareHandoverSelection, type HandoverIntent } from './player-handover
 import { acceptPreparedMedia, checkPreparedMediaReady, createPreparedMediaSelection, type PreparedMediaSelection } from './prepared-media-selection.js';
 import type { InstalledDecoderConfiguration, PreparedDecoderConfiguration } from './prepared-decoder-configuration.js';
 import { PreparedAudioEvidence } from './prepared-audio-evidence.js';
-import { copyMediaSelection, emptyMediaSelection, type MediaSelectionSnapshot, type AudioSelectionOptions, type AudioTimelineReference } from './player-selection-state.js';
+import { PreparedOutputEvidence } from './prepared-output-evidence.js';
+import { prepareRuntimeSelection, type RuntimeSelection } from './player-runtime-selection.js';
+import { placePresentationAnchor, type FractionUs, type PresentationPlacement } from './presentation-placement.js';
+import { preflightMseOutputs, type PreparedMseOutput } from './prepared-mse-output.js';
+import { copyMediaSelection, emptyMediaSelection, type MediaSelectionSnapshot, type AudioSelectionOptions, type AudioTimelineReference, type MediaSelectionOptions, type MediaTimelineReference } from './player-selection-state.js';
 import { MediaStageObservers } from './media-stage-observers.js';
 import type { MediaDiagnosticRuntime, MediaDiagnosticsFactory, MediaStageObserver, MediaDiscardReason } from './media-diagnostic-types.js';
 import type { ObjectRoutingContext, ObjectRoutingDiscardReason, ObjectDeliveryAdmission, ObjectDeliveryOptions } from './subscription-manager.js';
@@ -109,7 +114,7 @@ interface LocmafChunkDetails {
   readonly timescale: number;
   readonly baseMediaDecodeTime: bigint;
 }
-import type { MediaSourceLike, VideoPresentation, AudioOutputLike } from './interfaces.js';
+import type { MediaSourceLike, MediaAppendQueueLease, VideoPresentation, AudioOutputLike } from './interfaces.js';
 import { CommandDispatcher, type DispatcherOutputObserver } from './command-dispatcher.js';
 import { StatsAccumulator } from './stats.js';
 import type { PlayerStats } from './stats.js';
@@ -402,38 +407,76 @@ interface MigrationTxn {
 type PreparedMediaAttempt = Pick<MigrationTxn, 'conn' | 'aborted' | 'committed'> & { prep?: PreparedMediaSelection };
 
 interface AudioPresentationMapper { setAudioPresentationOffsetUs(offsetUs: bigint | null): void }
-type AudioTimingSource = Pick<SyncController, 'computeAudioRenderTime'>;
 interface AudioTimingSink { setAudioTimingSource(source: AudioTimingSource | undefined): void }
 
-interface AudioSelectionTxn extends PreparedMediaAttempt {
-  readonly prep: PreparedMediaSelection;
-  readonly manager: SubscriptionManager;
-  readonly source: MediaSourceLike | null;
-  readonly generation: number;
-  readonly catalog: CatalogState;
+interface SourceTimelineRecord {
+  reference: Omit<MediaTimelineReference, 'observedSourceTimeUs'>;
+  observedSourceTimeUs: bigint;
+  configuration: readonly unknown[];
+  connection: MoqtConnection;
+  authority: object | null;
+  epoch: bigint | null;
+  mappingWitness: object | null;
+  placementToken: object | null;
+  source: MediaSourceLike | null;
+  nativeOffset: number | undefined;
+  clockAnchorUs: bigint;
+  clockScheduleUs: number | null;
+}
+
+interface PreparedMsePlacement {
+  readonly assembler: CmafAssemblerLike;
+  readonly referenceRole: 'video' | 'audio';
+  readonly reference: PresentationPlacement;
+  readonly oldPlacementToken: object;
+  readonly referenceOffset: number;
+  readonly targetOffset: number;
+  readonly sourceKey: string;
+  readonly anchor: { readonly sourceTimeUs: bigint; readonly rebasedTimeUs: FractionUs };
+}
+
+interface PreparedMediaOutput {
+  readonly role: 'video' | 'audio';
   readonly target: CatalogTrack;
   readonly oldRequestId: bigint | null;
   readonly oldSubscription: object | null;
   readonly oldIdentity: TrackIdentity;
   /** Adopted output ownership survives normal wire drain, without recreating a route. */
   readonly oldIsCurrent: () => boolean;
-  readonly referenceToken: object | null;
-  presentationOffsetUs: bigint;
-  readonly liveOutput: AudioOutputLike | null;
-  readonly mappedTiming: boolean;
-  readonly presentationMapper: AudioPresentationMapper | null;
-  readonly timingSink: AudioTimingSink | null;
-  timingSource: AudioTimingSource | undefined;
+  readonly mse?: PreparedMsePlacement;
+  readonly timing: {
+    presentationOffsetUs: bigint;
+    readonly liveOutput: AudioOutputLike | null;
+    readonly mappedTiming: boolean;
+    readonly presentationMapper: AudioPresentationMapper | null;
+    readonly timingSink: AudioTimingSink | null;
+    timingSource: AudioTimingSource | undefined;
+    videoTimingSource?: VideoTimingSource;
+  };
   readonly evidence: PreparedAudioEvidence;
-  readonly registrations: Map<bigint, () => boolean>;
   init?: Uint8Array;
-  mutation?: Promise<void>;
-  readonly rawInputs: WeakSet<object>;
   readonly staged: Array<{ obj: MoqtObject; headers?: LocHeaders; input?: ObjectRoutingContext; sourceTimeUs?: bigint; run(): void }>;
-  readonly releasedRequests: Set<bigint>;
-  readonly terminalRequests: Set<bigint>;
   serial: Promise<void>;
   checked: number;
+}
+
+interface MediaSelectionTxn extends PreparedMediaAttempt {
+  readonly prep: PreparedMediaSelection;
+  readonly manager: SubscriptionManager;
+  readonly source: MediaSourceLike | null;
+  readonly generation: number;
+  readonly catalog: CatalogState;
+  readonly outputs: Map<'video' | 'audio', PreparedMediaOutput>;
+  readonly referenceToken: object | null;
+  readonly selection?: Extract<RuntimeSelection, { ok: true }>;
+  readonly audioPin?: boolean;
+  readonly audioLanguage?: string | null;
+  readonly referenceRole?: 'video' | 'audio';
+  readonly registrations: Map<bigint, () => boolean>;
+  mutation?: Promise<void>;
+  readonly rawInputs: WeakSet<object>;
+  readonly releasedRequests: Set<bigint>;
+  readonly terminalRequests: Set<bigint>;
   retainedBytes: number;
   inputCount: number;
   failure?: Error;
@@ -777,6 +820,7 @@ export class MoqtPlayer {
 
   /** Assembles moof+mdat pairs, patches tfdt, emits complete segments. */
   private cmafAssembler: CmafAssemblerLike | null = null;
+  private keyedCmafIdentity = false;
 
   /**
    * Init segment bytes received from each subscribed init track, keyed
@@ -915,23 +959,27 @@ export class MoqtPlayer {
    * overflow; `committed` stops staging once the candidate is authoritative.
    */
   private currentMigration: MigrationTxn | null = null;
-  private audioSelection: AudioSelectionTxn | null = null;
+  private mediaSelection: MediaSelectionTxn | null = null;
   private runtimeAudioIntent: TrackIdentity | null = null;
-  private readonly preparedMediaDeliveries = new WeakMap<() => boolean, { preparation: AudioSelectionTxn; alias: bigint }>();
+  private runtimeAudioLanguage: string | null = null;
+  private runtimeSelectionIntent: SelectionIntent | null = null;
+  private readonly preparedMediaDeliveries = new WeakMap<() => boolean, { preparation: MediaSelectionTxn; output: PreparedMediaOutput; alias: bigint }>();
   private audioPresentationOffsetUs = 0n;
   private audioTimingMapped = false;
   private audioTimingSource: AudioTimingSource | undefined;
+  private videoPresentationOffsetUs = 0n;
+  private videoTimingMapped = false;
+  private videoTimingSource: VideoTimingSource | undefined;
+  private mappedClockOwner: object | null = null;
   private audioOutput: AudioOutputLike | null = null;
   private lastAudioDomainOwner: object | null = null;
   private lastAudioDomain: AudioTimelineReference['domain'] | null = null;
   private readonly installedDecoderConfigurations = new Map<'video' | 'audio', InstalledDecoderConfiguration>();
   private readonly preparedDecoderConfigurations = new Map<'video' | 'audio', PreparedDecoderConfiguration>();
-  private audioTimelineRecord: {
-    reference: Omit<AudioTimelineReference, 'observedSourceTimeUs'>; observedSourceTimeUs: bigint;
-    configuration: readonly unknown[]; connection: MoqtConnection;
-    authority: object | null; epoch: bigint | null; mappingWitness: object | null; clockAnchorUs: bigint; clockScheduleUs: number | null;
-  } | null = null;
+  private audioTimelineRecord: SourceTimelineRecord | null = null;
+  private videoTimelineRecord: SourceTimelineRecord | null = null;
   private collectAudioTimeline = false;
+  private collectVideoTimeline = false;
 
   /** The catalog retrieval current playback depends on. */
   private catalogSlots: CatalogSlots = createCatalogSlots();
@@ -1061,7 +1109,9 @@ export class MoqtPlayer {
     mediaSource: MediaSourceLike | null;
     oldRequestId: bigint;
     oldTrackName: string;
+    oldSourceKey?: string;
     newTrackName: string;
+    newSourceKey?: string;
     newRequestId: bigint | null;
     newTrackPackaging: TrackPackaging;
     targetTrack: CatalogTrack;
@@ -1097,6 +1147,7 @@ export class MoqtPlayer {
    */
   private cmafSwitchStagingBuffer: Array<{
     trackName: string;
+    sourceKey?: string;
     mediaType: 'video' | 'audio';
     groupId: bigint;
     payload: Uint8Array;
@@ -1277,17 +1328,20 @@ export class MoqtPlayer {
     fetchInfo?: Pick<MediaFetchInfo, 'subscriptionRequestId' | 'warmStart' | 'warmOwner'>): Promise<void> {
     const manager = this.subscriptionManager;
     if (!manager) return Promise.resolve();
-    const audio = this.audioSelection;
-    if (audio && !audio.committed && audio.conn === sourceConnection
-        && [...audio.prep.media.values()].some(sub => sub.alias === BigInt(obj.trackAlias))) {
-      if (!this.reserveAudioInput(audio, obj)) return Promise.resolve();
+    const inputGeneration = manager.mediaInputGeneration;
+    const operation = this.mediaSelection;
+    const prepared = operation && !operation.committed && operation.conn === sourceConnection
+      ? [...operation.prep.media.values()].find(sub => sub.alias === BigInt(obj.trackAlias)) : undefined;
+    const output = prepared && operation?.outputs.get(prepared.mediaType);
+    if (operation && output) {
+      if (!this.reservePreparedMediaInput(operation, obj)) return Promise.resolve();
       const registration = manager.captureRoute(BigInt(obj.trackAlias));
-      const isLive = () => registration?.() === true && this.audioSelectionRouteCurrent(audio);
-      const admission = audio.serial.then((): ObjectDeliveryAdmission => isLive()
+      const isLive = () => manager.mediaInputGeneration === inputGeneration && registration?.() === true && this.mediaSelectionRouteCurrent(operation);
+      const admission = output.serial.then((): ObjectDeliveryAdmission => isLive()
         ? { kind: 'deliver', isLive, backfill: false } : { kind: 'discard', reason: 'route retired' });
-      this.preparedMediaDeliveries.set(isLive, { preparation: audio, alias: BigInt(obj.trackAlias) });
+      this.preparedMediaDeliveries.set(isLive, { preparation: operation, output, alias: BigInt(obj.trackAlias) });
       const work = manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput, { admission, isLive });
-      audio.serial = work;
+      output.serial = work;
       return work;
     }
     if (this.warmMediaOwners.size === 0) {
@@ -1301,7 +1355,8 @@ export class MoqtPlayer {
         || this.warmMediaOwners.get(owner.subscription) !== owner) return manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput,
       fetchInfo?.warmStart ? { isLive: () => false } : undefined);
     const registration = manager.captureRoute(alias);
-    const isLive = () => this.subscriptionManager === manager && registration?.() === true && this.warmMediaOwnerCurrent(owner);
+    const isLive = () => this.subscriptionManager === manager && manager.mediaInputGeneration === inputGeneration
+      && registration?.() === true && this.warmMediaOwnerCurrent(owner);
     let permit!: WarmMediaRoute['permit'];
     const admission = new Promise<ObjectDeliveryAdmission>(resolve => { permit = resolve; });
     const work = manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput, { isLive, admission });
@@ -1743,64 +1798,119 @@ export class MoqtPlayer {
   /** Accepted/adopted output identities, independent of startup selectors. */
   get selection(): MediaSelectionSnapshot { return this._selection; }
 
+  /** Canonical raw reference; audio is preferred while it is established. */
+  get mediaTimelineReference(): MediaTimelineReference | null {
+    if (this._selection.audio !== null) return this.audioTimelineReference;
+    if (!this._destroyed) this.collectVideoTimeline = true;
+    return this.readTimelineReference('video');
+  }
+
   /** Arms source observation for this load. First read may be null until the next accepted audio. */
   get audioTimelineReference(): AudioTimelineReference | null {
     if (!this._destroyed) this.collectAudioTimeline = true;
     return this.readAudioTimelineReference();
   }
 
-  private readAudioTimelineReference(): AudioTimelineReference | null {
-    const record = this.audioTimelineRecord;
-    const selected = this._selection.audio;
+  private readAudioTimelineReference(): AudioTimelineReference | null { return this.readTimelineReference('audio'); }
+
+  private readTimelineReference(role: 'video' | 'audio'): MediaTimelineReference | null {
+    const inputGeneration = this.subscriptionManager?.mediaInputGeneration;
+    const record = role === 'audio' ? this.audioTimelineRecord : this.videoTimelineRecord;
+    const selected = this._selection[role];
     if (!record || this._destroyed || !selected || this.connection !== record.connection
         || identityKey(selected.namespaceFields, selected.name) !== identityKey(record.reference.track.namespaceFields, record.reference.track.name)) return null;
-    const track = this.catalogTrackFor(selected.name, selected.namespaceFields, 'audio');
-    if (!track || !this.audioTimelineConfiguration(track).every((value, index) => value === record.configuration[index])) return null;
+    const current = () => !this._destroyed && this.connection === record.connection && this._selection[role] === selected
+      && this.subscriptionManager?.mediaInputGeneration === inputGeneration
+      && (role === 'audio' ? this.audioTimelineRecord : this.videoTimelineRecord) === record;
+    const track = this.catalogTrackFor(selected.name, selected.namespaceFields, role);
+    if (!track || !this.timelineConfiguration(track, role).every((value, index) => value === record.configuration[index])) return null;
     if (this.usesMse(track.packaging)) {
-      if (record.authority !== this.cmafAssembler || record.epoch !== this.cmafAssembler?.getEpoch('audio')) return null;
-      if (this.audioTimingMapped && (record.mappingWitness === null
-          || record.mappingWitness !== this.cmafAssembler?.getAudioPresentationMappingWitness?.())) return null;
+      const assembler = this.cmafAssembler, source = this.mediaSource;
+      if (record.authority !== assembler || record.source !== source) return null;
+      try {
+        if (record.epoch !== assembler?.getEpoch(role)) return null;
+        if (assembler?.capturePresentationPlacement) {
+          if (record.placementToken === null || assembler.capturePresentationPlacement(role)?.token !== record.placementToken) return null;
+        } else if (role === 'audio' && this.audioTimingMapped && (record.mappingWitness === null
+            || record.mappingWitness !== assembler?.getAudioPresentationMappingWitness?.())) return null;
+        if (!Object.is(source?.getTimestampOffset?.(role), record.nativeOffset)) return null;
+        // A native accessor may reenter an assembler reconfiguration while
+        // returning the same offset. Recheck its actual placement afterwards.
+        if (assembler?.capturePresentationPlacement
+            && assembler.capturePresentationPlacement(role)?.token !== record.placementToken) return null;
+      } catch { return null; }
     } else {
       if (record.authority !== this.syncController) return null;
-      const timing = this.syncController?.computeAudioRenderTime(record.clockAnchorUs + this.audioPresentationOffsetUs);
-      if (!timing) return null;
+      const raw = record.clockAnchorUs + (role === 'audio' ? this.audioPresentationOffsetUs : this.videoPresentationOffsetUs);
+      let timing: ReturnType<SyncController['computeAudioRenderTime']> | undefined;
+      try {
+        timing = role === 'audio' ? this.syncController?.computeAudioRenderTime(raw) : this.syncController?.computeVideoRenderTime(raw);
+      } catch {
+        // This optional read is not playback. A clock callback may reset its
+        // baselines while being read; unavailable evidence must not become a
+        // stale token or an exception from a supposedly read-only snapshot.
+        return null;
+      }
+      if (!timing || !Number.isFinite(timing.renderTimeUs) || !current() || record.authority !== this.syncController) return null;
       if (record.clockScheduleUs !== null && record.clockScheduleUs !== timing.renderTimeUs) return null;
       record.clockScheduleUs = timing.renderTimeUs;
     }
+    if (!current()) return null;
     return Object.freeze({ ...record.reference, observedSourceTimeUs: record.observedSourceTimeUs });
   }
 
-  private audioTimelineConfiguration(track: CatalogTrack): readonly unknown[] {
+  private timelineConfiguration(track: CatalogTrack, role: 'video' | 'audio'): readonly unknown[] {
     return [this.initKey(track), track.packaging, track.codec, track.samplerate, track.channelConfig,
-      track.initTrack, this.resolveInlineInitData(track), this.audioPresentationOffsetUs];
+      track.initTrack, this.resolveInlineInitData(track), role === 'audio' ? this.audioPresentationOffsetUs : this.videoPresentationOffsetUs,
+      ...(role === 'video' ? [track.width, track.height] : [])];
   }
 
   private noteAudioTimeline(sourceTimeUs: bigint, domain: AudioTimelineReference['domain']): void {
-    if (!this.collectAudioTimeline) return;
-    const selected = this._selection.audio;
-    const connection = this.connection;
+    if (this.collectAudioTimeline) this.noteMediaTimeline('audio', sourceTimeUs, domain);
+  }
+
+  private noteMediaTimeline(role: 'video' | 'audio', sourceTimeUs: bigint, domain: MediaTimelineReference['domain']): void {
+    const inputGeneration = this.subscriptionManager?.mediaInputGeneration;
+    const selected = this._selection[role], connection = this.connection;
     if (!selected || !connection || this._destroyed) return;
-    const track = this.catalogTrackFor(selected.name, selected.namespaceFields, 'audio');
+    const track = this.catalogTrackFor(selected.name, selected.namespaceFields, role);
     if (!track) return;
-    const prior = this.readAudioTimelineReference();
+    const prior = this.readTimelineReference(role);
     if (prior && prior.domain === domain) {
-      this.audioTimelineRecord!.observedSourceTimeUs = sourceTimeUs; return;
+      const record = role === 'audio' ? this.audioTimelineRecord : this.videoTimelineRecord;
+      record!.observedSourceTimeUs = sourceTimeUs; return;
     }
-    // A changed clock/configuration/epoch owns a new token. Never let an input
-    // update bless a reference that the public getter has already invalidated.
-    this.audioTimelineRecord = null;
+    // Clock/configuration/epoch changes require new evidence; observing a later
+    // input cannot renew a token the getter already refused.
     const identity = Object.freeze({ name: selected.name, namespaceFields: Object.freeze([...selected.namespaceFields]) });
-    const reference = Object.freeze({ token: prior?.domain === domain ? prior.token : Object.freeze({}),
-      track: identity, domain });
-    this.audioTimelineRecord = {
-      reference, observedSourceTimeUs: sourceTimeUs, configuration: this.audioTimelineConfiguration(track), connection,
-      authority: this.usesMse(track.packaging) ? this.cmafAssembler : this.syncController,
-      epoch: this.usesMse(track.packaging) ? this.cmafAssembler?.getEpoch('audio') ?? null : null,
-      mappingWitness: this.usesMse(track.packaging) && this.audioTimingMapped
-        ? this.cmafAssembler?.getAudioPresentationMappingWitness?.() ?? null : null,
-      clockAnchorUs: sourceTimeUs,
-      clockScheduleUs: null,
+    const mse = this.usesMse(track.packaging), assembler = this.cmafAssembler, source = this.mediaSource;
+    const authority = mse ? assembler : this.syncController;
+    let epoch: bigint | null = null, mappingWitness: object | null = null, placementToken: object | null = null;
+    let nativeOffset: number | undefined;
+    try {
+      if (mse) {
+        epoch = assembler?.getEpoch(role) ?? null;
+        placementToken = assembler?.capturePresentationPlacement?.(role)?.token ?? null;
+        mappingWitness = role === 'audio' && this.audioTimingMapped ? assembler?.getAudioPresentationMappingWitness?.() ?? null : null;
+        nativeOffset = source?.getTimestampOffset?.(role);
+        if (nativeOffset !== undefined && !Number.isFinite(nativeOffset)) return;
+        if (assembler?.capturePresentationPlacement
+            && assembler.capturePresentationPlacement(role)?.token !== placementToken) return;
+      }
+    } catch { return; }
+    const configuration = this.timelineConfiguration(track, role);
+    // Optional adapter reads may reenter playback. Evidence cannot revive the
+    // connection, source or selected output that those callbacks retired.
+    if (this._destroyed || this.connection !== connection || this._selection[role] !== selected
+        || this.subscriptionManager?.mediaInputGeneration !== inputGeneration
+        || this.mediaSource !== source || (mse ? this.cmafAssembler : this.syncController) !== authority) return;
+    const record: SourceTimelineRecord = {
+      reference: Object.freeze({ token: Object.freeze({}), track: identity, domain }), observedSourceTimeUs: sourceTimeUs,
+      configuration, connection, authority, epoch, mappingWitness, placementToken, source, nativeOffset,
+      clockAnchorUs: sourceTimeUs, clockScheduleUs: null,
     };
+    if (role === 'audio') this.audioTimelineRecord = record;
+    else this.videoTimelineRecord = record;
   }
 
   private refreshMediaSelection(outputs: Partial<Pick<MediaSelectionSnapshot, 'video' | 'audio'>> = {}, force = false): void {
@@ -2040,6 +2150,8 @@ export class MoqtPlayer {
    * @see draft-einarsson-moq-locmaf-01 §3, §9, §15, §16
    */
   private onLocmafMediaObject(mediaType: 'video' | 'audio' | 'eventtimeline', trackName: string, obj: MoqtObject, input?: ObjectRoutingContext, delivery?: ObjectDeliveryOptions): void {
+    const inputGeneration = this.subscriptionManager?.mediaInputGeneration;
+    const sourceKey = this.keyedCmafIdentity ? this.subscriptionManager?.getSourceKey(BigInt(obj.trackAlias)) : undefined;
     if (mediaType === 'eventtimeline') {
       this.onLocmafEventObject(trackName, obj);
       return;
@@ -2068,7 +2180,9 @@ export class MoqtPlayer {
       ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
     });
 
-    if (delivery?.isLive && !delivery.isLive()) { this.discardMediaInput(input, 'route retired'); return; }
+    if (delivery?.isLive?.() === false || this.subscriptionManager?.mediaInputGeneration !== inputGeneration) {
+      this.discardMediaInput(input, this.stateMachine.state === PlayerState.PAUSED ? 'paused' : 'route retired'); return;
+    }
     if (this.stateMachine.state === PlayerState.PAUSED) { this.discardMediaInput(input, 'paused'); return; }
     if (obj.kind === 'gap') {
       // §16: END_OF_GROUP / END_OF_TRACK markers let the LOC pipeline advance
@@ -2109,7 +2223,7 @@ export class MoqtPlayer {
     }
 
     if (this.switchInProgress && this.pendingVideoSwitch && mediaType === 'video'
-        && trackName === this.pendingVideoSwitch.oldTrackName) {
+        && this.isVideoSwitchAlias(BigInt(obj.trackAlias), 'old')) {
       this.discardMediaInput(input, 'track superseded');
       return;
     }
@@ -2134,11 +2248,11 @@ export class MoqtPlayer {
 
     // Make-before-break: stage the new track's chunks until a sync chunk, as for CMAF.
     if (this.pendingVideoSwitch && mediaType === 'video'
-        && trackName === this.pendingVideoSwitch.newTrackName) {
+        && this.isVideoSwitchAlias(BigInt(obj.trackAlias), 'new')) {
       if (!this.admitVideoSwitchObject(this.pendingVideoSwitch, decoded.bytes.byteLength)) {
         this.discardMediaInput(input, 'track superseded'); return;
       }
-      this.cmafSwitchStagingBuffer.push({ trackName, mediaType, groupId, payload: decoded.bytes, sync: decoded.sync, ...(input ? { input } : {}) });
+      this.cmafSwitchStagingBuffer.push({ trackName, ...(sourceKey === undefined ? {} : { sourceKey }), mediaType, groupId, payload: decoded.bytes, sync: decoded.sync, ...(input ? { input } : {}) });
       this.armVideoSwitchTimeout(this.pendingVideoSwitch);
       if (decoded.sync) {
         this.completePendingVideoSwitch();
@@ -2148,12 +2262,12 @@ export class MoqtPlayer {
 
     // Early stale-group drop, as for CMAF.
     if (this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
-      const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
-        .getCommittedGroupFloor(mediaType, trackName);
+      const floor = sourceKey === undefined ? this.mediaSource.getCommittedGroupFloor?.(mediaType, trackName)
+        : this.mediaSource.getCommittedGroupFloor?.(mediaType, trackName, sourceKey);
       if (floor !== undefined && groupId < floor) { this.discardMediaInput(input, 'stale group'); return; }
     }
 
-    this.pushCmafInput(mediaType, trackName, groupId, decoded.bytes, input);
+    this.pushCmafInput(mediaType, trackName, groupId, decoded.bytes, input, sourceKey);
   }
 
   /** Count reconstruction and pre-init rawBoxes validation through the same group-health policy. */
@@ -2389,6 +2503,7 @@ export class MoqtPlayer {
     input?: ObjectRoutingContext,
     delivery?: ObjectDeliveryOptions,
   ): void {
+    const inputGeneration = this.subscriptionManager?.mediaInputGeneration;
     if (rawBoxes && isCmafHeader(rawBoxes)) {
       this.noteLocmafInBandHeader(trackName, rawBoxes, BigInt(obj.trackAlias));
       return;
@@ -2465,16 +2580,18 @@ export class MoqtPlayer {
             }
           : {}),
       };
-      if (delivery?.isLive && !delivery.isLive()) { this.discardMediaInput(input, 'route retired'); return; }
+      if (delivery?.isLive?.() === false || this.subscriptionManager?.mediaInputGeneration !== inputGeneration) {
+        this.discardMediaInput(input, this.stateMachine.state === PlayerState.PAUSED ? 'paused' : 'route retired'); return;
+      }
       this.routeLocmafFrame(mediaType, trackName, synthetic, headers, input, delivery);
     }
   }
 
   /** Route one frame-path object like a LOC object: switch staging, old-track drop, pipeline push. */
-  private routeLocmafFrame(mediaType: 'video' | 'audio', trackName: string, frame: MoqtObject, headers: LocHeaders, input?: ObjectRoutingContext, delivery?: ObjectDeliveryOptions): void {
+  private routeLocmafFrame(mediaType: 'video' | 'audio', _trackName: string, frame: MoqtObject, headers: LocHeaders, input?: ObjectRoutingContext, delivery?: ObjectDeliveryOptions): void {
 
     if (this.pendingVideoSwitch && mediaType === 'video'
-        && trackName === this.pendingVideoSwitch.newTrackName) {
+        && this.isVideoSwitchAlias(BigInt(frame.trackAlias), 'new')) {
       if (!this.admitVideoSwitchObject(this.pendingVideoSwitch, frame.kind === 'data' ? frame.payload.byteLength : 0)) {
         this.discardMediaInput(input, 'track superseded'); return;
       }
@@ -2487,7 +2604,7 @@ export class MoqtPlayer {
     }
     if (this.switchInProgress && this.pendingVideoSwitch
         && mediaType === 'video'
-        && trackName === this.pendingVideoSwitch.oldTrackName) {
+        && this.isVideoSwitchAlias(BigInt(frame.trackAlias), 'old')) {
       this.discardMediaInput(input, 'track superseded'); return;
     }
     const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
@@ -2774,14 +2891,14 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-transport-16 §9.9 (SUBSCRIBE)
    */
   async selectVideoTrack(
-    trackName: string,
+    reference: string | TrackRefConfig,
     reason: string = 'manual',
     abrAction?: 'downshift' | 'upshift',
   ): Promise<void> {
     if (!this._catalogState || !this.connection || !this.subscriptionManager) {
       throw new Error('Cannot switch track: player not loaded');
     }
-    if (this._destroyed || this.isTerminalState() || this.currentMigration || this.audioSelection) {
+    if (this._destroyed || this.isTerminalState() || this.currentMigration || this.mediaSelection) {
       throw new Error('Cannot switch track: playback is not accepting selections');
     }
     const switchConn = this.connection;
@@ -2789,10 +2906,14 @@ export class MoqtPlayer {
     const live = (): boolean => !this._destroyed && !this.isTerminalState()
       && this.connection === switchConn && this.bootstrapGeneration === generation;
 
+    const trackName = typeof reference === 'string' ? reference : reference.name;
+    const namespace = typeof reference === 'string' ? undefined : namespaceFields(reference.namespace ?? this.config.namespace);
+    const matches = (track: CatalogTrack) => track.name === trackName && (namespace === undefined
+      || sameNamespaceFields(trackNamespaceFields(track, this.config.namespace), namespace));
     const eligible = this.qualityController?.eligibleLadder(this.activeVideoSet()) ?? [];
-    const candidates = eligible.filter(t => t.name === trackName);
+    const candidates = eligible.filter(matches);
     if (candidates.length > 1) throw new Error(`Ambiguous video track: "${trackName}"`);
-    const catalogMatches = this._catalogState.tracks.filter(t => t.name === trackName && t.role === 'video');
+    const catalogMatches = this._catalogState.tracks.filter(t => t.role === 'video' && matches(t));
     const targetTrack = candidates[0] ?? (catalogMatches.length === 1 ? catalogMatches[0] : undefined);
     if (!targetTrack) {
       throw new Error(`Unknown video track: "${trackName}"`);
@@ -2804,25 +2925,30 @@ export class MoqtPlayer {
       );
     }
 
-    // Find the current video subscription
+    const currentTrack = this.subscribedTrack('video');
+    if (!currentTrack) throw new Error('Cannot switch track: video selection not ready');
+    const currentKey = this.initKey(currentTrack), targetKey = this.initKey(targetTrack);
+    // A preparing or retiring video request is not the current output owner.
     let currentVideoRequestId: bigint | null = null;
     let currentVideoTrackName: string | null = null;
     for (const [requestId, sub] of this.activeSubscriptions) {
-      if (sub.mediaType === 'video') {
+      if (sub.mediaType === 'video' && identityKey(sub.namespace ?? namespaceFields(this.config.namespace), sub.trackName) === currentKey
+          && (sub.trackAlias === null || !this.supersededRouting?.aliases.has(sub.trackAlias))) {
         currentVideoRequestId = requestId;
         currentVideoTrackName = sub.trackName;
         break;
       }
     }
 
-    const currentTrack = this.subscribedTrack('video');
-    if (!currentTrack) throw new Error('Cannot switch track: video selection not ready');
     if (!candidates.includes(targetTrack)) {
-      throw new Error(`Cannot switch to "${trackName}": different video altGroup; select that view at tune-in with videoAltGroup`);
+      throw new Error(`Cannot switch to "${trackName}": different video altGroup; use selectMedia to change views`);
+    }
+    if (this.usesMse(targetTrack.packaging) && !this.keyedCmafIdentity && currentTrack.name === targetTrack.name && currentKey !== targetKey) {
+      throw new Error('Media adapters cannot distinguish same-name video tracks across namespaces');
     }
 
     const pending = this.pendingVideoSwitch;
-    if (pending?.newTrackName === trackName && pending.phase !== 'restoring') {
+    if (pending && this.initKey(pending.targetTrack) === targetKey && pending.phase !== 'restoring') {
       if (reason === 'manual') this.qualityController?.lockManual();
       return;
     }
@@ -2833,7 +2959,7 @@ export class MoqtPlayer {
     const revision = ++this.videoSwitchRevision;
     if (pending) this.discardPendingVideoSwitch(pending, new Error('Switch superseded by a newer selection'));
     if (revision !== this.videoSwitchRevision || !live()) return;
-    if (currentVideoTrackName === trackName) return;
+    if (currentKey === targetKey) return;
     if (currentVideoRequestId === null) throw new Error('Cannot switch track: current video subscription is not ready');
 
     const targetNamespace = trackNamespaceFields(targetTrack, this.config.namespace);
@@ -2844,6 +2970,10 @@ export class MoqtPlayer {
       oldRequestId: currentVideoRequestId, oldTrackName: currentVideoTrackName ?? '',
       newTrackName: trackName, newRequestId: null, newTrackPackaging: mediaTrackPackaging(targetTrack.packaging),
       targetTrack, catalog: this._catalogState, initData: undefined, cmafContext: undefined,
+      ...(this.keyedCmafIdentity ? {
+        oldSourceKey: identityKey(trackNamespaceFields(currentTrack, this.config.namespace), currentTrack.name),
+        newSourceKey: identityKey(targetNamespace, trackName),
+      } : {}),
       phase: 'preparing', requestReleased: false, failure: undefined, stagedBytes: 0, stagedObjects: 0, done, settle, reason,
       ...(abrAction ? { abrAction } : {}),
     };
@@ -2953,6 +3083,12 @@ export class MoqtPlayer {
       if (this.switchIsCurrent(sw)) this.abortPendingVideoSwitch(sw, error instanceof Error ? error : new Error(String(error)));
       if (sw.phase !== 'committed') throw error;
     }
+  }
+
+  private isVideoSwitchAlias(alias: bigint, side: 'old' | 'new'): boolean {
+    const sw = this.pendingVideoSwitch;
+    const id = sw && (side === 'old' ? sw.oldRequestId : sw.newRequestId);
+    return id !== null && id !== undefined && this.activeSubscriptions.get(id)?.trackAlias === alias;
   }
 
   private emitQualityEvent<K extends 'quality_switching' | 'quality_switched' | 'quality_switch_failed'>(event: K, data: PlayerEventMap[K]): void {
@@ -3141,9 +3277,8 @@ export class MoqtPlayer {
     // the sync controller keeps the old track's timing reference, and the
     // keyframe wait gap (decoder in NEEDS_KEYFRAME, audio keeps playing)
     // becomes a permanent A/V offset.
-    if (!this.audioTimingMapped) {
-      this.audioTimelineRecord = null;
-      this.syncController?.reset();
+    if (!this.audioTimingMapped && !this.videoTimingMapped) {
+      this.resetMediaClock();
     }
 
     this.log.info('[SWITCH] complete (sync): "%s" → "%s" (LOC staged=%d, firstGroup=%s)',
@@ -3215,7 +3350,7 @@ export class MoqtPlayer {
       }
       this.validateVideoSwitchInit(sw, current);
       assemblerChanged = true;
-      assembler?.selectTrack?.('video', sw.newTrackName);
+      this.selectCmafTrack(assembler, 'video', sw.newTrackName, sw.newSourceKey);
       if (initData !== undefined) assembler?.setInitSegment?.('video', initData);
       if (!this.switchIsCurrent(sw)) throw new Error('Video switch retired during initialization');
       const record = this.pendingRetypes.get('video');
@@ -3239,7 +3374,7 @@ export class MoqtPlayer {
       }
       if (assemblerChanged && !this._destroyed && assembler === this.cmafAssembler) {
         try {
-          assembler?.selectTrack?.('video', sw.oldTrackName);
+          this.selectCmafTrack(assembler, 'video', sw.oldTrackName, sw.oldSourceKey);
           if (previous !== undefined) assembler?.setInitSegment?.('video', previous);
         } catch (restoreError) {
           this.failCatalogPlayback(createPlayerError('fatal', 'player', PlayerErrorCode.CMAF_INIT_INVALID,
@@ -3295,7 +3430,7 @@ export class MoqtPlayer {
     // The replacement is now authoritative. Pin it before replaying staged
     // bytes so a late object from the retired stream cannot switch the
     // assembler back after this commit.
-    this.cmafAssembler?.selectTrack?.('video', sw.newTrackName);
+    this.selectCmafTrack(this.cmafAssembler, 'video', sw.newTrackName, sw.newSourceKey);
     if (!this.switchIsCurrent(sw)) return;
     const staged = this.cmafSwitchStagingBuffer;
     this.cmafSwitchStagingBuffer = [];
@@ -3304,9 +3439,9 @@ export class MoqtPlayer {
     for (const entry of firstSync < 0 ? staged : staged.slice(0, firstSync)) this.discardMediaInput(entry.input, 'awaiting keyframe');
     let replayed = 0;
     try {
-      for (const { trackName: stagedTrack, mediaType: stagedMt, groupId, payload, input } of cmafStaged) {
+      for (const { trackName: stagedTrack, sourceKey, mediaType: stagedMt, groupId, payload, input } of cmafStaged) {
         if (!this.switchIsCurrent(sw)) break;
-        this.pushCmafInput(stagedMt, stagedTrack, groupId, payload, input);
+        this.pushCmafInput(stagedMt, stagedTrack, groupId, payload, input, sourceKey);
         replayed++;
       }
     } finally {
@@ -3498,23 +3633,36 @@ export class MoqtPlayer {
     catch { /* Optional outcomes must not affect playback. */ }
   }
 
-  private pushCmafInput(mediaType: 'video' | 'audio', trackName: string, groupId: bigint, payload: Uint8Array, input?: ObjectRoutingContext): void {
+  private selectCmafTrack(assembler: CmafAssemblerLike | null, role: 'video' | 'audio', name: string, sourceKey?: string): void {
+    if (this.keyedCmafIdentity && sourceKey === undefined) throw new Error('CMAF selection is missing its source identity');
+    if (sourceKey === undefined) assembler?.selectTrack?.(role, name);
+    else assembler?.selectTrack?.(role, name, sourceKey);
+  }
+
+  private pushCmafInput(mediaType: 'video' | 'audio', trackName: string, groupId: bigint, payload: Uint8Array,
+    input?: ObjectRoutingContext, sourceKey?: string): void {
     const assembler = this.cmafAssembler;
-    if (mediaType !== 'audio' || !this.collectAudioTimeline) {
-      if (input === undefined) assembler?.push(mediaType, trackName, groupId, payload);
+    if (this.keyedCmafIdentity && sourceKey === undefined) {
+      this.discardMediaInput(input, 'route retired'); return;
+    }
+    if (!(mediaType === 'audio' ? this.collectAudioTimeline : this.collectVideoTimeline)) {
+      if (sourceKey !== undefined) assembler?.push(mediaType, trackName, groupId, payload, input, undefined, sourceKey);
+      else if (input === undefined) assembler?.push(mediaType, trackName, groupId, payload);
       else assembler?.push(mediaType, trackName, groupId, payload, input);
       return;
     }
     const conn = this.connection;
     const source = this.mediaSource;
-    const selected = this._selection.audio;
-    const owned = [...this.activeSubscriptions.values()].find(sub => sub.mediaType === 'audio' && sub.trackAlias !== null
+    const selected = this._selection[mediaType];
+    const owned = [...this.activeSubscriptions.values()].find(sub => sub.mediaType === mediaType && sub.trackAlias !== null
       && sub.trackName === selected?.name && sameNamespaceFields(sub.namespace ?? namespaceFields(this.config.namespace), selected.namespaceFields));
     const route = owned?.trackAlias === null || owned?.trackAlias === undefined ? null : this.subscriptionManager?.captureRoute(owned.trackAlias);
-    const receipt = assembler?.push(mediaType, trackName, groupId, payload, input, true);
+    const receipt = sourceKey === undefined ? assembler?.push(mediaType, trackName, groupId, payload, input, true)
+      : assembler?.push(mediaType, trackName, groupId, payload, input, true, sourceKey);
     if (receipt?.state === 'emitted' && !this._destroyed && this.connection === conn && this.mediaSource === source
-        && this.cmafAssembler === assembler && route?.() && [...this.activeSubscriptions.values()].includes(owned!)) {
-      this.noteAudioTimeline(receipt.sourcePresentationTimeUs, 'media-time');
+        && this.cmafAssembler === assembler && route?.() && [...this.activeSubscriptions.values()].includes(owned!)
+        && (sourceKey === undefined || selected !== null && sourceKey === identityKey(selected.namespaceFields, selected.name))) {
+      this.noteMediaTimeline(mediaType, receipt.sourcePresentationTimeUs, 'media-time');
     }
   }
 
@@ -3625,7 +3773,7 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-msf-00 §5.1.10 (catalog track name = "catalog")
    */
   async load(): Promise<void> {
-    this.audioTimelineRecord = null; this.collectAudioTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
+    this.audioTimelineRecord = null; this.videoTimelineRecord = null; this.collectAudioTimeline = false; this.collectVideoTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.runtimeAudioLanguage = null; this.runtimeSelectionIntent = null; this.mappedClockOwner = null; this.videoPresentationOffsetUs = 0n; this.videoTimingMapped = false; this.videoTimingSource = undefined; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
     this._selection = emptyMediaSelection(this._selection.revision + 1, this.config.autoQuality !== false);
     this.transitionState(PlayerState.LOADING);
     this._stats.recordLoadStart();
@@ -3696,7 +3844,8 @@ export class MoqtPlayer {
 
     // Wire object delivery → media_object events + pipeline routing
     this.subscriptionManager.onObject = (mediaType, trackName, obj, headers, input, delivery) => {
-      if (mediaType === 'audio' && this.stageAudioInput(obj, headers, input, () =>
+      const inputGeneration = this.subscriptionManager?.mediaInputGeneration;
+      if ((mediaType === 'audio' || mediaType === 'video') && this.stagePreparedMediaInput(obj, headers, input, () =>
         this.subscriptionManager?.onObject?.(mediaType, trackName, obj, headers, input, delivery), delivery)) return;
       // Liveness: ANY object on this track (data, gap, or staged-for-switch)
       // proves the delivery path is alive — stamp before every early return.
@@ -3706,7 +3855,7 @@ export class MoqtPlayer {
       // keyframe arrives, keeping the old track playing the entire time.
       // @see draft-ietf-moq-msf-00 §4.2 (seamless switch at group boundaries)
       if (this.pendingVideoSwitch && mediaType === 'video'
-          && trackName === this.pendingVideoSwitch.newTrackName) {
+          && this.isVideoSwitchAlias(BigInt(obj.trackAlias), 'new')) {
         if (!this.admitVideoSwitchObject(this.pendingVideoSwitch, obj.kind === 'data' ? obj.payload.byteLength : 0)) {
           this.discardMediaInput(input, 'track superseded'); return;
         }
@@ -3772,7 +3921,9 @@ export class MoqtPlayer {
         ...(headers.videoFrameMarking?.independent !== undefined ? { isKeyframe: headers.videoFrameMarking.independent } : {}),
       });
 
-      if (delivery?.isLive && !delivery.isLive()) { this.discardMediaInput(input, 'route retired'); return; }
+      if (delivery?.isLive?.() === false || this.subscriptionManager?.mediaInputGeneration !== inputGeneration) {
+        this.discardMediaInput(input, this.stateMachine.state === PlayerState.PAUSED ? 'paused' : 'route retired'); return;
+      }
 
       // After switch commit starts (switchInProgress), drop old-track
       // objects. During the overlap window BEFORE commit, old-track
@@ -3780,7 +3931,7 @@ export class MoqtPlayer {
       // track's keyframe arrives.
       if (this.switchInProgress && this.pendingVideoSwitch
           && mediaType === 'video'
-          && trackName === this.pendingVideoSwitch.oldTrackName) {
+          && this.isVideoSwitchAlias(BigInt(obj.trackAlias), 'old')) {
         this.discardMediaInput(input, 'track superseded'); return;
       }
 
@@ -3800,7 +3951,7 @@ export class MoqtPlayer {
     // Wire LOCMAF object delivery → reconstruction into CMAF chunks → assembler.
     // @see draft-einarsson-moq-locmaf-01 §15, §16
     this.subscriptionManager.onLocmafObject = (mediaType, trackName, obj, input, delivery?: ObjectDeliveryOptions) => {
-      if (mediaType === 'audio' && this.stageAudioInput(obj, undefined, input, () =>
+      if ((mediaType === 'audio' || mediaType === 'video') && this.stagePreparedMediaInput(obj, undefined, input, () =>
         this.subscriptionManager?.onLocmafObject?.(mediaType, trackName, obj, input, delivery), delivery)) return;
       this.onLocmafMediaObject(mediaType, trackName, obj, input, delivery);
     };
@@ -3808,7 +3959,9 @@ export class MoqtPlayer {
     // Wire CMAF object delivery → MediaSource adapter (pipeline bypass)
     // §3.3: CMAF objects are moof or mdat — concatenate then feed to MSE
     this.subscriptionManager.onCmafObject = (mediaType, trackName, obj, input, delivery?: ObjectDeliveryOptions) => {
-      if (mediaType === 'audio' && this.stageAudioInput(obj, undefined, input, () =>
+      const inputGeneration = this.subscriptionManager?.mediaInputGeneration;
+      const sourceKey = this.keyedCmafIdentity ? this.subscriptionManager?.getSourceKey(BigInt(obj.trackAlias)) : undefined;
+      if ((mediaType === 'audio' || mediaType === 'video') && this.stagePreparedMediaInput(obj, undefined, input, () =>
         this.subscriptionManager?.onCmafObject?.(mediaType, trackName, obj, input, delivery), delivery)) return;
       // Liveness: stamp before every early return (gates, staging, drops).
       this.stampMediaArrival(BigInt(obj.trackAlias));
@@ -3841,7 +3994,9 @@ export class MoqtPlayer {
         ...(obj.kind === 'gap' ? { status: BigInt(obj.status ?? 0n) } : {}),
       });
 
-      if (delivery?.isLive && !delivery.isLive()) { this.discardMediaInput(input, 'route retired'); return; }
+      if (delivery?.isLive?.() === false || this.subscriptionManager?.mediaInputGeneration !== inputGeneration) {
+        this.discardMediaInput(input, this.stateMachine.state === PlayerState.PAUSED ? 'paused' : 'route retired'); return;
+      }
       if (obj.kind !== 'data' || !obj.payload) return;
       if (this.stateMachine.state === PlayerState.PAUSED) { this.discardMediaInput(input, 'paused'); return; }
 
@@ -3873,7 +4028,7 @@ export class MoqtPlayer {
       }
 
       if (this.switchInProgress && this.pendingVideoSwitch && mediaType === 'video'
-          && trackName === this.pendingVideoSwitch.oldTrackName) {
+          && this.isVideoSwitchAlias(BigInt(obj.trackAlias), 'old')) {
         this.discardMediaInput(input, 'track superseded');
         return;
       }
@@ -3894,7 +4049,7 @@ export class MoqtPlayer {
       // Keep target data separate until its initialization and splice are
       // ready. The old track remains selected throughout preparation.
       if (this.pendingVideoSwitch && mediaType === 'video'
-          && trackName === this.pendingVideoSwitch.newTrackName) {
+          && this.isVideoSwitchAlias(BigInt(obj.trackAlias), 'new')) {
         if (!this.admitVideoSwitchObject(this.pendingVideoSwitch, obj.payload.byteLength)) {
           this.discardMediaInput(input, 'track superseded'); return;
         }
@@ -3903,7 +4058,7 @@ export class MoqtPlayer {
         const sync = this.cmafSwitchSync(this.pendingVideoSwitch, obj.payload)
           ?? BigInt(obj.objectId) === 0n;
         this.cmafSwitchStagingBuffer.push({
-          trackName, mediaType, groupId: BigInt(obj.groupId), payload: obj.payload, sync,
+          trackName, ...(sourceKey === undefined ? {} : { sourceKey }), mediaType, groupId: BigInt(obj.groupId), payload: obj.payload, sync,
           ...(input ? { input } : {}),
         });
 
@@ -3920,21 +4075,21 @@ export class MoqtPlayer {
       // poisoning the assembler's patchEpoch (false backward-bmd detection).
       const groupId = BigInt(obj.groupId);
       if (this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
-        const floor = (this.mediaSource as { getCommittedGroupFloor: (mt: string, tn: string) => bigint | undefined })
-          .getCommittedGroupFloor(mediaType, trackName);
+        const floor = sourceKey === undefined ? this.mediaSource.getCommittedGroupFloor?.(mediaType, trackName)
+          : this.mediaSource.getCommittedGroupFloor?.(mediaType, trackName, sourceKey);
         if (floor !== undefined && groupId < floor) { this.discardMediaInput(input, 'stale group'); return; }
       }
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
-      this.pushCmafInput(mediaType, trackName, groupId, obj.payload, input);
+      this.pushCmafInput(mediaType, trackName, groupId, obj.payload, input, sourceKey);
     };
 
     // §2.4.2: Malformed Track — MUST UNSUBSCRIBE, SHOULD deliver error
     this.subscriptionManager.onMalformedTrack = (trackAlias, _mediaType, trackName, error, sourceConnection) => {
-      const audio = this.audioSelection;
+      const audio = this.mediaSelection;
       if (audio && !audio.committed && sourceConnection === audio.conn
           && [...audio.prep.media.values()].some(sub => sub.alias === trackAlias)) {
-        this.failAudioSelection(audio, error); return;
+        this.failMediaSelection(audio, error); return;
       }
       this.handleMalformedTrack(trackAlias, trackName, error, sourceConnection as MoqtConnection | undefined);
     };
@@ -4014,7 +4169,7 @@ export class MoqtPlayer {
 
     // §3.1: Init track object delivery → initialize MediaSource with ftyp+moov
     this.subscriptionManager.onInitObject = (trackName, obj, source) => {
-      if (this.receiveAudioInit(obj, source)) return;
+      if (this.receivePreparedMediaInit(obj, source)) return;
       this.log.debug('[INIT] onInitObject: track=%s kind=%s payloadLen=%d mediaSource=%s',
         trackName, obj.kind, obj.kind === 'data' && obj.payload ? obj.payload.byteLength : 0,
         this.mediaSource ? 'exists' : 'null');
@@ -4432,8 +4587,7 @@ export class MoqtPlayer {
     if (fromState === PlayerState.PAUSED) {
       this.videoPipeline?.reset();
       this.audioPipeline?.reset();
-      this.audioTimelineRecord = null;
-      this.syncController?.reset();
+      this.resetMediaClock();
       this.recoveryController?.reset?.();
     }
 
@@ -4468,6 +4622,7 @@ export class MoqtPlayer {
     // Same transaction shape as play(): validate, commit everything, announce
     // last. See play() for why the announcement cannot come earlier.
     const fromState = this.applyState(PlayerState.PAUSED);
+    this.subscriptionManager?.invalidateMediaInputs();
     this.playbackIntent = false;
     this.mediaSource?.setPlaybackIntent?.(false);
     this._stats.recordPlayStop();
@@ -4569,10 +4724,12 @@ export class MoqtPlayer {
     // publisher sent them before the update was processed."
     // Pass target groupId so pipelines reject stale in-flight objects.
     const targetGroupBigInt = BigInt(target.groupId);
+    for (const sub of this.activeSubscriptions.values()) {
+      if (sub.trackAlias !== null) this.subscriptionManager?.setMinimumMediaLocation(sub.trackAlias, undefined);
+    }
     this.videoPipeline?.reset(targetGroupBigInt);
     this.audioPipeline?.reset(targetGroupBigInt);
-    this.audioTimelineRecord = null;
-    this.syncController?.reset();
+    this.resetMediaClock();
     this.commandDispatcher?.flush();
 
     // §9.2.2.5: Send REQUEST_UPDATE with AbsoluteStart filter for each
@@ -4708,7 +4865,7 @@ export class MoqtPlayer {
     if (this._destroyed) throw new Error('Cannot migrate: player is destroyed');
     if (this.isTerminalState()) throw new Error('Cannot migrate: playback has terminated');
     if (this.currentMigration) throw new Error('Cannot migrate: a migration is already in progress');
-    if (this.audioSelection) throw new Error('Cannot migrate: media selection is busy');
+    if (this.mediaSelection) throw new Error('Cannot migrate: media selection is busy');
     // A previous attempt's `changeType` has not settled, so the media source
     // is not in a known state. Adopting a replacement onto a buffer another
     // attempt can still mutate would hand it an initialization that is about
@@ -5060,6 +5217,7 @@ export class MoqtPlayer {
         .map(other => ({ name: other.name, namespaceFields: [...trackNamespaceFields(other, this.config.namespace)] }));
     };
     const activeScope = activeVideo ?? activeAudio;
+    const audioLanguages = this.effectiveAudioLanguages();
     return {
       // The LIVE mode, not the configured one: selectVideoTrack() and
       // unlockAuto() change auto quality at runtime.
@@ -5077,7 +5235,9 @@ export class MoqtPlayer {
       catalogNamespace: this.config.namespace,
       // The scope this presentation belongs to: configured, else the one the
       // established video was declared in.
-      ...(this.config.selection?.renderGroup !== undefined
+      ...(this.runtimeSelectionIntent?.scope !== undefined
+        ? { scope: this.runtimeSelectionIntent.scope.kind === 'render-group' ? this.runtimeSelectionIntent.scope.renderGroup : null }
+        : this.config.selection?.renderGroup !== undefined
         ? { scope: this.config.selection.renderGroup }
         : activeScope !== undefined ? { scope: activeScope.renderGroup ?? null } : {}),
       activeVideoTrack, activeAudioTrack,
@@ -5086,7 +5246,9 @@ export class MoqtPlayer {
       // `selectVideoTrack()`, which is what leaving automatic mode records.
       pinnedVideo: establishedVideo && this.qualityController !== null
         ? !this.qualityController.isAutoQuality : configured?.videoTrack !== undefined,
-      pinnedAudio: this.runtimeAudioIntent !== null || this.config.selection?.audioTrack !== undefined,
+      pinnedAudio: this.runtimeSelectionIntent === null
+        ? this.runtimeAudioIntent !== null || this.config.selection?.audioTrack !== undefined
+        : this.runtimeAudioIntent !== null,
       disableVideo: this.config.disableVideo === true,
       disableAudio: this.config.disableAudio === true,
       ...(altGroup !== undefined ? { videoAltGroup: altGroup } : {}),
@@ -5094,9 +5256,181 @@ export class MoqtPlayer {
         : this.config.selection?.audioAltGroup !== undefined
           ? { audioAltGroup: this.config.selection.audioAltGroup } : {}),
       ...(this.config.videoConstraints !== undefined ? { videoConstraints: this.config.videoConstraints } : {}),
-      ...(this.runtimeAudioIntent === null && this.config.audioConstraints !== undefined ? { audioConstraints: this.config.audioConstraints } : {}),
-      ...(this.config.audioLanguages !== undefined ? { audioLanguages: this.config.audioLanguages } : {}),
+      ...(this.runtimeAudioIntent === null && this.runtimeAudioLanguage === null && this.config.audioConstraints !== undefined ? { audioConstraints: this.config.audioConstraints } : {}),
+      ...(audioLanguages !== undefined ? { audioLanguages } : {}),
     };
+  }
+
+  /** Prepare a presentation on this session and publish its outputs in one adoption. */
+  async selectMedia(selection: SelectionConfig, options?: MediaSelectionOptions): Promise<void> {
+    if (this._destroyed || this.isTerminalState() || !this.connection || !this.subscriptionManager || !this._catalogState) {
+      throw new Error('Cannot select media: playback is not accepting selections');
+    }
+    if (this.currentMigration || this.mediaSelection || this.pendingVideoSwitch || this.switchInProgress || this.pendingRetypes.size) {
+      throw new Error('Cannot select media: media selection is busy');
+    }
+    const requested = structuredClone(selection);
+    const validation = { ...this.config, selection: requested };
+    Reflect.deleteProperty(validation, 'videoAltGroup'); // tune-in shorthand does not constrain a runtime view
+    validateConfig(validation);
+    const signal = options?.signal;
+    if (signal?.aborted) throw new Error('Media selection cancelled');
+    const timeline = options?.timeline;
+    const anchors = timeline === undefined ? undefined : {
+      kind: timeline.kind, token: timeline.referenceToken,
+      video: timeline.video === undefined ? undefined : { ...timeline.video },
+      audio: timeline.audio === undefined ? undefined : { ...timeline.audio },
+    };
+    if (anchors && anchors.kind !== 'reference-map') throw new Error('Unknown media timeline policy');
+    const originalCatalog = this._catalogState;
+    const catalog = structuredClone(originalCatalog);
+    const current = this._selection, controller = this.qualityController;
+    const conn = this.connection, manager = this.subscriptionManager, source = this.mediaSource;
+    const generation = this.bootstrapGeneration, sync = this.syncController;
+    const languages = this.effectiveAudioLanguages();
+    const choice = prepareRuntimeSelection(catalog, { selection: requested, current, catalogNamespace: this.config.namespace,
+      disableVideo: this.config.disableVideo === true, disableAudio: this.config.disableAudio === true,
+      quality: { startLevel: this.config.startLevel ?? 'auto', qualitySwitchCooldownMs: this.config.qualitySwitchCooldownMs ?? 0,
+        ...(this.config.capLevelToResolution ? { capLevelToResolution: this.config.capLevelToResolution } : {}) }, clock: this.clock,
+      ...(this.config.videoConstraints ? { videoConstraints: this.config.videoConstraints } : {}),
+      ...(this.runtimeAudioIntent === null && this.runtimeAudioLanguage === null && this.config.audioConstraints ? { audioConstraints: this.config.audioConstraints } : {}),
+      ...(languages !== undefined ? { audioLanguages: languages } : {}),
+    });
+    if (!choice.ok) throw new Error(`Cannot select media: ${choice.reason}`);
+    const prep = createPreparedMediaSelection();
+    prep.selection = {
+      video: choice.selected.video.state === 'selected' ? choice.selected.video.track.track : null,
+      audio: choice.selected.audio.state === 'selected' ? choice.selected.audio.track.track : null,
+    };
+    prep.controller = choice.controller;
+    let txn: MediaSelectionTxn | null = null;
+    const live = () => !this._destroyed && !this.isTerminalState() && this.connection === conn
+      && this.subscriptionManager === manager && this.mediaSource === source && this.bootstrapGeneration === generation
+      && this.syncController === sync && this.qualityController === controller && this._selection === current
+      && (txn === null ? this.mediaSelection === null : this.mediaSelection === txn);
+    const outputs = new Map<'video' | 'audio', PreparedMediaOutput>();
+    let referenceToken: object | null = null;
+    if (anchors) {
+      const reference = this.mediaTimelineReference;
+      if (!reference || reference.token !== anchors.token) throw new Error('Media timeline reference is stale or unavailable');
+      referenceToken = reference.token;
+    }
+    for (const role of ['video', 'audio'] as const) {
+      const target = prep.selection[role], selected = current[role];
+      if (target === null && selected === null) continue;
+      // Adding/removing native output graphs needs a separately supported
+      // resource operation. Refuse before disturbing an established output.
+      if (target === null || selected === null) throw new Error('Media adapter cannot change the enabled output types');
+      const targetKey = this.initKey(target), oldKey = identityKey(selected.namespaceFields, selected.name);
+      if (targetKey === oldKey) {
+        if (anchors?.[role]) throw new Error('Cannot remap an unchanged media output');
+        continue;
+      }
+      const running = this.catalogTrackFor(selected.name, selected.namespaceFields, role);
+      const owner = this.selectedOutputOwners.get(role);
+      if (!running || owner?.key !== oldKey) throw new Error(`Current ${role} output is no longer available`);
+      const mse = this.usesMse(running.packaging) && this.usesMse(target.packaging);
+      if (!mse && (running.packaging !== 'loc' || target.packaging !== 'loc')) {
+        throw new Error('Media adapter does not support this presentation transition');
+      }
+      const referenceRole = current.audio === null ? 'video' : 'audio';
+      const referenceId = current[referenceRole];
+      const referenceTrack = referenceId && this.catalogTrackFor(referenceId.name, referenceId.namespaceFields, referenceRole);
+      if (!referenceTrack || this.usesMse(referenceTrack.packaging) !== mse) {
+        throw new Error('Media adapter cannot map between different output clocks');
+      }
+      if (!target.codec || target.codec !== running.codec || (role === 'video'
+          ? target.width !== running.width || target.height !== running.height
+          : target.samplerate !== running.samplerate || target.channelConfig !== running.channelConfig)) {
+        throw new Error(`Cannot prepare changed ${role} decoder metadata on this adapter`);
+      }
+      const pipeline = role === 'video' ? this.videoPipeline : this.audioPipeline;
+      const assembler = this.cmafAssembler;
+      if (!mse && (!pipeline || !sync?.hasReference)) throw new Error(`Current ${role} pipeline has no continuing timeline`);
+      if (mse && (!source || !this.keyedCmafIdentity || !source.holdQueuedAppends || !source.getTimestampOffset
+          || !assembler?.setPresentationPlacement || !assembler.capturePresentationPlacement || !this.config.createCmafAssembler)) {
+        throw new Error('Media adapter cannot prepare independent MSE output identities and presentation placement');
+      }
+      const previous = [...this.activeSubscriptions.entries()].find(([, sub]) => sub.mediaType === role
+        && sub.trackAlias !== null && !this.supersededRouting?.aliases.has(sub.trackAlias)
+        && identityKey(sub.namespace ?? namespaceFields(this.config.namespace), sub.trackName) === oldKey);
+      const route = previous ? manager.captureRoute(previous[1].trackAlias!) : null;
+      if (previous && !route) throw new Error(`Current ${role} route was retired`);
+      const oldIsCurrent = () => live() && this.selectedOutputOwners.get(role) === owner
+        && (!mse || this.cmafAssembler === assembler)
+        && (role === 'video' ? this.videoPipeline : this.audioPipeline) === pipeline
+        && (previous ? this.activeSubscriptions.get(previous[0]) === previous[1] && route!()
+          || this.terminalMediaSubscriptions.has(previous[1]) : true);
+      let offset = role === 'audio' ? this.audioPresentationOffsetUs : this.videoPresentationOffsetUs;
+      const anchor = anchors?.[role];
+      if (anchor) {
+        if (typeof anchor.sourceTimeUs !== 'bigint' || typeof anchor.referenceTimeUs !== 'bigint') {
+          throw new TypeError('Media reference-map anchors must be bigint microseconds');
+        }
+        offset = (current.audio === null ? this.videoPresentationOffsetUs : this.audioPresentationOffsetUs)
+          + anchor.referenceTimeUs - anchor.sourceTimeUs;
+      } else if (choice.scopeChanged || running.altGroup === undefined || target.altGroup !== running.altGroup) {
+        throw new Error(`The target ${role} timeline requires an explicit reference mapping`);
+      }
+      let msePlacement: PreparedMsePlacement | undefined;
+      if (mse) {
+        if (!anchor) throw new Error('MSE media selection requires an explicit presentation reference mapping');
+        const reference = assembler!.capturePresentationPlacement!(referenceRole);
+        const oldPlacement = assembler!.capturePresentationPlacement!(role);
+        const referenceOffset = source!.getTimestampOffset!(referenceRole), targetOffset = source!.getTimestampOffset!(role);
+        if (!reference || !oldPlacement || referenceOffset === undefined || !Number.isFinite(referenceOffset)
+            || targetOffset === undefined || !Number.isFinite(targetOffset)) throw new Error('MSE presentation evidence is unavailable');
+        const placed = placePresentationAnchor(reference, anchor.sourceTimeUs, anchor.referenceTimeUs, referenceOffset, targetOffset);
+        if (placed === null) throw new Error('MSE presentation anchor is not representable');
+        msePlacement = { assembler: assembler!, referenceRole, reference, oldPlacementToken: oldPlacement.token,
+          referenceOffset, targetOffset, sourceKey: targetKey, anchor: placed };
+      } else if (role === 'video' && !this.commandDispatcher?.supportsVideoOutputTiming) {
+        throw new Error('Video decoder cannot preserve producing output timing');
+      }
+      const capturedOffset = offset;
+      const output: PreparedMediaOutput = { role, target, ...(msePlacement ? { mse: msePlacement } : {}),
+        oldRequestId: previous?.[0] ?? null, oldSubscription: previous?.[1] ?? null, oldIdentity: selected, oldIsCurrent,
+        timing: { presentationOffsetUs: offset, liveOutput: null, mappedTiming: true, presentationMapper: null,
+          timingSink: role === 'audio' ? this.audioPipeline : null,
+          timingSource: role === 'audio' ? this.createMappedAudioTiming(sync, capturedOffset) : undefined,
+          ...(role === 'video' ? { videoTimingSource: this.createMappedVideoTiming(sync, capturedOffset) } : {}) },
+        evidence: new PreparedOutputEvidence(mediaTrackPackaging(target.packaging), role, target.codec),
+        staged: [], serial: Promise.resolve(), checked: 0 };
+      outputs.set(role, output); prep.awaiting.add(`usable-${role}`);
+    }
+    if (referenceToken !== null && this.mediaTimelineReference?.token !== referenceToken) throw new Error('Media timeline reference changed during preparation');
+    if (!live()) throw new Error('Playback ownership changed during media selection');
+    const audioPin = requested.audioTrack !== undefined || !choice.scopeChanged && requested.audioAltGroup === undefined
+      && (this.runtimeAudioIntent !== null || this.runtimeSelectionIntent === null && this.config.selection?.audioTrack !== undefined);
+    const explicitAudio = !this.config.disableAudio && requested.audioTrack !== undefined
+      && choice.selected.audio.state === 'selected' ? choice.selected.audio.track.track : null;
+    const audioLanguage = explicitAudio === null ? undefined : explicitAudio.lang || null;
+    if (!outputs.size) {
+      if (signal?.aborted) throw new Error('Media selection cancelled');
+      if (this._catalogState !== originalCatalog) throw new Error('Catalog changed while selecting the current media');
+      this.adoptRuntimeSelectionPolicy(choice, audioPin, audioLanguage, false);
+      this.refreshMediaSelection();
+      return;
+    }
+    let cancel!: () => void;
+    const cancelled = new Promise<void>(resolve => { cancel = resolve; });
+    txn = { conn, prep, manager, source, generation, catalog, outputs, referenceToken, referenceRole: current.audio === null ? 'video' : 'audio', selection: choice, audioPin,
+      ...(audioLanguage !== undefined ? { audioLanguage } : {}),
+      rawInputs: new WeakSet(), registrations: new Map(), releasedRequests: new Set(), terminalRequests: new Set(),
+      retainedBytes: 0, inputCount: 0, aborted: false, committed: false, cancel };
+    this.mediaSelection = txn;
+    const operation = txn;
+    const abort = () => this.failMediaSelection(operation, new Error('Media selection cancelled'));
+    try {
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+      await this.runPreparedMediaSelection(operation, cancelled);
+    } catch (error) {
+      if (!operation.committed) this.failMediaSelection(operation, error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    } finally {
+      try { signal?.removeEventListener('abort', abort); } catch { /* Cleanup cannot leave the selection reserved. */ }
+    }
   }
 
   /** Select an exact audio identity without recreating the player or its session. */
@@ -5104,7 +5438,7 @@ export class MoqtPlayer {
     if (this._destroyed || this.isTerminalState() || !this.connection || !this.subscriptionManager || !this._catalogState) {
       throw new Error('Cannot select audio: playback is not accepting selections');
     }
-    if (this.currentMigration || this.audioSelection || this.pendingVideoSwitch || this.switchInProgress || this.pendingRetypes.size) {
+    if (this.currentMigration || this.mediaSelection || this.pendingVideoSwitch || this.switchInProgress || this.pendingRetypes.size) {
       throw new Error('Cannot select audio: media selection is busy');
     }
     const namespace = namespaceFields(reference.namespace ?? this.config.namespace);
@@ -5126,11 +5460,11 @@ export class MoqtPlayer {
       && identityKey(sub.namespace ?? namespaceFields(this.config.namespace), sub.trackName) === outputOwner.key);
     const oldRegistration = previous ? manager.captureRoute(previous[1].trackAlias!) : null;
     if (previous && !oldRegistration) throw new Error('Current audio route is no longer registered');
-    let reservedAttempt: AudioSelectionTxn | null = null;
+    let reservedAttempt: MediaSelectionTxn | null = null;
     const outputCurrent = () => !this._destroyed && !this.isTerminalState() && this.connection === conn
       && this.subscriptionManager === manager && this.mediaSource === source && this.bootstrapGeneration === generation
       && this.audioPipeline === pipeline && this.audioOutput === output && this.syncController === sync
-      && this.audioSelection === reservedAttempt
+      && this.mediaSelection === reservedAttempt
       && this.selectedOutputOwners.get('audio') === outputOwner && this._selection.audio !== null
       && identityKey(this._selection.audio.namespaceFields, this._selection.audio.name) === outputOwner.key;
     const oldIsCurrent = () => {
@@ -5172,7 +5506,7 @@ export class MoqtPlayer {
       liveOutput = this.audioOutput;
       const owner = outputOwner.selection;
       const head = this.liveAudioHead(liveOutput);
-      if (!oldIsCurrent() || this.audioSelection || this.currentMigration) {
+      if (!oldIsCurrent() || this.mediaSelection || this.currentMigration) {
         throw new Error('Audio ownership changed while reading the output witness');
       }
       // The current graph head itself is an observed source point. No elapsed
@@ -5185,13 +5519,16 @@ export class MoqtPlayer {
       if (!current) throw new Error('Audio live-resync has no current source-domain reference');
       referenceToken = current.token;
     } else if (timeline !== undefined) throw new Error('Unknown audio timeline policy');
-    else if (target.altGroup === undefined || running.altGroup === undefined || target.altGroup !== running.altGroup) {
+    else if (this.initKey(target) !== this.initKey(running)
+        && (target.altGroup === undefined || running.altGroup === undefined || target.altGroup !== running.altGroup)) {
       throw new Error('Audio timelines have no proven relationship; an explicit timeline mapping is required');
     }
     if (this.initKey(target) === this.initKey(running)) {
-      if (!oldIsCurrent() || this.audioSelection || this.currentMigration || this.pendingVideoSwitch
+      if (!oldIsCurrent() || this.mediaSelection || this.currentMigration || this.pendingVideoSwitch
           || this.switchInProgress || this.pendingRetypes.size) throw new Error('Audio ownership changed during selection');
       if (presentationOffsetUs !== this.audioPresentationOffsetUs) throw new Error('Cannot remap the already selected audio');
+      this.runtimeAudioIntent = Object.freeze({ name: target.name, namespaceFields: Object.freeze([...namespace]) });
+      this.runtimeAudioLanguage = target.lang || null;
       return;
     }
     const mse = this.usesMse(target.packaging);
@@ -5205,9 +5542,8 @@ export class MoqtPlayer {
       throw new Error('Audio adapter cannot map presentation timestamps without changing the shared video timeline');
     }
     const timingSource: AudioTimingSource | undefined = !mse && mappedTiming && !liveOutput
-      ? timeline === undefined && this.audioTimingSource ? this.audioTimingSource : {
-        computeAudioRenderTime: sourceUs => this.mappedAudioTiming(sync, sourceUs + presentationOffsetUs),
-      } : undefined;
+      ? timeline === undefined && this.audioTimingSource ? this.audioTimingSource
+        : this.createMappedAudioTiming(sync, presentationOffsetUs) : undefined;
     const transition = this.unadoptableTransition(target, 'audio', running);
     if (transition !== null) throw new Error(`Cannot select audio: ${transition}`);
     if (!target.codec) throw new Error('Target audio has no codec');
@@ -5222,81 +5558,141 @@ export class MoqtPlayer {
     prep.awaiting.add('usable-audio');
     let cancel!: () => void;
     const cancelled = new Promise<void>(resolve => { cancel = resolve; });
-    const txn: AudioSelectionTxn = {
-      conn, prep, manager, source, generation, catalog, target: track,
+    const preparedOutput: PreparedMediaOutput = {
+      role: 'audio', target: track,
       oldRequestId: previous?.[0] ?? null, oldSubscription: previous?.[1] ?? null, oldIdentity: selected, oldIsCurrent,
-      referenceToken, presentationOffsetUs, liveOutput, mappedTiming, presentationMapper, timingSink, timingSource, evidence: new PreparedAudioEvidence(mediaTrackPackaging(track.packaging)),
-      rawInputs: new WeakSet(), registrations: new Map(), staged: [], releasedRequests: new Set(), terminalRequests: new Set(), serial: Promise.resolve(), checked: 0,
+      timing: { presentationOffsetUs, liveOutput, mappedTiming, presentationMapper, timingSink, timingSource },
+      evidence: new PreparedAudioEvidence(mediaTrackPackaging(track.packaging)),
+      staged: [], serial: Promise.resolve(), checked: 0,
+    };
+    const txn: MediaSelectionTxn = {
+      conn, prep, manager, source, generation, catalog, outputs: new Map([['audio', preparedOutput]]), referenceToken,
+      rawInputs: new WeakSet(), registrations: new Map(), releasedRequests: new Set(), terminalRequests: new Set(),
       retainedBytes: 0, inputCount: 0, aborted: false, committed: false, cancel,
     };
-    if (!oldIsCurrent() || this.audioSelection || this.currentMigration || this.pendingVideoSwitch
+    if (!oldIsCurrent() || this.mediaSelection || this.currentMigration || this.pendingVideoSwitch
         || this.switchInProgress || this.pendingRetypes.size) throw new Error('Audio ownership changed during selection');
     reservedAttempt = txn;
-    this.audioSelection = txn; // final guard and reservation are synchronous
+    this.mediaSelection = txn; // final guard and reservation are synchronous
+    await this.runPreparedMediaSelection(txn, cancelled);
+  }
+
+  private async runPreparedMediaSelection(txn: MediaSelectionTxn, cancelled: Promise<void>): Promise<void> {
+    const required = [...txn.outputs.values()];
     const budget = this.config.connectionTimeoutMs && this.config.connectionTimeoutMs > 0
       ? Math.min(this.config.connectionTimeoutMs, SWITCH_STAGING_TIMEOUT_MS) : SWITCH_STAGING_TIMEOUT_MS;
-    const timer = setTimeout(() => this.failAudioSelection(txn, new Error('Audio selection timed out')), budget);
+    const timer = setTimeout(() => this.failMediaSelection(txn, new Error('Audio selection timed out')), budget);
     const guard = async <T>(work: Promise<T>): Promise<T> => {
       const result = await Promise.race([work.then(value => ({ value })), cancelled.then(() => null)]);
       if (result === null) throw txn.failure ?? new Error('Audio selection cancelled');
-      this.assertAudioSelection(txn);
+      this.assertMediaSelection(txn);
       return result.value;
     };
     try {
-      const inline = this.decodeResolvedInlineInitData(track, catalog);
-      if (inline) { txn.evidence.setInit(inline); txn.init = inline; }
-      if (isMsePackaging(track.packaging) && track.initRef !== undefined
-          && !catalog.initDataList?.some(item => item.id === track.initRef)) throw new Error('Target audio initRef is missing');
-      const allowed = this.hooks.beforeSubscribe.run({ trackName: track.name, namespace, mediaType: 'audio' });
-      this.assertAudioSelection(txn);
-      if (allowed === null) throw new Error('Audio subscription cancelled by beforeSubscribe');
-      await guard(this.issuePreparedMedia(txn, [{ track, mediaType: 'audio' }], catalog,
-        () => this.assertAudioSelection(txn), id => this.pendingAliasBinds.add(id)));
-      this.validateAudioSelection(txn);
-      const init = this.preparedInitBytes(prep, track, catalog);
-      if (this.usesMse(track.packaging) && init) {
-        const previousInit = this.runningInitBytes('audio');
-        if (previousInit === undefined) throw new Error('Cannot replace audio without its running initialization');
-        if (!bytesEqual(previousInit, init)) {
-          const source = txn.source;
-          if (!source?.changeType) throw new Error('Media source cannot reconfigure the audio initialization');
-          const offset = source.getTimestampOffset?.('audio');
-          this.assertAudioSelection(txn);
-          const mutation = (async () => {
-            try {
-              await this.applyMediaRetype(txn, { source, mediaType: 'audio', codec: track.codec!, next: init,
-                previousCodec: running.codec ?? '', previous: previousInit, offset });
-              this.assertAudioSelection(txn);
-              prep.reconfigured.set('audio', init);
-            } catch (error) { await this.restorePendingRetypes(txn); throw error; }
-          })();
-          txn.mutation = mutation;
-          void mutation.finally(() => {
-            if (txn.mutation === mutation) delete txn.mutation;
-            if (this.audioSelection === txn && txn.aborted && !this.pendingRetypes.size) this.audioSelection = null;
-            this.processPendingGoaway();
-          }).catch(() => {});
-          await guard(mutation);
+      for (const output of required) {
+        const track = output.target;
+        const inline = this.decodeResolvedInlineInitData(track, txn.catalog);
+        if (inline) { output.evidence.setInit(inline); output.init = inline; }
+        if (isMsePackaging(track.packaging) && track.initRef !== undefined
+            && !txn.catalog.initDataList?.some(item => item.id === track.initRef)) throw new Error('Target initRef is missing');
+        const allowed = this.hooks.beforeSubscribe.run({ trackName: track.name,
+          namespace: trackNamespaceFields(track, this.config.namespace), mediaType: output.role });
+        this.assertMediaSelection(txn);
+        if (allowed === null) throw new Error('Media subscription cancelled by beforeSubscribe');
+      }
+      await guard(this.issuePreparedMedia(txn, required.map(output => ({ track: output.target, mediaType: output.role })), txn.catalog,
+        () => this.assertMediaSelection(txn), id => this.pendingAliasBinds.add(id)));
+      this.validatePreparedMediaOutputs(txn);
+      for (const output of required) {
+        const track = output.target;
+        const running = this.catalogTrackFor(output.oldIdentity.name, output.oldIdentity.namespaceFields, output.role)!;
+        const init = this.preparedInitBytes(txn.prep, track, txn.catalog);
+        if (this.usesMse(track.packaging) && init) {
+          const previousInit = this.runningInitBytes(output.role);
+          if (previousInit === undefined) throw new Error('Cannot replace audio without its running initialization');
+          if (!bytesEqual(previousInit, init)) {
+            if (txn.selection) throw new Error('MSE media preparation requires the running initialization');
+            const source = txn.source;
+            if (!source?.changeType) throw new Error('Media source cannot reconfigure the audio initialization');
+            const offset = source.getTimestampOffset?.(output.role);
+            this.assertMediaSelection(txn);
+            const mutation = (async () => {
+              try {
+                await this.applyMediaRetype(txn, { source, mediaType: output.role, codec: track.codec!, next: init,
+                  previousCodec: running.codec ?? '', previous: previousInit, offset });
+                this.assertMediaSelection(txn);
+                txn.prep.reconfigured.set(output.role, init);
+              } catch (error) { await this.restorePendingRetypes(txn); throw error; }
+            })();
+            txn.mutation = mutation;
+            void mutation.finally(() => {
+              if (txn.mutation === mutation) delete txn.mutation;
+              if (this.mediaSelection === txn && txn.aborted && !this.pendingRetypes.size) this.mediaSelection = null;
+              this.processPendingGoaway();
+            }).catch(() => {});
+            await guard(mutation);
+          }
         }
       }
-      this.validateAudioSelection(txn);
-      this.adoptPreparedAudio(txn);
+      this.validatePreparedMediaOutputs(txn);
+      if (txn.selection) this.adoptPreparedOutputs(txn);
+      else this.adoptPreparedAudioOutput(txn, txn.outputs.get('audio')!);
     } catch (error) {
       const cause = error instanceof Error ? error : new Error(String(error));
       if (!txn.committed) {
-        this.failAudioSelection(txn, cause);
+        this.failMediaSelection(txn, cause);
         if (!txn.mutation) await this.restorePendingRetypes(txn);
       } else if (!this._destroyed) {
-        this.failCatalogPlayback(createPlayerError('fatal', 'decoder', PlayerErrorCode.AUDIO_DECODE_ERROR,
-          'Audio selection failed after adoption', { cause }));
+        this.failCatalogPlayback(createPlayerError('fatal', 'decoder', txn.selection && txn.outputs.has('video')
+          ? PlayerErrorCode.VIDEO_DECODE_ERROR : PlayerErrorCode.AUDIO_DECODE_ERROR,
+          `${txn.selection ? 'Media' : 'Audio'} selection failed after adoption`, { cause }));
       }
       throw cause;
     } finally {
       clearTimeout(timer);
-      if (this.audioSelection === txn) this.audioSelection = null;
-      if (!txn.committed) this.releasePreparedAudioRequests(txn);
+      if (this.mediaSelection === txn) this.mediaSelection = null;
+      if (!txn.committed) this.releasePreparedMediaRequests(txn);
+      for (const output of txn.outputs.values()) {
+        for (const item of output.staged.splice(0)) this.discardMediaInput(item.input, 'route retired');
+      }
       this.processPendingGoaway();
     }
+  }
+
+  private resetMediaClock(): void {
+    this.subscriptionManager?.invalidateMediaInputs();
+    this.audioTimelineRecord = null;
+    this.videoTimelineRecord = null;
+    this.syncController?.reset();
+    this.mappedClockOwner = this._selection.audio === null
+      ? this.videoTimingSource ?? null : this.audioTimingSource ?? null;
+  }
+
+  private establishMappedClock(owner: object, sync: SyncController | null, role: 'video' | 'audio', referenceUs: bigint): void {
+    if (this._destroyed || this.syncController !== sync || !sync || sync.hasReference || this.mappedClockOwner !== owner) return;
+    const active = role === 'audio' ? this.audioTimingSource : this.videoTimingSource;
+    if (active !== owner || role === 'video' && this._selection.audio !== null) return;
+    // Consume before the injected clock callback. Only an adopted input source
+    // can consume this clock-reset intent; readiness/output queries remain pure.
+    this.mappedClockOwner = null;
+    if (role === 'audio') sync.setAudioReference(referenceUs);
+    else sync.setVideoReference(referenceUs);
+  }
+
+  private createMappedAudioTiming(sync: SyncController | null, offset: bigint): AudioTimingSource {
+    const source: AudioTimingSource = {
+      computeAudioRenderTime: raw => this.mappedAudioTiming(sync, raw + offset),
+      establishReference: raw => this.establishMappedClock(source, sync, 'audio', raw + offset),
+    };
+    return source;
+  }
+
+  private createMappedVideoTiming(sync: SyncController | null, offset: bigint): VideoTimingSource {
+    const source: VideoTimingSource = {
+      computeVideoRenderTime: raw => this.mappedVideoTiming(sync, raw + offset),
+      establishReference: raw => this.establishMappedClock(source, sync, 'video', raw + offset),
+    };
+    return source;
   }
 
   private mappedAudioTiming(sync: SyncController | null, referenceUs: bigint) {
@@ -5311,6 +5707,14 @@ export class MoqtPlayer {
     return { ...timing, shouldDrop: timing.offsetUs + cushion < -this.config.lateFrameThresholdMs! * 1000 };
   }
 
+  private mappedVideoTiming(sync: SyncController | null, referenceUs: bigint) {
+    if (this._destroyed || this.syncController !== sync) return null;
+    const timing = sync?.computeVideoRenderTime(referenceUs);
+    if (!timing) return null;
+    const cushion = this.getRenderCushionUs?.() ?? computePlaybackDelayUs(this.videoPipeline?.effectiveGapTimeoutUs, this._handshakeRttMs);
+    return { ...timing, shouldDrop: timing.offsetUs + cushion < -this.config.lateFrameThresholdMs! * 1000 };
+  }
+
   private liveAudioHead(output: AudioOutputLike): bigint {
     if (this.audioOutput !== output || this._destroyed) throw new Error('Audio output witness is no longer current');
     const value = output.playheadCaptureUs?.();
@@ -5321,138 +5725,162 @@ export class MoqtPlayer {
     return BigInt(Math.round(value));
   }
 
-  private audioSelectionRouteCurrent(txn: AudioSelectionTxn): boolean {
+  private mediaSelectionRouteCurrent(txn: MediaSelectionTxn): boolean {
     if (txn.aborted || this._destroyed || this.isTerminalState() || this.connection !== txn.conn
         || this.subscriptionManager !== txn.manager || this.bootstrapGeneration !== txn.generation || this.mediaSource !== txn.source) return false;
     if (txn.committed) return true;
-    return this.audioSelection === txn && txn.oldIsCurrent() && this.audioSelection === txn && !txn.aborted;
+    if (this.mediaSelection !== txn) return false;
+    for (const output of txn.outputs.values()) if (!output.oldIsCurrent()) return false;
+    return this.mediaSelection === txn && !txn.aborted;
   }
 
-  private assertAudioSelection(txn: AudioSelectionTxn): void {
-    if (!this.audioSelectionRouteCurrent(txn) || txn.committed) throw txn.failure ?? new Error('Audio selection is no longer current');
-    if (txn.referenceToken !== null && this.audioTimelineRecord?.reference.token !== txn.referenceToken) {
+  private assertMediaSelection(txn: MediaSelectionTxn): void {
+    if (!this.mediaSelectionRouteCurrent(txn) || txn.committed) throw txn.failure ?? new Error('Audio selection is no longer current');
+    if (txn.referenceToken !== null && (txn.referenceRole === 'video' ? this.videoTimelineRecord : this.audioTimelineRecord)?.reference.token !== txn.referenceToken) {
       throw new Error('Audio timeline reference was retired during preparation');
     }
   }
 
-  private validateAudioSelection(txn: AudioSelectionTxn): void {
-    this.assertAudioSelection(txn);
-    if (txn.referenceToken !== null && this.audioTimelineReference?.token !== txn.referenceToken) {
+  private validatePreparedMediaOutputs(txn: MediaSelectionTxn): void {
+    this.assertMediaSelection(txn);
+    if (txn.referenceToken !== null && (txn.selection ? this.mediaTimelineReference : this.audioTimelineReference)?.token !== txn.referenceToken) {
       throw new Error('Audio timeline reference changed during preparation');
     }
-    const current = this.catalogTrackFor(txn.target.name, trackNamespaceFields(txn.target, this.config.namespace), 'audio');
-    const fields = ['packaging', 'codec', 'samplerate', 'channelConfig', 'renderGroup', 'altGroup', 'initData', 'initRef', 'initTrack'] as const;
-    if (!current || fields.some(key => current[key] !== txn.target[key])) throw new Error('Audio target changed during preparation');
-    const before = this.decodeResolvedInlineInitData(txn.target, txn.catalog);
-    const now = this.decodeResolvedInlineInitData(current);
-    if ((before === undefined) !== (now === undefined) || before && now && !bytesEqual(before, now)) {
-      throw new Error('Audio target initialization changed during preparation');
+    for (const output of txn.outputs.values()) {
+      if (output.mse) {
+        const geometry = output.mse, assembler = geometry.assembler, source = txn.source;
+        if (this.cmafAssembler !== assembler
+            || !Object.is(source?.getTimestampOffset?.(geometry.referenceRole), geometry.referenceOffset)
+            || !Object.is(source?.getTimestampOffset?.(output.role), geometry.targetOffset)
+            || assembler.capturePresentationPlacement?.(geometry.referenceRole)?.token !== geometry.reference.token
+            || assembler.capturePresentationPlacement?.(output.role)?.token !== geometry.oldPlacementToken) {
+          throw new Error('MSE presentation placement changed during preparation');
+        }
+        this.assertMediaSelection(txn);
+      }
+      const current = this.catalogTrackFor(output.target.name, trackNamespaceFields(output.target, this.config.namespace), output.role);
+      const fields = ['packaging', 'codec', 'width', 'height', 'samplerate', 'channelConfig', 'renderGroup', 'altGroup', 'initData', 'initRef', 'initTrack'] as const;
+      if (!current || fields.some(key => current[key] !== output.target[key])) throw new Error('Audio target changed during preparation');
+      const before = this.decodeResolvedInlineInitData(output.target, txn.catalog);
+      const now = this.decodeResolvedInlineInitData(current);
+      if ((before === undefined) !== (now === undefined) || before && now && !bytesEqual(before, now)) {
+        throw new Error('Audio target initialization changed during preparation');
+      }
     }
   }
 
-  private reserveAudioInput(txn: AudioSelectionTxn, obj: MoqtObject): boolean {
-    if (!this.audioSelectionRouteCurrent(txn)) return false;
+  private reservePreparedMediaInput(txn: MediaSelectionTxn, obj: MoqtObject): boolean {
+    if (!this.mediaSelectionRouteCurrent(txn)) return false;
     if (txn.rawInputs.has(obj)) return true;
     const bytes = MoqtPlayer.STAGED_EVENT_BASE_BYTES + (obj.kind === 'data' ? obj.payload.byteLength + (obj.extensions?.byteLength ?? 0) : 0);
     if (txn.inputCount >= SWITCH_STAGING_MAX_OBJECTS || bytes > MoqtPlayer.MAX_STAGED_BYTES - txn.retainedBytes) {
-      this.failAudioSelection(txn, new Error('Audio selection input retention limit exceeded')); return false;
+      this.failMediaSelection(txn, new Error('Audio selection input retention limit exceeded')); return false;
     }
     txn.rawInputs.add(obj); txn.inputCount++; txn.retainedBytes += bytes;
     return true;
   }
 
   /** Retain the manager's already-transformed input; adoption never transforms it twice. */
-  private stageAudioInput(obj: MoqtObject, headers: LocHeaders | undefined, input: ObjectRoutingContext | undefined,
+  private stagePreparedMediaInput(obj: MoqtObject, headers: LocHeaders | undefined, input: ObjectRoutingContext | undefined,
     run: () => void, delivery?: ObjectDeliveryOptions): boolean {
     // The owner was captured before transformation; a returned alias is not routing authority.
     const captured = delivery?.isLive ? this.preparedMediaDeliveries.get(delivery.isLive) : undefined;
     const txn = captured?.preparation;
     if (!txn) return false;
+    const output = captured.output;
     if (BigInt(obj.trackAlias) !== captured.alias) {
       const error = new Error('Audio transform changed the issued routing identity');
       this.discardMediaInput(input, 'route retired');
-      if (!txn.committed) this.failAudioSelection(txn, error);
-      else this.handleMalformedTrack(captured.alias, txn.target.name, error, txn.conn);
+      if (!txn.committed) this.failMediaSelection(txn, error);
+      else this.handleMalformedTrack(captured.alias, output.target.name, error, txn.conn);
       return true;
     }
     if (txn.committed) return false;
-    if (!this.audioSelectionRouteCurrent(txn)) { this.discardMediaInput(input, 'route retired'); return true; }
+    if (!this.mediaSelectionRouteCurrent(txn)) { this.discardMediaInput(input, 'route retired'); return true; }
     const bytes = obj.kind === 'data' ? obj.payload.byteLength : 0;
     if (bytes > MoqtPlayer.MAX_STAGED_BYTES - txn.retainedBytes) {
-      this.discardMediaInput(input, 'buffer full'); this.failAudioSelection(txn, new Error('Transformed audio retention limit exceeded')); return true;
+      this.discardMediaInput(input, 'buffer full'); this.failMediaSelection(txn, new Error('Transformed audio retention limit exceeded')); return true;
     }
     txn.retainedBytes += bytes;
-    txn.staged.push({ obj, ...(headers ? { headers } : {}), ...(input ? { input } : {}), run });
+    output.staged.push({ obj, ...(headers ? { headers } : {}), ...(input ? { input } : {}), run });
     try {
-      if (obj.kind === 'data' && isMsePackaging(txn.target.packaging)) {
+      if (obj.kind === 'data' && isMsePackaging(output.target.packaging)) {
         let bytes = obj.payload;
-        if (txn.target.packaging === 'locmaf') {
+        if (output.target.packaging === 'locmaf') {
           const parsed = deserializeLocmafObject(bytes);
           if (parsed.kind === 'rawBoxes') bytes = parsed.boxes;
         }
         if (isCmafHeader(bytes)) {
-          txn.prep.inbandBytes.set('audio', bytes);
-          txn.prep.inbandInit.delete(this.initKey(txn.target));
-          txn.prep.awaiting.delete(`in-band:${this.initKey(txn.target)}`);
+          txn.prep.inbandBytes.set(output.role, bytes);
+          txn.prep.inbandInit.delete(this.initKey(output.target));
+          txn.prep.awaiting.delete(`in-band:${this.initKey(output.target)}`);
         }
       }
-      this.checkPreparedAudio(txn);
-    } catch (error) { this.failAudioSelection(txn, error instanceof Error ? error : new Error(String(error))); }
+      this.checkPreparedMediaOutput(txn, output);
+    } catch (error) { this.failMediaSelection(txn, error instanceof Error ? error : new Error(String(error))); }
     return true;
   }
 
-  private checkPreparedAudio(txn: AudioSelectionTxn): void {
-    this.assertAudioSelection(txn);
-    const init = this.preparedInitBytes(txn.prep, txn.target, txn.catalog);
-    if (isMsePackaging(txn.target.packaging) && !init) return;
-    if (init && txn.init !== init) { txn.evidence.setInit(init); txn.init = init; }
-    while (txn.checked < txn.staged.length) {
-      const item = txn.staged[txn.checked++]!;
-      if (txn.evidence.inspect(item.obj, item.headers) && txn.evidence.sourcePresentationTimeUs !== null) {
-        item.sourceTimeUs = txn.evidence.sourcePresentationTimeUs;
+  private checkPreparedMediaOutput(txn: MediaSelectionTxn, output: PreparedMediaOutput): void {
+    this.assertMediaSelection(txn);
+    const init = this.preparedInitBytes(txn.prep, output.target, txn.catalog);
+    if (isMsePackaging(output.target.packaging) && !init) return;
+    if (init && (!output.init || !bytesEqual(output.init, init))) { output.evidence.setInit(init); output.init = init; }
+    while (output.checked < output.staged.length) {
+      const item = output.staged[output.checked++]!;
+      if (output.evidence.inspect(item.obj, item.headers) && output.evidence.sourcePresentationTimeUs !== null) {
+        item.sourceTimeUs = output.evidence.sourcePresentationTimeUs;
       }
     }
-    if (this.preparedAudioScheduleUsable(txn)) txn.prep.awaiting.delete('usable-audio');
-    else txn.prep.awaiting.add('usable-audio');
+    if (this.preparedOutputScheduleUsable(txn, output)) txn.prep.awaiting.delete(`usable-${output.role}`);
+    else txn.prep.awaiting.add(`usable-${output.role}`);
     checkPreparedMediaReady(txn.prep);
   }
 
-  private preparedAudioScheduleUsable(txn: AudioSelectionTxn): boolean {
-    return txn.staged.some(item => {
+  private preparedOutputScheduleUsable(txn: MediaSelectionTxn, output: PreparedMediaOutput): boolean {
+    return output.staged.some(item => {
       if (item.sourceTimeUs === undefined) return false;
       // MSE owns buffered-media admission. Live resync establishes its target
       // mapping from a fresh graph-head witness immediately before adoption.
-      if (this.usesMse(txn.target.packaging) || txn.liveOutput && !txn.timingSource) return true;
-      const timing = (txn.timingSource ?? this.syncController)?.computeAudioRenderTime(item.sourceTimeUs);
-      this.assertAudioSelection(txn);
+      if (this.usesMse(output.target.packaging) || output.timing.liveOutput && !output.timing.timingSource) return true;
+      const timing = output.timing.mappedTiming
+        ? output.role === 'video' ? this.mappedVideoTiming(this.syncController, item.sourceTimeUs + output.timing.presentationOffsetUs)
+          : this.mappedAudioTiming(this.syncController, item.sourceTimeUs + output.timing.presentationOffsetUs)
+        : output.role === 'video' ? this.syncController?.computeVideoRenderTime(item.sourceTimeUs)
+          : this.syncController?.computeAudioRenderTime(item.sourceTimeUs);
+      this.assertMediaSelection(txn);
       // Match the consumer's timing source: ordinary audio uses the shared
       // uncushioned drop decision; mapped audio uses its mapped timing provider.
       // A placeholder or the ordinary five-second "play now" fallback is not
       // evidence that this packet fits the continuing presentation schedule.
       return timing != null && Number.isFinite(timing.renderTimeUs) && Number.isFinite(timing.offsetUs)
-        && !timing.shouldDrop && (txn.mappedTiming || timing.offsetUs <= 5_000_000);
+        && !timing.shouldDrop && (output.timing.mappedTiming || timing.offsetUs <= 5_000_000);
     });
   }
 
-  private receiveAudioInit(obj: MoqtObject, source?: unknown): boolean {
-    const txn = this.audioSelection;
+  private receivePreparedMediaInit(obj: MoqtObject, source?: unknown): boolean {
+    const txn = this.mediaSelection;
     if (!txn || txn.committed || source !== txn.conn) return false;
     for (const [key, init] of txn.prep.initTracks) {
       if (init.alias !== BigInt(obj.trackAlias)) continue;
       try {
-        this.assertAudioSelection(txn);
+        this.assertMediaSelection(txn);
         if (obj.kind !== 'data' || !obj.payload.byteLength) throw new Error('Target initialization has no bytes');
-        txn.evidence.setInit(obj.payload); txn.init = obj.payload;
+        for (const output of txn.outputs.values()) {
+          if (output.target.initTrack === init.name && this.initKey(output.target, init.name) === key) {
+            output.evidence.setInit(obj.payload); output.init = obj.payload;
+          }
+        }
         init.bytes = obj.payload; txn.prep.awaiting.delete(key);
-        this.checkPreparedAudio(txn);
-      } catch (error) { this.failAudioSelection(txn, error instanceof Error ? error : new Error(String(error))); }
+        for (const output of txn.outputs.values()) this.checkPreparedMediaOutput(txn, output);
+      } catch (error) { this.failMediaSelection(txn, error instanceof Error ? error : new Error(String(error))); }
       return true;
     }
     return false;
   }
 
-  private handleAudioSelectionControl(msg: ControlMessage, conn: MoqtConnection): boolean {
-    const txn = this.audioSelection;
+  private handleMediaSelectionControl(msg: ControlMessage, conn: MoqtConnection): boolean {
+    const txn = this.mediaSelection;
     if (!txn || txn.committed || conn !== txn.conn || !('requestId' in msg)) return false;
     const id = BigInt(msg.requestId);
     const sub = txn.prep.media.get(id);
@@ -5460,7 +5888,7 @@ export class MoqtPlayer {
     if (!sub && !init) return false;
     if (txn.aborted) return true;
     try {
-      this.assertAudioSelection(txn);
+      this.assertMediaSelection(txn);
       if (msg.type === 'SUBSCRIBE_OK' && 'trackAlias' in msg) {
         const alias = BigInt(msg.trackAlias);
         if (txn.manager.getMediaType(alias) !== undefined || alias === this.catalogSlots.catalogTrackAlias) {
@@ -5468,23 +5896,23 @@ export class MoqtPlayer {
         }
         this.settleParkedOwnership(id, alias, conn);
         acceptPreparedMedia(txn.prep, id, alias);
-        txn.manager.registerTrack(alias, sub?.trackName ?? init!.name, 'audio', sub?.packaging ?? 'init',
+        txn.manager.registerTrack(alias, sub?.trackName ?? init!.name, sub?.mediaType ?? 'audio', sub?.packaging ?? 'init',
           { sourceConnection: conn, namespace: sub?.namespace ?? init!.namespace });
         txn.registrations.set(alias, txn.manager.captureRoute(alias)!);
-        this.assertAudioSelection(txn);
+        this.assertMediaSelection(txn);
         this.replayPendingObjects(alias, conn);
-        this.checkPreparedAudio(txn);
+        for (const output of txn.outputs.values()) this.checkPreparedMediaOutput(txn, output);
       } else if (msg.type === 'REQUEST_ERROR' || msg.type === 'PUBLISH_DONE') {
         txn.terminalRequests.add(id);
         if (msg.type === 'PUBLISH_DONE' && sub?.subscription && sub.alias !== null
             && this.registerMediaTerminal(conn, id, sub.subscription, BigInt(msg.statusCode), msg.errorReason ?? '', true)) return true;
         throw new Error(`Target audio request ${msg.type === 'REQUEST_ERROR' ? 'was refused' : 'ended'} before adoption`);
       }
-    } catch (error) { this.failAudioSelection(txn, error instanceof Error ? error : new Error(String(error))); }
+    } catch (error) { this.failMediaSelection(txn, error instanceof Error ? error : new Error(String(error))); }
     return true;
   }
 
-  private releasePreparedAudioRequests(txn: AudioSelectionTxn, initOnly = false): void {
+  private releasePreparedMediaRequests(txn: MediaSelectionTxn, initOnly = false): void {
     const requests = [
       ...(!initOnly ? [...txn.prep.media].map(([id, sub]) => ({ id, alias: sub.alias })) : []),
       ...[...txn.prep.initTracks.values()].flatMap(init => init.reqId === null ? [] : [{ id: init.reqId, alias: init.alias }]),
@@ -5502,14 +5930,16 @@ export class MoqtPlayer {
     }
   }
 
-  private failAudioSelection(txn: AudioSelectionTxn, error: Error): void {
+  private failMediaSelection(txn: MediaSelectionTxn, error: Error): void {
     if (txn.aborted || txn.committed) return;
     txn.aborted = true; txn.failure = error;
     txn.prep.rejectReady(error); txn.cancel();
-    this.releasePreparedAudioRequests(txn);
-    for (const item of txn.staged.splice(0)) this.discardMediaInput(item.input, 'route retired');
-    if (this.audioSelection === txn && !txn.mutation && ![...this.pendingRetypes.values()].some(record => record.owner === txn)) {
-      this.audioSelection = null;
+    this.releasePreparedMediaRequests(txn);
+    for (const output of txn.outputs.values()) {
+      for (const item of output.staged.splice(0)) this.discardMediaInput(item.input, 'route retired');
+    }
+    if (this.mediaSelection === txn && !txn.mutation && ![...this.pendingRetypes.values()].some(record => record.owner === txn)) {
+      this.mediaSelection = null;
     }
   }
 
@@ -5554,56 +5984,240 @@ export class MoqtPlayer {
     }
   }
 
-  private adoptPreparedAudio(txn: AudioSelectionTxn): void {
-    this.validateAudioSelection(txn);
+  private adoptRuntimeSelectionPolicy(chosen: Extract<RuntimeSelection, { ok: true }>, audioPin: boolean, audioLanguage?: string | null, replaceController = true): void {
+    if (replaceController) {
+      if (!chosen.selected.manualVideo && this.qualityController?.isAutoQuality) chosen.controller.unlockAuto();
+      else chosen.controller.lockManual();
+      this.qualityController = chosen.controller;
+      this.syncBufferAbrController();
+    } else if (chosen.selected.manualVideo) this.qualityController?.lockManual();
+    const video = chosen.selected.video.state === 'selected' ? chosen.selected.video.track : null;
+    const audio = chosen.selected.audio.state === 'selected' ? chosen.selected.audio.track : null;
+    this.runtimeSelectionIntent = {
+      scope: chosen.selected.scope.id,
+      ...(video === null ? {} : video.track.altGroup === undefined || chosen.selected.manualVideo
+        ? { videoTrack: video.id } : { videoAltGroup: video.track.altGroup }),
+      ...(audio?.track.altGroup === undefined ? {} : { audioAltGroup: audio.track.altGroup }),
+    };
+    this.runtimeAudioIntent = audio !== null && audioPin ? audio.id : null;
+    if (audioLanguage !== undefined) this.runtimeAudioLanguage = audioLanguage;
+  }
+
+  private adoptPreparedOutputs(txn: MediaSelectionTxn): void {
+    this.validatePreparedMediaOutputs(txn);
+    const chosen = txn.selection!;
+    const configurations = new Map<'video' | 'audio', Uint8Array>();
+    const mseOutputs: PreparedMseOutput[] = [];
+    // All outputs must be usable before ANY native reset/configure. A changed
+    // video description is refused here, while both old outputs still run.
+    for (const output of txn.outputs.values()) {
+      const first = output.staged.find(item => item.sourceTimeUs !== undefined);
+      if (!first) throw new Error(`Target ${output.role} lost its usable input`);
+      if (output.mse) {
+        const init = this.preparedInitBytes(txn.prep, output.target, txn.catalog), running = this.runningInitBytes(output.role);
+        if (!init || !running || !bytesEqual(init, running)) throw new Error('MSE media preparation requires the running initialization');
+        // Order only one source at a time. Group numbers do not align outputs.
+        output.staged.sort((a, b) => {
+          const ag = BigInt(a.obj.groupId), bg = BigInt(b.obj.groupId);
+          if (ag !== bg) return ag < bg ? -1 : 1;
+          const ao = BigInt(a.obj.objectId), bo = BigInt(b.obj.objectId);
+          return ao === bo ? 0 : ao < bo ? -1 : 1;
+        });
+        const start = output.evidence.firstUsableLocation;
+        if (!start) throw new Error('Prepared MSE output has no access-point Location');
+        // LOCMAF may need earlier objects in this group for its format state.
+        // Retain those only for decoder priming; CMAF has no such dependency.
+        const keep = output.staged.findIndex(item => BigInt(item.obj.groupId) > start.groupId
+          || BigInt(item.obj.groupId) === start.groupId
+            && (output.target.packaging === 'locmaf' || BigInt(item.obj.objectId) >= start.objectId));
+        if (keep < 0) throw new Error('Prepared MSE access point was not retained');
+        for (const item of output.staged.splice(0, keep)) this.discardMediaInput(item.input, 'awaiting keyframe');
+        this.validatePreparedMediaOutputs(txn);
+        const packaging = output.target.packaging;
+        if (packaging !== 'cmaf' && packaging !== 'locmaf') throw new Error('Unsupported MSE object packaging');
+        mseOutputs.push({ role: output.role, trackName: output.target.name, sourceKey: output.mse.sourceKey, packaging, init,
+          anchor: output.mse.anchor, objects: output.staged.map(item => item.obj), startLocation: start });
+        continue;
+      }
+      const config = output.role === 'video' ? first.headers?.videoConfig ?? output.init ?? new Uint8Array()
+        : first.headers?.audioConfig ?? output.init ?? new Uint8Array();
+      const running = this.installedDecoderConfigurations.get(output.role);
+      if (!running || !bytesEqual(running.requested, config)) throw new Error(`${output.role} decoder configuration cannot be prepared safely`);
+      // A dependent frame preceding the usable access point may carry a
+      // configuration too. Every retained input will be replayed, so checking
+      // just the readiness witness could apply an unprepared configuration
+      // after the old outputs have already been retired.
+      for (const item of output.staged) {
+        const carried = output.role === 'video' ? item.headers?.videoConfig : item.headers?.audioConfig;
+        if (carried && !bytesEqual(running.requested, carried)) {
+          throw new Error(`${output.role} decoder configuration cannot be prepared safely`);
+        }
+      }
+      configurations.set(output.role, config);
+      if (!this.preparedOutputScheduleUsable(txn, output)) throw new Error(`Target ${output.role} no longer fits the continuing schedule`);
+    }
+    this.validatePreparedMediaOutputs(txn);
+    let lease: MediaAppendQueueLease | undefined;
+    if (mseOutputs.length) {
+      const factory = this.config.createCmafAssembler, assembler = this.cmafAssembler, source = txn.source;
+      if (!factory || !assembler || !source?.holdQueuedAppends) throw new Error('MSE preparation capability was retired');
+      preflightMseOutputs(factory, assembler, mseOutputs, () => this.validatePreparedMediaOutputs(txn));
+      this.validatePreparedMediaOutputs(txn);
+      lease = source.holdQueuedAppends(mseOutputs.map(output => output.role));
+    }
+    try {
+      this.validatePreparedMediaOutputs(txn);
+      if (lease && !lease.current) throw new Error('MSE append ownership changed during preparation');
+      this.validatePreparedMediaOutputs(txn);
+      // From here an unexpected native failure is fatal, not a claimed rollback
+      // of decoded output. No candidate media was submitted before this point.
+      txn.committed = true;
+      this.mappedClockOwner = null;
+      const assertAdopted = () => {
+        if (!this.mediaSelectionRouteCurrent(txn)) throw new Error('Media selection retired during adoption');
+      };
+      this.adoptRuntimeSelectionPolicy(chosen, txn.audioPin === true, txn.audioLanguage);
+      const video = chosen.selected.video.state === 'selected' ? chosen.selected.video.track : null;
+      const audio = chosen.selected.audio.state === 'selected' ? chosen.selected.audio.track : null;
+      this.adoptPreparedSubscriptions(txn.prep, txn.conn);
+      assertAdopted();
+      for (const output of txn.outputs.values()) {
+        assertAdopted();
+        const pipeline = output.role === 'video' ? this.videoPipeline : this.audioPipeline;
+        const first = output.staged.find(item => item.sourceTimeUs !== undefined)!;
+        if (output.mse) {
+          const assembler = output.mse.assembler, init = this.preparedInitBytes(txn.prep, output.target, txn.catalog)!;
+          const firstInput = output.staged.find(item => item.obj.kind === 'data')?.obj;
+          const start = output.evidence.firstUsableLocation;
+          if (!firstInput || !start || !txn.manager.setMinimumMediaLocation(BigInt(firstInput.trackAlias), start)) {
+            throw new Error('Prepared MSE route was retired before adoption');
+          }
+          this.selectCmafTrack(assembler, output.role, output.target.name, output.mse.sourceKey);
+          assertAdopted(); assembler.setInitSegment?.(output.role, init);
+          assertAdopted(); assembler.setPresentationPlacement!(output.role, output.mse.anchor);
+          assertAdopted();
+          this.initSegmentByTrack.set(this.initKey(output.target, output.target.initTrack ?? output.target.name), init.slice());
+          if (output.role === 'video') {
+            this.videoPresentationOffsetUs = output.timing.presentationOffsetUs;
+            this.videoTimingMapped = true; this.videoTimingSource = undefined;
+            this.cmafVideoSynced = true; // the first ordered emission was proven independent in isolated assembly
+          } else {
+            this.audioPresentationOffsetUs = output.timing.presentationOffsetUs;
+            this.audioTimingMapped = true; this.audioTimingSource = undefined;
+          }
+        } else {
+          if (output.role === 'video') {
+            this.videoPresentationOffsetUs = output.timing.presentationOffsetUs;
+            this.videoTimingMapped = true; this.videoTimingSource = output.timing.videoTimingSource;
+            pipeline?.setVideoTimingSource(this.videoTimingSource);
+          } else {
+            this.audioPresentationOffsetUs = output.timing.presentationOffsetUs;
+            this.audioTimingMapped = true; this.audioTimingSource = output.timing.timingSource;
+            pipeline?.setAudioTimingSource(this.audioTimingSource);
+          }
+          assertAdopted();
+          pipeline?.resetForTrackSwitch(BigInt(first.obj.groupId));
+          assertAdopted();
+          pipeline?.configure(configurations.get(output.role)!);
+        }
+        assertAdopted();
+        this.mseCompletions?.delete(output.role);
+        if (output.oldRequestId !== null && this.activeSubscriptions.get(output.oldRequestId) === output.oldSubscription) {
+          this.clearLocmafDecoderForRequest(output.oldRequestId);
+          this.retireMediaSubscription(output.oldRequestId, txn.conn);
+          void txn.conn.unsubscribe(varint(output.oldRequestId)).catch(() => {});
+        }
+      }
+      if (lease) {
+        const held = lease; lease = undefined; held.discard();
+        assertAdopted();
+      }
+      this.releasePreparedMediaRequests(txn, true);
+      assertAdopted();
+      this.refreshMediaSelection({ video: video?.id ?? null, audio: audio?.id ?? null });
+      assertAdopted();
+      for (const [id] of txn.prep.media) this.pendingMediaTerminals.get(txn.conn)?.get(id)?.attach?.();
+      for (const output of txn.outputs.values()) {
+        const staged = output.staged.splice(0);
+        let index = 0;
+        try { for (; index < staged.length && this.mediaSelectionRouteCurrent(txn); index++) {
+          const item = staged[index]!, start = output.evidence.firstUsableLocation;
+          if (output.mse && output.target.packaging === 'locmaf' && start && item.obj.kind === 'data'
+              && BigInt(item.obj.groupId) === start.groupId && BigInt(item.obj.objectId) < start.objectId) {
+            if (this.stateMachine.state !== PlayerState.PAUSED && !this.decodeLocmafObject(output.role, output.target.name,
+              BigInt(item.obj.trackAlias), BigInt(item.obj.groupId), BigInt(item.obj.objectId), item.obj.payload)) {
+              throw new Error('Prepared LOCMAF prefix state was refused');
+            }
+            this.discardMediaInput(item.input, this.stateMachine.state === PlayerState.PAUSED ? 'paused' : 'awaiting keyframe');
+          } else item.run();
+        } }
+        finally { for (const item of staged.slice(index)) this.discardMediaInput(item.input, 'route retired'); }
+      }
+      for (const [id] of txn.prep.media) {
+        if (this.pendingMediaTerminals.get(txn.conn)?.get(id)?.drained) this.finishMediaTerminal(txn.conn, id);
+      }
+    } finally {
+      if (lease) {
+        try { if (txn.committed) lease.discard(); else lease.resume(); }
+        catch (error) {
+          if (!this._destroyed) this.failCatalogPlayback(createPlayerError('fatal', 'player', PlayerErrorCode.CMAF_INIT_INVALID,
+            'Could not release MSE append ownership after media preparation', error instanceof Error ? { cause: error } : {}));
+          throw error;
+        }
+      }
+    }
+  }
+
+  private adoptPreparedAudioOutput(txn: MediaSelectionTxn, output: PreparedMediaOutput): void {
+    this.validatePreparedMediaOutputs(txn);
     const subEntry = [...txn.prep.media.entries()][0];
     if (!subEntry || subEntry[1].alias === null) throw new Error('Audio target has no accepted subscription');
     const [, sub] = subEntry;
-    const init = this.preparedInitBytes(txn.prep, txn.target, txn.catalog);
+    const init = this.preparedInitBytes(txn.prep, output.target, txn.catalog);
     // Synchronous format/timing changes are one precommit unit. The asynchronous
     // source-buffer mutation uses the same pendingRetypes owner/undo as handover.
     const assembler = this.cmafAssembler;
     const previousInit = this.runningInitBytes('audio');
-    const previousName = txn.oldIdentity.name;
+    const previousName = output.oldIdentity.name;
     const previousMapped = this.audioTimingMapped;
     const previousOffset = this.audioPresentationOffsetUs;
     const previousTimingSource = this.audioTimingSource;
-    const first = txn.staged.find(item => item.obj.kind === 'data');
-    const decoderConfig = txn.target.packaging === 'locmaf' && init ? codecDescriptionFromInit(init) ?? new Uint8Array()
+    const first = output.staged.find(item => item.obj.kind === 'data');
+    const decoderConfig = output.target.packaging === 'locmaf' && init ? codecDescriptionFromInit(init) ?? new Uint8Array()
       : first?.headers?.audioConfig ?? init ?? new Uint8Array();
     let assemblerChanged = false, mappingChanged = false, timingChanged = false;
     try {
-      if (init && this.usesMse(txn.target.packaging)) {
+      if (init && this.usesMse(output.target.packaging)) {
         assemblerChanged = true;
-        assembler?.selectTrack?.('audio', sub.trackName);
-        this.assertAudioSelection(txn);
+        this.selectCmafTrack(assembler, 'audio', sub.trackName, this.keyedCmafIdentity ? identityKey(sub.namespace, sub.trackName) : undefined);
+        this.assertMediaSelection(txn);
         assembler?.setInitSegment?.('audio', init);
-        this.assertAudioSelection(txn);
+        this.assertMediaSelection(txn);
       }
-      if (txn.presentationMapper && txn.mappedTiming) {
+      if (output.timing.presentationMapper && output.timing.mappedTiming) {
         mappingChanged = true; // zero activates explicit-map semantics too
-        txn.presentationMapper.setAudioPresentationOffsetUs(txn.presentationOffsetUs);
-        this.assertAudioSelection(txn);
+        output.timing.presentationMapper.setAudioPresentationOffsetUs(output.timing.presentationOffsetUs);
+        this.assertMediaSelection(txn);
       }
-      if (!this.usesMse(txn.target.packaging)) {
+      if (!this.usesMse(output.target.packaging)) {
         this.prepareDecoderConfiguration(txn, 'audio', decoderConfig);
-        this.assertAudioSelection(txn);
+        this.assertMediaSelection(txn);
       }
-      if (txn.liveOutput) {
-        const sourceTimeUs = txn.evidence.firstPresentationTimeUs;
+      if (output.timing.liveOutput) {
+        const sourceTimeUs = output.evidence.firstPresentationTimeUs;
         if (sourceTimeUs === null) throw new Error('Live audio target has no usable source presentation time');
-        const graphHead = this.liveAudioHead(txn.liveOutput);
-        this.validateAudioSelection(txn); // the public adapter callback can reenter
-        txn.presentationOffsetUs = previousOffset + graphHead - sourceTimeUs;
-        const offset = txn.presentationOffsetUs, sync = this.syncController;
-        txn.timingSource = { computeAudioRenderTime: sourceUs => this.mappedAudioTiming(sync, sourceUs + offset) };
+        const graphHead = this.liveAudioHead(output.timing.liveOutput);
+        this.validatePreparedMediaOutputs(txn); // the public adapter callback can reenter
+        output.timing.presentationOffsetUs = previousOffset + graphHead - sourceTimeUs;
+        const offset = output.timing.presentationOffsetUs, sync = this.syncController;
+        output.timing.timingSource = this.createMappedAudioTiming(sync, offset);
       }
-      if (txn.timingSink && txn.timingSource !== previousTimingSource) {
+      if (output.timing.timingSink && output.timing.timingSource !== previousTimingSource) {
         timingChanged = true;
-        txn.timingSink.setAudioTimingSource(txn.timingSource);
-        this.assertAudioSelection(txn);
+        output.timing.timingSink.setAudioTimingSource(output.timing.timingSource);
+        this.assertMediaSelection(txn);
       }
-      if (!this.preparedAudioScheduleUsable(txn)) throw new Error('Target audio no longer fits the continuing schedule');
+      if (!this.preparedOutputScheduleUsable(txn, output)) throw new Error('Target audio no longer fits the continuing schedule');
     } catch (error) {
       if (!this._destroyed) {
         let restoreFailed = false;
@@ -5613,10 +6227,11 @@ export class MoqtPlayer {
           catch (failure) { if (!restoreFailed) { restoreFailed = true; restoreFailure = failure; } }
         };
         restore(() => this.restoreDecoderConfiguration(txn, 'audio'));
-        if (timingChanged) restore(() => txn.timingSink!.setAudioTimingSource(previousTimingSource));
-        if (mappingChanged) restore(() => txn.presentationMapper!.setAudioPresentationOffsetUs(previousMapped ? previousOffset : null));
+        if (timingChanged) restore(() => output.timing.timingSink!.setAudioTimingSource(previousTimingSource));
+        if (mappingChanged) restore(() => output.timing.presentationMapper!.setAudioPresentationOffsetUs(previousMapped ? previousOffset : null));
         if (assemblerChanged && assembler === this.cmafAssembler) restore(() => {
-          assembler?.selectTrack?.('audio', previousName);
+          this.selectCmafTrack(assembler, 'audio', previousName, this.keyedCmafIdentity
+            ? identityKey(output.oldIdentity.namespaceFields, previousName) : undefined);
           if (previousInit) assembler?.setInitSegment?.('audio', previousInit);
         });
         if (restoreFailed) this.failCatalogPlayback(createPlayerError('fatal', 'player', PlayerErrorCode.CMAF_INIT_INVALID,
@@ -5625,37 +6240,39 @@ export class MoqtPlayer {
       throw error;
     }
     txn.committed = true;
+    this.mappedClockOwner = null;
     this.runtimeAudioIntent = Object.freeze({ name: sub.trackName, namespaceFields: Object.freeze([...sub.namespace]) });
-    this.audioPresentationOffsetUs = txn.presentationOffsetUs;
-    this.audioTimingMapped = txn.mappedTiming;
-    this.audioTimingSource = txn.timingSource;
+    this.runtimeAudioLanguage = output.target.lang || null;
+    this.audioPresentationOffsetUs = output.timing.presentationOffsetUs;
+    this.audioTimingMapped = output.timing.mappedTiming;
+    this.audioTimingSource = output.timing.timingSource;
     this.adoptPreparedSubscriptions(txn.prep, txn.conn);
-    if (init) this.initSegmentByTrack.set(this.initKey(txn.target), init);
+    if (init) this.initSegmentByTrack.set(this.initKey(output.target), init);
     if (init && txn.source) this.installedCmafInit.set('audio', { source: txn.source, bytes: init.slice() });
     if (this.pendingRetypes.get('audio')?.owner === txn) this.pendingRetypes.delete('audio');
     this.retypingMedia.delete('audio');
     this.mseCompletions?.delete('audio');
-    if (txn.oldRequestId !== null) {
-      this.clearLocmafDecoderForRequest(txn.oldRequestId);
-      if (this.activeSubscriptions.get(txn.oldRequestId) === txn.oldSubscription) {
-        this.retireMediaSubscription(txn.oldRequestId, txn.conn);
-        void txn.conn.unsubscribe(varint(txn.oldRequestId)).catch(() => {});
+    if (output.oldRequestId !== null) {
+      this.clearLocmafDecoderForRequest(output.oldRequestId);
+      if (this.activeSubscriptions.get(output.oldRequestId) === output.oldSubscription) {
+        this.retireMediaSubscription(output.oldRequestId, txn.conn);
+        void txn.conn.unsubscribe(varint(output.oldRequestId)).catch(() => {});
       }
     }
-    if (!this.usesMse(txn.target.packaging)) {
+    if (!this.usesMse(output.target.packaging)) {
       if (!first) throw new Error('Audio target lost its usable input');
       this.audioPipeline?.resetForTrackSwitch(BigInt(first.obj.groupId));
       try { this.audioPipeline?.configure(decoderConfig); }
       finally { if (this.preparedDecoderConfigurations.get('audio')?.owner === txn) this.preparedDecoderConfigurations.delete('audio'); }
     }
-    this.releasePreparedAudioRequests(txn, true);
+    this.releasePreparedMediaRequests(txn, true);
     this.refreshMediaSelection({ audio: { name: sub.trackName, namespaceFields: sub.namespace } });
     const terminal = this.pendingMediaTerminals.get(txn.conn)?.get(subEntry[0]);
     terminal?.attach?.();
-    const staged = txn.staged.splice(0);
+    const staged = output.staged.splice(0);
     let index = 0;
     try {
-      for (; index < staged.length && this.audioSelectionRouteCurrent(txn); index++) staged[index]!.run();
+      for (; index < staged.length && this.mediaSelectionRouteCurrent(txn); index++) staged[index]!.run();
     } finally { for (const item of staged.slice(index)) this.discardMediaInput(item.input, 'route retired'); }
     if (terminal?.drained) this.finishMediaTerminal(txn.conn, subEntry[0]);
   }
@@ -6577,6 +7194,17 @@ export class MoqtPlayer {
         this.pendingRetypes.delete(mediaType);
         this.retypingMedia.delete(mediaType);
       }
+      if (this.keyedCmafIdentity) for (const mediaType of ['video', 'audio'] as const) {
+        const track = prep.selection?.[mediaType];
+        if (!track || !this.usesMse(track.packaging)) continue;
+        // The replacement can select a different member of the same set.
+        // Retain placement, but move the assembler's source fence with it.
+        this.selectCmafTrack(this.cmafAssembler, mediaType, track.name, this.initKey(track));
+        if (this._destroyed || this.connection !== newConnection || this.isTerminalState()) {
+          txn.terminated = true;
+          return;
+        }
+      }
       // The old session's registrations are SUPERSEDED, not deleted. Until its
       // close completes it may still be delivering media, and that media is
       // what playback is running on — dropping it at the instant of commit
@@ -6826,7 +7454,7 @@ export class MoqtPlayer {
    * it) and must be discarded rather than migrating off the caller's replacement.
    */
   private processPendingGoaway(): void {
-    if (this.currentMigration || this.audioSelection || this.pendingRetypes.size) return;
+    if (this.currentMigration || this.mediaSelection || this.pendingRetypes.size) return;
     const pending = this.pendingGoaway;
     this.pendingGoaway = null;
     if (pending !== null && !this._destroyed && !this.currentMigration && pending.sourceConnection === this.connection) {
@@ -8339,7 +8967,7 @@ export class MoqtPlayer {
       catch (err) { if (!failed) { failed = true; cause = err; } }
     };
     this.pendingGoaway = null;
-    if (this.audioSelection) this.failAudioSelection(this.audioSelection, new Error('Playback failed during audio selection'));
+    if (this.mediaSelection) this.failMediaSelection(this.mediaSelection, new Error('Playback failed during audio selection'));
     if (this.currentMigration) {
       this.currentMigration.terminated = true;
       if (!this.currentMigration.committed) attempt(() => this.abortMigration(this.currentMigration!));
@@ -8584,7 +9212,7 @@ export class MoqtPlayer {
     // Audio ticks first: its first sample establishes the sync reference
     // (LOC §2.3.1.1 CaptureTimestamp). Video needs this reference to compute
     // render times — without it, all frames render at clock.now() in a burst.
-    if (!this.preparedDecoderConfigurations.has('audio') || this.audioSelection?.committed) this.audioPipeline?.tick();
+    if (!this.preparedDecoderConfigurations.has('audio') || this.mediaSelection?.committed) this.audioPipeline?.tick();
     this.videoPipeline?.tick();
 
     // Proactive quality adaptation: if estimated bandwidth is below
@@ -8645,7 +9273,7 @@ export class MoqtPlayer {
     if (!this.bufferAbrController || !this.qualityController) return;
     // Don't trigger ABR while a switch is in flight — give the current
     // switch time to deliver data before deciding to switch again.
-    if (this.pendingVideoSwitch || this.switchInProgress || this.audioSelection) return;
+    if (this.pendingVideoSwitch || this.switchInProgress || this.mediaSelection) return;
 
     let effectiveBufferUs: number;
 
@@ -8721,7 +9349,7 @@ export class MoqtPlayer {
       this.log.warn('Buffer %.1fs, BW %.0fkbps → %s to %s',
         effectiveBufferUs / 1_000_000, bandwidthKbps, verb, newTrack.name);
       // No stats or controller mutation here — deferred to completePendingVideoSwitch.
-      this.selectVideoTrack(newTrack.name, 'bandwidth', isDown ? 'downshift' : 'upshift')
+      this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'bandwidth', isDown ? 'downshift' : 'upshift')
         .catch((err) => {
           this.log.warn('ABR %s to "%s" failed: %s', verb, newTrack.name, err);
         });
@@ -8738,9 +9366,9 @@ export class MoqtPlayer {
     this._destroyed = true;
     this.audioOutput = null; this.lastAudioDomainOwner = null; this.lastAudioDomain = null;
     this.installedDecoderConfigurations.clear(); this.preparedDecoderConfigurations.clear();
-    this.audioTimelineRecord = null; this.collectAudioTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
+    this.audioTimelineRecord = null; this.videoTimelineRecord = null; this.collectAudioTimeline = false; this.collectVideoTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.runtimeAudioLanguage = null; this.runtimeSelectionIntent = null; this.mappedClockOwner = null; this.videoPresentationOffsetUs = 0n; this.videoTimingMapped = false; this.videoTimingSource = undefined; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
     this._selection = emptyMediaSelection(this._selection.revision + 1, this.config.autoQuality !== false);
-    if (this.audioSelection) this.failAudioSelection(this.audioSelection, new Error('Player destroyed during audio selection'));
+    if (this.mediaSelection) this.failMediaSelection(this.mediaSelection, new Error('Player destroyed during audio selection'));
     for (const owner of this.warmMediaOwners.values()) owner.head?.retire();
     this.warmMediaOwners.clear();
     this.log.info('destroy()');
@@ -8833,6 +9461,7 @@ export class MoqtPlayer {
     this.watchdog.destroy();
     this.cmafAssembler?.destroy();
     this.cmafAssembler = null;
+    this.keyedCmafIdentity = false;
     this.mediaSource?.destroy();
     this.mediaSource = null;
     this.mseCompletions = null;
@@ -9310,7 +9939,7 @@ export class MoqtPlayer {
       ),
 
       onClose: (error, reason) => {
-        if (this.audioSelection?.conn === conn) this.failAudioSelection(this.audioSelection, new Error('Audio selection session closed'));
+        if (this.mediaSelection?.conn === conn) this.failMediaSelection(this.mediaSelection, new Error('Audio selection session closed'));
         this.retireInitWaiters(conn);
         this.log.info('[SESSION] closed: error=0x%s reason=%s',
           error?.toString(16) ?? 'none', reason ?? 'clean');
@@ -9645,9 +10274,9 @@ export class MoqtPlayer {
         // so replay uses the delivering session's draft and only replays for an
         // alias resolved on that same session — never routing an old-session
         // object into a reused-alias track on the new one.
-        const audio = this.audioSelection;
+        const audio = this.mediaSelection;
         if (audio && !audio.committed && audio.conn === conn && [...audio.prep.media.keys()].some(id => this.pendingAliasBinds.has(id))) {
-          if (!this.reserveAudioInput(audio, obj)) return;
+          if (!this.reservePreparedMediaInput(audio, obj)) return;
         }
         const existingBucket = this.pendingObjectsByAlias.get(alias);
         // Cap the number of distinct unresolved aliases — a peer must not be able
@@ -10181,8 +10810,8 @@ export class MoqtPlayer {
    */
   private handleSessionGoaway(newSessionUri: string, conn: MoqtConnection): void {
     this.log.info('GOAWAY received, uri=%s', newSessionUri || '(none)');
-    if (this.audioSelection && !this.audioSelection.committed) {
-      this.failAudioSelection(this.audioSelection, new Error('Audio selection cancelled by session GOAWAY'));
+    if (this.mediaSelection && !this.mediaSelection.committed) {
+      this.failMediaSelection(this.mediaSelection, new Error('Audio selection cancelled by session GOAWAY'));
     }
     // Established media is deliberately NOT cancelled here. Graceful switchover
     // orders the replacement's successful responses BEFORE cancellation:
@@ -10213,7 +10842,7 @@ export class MoqtPlayer {
     // §9.4 / §10.4 / §9.2: an empty New Session URI reuses the CURRENT session
     // URI — the endpoint we are actually on, not the configured origin.
     const uri = newSessionUri || this.activeEndpoint;
-    if (this.currentMigration || this.audioSelection || this.pendingRetypes.size) {
+    if (this.currentMigration || this.mediaSelection || this.pendingRetypes.size) {
       // A handoff is in flight (staged-event drain or old-session retirement
       // still holds the single-flight slot). Starting a migration now would be
       // rejected and the GOAWAY lost. QUEUE the target WITH its source session
@@ -10238,11 +10867,11 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-transport-22 §9.2, §6.6.1
    */
   private handleRequestGoaway(requestId: bigint, newSessionUri: string, conn: MoqtConnection): void {
-    const audio = this.audioSelection;
-    if (audio && audio.conn === conn && (audio.oldRequestId === requestId || audio.prep.media.has(requestId)
+    const audio = this.mediaSelection;
+    if (audio && audio.conn === conn && ([...audio.outputs.values()].some(output => output.oldRequestId === requestId) || audio.prep.media.has(requestId)
         || [...audio.prep.initTracks.values()].some(init => init.reqId === requestId))) {
       audio.terminalRequests.add(requestId);
-      this.failAudioSelection(audio, new Error('Audio selection request migrated'));
+      this.failMediaSelection(audio, new Error('Audio selection request migrated'));
     }
     const trackName = this.activeSubscriptions.get(requestId)?.trackName;
     this.log.info(
@@ -10491,7 +11120,7 @@ export class MoqtPlayer {
 
   private handleControlMessage(msg: ControlMessage, conn: MoqtConnection): void {
     const slots = this.slotsFor(conn);
-    if (this.handleAudioSelectionControl(msg, conn)) return;
+    if (this.handleMediaSelectionControl(msg, conn)) return;
     // Ignore control messages from a SUPERSEDED session. After a migration
     // `this.connection`, `activeSubscriptions`, `pendingMediaSubs`, the track
     // registrations, and the catalog alias all belong to the NEW session; a
@@ -11211,8 +11840,7 @@ export class MoqtPlayer {
         // after the REQUEST_UPDATE but before the relay switches.
         const minFreshGroup = (this.videoPipeline?.currentGroupId ?? -1n) + 1n;
         this.videoPipeline?.reset(minFreshGroup);
-        this.audioTimelineRecord = null;
-        this.syncController?.reset();
+        this.resetMediaClock();
 
         // Jump to live: when stalls persist (3+ consecutive without a
         // rendered frame), the player has fallen behind the live edge.
@@ -11244,7 +11872,7 @@ export class MoqtPlayer {
           doRecoveryAction(action, 'video', this.qualityController, this.log, {
             onQualityReduced: (newTrack) => {
               // No stats here — deferred to completePendingVideoSwitch.
-              this.selectVideoTrack(newTrack.name, 'recovery', 'downshift').catch((err) => {
+              this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'recovery', 'downshift').catch((err) => {
                 this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
               });
             },
@@ -11354,9 +11982,8 @@ export class MoqtPlayer {
         // causing an indefinite stall.
         if (mediaType === 'video' && this.videoPipeline) {
           this.videoPipeline.reset();
-          if (!this.audioTimingMapped) {
-            this.audioTimelineRecord = null;
-            this.syncController?.reset();
+          if (!this.audioTimingMapped && !this.videoTimingMapped) {
+            this.resetMediaClock();
           }
         }
       },
@@ -11382,7 +12009,7 @@ export class MoqtPlayer {
       onEvent: (mediaType, evt) => this.handlePipelineEvent(mediaType, evt),
       // A/V skew observability (LOC): record every sample, emit ~1/s.
       onAvSkew: (skewUs) => {
-        if (this.audioTimingMapped) return; // raw output clocks cannot be compared across a mapped source change
+        if (this.audioTimingMapped || this.videoTimingMapped) return; // raw output clocks cannot be compared across a mapped source change
         const skewMs = skewUs / 1000;
         this._stats.recordAvSkew(skewMs);
         const nowMs = performance.now();
@@ -11444,7 +12071,7 @@ export class MoqtPlayer {
         // first keyframe. Rapid cascading (4 switches in <2s) means no
         // track ever gets a chance to deliver — changeType() keeps wiping
         // the decoder before data arrives.
-        if (this.pendingVideoSwitch || this.switchInProgress || this.audioSelection) return;
+        if (this.pendingVideoSwitch || this.switchInProgress || this.mediaSelection) return;
 
         // Emergency downshift: non-mutating peek, deferred commit.
         if (this.qualityController && this.bufferAbrController) {
@@ -11452,7 +12079,7 @@ export class MoqtPlayer {
           if (newTrack) {
             this.lastAbrDownshiftUs = this.clock.now();
             this.log.warn('MSE stall %dms → emergency downshift to %s', durationMs, newTrack.name);
-            this.selectVideoTrack(newTrack.name, 'recovery', 'downshift').catch((err) => {
+            this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'recovery', 'downshift').catch((err) => {
               this.log.warn('Stall downshift to "%s" failed: %s', newTrack.name, err);
             });
           }
@@ -11701,7 +12328,7 @@ export class MoqtPlayer {
       throw new Error('CMAF tracks require createCmafAssembler in MoqtPlayerConfig');
     }
     this.cmafAssembler = this.config.createCmafAssembler({
-      onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint, inputs?: readonly (object | undefined)[]) => {
+      onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint, inputs?: readonly (object | undefined)[], sourceKey?: string) => {
         if (this._destroyed || this.mediaSource !== ms) return;
         const runtime = this.mediaDiagnosticRuntime;
         let unit: object | undefined;
@@ -11728,7 +12355,9 @@ export class MoqtPlayer {
         if (unit && runtime && runtime === this.mediaDiagnosticRuntime) try { token = runtime.appendToken(unit, ms); } catch { /* Optional evidence. */ }
         if (this._destroyed || this.mediaSource !== ms) return;
         try {
-          if (token === undefined) ms.appendChunk(mediaType, segment, segTrackName, groupId);
+          if (this.keyedCmafIdentity && sourceKey === undefined) throw new Error('CMAF assembler omitted the source identity');
+          if (sourceKey !== undefined) ms.appendChunk(mediaType, segment, segTrackName, groupId, token, sourceKey);
+          else if (token === undefined) ms.appendChunk(mediaType, segment, segTrackName, groupId);
           else ms.appendChunk(mediaType, segment, segTrackName, groupId, token);
         } catch (error) {
           if (unit) try { runtime?.discardUnit(unit, 'append error'); } catch { /* Optional evidence. */ }
@@ -11737,13 +12366,13 @@ export class MoqtPlayer {
         this.renewCmafFirstFrameDeadline(mediaType);
       },
       onDiscard: (input, reason) => this.discardMediaInput(input, reason),
-      onDiscontinuity: (mediaType, trackName) => {
+      onDiscontinuity: (mediaType, trackName, sourceKey) => {
         this.audioTimelineRecord = null;
-        if ('clearTimeline' in ms) {
-          (ms as { clearTimeline: (t: string, tn: string) => void }).clearTimeline(mediaType, trackName);
-        }
+        if (sourceKey === undefined) ms.clearTimeline?.(mediaType, trackName);
+        else ms.clearTimeline?.(mediaType, trackName, sourceKey);
       },
     });
+    this.keyedCmafIdentity = ms.supportsTrackIdentity === true && this.cmafAssembler.supportsTrackIdentity === true;
   }
 
   /**
@@ -11842,6 +12471,12 @@ export class MoqtPlayer {
     }
   }
 
+  /** A viewer's language choice survives automatic selections in other programs. */
+  private effectiveAudioLanguages(): readonly string[] | undefined {
+    return this.runtimeAudioLanguage === null ? this.config.audioLanguages
+      : [this.runtimeAudioLanguage, ...(this.config.audioLanguages ?? [])];
+  }
+
   /**
    * The explicit selection this config asks for, as the model's intent.
    *
@@ -11850,7 +12485,7 @@ export class MoqtPlayer {
    * than resolved: disabling is the stronger statement.
    */
   private selectionIntent(): SelectionIntent | undefined {
-    const configured = selectionIntentFromConfig(this.config);
+    const configured = this.runtimeSelectionIntent ?? selectionIntentFromConfig(this.config);
     return this.runtimeAudioIntent === null ? configured : { ...configured, audioTrack: this.runtimeAudioIntent };
   }
 
@@ -11890,14 +12525,15 @@ export class MoqtPlayer {
       };
     }
     const wasAuto = this.qualityController!.isAutoQuality;
+    const audioLanguages = this.effectiveAudioLanguages();
     const composed = composeSelection(catalog, {
       catalogNamespace: this.config.namespace,
       ...(intent !== undefined ? { intent } : {}),
       controller: this.qualityController!,
-      ...(this.config.audioLanguages !== undefined ? { audioLanguages: this.config.audioLanguages } : {}),
+      ...(audioLanguages !== undefined ? { audioLanguages } : {}),
       ...(this.config.videoConstraints !== undefined
         ? { videoConstraints: this.config.videoConstraints } : {}),
-      ...(this.runtimeAudioIntent === null && this.config.audioConstraints !== undefined
+      ...(this.runtimeAudioIntent === null && this.runtimeAudioLanguage === null && this.config.audioConstraints !== undefined
         ? { audioConstraints: this.config.audioConstraints } : {}),
     });
     if (!composed.ok) {
@@ -12430,6 +13066,14 @@ export class MoqtPlayer {
         this.noteAudioTimeline(source.ticks * 1_000_000n / source.ticksPerSecond, domain);
       }
     }
+    if (this.collectVideoTimeline && actual?.type === 'decode_video' && dispatcher !== null
+        && this.commandDispatcher === dispatcher && !this._destroyed) {
+      const source = actual.chunk.sourceTimestamp;
+      if (source && source.ticksPerSecond > 0n) {
+        const domain = source.domain === 'unix' ? 'wall-clock' : source.domain === 'media' ? 'media-time' : 'unknown';
+        this.noteMediaTimeline('video', source.ticks * 1_000_000n / source.ticksPerSecond, domain);
+      }
+    }
     if (cmd.type === 'configure' && actual?.type === 'configure' && actual.mediaType === cmd.mediaType
         && dispatcher !== null && this.commandDispatcher === dispatcher && !this._destroyed) {
       this.installedDecoderConfigurations.set(cmd.mediaType, {
@@ -12453,6 +13097,7 @@ export class MoqtPlayer {
       emitEvent: (event) => this.emitter.emit(event.type as any, event as any),
       log: this.log,
       syncController: this.audioTimingMapped ? null : this.syncController,
+      resetSync: () => this.resetMediaClock(),
       syncResetThisTick: this.syncResetThisTick,
       setSyncResetThisTick: (v) => { this.syncResetThisTick = v; },
       recordDiagnostic: (kind) => this._stats.recordLocDiagnostic(kind),
@@ -12461,7 +13106,7 @@ export class MoqtPlayer {
         if (result) {
           doRecoveryAction(result, mediaType, this.qualityController, this.log, {
             onQualityReduced: (newTrack) => {
-              this.selectVideoTrack(newTrack.name, 'recovery', 'downshift').catch((err) => {
+              this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'recovery', 'downshift').catch((err) => {
                 this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
               });
             },
@@ -12747,9 +13392,8 @@ export class MoqtPlayer {
     } else {
       this.audioPipeline?.reset();
     }
-    if (!this.audioTimingMapped) {
-      this.audioTimelineRecord = null;
-      this.syncController?.reset();
+    if (!this.audioTimingMapped && !this.videoTimingMapped) {
+      this.resetMediaClock();
     }
   }
 
@@ -12854,8 +13498,7 @@ export class MoqtPlayer {
     } else {
       this.audioPipeline?.reset();
     }
-    this.audioTimelineRecord = null;
-    this.syncController?.reset();
+    this.resetMediaClock();
 
     const ns = trackNamespaceFields(track, this.config.namespace);
     if (this.hooks.beforeSubscribe.run({ trackName, mediaType, namespace: ns }) === null) return;
@@ -12964,7 +13607,7 @@ export class MoqtPlayer {
     // staging timeout later "completes" the switch and unsubscribes the old,
     // working track, or the switch stays pending forever.
     const pendingSwitch = this.pendingVideoSwitch;
-    if (pendingSwitch && pendingSwitch.newTrackName === trackName) {
+    if (pendingSwitch && this.isVideoSwitchAlias(trackAlias, 'new')) {
       this.abortPendingVideoSwitch(pendingSwitch, error);
     }
 

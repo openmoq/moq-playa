@@ -26,7 +26,7 @@ import { AdaptiveToleranceController, DEFAULT_TOLERANCE_CONFIG } from './adaptiv
 import type { RecoveryController } from './recovery.js';
 import { PipelineInputs } from './pipeline-inputs.js';
 import type { PlaybackInputObserver } from './types.js';
-import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig, DecoderFeedback } from './types.js';
+import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig, DecoderFeedback, AudioTimingSource, VideoTimingSource } from './types.js';
 
 // ─── Pipeline ────────────────────────────────────────────────────────
 
@@ -57,7 +57,8 @@ export class PlaybackPipeline {
     private readonly mediaType: 'video' | 'audio';
     private readonly clock: ClockSource;
     private readonly sync: SyncController;
-    private audioTimingSource: Pick<SyncController, 'computeAudioRenderTime'>;
+    private audioTimingSource: AudioTimingSource;
+    private videoTimingSource: VideoTimingSource;
     private readonly onCommand: (cmd: DecoderCommand) => void;
     private readonly onEvent: (evt: PlaybackEvent) => void;
     private readonly recovery: RecoveryController | undefined;
@@ -175,6 +176,7 @@ export class PlaybackPipeline {
         this.clock = opts.clock;
         this.sync = opts.sync;
         this.audioTimingSource = opts.sync;
+        this.videoTimingSource = opts.sync;
         this.onCommand = opts.onCommand;
         this.onEvent = opts.onEvent;
         this.recovery = opts.recovery;
@@ -224,12 +226,26 @@ export class PlaybackPipeline {
      * must drain or retire buffered inputs before replacing this provider.
      * Emitted commands retain their already captured absolute render times.
      */
-    setAudioTimingSource(source: Pick<SyncController, 'computeAudioRenderTime'> | undefined): void {
+    setAudioTimingSource(source: AudioTimingSource | undefined): void {
         if (this.mediaType !== 'audio') throw new Error('Audio timing requires an audio pipeline');
         const next = source ?? this.sync;
         if (next === this.audioTimingSource) return;
         this.audioTimingSource = next;
         // Transit differences cancel one epoch, not a transition between epochs.
+        this.adaptiveTolerance?.reset();
+    }
+
+    /**
+     * Install engine-owned video timing without changing source metadata or shared
+     * sync control. The engine must retire buffered old inputs before replacement.
+     * Each emitted mapped decode retains its producing provider for native output.
+     * Undefined restores the ordinary shared timeline.
+     */
+    setVideoTimingSource(source: VideoTimingSource | undefined): void {
+        if (this.mediaType !== 'video') throw new Error('Video timing requires a video pipeline');
+        const next = source ?? this.sync;
+        if (next === this.videoTimingSource) return;
+        this.videoTimingSource = next;
         this.adaptiveTolerance?.reset();
     }
 
@@ -515,7 +531,7 @@ export class PlaybackPipeline {
             const nowMs = this.clock.now() / 1000;
             this.adaptiveTolerance.tick(nowMs);
             this.gapDetector.gapTimeoutUs = this.adaptiveTolerance.effectiveGapTimeoutMs * 1000;
-            if (this.audioTimingSource === this.sync) {
+            if (this.audioTimingSource === this.sync && this.videoTimingSource === this.sync) {
                 this.sync.driftThresholdUs = this.adaptiveTolerance.effectiveDriftThresholdMs * 1000;
             }
         }
@@ -877,7 +893,10 @@ export class PlaybackPipeline {
         // 2. Establish sync reference.
         //    Audio-master: first audio sample sets the reference (ONCE).
         //    Video-only: first video CaptureTimestamp sets the reference.
-        const originalTimeline = this.audioTimingSource === this.sync;
+        const videoTimingSource = this.videoTimingSource;
+        const captureTimestamp = headers.captureTimestamp;
+        const originalTimeline = this.mediaType === 'video'
+            ? videoTimingSource === this.sync : this.audioTimingSource === this.sync;
         if (originalTimeline && headers.captureTimestamp !== undefined && !this.sync.hasReference) {
             if (this.mediaType === 'audio') {
                 this.sync.setAudioReference(headers.captureTimestamp);
@@ -885,6 +904,11 @@ export class PlaybackPipeline {
                 this.sync.setVideoReference(headers.captureTimestamp);
             }
         }
+        if (!originalTimeline && captureTimestamp !== undefined && !this.sync.hasReference) {
+            if (this.mediaType === 'audio') this.audioTimingSource.establishReference?.(captureTimestamp);
+            else videoTimingSource.establishReference?.(captureTimestamp);
+        }
+        if (revision !== this.playbackRevision) { inputs?.report(input, 'decoder reset'); return; }
 
         // 3. Compute render time.
         //    Returns null when no reference — CommandDispatcher holds the frame.
@@ -901,12 +925,11 @@ export class PlaybackPipeline {
         let renderTimeUs: number;
         if (headers.captureTimestamp !== undefined) {
             const timing = this.mediaType === 'video'
-                ? this.sync.computeVideoRenderTime(headers.captureTimestamp)
+                ? videoTimingSource.computeVideoRenderTime(headers.captureTimestamp)
                 : this.audioTimingSource.computeAudioRenderTime(headers.captureTimestamp);
 
             if (timing === null) {
-                // Mapped audio has no output-side timing recomputation. An
-                // unavailable mapping cannot become a speculative "play now".
+                // An unavailable mapped schedule cannot become speculative "play now".
                 if (!originalTimeline) { inputs?.report(input, 'decoder policy'); return; }
                 // No reference yet — use placeholder. CommandDispatcher will
                 // hold this frame and recompute when the reference is ready.
@@ -922,7 +945,7 @@ export class PlaybackPipeline {
                     // OUTPUT stage decide what to present: the dispatcher
                     // recomputes timing at decoder output and CanvasRenderer
                     // drops sufficiently late frames while keeping the newest.
-                    renderTimeUs = this.clock.now();
+                    renderTimeUs = originalTimeline ? this.clock.now() : timing.renderTimeUs;
                 } else {
                     inputs?.report(input, 'late frame');
                     return; // Genuinely late and safe to discard — skip
@@ -983,7 +1006,7 @@ export class PlaybackPipeline {
 
             // Detect live join: NEEDS_KEYFRAME → DECODING (first keyframe decoded)
             // Apply video join re-anchor to prevent startup stutter.
-            if (!backfill && prevState === 'needs_keyframe' && this.decoderState.state === 'decoding'
+            if (originalTimeline && !backfill && prevState === 'needs_keyframe' && this.decoderState.state === 'decoding'
                 && headers.captureTimestamp !== undefined) {
                 this.sync.onVideoJoin(headers.captureTimestamp);
                 // Recompute render time with the offset applied
@@ -994,15 +1017,20 @@ export class PlaybackPipeline {
             }
 
             if (decision.action === 'decode') {
-                this.onCommand({
-                    type: 'decode_video',
+                const renderTiming = !originalTimeline && captureTimestamp !== undefined
+                    ? Object.freeze({ recomputeRenderTimeUs: () =>
+                        videoTimingSource.computeVideoRenderTime(captureTimestamp)?.renderTimeUs ?? null })
+                    : undefined;
+                const command = {
+                    type: 'decode_video' as const,
                     ...(input && inputs === this.inputState ? { inputToken: input } : {}),
                     chunk: decision.chunk as typeof chunk,
                     renderTimeUs,
                     ...(headers.captureTimestamp !== undefined
                         ? { captureTimestampUs: headers.captureTimestamp }
                         : {}),
-                });
+                };
+                this.onCommand(renderTiming ? { ...command, renderTiming } : command);
             } else if (decision.action === 'skip') {
                 inputs?.report(input, decision.reason === 'waiting for keyframe' ? 'awaiting keyframe' : 'decoder policy');
                 // Emit keyframe_waiting once per group (avoid per-object spam)

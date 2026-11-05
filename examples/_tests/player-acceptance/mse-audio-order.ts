@@ -175,6 +175,8 @@ async function prepare(kind: Kind, fixture: Fixture) {
     assert('media duration is 1.408 seconds', Math.abs(video.duration - 1.408) <= 1e-6, video.duration);
     context = new AudioContext({ sampleRate: rate });
     if (context.sampleRate !== rate) throw new Error('CAPABILITY: exact 8 kHz AudioContext unavailable');
+    await timed(context.suspend(), 'audio context suspend');
+    if (context.state !== 'suspended') throw new Error('audio context must be suspended before graph construction');
     await context.audioWorklet.addModule(new URL('./mse-audio-order.worklet.js', import.meta.url));
     node = new AudioWorkletNode(context, 'mse-audio-order-capture');
     input = context.createMediaElementSource(video); sink = context.createGain(); sink.gain.value = 0;

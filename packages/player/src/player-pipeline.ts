@@ -20,6 +20,7 @@ import type {
   DecoderFeedback,
 } from '@openmoq/playback';
 import type { MoqtPlayerConfig } from './config.js';
+import type { CatalogTrack } from '@openmoq/msf';
 import type { MediaSourceLike } from './interfaces.js';
 import { CommandDispatcher } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
@@ -121,6 +122,8 @@ export interface PipelineEventContext {
   emitEvent: (event: Record<string, unknown>) => void;
   log: LoggerLike;
   syncController: SyncController | null;
+  /** Player-owned input retirement and clock rearming, when supplied. */
+  resetSync?: () => void;
   syncResetThisTick: boolean;
   setSyncResetThisTick: (value: boolean) => void;
   recoveryHook: (action: RecoveryAction) => RecoveryAction | null;
@@ -134,7 +137,7 @@ export interface PipelineEventContext {
 
 /** Callbacks for handleRecoveryAction. */
 export interface RecoveryCallbacks {
-  onQualityReduced: (newTrack: { name: string; codec?: string; bitrate?: number; width?: number; height?: number }) => void;
+  onQualityReduced: (newTrack: CatalogTrack) => void;
   onResubscribe: (mediaType: 'video' | 'audio', startGroup?: bigint) => void;
   onTerminate: (reason: string) => void;
 }
@@ -442,7 +445,8 @@ export function handlePipelineEvent(
       ctx.recordDiagnostic?.('skip_forward');
       ctx.log.warn('Skip forward %s group=%s→%s', mediaType, evt.fromGroupId, evt.toGroupId);
       if (!ctx.syncResetThisTick && ctx.syncController) {
-        ctx.syncController.reset();
+        if (ctx.resetSync) ctx.resetSync();
+        else ctx.syncController.reset();
         ctx.setSyncResetThisTick(true);
         ctx.recordDiagnostic?.('sync_reset');
       }

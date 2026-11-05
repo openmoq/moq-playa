@@ -41,6 +41,10 @@ export interface FixtureTrack {
   readonly samplerate?: number;
   readonly channelConfig?: string;
   readonly altGroup?: number;
+  /** Override the fixture's default program for this track (zero is valid). */
+  readonly renderGroup?: number;
+  /** LOC media-time fixtures may retain the on-disk presentation origin. Pacing stays relative. */
+  readonly preserveMediaTimeOrigin?: boolean;
   readonly lang?: string;
   readonly label?: string;
 }

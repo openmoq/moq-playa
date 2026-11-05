@@ -56,6 +56,16 @@ describe('selectionIntentFromConfig', () => {
     });
   });
 
+  it.each(['video', 'audio'] as const)('does not read the disabled %s track selector', role => {
+    let reads = 0;
+    const selection = role === 'video'
+      ? { get videoTrack(): { name: string } { reads++; throw new Error('disabled video selector read'); } }
+      : { get audioTrack(): { name: string } { reads++; throw new Error('disabled audio selector read'); } };
+    const intent = selectionIntentFromConfig({ ...base, disableVideo: role === 'video', disableAudio: role === 'audio', selection });
+    expect(reads).toBe(0);
+    expect(intent).toEqual(role === 'video' ? { disableVideo: true } : { disableAudio: true });
+  });
+
   it('preserves frozen configuration and copies namespace tuples', () => {
     const namespace = Object.freeze(['live/show']);
     const referenceNamespace = Object.freeze(['other/show']);

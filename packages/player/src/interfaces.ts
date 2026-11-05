@@ -15,6 +15,8 @@
  */
 
 import type { VideoChunkInit, AudioChunkInit, SourceTimestamp } from '@openmoq/loc';
+import type { VideoRenderTiming } from '@openmoq/playback';
+import type { FractionUs, PresentationPlacement } from './presentation-placement.js';
 
 // ─── Layer 3: Decoder Backend (Swappable) ────────────────────────────
 
@@ -27,6 +29,8 @@ import type { VideoChunkInit, AudioChunkInit, SourceTimestamp } from '@openmoq/l
  * @see draft-ietf-moq-loc-01 §2.1 (video bitstream format)
  */
 export interface VideoDecoderLike {
+  /** Explicit capability: preserves producing timing, or reports null if association is lost. */
+  readonly supportsOutputTiming?: true;
   /**
    * Configure the decoder with codec extradata.
    *
@@ -47,7 +51,7 @@ export interface VideoDecoderLike {
    * Decode a video chunk. Frames are delivered via the onFrame callback.
    * @see draft-ietf-moq-loc-01 §2 (LOC payload = EncodedVideoChunk.data)
    */
-  decode(chunk: VideoChunkInit, renderTimeUs: number, inputToken?: object): void;
+  decode(chunk: VideoChunkInit, renderTimeUs: number, inputToken?: object, renderTiming?: VideoRenderTiming): void;
 
   /** Flush pending frames. Resolves when all pending frames are decoded. */
   flush(): Promise<void>;
@@ -69,7 +73,10 @@ export interface VideoDecoderLike {
    * this output's decode input; null/omitted means unavailable, never guessed from
    * the latest input or catalog. It is not a render observation or track identity.
    */
-  onFrame: ((frame: unknown, renderTimeUs: number, sourceTimestamp?: SourceTimestamp | null, inputToken?: object) => void) | null;
+  // Omitted timing retains ordinary scheduling. Explicit null refuses mapped
+  // output whose input association is ambiguous, unsafe or no longer retained.
+  onFrame: ((frame: unknown, renderTimeUs: number, sourceTimestamp?: SourceTimestamp | null, inputToken?: object,
+    renderTiming?: VideoRenderTiming | null) => void) | null;
 
   /** Callback: decode error occurred. */
   onError: ((error: Error) => void) | null;
@@ -262,6 +269,13 @@ export interface VideoPlaybackQualityStats {
   readonly creationTimeMs: number;
 }
 
+/** Queue ownership only; this cannot undo native coded-frame replacement. */
+export interface MediaAppendQueueLease {
+  readonly current: boolean;
+  resume(): void;
+  discard(): void;
+}
+
 /**
  * MediaSource adapter interface for CMAF-packaged tracks.
  *
@@ -281,6 +295,8 @@ export interface VideoPlaybackQualityStats {
  * @see draft-ietf-moq-cmsf-00 §3.5.1 (packaging: "cmaf" in catalog)
  */
 export interface MediaSourceLike {
+  /** Preserves the optional source key through append ordering, replay and timeline state. */
+  readonly supportsTrackIdentity?: true;
   /**
    * Initialize with codec strings and init segment bytes. Creates
    * SourceBuffers and appends the initialization segments (ftyp+moov).
@@ -322,6 +338,7 @@ export interface MediaSourceLike {
     trackName: string,
     groupId?: bigint,
     token?: MediaAppendToken,
+    sourceKey?: string,
   ): void;
 
   /**
@@ -384,6 +401,17 @@ export interface MediaSourceLike {
    * timeline. Optional, like the accessor above.
    */
   setTimestampOffset?(mediaType: 'video' | 'audio', offset: number): void;
+
+  /**
+   * Retain queued old media during preparation, without cancelling a native
+   * append in progress. The caller owns init/offset restoration before resume.
+   * Reset/destroy invalidates the lease; current must be checked after awaits.
+   */
+  holdQueuedAppends?(mediaTypes: readonly ('video' | 'audio')[]): MediaAppendQueueLease;
+
+  /** Per-source replay state; display names remain unchanged when an opaque key is supplied. */
+  getCommittedGroupFloor?(mediaType: 'video' | 'audio', trackName: string, sourceKey?: string): bigint | undefined;
+  clearTimeline?(mediaType: 'video' | 'audio', trackName: string, sourceKey?: string): void;
 
   /**
    * Signal end of stream. Called on live→ended or destroy().
@@ -503,6 +531,8 @@ export type CmafSourceReceipt =
   | { readonly state: 'partial' | 'refused' | 'unavailable' };
 
 export interface CmafAssemblerLike {
+  /** Separates a source identity key from its display track name throughout assembly. */
+  readonly supportsTrackIdentity?: true;
   push(
     mediaType: 'video' | 'audio',
     trackName: string,
@@ -510,6 +540,7 @@ export interface CmafAssemblerLike {
     payload: Uint8Array,
     input?: object,
     sourceTiming?: true,
+    sourceKey?: string,
   ): void | CmafSourceReceipt;
   /**
    * Hand the assembler an init segment so it can extract trex defaults
@@ -528,7 +559,7 @@ export interface CmafAssemblerLike {
    * track. Optional for compatibility with assemblers that do not retain
    * cross-object track state.
    */
-  selectTrack?(mediaType: 'video' | 'audio', trackName: string): void;
+  selectTrack?(mediaType: 'video' | 'audio', trackName: string, sourceKey?: string): void;
   /**
    * Map raw audio DTS (and therefore PTS, retaining composition offsets) into
    * the continuing reference domain before epoch/discontinuity processing.
@@ -538,6 +569,12 @@ export interface CmafAssemblerLike {
   setAudioPresentationOffsetUs?(offsetUs: bigint | null): void;
   /** Stable mapped-domain witness; null after a refused restart or without an active map. */
   getAudioPresentationMappingWitness?(): object | null;
+  /** Current, delivery-proven raw-to-rebased context; token changes invalidate preparation. */
+  capturePresentationPlacement?(mediaType: 'video' | 'audio'): PresentationPlacement | null;
+  /** Explicit absolute placement; raw timestamps and composition offsets are retained. */
+  setPresentationPlacement?(mediaType: 'video' | 'audio', anchor: {
+    readonly sourceTimeUs: bigint; readonly rebasedTimeUs: FractionUs;
+  } | null): void;
   getEpoch(mediaType: 'video' | 'audio'): bigint | null;
   /**
    * Drop pending half-pairs (moof without mdat) for one media type, leaving

@@ -7,19 +7,24 @@ import { observeLocmafDelivery, assessLocmafDelivery, observeConnectionObjects }
 import { observeDecodedSource } from './decoded.js';
 import { observeWarmStart } from './warm-start.js';
 import { observeNativeMse } from './native-mse.js';
+import { observeProgramDecodedSource } from '../../../scripts/player-acceptance/program-switch-observer.mjs';
+import { observeProgramSwitchWire } from '../../../scripts/player-acceptance/program-switch-wire-observer.mjs';
+import { observeMseProgramSwitch } from '../../../scripts/player-acceptance/mse-program-switch-observer.mjs';
 
 const video = document.querySelector<HTMLVideoElement>('#video')!;
 const canvas = document.querySelector<HTMLCanvasElement>('#canvas')!;
 const params = new URLSearchParams(location.search);
 const frameOutput = params.get('output') === 'canvas';
+const runtimeMedia = params.get('runtimeMedia') === '1';
 const webAudioOutput = params.has('audio') ? params.get('audio') === 'webcodecs' : frameOutput;
 const warmObserver = params.has('warm') ? observeWarmStart() : undefined;
 const locmafObserver = params.has('locmaf') ? observeLocmafDelivery() : undefined;
+const mseProgram = params.has('mseProgram') ? observeMseProgramSwitch() : undefined;
 canvas.width = 640;
 canvas.height = 360;
 const canvasObserver = frameOutput ? observeCanvas(canvas) : undefined;
 const audioObserver = webAudioOutput ? observeAudio() : undefined;
-const decodedSource = frameOutput ? observeDecodedSource() : undefined;
+const decodedSource = frameOutput ? runtimeMedia ? observeProgramDecodedSource() : observeDecodedSource() : undefined;
 const pinHex = params.get('hash')!;
 if (!/^[a-f0-9]{64}$/.test(pinHex)) throw new Error('Missing local certificate pin');
 const pin = Uint8Array.from(pinHex.match(/../g)!, (byte) => parseInt(byte, 16)).buffer;
@@ -31,6 +36,7 @@ const transportState: Array<{ url: string; openedAtMs: number; closedAtMs: numbe
 const events: { timeMs: number; type: string; data: unknown }[] = [];
 const nativeEvents: { timeMs: number; type: string }[] = [];
 const samples: PlaybackSample[] = [];
+const programWire = runtimeMedia ? observeProgramSwitchWire() : undefined;
 let startupError: string | null = null;
 let presentedFrames = 0;
 let presentedMediaTimeS = 0;
@@ -57,15 +63,19 @@ const player = new Player(null, {
     logLevel: params.has('debug') ? 'debug' : 'none',
     ...(warmObserver ? { warmStartCurrentGroup: params.get('warm') === '1', objectTransform: warmObserver.transform } : {}),
     locmafDecoding: params.get('locmaf') === 'frame' ? 'frame' : 'mse',
-    ...(params.get('runtimeAudio') === '1' ? {} : { audioConstraints: { lang: params.get('lang') ?? 'en' } }),
+    ...(params.get('runtimeAudio') === '1' || runtimeMedia ? {} : { audioConstraints: { lang: params.get('lang') ?? 'en' } }),
+    ...(runtimeMedia ? { selection: { renderGroup: 1, videoAltGroup: 1 } } : {}),
     ...(params.get('debug') === 'handover' || nativeMse ? { createMediaSource: () => {
       const source = new MseMediaSource(video, nativeMse ? { mseImplementation: 'standard' } : {});
       source.debug = params.has('debug');
+      mseProgram?.source(source);
       return source;
     } } : {}),
+    ...(mseProgram ? { createCmafAssembler: callbacks => mseProgram.createAssembler(callbacks) } : {}),
     ...(decodedSource ? { createVideoDecoder: () => decodedSource.wrap(new WebCodecsVideoDecoder()) } : {}),
     createConnection: () => {
       const connection = new MoqtConnection(18);
+      programWire?.connection(connection);
       warmObserver?.connection(connection);
       if (warmObserver || locmafObserver) {
         observeConnectionObjects(connection, (stream, object) => {
@@ -89,8 +99,12 @@ const player = new Player(null, {
   },
 });
 
-for (const type of ['ready', 'playing', 'statechange', 'error', 'stall', 'qualitychange', 'audiochange', 'audiochangefailed'] as const) {
+for (const type of ['ready', 'playing', 'statechange', 'error', 'stall', 'qualitychange', 'audiochange', 'audiochangefailed',
+  'programchange', 'programchangefailed', 'viewchange', 'viewchangefailed'] as const) {
   player.on(type, (data) => events.push({ timeMs: performance.now(), type, data }));
+}
+if (runtimeMedia) for (const type of ['pause', 'play'] as const) {
+  player.on(type, data => events.push({ timeMs: performance.now(), type, data }));
 }
 for (const type of ['error', 'waiting', 'stalled']) {
   video.addEventListener(type, () => {
@@ -217,6 +231,7 @@ function snapshot() {
     nativeEvents: [...nativeEvents], nativeError: video.error ? { code: video.error.code, message: video.error.message } : null,
     nativeMse: nativeMse?.snapshot() ?? null,
     warmStart: warmObserver?.snapshot() ?? null,
+    programWire: programWire?.snapshot() ?? null,
     playbackQuality: playbackQuality(),
     outputState: { presentedFrames: canvasObserver?.frames ?? presentedFrames,
       currentTime: player.currentTime, audioRms: audioRms(), audioContext: audioContext?.state,
@@ -228,6 +243,7 @@ function snapshot() {
 }
 
 const acceptance = {
+  ...(mseProgram ? mseProgram.pageHooks(player) : {}),
   get startupError() { return startupError; },
   get warmReceipts() { return warmObserver?.snapshot().received ?? []; },
   get presentedFrames() { return canvasObserver?.frames ?? presentedFrames; },
@@ -236,9 +252,21 @@ const acceptance = {
   get transportState() { return transportState.map(state => ({ ...state })); },
   get errors() { return events.filter(event => event.type === 'error'); },
   get latestSample() { return samples.at(-1); },
+  get playback() { return playbackPoint(); },
+  pausePlayback() {
+    const actionAtMs = performance.now(); player.pause();
+    return { ...playbackPoint(), actionAtMs };
+  },
+  resumePlayback() {
+    const actionAtMs = performance.now(); player.play();
+    return { ...playbackPoint(), actionAtMs };
+  },
   get selection() { return { levels: player.levels, currentLevel: player.currentLevel, autoQuality: player.autoQuality,
     currentAudioTrack: player.currentAudioTrack, currentAudioTrackId: player.audioTracks[player.currentAudioTrack]?.id ?? null,
     audioTracks: player.audioTracks }; },
+  get mediaSelection() { return { programs: player.programs, views: player.views,
+    currentProgram: player.currentProgram, currentView: player.currentView,
+    currentAudioTrackId: player.audioTracks[player.currentAudioTrack]?.id ?? null }; },
   async setQuality(index: number) { await player.setQuality(index); },
   async setAudioTrack(index: number) { await player.setAudioTrack(index); },
   async selectAudioTrack(id: string, options?: Parameters<Player['selectAudioTrack']>[1]) {
@@ -261,6 +289,22 @@ const acceptance = {
       sourceTimeUs: BigInt(sourceTimeUs), referenceTimeUs: BigInt(referenceTimeUs) } });
     return { track: reference.track, domain: reference.domain, observedSourceTimeUs: String(reference.observedSourceTimeUs),
       sourceTimeUs, referenceTimeUs };
+  },
+  async selectProgramMapped(renderGroup: number, anchors: MediaMapAnchors) {
+    const program = player.programs.find(item => item.renderGroup === renderGroup);
+    if (!program) throw new Error(`Missing program render group ${renderGroup}`);
+    const reference = await mediaReference();
+    await player.selectProgram(program.id, { timeline: { kind: 'reference-map', referenceToken: reference.token, ...rawAnchors(anchors) } });
+    return { id: program.id, track: reference.track, domain: reference.domain,
+      observedSourceTimeUs: String(reference.observedSourceTimeUs), anchors };
+  },
+  async selectViewMapped(trackName: string, anchors: MediaMapAnchors) {
+    const view = player.views.find(item => item.levels.some(level => level.trackName === trackName));
+    if (!view) throw new Error(`Missing view track ${trackName}`);
+    const reference = await mediaReference();
+    await player.selectView(view.id, { timeline: { kind: 'reference-map', referenceToken: reference.token, ...rawAnchors(anchors) } });
+    return { id: view.id, track: reference.track, domain: reference.domain,
+      observedSourceTimeUs: String(reference.observedSourceTimeUs), anchors };
   },
   snapshot,
   begin(silent: boolean): void {
@@ -285,6 +329,8 @@ const acceptance = {
     clearInterval(timer);
     video.cancelVideoFrameCallback(callbackHandle);
     await player.destroy();
+    mseProgram?.dispose();
+    programWire?.dispose();
     nativeMse?.restore();
     source?.disconnect();
     gain?.disconnect();
@@ -300,6 +346,39 @@ const acceptance = {
     };
   },
 };
+
+function playbackPoint() {
+  return { timeMs: performance.now(), state: player.state,
+    presentedFrames: canvasObserver?.frames ?? presentedFrames,
+    nativeDrawTimestampUs: canvasObserver?.lastDrawTimestampUs ?? null,
+    nativeDrawTimeMs: canvasObserver?.lastDrawTimeMs ?? null,
+    currentProgram: player.currentProgram, currentView: player.currentView,
+    currentAudioTrackId: player.audioTracks[player.currentAudioTrack]?.id ?? null };
+}
+
+interface MediaMapAnchors {
+  video?: { sourceTimeUs: string; referenceTimeUs: string };
+  audio?: { sourceTimeUs: string; referenceTimeUs: string };
+}
+function rawAnchors(anchors: MediaMapAnchors) {
+  const parse = (anchor: { sourceTimeUs: string; referenceTimeUs: string }) => {
+    if (!/^\d+$/.test(anchor.sourceTimeUs) || !/^\d+$/.test(anchor.referenceTimeUs)) throw new Error('Invalid raw media anchor');
+    return { sourceTimeUs: BigInt(anchor.sourceTimeUs), referenceTimeUs: BigInt(anchor.referenceTimeUs) };
+  };
+  return { ...(anchors.video ? { video: parse(anchors.video) } : {}), ...(anchors.audio ? { audio: parse(anchors.audio) } : {}) };
+}
+async function mediaReference() {
+  // Keep the opaque canonical token in this realm; no clock or serialized replacement token.
+  let reference = player.mediaTimelineReference;
+  const deadline = performance.now() + 5_000;
+  while (reference === null && performance.now() < deadline) {
+    await new Promise<void>(resolve => { setTimeout(resolve, 50); });
+    reference = player.mediaTimelineReference;
+  }
+  if (performance.now() >= deadline) throw new Error('Media timeline reference readiness exceeded the 5s deadline');
+  if (reference === null) throw new Error('Current media has no adopted raw timeline reference');
+  return reference;
+}
 
 declare global {
   interface Window { playerAcceptance: typeof acceptance }

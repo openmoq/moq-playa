@@ -132,6 +132,9 @@
     .controls-row button:disabled { opacity: 0.3; cursor: default; }
     .controls-row svg { width: 20px; height: 20px; }
     .controls-spacer { flex: 1; }
+    .selection-note { display: block; margin-bottom: 6px; font-size: 0.7rem; color: #bbb; }
+    .selection-note:empty { display: none; }
+    .controls-row { flex-wrap: wrap; }
     .view-control select {
       max-width: 150px; min-width: 72px; height: 28px;
       border: 1px solid rgba(255,255,255,0.15); border-radius: 5px;
@@ -147,7 +150,7 @@
     /* ─── Track dropdowns (in controls) ──────────── */
     .track-dropdown { position: relative; display: none; }
     .track-dropdown.visible { display: inline-block; }
-    .track-dropdown-btn {
+    .controls-row .track-dropdown-btn {
       padding: 4px 10px; border-radius: 5px;
       border: 1px solid rgba(255,255,255,0.15);
       background: rgba(255,255,255,0.06); color: #e0e0e0;
@@ -173,6 +176,7 @@
       padding: 6px 10px; border-radius: 5px; cursor: pointer;
       font-size: 0.8rem; color: #ccc; transition: background 0.1s;
     }
+    .track-dropdown-menu .track-dropdown-item { width: 100%; text-align: left; justify-content: space-between; gap: 8px; }
     .track-dropdown-item:hover { background: rgba(255,255,255,0.06); }
     .track-dropdown-item.active { background: rgba(96,165,250,0.12); color: #60a5fa; }
     .track-dropdown-item .item-detail {
@@ -396,28 +400,33 @@
 
     <!-- Bottom control bar -->
     <div class="controls" id="controls" style="display:none">
+      <span class="selection-note">Program, view &amp; audio: start selected presentation anew</span>
+      <span id="selection-status" class="selection-note" role="status"></span>
       <div class="controls-row">
         <!-- Play/Pause -->
-        <button id="pause" title="Play/Pause">
+        <button id="pause" title="Stop / start selected presentation anew">
           <svg id="pause-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M6 4h4v16H6zm8 0h4v16h-4z"/></svg>
         </button>
 
         <!-- Track dropdowns -->
+        <div id="program-control" class="view-control" hidden>
+          <select id="program-select" aria-label="Program (render group) — start selected presentation anew" title="Start selected presentation anew" disabled></select>
+        </div>
         <div id="view-control" class="view-control" hidden>
-          <select id="view-select" aria-label="Video view" title="Video view"></select>
+          <select id="view-select" aria-label="Video view — start selected presentation anew" title="Start selected presentation anew" disabled></select>
         </div>
         <div id="video-track-dropdown" class="track-dropdown">
-          <div class="track-dropdown-btn" id="video-track-btn">
+          <button type="button" class="track-dropdown-btn" id="video-track-btn" disabled>
             <span id="video-track-label">Video</span>
             <span class="chevron">&#9660;</span>
-          </div>
+          </button>
           <div class="track-dropdown-menu" id="video-track-menu"></div>
         </div>
         <div id="audio-track-dropdown" class="track-dropdown">
-          <div class="track-dropdown-btn" id="audio-track-btn">
+          <button type="button" class="track-dropdown-btn" id="audio-track-btn" title="Start selected presentation anew" disabled>
             <span id="audio-track-label">Audio</span>
             <span class="chevron">&#9660;</span>
-          </div>
+          </button>
           <div class="track-dropdown-menu" id="audio-track-menu"></div>
         </div>
 

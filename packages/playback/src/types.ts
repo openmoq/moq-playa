@@ -11,6 +11,7 @@
 
 import type { VideoChunkInit, AudioChunkInit } from '@openmoq/loc';
 import type { RecoveryAction } from './recovery.js';
+import type { RenderTiming } from './sync.js';
 
 // ─── Clock ──────────────────────────────────────────────────────────
 
@@ -25,6 +26,19 @@ import type { RecoveryAction } from './recovery.js';
 export interface ClockSource {
     /** Current time in microseconds (monotonic). */
     now(): number;
+}
+
+/** Mapped input timing; queries never establish a clock or rewrite raw metadata. */
+export interface AudioTimingSource {
+    computeAudioRenderTime(sourceTimeUs: bigint): RenderTiming | null;
+    /** Called only for a current input when the shared reference is absent. */
+    establishReference?(sourceTimeUs: bigint): void;
+}
+
+export interface VideoTimingSource {
+    computeVideoRenderTime(sourceTimeUs: bigint): RenderTiming | null;
+    /** Output-time recomputation never calls this input-only hook. */
+    establishReference?(sourceTimeUs: bigint): void;
 }
 
 // ─── Decoder Commands ───────────────────────────────────────────────
@@ -48,6 +62,12 @@ export interface ConfigureCommand {
     readonly config: Uint8Array;
 }
 
+/** Producing input's nominal output schedule, before the renderer's playout cushion. */
+export interface VideoRenderTiming {
+    /** Null means this producing context no longer supplies a proven schedule. */
+    readonly recomputeRenderTimeUs: () => number | null;
+}
+
 /** Decode a video chunk at the specified render time. @see draft-ietf-moq-loc-01 §2.1 */
 export interface DecodeVideoCommand {
     readonly type: 'decode_video';
@@ -55,6 +75,8 @@ export interface DecodeVideoCommand {
     readonly renderTimeUs: number;
     /** Optional application-local identity; never a wire field or payload. */
     readonly inputToken?: object;
+    /** Immutable producing context for mapped output; raw chunk timestamps stay unchanged. */
+    readonly renderTiming?: VideoRenderTiming;
     /**
      * CaptureTimestamp in microseconds — for PTS-anchored render scheduling.
      * The renderer should use this (via RenderScheduler) instead of renderTimeUs

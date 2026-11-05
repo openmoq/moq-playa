@@ -17,11 +17,13 @@
  */
 
 import type { CmafAssemblyDiscardReason, CmafSourceReceipt } from '@openmoq/player';
+import { mediaTrackIdentity } from './media-track-identity.js';
 
 import {
   boxType,
   boxSize,
   readBaseMediaDecodeTime,
+  findTfdtOffset,
   patchBaseMediaDecodeTime,
   concatBuffers,
   rewriteFragmentDropSamples,
@@ -39,6 +41,56 @@ import {
 const SOURCE_PARTIAL = Object.freeze({ state: 'partial' as const });
 const SOURCE_REFUSED = Object.freeze({ state: 'refused' as const });
 const SOURCE_UNAVAILABLE = Object.freeze({ state: 'unavailable' as const });
+
+/** Exact rational microseconds. The denominator is strictly positive. */
+export interface FractionUs {
+  readonly numerator: bigint;
+  readonly denominator: bigint;
+}
+
+/** Immutable producing context; compare its token with a fresh capture for currentness. */
+export interface CmafPresentationPlacement {
+  readonly token: object;
+  toRebasedTimeUs(sourcePresentationTimeUs: bigint): FractionUs | null;
+}
+
+export interface CmafPresentationAnchor {
+  readonly sourceTimeUs: bigint;
+  readonly rebasedTimeUs: FractionUs;
+}
+
+interface PresentationMap {
+  readonly numerator: bigint;
+  readonly denominator: bigint;
+  replaced: boolean;
+  refused: boolean;
+}
+
+interface PlacementState {
+  revision: number;
+  proven: number;
+  patched: number;
+  init: Uint8Array | null;
+  map: PresentationMap | null;
+  captured: CmafPresentationPlacement | null;
+}
+
+function floorDivide(numerator: bigint, denominator: bigint): bigint {
+  const quotient = numerator / denominator;
+  return numerator % denominator < 0n ? quotient - 1n : quotient;
+}
+
+function fractionUs(numerator: bigint, denominator: bigint): FractionUs {
+  let a = numerator < 0n ? -numerator : numerator, b = denominator;
+  while (b !== 0n) { const remainder = a % b; a = b; b = remainder; }
+  return { numerator: numerator / a, denominator: denominator / a };
+}
+
+function sameBytes(left: Uint8Array | null, right: Uint8Array): boolean {
+  if (left === null || left.byteLength !== right.byteLength) return false;
+  for (let i = 0; i < left.byteLength; i++) if (left[i] !== right[i]) return false;
+  return true;
+}
 
 /**
  * Startup geometry: what the rebase produced for each track's FIRST fragment,
@@ -62,10 +114,9 @@ export interface CmafAssemblerOptions {
   /**
    * Called when a complete moof+mdat segment is ready for MSE.
    *
-   * `trackName` identifies the source MoQ track. Downstream consumers
-   * (e.g. MseMediaSource's overlap detector) keep per-track state and need
-   * to distinguish between same-track duplicates and across-track
-   * splices (ABR switches).
+   * `trackName` remains the source's display name. When supplied to push,
+   * `sourceKey` identifies its full resolved namespace and name, allowing
+   * downstream consumers to distinguish same-name tracks across namespaces.
    */
   readonly onSegment: (
     mediaType: 'video' | 'audio',
@@ -73,6 +124,7 @@ export interface CmafAssemblerOptions {
     trackName: string,
     groupId: bigint,
     inputs?: readonly (object | undefined)[],
+    sourceKey?: string,
   ) => void;
   /**
    * Called when a decode-time discontinuity is detected (bmd went
@@ -82,7 +134,7 @@ export interface CmafAssemblerOptions {
    */
   /** Optional input outcomes; never carries payloads or affects media delivery. */
   readonly onDiscard?: (input: object, reason: CmafAssemblyDiscardReason) => void | Promise<void>;
-  readonly onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string) => void;
+  readonly onDiscontinuity?: (mediaType: 'video' | 'audio', trackName: string, sourceKey?: string) => void;
   /**
    * DIAGNOSTIC ONLY — rebase epoch mode; see `CmafAssembler.epochMode`.
    * Construction-time so it cannot change once an epoch is established.
@@ -105,19 +157,21 @@ export interface CmafAssemblerOptions {
  * ```
  */
 export class CmafAssembler {
+  /** Opaque source keys are honored throughout assembly and callbacks. */
+  readonly supportsTrackIdentity = true;
   private readonly onSegment: CmafAssemblerOptions['onSegment'];
   private readonly onDiscard: CmafAssemblerOptions['onDiscard'];
   private pendingInputs: WeakMap<Uint8Array, object> | undefined;
   private readonly onDiscontinuity: CmafAssemblerOptions['onDiscontinuity'];
 
   /**
-   * Pending moofs keyed by "mediaType:trackName:groupId".
+   * Pending moofs keyed by media type, tagged track identity, and group ID.
    * Multiple groups can have data in-flight simultaneously on different
    * QUIC streams — keying by groupId prevents cross-group contamination.
    */
   private pendingMoofs = new Map<string, Uint8Array>();
 
-  /** Tracks (mediaType:trackName) already warned about non-media drops. */
+  /** Tracks (media type and tagged identity) already warned about non-media drops. */
   private readonly droppedNonMediaWarned = new Set<string>();
 
   /** Per-track rebase epoch (in that track's timescale units). */
@@ -158,6 +212,8 @@ export class CmafAssembler {
   private audioPresentationOffsetUs: bigint | null = null;
   private audioMappingReplaced = false;
   private audioPresentationMappingWitness: object | null = null;
+  private readonly videoPlacement: PlacementState = { revision: 0, proven: -1, patched: -1, init: null, map: null, captured: null };
+  private readonly audioPlacement: PlacementState = { revision: 0, proven: -1, patched: -1, init: null, map: null, captured: null };
 
   /** High-water marks of bytes actually emitted to MSE, in track ticks. */
   private lastVideoOutputBmd: bigint | null = null;
@@ -196,15 +252,16 @@ export class CmafAssembler {
   private pendingDiscontinuities: Array<{
     mediaType: 'video' | 'audio';
     trackName: string;
+    sourceKey: string | undefined;
   }> = [];
 
-  /** Track name associated with the current epoch, for scoped timeline clear. */
-  private videoTrackName: string | null = null;
-  private audioTrackName: string | null = null;
+  /** Tagged source identity associated with the current epoch. */
+  private videoTrackIdentity: string | null = null;
+  private audioTrackIdentity: string | null = null;
 
   /** Track identities explicitly committed by the player after a switch. */
-  private selectedVideoTrackName: string | null = null;
-  private selectedAudioTrackName: string | null = null;
+  private selectedVideoTrackIdentity: string | null = null;
+  private selectedAudioTrackIdentity: string | null = null;
 
   /**
    * Trex defaults parsed from each init segment. Video uses them for the
@@ -299,6 +356,11 @@ export class CmafAssembler {
     const trex = trexMap.size > 0 ? trexMap.values().next().value! : null;
     if (mediaType === 'video') this.videoTrex = trex;
     else this.audioTrex = trex;
+    const placement = this.placementState(mediaType);
+    if (!sameBytes(placement.init, initBytes)) {
+      placement.init = initBytes.slice();
+      this.invalidatePlacement(placement);
+    }
   }
 
   /**
@@ -335,9 +397,14 @@ export class CmafAssembler {
    * be allowed to switch the assembler back. Pending half-pairs are discarded
    * at the same boundary so an old moof cannot pair with a later mdat.
    */
-  selectTrack(mediaType: 'video' | 'audio', trackName: string): void {
-    if (mediaType === 'video') this.selectedVideoTrackName = trackName;
-    else this.selectedAudioTrackName = trackName;
+  selectTrack(mediaType: 'video' | 'audio', trackName: string, sourceKey?: string): void {
+    const identity = mediaTrackIdentity(trackName, sourceKey);
+    const previous = mediaType === 'video'
+      ? this.selectedVideoTrackIdentity ?? this.videoTrackIdentity
+      : this.selectedAudioTrackIdentity ?? this.audioTrackIdentity;
+    if (mediaType === 'video') this.selectedVideoTrackIdentity = identity;
+    else this.selectedAudioTrackIdentity = identity;
+    if (previous !== identity) this.invalidatePlacement(this.placementState(mediaType));
     this.clearPending(mediaType);
   }
 
@@ -353,18 +420,100 @@ export class CmafAssembler {
       if (this.audioEpoch === null) throw new Error('An audio reference epoch is required for presentation mapping');
       if (this.audioTimescale === null) throw new Error('An audio timescale is required for presentation mapping');
     }
+    const changed = this.audioPlacement.map !== null || offsetUs !== this.audioPresentationOffsetUs || offsetUs !== null;
+    this.audioPlacement.map = null;
     this.audioPresentationOffsetUs = offsetUs;
     this.audioMappingReplaced = offsetUs !== null;
     this.audioPresentationMappingWitness = offsetUs === null ? null : Object.freeze({});
+    if (changed) this.invalidatePlacement(this.audioPlacement);
   }
 
   /** Identity of an active mapping; a refused source restart invalidates it. */
   getAudioPresentationMappingWitness(): object | null { return this.audioPresentationMappingWitness; }
 
+  private placementState(mediaType: 'video' | 'audio'): PlacementState {
+    return mediaType === 'video' ? this.videoPlacement : this.audioPlacement;
+  }
+
+  private invalidatePlacement(state: PlacementState): void {
+    state.revision++;
+    state.proven = -1;
+    state.patched = -1;
+    state.captured = null;
+  }
+
+  /**
+   * Capture the actual affine placement after successful segment delivery.
+   * Fractions describe assembler output, excluding native timestampOffset.
+   * Captures remain usable as historical contexts after reset or reconfiguration.
+   */
+  capturePresentationPlacement(mediaType: 'video' | 'audio'): CmafPresentationPlacement | null {
+    if (mediaType !== 'video' && mediaType !== 'audio') return null;
+    const state = this.placementState(mediaType);
+    const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+    if (state.proven !== state.revision || timescale === null || timescale <= 0) return null;
+    if (state.map?.refused || mediaType === 'audio' && this.audioPresentationOffsetUs !== null
+        && this.audioPresentationMappingWitness === null) return null;
+    if (state.captured) return state.captured;
+    const scale = BigInt(timescale);
+    let shiftTicks: bigint;
+    if (state.map) {
+      shiftTicks = floorDivide(state.map.numerator * scale, state.map.denominator * 1_000_000n);
+    } else {
+      const epoch = mediaType === 'video' ? this.videoEpoch : this.audioEpoch;
+      if (epoch === null) return null;
+      shiftTicks = (mediaType === 'video' ? this.videoOutputOffset : this.audioOutputOffset) - epoch;
+      if (mediaType === 'audio' && this.audioPresentationOffsetUs !== null) {
+        // Preserve the legacy setter's existing truncation, rather than
+        // retroactively assigning it the new rational-map rounding policy.
+        shiftTicks += this.audioPresentationOffsetUs * scale / 1_000_000n;
+      }
+    }
+    const shiftUsNumerator = shiftTicks * 1_000_000n;
+    state.captured = Object.freeze({
+      token: Object.freeze({}),
+      toRebasedTimeUs(sourcePresentationTimeUs: bigint): FractionUs | null {
+        return typeof sourcePresentationTimeUs === 'bigint'
+          ? fractionUs(sourcePresentationTimeUs * scale + shiftUsNumerator, scale) : null;
+      },
+    });
+    return state.captured;
+  }
+
+  /**
+   * Place source presentation time directly on the rebased output timeline.
+   * Source/init may arrive later. One floor operation converts the exact affine
+   * translation to target ticks; DTS and PTS receive that same constant shift.
+   * The latest audio setter owns audio mapping; null restores ordinary policy.
+   */
+  setPresentationPlacement(mediaType: 'video' | 'audio', anchor: CmafPresentationAnchor | null): void {
+    if (mediaType !== 'video' && mediaType !== 'audio') throw new TypeError('Unknown presentation media type');
+    let map: PresentationMap | null = null;
+    if (anchor !== null) {
+      const source = anchor?.sourceTimeUs;
+      const numerator = anchor?.rebasedTimeUs?.numerator, denominator = anchor?.rebasedTimeUs?.denominator;
+      if (typeof source !== 'bigint' || typeof numerator !== 'bigint' || typeof denominator !== 'bigint') {
+        throw new TypeError('Presentation anchors and fractions must contain bigint scalars');
+      }
+      if (denominator <= 0n) throw new RangeError('Presentation fraction denominator must be positive');
+      const offset = fractionUs(numerator - source * denominator, denominator);
+      map = { numerator: offset.numerator, denominator: offset.denominator, replaced: true, refused: false };
+    }
+    const state = this.placementState(mediaType);
+    if (map === null && state.map === null && (mediaType !== 'audio' || this.audioPresentationOffsetUs === null)) return;
+    state.map = map;
+    if (mediaType === 'audio') {
+      this.audioPresentationOffsetUs = null;
+      this.audioMappingReplaced = false;
+      this.audioPresentationMappingWitness = null;
+    }
+    this.invalidatePlacement(state);
+  }
+
   /**
    * Push a CMAF MoQ object payload (moof or mdat).
    *
-   * If it's a moof, buffer it keyed by (mediaType, trackName, groupId).
+   * If it's a moof, buffer it keyed by media type, source identity, and group ID.
    * If it's an mdat, pair with the pending moof from the same key,
    * patch tfdt, concatenate, and emit via onSegment.
    *
@@ -379,6 +528,8 @@ export class CmafAssembler {
    * @param sourceTiming Request a raw source-PTS receipt after assembler
    * delivery. Multi-chunk objects report the last moof's first sample. This is
    * not append or presentation evidence. Omitted: no timing read or receipt.
+   * @param sourceKey Optional opaque full track identity, separate from the
+   * display name and from unkeyed legacy identities. Does not request timing.
    */
   push(
     mediaType: 'video' | 'audio',
@@ -387,11 +538,14 @@ export class CmafAssembler {
     payload: Uint8Array,
     input?: object,
     sourceTiming?: true,
+    sourceKey?: string,
   ): void | CmafSourceReceipt {
-    const selectedTrackName = mediaType === 'video'
-      ? this.selectedVideoTrackName
-      : this.selectedAudioTrackName;
-    if (selectedTrackName !== null && trackName !== selectedTrackName) { this.discardInput(input, 'track superseded'); return sourceTiming ? SOURCE_REFUSED : undefined; }
+    const trackIdentity = mediaTrackIdentity(trackName, sourceKey);
+    this.placementState(mediaType).patched = -1;
+    const selectedIdentity = mediaType === 'video'
+      ? this.selectedVideoTrackIdentity
+      : this.selectedAudioTrackIdentity;
+    if (selectedIdentity !== null && trackIdentity !== selectedIdentity) { this.discardInput(input, 'track superseded'); return sourceTiming ? SOURCE_REFUSED : undefined; }
     if (payload.byteLength < 8) { this.discardInput(input, 'invalid media'); return sourceTiming ? SOURCE_REFUSED : undefined; }
 
     // CMAF segments may have prefix boxes before the moof: styp (Segment Type),
@@ -413,7 +567,7 @@ export class CmafAssembler {
       // init segment that should have been consumed by the player layer.
       // Silently eating it turns a publisher's init into a black screen;
       // warn once per track so the drop is diagnosable.
-      const warnKey = `${mediaType}:${trackName}`;
+      const warnKey = `${mediaType}:${trackIdentity}`;
       if (!this.droppedNonMediaWarned.has(warnKey)) {
         this.droppedNonMediaWarned.add(warnKey);
         console.warn(
@@ -425,7 +579,7 @@ export class CmafAssembler {
       return sourceTiming ? SOURCE_REFUSED : undefined;
     }
     const type = boxType(payload, moofOffset);
-    const key = `${mediaType}:${trackName}:${groupId}`;
+    const key = `${mediaType}:${trackIdentity}:${groupId}`;
 
     if (type === 'moof') {
       const moofSize = boxSize(payload, moofOffset);
@@ -452,11 +606,11 @@ export class CmafAssembler {
               if (ticks === null || timescale === null) sourceTimingAvailable = false;
               else sourcePresentationTimeUs = ticks * 1_000_000n / BigInt(timescale);
             }
-            if (!this.patchEpoch(mediaType, trackName, chunkMoof, groupId)) { this.discardInput(input, 'epoch refused'); return sourceTiming ? SOURCE_REFUSED : undefined; }
+            if (!this.patchEpoch(mediaType, trackName, chunkMoof, groupId, trackIdentity, sourceKey)) { this.discardInput(input, 'epoch refused'); return sourceTiming ? SOURCE_REFUSED : undefined; }
           }
           pos += size;
         }
-        this.emitSegment(mediaType, segment, trackName, groupId, input === undefined ? undefined : [input]);
+        this.emitSegment(mediaType, segment, trackName, groupId, input === undefined ? undefined : [input], sourceKey);
         this.flushStartupGeometry();
         return sourceTiming ? sourceTimingAvailable && sourcePresentationTimeUs !== null
           ? { state: 'emitted', sourcePresentationTimeUs } : SOURCE_UNAVAILABLE : undefined;
@@ -487,21 +641,22 @@ export class CmafAssembler {
         const timescale = mediaType === 'audio' ? this.audioTimescale : this.videoTimescale;
         if (ticks !== null && timescale !== null) sourcePresentationTimeUs = ticks * 1_000_000n / BigInt(timescale);
       }
-      if (!this.patchEpoch(mediaType, trackName, pending, groupId)) {
+      if (!this.patchEpoch(mediaType, trackName, pending, groupId, trackIdentity, sourceKey)) {
         this.discardInput(priorInput, 'epoch refused'); this.discardInput(input, 'epoch refused'); return sourceTiming ? SOURCE_REFUSED : undefined;
       }
 
       // Concatenate moof + mdat
       const segment = concatBuffers(pending, payload);
       this.emitSegment(mediaType, segment, trackName, groupId,
-        priorInput === undefined && input === undefined ? undefined : [priorInput, input]);
+        priorInput === undefined && input === undefined ? undefined : [priorInput, input], sourceKey);
       this.flushStartupGeometry();
       return sourceTiming ? sourcePresentationTimeUs !== null
         ? { state: 'emitted', sourcePresentationTimeUs } : SOURCE_UNAVAILABLE : undefined;
     }
 
     // Unknown box type — pass through as-is.
-    if (input === undefined) this.onSegment(mediaType, payload, trackName, groupId);
+    if (sourceKey !== undefined) this.onSegment(mediaType, payload, trackName, groupId, input === undefined ? undefined : [input], sourceKey);
+    else if (input === undefined) this.onSegment(mediaType, payload, trackName, groupId);
     else this.onSegment(mediaType, payload, trackName, groupId, [input]);
     return sourceTiming ? SOURCE_UNAVAILABLE : undefined;
   }
@@ -596,12 +751,17 @@ export class CmafAssembler {
     trackName: string,
     groupId: bigint,
     inputs?: readonly (object | undefined)[],
+    sourceKey?: string,
   ): void {
     const output = this.maybeStripRaslSamples(mediaType, segment);
     const trex = mediaType === 'video' ? this.videoTrex : this.audioTrex;
     const ranges = readSegmentTimeRanges(output, trex ?? undefined);
-    if (inputs === undefined) this.onSegment(mediaType, output, trackName, groupId);
+    const placement = this.placementState(mediaType), revision = placement.revision, patched = placement.patched;
+    placement.patched = -1;
+    if (sourceKey !== undefined) this.onSegment(mediaType, output, trackName, groupId, inputs, sourceKey);
+    else if (inputs === undefined) this.onSegment(mediaType, output, trackName, groupId);
     else this.onSegment(mediaType, output, trackName, groupId, inputs);
+    if (placement.revision === revision && patched === revision) placement.proven = revision;
     if (ranges !== null && ranges.length > 0) {
       const end = ranges.reduce(
         (max, range) => range.endTime > max ? range.endTime : max,
@@ -646,6 +806,11 @@ export class CmafAssembler {
 
   /** Clear all pending moofs, epoch state, and parsed init defaults. */
   reset(): void {
+    for (const placement of [this.videoPlacement, this.audioPlacement]) {
+      placement.init = null;
+      placement.map = null;
+      this.invalidatePlacement(placement);
+    }
     const removed = this.pendingInputs ? [...this.pendingMoofs.values()] : undefined;
     this.pendingMoofs.clear();
     this.videoEpoch = null;
@@ -657,10 +822,10 @@ export class CmafAssembler {
     this.videoEpochGroupFloor = null;
     this.audioEpochGroupFloor = null;
     this.pendingDiscontinuities = [];
-    this.videoTrackName = null;
-    this.audioTrackName = null;
-    this.selectedVideoTrackName = null;
-    this.selectedAudioTrackName = null;
+    this.videoTrackIdentity = null;
+    this.audioTrackIdentity = null;
+    this.selectedVideoTrackIdentity = null;
+    this.selectedAudioTrackIdentity = null;
     this.videoTrex = null;
     this.audioTrex = null;
     this.videoTimescale = null;
@@ -753,7 +918,8 @@ export class CmafAssembler {
     while (this.pendingDiscontinuities.length > 0) {
       const event = this.pendingDiscontinuities.shift()!;
       try {
-        this.onDiscontinuity?.(event.mediaType, event.trackName);
+        if (event.sourceKey === undefined) this.onDiscontinuity?.(event.mediaType, event.trackName);
+        else this.onDiscontinuity?.(event.mediaType, event.trackName, event.sourceKey);
       } catch { /* diagnostic callback is contained */ }
     }
   }
@@ -857,16 +1023,24 @@ export class CmafAssembler {
     trackName: string,
     moof: Uint8Array,
     groupId: bigint,
+    trackIdentity: string,
+    sourceKey?: string,
   ): boolean {
     const rawBmd = readBaseMediaDecodeTime(moof);
     if (rawBmd === null) return true;
+    const placement = this.placementState(mediaType);
+    if (placement.map !== null) return this.patchPresentationPlacement(mediaType, trackIdentity, moof, groupId, rawBmd, placement);
+    const previousEpoch = mediaType === 'video' ? this.videoEpoch : this.audioEpoch;
+    const previousOffset = mediaType === 'video' ? this.videoOutputOffset : this.audioOutputOffset;
+    const previousTrack = mediaType === 'video' ? this.videoTrackIdentity : this.audioTrackIdentity;
+    const previousEpochGen = mediaType === 'video' ? this.videoEpochGen : this.audioEpochGen;
     const mappedAudio = mediaType === 'audio' && this.audioPresentationOffsetUs !== null;
     if (mappedAudio && (this.audioTimescale === null || this.audioEpoch === null)) return false;
     const bmd = rawBmd + (mappedAudio
       ? this.audioPresentationOffsetUs! * BigInt(this.audioTimescale!) / 1_000_000n : 0n);
 
-    const currentTrackName = mediaType === 'video' ? this.videoTrackName : this.audioTrackName;
-    const isTrackSwitch = currentTrackName !== null && currentTrackName !== trackName;
+    const currentIdentity = mediaType === 'video' ? this.videoTrackIdentity : this.audioTrackIdentity;
+    const isTrackSwitch = currentIdentity !== null && currentIdentity !== trackIdentity;
     const epochGroupFloor = mediaType === 'video'
       ? this.videoEpochGroupFloor
       : this.audioEpochGroupFloor;
@@ -889,7 +1063,7 @@ export class CmafAssembler {
       // An explicit map fixes the output position. Neither a new source's Group
       // IDs nor the previous buffered end can redefine that relationship.
       if (isTrackSwitch || this.audioMappingReplaced) {
-        this.audioTrackName = trackName;
+        this.audioTrackIdentity = trackIdentity;
         this.lastAudioBmd = null;
         this.highestAudioGroupId = null;
         this.audioEpochGroupFloor = null;
@@ -900,6 +1074,7 @@ export class CmafAssembler {
         // A new source epoch needs a new application map. It cannot reset the
         // shared A/V clock merely because this audio source restarted.
         this.audioPresentationMappingWitness = null;
+        this.invalidatePlacement(placement);
         return false;
       }
     } else if (isTrackSwitch) {
@@ -909,7 +1084,7 @@ export class CmafAssembler {
       const anchored = this.anchorEpoch(mediaType, bmd, false);
       if (mediaType === 'video') {
         this.videoEpoch = anchored;
-        this.videoTrackName = trackName;
+        this.videoTrackIdentity = trackIdentity;
         this.lastVideoBmd = null;
         this.videoEpochGen = this.sharedEpochGen;
         this.highestVideoGroupId = null;
@@ -917,7 +1092,7 @@ export class CmafAssembler {
         this.videoEpochGroupFloor = null;
       } else {
         this.audioEpoch = anchored;
-        this.audioTrackName = trackName;
+        this.audioTrackIdentity = trackIdentity;
         this.lastAudioBmd = null;
         this.audioEpochGen = this.sharedEpochGen;
         this.highestAudioGroupId = null;
@@ -930,12 +1105,12 @@ export class CmafAssembler {
       const anchored = this.anchorEpoch(mediaType, bmd, false);
       if (mediaType === 'video') {
         this.videoEpoch = anchored;
-        this.videoTrackName = trackName;
+        this.videoTrackIdentity = trackIdentity;
         this.lastVideoBmd = null;
         this.videoOutputOffset = this.outputOffsetFor('video', bmd, anchored);
       } else {
         this.audioEpoch = anchored;
-        this.audioTrackName = trackName;
+        this.audioTrackIdentity = trackIdentity;
         this.lastAudioBmd = null;
         this.audioOutputOffset = this.outputOffsetFor('audio', bmd, anchored);
       }
@@ -974,7 +1149,7 @@ export class CmafAssembler {
           this.audioOutputOffset = this.outputOffsetFor('audio', bmd, anchored);
           this.audioEpochGroupFloor = groupId;
         }
-        this.pendingDiscontinuities.push({ mediaType, trackName });
+        this.pendingDiscontinuities.push({ mediaType, trackName, sourceKey });
       }
     }
 
@@ -995,9 +1170,15 @@ export class CmafAssembler {
 
     const currentEpoch = mediaType === 'video' ? this.videoEpoch! : this.audioEpoch!;
     const outputOffset = mediaType === 'video' ? this.videoOutputOffset : this.audioOutputOffset;
+    if (currentEpoch !== previousEpoch || outputOffset !== previousOffset
+        || (mediaType === 'video' ? this.videoEpochGen : this.audioEpochGen) !== previousEpochGen
+        || (mediaType === 'video' ? this.videoTrackIdentity : this.audioTrackIdentity) !== previousTrack) {
+      this.invalidatePlacement(placement);
+    }
     const patchedBmd = outputOffset + bmd - currentEpoch;
     if (patchedBmd < 0n) return false;
     patchBaseMediaDecodeTime(moof, patchedBmd);
+    placement.patched = placement.revision;
     if (mediaType === 'video') {
       if (this.lastVideoOutputBmd === null || patchedBmd > this.lastVideoOutputBmd) {
         this.lastVideoOutputBmd = patchedBmd;
@@ -1029,6 +1210,59 @@ export class CmafAssembler {
         );
       }
     }
+    return true;
+  }
+
+  /** Explicit placement is independent of the retired track's raw epoch. */
+  private patchPresentationPlacement(
+    mediaType: 'video' | 'audio', trackIdentity: string, moof: Uint8Array, groupId: bigint,
+    rawBmd: bigint, placement: PlacementState,
+  ): boolean {
+    const map = placement.map!;
+    const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
+    if (map.refused || timescale === null || timescale <= 0) return false;
+    const shift = floorDivide(map.numerator * BigInt(timescale), map.denominator * 1_000_000n);
+    const patched = rawBmd + shift;
+    const currentTrack = mediaType === 'video' ? this.videoTrackIdentity : this.audioTrackIdentity;
+    const last = mediaType === 'video' ? this.lastVideoBmd : this.lastAudioBmd;
+    const highest = mediaType === 'video' ? this.highestVideoGroupId : this.highestAudioGroupId;
+    const newSource = map.replaced || currentTrack !== trackIdentity;
+    if (!newSource && last !== null && rawBmd < last
+        && last - rawBmd > (mediaType === 'audio' ? BigInt(timescale) : 0n)
+        && (highest === null || groupId > highest)) {
+      // A new source epoch needs a new explicit map. Never reset the shared
+      // A/V epoch to conceal a restart in one independently mapped source.
+      map.refused = true;
+      this.invalidatePlacement(placement);
+      return false;
+    }
+    const tfdt = findTfdtOffset(moof);
+    if (tfdt === null || tfdt.version !== 0 && tfdt.version !== 1) return false;
+    const max = tfdt.version === 0 ? 0xffff_ffffn : 0xffff_ffff_ffff_ffffn;
+    if (patched < 0n || patched > max) return false;
+    if (newSource) {
+      map.replaced = false;
+      if (mediaType === 'video') {
+        this.videoTrackIdentity = trackIdentity;
+        this.lastVideoBmd = null; this.highestVideoGroupId = null; this.videoEpochGroupFloor = null;
+      } else {
+        this.audioTrackIdentity = trackIdentity;
+        this.lastAudioBmd = null; this.highestAudioGroupId = null; this.audioEpochGroupFloor = null;
+      }
+      this.invalidatePlacement(placement);
+    }
+    patchBaseMediaDecodeTime(moof, patched);
+    placement.patched = placement.revision;
+    if (mediaType === 'video') {
+      if (this.lastVideoBmd === null || rawBmd > this.lastVideoBmd) this.lastVideoBmd = rawBmd;
+      if (this.highestVideoGroupId === null || groupId > this.highestVideoGroupId) this.highestVideoGroupId = groupId;
+      if (this.lastVideoOutputBmd === null || patched > this.lastVideoOutputBmd) this.lastVideoOutputBmd = patched;
+    } else {
+      if (this.lastAudioBmd === null || rawBmd > this.lastAudioBmd) this.lastAudioBmd = rawBmd;
+      if (this.highestAudioGroupId === null || groupId > this.highestAudioGroupId) this.highestAudioGroupId = groupId;
+      if (this.lastAudioOutputBmd === null || patched > this.lastAudioOutputBmd) this.lastAudioOutputBmd = patched;
+    }
+    this.recordStartupGeometry(mediaType, rawBmd, patched);
     return true;
   }
 }

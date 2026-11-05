@@ -19,6 +19,7 @@ import type { MoqtObject, ObjectDatagram } from '@openmoq/transport';
 import type { LocHeaders, LocHeaderOptions } from '@openmoq/loc';
 import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
+import { identityKey } from '@openmoq/msf';
 
 /**
  * Packaging type for container format dispatch.
@@ -33,7 +34,9 @@ interface TrackInfo {
   readonly trackName: string;
   readonly mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline';
   readonly packaging: TrackPackaging;
+  readonly sourceKey?: string;
   readonly identity?: { readonly sourceConnection: unknown; readonly namespace: readonly string[] };
+  minimumMediaLocation?: { readonly groupId: bigint; readonly objectId: bigint } | undefined;
 }
 
 interface PendingLocmafTransform {
@@ -120,6 +123,15 @@ export class SubscriptionManager {
       if (result) void Promise.resolve(result).catch(() => {});
     } catch { /* Diagnostic outcomes cannot make a track malformed. */ }
   }
+
+  private mediaInputOwner: object = {};
+  get mediaInputGeneration(): object { return this.mediaInputOwner; }
+
+  /** Retire inputs received before a playback reset without retiring request/terminal ownership. */
+  invalidateMediaInputs(): void { this.mediaInputOwner = {}; }
+
+  /** Full resolved track identity, cached once at registration; never includes a connection or request id. */
+  getSourceKey(alias: bigint): string | undefined { return this.tracks.get(alias)?.sourceKey; }
 
   /** Opaque registration identity for an operation that may outlive this call. */
   captureRoute(alias: bigint): (() => boolean) | null {
@@ -305,13 +317,14 @@ export class SubscriptionManager {
     packaging: TrackPackaging = 'loc',
     identity?: { readonly sourceConnection: unknown; readonly namespace: readonly string[] },
   ): void {
+    const sourceKey = identity === undefined ? undefined : identityKey(identity.namespace, trackName);
     const previous = this.tracks.get(trackAlias);
     if (identity && previous?.identity && previous.identity.sourceConnection === identity.sourceConnection
-        && JSON.stringify(previous.identity.namespace) === JSON.stringify(identity.namespace)
-        && previous.trackName === trackName && previous.mediaType === mediaType && previous.packaging === packaging) return;
+        && previous.sourceKey === sourceKey && previous.mediaType === mediaType && previous.packaging === packaging) return;
     this.unregisterTrack(trackAlias);
     this.tracks.set(trackAlias, { trackName, mediaType, packaging,
-      ...(identity ? { identity: { sourceConnection: identity.sourceConnection, namespace: [...identity.namespace] } } : {}) });
+      ...(identity ? { identity: { sourceConnection: identity.sourceConnection, namespace: [...identity.namespace] },
+        sourceKey: sourceKey! } : {}) });
   }
 
   /**
@@ -323,6 +336,24 @@ export class SubscriptionManager {
     for (const pending of this.pendingLocmafTransforms) {
       if (pending.alias === trackAlias) pending.valid = false;
     }
+  }
+
+  /**
+   * Keep reordered data before an adopted access point out of that route.
+   * This is a local playback boundary, not a peer protocol error. Status
+   * objects still drain, and the existing registration/idle owner is retained.
+   */
+  setMinimumMediaLocation(trackAlias: bigint, location: { readonly groupId: bigint; readonly objectId: bigint } | undefined): boolean {
+    const info = this.tracks.get(trackAlias);
+    if (!info) return false;
+    info.minimumMediaLocation = location === undefined ? undefined : { ...location };
+    return true;
+  }
+
+  private isBeforeMinimum(info: TrackInfo, object: MoqtObject): boolean {
+    const minimum = info.minimumMediaLocation;
+    return object.kind === 'data' && minimum !== undefined && (object.groupId < minimum.groupId
+      || object.groupId === minimum.groupId && object.objectId < minimum.objectId);
   }
 
   /** In-flight work received before a reset cannot re-anchor its group afterwards. */
@@ -381,6 +412,9 @@ export class SubscriptionManager {
     const alias = BigInt(obj.trackAlias);
     const info = this.tracks.get(alias);
     if (!info) return; // Unknown track alias — silently ignore
+    // Receipt ownership is separate from the alias registration. An asynchronous
+    // transform may finish after pause/recovery while the subscription survives.
+    const inputOwner = this.mediaInputOwner;
 
     // Bind the LOC wire profile to the draft of the SOURCE connection that
     // delivered this object, captured BEFORE any transform await. A cross-draft
@@ -441,7 +475,7 @@ export class SubscriptionManager {
           } else context = captured;
         } catch { /* Optional evidence cannot affect media. */ }
       }
-      if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+      if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
         this.discardContext(context, provenance, provenanceGeneration, 'route retired');
         return;
       }
@@ -458,7 +492,7 @@ export class SubscriptionManager {
           return;
         }
         delivery = admission;
-        if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+        if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
           this.discardContext(context, provenance, provenanceGeneration, 'route retired');
           return;
         }
@@ -466,7 +500,7 @@ export class SubscriptionManager {
 
       if (earlier.length) {
         await Promise.all(earlier.map(waitForRoute));
-        if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+        if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
           this.discardContext(context, provenance, provenanceGeneration, 'route retired'); return;
         }
       }
@@ -495,14 +529,19 @@ export class SubscriptionManager {
           return;
         }
         // The route may have changed hands while the transform was awaited.
-        if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+        if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
           this.discardContext(context, provenance, provenanceGeneration, 'route retired');
           return;
         }
       }
 
-      if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+      if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
         this.discardContext(context, provenance, provenanceGeneration, 'route retired');
+        return;
+      }
+
+      if (this.isBeforeMinimum(info, obj)) {
+        this.discardContext(context, provenance, provenanceGeneration, 'stale group');
         return;
       }
 
@@ -541,7 +580,7 @@ export class SubscriptionManager {
         const parse = this.extensionParser
           ?? ((ext: Uint8Array | undefined) => parseLocHeaders(ext, opts));
         const headers = parse(extensions);
-        if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+        if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
           this.discardContext(context, provenance, provenanceGeneration, 'route retired');
           return;
         }
@@ -551,19 +590,23 @@ export class SubscriptionManager {
         else this.onObject?.(mediaType, info.trackName, transformed, headers, input);
       }
     } catch (error) {
-      if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+      if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
         this.discardContext(context, provenance, provenanceGeneration, 'route retired');
+        return;
+      }
+      if (this.isBeforeMinimum(info, obj)) {
+        this.discardContext(context, provenance, provenanceGeneration, 'stale group');
         return;
       }
       if (pendingTransform && !pendingTransform.valid) {
         this.discardContext(context, provenance, provenanceGeneration, 'transform cancelled');
         return;
       }
-      if (this.tracks.get(alias) !== info || this.routeStillValid !== null && !this.routeStillValid(source, alias)) {
+      if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || this.routeStillValid !== null && !this.routeStillValid(source, alias)) {
         this.discardContext(context, provenance, provenanceGeneration, 'route retired'); return;
       }
       this.discardContext(context, provenance, provenanceGeneration, 'object processing failed');
-      if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) return;
+      if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) return;
       // §2.4.2: Malformed Track — signal to player for UNSUBSCRIBE, tagged with
       // the source session so recovery does not cancel a request on another.
       this.onMalformedTrack?.(

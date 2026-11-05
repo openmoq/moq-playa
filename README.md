@@ -175,10 +175,12 @@ player.audioTracks    // available audio tracks
 player.currentAudioTrack // adopted audio index, or -1 while unknown
 player.programs       // catalog render groups, with unassigned tracks kept separate
 player.views          // views in the adopted program, including singleton tracks
+player.currentProgram // stable id of the adopted program
+player.currentView    // stable id of the adopted view
 player.currentLevel   // active level index
 player.activeMediaType  // 'canvas' | 'video' | null (before track selection)
 
-// Quality (async — resolves when switch commits)
+// Quality (active level changes on qualitychange)
 await player.setQuality(index);  // manual quality switch (disables ABR)
 await player.setQuality('auto'); // re-enable ABR
 player.levels;                   // available quality levels
@@ -197,6 +199,8 @@ player.on('seeked',         ({ currentTime }) => console.log(currentTime));
 player.on('qualitychange',  ({ level, auto }) => console.log(level, auto));
 player.on('audiochange',    ({ track }) => console.log(track));
 player.on('audiochangefailed', ({ trackId, message }) => console.warn(trackId, message));
+player.on('programchange',  ({ program }) => console.log(program));
+player.on('viewchange',     ({ view }) => console.log(view));
 player.on('stall',          ({ durationMs }) => console.log(durationMs));
 player.on('error',          ({ severity, code, message }) => console.error(severity, code, message));
 player.on('statechange',    ({ state }) => console.log(state));
@@ -249,13 +253,44 @@ portrait.play();
 `levels` and automatic quality selection only contain alternatives from that
 view. `videoGroups` (`availableVideoGroups` on `MoqtPlayer`) lists the catalog's
 supported video groups. Multiple players can select different groups independently.
-To change views, destroy the old player and create another with the desired
-group. `setQuality`/`selectVideoTrack` are quality switches within a view, not
-cross-view timeline mappings: different groups need not share timestamps or
-Group IDs. The player example's View selector stops and creates a fresh player
-for the requested group; `?altGroup=0` selects its initial view. Stop also cancels
-an in-progress retune. `videoAltGroup` cannot be combined with the catalog-free
-`knownTracks` fast path when video is enabled.
+`selectView(id, options)` prepares another view on the existing session;
+`selectProgram(id, options)` prepares the program's required video and audio
+together. Readback and change events move only after adoption. A refused or
+incomplete target leaves the old selection playing. `setQuality`/`selectVideoTrack`
+remain quality switches within a view, not cross-view timeline mappings:
+different sets need not share timestamps or Group IDs.
+
+For unrelated timelines, provide a correspondence established by the application.
+The anchors are raw presentation timestamps in microseconds, not Group IDs or
+the browser playhead. Both target outputs map into the same reference's domain:
+
+```ts
+const reference = player.mediaTimelineReference;
+if (!reference) throw new Error('Wait for accepted source timing');
+await player.selectProgram(nextProgram.id, {
+  timeline: {
+    kind: 'reference-map', referenceToken: reference.token,
+    video: { sourceTimeUs: 90_000_000n, referenceTimeUs: 1_000_000_000n },
+    audio: { sourceTimeUs: 900_000_000n, referenceTimeUs: 1_000_000_000n },
+  },
+});
+```
+
+Reading `mediaTimelineReference` enables source-time collection; it can remain
+null until subsequent accepted media supplies evidence. Its opaque token expires
+when the source, configuration or timeline changes. An explicit map establishes
+placement, not a promise that independently published content is synchronized.
+LOC program/view changes require the running decoder configuration. Generic MSE
+changes require the running initialization and an explicit presentation map;
+unsupported changes fail before adoption. Logical A/V selection is joint, but
+native decoder and device output is not an atomic splice.
+
+The player example offers program, view and audio menus from the catalog. These
+choices start the selected presentation anew, using a fresh player rather than
+an inferred timeline mapping. Video quality changes stay within the current
+view. `?altGroup=0` selects the initial view; Stop cancels an in-progress retune.
+`videoAltGroup` cannot be combined with the catalog-free `knownTracks` fast path
+when video is enabled.
 
 ### Audio selection
 
@@ -286,8 +321,11 @@ source-time mapping are refused; the default setter never enables this policy.
 `audioLanguages` tries preferences in order, preferring an exact tag and then
 regional variants in catalog order, with RFC 4647 singleton-aware fallback.
 This is the player's preference policy, rather than strict RFC 4647 Lookup.
-No match keeps the existing scope-local default. Explicit track pins win, and
-`audioConstraints.lang` retains exact matching.
+No match keeps the existing scope-local default. A successful explicit audio
+choice carries its language preference into later program selections, even if
+an intervening program lacks that language. Exact track pins stay local to the
+program. `audioConstraints.lang` is an exact startup filter and does not override
+a later viewer choice.
 
 ---
 

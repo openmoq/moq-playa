@@ -2,12 +2,14 @@ import { readFileSync } from 'node:fs';
 import { createContext, runInContext } from 'node:vm';
 import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { TeardownBarrier, parseVideoAltGroup } from './view-selection.js';
+import { TeardownBarrier, parseVideoAltGroup, waitForOutput } from './view-selection.js';
+import { buildCatalogSelection, type SelectionConfig, type PlayerEventMap, type MediaSelectionSnapshot } from '@openmoq/player';
+import { playbackOwnerIsCurrent, selectionMenus } from './selection-controls.js';
 import { createWebTransport } from '@openmoq/browser';
 
 // Run the demo's actual lifecycle with DOM and network boundaries replaced.
 const source = ts.createSourceFile('main.ts', readFileSync(new URL('./main.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true);
-const names = new Set(['startPlayback', 'startPlaybackAttempt', 'stopPlayback', 'prefetchCatalogViaFetch', 'waitForOutput']);
+const names = new Set(['startPlayback', 'startPlaybackAttempt', 'stopPlayback', 'prefetchCatalogViaFetch']);
 const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && names.has(n.name?.text ?? ''))
   .map(n => n.getText(source)).join('\n');
 const code = ts.transpileModule(functions, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
@@ -22,13 +24,16 @@ function fixture(fetchCatalog = false) {
   const nativeCloses = vi.fn();
   const context = createContext({
     AbortController, TextEncoder, TextDecoder, URLSearchParams, AggregateError, setTimeout, clearTimeout,
-    params: new URLSearchParams(fetchCatalog ? 'fetchCatalog=1' : ''), selectedVideoAltGroup: undefined,
+    params: new URLSearchParams(fetchCatalog ? 'fetchCatalog=1' : ''),
+    selectedPresentation: undefined, selectedAudioLanguage: undefined, catalogSelection: null, pendingVideoSelection: null,
+    selectionStatus: { textContent: '' }, refreshTrackSelector() {}, buildTrackSelector: vi.fn(),
+    buildCatalogSelection, playbackOwnerIsCurrent, selectionMenus, waitForOutput,
     playEpoch: 0, startupDiscovery: null, startupTransport: null, teardownBarrier: new TeardownBarrier(100),
     ensureAudio: () => ({ ctx: {}, clock: {} }), newStartupLatch: () => ({}),
     resolveRelayEndpoint: async () => 'https://test.invalid', log: vi.fn(),
     namespaceArg: 'live', authority: undefined, warmStart: false, catalogFromUrl: undefined, catalogBootstrap: undefined,
     certHash: undefined, draftVersion: undefined, CanvasRenderer: class { stop() {} start() {} },
-    canvas: {}, renderer: null, startupSummaryEnabled: false, trace: null,
+    canvas: { style: {} }, renderer: null, startupSummaryEnabled: false, trace: null,
     createWebTransport: ({ signal }: { signal: AbortSignal }) => async () => {
       if (!holdReady) return {};
       return new Promise((_resolve, reject) => {
@@ -39,14 +44,25 @@ function fixture(fetchCatalog = false) {
       async connect() { await holdConnect; } async fetch() { fetches++; return 1n; } async close() { closes(); }
     },
     varint: (v: unknown) => v, CATALOG_TRACK_NAME: 'catalog',
-    videoEl: { pause() {} }, lastMediaMs: 0, healthySinceMs: 0, cmafActive: false,
+    usesMsePath: () => false, videoEl: { pause() {}, style: {} }, lastMediaMs: 0, healthySinceMs: 0, cmafActive: false,
     player: null, externalConnection: null, mediaSourceRef: null, window: {}, isPlaying: false,
     setControlIcon() {}, flashCenter() {}, showPlayerControls() {}, hideTimer: null, parseVideoAltGroup,
     loadingSpinner: { style: {} }, controls: { style: {} },
   });
   class FakePlayer {
-    constructor(readonly options: { createTransport(url: string): Promise<unknown> }) { instances.push(this); }
-    on() { return () => {}; }
+    readonly listeners = new Map<keyof PlayerEventMap, Set<(event: unknown) => void>>();
+    selection: MediaSelectionSnapshot = { revision: 0, scope: null, video: null, audio: null,
+      videoAlternatives: [], audioChoices: [], autoQuality: true };
+    constructor(readonly options: { createTransport(url: string): Promise<unknown>; selection?: SelectionConfig; audioLanguages?: readonly string[] }) { instances.push(this); }
+    on<K extends keyof PlayerEventMap>(type: K, listener: (event: PlayerEventMap[K]) => void) {
+      const members = this.listeners.get(type) ?? new Set<(event: unknown) => void>();
+      this.listeners.set(type, members);
+      members.add(listener as (event: unknown) => void);
+      return () => { members.delete(listener as (event: unknown) => void); };
+    }
+    emit<K extends keyof PlayerEventMap>(type: K, event: PlayerEventMap[K]) {
+      for (const listener of this.listeners.get(type) ?? []) listener(event);
+    }
     async load() { await this.options.createTransport('https://test.invalid'); }
     play() {}
     async destroy() { await holdDestroy; }
@@ -167,5 +183,44 @@ describe('demo player teardown ownership', () => {
     await f.context.teardownBarrier.wait();
     await f.context.startPlayback();
     expect(f.instances).toHaveLength(2);
+  });
+});
+
+
+describe('demo selection configuration and event ownership', () => {
+  it('retains the legacy altGroup=0 startup link', async () => {
+    const f = fixture();
+    f.context.params.set('altGroup', '0');
+    await f.context.startPlayback();
+    expect(f.instances[0]!.options.selection).toEqual({ videoAltGroup: 0 });
+  });
+  it('passes an exact singleton tuple and explicit unassigned scope without the old URL group', async () => {
+    const f = fixture();
+    f.context.params.set('altGroup', '9');
+    f.context.selectedPresentation = { renderGroup: null, videoTrack: { name: 'main', namespace: ['a/b'] } };
+    await f.context.startPlayback();
+    expect(f.instances[0]!.options.selection).toEqual({ renderGroup: null, videoTrack: { name: 'main', namespace: ['a/b'] } });
+  });
+  it('carries a manual language into fresh configuration without carrying an exact pin to a new program', async () => {
+    const f = fixture();
+    f.context.selectedPresentation = { renderGroup: 2 };
+    f.context.selectedAudioLanguage = 'es';
+    await f.context.startPlayback();
+    expect(f.instances[0]!.options.audioLanguages).toEqual(['es']);
+    expect(f.instances[0]!.options.selection).toEqual({ renderGroup: 2 });
+  });
+  it('ignores stale catalog events and delayed renders after a successor starts', async () => {
+    const f = fixture();
+    const catalog = { version: 1, tracks: [] };
+    await f.context.startPlayback();
+    const old = f.instances[0]!;
+    old.emit('catalog_received', { type: 'catalog_received', catalog });
+    await f.context.stopPlayback(true);
+    await f.context.startPlayback();
+    old.emit('catalog_updated', { type: 'catalog_updated', catalog });
+    old.emit('selection_changed', { type: 'selection_changed', selection: old.selection, catalog });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(f.context.catalogSelection).toBeNull();
+    expect(f.context.buildTrackSelector).not.toHaveBeenCalled();
   });
 });

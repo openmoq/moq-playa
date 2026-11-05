@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { writeFile } from 'node:fs/promises';
+import { viewChoiceValue, programChoiceValue } from './view-choice.mjs';
 
 /** Exercise the actual demo controls, not a second implementation of retuning. */
-export async function checkExampleViews(page, webUrl, query, artifacts, name, canvasOutput) {
+export async function checkExampleViews(page, webUrl, query, artifacts, name, canvasOutput, programs = false) {
   await page.addInitScript(() => {
     const state = window.__viewEvidence = { transports: [], errors: [], taps: [], holdConnect: false };
     const NativeTransport = WebTransport;
@@ -60,17 +61,28 @@ export async function checkExampleViews(page, webUrl, query, artifacts, name, ca
     });
   }
   const observations = [];
-  for (const group of [1, 0, 1, 0]) {
+  const selector = programs ? '#program-select' : '#view-select';
+  const choose = programs ? programChoiceValue : viewChoiceValue;
+  const steps = programs ? [1, 2, 1, 2].map(group => ({ group, width: group === 1 ? 640 : 1920,
+    track: group === 1 ? 'video-360' : 'video-1080', audio: group === 1 ? 'audio-en' : 'audio-es' }))
+    : [1, 0, 1, 0].map(group => ({ group, width: group === 0 ? 360 : 640,
+      track: group === 0 ? 'video-portrait' : 'video-360', audio: 'audio-en' }));
+  for (const step of steps) {
+    const { group } = step;
     await page.hover('#player-wrap');
-    if (observations.length) await page.selectOption('#view-select', String(group));
-    await page.waitForFunction(({ group, canvasOutput }) => {
+    const value = choose(await page.locator(`${selector} option`).evaluateAll(options =>
+      options.map(option => option.value)), group);
+    if (observations.length) await page.selectOption(selector, value);
+    await page.waitForFunction(({ step, canvasOutput, value, selector, programs }) => {
       const p = window.__player;
       const element = document.querySelector(canvasOutput ? '#canvas' : '#video');
       const width = canvasOutput ? element.width : element.videoWidth;
-      return window.__liveness().isPlaying && document.querySelector('#view-select').value === String(group)
-        && width === (group === 0 ? 360 : 640) && p.stats.currentResolution?.width === width
+      return window.__liveness().isPlaying && document.querySelector(selector).value === value
+        && p.selection.video?.name === step.track && p.selection.audio?.name === step.audio
+        && (!programs || p.selection.scope?.kind === 'render-group' && p.selection.scope.renderGroup === step.group)
+        && width === step.width && p.stats.currentResolution?.width === width
         && (canvasOutput ? p.videoPresentation?.renderedAtUs != null : !element.paused && element.currentTime > 0.1);
-    }, { group, canvasOutput }, { timeout: 20000 });
+    }, { step, canvasOutput, value, selector, programs }, { timeout: 20000 });
     const samples = [];
     for (let i = 0; i < 12; i++) {
       samples.push(await page.evaluate(canvasOutput => {
@@ -97,13 +109,13 @@ export async function checkExampleViews(page, webUrl, query, artifacts, name, ca
     await writeFile(join(artifacts, `${name}-samples.json`), JSON.stringify(observations, null, 2));
     assert.ok(new Set(samples.map(s => s.hash)).size >= 3, 'Retuned picture must keep moving');
     assert.ok(samples.some(s => s.audioRms > 0.015), 'Retuned audio must flow');
-    assert.deepEqual(samples.at(-1).tracks, [group === 0 ? 'video-portrait' : 'video-360']);
+    assert.deepEqual(samples.at(-1).tracks, [step.track]);
     assert.ok(samples.at(-1).transports.slice(0, -1).every(t => t.status === 'closed'), 'Retired transports must close');
     await page.screenshot({ path: join(artifacts, `${name}-${observations.length}-${group}.png`) });
   }
   await page.setViewportSize({ width: 390, height: 844 });
   await page.hover('#player-wrap');
-  const mobileControl = await page.locator('#view-select').boundingBox();
+  const mobileControl = await page.locator(selector).boundingBox();
   assert.ok(mobileControl && mobileControl.x >= 0 && mobileControl.x + mobileControl.width <= 390,
     'View control must fit the mobile viewport');
   await page.screenshot({ path: join(artifacts, `${name}-mobile-playing.png`) });
@@ -111,7 +123,8 @@ export async function checkExampleViews(page, webUrl, query, artifacts, name, ca
   // Stop must cancel startup even while a factory still owns a connecting transport.
   await page.evaluate(() => { window.__viewEvidence.holdConnect = true; });
   await page.hover('#player-wrap');
-  await page.selectOption('#view-select', '1');
+  await page.selectOption(selector, choose(await page.locator(`${selector} option`).evaluateAll(options =>
+    options.map(option => option.value)), 1));
   await page.waitForFunction(() => window.__viewEvidence.transports.length === 5);
   await page.locator('#pause').click();
   await page.waitForFunction(() => !window.__liveness().transitioning && window.__player === null);

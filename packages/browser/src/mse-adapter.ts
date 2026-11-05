@@ -26,17 +26,37 @@ import {
   type TrexDefaults,
 } from './mp4-box.js';
 import { TimelineIndex } from './timeline-index.js';
+import { mediaTrackIdentity } from './media-track-identity.js';
 
 interface AppendEntry {
-  data: Uint8Array; trackName: string; groupId?: bigint; token?: MediaAppendToken;
+  data: Uint8Array; trackName: string; trackIdentity: string; sourceKey?: string;
+  groupId?: bigint; token?: MediaAppendToken;
   ranges?: readonly SegmentTimeRange[] | null;
   waitUntil?: number;
   skipsGap?: boolean;
+}
+interface TrackTimeline {
+  readonly trackName: string;
+  readonly index: TimelineIndex;
 }
 interface AppendGapWait {
   entry: AppendEntry;
   generation: number;
   timer: ReturnType<typeof setTimeout> | null;
+}
+
+/** Queue ownership only; the caller owns codec, timestamp and recovery-point restoration. */
+export interface MseAppendQueueLease {
+  readonly current: boolean;
+  resume(): void;
+  discard(): void;
+}
+
+interface AppendQueueHold {
+  readonly generation: number;
+  readonly types: ReadonlySet<'video' | 'audio'>;
+  readonly reconfigured: Set<'video' | 'audio'>;
+  invalidated: boolean;
 }
 
 // ─── Diagnostic ring buffer ──────────────────────────────────────────
@@ -433,6 +453,8 @@ function safeBuffered(buffer: SourceBuffer): TimeRanges | null {
  * @see draft-ietf-moq-cmsf-00 §3 (CMAF Packaging)
  */
 export class MseMediaSource implements MediaSourceLike {
+  readonly supportsTrackIdentity = true;
+
   private ms: MediaSource;
   private videoBuffer: SourceBuffer | null = null;
   private audioBuffer: SourceBuffer | null = null;
@@ -610,11 +632,12 @@ export class MseMediaSource implements MediaSourceLike {
 
   /**
    * Back-pressure queues — serialized through each mutation's updateend.
-   * Each entry preserves its source `trackName` so the timeline check
-   * runs against the right per-track index when the queue drains.
+   * Each entry preserves its tagged identity and raw source label so the
+   * timeline check runs against the right source when the queue drains.
    */
   private readonly videoQueue: AppendEntry[] = [];
   private readonly audioQueue: AppendEntry[] = [];
+  private appendQueueHold: AppendQueueHold | null = null;
   private readonly reorderWindowMs: number;
   private readonly maxQueuedChunks: number;
   private readonly maxQueuedBytes: number;
@@ -623,7 +646,7 @@ export class MseMediaSource implements MediaSourceLike {
   private readonly pendingGapSkip = { video: false, audio: false };
   private endRequested = false;
 
-  /** Per-(mediaType:trackName) committed group high-water mark. */
+  /** Per-(mediaType:tagged identity) committed group high-water mark. */
   private readonly committedGroupFloor = new Map<string, bigint>();
 
   private readonly video: HTMLVideoElement;
@@ -790,16 +813,16 @@ export class MseMediaSource implements MediaSourceLike {
 
   // ── Timeline-owned append state (see timeline-index.ts) ─────────
   /**
-   * Per-track timelines, keyed by trackName. ABR switches deliver the
-   * same decode-time range under a different trackName — those overlaps
+   * Per-track timelines, keyed by tagged source identity. ABR switches deliver the
+   * same decode-time range under a different identity — those overlaps
    * are legitimate splices and must not be dropped, so each track gets
    * its own index. Single-track duplicates (e.g., a relay that
    * publishes both regular IDR-GOP segments and mid-segment CRA entry
    * points under one track-name) still collide within their shared
    * index and are dropped.
    */
-  private readonly videoTimelines = new Map<string, TimelineIndex>();
-  private readonly audioTimelines = new Map<string, TimelineIndex>();
+  private readonly videoTimelines = new Map<string, TrackTimeline>();
+  private readonly audioTimelines = new Map<string, TrackTimeline>();
 
   /**
    * Diagnostic CHRONOLOGY state — deliberately not ownership.
@@ -832,13 +855,15 @@ export class MseMediaSource implements MediaSourceLike {
 
   /**
    * Ranges for the in-flight appendBuffer, per media type, with the
-   * source trackName so updateend commits into the right per-track
+   * source identity and label so updateend commits into the right per-track
    * index. The owned operation prevents concurrent appends until updateend.
    */
   private pendingVideoRanges: readonly SegmentTimeRange[] = [];
   private pendingAudioRanges: readonly SegmentTimeRange[] = [];
   private pendingVideoTrackName: string | null = null;
   private pendingAudioTrackName: string | null = null;
+  private pendingVideoTrackIdentity: string | null = null;
+  private pendingAudioTrackIdentity: string | null = null;
   private pendingVideoGroupId: bigint | undefined;
   private pendingAudioGroupId: bigint | undefined;
 
@@ -1128,9 +1153,13 @@ export class MseMediaSource implements MediaSourceLike {
     }
   }
 
-  private appendEntry(data: Uint8Array, trackName: string, groupId: bigint | undefined, token: MediaAppendToken | undefined): AppendEntry {
-    const entry: AppendEntry = groupId === undefined ? { data, trackName } : { data, trackName, groupId };
+  private appendEntry(
+    data: Uint8Array, trackName: string, trackIdentity: string, groupId: bigint | undefined,
+    token: MediaAppendToken | undefined, sourceKey: string | undefined,
+  ): AppendEntry {
+    const entry: AppendEntry = groupId === undefined ? { data, trackName, trackIdentity } : { data, trackName, trackIdentity, groupId };
     if (token !== undefined) entry.token = token;
+    if (sourceKey !== undefined) entry.sourceKey = sourceKey;
     return entry;
   }
 
@@ -1194,7 +1223,7 @@ export class MseMediaSource implements MediaSourceLike {
     let chosen = 0, start = ranges[0]!.startTime;
     for (let i = 1; i < queue.length; i++) {
       const entry = queue[i]!;
-      if (entry.trackName !== first.trackName) break; // Configuration/name boundaries retain caller order.
+      if (entry.trackIdentity !== first.trackIdentity) break; // Source boundaries retain caller order.
       const candidate = this.scoreAppend(mediaType, entry);
       if (!candidate?.length) break;
       if (candidate[0]!.startTime < start) { chosen = i; start = candidate[0]!.startTime; }
@@ -1207,14 +1236,14 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.reorderWindowMs === 0) return false;
     const ranges = this.scoreAppend(mediaType, entry);
     const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
-    const end = timelines.get(entry.trackName)?.extent?.end;
+    const end = timelines.get(entry.trackIdentity)?.index.extent?.end;
     // The first segment anchors the clock. Unknown layouts retain the existing
     // fail-open policy; tick values are compared only within this track/context.
     if (!ranges?.length || end === undefined || ranges[0]!.startTime <= end) return false;
     const previous = this.appendGapWait[mediaType];
     const now = performance.now();
     entry.waitUntil ??= now + this.reorderWindowMs;
-    if (previous?.entry.trackName === entry.trackName && previous.entry.waitUntil !== undefined) {
+    if (previous?.entry.trackIdentity === entry.trackIdentity && previous.entry.waitUntil !== undefined) {
       entry.waitUntil = Math.min(entry.waitUntil, previous.entry.waitUntil);
     }
     if (now >= entry.waitUntil) { entry.skipsGap = true; return false; }
@@ -1232,6 +1261,7 @@ export class MseMediaSource implements MediaSourceLike {
 
   private finishEndOfStream(): void {
     if (!this.endRequested || this.destroyed || this.ms.readyState !== 'open'
+        || this.appendQueueHold !== null
         || this.videoQueue.length || this.audioQueue.length
         || this.inFlightOp.video || this.inFlightOp.audio
         || this.videoBuffer?.updating || this.audioBuffer?.updating
@@ -1251,10 +1281,15 @@ export class MseMediaSource implements MediaSourceLike {
    *
    * Known timestamp holes are held briefly; native back-pressure is serialized.
    */
-  appendChunk(mediaType: 'video' | 'audio', data: Uint8Array, trackName: string, groupId?: bigint, token?: MediaAppendToken): void {
+  appendChunk(mediaType: 'video' | 'audio', data: Uint8Array, trackName: string, groupId?: bigint, token?: MediaAppendToken, sourceKey?: string): void {
     if (this.destroyed) { this.appendOutcome(token, 'discarded', 'destroyed'); return; }
     // Without observers, never add diagnostic ownership to a normal queue entry.
     if (!this.appendObservers) token = undefined;
+    if (this.appendQueueHold?.types.has(mediaType)) {
+      // Identity belongs to the caller; never guess whether this is old or target media.
+      this.appendOutcome(token, 'discarded', 'retype');
+      return;
+    }
 
     const buffer = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
     if (!buffer) {
@@ -1277,8 +1312,9 @@ export class MseMediaSource implements MediaSourceLike {
     // Stale-group drop: if this group is older than what MSE has
     // already committed, skip it. Prevents late-arriving old-group
     // data from causing blocky artifacts or false discontinuities.
+    const trackIdentity = mediaTrackIdentity(trackName, sourceKey);
     if (groupId !== undefined) {
-      const key = `${mediaType}:${trackName}`;
+      const key = `${mediaType}:${trackIdentity}`;
       const floor = this.committedGroupFloor.get(key);
       if (floor !== undefined && groupId < floor) {
         this.appendOutcome(token, 'discarded', 'stale group');
@@ -1286,9 +1322,68 @@ export class MseMediaSource implements MediaSourceLike {
       }
     }
 
-    const entry = this.appendEntry(data, trackName, groupId, token);
+    const entry = this.appendEntry(data, trackName, trackIdentity, groupId, token, sourceKey);
     if (!this.enqueueAppend(mediaType, entry)) return;
     this.drainQueue(mediaType);
+  }
+
+  /**
+   * Retain the current bounded queues while the caller prepares output changes.
+   * New direct appends for these types are rejected until release. In-flight
+   * native operations finish normally. Resume only after restoring the old
+   * initialization and offsets, with a valid random-access recovery chain:
+   * another init can require a new random-access point (MSE §5.5.7).
+   * This lease does not roll back native buffers or guarantee uninterrupted decoding.
+   * A quota flush invalidates the lease and keeps its types gated until reset;
+   * releasing an invalidated handle cannot make a temporary init safe to use.
+   */
+  holdQueuedAppends(types: readonly ('video' | 'audio')[]): MseAppendQueueLease {
+    if (!Array.isArray(types)) throw new TypeError('Expected distinct video/audio queue types');
+    const count = types.length;
+    if (count !== 1 && count !== 2) throw new TypeError('Expected distinct video/audio queue types');
+    const requested = new Set<'video' | 'audio'>();
+    for (let i = 0; i < count; i++) {
+      const type = types[i];
+      if (type !== 'video' && type !== 'audio' || requested.has(type)) throw new TypeError('Expected distinct video/audio queue types');
+      requested.add(type);
+    }
+    if (this.destroyed || !this._attached) throw new Error('Cannot hold queues before attachment');
+    if (this.appendQueueHold !== null) throw new Error(this.appendQueueHold.invalidated
+      ? 'Append queues invalidated; reset is required' : 'Append queues are already owned');
+    if (this.quotaFlushInFlight) throw new Error('Cannot hold queues during quota recovery');
+    for (const type of requested) {
+      if (!(type === 'video' ? this.videoBuffer : this.audioBuffer)) throw new Error(`No ${type} SourceBuffer to hold`);
+      if (this.changingType[type]) throw new Error('Cannot acquire queues during reconfiguration');
+    }
+    const hold: AppendQueueHold = { generation: this.bufferGen, types: requested, reconfigured: new Set(), invalidated: false };
+    this.appendQueueHold = hold;
+    for (const type of hold.types) this.clearAppendGap(type);
+    const current = () => this.appendQueueHold === hold && !hold.invalidated && !this.destroyed && this.bufferGen === hold.generation;
+    const release = (discard: boolean) => {
+      if (!current()) return;
+      for (const type of hold.types) if (this.changingType[type]) throw new Error('Queue reconfiguration is still in progress');
+      let tokens: Set<MediaAppendToken> | undefined;
+      if (discard) for (const type of hold.types) {
+        const queue = type === 'video' ? this.videoQueue : this.audioQueue;
+        tokens = this.queuedTokens(queue, tokens);
+        queue.length = 0;
+        this.clearAppendGap(type);
+        if (hold.reconfigured.has(type)) {
+          (type === 'video' ? this.videoTimelines : this.audioTimelines).clear();
+          this.lateAppendFloor[type].clear();
+        }
+      }
+      // Clear every owned queue before any observer can reenter or take a successor lease.
+      this.appendQueueHold = null;
+      this.discardTokens(tokens, 'retype');
+      for (const type of hold.types) {
+        if (this.destroyed || this.bufferGen !== hold.generation) return;
+        this.drainQueue(type);
+      }
+      if (this.destroyed || this.bufferGen !== hold.generation) return;
+      this.finishEndOfStream();
+    };
+    return Object.freeze({ get current() { return current(); }, resume: () => release(false), discard: () => release(true) });
   }
 
   /**
@@ -1338,7 +1433,9 @@ export class MseMediaSource implements MediaSourceLike {
       const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
       // Discard queued media from the previous configuration before its
       // replacement init. The caller stages and re-delivers the target media.
-      this.discardQueue(queue, 'retype');
+      const hold = this.appendQueueHold?.types.has(mediaType) ? this.appendQueueHold : null;
+      if (hold) hold.reconfigured.add(mediaType);
+      else this.discardQueue(queue, 'retype');
       if (this.destroyed || generation !== this.bufferGen) return;
 
       // Wait for the in-flight mutation's terminal event before reconfiguring.
@@ -1382,8 +1479,10 @@ export class MseMediaSource implements MediaSourceLike {
       // Drop the per-track overlap indexes; the retired track's entries are
       // dead weight, and a later switch back to it starts a fresh index.
       const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
-      timelines.clear();
-      this.lateAppendFloor[mediaType].clear();
+      if (!hold) {
+        timelines.clear();
+        this.lateAppendFloor[mediaType].clear();
+      }
     } finally {
       if (generation === this.bufferGen) this.changingType[mediaType] = false;
     }
@@ -1513,11 +1612,11 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /**
-   * Get the committed group floor for a (mediaType, trackName) pair.
+   * Get the committed group floor for a media type and source identity.
    * Returns undefined if no group has been committed yet.
    */
-  getCommittedGroupFloor(mediaType: 'video' | 'audio', trackName: string): bigint | undefined {
-    return this.committedGroupFloor.get(`${mediaType}:${trackName}`);
+  getCommittedGroupFloor(mediaType: 'video' | 'audio', trackName: string, sourceKey?: string): bigint | undefined {
+    return this.committedGroupFloor.get(`${mediaType}:${mediaTrackIdentity(trackName, sourceKey)}`);
   }
 
   /**
@@ -1527,24 +1626,27 @@ export class MseMediaSource implements MediaSourceLike {
    * affected track — other tracks (e.g., during ABR switch) keep
    * their overlap protection intact.
    */
-  clearTimeline(mediaType: 'video' | 'audio', trackName: string): void {
+  clearTimeline(mediaType: 'video' | 'audio', trackName: string, sourceKey?: string): void {
     this.endRequested = false;
     const generation = this.bufferGen;
+    const trackIdentity = mediaTrackIdentity(trackName, sourceKey);
     const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
-    if (this.appendGapWait[mediaType]?.entry.trackName === trackName) this.clearAppendGap(mediaType);
-    this.lateAppendFloor[mediaType].delete(trackName);
+    if (this.appendGapWait[mediaType]?.entry.trackIdentity === trackIdentity) this.clearAppendGap(mediaType);
+    this.lateAppendFloor[mediaType].delete(trackIdentity);
     // The assembler notifies after delivering the rebased restart segment.
     // Keep accepted media, including that segment, and reset only its wait/index.
-    for (const entry of queue) if (entry.trackName === trackName) {
+    for (const entry of queue) if (entry.trackIdentity === trackIdentity) {
       delete entry.waitUntil; delete entry.skipsGap;
     }
     const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
-    timelines.delete(trackName);
-    if (mediaType === 'video' && this.pendingVideoTrackName === trackName) {
+    timelines.delete(trackIdentity);
+    if (mediaType === 'video' && this.pendingVideoTrackIdentity === trackIdentity) {
       this.pendingVideoRanges = []; this.pendingVideoTrackName = null; this.pendingVideoGroupId = undefined;
+      this.pendingVideoTrackIdentity = null;
       this.pendingGapSkip.video = false;
-    } else if (mediaType === 'audio' && this.pendingAudioTrackName === trackName) {
+    } else if (mediaType === 'audio' && this.pendingAudioTrackIdentity === trackIdentity) {
       this.pendingAudioRanges = []; this.pendingAudioTrackName = null; this.pendingAudioGroupId = undefined;
+      this.pendingAudioTrackIdentity = null;
       this.pendingGapSkip.audio = false;
     }
     if (!this.destroyed && generation === this.bufferGen) this.drainQueue(mediaType);
@@ -1560,6 +1662,7 @@ export class MseMediaSource implements MediaSourceLike {
     }
     this.diag('reset (buffer generation %d → %d)', this.bufferGen, this.bufferGen + 1);
     this.bufferGen++;
+    this.appendQueueHold = null;
     this.clearAppendGap('video'); this.clearAppendGap('audio');
     this.lateAppendFloor.video.clear(); this.lateAppendFloor.audio.clear();
     this.pendingGapSkip.video = false; this.pendingGapSkip.audio = false;
@@ -1595,6 +1698,8 @@ export class MseMediaSource implements MediaSourceLike {
     this.pendingAudioRanges = [];
     this.pendingVideoTrackName = null;
     this.pendingAudioTrackName = null;
+    this.pendingVideoTrackIdentity = null;
+    this.pendingAudioTrackIdentity = null;
     this.pendingVideoGroupId = undefined;
     this.pendingAudioGroupId = undefined;
     this.appendErrored = { video: false, audio: false };
@@ -1797,7 +1902,7 @@ export class MseMediaSource implements MediaSourceLike {
     // While a changeType is in flight for this media type, leave the
     // queue parked. The changeType handler resumes draining itself
     // once the format-change + init append is committed.
-    if (this.changingType[mediaType]) return;
+    if (this.changingType[mediaType] || this.appendQueueHold?.types.has(mediaType)) return;
 
     if (!buffer || this.bufferBusy(mediaType, buffer) || queue.length === 0) {
       // Trigger play after the first relevant media data is buffered.
@@ -1832,11 +1937,12 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
 
-    while (queue.length > 0 && !this.bufferBusy(mediaType, buffer) && !this.changingType[mediaType]) {
+    while (queue.length > 0 && !this.bufferBusy(mediaType, buffer) && !this.changingType[mediaType]
+        && !this.appendQueueHold?.types.has(mediaType)) {
       const index = this.nextAppendIndex(mediaType, queue);
       const entry = queue[index]!;
       if (entry.groupId !== undefined) {
-        const floor = this.committedGroupFloor.get(`${mediaType}:${entry.trackName}`);
+        const floor = this.committedGroupFloor.get(`${mediaType}:${entry.trackIdentity}`);
         if (floor !== undefined && entry.groupId < floor) {
           queue.splice(index, 1);
           if (this.appendGapWait[mediaType]?.entry === entry) this.clearAppendGap(mediaType);
@@ -2813,7 +2919,7 @@ export class MseMediaSource implements MediaSourceLike {
   private doAppend(
     mediaType: 'video' | 'audio', buffer: SourceBuffer, entry: AppendEntry,
   ): void {
-    const { data, trackName, groupId, token } = entry;
+    const { data, trackName, trackIdentity, groupId, token } = entry;
     // ── Step 1: parse + tri-state decide ─────────────────────────
     const ranges = this.scoreAppend(mediaType, entry);
 
@@ -2838,7 +2944,7 @@ export class MseMediaSource implements MediaSourceLike {
     // those wholesale manufactures fragment-sized buffered holes and stalls
     // playback at the first hole.
     const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
-    const timeline = timelines.get(trackName);
+    const timeline = timelines.get(trackIdentity)?.index;
     if (ranges !== null && ranges.length > 0 && timeline) {
       const allContained = ranges.every((r) => timeline.containsRange(r.startTime, r.endTime));
       if (allContained) {
@@ -2856,7 +2962,7 @@ export class MseMediaSource implements MediaSourceLike {
         return;
       }
 
-      const lateFloor = this.lateAppendFloor[mediaType].get(trackName);
+      const lateFloor = this.lateAppendFloor[mediaType].get(trackIdentity);
       if (lateFloor !== undefined && ranges.every(range => range.endTime <= lateFloor)) {
         this.appendOutcome(token, 'discarded', 'late segment');
         return;
@@ -2873,7 +2979,7 @@ export class MseMediaSource implements MediaSourceLike {
         !timeline.containsRange(r.startTime, r.endTime)
         && timeline.containsRange(r.startTime, r.startTime + 1n));
       if (seam !== undefined) {
-        const key = `${mediaType}:seam:${trackName}`;
+        const key = `${mediaType}:seam:${trackIdentity}`;
         if (!this.seenDiagnostics.has(key)) {
           this.seenDiagnostics.add(key);
           // Unconditional (not debug-gated): accountability for source
@@ -2912,10 +3018,12 @@ export class MseMediaSource implements MediaSourceLike {
     if (mediaType === 'video') {
       this.pendingVideoRanges = safeRanges;
       this.pendingVideoTrackName = trackName;
+      this.pendingVideoTrackIdentity = trackIdentity;
       this.pendingVideoGroupId = groupId;
     } else {
       this.pendingAudioRanges = safeRanges;
       this.pendingAudioTrackName = trackName;
+      this.pendingAudioTrackIdentity = trackIdentity;
       this.pendingAudioGroupId = groupId;
     }
 
@@ -2929,9 +3037,11 @@ export class MseMediaSource implements MediaSourceLike {
       if (mediaType === 'video') {
         this.pendingVideoRanges = [];
         this.pendingVideoTrackName = null;
+        this.pendingVideoTrackIdentity = null;
       } else {
         this.pendingAudioRanges = [];
         this.pendingAudioTrackName = null;
+        this.pendingAudioTrackIdentity = null;
       }
       // QuotaExceededError is RECOVERABLE (evict + retry, escalating to
       // flush-and-rejoin) — handle it without surfacing an error event.
@@ -3008,6 +3118,7 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
     this.quotaFlushInFlight = true;
+    if (this.appendQueueHold) this.appendQueueHold.invalidated = true;
     this.logWarn('[MSE] quota exceeded (%s) with nothing evictable — flushing buffers and rejoining live', mediaType);
     let tokens = this.queuedTokens(this.videoQueue);
     tokens = this.queuedTokens(this.audioQueue, tokens);
@@ -3082,16 +3193,18 @@ export class MseMediaSource implements MediaSourceLike {
       const pending =
         mediaType === 'video' ? this.pendingVideoRanges : this.pendingAudioRanges;
       const pendingTrack =
+        mediaType === 'video' ? this.pendingVideoTrackIdentity : this.pendingAudioTrackIdentity;
+      const pendingTrackName =
         mediaType === 'video' ? this.pendingVideoTrackName : this.pendingAudioTrackName;
       const pendingGroup =
         mediaType === 'video' ? this.pendingVideoGroupId : this.pendingAudioGroupId;
       const timelines =
         mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
-      if (pendingTrack !== null) {
-        let timeline = timelines.get(pendingTrack);
+      if (pendingTrack !== null && pendingTrackName !== null) {
+        let timeline = timelines.get(pendingTrack)?.index;
         if (!timeline) {
           timeline = new TimelineIndex();
-          timelines.set(pendingTrack, timeline);
+          timelines.set(pendingTrack, { trackName: pendingTrackName, index: timeline });
         }
         for (const r of pending) {
           timeline.insert(r.startTime, r.endTime);
@@ -3132,10 +3245,12 @@ export class MseMediaSource implements MediaSourceLike {
     if (mediaType === 'video') {
       this.pendingVideoRanges = [];
       this.pendingVideoTrackName = null;
+      this.pendingVideoTrackIdentity = null;
       this.pendingVideoGroupId = undefined;
     } else {
       this.pendingAudioRanges = [];
       this.pendingAudioTrackName = null;
+      this.pendingAudioTrackIdentity = null;
       this.pendingAudioGroupId = undefined;
     }
     this.pendingGapSkip[mediaType] = false;
@@ -3213,11 +3328,11 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.audioInitSummary) {
       console.error(`[MSE]   audio init: ${this.audioInitSummary}`);
     }
-    const fmtTimelines = (m: Map<string, TimelineIndex>): string =>
+    const fmtTimelines = (m: Map<string, TrackTimeline>): string =>
       m.size === 0
         ? 'empty'
-        : Array.from(m.entries())
-            .map(([t, idx]) => `"${t}": ${idx.toString()}`)
+        : Array.from(m.values())
+            .map(({ trackName, index }) => `"${trackName}": ${index.toString()}`)
             .join('; ');
     console.error(`[MSE]   video timelines: ${fmtTimelines(this.videoTimelines)}`);
     console.error(`[MSE]   audio timelines: ${fmtTimelines(this.audioTimelines)}`);

@@ -15,6 +15,19 @@ const fixture = (tracks: LoadedFixture['tracks']): LoadedFixture => ({
   tracks,
 });
 
+it.each([
+  ['msf-00', 'cmaf'], ['cmsf-01', 'cmaf'], ['cmsf-01', 'locmaf'],
+] as const)('preserves per-track programs in the %s %s catalog, including group zero', (format, packaging) => {
+  const source = videoFixture().tracks[0]!;
+  const f = fixture([0, 2, undefined].map((renderGroup, i) => ({ ...source,
+    meta: { ...source.meta, name: `video-${i}`, ...(renderGroup === undefined ? {} : { renderGroup }) },
+  })));
+  const catalog = parseCatalogAuto(buildFixtureCatalog(f, format, packaging));
+  expect(catalog.tracks.map(track => [track.name, track.renderGroup])).toEqual([
+    ['video-0', 0], ['video-1', 2], ['video-2', 1],
+  ]);
+});
+
 function connection() {
   const sent: { stream: number; alias: bigint; group: bigint; object: bigint; time: number }[] = [];
   const streams = new Map<number, { alias: bigint; group: bigint; subgroup: bigint }>();

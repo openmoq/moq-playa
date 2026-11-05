@@ -24,6 +24,43 @@ const model: CatalogSelection = { excluded: [], scopes: [
 ] };
 
 describe('program and view menus', () => {
+  it('keeps private selectors for group zero and unassigned programs distinct', () => {
+    const menu = programMenu(model, selected);
+    expect(menu.programSelectors).toBeDefined();
+    expect(menu.programSelectors.get(menu.programs[0]!.id)).toEqual({ renderGroup: 0 });
+    expect(menu.programSelectors.get(menu.programs[2]!.id)).toEqual({ renderGroup: null });
+  });
+
+  it('binds declared views to their program even when alternate group numbers repeat', () => {
+    const menu = programMenu(model, selected);
+    expect(menu.viewSelectors).toBeDefined();
+    const first = menu.programs[0]!, second = menu.programs[1]!;
+    expect(menu.viewSelectors.get(first.views[0]!.id)).toEqual({ programId: first.id,
+      selection: { renderGroup: 0, videoAltGroup: 0 } });
+    expect(menu.viewSelectors.get(second.views[0]!.id)).toEqual({ programId: second.id,
+      selection: { renderGroup: 2, videoAltGroup: 0 } });
+  });
+
+  it('uses a singleton’s complete tuple identity without inventing an alternate group', () => {
+    const menu = programMenu(model, selected);
+    expect(menu.viewSelectors).toBeDefined();
+    const program = menu.programs[2]!, singleton = program.views[0]!;
+    expect(menu.viewSelectors.get(singleton.id)).toEqual({ programId: program.id,
+      selection: { renderGroup: null, videoTrack: { name: 'cam', namespace: ['live', 'show'] } } });
+  });
+
+  it('keeps display-menu mutation from retargeting a captured view selector', () => {
+    const menu = programMenu(model, selected);
+    expect(menu.viewSelectors).toBeDefined();
+    const program = menu.programs[1]!, singleton = program.views[1]!;
+    const captured = menu.viewSelectors.get(singleton.id)!;
+    const fields = singleton.levels[0]!.namespace! as string[];
+    fields[0] = 'changed';
+    expect(captured.selection).toEqual({ renderGroup: 2,
+      videoTrack: { name: 'other', namespace: ['live/show'] } });
+    expect(model.scopes[1]!.video[1]!.tracks[0]!.id.namespaceFields).toEqual(['live/show']);
+  });
+
   it('keeps declared group zero distinct from unassigned tracks', () => {
     const menu = programMenu(model, null);
     expect(menu.programs.map(program => program.renderGroup)).toEqual([0, 2, null]);

@@ -4911,3 +4911,268 @@ describe('MSE playback-quality attachment ownership', () => {
         } finally { adapter.destroy(); }
     });
 });
+
+describe('MseMediaSource — queued media leases', () => {
+    it.each([false, true])('never appends old media under a temporary init after quota invalidation: %s', async quota => {
+        const video = new MockVideoElement(), adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) },
+            audio: { codec: 'mp4a.40.2', initData: makeInit(2, 100, 'soun') } });
+        currentMs.open(); await flush();
+        const ab = currentMs.audioBuffer, vb = currentMs.videoBuffer;
+        const events: unknown[] = [], old = {}, late = {};
+        adapter.observeAppends(event => { events.push(event); });
+        const lateBytes = makeSegment({ bmd: 100, trackId: 2, defaultDur: 100, sampleCount: 1 });
+        try {
+            ab.updating = true;
+            adapter.appendChunk('audio', makeSegment({ bmd: 0, trackId: 2, defaultDur: 100, sampleCount: 1 }), 'old', 7n, old);
+            const lease = adapter.holdQueuedAppends(['audio']);
+            ab.updating = false; ab.autoComplete = false;
+            const changing = adapter.changeType('audio', 'mp4a.40.2', makeInit(2, 200, 'soun'));
+            expect(ab.updating).toBe(true);
+            if (quota) {
+                vb.throwNextAppend = new DOMException('quota', 'QuotaExceededError');
+                adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 }), 'v');
+                expect(lease.current).toBe(false);
+            } else expect(lease.current).toBe(true);
+            adapter.appendChunk('audio', lateBytes, 'old', 8n, late);
+            ab.autoComplete = true; ab.updating = false; ab.fire('update'); ab.fire('updateend');
+            await changing; await flush();
+            expect(ab.appendedPayloads.filter(bytes => Buffer.from(bytes).equals(lateBytes)), JSON.stringify(events)).toHaveLength(0);
+            lease.discard();
+            if (quota) {
+                expect(() => adapter.holdQueuedAppends(['audio'])).toThrow(/reset/i);
+                adapter.appendChunk('audio', lateBytes, 'old', 9n, {});
+                await flush();
+                expect(ab.appendedPayloads.filter(bytes => Buffer.from(bytes).equals(lateBytes))).toHaveLength(0);
+                adapter.reset();
+                adapter.initialize({ audio: { codec: 'mp4a.40.2', initData: makeInit(2, 100, 'soun') } });
+                await flush();
+                const successor = adapter.holdQueuedAppends(['audio']);
+                lease.resume(); lease.discard();
+                expect(successor.current).toBe(true);
+                successor.discard();
+            }
+        } finally { adapter.destroy(); }
+    });
+
+    it('preserves context committed by an old append that finishes after acquisition', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const events: unknown[] = [], first = {}, duplicate = {};
+        adapter.observeAppends(event => { events.push(event); });
+        const old = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 2 });
+        try {
+            vsb.autoComplete = false;
+            adapter.appendChunk('video', old, 'old', 7n, first);
+            adapter.appendChunk('video', old.slice(), 'old', 7n, duplicate);
+            const lease = adapter.holdQueuedAppends(['video']);
+            vsb.updating = false; vsb.fire('update'); vsb.fire('updateend');
+            vsb.autoComplete = true;
+            await adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(1, 200));
+            await adapter.changeType('video', 'avc1.42c01e', makeInit(1, 100));
+            lease.resume(); await flush();
+            expect(events).toEqual([{ token: first, state: 'appended', reason: null },
+                { token: duplicate, state: 'discarded', reason: 'treated as a replay' }]);
+            expect(vsb.appendedPayloads.filter(bytes => Buffer.from(bytes).equals(old))).toHaveLength(1);
+        } finally { adapter.destroy(); }
+    });
+
+    it('keeps unheld audio draining while video is held', async () => {
+        const video = new MockVideoElement(), adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) },
+            audio: { codec: 'mp4a.40.2', initData: makeInit(2, 100, 'soun') } });
+        currentMs.open(); await flush();
+        const events: unknown[] = [], held = {}, audible = {};
+        adapter.observeAppends(event => { events.push(event); });
+        try {
+            currentMs.videoBuffer.updating = true;
+            adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 }), 'v', 7n, held);
+            const lease = adapter.holdQueuedAppends(['video']);
+            currentMs.videoBuffer.updating = false;
+            adapter.appendChunk('audio', makeSegment({ bmd: 0, trackId: 2, defaultDur: 100, sampleCount: 1 }), 'a', 7n, audible);
+            await flush();
+            expect(events).toEqual([{ token: audible, state: 'appended', reason: null }]);
+            lease.resume(); await flush();
+            expect(events).toEqual([{ token: audible, state: 'appended', reason: null },
+                { token: held, state: 'appended', reason: null }]);
+        } finally { adapter.destroy(); }
+    });
+
+    it('clears all held queues before a discard observer can acquire a successor', async () => {
+        const video = new MockVideoElement(), adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) },
+            audio: { codec: 'mp4a.40.2', initData: makeInit(2, 100, 'soun') } });
+        currentMs.open(); await flush();
+        const events: unknown[] = [], first = {}, second = {};
+        let successor: ReturnType<MseMediaSource['holdQueuedAppends']> | undefined;
+        adapter.observeAppends(event => {
+            events.push(event);
+            if (event.token === first) successor = adapter.holdQueuedAppends(['video', 'audio']);
+        });
+        try {
+            currentMs.videoBuffer.updating = true; currentMs.audioBuffer.updating = true;
+            adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 }), 'v', 7n, first);
+            adapter.appendChunk('audio', makeSegment({ bmd: 0, trackId: 2, defaultDur: 100, sampleCount: 1 }), 'a', 7n, second);
+            const lease = adapter.holdQueuedAppends(['video', 'audio']);
+            currentMs.videoBuffer.updating = false; currentMs.audioBuffer.updating = false;
+            lease.discard();
+            expect(events).toEqual([{ token: first, state: 'discarded', reason: 'retype' },
+                { token: second, state: 'discarded', reason: 'retype' }]);
+            expect(successor?.current).toBe(true);
+            expect(currentMs.videoBuffer.appendedPayloads).toHaveLength(1);
+            expect(currentMs.audioBuffer.appendedPayloads).toHaveLength(1);
+            lease.resume(); lease.discard();
+            expect(successor?.current).toBe(true);
+            successor?.resume(); await flush();
+            expect(events).toHaveLength(2);
+        } finally { adapter.destroy(); }
+    });
+
+    it('invalidates a hold when unrelated-output quota recovery flushes both queues', async () => {
+        const video = new MockVideoElement(), adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) },
+            audio: { codec: 'mp4a.40.2', initData: makeInit(2, 100, 'soun') } });
+        currentMs.open(); await flush();
+        const events: unknown[] = [], token = {};
+        adapter.observeAppends(event => { events.push(event); });
+        try {
+            currentMs.audioBuffer.updating = true;
+            adapter.appendChunk('audio', makeSegment({ bmd: 0, trackId: 2, defaultDur: 100, sampleCount: 1 }), 'a', 7n, token);
+            const lease = adapter.holdQueuedAppends(['audio']);
+            currentMs.audioBuffer.updating = false;
+            currentMs.videoBuffer.throwNextAppend = new DOMException('quota', 'QuotaExceededError');
+            adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 }), 'v');
+            expect(lease.current).toBe(false);
+            expect(events).toEqual([{ token, state: 'discarded', reason: 'flushed' }]);
+            lease.resume(); lease.discard(); await flush();
+            expect(events).toHaveLength(1);
+        } finally { adapter.destroy(); }
+    });
+
+    it('retains queued media across target init and undo until the caller resumes', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const events: unknown[] = [], token = {};
+        adapter.observeAppends(event => { events.push(event); });
+        const old = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 2 });
+        try {
+            vsb.updating = true;
+            adapter.appendChunk('video', old, 'old', 7n, token);
+            const lease = adapter.holdQueuedAppends(['video']);
+            vsb.updating = false;
+            await adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(1, 200));
+            expect(vsb.appendedPayloads.some(bytes => bytes === old || Buffer.from(bytes).equals(old))).toBe(false);
+            expect(events).toEqual([]);
+            await adapter.changeType('video', 'avc1.42c01e', makeInit(1, 100));
+            expect(events).toEqual([]);
+            expect(lease.current).toBe(true);
+            lease.resume();
+            await flush();
+            expect(vsb.appendedPayloads.filter(bytes => Buffer.from(bytes).equals(old))).toHaveLength(1);
+            expect(events).toEqual([{ token, state: 'appended', reason: null }]);
+            expect(lease.current).toBe(false);
+            lease.discard(); lease.resume();
+            expect(events).toHaveLength(1);
+        } finally { adapter.destroy(); }
+    });
+
+    it('discards the retained queue once without appending it under the target init', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const events: unknown[] = [], token = {}, late = {};
+        adapter.observeAppends(event => { events.push(event); });
+        const old = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 2 });
+        try {
+            vsb.updating = true;
+            adapter.appendChunk('video', old, 'old', 7n, token);
+            const lease = adapter.holdQueuedAppends(['video']);
+            vsb.updating = false;
+            await adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(1, 200));
+            adapter.appendChunk('video', old, 'ambiguous', 8n, late);
+            expect(events).toEqual([{ token: late, state: 'discarded', reason: 'retype' }]);
+            lease.discard(); lease.discard(); lease.resume();
+            await flush();
+            expect(events).toEqual([{ token: late, state: 'discarded', reason: 'retype' },
+                { token, state: 'discarded', reason: 'retype' }]);
+            expect(vsb.appendedPayloads.filter(bytes => Buffer.from(bytes).equals(old))).toHaveLength(0);
+        } finally { adapter.destroy(); }
+    });
+
+    it('allows an in-flight append to finish while keeping its queued successor held', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const events: unknown[] = [], first = {}, second = {};
+        adapter.observeAppends(event => { events.push(event); });
+        try {
+            vsb.autoComplete = false;
+            adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 }), 'old', 7n, first);
+            adapter.appendChunk('video', makeSegment({ bmd: 100, defaultDur: 100, sampleCount: 1 }), 'old', 8n, second);
+            const lease = adapter.holdQueuedAppends(['video']);
+            vsb.updating = false; vsb.fire('update'); vsb.fire('updateend');
+            expect(events).toEqual([{ token: first, state: 'appended', reason: null }]);
+            expect(vsb.appendedPayloads).toHaveLength(2); // init + first media
+            vsb.autoComplete = true;
+            lease.resume(); await flush();
+            expect(events).toEqual([{ token: first, state: 'appended', reason: null },
+                { token: second, state: 'appended', reason: null }]);
+        } finally { adapter.destroy(); }
+    });
+
+    it.each(['reset', 'destroy'] as const)('invalidates a lease on %s without affecting a successor', async method => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        const events: unknown[] = [], token = {};
+        adapter.observeAppends(event => { events.push(event); });
+        try {
+            vsb.updating = true;
+            adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 1 }), 'old', 7n, token);
+            const old = adapter.holdQueuedAppends(['video']);
+            vsb.updating = false;
+            adapter[method]();
+            expect(old.current).toBe(false);
+            expect(events).toEqual([{ token, state: 'discarded', reason: method === 'reset' ? 'decoder reset' : 'destroyed' }]);
+            if (method === 'reset') {
+                adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+                await flush();
+                const next = adapter.holdQueuedAppends(['video']);
+                old.resume(); old.discard();
+                expect(next.current).toBe(true);
+                next.discard();
+            } else { old.resume(); old.discard(); }
+            expect(events).toHaveLength(1);
+        } finally { adapter.destroy(); }
+    });
+
+    it('rejects release during an owned type change without consuming the lease', async () => {
+        const { adapter } = await makeReadyAdapter();
+        try {
+            const lease = adapter.holdQueuedAppends(['video']);
+            const changing = adapter.changeType('video', 'hvc1.1.6.L93.90', makeInit(1, 200));
+            expect(() => lease.resume()).toThrow(/reconfiguration/i);
+            expect(() => lease.discard()).toThrow(/reconfiguration/i);
+            expect(lease.current).toBe(true);
+            await changing;
+            lease.discard();
+            expect(lease.current).toBe(false);
+        } finally { adapter.destroy(); }
+    });
+
+    it('keeps end-of-stream pending until an empty lease is released', async () => {
+        const { adapter } = await makeReadyAdapter();
+        try {
+            const lease = adapter.holdQueuedAppends(['video']);
+            adapter.endOfStream();
+            expect(currentMs.readyState).toBe('open');
+            lease.resume();
+            expect(currentMs.readyState).toBe('ended');
+        } finally { adapter.destroy(); }
+    });
+
+    it('validates the entire requested cohort before taking any queue', async () => {
+        const { adapter } = await makeReadyAdapter();
+        try {
+            expect(() => adapter.holdQueuedAppends([])).toThrow();
+            expect(() => adapter.holdQueuedAppends(['video', 'video'])).toThrow();
+            expect(() => adapter.holdQueuedAppends(['video', 'audio'])).toThrow(/audio/i);
+            const lease = adapter.holdQueuedAppends(['video']);
+            expect(() => adapter.holdQueuedAppends(['video'])).toThrow(/owned|held/i);
+            expect(lease.current).toBe(true);
+            lease.discard();
+        } finally { adapter.destroy(); }
+    });
+});

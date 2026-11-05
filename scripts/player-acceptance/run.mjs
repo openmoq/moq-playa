@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +18,9 @@ import { assessWarmStart } from './warm-start.mjs';
 import { checkRenditionSwitch } from './rendition-switch.mjs';
 import { checkAudioLanguageSwitch } from './audio-switch.mjs';
 import { prepareAudioSwitchVariant } from './audio-switch.fixture.mjs';
+import { checkProgramSwitch } from './program-switch.mjs';
+import { prepareProgramSwitchVariant } from './program-switch.fixture.mjs';
+import { mseProgramSwitchCases, checkMseProgramSwitch } from './mse-program-switch.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
@@ -149,6 +152,22 @@ try {
     result.fixtures[name] = await prepareFixture(join(artifacts, name), namespace, frozen, abort.signal);
   }
   result.fixtures.alternatives = await prepareFixture(join(artifacts, 'alternatives'), namespace, false, abort.signal, true);
+  if (selectedCase === 'example-programs-cmaf') {
+    const input = join(artifacts, 'alternatives'), output = join(artifacts, 'examplePrograms');
+    await cp(input, output, { recursive: true });
+    const manifest = JSON.parse(await readFile(join(output, 'manifest.json'), 'utf8'));
+    for (const track of manifest.tracks) {
+      track.renderGroup = ['video-1080', 'audio-es'].includes(track.name) ? 2 : 1;
+      if (track.name === 'video-720') track.altGroup = 4;
+    }
+    await writeFile(join(output, 'manifest.json'), JSON.stringify(manifest, null, 2));
+    for (const [file, expected] of Object.entries(result.fixtures.alternatives.sha256)) {
+      assert.equal(createHash('sha256').update(await readFile(join(output, file))).digest('hex'), expected,
+        `${file}: program menu fixture must not rewrite media`);
+    }
+    result.fixtures.examplePrograms = { kind: 'metadata-only', source: result.fixtures.alternatives,
+      tracks: manifest.tracks.map(({ name, renderGroup, altGroup }) => ({ name, renderGroup, altGroup })) };
+  }
   if (selectedCase === 'cmaf-audio-language-switch-same-set' || selectedCase === 'cmaf-audio-language-switch-reference-map') {
     const sameSet = selectedCase === 'cmaf-audio-language-switch-same-set';
     const variant = sameSet ? 'audioSwitchSameSet' : 'audioSwitchMapped';
@@ -163,6 +182,13 @@ try {
     result.fixtures.locAlternatives = await prepareFixture(join(artifacts, 'locAlternatives'), namespace, false, abort.signal, true, 'opus');
     result.fixtures.locAudioSwitchSameSet = await prepareAudioSwitchVariant(join(artifacts, 'locAlternatives'),
       join(artifacts, 'locAudioSwitchSameSet'), result.fixtures.locAlternatives, true);
+  }
+  if (selectedCase === 'loc-program-switch-reference-map' || selectedCase === 'loc-view-switch-reference-map'
+      || mseProgramSwitchCases.some(item => item.name === selectedCase)) {
+    result.fixtures.locProgramAlternatives = await prepareFixture(join(artifacts, 'locProgramAlternatives'), namespace,
+      false, abort.signal, true, 'opus');
+    result.fixtures.locProgramSwitch = await prepareProgramSwitchVariant(join(artifacts, 'locProgramAlternatives'),
+      join(artifacts, 'locProgramSwitch'), result.fixtures.locProgramAlternatives);
   }
   result.fixtures.retimed = await prepareFixture(join(artifacts, 'retimed'), namespace, false, abort.signal, false, 'aac', false,
     { videoTimescale: 60000 });
@@ -207,6 +233,19 @@ try {
       expected: { videoWidth: 640, videoHeight: 360, audioHz: scenario.audioHz, videoFps: 24,
         outputKind: scenario.version ? 'canvas' : 'video' },
     })),
+    ...mseProgramSwitchCases.filter(item => item.name === selectedCase).map(({ name, mode, outcome }) => ({
+      name, mseProgramSwitch: mode, mseOutcome: outcome, fixture: 'locProgramSwitch', silent: false, expectedFailure: null,
+      expected: { videoWidth: 640, videoHeight: 360, audioHz: outcome === 'adopt' && mode === 'program' ? 880 : 440,
+        videoFps: 24, outputKind: 'video' },
+    })),
+    // Explicit-only until the frozen candidate is qualified on native Chrome.
+    ...[
+      { name: 'loc-program-switch-reference-map', programSwitch: 'program', audioHz: 880 },
+      { name: 'loc-view-switch-reference-map', programSwitch: 'view', audioHz: 440 },
+    ].filter(scenario => scenario.name === selectedCase).map(scenario => ({ ...scenario, fixture: 'locProgramSwitch',
+      version: 4, mode: 'media', silent: false, expectedFailure: null,
+      expected: { videoWidth: 640, videoHeight: 360, audioHz: scenario.audioHz, videoFps: 24, outputKind: 'canvas' },
+    })),
     ...[
       { name: 'warm-start-cmaf', fixture: 'moving' },
       { name: 'warm-start-loc', fixture: 'loc', version: 4, mode: 'media',
@@ -237,6 +276,8 @@ try {
       expected: { videoWidth: 360, videoHeight: 640, audioHz: 440, videoFps: 24, outputKind: 'canvas' } },
     { name: 'example-views-cmaf', fixture: 'views', exampleViews: true, silent: false, expectedFailure: null },
     { name: 'example-views-loc', fixture: 'locViews', exampleViews: true, version: 4, mode: 'media', silent: false, expectedFailure: null },
+    ...[ { name: 'example-programs-cmaf', fixture: 'examplePrograms', exampleViews: true, examplePrograms: true,
+      silent: false, expectedFailure: null } ].filter(scenario => scenario.name === selectedCase),
     ...['video', 'audio'].map(cmafRole => ({
       name: `mixed-cmaf-${cmafRole}`, fixture: 'moving', mixed: cmafRole, silent: false, expectedFailure: null,
       expected: { videoWidth: 640, videoHeight: 360, audioHz: 440, videoFps: 24, outputKind: cmafRole === 'video' ? 'video' : 'canvas' },
@@ -383,9 +424,14 @@ try {
       }
       if (scenario.alternatives) { query.set('level', String(scenario.level)); query.set('lang', scenario.lang); }
       if (scenario.audioSwitch) query.set('runtimeAudio', '1');
+      if (scenario.programSwitch) query.set('runtimeMedia', '1');
+      if (scenario.mseProgramSwitch) {
+        query.set('runtimeMedia', '1'); query.set('nativeMse', '1'); query.set('mseProgram', '1');
+        caseResult.media = { packaging: 'cmaf', video: 'H.264', audio: 'Opus', output: 'MSE' };
+      }
       if (scenario.altGroup !== undefined) query.set('altGroup', String(scenario.altGroup));
       if (scenario.exampleViews) {
-        caseResult.observed = await checkExampleViews(page, webUrl, query, artifacts, scenario.name, Boolean(scenario.version));
+        caseResult.observed = await checkExampleViews(page, webUrl, query, artifacts, scenario.name, Boolean(scenario.version), Boolean(scenario.examplePrograms));
         caseResult.assessment = { passed: true, failures: [] };
       } else {
         await page.goto(`${webUrl}_tests/player-acceptance/?${query}`, { waitUntil: 'domcontentloaded' });
@@ -431,6 +477,17 @@ try {
         if (scenario.manualSwitch) {
           caseResult.renditionSwitch = {};
           observed = await checkRenditionSwitch(page, caseResult.renditionSwitch, bounded, Boolean(scenario.nativeRetypes));
+        } else if (scenario.mseProgramSwitch) {
+          caseResult.mseProgramSwitch = {};
+          caseResult.programFixture = result.fixtures[scenario.fixture].programSelectionVariant;
+          observed = await checkMseProgramSwitch(page, caseResult.mseProgramSwitch, bounded, {
+            mode: scenario.mseProgramSwitch, outcome: scenario.mseOutcome, namespace, relayUrl,
+            expected: scenario.expected, variant: caseResult.programFixture });
+        } else if (scenario.programSwitch) {
+          caseResult.programSwitch = {};
+          caseResult.programFixture = result.fixtures[scenario.fixture].programSelectionVariant;
+          observed = await checkProgramSwitch(page, caseResult.programSwitch, bounded, { mode: scenario.programSwitch,
+            namespace, expected: scenario.expected, variant: caseResult.programFixture });
         } else if (scenario.audioSwitch) {
           caseResult.audioSwitch = {};
           const variant = result.fixtures[scenario.fixture].audioSelectionVariant;
@@ -461,7 +518,9 @@ try {
         caseResult.playbackQuality = assessPlaybackQuality(observed.playbackQuality, scenario.expected?.outputKind !== 'canvas');
         assert.deepEqual(caseResult.playbackQuality.failures, [], 'Public playback quality must match its owned native video source');
         caseResult.assessment = scenario.manualSwitch ? caseResult.renditionSwitch.continuity
-          : scenario.audioSwitch ? caseResult.audioSwitch.assessment : assessPlayback(observed.samples, scenario.expected);
+          : scenario.mseProgramSwitch ? caseResult.mseProgramSwitch.assessment
+          : scenario.programSwitch ? caseResult.programSwitch.assessment
+            : scenario.audioSwitch ? caseResult.audioSwitch.assessment : assessPlayback(observed.samples, scenario.expected);
         caseResult.presentationFailures = assessVideoPresentation(observed.samples);
         assert.deepEqual(caseResult.presentationFailures, [], 'Public video draw observation');
         if (scenario.expected?.outputKind === 'canvas') {

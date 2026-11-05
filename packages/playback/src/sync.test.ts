@@ -546,3 +546,55 @@ describe('SyncController', () => {
         });
     });
 });
+
+describe('reference ownership across injected clock callbacks', () => {
+    it.each(['audio', 'video'] as const)('does not reinstall an old %s reference after a nested reset', media => {
+        let act = () => {};
+        const sync = new SyncController({ driftThresholdUs: 500_000, clock: { now: () => { act(); return 10_000_000; } } });
+        act = () => { act = () => {}; sync.reset(); };
+        if (media === 'audio') sync.setAudioReference(1_000_000n);
+        else sync.setVideoReference(1_000_000n);
+        expect(sync.hasReference).toBe(false);
+        expect(sync.computeAudioRenderTime(1_000_000n)).toBeNull();
+        sync.setAudioReference(20_000_000n);
+        expect(sync.computeAudioRenderTime(20_000_000n)?.renderTimeUs).toBe(10_000_000);
+    });
+
+    it.each(['audio', 'video'] as const)('preserves a newer nested reference instead of the outer %s baseline', media => {
+        let act = () => {};
+        const sync = new SyncController({ driftThresholdUs: 500_000, clock: { now: () => { act(); return 10_000_000; } } });
+        act = () => { act = () => {}; sync.reset(); sync.setAudioReference(20_000_000n); };
+        if (media === 'audio') sync.setAudioReference(1_000_000n);
+        else sync.setVideoReference(1_000_000n);
+        expect(sync.computeAudioRenderTime(20_000_000n)?.renderTimeUs).toBe(10_000_000);
+    });
+
+    it.each(['reset', 'replace'] as const)('does not return a timing query spanning a nested %s', change => {
+        let act = () => {};
+        const sync = new SyncController({ driftThresholdUs: 500_000, clock: { now: () => { act(); return 10_000_000; } } });
+        sync.setAudioReference(1_000_000n);
+        act = () => { act = () => {}; sync.reset(); if (change === 'replace') sync.setAudioReference(20_000_000n); };
+        expect(sync.computeAudioRenderTime(1_000_000n)).toBeNull();
+        if (change === 'replace') expect(sync.computeAudioRenderTime(20_000_000n)?.renderTimeUs).toBe(10_000_000);
+        else expect(sync.hasReference).toBe(false);
+    });
+});
+
+it('does not commit a video join offset after the clock callback resets its reference', () => {
+    let act = () => {};
+    const sync = new SyncController({ driftThresholdUs: 500_000, clock: { now: () => { act(); return 10_000_000; } } });
+    sync.setAudioReference(10_000_000n);
+    act = () => { act = () => {}; sync.reset(); };
+    sync.onVideoJoin(1_000_000n);
+    expect(sync.hasReference).toBe(false); expect(sync.videoJoinOffsetUs).toBe(0);
+});
+
+it('refuses a video query when its second clock callback retires the join reference', () => {
+    let act = () => {};
+    const sync = new SyncController({ driftThresholdUs: 500_000, clock: { now: () => { act(); return 10_000_000; } } });
+    sync.setAudioReference(10_000_000n); sync.onVideoJoin(1_000_000n);
+    expect(sync.videoJoinOffsetUs).toBeGreaterThan(0);
+    let reads = 0; act = () => { if (++reads === 2) sync.reset(); };
+    expect(sync.computeVideoRenderTime(1_000_000n)).toBeNull();
+    expect(reads).toBe(2); expect(sync.hasReference).toBe(false);
+});

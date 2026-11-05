@@ -37,7 +37,7 @@ import {
   MoqtPlayer, QualityController, TypedEmitter, checkSupport, usesMsePath,
   composeSelection, selectionIntentFromConfig, PlayerErrorCode, buildCatalogSelection,
 } from '@openmoq/player';
-import type { AudioSelectionOptions, AudioTimelineReference, LocmafDecoding, MediaSelectionSnapshot, MoqtPlayerConfig, SupportReport, TrackIdentity, VideoPresentation } from '@openmoq/player';
+import type { AudioSelectionOptions, AudioTimelineReference, MediaSelectionOptions, MediaTimelineReference, LocmafDecoding, MediaSelectionSnapshot, MoqtPlayerConfig, SupportReport, TrackIdentity, VideoPresentation } from '@openmoq/player';
 import { MoqtConnection } from '@openmoq/webtransport';
 import {
   AudioAlignedClock,
@@ -144,6 +144,8 @@ export class Player {
   private _currentAudioTrack = -1;
   private latestCatalog: CatalogState | null = null;
   private adoptedSelection: MediaSelectionSnapshot | null = null;
+  private acceptedProgram: string | null = null;
+  private acceptedView: string | null = null;
   private audioReferences = new Map<string, TrackIdentity>();
   private audioIndexes: readonly (string | null)[] = [];
   private _autoQuality: boolean;
@@ -294,6 +296,11 @@ export class Player {
   /** Stable id of the adopted program, or null before acceptance. */
   get currentProgram(): string | null { return this.programChoices().currentProgram; }
 
+  /** Raw adopted reference for explicit presentation maps; unavailable until observed. */
+  get mediaTimelineReference(): MediaTimelineReference | null {
+    return this.presentationRetired ? null : this.engine.mediaTimelineReference;
+  }
+
   /** Views within the adopted program, including ungrouped singleton tracks. */
   get views(): readonly View[] {
     const menu = this.programChoices();
@@ -412,7 +419,8 @@ export class Player {
     this._autoQuality = false;
     this.engine.setAutoQuality(false);
     const level = this._levels[levelIndex]!;
-    await this.engine.selectVideoTrack(level.trackName, 'manual');
+    await this.engine.selectVideoTrack(level.namespace === undefined ? level.trackName
+      : { name: level.trackName, namespace: [...level.namespace] }, 'manual');
   }
 
   /** Set audio track by index. */
@@ -442,6 +450,39 @@ export class Player {
           this.emitter.emit('audiochangefailed', { trackId: id,
             message: error instanceof Error ? error.message : String(error) });
         } catch { /* Observer failure does not change the selection outcome. */ }
+      }
+      throw error;
+    }
+  }
+
+  /** Select a catalog program by stable id; resolves after all required outputs adopt. */
+  async selectProgram(id: string, options?: MediaSelectionOptions): Promise<void> {
+    try {
+      if (this.presentationRetired) throw new Error('Cannot select a program after player destruction');
+      const selection = this.programChoices().programSelectors.get(id);
+      if (!selection) throw new RangeError('Unknown program identity');
+      await this.engine.selectMedia(structuredClone(selection), options);
+    } catch (error) {
+      if (!this.presentationRetired) {
+        try { this.emitter.emit('programchangefailed', { programId: id, message: error instanceof Error ? error.message : String(error) }); }
+        catch { /* An observer cannot change the operation's outcome. */ }
+      }
+      throw error;
+    }
+  }
+
+  /** Select a view within the adopted program, retaining its existing audio. */
+  async selectView(id: string, options?: MediaSelectionOptions): Promise<void> {
+    try {
+      if (this.presentationRetired) throw new Error('Cannot select a view after player destruction');
+      const menu = this.programChoices(), target = menu.viewSelectors.get(id);
+      if (!target) throw new RangeError('Unknown view identity');
+      if (target.programId !== menu.currentProgram) throw new Error('View does not belong to the active program');
+      await this.engine.selectMedia(structuredClone(target.selection), options);
+    } catch (error) {
+      if (!this.presentationRetired) {
+        try { this.emitter.emit('viewchangefailed', { viewId: id, message: error instanceof Error ? error.message : String(error) }); }
+        catch { /* An observer cannot change the operation's outcome. */ }
       }
       throw error;
     }
@@ -714,6 +755,12 @@ export class Player {
     this._currentLevel = menu.currentLevel;
     this._currentAudioTrack = menu.currentAudioTrack;
     this.indexAudioReferences();
+    const programs = this.programChoices();
+    const previousProgram = this.acceptedProgram, previousView = this.acceptedView;
+    if (updateOutput) {
+      this.acceptedProgram = programs.currentProgram;
+      this.acceptedView = programs.currentView;
+    }
     if (updateOutput) {
       const previousAudioOutput = this.webAudioRequired;
       if (menu.audio !== undefined) this.webAudioRequired = !usesMsePath(menu.audio.packaging, this.locmafDecoding);
@@ -729,11 +776,21 @@ export class Player {
           || identityKey(previous.namespaceFields, previous.name) !== identityKey(selection.audio.namespaceFields, selection.audio.name))) {
       this.emitter.emit('audiochange', { track: this._audioTracks[this._currentAudioTrack]! });
     }
+    if (updateOutput && !this.presentationRetired && this.adoptedSelection === selection
+        && previousProgram !== this.acceptedProgram) {
+      this.emitter.emit('programchange', { program: programs.programs.find(item => item.id === this.acceptedProgram) ?? null });
+    }
+    if (updateOutput && !this.presentationRetired && this.adoptedSelection === selection
+        && previousView !== this.acceptedView) {
+      const views = programs.programs.find(item => item.id === this.acceptedProgram)?.views;
+      this.emitter.emit('viewchange', { view: views?.find(item => item.id === this.acceptedView) ?? null });
+    }
   }
 
   private programChoices(): ReturnType<typeof programMenu> {
     if (this.latestCatalog === null || this.presentationRetired) {
-      return { programs: [], currentProgram: null, currentView: null };
+      return { programs: [], currentProgram: null, currentView: null,
+        programSelectors: new Map(), viewSelectors: new Map() };
     }
     const model = buildCatalogSelection(this.latestCatalog, { catalogNamespace: this.selectionConfig.namespace });
     return programMenu(model, this.adoptedSelection);

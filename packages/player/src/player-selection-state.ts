@@ -7,8 +7,28 @@ export interface AudioSelectionOptions {
     | { readonly kind: 'live-resync' };
 }
 
-/** Raw presentation domain of the currently adopted audio, normalized to microseconds. */
-export interface AudioTimelineReference {
+/** An application-supplied correspondence between raw presentation timestamps. */
+export interface MediaTimelineAnchor {
+  readonly sourceTimeUs: bigint;
+  readonly referenceTimeUs: bigint;
+}
+
+export interface MediaSelectionOptions {
+  readonly signal?: AbortSignal;
+  /**
+   * Each changed output maps into the SAME adopted reference's raw domain.
+   * Group numbers and equal timestamps alone do not establish this relation.
+   */
+  readonly timeline?: {
+    readonly kind: 'reference-map';
+    readonly referenceToken: object;
+    readonly video?: MediaTimelineAnchor;
+    readonly audio?: MediaTimelineAnchor;
+  };
+}
+
+/** Raw domain of adopted media, normalized to microseconds; not a playhead. */
+export interface MediaTimelineReference {
   /** Identity witness; retain this object, never serialize or reconstruct it. */
   readonly token: object;
   readonly track: TrackIdentity;
@@ -16,6 +36,9 @@ export interface AudioTimelineReference {
   /** Source metadata, not an output playhead or evidence of presentation. */
   readonly observedSourceTimeUs: bigint;
 }
+
+/** Raw presentation domain of the currently adopted audio. */
+export interface AudioTimelineReference extends MediaTimelineReference {}
 
 /** Accepted/adopted outputs. These identities survive finite track completion. */
 export interface MediaSelectionSnapshot {

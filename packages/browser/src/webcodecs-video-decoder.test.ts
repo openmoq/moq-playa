@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebCodecsVideoDecoder } from './webcodecs-video-decoder.js';
+import type { VideoRenderTiming } from '@openmoq/playback';
+import { PlaybackPipeline, SyncController } from '@openmoq/playback';
+import { varint } from '../../transport/src/index.js';
+import { CommandDispatcher } from '../../player/src/command-dispatcher.js';
+
+type VideoDecoderState = VideoDecoder['state'];
 
 class MockEncodedVideoChunk {
   readonly type: 'key' | 'delta';
@@ -18,7 +24,8 @@ class MockEncodedVideoChunk {
 describe('WebCodecsVideoDecoder', () => {
   let decodeSpy: ReturnType<typeof vi.fn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
-  let createdDecoders: Array<{ error: (error: DOMException) => void }>;
+  let createdDecoders: Array<{ error: (error: DOMException) => void; output: (frame: VideoFrame) => void;
+    state: VideoDecoderState; flush: () => Promise<void> }>;
 
   beforeEach(() => {
     decodeSpy = vi.fn();
@@ -64,6 +71,143 @@ describe('WebCodecsVideoDecoder', () => {
   afterEach(() => {
     warnSpy.mockRestore();
     vi.unstubAllGlobals();
+  });
+
+  describe('producing output timing', () => {
+    function chunk(timestamp: number) {
+      return { type: 'key' as const, timestamp, duration: 33_333, data: Uint8Array.of(1),
+        sourceTimestamp: { ticks: BigInt(timestamp), ticksPerSecond: 1_000_000n, domain: 'media' as const } };
+    }
+    function frame(timestamp: number) { return { timestamp, close: vi.fn() }; }
+    function emit(index: number, value: ReturnType<typeof frame>) { createdDecoders[index]!.output(value as unknown as VideoFrame); }
+    function outputTimings(decoder: WebCodecsVideoDecoder) {
+      return (decoder as unknown as { owner: { outputTimings?: Map<number, VideoRenderTiming | null | undefined> } }).owner.outputTimings;
+    }
+
+    it('schedules held, reordered native output with the provider that produced each decode', () => {
+      const decoder = new WebCodecsVideoDecoder();
+      const renderer = { enqueue: vi.fn(), flush() {}, destroy() {}, onFirstFrame: null, onFrameRendered: null, onStall: null };
+      let ready = false, now = 0;
+      const sync = new SyncController({ clock: { now: () => now }, driftThresholdUs: 500_000 });
+      sync.setAudioReference(990_000_000n); now = 9_980_000;
+      const global = vi.fn(() => 9_000_000);
+      const dispatcher = new CommandDispatcher({ videoDecoder: decoder, renderer, videoCodec: 'test',
+        hasSyncReference: () => ready, getPlaybackDelayUs: () => 2_000, recomputeVideoRenderTime: global });
+      const pipeline = new PlaybackPipeline({ mediaType: 'video', clock: { now: () => now }, sync,
+        config: { gapTimeoutUs: 200_000, driftThresholdUs: 500_000, maxBufferDepth: 100 },
+        onCommand: command => dispatcher.dispatch(command), onEvent() {} });
+      pipeline.configure(Uint8Array.of(1));
+      const firstSeen: bigint[] = [], secondSeen: bigint[] = [];
+      const provider = (seen: bigint[], origin: bigint, nominal: number) => ({ computeVideoRenderTime(timestamp: bigint) {
+        seen.push(timestamp); return { renderTimeUs: nominal + Number(timestamp - origin), offsetUs: 20_000, shouldDrop: false };
+      } });
+      const push = (id: number, timestamp: bigint) => {
+        pipeline.pushObject({ kind: 'data', trackAlias: varint(1), groupId: varint(0), subgroupId: varint(0),
+          objectId: varint(id), publisherPriority: 128, extensions: undefined, payload: Uint8Array.of(1) },
+        { captureTimestamp: timestamp, timestamp, timescale: 1_000_000n,
+          videoFrameMarking: { independent: true, startOfFrame: true, endOfFrame: true,
+            discardable: false, baseLayerSync: false, temporalId: 0 } });
+        pipeline.tick();
+      };
+      try {
+        pipeline.setVideoTimingSource(provider(firstSeen, 90_000_000n, 10_000_000)); push(0, 90_000_000n);
+        pipeline.setVideoTimingSource(provider(secondSeen, 190_000_000n, 11_000_000)); push(1, 190_000_000n);
+        const second = frame(190_000_000), first = frame(90_000_000);
+        emit(0, second); emit(0, first);
+        expect(renderer.enqueue).not.toHaveBeenCalled();
+        pipeline.setVideoTimingSource(undefined); push(2, 1_000_020_000n);
+        ready = true; const ordinary = frame(1_000_020_000); emit(0, ordinary);
+        expect(renderer.enqueue).toHaveBeenNthCalledWith(1, second, 11_002_000);
+        expect(renderer.enqueue).toHaveBeenNthCalledWith(2, first, 10_002_000);
+        expect(renderer.enqueue).toHaveBeenNthCalledWith(3, ordinary, 9_000_000);
+        expect(firstSeen).toEqual([90_000_000n, 90_000_000n]);
+        expect(secondSeen).toEqual([190_000_000n, 190_000_000n]);
+        expect(global).toHaveBeenCalledOnce();
+      } finally { dispatcher.destroy(); decoder.destroy(); }
+    });
+
+    it('advertises timing association and returns each producing context out of order', () => {
+      const decoder = new WebCodecsVideoDecoder(), output = vi.fn(), one = {}, two = {};
+      decoder.onFrame = output; decoder.configure(Uint8Array.of(1), 'test');
+      const a = Object.freeze({ recomputeRenderTimeUs: () => 10_000 });
+      const b = Object.freeze({ recomputeRenderTimeUs: () => 20_000 });
+      const first = chunk(90), second = chunk(91);
+      decoder.decode(first, 1, one, a); decoder.decode(second, 2, two, b);
+      const later = frame(91), earlier = frame(90); emit(0, later); emit(0, earlier);
+      expect(decoder.supportsOutputTiming).toBe(true);
+      expect(output).toHaveBeenNthCalledWith(1, later, 2, second.sourceTimestamp, two, b);
+      expect(output).toHaveBeenNthCalledWith(2, earlier, 1, first.sourceTimestamp, one, a);
+      expect(outputTimings(decoder)?.size).toBeLessThanOrEqual(256);
+      decoder.destroy();
+    });
+
+    it.each([false, true])('does not assign a duplicate timestamp to either producing context: normalCollision=%s', normal => {
+      const decoder = new WebCodecsVideoDecoder(), output = vi.fn();
+      decoder.onFrame = output; decoder.configure(Uint8Array.of(1), 'test');
+      decoder.decode(chunk(90), 1, undefined, { recomputeRenderTimeUs: () => 10 });
+      decoder.decode(chunk(90), 2, undefined, normal ? undefined : { recomputeRenderTimeUs: () => 20 });
+      const first = frame(90), second = frame(90); emit(0, first); emit(0, second);
+      expect(output.mock.calls.map(call => call[4])).toEqual([null, null]);
+      decoder.destroy();
+    });
+
+    it('marks an unsafe mapped timestamp unavailable instead of reverting to global scheduling', () => {
+      const decoder = new WebCodecsVideoDecoder(), output = vi.fn();
+      decoder.onFrame = output; decoder.configure(Uint8Array.of(1), 'test');
+      const timestamp = 2 ** 54;
+      decoder.decode(chunk(timestamp), 1, undefined, { recomputeRenderTimeUs: () => 10 });
+      emit(0, frame(timestamp));
+      expect(output.mock.calls[0]?.[4]).toBeNull();
+      decoder.destroy();
+    });
+
+    it('bounds mapped metadata with source-time eviction and retains ordinary output arity', () => {
+      const decoder = new WebCodecsVideoDecoder(), output = vi.fn();
+      decoder.onFrame = output; decoder.configure(Uint8Array.of(1), 'test');
+      decoder.decode(chunk(10), 1, undefined, { recomputeRenderTimeUs: () => 10 });
+      for (let timestamp = 11; timestamp <= 266; timestamp++) decoder.decode(chunk(timestamp), 1);
+      expect(outputTimings(decoder)?.size).toBeLessThanOrEqual(256);
+      emit(0, frame(10));
+      expect(output.mock.calls[0]?.[4]).toBeNull();
+      emit(0, frame(266));
+      expect(output.mock.calls[1]).toHaveLength(3);
+      decoder.destroy();
+    });
+
+    it('does not allocate a timing map or extend default output arguments when unused', () => {
+      const decoder = new WebCodecsVideoDecoder(), output = vi.fn();
+      decoder.onFrame = output; decoder.configure(Uint8Array.of(1), 'test');
+      decoder.decode(chunk(10), 11); const value = frame(10); emit(0, value);
+      expect(outputTimings(decoder)).toBeUndefined();
+      expect(output).toHaveBeenCalledExactlyOnceWith(value, 11, chunk(10).sourceTimestamp);
+      decoder.destroy();
+    });
+
+    it('retires timing at reset and cannot transfer it to the new native owner', () => {
+      const decoder = new WebCodecsVideoDecoder(), output = vi.fn();
+      decoder.onFrame = output; decoder.configure(Uint8Array.of(1), 'test');
+      decoder.decode(chunk(10), 1, undefined, { recomputeRenderTimeUs: () => 10 });
+      decoder.reset(); const stale = frame(10); emit(0, stale);
+      expect(stale.close).toHaveBeenCalledOnce(); expect(output).not.toHaveBeenCalled();
+      decoder.decode(chunk(10), 2); emit(1, frame(10));
+      expect(output.mock.calls[0]).toHaveLength(3);
+      expect(outputTimings(decoder)).toBeUndefined();
+      decoder.destroy();
+    });
+
+    it('retains the context of a draining native predecessor across reconfiguration', async () => {
+      const decoder = new WebCodecsVideoDecoder(), output = vi.fn();
+      decoder.onFrame = output; decoder.configure(Uint8Array.of(1), 'test');
+      const a = { recomputeRenderTimeUs: () => 10 }, b = { recomputeRenderTimeUs: () => 20 };
+      decoder.decode(chunk(10), 1, undefined, a);
+      decoder.configure(Uint8Array.of(2), 'test-two'); decoder.decode(chunk(10), 2, undefined, b);
+      emit(1, frame(10)); emit(0, frame(10));
+      expect(output.mock.calls.map(call => call[4])).toEqual([b, a]);
+      await Promise.resolve(); await Promise.resolve();
+      const retired = frame(10); emit(0, retired);
+      expect(retired.close).toHaveBeenCalledOnce();
+      decoder.destroy();
+    });
   });
 
   it('drops reserved NAL type 0 chunks before decode', () => {

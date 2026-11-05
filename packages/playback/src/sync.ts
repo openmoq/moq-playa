@@ -94,6 +94,7 @@ export class SyncController {
 
     /** Local clock time when audio reference was set. */
     private localBaselineUs: number | undefined;
+    private referenceRevision = 0;
     /** CaptureTimestamp of the audio reference sample. */
     private captureBaselineUs: bigint | undefined;
 
@@ -210,7 +211,11 @@ export class SyncController {
      * @param captureTimestampUs CaptureTimestamp in microseconds
      */
     setAudioReference(captureTimestampUs: bigint): void {
-        this.localBaselineUs = this.clock.now();
+        const revision = ++this.referenceRevision;
+        const now = this.clock.now();
+        // An injected clock may reset or establish a newer reference.
+        if (revision !== this.referenceRevision) return;
+        this.localBaselineUs = now;
         this.captureBaselineUs = captureTimestampUs;
         this._currentDriftUs = 0;
     }
@@ -223,7 +228,11 @@ export class SyncController {
      */
     setVideoReference(captureTimestampUs: bigint): void {
         if (this.hasReference) return;
-        this.localBaselineUs = this.clock.now();
+        const revision = ++this.referenceRevision;
+        const now = this.clock.now();
+        // An injected clock may reset or establish a newer reference.
+        if (revision !== this.referenceRevision) return;
+        this.localBaselineUs = now;
         this.captureBaselineUs = captureTimestampUs;
         this._currentDriftUs = 0;
     }
@@ -250,9 +259,11 @@ export class SyncController {
     onVideoJoin(firstKeyframeCaptureUs: bigint, cushionUs: number = 16_000): void {
         if (this.localBaselineUs === undefined || this.captureBaselineUs === undefined) return;
 
+        const revision = this.referenceRevision;
         const naiveRenderTimeUs = this.localBaselineUs +
             Number(firstKeyframeCaptureUs - this.captureBaselineUs);
         const nowUs = this.clock.now();
+        if (revision !== this.referenceRevision) return;
         const gapUs = nowUs + cushionUs - naiveRenderTimeUs;
 
         if (gapUs > 0) {
@@ -266,6 +277,7 @@ export class SyncController {
      * @param captureTimestampUs CaptureTimestamp in microseconds
      */
     computeVideoRenderTime(captureTimestampUs: bigint): RenderTiming | null {
+        const revision = this.referenceRevision;
         const timing = this.computeRenderTime(captureTimestampUs);
         if (timing === null) return null;
 
@@ -273,6 +285,7 @@ export class SyncController {
             // Apply offset — shift render time forward
             const adjustedRenderTimeUs = timing.renderTimeUs + this._videoJoinOffsetUs;
             const nowUs = this.clock.now();
+            if (revision !== this.referenceRevision) return null;
 
             // Check if base render time (without offset) is now in the future
             // → video has caught up to live edge, snap offset to zero
@@ -415,6 +428,7 @@ export class SyncController {
      * Reset the sync reference (e.g., after a skip-forward).
      */
     reset(): void {
+        this.referenceRevision++;
         this._captureTimestampAgeUs = null;
         this.localBaselineUs = undefined;
         this.captureBaselineUs = undefined;
@@ -431,7 +445,9 @@ export class SyncController {
             return null;
         }
 
+        const revision = this.referenceRevision;
         const now = this.clock.now();
+        if (revision !== this.referenceRevision) return null;
 
         const renderTimeUs = this.localBaselineUs +
             Number(captureTimestampUs - this.captureBaselineUs);

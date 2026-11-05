@@ -25,6 +25,7 @@ import type { MediaSourceLike, VideoDecoderLike, VideoRendererLike } from './int
 import type { LoggerLike } from './logger.js';
 import type { QualityController } from './quality-controller.js';
 import { varint } from '@openmoq/transport';
+import { SyncController } from '@openmoq/playback';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -366,6 +367,20 @@ describe('handlePipelineEvent', () => {
     expect(emitEvent).toHaveBeenCalledWith(expect.objectContaining({
       type: 'skip_forward', mediaType: 'video',
     }));
+  });
+
+  it('delegates shared clock ownership to the player reset boundary once per tick', () => {
+    const syncController = new SyncController({ clock: mockClock, driftThresholdUs: 30_000 });
+    const reset = vi.spyOn(syncController, 'reset'), resetSync = vi.fn(), setSyncReset = vi.fn();
+    const evt: PlaybackEvent = { type: 'skip_forward', fromGroupId: 3n, toGroupId: 7n };
+    const ctx = { emitEvent: vi.fn(), log: mockLog, syncController,
+      resetSync, syncResetThisTick: false, setSyncResetThisTick: setSyncReset,
+      recoveryHook: (a: RecoveryAction) => a };
+    handlePipelineEvent('video', evt, ctx);
+    expect(resetSync).toHaveBeenCalledOnce(); expect(reset).not.toHaveBeenCalled();
+    expect(setSyncReset).toHaveBeenCalledExactlyOnceWith(true);
+    handlePipelineEvent('video', evt, { ...ctx, syncResetThisTick: true });
+    expect(resetSync).toHaveBeenCalledOnce();
   });
 
   it('does not double-reset sync within same tick', () => {

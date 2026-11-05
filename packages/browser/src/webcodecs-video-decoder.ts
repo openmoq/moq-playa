@@ -19,6 +19,7 @@
  */
 
 import type { VideoDecoderLike } from '@openmoq/player';
+import type { VideoRenderTiming } from '@openmoq/playback';
 import type { VideoChunkInit, SourceTimestamp } from '@openmoq/loc';
 import { createCodecStrategy } from './codec-strategy.js';
 import type { CodecStrategy } from './codec-strategy.js';
@@ -41,6 +42,8 @@ interface DecoderOwner {
   readonly sourceTimes: Map<number, SourceTimestamp | null>;
   /** Lazy identity metadata, bounded by sourceTimes eviction (256 entries). */
   inputTokens?: Map<number, object>;
+  /** Lazy producing context, sharing sourceTimes' uniqueness and eviction rules. */
+  outputTimings?: Map<number, VideoRenderTiming | null | undefined>;
   retiredTimestampFloor: number;
   active: boolean;
 }
@@ -70,6 +73,7 @@ export interface WebCodecsVideoDecoderConfig {
 }
 
 export class WebCodecsVideoDecoder implements VideoDecoderLike {
+  readonly supportsOutputTiming = true;
   private decoder: VideoDecoder | null = null;
   private owner: DecoderOwner | null = null;
   private readonly owners = new Set<DecoderOwner>();
@@ -125,7 +129,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
 
   // ─── Callbacks ──────────────────────────────────────────────────
 
-  onFrame: ((frame: unknown, renderTimeUs: number, sourceTimestamp?: SourceTimestamp | null, inputToken?: object) => void) | null = null;
+  onFrame: VideoDecoderLike['onFrame'] = null;
   onError: ((error: Error) => void) | null = null;
 
   // ─── VideoDecoderLike ───────────────────────────────────────────
@@ -210,7 +214,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
    *
    * @see draft-ietf-moq-loc-01 §2 (LOC payload = EncodedVideoChunk.data)
    */
-  decode(chunk: VideoChunkInit, renderTimeUs: number, inputToken?: object): void {
+  decode(chunk: VideoChunkInit, renderTimeUs: number, inputToken?: object, renderTiming?: VideoRenderTiming): void {
     const owner = this.owner;
     if (this.destroyed || !owner?.active || !this.lastCodec || owner.decoder.state !== 'configured') return;
 
@@ -280,6 +284,15 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
       const source = copySourceTimestamp(chunk, encoded.timestamp);
       if (!owner.active || this.owner !== owner) return;
       const unique = this.rememberSource(owner, encoded.timestamp, source);
+      if (renderTiming !== undefined && !owner.outputTimings) {
+        // All earlier inputs in this owner were ordinary. Preserve that fact
+        // when timing collection is armed while some of them still await output.
+        owner.outputTimings = new Map();
+        for (const timestamp of owner.sourceTimes.keys()) owner.outputTimings.set(timestamp, undefined);
+      }
+      if (owner.outputTimings && owner.sourceTimes.has(encoded.timestamp)) {
+        owner.outputTimings.set(encoded.timestamp, unique && Number.isSafeInteger(encoded.timestamp) ? renderTiming : null);
+      }
       if (inputToken && unique && Number.isSafeInteger(encoded.timestamp)) {
         (owner.inputTokens ??= new Map()).set(encoded.timestamp, inputToken);
       }
@@ -295,6 +308,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
         if (owner.sourceTimes.has(submittedTimestamp)) owner.sourceTimes.set(submittedTimestamp, null);
         owner.renderTimes.delete(submittedTimestamp);
         owner.inputTokens?.delete(submittedTimestamp);
+        if (owner.outputTimings?.has(submittedTimestamp)) owner.outputTimings.set(submittedTimestamp, null);
       }
       throw this.enrichError(
         err,
@@ -371,11 +385,18 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
         if (owner.sourceTimes.has(timestamp)) owner.sourceTimes.set(timestamp, null);
         const inputToken = owner.inputTokens?.get(timestamp);
         owner.inputTokens?.delete(timestamp);
+        // Missing retained association after opt-in is explicitly unavailable,
+        // never permission to apply the current global timeline to old output.
+        const renderTiming = owner.outputTimings
+          ? owner.outputTimings.has(timestamp) ? owner.outputTimings.get(timestamp) : null
+          : undefined;
+        if (owner.outputTimings?.has(timestamp)) owner.outputTimings.set(timestamp, null);
         if (!this.onFrame) {
           frame.close();
           return;
         }
-        if (inputToken === undefined) this.onFrame(frame, renderTimeUs, source);
+        if (renderTiming !== undefined) this.onFrame(frame, renderTimeUs, source, inputToken, renderTiming);
+        else if (inputToken === undefined) this.onFrame(frame, renderTimeUs, source);
         else this.onFrame(frame, renderTimeUs, source, inputToken);
       },
       error: (err: DOMException) => {
@@ -423,6 +444,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
       // Repeated PTS cannot identify an input, even after its first output.
       owner.sourceTimes.set(timestamp, null);
       owner.inputTokens?.delete(timestamp);
+      owner.outputTimings?.set(timestamp, null);
       return false;
     }
     if (timestamp <= owner.retiredTimestampFloor) return false;
@@ -431,6 +453,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
       owner.retiredTimestampFloor = Math.max(owner.retiredTimestampFloor, oldest);
       owner.sourceTimes.delete(oldest);
       owner.inputTokens?.delete(oldest);
+      owner.outputTimings?.delete(oldest);
     }
     owner.sourceTimes.set(timestamp, source);
     return true;
@@ -442,6 +465,8 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
     owner.renderTimes.clear();
     owner.inputTokens?.clear();
     delete owner.inputTokens;
+    owner.outputTimings?.clear();
+    delete owner.outputTimings;
     this.owners.delete(owner);
     if (this.owner === owner) {
       this.owner = null;
