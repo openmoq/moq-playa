@@ -118,12 +118,26 @@ describe('WebCodecsAudioDecoder', () => {
     decoder.decode(chunk(0), 100_000); createdDecoders[0]!.output({ timestamp: 5_000 });
     expect(times).toEqual([105_000]); decoder.destroy();
   });
-  it('does not invent a render time when repeated PTS have conflicting schedules', () => {
-    const decoder = configuredDecoder(), times: number[] = [];
+  it('pairs repeated PTS with their schedules in submission order without claiming identity', () => {
+    const decoder = configuredDecoder(), times: number[] = [], tokens: unknown[] = [];
+    decoder.onData = (_data, time, token) => { times.push(time); tokens.push(token); };
+    decoder.decode(chunk(0), 100_000, {}); decoder.decode(chunk(0), 200_000, {});
+    createdDecoders[0]!.output({ timestamp: 0 }); createdDecoders[0]!.output({ timestamp: 0 });
+    expect(times).toEqual([100_000, 200_000]); expect(tokens).toEqual([undefined, undefined]); decoder.destroy();
+  });
+  it('keeps render times when chunks carry no capture timestamp (all 0) and outputs interleave', () => {
+    const decoder = configuredDecoder('mp4a.40.2'), times: number[] = [];
     decoder.onData = (_data, time) => { times.push(time); };
-    decoder.decode(chunk(0), 100_000); decoder.decode(chunk(0), 200_000);
-    createdDecoders[0]!.output({ timestamp: 0 });
-    expect(times).toEqual([0]); decoder.destroy();
+    for (let i = 0; i < 5; i++) { decoder.decode(chunk(0), 100_000 + i * 20_000); createdDecoders[0]!.output({ timestamp: 0 }); }
+    expect(times).toEqual([100_000, 120_000, 140_000, 160_000, 180_000]); decoder.destroy();
+  });
+  it('pairs decoder-synthesized output timestamps with jittered capture timestamps', () => {
+    const decoder = configuredDecoder('mp4a.40.2'), times: number[] = [];
+    decoder.onData = (_data, time) => { times.push(time); };
+    const jittered = [0, 20_002, 39_998, 60_001, 79_999];
+    jittered.forEach(ts => decoder.decode(chunk(ts), 1_000_000 + ts));
+    jittered.forEach((_ts, i) => createdDecoders[0]!.output({ timestamp: i * 20_000 }));
+    expect(times).toEqual(jittered.map(ts => 1_000_000 + ts)); decoder.destroy();
   });
   it('clears queued render times on decode error — outputs after recovery use fresh times', () => {
     const decoder = configuredDecoder();
