@@ -451,7 +451,8 @@ describe('MoqtConnection(18) FETCH data', () => {
     expect(objs[1]!.kind).toBe('gap');
     expect(objs[1]!.groupId).toBe(1n);
     expect(objs[1]!.objectId).toBe(5n);
-    if (objs[1]!.kind === 'gap') expect(objs[1]!.status).toBe(0x3n);
+    // §11.4.4.2: the objects do not exist; the group has not ended.
+    if (objs[1]!.kind === 'gap') expect(objs[1]!.status).toBe(0x1n);
   });
 
   it('reassembles a fragmented fetch stream (header + objects across chunks)', async () => {

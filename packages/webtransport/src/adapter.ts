@@ -393,6 +393,19 @@ function splitOwnership<T extends object>(
 /** draft-22 FILL_PARAMETERS message parameter (§9.20.15). */
 const FILL_PARAMETERS = 0x23n;
 
+/**
+ * Gap status for a FETCH End of Range marker. Every Object from the last one
+ * serialized through the marker's Location, inclusive, either does not exist
+ * (0x8C) or has unknown status (0x10C). Neither says where a Group ends, so a
+ * Non-Existent Range is OBJECT_DOES_NOT_EXIST (as a draft-14 FETCH status
+ * object already reports it), never END_OF_GROUP; an Unknown Range stays 0x0.
+ *
+ * @see draft-ietf-moq-transport-16 §10.4.4, draft-18 §11.4.4.2, draft-22 §11.4.1.2
+ */
+function fetchRangeGapStatus(nonExistent: boolean): bigint {
+  return nonExistent ? ObjectStatus.OBJECT_DOES_NOT_EXIST : ObjectStatus.NORMAL;
+}
+
 export class MoqtConnection {
   /** The underlying sans-I/O session state machine. Set by {@link configureForVersion}. */
   session!: Session;
@@ -8036,7 +8049,7 @@ export class MoqtConnection {
             // Use rawStatus when available (draft-14 preserves exact status code),
             // otherwise derive from nonExistent boolean (draft-16).
             const gapStatus = item.rawStatus
-              ?? varint(item.nonExistent ? 0x3 : 0x0);
+              ?? fetchRangeGapStatus(item.nonExistent);
             const delivered: MoqtObjectGap = {
               kind: 'gap',
               trackAlias: varint(0),
@@ -8171,7 +8184,7 @@ export class MoqtConnection {
               groupId: item.groupId,
               subgroupId: 0n,
               objectId: item.objectId,
-              status: varint(item.nonExistent ? 0x3 : 0x0),
+              status: fetchRangeGapStatus(item.nonExistent),
             };
             this.onObject?.(streamId, delivered);
           }
