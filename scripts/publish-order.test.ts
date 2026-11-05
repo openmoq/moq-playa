@@ -32,7 +32,7 @@ function order(packages: Manifest[]): string[] {
 
 describe('release publication order', () => {
   it.each([
-    'healthy', 'system bash', 'publish fails', 'dependency unavailable',
+    'healthy', 'system bash', 'node version manager shim', 'publish fails', 'dependency unavailable',
     'metadata delayed', 'tarball delayed', 'already published',
     'last tarball unavailable', 'download forbidden', 'wrong download version',
     'download timeout', 'download hangs',
@@ -50,6 +50,26 @@ describe('release publication order', () => {
       if (existsSync(waitScript)) copyFileSync(waitScript, join(directory, 'scripts/wait-for-npm-package.mjs'));
       const bin = join(directory, 'bin');
       mkdirSync(bin);
+      const shellQuote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+      // Version-manager shims can rewrite PATH and bypass the fixture's npm.
+      writeFileSync(join(bin, 'node'), `#!/bin/sh
+exec ${shellQuote(process.execPath)} "$@"
+`, { mode: 0o755 });
+      const shimBin = join(directory, 'node-shim');
+      if (condition === 'node version manager shim') {
+        const poisonBin = join(directory, 'poison-npm');
+        mkdirSync(shimBin);
+        mkdirSync(poisonBin);
+        writeFileSync(join(poisonBin, 'npm'), `#!/bin/sh
+printf '%s\\n' '{"error":{"code":"ENODE_SHIM_BYPASS"}}'
+exit 1
+`, { mode: 0o755 });
+        writeFileSync(join(shimBin, 'node'), `#!/bin/sh
+PATH=${shellQuote(poisonBin)}:"$PATH"
+export PATH
+exec ${shellQuote(process.execPath)} "$@"
+`, { mode: 0o755 });
+      }
       const log = join(directory, 'published.jsonl');
       const downloads = join(directory, 'downloads.jsonl');
       writeFileSync(join(bin, 'npm'), `#!${process.execPath}
@@ -95,7 +115,7 @@ describe('release publication order', () => {
       expect(step).toBeDefined();
       const run = () => execFileSync(condition === 'system bash' ? '/bin/bash' : 'bash', ['-c', step!.replace(/^          /gm, '')], {
         cwd: directory,
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`,
+        env: { ...process.env, PATH: `${bin}:${condition === 'node version manager shim' ? `${shimBin}:` : ''}${process.env.PATH}`,
           NPM_PACKAGE_WAIT_MS: ['dependency unavailable', 'last tarball unavailable', 'download hangs'].includes(condition) ? '3000' : '30000',
           NPM_PACKAGE_POLL_MS: '1' },
         stdio: 'pipe', timeout: 60_000,
