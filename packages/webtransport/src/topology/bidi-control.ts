@@ -38,7 +38,7 @@ export interface BidiControlTopology {
 
 /**
  * Build the {@link BidiControlTopology} bundle for a draft version.
- * @param version Draft version (default: 16). Throws for drafts without a wired
+ * @param version Draft version (default: 16, the newest draft with a bidi control stream). Throws for drafts without a wired
  *   bidi-control codec (e.g. draft-18, which uses the uni-pair topology).
  */
 export function createBidiControlTopology(version: DraftVersion = 16): BidiControlTopology {

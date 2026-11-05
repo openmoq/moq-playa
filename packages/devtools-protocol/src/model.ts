@@ -36,8 +36,8 @@ const sessionReader = refined(object({
   draftEvidence: oneOf('configured', 'in-band', 'transport', 'unknown'),
   offeredProtocols: array(text(128), 16), negotiatedProtocol: protocolReader,
   setupDurationMs: nullable(nonnegative), maxRequestId: creditReader,
-}), v => (v.draft !== 18 && v.draft !== 22) || v.maxRequestId.unavailable === 'not-applicable',
-'no MAX_REQUEST_ID on draft 18 or 22');
+}), v => (v.draft !== 18 && v.draft !== 22 && v.draft !== 23) || v.maxRequestId.unavailable === 'not-applicable',
+'no MAX_REQUEST_ID on draft 18, 22 or 23');
 
 const readers = {
   source_state: object({

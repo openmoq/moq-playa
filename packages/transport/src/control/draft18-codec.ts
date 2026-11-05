@@ -40,6 +40,7 @@ import type {
   SubscribeOk,
   RequestOk,
   RequestErrorMsg,
+  Redirect,
   RequestUpdate,
   Fetch,
   FetchOk,
@@ -60,7 +61,8 @@ import type {
 } from './messages.js';
 import type { Location } from '../primitives/location.js';
 import { readVi64, writeVi64, vi64EncodingLength, MAX_VI64 } from '../primitives/vi64.js';
-import { ControlMessageType18, SetupOption18 } from './codes-18.js';
+import { ControlMessageType18, ErrorDetail23, SetupOption18, SetupOption23 } from './codes-18.js';
+import { MAX_CONTROL_MESSAGE_SIZE } from './control-message-size.js';
 import { MessageParam } from './parameters.js';
 import {
   encodeMessageParams18,
@@ -68,6 +70,7 @@ import {
   messageParams18EncodingLength,
   DEFAULT_MESSAGE_PARAM_REGISTRY,
   DRAFT22_MESSAGE_PARAM_REGISTRY,
+  DRAFT23_MESSAGE_PARAM_REGISTRY,
   type MessageParams18,
   type MessageParamRegistry,
   type MessageParamValue,
@@ -78,12 +81,19 @@ import {
   decodeTrackProperties18,
   trackProperties18EncodingLength,
 } from './track-properties-18.js';
-import { ProtocolViolationError } from '../errors.js';
+import { ProtocolViolationError, SessionError } from '../errors.js';
 import { validateTrackNamespacePrefix, validateFullTrackName, validateTrackNamespace } from '../primitives/bytes.js';
 import type { RequestStreamDraft } from '../versions.js';
+import { isDraft22, isDraft23 } from '../versions.js';
 
 /** Error Code value that carries an optional Redirect structure (§10.6.2). */
 const REDIRECT_ERROR_CODE = 0x34n;
+/** Error Code that UNSUPPORTED_PROPERTY Error Details accompany (draft-23 §9.4.2.2). */
+const UNSUPPORTED_EXTENSION_ERROR_CODE = 0x33n;
+const ERROR_DETAIL_REDIRECT = BigInt(ErrorDetail23.REDIRECT);
+const ERROR_DETAIL_UNSUPPORTED_PROPERTY = BigInt(ErrorDetail23.UNSUPPORTED_PROPERTY);
+/** Error Details a sender must not repeat; UNSUPPORTED_PROPERTY may (§9.4.2). */
+const ERROR_DETAIL_SINGLETONS = new Set<bigint>([ERROR_DETAIL_REDIRECT]);
 
 /** Read a message's Track Properties, accepting the canonical `trackProperties`
  *  or the deprecated `trackExtensions` alias (empty if neither). */
@@ -207,6 +217,7 @@ const SETUP_SINGLETONS = new Set<bigint>([
   BigInt(SetupOption18.AUTHORITY),
   BigInt(SetupOption18.MAX_AUTH_TOKEN_CACHE_SIZE),
   BigInt(SetupOption18.MOQT_IMPLEMENTATION),
+  BigInt(SetupOption23.MAX_CONTROL_MESSAGE_SIZE),
 ]);
 
 function setupValueLength(type: bigint, value: SetupOptionValue): number {
@@ -229,14 +240,22 @@ function writeSetupValue(type: bigint, value: SetupOptionValue, buf: Uint8Array,
 }
 
 function encodeSetupOptionMap18(options: SetupOptionMap): Uint8Array {
+  return encodeKvps18(options, SETUP_SINGLETONS, 'Setup Option');
+}
+
+/**
+ * Encode delta-typed Key-Value-Pairs (draft-23 §8.3): even Types carry a vi64,
+ * odd Types length-prefixed bytes. Setup Options and Error Details use it.
+ */
+function encodeKvps18(options: SetupOptionMap, singletons: ReadonlySet<bigint>, what: string): Uint8Array {
   const entries = [...options.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   const flat: { delta: bigint; type: bigint; value: SetupOptionValue }[] = [];
   let prev = 0n;
   let len = 0;
   for (const [type, values] of entries) {
     // Sender-side duplicate validation: known singletons must not repeat.
-    if (SETUP_SINGLETONS.has(type) && values.length > 1) {
-      throw new ProtocolViolationError(`Setup Option 0x${type.toString(16)} must not be repeated`);
+    if (singletons.has(type) && values.length > 1) {
+      throw new ProtocolViolationError(`${what} 0x${type.toString(16)} must not be repeated`);
     }
     for (const value of values) {
       const delta = type - prev;
@@ -254,15 +273,17 @@ function encodeSetupOptionMap18(options: SetupOptionMap): Uint8Array {
   return buf;
 }
 
-function decodeSetupOptionMap18(payload: Uint8Array): SetupOptionMap {
+function decodeSetupOptionMap18(payload: Uint8Array, offset = 0): SetupOptionMap {
   const out: SetupOptionMap = new Map();
-  let p = 0;
+  let p = offset;
   let prev = 0n;
   while (p < payload.length) {
     const dt = readVi64(payload, p);
     p += dt.bytesRead;
     const type = prev + dt.value;
-    if (type > MAX_VI64) throw new ProtocolViolationError(`Setup Option type ${type} exceeds 2^64-1`);
+    if (type > MAX_VI64) {
+      throw new ProtocolViolationError(`Setup Option type ${type} exceeds 2^64-1`, Number(SessionError.DELTA_ENCODING_OVERFLOW));
+    }
     prev = type;
     let value: SetupOptionValue;
     if (type % 2n === 0n) {
@@ -314,6 +335,16 @@ function toTypedParam(type: bigint, v: ParameterValue, registry: MessageParamReg
     case 'locationFilter':
       if (!(v instanceof Uint8Array)) throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} expects a LOCATION_FILTER`);
       return { kind: 'locationFilter', value: v };
+    case 'paramBlock': {
+      // The semantic value is the counted parameter block draft 22 carries in
+      // its FILL_PARAMETERS; draft 23 writes it with no Length, so it must be
+      // exactly one well-formed block.
+      if (!(v instanceof Uint8Array)) throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} expects a parameter block`);
+      if (decodeMessageParams18(v, 0, registry).bytesRead !== v.length) {
+        throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} block has trailing bytes`);
+      }
+      return { kind: 'paramBlock', value: v };
+    }
     case 'location':
       if (!isLocation(v)) throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} expects Location`);
       return { kind: 'location', group: v.group, object: v.object };
@@ -328,6 +359,17 @@ function toTypedParam(type: bigint, v: ParameterValue, registry: MessageParamReg
   }
 }
 
+/** draft-23 PAUSED (§9.19.18): FORWARD's successor, with the value inverted. */
+const PAUSED_TYPE = 0x11n;
+
+/**
+ * Whether `registry` speaks PAUSED rather than FORWARD (draft 23). The session
+ * keeps the semantic FORWARD parameter on every draft; this bridge rewrites it.
+ */
+function usesPaused(registry: MessageParamRegistry): boolean {
+  return registry.has(PAUSED_TYPE) && !registry.has(MessageParam.FORWARD as bigint);
+}
+
 function paramsToTyped(params: Parameters, registry: MessageParamRegistry): MessageParams18 {
   const out = new Map<bigint, MessageParamValue[]>();
   for (const [type, values] of params) {
@@ -336,6 +378,12 @@ function paramsToTyped(params: Parameters, registry: MessageParamRegistry): Mess
       if (values.length !== 1 || typeof value !== 'bigint'
           || (value !== 0n && value !== 1n)) {
         throw new ProtocolViolationError('FORWARD must be exactly one value, 0 or 1');
+      }
+      if (usesPaused(registry)) {
+        // Absent FORWARD and absent PAUSED both mean "delivering", so only a
+        // present value needs rewriting: PAUSED = 1 - FORWARD.
+        out.set(PAUSED_TYPE, [{ kind: 'uint8', value: value === 0n ? 1 : 0 }]);
+        continue;
       }
     }
     out.set(type, values.map((v) => toTypedParam(type, v, registry)));
@@ -353,6 +401,7 @@ function fromTypedParam(v: MessageParamValue): ParameterValue {
       return v.value;
     case 'bytes':
     case 'locationFilter':
+    case 'paramBlock':
       return v.value;
     case 'location':
       return { group: v.group, object: v.object };
@@ -363,7 +412,19 @@ function fromTypedParam(v: MessageParamValue): ParameterValue {
 
 function typedToParams(typed: MessageParams18): Parameters {
   const out: Parameters = new Map();
-  for (const [type, values] of typed) out.set(type, values.map(fromTypedParam));
+  for (const [type, values] of typed) {
+    if (type === PAUSED_TYPE) {
+      // Only a draft-23 registry decodes 0x11. Expose it as the semantic
+      // FORWARD; a repeated or out-of-range PAUSED is INVALID_PARAMETER.
+      const v = values[0];
+      if (values.length !== 1 || v?.kind !== 'uint8' || v.value > 1) {
+        throw new ProtocolViolationError('PAUSED must be exactly one value, 0 or 1', Number(SessionError.INVALID_PARAMETER));
+      }
+      out.set(MessageParam.FORWARD as bigint, [BigInt(1 - v.value)]);
+      continue;
+    }
+    out.set(type, values.map(fromTypedParam));
+  }
   return out;
 }
 
@@ -371,6 +432,17 @@ function typedToParams(typed: MessageParams18): Parameters {
 
 const notImplemented = (what: string): never => {
   throw new ProtocolViolationError(`Draft18Codec: ${what} is not yet implemented`);
+};
+
+export { MAX_CONTROL_MESSAGE_SIZE };
+
+const MALFORMED_MESSAGE = Number(SessionError.MALFORMED_MESSAGE);
+
+const unexpectedMessage = (type: bigint): never => {
+  throw new ProtocolViolationError(
+    `Unknown draft-23 control message type 0x${type.toString(16)}`,
+    Number(SessionError.UNEXPECTED_MESSAGE),
+  );
 };
 
 export class Draft18Codec implements ControlCodec {
@@ -382,7 +454,13 @@ export class Draft18Codec implements ControlCodec {
 
   /** The message-parameter table of this codec's draft. */
   private get paramRegistry(): MessageParamRegistry {
-    return this.version === 22 ? DRAFT22_MESSAGE_PARAM_REGISTRY : DEFAULT_MESSAGE_PARAM_REGISTRY;
+    if (isDraft23(this.version)) return DRAFT23_MESSAGE_PARAM_REGISTRY;
+    return isDraft22(this.version) ? DRAFT22_MESSAGE_PARAM_REGISTRY : DEFAULT_MESSAGE_PARAM_REGISTRY;
+  }
+
+  /** Full Track Name rules: draft 23 forbids an empty Track Name (§2.4.1). */
+  private get fullTrackNameRules(): { allowEmptyNamespace: true; forbidEmptyTrackName: boolean } {
+    return { allowEmptyNamespace: true, forbidEmptyTrackName: isDraft23(this.version) };
   }
 
   encode(msg: ControlMessage): Uint8Array {
@@ -400,8 +478,12 @@ export class Draft18Codec implements ControlCodec {
       case 'REQUEST_ERROR':
         return this.frame(ControlMessageType18.REQUEST_ERROR, this.encodeRequestError(msg));
       case 'FETCH':
-        return this.frame(ControlMessageType18.FETCH, this.version === 22 ? this.encodeFetch22(msg) : this.encodeFetch(msg));
+        return this.frame(ControlMessageType18.FETCH, isDraft22(this.version) ? this.encodeFetch22(msg) : this.encodeFetch(msg));
       case 'FETCH_OK':
+        if (isDraft23(this.version)) {
+          // draft-23 §9.3: a FETCH is answered with REQUEST_OK; 0x18 is reserved.
+          throw new ProtocolViolationError('Draft18Codec: draft 23 answers a FETCH with REQUEST_OK, not FETCH_OK');
+        }
         return this.frame(ControlMessageType18.FETCH_OK, this.encodeFetchOk(msg));
       case 'TRACK_STATUS':
         return this.frame(ControlMessageType18.TRACK_STATUS, this.encodeTrackStatus(msg));
@@ -416,7 +498,7 @@ export class Draft18Codec implements ControlCodec {
       case 'SUBSCRIBE_TRACKS':
         return this.frame(ControlMessageType18.SUBSCRIBE_TRACKS, this.encodeNamespacePrefixRequest(msg.requestId, msg.trackNamespacePrefix, msg.parameters));
       case 'NAMESPACE':
-        return this.frame(ControlMessageType18.NAMESPACE, encodeTuple(msg.trackNamespaceSuffix));
+        return this.frame(ControlMessageType18.NAMESPACE, this.encodeNamespace(msg));
       case 'NAMESPACE_DONE':
         return this.frame(ControlMessageType18.NAMESPACE_DONE, encodeTuple(msg.trackNamespaceSuffix));
       case 'PUBLISH_BLOCKED':
@@ -424,7 +506,7 @@ export class Draft18Codec implements ControlCodec {
       case 'GOAWAY':
         return this.frame(ControlMessageType18.GOAWAY, this.encodeGoaway(msg));
       case 'PUBLISH_STATE_NOTIFY':
-        if (this.version !== 22) {
+        if (!isDraft22(this.version)) {
           throw new ProtocolViolationError('Draft18Codec: PUBLISH_STATE_NOTIFY exists only in draft 22');
         }
         return this.frame(ControlMessageType18.PUBLISH_STATE_NOTIFY, this.encodeParamsOnly(msg.parameters));
@@ -438,79 +520,139 @@ export class Draft18Codec implements ControlCodec {
   }
 
   decode(buf: Uint8Array, offset: number): { message: DecodedControlMessage; bytesRead: number } {
-    const { value: type, bytesRead: typeBytes } = readVi64(buf, offset);
-    const lenOff = offset + typeBytes;
-    if (lenOff + 2 > buf.length) throw new ProtocolViolationError('draft-18 control frame: truncated length');
-    const payloadLen = (buf[lenOff]! << 8) | buf[lenOff + 1]!;
-    const payloadOff = lenOff + 2;
-    if (payloadOff + payloadLen > buf.length) throw new ProtocolViolationError('draft-18 control frame: truncated payload');
-    const payload = buf.subarray(payloadOff, payloadOff + payloadLen);
-    const total = typeBytes + 2 + payloadLen;
+    const header = this.readHeader(buf, offset);
+    if (header === undefined) {
+      throw new ProtocolViolationError('draft-18 control frame: truncated length', MALFORMED_MESSAGE);
+    }
+    if (header.payloadOff + header.payloadLen > buf.length) {
+      throw new ProtocolViolationError('draft-18 control frame: truncated payload', MALFORMED_MESSAGE);
+    }
+    const payload = buf.subarray(header.payloadOff, header.payloadOff + header.payloadLen);
+    const bytesRead = header.payloadOff + header.payloadLen - offset;
+    if (!isDraft23(this.version)) return { message: this.decodeBody(header.type, payload), bytesRead };
+    try {
+      return { message: this.decodeBody(header.type, payload), bytesRead };
+    } catch (err) {
+      // draft-23 §9: a body that does not parse, or does not fill the Length, is
+      // MALFORMED_MESSAGE unless a more specific code was already attached.
+      if (err instanceof ProtocolViolationError && err.code !== undefined) throw err;
+      if (err instanceof ProtocolViolationError || err instanceof RangeError) {
+        throw new ProtocolViolationError(err.message, MALFORMED_MESSAGE);
+      }
+      throw err;
+    }
+  }
 
+  private decodeBody(type: bigint, payload: Uint8Array): DecodedControlMessage {
     switch (Number(type)) {
       case ControlMessageType18.SETUP:
-        return { message: { type: 'SETUP', setupOptions: decodeSetupOptionMap18(payload) }, bytesRead: total };
+        return { type: 'SETUP', setupOptions: decodeSetupOptionMap18(payload) };
       case ControlMessageType18.SUBSCRIBE:
-        return { message: this.decodeSubscribe(payload), bytesRead: total };
+        return this.decodeSubscribe(payload);
       case ControlMessageType18.REQUEST_UPDATE:
-        return { message: this.decodeRequestUpdate(payload), bytesRead: total };
+        return this.decodeRequestUpdate(payload);
       case ControlMessageType18.SUBSCRIBE_OK:
-        return { message: this.decodeSubscribeOk(payload), bytesRead: total };
+        return this.decodeSubscribeOk(payload);
       case ControlMessageType18.REQUEST_OK:
-        return { message: this.decodeRequestOk(payload), bytesRead: total };
+        return this.decodeRequestOk(payload);
       case ControlMessageType18.REQUEST_ERROR:
-        return { message: this.decodeRequestError(payload), bytesRead: total };
+        return this.decodeRequestError(payload);
       case ControlMessageType18.FETCH:
-        return { message: this.version === 22 ? this.decodeFetch22(payload) : this.decodeFetch(payload), bytesRead: total };
+        return isDraft22(this.version) ? this.decodeFetch22(payload) : this.decodeFetch(payload);
       case ControlMessageType18.FETCH_OK:
-        return { message: this.decodeFetchOk(payload), bytesRead: total };
+        // draft-23 §9: 0x18 is reserved; a FETCH is answered with REQUEST_OK.
+        if (isDraft23(this.version)) return unexpectedMessage(type);
+        return this.decodeFetchOk(payload);
       case ControlMessageType18.TRACK_STATUS:
-        return { message: this.decodeTrackStatus(payload), bytesRead: total };
+        return this.decodeTrackStatus(payload);
       case ControlMessageType18.PUBLISH_NAMESPACE:
-        return { message: this.decodePublishNamespace(payload), bytesRead: total };
+        return this.decodePublishNamespace(payload);
       case ControlMessageType18.PUBLISH:
-        return { message: this.decodePublish(payload), bytesRead: total };
+        return this.decodePublish(payload);
       case ControlMessageType18.PUBLISH_DONE:
-        return { message: this.decodePublishDone(payload), bytesRead: total };
+        return this.decodePublishDone(payload);
       case ControlMessageType18.SUBSCRIBE_NAMESPACE:
-        return { message: this.decodeSubscribeNamespace(payload), bytesRead: total };
+        return this.decodeSubscribeNamespace(payload);
       case ControlMessageType18.SUBSCRIBE_TRACKS:
-        return { message: this.decodeSubscribeTracks(payload), bytesRead: total };
+        return this.decodeSubscribeTracks(payload);
       case ControlMessageType18.NAMESPACE:
-        return { message: this.decodeNamespaceSuffix('NAMESPACE', payload), bytesRead: total };
+        return isDraft23(this.version) ? this.decodeNamespace23(payload) : this.decodeNamespaceSuffix('NAMESPACE', payload);
       case ControlMessageType18.NAMESPACE_DONE:
-        return { message: this.decodeNamespaceSuffix('NAMESPACE_DONE', payload), bytesRead: total };
+        return this.decodeNamespaceSuffix('NAMESPACE_DONE', payload);
       case ControlMessageType18.PUBLISH_BLOCKED:
-        return { message: this.decodePublishBlocked(payload), bytesRead: total };
+        return this.decodePublishBlocked(payload);
       case ControlMessageType18.GOAWAY:
-        return { message: this.decodeGoaway(payload), bytesRead: total };
+        return this.decodeGoaway(payload);
       case ControlMessageType18.PUBLISH_STATE_NOTIFY:
-        if (this.version !== 22) return notImplemented(`decode of type 0x${type.toString(16)}`);
-        return {
-          message: { type: 'PUBLISH_STATE_NOTIFY', parameters: this.decodeParamsOnly(payload, 'PUBLISH_STATE_NOTIFY') },
-          bytesRead: total,
-        };
+        if (!isDraft22(this.version)) return this.unknownMessage(type);
+        return { type: 'PUBLISH_STATE_NOTIFY', parameters: this.decodeParamsOnly(payload, 'PUBLISH_STATE_NOTIFY') };
       default:
-        return notImplemented(`decode of type 0x${type.toString(16)}`);
+        return this.unknownMessage(type);
     }
+  }
+
+  /** An unknown message type: UNEXPECTED_MESSAGE on draft 23 (§9). */
+  private unknownMessage(type: bigint): never {
+    if (isDraft23(this.version)) return unexpectedMessage(type);
+    return notImplemented(`decode of type 0x${type.toString(16)}`);
   }
 
   peekFrameSize(buf: Uint8Array): number | undefined {
-    let type: { bytesRead: number };
-    try {
-      type = readVi64(buf, 0);
-    } catch {
-      return undefined; // not enough bytes for the type vi64 yet
-    }
-    const headerLen = type.bytesRead + 2;
-    if (buf.length < headerLen) return undefined;
-    const payloadLen = (buf[type.bytesRead]! << 8) | buf[type.bytesRead + 1]!;
-    return headerLen + payloadLen;
+    const header = this.readHeader(buf, 0);
+    return header === undefined ? undefined : header.payloadOff + header.payloadLen;
   }
 
   // ── framing ──────────────────────────────────────────────────────
+  // Type (vi64) + Length + Payload. The Length is 16 bits through draft 22 and
+  // a vi64 from draft 23 (§9), bounded by MAX_CONTROL_MESSAGE_SIZE.
+
+  /**
+   * Read a frame header at `offset`, or `undefined` if its bytes have not all
+   * arrived. The payload itself may still be incomplete.
+   * @throws {ProtocolViolationError} FIELD_LENGTH_EXCEEDED for a draft-23 Length
+   *   above our MAX_CONTROL_MESSAGE_SIZE, before any of the payload is buffered.
+   */
+  private readHeader(buf: Uint8Array, offset: number): { type: bigint; payloadOff: number; payloadLen: number } | undefined {
+    let type: { value: bigint; bytesRead: number };
+    try {
+      type = readVi64(buf, offset);
+    } catch {
+      return undefined; // not enough bytes for the type vi64 yet
+    }
+    const lenOff = offset + type.bytesRead;
+    if (!isDraft23(this.version)) {
+      if (lenOff + 2 > buf.length) return undefined;
+      return { type: type.value, payloadOff: lenOff + 2, payloadLen: (buf[lenOff]! << 8) | buf[lenOff + 1]! };
+    }
+    let len: { value: bigint; bytesRead: number };
+    try {
+      len = readVi64(buf, lenOff);
+    } catch {
+      return undefined;
+    }
+    if (len.value > BigInt(MAX_CONTROL_MESSAGE_SIZE)) {
+      throw new ProtocolViolationError(
+        `control message Length ${len.value} exceeds MAX_CONTROL_MESSAGE_SIZE ${MAX_CONTROL_MESSAGE_SIZE}`,
+        Number(SessionError.FIELD_LENGTH_EXCEEDED),
+      );
+    }
+    return { type: type.value, payloadOff: lenOff + len.bytesRead, payloadLen: Number(len.value) };
+  }
 
   private frame(type: number, payload: Uint8Array): Uint8Array {
+    if (isDraft23(this.version)) {
+      // §9: never send more than the peer's MAX_CONTROL_MESSAGE_SIZE. We never
+      // need more than the default, which every peer must accept (§9.1.8).
+      if (payload.length > MAX_CONTROL_MESSAGE_SIZE) {
+        throw new ProtocolViolationError(`draft-23 control payload exceeds MAX_CONTROL_MESSAGE_SIZE ${MAX_CONTROL_MESSAGE_SIZE}`);
+      }
+      const length = BigInt(payload.length);
+      const out = new Uint8Array(vi64EncodingLength(BigInt(type)) + vi64EncodingLength(length) + payload.length);
+      let p = writeVi64(BigInt(type), out, 0);
+      p += writeVi64(length, out, p);
+      out.set(payload, p);
+      return out;
+    }
     if (payload.length > 0xffff) throw new ProtocolViolationError('draft-18 control payload exceeds 2^16-1');
     const out = new Uint8Array(vi64EncodingLength(BigInt(type)) + 2 + payload.length);
     let p = writeVi64(BigInt(type), out, 0);
@@ -524,7 +666,7 @@ export class Draft18Codec implements ControlCodec {
 
   private encodeSubscribe(msg: Subscribe): Uint8Array {
     // §2.4.1: Track Namespace (0-32 non-empty fields) + Full Track Name ≤ 4096 bytes.
-    validateFullTrackName(msg.trackNamespace, msg.trackName, { allowEmptyNamespace: true });
+    validateFullTrackName(msg.trackNamespace, msg.trackName, this.fullTrackNameRules);
     const typed = paramsToTyped(msg.parameters, this.paramRegistry);
     const len =
       vi64EncodingLength(msg.requestId) +
@@ -551,7 +693,7 @@ export class Draft18Codec implements ControlCodec {
       throw new ProtocolViolationError('SUBSCRIBE: unexpected trailing bytes after parameters');
     }
     // §2.4.1: validate Track Namespace (0-32 non-empty fields) + Full Track Name ≤ 4096.
-    validateFullTrackName(ns.value, name.value, { allowEmptyNamespace: true });
+    validateFullTrackName(ns.value, name.value, this.fullTrackNameRules);
     return {
       type: 'SUBSCRIBE',
       requestId: rid.value,
@@ -567,7 +709,7 @@ export class Draft18Codec implements ControlCodec {
 
   private encodeTrackStatus(msg: TrackStatus): Uint8Array {
     // §2.4.1: Track Namespace (0-32 non-empty fields) + Full Track Name ≤ 4096 bytes.
-    validateFullTrackName(msg.trackNamespace, msg.trackName, { allowEmptyNamespace: true });
+    validateFullTrackName(msg.trackNamespace, msg.trackName, this.fullTrackNameRules);
     const typed = paramsToTyped(msg.parameters, this.paramRegistry);
     const len =
       vi64EncodingLength(msg.requestId) +
@@ -593,7 +735,7 @@ export class Draft18Codec implements ControlCodec {
       throw new ProtocolViolationError('TRACK_STATUS: unexpected trailing bytes after parameters');
     }
     // §2.4.1: validate Track Namespace (0-32 non-empty fields) + Full Track Name ≤ 4096.
-    validateFullTrackName(ns.value, name.value, { allowEmptyNamespace: true });
+    validateFullTrackName(ns.value, name.value, this.fullTrackNameRules);
     return {
       type: 'TRACK_STATUS',
       requestId: rid.value,
@@ -650,7 +792,7 @@ export class Draft18Codec implements ControlCodec {
 
   private encodePublish(msg: Publish): Uint8Array {
     // §2.4.1: Track Namespace (0-32 non-empty fields) + Full Track Name ≤ 4096 bytes.
-    validateFullTrackName(msg.trackNamespace, msg.trackName, { allowEmptyNamespace: true });
+    validateFullTrackName(msg.trackNamespace, msg.trackName, this.fullTrackNameRules);
     const typed = paramsToTyped(msg.parameters, this.paramRegistry);
     const len =
       vi64EncodingLength(msg.requestId) +
@@ -681,7 +823,7 @@ export class Draft18Codec implements ControlCodec {
     const props = decodeTrackProperties18(payload, p); // remaining bytes (empty → {})
     p += props.bytesRead;
     // §2.4.1: validate Track Namespace (0-32 non-empty fields) + Full Track Name ≤ 4096.
-    validateFullTrackName(ns.value, name.value, { allowEmptyNamespace: true });
+    validateFullTrackName(ns.value, name.value, this.fullTrackNameRules);
     return {
       type: 'PUBLISH',
       requestId: rid.value,
@@ -813,7 +955,7 @@ export class Draft18Codec implements ControlCodec {
     }
     const timeout = msg.timeout ?? 0n;
     // draft-22 §9.2 dropped the Request ID.
-    const requestId = this.version === 22 ? undefined : msg.requestId;
+    const requestId = isDraft22(this.version) ? undefined : msg.requestId;
     let len = vi64BytesLength(uri) + vi64EncodingLength(timeout);
     if (requestId !== undefined) len += vi64EncodingLength(requestId);
     const buf = new Uint8Array(len);
@@ -833,12 +975,12 @@ export class Draft18Codec implements ControlCodec {
     // Request ID is present only on the control stream (§10.4). The codec is
     // context-free: read it iff bytes remain, and expose it optionally.
     let requestId: bigint | undefined;
-    if (p < payload.length && this.version !== 22) {
+    if (p < payload.length && !isDraft22(this.version)) {
       const rid = readVi64(payload, p); p += rid.bytesRead;
       requestId = rid.value;
     }
     if (p !== payload.length) {
-      throw new ProtocolViolationError(this.version === 22
+      throw new ProtocolViolationError(isDraft22(this.version)
         ? `GOAWAY: ${payload.length - p} trailing bytes after Timeout`
         : `GOAWAY: ${payload.length - p} trailing bytes after Request ID`);
     }
@@ -862,6 +1004,26 @@ export class Draft18Codec implements ControlCodec {
       throw new ProtocolViolationError(`${type}: unexpected trailing bytes after namespace suffix`);
     }
     return { type, trackNamespaceSuffix: suffix.value } as Namespace | NamespaceDone;
+  }
+
+  /** NAMESPACE: the suffix, then (draft 23, §9.15) a Parameters block. */
+  private encodeNamespace(msg: Namespace): Uint8Array {
+    const suffix = encodeTuple(msg.trackNamespaceSuffix);
+    if (!isDraft23(this.version)) return suffix;
+    const params = encodeMessageParams18(paramsToTyped(msg.parameters ?? new Map(), this.paramRegistry), this.paramRegistry);
+    const buf = new Uint8Array(suffix.length + params.length);
+    buf.set(suffix, 0);
+    buf.set(params, suffix.length);
+    return buf;
+  }
+
+  private decodeNamespace23(payload: Uint8Array): DecodedControlMessage {
+    const suffix = readVi64Tuple(payload, 0);
+    const params = decodeMessageParams18(payload, suffix.bytesRead, this.paramRegistry);
+    if (suffix.bytesRead + params.bytesRead !== payload.length) {
+      throw new ProtocolViolationError('NAMESPACE: unexpected trailing bytes after Parameters');
+    }
+    return { type: 'NAMESPACE', trackNamespaceSuffix: suffix.value, parameters: typedToParams(params.params) };
   }
 
   // ── REQUEST_UPDATE (request, §10.9) ─────────────────────────────────
@@ -949,6 +1111,7 @@ export class Draft18Codec implements ControlCodec {
   // ── REQUEST_ERROR (response, §10.6 — no Request ID) ────────────────
 
   private encodeRequestError(msg: RequestErrorMsg): Uint8Array {
+    if (isDraft23(this.version)) return this.encodeRequestError23(msg);
     // §10.6.2: Error Code and Retry Interval are vi64 (full uint64, NOT QUIC-capped).
     // §10.6.2: a Redirect is present iff the Error Code is REDIRECT (0x34).
     const isRedirect = msg.errorCode === REDIRECT_ERROR_CODE;
@@ -989,6 +1152,7 @@ export class Draft18Codec implements ControlCodec {
     const ec = readVi64(payload, p); p += ec.bytesRead;
     const ri = readVi64(payload, p); p += ri.bytesRead;
     const reason = readReasonPhrase18(payload, p); p += reason.bytesRead;
+    if (isDraft23(this.version)) return this.decodeRequestError23(ec.value, ri.value, reason.value, payload, p);
 
     // §10.6.2: the optional Redirect is present iff Error Code is REDIRECT (0x34).
     // A truncated Redirect throws via the vi64 helpers; other contexts are decided
@@ -1019,6 +1183,86 @@ export class Draft18Codec implements ControlCodec {
     };
   }
 
+  // draft-23 §9.4.2: Error Details are Key-Value-Pairs to the end of the
+  // message. REDIRECT (0x01) holds draft 22's Redirect fields;
+  // UNSUPPORTED_PROPERTY (0x02) a Property Type, and may repeat.
+
+  private encodeRequestError23(msg: RequestErrorMsg): Uint8Array {
+    const isRedirect = msg.errorCode === REDIRECT_ERROR_CODE;
+    if (msg.redirect && !isRedirect) {
+      throw new ProtocolViolationError('REQUEST_ERROR carries a Redirect but Error Code is not REDIRECT (0x34)');
+    }
+    if (isRedirect && !msg.redirect) {
+      throw new ProtocolViolationError('REQUEST_ERROR with Error Code REDIRECT (0x34) requires a REDIRECT Error Detail');
+    }
+    const details: SetupOptionMap = new Map();
+    for (const [type, values] of msg.errorDetails ?? []) {
+      if (type !== ERROR_DETAIL_REDIRECT && type !== ERROR_DETAIL_UNSUPPORTED_PROPERTY) details.set(type, [...values]);
+    }
+    if (msg.redirect) {
+      validateTrackNamespacePrefix(msg.redirect.trackNamespace);
+      const r = msg.redirect;
+      const bytes = new Uint8Array(vi64BytesLength(r.connectUri) + vi64TupleLength(r.trackNamespace) + vi64BytesLength(r.trackName));
+      let q = writeVi64Bytes(r.connectUri, bytes, 0);
+      q += writeVi64Tuple(r.trackNamespace, bytes, q);
+      writeVi64Bytes(r.trackName, bytes, q);
+      details.set(ERROR_DETAIL_REDIRECT, [bytes]);
+    }
+    if (msg.unsupportedProperties && msg.unsupportedProperties.length > 0) {
+      details.set(ERROR_DETAIL_UNSUPPORTED_PROPERTY, [...msg.unsupportedProperties]);
+    }
+    const detailBytes = encodeKvps18(details, ERROR_DETAIL_SINGLETONS, 'Error Detail');
+    const buf = new Uint8Array(
+      vi64EncodingLength(msg.errorCode) + vi64EncodingLength(msg.retryInterval)
+        + reasonPhrase18Length(msg.errorReason) + detailBytes.length,
+    );
+    let p = writeVi64(msg.errorCode, buf, 0);
+    p += writeVi64(msg.retryInterval, buf, p);
+    p += writeReasonPhrase18(msg.errorReason, buf, p);
+    buf.set(detailBytes, p);
+    return buf;
+  }
+
+  private decodeRequestError23(
+    errorCode: bigint,
+    retryInterval: bigint,
+    errorReason: string,
+    payload: Uint8Array,
+    offset: number,
+  ): DecodedControlMessage {
+    const details = decodeSetupOptionMap18(payload, offset);
+    // Known details on an Error Code they are not defined for are ignored.
+    let redirect: Redirect | undefined;
+    if (errorCode === REDIRECT_ERROR_CODE) {
+      const values = details.get(ERROR_DETAIL_REDIRECT);
+      if (!values || values.length !== 1) {
+        throw new ProtocolViolationError('REQUEST_ERROR REDIRECT needs exactly one REDIRECT Error Detail', MALFORMED_MESSAGE);
+      }
+      const bytes = values[0] as Uint8Array;
+      let p = 0;
+      const uri = readVi64Bytes(bytes, p); p += uri.bytesRead;
+      const ns = readVi64Tuple(bytes, p); p += ns.bytesRead;
+      const name = readVi64Bytes(bytes, p); p += name.bytesRead;
+      if (p !== bytes.length) {
+        throw new ProtocolViolationError('REDIRECT Error Detail: unexpected trailing bytes after Track Name', MALFORMED_MESSAGE);
+      }
+      validateTrackNamespacePrefix(ns.value);
+      redirect = { connectUri: uri.value, trackNamespace: ns.value, trackName: name.value };
+    }
+    const unsupported = errorCode === UNSUPPORTED_EXTENSION_ERROR_CODE
+      ? details.get(ERROR_DETAIL_UNSUPPORTED_PROPERTY) as bigint[] | undefined
+      : undefined;
+    return {
+      type: 'REQUEST_ERROR',
+      errorCode,
+      retryInterval,
+      errorReason,
+      ...(redirect ? { redirect } : {}),
+      ...(unsupported ? { unsupportedProperties: unsupported } : {}),
+      ...(details.size > 0 ? { errorDetails: details } : {}),
+    };
+  }
+
   // ── FETCH (request, §10.12) ─────────────────────────────────────────
   // First message on a new bidi request stream. Keeps its Request ID. The
   // Standalone body uses vi64 Location fields (full uint64, no QUIC cap).
@@ -1030,7 +1274,7 @@ export class Draft18Codec implements ControlCodec {
     if (f.fetchType === 0x1) {
       // §2.4.1: a standalone FETCH carries a Full Track Name (≤ 4096 bytes, 0-32
       // non-empty namespace fields). Joining fetches carry no name.
-      validateFullTrackName(f.trackNamespace, f.trackName, { allowEmptyNamespace: true });
+      validateFullTrackName(f.trackNamespace, f.trackName, this.fullTrackNameRules);
       bodyLen =
         vi64TupleLength(f.trackNamespace) +
         vi64BytesLength(f.trackName) +
@@ -1075,7 +1319,7 @@ export class Draft18Codec implements ControlCodec {
       const end = readVi64Location(payload, p); p += end.bytesRead;
       // §2.4.1: a standalone FETCH carries a Full Track Name (≤ 4096 bytes, 0-32
       // non-empty namespace fields).
-      validateFullTrackName(ns.value, name.value, { allowEmptyNamespace: true });
+      validateFullTrackName(ns.value, name.value, this.fullTrackNameRules);
       fetch = {
         fetchType: 0x1,
         trackNamespace: ns.value,
@@ -1112,7 +1356,7 @@ export class Draft18Codec implements ControlCodec {
     if (f.fetchType !== 0x1) {
       throw new ProtocolViolationError('draft-22 has no Joining FETCH; request the prefix with FILL_PARAMETERS');
     }
-    validateFullTrackName(f.trackNamespace, f.trackName, { allowEmptyNamespace: true });
+    validateFullTrackName(f.trackNamespace, f.trackName, this.fullTrackNameRules);
     const parameters = new Map(msg.parameters);
     if (!parameters.has(LOCATION_FILTER_TYPE)) {
       const { startLocation: start, endLocation: end } = f;
@@ -1150,7 +1394,7 @@ export class Draft18Codec implements ControlCodec {
     const rid = readVi64(payload, p); p += rid.bytesRead;
     const ns = readVi64Tuple(payload, p); p += ns.bytesRead;
     const name = readVi64Bytes(payload, p); p += name.bytesRead;
-    validateFullTrackName(ns.value, name.value, { allowEmptyNamespace: true });
+    validateFullTrackName(ns.value, name.value, this.fullTrackNameRules);
     const params = decodeMessageParams18(payload, p, this.paramRegistry);
     p += params.bytesRead;
     if (p !== payload.length) {

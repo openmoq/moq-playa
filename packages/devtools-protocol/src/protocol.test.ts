@@ -65,7 +65,7 @@ describe('DevTools diagnostic boundary', () => {
       .toMatchObject({ ok: true, message: { facts: [{ fact: { negotiatedProtocol: null, offeredProtocols: ['moqt-18'] } }] } });
   });
 
-  it.each([18, 22])('does not accept a MAX_REQUEST_ID value on draft %s', (draft) => {
+  it.each([18, 22, 23])('does not accept a MAX_REQUEST_ID value on draft %s', (draft) => {
     const first = snapshotFixture.facts[0];
     expect(decodeMessage(wire({ ...snapshotFixture, facts: [{ ...first,
       fact: { ...first.fact, draft, maxRequestId: { value: '100', unavailable: null } } }] })).ok).toBe(false);

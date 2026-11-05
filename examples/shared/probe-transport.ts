@@ -4,7 +4,8 @@
  * Acceptance behavior deliberately MIRRORS the shared factory in
  * packages/browser/src/webtransport-factory.ts — same cert-hash pinning,
  * same WT-Available-Protocols offer (`moqt-<v>` for v ≥ 15, `moqt-16` by
- * default, none for draft 14), same strict-UA retry without protocols — so
+ * default, none for draft 14), same strict-UA retry without protocols for
+ * drafts 16 and 18 only — so
  * probes and real connections apply the same compatibility rules.
  * The duplication is intentional: discovery is an example convenience, and
  * the published package must not grow abort/probe API for it (this pointer
@@ -15,12 +16,15 @@
  * still connecting, which aborts the handshake and rejects `ready`.
  */
 
+/** The factory's default draft, offered when the probe names none. */
+const DEFAULT_DRAFT_VERSION = 16;
+
 /** Options for one probe. */
 export interface ProbeOptions {
   /** SHA-256 certificate hash for self-signed relays. */
   readonly certHash?: ArrayBuffer;
   /** MOQT draft version, controlling the WT protocols offer. */
-  readonly draftVersion?: 14 | 16 | 18 | 22;
+  readonly draftVersion?: 14 | 16 | 18 | 22 | 23;
   /** Abort the handshake: closes the connecting transport, rejects with `signal.reason`. */
   readonly signal?: AbortSignal;
 }
@@ -37,11 +41,8 @@ function buildOptions(options: ProbeOptions | undefined, withProtocols: boolean)
   }
   if (!withProtocols) return opts;
   // Mirror of the factory's offer policy (see module doc comment).
-  if (options?.draftVersion && options.draftVersion >= 15) {
-    opts.protocols = [`moqt-${options.draftVersion}`];
-  } else if (!options?.draftVersion) {
-    opts.protocols = ['moqt-16'];
-  }
+  const draftVersion = options?.draftVersion ?? DEFAULT_DRAFT_VERSION;
+  if (draftVersion >= 15) opts.protocols = [`moqt-${draftVersion}`];
   // draft 14: no protocols — h3 ALPN with in-band CLIENT_SETUP negotiation.
   return opts;
 }
@@ -119,9 +120,9 @@ export async function probeTransport(url: string, options?: ProbeOptions): Promi
   } catch (err) {
     // An abort must never be misread as a protocol-negotiation failure.
     if (signal?.aborted) throw signal.reason;
-    if (!offersProtocols || options?.draftVersion === 22) throw err;
-    // Older-draft compatibility retry, matching the shared factory. Draft 22
-    // requires WT protocol negotiation (6.2.1), so never retry it bare.
+    if (!offersProtocols || (options?.draftVersion ?? DEFAULT_DRAFT_VERSION) >= 22) throw err;
+    // Older-draft compatibility retry, matching the shared factory. Drafts 22
+    // and 23 require WT protocol negotiation (6.2.1), so never retry it bare.
     try {
       transport = await attempt(url, options, false);
     } catch (retryErr) {
@@ -132,9 +133,11 @@ export async function probeTransport(url: string, options?: ProbeOptions): Promi
     }
   }
 
-  if (options?.draftVersion === 22 && transport.protocol !== 'moqt-22') {
+  const draftVersion = options?.draftVersion ?? DEFAULT_DRAFT_VERSION;
+  const required = draftVersion >= 22 ? draftVersion : undefined;
+  if (required !== undefined && transport.protocol !== `moqt-${required}`) {
     safeClose(transport);
-    throw new Error('WebTransport did not negotiate moqt-22 (draft-22 section 6.2.1)');
+    throw new Error(`WebTransport did not negotiate moqt-${required} (draft-${required} section 6.2.1)`);
   }
   let closed = false;
   return {

@@ -95,11 +95,22 @@ export interface FetchObject {
 }
 
 /**
+ * What an End of Range says about the objects it covers.
+ * - `non-existent` (0x8C): they do not exist.
+ * - `unknown` (0x10C): their status is unknown.
+ * - `timed-out` (0x20C, draft 22+): their delivery timeout expired.
+ * - `gone` (0x40C, draft 23): the original publisher cannot deliver them and
+ *   does not know whether they exist (§2.1.2). Like `unknown`, never a reason
+ *   to infer non-existence.
+ */
+export type FetchRangeKind = 'non-existent' | 'unknown' | 'timed-out' | 'gone';
+
+/**
  * Special fetch marker indicating a range of non-existent objects.
  * @see draft-ietf-moq-transport-16 §10.4.4
  */
 export interface FetchEndOfRange {
-  /** The special flags value (0x8C or 0x10C). */
+  /** The special flags value (0x8C, 0x10C, 0x20C or 0x40C). */
   readonly flags: Varint;
   /** Group ID of the range end. */
   readonly groupId: bigint;
@@ -107,6 +118,8 @@ export interface FetchEndOfRange {
   readonly objectId: bigint;
   /** Whether objects are known to not exist (true) or status unknown (false). */
   readonly nonExistent: boolean;
+  /** The range's kind; set by the draft-18 and later decoders. */
+  readonly kind?: FetchRangeKind;
   /**
    * Raw Object Status code from the wire.
    * Present in draft-14 fetch status objects to preserve exact status semantics
@@ -114,6 +127,18 @@ export interface FetchEndOfRange {
    * @see draft-ietf-moq-transport-14 §10.4.4
    */
   readonly rawStatus?: Varint;
+}
+
+/**
+ * draft-23 §11.4.2.2: End of Group (0x80) or End of Track (0x81) on a FETCH
+ * stream. Neither carries fields; `groupId` / `objectId` locate the prior
+ * Object, the last in its Group (or, for End of Track, in the Track).
+ */
+export interface FetchEndMarker {
+  readonly flags: Varint;
+  readonly marker: 'end-of-group' | 'end-of-track';
+  readonly groupId: bigint;
+  readonly objectId: bigint;
 }
 
 /**

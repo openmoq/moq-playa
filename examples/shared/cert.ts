@@ -62,13 +62,14 @@ export const catalogBootstrap: 'auto' | 'joining-fetch' | 'strict' | 'subscribe'
   return v === 'auto' || v === 'joining-fetch' || v === 'strict' || v === 'subscribe' ? v : undefined;
 })();
 
-/** Draft version override (e.g. ?v=14 for draft-14 relays, ?v=18 for draft-18, ?v=22 for draft-22). */
-export const draftVersion: 14 | 16 | 18 | 22 | undefined = (() => {
+/** Draft version override (e.g. ?v=14 for draft-14 relays, ?v=18 for draft-18, ?v=22 for draft-22, ?v=23 for draft-23). */
+export const draftVersion: 14 | 16 | 18 | 22 | 23 | undefined = (() => {
   const v = params.get('v');
   if (v === '14') return 14;
   if (v === '16') return 16;
   if (v === '18') return 18;
   if (v === '22') return 22;
+  if (v === '23') return 23;
   return undefined;
 })();
 

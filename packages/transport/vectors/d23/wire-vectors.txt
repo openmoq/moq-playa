@@ -1,0 +1,51 @@
+# Draft-23 (draft-ietf-moq-transport-23, ALPN moqt-23) wire vectors.
+# Format: <name> <kind> <source> <hex>
+#   kind:   control   = one framed control message {Type vi64, Length vi64, Body}
+#           parameter = one message parameter {Type, Length, Value}
+#           stream    = entries of a FETCH stream after its FETCH_HEADER, or the start of a data stream
+#   source: converted-from-d22 = a draft-22 vector (../d22/wire-vectors.txt) decoded by Playa's draft-22
+#                                codec and re-encoded by its draft-23 codec: the Length becomes a vi64,
+#                                FORWARD becomes PAUSED (inverted) and FILL_PARAMETERS is counted
+#           unchanged-from-d22 = a draft-22 vector whose bytes draft 23 leaves as they are
+#           draft-text         = hand-built from docs/specs/draft-ietf-moq-transport-23.txt
+# These vectors come from one implementation only. They pin Playa's encoding; they are not
+# interoperability evidence until another draft-23 implementation decodes them.
+# FETCH_OK (0x18) is reserved on draft 23, so the draft-22 fetch_ok vector has no counterpart.
+client_setup control converted-from-d22 af001901042f6d6f71041172656c61792e6578616d706c652e636f6d
+publish_namespace control converted-from-d22 06080001046c69766500
+publish control converted-from-d22 1d0f0201046c69766505766964656f0100
+subscribe_ok_no_largest control converted-from-d22 04020100
+subscribe_ok_largest_3_7 control converted-from-d22 04050101090307
+request_update_ok_largest_3_7 control converted-from-d22 070401090307
+publish_done_track_ended_unknown_count control converted-from-d22 0b0f02ffffffffffffffffff04646f6e65
+fetch_header_fill_req_95 stream unchanged-from-d22 055f
+subgroup_header_alias1_g3_sg0 stream unchanged-from-d22 300103
+server_setup_filter_ranges_16_request_updates_4 control converted-from-d22 af000406100204
+subscribe_location_filter_empty control converted-from-d22 03100901046c69766505766964656f012100
+subscribe_location_filter_next_group control converted-from-d22 03110901046c69766505766964656f01210100
+subscribe_location_filter_relative_3 control converted-from-d22 03110901046c69766505766964656f01210103
+subscribe_location_filter_next_object control converted-from-d22 03100901046c69766505766964656f012105
+subscribe_location_filter_start_12_5 control converted-from-d22 03120901046c69766505766964656f0121020c05
+subscribe_location_filter_range_12_5_delta_3 control converted-from-d22 03130901046c69766505766964656f0121030c0503
+subscribe_location_filter_range_12_5_delta_3_end_object_7 control converted-from-d22 03140901046c69766505766964656f0121040c050307
+subscribe_join_current_group_with_fill_include_properties_0 control converted-from-d22 03170901046c69766505766964656f03210502012101011200
+subscribe_tracks_next_object_group_order_descending control converted-from-d22 510c5d01046c6976650221050102
+request_update_fill_whole_track control converted-from-d22 02045f012300
+publish_ok_expires_30000 control converted-from-d22 07050108c07530
+fetch_range_12_5_to_15_9 control converted-from-d22 16140701046c69766505766964656f0121040c050309
+goaway_no_uri_timeout_5000 control converted-from-d22 1003009388
+publish_state_notify_largest_3_7_paused_1 control converted-from-d22 2206020903070801
+publish_skipped_cam2_video control converted-from-d22 0f0c010463616d3205766964656f
+param_subgroup_filter_set0_3to5_10to15 parameter unchanged-from-d22 25050003020505
+param_object_property_filter_set1_prop16_from100 parameter unchanged-from-d22 2803011064
+fetch_object_end_of_timed_out_range_g2_o4 stream unchanged-from-d22 820c0204
+namespace_suffix_a_no_params control draft-text 080401016100
+request_error_redirect_empty_uri_namespace_and_name control draft-text 05083400000103000000
+request_error_unsupported_extension_props_3e_10 control draft-text 0507330000023e0010
+setup_max_control_message_size_70000 control draft-text af00050903c11170
+request_ok_fetch_largest_6_1 control draft-text 070401090601
+fetch_objects_g1_o0_o3_o4 stream draft-text 1f0100008001aa1700018001aa13008001aa
+fetch_end_of_unknown_range_first_g2_o5 stream draft-text 810c0205
+fetch_object_g2_o3_then_end_of_non_existent_range_g2_o7 stream draft-text 1f0200038001aa808c0003
+fetch_object_g2_o3_then_end_of_gone_range_g5_o1 stream draft-text 1f0200038001aa840c0301
+fetch_object_g1_o0_end_of_group_object_g2_o0_end_of_track stream draft-text 1f0100008001aa80801f0000008001aa8081

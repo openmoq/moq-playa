@@ -73,6 +73,15 @@ export const SetupOption22 = {
 } as const;
 
 /**
+ * draft-23 Setup Options: draft 22's plus MAX_CONTROL_MESSAGE_SIZE (§9.1.8). The
+ * type is odd, so its value is length-prefixed bytes holding a vi64.
+ */
+export const SetupOption23 = {
+  ...SetupOption22,
+  MAX_CONTROL_MESSAGE_SIZE: 0x09,
+} as const;
+
+/**
  * Value-encoding kind for a draft-18 message parameter (§10.2).
  * `namespace` is a Track Namespace structure (§2.4.1): a vi64 field count
  * followed by that many vi64-length-prefixed fields (used by TRACK_NAMESPACE_PREFIX).
@@ -81,7 +90,11 @@ export const SetupOption22 = {
  * `locationFilter` is draft 22's LOCATION_FILTER (§9.20.9): a Location Filter
  * Type followed by the 0-4 vi64 fields it selects, with no Length.
  */
-export type ParamValueKind = 'uint8' | 'varint' | 'location' | 'bytes' | 'namespace' | 'locationFilter';
+/**
+ * `paramBlock` is draft 23's FILL_PARAMETERS (§9.19.15): a vi64 Number of
+ * Parameters followed by that many Message Parameters, with no Length.
+ */
+export type ParamValueKind = 'uint8' | 'varint' | 'location' | 'bytes' | 'namespace' | 'locationFilter' | 'paramBlock';
 
 /**
  * draft-18 Message Parameter codes + their value encodings (§10.2 registry).
@@ -132,6 +145,44 @@ export const MessageParam22: Record<string, { type: number; kind: ParamValueKind
   NEW_GROUP_REQUEST: { type: 0x32, kind: 'varint' },
   TRACK_NAMESPACE_PREFIX: { type: 0x34, kind: 'namespace' },
   INCLUDE_PROPERTIES: { type: 0x35, kind: 'uint8' },
+} as const;
+
+/**
+ * draft-23 Message Parameter codes + value encodings (§9.19, Table 7). Draft
+ * 22's table with FORWARD (0x10) replaced by PAUSED (0x11, value inverted),
+ * FILL_PARAMETERS counted rather than length-prefixed, and SUBSCRIBE_TRACKS_ID
+ * (0x36) added.
+ */
+export const MessageParam23: Record<string, { type: number; kind: ParamValueKind }> = {
+  OBJECT_DELIVERY_TIMEOUT: { type: 0x02, kind: 'varint' },
+  AUTHORIZATION_TOKEN: { type: 0x03, kind: 'bytes' },
+  RENDEZVOUS_TIMEOUT: { type: 0x04, kind: 'varint' },
+  SUBGROUP_DELIVERY_TIMEOUT: { type: 0x06, kind: 'varint' },
+  EXPIRES: { type: 0x08, kind: 'varint' },
+  LARGEST_OBJECT: { type: 0x09, kind: 'location' },
+  FILL_TIMEOUT: { type: 0x0a, kind: 'varint' },
+  PAUSED: { type: 0x11, kind: 'uint8' },
+  SUBSCRIBER_PRIORITY: { type: 0x20, kind: 'uint8' },
+  LOCATION_FILTER: { type: 0x21, kind: 'locationFilter' },
+  GROUP_ORDER: { type: 0x22, kind: 'uint8' },
+  FILL_PARAMETERS: { type: 0x23, kind: 'paramBlock' },
+  SUBGROUP_FILTER: { type: 0x25, kind: 'bytes' },
+  OBJECTID_FILTER: { type: 0x26, kind: 'bytes' },
+  PRIORITY_FILTER: { type: 0x27, kind: 'bytes' },
+  OBJECT_PROPERTY_FILTER: { type: 0x28, kind: 'bytes' },
+  TRACK_PROPERTY_FILTER: { type: 0x29, kind: 'bytes' },
+  NEW_GROUP_REQUEST: { type: 0x32, kind: 'varint' },
+  TRACK_NAMESPACE_PREFIX: { type: 0x34, kind: 'namespace' },
+  INCLUDE_PROPERTIES: { type: 0x35, kind: 'uint8' },
+  SUBSCRIBE_TRACKS_ID: { type: 0x36, kind: 'varint' },
+} as const;
+
+/** draft-23 Error Detail Types in REQUEST_ERROR (§9.4.2, §16.11). */
+export const ErrorDetail23 = {
+  /** Odd: length-prefixed bytes holding the Redirect fields (§9.4.2.1). */
+  REDIRECT: 0x01,
+  /** Even: the vi64 Type of a Mandatory Track Property not understood (§9.4.2.2). */
+  UNSUPPORTED_PROPERTY: 0x02,
 } as const;
 
 /** Property type ranges (§2.5, §12). Properties are carried by control messages

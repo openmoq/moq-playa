@@ -9,7 +9,7 @@ import { createDataCodec } from './data/data-codec.js';
 import { getRequestPolicy } from './session/request-policy.js';
 
 describe('getProtocolProfile', () => {
-  for (const version of [14, 16, 18, 22] as const) {
+  for (const version of [14, 16, 18, 22, 23] as const) {
     it(`bundles control + data + policy for draft-${version}`, () => {
       const profile = getProtocolProfile(version);
       expect(profile.version).toBe(version);

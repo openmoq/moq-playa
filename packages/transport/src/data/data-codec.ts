@@ -16,7 +16,7 @@
  */
 
 import type { DraftVersion } from '../versions.js';
-import { isWiredDraft } from '../versions.js';
+import { DEFAULT_DRAFT_VERSION, isWiredDraft } from '../versions.js';
 import { createDataCodec18 } from './data-codec-18.js';
 import {
   decodeSubgroupHeader,
@@ -111,12 +111,12 @@ export interface DataCodec {
 
 /**
  * Create a {@link DataCodec} for the given draft version.
- * @param version Draft version (default: 16). Drafts 14, 16, and 18 are wired
- *   (draft-18 covers subgroup + datagram decode; fetch decode is pending).
+ * @param version Draft version (default: {@link DEFAULT_DRAFT_VERSION}).
+ *   Drafts 14, 16, 18, 22 and 23 are wired.
  * @throws {Error} for draft versions without a wired data codec.
  */
-export function createDataCodec(version: DraftVersion = 16): DataCodec {
-  if (version === 18 || version === 22) {
+export function createDataCodec(version: DraftVersion = DEFAULT_DRAFT_VERSION): DataCodec {
+  if (version === 18 || version === 22 || version === 23) {
     return createDataCodec18(version);
   }
   if (!isWiredDraft(version)) {

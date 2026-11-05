@@ -20,7 +20,7 @@ afterEach(async () => {
 });
 const bytes = (id: number) => Uint8Array.of(0x00, id, 0xff, 0x80);
 
-async function fixture(options: { draft?: 16 | 18 | 22; warm?: boolean; audio?: boolean; audioOnly?: boolean; transform?: MoqtPlayerConfig['objectTransform'] } = {}) {
+async function fixture(options: { draft?: 16 | 18 | 22 | 23; warm?: boolean; audio?: boolean; audioOnly?: boolean; transform?: MoqtPlayerConfig['objectTransform'] } = {}) {
   const draft = options.draft ?? 18;
   const pair = await connectedPair(draft);
   const { client, server } = pair;
@@ -103,9 +103,9 @@ async function fixture(options: { draft?: 16 | 18 | 22; warm?: boolean; audio?: 
     await flush(256);
   };
   const openPrefix = async (index = 0, endLocation = { group: 9n, object: 2n }) => {
-    const request = draft === 22 ? requests[0]!.id : fetches[index]!;
+    const request = draft >= 22 ? requests[0]!.id : fetches[index]!;
     expect(request).toBeDefined();
-    if (draft !== 22) await server.acceptFetch(request, { endLocation });
+    if (draft < 22) await server.acceptFetch(request, { endLocation });
     if (draft === 16) {
       // The serving convenience API is draft-18+; use the actual draft-16
       // encoders on its real uni stream without changing received objects.
@@ -117,7 +117,7 @@ async function fixture(options: { draft?: 16 | 18 | 22; warm?: boolean; audio?: 
         await flush(256);
       }, async fin() { await writer.close(); await flush(256); } };
     }
-    const stream = draft === 22 ? await server.openFillStream(request) : await server.openFetchStream(request);
+    const stream = draft >= 22 ? await server.openFillStream(request) : await server.openFetchStream(request);
     return { stream, async send(object: bigint, payload = bytes(Number(object)), group = 9n) {
       await server.sendFetchObject(stream, { groupId: group, subgroupId: 0n, objectId: object, publisherPriority: 128, payload });
       await flush(256);
@@ -147,7 +147,7 @@ describe('owner-local initial warm admission', () => {
     } finally { push.mockRestore(); }
   });
 
-  it.each([16, 18, 22] as const)('draft-%i captures live receipt immediately, then transforms exact prefix bytes before the held live suffix', async draft => {
+  it.each([16, 18, 22, 23] as const)('draft-%i captures live receipt immediately, then transforms exact prefix bytes before the held live suffix', async draft => {
     const transformed: MoqtObject[] = [];
     const h = await fixture({ draft, transform: obj => { transformed.push(obj); return obj; } });
     const pipeline = (h.player as unknown as { videoPipeline: { pushObject: (...args: unknown[]) => void } }).videoPipeline;
@@ -167,7 +167,7 @@ describe('owner-local initial warm admission', () => {
     expect(h.errors).toEqual([]);
   });
 
-  it.each([16, 18, 22] as const)('draft-%i FIN ends retrieval without cancelling an admitted async prefix transform or starting the suffix early', async draft => {
+  it.each([16, 18, 22, 23] as const)('draft-%i FIN ends retrieval without cancelling an admitted async prefix transform or starting the suffix early', async draft => {
     let resolve!: (obj: MoqtObject) => void;
     let first!: MoqtObject;
     const starts: bigint[] = [];

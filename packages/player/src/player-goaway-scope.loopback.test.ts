@@ -53,7 +53,7 @@ function requestStream(server: unknown, requestId: bigint): { writeMessage(m: un
   return ctx as { writeMessage(m: unknown): Promise<void> };
 }
 
-async function boot(draft: 18 | 22) {
+async function boot(draft: 18 | 22 | 23) {
   const pair = await connectedPair(draft);
   const { client, server } = pair;
   const ids = new Map<string, bigint>();
@@ -117,7 +117,7 @@ async function boot(draft: 18 | 22) {
   };
 }
 
-describe.each([18, 22] as const)('draft-%i request-stream GOAWAY scope', (draft) => {
+describe.each([18, 22, 23] as const)('draft-%i request-stream GOAWAY scope', (draft) => {
   it('preserves unrelated delivery and does not drain the session', async () => {
     const h = await boot(draft);
     try {
