@@ -2097,7 +2097,7 @@ describe('PlaybackPipeline', () => {
             pipeline.pushObject(makeData(1, 0), { captureTimestamp: 1_000_000n, timestampIsWallClock: false });
             pipeline.tick();
 
-            expect(spy).toHaveBeenCalledWith(1_000_000n, false);
+            expect(spy).toHaveBeenCalledWith(1_000_000n, false, 'audio');
             expect(sync.latencyUs).toBe(0);
         });
 
