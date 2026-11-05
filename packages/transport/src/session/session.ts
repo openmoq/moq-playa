@@ -537,6 +537,18 @@ export interface RequestResult {
 }
 
 /**
+ * The last Location a FETCH requested, inclusive. A FETCH's End Object is
+ * carried as End Object + 1, and 0 selects the whole End Group. `undefined`
+ * when the request has no range (a Joining FETCH).
+ */
+function requestedFetchEnd(fetch: FetchStateMachine): { group: bigint; object: bigint } | undefined {
+  if (fetch.endGroup === undefined) return undefined;
+  const end = fetch.endObject ?? 0n;
+  return { group: fetch.endGroup, object: end === 0n ? MAX_VI64 : end - 1n };
+}
+
+
+/**
  * MOQT Session state machine.
  *
  * Manages the full lifecycle of a MOQT session from setup to close.
@@ -1734,7 +1746,8 @@ export class Session {
 
       if (
         endGroup < startGroup ||
-        (endGroup === startGroup && endObject < startObject)
+        (endGroup === startGroup && endObject < startObject
+          && !(this._draftVersion <= 18 && endObject === 0n))
       ) {
         return this.closeWithError(
           SessionErrorCode.PROTOCOL_VIOLATION,
@@ -1750,12 +1763,48 @@ export class Session {
         `Duplicate FETCH_OK for request ${msg.requestId}`,
       );
     }
+    const refusedData = this.prepareFetchDataResponse(msg);
+    if (refusedData) return refusedData;
     fetch.handleFetchOk();
     // §10.13: FETCH_OK may arrive AFTER the data stream already ended. Reclaim only
     // once BOTH are done; if the data has NOT finished, keep the fetch (a later
     // data-stream FIN reclaims it) — see handleFetchStreamFinished.
     if (fetch.isFetcherComplete) this.fetches.delete(msg.requestId as bigint);
     return [];
+  }
+
+  /** DATA admission is request state, separate from the context-free wire codec. */
+  admitFetchData(requestId: bigint, group: bigint, object: bigint): { accepted: boolean; actions: SessionOutboundAction[] } {
+    const fetch = this.fetches.get(requestId);
+    if (!fetch || fetch.isCompleted) return { accepted: false, actions: [] };
+    const reason = fetch.admitData(group, object);
+    return reason ? { accepted: false, actions: this.refuseFetchData(requestId, reason) } : { accepted: true, actions: [] };
+  }
+
+  /** Preflight before semantic OK delivery; unknown/duplicate/invalid OKs keep their existing handlers. */
+  prepareFetchDataResponse(msg: FetchOk): SessionOutboundAction[] | undefined {
+    const fetch = this.fetches.get(msg.requestId);
+    const end = msg.endLocation;
+    if (!fetch || fetch.isCompleted || fetch.responseReceived || !end) return undefined;
+    if (this.validateControlMessageParams(msg)) return undefined;
+    if (fetch.startGroup !== undefined && (end.group < fetch.startGroup
+        || (end.group === fetch.startGroup && end.object < (fetch.startObject ?? 0n)
+          && !(this._draftVersion <= 18 && end.object === 0n)))) return undefined;
+    const inclusive = this._draftVersion >= 22 ? end
+      : { group: end.group, object: end.object === 0n ? MAX_VI64 : end.object - 1n };
+    const reason = fetch.acceptResponseEnd(inclusive);
+    if (!reason) return undefined;
+    const actions = this.refuseFetchData(msg.requestId, reason);
+    // This is the current response, not a future crossed OK awaiting consumption.
+    this.recentlyCancelled.delete(msg.requestId);
+    return actions;
+  }
+
+  private refuseFetchData(requestId: bigint, reason: string): SessionOutboundAction[] {
+    const finished = this.fetches.get(requestId)!.dataFinished;
+    const actions = this.fetchCancel(requestId);
+    actions.push({ type: 'cancel_request', requestId, reason, fetchDataError: true, fetchDataFinished: finished });
+    return actions;
   }
 
   /**
@@ -3606,7 +3655,7 @@ export class Session {
     if (
       endLocation.group < startLocation.group ||
       (endLocation.group === startLocation.group &&
-        endLocation.object < startLocation.object)
+        endLocation.object !== 0n && endLocation.object < startLocation.object)
     ) {
       throw new SessionError(
         `FETCH endLocation (${endLocation.group},${endLocation.object}) < startLocation (${startLocation.group},${startLocation.object}) — §9.16`,
@@ -5451,7 +5500,8 @@ export class Session {
 
   /**
    * Accept an incoming fetch request.
-   * Sends FETCH_OK and transitions the fetch to TRANSFERRING.
+   * Omitting response metadata promises the known requested coverage. A shorter
+   * actual end, or an unresolved joining range, requires explicit metadata.
    * @see draft-ietf-moq-transport-16 §9.17
    */
   acceptFetch(requestId: bigint, options: FetchAcceptOptions = {}): SessionOutboundAction[] {
@@ -5464,6 +5514,14 @@ export class Session {
     }
 
     const trackProperties = this.resolveTrackProperties(options.trackProperties, 'FETCH_OK');
+    let endLocation = options.endLocation;
+    if (endLocation === undefined) {
+      if (fetch.endGroup === undefined) {
+        throw new SessionError('FETCH response End Location is required until the joining range is resolved', 'INVALID_STATE');
+      }
+      endLocation = isDraft22(this._draftVersion) ? requestedFetchEnd(fetch)!
+        : { group: fetch.endGroup, object: fetch.endObject ?? 0n };
+    }
 
     fetch.sendFetchOk();
 
@@ -5471,7 +5529,7 @@ export class Session {
       type: 'FETCH_OK',
       requestId,
       endOfTrack: options.endOfTrack ?? 0,
-      endLocation: options.endLocation ?? { group: 0n, object: 0n },
+      endLocation: endLocation!,
       parameters: options.parameters ?? new Map(),
       trackProperties,
     };

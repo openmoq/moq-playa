@@ -137,7 +137,7 @@ describe('owner-local initial warm admission', () => {
       pushObject: (obj: MoqtObject) => void; endedGroups: Set<bigint>;
     } }).videoPipeline;
     const push = vi.spyOn(pipeline, 'pushObject');
-    const prefix = await h.openPrefix(0, { group: 9n, object: 3n });
+    const prefix = await h.openPrefix(0, { group: 9n, object: draft === 18 ? 4n : 3n });
     await prefix.send(0n);
     const pipe = h.b.uniOut.at(-1)!;
     // Absolute Locations 9/1 (DNE), 9/2 (Unknown), then normal Object 9/3.

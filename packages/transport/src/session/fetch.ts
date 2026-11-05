@@ -18,6 +18,9 @@
 
 import { FetchState, type FetchStateValue } from './types.js';
 
+type FetchLocation = { group: bigint; object: bigint };
+const before = (a: FetchLocation, b: FetchLocation) => a.group < b.group || (a.group === b.group && a.object < b.object);
+
 /** Joining Fetch fields carried by the state machine (§9.16.2). */
 export interface JoiningFetchState {
   /** 0x2 = Relative Joining Fetch, 0x3 = Absolute Joining Fetch. */
@@ -38,6 +41,8 @@ export class FetchStateMachine {
   private _wasCanceled: boolean = false;
   private _joining: JoiningFetchState | undefined;
   private _trackKey: string | undefined;
+  private _responseEnd: FetchLocation | undefined;
+  private _largestReceived: FetchLocation | undefined;
   // §10.13: FETCH_OK and the data stream are INDEPENDENT — "the FETCH_OK or
   // REQUEST_ERROR can come at any time relative to object delivery." A fetcher's
   // fetch is fully done only after BOTH the response (FETCH_OK) AND the data stream
@@ -223,6 +228,32 @@ export class FetchStateMachine {
   /** End object of the fetch range. */
   get endObject(): bigint | undefined {
     return this._endObject;
+  }
+
+  /** Admit ordinary DATA only; request End Object uses the SDK's half-open/zero convention. */
+  admitData(group: bigint, object: bigint): string | undefined {
+    const location = { group, object };
+    if (this._startGroup !== undefined && before(location, { group: this._startGroup, object: this._startObject ?? 0n })) {
+      return `FETCH DATA ${group}/${object} is before the requested start`;
+    }
+    if (this._endGroup !== undefined && (group > this._endGroup
+        || (group === this._endGroup && (this._endObject ?? 0n) > 0n && object >= this._endObject!))) {
+      return `FETCH DATA ${group}/${object} is after the requested end`;
+    }
+    if (this._responseEnd && before(this._responseEnd, location)) {
+      return `FETCH DATA ${group}/${object} is after the response end`;
+    }
+    if (!this._largestReceived || before(this._largestReceived, location)) this._largestReceived = location;
+    return undefined;
+  }
+
+  /** Retain one maximum until both OK and DATA finish, including DATA-FIN-before-OK. */
+  acceptResponseEnd(end: FetchLocation): string | undefined {
+    if (this._largestReceived && before(end, this._largestReceived)) {
+      return `FETCH response end ${end.group}/${end.object} precedes received DATA ${this._largestReceived.group}/${this._largestReceived.object}`;
+    }
+    this._responseEnd = { ...end };
+    return undefined;
   }
 
   // ─── State Queries ────────────────────────────────────────────────────

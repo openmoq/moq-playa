@@ -41,7 +41,7 @@ for (const draft of [18, 22] as const) for (const trigger of ['fetch', 'subgroup
       const otherIndex = f.transport.bidi.length; await f.conn.subscribe(other, name); f.transport.bidi[otherIndex]!.push(bytes('0400021200'));
       const otherFetchIndex = f.transport.bidi.length, otherFetch = await f.conn.fetch(other, name, range);
       for (const index of [fetchIndex, siblingIndex, otherFetchIndex]) {
-        if (!(trigger === 'track-properties' && index === fetchIndex)) f.transport.bidi[index]!.push(bytes('18000400020900'));
+        if (!(trigger === 'track-properties' && index === fetchIndex)) f.transport.bidi[index]!.push(bytes('18000400090000'));
       }
       await flush(512); expect(f.errors).toEqual([]);
       // Prove two sibling readers are already accepted and capable of delivery.
@@ -84,7 +84,7 @@ for (const draft of [18, 22] as const) it(`draft${draft} unsupported mandatory T
     await f.conn.fetch([bytes('4e')], bytes('76'), range);
     const sibling = await f.conn.fetch([bytes('4e')], bytes('76'), range);
     f.transport.bidi[0]!.push(bytes('18000800020900c0400100'));
-    f.transport.bidi[1]!.push(bytes('18000400020900')); await flush(512);
+    f.transport.bidi[1]!.push(bytes('18000400090000')); await flush(512);
     f.transport.openIncomingUni().push(bytes('05' + byte(sibling) + '1f0200030701bb')); await flush(512);
     expect(f.transport.bidi[0]!.writeAborted).toBe(true); expect(f.transport.bidi[1]!.writeAborted).toBe(false);
     expect(f.objects).toEqual([expect.objectContaining({ kind: 'data', payload: bytes('bb') })]); expect(f.transport.closeInfo).toBeUndefined();
@@ -103,15 +103,15 @@ for (const draft of [18, 22] as const) for (const duplicate of [false, true]) it
     if (draft === 22) await f.conn.subscribe([bytes('4e')], bytes('76'));
     f.transport.openIncomingUni().push(bytes('111002070002220101aa')); await flush(512);
     expect(f.held()).toBe(true);
-    f.transport.bidi[1]!.push(bytes('18000400020900'));
-    f.transport.bidi[2]!.push(bytes('18000400020900'));
+    f.transport.bidi[1]!.push(bytes('18000400090000'));
+    f.transport.bidi[2]!.push(bytes('18000400090000'));
     if (draft === 22) f.transport.bidi[3]!.push(bytes('0400021100'));
     await flush(512);
     f.transport.openIncomingUni().push(bytes('05' + byte(pending) + '1f0200000701aa'));
     f.transport.openIncomingUni().push(bytes('05' + byte(joining) + '1f0200000701aa')); await flush(512);
     expect(f.transport.closeInfo).toBeUndefined(); expect(f.objects).toEqual([]);
     if (duplicate) {
-      f.transport.bidi[1]!.push(bytes('18000400020900')); await flush(512);
+      f.transport.bidi[1]!.push(bytes('18000400090000')); await flush(512);
       // The unchanged request topology rejects an unsolicited second reply
       // before it can be matched or delivered as another successful response.
       expect(f.transport.bidi[1]!.writeAborted).toBe(true);
@@ -133,7 +133,7 @@ for (const draft of [18, 22] as const) it(`draft${draft} malformed FETCH also re
     await flush(512); expect(published).toBe(true); await f.conn.acceptSubscribe(1n, 19n); await flush(512);
     const fetch = await f.conn.fetch([bytes('4e')], bytes('76'), range);
     const other = await f.conn.fetch([bytes('4f')], bytes('76'), range);
-    for (const request of f.transport.bidi) request.push(bytes('18000400020900'));
+    for (const request of f.transport.bidi) request.push(bytes('18000400090000'));
     await flush(512); expect(f.errors).toEqual([]);
     const oldReader = f.transport.openIncomingUni().push(bytes('101302070001cc')); await flush(512);
     expect(f.objects).toEqual([expect.objectContaining({ payload: bytes('cc') })]); f.objects.length = 0;

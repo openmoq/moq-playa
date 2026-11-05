@@ -143,7 +143,7 @@ describe('draft-18 fetch preludes (hand-authored invariants)', () => {
     client.onDataStream = (sid, h) => { if (h.type === 'fetch') streamToReq.set(sid, h.header.requestId as bigint); };
     client.onObject = (sid, o) => { if (streamToReq.get(sid) === fetchRid) recv.push(o); };
 
-    const requestId = await client.fetch(ns('live'), nm('vid'), { startGroup: 0n, startObject: 0n, endGroup: 9n, endObject: 0n });
+    const requestId = await client.fetch(ns('live'), nm('vid'), { startGroup: 0n, startObject: 0n, endGroup: 9000n, endObject: 0n });
     await flush();
     expect(requestId).toBe(0n); // client (even parity) first request
     expect(fetchRid).toBe(0n);
@@ -198,7 +198,7 @@ describe('draft-18 fetch preludes (hand-authored invariants)', () => {
     client.onDataStream = (sid, h) => { if (h.type === 'fetch') streamToReq.set(sid, h.header.requestId as bigint); };
     client.onObject = (sid, o) => { if (streamToReq.get(sid) === fetchRid) recv.push(o); };
 
-    const requestId = await client.fetch(ns('live'), nm('vid'), { startGroup: 0n, startObject: 0n });
+    const requestId = await client.fetch(ns('live'), nm('vid'), { startGroup: 0n, startObject: 0n, endGroup: 9000n, endObject: 0n });
     await flush();
     await server.acceptFetch(fetchRid);
     await flush();

@@ -94,6 +94,7 @@ import { ObjectReceiptObservers } from './object-receipts.js';
 import type { ObjectReceipt, ObjectReceiptObservation, ObjectReceiptDiscard } from './object-receipts.js';
 import type { WebTransportLike, WebTransportBidirectionalStream, MoqtSetupRouting } from './types.js';
 import { isDraft22, isRequestStreamDraft, isWiredDraft } from '@openmoq/transport';
+import type { FetchOk } from '@openmoq/transport';
 
 
 
@@ -2382,6 +2383,14 @@ export class MoqtConnection {
       return;
     }
 
+    if (message.type === 'FETCH_OK') {
+      const refusal = this.session.prepareFetchDataResponse({ ...message, requestId } as FetchOk);
+      if (refusal) {
+        await this.executeActions(refusal);
+        return;
+      }
+    }
+
     // §5.1: a response (e.g. REQUEST_ERROR) crossing a cancellation is consumed by
     // the session as a superseded-request reclaim — suppress it from the application
     // onMessage for consistency with the crossed-SUBSCRIBE_OK path (qlog above stays raw).
@@ -4445,7 +4454,11 @@ export class MoqtConnection {
     // by handleFetchStreamFinished, or a REQUEST_ERROR). Cancelling a fetch that is
     // already gone is a NO-OP, not an error — makes fetchCancel idempotent and safe
     // to call racing the terminal.
-    if (this.session.getFetch(requestId) === undefined) return;
+    const fetch = this.session.getFetch(requestId);
+    if (fetch === undefined) return;
+    const dataFinished = fetch.dataFinished;
+    // Revoke core ownership before backend cancellation can reenter this method.
+    const actions = this.session.fetchCancel(requestId);
     // §10.13: install the late-stream cancellation marker SYNCHRONOUSLY — BEFORE any
     // await below — so a data stream arriving during the teardown awaits is discarded
     // (see the FETCH_HEADER handler), never delivered to onObject. The marker is
@@ -4454,12 +4467,22 @@ export class MoqtConnection {
     // It is the SOLE provenance for "a stream for a fetch WE cancelled" — a missing
     // marker means the stream is NOT a cancelled fetch (completed / unknown / wrong
     // request kind) and is a protocol violation. Consumed one-shot on the late stream.
-    this.recentlyCancelledFetches.add(requestId as bigint);
-    // Mark the fetch completed. draft-18 returns no actions (FETCH_CANCEL was
-    // removed); draft-14/16 returns a FETCH_CANCEL to send.
-    const actions = this.session.fetchCancel(requestId);
+    const dataStop = this.fenceFetchCancellation(requestId, dataFinished);
     await this.executeActions(actions);
+    await this.cancelFetchTransport(requestId, dataStop);
+  }
 
+  private fenceFetchCancellation(requestId: bigint, dataFinished = false): { opened: boolean; stopped: Promise<void> } {
+    if (!dataFinished) this.recentlyCancelledFetches.add(requestId);
+    const streamId = this.fetchStreams.get(requestId);
+    const reader = streamId === undefined ? undefined : this.dataStreamReaders.get(streamId);
+    // Start physical cancellation before finalization can release/remove the reader.
+    const stopped = streamId !== undefined && reader
+      ? this.discardLocalReader(streamId, reader, new Error('FETCH cancelled')) : Promise.resolve();
+    return { opened: streamId !== undefined, stopped };
+  }
+
+  private async cancelFetchTransport(requestId: bigint, dataStop: { opened: boolean; stopped: Promise<void> }): Promise<void> {
     if (isRequestStreamDraft(this.session.draftVersion)) {
       // §3.3.2: cancel the bidi request stream (STOP_SENDING + RESET_STREAM).
       // This is a LOCAL cancel, so the request-stream response handler ignores
@@ -4468,12 +4491,8 @@ export class MoqtConnection {
     }
 
     // Also STOP_SENDING the fetch DATA stream if one is open (both drafts).
-    const streamId = this.fetchStreams.get(requestId as bigint);
-    if (streamId !== undefined) {
-      const reader = this.dataStreamReaders.get(streamId);
-      if (reader) {
-        await this.discardLocalReader(streamId, reader, new Error('FETCH cancelled'));
-      }
+    await dataStop.stopped;
+    if (dataStop.opened) {
       this.fetchStreams.delete(requestId as bigint);
       // The known open response stream is torn down HERE, so the marker that guards a
       // NOT-yet-arrived late stream is redundant for it — CONSUME it. Cancelling a
@@ -4847,8 +4866,10 @@ export class MoqtConnection {
   /**
    * Accept an incoming FETCH (§10.12). draft-18 writes FETCH_OK (no wire Request
    * ID) on the FETCH's own bidi request stream; draft-14/16 send it on the
-   * control stream. Pass real FETCH_OK metadata via `options` (End Location may
-   * be a full-uint64 draft-18 Location). FETCH response data is sent separately
+   * control stream. Omitted metadata promises the known requested coverage;
+   * pass the actual End Location for a shorter response, and explicit metadata
+   * until a joining range is resolved. End Location may be full-uint64.
+   * FETCH response data is sent separately
    * via openFetchStream / sendFetchObject / sendFetchEndOfRange.
    *
    * @param requestId The request ID from the incoming FETCH
@@ -6169,6 +6190,12 @@ export class MoqtConnection {
   private async executeActions(
     actions: SessionOutboundAction[],
   ): Promise<void> {
+    const fetchDataStops = new Map<bigint, { opened: boolean; stopped: Promise<void> }>();
+    for (const action of actions) {
+      if (action.type === 'cancel_request' && action.fetchDataError) {
+        fetchDataStops.set(action.requestId, this.fenceFetchCancellation(action.requestId, action.fetchDataFinished));
+      }
+    }
     if (actions.some(action => action.type === 'cancel_request' && action.malformedTrack)) {
       const malformedOwners = new Set<bigint>();
       const aliases = new Set<bigint>();
@@ -6257,6 +6284,11 @@ export class MoqtConnection {
           break;
         }
         case 'cancel_request': {
+          if (action.fetchDataError) {
+            await this.cancelFetchTransport(action.requestId, fetchDataStops.get(action.requestId)!);
+            this.onError?.(new MoqtConnectionError(action.reason, { errorSource: 'data', isFatal: false }));
+            break;
+          }
           // Out-of-band cancellation: a superseded SUBSCRIBE or a malformed
           // exact-Track owner. Session state is already terminal. Settle callers
           // and perform the corresponding adapter/request-stream cleanup.
@@ -6379,6 +6411,13 @@ export class MoqtConnection {
             stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID,
             message,
           });
+          if (message.type === 'FETCH_OK') {
+            const refusal = this.session.prepareFetchDataResponse(message as FetchOk);
+            if (refusal) {
+              await this.executeActions(refusal);
+              continue;
+            }
+          }
           // §10.11 / §9.15: a subscriber-side PUBLISH_DONE terminates the
           // subscription — apply its Stream Count so the alias routing is torn
           // down and late streams are bounded/discarded (parity with draft-18).
@@ -7760,7 +7799,7 @@ export class MoqtConnection {
         // FETCH_HEADER.requestId — not by a (fabricated) track alias.
         readTerminal = isRequestStreamDraft(this.dataCodec!.version)
           ? await this.readFetchObjects18(reader, buf, streamId, header)
-          : await this.readFetchObjects(reader, buf, streamId);
+          : await this.readFetchObjects(reader, buf, streamId, header);
       }
 
       this.onStreamClosed?.(streamId, undefined, terminalKind(readTerminal));
@@ -8105,6 +8144,7 @@ export class MoqtConnection {
     reader: ReadableStreamDefaultReader<Uint8Array>,
     buf: Uint8Array,
     streamId: bigint,
+    header: FetchHeader,
   ): Promise<DataStreamReadTerminal> {
     let prior: FetchPriorContext | undefined;
     let isFirstObject = true;
@@ -8148,6 +8188,14 @@ export class MoqtConnection {
             // FETCH objects have no Track Alias. Alias 0 here is synthetic and
             // must never be confused with a subgroup racing SUBSCRIBE_OK.
             if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
+            // Legacy header acceptance is separate; this guard checks only known request bounds.
+            if (this.session.getFetch(header.requestId)) {
+              const admission = this.session.admitFetchData(header.requestId, item.groupId, item.objectId);
+              if (!admission.accepted) {
+                await this.executeActions(admission.actions);
+                return 'local-discard';
+              }
+            }
             this.onObject?.(streamId, delivered);
 
             // Update prior context for next object's inheritance
@@ -8294,6 +8342,13 @@ export class MoqtConnection {
               const fillOwner = this.fillStreams.get(header.requestId)?.subscriptionId;
               await this.cancelMalformedObjectOwners(propertyFault, undefined, fillOwner ?? header.requestId);
               return 'local-discard';
+            }
+            if (!this.fillStreams.has(header.requestId)) {
+              const admission = this.session.admitFetchData(header.requestId, item.groupId, item.objectId);
+              if (!admission.accepted) {
+                await this.executeActions(admission.actions);
+                return 'local-discard';
+              }
             }
             this.onObject?.(streamId, delivered); // no alias routing for fetch
           } else {

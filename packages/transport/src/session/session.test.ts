@@ -6091,7 +6091,7 @@ describe('acceptFetch options (draft-18 §10.13)', () => {
     expect(fetchOk.endLocation).toEqual({ group: big, object: big + 1n });
   });
 
-  it('acceptFetch defaults to endOfTrack 0 + {0,0} when no options are given', () => {
+  it('acceptFetch defaults to endOfTrack 0 and the known requested coverage', () => {
     const s = established18();
     s.handleControlMessage({
       type: 'FETCH', requestId: 1n,
@@ -6101,7 +6101,7 @@ describe('acceptFetch options (draft-18 §10.13)', () => {
     const actions = s.acceptFetch(1n);
     const fetchOk = (actions[0] as SendControlAction).message as { endOfTrack: number; endLocation: { group: bigint; object: bigint } };
     expect(fetchOk.endOfTrack).toBe(0);
-    expect(fetchOk.endLocation).toEqual({ group: 0n, object: 0n });
+    expect(fetchOk.endLocation).toEqual({ group: 9n, object: 0n });
   });
 });
 

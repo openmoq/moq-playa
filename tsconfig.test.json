@@ -27,6 +27,8 @@
     "packages/webtransport/src/adapter-property-fanout-legacy.test.ts",
     "packages/webtransport/src/adapter-property-receive-legacy.test.ts",
     "packages/webtransport/src/adapter-property-scope-legacy.test.ts",
+    "packages/webtransport/src/adapter-fetch-data-admission.test.ts",
+    "packages/webtransport/src/adapter-fetch-data-contract.test.ts",
     "packages/transport/src/session/fetch.test.ts",
     "packages/transport/src/control/property-semantics.test.ts",
     "packages/player/src/player-stats.test.ts",

@@ -534,7 +534,7 @@ describe('MoqtConnection(18) FETCH data', () => {
     let closeCode: number | undefined;
     conn.onClose = (code) => { closeCode = code; };
 
-    const reqId = await issueFetch(conn);
+    const reqId = await conn.fetch(ns('a'), nm('1'), { startGroup: 0n, startObject: 0n, endGroup: (1n << 64n) - 1n, endObject: 0n });
     transport.pushIncomingUni(concat(
       fetchHeader(reqId),
       firstFetchObj((1n << 64n) - 1n, 0n, 3, [0xaa]), // group at 2^64-1

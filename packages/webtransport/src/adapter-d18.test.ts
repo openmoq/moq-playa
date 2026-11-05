@@ -1026,11 +1026,9 @@ describe('MoqtConnection(18) fetch cancellation (§3.3.2)', () => {
     const objects: MoqtObject[] = [];
     conn.onObject = (_sid, o) => objects.push(o);
     const terminals = terminalsOf(conn);
-    // The marker is installed SYNCHRONOUSLY by fetchCancel; delivering a chunk
-    // before its teardown awaits complete wakes the parked read, so the loop
-    // re-enters its top and takes the guard rather than the `done` branch.
-    const cancelling = conn.fetchCancel(reqId);
+    // Resolve the parked read, then cancel before its decoding continuation runs.
     dataStream.push(firstFetchObjBytes(1n, 0n, 3, [0xaa, 0xbb, 0xcc]));
+    const cancelling = conn.fetchCancel(reqId);
     await cancelling;
     await flush();
 
@@ -1038,6 +1036,7 @@ describe('MoqtConnection(18) fetch cancellation (§3.3.2)', () => {
     // Asserting only the terminal would also pass with the guard deleted: the
     // later reader cancellation produces the same terminal either way.
     expect(objects).toEqual([]);
+    expect(dataStream.readCancelled).toBe(true);
     expect(terminals).toEqual(['local-discard']);
     expect(conn.session.state).not.toBe(SessionState.CLOSED);
   });

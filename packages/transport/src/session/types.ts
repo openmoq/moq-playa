@@ -288,6 +288,9 @@ export interface CancelRequestAction {
   readonly reason: string;
   /** Locally detected malformed Track: revoke corresponding data ownership too. */
   readonly malformedTrack?: boolean;
+  /** A request-local ordinary FETCH DATA bound fault, not malformed Track state. */
+  readonly fetchDataError?: boolean;
+  readonly fetchDataFinished?: boolean;
 }
 
 /**
