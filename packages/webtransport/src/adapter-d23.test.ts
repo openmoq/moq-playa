@@ -104,6 +104,26 @@ describe('MoqtConnection(23) FETCH (§3.2, §9.3, §11.4)', () => {
   });
 });
 
+describe('MoqtConnection(23) fill updates (§9.5, §9.19.15)', () => {
+  it('keeps two pipelined fill updates separate instead of coalescing them', async () => {
+    const { client, server, errors } = await connectedPair(23);
+    const largest = { group: 5n, object: 0n };
+    server.setLargestLocationProvider(() => largest);
+    server.onSubscribe = (rid) => {
+      void server.acceptSubscribe(rid, 7n, { parameters: new Map([[0x09n, [largest]]]) }).catch((e: Error) => errors.push(e));
+    };
+    const id = await client.subscribe(ns('live'), nm('vid'));
+    await flush();
+    const fill = { filter: { type: 'AbsoluteStart', startGroup: 0n, startObject: 0n } } as const;
+    const updates = await Promise.all([client.requestUpdate(id, { fill }), client.requestUpdate(id, { fill })]);
+    await flush();
+    expect(new Set(updates).size).toBe(2);
+    // Each update keeps its own pending fill, so each gets its own fill stream.
+    for (const update of updates) await expect(server.openFillStream(update)).resolves.toBeTypeOf('bigint');
+    expect(errors).toEqual([]);
+  });
+});
+
 describe('end markers before draft 23', () => {
   it('sendFetchEndMarker writes nothing on draft 22', async () => {
     const { client, server, errors } = await connectedPair(22);
