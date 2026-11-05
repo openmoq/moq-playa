@@ -57,7 +57,7 @@ describe('MoqtConnection(18) construction + connect', () => {
 
   it('a clean close() leaves the control streams to the transport close', async () => {
     // A control stream stopped or reset before the session close lands makes
-    // the peer end the session with an error (draft-23 §6.3), so a clean close
+    // the peer end the session with an error (draft-18 §3.3), so a clean close
     // only releases them; the transport close ends them with the session.
     const conn = new MoqtConnection(18);
     const transport = new TransportSim();
@@ -198,7 +198,7 @@ describe('MoqtConnection(18) construction + connect', () => {
       const conn = new MoqtConnection(18);
       const transport = Object.assign(new TransportSim(), {
         kind: 'quic' as const,
-        protocol,
+        ...(protocol === undefined ? {} : { protocol }),
         maxDatagramSize: 1200,
       });
 
@@ -233,7 +233,7 @@ describe('MoqtConnection(18) construction + connect', () => {
       await localSetupGate;
       return realCreate();
     };
-    const closes: Array<{ code?: number; reason?: string }> = [];
+    const closes: Array<{ code: number | undefined; reason: string | undefined }> = [];
     conn.onClose = (code, reason) => closes.push({ code, reason });
     const invalidSetup = codec18.encode({
       type: 'SETUP',
@@ -256,7 +256,7 @@ describe('MoqtConnection(18) construction + connect', () => {
     const conn = new MoqtConnection(18);
     const transport = new TransportSim();
     const failure = new Error('local control stream failed');
-    const closes: Array<{ code?: number; reason?: string }> = [];
+    const closes: Array<{ code: number | undefined; reason: string | undefined }> = [];
     conn.onClose = (code, reason) => closes.push({ code, reason });
     transport.createUnidirectionalStream = async () => { throw failure; };
     transport.openIncomingUni().push(setupBytes());
@@ -388,8 +388,8 @@ describe('MoqtConnection(18) subscribe', () => {
     expect(sub.requestId).toBe(0n);
 
     // Two overlapping updates: BOTH sent (written) before either response.
-    const u1 = await conn.requestUpdate(0n, { forward: false }); // id 2
-    const u2 = await conn.requestUpdate(0n, { forward: true }); // id 4
+    const u1 = await conn.requestUpdate(0n, { forward: 0 }); // id 2
+    const u2 = await conn.requestUpdate(0n, { forward: 1 }); // id 4
     expect([u1, u2]).toEqual([2n, 4n]);
     await flush();
     expect(transport.bidi.length).toBe(1); // both reused the existing request stream
@@ -424,7 +424,7 @@ describe('MoqtConnection(18) subscribe', () => {
 
   it('requestUpdate for an unknown request stream errors clearly', async () => {
     const { conn } = await connected();
-    await expect(conn.requestUpdate(999n, { forward: false })).rejects.toThrow(/no open .*request stream/i);
+    await expect(conn.requestUpdate(999n, { forward: 0 })).rejects.toThrow(/no open .*request stream/i);
   });
 
   it('REQUEST_ERROR rejects only the matching subscribeTrack', async () => {
@@ -776,7 +776,7 @@ describe('MoqtConnection(18) fetch cancellation (§3.3.2)', () => {
   });
 
   it('does not fire onError or leave an unhandled rejection for a local cancel', async () => {
-    const { conn, transport } = await connected();
+    const { conn } = await connected();
     const errors: Error[] = [];
     conn.onError = (e) => errors.push(e);
 
@@ -1051,7 +1051,7 @@ describe('MoqtConnection(18) fetch cancellation (§3.3.2)', () => {
 
   it('a SECOND FETCH response stream for the same request is a PROTOCOL_VIOLATION (§11.4.4)', async () => {
     const { conn, transport } = await connected();
-    const errs: MoqtConnectionError[] = [];
+    const errs: Error[] = [];
     conn.onError = (e) => errs.push(e);
     const reqId = await conn.fetch(ns('a'), nm('1'), fetchRangeC);
 
@@ -1257,7 +1257,7 @@ describe('MoqtConnection(18) request-stream GOAWAY (§10.4 — per-request migra
 
   it('settles a pending subscribeTrack() (rejects, does not hang), keeps the session ESTABLISHED, fires no onClose, surfaces the GOAWAY via onMessage', async () => {
     const { conn, transport } = await connected();
-    let closeCode = -1;
+    let closeCode: number | undefined = -1;
     conn.onClose = (code) => { closeCode = code; };
     const seen: string[] = [];
     conn.onMessage = (m) => seen.push(m.type);
@@ -1278,7 +1278,7 @@ describe('MoqtConnection(18) request-stream GOAWAY (§10.4 — per-request migra
 
   it('an ESTABLISHED subscribe (after SUBSCRIBE_OK, empty queue) still surfaces a later request-stream GOAWAY via onMessage; session stays ESTABLISHED, no onClose, state cleaned up', async () => {
     const { conn, transport } = await connected();
-    let closeCode = -1;
+    let closeCode: number | undefined = -1;
     conn.onClose = (code) => { closeCode = code; };
     const seen: string[] = [];
     conn.onMessage = (m) => seen.push(m.type);
@@ -1305,7 +1305,7 @@ describe('MoqtConnection(18) request-stream GOAWAY (§10.4 — per-request migra
 
   it('a request-stream GOAWAY on one subscribe does not disturb an unrelated pending subscribe', async () => {
     const { conn, transport } = await connected();
-    let closeCode = -1;
+    let closeCode: number | undefined = -1;
     conn.onClose = (code) => { closeCode = code; };
 
     const pA = conn.subscribeTrack(ns('a'), nm('1')); // bidi[0]

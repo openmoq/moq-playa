@@ -119,6 +119,8 @@ export class UniPairTopology {
   private controlReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   /** Invalidates a control-stream open that settles after terminal shutdown. */
   private controlEpoch = 0;
+  /** First terminal owner also governs control streams whose creation resolves late. */
+  private controlShutdown: 'reset' | 'release' | undefined;
   /** Owns the shared incoming-unidirectional-stream accept loop after setup. */
   private incomingUniRouter: IncomingUniRouter | null = null;
 
@@ -301,7 +303,10 @@ export class UniPairTopology {
     } catch (error) {
       if (this.controlWriter === writer) this.controlWriter = null;
       if (writer) {
-        try { void writer.abort(error).catch(() => {}); } catch { /* stream already closed */ }
+        try {
+          if (this.controlShutdown === 'release') writer.releaseLock();
+          else void writer.abort(error).catch(() => {});
+        } catch { /* stream already closed or released */ }
       }
       throw error;
     }
@@ -709,17 +714,17 @@ export class UniPairTopology {
    */
   shutdown(options: { transportClosing?: boolean; graceful?: boolean } = {}): void {
     const reason = new Error('session terminated');
+    this.controlShutdown ??= options.transportClosing === true && options.graceful === true ? 'release' : 'reset';
+    const release = this.controlShutdown === 'release';
     const router = this.incomingUniRouter;
     this.incomingUniRouter = null;
-    if (options.transportClosing) router?.retire(reason);
+    if (options.transportClosing) router?.retire(reason, { graceful: release });
     else router?.abort(reason);
     this.controlEpoch++;
-    // The control streams must stay open for the whole session (§6.3): a peer
-    // that sees one reset or stopped closes the session with an error
-    // (CLOSED_CONTROL_STREAM on draft 23). On a clean close the transport close
-    // ends them with the session, so only release them locally; a RESET_STREAM
-    // or STOP_SENDING sent now can reach the peer first.
-    const release = options.transportClosing === true && options.graceful === true;
+    // Draft 18 §3.3 and draft 22 §6.3 keep control streams open for the session.
+    // On a clean close, the transport ends them with the session; only release
+    // local ownership so a RESET_STREAM or STOP_SENDING cannot reach the peer
+    // first and turn a normal close into PROTOCOL_VIOLATION.
     const controlReader = this.controlReader;
     this.controlReader = null;
     if (controlReader) {

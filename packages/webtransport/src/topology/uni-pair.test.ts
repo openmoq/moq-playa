@@ -18,7 +18,7 @@ const okBytes = (alias: bigint): Uint8Array =>
   codec18.encode({ type: 'SUBSCRIBE_OK', requestId: 0n, trackAlias: alias, parameters: new Map(), trackExtensions: new Map() } as SubscribeOk);
 const reqOkBytes = (): Uint8Array => codec18.encode({ type: 'REQUEST_OK', requestId: 0n, parameters: new Map() } as RequestOk);
 function updateMessage(session: Session, existingRequestId: bigint): ControlMessage {
-  const r = session.requestUpdate(existingRequestId, { forward: false });
+  const r = session.requestUpdate(existingRequestId, { forward: 0 });
   return (r.actions.find((a) => a.type === 'send_control') as SendControlAction).message;
 }
 const errBytes = (): Uint8Array =>
@@ -995,7 +995,7 @@ describe('UniPairTopology — outbound request-stream cleanup (lifecycle)', () =
     const topo = createUniPairTopology(session);
     const transport = new TransportSim();
     const closed: bigint[] = [];
-    topo.onRequestClosed = (rid) => closed.push(rid);
+    topo.onRequestClosed = (rid) => { closed.push(rid); };
 
     const p = session.publish(ns('a'), nm('1'), 5n);
     const handle = await topo.openRequest(transport, reqMessage(p), () => {});
@@ -1013,7 +1013,7 @@ describe('UniPairTopology — outbound request-stream cleanup (lifecycle)', () =
     const topo = createUniPairTopology(session);
     const transport = new TransportSim();
     const closed: bigint[] = [];
-    topo.onRequestClosed = (rid) => closed.push(rid);
+    topo.onRequestClosed = (rid) => { closed.push(rid); };
 
     const p = session.publish(ns('a'), nm('1'), 5n);
     const handle = await topo.openRequest(transport, reqMessage(p), () => {});

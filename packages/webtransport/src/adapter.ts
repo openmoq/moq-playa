@@ -654,6 +654,8 @@ export class MoqtConnection {
    * or transport close). Guards {@link terminate} so shutdown is exactly-once.
    */
   private _terminated = false;
+  /** A clean local close leaves control-stream termination with the transport. */
+  private localCloseIsGraceful = false;
   /** The close report to emit; upgraded from preliminary→authoritative before it fires. */
   private _terminalReport: { code: number; reason: string; authoritative: boolean } | null = null;
   /** True once onClose has actually fired (emission is deferred one microtask). */
@@ -759,14 +761,11 @@ export class MoqtConnection {
    * once: parked-join timers, alias tombstones, publisher accounting, deferred
    * update responses, inbound-request contexts, publish/fetch routing, data
    * readers and writers, and the topology's request-stream contexts. Nothing
-   * owned by the connection outlives the terminal shutdown.
-   */
-  /**
-   * @param graceful A clean local close: the topology releases the control
-   *   streams instead of resetting them, so the peer sees only the session close.
+   * owned by the connection outlives the terminal shutdown. On a clean local
+   * close, release control streams so the transport owns their termination.
    */
   private clearTerminalState(graceful = false): void {
-    this.draft16ControlAcceptor?.retire(new Error('Connection closed during setup'));
+    this.draft16ControlAcceptor?.retire(new Error('Connection closed during setup'), { graceful });
     this.draft16ControlAcceptor = null;
     const namespaceReader = this.draft16NamespaceReader;
     this.draft16NamespaceReader = null;
@@ -783,7 +782,7 @@ export class MoqtConnection {
     // The transport owns the aggregate incoming-stream readable's terminal
     // transition. Retire our classifier and child readers, but leave that source
     // for transport.close(); some backends close its controller from onClose.
-    incomingUniRouter?.retire(new Error('session terminated'));
+    incomingUniRouter?.retire(new Error('session terminated'), { graceful });
     this.pendingGenericSubscriptions.clear();
     this.pendingSubscriptionGenerations.clear();
     this.clearAllPendingAliases();
@@ -1711,8 +1710,11 @@ export class MoqtConnection {
         try {
           const control = await acceptor.start(incoming);
           if (this._terminated) {
-            this.swallow(() => control.reader.cancel());
-            this.swallow(() => control.stream.writable.abort());
+            if (!this.localCloseIsGraceful) {
+              this.swallow(() => control.reader.cancel());
+              this.swallow(() => control.stream.writable.abort());
+            }
+            try { control.reader.releaseLock(); } catch { /* already released */ }
             throw new Error('Connection closed during setup');
           }
           this.controlWriter = control.stream.writable.getWriter();
@@ -1763,7 +1765,7 @@ export class MoqtConnection {
             if (replying) this.closeSessionInternalError(`SERVER_SETUP failed: ${error instanceof Error ? error.message : String(error)}`);
             else this.closeSessionFatal(`CLIENT_SETUP failed: ${error instanceof Error ? error.message : String(error)}`);
           });
-          this.swallow(() => reader.cancel());
+          if (!this.localCloseIsGraceful) this.swallow(() => reader.cancel());
           try { reader.releaseLock(); } catch { /* already released */ }
         }
         throw error;
@@ -4009,14 +4011,14 @@ export class MoqtConnection {
     // (a quiet local close fires no onClose, and cannot be upgraded into one).
     this._terminated = true;
     this._closeEmitted = true;
+    this.localCloseIsGraceful = error === undefined || BigInt(error) === 0n;
     const actions = this.session.close(error, reason);
     this.failPendingRawSubscriptions(reason ?? 'Session closed');
     // Start transport shutdown before retiring local I/O, while still making
     // every reader and publisher inert before this method first yields.
     const transportClose = this.executeActions(actions);
-    // No error code (or NO_ERROR) is a clean close: keep the control streams
-    // out of it, so a draft-23 peer does not see CLOSED_CONTROL_STREAM (§6.3).
-    this.clearTerminalState(error === undefined || BigInt(error) === 0n);
+    // Clean local close leaves control streams to the transport's termination.
+    this.clearTerminalState(this.localCloseIsGraceful);
     await transportClose;
   }
 

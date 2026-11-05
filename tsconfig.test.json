@@ -77,6 +77,7 @@
     "packages/webtransport/src/adapter-d16-request-order.test.ts",
     "packages/webtransport/src/topology/draft16-control-acceptor.test.ts",
     "packages/webtransport/src/adapter-d22-conformance.test.ts",
+    "packages/webtransport/src/adapter-clean-close-review.test.ts",
     "packages/webtransport/src/adapter-d18.test.ts",
     "packages/webtransport/src/adapter-d18-data.test.ts",
     "packages/webtransport/src/adapter-d22.test.ts",

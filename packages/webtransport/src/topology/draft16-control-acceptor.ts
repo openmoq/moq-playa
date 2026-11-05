@@ -18,6 +18,7 @@ export class Draft16ControlAcceptor {
   private source: ReadableStreamDefaultReader<WebTransportBidirectionalStream> | null = null;
   private readonly pending = new Set<PendingStream>();
   private finished = false;
+  private releasePendingStreams = false;
   private resolve!: (control: AcceptedControlStream) => void;
   private reject!: (error: Error) => void;
   private readonly ready = new Promise<AcceptedControlStream>((resolve, reject) => {
@@ -35,9 +36,10 @@ export class Draft16ControlAcceptor {
     return this.ready;
   }
 
-  retire(error: Error): void {
+  retire(error: Error, options: { graceful?: boolean } = {}): void {
     if (this.finished) return;
     this.finished = true;
+    this.releasePendingStreams = options.graceful === true;
     this.releaseSource();
     for (const entry of this.pending) this.drop(entry);
     this.reject(error);
@@ -49,7 +51,7 @@ export class Draft16ControlAcceptor {
       while (!this.finished) {
         const { value: stream, done } = await source.read();
         if (this.finished) {
-          if (stream) this.abortStream(stream);
+          if (stream && !this.releasePendingStreams) this.abortStream(stream);
           return;
         }
         if (done) {
@@ -111,8 +113,10 @@ export class Draft16ControlAcceptor {
     if (entry.cancelled) return;
     entry.cancelled = true;
     this.pending.delete(entry);
-    void entry.reader.cancel().catch(() => {});
-    void entry.stream.writable.abort().catch(() => {});
+    if (!this.releasePendingStreams) {
+      void entry.reader.cancel().catch(() => {});
+      void entry.stream.writable.abort().catch(() => {});
+    }
     try { entry.reader.releaseLock(); } catch { /* pending read cancellation */ }
   }
 

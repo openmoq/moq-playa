@@ -74,6 +74,7 @@ export class IncomingUniRouter {
   private setupAccepted = false;
   private dataReleased = false;
   private terminal = false;
+  private releaseStreamReaders = false;
   private started = false;
 
   constructor(
@@ -120,17 +121,25 @@ export class IncomingUniRouter {
    * Stop locally-owned work while leaving the aggregate source to transport
    * shutdown. The transport owns that readable's terminal transition; cancelling
    * it here can race a backend that closes the same controller from onClose.
+   * Graceful transport shutdown also releases child readers: an incomplete
+   * stream type may still identify a control stream.
    */
-  retire(reason: unknown): void {
-    this.stop(reason, false);
+  retire(reason: unknown, options: { graceful?: boolean } = {}): void {
+    this.stop(reason, false, options.graceful === true);
   }
 
-  private stop(reason: unknown, cancelSource: boolean): void {
+  private stop(reason: unknown, cancelSource: boolean, releaseReaders = false): void {
     if (this.terminal) return;
     const error = reason instanceof Error ? reason : new Error(String(reason));
     this.terminal = true;
+    this.releaseStreamReaders = releaseReaders;
     this.setup.reject(error);
-    this.cancelOwnedReaders(error);
+    this.retireOwnedReaders(error);
+    if (releaseReaders) {
+      // A partial stream type may still be SETUP. A clean transport close owns
+      // its termination, as well as the aggregate source's terminal transition.
+      try { this.sourceReader?.releaseLock(); } catch { /* already released */ }
+    }
     if (cancelSource) {
       try { void this.sourceReader?.cancel(error).catch(() => {}); } catch { /* transport already closed */ }
     }
@@ -147,7 +156,7 @@ export class IncomingUniRouter {
           return;
         }
         if (this.terminal) {
-          void stream.cancel().catch(() => {});
+          if (!this.releaseStreamReaders) void stream.cancel().catch(() => {});
           continue;
         }
         if (this.activeClassifiers + this.earlyData.length >= this.maxPendingStreams) {
@@ -171,7 +180,9 @@ export class IncomingUniRouter {
     try {
       const classified = await classifyIncomingStream(reader);
       if (this.terminal) {
-        cancelAndRelease(classified.reader);
+        if (this.releaseStreamReaders) {
+          try { classified.reader.releaseLock(); } catch { /* already released */ }
+        } else cancelAndRelease(classified.reader);
         return;
       }
       if (classified.kind === 'setup') {
@@ -239,12 +250,18 @@ export class IncomingUniRouter {
     this.handlers.onViolation(reason, error);
   }
 
-  private cancelOwnedReaders(reason: Error): void {
+  private retireOwnedReaders(reason: Error): void {
     for (const reader of this.classifyingReaders) {
-      try { void reader.cancel(reason).catch(() => {}); } catch { /* stream already closed */ }
+      try {
+        if (this.releaseStreamReaders) reader.releaseLock();
+        else void reader.cancel(reason).catch(() => {});
+      } catch { /* stream already closed or released */ }
     }
     for (const stream of this.earlyData.splice(0)) {
-      try { void stream.reader.cancel(reason).catch(() => {}); } catch { /* stream already closed */ }
+      try {
+        if (this.releaseStreamReaders) stream.reader.releaseLock();
+        else void stream.reader.cancel(reason).catch(() => {});
+      } catch { /* stream already closed or released */ }
     }
   }
 }
