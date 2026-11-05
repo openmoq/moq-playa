@@ -17,7 +17,7 @@ import { FetchFlags, FetchSpecialFlags, FetchSubgroupMode } from './codes.js';
 import type { SubgroupHeader, SubgroupObject, ObjectDatagram, GroupOrder, FetchRangeKind } from './types.js';
 import type { FetchObjectPrior18 } from './decoder-18.js';
 import { StreamType18 } from './codes-18.js';
-import type { RequestStreamDraft } from '../versions.js';
+import { isDraft23, type RequestStreamDraft } from '../versions.js';
 
 /** Subgroup-ID mode 0b10: an explicit Subgroup ID field is present (§11.4.2). */
 const SUBGROUP_ID_MODE_EXPLICIT = 0b10;
@@ -224,7 +224,7 @@ export function encodeFetchObject18(
       throw new Error(`fetch Group ID Delta out of range for ${groupOrder} order`);
     }
     objDelta = objectId; // group present → object delta is absolute
-  } else if (version === 23) {
+  } else if (isDraft23(version)) {
     // draft-23 §11.4.1.1: an absent delta is prior + 1; a present one prior + delta + 2.
     if (objectId <= prior!.objectId) throw new Error('fetch Object ID must increase within a group');
     if (objectId === prior!.objectId + 1n) {
@@ -307,7 +307,7 @@ export function encodeFetchEndOfRange18(
   const flags = BigInt(RANGE_FLAGS[rangeKind]);
   let gField = groupId;
   let oField = objectId;
-  if (version === 23 && prior !== undefined) {
+  if (isDraft23(version) && prior !== undefined) {
     const gd = groupOrder === 'ascending' ? groupId - prior.groupId : prior.groupId - groupId;
     if (gd < 0n) throw new Error(`End of Range Group ${groupId} is behind the prior entry for ${groupOrder} order`);
     gField = gd;

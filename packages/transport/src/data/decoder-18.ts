@@ -36,7 +36,7 @@ import type {
   ObjectHeaderLayout,
 } from './types.js';
 import type { DecodedFetchItem } from './decoder.js';
-import type { RequestStreamDraft } from '../versions.js';
+import { isDraft23, type RequestStreamDraft } from '../versions.js';
 
 /** Subgroup-ID mode 0b10: an explicit Subgroup ID field follows (§11.4.2). */
 const SUBGROUP_ID_MODE_EXPLICIT = 0b10;
@@ -371,7 +371,7 @@ function rangeKind18(flags: bigint, version: RequestStreamDraft): FetchRangeKind
     // draft-22 §11.4: End of Timed-Out Range, the objects' delivery timeout expired.
     case FetchSpecialFlags.END_TIMED_OUT: return version !== 18 ? 'timed-out' : undefined;
     // draft-23 §11.4.2: End of Gone Range.
-    case FetchSpecialFlags.END_GONE: return version === 23 ? 'gone' : undefined;
+    case FetchSpecialFlags.END_GONE: return isDraft23(version) ? 'gone' : undefined;
     default: return undefined;
   }
 }
@@ -392,7 +392,7 @@ function endMarker23(flags: bigint, version: RequestStreamDraft): FetchEndMarker
 function validateFetchFlags18(flags: bigint, version: RequestStreamDraft = 18): void {
   if (rangeKind18(flags, version) !== undefined || endMarker23(flags, version) !== undefined) return;
   if (flags >= 0n && flags <= 0x7fn) return;
-  const allowed = version === 23 ? ', 0x20C, 0x40C, 0x80, 0x81' : version !== 18 ? ', 0x20C' : '';
+  const allowed = isDraft23(version) ? ', 0x20C, 0x40C, 0x80, 0x81' : version !== 18 ? ', 0x20C' : '';
   throw new ProtocolViolationError(
     `Invalid draft-${version} fetch Serialization Flags 0x${flags.toString(16)} (allowed: 0x00-0x7F, 0x8C, 0x10C${allowed})`,
     MALFORMED_OBJECT,
@@ -495,7 +495,7 @@ export function decodeFetchObjectHeader18(
       }
     }
     // Drafts 18 and 22 carry absolute IDs; draft 23 delta-codes them.
-    const { groupId, objectId } = version === 23
+    const { groupId, objectId } = isDraft23(version)
       ? decodeEndOfRange23(gd.value, od.value, prior, isFirstObject, groupOrder)
       : { groupId: gd.value, objectId: od.value };
     // Position prior comes from the marker; field priors are UNCHANGED.
@@ -602,7 +602,7 @@ export function decodeFetchObjectHeader18(
     } else {
       // draft-23 §11.4.1.1: within a Group the delta skips at least one Object
       // (prior + 1 is the absent-delta case), so it is prior + delta + 2.
-      objectId = prior!.objectId + od.value + (version === 23 ? 2n : 0n);
+      objectId = prior!.objectId + od.value + (isDraft23(version) ? 2n : 0n);
       if (objectId > MAX_VI64) {
         throw new ProtocolViolationError(`Fetch Object ID overflow: ${objectId} > 2^64-1`, DELTA_ENCODING_OVERFLOW);
       }
