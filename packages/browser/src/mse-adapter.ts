@@ -225,10 +225,16 @@ function equalDrmBytes(a: Uint8Array | undefined, b: Uint8Array | undefined): bo
 }
 
 export interface MseMediaSourceOptions {
-  /** Maximum additional wait for a known decode-time hole. Default 250 ms;
-   *  zero preserves immediate append scheduling. Independent of gap duration. */
+  /** Maximum additional wait for a known decode-time hole, so a delayed group
+   *  tail can still land in order. Default 2000 ms, matching the `gapJumpMs`
+   *  default: a hole committed sooner would only stall at the gap-jump wait
+   *  anyway, and lose the tail for good. Before playback first starts the wait
+   *  is capped at 250 ms so a hole cannot delay startup. Zero preserves
+   *  immediate append scheduling. Independent of gap duration. */
   readonly reorderWindowMs?: number;
-  /** Retained append-queue limits, per media type. Defaults 100 chunks / 8 MiB. */
+  /** Retained append-queue limits, per media type. Defaults: 100 chunks plus one
+   *  per frame of a 60 fps reorder window (220 at the default), and 8 MiB. A
+   *  pending hold that would exceed either limit is released, not discarded. */
   readonly maxQueuedChunks?: number;
   readonly maxQueuedBytes?: number;
   /** DRM configuration. When set, EME is initialized and license requests
@@ -730,6 +736,12 @@ export class MseMediaSource implements MediaSourceLike {
   private static readonly GAP_EDGE_WINDOW_SEC = 0.5;
   /** Playhead movement below this is "stuck" (gap detection only). */
   private static readonly GAP_MOVE_TOLERANCE_SEC = 0.05;
+  /** Default reorder hold; matches the default gapJumpMs. */
+  private static readonly DEFAULT_REORDER_WINDOW_MS = 2_000;
+  /** Reorder hold cap before playback first starts (startup latency bound). */
+  private static readonly STARTUP_REORDER_WINDOW_MS = 250;
+  /** Frame rate the default queue capacity is sized for across one window. */
+  private static readonly REORDER_QUEUE_FPS = 60;
   /** Candidate identity comparison tolerance (never float equality). */
   private static readonly GAP_IDENTITY_TOLERANCE_SEC = 0.01;
   /** Per-attempt wait before jumping; 0 disables. */
@@ -883,9 +895,13 @@ export class MseMediaSource implements MediaSourceLike {
       if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`${name} must be a safe integer >= ${minimum}`);
       return value;
     };
-    this.reorderWindowMs = boundedInteger('reorderWindowMs', options.reorderWindowMs ?? 250, 0);
+    this.reorderWindowMs = boundedInteger('reorderWindowMs',
+      options.reorderWindowMs ?? MseMediaSource.DEFAULT_REORDER_WINDOW_MS, 0);
     if (this.reorderWindowMs > 0x7fffffff) throw new Error('reorderWindowMs exceeds the timer range');
-    this.maxQueuedChunks = boundedInteger('maxQueuedChunks', options.maxQueuedChunks ?? 100, 1);
+    // A full window of one-chunk-per-frame 60 fps media on top of the base
+    // back-pressure allowance, so a hold does not starve the queue.
+    this.maxQueuedChunks = boundedInteger('maxQueuedChunks', options.maxQueuedChunks
+      ?? 100 + Math.ceil(this.reorderWindowMs * MseMediaSource.REORDER_QUEUE_FPS / 1000), 1);
     this.maxQueuedBytes = boundedInteger('maxQueuedBytes', options.maxQueuedBytes ?? 8 * 1024 * 1024, 1);
     this.keepBehindSec = options.keepBehindSec ?? 10;
     this.maxAheadSec = options.maxAheadSec ?? 15;
@@ -1157,10 +1173,30 @@ export class MseMediaSource implements MediaSourceLike {
     if (wait?.timer !== null && wait?.timer !== undefined) clearTimeout(wait.timer);
   }
 
+  /** Expire a pending hold now and let the queue drain past its hole. */
+  private releaseAppendGap(mediaType: 'video' | 'audio'): void {
+    const wait = this.appendGapWait[mediaType];
+    if (!wait) return;
+    this.logWarn('[MSE] %s append queue full while holding a hole; releasing the hold', mediaType);
+    wait.entry.waitUntil = performance.now();
+    this.clearAppendGap(mediaType);
+    this.drainQueue(mediaType);
+  }
+
   private enqueueAppend(mediaType: 'video' | 'audio', entry: AppendEntry): boolean {
     const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
-    const bytes = queue.reduce((total, queued) => total + queued.data.byteLength, 0);
-    if (queue.length >= this.maxQueuedChunks || entry.data.byteLength > this.maxQueuedBytes - bytes) {
+    const full = (): boolean => queue.length >= this.maxQueuedChunks
+      || entry.data.byteLength > this.maxQueuedBytes - queue.reduce((total, queued) => total + queued.data.byteLength, 0);
+    if (full() && this.appendGapWait[mediaType]) {
+      // Holding must never cost accepted media: give up on the hole first.
+      const generation = this.bufferGen;
+      this.releaseAppendGap(mediaType);
+      if (this.destroyed || generation !== this.bufferGen) {
+        this.appendOutcome(entry.token, 'discarded', this.destroyed ? 'destroyed' : 'decoder reset');
+        return false;
+      }
+    }
+    if (full()) {
       this.appendOutcome(entry.token, 'discarded', 'queue capacity');
       this.logWarn('[MSE] %s append queue capacity reached', mediaType);
       return false;
@@ -1228,7 +1264,8 @@ export class MseMediaSource implements MediaSourceLike {
         || ranges[0]!.startTime - end <= MseMediaSource.appendHoleTolerance(ranges[0]!)) return false;
     const previous = this.appendGapWait[mediaType];
     const now = performance.now();
-    entry.waitUntil ??= now + this.reorderWindowMs;
+    entry.waitUntil ??= now + (this.playTriggered ? this.reorderWindowMs
+      : Math.min(this.reorderWindowMs, MseMediaSource.STARTUP_REORDER_WINDOW_MS));
     if (previous?.entry.trackName === entry.trackName && previous.entry.waitUntil !== undefined) {
       entry.waitUntil = Math.min(entry.waitUntil, previous.entry.waitUntil);
     }

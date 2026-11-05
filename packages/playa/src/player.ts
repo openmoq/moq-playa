@@ -643,7 +643,8 @@ export class Player {
     }
 
     Object.assign(base, {
-      createMediaSource: () => new MseMediaSource(this.videoElement!),
+      createMediaSource: () => new MseMediaSource(this.videoElement!,
+        opts.reorderWindowMs === undefined ? {} : { reorderWindowMs: opts.reorderWindowMs }),
       createCmafAssembler: (opts: { onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array) => void }) =>
         new CmafAssembler(opts),
     });

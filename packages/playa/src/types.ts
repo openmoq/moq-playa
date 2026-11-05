@@ -56,6 +56,12 @@ export interface PlayerOptions {
   readonly audioActivation?: 'auto' | 'gesture';
   /** Target latency in ms for live edge. */
   readonly targetLatencyMs?: number;
+  /**
+   * MSE (CMAF) only: how long a decode-time hole is held open for a delayed or
+   * reordered group tail before later media is appended past it. Default
+   * 2000 ms (250 ms before playback first starts); 0 disables the hold.
+   */
+  readonly reorderWindowMs?: number;
 
   // ── Quality ──
 
