@@ -100,6 +100,7 @@
     "packages/webtransport/src/adapter-clean-close-review.test.ts",
     "packages/webtransport/src/adapter-d18.test.ts",
     "packages/webtransport/src/adapter-d18-data.test.ts",
+    "packages/webtransport/src/adapter-fetch-range-status.test.ts",
     "packages/webtransport/src/adapter-d22.test.ts",
     "packages/webtransport/src/topology/uni-pair.test.ts",
     "packages/webtransport/src/adapter-fetch-range-gap-legacy.test.ts",

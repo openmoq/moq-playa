@@ -12,11 +12,12 @@
  * @see draft-ietf-moq-msf-01 §5, draft-ietf-moq-transport-18 §10.12.2
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { MoqtPlayer } from './player.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import { varint } from '@openmoq/transport';
+import { CatalogBootstrap } from './catalog-bootstrap.js';
 
 const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
 const td = new TextDecoder();
@@ -43,7 +44,7 @@ interface ServerState {
 }
 
 /** Wire the server side as a minimal catalog publisher. */
-function wireServer(server: MoqtConnection, opts?: { refuseJoin?: boolean }): ServerState {
+function wireServer(server: MoqtConnection, opts?: { refuseJoin?: boolean; nonExistentDelta?: boolean }): ServerState {
     const state: ServerState = { catalogSubReqId: null, catalogAlias: 40n, joinReqId: null, joinRange: null, mediaSubs: [] };
     let nextAlias = 41n;
     server.onSubscribe = (requestId, _ns, trackName) => {
@@ -78,7 +79,9 @@ function wireServer(server: MoqtConnection, opts?: { refuseJoin?: boolean }): Se
             await server.acceptFetch(requestId, { endLocation: range.endLocation });
             const sid = await server.openFetchStream(requestId);
             await server.sendFetchObject(sid, { groupId: 5n, subgroupId: 0n, objectId: 0n, publisherPriority: 5, payload: enc(CATALOG) });
-            await server.sendFetchObject(sid, { groupId: 5n, subgroupId: 0n, objectId: 1n, publisherPriority: 5, payload: enc(DELTA) });
+            // §11.4.4.2: End of Non-Existent Range — {5,1} does not exist.
+            if (opts?.nonExistentDelta) await server.sendFetchEndOfRange(sid, true, 5n, 1n);
+            else await server.sendFetchObject(sid, { groupId: 5n, subgroupId: 0n, objectId: 1n, publisherPriority: 5, payload: enc(DELTA) });
             await server.closeFetchStream(sid);
         })();
     };
@@ -136,6 +139,38 @@ describe('d18 loopback — catalog bootstrap end-to-end (#28/#30)', () => {
         expect(playerErrors).toEqual([]);
         expect(errors).toEqual([]);
         await player.destroy();
+    });
+
+    it('a non-existent range in the join prefix is a missing object, not a group terminator, and the head still converges', async () => {
+        const { client, server, errors } = await connectedPair(18);
+        wireServer(server as unknown as MoqtConnection, { nonExistentDelta: true });
+        const seen = vi.spyOn(CatalogBootstrap.prototype, 'onFetchObject');
+        let player: MoqtPlayer | undefined;
+        try {
+            player = new MoqtPlayer({
+                url: 'https://unused.example/moq',
+                namespace: 'live/broadcast',
+                connection: client as unknown as MoqtConnection,
+                createTransport: async () => ({}) as never,
+                draftVersion: 18,
+            });
+            const received: string[][] = [];
+            player.on('catalog_received', (e) => received.push(e.catalog.tracks.map((t) => t.name)));
+            const playerErrors: unknown[] = [];
+            player.on('error', (e) => playerErrors.push(e.error));
+
+            await player.load();
+            await settle();
+
+            const gaps = seen.mock.calls.map(([, event]) => event).filter((event) => event.kind === 'gap');
+            expect(gaps).toEqual([{ location: { group: 5n, object: 1n }, kind: 'gap', gapKind: 'missing' }]);
+            // Prefix {5,0}..{5,1} complete: the head applies alone.
+            expect(received).toEqual([['video']]);
+            expect(playerErrors).toEqual([]);
+            expect(errors).toEqual([]);
+        } finally {
+            try { await player?.destroy(); } finally { seen.mockRestore(); }
+        }
     });
 
     it('refused join → fallback observed as a second inbound catalog SUBSCRIBE (AbsoluteStart)', async () => {
