@@ -123,6 +123,9 @@ export class SyncController {
     private _catchUpActive = false;
     private _currentRate = 1.0;
     private _captureTimestampAgeUs: number | null = null;
+    /** Latest age per timestamp source whose latest observation was measurable,
+     *  in measurement order (the last entry is the most recent). */
+    private readonly _captureTimestampAgeBySource = new Map<string, number>();
 
     constructor(config: SyncControllerConfig) {
         this._driftThresholdUs = config.driftThresholdUs;
@@ -195,7 +198,8 @@ export class SyncController {
     }
 
     /** Latest receiver-wall-clock minus capture timestamp, in microseconds.
-     * Null before a wall-clock observation and after reset/domain invalidation.
+     * Null before a wall-clock observation, after reset, and while no source's
+     * latest observation is measurable (see evaluateCatchUp).
      * May be zero or negative; no sender/receiver clock correction is implied.
      */
     get captureTimestampAgeUs(): number | null {
@@ -368,13 +372,22 @@ export class SyncController {
      * Rate is proportional to overshoot, quantized to 0.05x increments.
      *
      * @param captureTimestampUs CaptureTimestamp in microseconds (Unix epoch)
+     * @param isWallClock False when the timestamp is media time. Undefined means wall clock.
+     * @param source Which track the timestamp came from (e.g. 'video', 'audio').
+     *   An unmeasurable timestamp invalidates only its own source's age, so a
+     *   media-time track cannot null out a wall-clock track's measurement.
      * @returns CatchUpState if evaluated, null if catch-up is disabled or no timestamp
      * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
      */
-    evaluateCatchUp(captureTimestampUs: bigint, isWallClock?: boolean): CatchUpState | null {
+    evaluateCatchUp(captureTimestampUs: bigint, isWallClock?: boolean, source = ''): CatchUpState | null {
         // Measure latency
         const latencyUs = this.measureLatency(captureTimestampUs, isWallClock);
-        this._captureTimestampAgeUs = latencyUs;
+        const ages = this._captureTimestampAgeBySource;
+        ages.delete(source);
+        if (latencyUs !== null) ages.set(source, latencyUs);
+        let latest: number | null = null;
+        for (const age of ages.values()) latest = age;
+        this._captureTimestampAgeUs = latest;
         if (latencyUs === null) return null;
 
         // Catch-up disabled?
@@ -416,6 +429,7 @@ export class SyncController {
      */
     reset(): void {
         this._captureTimestampAgeUs = null;
+        this._captureTimestampAgeBySource.clear();
         this.localBaselineUs = undefined;
         this.captureBaselineUs = undefined;
         this._currentDriftUs = 0;

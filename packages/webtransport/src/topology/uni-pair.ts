@@ -288,6 +288,9 @@ export class UniPairTopology {
       for (const action of actions) {
         if (action.type === 'send_control') {
           const encoded = this.codec.encode(action.message);
+          if (this.controlOpenInvalid(epoch)) {
+            throw new Error('UniPairTopology: connection closed during SETUP');
+          }
           this.onSetupCreated?.(action.message, encoded.byteLength);
           if (this.controlOpenInvalid(epoch)) {
             throw new Error('UniPairTopology: connection closed during SETUP observation');
@@ -361,6 +364,11 @@ export class UniPairTopology {
               throw new Error(`UniPairTopology: expected SETUP on the control stream, got ${message.type}`);
             }
             sawSetup = true;
+            // Closed before the observer ran (e.g. while the read was pending):
+            // the observer is not involved, so don't say it was.
+            if (this.controlOpenInvalid(epoch)) {
+              throw new Error('UniPairTopology: connection closed during SETUP');
+            }
             this.onSetupParsed?.(message);
             if (this.controlOpenInvalid(epoch)) {
               throw new Error('UniPairTopology: connection closed during SETUP observation');

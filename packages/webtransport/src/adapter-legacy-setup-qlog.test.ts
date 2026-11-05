@@ -57,4 +57,13 @@ describe('legacy setup qlog observations', () => {
     await expect(connecting).rejects.toThrow(/closed during setup observation/);
     expect(transport.closeInfo).toBeDefined();
   });
+
+  it.each([14, 16] as const)('reports a plain setup close in draft %i when no observer is involved', async draft => {
+    const conn = new MoqtConnection(draft); const transport = new TransportSim();
+    const connecting = conn.connect(transport); await flush(100);
+    transport.bidi[0]!.push(createControlCodec(draft).encode({ type: 'SERVER_SETUP', parameters: new Map() }));
+    void conn.close().catch(() => {});
+    const error = await connecting.then(() => null, (e: unknown) => e as Error);
+    expect(error?.message).toBe('Connection closed during setup');
+  });
 });

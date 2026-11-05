@@ -1282,6 +1282,47 @@ describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft
     }
   });
 
+  it('fails cleanly when the commit throws before the replacement is adopted', async () => {
+    const h = await fixture(draft);
+    const commit = vi.spyOn(h.player as unknown as { adoptMigration(): void }, 'adoptMigration')
+      .mockImplementation(() => { throw new Error('adoption fault'); });
+    try {
+      await h.old.goaway();
+      await h.next.accept('catalog', 100n);
+      await h.next.send('catalog', catalog());
+      await h.next.accept('video', 200n);
+      await h.next.accept('audio', 201n);
+      await flush(512);
+      expect(commit).toHaveBeenCalledTimes(1);
+      expect(h.migrated).not.toHaveBeenCalled();
+      // The candidate was never adopted: it is closed, and the session the
+      // player still holds is not retired out from under it.
+      expect(h.next.close).toHaveBeenCalled();
+      expect(h.old.close).not.toHaveBeenCalled();
+      expect(h.player.state).toBe('error');
+      expect(h.fatalErrors.some(message => /adoption fault/.test(message))).toBe(true);
+    } finally { commit.mockRestore(); await h.destroy(); }
+  });
+
+  it('fails cleanly when the commit throws after the replacement became current', async () => {
+    const h = await fixture(draft);
+    const adopt = vi.spyOn(h.player as unknown as { adoptPreparedSubscriptions(): void }, 'adoptPreparedSubscriptions')
+      .mockImplementation(() => { throw new Error('adoption fault'); });
+    try {
+      await h.old.goaway();
+      await h.next.accept('catalog', 100n);
+      await h.next.send('catalog', catalog());
+      await h.next.accept('video', 200n);
+      await h.next.accept('audio', 201n);
+      await flush(512);
+      expect(adopt).toHaveBeenCalledTimes(1);
+      expect(h.migrated).not.toHaveBeenCalled();
+      // The half-adopted replacement is not reported as a working session.
+      expect(h.player.state).toBe('error');
+      expect(h.fatalErrors.some(message => /adoption fault/.test(message))).toBe(true);
+    } finally { adopt.mockRestore(); await h.destroy(); }
+  });
+
   it('has a positive control for old-session delivery without a GOAWAY', async () => {
     const h = await fixture(draft);
     try {

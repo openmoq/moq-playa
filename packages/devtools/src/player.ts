@@ -380,6 +380,10 @@ export function installPlayerDiagnostics(target: PlayerDiagnosticSource | Player
     if (!started) { started = true; return; }
     stop(); capture.dispose(); unregister(); delivery = 0n; trackSequence = 0; observationDrops = 0; makeCapture();
   })));
+  // Prefer the explicit destroy hook: a state_changed after destroy is not
+  // guaranteed (destroy() re-entered from a state listener drops the queued
+  // ENDED announcement). The state probe stays for sources without the hook.
+  if (player.observeDestroy) removers.push(player.observeDestroy(() => guarded(() => installation.dispose())));
   removers.push(player.on('state_changed', () => guarded(() => { if (player.diagnosticSnapshot().destroyed) installation.dispose(); })));
   return installation;
 }

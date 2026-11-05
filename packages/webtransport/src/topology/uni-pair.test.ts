@@ -64,6 +64,21 @@ describe('UniPairTopology — control handshake', () => {
     expect(transport.uniOut[0]!.writeClosed).toBe(false); // control stream stays open
   });
 
+  it('does not blame SETUP observation for a close with no observer installed', async () => {
+    // Close lands while the peer SETUP read is pending; no onSetupParsed is set.
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const control = transport.openIncomingUni();
+    const establishing = topo.establish(transport);
+    for (let i = 0; i < 3; i++) await Promise.resolve();
+    control.push(setupBytes());
+    client.close(SessionErrorCode.NO_ERROR, 'bye');
+    const error = await establishing.then(() => null, (e: unknown) => e as Error);
+    expect(error?.message).toMatch(/closed during SETUP/);
+    expect(error?.message).not.toMatch(/observation/);
+  });
+
   it('shutdown cancels the peer control reader without reporting a peer FIN', async () => {
     const client = new Session(EndpointRole.CLIENT, 18);
     const topo = createUniPairTopology(client);
