@@ -9601,14 +9601,14 @@ describe('MoqtPlayer', () => {
 
       // Old track plays until the switch commits.
       deliver(oldAlias, 4, 0, moof);
-      deliver(oldAlias, 4, 0, mdat);
+      deliver(oldAlias, 4, 1, mdat);
       expect(pushed.filter(p => p.trackName === 'video_720')).toHaveLength(2);
 
       // New keyframe starts the commit; the old track's next group lands
       // while changeType is still pending.
       deliver(newAlias, 5, 0, moof);
       deliver(oldAlias, 5, 0, moof);
-      deliver(oldAlias, 5, 0, mdat);
+      deliver(oldAlias, 5, 1, mdat);
       expect(pushed.filter(p => p.trackName === 'video_720')).toHaveLength(2);
 
       finish();

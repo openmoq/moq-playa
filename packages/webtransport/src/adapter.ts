@@ -772,6 +772,7 @@ export class MoqtConnection {
     this.draft16NamespaceContexts.clear();
     this.objectReceiptObservers = undefined;
     this.reboundSubscribers = undefined;
+    this.reboundAliases = undefined;
     this.authorization?.close();
     this.authorizationUpdateTails.clear();
     const incomingUniRouter = this.incomingUniRouter;
@@ -2432,7 +2433,7 @@ export class MoqtConnection {
     const stampedOk = { ...message, requestId } as ControlMessage;
     // The old generation's complete guard (if any) is safe to clear now.
     if (this.terminatedAliases.get(alias)?.strict === false) {
-      (this.reboundSubscribers ??= new WeakSet()).add(this.session.getSubscription(requestId)!);
+      this.markRebound(alias, this.session.getSubscription(requestId)!);
     }
     this.clearTerminatedAlias(alias, true);
     const suppress = this.handleRawSubControlMessage(stampedOk);
@@ -3076,12 +3077,25 @@ export class MoqtConnection {
   // retain their existing per-receipt behavior. No history or timer is retained
   // after the owner is reclaimed.
   private reboundSubscribers: WeakSet<SubscriptionStateMachine> | undefined;
+  /**
+   * Aliases that may still have a rebound owner, so objects on every other
+   * alias skip the owner lookup. An alias leaves once no owner is rebound.
+   */
+  private reboundAliases: Set<bigint> | undefined;
+
+  private markRebound(alias: bigint, owner: SubscriptionStateMachine): void {
+    (this.reboundSubscribers ??= new WeakSet()).add(owner);
+    (this.reboundAliases ??= new Set()).add(alias);
+  }
 
   private reboundAllowsObject(alias: bigint, group: bigint, object: bigint): boolean {
     const rebound = this.reboundSubscribers;
-    if (!rebound) return true;
+    if (!rebound || this.reboundAliases?.has(alias) !== true) return true;
     const owners = this.session.getSubscriberRequestsForAlias(alias);
-    if (!owners.some(owner => rebound.has(owner))) return true;
+    if (!owners.some(owner => rebound.has(owner))) {
+      this.reboundAliases.delete(alias);
+      return true;
+    }
     return owners.some(owner => owner.isActive
       && (!owner.locationWindow || windowContains(owner.locationWindow, group, object)));
   }
@@ -7093,7 +7107,7 @@ export class MoqtConnection {
     }
     // The old generation's complete guard (if any) is safe to clear now.
     if (this.terminatedAliases.get(pubAlias)?.strict === false) {
-      (this.reboundSubscribers ??= new WeakSet()).add(this.session.getIncomingSubscription(requestId)!);
+      this.markRebound(pubAlias, this.session.getIncomingSubscription(requestId)!);
     }
     this.clearTerminatedAlias(pubAlias, true);
     const incoming: IncomingPublish = {

@@ -1291,25 +1291,27 @@ export class MoqtPlayer {
       const admission = audio.serial.then((): ObjectDeliveryAdmission => isLive()
         ? { kind: 'deliver', isLive, backfill: false } : { kind: 'discard', reason: 'route retired' });
       this.preparedMediaDeliveries.set(isLive, { preparation: audio, alias: BigInt(obj.trackAlias) });
-      const work = manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput, { admission, isLive });
+      const work = manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput,
+        { admission, isLive, ...(fetchInfo ? { fetched: true } : {}) });
       audio.serial = work;
       return work;
     }
     if (this.warmMediaOwners.size === 0) {
       return manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput,
-        fetchInfo?.warmStart ? { isLive: () => false } : undefined);
+        fetchInfo ? { ...(fetchInfo.warmStart ? { isLive: () => false } : {}), fetched: true } : undefined);
     }
     const alias = BigInt(obj.trackAlias);
     const owner = fetchInfo ? (fetchInfo.warmStart ? fetchInfo.warmOwner : undefined)
       : [...this.warmMediaOwners.values()].find(candidate => candidate.connection === sourceConnection && candidate.subscription.trackAlias === alias);
     if (!owner || owner.connection !== sourceConnection || owner.subscription.trackAlias !== alias
         || this.warmMediaOwners.get(owner.subscription) !== owner) return manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput,
-      fetchInfo?.warmStart ? { isLive: () => false } : undefined);
+      fetchInfo ? { ...(fetchInfo.warmStart ? { isLive: () => false } : {}), fetched: true } : undefined);
     const registration = manager.captureRoute(alias);
     const isLive = () => this.subscriptionManager === manager && registration?.() === true && this.warmMediaOwnerCurrent(owner);
     let permit!: WarmMediaRoute['permit'];
     const admission = new Promise<ObjectDeliveryAdmission>(resolve => { permit = resolve; });
-    const work = manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput, { isLive, admission });
+    const work = manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput,
+      { isLive, admission, ...(fetchInfo ? { fetched: true } : {}) });
     const head = owner.head;
     if (!head) permit({ kind: 'discard', reason: 'route retired' });
     else head.push({ group: BigInt(obj.groupId), object: BigInt(obj.objectId),
@@ -9837,6 +9839,7 @@ export class MoqtPlayer {
           if (terminal === 'reset') {
             this.livenessMonitor?.noteStreamReset(subgroup.trackAlias, performance.now());
             this.subscriptionManager?.invalidateLocmafGroup(subgroup.trackAlias, subgroup.groupId, conn);
+            this.subscriptionManager?.forgetRoutedLocations(subgroup.trackAlias, subgroup.groupId);
             for (const subscription of this.activeSubscriptions.values()) {
               if (subscription.trackAlias === subgroup.trackAlias) {
                 this.locmafDecoders.get(this.mediaKey(subscription.trackName, subscription.mediaType, subgroup.trackAlias))?.resetGroup(subgroup.groupId);
@@ -10886,6 +10889,7 @@ export class MoqtPlayer {
       if (resolvingConnection !== this.connection || ordinal === undefined
           || ordinal <= (appliedResetByGroup.get(groupId) ?? -1)) return;
       this.subscriptionManager?.invalidateLocmafGroup(alias, groupId, resolvingConnection);
+      this.subscriptionManager?.forgetRoutedLocations(alias, groupId);
       for (const subscription of this.activeSubscriptions.values()) {
         if (subscription.trackAlias === alias) {
           this.locmafDecoders.get(this.mediaKey(subscription.trackName, subscription.mediaType, alias))?.resetGroup(groupId);
@@ -11604,6 +11608,7 @@ export class MoqtPlayer {
     this.cmafVideoSynced = false;
     // Held LOCMAF objects never reached their decoders: restart each group reference.
     for (const decoder of this.locmafDecoders.values()) decoder.reset();
+    this.subscriptionManager?.forgetRoutedLocations();
     this.log.info('[CMAF] MediaSource attached — resuming at the next group start (live edge)');
   }
 
@@ -12724,6 +12729,8 @@ export class MoqtPlayer {
    */
   private flushForLivenessRestart(track: LivenessTrack): void {
     const catalogTrack = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === track.trackName);
+    // The restarted delivery feeds reset assembly/reconstruction state.
+    this.subscriptionManager?.forgetRoutedLocations(track.trackAlias);
     // LOCMAF on either path: drop the in-group reference; the restarted delivery begins at a full header.
     if (catalogTrack?.packaging === 'locmaf') {
       this.locmafDecoders.get(this.mediaKey(track.trackName, track.mediaType, track.trackAlias))?.reset();
