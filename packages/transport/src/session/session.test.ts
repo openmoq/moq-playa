@@ -6895,3 +6895,41 @@ describe('draft-18 inbound Full Track Name / Track Namespace validation (§2.4.1
     expectClose(s.handleControlMessage(pnMsg(EMPTY_FIELD)));
   });
 });
+
+// A SUBSCRIPTION_FILTER the session sends must be one its own decoder accepts:
+// SUBSCRIBE_OK / REQUEST_OK now resolve the subscription window from it on every
+// draft, so a filter only the decoder rejects would close the connection on the
+// peer's valid response. Reject it at the API instead, as draft 18 already does.
+describe('outbound AbsoluteRange End Group below Start Group (§5.1.2)', () => {
+  const NS = [new Uint8Array([0x6c])];
+  const NAME = new Uint8Array([0x76]);
+  const inverted: SubscriptionFilter = { type: 'AbsoluteRange', startGroup: 10n, startObject: 0n, endGroup: 5n };
+  function established(draft: 14 | 16): Session {
+    const s = new Session(EndpointRole.CLIENT, draft);
+    s.initiateSetup({ maxRequestId: varint(100n) });
+    s.handleControlMessage({
+      type: 'SERVER_SETUP',
+      parameters: new Map([[varint(SetupParam.MAX_REQUEST_ID), [varint(100n)]]]),
+    } as ServerSetup);
+    return s;
+  }
+
+  for (const draft of [14, 16] as const) {
+    it(`draft-${draft} subscribe() throws RangeError and sends nothing`, () => {
+      const s = established(draft);
+      expect(() => s.subscribe(NS, NAME, { subscriptionFilter: inverted })).toThrow(RangeError);
+      expect(s.state).toBe(SessionState.ESTABLISHED);
+    });
+
+    it(`draft-${draft} requestUpdate() throws RangeError and keeps the session`, () => {
+      const s = established(draft);
+      const { requestId } = s.subscribe(NS, NAME);
+      const ok: SubscribeOk = {
+        type: 'SUBSCRIBE_OK', requestId, trackAlias: varint(1n), parameters: new Map(), trackExtensions: [],
+      };
+      expect(s.handleControlMessage(ok).some(a => a.type === 'close_connection')).toBe(false);
+      expect(() => s.requestUpdate(requestId, { subscriptionFilter: inverted })).toThrow(RangeError);
+      expect(s.state).toBe(SessionState.ESTABLISHED);
+    });
+  }
+});
