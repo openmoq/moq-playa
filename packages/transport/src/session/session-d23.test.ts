@@ -134,6 +134,40 @@ describe('draft-23 FETCH response (§3.2, §9.3)', () => {
   });
 });
 
+describe('draft-23 relative FETCH filters (§3.2)', () => {
+  /** An inbound FETCH carrying the LOCATION_FILTER (0x21) bytes `filter`. */
+  function filteredFetch(session: Session, filter: number[]): SessionOutboundAction[] {
+    return session.handleControlMessage({
+      type: 'FETCH', requestId: 0n,
+      fetch: {
+        fetchType: 0x1, trackNamespace: namespace, trackName: name,
+        startLocation: { group: 0n, object: 0n }, endLocation: { group: 2n ** 64n - 1n, object: 0n },
+      } as StandaloneFetch,
+      parameters: new Map([[0x21n, [Uint8Array.from(filter)]]]),
+    } as Fetch);
+  }
+
+  it.each([
+    ['Relative Start', [0x01, 2]],
+    ['Next Object', [0x05]],
+  ])('refuses a %s filter with REQUEST_ERROR INVALID_RANGE', (_kind, filter) => {
+    const session = established(23, 'server');
+    const [error] = sent(filteredFetch(session, filter));
+    expect(error).toMatchObject({ type: 'REQUEST_ERROR', requestId: 0n, errorCode: 0x11n });
+    expect(session.getIncomingFetch(0n)).toBeUndefined();
+    expect(session.state).toBe(SessionState.ESTABLISHED);
+  });
+
+  it('accepts an absolute filter, and leaves a relative one to the receiver on draft 22', () => {
+    const session = established(23, 'server');
+    expect(sent(filteredFetch(session, [0x02, 2, 0]))).toEqual([]);
+    expect(session.getIncomingFetch(0n)).toBeDefined();
+    const d22 = established(22, 'server');
+    expect(sent(filteredFetch(d22, [0x01, 2]))).toEqual([]);
+    expect(d22.getIncomingFetch(0n)).toBeDefined();
+  });
+});
+
 describe('draft-23 parameter scope (§9.19)', () => {
   it('a bad parameter is INVALID_PARAMETER (draft 22: PROTOCOL_VIOLATION)', () => {
     for (const [draft, code] of [[23, 0x305n], [22, 0x3n]] as const) {
@@ -158,6 +192,15 @@ describe('draft-23 parameter scope (§9.19)', () => {
       type: 'SUBSCRIBE_TRACKS', requestId: 0n, trackNamespacePrefix: namespace,
       parameters: new Map([[0x04n, [100n]]]),
     }))).toBeUndefined();
+  });
+
+  it('NEW_GROUP_REQUEST cannot appear in SUBSCRIBE_TRACKS (§3.6.2)', () => {
+    const subscribeTracks = (session: Session) => session.handleControlMessage({
+      type: 'SUBSCRIBE_TRACKS', requestId: 0n, trackNamespacePrefix: namespace,
+      parameters: new Map([[0x32n, [0n]]]),
+    });
+    expect(closeCode(subscribeTracks(established(23, 'server')))).toBe(0x305n);
+    expect(closeCode(subscribeTracks(established(22, 'server')))).toBeUndefined();
   });
 
   it('EXPIRES may appear in TRACK_STATUS_OK', () => {

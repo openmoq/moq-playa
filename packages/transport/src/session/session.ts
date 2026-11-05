@@ -21,6 +21,7 @@ import { readLocation, writeLocation, locationEncodingLength } from '../primitiv
 const MAX_VI64 = 18446744073709551615n;
 import {
   encodeFillParameters, encodeSubscriptionFilter, validateSubscriptionFilter, decodeSubscriptionFilter, subscriptionWindow, type SubscriptionFilter,
+  isRelativeLocationFilter,
 } from '../control/subscription-filter.js';
 import { resolveJoiningFetchRange } from './joining.js';
 import { decodeFillParameters, resolveFillWindow, type FillOptions } from '../control/fill-parameters.js';
@@ -2707,6 +2708,9 @@ export class Session {
 
     const filterError = this.rejectUnsupportedRangeFilters(msg.requestId, msg.parameters);
     if (filterError) return filterError;
+
+    const relativeError = this.rejectRelativeFetchFilter(msg, validated.replenish);
+    if (relativeError) return relativeError;
 
     // Joining Fetch (0x2/0x3): enforce the MUSTs decidable from protocol state
     // BEFORE creating any fetch state (§9.16.2 / draft-18 §10.12.2).
@@ -6023,6 +6027,22 @@ export class Session {
     return [this.sendControl({ type: 'REQUEST_ERROR', requestId, errorCode: varint(0x36n),
       retryInterval: varint(0n), errorReason: 'Range filters exceed MAX_FILTER_RANGES=0 (9.1.6)',
     })];
+  }
+
+  /**
+   * draft-23 §3.2: a FETCH whose Location Filter is relative to the Largest
+   * Object gets REQUEST_ERROR INVALID_RANGE. Draft 22 leaves such a filter for
+   * the receiver to resolve.
+   */
+  private rejectRelativeFetchFilter(msg: Fetch, replenish?: SessionOutboundAction[]): SessionOutboundAction[] | undefined {
+    if (!isDraft23(this._draftVersion)) return undefined;
+    const filter = msg.parameters.get(MessageParam.SUBSCRIPTION_FILTER as bigint)?.[0];
+    if (!(filter instanceof Uint8Array) || !isRelativeLocationFilter(filter)) return undefined;
+    return [this.sendControl({ type: 'REQUEST_ERROR', requestId: msg.requestId,
+      errorCode: RequestErrorCode.INVALID_RANGE, retryInterval: varint(0n),
+      errorReason: 'A FETCH Location Filter cannot be relative to the Largest Object (3.2)',
+      requestKind: 'FETCH',
+    }), ...(replenish ?? [])];
   }
 
   /**

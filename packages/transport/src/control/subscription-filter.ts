@@ -197,6 +197,17 @@ export function decodeFetchLocationFilter(bytes: Uint8Array): bigint[] {
   return values[0] === LocationFilterType.NEXT_OBJECT ? [0n, 0n] : values.slice(1);
 }
 
+/**
+ * Whether a LOCATION_FILTER is defined relative to the Largest Object: a
+ * Relative Start (0x01) or the Next Object (0x05). Draft 23 refuses either on a
+ * FETCH with INVALID_RANGE (§3.2).
+ */
+export function isRelativeLocationFilter(bytes: Uint8Array): boolean {
+  if (bytes.length === 0) return false;
+  const type = readVi64(bytes, 0).value;
+  return type === LocationFilterType.RELATIVE_START || type === LocationFilterType.NEXT_OBJECT;
+}
+
 /** The {@link SubscriptionFilter} a draft-22 typed LOCATION_FILTER expresses. */
 function filterFromTypedLocationFilter(bytes: Uint8Array): SubscriptionFilter {
   const values: bigint[] = [];
