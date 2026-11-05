@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { MoqtObject, ObjectDatagram } from '@openmoq/transport';
 import type { MoqtConnection as PlayerConnection } from '@openmoq/webtransport';
-import { encodeObjectDatagram18, encodeSubgroupObject18, encodeFetchHeader, encodeFetchObject, locationEncodingLength, writeLocation, ObjectStatus, varint } from '@openmoq/transport';
+import { encodeObjectDatagram18, encodeSubgroupObject18, encodeFetchHeader, encodeFetchObject, encodeFetchEndOfRange, locationEncodingLength, writeLocation, ObjectStatus, varint } from '@openmoq/transport';
 import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { createLoopback, flush } from '../../webtransport/src/testkit/loopback.js';
 import { MoqtConnection } from '../../webtransport/src/adapter.js';
@@ -115,12 +115,17 @@ async function fixture(options: { draft?: 16 | 18 | 22; warm?: boolean; audio?: 
         await writer.write(encodeFetchObject({ flags: varint(0x1c), groupId: varint(group), subgroupId: varint(0n),
           objectId: varint(object), publisherPriority: 128, isDatagram: false, extensions: undefined, payload }));
         await flush(256);
+      }, async nonExistent(object: bigint, group = 9n) {
+        await writer.write(encodeFetchEndOfRange({ flags: varint(0x8c), groupId: group, objectId: object, nonExistent: true }));
+        await flush(256);
       }, async fin() { await writer.close(); await flush(256); } };
     }
     const stream = draft === 22 ? await server.openFillStream(request) : await server.openFetchStream(request);
     return { stream, async send(object: bigint, payload = bytes(Number(object)), group = 9n) {
       await server.sendFetchObject(stream, { groupId: group, subgroupId: 0n, objectId: object, publisherPriority: 128, payload });
       await flush(256);
+    }, async nonExistent(object: bigint, group = 9n) {
+      await server.sendFetchEndOfRange(stream, true, group, object); await flush(256);
     }, async fin() { await server.closeFetchStream(stream); await flush(256); } };
   };
   return { ...pair, player, requests, fetches, manager, captured, discarded, raw, media, errors, accept, live, openPrefix, status, decodeAudio, flushAudio, warn,
@@ -182,6 +187,23 @@ describe('owner-local initial warm admission', () => {
     resolve(first); await flush(256);
     expect(starts).toEqual([0n, 1n, 2n]);
     expect(h.media.map(e => e.object)).toEqual([0n, 1n, 2n]);
+  });
+
+  it.each([16, 18, 22] as const)('draft-%i End of Non-Existent Range in the prefix is a missing object, not END_OF_GROUP', async draft => {
+    const h = await fixture({ draft });
+    const pipeline = (h.player as unknown as { videoPipeline: { pushObject: (...args: unknown[]) => void; endedGroups: Set<bigint> } }).videoPipeline;
+    const push = vi.spyOn(pipeline, 'pushObject');
+    const gaps: Array<{ group: bigint; object: bigint; status?: bigint }> = [];
+    h.player.on('media_object', e => { if (e.kind === 'gap') gaps.push({ group: e.groupId, object: e.objectId, ...(e.status !== undefined ? { status: e.status } : {}) }); });
+    await h.accept();
+    await h.live(2n);
+    // Largest {9,1}: {9,0} is served and {9,1} does not exist. Group 9 goes on.
+    const prefix = await h.openPrefix(); await prefix.send(0n); await prefix.nonExistent(1n); await prefix.fin();
+    expect(h.media.map(e => e.object)).toEqual([0n, 1n, 2n]);
+    expect(gaps).toEqual([{ group: 9n, object: 1n, status: ObjectStatus.OBJECT_DOES_NOT_EXIST }]);
+    expect(push.mock.calls.map(call => (call[0] as MoqtObject).kind)).toEqual(['data', 'gap', 'data']);
+    expect(pipeline.endedGroups.has(9n)).toBe(false);
+    expect(h.errors).toEqual([]);
   });
 
   it('abandonment wakes a queued future group without another push; a late rejected transform cannot unsubscribe', async () => {
