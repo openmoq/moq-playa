@@ -4859,18 +4859,30 @@ export class MoqtPlayer {
     // mark txn.terminated. Cleanup runs in `finally` even if something throws — a
     // stranded transaction would leave a permanent "migration in progress" lock.
     // (drainStagedCandidate never throws; retireMigratedSession never throws.)
+    // commitMigration CAN throw part-way (an application listener it emits to,
+    // a media adapter it calls). Adoption is then half-applied and cannot be
+    // trusted either way, so the handover fails fatally instead.
+    let commitFault: { error: unknown } | undefined;
     try {
-      this.commitMigration(txn, newConnection);
-      this.drainStagedCandidate(txn);
+      try {
+        this.commitMigration(txn, newConnection);
+      } catch (error) {
+        commitFault = { error };
+        this.failMigrationCommit(txn, newConnection, error);
+      }
+      if (commitFault === undefined) this.drainStagedCandidate(txn);
     } finally {
       try {
-        await this.retireMigratedSession(oldConnection);
+        // Never retire a session the player is still holding: a commit that
+        // threw before switching left `this.connection` on the old one.
+        if (this.connection !== oldConnection) await this.retireMigratedSession(oldConnection);
         this.pruneSupersededSubscriptions(txn);
       } finally {
         if (this.currentMigration === txn) this.currentMigration = null;
         this.processPendingGoaway();
       }
     }
+    if (commitFault !== undefined) throw commitFault.error;
     // The single-flight slot is now released — a GOAWAY queued during drain or
     // retirement can be acted on (a fresh migration to its target). Done before
     // the termination check so a GOAWAY that raced a dying session still drives
@@ -6467,6 +6479,27 @@ export class MoqtPlayer {
     }
     txn.events.length = 0;
     txn.retainedBytes = 0;
+  }
+
+  /**
+   * A commit that threw part-way: close the candidate if it never became the
+   * current session, and move the player to ERROR rather than leaving it on a
+   * half-adopted (or about-to-be-retired) session that looks healthy.
+   */
+  private failMigrationCommit(txn: MigrationTxn, newConnection: MoqtConnection, error: unknown): void {
+    txn.terminated = true;
+    if (this.connection !== newConnection) this.abandonCandidate(txn);
+    const cause = error instanceof Error ? error : new Error(String(error));
+    try {
+      this.failCatalogPlayback(createPlayerError('fatal', 'connection', PlayerErrorCode.CONNECTION_LOST,
+        `Session handover failed while committing the replacement: ${cause.message}`, { cause }));
+    } catch (reportErr) {
+      // A listener threw while the failure was published; the state is committed.
+      try {
+        this.log.warn('Reporting a handover commit failure threw (ignored): %s',
+          reportErr instanceof Error ? reportErr.message : String(reportErr));
+      } catch { /* logger itself threw */ }
+    }
   }
 
   /**
