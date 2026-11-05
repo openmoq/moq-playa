@@ -124,6 +124,19 @@ describe('AudioDecoder render-time fallback to submission order', () => {
     expect(timing.resolve(7_000_000)).toEqual({ renderTimeUs: 0, input: null });
   });
 
+  it.each([1, 5])('does not trust a stale exact match after a %i-frame gap in input timestamps', (gap) => {
+    // Chrome stamps outputs from the first input plus frames emitted, so after
+    // a gap every output lands `gap` frames early, and soon exactly on an
+    // input that was already consumed.
+    const timing = new AudioOutputTiming();
+    const inputs = [...Array.from({ length: 10 }, (_, i) => i), ...Array.from({ length: 10 }, (_, i) => i + 10 + gap)];
+    for (const i of inputs) timing.remember(i * FRAME_US, FRAME_US, 1_000_000 + i * FRAME_US);
+    const results = inputs.map((_, k) => timing.resolve(k * FRAME_US));
+    expect(results.map(r => r.renderTimeUs)).toEqual(inputs.map(i => 1_000_000 + i * FRAME_US));
+    // Outputs stamped on an already-consumed input claim no identity.
+    for (const r of results.slice(10 + gap)) expect(r.input).toBeNull();
+  });
+
   it('drops a fallback queue on clear', () => {
     const timing = new AudioOutputTiming();
     timing.remember(0, FRAME_US, 100_000); timing.remember(0, FRAME_US, 120_000); timing.clear();

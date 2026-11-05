@@ -30,6 +30,8 @@ export class AudioOutputTiming {
   private historyIncomplete = false;
   /** Every accepted native submission in decode order, until an output consumes it. */
   private pending: PendingSubmission[] = [];
+  /** Submission the latest output matched by timestamp; further outputs on it still belong to it. */
+  private lastOwner: number | null = null;
   constructor(private readonly maxInputs = 256, private readonly initialPrimingOnly = true) {
     if (!Number.isSafeInteger(maxInputs) || maxInputs <= 0) throw new TypeError('Expected a positive safe timing limit');
   }
@@ -76,8 +78,22 @@ export class AudioOutputTiming {
       // Outputs arrive in decode order: submissions before this one produced no output.
       const owner = matched.input?.timestamp ?? timestamp;
       const index = this.pending.findIndex(entry => entry.timestamp === owner);
-      if (index >= 0) this.pending.splice(0, index + 1);
-      return { renderTimeUs: matched.renderTimeUs, input: matched.input };
+      if (index >= 0) {
+        this.pending.splice(0, index + 1);
+        this.lastOwner = owner;
+        return { renderTimeUs: matched.renderTimeUs, input: matched.input };
+      }
+      // A match on an input already consumed is only trusted for the input the
+      // previous output matched by timestamp (one chunk can yield several
+      // outputs). Any other is a stale
+      // collision: Chrome stamps outputs from frame counts, so after a gap in
+      // input timestamps an output can land exactly on an earlier input. Use
+      // the submission order instead, and claim no identity.
+      if (owner === this.lastOwner || this.pending.length === 0) {
+        return { renderTimeUs: matched.renderTimeUs, input: matched.input };
+      }
+      const stale = this.takePending(timestamp);
+      return { renderTimeUs: stale?.renderTimeUs ?? 0, input: null };
     }
     const fallback = this.takePending(timestamp);
     return { renderTimeUs: fallback?.renderTimeUs ?? 0, input: matched.input };
@@ -95,8 +111,11 @@ export class AudioOutputTiming {
     }
     if (index < 0) index = this.pending.findIndex(entry => entry.renderTimeUs !== null);
     if (index < 0) { this.pending.length = 0; return; }
-    const entry = this.pending[index];
+    const entry = this.pending[index]!;
     this.pending.splice(0, index + 1);
+    // An output paired by order proves nothing about its timestamp, so a later
+    // exact match on this entry is a stale collision, not a further output.
+    this.lastOwner = null;
     return entry;
   }
 
@@ -124,7 +143,7 @@ export class AudioOutputTiming {
   }
 
   clear(): void {
-    this.inputs.clear(); this.retiredTimestampFloor = -Infinity; this.outputSeen = false; this.historyIncomplete = false; this.pending = [];
+    this.inputs.clear(); this.retiredTimestampFloor = -Infinity; this.outputSeen = false; this.historyIncomplete = false; this.pending = []; this.lastOwner = null;
   }
 }
 
