@@ -73,6 +73,11 @@ export type ObjectDeliveryAdmission =
 export interface ObjectDeliveryOptions {
   readonly isLive?: () => boolean;
   readonly backfill?: boolean;
+  /**
+   * Delivered by a FETCH. A FETCH asks for its range explicitly, so its Objects
+   * are neither replay-checked nor recorded against the subscription's receipts.
+   */
+  readonly fetched?: boolean;
   /** Register/capture now, but defer transformation until the owner admits it. */
   readonly admission?: Promise<ObjectDeliveryAdmission>;
 }
@@ -84,6 +89,17 @@ export class SubscriptionManager {
   /** Map of track alias (bigint) → track info. */
   private readonly tracks = new Map<bigint, TrackInfo>();
   private readonly pendingRoutes = new WeakMap<TrackInfo, Set<PendingRoute>>();
+  /**
+   * CMAF/LOCMAF Object locations already routed, per registration and recent
+   * group. Same-track alias reuse can deliver an immutable Object again (the
+   * transport leaves replay suppression to its consumer), and both paths feed
+   * location-blind state: a repeated moof mispairs with a later mdat, and a
+   * repeated LOCMAF Object breaks its group's delta chain. A registration is
+   * one track on one connection, so a migration never inherits these records.
+   */
+  private routedLocations = new WeakMap<TrackInfo, Map<bigint, Set<bigint>>>();
+  /** Groups per registration whose routed Object IDs are kept; older ones are dropped first. */
+  static readonly REPLAY_TRACKED_GROUPS = 8;
 
   /** Already-accepted asynchronous transforms must finish before terminal retirement invalidates their route. */
   captureTrackIdle(alias: bigint): () => Promise<void> | undefined {
@@ -325,6 +341,34 @@ export class SubscriptionManager {
     }
   }
 
+  /**
+   * Forget routed CMAF/LOCMAF locations — of every track, of `alias`, or of one
+   * of its groups — after the consumer reset the state they fed, so a fresh
+   * delivery of those locations is admitted again.
+   */
+  forgetRoutedLocations(alias?: bigint, groupId?: bigint): void {
+    if (alias === undefined) { this.routedLocations = new WeakMap(); return; }
+    const info = this.tracks.get(alias);
+    if (!info) return;
+    if (groupId === undefined) this.routedLocations.delete(info);
+    else this.routedLocations.get(info)?.delete(groupId);
+  }
+
+  /** Record a routed location; false when this registration already routed it. */
+  private admitLocation(info: TrackInfo, obj: MoqtObject): boolean {
+    const groupId = BigInt(obj.groupId), objectId = BigInt(obj.objectId);
+    let groups = this.routedLocations.get(info);
+    if (!groups) { groups = new Map(); this.routedLocations.set(info, groups); }
+    let objects = groups.get(groupId);
+    if (!objects) {
+      objects = new Set();
+      groups.set(groupId, objects);
+      if (groups.size > SubscriptionManager.REPLAY_TRACKED_GROUPS) groups.delete(groups.keys().next().value!);
+    } else if (objects.has(objectId)) return false;
+    objects.add(objectId);
+    return true;
+  }
+
   /** In-flight work received before a reset cannot re-anchor its group afterwards. */
   invalidateLocmafGroup(alias: bigint, groupId: bigint, source?: unknown): void {
     for (const pending of this.pendingLocmafTransforms) {
@@ -392,6 +436,7 @@ export class SubscriptionManager {
     // malformed old-session object recovers against ITS session, not the current.
     const draft = sourceDraft ?? this.draftVersion;
     const source = sourceConnection;
+    const fetched = delivery?.fetched === true; // An admission replaces `delivery`.
     let pendingTransform: PendingLocmafTransform | undefined;
     let pending = this.pendingRoutes.get(info);
     if (!pending) { pending = new Set(); this.pendingRoutes.set(info, pending); }
@@ -503,6 +548,11 @@ export class SubscriptionManager {
 
       if (this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
         this.discardContext(context, provenance, provenanceGeneration, 'route retired');
+        return;
+      }
+
+      if ((info.packaging === 'cmaf' || info.packaging === 'locmaf') && !fetched && !this.admitLocation(info, obj)) {
+        this.discardContext(context, provenance, provenanceGeneration, 'treated as a replay');
         return;
       }
 
