@@ -3036,6 +3036,7 @@ export class MoqtPlayer {
       this.switchInProgress = false;
       this.discardLocStaging('decoder reset');
       this.discardCmafStaging('decoder reset');
+      this.videoSwitchSettled();
       return;
     }
 
@@ -3256,6 +3257,7 @@ export class MoqtPlayer {
         this.switchInProgress = false;
         this.discardLocStaging('decoder reset');
         this.discardCmafStaging('decoder reset');
+        this.videoSwitchSettled();
       }
     }
   }
@@ -3328,6 +3330,7 @@ export class MoqtPlayer {
     }
     this.pendingVideoSwitch = null;
     this.switchInProgress = false;
+    this.videoSwitchSettled();
 
     // Switch is now committed — commit controllers, record stat, fire event.
     // All mutation is deferred to this point. ABR/recovery initiation paths
@@ -3383,6 +3386,7 @@ export class MoqtPlayer {
     if (this.pendingVideoSwitch !== sw) return false;
     this.pendingVideoSwitch = null;
     this.switchInProgress = false;
+    this.videoSwitchSettled();
     if (this.switchStagingTimeout !== null) {
       clearTimeout(this.switchStagingTimeout);
       this.switchStagingTimeout = null;
@@ -4709,7 +4713,9 @@ export class MoqtPlayer {
     if (this._destroyed) throw new Error('Cannot migrate: player is destroyed');
     if (this.isTerminalState()) throw new Error('Cannot migrate: playback has terminated');
     if (this.currentMigration) throw new Error('Cannot migrate: a migration is already in progress');
-    if (this.audioSelection) throw new Error('Cannot migrate: media selection is busy');
+    if (this.audioSelection || this.pendingVideoSwitch || this.switchInProgress) {
+      throw new Error('Cannot migrate: media selection is busy');
+    }
     // A previous attempt's `changeType` has not settled, so the media source
     // is not in a known state. Adopting a replacement onto a buffer another
     // attempt can still mutate would hand it an initialization that is about
@@ -6827,12 +6833,23 @@ export class MoqtPlayer {
    * it) and must be discarded rather than migrating off the caller's replacement.
    */
   private processPendingGoaway(): void {
-    if (this.currentMigration || this.audioSelection || this.pendingRetypes.size) return;
+    if (this.handoverBlocked()) return;
     const pending = this.pendingGoaway;
     this.pendingGoaway = null;
     if (pending !== null && !this._destroyed && !this.currentMigration && pending.sourceConnection === this.connection) {
       this.startGoawayMigration(pending.uri);
     }
+  }
+
+  /** Media state a handover cannot start under: it would capture a selection about to change. */
+  private handoverBlocked(): boolean {
+    return this.currentMigration !== null || this.audioSelection !== null || this.pendingRetypes.size > 0
+      || this.pendingVideoSwitch !== null || this.switchInProgress;
+  }
+
+  /** A video switch released its slot; act on a GOAWAY it deferred once its settlement finishes. */
+  private videoSwitchSettled(): void {
+    if (this.pendingGoaway !== null) queueMicrotask(() => this.processPendingGoaway());
   }
 
   private async migrateToUrl(newConnection: MoqtConnection, url: string): Promise<void> {
@@ -10185,6 +10202,14 @@ export class MoqtPlayer {
     if (this.audioSelection && !this.audioSelection.committed) {
       this.failAudioSelection(this.audioSelection, new Error('Audio selection cancelled by session GOAWAY'));
     }
+    // A video switch that has not yet sent its target SUBSCRIBE can never
+    // commit here: the draining session refuses new requests. Cancel it, as an
+    // uncommitted audio selection is. One whose target is already requested
+    // may still commit on this session, so the handover defers to it below.
+    const videoSwitch = this.pendingVideoSwitch;
+    if (videoSwitch?.connection === conn && videoSwitch.phase === 'preparing' && videoSwitch.newRequestId === null) {
+      this.discardPendingVideoSwitch(videoSwitch, new Error('Video switch cancelled by session GOAWAY'));
+    }
     // Established media is deliberately NOT cancelled here. Graceful switchover
     // orders the replacement's successful responses BEFORE cancellation:
     // "The new relay will send a response to the subscribes and if they are
@@ -10214,12 +10239,17 @@ export class MoqtPlayer {
     // §9.4 / §10.4 / §9.2: an empty New Session URI reuses the CURRENT session
     // URI — the endpoint we are actually on, not the configured origin.
     const uri = newSessionUri || this.activeEndpoint;
-    if (this.currentMigration || this.audioSelection || this.pendingRetypes.size) {
+    if (this.handoverBlocked()) {
       // A handoff is in flight (staged-event drain or old-session retirement
       // still holds the single-flight slot). Starting a migration now would be
       // rejected and the GOAWAY lost. QUEUE the target WITH its source session
       // (do NOT create the replacement adapter yet — it would leak); it is
       // acted on once the handoff finishes, only if `conn` is still current.
+      //
+      // A video switch whose target is already requested is deferred to, not
+      // cancelled: it is the selection the viewer or ABR asked for, and its
+      // commit changes the identity the replacement must carry. Its own
+      // staging and commit deadlines bound the wait.
       this.pendingGoaway = { uri, sourceConnection: conn };
       return;
     }

@@ -173,6 +173,15 @@ function catalogWithVideoInitRef(data: string) {
   ] }));
 }
 
+/** Two renditions of one view: a rendition switch that stays inside the altGroup. */
+function ladderCatalog() {
+  const base = JSON.parse(dec.decode(catalog())) as { version: number; tracks: Array<Record<string, unknown>> };
+  const video = { ...base.tracks.find(track => track['role'] === 'video')!, altGroup: 1 };
+  const rest = base.tracks.filter(track => track['role'] !== 'video');
+  return enc.encode(JSON.stringify({ ...base, tracks: [video,
+    { ...video, name: 'video-lo', width: 320, height: 180, bitrate: 300_000 }, ...rest] }));
+}
+
 function chunk(media: 'video' | 'audio', group: bigint) {
   return buildChunk({ trackId: media === 'video' ? 1 : 2, bmdt: group * 9000n,
     samples: [{ duration: 3000, size: 4, flags: SYNC_FLAGS }], mdat: Uint8Array.of(0, 0, 0, 0) });
@@ -183,6 +192,7 @@ async function fixture(draft: Draft, options: {
   silentCandidate?: boolean;
   defaultBootstrap?: boolean;
   oldSeparateInit?: boolean;
+  oldCatalog?: Uint8Array;
   config?: Partial<MoqtPlayerConfig>;
 } = {}) {
   const catalogName = options.config?.catalogTrackName ?? 'catalog';
@@ -244,7 +254,7 @@ async function fixture(draft: Draft, options: {
     if (options.defaultBootstrap) await old.bootstrap(catalog(options.oldSeparateInit, 'draft-01'));
     else {
       await old.accept(catalogName, 100n);
-      await old.send(catalogName, catalog(options.oldSeparateInit));
+      await old.send(catalogName, options.oldCatalog ?? catalog(options.oldSeparateInit));
     }
     if (options.oldSeparateInit) {
       await old.accept('init-video', 202n);
@@ -1281,6 +1291,88 @@ describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft
       vi.useRealTimers();
     }
   });
+
+  it('hands over to the rendition a video switch in flight at GOAWAY commits to', async () => {
+    const h = await fixture(draft, { oldCatalog: ladderCatalog(), config: { autoQuality: false, selection: { videoTrack: { name: 'video' } } } });
+    const switched = vi.fn();
+    h.player.on('quality_switched', switched);
+    try {
+      // A prompt relay answers the replacement's catalog as soon as it is asked for.
+      let catalogAnswered = false;
+      const answerCatalog = async () => {
+        if (catalogAnswered || !h.next.requests.some(r => r.name === 'catalog')) return;
+        catalogAnswered = true;
+        await h.next.accept('catalog', 100n);
+        await h.next.send('catalog', ladderCatalog());
+      };
+      const switching = h.player.selectVideoTrack('video-lo');
+      await h.old.accept('video-lo', 210n);
+      // GOAWAY lands while the switch is staged but not yet committed.
+      await h.old.goaway();
+      await answerCatalog();
+      await h.old.send('video-lo', chunk('video', 2n), 2n);
+      await switching;
+      expect(switched).toHaveBeenCalledTimes(1);
+      expect(h.received).toContainEqual({ name: 'video-lo', group: 2n });
+
+      await answerCatalog();
+      const aliases: Record<string, bigint> = { video: 200n, audio: 201n, 'video-lo': 210n };
+      for (const name of new Set(h.next.requests.map(r => r.name).filter(name => name !== 'catalog'))) {
+        await h.next.accept(name, aliases[name]!);
+      }
+      await flush(512);
+      expect(h.errors).toEqual([]);
+      expect(h.next.requests.map(r => r.name).filter(name => name.startsWith('video'))).toEqual(['video-lo']);
+      expect(h.migrated).toHaveBeenCalledTimes(1);
+      expect(h.old.close).toHaveBeenCalledTimes(1);
+      await h.next.send('video-lo', chunk('video', 3n), 3n);
+      await h.next.send('audio', chunk('audio', 3n), 3n);
+      expect(h.received).toContainEqual({ name: 'video-lo', group: 3n });
+      expect(h.received).toContainEqual({ name: 'audio', group: 3n });
+    } finally { await h.destroy(); }
+  });
+
+  it.each(['expired', 'rejected', 'cancelled'] as const)(
+    'hands over on the established rendition when a deferred video switch is %s', async outcome => {
+      if (outcome !== 'cancelled') vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      let h: Awaited<ReturnType<typeof fixture>> | undefined;
+      try {
+        h = await fixture(draft, { oldCatalog: ladderCatalog(),
+          config: { autoQuality: false, selection: { videoTrack: { name: 'video' } } } });
+        const failed = vi.fn();
+        h.player.on('quality_switch_failed', failed);
+        const switching = h.player.selectVideoTrack('video-lo');
+        if (outcome === 'rejected') await flush(256);
+        else await h.old.accept('video-lo', 210n);
+        await h.old.goaway();
+        // The handover waits for the switch rather than selecting from a view about to change.
+        expect(h.next.requests).toEqual([]);
+        if (outcome === 'cancelled') {
+          // Re-selecting the established rendition supersedes the pending switch.
+          await h.player.selectVideoTrack('video');
+        } else {
+          // No usable target media arrives: the switch's own deadline bounds the wait.
+          if (outcome === 'rejected') await h.old.reject('video-lo');
+          await vi.advanceTimersByTimeAsync(3_001);
+        }
+        await switching;
+        await flush(256);
+        expect(failed).toHaveBeenCalledTimes(1);
+
+        await h.next.accept('catalog', 100n);
+        await h.next.send('catalog', ladderCatalog());
+        expect(h.next.requests.map(r => r.name).filter(name => name.startsWith('video'))).toEqual(['video']);
+        await h.next.accept('video', 200n);
+        await h.next.accept('audio', 201n);
+        await flush(512);
+        expect(h.migrated).toHaveBeenCalledTimes(1);
+        await h.next.send('video', chunk('video', 3n), 3n);
+        expect(h.received).toContainEqual({ name: 'video', group: 3n });
+      } finally {
+        vi.useRealTimers();
+        await h?.destroy();
+      }
+    });
 
   it('has a positive control for old-session delivery without a GOAWAY', async () => {
     const h = await fixture(draft);
