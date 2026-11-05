@@ -3448,6 +3448,40 @@ describe('video-only hole', () => {
         check();
         expect(element.seekCount).toBe(0);
     });
+
+    it('does not re-seek after a buffered-hole gap jump lands past the hole', () => {
+        // The hole is in both tracks, so the gap jump (not this check) crosses it.
+        const { element, jumps, check } = holeSetup({ video: [[0, 1], [2, 7]], audio: [[0, 1], [2, 7]], ct: 0.95 });
+        check();
+        element.currentTime = 2.01; // the gap jump's seek, between watchdog ticks
+        element.fire('seeking');
+        element.currentTime = 2.05;
+        element.seekCount = 0;
+        check();
+        expect(element.seekCount).toBe(0);
+        expect(jumps).toHaveLength(0);
+    });
+
+    it('does not read a seek forward over a video-only hole as crossing it', () => {
+        const { element, jumps, check } = holeSetup({ ct: 0.5 });
+        check();
+        element.currentTime = 4; // the application seeks past [1, 2]
+        element.fire('seeking');
+        element.seekCount = 0;
+        check();
+        expect(element.seekCount).toBe(0);
+        expect(jumps).toHaveLength(0);
+    });
+
+    it('leaves a hole alone while the video SourceBuffer is changing type', () => {
+        const { adapter, element, check } = holeSetup();
+        (adapter as any).changingType.video = true;
+        check();
+        expect(element.seekCount).toBe(0);
+        (adapter as any).changingType.video = false;
+        check();
+        expect(element.seekCount).toBe(1);
+    });
 });
 
 // ─── Buffered-hole gap-jump (defensive recovery for source holes) ──────

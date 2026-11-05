@@ -951,6 +951,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.addEventListener('waiting', this.handleWaiting);
     this.video.addEventListener('timeupdate', this.handleTimeUpdate);
     this.video.addEventListener('error', this.handleVideoError);
+    this.video.addEventListener('seeking', this.handleSeeking);
 
     // ── EME / DRM setup ─────────────────────────────────────────────
     const drm = options.drmConfig;
@@ -1633,6 +1634,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.removeEventListener('waiting', this.handleWaiting);
     this.video.removeEventListener('timeupdate', this.handleTimeUpdate);
     this.video.removeEventListener('error', this.handleVideoError);
+    this.video.removeEventListener('seeking', this.handleSeeking);
     this.video.removeEventListener('encrypted', this.handleEncrypted);
     for (const session of this.keySessions.keys()) this.retireKeySession(session);
     this.mediaKeys = null;
@@ -2402,6 +2404,15 @@ export class MseMediaSource implements MediaSourceLike {
   private videoHoleLastTime: number | null = null;
 
   /**
+   * Any seek (a gap jump, the behind-live cap, the application) moves the
+   * playhead without playing across what lies between, so it must not read as
+   * crossing a hole on the next check.
+   */
+  private handleSeeking = (): void => {
+    this.videoHoleLastTime = null;
+  };
+
+  /**
    * Recover from a hole in the VIDEO SourceBuffer that audio plays across.
    *
    * With audio buffered through it, the element does not stop at a video-only
@@ -2423,6 +2434,9 @@ export class MseMediaSource implements MediaSourceLike {
     this.videoHoleLastTime = null;
     if (this.destroyed || !this.playTriggered || this.gapJumpMs <= 0) return;
     if (v.paused || v.seeking || v.error !== null || !this.playbackIntent) return;
+    // A video retype or reinit can leave a transient hole until the new
+    // configuration's media lands; it is not a hole to recover from.
+    if (this.changingType.video) return;
     const video = this.videoBuffer;
     const audio = this.audioBuffer;
     if (video === null || audio === null) return;
