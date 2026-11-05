@@ -4620,6 +4620,45 @@ describe.each(['audio', 'video'] as const)('MSE %s append scheduling', mediaType
             expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix, head]);
         } finally { h.adapter.destroy(); vi.useRealTimers(); }
     });
+    it('does not hold sub-frame timestamp drift between fragments', async () => {
+        vi.useFakeTimers(); const h = await ready();
+        // 30 fps at 90 kHz with tfdt one tick past each nominal trun end.
+        const fragments = Array.from({ length: 30 }, (_, i) =>
+            makeSegment({ bmd: i * 3001, defaultDur: 3000, sampleCount: 1 }));
+        try {
+            for (const [i, fragment] of fragments.entries()) {
+                h.adapter.appendChunk(mediaType, fragment, 'track', BigInt(i)); await flush();
+            }
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual(fragments);
+            expect(vi.getTimerCount()).toBe(0);
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
+    it('treats up to half a mean sample duration as contiguous', async () => {
+        const h = await ready();
+        const first = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 4 });
+        const drift = makeSegment({ bmd: 450, defaultDur: 100, sampleCount: 4 });
+        const hole = makeSegment({ bmd: 901, defaultDur: 100, sampleCount: 4 });
+        try {
+            h.adapter.appendChunk(mediaType, first, 'track'); await flush();
+            h.adapter.appendChunk(mediaType, drift, 'track'); await flush();
+            h.adapter.appendChunk(mediaType, hole, 'track'); await flush();
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([first, drift]);
+        } finally { h.adapter.destroy(); }
+    });
+    it('still holds a one-frame hole when fragments carry tick drift', async () => {
+        vi.useFakeTimers(); const h = await ready();
+        const prefix = makeSegment({ bmd: 0, defaultDur: 3000, sampleCount: 1 });
+        const tail = makeSegment({ bmd: 3001, defaultDur: 3000, sampleCount: 1 });
+        const head = makeSegment({ bmd: 6002, defaultDur: 3000, sampleCount: 1 });
+        try {
+            h.adapter.appendChunk(mediaType, prefix, 'track', 1n); await flush();
+            h.adapter.appendChunk(mediaType, head, 'track', 2n); await flush();
+            vi.advanceTimersByTime(100); await flush();
+            expect.soft(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix]);
+            h.adapter.appendChunk(mediaType, tail, 'track', 1n); await flush(); await flush();
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix, tail, head]);
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
     it('adds no wait to timestamp-contiguous groups', async () => {
         const h = await ready();
         const prefix = makeSegment({ bmd: 0, sampleCount: 1 });

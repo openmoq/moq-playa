@@ -1202,6 +1202,20 @@ export class MseMediaSource implements MediaSourceLike {
     return chosen;
   }
 
+  /**
+   * Decode-time slack below which a start past the buffered end is not a hole.
+   * Ticks are in the track timescale, which the adapter does not know, so the
+   * tolerance is relative to the segment's own mean sample duration: less than
+   * half a frame cannot be a missing sample, only producer clock jitter (tfdt
+   * from capture time, nominal trun durations). Same spirit as
+   * GAP_IDENTITY_TOLERANCE_SEC on the presentation side, which is also well
+   * under one frame. A segment with no samples/duration keeps exact comparison.
+   */
+  private static appendHoleTolerance(range: SegmentTimeRange): bigint {
+    if (range.sampleCount <= 0 || range.endTime <= range.startTime) return 0n;
+    return (range.endTime - range.startTime) / BigInt(range.sampleCount) / 2n;
+  }
+
   private holdAppendGap(mediaType: 'video' | 'audio', entry: AppendEntry): boolean {
     delete entry.skipsGap;
     if (this.reorderWindowMs === 0) return false;
@@ -1210,7 +1224,8 @@ export class MseMediaSource implements MediaSourceLike {
     const end = timelines.get(entry.trackName)?.extent?.end;
     // The first segment anchors the clock. Unknown layouts retain the existing
     // fail-open policy; tick values are compared only within this track/context.
-    if (!ranges?.length || end === undefined || ranges[0]!.startTime <= end) return false;
+    if (!ranges?.length || end === undefined
+        || ranges[0]!.startTime - end <= MseMediaSource.appendHoleTolerance(ranges[0]!)) return false;
     const previous = this.appendGapWait[mediaType];
     const now = performance.now();
     entry.waitUntil ??= now + this.reorderWindowMs;
