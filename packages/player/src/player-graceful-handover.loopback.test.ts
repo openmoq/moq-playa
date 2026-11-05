@@ -15,7 +15,7 @@ const OLD_URL = 'https://old.example/moq';
 const NEW_URL = 'https://new.example/moq';
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-type Draft = 14 | 16 | 18 | 22;
+type Draft = 14 | 16 | 18 | 22 | 23;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -77,7 +77,7 @@ function peer(draft: Draft, catalogName = 'catalog') {
       await this.accept(catalogName, 100n, { group: 5n, object: 0n });
       const request = requests.find(r => r.name === catalogName)!;
       let complete: () => Promise<void>;
-      if (draft === 22) {
+      if (draft >= 22) {
         expect(request.parameters?.get(0x23n)?.[0]).toEqual(Uint8Array.of(1, 0x21, 1, 1));
         expect(fetches).toEqual([]);
         const stream = await server.openFillStream(request.id);
@@ -305,7 +305,7 @@ async function fixture(draft: Draft, options: {
   };
 }
 
-describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft => {
+describe.each([16, 18, 22, 23] as const)('draft-%i graceful session handover', draft => {
   it.each([undefined, '.catalog'])('keeps catalog name %s through default-bootstrap handover', async name => {
     const h = await fixture(draft, { defaultBootstrap: true,
       config: name === undefined ? {} : { catalogTrackName: name } });
@@ -1682,7 +1682,7 @@ describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft
       await flush(256);
       expect(h.migrated).toHaveBeenCalledTimes(1);
       expect(h.next.requests.map(r => r.name).sort()).toEqual(['audio', 'catalog', 'video']);
-      expect(h.next.fetches).toHaveLength(draft === 22 ? 0 : 1);
+      expect(h.next.fetches).toHaveLength(draft >= 22 ? 0 : 1);
       await h.next.send('video', chunk('video', 3n), 3n);
       await h.next.send('audio', chunk('audio', 3n), 3n);
       const live = await h.next.server.openSubgroup(100n, 5n, 0n, { publisherPriority: 128 });

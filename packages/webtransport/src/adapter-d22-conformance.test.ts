@@ -23,7 +23,7 @@ async function settle(): Promise<void> {
   for (let i = 0; i < 10; i++) await flush();
 }
 
-async function pair(draft: 18 | 22 = 22): Promise<ConnectedPair> {
+async function pair(draft: 18 | 22 | 23 = 22): Promise<ConnectedPair> {
   const result = await connectedPair(draft);
   connections.push(result.client, result.server);
   return result;
@@ -610,7 +610,7 @@ describe('draft-22 fill lifecycle (3.4 and 9.9)', () => {
     expect(p.server.session.getIncomingSubscription(id)).toBeUndefined();
   });
 
-  it.each([18, 22] as const)('releases a failed ordinary FETCH allocation in draft %s', async (draft) => {
+  it.each([18, 22, 23] as const)('releases a failed ordinary FETCH allocation in draft %s', async (draft) => {
     const p = await pair(draft);
     p.server.onFetch = (id) => { void p.server.acceptFetch(id, {
       endOfTrack: 0, endLocation: { group: 5n, object: 0n },
