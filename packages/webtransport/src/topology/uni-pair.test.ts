@@ -82,7 +82,31 @@ describe('UniPairTopology — control handshake', () => {
     expect(violations).toEqual([]);
   });
 
-  it('leaves the aggregate source to a transport-closing owner', async () => {
+  it('a clean transport-closing shutdown leaves the aggregate source and the control streams', async () => {
+    // A control stream reset or stopped mid-session makes the peer close the
+    // session with an error (CLOSED_CONTROL_STREAM on draft 23, section 6.3).
+    // When the transport is closing, its close must be the only thing the peer sees.
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const violations: string[] = [];
+    topo.onControlStreamViolation = (reason) => violations.push(reason);
+    const control = transport.openIncomingUni();
+    control.push(setupBytes());
+    await topo.establish(transport);
+
+    topo.shutdown({ transportClosing: true, graceful: true });
+    await flush();
+
+    expect(control.readCancelled).toBe(false);
+    expect(transport.uniOut[0]!.writeAborted).toBe(false);
+    expect(transport.uniOut[0]!.writeClosed).toBe(false);
+    expect(transport.incomingUniSourceCancelled).toBe(false);
+    expect(violations).toEqual([]);
+    expect(() => transport.closeIncomingSources()).not.toThrow();
+  });
+
+  it('an error transport-closing shutdown still resets both control streams', async () => {
     const client = new Session(EndpointRole.CLIENT, 18);
     const topo = createUniPairTopology(client);
     const transport = new TransportSim();
@@ -94,8 +118,23 @@ describe('UniPairTopology — control handshake', () => {
     await flush();
 
     expect(control.readCancelled).toBe(true);
+    expect(transport.uniOut[0]!.writeAborted).toBe(true);
     expect(transport.incomingUniSourceCancelled).toBe(false);
-    expect(() => transport.closeIncomingSources()).not.toThrow();
+  });
+
+  it('a standalone shutdown still resets both control streams', async () => {
+    const client = new Session(EndpointRole.CLIENT, 18);
+    const topo = createUniPairTopology(client);
+    const transport = new TransportSim();
+    const control = transport.openIncomingUni();
+    control.push(setupBytes());
+    await topo.establish(transport);
+
+    topo.shutdown();
+    await flush();
+
+    expect(control.readCancelled).toBe(true);
+    expect(transport.uniOut[0]!.writeAborted).toBe(true);
   });
 
   it('classifies an Object stream that arrives before SETUP without stealing the control stream', async () => {
