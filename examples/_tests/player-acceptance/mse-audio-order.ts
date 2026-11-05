@@ -1,5 +1,6 @@
 /** Native PCM gate; TimeRanges is diagnostic, not a sample-residency oracle. */
 import { MseMediaSource } from '../../../packages/browser/src/mse-adapter.js';
+import { createQuantumGate } from '../../../scripts/player-acceptance/mse-audio-order.assessment.mjs';
 
 type Kind = 'in-order' | 'in-order-repeat' | 'candidate' | 'omitted-tail' | 'native-reordered' | 'zero-window';
 type Frame = { index: number; group: string; bmd: string; duration: number };
@@ -17,6 +18,9 @@ async function prepare(kind: Kind, fixture: Fixture) {
   const assertions: { name: string; passed: boolean; actual?: unknown }[] = [];
   const tokens: { index: number; terminals: { state: string; reason: string | null }[] }[] = [];
   const quantumDiagnostics: unknown[] = [], captureIssues: unknown[] = [];
+  const gate = createQuantumGate();
+  let settle: (() => void) | undefined;
+  const settled = new Promise<void>(resolve => { settle = resolve; });
   const elementEvents: { type: string; mediaTime: number; contextFrame: number | null }[] = [];
   const buffers: SourceBuffer[] = [], active = new Map<SourceBuffer, Operation>(), failures: string[] = [];
   const assert = (name: string, passed: boolean, actual?: unknown) => assertions.push({ name, passed, actual });
@@ -91,7 +95,7 @@ async function prepare(kind: Kind, fixture: Fixture) {
     SourceBuffer.prototype.appendBuffer = nativeAppend;
   };
   const metadata = () => ({ kind, assertions, failures, operations, events, tokens, elementEvents,
-    quantumDiagnostics, captureIssues, actualContextSampleRate: context?.sampleRate,
+    quantumDiagnostics, captureIssues, preroll: gate.preroll, actualContextSampleRate: context?.sampleRate,
     contextRenderQuantumSize: context ? (context as AudioContext & { renderQuantumSize?: number }).renderQuantumSize ?? null : null });
   try {
     if (fixture.timescale !== rate) throw new Error('fixture rate must be exactly 8000 Hz');
@@ -199,8 +203,11 @@ async function prepare(kind: Kind, fixture: Fixture) {
         quantumDiagnostics.push(diagnostic);
         try {
           if (!(data.samples instanceof Float32Array) || data.samples.length !== 128 || !Number.isSafeInteger(data.frame)) throw new Error('invalid worklet quantum');
-          if (previous && data.frame !== previous.frame + previous.length) throw new Error('non-contiguous worklet quanta');
           if (!data.samples.every((value: number) => Number.isFinite(value))) throw new Error('non-finite PCM');
+          // Paused-element silence before the clock settles is not measured.
+          const accepted = gate.accept(data.frame, data.samples.length);
+          if (accepted === 'gap') throw new Error('non-contiguous worklet quanta');
+          if (accepted === 'preroll') { if (gate.recording) settle?.(); return; }
           samples += data.samples.length;
           if (samples > maxSamples || samples * 4 > maxPcmBytes) throw new Error('PCM capture cap');
           chunks.push(data.samples); quanta.push({ frame: data.frame, length: data.samples.length });
@@ -218,6 +225,9 @@ async function prepare(kind: Kind, fixture: Fixture) {
       try {
         if (failures.length) throw new Error(failures.join('; '));
         await timed(context!.resume(), 'audio context resume');
+        gate.arm();
+        await timed(settled, 'audio clock settle');
+        if (failures.length) throw new Error(failures.join('; '));
         await timed(video.play(), 'native play');
         await timed(capture, 'PCM completion', 10000);
         assert('ended at 1.408 seconds', video.ended && Math.abs(video.currentTime - 1.408) <= 1e-6, video.currentTime);
