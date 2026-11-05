@@ -114,7 +114,7 @@ describe('Player catalog track name', () => {
     const player = new Player(mockElement() as HTMLElement, {
       url: 'x', namespace: 'y', ...(catalogTrackName === undefined ? {} : { catalogTrackName }),
     });
-    expect(capturedCatalogTrackName).toBe(catalogTrackName);
+    expect(capturedCatalogTrackName).toBe(catalogTrackName ?? 'catalog');
     await player.destroy();
   });
 });

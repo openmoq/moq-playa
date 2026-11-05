@@ -613,7 +613,7 @@ export class MoqtPlayer {
   /** Player version (set at build time). */
   static readonly version = '0.6.1';
 
-  private readonly config: MoqtPlayerConfig;
+  private readonly config: MoqtPlayerConfig & { readonly catalogTrackName: string };
   private readonly emitter = new TypedEmitter<PlayerEventMap>();
   private _selection: MediaSelectionSnapshot = emptyMediaSelection();
   private readonly selectedOutputOwners = new Map<'video' | 'audio', { selection: object; key: string }>();
@@ -1618,8 +1618,12 @@ export class MoqtPlayer {
   constructor(config: MoqtPlayerConfig) {
     // Validate + merge defaults — bad config fails fast, not 30 seconds into a stream.
     validateConfig(config);
-    this.config = { ...DEFAULT_PLAYER_CONFIG, ...config,
+    const merged = { ...DEFAULT_PLAYER_CONFIG, ...config,
       ...(Array.isArray(config.audioLanguages) ? { audioLanguages: Object.freeze([...config.audioLanguages]) } : {}) };
+    // An explicit undefined from JavaScript must not erase the default. Keep
+    // caller-owned empty strings intact as compatibility track identities.
+    if (merged.catalogTrackName === undefined) merged.catalogTrackName = DEFAULT_PLAYER_CONFIG.catalogTrackName;
+    this.config = merged;
     this._selection = emptyMediaSelection(0, this.config.autoQuality !== false);
     this.activeEndpoint = this.config.url;
     // Default clock: performance.now() in microseconds.

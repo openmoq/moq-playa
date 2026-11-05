@@ -21,8 +21,8 @@ describe('catalog track name configuration', () => {
     expect(() => validateConfig(minConfig({ catalogTrackName }))).toThrow(/UTF-8|surrogate/);
   });
 
-  it('rejects a non-string name from an untyped caller', () => {
-    expect(() => validateConfig(minConfig({ catalogTrackName: 42 as unknown as string }))).toThrow(/catalogTrackName/);
+  it.each([42, null])('rejects non-string name %j from an untyped caller', value => {
+    expect(() => validateConfig(minConfig({ catalogTrackName: value as unknown as string }))).toThrow(/catalogTrackName/);
   });
 });
 
@@ -63,6 +63,7 @@ describe('DEFAULT_PLAYER_CONFIG', () => {
     expect(DEFAULT_PLAYER_CONFIG.reconnectDelayMs).toBe(1_000);
     expect(DEFAULT_PLAYER_CONFIG.reconnectBackoff).toBe('exponential');
     expect(DEFAULT_PLAYER_CONFIG.moqtImplementation).toBe('proto-moq');
+    expect(DEFAULT_PLAYER_CONFIG.catalogTrackName).toBe('catalog');
     expect(DEFAULT_PLAYER_CONFIG.gapTimeoutMs).toBe(500);
     expect(DEFAULT_PLAYER_CONFIG.driftThresholdMs).toBe(200);
     expect(DEFAULT_PLAYER_CONFIG.maxBufferDepth).toBe(500);

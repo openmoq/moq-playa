@@ -602,7 +602,7 @@ export class Player {
       url: opts.url,
       namespace: opts.namespace,
       draftVersion,
-      catalogTrackName: opts.catalogTrackName ?? DEFAULTS.catalogTrackName,
+      catalogTrackName: opts.catalogTrackName === undefined ? DEFAULTS.catalogTrackName : opts.catalogTrackName,
       autoQuality: opts.autoQuality ?? DEFAULTS.autoQuality,
       startLevel: opts.startLevel ?? DEFAULTS.startLevel,
       clock: this.audioClock,
