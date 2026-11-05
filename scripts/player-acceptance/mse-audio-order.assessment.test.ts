@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { activePcmSpan, assessAudioOrder } from './mse-audio-order.assessment.mjs';
+import { activePcmSpan, assessAudioOrder, CLOCK_SETTLE_QUANTA, createQuantumGate } from './mse-audio-order.assessment.mjs';
 
 function row(kind: string, span = 10240) {
   const nativeOrder = kind === 'omitted-tail' ? [0, 1, 2, 3, 4, 5, 6, 7, 9, 10] : Array.from({ length: 11 }, (_, i) => i);
@@ -47,5 +47,38 @@ describe('native audio PCM gate assessment', () => {
     expect(assessAudioOrder(rows).failures).toContain('candidate: exact native byte order');
     const duplicate = healthy(); duplicate[2]!.tokens[0]!.terminals.push({ state: 'appended', reason: null });
     expect(assessAudioOrder(duplicate).failures).toContain('candidate: exactly-once token outcomes');
+  });
+
+  it('ignores realtime startup frame jumps before the clock settles and play starts', () => {
+    // Chrome 157 on headless/fake output: currentFrame 0 then 384 (CI run 41952159537).
+    const gate = createQuantumGate();
+    expect(gate.accept(0, 128)).toBe('preroll');
+    expect(gate.accept(384, 128)).toBe('preroll');
+    expect(gate.preroll.discontinuities).toEqual([{ expectedFrame: 128, frame: 384 }]);
+    gate.arm();
+    let frame = 384;
+    for (let i = 1; i < CLOCK_SETTLE_QUANTA; i++) expect(gate.accept(frame += 128, 128)).toBe('preroll');
+    expect(gate.recording).toBe(true);
+    expect(gate.accept(frame += 128, 128)).toBe('record');
+  });
+
+  it('requires a contiguous settle run after arming and fails any gap while recording', () => {
+    const gate = createQuantumGate(2);
+    gate.arm();
+    expect(gate.accept(0, 128)).toBe('preroll');
+    expect(gate.accept(256, 128)).toBe('preroll'); // gap restarts the settle run
+    expect(gate.recording).toBe(false);
+    expect(gate.accept(384, 128)).toBe('preroll');
+    expect(gate.recording).toBe(true);
+    expect(gate.accept(512, 128)).toBe('record');
+    expect(gate.accept(768, 128)).toBe('gap');
+  });
+
+  it('never records before the capture is armed', () => {
+    const gate = createQuantumGate(2);
+    for (let i = 0; i < 16; i++) expect(gate.accept(i * 128, 128)).toBe('preroll');
+    gate.arm();
+    expect(gate.accept(16 * 128, 128)).toBe('preroll');
+    expect(gate.accept(17 * 128, 128)).toBe('record');
   });
 });

@@ -22,6 +22,14 @@ export interface AudioOrderCase {
 }
 export const PCM_TOLERANCE_SAMPLES: 16;
 export const PCM_THRESHOLD: 0.005;
+export const CLOCK_SETTLE_QUANTA: 8;
+export interface QuantumGate {
+  readonly preroll: { quanta: number; discontinuities: { expectedFrame: number | null; frame: number }[] };
+  readonly recording: boolean;
+  arm(): void;
+  accept(frame: number, length: number): 'preroll' | 'record' | 'gap';
+}
+export function createQuantumGate(settleQuanta?: number): QuantumGate;
 export function activePcmSpan(bytes: Uint8Array): PcmActiveSpan;
 export function assessAudioOrder(cases: readonly AudioOrderCase[]): {
   passed: boolean;
