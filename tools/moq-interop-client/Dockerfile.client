@@ -103,7 +103,7 @@ RUN node dist-test/test/teardown.test.js \
 
 FROM node-quic
 LABEL org.opencontainers.image.source="https://github.com/openmoq/moq-playa"
-LABEL org.opencontainers.image.description="moq-playa MoQT interop test client (drafts 16, 18, 22)"
+LABEL org.opencontainers.image.description="moq-playa MoQT interop test client (drafts 16, 18, 22, 23)"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 WORKDIR /app
 COPY --from=builder /app/node_modules ./node_modules
