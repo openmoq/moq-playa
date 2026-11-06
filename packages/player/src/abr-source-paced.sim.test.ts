@@ -22,8 +22,6 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { MoqtPlayer } from './player.js';
-import { DEFAULT_PLAYER_CONFIG } from './config.js';
-import { DefaultRecoveryController } from '@openmoq/playback';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, MoqtObject } from '@openmoq/transport';
 import { varint, ObjectStatus } from '@openmoq/transport';
@@ -236,11 +234,6 @@ interface Scenario {
    * bandwidth signal is right, so a defect can be pinned on the estimator.
    */
   readonly oracleEstimate?: boolean;
-  /**
-   * Give the default recovery controller a clock. Production builds it
-   * without one, which disables its windowed stall escalation (defect #5).
-   */
-  readonly clockedRecovery?: boolean;
 }
 
 interface Run {
@@ -294,16 +287,6 @@ async function runScenario(s: Scenario): Promise<Run> {
     createConnection: () => relay.adapter as unknown as MoqtConnection,
     catalogBootstrap: 'subscribe',
     clock,
-    ...(s.clockedRecovery ? {
-      createRecoveryController: (c: { now(): number }) => {
-        const recovery = new DefaultRecoveryController({
-          gapEscalationThreshold: DEFAULT_PLAYER_CONFIG.maxConsecutiveGaps,
-          maxDecodeErrors: DEFAULT_PLAYER_CONFIG.maxDecodeErrors,
-        });
-        recovery.setClock(c);
-        return recovery;
-      },
-    } : {}),
     ...(s.packaging === 'loc'
       ? { createVideoDecoder: () => decoder, createRenderer: () => renderer }
       : { createMediaSource: () => mediaSource as any, createCmafAssembler: () => assembler as any }),
@@ -404,10 +387,10 @@ describe('ABR under source-paced live delivery', () => {
       expect(run.finalTrack).toBe(START);
     });
 
-    it('LOC: a link below the encoding rate stalls, and (with a clocked recovery controller) the stalls step quality down', async () => {
-      const run = await runScenario({
-        packaging: 'loc', capacityBps: 1_000_000, durationUs: SECONDS(60), clockedRecovery: true,
-      });
+    it('LOC: a link below the encoding rate stalls, and the stalls step quality down', async () => {
+      // The player's own default recovery controller: it must be built with a
+      // clock, or its windowed stall escalation never fires.
+      const run = await runScenario({ packaging: 'loc', capacityBps: 1_000_000, durationUs: SECONDS(60) });
       expect(run.stallsAtUs.length).toBeGreaterThan(0);
       expect(run.switches.length).toBeGreaterThan(0);
       expect(run.switches.every(sw => rungIndex(sw.to) > rungIndex(sw.from))).toBe(true);
@@ -459,15 +442,6 @@ describe('ABR under source-paced live delivery', () => {
       // Today: ≈80% of 1500 kbps. One sample per frame-sized object, smoothed
       // with EWMA, tracks the P-frame rate and averages the keyframes away.
       expect(run.estimateKbps).toBeGreaterThanOrEqual(1_500 * 0.95);
-    });
-
-    it.fails('#5 LOC stall escalation: sustained stalls step quality down with the default recovery controller', async () => {
-      const run = await runScenario({ packaging: 'loc', capacityBps: 1_000_000, durationUs: SECONDS(60) });
-      // Today: ~20 stalls of ≥500ms and no switch. The player builds
-      // DefaultRecoveryController without a clock and never calls setClock(),
-      // so handleStall() skips its windowed counter and only ever skips forward.
-      expect(run.stallsAtUs.length).toBeGreaterThan(5);
-      expect(run.switches.length).toBeGreaterThan(0);
     });
 
     it.fails('LOC proactive downshift: steps down before the first stall when the link is below the encoding rate', async () => {

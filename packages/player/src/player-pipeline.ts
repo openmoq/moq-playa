@@ -229,11 +229,16 @@ export function createPipelines(
     catchUpRecoveryMs: config.catchUpRecoveryMs,
   }));
 
-  const recoveryController = config.createRecoveryController?.(clock)
-    ?? new DefaultRecoveryController({
+  // The default controller's windowed escalation — the only path by which
+  // stalls reduce quality — is disabled until it has a clock.
+  const recoveryController = config.createRecoveryController?.(clock) ?? (() => {
+    const recovery = new DefaultRecoveryController({
       gapEscalationThreshold: config.maxConsecutiveGaps!,
       maxDecodeErrors: config.maxDecodeErrors!,
     });
+    recovery.setClock(clock);
+    return recovery;
+  })();
 
   // ── CommandDispatcher + browser adapters ────────────────────────
   // Only create WebCodecs adapters for LOC media types — CMAF goes through MSE.
