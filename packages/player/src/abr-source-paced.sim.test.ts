@@ -25,6 +25,7 @@ import { MoqtPlayer } from './player.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, MoqtObject } from '@openmoq/transport';
 import { varint, ObjectStatus } from '@openmoq/transport';
+import { encodeLocHeaders } from '@openmoq/loc';
 
 // ─── Media and link model ────────────────────────────────────────────
 
@@ -34,6 +35,8 @@ const GOP_FRAMES = 60; // ≈2s groups — the player's default GOP assumption
 const KEYFRAME_SHARE = 0.2;
 const TICK_US = 16_667;
 const PATH_DELAY_US = 20_000;
+/** Publisher wall clock at simulation time 0: LOC capture timestamps are epoch µs. */
+const PUBLISHER_EPOCH_US = 1_762_000_000_000_000;
 
 interface Rung { readonly name: string; readonly bitrateBps: number }
 
@@ -100,7 +103,11 @@ class SourcePacedRelay {
   constructor(
     private readonly capacityBps: number,
     private readonly catalog: string,
-    private readonly sendGroupEnd: boolean,
+    private readonly packaging: 'loc' | 'cmaf',
+    /** Actual bytes as a fraction of the catalog bitrate (VBR undershoot). */
+    private readonly contentScale = 1,
+    /** Whether LOC frames carry a capture timestamp. */
+    private readonly captureTimestamps = true,
   ) {
     const relay = this;
     this.adapter = {
@@ -180,7 +187,7 @@ class SourcePacedRelay {
     due.sort((a, b) => a.releaseUs - b.releaseUs);
     const rung = (name: string) => LADDER.find(r => r.name === name)!;
     for (const d of due) {
-      const bytes = frameBytes(rung(d.sub.trackName).bitrateBps, d.frameIndex);
+      const bytes = Math.round(frameBytes(rung(d.sub.trackName).bitrateBps, d.frameIndex) * this.contentScale);
       const start = Math.max(d.releaseUs, this.serverFreeUs);
       this.serverFreeUs = start + (bytes * 8 * 1_000_000) / this.capacityBps;
       this.inFlight.push({ sub: d.sub, frameIndex: d.frameIndex, bytes, arrivalUs: Math.round(this.serverFreeUs + PATH_DELAY_US) });
@@ -198,10 +205,13 @@ class SourcePacedRelay {
       const streamId = f.sub.requestId * 1_000_000n + groupId;
       const frame: MoqtObject = {
         kind: 'data', trackAlias: f.sub.alias, groupId, subgroupId: 0n, objectId: BigInt(objectId),
-        publisherPriority: undefined, payload: new Uint8Array(f.bytes), extensions: new Uint8Array(0),
+        publisherPriority: undefined, payload: new Uint8Array(f.bytes),
+        extensions: this.packaging === 'loc' && this.captureTimestamps
+          ? encodeLocHeaders({ captureTimestamp: BigInt(PUBLISHER_EPOCH_US + f.frameIndex * FRAME_US) })
+          : new Uint8Array(0),
       };
       this.adapter.onObject?.(streamId, frame);
-      if (this.sendGroupEnd && objectId === GOP_FRAMES - 1) {
+      if (this.packaging === 'loc' && objectId === GOP_FRAMES - 1) {
         const groupEnd: MoqtObject = {
           kind: 'gap', trackAlias: f.sub.alias, groupId, subgroupId: 0n,
           objectId: BigInt(GOP_FRAMES), status: ObjectStatus.END_OF_GROUP,
@@ -234,6 +244,12 @@ interface Scenario {
    * bandwidth signal is right, so a defect can be pinned on the estimator.
    */
   readonly oracleEstimate?: boolean;
+  /** Actual bytes as a fraction of the catalog bitrate. Default 1. */
+  readonly contentScale?: number;
+  /** LOC: whether frames carry a capture timestamp. Default true. */
+  readonly captureTimestamps?: boolean;
+  /** Start rung index (0 = top). Default: the player's `auto` (mid-ladder). */
+  readonly startLevel?: number;
 }
 
 interface Run {
@@ -254,7 +270,7 @@ async function flushMicrotasks(): Promise<void> {
 }
 
 async function runScenario(s: Scenario): Promise<Run> {
-  const relay = new SourcePacedRelay(s.capacityBps, catalogJson(s.packaging), s.packaging === 'loc');
+  const relay = new SourcePacedRelay(s.capacityBps, catalogJson(s.packaging), s.packaging, s.contentScale, s.captureTimestamps);
   let clockUs = 0;
   const clock = { now: () => clockUs };
   const setClock = (us: number) => { clockUs = us; relay.nowUs = us; };
@@ -287,6 +303,7 @@ async function runScenario(s: Scenario): Promise<Run> {
     createConnection: () => relay.adapter as unknown as MoqtConnection,
     catalogBootstrap: 'subscribe',
     clock,
+    ...(s.startLevel !== undefined ? { startLevel: s.startLevel } : {}),
     ...(s.packaging === 'loc'
       ? { createVideoDecoder: () => decoder, createRenderer: () => renderer }
       : { createMediaSource: () => mediaSource as any, createCmafAssembler: () => assembler as any }),
@@ -387,14 +404,38 @@ describe('ABR under source-paced live delivery', () => {
       expect(run.finalTrack).toBe(START);
     });
 
-    it('LOC: a link below the encoding rate stalls, and the stalls step quality down', async () => {
-      // The player's own default recovery controller: it must be built with a
-      // clock, or its windowed stall escalation never fires.
-      const run = await runScenario({ packaging: 'loc', capacityBps: 1_000_000, durationUs: SECONDS(60) });
+    it('LOC without capture timestamps: a link below the encoding rate stalls, and the stalls step quality down', async () => {
+      // No lag signal, so this is the last-resort path: the player's own
+      // default recovery controller, which must be built with a clock or its
+      // windowed stall escalation never fires.
+      const run = await runScenario({
+        packaging: 'loc', capacityBps: 1_000_000, durationUs: SECONDS(60), captureTimestamps: false,
+      });
       expect(run.stallsAtUs.length).toBeGreaterThan(0);
       expect(run.switches.length).toBeGreaterThan(0);
       expect(run.switches.every(sw => rungIndex(sw.to) > rungIndex(sw.from))).toBe(true);
       expect(LADDER[rungIndex(run.finalTrack)]!.bitrateBps).toBeLessThan(1_000_000);
+    });
+
+    it('LOC: rising delivery lag steps quality down well before stall escalation would', async () => {
+      const run = await runScenario({ packaging: 'loc', capacityBps: 1_000_000, durationUs: SECONDS(60) });
+      // Stalls alone first step down at ~24s. The first stall itself cannot be
+      // beaten: 0.5s of playout buffer at 50% overload lasts ~1s, less than a
+      // group-aligned switch takes to land.
+      expect(run.switches[0]).toMatchObject({ from: START, to: 'v800', reason: 'bandwidth' });
+      expect(run.switches[0]!.atUs).toBeLessThan(SECONDS(10));
+      expect(LADDER[rungIndex(run.finalTrack)]!.bitrateBps).toBeLessThan(1_000_000);
+    });
+
+    // The lag signal must not fire on what a bitrate comparison would misread.
+    it.each([
+      ['VBR content at 60% of its nominal bitrate, ample link', { capacityBps: AMPLE_BPS, contentScale: 0.6 }],
+      ['v1500 on a 1.65 Mbps link (91% utilised)', { capacityBps: 1_650_000 }],
+      ['v800 on a 1 Mbps link (80% utilised)', { capacityBps: 1_000_000, startLevel: 3 }],
+    ] as const)('LOC: no downshift for %s', async (_label, sc) => {
+      const run = await runScenario({ packaging: 'loc', durationUs: SECONDS(60), ...sc });
+      expect(run.switches).toEqual([]);
+      expect(run.stallsAtUs).toEqual([]);
     });
   });
 
@@ -442,14 +483,6 @@ describe('ABR under source-paced live delivery', () => {
       // Today: ≈80% of 1500 kbps. One sample per frame-sized object, smoothed
       // with EWMA, tracks the P-frame rate and averages the keyframes away.
       expect(run.estimateKbps).toBeGreaterThanOrEqual(1_500 * 0.95);
-    });
-
-    it.fails('LOC proactive downshift: steps down before the first stall when the link is below the encoding rate', async () => {
-      const run = await runScenario({ packaging: 'loc', capacityBps: 1_000_000, durationUs: SECONDS(60) });
-      // Today: the estimate is accurate here (the link is saturated) but the
-      // LOC path never uses it to downshift; only stalls do.
-      expect(run.switches.length).toBeGreaterThan(0);
-      expect(run.stallsAtUs.length === 0 || run.switches[0]!.atUs < run.stallsAtUs[0]!).toBe(true);
     });
   });
 });
