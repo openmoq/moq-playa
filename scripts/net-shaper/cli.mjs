@@ -18,12 +18,13 @@ const usage = `Usage: node scripts/net-shaper/cli.mjs --upstream HOST:PORT [opti
   --{down,up}-schedule S   AT_MS:BPS[,AT_MS:BPS...] from the first packet
   --seed N                 random seed (default 1)
   --stats-out FILE         JSON stats written on exit
-  --record-packets         include per-packet intended/actual times in stats`;
+  --record-packets         include per-packet intended/actual times in stats
+  --spin-ms MS             poll this close to a due time instead of sleeping (default 1; 0 saves CPU)`;
 
 const linkFlags = ['rate', 'delay', 'jitter', 'queue', 'loss', 'schedule'];
 const options = {
   listen: { type: 'string' }, 'listen-host': { type: 'string' }, upstream: { type: 'string' }, preset: { type: 'string' },
-  seed: { type: 'string' }, 'stats-out': { type: 'string' }, 'record-packets': { type: 'boolean' }, help: { type: 'boolean' },
+  seed: { type: 'string' }, 'stats-out': { type: 'string' }, 'record-packets': { type: 'boolean' }, 'spin-ms': { type: 'string' }, help: { type: 'boolean' },
   ...Object.fromEntries(['down', 'up'].flatMap(direction => linkFlags.map(flag => [`${direction}-${flag}`, { type: 'string' }]))),
 };
 
@@ -65,6 +66,7 @@ export function parseShaperArgs(argv) {
     down: link('down'), up: link('up'),
     seed: values.seed === undefined ? 1 : number('seed', values.seed),
     recordPackets: values['record-packets'] ?? false,
+    ...(values['spin-ms'] !== undefined ? { spinMs: number('spin-ms', values['spin-ms']) } : {}),
     ...(values['stats-out'] ? { statsFile: values['stats-out'] } : {}),
   };
 }
