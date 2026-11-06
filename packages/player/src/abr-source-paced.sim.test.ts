@@ -26,6 +26,7 @@ import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, MoqtObject } from '@openmoq/transport';
 import { varint, ObjectStatus } from '@openmoq/transport';
 import { encodeLocHeaders } from '@openmoq/loc';
+import { NON_SYNC_FLAGS, SYNC_FLAGS, buildChunk, videoInit } from '../../locmaf/test-support/cmaf.js';
 
 // ─── Media and link model ────────────────────────────────────────────
 
@@ -37,6 +38,10 @@ const TICK_US = 16_667;
 const PATH_DELAY_US = 20_000;
 /** Publisher wall clock at simulation time 0: LOC capture timestamps are epoch µs. */
 const PUBLISHER_EPOCH_US = 1_762_000_000_000_000;
+/** CMAF media timeline: `videoInit()` declares 90 kHz; the origin is arbitrary. */
+const CMAF_TIMESCALE = 90_000;
+const CMAF_ORIGIN_TICKS = 123_456_789n;
+const CMAF_FRAME_TICKS = CMAF_TIMESCALE / FPS;
 
 interface Rung { readonly name: string; readonly bitrateBps: number }
 
@@ -61,7 +66,7 @@ function catalogJson(packaging: 'loc' | 'cmaf'): string {
     tracks: LADDER.map((r, i) => ({
       name: r.name, packaging, isLive: true, role: 'video', renderGroup: 1, altGroup: 1,
       codec: 'avc1.64001f', width: 320 * (5 - i), height: 180 * (5 - i), bitrate: r.bitrateBps,
-      ...(packaging === 'cmaf' ? { initData: 'AAAA' } : {}),
+      ...(packaging === 'cmaf' ? { initData: Buffer.from(videoInit()).toString('base64') } : {}),
     })),
   });
 }
@@ -196,16 +201,29 @@ class SourcePacedRelay {
 
     while (this.inFlight.length > 0 && this.inFlight[0]!.arrivalUs <= targetUs) {
       const f = this.inFlight.shift()!;
-      // An unsubscribed track's streams are reset; nothing more arrives.
+      // An unsubscribed track's streams are reset; nothing more arrives. Its
+      // link time is NOT returned: the model queues everything at the
+      // bottleneck, where a real relay would hold most of it behind QUIC's
+      // congestion window and free it on RESET_STREAM. After a switch on a
+      // congested link the model is therefore pessimistic.
       if (!f.sub.active) continue;
       setClock(Math.max(f.arrivalUs, this.nowUs));
       this.carriedBits += f.bytes * 8;
       const groupId = BigInt(Math.floor(f.frameIndex / GOP_FRAMES));
       const objectId = f.frameIndex % GOP_FRAMES;
       const streamId = f.sub.requestId * 1_000_000n + groupId;
+      // CMAF: one low-latency chunk per frame, with a real moof (tfdt,
+      // duration, sync flag) around the frame's bytes.
+      const payload = this.packaging === 'cmaf'
+        ? buildChunk({
+          bmdt: CMAF_ORIGIN_TICKS + BigInt(f.frameIndex * CMAF_FRAME_TICKS),
+          samples: [{ duration: CMAF_FRAME_TICKS, size: f.bytes, flags: objectId === 0 ? SYNC_FLAGS : NON_SYNC_FLAGS }],
+          mdat: new Uint8Array(f.bytes),
+        })
+        : new Uint8Array(f.bytes);
       const frame: MoqtObject = {
         kind: 'data', trackAlias: f.sub.alias, groupId, subgroupId: 0n, objectId: BigInt(objectId),
-        publisherPriority: undefined, payload: new Uint8Array(f.bytes),
+        publisherPriority: undefined, payload,
         extensions: this.packaging === 'loc' && this.captureTimestamps
           ? encodeLocHeaders({ captureTimestamp: BigInt(PUBLISHER_EPOCH_US + f.frameIndex * FRAME_US) })
           : new Uint8Array(0),
@@ -236,7 +254,11 @@ interface Scenario {
   readonly packaging: 'loc' | 'cmaf';
   readonly capacityBps: number;
   readonly durationUs: number;
-  /** CMAF only: scripted MSE buffer-ahead (µs); null = no signal yet. */
+  /**
+   * CMAF only: scripted MSE buffer-ahead (µs) once media has arrived; null =
+   * no signal. Before the first video chunk the buffer is always null — MSE
+   * cannot hold media that has not been delivered.
+   */
   readonly bufferAheadUs?: (nowUs: number) => number | null;
   /**
    * Replace the player's estimator with one that reports the true link
@@ -272,6 +294,7 @@ async function flushMicrotasks(): Promise<void> {
 async function runScenario(s: Scenario): Promise<Run> {
   const relay = new SourcePacedRelay(s.capacityBps, catalogJson(s.packaging), s.packaging, s.contentScale, s.captureTimestamps);
   let clockUs = 0;
+  let firstVideoUs: number | null = null;
   const clock = { now: () => clockUs };
   const setClock = (us: number) => { clockUs = us; relay.nowUs = us; };
 
@@ -292,7 +315,7 @@ async function runScenario(s: Scenario): Promise<Run> {
     onError: null as ((e: Error) => void) | null,
     onStall: null as ((ms: number) => void) | null,
     changeType: vi.fn(() => Promise.resolve()),
-    getBufferAheadUs: vi.fn(() => s.bufferAheadUs?.(clockUs) ?? null),
+    getBufferAheadUs: vi.fn(() => firstVideoUs === null ? null : s.bufferAheadUs?.(clockUs) ?? null),
   };
   const assembler = { push: vi.fn(), selectTrack: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn() };
 
@@ -323,6 +346,7 @@ async function runScenario(s: Scenario): Promise<Run> {
   let playoutOffsetUs = PLAYOUT_DELAY_US;
   let rendered = 0n;
   relay.onFrameDelivered = (trackName, captureUs) => {
+    firstVideoUs ??= clockUs;
     if (trackName !== internals.subscribedTrack('video')?.name) return;
     const lateUs = clockUs - (captureUs + playoutOffsetUs);
     if (lateUs > 0) {
@@ -363,7 +387,7 @@ const START = 'v1500';
 const AMPLE_BPS = 30_000_000; // 5× the top rung
 const SECONDS = (n: number) => n * 1_000_000;
 /** A low-latency MSE buffer: thin because the player sits near the live edge. */
-const LL_BUFFER = (nowUs: number) => nowUs < SECONDS(1) ? null : 300_000;
+const LL_BUFFER = () => 300_000;
 
 // ─── Scenarios ───────────────────────────────────────────────────────
 
@@ -437,6 +461,37 @@ describe('ABR under source-paced live delivery', () => {
       expect(run.switches).toEqual([]);
       expect(run.stallsAtUs).toEqual([]);
     });
+
+    it('CMAF: a thin low-latency buffer on an ample link does not downshift', async () => {
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(60), bufferAheadUs: LL_BUFFER,
+      });
+      // Formerly v1500 → v800 → v400 within ~4s: the `bw > 1.5 × current`
+      // exemption for thin-but-fed buffers never applies at the live edge.
+      // Delivery lag now shows the link keeping up.
+      expect(run.switches.filter(sw => rungIndex(sw.to) > rungIndex(sw.from))).toEqual([]);
+    });
+
+    it('CMAF: a thin low-latency buffer on an ample link does not ratchet down', async () => {
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(90), bufferAheadUs: LL_BUFFER,
+      });
+      // Formerly ended on v400, the lowest rung, with no stall to justify it.
+      expect(run.stallsAtUs).toEqual([]);
+      expect(rungIndex(run.finalTrack)).toBeLessThanOrEqual(rungIndex(START));
+    });
+
+    it('CMAF: a thin buffer still steps down when delivery lag shows the link falling behind', async () => {
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: 1_000_000, durationUs: SECONDS(60), bufferAheadUs: LL_BUFFER,
+      });
+      // The MSE stall callback downshifts at once, so the first step may come
+      // from either path; the lag path must still get through the thin buffer.
+      expect(run.switches.length).toBeGreaterThan(0);
+      expect(run.switches[0]!.atUs).toBeLessThan(SECONDS(10));
+      expect(run.switches.some(sw => sw.reason === 'bandwidth')).toBe(true);
+      expect(LADDER[rungIndex(run.finalTrack)]!.bitrateBps).toBeLessThan(1_000_000);
+    });
   });
 
   // Known defects. Each states the DESIRED behaviour and is marked `it.fails`
@@ -454,24 +509,6 @@ describe('ABR under source-paced live delivery', () => {
       // Today: no switch at all — `bw > 2.25 × next rung` cannot hold when
       // bw is the current rung's own bitrate.
       expect(rungIndex(run.finalTrack)).toBeLessThan(rungIndex(START));
-    });
-
-    it.fails('#2 CMAF: a thin low-latency buffer on an ample link does not downshift', async () => {
-      const run = await runScenario({
-        packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(60), bufferAheadUs: LL_BUFFER,
-      });
-      // Today: v1500 → v800 → v400 within ~4s. The `bw > 1.5 × current`
-      // exemption for thin-but-fed buffers never applies at the live edge.
-      expect(run.switches.filter(sw => rungIndex(sw.to) > rungIndex(sw.from))).toEqual([]);
-    });
-
-    it.fails('#2 CMAF ratchet: after any downshift on an ample link, quality recovers to the start rung', async () => {
-      const run = await runScenario({
-        packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(90), bufferAheadUs: LL_BUFFER,
-      });
-      // Today: ends on v400, the lowest rung, with no stall to justify it.
-      expect(run.stallsAtUs).toEqual([]);
-      expect(rungIndex(run.finalTrack)).toBeLessThanOrEqual(rungIndex(START));
     });
 
     it.fails('#3 per-object sampling: the CMAF estimate is not below the rate actually received', async () => {
