@@ -566,7 +566,7 @@ try {
           // Informational: under a constrained link output defects are the
           // measurement, so they are recorded rather than asserted.
           caseResult.assessment = { passed: true, failures: [], observed: assessPlayback(observed.samples, {
-            videoWidth: 1920, videoHeight: 1080, audioHz: 440, videoFps: 24,
+            ...scenario.expected, videoWidth: 1920, videoHeight: 1080, audioHz: 440, videoFps: 24,
             videoSizes: [{ width: 1920, height: 1080 }, { width: 1280, height: 720 }, { width: 640, height: 360 }] }) };
         } else if (handover) {
           caseResult.handover = {};
