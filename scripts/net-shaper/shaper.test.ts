@@ -71,12 +71,19 @@ describe('net shaper', () => {
     expect(arrivals.length).toBe(sent);
     expect(down.tailPackets).toBe(0);
     const measured = receivedBps(arrivals);
-    const latenessP99 = down.lateness.p99Ms!;
     console.log(`rate ${rateBps}: received ${Math.round(measured)} bps (${((measured / rateBps - 1) * 100).toFixed(2)}%), `
-      + `shaper ${down.deliveredBps} bps, lateness p50 ${down.lateness.p50Ms} p99 ${latenessP99} max ${down.lateness.maxMs.toFixed(3)} ms`);
+      + `shaper ${down.deliveredBps} bps, lateness p50 ${down.lateness.p50Ms} p99 ${down.lateness.p99Ms} max ${down.lateness.maxMs.toFixed(3)} ms`);
     expect(Math.abs(measured / rateBps - 1)).toBeLessThan(0.05);
     expect(Math.abs(down.deliveredBps! / rateBps - 1)).toBeLessThan(0.05);
-    if (rateBps === 30_000_000) expect(latenessP99).toBeLessThan(2);
+  });
+
+  // Host-sensitive: an idle machine measures p99 well under 1 ms, but parallel
+  // test workers or other load can deschedule the process for tens of ms.
+  // Retries are explicit: the shaper must reach the bound in one of three runs.
+  it('adds under 2 ms p99 send lateness at 30 Mbps', { retry: 2 }, async () => {
+    const { down } = await run({ rateBps: 30_000_000, queueBytes: 64 * 1024 * 1024 }, 36_000_000, 1500);
+    console.log(`30 Mbps lateness p50 ${down.lateness.p50Ms} p90 ${down.lateness.p90Ms} p99 ${down.lateness.p99Ms} max ${down.lateness.maxMs.toFixed(3)} ms`);
+    expect(down.lateness.p99Ms!).toBeLessThan(2);
   });
 
   it('tail-drops overload at a bounded queue', async () => {
