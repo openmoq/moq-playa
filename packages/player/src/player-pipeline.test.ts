@@ -168,6 +168,25 @@ describe('createPipelines', () => {
     expect(result.syncController).not.toBeNull();
   });
 
+  it('gives the default recovery controller the clock, so sustained stalls reduce quality', () => {
+    let nowUs = 0;
+    const clock: ClockSource = { now: () => nowUs };
+    const trackInfo: TrackInfo = {
+      video: { codec: 'avc1.64001e', packaging: 'loc' },
+      audio: undefined,
+    };
+    const { recoveryController } = createPipelines(minimalConfig(), clock, trackInfo, mockCallbacks());
+
+    // Five sustained stalls a second apart: inside the 30s window. Without a
+    // clock the windowed counter never runs and every stall only skips forward.
+    const actions: RecoveryAction['type'][] = [];
+    for (let i = 0; i < 5; i++) {
+      nowUs += 1_000_000;
+      actions.push(recoveryController.evaluate({ type: 'stall', durationMs: 500 }).type);
+    }
+    expect(actions).toEqual(['skip_forward', 'skip_forward', 'skip_forward', 'skip_forward', 'reduce_quality']);
+  });
+
   it('creates CommandDispatcher when video decoder factory provided', () => {
     const config = minimalConfig({
       createVideoDecoder: () => ({
