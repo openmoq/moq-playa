@@ -124,6 +124,8 @@ export function createLink(options = {}, { seed = 1, recordPackets = false, maxR
     const wait = line[lineHead].due - clock();
     // Node timers have millisecond granularity and fire late; poll the last
     // `spinMs` on the check phase instead of overshooting by a whole tick.
+    // That costs a core while a fast link is busy; 0 trades ~1.5 ms p99
+    // lateness for idle CPU, and also fares better on an oversubscribed host.
     if (wait <= spinMs) immediate = setImmediate(flush);
     else timer = setTimeout(flush, Math.max(1, Math.floor(wait - spinMs)));
   };

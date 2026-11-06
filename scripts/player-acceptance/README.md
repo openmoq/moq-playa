@@ -273,3 +273,37 @@ that live-group evidence, report the wait separately, then run the normal
 `warm-start-disabled` verifies that the default path issues no media FETCH.
 These runs demonstrate initial ordering and playback; they do not measure
 physical A/V synchronization or certify a remote relay.
+
+## Shaped-link ABR runs
+
+`PLAYER_NET_SHAPE=<preset>` (or `--net-shape <preset>`) puts the userspace UDP
+shaper in `scripts/net-shaper/` between the browser and each case's relay. It
+is off by default; unset, every case runs exactly as above. Publishers still
+dial the relay directly; only the browser's URL port changes, so the pinned
+certificate hash is unchanged. The shaper queues, serializes and tail-drops real
+QUIC packets, so the relay's congestion controller sees the bottleneck.
+
+| Preset | Downlink (relay to browser) | Uplink |
+| --- | --- | --- |
+| `cap-1m` | 1 Mbps, 20 ms | 20 ms |
+| `step-5m-1m` | 5 Mbps, 1 Mbps from 20 s after the first packet, 20 ms | 20 ms |
+| `jitter` | 10 Mbps, 20 ms ± 30 ms, never reordered | 20 ms |
+| `ample` | 30 Mbps, 20 ms | 20 ms |
+
+Queues default to the larger of 100 ms at the initial rate and one BDP.
+Without `--case`, a shaped run selects `abr-net-shape`: the three-rung
+1080p/720p/360p CMAF ladder with ABR enabled for `PLAYER_NET_SHAPE_SECONDS`
+(default 45). `--case abr-net-shape-loc` runs the same ladder as LOC-04 with
+wall-clock capture timestamps, so delivery lag is observable. Either is a
+calibration trace, not a quality gate: startup and clean teardown are required,
+output defects are recorded. Other cases may be selected with a preset and keep
+all their usual assertions; handover cases are refused. Each shaped case writes
+`<case>-abr-trace.json` with the engine's `quality_switched` (from, to, reason),
+`stall` and `stall_recovered` events, 1 Hz player stats, the shaper's per-direction
+stats, and a summary on the shaper's time base. `PLAYER_NET_SHAPE_SEED` fixes
+jitter and loss draws.
+
+```bash
+PLAYER_NET_SHAPE=step-5m-1m node scripts/player-acceptance/run.mjs --skip-build
+node scripts/net-shaper/cli.mjs --upstream 127.0.0.1:4443 --down-rate 1500000 --down-delay 20 --stats-out stats.json
+```

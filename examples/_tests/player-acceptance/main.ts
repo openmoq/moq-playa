@@ -23,6 +23,8 @@ const webAudioOutput = params.has('audio') ? params.get('audio') === 'webcodecs'
 const warmObserver = params.has('warm') ? observeWarmStart() : undefined;
 const locmafObserver = params.has('locmaf') ? observeLocmafDelivery() : undefined;
 const mseProgram = params.has('mseProgram') ? observeMseProgramSwitch() : undefined;
+// Shaped-link runs let ABR choose; every other case keeps manual selection.
+const abr = params.get('abr') === '1';
 canvas.width = 640;
 canvas.height = 360;
 const canvasObserver = frameOutput ? observeCanvas(canvas) : undefined;
@@ -60,9 +62,9 @@ let firstFrameTimestampUs: number | undefined;
 
 const player = new Player(null, {
   url: params.get('url')!, namespace: params.get('ns')!,
-  video, canvas, certHash: pin, draftVersion: 18, autoQuality: false,
+  video, canvas, certHash: pin, draftVersion: 18, autoQuality: abr,
   ...(params.has('gestureAudio') ? { audioActivation: 'gesture' as const } : {}),
-  startLevel: Number(params.get('level') ?? 0),
+  startLevel: abr && !params.has('level') ? 'auto' : Number(params.get('level') ?? 0),
   ...(params.has('altGroup') ? { videoAltGroup: Number(params.get('altGroup')) } : {}),
   moqtPlayerConfig: {
     logLevel: params.has('debug') ? 'debug' : 'none',
@@ -107,6 +109,20 @@ const player = new Player(null, {
 });
 
 groupTail?.observeDiagnostics(player.diagnosticSource, createMediaDiagnostics);
+
+// Engine-level ABR evidence: the switch reason and stall episodes are not
+// carried by the facade's `qualitychange`/`stall` events.
+const abrTrace: { timeMs: number; type: string; data: unknown }[] = [];
+if (abr) {
+  for (const type of ['quality_switching', 'quality_switched', 'quality_switch_failed', 'stall', 'stall_recovered',
+    'catch_up_changed'] as const) {
+    player.diagnosticSource.on(type, data => abrTrace.push({ timeMs: performance.now(), type,
+      data: 'error' in data ? { ...data, error: String(data.error) } : data }));
+  }
+  player.on('stats', stats => abrTrace.push({ timeMs: performance.now(), type: 'stats', data: {
+    bitrate: stats.bitrate, latencyMs: stats.latencyMs, captureTimestampAgeMs: stats.captureTimestampAgeMs ?? null,
+    stallCount: stats.stallCount, framesDropped: stats.framesDropped, resolution: stats.resolution } }));
+}
 
 for (const type of ['ready', 'playing', 'statechange', 'error', 'stall', 'qualitychange', 'audiochange', 'audiochangefailed',
   'programchange', 'programchangefailed', 'viewchange', 'viewchangefailed'] as const) {
@@ -261,6 +277,7 @@ const acceptance = {
   get transportState() { return transportState.map(state => ({ ...state })); },
   get errors() { return events.filter(event => event.type === 'error'); },
   get latestSample() { return samples.at(-1); },
+  get abrTrace() { return { timeOrigin: performance.timeOrigin, events: abrTrace.slice() }; },
   get playback() { return playbackPoint(); },
   pausePlayback() {
     const actionAtMs = performance.now(); player.pause();
