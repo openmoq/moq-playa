@@ -28,9 +28,9 @@ import { MoqtConnectionError } from '@openmoq/webtransport';
 import type { DataStreamTerminal, GoawayNotice, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
 import type { DataStreamHeader, MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
-import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@openmoq/playback';
+import { PlaybackPipeline, SyncController, BandwidthEstimator, DeliveryLagDetector } from '@openmoq/playback';
 import { BufferBasedController } from '@openmoq/playback';
-import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback, PlaybackInputObserver, AudioTimingSource, VideoTimingSource } from '@openmoq/playback';
+import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback, PlaybackInputObserver, AudioTimingSource, VideoTimingSource, AbrDecision } from '@openmoq/playback';
 import type { AltGroup, CatalogState, CatalogTrack, ResolvedTrackNamespace } from '@openmoq/msf';
 import type { SelectionIntent, TrackIdentity } from './catalog-selection.js';
 import { buildCatalogSelection, resolveSelection } from './catalog-selection.js';
@@ -708,6 +708,8 @@ export class MoqtPlayer {
   private _adapterOwned = true;
   private qualityController: QualityController | null = null;
   private bandwidthEstimator: BandwidthEstimator | null = null;
+  /** LOC video delivery lag (arrival − capture); its rise is the proactive downshift signal. */
+  private deliveryLag: DeliveryLagDetector | null = null;
   private bufferAbrController: BufferBasedController | null = null;
   private bwEstimatorGroupId: bigint = -1n;
   private bwEstimatorGroupBytes = 0;
@@ -3930,6 +3932,7 @@ export class MoqtPlayer {
     this.subscriptionManager = new SubscriptionManager();
     if (this.mediaDiagnosticRuntime) this.subscriptionManager.objectProvenance = this.mediaDiagnosticRuntime;
     this.bandwidthEstimator = new BandwidthEstimator();
+    this.deliveryLag = new DeliveryLagDetector();
 
     // Set draft version for version-aware KVP encoding
     // Draft-14 §1.4.2: absolute type IDs
@@ -4015,6 +4018,11 @@ export class MoqtPlayer {
             this.bwEstimatorGroupBytes = bytes;
           } else {
             this.bwEstimatorGroupBytes += bytes;
+          }
+          // Backfill was captured before it was requested; its lag says
+          // nothing about the link.
+          if (headers.captureTimestamp !== undefined && !delivery?.backfill) {
+            this.deliveryLag?.record(Number(headers.captureTimestamp), this.clock.now());
           }
         }
       } else {
@@ -9437,10 +9445,18 @@ export class MoqtPlayer {
 
     const bandwidthKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
 
-    const decision = this.bufferAbrController.evaluate({
-      bufferDepthUs: effectiveBufferUs,
-      bandwidthEstimateKbps: bandwidthKbps,
-    });
+    // LOC: a delivery lag standing above its baseline and still rising means
+    // the link cannot carry this rung. Step down before the playout buffer
+    // runs dry — stalls are the last-resort signal, not the first.
+    const congested = this.videoPipeline !== null
+      && (this.deliveryLag?.isCongested(this.clock.now()) ?? false);
+
+    const decision: AbrDecision = congested
+      ? { action: 'downshift' }
+      : this.bufferAbrController.evaluate({
+        bufferDepthUs: effectiveBufferUs,
+        bandwidthEstimateKbps: bandwidthKbps,
+      });
 
     if (decision.action === 'hold') return;
 
@@ -9461,8 +9477,13 @@ export class MoqtPlayer {
     if (newTrack) {
       if (isDown) this.lastAbrDownshiftUs = this.clock.now();
       const verb = isDown ? 'downshift' : 'upshift';
-      this.log.warn('Buffer %.1fs, BW %.0fkbps → %s to %s',
-        effectiveBufferUs / 1_000_000, bandwidthKbps, verb, newTrack.name);
+      if (congested) {
+        this.log.warn('Delivery lag +%.0fms and rising → downshift to %s',
+          (this.deliveryLag?.excessLagUs(this.clock.now()) ?? 0) / 1000, newTrack.name);
+      } else {
+        this.log.warn('Buffer %.1fs, BW %.0fkbps → %s to %s',
+          effectiveBufferUs / 1_000_000, bandwidthKbps, verb, newTrack.name);
+      }
       // No stats or controller mutation here — deferred to completePendingVideoSwitch.
       this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'bandwidth', isDown ? 'downshift' : 'upshift')
         .catch((err) => {
@@ -9594,6 +9615,7 @@ export class MoqtPlayer {
     this.catalogSlots.catalogManager = null;
     this.qualityController = null;
     this.bandwidthEstimator = null;
+    this.deliveryLag = null;
     if (this.connection) {
       this.releaseMediaTerminals(this.connection);
       if (this._adapterOwned) {
