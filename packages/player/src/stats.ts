@@ -69,7 +69,9 @@ export interface PlayerStats {
    * Neither field establishes synchronized clocks or presentation latency.
    */
   readonly currentLatencyMs: number;
-  /** Latest uncorrected receiver-wall-clock minus LOC wall-clock timestamp.
+  /** Latest uncorrected receiver-wall-clock minus LOC wall-clock timestamp,
+   * or for CMAF video minus the media timeline's wallclock for the object
+   * (draft-ietf-moq-msf-00 §7.1); both taken on arrival, before decoding.
    * May be negative. Null without a measurement; not end-to-end latency.
    */
   readonly captureTimestampAgeMs?: number | null;

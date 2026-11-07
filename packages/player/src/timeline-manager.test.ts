@@ -10,6 +10,7 @@ import {
   processTimelineObject,
   findSeekTarget,
   getTimelineDuration,
+  wallclockForPts,
 } from './timeline-manager.js';
 
 /** §5.3.8: VOD catalog track with mediatimeline packaging */
@@ -164,6 +165,46 @@ describe('timeline-manager', () => {
       const state = createTimelineState(liveTimelineTrack());
 
       expect(getTimelineDuration(state)).toBeUndefined();
+    });
+  });
+
+  describe('wallclockForPts', () => {
+    it('advances the newest entry at or before the PTS by the media time since it (§7.1)', () => {
+      let state = createTimelineState(liveTimelineTrack());
+      state = processTimelineObject(state, encodeTimeline([
+        [0, [0, 0], 1759924158381],
+        [2002, [1, 0], 1759924160390],
+        [4004, [2, 0], 1759924162395],
+      ]));
+
+      expect(wallclockForPts(state, 0)).toBe(1759924158381);
+      expect(wallclockForPts(state, 2002)).toBe(1759924160390);
+      expect(wallclockForPts(state, 3000)).toBe(1759924160390 + 998);
+      expect(wallclockForPts(state, 5000)).toBe(1759924162395 + 996);
+    });
+
+    it('skips entries whose wallclock is unknown (§7.1: 0)', () => {
+      let state = createTimelineState(liveTimelineTrack());
+      state = processTimelineObject(state, encodeTimeline([
+        [0, [0, 0], 1759924158381],
+        [2002, [1, 0], 0],
+      ]));
+
+      expect(wallclockForPts(state, 2500)).toBe(1759924158381 + 2500);
+    });
+
+    it('returns undefined before the first entry or without any wallclock', () => {
+      let state = createTimelineState(liveTimelineTrack());
+      expect(wallclockForPts(state, 0)).toBeUndefined();
+
+      state = processTimelineObject(state, encodeTimeline([[2002, [1, 0], 1759924160390]]));
+      expect(wallclockForPts(state, 2001)).toBeUndefined();
+
+      const vod = processTimelineObject(createTimelineState(vodTimelineTrack()), encodeTimeline([
+        [0, [0, 0], 0],
+        [2002, [1, 0], 0],
+      ]));
+      expect(wallclockForPts(vod, 3000)).toBeUndefined();
     });
   });
 });

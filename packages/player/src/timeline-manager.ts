@@ -78,6 +78,25 @@ export function findSeekTarget(
 }
 
 /**
+ * Wall-clock time (ms since epoch) at which the media at `ptsMs` was captured.
+ *
+ * Uses the newest entry at or before `ptsMs` whose wallclock is known (§7.1: 0
+ * means unknown), and advances it by the media time since that entry: media
+ * time and wall clock run at the same rate between entries.
+ *
+ * @returns undefined when no entry at or before `ptsMs` has a wallclock.
+ * @see draft-ietf-moq-msf-00 §7.1 (wallclock time)
+ */
+export function wallclockForPts(state: TimelineState, ptsMs: number): number | undefined {
+  let anchor: MediaTimelineEntry | undefined;
+  for (const entry of state.entries) {
+    if (entry.wallclockTime <= 0 || entry.mediaPts > ptsMs) continue;
+    if (anchor === undefined || entry.mediaPts > anchor.mediaPts) anchor = entry;
+  }
+  return anchor === undefined ? undefined : anchor.wallclockTime + (ptsMs - anchor.mediaPts);
+}
+
+/**
  * Get the known duration of the timeline.
  *
  * Prefers the catalog's trackDuration (§5.1.37) when available.

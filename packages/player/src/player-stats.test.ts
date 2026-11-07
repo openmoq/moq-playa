@@ -3,6 +3,7 @@ import { SyncController } from '@openmoq/playback';
 import { MoqtPlayer } from './player.js';
 import type { MediaSourceLike } from './interfaces.js';
 import type { StatsAccumulator } from './stats.js';
+import { createTimelineState, processTimelineObject, type TimelineState } from './timeline-manager.js';
 
 const players: MoqtPlayer[] = [];
 afterEach(async () => { for (const player of players.splice(0)) await player.destroy(); });
@@ -81,4 +82,39 @@ it('copies named playback-quality properties from a valid accessor adapter', () 
   total = 400;
   expect(snapshot?.totalVideoFrames).toBe(300);
   expect(player.stats.videoPlaybackQuality?.totalVideoFrames).toBe(400);
+});
+
+it('dates arriving CMAF video with the media timeline (MSF §7.1)', () => {
+  const { player, state } = makePlayer();
+  const cmaf = state as unknown as {
+    cmafAssembler: unknown; timelineState: TimelineState | null;
+    pushCmafInput(mediaType: 'video' | 'audio', trackName: string, groupId: bigint, payload: Uint8Array): void;
+  };
+  const wallAtEntry = 1_759_924_160_390;
+  let receipt: unknown = { state: 'emitted', sourcePresentationTimeUs: 1_002_500_000n };
+  const push = vi.fn(() => receipt);
+  cmaf.cmafAssembler = { push, reset: vi.fn(), destroy: vi.fn() };
+  const now = vi.spyOn(Date, 'now').mockReturnValue(wallAtEntry + 498 + 75);
+  try {
+    cmaf.pushCmafInput('video', 'video', 1n, new Uint8Array(0));
+    expect(player.stats.captureTimestampAgeMs).toBeNull(); // No timeline yet.
+    cmaf.timelineState = processTimelineObject(createTimelineState({ name: 'timeline', packaging: 'mediatimeline',
+      isLive: true, depends: ['video'] } as never), new TextEncoder().encode(JSON.stringify([[1_002_002, [1, 0], wallAtEntry]])));
+    cmaf.pushCmafInput('video', 'video', 1n, new Uint8Array(0));
+    expect(push).toHaveBeenLastCalledWith('video', 'video', 1n, expect.any(Uint8Array), undefined, true);
+    // Arrived 498 ms of media after the entry, 75 ms after its capture.
+    expect(player.stats.captureTimestampAgeMs).toBe(75);
+    expect(player.stats.currentLatencyMs).toBe(75);
+    receipt = { state: 'partial' };
+    cmaf.pushCmafInput('video', 'video', 1n, new Uint8Array(0));
+    expect(player.stats.captureTimestampAgeMs).toBe(75); // A partial object keeps the last measurement.
+    cmaf.pushCmafInput('audio', 'audio', 1n, new Uint8Array(0));
+    expect(push).toHaveBeenLastCalledWith('audio', 'audio', 1n, expect.any(Uint8Array));
+    // A LOC capture timestamp, when there is one, stays the measurement.
+    state.syncController = new SyncController({ clock: { now: () => 0 }, wallClock: { now: () => 1_000_000 }, driftThresholdUs: 1000 });
+    state.syncController.evaluateCatchUp(BigInt(1_000_000 - 250_000));
+    expect(player.stats.captureTimestampAgeMs).toBe(250);
+  } finally {
+    now.mockRestore();
+  }
 });
