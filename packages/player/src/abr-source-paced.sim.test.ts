@@ -22,6 +22,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { MoqtPlayer } from './player.js';
+import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, MoqtObject } from '@openmoq/transport';
 import { varint, ObjectStatus } from '@openmoq/transport';
@@ -60,13 +61,15 @@ function frameBytes(bitrateBps: number, frameIndex: number): number {
     : gopBytes * (1 - KEYFRAME_SHARE) / (GOP_FRAMES - 1));
 }
 
-function catalogJson(packaging: 'loc' | 'cmaf'): string {
+function catalogJson(packaging: 'loc' | 'cmaf', cmafHeader: 'real' | 'opaque' = 'real'): string {
   return JSON.stringify({
     version: 1,
     tracks: LADDER.map((r, i) => ({
       name: r.name, packaging, isLive: true, role: 'video', renderGroup: 1, altGroup: 1,
       codec: 'avc1.64001f', width: 320 * (5 - i), height: 180 * (5 - i), bitrate: r.bitrateBps,
-      ...(packaging === 'cmaf' ? { initData: Buffer.from(videoInit()).toString('base64') } : {}),
+      ...(packaging === 'cmaf'
+        ? { initData: cmafHeader === 'real' ? Buffer.from(videoInit()).toString('base64') : 'AAAA' }
+        : {}),
     })),
   });
 }
@@ -82,6 +85,8 @@ interface Subscription {
   acked: boolean;
   readonly ackAtUs: number;
   active: boolean;
+  /** Forward state 0: the relay holds this subscription's objects back. */
+  paused: boolean;
 }
 
 interface InFlight {
@@ -99,11 +104,19 @@ class SourcePacedRelay {
   nowUs = 0;
   private nextRequestId = 1n;
   private serverFreeUs = 0;
-  private readonly subs = new Map<bigint, Subscription>();
+  readonly subs = new Map<bigint, Subscription>();
   private readonly inFlight: InFlight[] = [];
   readonly adapter: any;
   /** Bytes the link carried — the ground truth an estimator should approach. */
   carriedBits = 0;
+  /** Every SUBSCRIBE the player sent, in order. */
+  readonly subscribes: { atUs: number; requestId: bigint; trackName: string; options: any }[] = [];
+  /** Every REQUEST_UPDATE the player sent, in order. */
+  readonly updates: { atUs: number; requestId: bigint; options: any }[] = [];
+  /** Once set, the session is gone: requests fail as on a closed session. */
+  closed = false;
+  /** Requests attempted after the session closed. */
+  rejectedAfterClose = 0;
 
   constructor(
     private readonly capacityBps: number,
@@ -122,12 +135,25 @@ class SourcePacedRelay {
       onStreamClosed: null, onDatagram: null, onNamespaceMessage: null, onQlogEvent: null,
       connect: vi.fn(async () => {}),
       subscribe: vi.fn(async (_ns: Uint8Array[], name: Uint8Array, opts?: any) => {
+        if (relay.closed) { relay.rejectedAfterClose++; throw new Error('Cannot subscribe in state closed; session must be ESTABLISHED'); }
         const requestId = relay.nextRequestId++;
+        relay.subscribes.push({ atUs: relay.nowUs, requestId, trackName: new TextDecoder().decode(name), options: opts });
         opts?.onRequestId?.(requestId);
         relay.addSubscription(requestId, new TextDecoder().decode(name), opts?.subscriptionFilter);
         return varint(requestId);
       }),
-      requestUpdate: vi.fn(async () => varint(relay.nextRequestId++)),
+      requestUpdate: vi.fn(async (id: bigint, opts?: any) => {
+        if (relay.closed) { relay.rejectedAfterClose++; throw new Error('Cannot update in state closed; session must be ESTABLISHED'); }
+        relay.updates.push({ atUs: relay.nowUs, requestId: BigInt(id), options: opts });
+        const sub = relay.subs.get(BigInt(id));
+        if (sub !== undefined && opts?.forward !== undefined) {
+          const forward = Number(opts.forward);
+          // Resuming a live track starts at the next group; what was held back is skipped.
+          if (sub.paused && forward === 1) sub.nextFrame = Math.max(sub.nextFrame, Number(relay.liveGroup() + 1n) * GOP_FRAMES);
+          sub.paused = forward === 0;
+        }
+        return varint(relay.nextRequestId++);
+      }),
       unsubscribe: vi.fn(async (id: bigint) => {
         const sub = relay.subs.get(BigInt(id));
         if (sub) sub.active = false;
@@ -145,7 +171,7 @@ class SourcePacedRelay {
     };
   }
 
-  private liveGroup(): bigint {
+  liveGroup(): bigint {
     return BigInt(Math.floor(this.nowUs / FRAME_US / GOP_FRAMES));
   }
 
@@ -155,12 +181,13 @@ class SourcePacedRelay {
     this.subs.set(requestId, {
       requestId, alias: requestId + 1000n, trackName, startGroup,
       nextFrame: Number(startGroup) * GOP_FRAMES,
-      acked: false, ackAtUs: this.nowUs + 2 * PATH_DELAY_US, active: true,
+      acked: false, ackAtUs: this.nowUs + 2 * PATH_DELAY_US, active: true, paused: false,
     });
   }
 
   /** Answer subscriptions, release due frames into the link, deliver arrivals. */
   advanceTo(targetUs: number, setClock: (us: number) => void): void {
+    if (this.closed) { setClock(targetUs); return; }
     for (const sub of this.subs.values()) {
       if (sub.acked || sub.ackAtUs > targetUs) continue;
       sub.acked = true;
@@ -182,7 +209,7 @@ class SourcePacedRelay {
     // subscriptions, through one FIFO bottleneck.
     const due: Array<{ sub: Subscription; frameIndex: number; releaseUs: number }> = [];
     for (const sub of this.subs.values()) {
-      if (!sub.active || !sub.acked) continue;
+      if (!sub.active || !sub.acked || sub.paused) continue;
       while (sub.nextFrame * FRAME_US <= targetUs) {
         // Already-captured frames (cache) leave as soon as the subscription is live.
         due.push({ sub, frameIndex: sub.nextFrame, releaseUs: Math.max(sub.nextFrame * FRAME_US, sub.ackAtUs) });
@@ -242,6 +269,13 @@ class SourcePacedRelay {
   }
 
   onFrameDelivered: ((trackName: string, captureUs: number) => void) | undefined;
+
+  /** The relay drops the session: in-flight media is lost, and requests fail from now on. */
+  close(): void {
+    this.closed = true;
+    for (const sub of this.subs.values()) sub.active = false;
+    this.adapter.onClose?.(0, 'relay closed the session');
+  }
 }
 
 // ─── Player harness ──────────────────────────────────────────────────
@@ -272,6 +306,15 @@ interface Scenario {
   readonly captureTimestamps?: boolean;
   /** Start rung index (0 = top). Default: the player's `auto` (mid-ladder). */
   readonly startLevel?: number;
+  /** Extra player configuration. */
+  readonly playerConfig?: Partial<MoqtPlayerConfig>;
+  /** The relay drops the session at this time (µs). */
+  readonly closeAtUs?: number;
+  /**
+   * CMAF: a readable CMAF Header in the catalog (default), or opaque bytes —
+   * a header the player cannot parse, which leaves it no delivery-lag signal.
+   */
+  readonly cmafHeader?: 'real' | 'opaque';
 }
 
 interface Run {
@@ -285,6 +328,15 @@ interface Run {
   readonly estimateKbps: number;
   /** Average rate the link actually carried over the run (kbps). */
   readonly carriedKbps: number;
+  /** Switches that failed and rolled back. */
+  readonly failedSwitches: readonly { atUs: number; from: string; to: string; error: string }[];
+  /** Requests the player sent, as the relay saw them. */
+  readonly subscribes: SourcePacedRelay['subscribes'];
+  readonly updates: SourcePacedRelay['updates'];
+  /** CMAF: groups handed to the assembler, per track, in order. */
+  readonly assembledGroups: ReadonlyMap<string, readonly bigint[]>;
+  /** Requests the player attempted after the relay closed the session. */
+  readonly rejectedAfterClose: number;
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -292,7 +344,11 @@ async function flushMicrotasks(): Promise<void> {
 }
 
 async function runScenario(s: Scenario): Promise<Run> {
-  const relay = new SourcePacedRelay(s.capacityBps, catalogJson(s.packaging), s.packaging, s.contentScale, s.captureTimestamps);
+  // The player's own timers (switch deadlines, retry delays) run on simulated
+  // time, advanced with the clock; otherwise a 60 s run would finish before
+  // any of them fired.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+  const relay = new SourcePacedRelay(s.capacityBps, catalogJson(s.packaging, s.cmafHeader), s.packaging, s.contentScale, s.captureTimestamps);
   let clockUs = 0;
   let firstVideoUs: number | null = null;
   const clock = { now: () => clockUs };
@@ -316,8 +372,19 @@ async function runScenario(s: Scenario): Promise<Run> {
     onStall: null as ((ms: number) => void) | null,
     changeType: vi.fn(() => Promise.resolve()),
     getBufferAheadUs: vi.fn(() => firstVideoUs === null ? null : s.bufferAheadUs?.(clockUs) ?? null),
+    // The highest group handed to the assembler stands in for what MSE committed.
+    getCommittedGroupFloor: vi.fn((_mt: string, trackName: string) => assembledGroups.get(trackName)?.at(-1)),
   };
-  const assembler = { push: vi.fn(), selectTrack: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn() };
+  const assembledGroups = new Map<string, bigint[]>();
+  const assembler = {
+    push: vi.fn((mediaType: string, trackName: string, groupId: bigint) => {
+      if (mediaType !== 'video') return;
+      const groups = assembledGroups.get(trackName) ?? [];
+      if (groups.at(-1) !== groupId) groups.push(groupId);
+      assembledGroups.set(trackName, groups);
+    }),
+    selectTrack: vi.fn(), getEpoch: () => null, reset: vi.fn(), destroy: vi.fn(),
+  };
 
   const player = new MoqtPlayer({
     url: 'https://relay.example.com/moq',
@@ -326,6 +393,7 @@ async function runScenario(s: Scenario): Promise<Run> {
     createConnection: () => relay.adapter as unknown as MoqtConnection,
     catalogBootstrap: 'subscribe',
     clock,
+    ...s.playerConfig,
     ...(s.startLevel !== undefined ? { startLevel: s.startLevel } : {}),
     ...(s.packaging === 'loc'
       ? { createVideoDecoder: () => decoder, createRenderer: () => renderer }
@@ -338,6 +406,8 @@ async function runScenario(s: Scenario): Promise<Run> {
 
   const switches: Array<{ atUs: number; from: string; to: string; reason: string }> = [];
   player.on('quality_switched', e => switches.push({ atUs: clockUs, from: e.fromTrackName, to: e.toTrackName, reason: e.reason }));
+  const failedSwitches: Array<{ atUs: number; from: string; to: string; error: string }> = [];
+  player.on('quality_switch_failed', e => failedSwitches.push({ atUs: clockUs, from: e.fromTrackName, to: e.toTrackName, error: e.error.message }));
 
   // Playout model: a frame of the playing rung is due PLAYOUT_DELAY_US after
   // capture, plus all rebuffering so far. A late frame is a stall: playback
@@ -356,6 +426,10 @@ async function runScenario(s: Scenario): Promise<Run> {
       if (s.packaging === 'loc') renderer.onStall?.(stallMs);
       else mediaSource.onStall?.(stallMs);
     }
+    if (rendered === 0n) {
+      if (s.packaging === 'loc') renderer.onFirstFrame?.();
+      else mediaSource.onFirstFrame?.();
+    }
     renderer.onFrameRendered?.(++rendered * BigInt(FRAME_US), clockUs);
   };
 
@@ -365,7 +439,9 @@ async function runScenario(s: Scenario): Promise<Run> {
   }
   try {
     for (let t = TICK_US; t <= s.durationUs; t += TICK_US) {
+      if (s.closeAtUs !== undefined && !relay.closed && t >= s.closeAtUs) relay.close();
       relay.advanceTo(t, setClock);
+      vi.advanceTimersByTime(TICK_US / 1000);
       player.tick();
       await flushMicrotasks();
     }
@@ -375,9 +451,15 @@ async function runScenario(s: Scenario): Promise<Run> {
       stallsAtUs,
       estimateKbps: internals.bandwidthEstimator?.getEstimateKbps() ?? 0,
       carriedKbps: relay.carriedBits / (s.durationUs / 1_000_000) / 1000,
+      failedSwitches,
+      subscribes: relay.subscribes,
+      updates: relay.updates,
+      assembledGroups,
+      rejectedAfterClose: relay.rejectedAfterClose,
     };
   } finally {
     await player.destroy();
+    vi.useRealTimers();
   }
 }
 
@@ -491,6 +573,68 @@ describe('ABR under source-paced live delivery', () => {
       expect(run.switches[0]!.atUs).toBeLessThan(SECONDS(10));
       expect(run.switches.some(sw => sw.reason === 'bandwidth')).toBe(true);
       expect(LADDER[rungIndex(run.finalTrack)]!.bitrateBps).toBeLessThan(1_000_000);
+    });
+  });
+
+  // Switching under congestion: the target must get through a link that is
+  // already behind, without the outgoing rung's backlog shutting it out.
+  describe('switching under congestion', () => {
+    const initialVideo = (run: Run) => run.subscribes.find(sub => sub.trackName === START)!;
+    const switchSubscribes = (run: Run) => run.subscribes.filter(sub => sub.trackName.startsWith('v')).slice(1);
+
+    it('CMAF: a switch continues from the group after the last one MSE committed', async () => {
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: 1_000_000, durationUs: SECONDS(40), bufferAheadUs: LL_BUFFER,
+      });
+      // Formerly NextGroupStart: the live edge, however far behind playback was.
+      expect(switchSubscribes(run)[0]!.options.subscriptionFilter.type).toBe('AbsoluteStart');
+      const from = run.assembledGroups.get(run.switches[0]!.from)!;
+      const to = run.assembledGroups.get(run.switches[0]!.to)!;
+      expect(to[0]!).toBeLessThanOrEqual(from.at(-1)! + 1n);
+    });
+
+    it('a downshift first lowers the outgoing rung\'s priority', async () => {
+      const run = await runScenario({ packaging: 'loc', capacityBps: 1_000_000, durationUs: SECONDS(30) });
+      const outgoing = initialVideo(run).requestId;
+      const lowered = run.updates.find(u => u.requestId === outgoing && u.options?.subscriberPriority !== undefined);
+      expect(BigInt(lowered!.options.subscriberPriority)).toBe(129n);
+      expect(lowered!.atUs).toBeLessThan(run.switches[0]!.atUs);
+    });
+
+    it('a downshift stuck behind the backlog pauses the outgoing rung, and lands', async () => {
+      // No capture timestamps: no lag to size the backlog by, so the switch
+      // must rely on the paused rung's arrivals showing the link still draining.
+      const run = await runScenario({
+        packaging: 'loc', capacityBps: 1_000_000, durationUs: SECONDS(60), captureTimestamps: false,
+      });
+      const outgoing = initialVideo(run).requestId;
+      expect(run.updates.some(u => u.requestId === outgoing && Number(u.options?.forward) === 0)).toBe(true);
+      expect(run.failedSwitches).toEqual([]);
+      expect(run.switches[0]).toMatchObject({ from: START, to: 'v800' });
+    });
+
+    it('switch subscriptions keep the configured subscribe parameters', async () => {
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: 1_000_000, durationUs: SECONDS(30), bufferAheadUs: LL_BUFFER,
+        playerConfig: { deliveryTimeoutMs: 2_000, subscriberPriority: 100 },
+      });
+      const options = switchSubscribes(run)[0]!.options;
+      expect(options.subscriptionFilter.type).toBe('AbsoluteStart');
+      expect(BigInt(options.deliveryTimeout)).toBe(2_000n);
+      expect(BigInt(options.subscriberPriority)).toBe(100n);
+      const outgoing = initialVideo(run).requestId;
+      expect(run.updates.some(u => u.requestId === outgoing && BigInt(u.options?.subscriberPriority ?? 0) === 101n)).toBe(true);
+    });
+
+    it('after the relay closes the session, ABR stops requesting switches', async () => {
+      // An opaque CMAF Header leaves no lag signal, so the thin buffer keeps
+      // asking for a downshift; the reconnect is far off, so the closed
+      // session stays current. Formerly: a rejected switch on every tick.
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: 1_000_000, durationUs: SECONDS(30), bufferAheadUs: LL_BUFFER,
+        cmafHeader: 'opaque', closeAtUs: SECONDS(3), playerConfig: { reconnectDelayMs: 60_000 },
+      });
+      expect(run.rejectedAfterClose).toBeLessThanOrEqual(2);
     });
   });
 
