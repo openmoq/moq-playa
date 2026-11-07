@@ -105,6 +105,17 @@ export class PlaybackPipeline {
 
     /** Timestamp when we first started waiting for active group completion. */
     private activeGroupWaitStartUs: number | null = null;
+    /**
+     * When the pipeline began waiting for a missing object of a video group
+     * whose later objects are already here. null = not waiting.
+     */
+    private objectReorderWaitStartUs: number | null = null;
+    /**
+     * Video groups that lost an object inside this pipeline (eviction, or
+     * refused when full). Such an object will never arrive, so waiting for it
+     * as for a reordered one would only delay the skip.
+     */
+    private readonly locallyDroppedGroups = new Set<bigint>();
 
     /**
  * Minimum group ID accepted by pushObject().
@@ -412,6 +423,7 @@ export class PlaybackPipeline {
             }
         } else {
             refused = true;
+            if (this.mediaType === 'video') this.locallyDroppedGroups.add(obj.groupId);
             if (this.recovery) {
                 // No priority info, can't evict — notify recovery
                 this.onEvent({
@@ -436,7 +448,10 @@ export class PlaybackPipeline {
         // Observe group for gap timeout tracking
         this.gapDetector.observeGroup(obj.groupId);
         inputs?.reportAll(discarded, 'buffer eviction');
-        if (refused) inputs?.report(token, 'buffer full');
+        if (refused) {
+            if (this.mediaType === 'video') this.locallyDroppedGroups.add(obj.groupId);
+            inputs?.report(token, 'buffer full');
+        }
     }
 
     /**
@@ -487,6 +502,8 @@ export class PlaybackPipeline {
         this.lastKeyframeWaitingGroupId = -1n;
         this._throttled = false;
         this.activeGroupWaitStartUs = null;
+        this.objectReorderWaitStartUs = null;
+        this.locallyDroppedGroups.clear();
         this.gapDetector.reset();
         // Force decoder back to NEEDS_KEYFRAME so partial-group deltas
         // from a mid-stream subscription are skipped, not decoded.
@@ -512,6 +529,8 @@ export class PlaybackPipeline {
         this.trackEndHolds = 0;
         this.endedGroups.clear();
         this.activeGroupWaitStartUs = null;
+        this.objectReorderWaitStartUs = null;
+        this.locallyDroppedGroups.clear();
         this.gapDetector.reset();
         this.adaptiveTolerance?.reset();
         const decision = this.decoderState.notifyGap();
@@ -628,6 +647,7 @@ export class PlaybackPipeline {
             this.endedGroups.add(this.lastConsumedGroupId);
             this.nextExpectedObjectId = 0n;
             this.activeGroupWaitStartUs = null;
+            this.objectReorderWaitStartUs = null;
         }
 
         // 3. Backlog shedding: runs BEFORE throttle check so backlog is
@@ -696,6 +716,26 @@ export class PlaybackPipeline {
                 break;
             }
 
+            // Video reorder wait. An object ahead of the next expected one is
+            // not evidence the expected one is lost: a group's objects may ride
+            // different subgroup streams, and QUIC orders nothing across
+            // streams. Under congestion a dropped packet holds one stream for a
+            // retransmission while later ones complete — most often a group's
+            // keyframe, the largest. Skipping at once discarded whole groups
+            // and reset the decoder on every such reorder. Wait for it, bounded
+            // as the inter-group gap is, before the contiguity check below
+            // gives up; an object this pipeline dropped itself is not waited
+            // for. Placed before the group-boundary bookkeeping, which must
+            // not run for a group that is not yet being consumed.
+            if (this.mediaType === 'video' && !this.locallyDroppedGroups.has(top.groupId)) {
+                const expectedObjectId = top.groupId > this.lastConsumedGroupId ? 0n : this.nextExpectedObjectId;
+                if (top.objectId > expectedObjectId) {
+                    const now = this.clock.now();
+                    if (this.objectReorderWaitStartUs === null) this.objectReorderWaitStartUs = now;
+                    if (now - this.objectReorderWaitStartUs <= this.gapDetector.gapTimeoutUs) break;
+                }
+            }
+
             // New group boundary: for video, don't silently transition from
             // a partial group. If the current group wasn't ended (END_OF_GROUP),
             // wait for the intra-group timeout to explicitly abandon it.
@@ -714,13 +754,16 @@ export class PlaybackPipeline {
             // New group: reset objectId contiguity tracker
             if (top.groupId > this.lastConsumedGroupId) {
                 this.nextExpectedObjectId = 0n;
+                for (const group of this.locallyDroppedGroups) if (group < top.groupId) this.locallyDroppedGroups.delete(group);
             }
 
             // Intra-group contiguity (video only): if object N is missing
             // but N+1 is available, skip the rest of this group — decoding
             // N+1 without N's reference produces artifacts. Audio chunks
             // are independently decodable (LOC §4.1) so gaps are harmless.
+            // (Only once the reorder wait above has given up on N.)
             if (this.mediaType === 'video' && top.objectId > this.nextExpectedObjectId) {
+                this.objectReorderWaitStartUs = null;
                 // Discard remaining objects in this group — they can't
                 // decode correctly without the missing reference.
                 const skipGroupId = top.groupId;
@@ -735,6 +778,7 @@ export class PlaybackPipeline {
                 }
                 this.lastConsumedGroupId = skipGroupId;
                 this.nextExpectedObjectId = 0n;
+                for (const group of this.locallyDroppedGroups) if (group <= skipGroupId) this.locallyDroppedGroups.delete(group);
                 // Let decoder know it needs a fresh keyframe
                 const decision = this.decoderState.notifyGap();
                 this.emitFsmDecision(decision);
@@ -744,6 +788,7 @@ export class PlaybackPipeline {
 
             const obj = this.buffer.extract()!;
             this.decrementGroupCount(obj.groupId);
+            this.objectReorderWaitStartUs = null;
 
             if (obj.kind === 'data') {
                 this.processDataObject(obj);
@@ -841,6 +886,7 @@ export class PlaybackPipeline {
         if (evicted.publisherPriority! > obj.publisherPriority!) {
             // Evicted is less important — insert incoming
             this.decrementGroupCount(evicted.groupId);
+            if (this.mediaType === 'video') this.locallyDroppedGroups.add(evicted.groupId);
             const evictedKey = `${evicted.groupId}:${evicted.objectId}`;
             this.forgetHeaders(evictedKey);
             const evictedInput = inputs?.take(evictedKey); if (evictedInput) dropped?.push(evictedInput);

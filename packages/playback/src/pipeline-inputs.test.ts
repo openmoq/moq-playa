@@ -3,7 +3,8 @@ import { PlaybackPipeline } from './pipeline.js';
 import { SyncController } from './sync.js';
 import { varint } from '@openmoq/transport';
 function fixture(mediaType: 'video' | 'audio' = 'audio', maxBufferDepth = 100) {
-  const clock = { now: () => 1_000_000 }, commands: Array<{ type: string; inputToken?: object }> = [];
+  let nowUs = 1_000_000;
+  const clock = { now: () => nowUs }, commands: Array<{ type: string; inputToken?: object }> = [];
   const pipeline = new PlaybackPipeline({ mediaType, clock,
     config: { gapTimeoutUs: 200_000, driftThresholdUs: 500_000, maxBufferDepth },
     sync: new SyncController({ clock, driftThresholdUs: 500_000 }),
@@ -11,7 +12,7 @@ function fixture(mediaType: 'video' | 'audio' = 'audio', maxBufferDepth = 100) {
   pipeline.configure(Uint8Array.of(1)); pipeline.inputObserver = () => {};
   const obj = (id: number, group = 0, priority = 128) => ({ kind: 'data' as const, trackAlias: varint(1), groupId: varint(group), subgroupId: varint(group),
     objectId: varint(id), publisherPriority: priority, payload: Uint8Array.of(1), extensions: undefined });
-  return { pipeline, commands, obj };
+  return { pipeline, commands, obj, advance: (us: number) => { nowUs += us; } };
 }
 describe('LOC input identity carried by the admitted pipeline entry', () => {
   it('carries the accepted input identity with the decode command', () => {
@@ -114,6 +115,9 @@ it('reports the actual buffered suffix discarded for a missing video dependency'
   const f = fixture('video'), missingSuffix = {}, observer = vi.fn(); f.pipeline.inputObserver = observer;
   f.pipeline.pushObject(f.obj(0), { captureTimestamp: 1_000_000n }, {});
   f.pipeline.pushObject(f.obj(2), { captureTimestamp: 1_040_000n }, missingSuffix); f.pipeline.tick();
+  // Object 1 may still be in flight on another stream: nothing is discarded yet.
+  expect(observer).not.toHaveBeenCalled();
+  f.advance(200_001); f.pipeline.tick();
   expect(observer).toHaveBeenCalledExactlyOnceWith(missingSuffix, 'skipped');
   expect(f.commands.filter(command => command.type === 'decode_video')).toHaveLength(1);
 });

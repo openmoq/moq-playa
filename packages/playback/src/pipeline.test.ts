@@ -2044,6 +2044,66 @@ describe('PlaybackPipeline', () => {
             expect(decodes.length).toBe(0);
         });
 
+        it('waits for an object that arrives after its successor — no reset on cross-stream reorder', () => {
+            // A group's objects may ride different subgroup streams, which QUIC
+            // does not order: N+1 completing before N is a reorder, not a loss.
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const { pipeline, commands, sync } = createPipeline({ mediaType: 'video', clock });
+            sync.setAudioReference(1_000_000_000n);
+
+            pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([0x01, 0x64])));
+            pipeline.tick();
+            pipeline.pushObject(makeData(0, 2), videoHeaders(1_000_066_000n, false));
+            pipeline.tick(); // object 1 still in flight: hold, do not skip
+            clock.advance(50_000);
+            pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_000n, false));
+            pipeline.tick();
+
+            expect(commands.filter(c => c.type === 'reset')).toEqual([]);
+            expect(commands.filter(c => c.type === 'decode_video')).toHaveLength(3);
+        });
+
+        it('waits for a new group\'s keyframe that arrives after its deltas', () => {
+            // The keyframe is the largest object, so the likeliest to be held
+            // up by a retransmission; skipping at once discarded the group.
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const { pipeline, commands, sync } = createPipeline({ mediaType: 'video', clock });
+            sync.setAudioReference(1_000_000_000n);
+
+            pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([0x01, 0x64])));
+            pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_000n, false));
+            pipeline.pushObject(makeGap(0, 2, ObjectStatus.END_OF_GROUP));
+            pipeline.tick();
+            commands.length = 0;
+            pipeline.pushObject(makeData(1, 1), videoHeaders(1_000_133_000n, false));
+            pipeline.tick();
+            clock.advance(50_000);
+            pipeline.pushObject(makeData(1, 0), videoHeaders(1_000_100_000n, true, new Uint8Array([0x01, 0x64])));
+            pipeline.tick();
+
+            expect(commands.filter(c => c.type === 'reset')).toEqual([]);
+            expect(commands.filter(c => c.type === 'decode_video')).toHaveLength(2);
+        });
+
+        it('still skips the rest of a group once the missing object is overdue', () => {
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const { pipeline, commands, sync } = createPipeline({ mediaType: 'video', clock });
+            sync.setAudioReference(1_000_000_000n);
+
+            pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([0x01, 0x64])));
+            pipeline.tick();
+            pipeline.pushObject(makeData(0, 2), videoHeaders(1_000_066_000n, false));
+            pipeline.tick();
+            expect(commands.filter(c => c.type === 'reset')).toEqual([]);
+            clock.advance(10_000_000); // far past any gap timeout
+            pipeline.tick();
+
+            expect(commands.filter(c => c.type === 'reset')).toHaveLength(1);
+        });
+
         it('audio is NOT affected by video group lifecycle (independently decodable)', () => {
             const clock = new MockClock();
             clock.set(5_000_000);
