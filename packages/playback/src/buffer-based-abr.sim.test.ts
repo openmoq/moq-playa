@@ -204,4 +204,29 @@ describe('Buffer-based ABR — hybrid buffer depth + bandwidth', () => {
 
         expect(decision.action).toBe('hold'); // can't go higher
     });
+
+    /**
+     * Test 7: A rung without a declared bitrate is never an upshift target.
+     *
+     * Its bitrate maps to 0, and every estimate exceeds 0 × the multiple, so
+     * without the guard a ladder lacking catalog bitrates upshifts on any
+     * healthy buffer.
+     */
+    it('does not upshift to a rung of unknown bitrate', () => {
+        const clock = new SimClock();
+        const ctrl = new BufferBasedController({
+            clock,
+            ladder: [{ name: 'unknown', bitrateKbps: 0 }, { name: 'known', bitrateKbps: 500 }],
+            initialIndex: 1,
+            lowThresholdUs: 500_000,
+            highThresholdUs: 4_000_000,
+        });
+
+        const decision = ctrl.evaluate({
+            bufferDepthUs: 6_000_000,
+            bandwidthEstimateKbps: 600,
+        });
+
+        expect(decision.action).toBe('hold');
+    });
 });
