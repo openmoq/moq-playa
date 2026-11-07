@@ -28,9 +28,9 @@ import { MoqtConnectionError } from '@openmoq/webtransport';
 import type { DataStreamTerminal, GoawayNotice, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
 import type { DataStreamHeader, MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
-import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@openmoq/playback';
+import { PlaybackPipeline, SyncController, BandwidthEstimator, DeliveryLagDetector } from '@openmoq/playback';
 import { BufferBasedController } from '@openmoq/playback';
-import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback, PlaybackInputObserver, AudioTimingSource, VideoTimingSource } from '@openmoq/playback';
+import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback, PlaybackInputObserver, AudioTimingSource, VideoTimingSource, AbrDecision } from '@openmoq/playback';
 import type { AltGroup, CatalogState, CatalogTrack, ResolvedTrackNamespace } from '@openmoq/msf';
 import type { SelectionIntent, TrackIdentity } from './catalog-selection.js';
 import { buildCatalogSelection, resolveSelection } from './catalog-selection.js';
@@ -156,6 +156,15 @@ const CATALOG_FILL = CURRENT_GROUP_FILL;
 
 /** Max time (ms) to wait for a keyframe during make-before-break switch. */
 const SWITCH_STAGING_TIMEOUT_MS = 3_000;
+
+/**
+ * Most extra time a switch may wait for its target, beyond the base deadline,
+ * while delivery lag shows a backlog ahead of it on the link.
+ */
+const SWITCH_STAGING_BACKLOG_ALLOWANCE_MS = 10_000;
+
+/** Subscriber priority a SUBSCRIBE without the parameter is treated as (the transport codecs' default). */
+const DEFAULT_SUBSCRIBER_PRIORITY = 128;
 
 /** One current route's receiving admission; no payload or group history. */
 interface ReceivingVideoOwner {
@@ -708,6 +717,12 @@ export class MoqtPlayer {
   private _adapterOwned = true;
   private qualityController: QualityController | null = null;
   private bandwidthEstimator: BandwidthEstimator | null = null;
+  /** Video delivery lag (arrival − capture); its rise is the proactive downshift signal. */
+  private deliveryLag: DeliveryLagDetector | null = null;
+  /** Playing video track the detector is measuring; a change restarts it. */
+  private deliveryLagTrack: string | null = null;
+  /** CMAF Header context of the playing CMAF video track, for chunk decode times. */
+  private deliveryLagCmafContext: { readonly track: CatalogTrack; readonly context: LocmafTrackContext | null } | null = null;
   private bufferAbrController: BufferBasedController | null = null;
   private bwEstimatorGroupId: bigint = -1n;
   private bwEstimatorGroupBytes = 0;
@@ -923,6 +938,8 @@ export class MoqtPlayer {
    * until something replaces it.
    */
   private readonly supersededConns = new WeakSet<MoqtConnection>();
+  /** Connections whose session has closed; nothing more may be requested on them. */
+  private readonly closedConns = new WeakSet<MoqtConnection>();
 
   private readonly pendingRetypes = new Map<'video' | 'audio',
     { owner: object; source: MediaSourceLike; codec: string; previous: Uint8Array; offset: number | undefined }>();
@@ -1147,6 +1164,14 @@ export class MoqtPlayer {
     reason: string;
     /** ABR direction — set by ABR/recovery paths for deferred commit. */
     abrAction?: 'downshift' | 'upshift';
+    /** Priority the outgoing track had before a downshift lowered it; restored if the switch fails. */
+    oldPriorityRestore?: number | undefined;
+    /** The outgoing track was paused (forward 0) to let the target through; resumed if the switch fails. */
+    oldPaused?: boolean;
+    /** When the outgoing track was paused (µs). */
+    oldPausedAtUs?: number;
+    /** Last arrival of an outgoing-track object while paused (µs): the link still draining its backlog. */
+    oldLastArrivalUs?: number;
   } | null = null;
 
   /**
@@ -3165,17 +3190,26 @@ export class MoqtPlayer {
       if (!this.switchIsCurrent(sw)) return;
       const nsBytes = targetNamespace.map(field => this.enc.encode(field));
       const nameBytes = this.enc.encode(trackName);
-      const currentGroup = this.videoPipeline?.currentGroupId ?? -1n;
+      const currentGroup = this.videoSwitchContinuationGroup(currentVideoRequestId, currentVideoTrackName ?? '');
       const nextGroup = currentGroup >= 0n ? currentGroup + 1n : undefined;
+      // The configured parameters (delivery timeout, priority, group order)
+      // apply to the replacement as to any media subscription; only the filter
+      // is the switch's own.
+      const configured = buildSubscribeOptions(this.config);
       const subscribeOptions = nextGroup !== undefined
-        ? { subscriptionFilter: { type: 'AbsoluteStart' as const, startGroup: varint(nextGroup), startObject: varint(0n) } }
-        : (buildSubscribeOptions(this.config) ?? defaultMediaSubscriptionFilter(targetTrack.isLive === true));
+        ? { ...configured, subscriptionFilter: { type: 'AbsoluteStart' as const, startGroup: varint(nextGroup), startObject: varint(0n) } }
+        : (configured ?? defaultMediaSubscriptionFilter(targetTrack.isLive === true));
       const register = (id: bigint): void => {
         if (sw.newRequestId !== null) return;
         if (!this.switchIsCurrent(sw) || !this.subscriptionManager) throw new Error('Video switch retired before emission');
         sw.newRequestId = id;
         sw.phase = 'staging';
-        this.armVideoSwitchTimeout(sw, SWITCH_STAGING_TIMEOUT_MS, true);
+        // The target's first group queues behind whatever backlog the link
+        // already holds, so allow for it as delivery lag measures it.
+        const backlogMs = Math.min(SWITCH_STAGING_BACKLOG_ALLOWANCE_MS,
+          Math.max(0, (this.deliveryLag?.excessLagUs(this.clock.now()) ?? 0) / 1000));
+        this.armVideoSwitchTimeout(sw, SWITCH_STAGING_TIMEOUT_MS + backlogMs, true);
+        if (sw.abrAction === 'downshift') this.lowerOutgoingVideoPriority(sw);
         this.pendingAliasBinds.add(id);
         this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null, namespace: targetNamespace });
         this.pendingMediaSubs.set(id, { trackName, mediaType: 'video', packaging: sw.newTrackPackaging });
@@ -3226,6 +3260,18 @@ export class MoqtPlayer {
       if (this.pendingRetypes.get('video')?.owner === sw) {
         this.failCatalogPlayback(createPlayerError('fatal', 'player', PlayerErrorCode.CMAF_INIT_INVALID,
           'Video reconfiguration did not settle before its deadline'));
+      } else if (this.pauseOutgoingVideoTrack(sw)) {
+        // A downshift whose target is stuck behind the outgoing track's backlog:
+        // stop adding to that backlog and give the target one more deadline,
+        // sized to what the link still has to drain.
+        const backlogMs = Math.min(SWITCH_STAGING_BACKLOG_ALLOWANCE_MS,
+          Math.max(0, (this.deliveryLag?.excessLagUs(this.clock.now()) ?? 0) / 1000));
+        this.armVideoSwitchTimeout(sw, SWITCH_STAGING_TIMEOUT_MS + backlogMs, true);
+      } else if (this.outgoingVideoBacklogDraining(sw)) {
+        // Still making progress: the paused track's backlog is arriving, and
+        // the target is queued behind it. Failing now would resume the very
+        // traffic that is in its way.
+        this.armVideoSwitchTimeout(sw, SWITCH_STAGING_TIMEOUT_MS, true);
       } else this.abortPendingVideoSwitch(sw, new Error('Video switch deadline elapsed without a usable target'));
     }, Math.min(ms, 0x7fffffff));
     this.switchStagingTimeout = timer;
@@ -3629,6 +3675,7 @@ export class MoqtPlayer {
     sw.failure = cause;
     sw.settle();
     this.retireVideoSwitchTarget(sw);
+    this.restoreOutgoingVideoPriority(sw);
     if (this.pendingVideoSwitch !== sw) return false;
     this.pendingVideoSwitch = null;
     this.switchInProgress = false;
@@ -3930,6 +3977,7 @@ export class MoqtPlayer {
     this.subscriptionManager = new SubscriptionManager();
     if (this.mediaDiagnosticRuntime) this.subscriptionManager.objectProvenance = this.mediaDiagnosticRuntime;
     this.bandwidthEstimator = new BandwidthEstimator();
+    this.deliveryLag = new DeliveryLagDetector();
 
     // Set draft version for version-aware KVP encoding
     // Draft-14 §1.4.2: absolute type IDs
@@ -4004,6 +4052,7 @@ export class MoqtPlayer {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
         if (mediaType === 'video' && bytes > 0) {
+          this.noteOutgoingVideoArrival(trackName);
           const gid = BigInt(obj.groupId);
           if (gid !== this.bwEstimatorGroupId) {
             if (this.bwEstimatorGroupBytes > 0) {
@@ -4015,6 +4064,11 @@ export class MoqtPlayer {
             this.bwEstimatorGroupBytes = bytes;
           } else {
             this.bwEstimatorGroupBytes += bytes;
+          }
+          // Backfill was captured before it was requested; its lag says
+          // nothing about the link.
+          if (headers.captureTimestamp !== undefined && !delivery?.backfill) {
+            this.recordDeliveryLag(trackName, Number(headers.captureTimestamp));
           }
         }
       } else {
@@ -4090,7 +4144,12 @@ export class MoqtPlayer {
         this._stats.recordMediaObject(bytes);
         // CMAF: one moof+mdat per group — each object IS a group
         if (mediaType === 'video' && bytes > 0) {
+          this.noteOutgoingVideoArrival(trackName);
           this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
+          // A chunk's decode time stands in for LOC's capture timestamp:
+          // only the lag's trend is used, so the timeline's origin is irrelevant.
+          const decodeUs = delivery?.backfill ? undefined : this.cmafChunkDecodeTimeUs(trackName, obj.payload);
+          if (decodeUs !== undefined) this.recordDeliveryLag(trackName, decodeUs);
         }
       } else {
         this._stats.recordGapObject();
@@ -9384,8 +9443,150 @@ export class MoqtPlayer {
     return true;
   }
 
+  /**
+   * Group a video switch continues from: the target subscribes from the group
+   * after it, so playback carries on without a hole. LOC reads the pipeline's
+   * current group; CMAF has no pipeline, so it reads the highest group MSE has
+   * committed for the playing track. -1n when neither knows, and the switch
+   * takes the default filter.
+   */
+  private videoSwitchContinuationGroup(currentRequestId: bigint, currentTrackName: string): bigint {
+    if (this.videoPipeline) return this.videoPipeline.currentGroupId;
+    const alias = this.activeSubscriptions.get(currentRequestId)?.trackAlias;
+    const sourceKey = this.keyedCmafIdentity && alias !== null && alias !== undefined
+      ? this.subscriptionManager?.getSourceKey(alias) : undefined;
+    const floor = sourceKey === undefined
+      ? this.mediaSource?.getCommittedGroupFloor?.('video', currentTrackName)
+      : this.mediaSource?.getCommittedGroupFloor?.('video', currentTrackName, sourceKey);
+    return floor ?? -1n;
+  }
+
+  /**
+   * On a downshift, let the target's data go first: the outgoing track's
+   * backlog is what the link cannot carry, and the target is what has to
+   * arrive before playback can move to it. Advisory — a relay that ignores
+   * the update leaves both tracks where they were.
+   */
+  private lowerOutgoingVideoPriority(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
+    const base = this.config.subscriberPriority ?? DEFAULT_SUBSCRIBER_PRIORITY;
+    if (base >= 255 || sw.oldPriorityRestore !== undefined || this.closedConns.has(sw.connection)) return;
+    sw.oldPriorityRestore = base;
+    this.updateOutgoingVideoTrack(sw, { subscriberPriority: varint(BigInt(base + 1)) });
+  }
+
+  /**
+   * Pause the outgoing track of a downshift still waiting for its target.
+   *
+   * Under congestion make-before-break defeats itself: both tracks share the
+   * link, the outgoing one keeps adding to the backlog the target waits
+   * behind, and the target may never arrive. Pausing trades that for a stall
+   * bounded by the backlog. Only once, only while staging: a lowered priority
+   * is tried first, so a relay that honours it never needs this.
+   */
+  private pauseOutgoingVideoTrack(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): boolean {
+    if (sw.abrAction !== 'downshift' || sw.phase !== 'staging' || sw.oldPaused) return false;
+    if (!this.activeSubscriptions.has(sw.oldRequestId) || this.closedConns.has(sw.connection)) return false;
+    sw.oldPaused = true;
+    sw.oldPausedAtUs = this.clock.now();
+    this.log.warn('[SWITCH] target "%s" not through by its deadline; pausing "%s" to drain the link',
+      sw.newTrackName, sw.oldTrackName);
+    this.updateOutgoingVideoTrack(sw, { forward: 0 });
+    return true;
+  }
+
+  /**
+   * Whether a paused outgoing track is still draining: one of its objects
+   * arrived within the last second, and the pause is within its allowance.
+   * Lag measures the backlog only when capture times exist; arrival
+   * progress does not need them.
+   */
+  private outgoingVideoBacklogDraining(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): boolean {
+    if (!sw.oldPaused || sw.phase !== 'staging' || sw.oldPausedAtUs === undefined) return false;
+    const now = this.clock.now();
+    if (now - sw.oldPausedAtUs >= SWITCH_STAGING_BACKLOG_ALLOWANCE_MS * 1000) return false;
+    return sw.oldLastArrivalUs !== undefined && now - sw.oldLastArrivalUs < 1_000_000;
+  }
+
+  /** Note an object of a paused outgoing video track: its backlog is still draining. */
+  private noteOutgoingVideoArrival(trackName: string): void {
+    const sw = this.pendingVideoSwitch;
+    if (sw?.oldPaused && trackName === sw.oldTrackName) sw.oldLastArrivalUs = this.clock.now();
+  }
+
+  /** Undo the outgoing track's lowered priority and pause when it stays. */
+  private restoreOutgoingVideoPriority(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
+    const restore = sw.oldPriorityRestore;
+    const paused = sw.oldPaused === true;
+    sw.oldPriorityRestore = undefined;
+    sw.oldPaused = false;
+    if (restore === undefined && !paused) return;
+    if (!this.activeSubscriptions.has(sw.oldRequestId) || this.closedConns.has(sw.connection)) return;
+    this.updateOutgoingVideoTrack(sw, {
+      ...(restore !== undefined ? { subscriberPriority: varint(BigInt(restore)) } : {}),
+      ...(paused ? { forward: 1 as const } : {}),
+    });
+  }
+
+  private updateOutgoingVideoTrack(
+    sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>,
+    update: { subscriberPriority?: ReturnType<typeof varint>; forward?: 0 | 1 },
+  ): void {
+    // Advisory: however the update fails, the switch carries on without it.
+    const failed = (err: unknown): void => {
+      this.log.warn('Switch update for outgoing "%s" failed: %s', sw.oldTrackName,
+        err instanceof Error ? err.message : String(err));
+    };
+    try {
+      sw.connection.requestUpdate(varint(sw.oldRequestId), update).catch(failed);
+    } catch (err) { failed(err); }
+  }
+
+  /**
+   * Feed the delivery-lag detector with one object of the PLAYING video track.
+   *
+   * During a switch overlap the target's objects are still staged, and
+   * renditions need not share a timeline closely enough for their lags to be
+   * compared, so a change of playing track restarts the baseline.
+   */
+  private recordDeliveryLag(trackName: string, captureUs: number): void {
+    if (!this.deliveryLag || this.subscribedTrack('video')?.name !== trackName) return;
+    if (this.deliveryLagTrack !== trackName) {
+      this.deliveryLag.reset();
+      this.deliveryLagTrack = trackName;
+    }
+    this.deliveryLag.record(captureUs, this.clock.now());
+  }
+
+  /**
+   * First-sample decode time (µs) of a chunk of the playing CMAF video track,
+   * or undefined when the track's CMAF Header or the chunk cannot be read (an
+   * in-band header, a split moof/mdat object).
+   */
+  private cmafChunkDecodeTimeUs(trackName: string, payload: Uint8Array): number | undefined {
+    const track = this.subscribedTrack('video');
+    if (track?.name !== trackName) return undefined;
+    if (this.deliveryLagCmafContext?.track !== track) {
+      let context: LocmafTrackContext | null = null;
+      try {
+        const init = this.decodeResolvedInlineInitData(track)
+          ?? (track.initTrack ? this.initSegmentByTrack.get(this.initKey(track, track.initTrack)) : undefined);
+        context = init === undefined ? null : parseLocmafTrackContext(init);
+      } catch { context = null; }
+      this.deliveryLagCmafContext = { track, context };
+    }
+    const { context } = this.deliveryLagCmafContext;
+    if (context === null || !(context.timescale > 0)) return undefined;
+    try {
+      const { baseMediaDecodeTime } = readCmafChunkSamples(payload, context).effective;
+      return Number(baseMediaDecodeTime) * 1_000_000 / context.timescale;
+    } catch { return undefined; }
+  }
+
   private checkBandwidthAdaptation(): void {
     if (!this.bufferAbrController || !this.qualityController) return;
+    // A closed session cannot carry a switch: every attempt would fail at once
+    // and be retried on the next tick.
+    if (!this.connection || this.closedConns.has(this.connection)) return;
     // Don't trigger ABR while a switch is in flight — give the current
     // switch time to deliver data before deciding to switch again.
     if (this.pendingVideoSwitch || this.switchInProgress || this.mediaSelection) return;
@@ -9419,15 +9620,23 @@ export class MoqtPlayer {
         // bandwidth estimates suppress the downshift.
         effectiveBufferUs = 0;
       } else if (bufferUs < this.bufferAbrController.lowThresholdUs) {
-        // Thin but not empty — check if bandwidth sustains.
-        // On fast networks MSE buffers are naturally thin; a thin
-        // buffer with high bandwidth is healthy, not starving.
-        const bwKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
-        const currentTrack = this.bufferAbrController.currentTrack;
-        const currentBitrateKbps = currentTrack ? currentTrack.bitrateKbps : 0;
-        effectiveBufferUs = bwKbps > currentBitrateKbps * 1.5
-          ? this.bufferAbrController.lowThresholdUs
-          : bufferUs;
+        // Thin but not empty. Near the live edge a thin buffer is the design,
+        // not starvation: it is starving only if the link is falling behind.
+        // Delivery lag says so directly. Without it, fall back to bandwidth —
+        // which, under source-paced delivery, reads the encoding rate and
+        // rarely clears the bar.
+        if (this.deliveryLag?.excessLagUs(this.clock.now()) != null) {
+          effectiveBufferUs = this.deliveryLag.isCongested(this.clock.now())
+            ? bufferUs
+            : this.bufferAbrController.lowThresholdUs;
+        } else {
+          const bwKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
+          const currentTrack = this.bufferAbrController.currentTrack;
+          const currentBitrateKbps = currentTrack ? currentTrack.bitrateKbps : 0;
+          effectiveBufferUs = bwKbps > currentBitrateKbps * 1.5
+            ? this.bufferAbrController.lowThresholdUs
+            : bufferUs;
+        }
       } else {
         effectiveBufferUs = bufferUs;
       }
@@ -9437,10 +9646,17 @@ export class MoqtPlayer {
 
     const bandwidthKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
 
-    const decision = this.bufferAbrController.evaluate({
-      bufferDepthUs: effectiveBufferUs,
-      bandwidthEstimateKbps: bandwidthKbps,
-    });
+    // A delivery lag standing above its baseline and still rising means the
+    // link cannot carry this rung. Step down before the playout buffer runs
+    // dry — stalls are the last-resort signal, not the first.
+    const congested = this.deliveryLag?.isCongested(this.clock.now()) ?? false;
+
+    const decision: AbrDecision = congested
+      ? { action: 'downshift' }
+      : this.bufferAbrController.evaluate({
+        bufferDepthUs: effectiveBufferUs,
+        bandwidthEstimateKbps: bandwidthKbps,
+      });
 
     if (decision.action === 'hold') return;
 
@@ -9461,8 +9677,13 @@ export class MoqtPlayer {
     if (newTrack) {
       if (isDown) this.lastAbrDownshiftUs = this.clock.now();
       const verb = isDown ? 'downshift' : 'upshift';
-      this.log.warn('Buffer %.1fs, BW %.0fkbps → %s to %s',
-        effectiveBufferUs / 1_000_000, bandwidthKbps, verb, newTrack.name);
+      if (congested) {
+        this.log.warn('Delivery lag +%.0fms and rising → downshift to %s',
+          (this.deliveryLag?.excessLagUs(this.clock.now()) ?? 0) / 1000, newTrack.name);
+      } else {
+        this.log.warn('Buffer %.1fs, BW %.0fkbps → %s to %s',
+          effectiveBufferUs / 1_000_000, bandwidthKbps, verb, newTrack.name);
+      }
       // No stats or controller mutation here — deferred to completePendingVideoSwitch.
       this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'bandwidth', isDown ? 'downshift' : 'upshift')
         .catch((err) => {
@@ -9594,6 +9815,9 @@ export class MoqtPlayer {
     this.catalogSlots.catalogManager = null;
     this.qualityController = null;
     this.bandwidthEstimator = null;
+    this.deliveryLag = null;
+    this.deliveryLagTrack = null;
+    this.deliveryLagCmafContext = null;
     if (this.connection) {
       this.releaseMediaTerminals(this.connection);
       if (this._adapterOwned) {
@@ -10058,6 +10282,7 @@ export class MoqtPlayer {
       ),
 
       onClose: (error, reason) => {
+        this.closedConns.add(conn);
         if (this.mediaSelection?.conn === conn) this.failMediaSelection(this.mediaSelection, new Error('Audio selection session closed'));
         this.retireInitWaiters(conn);
         this.log.info('[SESSION] closed: error=0x%s reason=%s',
@@ -13593,10 +13818,13 @@ export class MoqtPlayer {
     issuedTrack?: CatalogTrack,
   ): void {
     if (!this.connection || !this.subscriptionManager || !this._catalogState) return;
+    // A closed session cannot carry the replacement; reconnection owns recovery.
+    if (this.closedConns.has(this.connection)) return;
     const operationConn = this.connection;
     const generation = this.bootstrapGeneration;
     const live = (): boolean => this.connection === operationConn && this.bootstrapGeneration === generation
-      && !this._destroyed && !this.isTerminalState() && this.subscriptionManager !== null;
+      && !this._destroyed && !this.isTerminalState() && this.subscriptionManager !== null
+      && !this.closedConns.has(operationConn);
 
     // Don't resurrect the OLD track during a make-before-break switch —
     // that would fight the switch by resubscribing to a track we're
