@@ -342,6 +342,24 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await player.destroy();
   });
 
+  it('a closed session is never asked for a liveness resubscribe', async () => {
+    // The relay dropped the session; reconnection owns recovery from here.
+    // Starvation on the dead session must not send it a fresh SUBSCRIBE.
+    const adapter = createMockAdapter();
+    adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
+    const { player } = await startPlaying(adapter, { reconnectDelayMs: 60_000 });
+    feedVideo(adapter);
+    adapter.onClose?.(0, 'relay closed the session');
+    const before = adapter.subscribe.mock.calls.length;
+
+    await sleep(500); // well past the liveness timeout and its ladder
+
+    const names = adapter.subscribe.mock.calls.slice(before).map(
+      (c: any[]) => new TextDecoder().decode(c[1] as Uint8Array));
+    expect(names.filter((n: string) => n === 'video')).toEqual([]);
+    await player.destroy();
+  });
+
   it('destroy() during a starvation incident stays quiet — no MEDIA_STARVED', async () => {
     const adapter = createMockAdapter();
     adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));

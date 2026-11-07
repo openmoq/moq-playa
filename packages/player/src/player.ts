@@ -13818,10 +13818,13 @@ export class MoqtPlayer {
     issuedTrack?: CatalogTrack,
   ): void {
     if (!this.connection || !this.subscriptionManager || !this._catalogState) return;
+    // A closed session cannot carry the replacement; reconnection owns recovery.
+    if (this.closedConns.has(this.connection)) return;
     const operationConn = this.connection;
     const generation = this.bootstrapGeneration;
     const live = (): boolean => this.connection === operationConn && this.bootstrapGeneration === generation
-      && !this._destroyed && !this.isTerminalState() && this.subscriptionManager !== null;
+      && !this._destroyed && !this.isTerminalState() && this.subscriptionManager !== null
+      && !this.closedConns.has(operationConn);
 
     // Don't resurrect the OLD track during a make-before-break switch —
     // that would fight the switch by resubscribing to a track we're
