@@ -28,9 +28,9 @@ import { MoqtConnectionError } from '@openmoq/webtransport';
 import type { DataStreamTerminal, GoawayNotice, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
 import type { DataStreamHeader, MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
-import { PlaybackPipeline, SyncController, BandwidthEstimator } from '@openmoq/playback';
+import { PlaybackPipeline, SyncController, BandwidthEstimator, DeliveryLagDetector } from '@openmoq/playback';
 import { BufferBasedController } from '@openmoq/playback';
-import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback, PlaybackInputObserver, AudioTimingSource, VideoTimingSource } from '@openmoq/playback';
+import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback, PlaybackInputObserver, AudioTimingSource, VideoTimingSource, AbrDecision } from '@openmoq/playback';
 import type { AltGroup, CatalogState, CatalogTrack, ResolvedTrackNamespace } from '@openmoq/msf';
 import type { SelectionIntent, TrackIdentity } from './catalog-selection.js';
 import { buildCatalogSelection, resolveSelection } from './catalog-selection.js';
@@ -708,6 +708,12 @@ export class MoqtPlayer {
   private _adapterOwned = true;
   private qualityController: QualityController | null = null;
   private bandwidthEstimator: BandwidthEstimator | null = null;
+  /** Video delivery lag (arrival − capture); its rise is the proactive downshift signal. */
+  private deliveryLag: DeliveryLagDetector | null = null;
+  /** Playing video track the detector is measuring; a change restarts it. */
+  private deliveryLagTrack: string | null = null;
+  /** CMAF Header context of the playing CMAF video track, for chunk decode times. */
+  private deliveryLagCmafContext: { readonly track: CatalogTrack; readonly context: LocmafTrackContext | null } | null = null;
   private bufferAbrController: BufferBasedController | null = null;
   private bwEstimatorGroupId: bigint = -1n;
   private bwEstimatorGroupBytes = 0;
@@ -3930,6 +3936,7 @@ export class MoqtPlayer {
     this.subscriptionManager = new SubscriptionManager();
     if (this.mediaDiagnosticRuntime) this.subscriptionManager.objectProvenance = this.mediaDiagnosticRuntime;
     this.bandwidthEstimator = new BandwidthEstimator();
+    this.deliveryLag = new DeliveryLagDetector();
 
     // Set draft version for version-aware KVP encoding
     // Draft-14 §1.4.2: absolute type IDs
@@ -4016,6 +4023,11 @@ export class MoqtPlayer {
           } else {
             this.bwEstimatorGroupBytes += bytes;
           }
+          // Backfill was captured before it was requested; its lag says
+          // nothing about the link.
+          if (headers.captureTimestamp !== undefined && !delivery?.backfill) {
+            this.recordDeliveryLag(trackName, Number(headers.captureTimestamp));
+          }
         }
       } else {
         this._stats.recordGapObject();
@@ -4091,6 +4103,10 @@ export class MoqtPlayer {
         // CMAF: one moof+mdat per group — each object IS a group
         if (mediaType === 'video' && bytes > 0) {
           this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
+          // A chunk's decode time stands in for LOC's capture timestamp:
+          // only the lag's trend is used, so the timeline's origin is irrelevant.
+          const decodeUs = delivery?.backfill ? undefined : this.cmafChunkDecodeTimeUs(trackName, obj.payload);
+          if (decodeUs !== undefined) this.recordDeliveryLag(trackName, decodeUs);
         }
       } else {
         this._stats.recordGapObject();
@@ -9384,6 +9400,47 @@ export class MoqtPlayer {
     return true;
   }
 
+  /**
+   * Feed the delivery-lag detector with one object of the PLAYING video track.
+   *
+   * During a switch overlap the target's objects are still staged, and
+   * renditions need not share a timeline closely enough for their lags to be
+   * compared, so a change of playing track restarts the baseline.
+   */
+  private recordDeliveryLag(trackName: string, captureUs: number): void {
+    if (!this.deliveryLag || this.subscribedTrack('video')?.name !== trackName) return;
+    if (this.deliveryLagTrack !== trackName) {
+      this.deliveryLag.reset();
+      this.deliveryLagTrack = trackName;
+    }
+    this.deliveryLag.record(captureUs, this.clock.now());
+  }
+
+  /**
+   * First-sample decode time (µs) of a chunk of the playing CMAF video track,
+   * or undefined when the track's CMAF Header or the chunk cannot be read (an
+   * in-band header, a split moof/mdat object).
+   */
+  private cmafChunkDecodeTimeUs(trackName: string, payload: Uint8Array): number | undefined {
+    const track = this.subscribedTrack('video');
+    if (track?.name !== trackName) return undefined;
+    if (this.deliveryLagCmafContext?.track !== track) {
+      let context: LocmafTrackContext | null = null;
+      try {
+        const init = this.decodeResolvedInlineInitData(track)
+          ?? (track.initTrack ? this.initSegmentByTrack.get(this.initKey(track, track.initTrack)) : undefined);
+        context = init === undefined ? null : parseLocmafTrackContext(init);
+      } catch { context = null; }
+      this.deliveryLagCmafContext = { track, context };
+    }
+    const { context } = this.deliveryLagCmafContext;
+    if (context === null || !(context.timescale > 0)) return undefined;
+    try {
+      const { baseMediaDecodeTime } = readCmafChunkSamples(payload, context).effective;
+      return Number(baseMediaDecodeTime) * 1_000_000 / context.timescale;
+    } catch { return undefined; }
+  }
+
   private checkBandwidthAdaptation(): void {
     if (!this.bufferAbrController || !this.qualityController) return;
     // Don't trigger ABR while a switch is in flight — give the current
@@ -9419,15 +9476,23 @@ export class MoqtPlayer {
         // bandwidth estimates suppress the downshift.
         effectiveBufferUs = 0;
       } else if (bufferUs < this.bufferAbrController.lowThresholdUs) {
-        // Thin but not empty — check if bandwidth sustains.
-        // On fast networks MSE buffers are naturally thin; a thin
-        // buffer with high bandwidth is healthy, not starving.
-        const bwKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
-        const currentTrack = this.bufferAbrController.currentTrack;
-        const currentBitrateKbps = currentTrack ? currentTrack.bitrateKbps : 0;
-        effectiveBufferUs = bwKbps > currentBitrateKbps * 1.5
-          ? this.bufferAbrController.lowThresholdUs
-          : bufferUs;
+        // Thin but not empty. Near the live edge a thin buffer is the design,
+        // not starvation: it is starving only if the link is falling behind.
+        // Delivery lag says so directly. Without it, fall back to bandwidth —
+        // which, under source-paced delivery, reads the encoding rate and
+        // rarely clears the bar.
+        if (this.deliveryLag?.excessLagUs(this.clock.now()) != null) {
+          effectiveBufferUs = this.deliveryLag.isCongested(this.clock.now())
+            ? bufferUs
+            : this.bufferAbrController.lowThresholdUs;
+        } else {
+          const bwKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
+          const currentTrack = this.bufferAbrController.currentTrack;
+          const currentBitrateKbps = currentTrack ? currentTrack.bitrateKbps : 0;
+          effectiveBufferUs = bwKbps > currentBitrateKbps * 1.5
+            ? this.bufferAbrController.lowThresholdUs
+            : bufferUs;
+        }
       } else {
         effectiveBufferUs = bufferUs;
       }
@@ -9437,10 +9502,17 @@ export class MoqtPlayer {
 
     const bandwidthKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
 
-    const decision = this.bufferAbrController.evaluate({
-      bufferDepthUs: effectiveBufferUs,
-      bandwidthEstimateKbps: bandwidthKbps,
-    });
+    // A delivery lag standing above its baseline and still rising means the
+    // link cannot carry this rung. Step down before the playout buffer runs
+    // dry — stalls are the last-resort signal, not the first.
+    const congested = this.deliveryLag?.isCongested(this.clock.now()) ?? false;
+
+    const decision: AbrDecision = congested
+      ? { action: 'downshift' }
+      : this.bufferAbrController.evaluate({
+        bufferDepthUs: effectiveBufferUs,
+        bandwidthEstimateKbps: bandwidthKbps,
+      });
 
     if (decision.action === 'hold') return;
 
@@ -9461,8 +9533,13 @@ export class MoqtPlayer {
     if (newTrack) {
       if (isDown) this.lastAbrDownshiftUs = this.clock.now();
       const verb = isDown ? 'downshift' : 'upshift';
-      this.log.warn('Buffer %.1fs, BW %.0fkbps → %s to %s',
-        effectiveBufferUs / 1_000_000, bandwidthKbps, verb, newTrack.name);
+      if (congested) {
+        this.log.warn('Delivery lag +%.0fms and rising → downshift to %s',
+          (this.deliveryLag?.excessLagUs(this.clock.now()) ?? 0) / 1000, newTrack.name);
+      } else {
+        this.log.warn('Buffer %.1fs, BW %.0fkbps → %s to %s',
+          effectiveBufferUs / 1_000_000, bandwidthKbps, verb, newTrack.name);
+      }
       // No stats or controller mutation here — deferred to completePendingVideoSwitch.
       this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'bandwidth', isDown ? 'downshift' : 'upshift')
         .catch((err) => {
@@ -9594,6 +9671,9 @@ export class MoqtPlayer {
     this.catalogSlots.catalogManager = null;
     this.qualityController = null;
     this.bandwidthEstimator = null;
+    this.deliveryLag = null;
+    this.deliveryLagTrack = null;
+    this.deliveryLagCmafContext = null;
     if (this.connection) {
       this.releaseMediaTerminals(this.connection);
       if (this._adapterOwned) {
