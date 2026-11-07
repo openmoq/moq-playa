@@ -14552,6 +14552,8 @@ export class MoqtPlayer {
     return connection !== null && this.connection === connection
       && connection.session?.state !== SessionState.DRAINING
       && connection.session?.state !== SessionState.CLOSED
+      // The transport may report the close before the session state says so.
+      && !this.closedConns.has(connection)
       && (!this.currentMigration || this.currentMigration.committed || this.currentMigration.aborted);
   }
 
