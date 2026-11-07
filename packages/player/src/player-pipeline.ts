@@ -550,7 +550,10 @@ export function handleRecoveryAction(
 ): void {
   switch (action.type) {
     case 'skip_forward':
-      log.warn('Recovery: skip forward %s — flush pipeline and resubscribe from live edge', mediaType);
+      // Whether a fresh subscription start follows is the caller's call (a
+      // stall flushes first and needs one; a gap skip does not), and it is
+      // logged where it is sent.
+      log.warn('Recovery: skip forward %s', mediaType);
       callbacks.onResubscribe(mediaType);
       break;
     case 'reduce_quality':
