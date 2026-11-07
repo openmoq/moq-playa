@@ -23,7 +23,7 @@ import { prepareProgramSwitchVariant } from './program-switch.fixture.mjs';
 import { mseProgramSwitchCases, checkMseProgramSwitch } from './mse-program-switch.mjs';
 import { checkGroupTail, assessTailDiagnostics } from './group-tail-check.mjs';
 import { isTailHarnessFile, isTailSupportFile } from './group-tail-cli.mjs';
-import { netShapeOption, shapedUrl, summarizeAbrTrace, observeShapedAbr } from './net-shape.mjs';
+import { netShapeOption, shapedUrl, summarizeAbrTrace, observeShapedAbr, assessAudioContinuity, MIN_AUDIBLE_FRACTION } from './net-shape.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
@@ -572,6 +572,13 @@ try {
           caseResult.assessment = { passed: true, failures: [], observed: assessPlayback(observed.samples, {
             ...scenario.expected, videoWidth: 1920, videoHeight: 1080, audioHz: 440, videoFps: 24,
             videoSizes: [{ width: 1920, height: 1080 }, { width: 1280, height: 720 }, { width: 640, height: 360 }] }) };
+          // Except audio continuity: a constrained link may cost latency and
+          // quality, but audio that plays only in fragments is a failure, and
+          // the startup check alone cannot see it.
+          caseResult.audioContinuity = assessAudioContinuity(observed.samples);
+          assert.ok(caseResult.audioContinuity.passed,
+            `Audio audible in ${Math.round(caseResult.audioContinuity.audibleFraction * 100)}% of samples after it began `
+            + `(longest silence ${caseResult.audioContinuity.longestSilenceMs}ms); at least ${MIN_AUDIBLE_FRACTION * 100}% required`);
         } else if (handover) {
           caseResult.handover = {};
           await checkHandover(page, handover.control, scenario.expected, scenario.handover, caseResult.handover,
