@@ -189,6 +189,29 @@ const SWITCH_FILL_TIMEOUT_MS = 3_000;
 /** Live objects held behind a switch's gap fill; past this the fill is given up. */
 const SWITCH_FILL_MAX_HELD = 400;
 
+/**
+ * Delivery-lag excess (µs) from which late audio counts as a standing queue on
+ * the link — latency to absorb — rather than jitter to discard. Matches the
+ * delivery-lag detector's congestion threshold.
+ */
+const LATE_AUDIO_STANDING_QUEUE_US = 300_000;
+
+/**
+ * Extra playout latency added when absorbing late audio, beyond the frame's
+ * own lateness, so the frames queued behind it also land on time while a
+ * downshift drains the backlog.
+ */
+const LATE_AUDIO_HEADROOM_US = 500_000;
+
+/**
+ * Late audio frames within {@link LATE_AUDIO_SUSTAINED_WINDOW_US} that mark
+ * the clock as behind delivery rather than jittered: at 20-50 ms per frame,
+ * jitter makes one or two frames late, a clock behind delivery makes all of
+ * them late.
+ */
+const LATE_AUDIO_SUSTAINED_FRAMES = 6;
+const LATE_AUDIO_SUSTAINED_WINDOW_US = 300_000;
+
 /** One current route's receiving admission; no payload or group history. */
 interface ReceivingVideoOwner {
   readonly token: object;
@@ -869,6 +892,8 @@ export class MoqtPlayer {
     readonly held: Array<() => void>;
     timer: ReturnType<typeof setTimeout> | null;
   } | null = null;
+  /** Times (µs) of recent late-audio decisions, for telling sustained lateness from jitter. */
+  private readonly lateAudioAsksUs: number[] = [];
   /** CMAF Header context of the playing CMAF video track, for chunk decode times. */
   private cmafLagContext: { readonly track: CatalogTrack; readonly context: LocmafTrackContext | null } | null = null;
   private evaluatingBandwidth = false;
@@ -10203,6 +10228,36 @@ export class MoqtPlayer {
   }
 
   /**
+   * Decide whether an audio frame about to be discarded as late is latency to
+   * absorb: when the link holds a standing queue, every frame behind it is
+   * late, and dropping them all left audio silent while video played on
+   * behind. Slip the shared clock by the lateness plus headroom — a rebuffer,
+   * keeping audio and video aligned — and play it. Without a standing queue,
+   * lateness is jitter and the frame is dropped as before.
+   */
+  private absorbLateAudio(offsetUs: number): boolean {
+    if (!this.syncController?.hasReference) return false;
+    const now = this.clock.now();
+    // Audio's own lateness is the primary evidence: the clock was anchored
+    // before the queue built, and a delivery-lag baseline that restarted on a
+    // track switch cannot see a queue that was already standing. A standing
+    // queue, where the detector does see one, only lets this act sooner.
+    while (this.lateAudioAsksUs.length > 0 && this.lateAudioAsksUs[0]! <= now - LATE_AUDIO_SUSTAINED_WINDOW_US) {
+      this.lateAudioAsksUs.shift();
+    }
+    this.lateAudioAsksUs.push(now);
+    const excessUs = this.videoDeliveryLagExcessUs();
+    const standingQueue = excessUs !== null && excessUs > LATE_AUDIO_STANDING_QUEUE_US;
+    if (!standingQueue && this.lateAudioAsksUs.length < LATE_AUDIO_SUSTAINED_FRAMES) return false;
+    this.lateAudioAsksUs.length = 0;
+    const slipUs = -offsetUs + LATE_AUDIO_HEADROOM_US;
+    this.syncController.slipReference(slipUs);
+    this.log.info('Late audio %s: playout slipped %.0fms',
+      standingQueue ? `behind a standing queue (+${Math.round(excessUs! / 1000)}ms lag)` : 'sustained', slipUs / 1000);
+    return true;
+  }
+
+  /**
    * Feed the delivery-lag detector from a CMAF video chunk. Its first-sample
    * decode time (tfdt over the CMAF Header timescale) stands in for LOC's
    * capture timestamp: only the lag's trend is used, so the timeline's origin
@@ -13213,6 +13268,7 @@ export class MoqtPlayer {
     this.videoPipeline = pipelines.videoPipeline;
     this.audioPipeline = pipelines.audioPipeline;
     this.syncController = pipelines.syncController;
+    if (this.audioPipeline) this.audioPipeline.lateAudioHandler = (offsetUs) => this.absorbLateAudio(offsetUs);
     this.recoveryController = pipelines.recoveryController;
     this.commandDispatcher = pipelines.commandDispatcher;
     owningDispatcher = pipelines.commandDispatcher;
