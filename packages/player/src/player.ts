@@ -13507,6 +13507,12 @@ export class MoqtPlayer {
               });
             },
             onResubscribe: (recoveryMediaType, startGroup) => {
+              // A pipeline gap skip has already moved to a group it holds, so
+              // playback continues locally. Resubscribing from the live edge
+              // jumped this one track over the link's whole backlog — under
+              // congestion, audio landed seconds ahead of video. (A stall,
+              // which flushes the pipeline first, still resubscribes.)
+              if (result.type === 'skip_forward') return;
               this.requestFreshSubscriptionStart(recoveryMediaType, startGroup);
             },
             onTerminate: (_reason) => {

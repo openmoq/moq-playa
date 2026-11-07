@@ -2986,6 +2986,41 @@ describe('MoqtPlayer', () => {
       expect(recoveryFactory).toHaveBeenCalledWith(mockClock);
     });
 
+    it('a gap skip continues from the buffered group — no resubscribe from the live edge', async () => {
+      // One missing audio group under congestion must not jump audio over the
+      // link's backlog: the pipeline already holds the group it skips to, and
+      // a live-edge resubscribe would land audio seconds ahead of video.
+      const adapter = createMockAdapter();
+      const player = await loadWithCatalog(adapter);
+      const skips: unknown[] = [];
+      player.on('skip_forward', e => skips.push(e));
+      const audioReqId = await (adapter.subscribe as any).mock.results[2]?.value;
+      adapter._triggerMessage({
+        type: 'SUBSCRIBE_OK', requestId: audioReqId, trackAlias: varint(51n),
+        parameters: new Map(), trackExtensions: [],
+      } as ControlMessage);
+      const audio = (group: number) => adapter._triggerObject(BigInt(group + 1), {
+        kind: 'data', trackAlias: varint(51n), groupId: varint(group), subgroupId: varint(0),
+        objectId: varint(0), payload: new Uint8Array([0xAA]), extensions: undefined, publisherPriority: 128,
+      } as MoqtObject);
+
+      clockTime = 1_000_000;
+      audio(0);
+      player.tick();
+      audio(2); // group 1 never arrives
+      for (let i = 0; i < 100 && skips.length === 0; i++) {
+        clockTime += 100_000;
+        player.tick();
+      }
+      await new Promise(r => setTimeout(r, 0));
+
+      expect(skips.length).toBeGreaterThan(0);
+      const liveEdge = (adapter.requestUpdate as any).mock.calls.filter((c: any[]) =>
+        BigInt(c[0]) === BigInt(audioReqId) && c[1]?.subscriptionFilter?.type === 'NextGroupStart');
+      expect(liveEdge).toEqual([]);
+      await player.destroy();
+    });
+
     it('emits decoder_command for audio decode after tick', async () => {
       // Audio pipeline: configure → push object → tick → decode_audio command.
       // Audio decoder FSM goes IDLE→configure→DECODING (no keyframe wait).
