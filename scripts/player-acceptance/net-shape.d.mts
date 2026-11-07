@@ -20,3 +20,7 @@ export function netShapeOption(argv: readonly string[], env: Record<string, stri
 export function shapedUrl(relayUrl: string, port: number): string;
 export function summarizeAbrTrace(trace: AbrTrace, shaper: Pick<ShaperStats, 'startedAtEpochMs' | 'down'> | null): AbrSummary;
 export function observeShapedAbr(page: Page, evidence: Record<string, unknown>, durationMs: number): Promise<unknown>;
+export const AUDIBLE_RMS: number;
+export const MIN_AUDIBLE_FRACTION: number;
+export interface AudioContinuity { samples: number; audibleFraction: number; longestSilenceMs: number | null; passed: boolean }
+export function assessAudioContinuity(samples: readonly { audioRms: number; wallMs: number }[]): AudioContinuity;

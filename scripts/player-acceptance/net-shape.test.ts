@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { netShapeOption, shapedUrl, summarizeAbrTrace } from './net-shape.mjs';
+import { assessAudioContinuity, netShapeOption, shapedUrl, summarizeAbrTrace } from './net-shape.mjs';
 import type { LinkStats } from '../net-shaper/shaper.mjs';
 
 it('stays unshaped unless a preset is named', async () => {
@@ -35,4 +35,17 @@ it('puts browser events on the shaper downlink time base', () => {
   expect(summary.shaper?.tailPackets).toBe(3);
   expect(summary.shaper?.downlinkMbps).toEqual([1.5, 0]);
   expect(summary.shaper?.queueMaxBytes).toEqual([200, 300]);
+});
+
+it('judges audio continuity from the first audible sample, not a single one', () => {
+  const at = (rms: number[]) => rms.map((audioRms, i) => ({ audioRms, wallMs: i * 250 }));
+  // Silent startup, then steady audio: continuous.
+  expect(assessAudioContinuity(at([0, 0, 0.1, 0.1, 0.1, 0.1, 0.1]))).toMatchObject({ audibleFraction: 1, passed: true });
+  // One audible burst among silence: the startup check would pass; this does not.
+  const fragments = assessAudioContinuity(at([0.1, 0, 0, 0, 0, 0.1, 0, 0, 0, 0]));
+  expect(fragments.passed).toBe(false);
+  expect(fragments.audibleFraction).toBeCloseTo(0.2);
+  expect(fragments.longestSilenceMs).toBe(750);
+  // Never audible.
+  expect(assessAudioContinuity(at([0, 0, 0]))).toMatchObject({ audibleFraction: 0, passed: false });
 });

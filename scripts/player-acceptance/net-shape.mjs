@@ -71,6 +71,35 @@ export function summarizeAbrTrace(trace, shaper) {
   };
 }
 
+/** Audio level above which a sample counts as audible (the startup check's bound). */
+export const AUDIBLE_RMS = 0.015;
+/** Least fraction of samples, from the first audible one, that must be audible. */
+export const MIN_AUDIBLE_FRACTION = 0.8;
+
+/**
+ * Audio continuity over an observation: of the samples from the first audible
+ * one on, the fraction that were audible, and the longest silent run. A single
+ * audible sample is not evidence that audio played — on a congested link it
+ * can come from a brief burst between long silences.
+ */
+export function assessAudioContinuity(samples) {
+  const first = samples.findIndex(sample => sample.audioRms > AUDIBLE_RMS);
+  if (first < 0) return { samples: samples.length, audibleFraction: 0, longestSilenceMs: null, passed: false };
+  const window = samples.slice(first);
+  let audible = 0, longestSilenceMs = 0, silenceStartMs = null;
+  for (const sample of window) {
+    if (sample.audioRms > AUDIBLE_RMS) {
+      audible++;
+      silenceStartMs = null;
+    } else {
+      silenceStartMs ??= sample.wallMs;
+      longestSilenceMs = Math.max(longestSilenceMs, sample.wallMs - silenceStartMs);
+    }
+  }
+  const audibleFraction = audible / window.length;
+  return { samples: window.length, audibleFraction, longestSilenceMs, passed: audibleFraction >= MIN_AUDIBLE_FRACTION };
+}
+
 /**
  * Calibration run, not a quality gate: let ABR react to the shaped link for
  * the configured time while the ordinary observer keeps sampling output.
