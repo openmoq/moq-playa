@@ -19,9 +19,9 @@ import {
   type TrackInfo,
 } from './player-pipeline.js';
 import type { MoqtPlayerConfig } from './config.js';
-import type { DecoderCommand, PlaybackEvent, RecoveryAction, ClockSource, DecoderFeedback } from '@openmoq/playback';
+import type { DecoderCommand, PlaybackEvent, RecoveryAction, ClockSource } from '@openmoq/playback';
 import type { CommandDispatcher } from './command-dispatcher.js';
-import type { MediaSourceLike, VideoDecoderLike, VideoRendererLike } from './interfaces.js';
+import type { VideoDecoderLike, VideoRendererLike } from './interfaces.js';
 import type { LoggerLike } from './logger.js';
 import type { QualityController } from './quality-controller.js';
 import { varint } from '@openmoq/transport';
@@ -168,6 +168,25 @@ describe('createPipelines', () => {
     expect(result.syncController).not.toBeNull();
   });
 
+  it('gives the default recovery controller the clock, so sustained stalls reduce quality', () => {
+    let nowUs = 0;
+    const clock: ClockSource = { now: () => nowUs };
+    const trackInfo: TrackInfo = {
+      video: { codec: 'avc1.64001e', packaging: 'loc' },
+      audio: undefined,
+    };
+    const { recoveryController } = createPipelines(minimalConfig(), clock, trackInfo, mockCallbacks());
+
+    // Five sustained stalls a second apart: inside the 30s window. Without a
+    // clock the windowed counter never runs and every stall only skips forward.
+    const actions: RecoveryAction['type'][] = [];
+    for (let i = 0; i < 5; i++) {
+      nowUs += 1_000_000;
+      actions.push(recoveryController.evaluate({ type: 'stall', durationMs: 500 }).type);
+    }
+    expect(actions).toEqual(['skip_forward', 'skip_forward', 'skip_forward', 'skip_forward', 'reduce_quality']);
+  });
+
   it('creates CommandDispatcher when video decoder factory provided', () => {
     const config = minimalConfig({
       createVideoDecoder: () => ({
@@ -301,7 +320,7 @@ describe('handlePipelineCommand', () => {
   it('dispatches command to CommandDispatcher', () => {
     const dispatcher = { dispatch: vi.fn() } as unknown as CommandDispatcher;
     const emitEvent = vi.fn();
-    const cmd: DecoderCommand = { type: 'decode_video', data: new Uint8Array(10), timestamp: 0, duration: 33333, isKey: true };
+    const cmd: DecoderCommand = { type: 'decode_video', chunk: { type: 'key', data: new Uint8Array(10), timestamp: 0, duration: 33333 }, renderTimeUs: 0 };
     handlePipelineCommand(cmd, undefined, dispatcher, null, emitEvent);
     expect(dispatcher.dispatch).toHaveBeenCalledWith(cmd);
   });
@@ -309,17 +328,18 @@ describe('handlePipelineCommand', () => {
   it('applies commandTransform before dispatch', () => {
     const dispatcher = { dispatch: vi.fn() } as unknown as CommandDispatcher;
     const emitEvent = vi.fn();
-    const cmd: DecoderCommand = { type: 'decode_video', data: new Uint8Array(10), timestamp: 0, duration: 33333, isKey: true };
-    const transform = vi.fn((c: DecoderCommand) => ({ ...c, timestamp: 999 }));
+    const cmd: DecoderCommand = { type: 'decode_video', chunk: { type: 'key', data: new Uint8Array(10), timestamp: 0, duration: 33333 }, renderTimeUs: 0 };
+    const transform = vi.fn((c: DecoderCommand): DecoderCommand => c.type === 'decode_video'
+      ? { ...c, chunk: { ...c.chunk, timestamp: 999 } } : c);
     handlePipelineCommand(cmd, transform, dispatcher, null, emitEvent);
     expect(transform).toHaveBeenCalledWith(cmd);
-    expect(dispatcher.dispatch).toHaveBeenCalledWith(expect.objectContaining({ timestamp: 999 }));
+    expect(dispatcher.dispatch).toHaveBeenCalledWith(expect.objectContaining({ chunk: expect.objectContaining({ timestamp: 999 }) }));
   });
 
   it('suppresses command when transform returns null', () => {
     const dispatcher = { dispatch: vi.fn() } as unknown as CommandDispatcher;
     const emitEvent = vi.fn();
-    const cmd: DecoderCommand = { type: 'decode_video', data: new Uint8Array(10), timestamp: 0, duration: 33333, isKey: true };
+    const cmd: DecoderCommand = { type: 'decode_video', chunk: { type: 'key', data: new Uint8Array(10), timestamp: 0, duration: 33333 }, renderTimeUs: 0 };
     handlePipelineCommand(cmd, () => null, dispatcher, null, emitEvent);
     expect(dispatcher.dispatch).not.toHaveBeenCalled();
     expect(emitEvent).not.toHaveBeenCalled();
@@ -327,7 +347,7 @@ describe('handlePipelineCommand', () => {
 
   it('emits decoder_command event', () => {
     const emitEvent = vi.fn();
-    const cmd: DecoderCommand = { type: 'decode_video', data: new Uint8Array(10), timestamp: 0, duration: 33333, isKey: true };
+    const cmd: DecoderCommand = { type: 'decode_video', chunk: { type: 'key', data: new Uint8Array(10), timestamp: 0, duration: 33333 }, renderTimeUs: 0 };
     handlePipelineCommand(cmd, undefined, null, null, emitEvent);
     expect(emitEvent).toHaveBeenCalledWith(expect.objectContaining({
       type: 'decoder_command',
@@ -438,7 +458,7 @@ describe('handleRecoveryAction', () => {
   it('peeks lower quality via QualityController (non-mutating)', () => {
     const qc = { peekLowerVideoQuality: vi.fn(() => ({ name: 'low', codec: 'avc1', bitrate: 500_000 })) };
     const callbacks = { onQualityReduced: vi.fn(), onResubscribe: vi.fn(), onTerminate: vi.fn() };
-    const action: RecoveryAction = { type: 'reduce_quality' };
+    const action: RecoveryAction = { type: 'reduce_quality', reason: 'repeated gaps' };
     handleRecoveryAction(action, 'video', qc as unknown as QualityController, mockLog, callbacks);
     expect(qc.peekLowerVideoQuality).toHaveBeenCalled();
     expect(callbacks.onQualityReduced).toHaveBeenCalled();
