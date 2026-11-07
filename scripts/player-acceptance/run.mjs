@@ -360,7 +360,11 @@ try {
         ? ['--filter', '@moqt/example-node-relay', 'exec', 'tsx', '../../scripts/player-acceptance/warm-start-relay.ts']
         : ['--filter', '@moqt/example-node-relay', 'relay-server'],
       { HOST: '127.0.0.1', PORT: '0', DEMO_NAMESPACE: namespace, RELAY_CERT: relayCert, RELAY_KEY: relayKey,
-        ...(scenario.view !== undefined || scenario.exampleViews ? { DEMO_TRACK: 'video-portrait' } : {}) });
+        ...(scenario.view !== undefined || scenario.exampleViews ? { DEMO_TRACK: 'video-portrait' } : {}),
+        // A shaped link queues seconds of media at the relay by design. The
+        // default backlog (256 objects) sheds the session within ~5 s of audio,
+        // before ABR has had the chance it is being tested on.
+        ...(netShape ? { RELAY_MAX_PENDING_OBJECTS: '4096', RELAY_MAX_PENDING_BYTES: String(32 * 1024 * 1024) } : {}) });
     const handover = scenario.handover ? JSON.parse(await waitForLine(relay, /handover-ready: (.+)/)) : null;
     const warmPeer = scenario.warm !== undefined ? JSON.parse(await waitForLine(relay, /warm-start-ready: (.+)/)) : null;
     const relayUrl = warmPeer?.source ?? handover?.source ?? await waitForLine(relay, /listening on (https:\/\/127\.0\.0\.1:\d+\/moq)/);
