@@ -726,6 +726,10 @@ export class MoqtPlayer {
   private bufferAbrController: BufferBasedController | null = null;
   private bwEstimatorGroupId: bigint = -1n;
   private bwEstimatorGroupBytes = 0;
+  /** Playing video track the bandwidth estimator is sampling; a change restarts it. */
+  private bwEstimatorTrack: string | null = null;
+  /** First capture time of the playing LOC track's latest group, for measuring GOP duration. */
+  private gopStart: { readonly groupId: bigint; readonly captureUs: number } | null = null;
   /** Estimated GOP duration in µs, computed from first two group arrivals. */
   private estimatedGopDurationUs = 2_000_000; // default 2s
   private subscriptionManager: SubscriptionManager | null = null;
@@ -2303,9 +2307,7 @@ export class MoqtPlayer {
     if (obj.kind === 'data') {
       const bytes = obj.payload ? obj.payload.byteLength : 0;
       this._stats.recordMediaObject(bytes);
-      if (mediaType === 'video' && bytes > 0) {
-        this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
-      }
+      if (mediaType === 'video' && bytes > 0) this.recordBandwidthSample(trackName, BigInt(obj.groupId), bytes);
     } else {
       this._stats.recordGapObject();
     }
@@ -4053,22 +4055,14 @@ export class MoqtPlayer {
         this._stats.recordMediaObject(bytes);
         if (mediaType === 'video' && bytes > 0) {
           this.noteOutgoingVideoArrival(trackName);
-          const gid = BigInt(obj.groupId);
-          if (gid !== this.bwEstimatorGroupId) {
-            if (this.bwEstimatorGroupBytes > 0) {
-              this.bandwidthEstimator?.recordGroup(
-                this.bwEstimatorGroupBytes, this.clock.now(),
-              );
-            }
-            this.bwEstimatorGroupId = gid;
-            this.bwEstimatorGroupBytes = bytes;
-          } else {
-            this.bwEstimatorGroupBytes += bytes;
-          }
+          this.recordBandwidthSample(trackName, BigInt(obj.groupId), bytes);
           // Backfill was captured before it was requested; its lag says
           // nothing about the link.
           if (headers.captureTimestamp !== undefined && !delivery?.backfill) {
             this.recordDeliveryLag(trackName, Number(headers.captureTimestamp));
+          }
+          if (headers.captureTimestamp !== undefined && BigInt(obj.objectId) === 0n) {
+            this.noteGroupStart(trackName, BigInt(obj.groupId), Number(headers.captureTimestamp));
           }
         }
       } else {
@@ -4142,10 +4136,9 @@ export class MoqtPlayer {
       if (obj.kind === 'data') {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
-        // CMAF: one moof+mdat per group — each object IS a group
         if (mediaType === 'video' && bytes > 0) {
           this.noteOutgoingVideoArrival(trackName);
-          this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
+          this.recordBandwidthSample(trackName, BigInt(obj.groupId), bytes);
           // A chunk's decode time stands in for LOC's capture timestamp:
           // only the lag's trend is used, so the timeline's origin is irrelevant.
           const decodeUs = delivery?.backfill ? undefined : this.cmafChunkDecodeTimeUs(trackName, obj.payload);
@@ -9542,6 +9535,50 @@ export class MoqtPlayer {
   }
 
   /**
+   * Feed one video object's bytes to the bandwidth estimator: a sample per
+   * GROUP, whatever the packaging's object granularity, so frame-sized CMAF
+   * and LOCMAF chunks do not each become a sample that averages keyframes
+   * away. Only the playing track counts — a switch overlap's target traffic
+   * is not the rate being played — and a change of playing track restarts
+   * the estimate, which describes one rung's delivery.
+   */
+  private recordBandwidthSample(trackName: string, groupId: bigint, bytes: number): void {
+    if (!this.bandwidthEstimator || this.subscribedTrack('video')?.name !== trackName) return;
+    if (this.bwEstimatorTrack !== trackName) {
+      this.bandwidthEstimator.reset();
+      this.bwEstimatorTrack = trackName;
+      this.bwEstimatorGroupId = -1n;
+      this.bwEstimatorGroupBytes = 0;
+    }
+    // A newer group closes the sample. An older group's late tail is still
+    // bytes the link carried in this interval, so it joins the current one.
+    if (groupId > this.bwEstimatorGroupId) {
+      if (this.bwEstimatorGroupBytes > 0) {
+        this.bandwidthEstimator.recordGroup(this.bwEstimatorGroupBytes, this.clock.now());
+      }
+      this.bwEstimatorGroupId = groupId;
+      this.bwEstimatorGroupBytes = bytes;
+    } else {
+      this.bwEstimatorGroupBytes += bytes;
+    }
+  }
+
+  /**
+   * Measure GOP duration from the capture times of consecutive group starts
+   * of the playing LOC track, replacing the 2 s assumption the buffer-depth
+   * estimate otherwise makes.
+   */
+  private noteGroupStart(trackName: string, groupId: bigint, captureUs: number): void {
+    if (this.subscribedTrack('video')?.name !== trackName) return;
+    const previous = this.gopStart;
+    this.gopStart = { groupId, captureUs };
+    if (previous === null || groupId !== previous.groupId + 1n) return;
+    const gopUs = captureUs - previous.captureUs;
+    // Ignore discontinuities; anything outside a plausible GOP is not one.
+    if (gopUs > 0 && gopUs <= 20_000_000) this.estimatedGopDurationUs = gopUs;
+  }
+
+  /**
    * Feed the delivery-lag detector with one object of the PLAYING video track.
    *
    * During a switch overlap the target's objects are still staged, and
@@ -9602,6 +9639,9 @@ export class MoqtPlayer {
       if (!healthy) {
         effectiveBufferUs = this.bufferAbrController.lowThresholdUs;
       } else if (bufferedGroups === 0) {
+        // Near the live edge the jitter buffer is normally empty — frames are
+        // consumed as they arrive — so buffer depth cannot gate upshift here;
+        // the health check above does.
         effectiveBufferUs = this.bufferAbrController.highThresholdUs;
       } else {
         effectiveBufferUs = bufferedGroups * this.estimatedGopDurationUs;
@@ -9818,6 +9858,8 @@ export class MoqtPlayer {
     this.deliveryLag = null;
     this.deliveryLagTrack = null;
     this.deliveryLagCmafContext = null;
+    this.bwEstimatorTrack = null;
+    this.gopStart = null;
     if (this.connection) {
       this.releaseMediaTerminals(this.connection);
       if (this._adapterOwned) {

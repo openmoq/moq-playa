@@ -104,9 +104,12 @@ export class BufferBasedController {
         // Upshift: buffer must be above the high threshold — asymmetric
         // hysteresis so upshift is much harder to trigger than downshift.
         // AND bandwidth must corroborate.
+        // A rung of unknown bitrate (0) can never be shown to fit, so it is
+        // never an upshift target: any estimate would clear `0 × multiple`.
         if (this.currentIndex > 0 && signals.bufferDepthUs >= this.highThresholdUs) {
             const higherTrack = this.ladder[this.currentIndex - 1]!;
-            if (signals.bandwidthEstimateKbps > higherTrack.bitrateKbps * this.upshiftMultiple) {
+            if (higherTrack.bitrateKbps > 0
+                && signals.bandwidthEstimateKbps > higherTrack.bitrateKbps * this.upshiftMultiple) {
                 return { action: 'upshift', targetIndex: this.currentIndex - 1 };
             }
         }

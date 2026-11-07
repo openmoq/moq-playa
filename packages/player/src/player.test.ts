@@ -9907,6 +9907,24 @@ describe('MoqtPlayer', () => {
       return { adapter, renderer, decoder, player, feedGroups, simulateRenderedFrames, hasSubscribeTo };
     }
 
+    it('LOC: measures GOP duration from the capture times of group starts', async () => {
+      const { player, adapter } = await setupAbrTest(1_000);
+      const videoAlias = varint(BigInt(await (adapter.subscribe as any).mock.results[1]?.value) + 100n);
+      const EPOCH_US = 1_762_000_000_000_000n;
+      // 1 s groups, where the buffer-depth estimate otherwise assumes 2 s.
+      for (let g = 0; g < 4; g++) {
+        advanceClock(1_000_000);
+        adapter._triggerObject(BigInt(g + 1), {
+          kind: 'data', trackAlias: videoAlias,
+          groupId: varint(g), subgroupId: varint(0), objectId: varint(0),
+          payload: new Uint8Array(1_000),
+          extensions: encodeLocHeaders({ captureTimestamp: EPOCH_US + BigInt(g) * 1_000_000n }),
+        } as MoqtObject);
+      }
+      expect((player as any).estimatedGopDurationUs).toBe(1_000_000);
+      await player.destroy();
+    });
+
     it('LOC: upshifts when healthy delivery + high bandwidth + stability elapsed + rendered frames', async () => {
       const { player, feedGroups, simulateRenderedFrames, hasSubscribeTo, adapter } = await setupAbrTest();
 

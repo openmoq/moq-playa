@@ -638,6 +638,19 @@ describe('ABR under source-paced live delivery', () => {
     });
   });
 
+  describe('measurement', () => {
+    it('CMAF: one bandwidth sample per group reads the full received rate', async () => {
+      // A healthy buffer, so the player stays on v1500 and only measures.
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(30), bufferAheadUs: () => 2_000_000,
+      });
+      expect(run.finalTrack).toBe(START);
+      // Formerly ≈80% of 1500 kbps: one sample per frame-sized object, smoothed
+      // with EWMA, tracked the P-frame rate and averaged the keyframes away.
+      expect(run.estimateKbps).toBeGreaterThanOrEqual(1_500 * 0.95);
+    });
+  });
+
   // Known defects. Each states the DESIRED behaviour and is marked `it.fails`
   // because today's player violates it; remove `.fails` as the fix lands. The
   // controls above use the same harness, so a broken harness cannot hide here.
@@ -653,17 +666,6 @@ describe('ABR under source-paced live delivery', () => {
       // Today: no switch at all — `bw > 2.25 × next rung` cannot hold when
       // bw is the current rung's own bitrate.
       expect(rungIndex(run.finalTrack)).toBeLessThan(rungIndex(START));
-    });
-
-    it.fails('#3 per-object sampling: the CMAF estimate is not below the rate actually received', async () => {
-      // A healthy buffer, so the player stays on v1500 and only measures.
-      const run = await runScenario({
-        packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(30), bufferAheadUs: () => 2_000_000,
-      });
-      expect(run.finalTrack).toBe(START);
-      // Today: ≈80% of 1500 kbps. One sample per frame-sized object, smoothed
-      // with EWMA, tracks the P-frame rate and averages the keyframes away.
-      expect(run.estimateKbps).toBeGreaterThanOrEqual(1_500 * 0.95);
     });
   });
 });
