@@ -21,7 +21,7 @@
  */
 
 import type { ControlMessage, Parameters, DraftVersion } from '@openmoq/transport';
-import { varint, PublishDoneCode, PublishDoneCode18, RequestError, ObjectStatus } from '@openmoq/transport';
+import { varint, PublishDoneCode, PublishDoneCode18, RequestError, ObjectStatus, SessionState } from '@openmoq/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import { MoqtConnectionError } from '@openmoq/webtransport';
@@ -1260,6 +1260,7 @@ export class MoqtPlayer {
     attempts: number;
     active: boolean;
     cancelled: boolean;
+    connection: MoqtConnection;
   }>();
 
   /**
@@ -4742,6 +4743,7 @@ export class MoqtPlayer {
     this.mediaSource?.setPlaybackIntent?.(false);
     this._stats.recordPlayStop();
     this.stopTicking();
+    this.cancelLivenessRestarts();
 
     // Flush pre-scheduled audio and queued video frames immediately
     this.commandDispatcher?.flush();
@@ -7205,6 +7207,7 @@ export class MoqtPlayer {
     // retained-route ownership below is about that connection, and reading it
     // afterwards would name the replacement as its own predecessor.
     const retiring = this.connection;
+    if (retiring) this.cancelLivenessRestarts(retiring);
     txn.committed = true; // staging closed — further candidate events run live on the now-current session
     if (this.pendingVideoSwitch) {
       this.discardPendingVideoSwitch(this.pendingVideoSwitch, new Error('Session replaced during the video switch'));
@@ -9515,7 +9518,7 @@ export class MoqtPlayer {
     this.stopTicking();
     // Liveness: quiet destroy — cancel any in-flight restart ladder (it must
     // never emit MEDIA_STARVED for an intentional teardown) and disarm.
-    for (const restart of this.livenessRestarts.values()) restart.cancelled = true;
+    this.cancelLivenessRestarts();
     this.livenessMonitor?.clear();
     this.pendingMediaSubs.clear();
     this.activeFetches.clear();
@@ -10938,6 +10941,7 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-transport-16 §9.4, §3.5
    */
   private handleSessionGoaway(newSessionUri: string, conn: MoqtConnection): void {
+    this.cancelLivenessRestarts(conn);
     this.log.info('GOAWAY received, uri=%s', newSessionUri || '(none)');
     if (this.mediaSelection && !this.mediaSelection.committed) {
       this.failMediaSelection(this.mediaSelection, new Error('Audio selection cancelled by session GOAWAY'));
@@ -13314,6 +13318,7 @@ export class MoqtPlayer {
     if (!monitor) return;
     if (this.stateMachine.state !== PlayerState.PLAYING) return;
     monitor.reconcile(this.collectLivenessTracks());
+    if (!this.mediaRecoveryOwnsConnection(this.connection)) return;
     monitor.check(performance.now());
   }
 
@@ -13369,10 +13374,13 @@ export class MoqtPlayer {
     starvedForMs: number,
     healthyForMs: number,
   ): Promise<void> {
+    const connection = this.connection;
+    if (!this.mediaRecoveryOwnsConnection(connection)) return;
     const key = `${track.mediaType}:${track.trackName}`;
     let restart = this.livenessRestarts.get(key);
-    if (!restart) {
-      restart = { attempts: 0, active: false, cancelled: false };
+    if (!restart || restart.connection !== connection) {
+      if (restart) restart.cancelled = true;
+      restart = { attempts: 0, active: false, cancelled: false, connection };
       this.livenessRestarts.set(key, restart);
     }
     if (restart.active) return;
@@ -13416,7 +13424,9 @@ export class MoqtPlayer {
           },
         });
 
+        if (!this.livenessLadderMayContinue(restart)) return;
         this.flushForLivenessRestart(track);
+        if (!this.livenessLadderMayContinue(restart)) return;
         const refreshed = attempt === 1 && await this.tryRefreshSubscription(track);
         if (!this.livenessLadderMayContinue(restart)) return;
         if (refreshed) {
@@ -13453,14 +13463,32 @@ export class MoqtPlayer {
     }
   }
 
-  /** The ladder stops on cancel (stop/destroy), destroy, or leaving PLAYING. */
-  private livenessLadderMayContinue(restart: { cancelled: boolean }): boolean {
+  /** Cancel waiting recovery and release its cached session reference before retirement. */
+  private cancelLivenessRestarts(connection?: MoqtConnection): void {
+    for (const [key, restart] of this.livenessRestarts) {
+      if (connection !== undefined && restart.connection !== connection) continue;
+      restart.cancelled = true;
+      this.livenessRestarts.delete(key);
+    }
+  }
+
+  /** Established media keeps delivering during GOAWAY; migration owns its replacement. */
+  private mediaRecoveryOwnsConnection(connection: MoqtConnection | null): connection is MoqtConnection {
+    return connection !== null && this.connection === connection
+      && connection.session?.state !== SessionState.DRAINING
+      && connection.session?.state !== SessionState.CLOSED
+      && (!this.currentMigration || this.currentMigration.committed || this.currentMigration.aborted);
+  }
+
+  /** A waiting ladder must not resume against a replacement connection. */
+  private livenessLadderMayContinue(restart: { cancelled: boolean; connection: MoqtConnection }): boolean {
     return !restart.cancelled && !this._destroyed
-      && this.stateMachine.state === PlayerState.PLAYING;
+      && this.stateMachine.state === PlayerState.PLAYING
+      && this.mediaRecoveryOwnsConnection(restart.connection);
   }
 
   /** Cancellation-aware sleep (checks every 250ms). */
-  private async livenessSleep(ms: number, restart: { cancelled: boolean }): Promise<void> {
+  private async livenessSleep(ms: number, restart: { cancelled: boolean; connection: MoqtConnection }): Promise<void> {
     const deadline = performance.now() + ms;
     while (performance.now() < deadline) {
       if (!this.livenessLadderMayContinue(restart)) return;
@@ -13474,7 +13502,7 @@ export class MoqtPlayer {
     track: LivenessTrack,
     sinceMs: number,
     timeoutMs: number,
-    restart: { cancelled: boolean },
+    restart: { cancelled: boolean; connection: MoqtConnection },
   ): Promise<boolean> {
     const deadline = performance.now() + timeoutMs;
     const pollMs = Math.min(250, Math.max(10, timeoutMs / 5));
@@ -13533,18 +13561,21 @@ export class MoqtPlayer {
    * subscription's request stream died with the delivery path (§9.11).
    */
   private async tryRefreshSubscription(track: LivenessTrack): Promise<boolean> {
-    if (!this.connection) return false;
+    const connection = this.connection;
+    if (!this.mediaRecoveryOwnsConnection(connection)) return false;
     const matching = [...this.activeSubscriptions.entries()].filter(([, sub]) =>
       sub.trackName === track.trackName && sub.mediaType === track.mediaType && !this.terminalMediaSubscriptions.has(sub));
     if (matching.length === 0) return false;
     try {
       for (const [requestId] of matching) {
-        await this.connection.requestUpdate(varint(requestId), {
+        if (!this.mediaRecoveryOwnsConnection(connection)) return false;
+        await connection.requestUpdate(varint(requestId), {
           subscriptionFilter: { type: 'NextGroupStart' },
         });
       }
-      return true;
+      return this.mediaRecoveryOwnsConnection(connection);
     } catch (err) {
+      if (!this.mediaRecoveryOwnsConnection(connection)) return false;
       this.log.warn('Liveness: REQUEST_UPDATE refresh failed for %s "%s" (%s) — escalating to resubscribe',
         track.mediaType, track.trackName, err instanceof Error ? err.message : String(err));
       return false;
@@ -13557,7 +13588,8 @@ export class MoqtPlayer {
    * pipeline reset; outcome is observed by the caller's arrival probe.
    */
   private fullResubscribeForLiveness(track: LivenessTrack): void {
-    if (!this.connection || !this.subscriptionManager) return;
+    const connection = this.connection;
+    if (!this.mediaRecoveryOwnsConnection(connection) || !this.subscriptionManager) return;
     const issued = this.activeSubscriptions.get(track.requestId);
     if (issued && this.terminalMediaSubscriptions.has(issued)) return;
     const catalogTrack = issued === undefined ? undefined : this.catalogTrackFor(track.trackName,
@@ -13567,12 +13599,14 @@ export class MoqtPlayer {
         || (issued !== undefined && !sameNamespaceFields(
           sub.namespace ?? namespaceFields(this.config.namespace),
           issued.namespace ?? namespaceFields(this.config.namespace)))) continue;
-      this.retireMediaSubscription(requestId, this.connection);
+      if (!this.mediaRecoveryOwnsConnection(connection)) return;
+      this.retireMediaSubscription(requestId, connection);
+      if (!this.mediaRecoveryOwnsConnection(connection)) return;
       // Async — a sync try/catch would let the rejection escape. Best-effort:
       // the request stream may have died with the delivery path.
-      void this.connection.unsubscribe(varint(requestId)).catch(() => { /* gone */ });
+      void connection.unsubscribe(varint(requestId)).catch(() => { /* gone */ });
     }
-    this.replaceSubscription(track.trackName, 'liveness', catalogTrack);
+    if (this.mediaRecoveryOwnsConnection(connection)) this.replaceSubscription(track.trackName, 'liveness', catalogTrack);
   }
 
   /**
@@ -13592,11 +13626,12 @@ export class MoqtPlayer {
     cause: 'too_far_behind' | 'liveness',
     issuedTrack?: CatalogTrack,
   ): void {
-    if (!this.connection || !this.subscriptionManager || !this._catalogState) return;
+    if (!this.mediaRecoveryOwnsConnection(this.connection) || !this.subscriptionManager || !this._catalogState) return;
     const operationConn = this.connection;
     const generation = this.bootstrapGeneration;
     const live = (): boolean => this.connection === operationConn && this.bootstrapGeneration === generation
-      && !this._destroyed && !this.isTerminalState() && this.subscriptionManager !== null;
+      && !this._destroyed && !this.isTerminalState() && this.subscriptionManager !== null
+      && this.mediaRecoveryOwnsConnection(operationConn);
 
     // Don't resurrect the OLD track during a make-before-break switch —
     // that would fight the switch by resubscribing to a track we're

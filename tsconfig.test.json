@@ -121,6 +121,7 @@
     "packages/player/src/player-goaway-catalog-retirement.test.ts",
     "packages/player/src/player-goaway-owner-isolation.test.ts",
     "packages/player/src/player-goaway-inflight-fallback.test.ts",
+    "packages/player/src/player-goaway-recovery.loopback.test.ts",
     "packages/player/src/player-goaway-scope.loopback.test.ts",
     "packages/player/src/player-graceful-handover.loopback.test.ts",
     "packages/player/src/player-handover-selection.test.ts",
