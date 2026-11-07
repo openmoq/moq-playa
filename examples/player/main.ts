@@ -451,6 +451,14 @@ function noteMediaArrival(): void {
     sinceMediaMs: lastMediaMs === 0 ? null : Math.round(performance.now() - lastMediaMs),
 });
 
+/** Startup failure retains retry policy and the epoch its own cleanup retired. */
+class PlaybackStartFailure extends Error {
+    cleanupEpoch: number | null = null;
+    constructor(message: string, readonly retryable: boolean, options?: ErrorOptions) {
+        super(message, options);
+    }
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
     return Promise.race([
         p,
@@ -474,22 +482,37 @@ async function reconnect(reason: string): Promise<void> {
             log(`Reconnect attempt ${retryCount + 1}/${MAX_RECONNECT_ATTEMPTS} in ${delay / 1000}s...`);
             await new Promise((r) => setTimeout(r, delay));
             if (reconnectCancelled) break;
+            const attemptEpoch = playEpoch;
             try {
                 transitioning = true;
                 loadingSpinner.style.display = '';
                 await withTimeout(startPlayback(), START_ATTEMPT_TIMEOUT_MS, 'tune-in');
-                if (reconnectCancelled) {
-                    // User pressed Stop while this attempt was in flight — honor it.
-                    try { await stopPlayback(); } catch { /* best effort */ }
+                if (reconnectCancelled || !isPlaying) {
+                    // A stale completion cannot stop a newer user-owned session.
+                    if (playEpoch === attemptEpoch) {
+                        try { await stopPlayback(); } catch { /* best effort */ }
+                    }
                     return;
                 }
                 log('Reconnected.');
                 return; // success — retry budget resets after sustained healthy media
             } catch (err) {
+                if (err instanceof PlaybackStartFailure) {
+                    if (err.cleanupEpoch === null || err.cleanupEpoch !== playEpoch || player !== null) return;
+                } else if (playEpoch !== attemptEpoch) return;
                 retryCount++;
                 log(`Reconnect failed: ${(err as Error).message}`);
-                // Clean up any half-started state before the next attempt.
-                try { await stopPlayback(); } catch { /* best effort */ }
+                if (err instanceof PlaybackStartFailure) {
+                    if (!err.retryable) {
+                        // A new session does not override catalog refusal/retry advice.
+                        log('Startup refused — press play to try again manually.');
+                        centerPlay.style.display = '';
+                        return;
+                    }
+                } else {
+                    // A local timeout still owns its unfinished attempt.
+                    try { await stopPlayback(); } catch { /* best effort */ }
+                }
             } finally {
                 transitioning = false;
                 loadingSpinner.style.display = 'none';
@@ -724,11 +747,14 @@ async function toggleStopPlay(): Promise<void> {
     }
     if (transitioning) return;
     transitioning = true;
+    let actionEpoch = playEpoch;
     refreshTrackSelector();
     pauseBtn.disabled = true;
     try {
         if (isPlaying) {
-            await stopPlayback();
+            const stopped = stopPlayback();
+            actionEpoch = playEpoch;
+            await stopped;
         } else {
             retryCount = 0; // a manual play starts with a fresh retry budget
             flashCenter('play');
@@ -736,13 +762,21 @@ async function toggleStopPlay(): Promise<void> {
             await startPlayback();
         }
     } catch (err) {
+        if (err instanceof PlaybackStartFailure && err.cleanupEpoch !== null) actionEpoch = err.cleanupEpoch;
+        if (playEpoch !== actionEpoch) return;
         log(`Fatal: ${(err as Error).message}`);
         console.error(err);
         loadingSpinner.style.display = 'none';
     } finally {
-        transitioning = false;
-        pauseBtn.disabled = false;
-        refreshTrackSelector();
+        if (playEpoch === actionEpoch) {
+            transitioning = false;
+            pauseBtn.disabled = false;
+            refreshTrackSelector();
+            if (playEpoch === actionEpoch && !reconnecting && !viewRetuner.busy) {
+                if (isPlaying) centerPlay.style.display = 'none';
+                else if (player === null && startupTransport === null) centerPlay.style.display = '';
+            }
+        }
     }
 }
 
@@ -1099,8 +1133,26 @@ async function startPlayback(outputSignal?: AbortSignal): Promise<void> {
     try {
         await startPlaybackAttempt(epoch, transportAbort, outputSignal);
     } catch (error) {
-        if (epoch === playEpoch) await stopPlayback(true);
-        throw error;
+        let failure: PlaybackStartFailure;
+        if (error instanceof PlaybackStartFailure) failure = error;
+        else {
+            let message = 'Playback startup failed';
+            try {
+                const detail = (error as { readonly message?: unknown } | null)?.message;
+                if (typeof detail === 'string') message = detail;
+            } catch { /* A foreign error cannot prevent owned cleanup. */ }
+            failure = new PlaybackStartFailure(message, true, { cause: error });
+        }
+        if (epoch === playEpoch && startupTransport === transportAbort) {
+            const cleanup = stopPlayback(true);
+            const stoppedEpoch = playEpoch;
+            try { await cleanup; }
+            catch (cleanupError) { log(`Startup cleanup failed: ${(cleanupError as Error).message}`); }
+            if (playEpoch === stoppedEpoch && player === null && startupTransport === null) {
+                failure.cleanupEpoch = stoppedEpoch;
+            }
+        }
+        throw failure;
     } finally {
         outputSignal?.removeEventListener('abort', abortTransport);
     }
@@ -1298,6 +1350,23 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     });
     if (outputSignal?.aborted) transportAbort.abort(outputSignal.reason);
     player = p;
+    let starting = true;
+    let startupError: PlaybackStartFailure | undefined;
+    let rejectStartup!: (error: PlaybackStartFailure) => void;
+    let retireStartup!: () => void;
+    const startupFailure = new Promise<void>((resolve, reject) => { retireStartup = resolve; rejectStartup = reject; });
+    void startupFailure.catch(() => {});
+    const wakeStoppedStartup = () => {
+        if (epoch !== playEpoch) {
+            retireStartup();
+        } else {
+            startupError ??= new PlaybackStartFailure('Playback startup cancelled', false,
+                { cause: transportAbort.signal.reason });
+            rejectStartup(startupError);
+        }
+    };
+    transportAbort.signal.addEventListener('abort', wakeStoppedStartup, { once: true });
+    if (transportAbort.signal.aborted) wakeStoppedStartup();
     const on = <K extends keyof PlayerEventMap>(type: K, listener: (event: PlayerEventMap[K]) => void) =>
         p.on(type, event => { if (playbackOwnerIsCurrent(p, epoch, player, playEpoch)) listener(event); });
     const applySurface = (track: CatalogTrack) => {
@@ -1327,9 +1396,16 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
         // MEDIA_ELEMENT_WEDGED (fatal/decoder): Safari froze the <video>
         // element beyond the MSE adapter's nudge ladder — only a fresh
         // tune-in rebuilds the MediaSource, so it takes the same path.
-        if (err.severity === 'fatal'
-            && (err.source === 'connection' || err.code === PlayerErrorCode.MEDIA_ELEMENT_WEDGED)) {
+        if (err.severity !== 'fatal' || !playbackOwnerIsCurrent(p, epoch, player, playEpoch)) return;
+        const retryable = err.source === 'connection' || err.code === PlayerErrorCode.MEDIA_ELEMENT_WEDGED;
+        if (starting) {
+            startupError ??= new PlaybackStartFailure(err.message, retryable, { cause: err });
+            rejectStartup(startupError);
+        } else if (retryable) {
             void reconnect(`Fatal ${err.source} error (0x${err.code.toString(16)})`);
+        } else {
+            // Fatal catalog refusal is a failed session, not an automatic retune.
+            void stopPlayback().catch(error => log(`Playback cleanup failed: ${(error as Error).message}`));
         }
     });
 
@@ -1423,15 +1499,22 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
         () => playbackOwnerIsCurrent(p, epoch, player, playEpoch)) : undefined;
     void output?.promise.catch(() => {});
     try {
-        await p.load();
+        if (epoch !== playEpoch) return;
+        if (transportAbort.signal.aborted) wakeStoppedStartup();
+        if (startupError) throw startupError;
+        await Promise.race([p.load(), startupFailure]);
+        if (transportAbort.signal.aborted) wakeStoppedStartup();
+        if (startupError) throw startupError;
         if (epoch !== playEpoch) {
             // A late completion must not resurrect a stopped player.
             return;
         }
         // The MSE adapter owns startup positioning and playback.
         p.play();
+        if (startupError) throw startupError;
         attemptRenderer.start();
-        const started = await output?.promise;
+        const started = await Promise.race([output?.promise ?? Promise.resolve(undefined), startupFailure]);
+        if (startupError) throw startupError;
         if (epoch !== playEpoch) return;
         if (started === 'audio-accepted') {
             selectionStatus.textContent = 'Audio selection accepted; output not verified.';
@@ -1443,7 +1526,12 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
         isPlaying = true;
         setControlIcon(true);
         showPlayerControls();
+    } catch (error) {
+        // A fatal event retains its policy even if load subsequently rejects.
+        throw startupError ?? error;
     } finally {
+        starting = false;
+        transportAbort.signal.removeEventListener('abort', wakeStoppedStartup);
         output?.dispose();
     }
 }

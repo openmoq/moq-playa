@@ -10,7 +10,8 @@ import { createWebTransport } from '@openmoq/browser';
 // Run the demo's actual lifecycle with DOM and network boundaries replaced.
 const source = ts.createSourceFile('main.ts', readFileSync(new URL('./main.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true);
 const names = new Set(['startPlayback', 'startPlaybackAttempt', 'stopPlayback', 'prefetchCatalogViaFetch']);
-const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && names.has(n.name?.text ?? ''))
+const functions = source.statements.filter(n => ts.isClassDeclaration(n) && n.name?.text === 'PlaybackStartFailure'
+  || ts.isFunctionDeclaration(n) && names.has(n.name?.text ?? ''))
   .map(n => n.getText(source)).join('\n');
 const code = ts.transpileModule(functions, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
 
