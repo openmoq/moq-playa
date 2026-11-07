@@ -118,7 +118,7 @@ import type { MediaSourceLike, MediaAppendQueueLease, VideoPresentation, AudioOu
 import { CommandDispatcher, type DispatcherOutputObserver } from './command-dispatcher.js';
 import { StatsAccumulator } from './stats.js';
 import type { PlayerStats } from './stats.js';
-import type { CmafAssemblerLike } from './interfaces.js';
+import type { CmafAssemblerLike, CmafSourceReceipt } from './interfaces.js';
 import { buildConnectUrl, buildSetupOptions, buildSubscribeOptions, invalidGoawayUriReason } from './player-connect.js';
 import { computePlaybackDelayUs,
   createPipelines,
@@ -137,6 +137,7 @@ import { wireConnectionCallbacks } from './player-wiring.js';
 import {
   createTimelineState,
   processTimelineObject,
+  wallclockForPts,
   findSeekTarget,
   getTimelineDuration,
   type TimelineState,
@@ -998,6 +999,8 @@ export class MoqtPlayer {
   private videoTimelineRecord: SourceTimelineRecord | null = null;
   private collectAudioTimeline = false;
   private collectVideoTimeline = false;
+  /** CMAF capture age at arrival from the media timeline; null without a measurement. */
+  private cmafArrivalAgeMs: number | null = null;
 
   /** The catalog retrieval current playback depends on. */
   private catalogSlots: CatalogSlots = createCatalogSlots();
@@ -2134,7 +2137,7 @@ export class MoqtPlayer {
       renderCushionMs: (this.getRenderCushionUs?.() ?? computePlaybackDelayUs(gapUs, this._handshakeRttMs)) / 1000,
     } : undefined;
     const ageUs = this.syncController?.captureTimestampAgeUs ?? null;
-    const captureTimestampAgeMs = ageUs === null ? null : ageUs / 1000;
+    const captureTimestampAgeMs = ageUs === null ? this.cmafArrivalAgeMs : ageUs / 1000;
     let videoPlaybackQuality: PlayerStats['videoPlaybackQuality'] = null;
     try {
       const quality = this.mediaSource?.getVideoPlaybackQuality?.();
@@ -3760,8 +3763,15 @@ export class MoqtPlayer {
     if (this.keyedCmafIdentity && sourceKey === undefined) {
       this.discardMediaInput(input, 'route retired'); return;
     }
+    // A media timeline with wallclocks dates arriving video (MSF §7.1).
+    const measure = mediaType === 'video' && this.timelineState !== null;
     if (!(mediaType === 'audio' ? this.collectAudioTimeline : this.collectVideoTimeline)) {
-      if (sourceKey !== undefined) assembler?.push(mediaType, trackName, groupId, payload, input, undefined, sourceKey);
+      if (measure) {
+        const receipt = sourceKey === undefined ? assembler?.push(mediaType, trackName, groupId, payload, input, true)
+          : assembler?.push(mediaType, trackName, groupId, payload, input, true, sourceKey);
+        this.noteCmafArrival(receipt);
+      }
+      else if (sourceKey !== undefined) assembler?.push(mediaType, trackName, groupId, payload, input, undefined, sourceKey);
       else if (input === undefined) assembler?.push(mediaType, trackName, groupId, payload);
       else assembler?.push(mediaType, trackName, groupId, payload, input);
       return;
@@ -3774,11 +3784,26 @@ export class MoqtPlayer {
     const route = owned?.trackAlias === null || owned?.trackAlias === undefined ? null : this.subscriptionManager?.captureRoute(owned.trackAlias);
     const receipt = sourceKey === undefined ? assembler?.push(mediaType, trackName, groupId, payload, input, true)
       : assembler?.push(mediaType, trackName, groupId, payload, input, true, sourceKey);
+    if (measure) this.noteCmafArrival(receipt);
     if (receipt?.state === 'emitted' && !this._destroyed && this.connection === conn && this.mediaSource === source
         && this.cmafAssembler === assembler && route?.() && [...this.activeSubscriptions.values()].includes(owned!)
         && (sourceKey === undefined || selected !== null && sourceKey === identityKey(selected.namespaceFields, selected.name))) {
       this.noteMediaTimeline(mediaType, receipt.sourcePresentationTimeUs, 'media-time');
     }
+  }
+
+  /**
+   * Capture age of arriving CMAF video, which carries no per-object
+   * CaptureTimestamp: receiver wall clock minus the media timeline's wallclock
+   * for the object's presentation time. Like the LOC measurement, it is taken
+   * on arrival, before decoding.
+   *
+   * @see draft-ietf-moq-msf-00 §7.1 (media timeline wallclock)
+   */
+  private noteCmafArrival(receipt: void | CmafSourceReceipt | undefined): void {
+    if (receipt?.state !== 'emitted' || !this.timelineState || this._destroyed) return;
+    const wallMs = wallclockForPts(this.timelineState, Number(receipt.sourcePresentationTimeUs) / 1000);
+    if (wallMs !== undefined) this.cmafArrivalAgeMs = Date.now() - wallMs;
   }
 
   /** On-demand copied metadata for optional tooling; never retains media or credentials. */
@@ -3888,7 +3913,8 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-msf-00 §5.1.10 (catalog track name = "catalog")
    */
   async load(): Promise<void> {
-    this.audioTimelineRecord = null; this.videoTimelineRecord = null; this.collectAudioTimeline = false; this.collectVideoTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.runtimeAudioLanguage = null; this.runtimeSelectionIntent = null; this.mappedClockOwner = null; this.videoPresentationOffsetUs = 0n; this.videoTimingMapped = false; this.videoTimingSource = undefined; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
+    // A broadcast without a media timeline must not keep the previous load's.
+    this.timelineState = null; this.cmafArrivalAgeMs = null; this.audioTimelineRecord = null; this.videoTimelineRecord = null; this.collectAudioTimeline = false; this.collectVideoTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.runtimeAudioLanguage = null; this.runtimeSelectionIntent = null; this.mappedClockOwner = null; this.videoPresentationOffsetUs = 0n; this.videoTimingMapped = false; this.videoTimingSource = undefined; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
     this._selection = emptyMediaSelection(this._selection.revision + 1, this.config.autoQuality !== false);
     this.transitionState(PlayerState.LOADING);
     this._stats.recordLoadStart();
@@ -9482,7 +9508,7 @@ export class MoqtPlayer {
     this.receivingVideoOwners.clear();
     this.audioOutput = null; this.lastAudioDomainOwner = null; this.lastAudioDomain = null;
     this.installedDecoderConfigurations.clear(); this.preparedDecoderConfigurations.clear();
-    this.audioTimelineRecord = null; this.videoTimelineRecord = null; this.collectAudioTimeline = false; this.collectVideoTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.runtimeAudioLanguage = null; this.runtimeSelectionIntent = null; this.mappedClockOwner = null; this.videoPresentationOffsetUs = 0n; this.videoTimingMapped = false; this.videoTimingSource = undefined; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
+    this.cmafArrivalAgeMs = null; this.audioTimelineRecord = null; this.videoTimelineRecord = null; this.collectAudioTimeline = false; this.collectVideoTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.runtimeAudioLanguage = null; this.runtimeSelectionIntent = null; this.mappedClockOwner = null; this.videoPresentationOffsetUs = 0n; this.videoTimingMapped = false; this.videoTimingSource = undefined; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
     this._selection = emptyMediaSelection(this._selection.revision + 1, this.config.autoQuality !== false);
     if (this.mediaSelection) this.failMediaSelection(this.mediaSelection, new Error('Player destroyed during audio selection'));
     for (const owner of this.warmMediaOwners.values()) owner.head?.retire();
