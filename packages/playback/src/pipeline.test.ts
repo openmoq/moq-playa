@@ -2104,6 +2104,24 @@ describe('PlaybackPipeline', () => {
             expect(commands.filter(c => c.type === 'reset')).toHaveLength(1);
         });
 
+        it('a late audio frame is dropped, unless the late-audio handler moves the clock', () => {
+            const run = (handler?: (offsetUs: number) => boolean) => {
+                const clock = new MockClock();
+                clock.set(5_000_000);
+                const { pipeline, commands, sync } = createPipeline({ mediaType: 'audio', clock });
+                pipeline.configure(new Uint8Array([0x01]));
+                sync.setAudioReference(1_000_000_000n);
+                if (handler) pipeline.lateAudioHandler = offsetUs => handler(offsetUs) && (sync.slipReference(-offsetUs + 500_000), true);
+                clock.advance(2_000_000); // delivery has fallen two seconds behind the clock
+                pipeline.pushObject(makeData(0, 0), audioHeaders(1_000_020_000n));
+                pipeline.tick();
+                return commands.filter(c => c.type === 'decode_audio').length;
+            };
+            expect(run()).toBe(0);
+            expect(run(() => false)).toBe(0);
+            expect(run(() => true)).toBe(1);
+        });
+
         it('audio is NOT affected by video group lifecycle (independently decodable)', () => {
             const clock = new MockClock();
             clock.set(5_000_000);

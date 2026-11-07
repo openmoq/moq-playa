@@ -237,6 +237,21 @@ export class SyncController {
         this._currentDriftUs = 0;
     }
 
+    /**
+     * Move the established timeline later by `byUs`: every render time computed
+     * from now on is `byUs` later, for audio and video alike, so the two stay
+     * aligned. Unlike {@link reset} the reference survives — this adds playout
+     * latency (a rebuffer), it does not re-anchor.
+     *
+     * For delivery that has fallen behind the clock under congestion: playing
+     * late is better than discarding everything that arrives late.
+     * No-op without a reference, or for a non-positive amount.
+     */
+    slipReference(byUs: number): void {
+        if (this.localBaselineUs === undefined || !(byUs > 0)) return;
+        this.localBaselineUs += byUs;
+    }
+
     /** Current video join offset in microseconds. 0 = no offset active. */
     get videoJoinOffsetUs(): number {
         return this._videoJoinOffsetUs;

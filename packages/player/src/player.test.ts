@@ -9942,6 +9942,35 @@ describe('MoqtPlayer', () => {
       return { adapter, renderer, decoder, player, feedGroups, simulateRenderedFrames, hasSubscribeTo };
     }
 
+    it('absorbs late audio behind a standing queue, or once lateness is sustained — not on jitter', async () => {
+      const { player } = await setupAbrTest(1_000);
+      const p = player as any;
+      const slips: number[] = [];
+      p.syncController = { hasReference: true, slipReference: (us: number) => slips.push(us) };
+
+      // A standing queue on the link: absorbed at once, by the lateness plus headroom.
+      p.deliveryLag = { excessLagUs: () => 800_000 };
+      expect(p.absorbLateAudio(-1_200_000)).toBe(true);
+      expect(slips).toEqual([1_700_000]);
+
+      // No queue the detector can see. One late frame is jitter: dropped.
+      p.deliveryLag = { excessLagUs: () => null };
+      advanceClock(1_000_000);
+      expect(p.absorbLateAudio(-150_000)).toBe(false);
+      // Isolated late frames, spread out, stay jitter.
+      for (let i = 0; i < 5; i++) { advanceClock(400_000); expect(p.absorbLateAudio(-150_000)).toBe(false); }
+      expect(slips).toHaveLength(1);
+
+      // Every frame late, 20 ms apart: the clock is behind delivery. Absorbed.
+      const verdicts: boolean[] = [];
+      for (let i = 0; i < 6; i++) { advanceClock(20_000); verdicts.push(p.absorbLateAudio(-400_000)); }
+      // The last isolated frame is still within the window, so the fifth of
+      // the run is the sixth late frame there; the count then starts over.
+      expect(verdicts).toEqual([false, false, false, false, true, false]);
+      expect(slips.at(-1)).toBe(900_000);
+      await player.destroy();
+    });
+
     it('LOC: measures GOP duration from the capture times of group starts', async () => {
       const { player, adapter } = await setupAbrTest(1_000);
       const videoAlias = varint(BigInt(await (adapter.subscribe as any).mock.results[1]?.value) + 100n);

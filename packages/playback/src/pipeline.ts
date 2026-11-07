@@ -81,6 +81,15 @@ export class PlaybackPipeline {
      * media. Ending observation forgets buffered identities without inventing
      * media discards; a successor observes only newly admitted identities.
      */
+    /**
+     * Consulted before an audio frame is discarded as late. Return true after
+     * moving the playout clock later (e.g. {@link SyncController.slipReference})
+     * and the frame is retimed and played rather than dropped. Lateness from a
+     * standing queue on the link is latency to absorb, not jitter to discard:
+     * discarding it left audio silent while video played on behind it.
+     */
+    lateAudioHandler: ((offsetUs: number) => boolean) | undefined;
+
     get inputObserver(): PlaybackInputObserver | undefined { return this.inputState?.observer; }
     set inputObserver(observer: PlaybackInputObserver | undefined) {
         if (observer !== undefined && typeof observer !== 'function') throw new TypeError('Expected a pipeline input observer');
@@ -993,8 +1002,14 @@ export class PlaybackPipeline {
                     // drops sufficiently late frames while keeping the newest.
                     renderTimeUs = originalTimeline ? this.clock.now() : timing.renderTimeUs;
                 } else {
-                    inputs?.report(input, 'late frame');
-                    return; // Genuinely late and safe to discard — skip
+                    const retimed = this.mediaType === 'audio' && this.lateAudioHandler?.(timing.offsetUs)
+                        ? this.audioTimingSource.computeAudioRenderTime(headers.captureTimestamp)
+                        : null;
+                    if (retimed === null || retimed.shouldDrop) {
+                        inputs?.report(input, 'late frame');
+                        return; // Genuinely late and safe to discard — skip
+                    }
+                    renderTimeUs = retimed.renderTimeUs;
                 }
             } else if (originalTimeline && timing.offsetUs > 5_000_000) {
                 renderTimeUs = this.clock.now();
