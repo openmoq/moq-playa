@@ -23,6 +23,7 @@ import { prepareProgramSwitchVariant } from './program-switch.fixture.mjs';
 import { mseProgramSwitchCases, checkMseProgramSwitch } from './mse-program-switch.mjs';
 import { checkGroupTail, assessTailDiagnostics } from './group-tail-check.mjs';
 import { isTailHarnessFile, isTailSupportFile } from './group-tail-cli.mjs';
+import { netShapeOption, shapedUrl, summarizeAbrTrace, observeShapedAbr } from './net-shape.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
@@ -32,7 +33,9 @@ const children = new Set();
 const logs = [];
 const abort = new AbortController();
 const caseArg = process.argv.indexOf('--case');
-const selectedCase = caseArg < 0 ? null : process.argv[caseArg + 1];
+// Opt-in only: a shaped run without `--case` selects the ABR calibration case.
+const netShape = await netShapeOption(process.argv, process.env);
+const selectedCase = caseArg < 0 ? netShape ? 'abr-net-shape' : null : process.argv[caseArg + 1];
 const tailCase = ['cmaf-group-tail-ordinary', 'cmaf-group-tail-held'].includes(selectedCase);
 const tailExpectedLoss = tailCase && selectedCase.endsWith('-held') && process.env.PLAYER_TAIL_EXPECT_LOSS === '1';
 const onInterrupt = () => abort.abort(new Error('Playback test interrupted'));
@@ -207,7 +210,7 @@ try {
     result.fixtures.loc = await prepareFixture(join(artifacts, 'loc'), namespace, false, abort.signal, false, 'opus');
     result.fixtures.locViews = await prepareFixture(join(artifacts, 'locViews'), namespace, false, abort.signal, false, 'opus', true);
     result.fixtures.locFrozen = await prepareFixture(join(artifacts, 'locFrozen'), namespace, true, abort.signal, false, 'opus');
-    if (selectedCase === 'loc-audio-language-switch-same-set') {
+    if (selectedCase === 'loc-audio-language-switch-same-set' || selectedCase === 'abr-net-shape-loc') {
       result.fixtures.locAlternatives = await prepareFixture(join(artifacts, 'locAlternatives'), namespace, false, abort.signal, true, 'opus');
       result.fixtures.locAudioSwitchSameSet = await prepareAudioSwitchVariant(join(artifacts, 'locAlternatives'),
         join(artifacts, 'locAudioSwitchSameSet'), result.fixtures.locAlternatives, true);
@@ -253,6 +256,14 @@ try {
       silent: false, expectedFailure: mode === 'held' && tailExpectedLoss ? 'tail-loss-control' : null }))
       .filter(scenario => scenario.name === selectedCase),
     { name: 'moving-video-and-audio', fixture: 'moving', silent: false, expectedFailure: null },
+    // ABR over the shaped link, starting wherever ABR chooses on the three-rung ladder.
+    // The LOC arm carries wall-clock capture timestamps, so delivery lag is observable.
+    ...(netShape ? [{ name: 'abr-net-shape', fixture: 'alternatives', abrTrace: true, lang: 'en',
+      silent: false, expectedFailure: null },
+    { name: 'abr-net-shape-loc', fixture: 'locAlternatives', abrTrace: true, lang: 'en', version: 4, mode: 'wall-clock',
+      silent: false, expectedFailure: null,
+      expected: { videoWidth: 1920, videoHeight: 1080, audioHz: 440, videoFps: 24, outputKind: 'canvas' } }]
+      : []).filter(scenario => scenario.name === selectedCase),
     // Explicit-only until each policy is qualified. The original distinct-set
     // fixture is now a refusal control; its recorded index-only red is retained.
     ...[
@@ -339,6 +350,7 @@ try {
   ];
   if (caseArg >= 0 && !scenarios.some((s) => s.name === selectedCase)) throw new Error(`Unknown playback case: ${selectedCase}`);
   result.selectedCase = selectedCase;
+  if (netShape) result.netShape = { preset: netShape.preset, params: netShape.params, seed: netShape.seed };
   for (const scenario of scenarios.filter((s) => selectedCase === null || s.name === selectedCase)) {
     const relay = launch(`${scenario.name}-relay`, 'pnpm', scenario.handover
       ? ['--filter', '@moqt/example-node-relay', 'exec', 'tsx', '../../scripts/player-acceptance/handover-relays.ts',
@@ -352,6 +364,15 @@ try {
     const handover = scenario.handover ? JSON.parse(await waitForLine(relay, /handover-ready: (.+)/)) : null;
     const warmPeer = scenario.warm !== undefined ? JSON.parse(await waitForLine(relay, /warm-start-ready: (.+)/)) : null;
     const relayUrl = warmPeer?.source ?? handover?.source ?? await waitForLine(relay, /listening on (https:\/\/127\.0\.0\.1:\d+\/moq)/);
+    // The shaper is a separate process so its timers do not share this
+    // runner's event loop. Publishers keep dialing the relay directly.
+    if (netShape && handover) throw new Error('Net shaping does not cover the handover target relay');
+    const shaperStats = netShape ? join(artifacts, `${scenario.name}-net-shaper.json`) : null;
+    const shaper = netShape ? launch(`${scenario.name}-net-shaper`, process.execPath, ['scripts/net-shaper/cli.mjs',
+      '--preset', netShape.preset, '--seed', String(netShape.seed), '--stats-out', shaperStats,
+      '--upstream', `127.0.0.1:${new URL(relayUrl).port}`]) : null;
+    const browserUrl = shaper ? shapedUrl(relayUrl, Number(await waitForLine(shaper, /net-shaper listening on 127\.0\.0\.1:(\d+)/)))
+      : relayUrl;
     // `startLoop` applies to BOTH publishers: a later media origin is a
     // property of the presentation, not of one relay. Offsetting only the
     // source would also put the replacement's live point 18 s behind, which
@@ -407,7 +428,8 @@ try {
       httpErrorCount++;
       if (httpErrors.length < 32) httpErrors.push({ url: response.url(), status: response.status() });
     });
-    const caseResult = { name: scenario.name, expectedFailure: scenario.expectedFailure, relayUrl, passed: false };
+    const caseResult = { name: scenario.name, expectedFailure: scenario.expectedFailure, relayUrl, passed: false,
+      ...(shaper ? { netShape: { preset: netShape.preset, browserUrl } } : {}) };
     // The decode time each publisher actually emits FIRST, read back from the
     // bytes it is about to send. A relay's group-replay log identifies the
     // iteration; this is the media timing that goes with it, which is what a
@@ -434,7 +456,8 @@ try {
           assert.equal(origin.timescale, result.fixtures[scenario.fixture].headers[track].timescale, `${track}: published timescale changed`);
         }
       }
-      const query = new URLSearchParams({ url: relayUrl, ns: namespace, hash: pin });
+      const query = new URLSearchParams({ url: browserUrl, ns: namespace, hash: pin });
+      if (scenario.abrTrace) { query.set('abr', '1'); query.set('lang', scenario.lang); }
       if (scenario.tailMode) query.set('groupTail', scenario.tailMode);
       if (scenario.warm !== undefined) query.set('warm', scenario.warm ? '1' : '0');
       if (scenario.manualSwitch) {
@@ -537,6 +560,14 @@ try {
             expected: scenario.expected,
             ...(scenario.audioSwitchMode === 'reference-map' ? variant.referenceMap : {}),
           });
+        } else if (scenario.abrTrace) {
+          caseResult.abr = {};
+          observed = await observeShapedAbr(page, caseResult.abr, netShape.durationMs);
+          // Informational: under a constrained link output defects are the
+          // measurement, so they are recorded rather than asserted.
+          caseResult.assessment = { passed: true, failures: [], observed: assessPlayback(observed.samples, {
+            ...scenario.expected, videoWidth: 1920, videoHeight: 1080, audioHz: 440, videoFps: 24,
+            videoSizes: [{ width: 1920, height: 1080 }, { width: 1280, height: 720 }, { width: 640, height: 360 }] }) };
         } else if (handover) {
           caseResult.handover = {};
           await checkHandover(page, handover.control, scenario.expected, scenario.handover, caseResult.handover,
@@ -556,14 +587,15 @@ try {
           assert.deepEqual(caseResult.warmStart.failures, [], 'Warm prefix processing and overtaking receipt evidence');
         }
         caseResult.playbackQuality = assessPlaybackQuality(observed.playbackQuality, scenario.expected?.outputKind !== 'canvas');
-        assert.deepEqual(caseResult.playbackQuality.failures, [], 'Public playback quality must match its owned native video source');
+        if (!scenario.abrTrace) assert.deepEqual(caseResult.playbackQuality.failures, [], 'Public playback quality must match its owned native video source');
         caseResult.assessment ??= scenario.manualSwitch ? caseResult.renditionSwitch.continuity
           : scenario.mseProgramSwitch ? caseResult.mseProgramSwitch.assessment
           : scenario.programSwitch ? caseResult.programSwitch.assessment
             : scenario.audioSwitch ? caseResult.audioSwitch.assessment : assessPlayback(observed.samples, scenario.expected);
         caseResult.presentationFailures = assessVideoPresentation(observed.samples);
-        assert.deepEqual(caseResult.presentationFailures, [], 'Public video draw observation');
-        if (scenario.expected?.outputKind === 'canvas') {
+        if (!scenario.abrTrace) assert.deepEqual(caseResult.presentationFailures, [], 'Public video draw observation');
+        if (scenario.abrTrace) caseResult.decodedSource = observed.decodedSource;
+        else if (scenario.expected?.outputKind === 'canvas') {
           assert.ok(observed.decodedSource?.matched > 0, 'No decoded source timestamp evidence');
           assert.deepEqual(observed.decodedSource.failures, [], 'Decoded source timestamp correlation');
         } else assert.equal(observed.decodedSource, null, 'MSE must not claim WebCodecs output evidence');
@@ -672,9 +704,22 @@ try {
       }
       caseResult.httpErrors = { total: httpErrorCount, responses: httpErrors, truncated: Math.max(0, httpErrorCount - httpErrors.length) };
       await writeFile(join(artifacts, `${scenario.name}-console.json`), JSON.stringify(consoleLines, null, 2));
+      const abrTrace = shaper ? await bounded(page.evaluate(() => window.playerAcceptance?.abrTrace ?? null), 5000,
+        'ABR trace', false).catch(() => null) : null;
       try {
         await bounded(context.close(), 5000, 'browser context close', false);
         assert.deepEqual(pageErrors, [], 'Uncaught browser error during context shutdown');
+        if (shaper) {
+          // The shaper writes its stats on SIGTERM; one file per run joins both sides.
+          await stop(shaper);
+          const stats = JSON.parse(await readFile(shaperStats, 'utf8'));
+          const trace = { preset: netShape.preset, params: netShape.params, browserUrl, relayUrl,
+            summary: abrTrace ? summarizeAbrTrace(abrTrace, stats) : null,
+            relayBackpressure: [...relay.text.matchAll(/^\[relay\] .*cannot keep up.*$/gm)].map(match => match[0]),
+            abrTrace, shaper: stats };
+          caseResult.netShape.summary = trace.summary;
+          await writeFile(join(artifacts, `${scenario.name}-abr-trace.json`), `${JSON.stringify(trace, null, 2)}\n`);
+        }
         await stop(publisher);
         if (replacementPublisher) await stop(replacementPublisher);
         await stop(relay);
