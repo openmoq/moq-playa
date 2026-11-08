@@ -118,6 +118,8 @@ interface JoiningFetch {
   readonly releaseAtUs: number;
   readonly priority: number;
   started: boolean;
+  /** Draft 22: a fill on the SUBSCRIBE rather than a FETCH of its own. */
+  readonly fill?: boolean;
 }
 
 /**
@@ -146,6 +148,8 @@ class SourcePacedRelay {
   rejectedAfterClose = 0;
   /** Every Joining FETCH the player sent, in order. */
   readonly joiningFetches: { atUs: number; requestId: bigint; options: any }[] = [];
+  /** Draft 22: every fill served on a SUBSCRIBE. */
+  readonly fills: { atUs: number; requestId: bigint; startGroup: bigint }[] = [];
   private readonly fetches: JoiningFetch[] = [];
 
   constructor(
@@ -160,10 +164,12 @@ class SourcePacedRelay {
     private readonly honoursPriority = true,
     /** How the relay answers a Joining FETCH: serve it, refuse it, or accept it and never send. */
     private readonly joiningFetchMode: 'serve' | 'refuse' | 'stall' = 'serve',
+    /** Draft 22: the past comes as a fill on the SUBSCRIBE (§3.4), and there is no Joining FETCH. */
+    private readonly draft22 = false,
   ) {
     const relay = this;
     this.adapter = {
-      draftVersion: 16,
+      draftVersion: draft22 ? 22 : 16,
       session: { state: 'established', subscribe: vi.fn(() => ({ requestId: varint(1), actions: [] })), close: vi.fn(() => []) },
       onMessage: null, onClose: null, onError: null, onDataStream: null, onObject: null,
       onStreamClosed: null, onDatagram: null, onNamespaceMessage: null, onQlogEvent: null,
@@ -174,6 +180,16 @@ class SourcePacedRelay {
         relay.subscribes.push({ atUs: relay.nowUs, requestId, trackName: new TextDecoder().decode(name), options: opts });
         opts?.onRequestId?.(requestId);
         relay.addSubscription(requestId, new TextDecoder().decode(name), opts?.subscriptionFilter, opts?.subscriberPriority);
+        const fillStart = opts?.fill?.filter?.type === 'AbsoluteStart' ? Number(opts.fill.filter.startGroup) * GOP_FRAMES : undefined;
+        const sub = relay.subs.get(requestId)!;
+        if (relay.draft22 && fillStart !== undefined && fillStart <= sub.joiningFrame) {
+          // The fill stream bears the SUBSCRIBE's Request ID.
+          relay.fills.push({ atUs: relay.nowUs, requestId, startGroup: BigInt(opts.fill.filter.startGroup) });
+          relay.fetches.push({
+            requestId, streamId: requestId * 1_000_000n + 999_999n, sub, nextFrame: fillStart, lastFrame: sub.joiningFrame,
+            releaseAtUs: relay.nowUs + 2 * PATH_DELAY_US, priority: sub.priority, started: false, fill: true,
+          });
+        }
         return varint(requestId);
       }),
       requestUpdate: vi.fn(async (id: bigint, opts?: any) => {
@@ -203,6 +219,7 @@ class SourcePacedRelay {
         relay.joiningFetches.push({ atUs: relay.nowUs, requestId, options: opts });
         const sub = relay.subs.get(BigInt(opts.joiningRequestId));
         const first = Number(opts.joiningStart) * GOP_FRAMES;
+        if (relay.draft22) throw new Error('draft-22 has no Joining FETCH');
         if (relay.joiningFetchMode === 'refuse') throw new Error('REQUEST_ERROR NOT_SUPPORTED');
         if (relay.joiningFetchMode === 'stall') return varint(requestId);
         if (!sub || opts.joiningFetchType !== 'absolute' || first > sub.joiningFrame) {
@@ -342,7 +359,9 @@ class SourcePacedRelay {
       const streamId = f.fetch ? f.fetch.streamId : f.sub.requestId * 1_000_000n + groupId;
       if (f.fetch && !f.fetch.started) {
         f.fetch.started = true;
-        this.adapter.onDataStream?.(streamId, { type: 'fetch', header: { requestId: f.fetch.requestId } });
+        this.adapter.onDataStream?.(streamId, {
+          type: 'fetch', header: { requestId: f.fetch.requestId }, ...(f.fetch.fill ? { fill: true } : {}),
+        });
       }
       // Objects on a FETCH stream carry no alias (§10.4.4); the player maps them.
       const wireAlias = f.fetch ? 0n : f.sub.alias;
@@ -418,6 +437,8 @@ interface Scenario {
   readonly startLevel?: number;
   /** Extra player configuration. */
   readonly playerConfig?: Partial<MoqtPlayerConfig>;
+  /** Draft the relay speaks (default 16). */
+  readonly draft?: 16 | 22;
   /** How the relay answers a Joining FETCH (default 'serve'). */
   readonly joiningFetch?: 'serve' | 'refuse' | 'stall';
   /** Whether the relay honours subscriber priority (default true). */
@@ -457,6 +478,7 @@ interface Run {
   readonly rejectedAfterClose: number;
   /** Joining FETCHes the player sent. */
   readonly joiningFetches: SourcePacedRelay['joiningFetches'];
+  readonly fills: SourcePacedRelay['fills'];
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -469,7 +491,7 @@ async function runScenario(s: Scenario): Promise<Run> {
   // any of them fired.
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
   const relay = new SourcePacedRelay(s.capacityBps, catalogJson(s.packaging, s.cmafHeader), s.packaging, s.contentScale, s.captureTimestamps,
-    s.relayPriority, s.joiningFetch);
+    s.relayPriority, s.joiningFetch, s.draft === 22);
   let clockUs = 0;
   let firstVideoUs: number | null = null;
   const clock = { now: () => clockUs };
@@ -596,6 +618,7 @@ async function runScenario(s: Scenario): Promise<Run> {
       decodedKeys,
       rejectedAfterClose: relay.rejectedAfterClose,
       joiningFetches: relay.joiningFetches,
+      fills: relay.fills,
     };
   } finally {
     await player.destroy();
@@ -754,18 +777,26 @@ describe('ABR under source-paced live delivery', () => {
       expect(to[0]!).toBeLessThanOrEqual(from.at(-1)! + 1n);
     });
 
-    it('CMAF: downshifts from far above the link leave no hole between rungs', async () => {
+    it.each([16, 22] as const)('CMAF (draft %s): downshifts from far above the link leave no hole between rungs', async draft => {
       // Starting at v6000 on 1 Mbps, playback falls more than a group behind
       // live before each downshift. Every target continues from the group after
-      // the committed one, fetched by Joining FETCH, so no group is skipped.
+      // the committed one — by Joining FETCH, or on draft 22 a fill on the
+      // SUBSCRIBE — so no group is skipped.
       const run = await runScenario({
-        packaging: 'cmaf', capacityBps: 1_000_000, durationUs: SECONDS(40), bufferAheadUs: LL_BUFFER, startLevel: 0,
+        packaging: 'cmaf', capacityBps: 1_000_000, durationUs: SECONDS(40), bufferAheadUs: LL_BUFFER, startLevel: 0, draft,
       });
       expect(run.switches.length).toBeGreaterThanOrEqual(2);
       const groups = [...new Set([...run.assembledGroups.values()].flat())].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
       const missing = groups.slice(1).flatMap((g, k) => (g - groups[k]! > 1n ? [groups[k]! + 1n] : []));
       expect(missing).toEqual([]);
-      expect(run.joiningFetches.length).toBe(run.switches.length);
+      if (draft === 22) {
+        // The fill rides on each switch SUBSCRIBE; one starting past the Largest Object is empty.
+        expect(switchSubscribes(run).map(sub => sub.options.fill?.filter?.type)).toEqual(run.switches.map(() => 'AbsoluteStart'));
+        expect(run.fills.length).toBeGreaterThan(0);
+        expect(run.joiningFetches).toEqual([]);
+      } else {
+        expect(run.joiningFetches.length).toBe(run.switches.length);
+      }
       for (const sw of run.switches) expect(run.firstAssembled.get(sw.to)?.sync).toBe(true);
     });
 
