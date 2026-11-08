@@ -670,9 +670,17 @@ describe('video switch request and source ownership', () => {
       const installed = h.mse.retypes[0]!.init;
       expect(installed).toEqual(refreshedInit);
       const delivered = h.mse.appends.filter(entry => entry.track === b.name);
-      expect(delivered).toHaveLength(1);
+      // Changed header: object 1 (the delta) was staged before its group's
+      // object 0, on another subgroup. Staging replays in location order, so
+      // the keyframe is appended first and the delta follows it — rather than
+      // the delta reaching MSE first and being discarded ahead of a keyframe.
+      expect(delivered).toHaveLength(changed ? 2 : 1);
       expect(readCmafChunkSamples(delivered[0]!.bytes, parseLocmafTrackContext(installed)).effective.flags)
         .toEqual([changed ? SYNC_FLAGS : 0]);
+      if (changed) {
+        expect(readCmafChunkSamples(delivered[1]!.bytes, parseLocmafTrackContext(installed)).effective.flags)
+          .toEqual([NON_SYNC_FLAGS]);
+      }
       expect(h.errors.some(error => error.severity === 'fatal')).toBe(false);
       expect(h.wire.errors).toEqual([]);
     } finally { await h.destroy(); }
