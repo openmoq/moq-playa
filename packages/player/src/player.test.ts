@@ -8781,47 +8781,34 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
-    it('selectVideoTrack() uses AbsoluteStart{startGroup:1n} when currentGroup is 0n', async () => {
+    /**
+     * A live switch target resumes where playback is: a SUBSCRIBE never
+     * replays the past (draft-18 §10.7), so it subscribes from the Largest
+     * Object and fetches the groups from currentGroup + 1 with an Absolute
+     * Joining FETCH tied to that SUBSCRIBE (§10.12.2).
+     */
+    it.each([[0n, 1n], [42n, 43n]])('selectVideoTrack() subscribes from the Largest Object and fills from group %s + 1', async (current, start) => {
       const adapter = createMockAdapter();
+      const joiningFetch = vi.fn(async (opts: { onRequestId?: (id: bigint) => void }) => {
+        const id = varint(900n); opts.onRequestId?.(900n); return id;
+      });
+      (adapter as unknown as { joiningFetch: typeof joiningFetch }).joiningFetch = joiningFetch;
       const player = await loadMultitrack(adapter);
 
-      // Force the no-pipeline-currentGroup path explicitly: stub
-      // videoPipeline to expose currentGroupId === 0n. This skips the
-      // LOC pipeline-creation flow but exercises the exact branch
-      // selectVideoTrack reads.
+      // Stub the pipeline to expose the continuation group selectVideoTrack reads.
       (player as unknown as { videoPipeline: { currentGroupId: bigint } }).videoPipeline = {
-        currentGroupId: 0n,
+        currentGroupId: current,
       };
 
       await player.selectVideoTrack('video-0');
 
-      const opts = lastSubscribeOptions(adapter) as {
-        subscriptionFilter?: { type?: string; startGroup?: bigint; startObject?: bigint };
-      } | undefined;
-      expect(opts?.subscriptionFilter?.type).toBe('AbsoluteStart');
-      expect(opts?.subscriptionFilter?.startGroup).toBe(1n);
-      expect(opts?.subscriptionFilter?.startObject).toBe(0n);
-
-      await player.destroy();
-    });
-
-    it('selectVideoTrack() uses AbsoluteStart{startGroup:N+1} when currentGroup > 0n', async () => {
-      const adapter = createMockAdapter();
-      const player = await loadMultitrack(adapter);
-
-      (player as unknown as { videoPipeline: { currentGroupId: bigint } }).videoPipeline = {
-        currentGroupId: 42n,
-      };
-
-      await player.selectVideoTrack('video-0');
-
-      const opts = lastSubscribeOptions(adapter) as {
-        subscriptionFilter?: { type?: string; startGroup?: bigint; startObject?: bigint };
-      } | undefined;
-      expect(opts?.subscriptionFilter?.type).toBe('AbsoluteStart');
-      // Avoid replaying the in-flight group: start at currentGroup + 1.
-      expect(opts?.subscriptionFilter?.startGroup).toBe(43n);
-      expect(opts?.subscriptionFilter?.startObject).toBe(0n);
+      const opts = lastSubscribeOptions(adapter) as { subscriptionFilter?: { type?: string } } | undefined;
+      expect(opts?.subscriptionFilter?.type).toBe('LargestObject');
+      expect(joiningFetch).toHaveBeenCalledOnce();
+      const subscribeId = BigInt(await (adapter.subscribe as any).mock.results.at(-1)!.value);
+      expect(joiningFetch.mock.calls[0]![0]).toMatchObject({
+        joiningFetchType: 'absolute', joiningRequestId: subscribeId, joiningStart: start,
+      });
 
       await player.destroy();
     });

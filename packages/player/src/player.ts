@@ -115,6 +115,8 @@ interface MediaFetchInfo {
   trackAlias: bigint | null;
   readonly warmStart?: boolean;
   readonly warmOwner?: WarmMediaOwner;
+  /** The gap fill of a video switch resuming behind the live edge. */
+  readonly switchFill?: boolean;
   retired: boolean;
   readonly streams: Map<bigint, boolean>;
 }
@@ -181,6 +183,11 @@ const SWITCH_STAGING_BACKLOG_ALLOWANCE_MS = 10_000;
 
 /** Subscriber priority a SUBSCRIBE without the parameter is treated as (the transport codecs' default). */
 const DEFAULT_SUBSCRIBER_PRIORITY = 128;
+
+/** Longest a switch's live objects wait behind its gap fill before going on without it. */
+const SWITCH_FILL_TIMEOUT_MS = 3_000;
+/** Live objects held behind a switch's gap fill; past this the fill is given up. */
+const SWITCH_FILL_MAX_HELD = 400;
 
 /** One current route's receiving admission; no payload or group history. */
 interface ReceivingVideoOwner {
@@ -844,6 +851,23 @@ export class MoqtPlayer {
     readonly arrivalOriginUs: number;
     readonly detector: DeliveryLagDetector;
     lastAttemptUs: number | null;
+  } | null = null;
+  /**
+   * A video switch resuming behind the live edge, and its gap fill: the target
+   * rung's groups from `startGroup` to the subscription's Largest Object. A
+   * SUBSCRIBE never delivers objects from the past — they come by FETCH or a
+   * fill (draft-18 §10.7, §10.12.2; draft-22 §3, §3.4) — so without it the
+   * target would start at the live edge and leave a hole. Until the fill ends
+   * the target's live objects are held, so the past is delivered first.
+   */
+  private switchFill: {
+    readonly connection: MoqtConnection;
+    readonly subscriptionRequestId: bigint;
+    readonly startGroup: bigint;
+    fetchRequestId: bigint | null;
+    done: boolean;
+    readonly held: Array<() => void>;
+    timer: ReturnType<typeof setTimeout> | null;
   } | null = null;
   /** CMAF Header context of the playing CMAF video track, for chunk decode times. */
   private cmafLagContext: { readonly track: CatalogTrack; readonly context: LocmafTrackContext | null } | null = null;
@@ -1596,9 +1620,15 @@ export class MoqtPlayer {
   /** Capture manager work/provenance now; only its admission waits for prefix order. */
   private routeMediaObject(streamId: bigint, obj: MoqtObject, sourceDraft?: DraftVersion, sourceConnection?: MoqtConnection,
     receiptInput: MoqtObject | ObjectDatagram = obj,
-    fetchInfo?: Pick<MediaFetchInfo, 'subscriptionRequestId' | 'warmStart' | 'warmOwner'>): Promise<void> {
+    fetchInfo?: Pick<MediaFetchInfo, 'subscriptionRequestId' | 'warmStart' | 'warmOwner' | 'switchFill'>,
+    releasedFromFillHold = false): Promise<void> {
     const manager = this.subscriptionManager;
     if (!manager) return Promise.resolve();
+    if (!releasedFromFillHold && this.holdForSwitchFill(streamId, obj, sourceDraft, sourceConnection, receiptInput, fetchInfo)) {
+      return Promise.resolve();
+    }
+    // Fill objects and objects released from behind a fill arrive as backfill:
+    // neither is evidence of live delivery timing.
     const inputGeneration = manager.mediaInputGeneration;
     // Measurement ownership travels through transforms independently of playback validity.
     const cadenceOwner = fetchInfo === undefined && obj.kind === 'data'
@@ -1641,16 +1671,16 @@ export class MoqtPlayer {
     }
     if (this.warmMediaOwners.size === 0) {
       return manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput,
-        fetchInfo ? { fetched: true, ...(fetchInfo.warmStart ? { isLive: () => false } : {}) }
-          : cadenceIdentity ? { identity: cadenceIdentity } : undefined);
+      fetchInfo ? { fetched: true, ...(fetchInfo.warmStart ? { isLive: () => false } : {}), ...(fetchInfo.switchFill ? { backfill: true } : {}) }
+          : releasedFromFillHold ? { backfill: true } : cadenceIdentity ? { identity: cadenceIdentity } : undefined);
     }
     const alias = BigInt(obj.trackAlias);
     const owner = fetchInfo ? (fetchInfo.warmStart ? fetchInfo.warmOwner : undefined)
       : [...this.warmMediaOwners.values()].find(candidate => candidate.connection === sourceConnection && candidate.subscription.trackAlias === alias);
     if (!owner || owner.connection !== sourceConnection || owner.subscription.trackAlias !== alias
         || this.warmMediaOwners.get(owner.subscription) !== owner) return manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput,
-      fetchInfo ? { fetched: true, ...(fetchInfo.warmStart ? { isLive: () => false } : {}) }
-          : cadenceIdentity ? { identity: cadenceIdentity } : undefined);
+      fetchInfo ? { fetched: true, ...(fetchInfo.warmStart ? { isLive: () => false } : {}), ...(fetchInfo.switchFill ? { backfill: true } : {}) }
+          : releasedFromFillHold ? { backfill: true } : cadenceIdentity ? { identity: cadenceIdentity } : undefined);
     const registration = manager.captureRoute(alias);
     const isLive = () => this.subscriptionManager === manager && manager.mediaInputGeneration === inputGeneration
       && registration?.() === true && this.warmMediaOwnerCurrent(owner);
@@ -2570,7 +2600,7 @@ export class MoqtPlayer {
       if (!this.admitVideoSwitchObject(this.pendingVideoSwitch, decoded.bytes.byteLength)) {
         this.discardMediaInput(input, 'track superseded'); return;
       }
-      this.cmafSwitchStagingBuffer.push({ trackName, ...(sourceKey === undefined ? {} : { sourceKey }), mediaType, groupId, payload: decoded.bytes, sync: decoded.sync, ...(input ? { input } : {}) });
+      this.cmafSwitchStagingBuffer.push({ trackName, ...(sourceKey === undefined ? {} : { sourceKey }), mediaType, groupId, objectId: BigInt(obj.objectId), payload: decoded.bytes, sync: decoded.sync, ...(input ? { input } : {}) });
       this.armVideoSwitchTimeout(this.pendingVideoSwitch);
       if (decoded.sync) {
         this.completePendingVideoSwitch();
@@ -3446,9 +3476,17 @@ export class MoqtPlayer {
       // apply to the replacement as to any media subscription; only the filter
       // is the switch's own.
       const configured = buildSubscribeOptions(this.config);
-      const subscribeOptions = nextGroup !== undefined
-        ? { ...configured, subscriptionFilter: { type: 'AbsoluteStart' as const, startGroup: varint(nextGroup), startObject: varint(0n) } }
-        : (configured ?? defaultMediaSubscriptionFilter(targetTrack.isLive === true));
+      // Resuming a live rung where playback is: subscribe from the Largest
+      // Object and fill the groups before it — on draft 22 a fill on the
+      // SUBSCRIBE itself, earlier an Absolute Joining FETCH issued below.
+      const fillFrom = nextGroup !== undefined && targetTrack.isLive === true ? nextGroup : undefined;
+      const fillOnSubscribe = fillFrom !== undefined && isDraft22(switchConn.draftVersion);
+      const subscribeOptions = fillFrom !== undefined
+        ? { ...configured, subscriptionFilter: { type: 'LargestObject' as const },
+          ...(fillOnSubscribe ? { fill: { filter: { type: 'AbsoluteStart' as const, startGroup: fillFrom, startObject: 0n } } } : {}) }
+        : nextGroup !== undefined
+          ? { ...configured, subscriptionFilter: { type: 'AbsoluteStart' as const, startGroup: varint(nextGroup), startObject: varint(0n) } }
+          : (configured ?? defaultMediaSubscriptionFilter(targetTrack.isLive === true));
       const register = (id: bigint): void => {
         if (sw.newRequestId !== null) return;
         if (!this.switchIsCurrent(sw) || !this.subscriptionManager) throw new Error('Video switch retired before emission');
@@ -3467,6 +3505,7 @@ export class MoqtPlayer {
         this.pendingAliasBinds.add(id);
         this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null, namespace: targetNamespace });
         this.pendingMediaSubs.set(id, { trackName, mediaType: 'video', packaging: sw.newTrackPackaging });
+        if (fillFrom !== undefined) this.beginSwitchFill(switchConn, id, fillFrom, trackName, fillOnSubscribe);
       };
       const sending = switchConn.subscribe(nsBytes, nameBytes,
         { ...subscribeOptions, ...this.mediaTerminalOptions(switchConn), onRequestId: (id: bigint) => register(BigInt(id)) } as never,
@@ -3482,6 +3521,7 @@ export class MoqtPlayer {
       if (requestId === undefined || sw.phase === 'committed') return;
       if (!this.switchIsCurrent(sw)) return;
       register(requestId);
+      if (fillFrom !== undefined && !fillOnSubscribe) this.issueSwitchJoiningFetch(sw, requestId, fillFrom, trackName);
     } catch (error) {
       if (automaticWithdrawal !== undefined && error === automaticWithdrawal) {
         this.discardPendingVideoSwitch(sw, automaticWithdrawal);
@@ -3490,6 +3530,93 @@ export class MoqtPlayer {
       if (this.switchIsCurrent(sw)) this.abortPendingVideoSwitch(sw, error instanceof Error ? error : new Error(String(error)));
       if (sw.phase !== 'committed') throw error;
     }
+  }
+
+  /**
+   * Start a switch's gap fill and its live hold. With the fill carried on the
+   * SUBSCRIBE (draft 22) its stream bears the SUBSCRIBE's Request ID, so it is
+   * registered under that ID now; a Joining FETCH registers once issued.
+   */
+  private beginSwitchFill(connection: MoqtConnection, subscriptionRequestId: bigint, startGroup: bigint,
+    trackName: string, onSubscribe: boolean): void {
+    this.endSwitchFill('superseded');
+    const fill: NonNullable<MoqtPlayer['switchFill']> = {
+      connection, subscriptionRequestId, startGroup, fetchRequestId: onSubscribe ? subscriptionRequestId : null,
+      done: false, held: [], timer: null,
+    };
+    fill.timer = setTimeout(() => { if (this.switchFill === fill) this.endSwitchFill('timed out'); }, SWITCH_FILL_TIMEOUT_MS);
+    this.switchFill = fill;
+    if (onSubscribe) this.registerMediaFetch(subscriptionRequestId, {
+      trackName, mediaType: 'video', subscriptionRequestId, trackAlias: null, switchFill: true,
+    }, connection);
+  }
+
+  /** Draft 18: fetch the gap as an Absolute Joining FETCH tied to the target's SUBSCRIBE (§10.12.2). */
+  private issueSwitchJoiningFetch(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>, subscriptionRequestId: bigint,
+    startGroup: bigint, trackName: string): void {
+    const conn = sw.connection;
+    const fill = this.switchFill;
+    if (!fill || fill.subscriptionRequestId !== subscriptionRequestId) return;
+    let registered = false;
+    const register = (id: bigint): void => {
+      if (registered) return;
+      registered = true;
+      if (this.switchFill !== fill || fill.done || this.connection !== conn) return;
+      fill.fetchRequestId = id;
+      this.registerMediaFetch(id, {
+        trackName, mediaType: 'video', subscriptionRequestId, trackAlias: null, switchFill: true,
+      }, conn);
+    };
+    // Advisory: however the fill fails, the switch carries on from the live edge.
+    const unavailable = (err: unknown): void => {
+      // Refused, or a start past the Joining Location: nothing to fill.
+      this.log.info('[SWITCH] gap fill for "%s" from group %s not available: %s', trackName, startGroup,
+        err instanceof Error ? err.message : String(err));
+      if (this.switchFill === fill) this.endSwitchFill('refused');
+    };
+    try {
+      void conn.joiningFetch({
+        joiningFetchType: 'absolute',
+        joiningRequestId: subscriptionRequestId,
+        joiningStart: startGroup,
+        groupOrder: varint(0x1n), // ascending: the gap in playout order
+        onRequestId: register,
+      } as never).then(id => register(BigInt(id)), unavailable);
+    } catch (err) { unavailable(err); }
+  }
+
+  /**
+   * End a switch's gap fill — complete, refused, empty, timed out or
+   * superseded — and release the live objects held behind it, in arrival
+   * order. They are marked backfill: the hold delayed them, and that delay is
+   * not delivery lag.
+   */
+  private endSwitchFill(reason: string, dropHeld = false): void {
+    const fill = this.switchFill;
+    if (!fill || fill.done) { if (fill) this.switchFill = null; return; }
+    fill.done = true;
+    this.switchFill = null;
+    if (fill.timer !== null) clearTimeout(fill.timer);
+    const held = fill.held.splice(0);
+    this.log.info('[SWITCH] gap fill from group %s ended (%s); releasing %d held object(s)', fill.startGroup, reason,
+      dropHeld ? 0 : held.length);
+    if (!dropHeld) for (const release of held) release();
+  }
+
+  /**
+   * Hold a live object of the switch target while its gap fill is
+   * outstanding, so the fill's earlier groups reach the pipeline or MSE first.
+   */
+  private holdForSwitchFill(streamId: bigint, obj: MoqtObject, sourceDraft: DraftVersion | undefined,
+    sourceConnection: MoqtConnection | undefined, receiptInput: MoqtObject | ObjectDatagram,
+    fetchInfo: Pick<MediaFetchInfo, 'subscriptionRequestId'> | undefined): boolean {
+    const fill = this.switchFill;
+    if (!fill || fill.done || fetchInfo !== undefined || sourceConnection !== fill.connection) return false;
+    const alias = this.activeSubscriptions.get(fill.subscriptionRequestId)?.trackAlias;
+    if (alias === null || alias === undefined || BigInt(obj.trackAlias) !== alias) return false;
+    if (fill.held.length >= SWITCH_FILL_MAX_HELD) { this.endSwitchFill('hold limit reached'); return false; }
+    fill.held.push(() => { void this.routeMediaObject(streamId, obj, sourceDraft, sourceConnection, receiptInput, undefined, true); });
+    return true;
   }
 
   private isVideoSwitchAlias(alias: bigint, side: 'old' | 'new'): boolean {
@@ -3563,9 +3690,41 @@ export class MoqtPlayer {
     return result === null ? undefined : result.value;
   }
 
+  /**
+   * Put both staging buffers in (group, object) order and drop repeats of a
+   * location, keeping the first arrival. Stable, so equal locations keep their
+   * order before de-duplication. An entry without an object ID is ordered by
+   * its group alone and never treated as a repeat.
+   */
+  private sortVideoSwitchStaging(): void {
+    const byLocation = (ag: bigint, ao: bigint | undefined, bg: bigint, bo: bigint | undefined): number =>
+      ag < bg ? -1 : ag > bg ? 1 : ao === undefined || bo === undefined ? 0 : ao < bo ? -1 : ao > bo ? 1 : 0;
+    const unique = <T>(entries: T[], key: (entry: T) => string | null): T[] => {
+      const seen = new Set<string>();
+      return entries.filter(entry => {
+        const k = key(entry);
+        if (k === null) return true;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+    };
+    this.switchStagingBuffer = unique(
+      [...this.switchStagingBuffer].sort((a, b) => byLocation(
+        BigInt(a.obj.groupId), BigInt(a.obj.objectId), BigInt(b.obj.groupId), BigInt(b.obj.objectId))),
+      entry => `${entry.obj.groupId}:${entry.obj.objectId}`);
+    this.cmafSwitchStagingBuffer = unique(
+      [...this.cmafSwitchStagingBuffer].sort((a, b) => byLocation(a.groupId, a.objectId, b.groupId, b.objectId)),
+      entry => (entry.objectId === undefined ? null : `${entry.groupId}:${entry.objectId}`));
+  }
+
   private retireVideoSwitchTarget(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
     sw.historical?.cancel();
     sw.frame?.cancel();
+    // The target is going away: its fill has nobody to deliver to.
+    if (sw.newRequestId !== null && this.switchFill?.subscriptionRequestId === sw.newRequestId) {
+      this.endSwitchFill('switch retired', true);
+    }
     if (sw.newRequestId === null || sw.requestReleased) return;
     sw.requestReleased = true;
     if (sw.connection === this.connection) this.clearLocmafDecoderForRequest(sw.newRequestId);
@@ -3602,6 +3761,11 @@ export class MoqtPlayer {
       this.discardCmafStaging('decoder reset');
       return;
     }
+
+    // A switch filled behind the live edge stages two sources: the fill's
+    // earlier groups and live objects past the Largest Object, interleaved
+    // as they arrived. Replay must follow location order, once each.
+    this.sortVideoSwitchStaging();
 
     const issued = sw.newRequestId === null ? undefined : this.activeSubscriptions.get(sw.newRequestId);
     const newTrack = issued === undefined ? undefined : this.catalogTrackFor(sw.newTrackName,
@@ -8256,6 +8420,7 @@ export class MoqtPlayer {
       if (this.connection !== conn) return;
       if (pending.terminal !== undefined && this.activeFetches.get(fetchReqId) === info) {
         this.finishWarmMediaPrefix(info, pending.terminal === 'fin' ? 'fin' : pending.terminal === 'reset' ? 'reset' : 'error');
+        if (info.switchFill && this.switchFill?.fetchRequestId === fetchReqId) this.endSwitchFill(`fill stream ${pending.terminal}`);
         // The stream already ended — however it ended, no live routing maps
         // are needed and the fetch bookkeeping ends with it. Only the
         // BOOTSTRAP path below needs the terminal to be a peer FIN.
@@ -8270,7 +8435,7 @@ export class MoqtPlayer {
    * same SubscriptionManager path live objects use.
    */
   private routeFetchObject(streamId: bigint, alias: bigint, obj: MoqtObject, sourceDraft?: DraftVersion, sourceConnection?: MoqtConnection,
-    info?: Pick<MediaFetchInfo, 'subscriptionRequestId' | 'warmStart' | 'warmOwner'>): void {
+    info?: Pick<MediaFetchInfo, 'subscriptionRequestId' | 'warmStart' | 'warmOwner' | 'switchFill'>): void {
     if (this.subscriptionManager?.getMediaType(alias) === undefined) return;
     const remapped: MoqtObject = { ...obj, trackAlias: varint(alias) };
     void this.routeMediaObject(streamId, remapped, sourceDraft, sourceConnection, obj, info ?? { subscriptionRequestId: null });
@@ -10334,6 +10499,7 @@ export class MoqtPlayer {
       this.switchInProgress = false;
       this.switchStagingBuffer = [];
       this.cmafSwitchStagingBuffer = [];
+      this.endSwitchFill('destroyed', true);
       if (this.switchStagingTimeout !== null) {
         clearTimeout(this.switchStagingTimeout);
         this.switchStagingTimeout = null;
@@ -12193,6 +12359,12 @@ export class MoqtPlayer {
         });
       },
       onMediaSubscribeOk: (requestId, _trackName, _mediaType, largest) => {
+        // A fill starting past the Largest Object has nothing to deliver.
+        const fill = this.switchFill;
+        if (fill?.subscriptionRequestId === requestId && fill.connection === conn
+            && (largest === null || largest === undefined || largest.group < fill.startGroup)) {
+          this.endSwitchFill('nothing to fill');
+        }
         const accepted = this.activeSubscriptions.get(requestId);
         const planned = _mediaType === 'video' ? this.qualityController?.currentVideoTrack : this.qualityController?.currentAudioTrack;
         const known = this.config.knownTracks?.[_mediaType];
@@ -12408,6 +12580,7 @@ export class MoqtPlayer {
         });
       },
       onMediaFetchError: (requestId, errorReason, errorCode) => {
+        if (this.switchFill?.fetchRequestId === requestId && this.switchFill.connection === conn) this.endSwitchFill('refused');
         const fetchInfo = this.activeFetches.get(requestId);
         if (!fetchInfo) {
           // Refusal raced the fetch()/joiningFetch() continuation — remember

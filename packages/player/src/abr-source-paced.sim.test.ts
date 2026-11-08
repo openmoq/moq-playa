@@ -28,6 +28,7 @@ import type { ControlMessage, MoqtObject } from '@openmoq/transport';
 import { varint, ObjectStatus } from '@openmoq/transport';
 import { encodeLocHeaders } from '@openmoq/loc';
 import { NON_SYNC_FLAGS, SYNC_FLAGS, buildChunk, videoInit } from '../../locmaf/test-support/cmaf.js';
+import { isSyncSampleFlags, parseLocmafTrackContext, readCmafChunkSamples } from '@openmoq/locmaf';
 
 // ─── Media and link model ────────────────────────────────────────────
 
@@ -84,27 +85,53 @@ interface Subscription {
   nextFrame: number;
   acked: boolean;
   readonly ackAtUs: number;
+  /** Largest Object when the subscription was made: its Joining Location. */
+  readonly joiningFrame: number;
   active: boolean;
   /** Forward state 0: the relay holds this subscription's objects back. */
   paused: boolean;
+  /** Subscriber priority: a lower value is sent first. */
+  priority: number;
 }
+
+type Queued = Omit<InFlight, 'arrivalUs'>;
 
 interface InFlight {
   readonly sub: Subscription;
   readonly frameIndex: number;
   readonly bytes: number;
+  /** When the frame may leave the relay. */
+  readonly releaseUs: number;
   readonly arrivalUs: number;
+  /** Set for a frame served by a FETCH rather than the subscription. */
+  readonly fetch?: JoiningFetch;
+}
+
+/** An Absolute Joining FETCH being served from the relay's cache. */
+interface JoiningFetch {
+  readonly requestId: bigint;
+  readonly streamId: bigint;
+  readonly sub: Subscription;
+  /** Next frame index to release, and the last one (the Joining Location). */
+  nextFrame: number;
+  readonly lastFrame: number;
+  readonly releaseAtUs: number;
+  readonly priority: number;
+  started: boolean;
 }
 
 /**
  * Mock relay + bottleneck link. Serves every active subscription from its
- * start group at capture pace, serialised through one FIFO server.
+ * start group at capture pace, serialised through one server that sends by
+ * subscriber priority, then release order.
  */
 class SourcePacedRelay {
   nowUs = 0;
   private nextRequestId = 1n;
   private serverFreeUs = 0;
   readonly subs = new Map<bigint, Subscription>();
+  /** Frames released by the relay and waiting for the bottleneck link. */
+  private readonly queued: Queued[] = [];
   private readonly inFlight: InFlight[] = [];
   readonly adapter: any;
   /** Bytes the link carried — the ground truth an estimator should approach. */
@@ -117,6 +144,9 @@ class SourcePacedRelay {
   closed = false;
   /** Requests attempted after the session closed. */
   rejectedAfterClose = 0;
+  /** Every Joining FETCH the player sent, in order. */
+  readonly joiningFetches: { atUs: number; requestId: bigint; options: any }[] = [];
+  private readonly fetches: JoiningFetch[] = [];
 
   constructor(
     private readonly capacityBps: number,
@@ -126,6 +156,10 @@ class SourcePacedRelay {
     private readonly contentScale = 1,
     /** Whether LOC frames carry a capture timestamp. */
     private readonly captureTimestamps = true,
+    /** Whether the relay schedules by subscriber priority, or sends in release order. */
+    private readonly honoursPriority = true,
+    /** How the relay answers a Joining FETCH: serve it, refuse it, or accept it and never send. */
+    private readonly joiningFetchMode: 'serve' | 'refuse' | 'stall' = 'serve',
   ) {
     const relay = this;
     this.adapter = {
@@ -139,13 +173,14 @@ class SourcePacedRelay {
         const requestId = relay.nextRequestId++;
         relay.subscribes.push({ atUs: relay.nowUs, requestId, trackName: new TextDecoder().decode(name), options: opts });
         opts?.onRequestId?.(requestId);
-        relay.addSubscription(requestId, new TextDecoder().decode(name), opts?.subscriptionFilter);
+        relay.addSubscription(requestId, new TextDecoder().decode(name), opts?.subscriptionFilter, opts?.subscriberPriority);
         return varint(requestId);
       }),
       requestUpdate: vi.fn(async (id: bigint, opts?: any) => {
         if (relay.closed) { relay.rejectedAfterClose++; throw new Error('Cannot update in state closed; session must be ESTABLISHED'); }
         relay.updates.push({ atUs: relay.nowUs, requestId: BigInt(id), options: opts });
         const sub = relay.subs.get(BigInt(id));
+        if (sub !== undefined && opts?.subscriberPriority !== undefined) sub.priority = Number(opts.subscriberPriority);
         if (sub !== undefined && opts?.forward !== undefined) {
           const forward = Number(opts.forward);
           // Resuming a live track starts at the next group; what was held back is skipped.
@@ -159,6 +194,26 @@ class SourcePacedRelay {
         if (sub) sub.active = false;
       }),
       fetch: vi.fn(async () => varint(relay.nextRequestId++)),
+      // Absolute Joining FETCH (draft-18 §10.12.2): the subscription's groups
+      // from Joining Start up to its Joining Location, served from cache.
+      joiningFetch: vi.fn(async (opts: any) => {
+        if (relay.closed) { relay.rejectedAfterClose++; throw new Error('Cannot fetch in state closed; session must be ESTABLISHED'); }
+        const requestId = relay.nextRequestId++;
+        opts?.onRequestId?.(requestId);
+        relay.joiningFetches.push({ atUs: relay.nowUs, requestId, options: opts });
+        const sub = relay.subs.get(BigInt(opts.joiningRequestId));
+        const first = Number(opts.joiningStart) * GOP_FRAMES;
+        if (relay.joiningFetchMode === 'refuse') throw new Error('REQUEST_ERROR NOT_SUPPORTED');
+        if (relay.joiningFetchMode === 'stall') return varint(requestId);
+        if (!sub || opts.joiningFetchType !== 'absolute' || first > sub.joiningFrame) {
+          throw new Error('REQUEST_ERROR INVALID_RANGE: joining start past the Joining Location');
+        }
+        relay.fetches.push({
+          requestId, streamId: requestId * 1_000_000n + 999_999n, sub, nextFrame: first, lastFrame: sub.joiningFrame,
+          releaseAtUs: relay.nowUs + 2 * PATH_DELAY_US, priority: Number(opts.subscriberPriority ?? 128), started: false,
+        });
+        return varint(requestId);
+      }),
       fetchCancel: vi.fn(async () => {}),
       trackStatus: vi.fn(async (_ns: unknown, _n: unknown, opts?: { onRequestId?: (id: bigint) => void }) => {
         const id = relay.nextRequestId++;
@@ -175,14 +230,48 @@ class SourcePacedRelay {
     return BigInt(Math.floor(this.nowUs / FRAME_US / GOP_FRAMES));
   }
 
-  private addSubscription(requestId: bigint, trackName: string, filter: any): void {
+  private addSubscription(requestId: bigint, trackName: string, filter: any, subscriberPriority?: unknown): void {
     // The catalog subscription is answered with the catalog object, not media.
-    const startGroup = filter?.type === 'AbsoluteStart' ? BigInt(filter.startGroup) : this.liveGroup() + 1n;
+    // A SUBSCRIBE only delivers newly published objects (draft-18 §10.7): its
+    // filter may name a start in the past, but nothing before the Largest
+    // Object is sent. The past comes by FETCH.
+    const largestFrame = Math.floor(this.nowUs / FRAME_US);
+    const nextGroupStart = Number(this.liveGroup() + 1n) * GOP_FRAMES;
+    const nextFrame = filter?.type === 'LargestObject' ? largestFrame + 1
+      : filter?.type === 'AbsoluteStart' ? Math.max(Number(filter.startGroup) * GOP_FRAMES, largestFrame + 1)
+        : nextGroupStart;
     this.subs.set(requestId, {
-      requestId, alias: requestId + 1000n, trackName, startGroup,
-      nextFrame: Number(startGroup) * GOP_FRAMES,
+      requestId, alias: requestId + 1000n, trackName, startGroup: BigInt(Math.floor(nextFrame / GOP_FRAMES)),
+      nextFrame, joiningFrame: largestFrame, priority: Number(subscriberPriority ?? 128),
       acked: false, ackAtUs: this.nowUs + 2 * PATH_DELAY_US, active: true, paused: false,
     });
+  }
+
+  /**
+   * Put queued frames on the bottleneck link until it is busy past `untilUs`.
+   * Each time the link frees, the relay sends the waiting frame with the best
+   * subscriber priority, oldest first within a priority. A paused (forward 0)
+   * or ended subscription's frames that have not started are never sent.
+   */
+  private transmit(untilUs: number): void {
+    const stopped = (q: Queued) => q.fetch === undefined && (!q.sub.active || q.sub.paused);
+    const priority = (q: Queued) => (this.honoursPriority ? q.fetch?.priority ?? q.sub.priority : 0);
+    for (;;) {
+      for (let i = this.queued.length - 1; i >= 0; i--) if (stopped(this.queued[i]!)) this.queued.splice(i, 1);
+      if (this.queued.length === 0) return;
+      const t = Math.max(this.serverFreeUs, Math.min(...this.queued.map(q => q.releaseUs)));
+      if (t > untilUs) return;
+      let best = -1;
+      for (let i = 0; i < this.queued.length; i++) {
+        const q = this.queued[i]!;
+        if (q.releaseUs > t) continue;
+        const b = best < 0 ? undefined : this.queued[best]!;
+        if (b === undefined || priority(q) < priority(b) || (priority(q) === priority(b) && q.releaseUs < b.releaseUs)) best = i;
+      }
+      const [q] = this.queued.splice(best, 1);
+      this.serverFreeUs = t + (q!.bytes * 8 * 1_000_000) / this.capacityBps;
+      this.inFlight.push({ ...q!, arrivalUs: Math.round(this.serverFreeUs + PATH_DELAY_US) });
+    }
   }
 
   /** Answer subscriptions, release due frames into the link, deliver arrivals. */
@@ -193,7 +282,11 @@ class SourcePacedRelay {
       sub.acked = true;
       this.adapter.onMessage?.({
         type: 'SUBSCRIBE_OK', requestId: varint(sub.requestId), trackAlias: varint(sub.alias),
-        parameters: new Map(), trackExtensions: new Map(),
+        // LARGEST_OBJECT (0x09): the track has content once the source starts.
+        parameters: new Map(sub.joiningFrame >= 0 ? [[0x09n, [{
+          group: BigInt(Math.floor(sub.joiningFrame / GOP_FRAMES)), object: BigInt(sub.joiningFrame % GOP_FRAMES),
+        }]]] : []),
+        trackExtensions: new Map(),
       } as unknown as ControlMessage);
       if (sub.trackName === 'catalog') {
         const catalogObject: MoqtObject = {
@@ -216,29 +309,43 @@ class SourcePacedRelay {
         sub.nextFrame++;
       }
     }
-    due.sort((a, b) => a.releaseUs - b.releaseUs);
-    const rung = (name: string) => LADDER.find(r => r.name === name)!;
-    for (const d of due) {
-      const bytes = Math.round(frameBytes(rung(d.sub.trackName).bitrateBps, d.frameIndex) * this.contentScale);
-      const start = Math.max(d.releaseUs, this.serverFreeUs);
-      this.serverFreeUs = start + (bytes * 8 * 1_000_000) / this.capacityBps;
-      this.inFlight.push({ sub: d.sub, frameIndex: d.frameIndex, bytes, arrivalUs: Math.round(this.serverFreeUs + PATH_DELAY_US) });
+    // A Joining FETCH's frames are already cached: all are released at once,
+    // in order, on one stream through the same bottleneck.
+    const fetched: Array<{ sub: Subscription; frameIndex: number; releaseUs: number; fetch: JoiningFetch }> = [];
+    for (const fetch of this.fetches) {
+      if (fetch.releaseAtUs > targetUs) continue;
+      while (fetch.nextFrame <= fetch.lastFrame) {
+        fetched.push({ sub: fetch.sub, frameIndex: fetch.nextFrame, releaseUs: fetch.releaseAtUs, fetch });
+        fetch.nextFrame++;
+      }
     }
+    const rung = (name: string) => LADDER.find(r => r.name === name)!;
+    const released: Array<{ sub: Subscription; frameIndex: number; releaseUs: number; fetch?: JoiningFetch }> = [...due, ...fetched];
+    for (const d of released.sort((a, b) => a.releaseUs - b.releaseUs)) {
+      const bytes = Math.round(frameBytes(rung(d.sub.trackName).bitrateBps, d.frameIndex) * this.contentScale);
+      this.queued.push({ sub: d.sub, frameIndex: d.frameIndex, bytes, releaseUs: d.releaseUs,
+        ...(d.fetch !== undefined ? { fetch: d.fetch } : {}) });
+    }
+    this.transmit(targetUs);
     this.inFlight.sort((a, b) => a.arrivalUs - b.arrivalUs);
 
     while (this.inFlight.length > 0 && this.inFlight[0]!.arrivalUs <= targetUs) {
       const f = this.inFlight.shift()!;
-      // An unsubscribed track's streams are reset; nothing more arrives. Its
-      // link time is NOT returned: the model queues everything at the
-      // bottleneck, where a real relay would hold most of it behind QUIC's
-      // congestion window and free it on RESET_STREAM. After a switch on a
-      // congested link the model is therefore pessimistic.
-      if (!f.sub.active) continue;
+      // An unsubscribed track's streams are reset; nothing more arrives.
+      // Its frames still waiting for the link were dropped by transmit().
+      // A FETCH outlives its subscription (it has its own request).
+      if (f.fetch ? this.closed : !f.sub.active) continue;
       setClock(Math.max(f.arrivalUs, this.nowUs));
       this.carriedBits += f.bytes * 8;
       const groupId = BigInt(Math.floor(f.frameIndex / GOP_FRAMES));
       const objectId = f.frameIndex % GOP_FRAMES;
-      const streamId = f.sub.requestId * 1_000_000n + groupId;
+      const streamId = f.fetch ? f.fetch.streamId : f.sub.requestId * 1_000_000n + groupId;
+      if (f.fetch && !f.fetch.started) {
+        f.fetch.started = true;
+        this.adapter.onDataStream?.(streamId, { type: 'fetch', header: { requestId: f.fetch.requestId } });
+      }
+      // Objects on a FETCH stream carry no alias (§10.4.4); the player maps them.
+      const wireAlias = f.fetch ? 0n : f.sub.alias;
       // CMAF: one low-latency chunk per frame, with a real moof (tfdt,
       // duration, sync flag) around the frame's bytes.
       const payload = this.packaging === 'cmaf'
@@ -249,7 +356,7 @@ class SourcePacedRelay {
         })
         : new Uint8Array(f.bytes);
       const frame: MoqtObject = {
-        kind: 'data', trackAlias: f.sub.alias, groupId, subgroupId: 0n, objectId: BigInt(objectId),
+        kind: 'data', trackAlias: wireAlias, groupId, subgroupId: 0n, objectId: BigInt(objectId),
         publisherPriority: undefined, payload,
         extensions: this.packaging === 'loc' && this.captureTimestamps
           ? encodeLocHeaders({ captureTimestamp: BigInt(PUBLISHER_EPOCH_US + f.frameIndex * FRAME_US) })
@@ -258,12 +365,15 @@ class SourcePacedRelay {
       this.adapter.onObject?.(streamId, frame);
       if (this.packaging === 'loc' && objectId === GOP_FRAMES - 1) {
         const groupEnd: MoqtObject = {
-          kind: 'gap', trackAlias: f.sub.alias, groupId, subgroupId: 0n,
+          kind: 'gap', trackAlias: wireAlias, groupId, subgroupId: 0n,
           objectId: BigInt(GOP_FRAMES), status: ObjectStatus.END_OF_GROUP,
         };
         this.adapter.onObject?.(streamId, groupEnd);
       }
-      this.onFrameDelivered?.(f.sub.trackName, f.frameIndex * FRAME_US);
+      if (f.fetch && f.frameIndex === f.fetch.lastFrame) this.adapter.onStreamClosed?.(streamId, undefined, 'fin');
+      // The playout model judges live delivery against capture time. Fetched
+      // frames are past media filling a gap, so they stay out of its accounting.
+      if (!f.fetch) this.onFrameDelivered?.(f.sub.trackName, f.frameIndex * FRAME_US);
     }
     setClock(targetUs);
   }
@@ -308,6 +418,10 @@ interface Scenario {
   readonly startLevel?: number;
   /** Extra player configuration. */
   readonly playerConfig?: Partial<MoqtPlayerConfig>;
+  /** How the relay answers a Joining FETCH (default 'serve'). */
+  readonly joiningFetch?: 'serve' | 'refuse' | 'stall';
+  /** Whether the relay honours subscriber priority (default true). */
+  readonly relayPriority?: boolean;
   /** The relay drops the session at this time (µs). */
   readonly closeAtUs?: number;
   /**
@@ -335,8 +449,14 @@ interface Run {
   readonly updates: SourcePacedRelay['updates'];
   /** CMAF: groups handed to the assembler, per track, in order. */
   readonly assembledGroups: ReadonlyMap<string, readonly bigint[]>;
+  /** CMAF: the first chunk handed to the assembler per track — its group, and whether it starts with a sync sample. */
+  readonly firstAssembled: ReadonlyMap<string, { readonly group: bigint; readonly sync: boolean }>;
+  /** LOC: each keyframe handed to the decoder — its group, and when (µs). */
+  readonly decodedKeys: readonly { readonly group: bigint; readonly atUs: number }[];
   /** Requests the player attempted after the relay closed the session. */
   readonly rejectedAfterClose: number;
+  /** Joining FETCHes the player sent. */
+  readonly joiningFetches: SourcePacedRelay['joiningFetches'];
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -348,7 +468,8 @@ async function runScenario(s: Scenario): Promise<Run> {
   // time, advanced with the clock; otherwise a 60 s run would finish before
   // any of them fired.
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
-  const relay = new SourcePacedRelay(s.capacityBps, catalogJson(s.packaging, s.cmafHeader), s.packaging, s.contentScale, s.captureTimestamps);
+  const relay = new SourcePacedRelay(s.capacityBps, catalogJson(s.packaging, s.cmafHeader), s.packaging, s.contentScale, s.captureTimestamps,
+    s.relayPriority, s.joiningFetch);
   let clockUs = 0;
   let firstVideoUs: number | null = null;
   const clock = { now: () => clockUs };
@@ -360,8 +481,15 @@ async function runScenario(s: Scenario): Promise<Run> {
     onFrameRendered: null as ((ts: bigint, r: number) => void) | null,
     onStall: null as ((ms: number) => void) | null,
   };
+  const decodedKeys: { group: bigint; atUs: number }[] = [];
   const decoder = {
-    configure: vi.fn(), decode: vi.fn(), flush: vi.fn(() => Promise.resolve()),
+    configure: vi.fn(),
+    decode: vi.fn((chunk: { type: string; timestamp: number }) => {
+      if (chunk.type !== 'key') return;
+      const frame = Math.round((chunk.timestamp - PUBLISHER_EPOCH_US) / FRAME_US);
+      decodedKeys.push({ group: BigInt(Math.floor(frame / GOP_FRAMES)), atUs: clockUs });
+    }),
+    flush: vi.fn(() => Promise.resolve()),
     reset: vi.fn(), queueDepth: 0, onFrame: null as any, onError: null as any, destroy: vi.fn(),
   };
   const mediaSource = {
@@ -376,9 +504,16 @@ async function runScenario(s: Scenario): Promise<Run> {
     getCommittedGroupFloor: vi.fn((_mt: string, trackName: string) => assembledGroups.get(trackName)?.at(-1)),
   };
   const assembledGroups = new Map<string, bigint[]>();
+  const firstAssembled = new Map<string, { group: bigint; sync: boolean }>();
+  const cmafContext = parseLocmafTrackContext(videoInit());
   const assembler = {
-    push: vi.fn((mediaType: string, trackName: string, groupId: bigint) => {
+    push: vi.fn((mediaType: string, trackName: string, groupId: bigint, payload?: Uint8Array) => {
       if (mediaType !== 'video') return;
+      if (!firstAssembled.has(trackName) && payload) {
+        let sync = false;
+        try { sync = isSyncSampleFlags(readCmafChunkSamples(payload, cmafContext).effective.flags[0]!); } catch { /* not a parseable chunk */ }
+        firstAssembled.set(trackName, { group: groupId, sync });
+      }
       const groups = assembledGroups.get(trackName) ?? [];
       if (groups.at(-1) !== groupId) groups.push(groupId);
       assembledGroups.set(trackName, groups);
@@ -457,7 +592,10 @@ async function runScenario(s: Scenario): Promise<Run> {
       subscribes: relay.subscribes,
       updates: relay.updates,
       assembledGroups,
+      firstAssembled,
+      decodedKeys,
       rejectedAfterClose: relay.rejectedAfterClose,
+      joiningFetches: relay.joiningFetches,
     };
   } finally {
     await player.destroy();
@@ -567,7 +705,7 @@ describe('ABR under source-paced live delivery', () => {
 
     it('CMAF: a thin buffer still steps down when delivery lag shows the link falling behind', async () => {
       const run = await runScenario({
-        packaging: 'cmaf', capacityBps: 1_000_000, durationUs: SECONDS(60), bufferAheadUs: LL_BUFFER,
+        packaging: 'cmaf', capacityBps: 700_000, durationUs: SECONDS(60), bufferAheadUs: LL_BUFFER,
       });
       // The MSE stall callback downshifts at once, so the first step may come
       // from either path; the lag path must still get through the thin buffer.
@@ -598,11 +736,60 @@ describe('ABR under source-paced live delivery', () => {
       const run = await runScenario({
         packaging: 'cmaf', capacityBps: 1_000_000, durationUs: SECONDS(40), bufferAheadUs: LL_BUFFER,
       });
-      // Formerly NextGroupStart: the live edge, however far behind playback was.
-      expect(switchSubscribes(run)[0]!.options.subscriptionFilter.type).toBe('AbsoluteStart');
+      // A SUBSCRIBE never replays the past (the mock relay follows draft-18
+      // §10.7), so the target subscribes from the Largest Object and fetches
+      // the groups after the committed one with an Absolute Joining FETCH.
+      const target = switchSubscribes(run)[0]!;
+      expect(target.options.subscriptionFilter.type).toBe('LargestObject');
+      const fill = run.joiningFetches.find(f => BigInt(f.options.joiningRequestId) === target.requestId);
+      expect(fill?.options).toMatchObject({ joiningFetchType: 'absolute' });
       const from = run.assembledGroups.get(run.switches[0]!.from)!;
       const to = run.assembledGroups.get(run.switches[0]!.to)!;
+      // The fill reached MSE first, whole: the target's first chunk is the
+      // keyframe of the group it fetched from — the group after the one MSE
+      // had committed — and no hole opens after the outgoing rung's last
+      // group. Without the fill the target began mid-group, from the Largest
+      // Object, with deltas MSE cannot use until the next keyframe.
+      expect(run.firstAssembled.get(run.switches[0]!.to)).toEqual({ group: BigInt(fill!.options.joiningStart), sync: true });
       expect(to[0]!).toBeLessThanOrEqual(from.at(-1)! + 1n);
+    });
+
+    it('CMAF: downshifts from far above the link leave no hole between rungs', async () => {
+      // Starting at v6000 on 1 Mbps, playback falls more than a group behind
+      // live before each downshift. Every target continues from the group after
+      // the committed one, fetched by Joining FETCH, so no group is skipped.
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: 1_000_000, durationUs: SECONDS(40), bufferAheadUs: LL_BUFFER, startLevel: 0,
+      });
+      expect(run.switches.length).toBeGreaterThanOrEqual(2);
+      const groups = [...new Set([...run.assembledGroups.values()].flat())].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      const missing = groups.slice(1).flatMap((g, k) => (g - groups[k]! > 1n ? [groups[k]! + 1n] : []));
+      expect(missing).toEqual([]);
+      expect(run.joiningFetches.length).toBe(run.switches.length);
+      for (const sw of run.switches) expect(run.firstAssembled.get(sw.to)?.sync).toBe(true);
+    });
+
+    it.each(['refuse', 'stall'] as const)('CMAF: when the relay %ss the gap fill, downshifts still land from the live edge', async mode => {
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: 1_000_000, durationUs: SECONDS(40), bufferAheadUs: LL_BUFFER, startLevel: 0,
+        joiningFetch: mode,
+      });
+      expect(run.joiningFetches.length).toBeGreaterThan(0);
+      expect(run.failedSwitches).toEqual([]);
+      expect(LADDER[rungIndex(run.finalTrack)]!.bitrateBps).toBeLessThan(1_000_000);
+      for (const sw of run.switches) expect(run.firstAssembled.get(sw.to)?.sync).toBe(true);
+    });
+
+    it('LOC: a downshift continues decoding from the group after the current one', async () => {
+      const run = await runScenario({ packaging: 'loc', capacityBps: 1_000_000, durationUs: SECONDS(40), startLevel: 0 });
+      // Some switches start at the live edge, where there is nothing to fill
+      // (the fill is refused); at least one starts a group or more behind it.
+      const fill = run.joiningFetches.find(f => run.decodedKeys.some(k => k.atUs < f.atUs));
+      expect(fill?.options).toMatchObject({ joiningFetchType: 'absolute' });
+      const current = run.decodedKeys.filter(k => k.atUs < fill!.atUs).at(-1)!.group;
+      expect(BigInt(fill!.options.joiningStart)).toBe(current + 1n);
+      const next = run.decodedKeys.find(k => k.atUs >= fill!.atUs && k.group > current)!;
+      expect(next.group).toBe(current + 1n);
     });
 
     it('a downshift first lowers the outgoing rung\'s priority', async () => {
@@ -616,8 +803,9 @@ describe('ABR under source-paced live delivery', () => {
     it('a downshift stuck behind the backlog pauses the outgoing rung, and lands', async () => {
       // No capture timestamps: no lag to size the backlog by, so the switch
       // must rely on the paused rung's arrivals showing the link still draining.
+      // The relay ignores priority, so lowering the outgoing rung's is not enough.
       const run = await runScenario({
-        packaging: 'loc', capacityBps: 1_000_000, durationUs: SECONDS(60), captureTimestamps: false,
+        packaging: 'loc', capacityBps: 1_000_000, durationUs: SECONDS(60), captureTimestamps: false, relayPriority: false,
       });
       const outgoing = initialVideo(run).requestId;
       expect(run.updates.some(u => u.requestId === outgoing && Number(u.options?.forward) === 0)).toBe(true);
@@ -631,7 +819,7 @@ describe('ABR under source-paced live delivery', () => {
         playerConfig: { deliveryTimeoutMs: 2_000, subscriberPriority: 100 },
       });
       const options = switchSubscribes(run)[0]!.options;
-      expect(options.subscriptionFilter.type).toBe('AbsoluteStart');
+      expect(options.subscriptionFilter.type).toBe('LargestObject');
       expect(BigInt(options.deliveryTimeout)).toBe(2_000n);
       expect(BigInt(options.subscriberPriority)).toBe(100n);
       const outgoing = initialVideo(run).requestId;
