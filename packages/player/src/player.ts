@@ -168,7 +168,7 @@ const SWITCH_STAGING_BACKLOG_ALLOWANCE_MS = 10_000;
 /** Subscriber priority a SUBSCRIBE without the parameter is treated as (the transport codecs' default). */
 const DEFAULT_SUBSCRIBER_PRIORITY = 128;
 
-/** Longest a switch's live objects wait behind its gap fill before going on without it. */
+/** Longest a switch's first held live object waits behind its gap fill before going on without it. */
 const SWITCH_FILL_TIMEOUT_MS = 3_000;
 /** Live objects held behind a switch's gap fill; past this the fill is given up. */
 const SWITCH_FILL_MAX_HELD = 400;
@@ -3315,7 +3315,6 @@ export class MoqtPlayer {
       connection, subscriptionRequestId, startGroup, fetchRequestId: onSubscribe ? subscriptionRequestId : null,
       done: false, held: [], timer: null,
     };
-    fill.timer = setTimeout(() => { if (this.switchFill === fill) this.endSwitchFill('timed out'); }, SWITCH_FILL_TIMEOUT_MS);
     this.switchFill = fill;
     if (onSubscribe) this.registerMediaFetch(subscriptionRequestId, {
       trackName, mediaType: 'video', subscriptionRequestId, trackAlias: null, switchFill: true,
@@ -3386,6 +3385,10 @@ export class MoqtPlayer {
     const alias = this.activeSubscriptions.get(fill.subscriptionRequestId)?.trackAlias;
     if (alias === null || alias === undefined || BigInt(obj.trackAlias) !== alias) return false;
     if (fill.held.length >= SWITCH_FILL_MAX_HELD) { this.endSwitchFill('hold limit reached'); return false; }
+    // Timed from the first held object, not the SUBSCRIBE: on a congested
+    // link the fill may take longer to start, and until live objects wait
+    // behind it nothing is delayed.
+    fill.timer ??= setTimeout(() => { if (this.switchFill === fill) this.endSwitchFill('timed out'); }, SWITCH_FILL_TIMEOUT_MS);
     fill.held.push(() => { void this.routeMediaObject(streamId, obj, sourceDraft, sourceConnection, receiptInput, undefined, true); });
     return true;
   }
