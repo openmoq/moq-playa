@@ -67,9 +67,10 @@ describe('DEFAULT_PLAYER_CONFIG', () => {
     expect(DEFAULT_PLAYER_CONFIG.gapTimeoutMs).toBe(500);
     expect(DEFAULT_PLAYER_CONFIG.driftThresholdMs).toBe(200);
     expect(DEFAULT_PLAYER_CONFIG.maxBufferDepth).toBe(500);
-    expect(DEFAULT_PLAYER_CONFIG.maxCatchUpRate).toBe(1.0);
+    expect(DEFAULT_PLAYER_CONFIG.maxCatchUpRate).toBe(1.05);
     expect(DEFAULT_PLAYER_CONFIG.catchUpThresholdMs).toBe(500);
     expect(DEFAULT_PLAYER_CONFIG.catchUpRecoveryMs).toBe(50);
+    expect(DEFAULT_PLAYER_CONFIG.liveJumpThresholdMs).toBe(3000);
     expect(DEFAULT_PLAYER_CONFIG.lateFrameThresholdMs).toBe(100);
     expect(DEFAULT_PLAYER_CONFIG.maxDriftMs).toBe(500);
     expect(DEFAULT_PLAYER_CONFIG.autoQuality).toBe(true);

@@ -571,6 +571,16 @@ export class CommandDispatcher {
     this.audioOutput?.flush();
   }
 
+  /** Live catch-up: play audio at `rate`. WebAudio changes pitch with it. */
+  setCatchUpRate(rate: number): void {
+    this.audioOutput?.setPlaybackRate?.(rate);
+  }
+
+  /** Shift queued video by `deltaUs` (negative: earlier), where the renderer can. */
+  retimeVideo(deltaUs: number): void {
+    this.renderer?.retime?.(deltaUs);
+  }
+
   /** Release all adapter resources. */
   destroy(): void {
     // Retire before fallible cleanup; custom adapters may retain callbacks.

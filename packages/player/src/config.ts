@@ -333,23 +333,29 @@ export interface PlaybackTuningConfig {
 /** Latency and catch-up options. */
 export interface LatencyConfig {
   /**
-   * Target end-to-end latency in milliseconds.
-   * When undefined, uses the catalog's targetLatency or disables catch-up.
+   * Target end-to-end latency in milliseconds. When undefined, the catalog's
+   * targetLatency. Live catch-up never plays closer to live than this, where
+   * latency is measurable (LOC with wall-clock capture timestamps).
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */
   readonly targetLatencyMs?: number;
 
   /**
-   * Maximum playback rate for catch-up (e.g., 1.05 = 5% faster).
-   * Default: 1.0 (catch-up disabled).
-   * Must be >= 1.0.
+   * Fastest playback rate for live catch-up (e.g., 1.05 = 5% faster). While
+   * media is buffered ahead of playout beyond what delivery needs, playback
+   * runs faster, up to this rate, until the excess drains. Default: 1.05.
+   * 1.0 disables catch-up. Must be >= 1.0.
+   *
+   * LOC audio plays through WebAudio, which raises pitch with the rate (about
+   * 0.85 semitone at 1.05×). CMAF plays through the media element, which
+   * keeps pitch.
    */
   readonly maxCatchUpRate?: number;
 
   /**
-   * Latency threshold in ms before catch-up activates. Default: 500.
-   * Catch-up only kicks in when current latency exceeds
-   * targetLatencyMs + catchUpThresholdMs.
+   * Excess buffered media, in ms, before catch-up activates. Default: 500.
+   * The excess is media buffered ahead of playout beyond a 500 ms floor
+   * kept for delivery jitter, and no more than latency above the target.
    */
   readonly catchUpThresholdMs?: number;
 
@@ -367,9 +373,8 @@ export interface LatencyConfig {
   readonly maxDriftMs?: number;
 
   /**
-   * Latency threshold for deactivating catch-up (hysteresis).
-   * Catch-up deactivates when latency drops to targetLatencyMs + catchUpRecoveryMs.
-   * Default: 50ms.
+   * Excess for deactivating catch-up (hysteresis): catch-up stops when the
+   * excess drops to this. Default: 50ms.
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */
   readonly catchUpRecoveryMs?: number;
@@ -792,7 +797,7 @@ export const DEFAULT_PLAYER_CONFIG = {
   maxBufferDepth: 500,
 
   // Latency / catch-up
-  maxCatchUpRate: 1.0,
+  maxCatchUpRate: 1.05,
   catchUpThresholdMs: 500,
   catchUpRecoveryMs: 50,
   liveJumpThresholdMs: 3000,

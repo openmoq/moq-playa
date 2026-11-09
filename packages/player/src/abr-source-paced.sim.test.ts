@@ -478,6 +478,9 @@ interface Run {
   readonly firstAssembled: ReadonlyMap<string, { readonly group: bigint; readonly sync: boolean }>;
   /** LOC with `decoderOutput`: each frame's playout latency (render time − capture time) when queued for rendering. */
   readonly enqueuedLatency: readonly { readonly atUs: number; readonly latencyUs: number }[];
+  /** Every catch_up_changed event, and the rates set on the media element (CMAF). */
+  readonly catchUps: readonly { readonly atUs: number; readonly active: boolean; readonly rate: number }[];
+  readonly elementRates: readonly number[];
   /** Every recovery action the player reported. */
   readonly recoveryActions: readonly { readonly atUs: number; readonly action: any }[];
   /** LOC: each frame's capture age (decode time − capture time) when handed to the decoder. */
@@ -532,6 +535,7 @@ async function runScenario(s: Scenario): Promise<Run> {
     flush: vi.fn(() => Promise.resolve()),
     reset: vi.fn(), queueDepth: 0, onFrame: null as any, onError: null as any, destroy: vi.fn(),
   };
+  const elementRates: number[] = [];
   const mediaSource = {
     initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
     mediaElement: null,
@@ -540,6 +544,7 @@ async function runScenario(s: Scenario): Promise<Run> {
     onStall: null as ((ms: number) => void) | null,
     changeType: vi.fn(() => Promise.resolve()),
     getBufferAheadUs: vi.fn(() => firstVideoUs === null ? null : s.bufferAheadUs?.(clockUs) ?? null),
+    setPlaybackRate: vi.fn((rate: number) => { elementRates.push(rate); }),
     // The highest group handed to the assembler stands in for what MSE committed.
     getCommittedGroupFloor: vi.fn((_mt: string, trackName: string) => assembledGroups.get(trackName)?.at(-1)),
   };
@@ -581,6 +586,8 @@ async function runScenario(s: Scenario): Promise<Run> {
 
   const switches: Array<{ atUs: number; from: string; to: string; reason: string }> = [];
   const recoveryActions: { atUs: number; action: any }[] = [];
+  const catchUps: { atUs: number; active: boolean; rate: number }[] = [];
+  player.on('catch_up_changed', e => catchUps.push({ atUs: clockUs, active: e.active, rate: e.rate }));
   player.on('recovery_action', e => recoveryActions.push({ atUs: clockUs, action: e.action }));
   player.on('quality_switched', e => switches.push({ atUs: clockUs, from: e.fromTrackName, to: e.toTrackName, reason: e.reason }));
   const failedSwitches: Array<{ atUs: number; from: string; to: string; error: string }> = [];
@@ -640,6 +647,8 @@ async function runScenario(s: Scenario): Promise<Run> {
       decodedAges,
       enqueuedLatency,
       recoveryActions,
+      catchUps,
+      elementRates,
       rejectedAfterClose: relay.rejectedAfterClose,
       joiningFetches: relay.joiningFetches,
       fills: relay.fills,
@@ -834,9 +843,10 @@ describe('ABR under source-paced live delivery', () => {
     it.each([3000, 0])('LOC: playout latency added under congestion is given back (liveJumpThresholdMs %s)', async threshold => {
       // At 10 s the clock slips 6 s later, as absorbing late audio does; the
       // link is ample, so the media then stands buffered well ahead of playout.
+      // Catch-up is off, so the jump alone is measured.
       const run = await runScenario({
         packaging: 'loc', capacityBps: AMPLE_BPS, durationUs: SECONDS(30), decoderOutput: true,
-        slipAt: { atUs: SECONDS(10), byUs: 6_000_000 }, playerConfig: { liveJumpThresholdMs: threshold },
+        slipAt: { atUs: SECONDS(10), byUs: 6_000_000 }, playerConfig: { liveJumpThresholdMs: threshold, maxCatchUpRate: 1 },
       });
       const latencyAt = (sec: number) => run.enqueuedLatency.filter(f => f.atUs >= SECONDS(sec)).at(0)!.latencyUs;
       expect(latencyAt(9)).toBeLessThan(1_000_000);
@@ -854,6 +864,35 @@ describe('ABR under source-paced live delivery', () => {
         expect(latencyAt(20)).toBeLessThan(1_000_000);
         expect(latencyAt(29)).toBeLessThan(1_000_000);
       }
+    });
+
+    it.each([1.05, 1])('LOC: a smaller excess drains by playing faster (maxCatchUpRate %s)', async maxCatchUpRate => {
+      // A 2 s slip, under the 3 s jump threshold: catch-up drains it.
+      const run = await runScenario({
+        packaging: 'loc', capacityBps: AMPLE_BPS, durationUs: SECONDS(60), decoderOutput: true,
+        slipAt: { atUs: SECONDS(10), byUs: 2_000_000 }, playerConfig: { maxCatchUpRate },
+      });
+      const latencyAt = (sec: number) => run.enqueuedLatency.filter(f => f.atUs >= SECONDS(sec)).at(0)!.latencyUs;
+      expect(latencyAt(10.5)).toBeGreaterThan(2_000_000);
+      expect(run.recoveryActions.filter(r => r.action.type === 'jump_to_live')).toEqual([]);
+      if (maxCatchUpRate === 1) {
+        expect(run.catchUps).toEqual([]);
+        expect(latencyAt(59)).toBeGreaterThan(2_000_000);
+      } else {
+        expect(run.catchUps[0]).toMatchObject({ active: true, rate: 1.05 });
+        expect(run.catchUps.at(-1)).toMatchObject({ active: false, rate: 1 });
+        // 1.45 s of excess at 5% takes about 29 s.
+        expect(run.catchUps.at(-1)!.atUs).toBeGreaterThan(SECONDS(35));
+        expect(latencyAt(59)).toBeLessThan(1_000_000);
+      }
+    });
+
+    it('CMAF: catch-up sets the media element\'s rate while the buffer stands high', async () => {
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(20), bufferAheadUs: now => (now > SECONDS(10) ? 2_500_000 : 300_000),
+      });
+      expect(run.elementRates).toEqual([1.05]);
+      expect(run.catchUps[0]!.atUs).toBeGreaterThan(SECONDS(10));
     });
 
     it('LOC: a downshift continues decoding from the group after the current one', async () => {

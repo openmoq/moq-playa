@@ -460,6 +460,13 @@ export interface MediaSourceLike {
    */
   getBufferAheadUs?(): number | null;
 
+  /**
+   * Optional: play at this rate (live catch-up). The media element keeps
+   * pitch. Without it, CMAF live catch-up is unavailable.
+   * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
+   */
+  setPlaybackRate?(rate: number): void;
+
   /** Native element-load-scoped video counters, or null without owned video,
    * support, or valid measurements. A supported all-zero snapshot is observed
    * zero, not unavailable. Optional for existing/custom media adapters.

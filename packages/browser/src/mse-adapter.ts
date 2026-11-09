@@ -1682,6 +1682,11 @@ export class MseMediaSource implements MediaSourceLike {
     } catch { return null; }
   }
 
+  /** Live catch-up: play at `rate`. The element preserves pitch by default. */
+  setPlaybackRate(rate: number): void {
+    this.video.playbackRate = rate;
+  }
+
   getBufferAheadUs(): number | null {
     const v = this.video;
     if (!v.buffered.length) {

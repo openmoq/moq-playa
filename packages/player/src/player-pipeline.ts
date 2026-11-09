@@ -223,10 +223,9 @@ export function createPipelines(
     driftThresholdUs: playbackConfig.driftThresholdUs,
     dropThresholdUs: config.lateFrameThresholdMs! * 1000,
     clock,
+    // Catch-up is the player's (LiveCatchUp), on the shared timeline; the
+    // controller only measures capture-timestamp age here.
     targetLatencyMs: config.targetLatencyMs,
-    maxCatchUpRate: config.maxCatchUpRate,
-    catchUpThresholdMs: config.catchUpThresholdMs,
-    catchUpRecoveryMs: config.catchUpRecoveryMs,
   }));
 
   // The default controller's windowed escalation — the only path by which

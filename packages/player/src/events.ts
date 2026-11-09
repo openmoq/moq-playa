@@ -486,7 +486,12 @@ export interface CatchUpChangedEvent {
   readonly type: 'catch_up_changed';
   readonly active: boolean;
   readonly rate: number;
+  /**
+   * End-to-end playout latency, where measurable (LOC with wall-clock
+   * capture timestamps); otherwise the media buffered ahead of playout.
+   */
   readonly latencyMs: number;
+  /** Target latency; 0 when none is set. */
   readonly targetMs: number;
 }
 

@@ -118,6 +118,7 @@ interface LocmafChunkDetails {
 }
 import type { MediaSourceLike, MediaAppendQueueLease, VideoPresentation, AudioOutputLike } from './interfaces.js';
 import { CommandDispatcher, type DispatcherOutputObserver } from './command-dispatcher.js';
+import { LiveCatchUp } from './live-catch-up.js';
 import { StatsAccumulator } from './stats.js';
 import type { PlayerStats } from './stats.js';
 import type { CmafAssemblerLike } from './interfaces.js';
@@ -783,6 +784,14 @@ export class MoqtPlayer {
   private readonly lateAudioAsksUs: number[] = [];
   /** Newest capture time (µs) received per media type: how far playout could move toward live. */
   private readonly newestCaptureUs: { video: number | null; audio: number | null } = { video: null, audio: null };
+  /** Whether the newest capture times are wall clock, so end-to-end latency is measurable. */
+  private captureIsWallClock = true;
+  /** Live catch-up on the shared timeline; null when disabled. */
+  private liveCatchUp: LiveCatchUp | null = null;
+  /** Previous catch-up tick (µs), to advance the timeline by elapsed time. */
+  private lastCatchUpTickUs: number | null = null;
+  /** Catalog targetLatency (ms) of the selected video, used when the config sets none. */
+  private catalogTargetLatencyMs: number | undefined;
   /** Since when (µs) buffered media has stood past the jump threshold. */
   private liveJumpExcessSinceUs: number | null = null;
   /** When (µs) playback last jumped toward live. */
@@ -4315,6 +4324,7 @@ export class MoqtPlayer {
         const captureUs = Number(headers.captureTimestamp);
         const newest = this.newestCaptureUs[mediaType];
         if (newest === null || captureUs > newest) this.newestCaptureUs[mediaType] = captureUs;
+        this.captureIsWallClock = headers.timestampIsWallClock !== false;
       }
       if (!pipeline) this.discardMediaInput(input, 'not attached');
       else if (delivery?.backfill) pipeline.pushObject(obj, headers, input, { backfill: true });
@@ -9599,6 +9609,7 @@ export class MoqtPlayer {
     this.checkBandwidthAdaptation();
 
     this.checkLiveJump();
+    this.checkLiveCatchUp();
 
     // Media liveness: reconcile monitored tracks with the live subscription
     // map (a handful of entries — cheap at tick rate, and immune to drift
@@ -9843,12 +9854,8 @@ export class MoqtPlayer {
       this.liveJumpExcessSinceUs = null;
       return;
     }
-    const received = [
-      ...(this.videoPipeline ? [this.newestCaptureUs.video] : []),
-      ...(this.audioPipeline && this._selection.audio !== null ? [this.newestCaptureUs.audio] : []),
-    ];
-    if (received.length === 0 || received.includes(null)) return;
-    const aheadUs = Math.min(...(received as number[])) - playhead;
+    const aheadUs = this.locAheadOfPlayoutUs(playhead);
+    if (aheadUs === null) return;
     const now = this.clock.now();
     if (aheadUs <= thresholdUs) { this.liveJumpExcessSinceUs = null; return; }
     this.liveJumpExcessSinceUs ??= now;
@@ -9864,6 +9871,64 @@ export class MoqtPlayer {
       type: 'recovery_action',
       action: { type: 'jump_to_live', trigger: 'latency', byMs: Math.round(byUs / 1000) },
     });
+  }
+
+  /** LOC: media both selected tracks have received ahead of `playhead` (µs); null until both have some. */
+  private locAheadOfPlayoutUs(playhead: number): number | null {
+    const received = [
+      ...(this.videoPipeline ? [this.newestCaptureUs.video] : []),
+      ...(this.audioPipeline && this._selection.audio !== null ? [this.newestCaptureUs.audio] : []),
+    ];
+    if (received.length === 0 || received.includes(null)) return null;
+    return Math.min(...(received as number[])) - playhead;
+  }
+
+  /**
+   * Live catch-up: while media stands buffered ahead of playout beyond what
+   * delivery needs, play faster, up to `maxCatchUpRate`, until it drains —
+   * the gentle counterpart of {@link checkLiveJump}. LOC runs the shared
+   * timeline ahead by the extra rate and plays audio at that rate (WebAudio
+   * raises pitch with it); CMAF sets the media element's rate, which keeps
+   * pitch.
+   */
+  private checkLiveCatchUp(): void {
+    const catchUp = this.liveCatchUp ??= (this.config.maxCatchUpRate ?? 1) > 1 ? new LiveCatchUp({
+      maxRate: this.config.maxCatchUpRate!,
+      thresholdUs: (this.config.catchUpThresholdMs ?? 500) * 1000,
+      recoveryUs: (this.config.catchUpRecoveryMs ?? 50) * 1000,
+      floorAheadUs: LIVE_JUMP_CUSHION_US,
+    }) : null;
+    const now = this.clock.now();
+    const elapsedUs = this.lastCatchUpTickUs === null ? 0 : now - this.lastCatchUpTickUs;
+    this.lastCatchUpTickUs = now;
+    const state = this.stateMachine.state;
+    if (!catchUp || state === PlayerState.PAUSED || state === PlayerState.ERROR) return;
+    const sync = this.syncController;
+    const dispatcher = this.commandDispatcher;
+    const playhead = sync?.playheadCaptureUs() ?? null;
+    const loc = sync !== null && dispatcher !== null && playhead !== null;
+    const aheadUs = loc ? this.locAheadOfPlayoutUs(playhead!) : this.mediaSource?.setPlaybackRate ? this.mediaSource.getBufferAheadUs?.() ?? null : null;
+    if (aheadUs === null) return;
+    const latencyUs = loc ? sync!.measureLatency(BigInt(Math.round(playhead!)), this.captureIsWallClock) : null;
+    const targetMs = this.config.targetLatencyMs ?? this.catalogTargetLatencyMs;
+    const previousRate = catchUp.currentRate;
+    const decision = catchUp.evaluate(aheadUs, latencyUs, targetMs === undefined ? undefined : targetMs * 1000);
+    if (decision.rate !== previousRate) {
+      if (loc) dispatcher!.setCatchUpRate(decision.rate);
+      else this.mediaSource!.setPlaybackRate!(decision.rate);
+      const latencyMs = Math.round((latencyUs ?? aheadUs) / 1000);
+      this._stats.recordLatency(latencyMs);
+      this.log.info('Catch-up %s: rate %.2f (%.1fs buffered ahead)', decision.active ? 'active' : 'off', decision.rate, aheadUs / 1_000_000);
+      this.emitter.emit('catch_up_changed', {
+        type: 'catch_up_changed', active: decision.active, rate: decision.rate, latencyMs, targetMs: targetMs ?? 0,
+      });
+    }
+    // The timeline runs at the playback rate: (rate − 1) of each elapsed tick ahead.
+    if (loc && decision.rate > 1 && elapsedUs > 0) {
+      const byUs = (decision.rate - 1) * elapsedUs;
+      sync!.advanceReference(byUs);
+      dispatcher!.retimeVideo(-byUs);
+    }
   }
 
   /**
@@ -13337,6 +13402,7 @@ export class MoqtPlayer {
     if (selected.video?.targetLatency !== undefined) {
       this._stats.setTargetLatency(selected.video.targetLatency);
     }
+    this.catalogTargetLatencyMs = selected.video?.targetLatency;
 
     // §9.2.2: Build subscription options from config
     const subscribeOptions = buildSubscribeOptions(this.config);
