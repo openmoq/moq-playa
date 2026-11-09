@@ -309,6 +309,35 @@ export interface MediaAppendObservation {
 }
 export type MediaAppendObserver = (event: MediaAppendObservation) => void | Promise<void>;
 
+/**
+ * A one-use permission to cross the buffered hole a live video switch can
+ * leave when its history could not be retrieved and the target restarts
+ * later than the outgoing track ended.
+ *
+ * Holding it permits nothing. `activate()` states that the target was
+ * adopted. The media source then binds to the first target append submitted
+ * afterwards and, if that append succeeds and creates one new buffered range
+ * ahead of the outgoing media, may move the playhead once, from the hole in
+ * front of that range to its start, when audio and video are both buffered
+ * there. Authority comes from where the browser actually placed that append,
+ * not from timestamps in the media. If the placement cannot be attributed,
+ * or no shared landing appears, nothing is crossed and ordinary buffered-hole
+ * handling applies.
+ *
+ * The crossing is a live recovery, not a seamless switch: media between the
+ * playhead and the landing is skipped, including audio that was already
+ * buffered. It is never used for finite playback or for a caller-chosen
+ * subscription range.
+ *
+ * Pausing suspends the permission. A seek, a reset, a source or video
+ * reconfiguration after activation, a changed video timestamp offset, or a
+ * newer reservation ends it. Both calls are idempotent and never throw.
+ */
+export interface MediaSwitchRecovery {
+  activate(): void;
+  revoke(): void;
+}
+
 /** Native playback-quality counters, scoped to the media element's load.
  * They reset on the HTML media-element load algorithm, not on engine counters
  * or each SourceBuffer reconfiguration. Counts do not identify decoded output.
@@ -528,6 +557,24 @@ export interface MediaSourceLike {
    * Reset/destroy invalidates the lease; current must be checked after awaits.
    */
   holdQueuedAppends?(mediaTypes: readonly ('video' | 'audio')[]): MediaAppendQueueLease;
+
+  /**
+   * Reserve a {@link MediaSwitchRecovery} for one video switch target while
+   * the outgoing track is still the output. The player calls this only for a
+   * live switch whose history retrieval failed, before it retires the
+   * outgoing track.
+   *
+   * Optional. Return null when this source cannot attribute or perform such
+   * a crossing now, for example during an owned seek, with video already
+   * buffered ahead of the current output, or with no video buffered at or
+   * before the playhead. When the method is absent or returns null the
+   * player declines that switch and keeps the outgoing track playing, rather
+   * than adopt a restart that could strand playback behind a hole. A custom
+   * source that does not implement it therefore sees such switches fail with
+   * the ordinary switch-failure event. A new reservation replaces the
+   * previous one.
+   */
+  reserveSwitchRecovery?(target: { mediaType: 'video'; trackName: string; sourceKey?: string }): MediaSwitchRecovery | null;
 
   /** Per-source replay state; display names remain unchanged when an opaque key is supplied. */
   getCommittedGroupFloor?(mediaType: 'video' | 'audio', trackName: string, sourceKey?: string): bigint | undefined;

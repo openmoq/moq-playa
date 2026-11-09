@@ -1,4 +1,4 @@
-/** Live LOC frame-path fixture (real SDK loopback, drafts 16/18/22; default 18): two video renditions in one altGroup plus audio; fake
+/** Live LOC frame-path fixture (real SDK loopback, drafts 14/16/18/22; default 18): two video renditions in one altGroup plus audio; fake
  *  decoders/renderer; objects sent with explicit group ids; SUBSCRIBE parameters recorded as the server session decoded them. */
 import { vi } from 'vitest';
 import { MoqtConnection } from '@openmoq/webtransport';
@@ -11,7 +11,7 @@ import { MoqtPlayer } from '../src/player.js';
 import type { MoqtPlayerConfig } from '../src/config.js';
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike } from '../src/interfaces.js';
 
-export async function liveLocFixture(config: Partial<MoqtPlayerConfig> = {}, draft: 16 | 18 | 22 = 18) {
+export async function liveLocFixture(config: Partial<MoqtPlayerConfig> = {}, draft: 14 | 16 | 18 | 22 = 18) {
   const { a, b } = createLoopback(), client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' });
   const requests: Array<{ id: bigint; name: string; parameters?: MessageParameters }> = [];
   const dec = new TextDecoder();
@@ -25,7 +25,7 @@ export async function liveLocFixture(config: Partial<MoqtPlayerConfig> = {}, dra
   const output: AudioOutputLike = { flush() {}, destroy() {}, currentPlayoutTimeUs: 0, schedule: vi.fn() };
   let serving: Promise<void> | undefined, clock = 1_000_000;
   const player = new MoqtPlayer({ url: 'https://relay.example/moq', namespace: ['live'], draftVersion: draft, maxBufferDepth: 2048, clock: { now: () => clock },
-    createConnection: () => client, createTransport: async () => { serving = server.connect(b, draft === 16 ? { maxRequestId: varint(1000n) } : {}); void serving.catch(() => {}); return a; },
+    createConnection: () => client, createTransport: async () => { serving = server.connect(b, draft === 14 || draft === 16 ? { maxRequestId: varint(1000n) } : {}); void serving.catch(() => {}); return a; },
     createVideoDecoder: () => video, createAudioDecoder: () => audio, createRenderer: () => renderer, createAudioOutput: () => output,
     autoQuality: false, selection: { videoTrack: { name: 'v' } },
     catalog: { tracks: [

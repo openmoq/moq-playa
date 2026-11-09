@@ -375,6 +375,27 @@ describe.each([18, 22] as const)('player-owned seek output draft %s', draft => {
     } finally { await f.destroy(); }
   });
 
+  it('a refused seek keeps a held switch recovery; an admitted seek releases it only when it takes over the output', async () => {
+    const f = await fixture(draft);
+    const held = (f.player as unknown as { videoSwitchRecovery: { owner: object; handle: { activate(): void; revoke(): void } } | null });
+    const handle = { activate: vi.fn(), revoke: vi.fn() };
+    try {
+      held.videoSwitchRecovery = { owner: {}, handle };
+      let refusing = true; f.player.hooks.beforeSubscribe.add(intent => refusing ? null : intent);
+      await expect(f.player.seek(5000)).rejects.toThrow(/declined by beforeSubscribe/);
+      expect(handle.revoke, 'playback is unchanged by a refused seek').not.toHaveBeenCalled();
+      expect(held.videoSwitchRecovery?.handle).toBe(handle); expect(f.resources).toEqual([]);
+      refusing = false;
+      await f.player.seek(5000); await flush(256);
+      expect(f.resources, 'admitted, still retrieving: the output is not replaced yet').toEqual([]);
+      expect(handle.revoke).not.toHaveBeenCalled();
+      await f.deliver();
+      expect(f.resources).toHaveLength(1);
+      expect(handle.revoke, 'released when the seek replaced the output').toHaveBeenCalledOnce();
+      expect(held.videoSwitchRecovery).toBeNull(); expect(handle.activate).not.toHaveBeenCalled();
+    } finally { await f.destroy(); }
+  });
+
   it('rejects invalid admission before a clock owner or native resource exists', async () => {
     const f = await fixture(draft);
     try {

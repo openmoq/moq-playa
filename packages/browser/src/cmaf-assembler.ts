@@ -178,6 +178,8 @@ export class CmafAssembler {
 
   /** Per-track rebase epoch (in that track's timescale units). */
   private videoEpoch: bigint | null = null;
+  /** Whether the retained video epoch has known, rescalable tick units. */
+  private videoEpochHasKnownTimescale = false;
   private audioEpoch: bigint | null = null;
 
   /** Media timescale per track, parsed from the init segment's mdhd. */
@@ -341,6 +343,7 @@ export class CmafAssembler {
     const previous = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
     if (mediaType === 'video') {
       this.videoTimescale = timescale;
+      if (previous === null || timescale === null) this.videoEpochHasKnownTimescale = false;
     } else {
       this.audioTimescale = timescale;
     }
@@ -831,6 +834,7 @@ export class CmafAssembler {
     this.pendingMoofs.clear();
     this.pendingObjectIds = undefined;
     this.videoEpoch = null;
+    this.videoEpochHasKnownTimescale = false;
     this.audioEpoch = null;
     this.lastVideoBmd = null;
     this.lastAudioBmd = null;
@@ -1098,14 +1102,26 @@ export class CmafAssembler {
       // Track switch (ABR splice): variants in a switching set are media-time
       // aligned. Keep the shared raw/output epochs so a switch cannot jump
       // back to presentation time zero after a source restart.
-      const anchored = this.anchorEpoch(mediaType, bmd, false);
+      const preserveVideoMapping = mediaType === 'video' && this.epochMode === 'shared'
+        && this.videoEpochHasKnownTimescale && this.videoTimescale !== null
+        && epoch !== null && this.videoEpochGen === this.sharedEpochGen;
+      const anchored = preserveVideoMapping ? epoch : this.anchorEpoch(mediaType, bmd, false);
       if (mediaType === 'video') {
         this.videoEpoch = anchored;
+        this.videoEpochHasKnownTimescale = this.videoTimescale !== null;
         this.videoTrackIdentity = trackIdentity;
         this.lastVideoBmd = null;
         this.videoEpochGen = this.sharedEpochGen;
         this.highestVideoGroupId = null;
-        this.videoOutputOffset = this.outputOffsetFor('video', bmd, anchored);
+        // Aligned replacements retain the existing video mapping, including
+        // a startup clamp or a restart continuation offset (CMSF §3.2).
+        // Re-anchor when the retained units are unknown or this track has
+        // not adopted the current epoch.
+        if (!preserveVideoMapping) {
+          this.videoOutputOffset = this.epochMode === 'shared' && this.videoTimescale !== null
+            ? this.scaledSharedOutputOffset(this.videoTimescale) ?? 0n
+            : this.outputOffsetFor('video', bmd, anchored);
+        }
         this.videoEpochGroupFloor = null;
       } else {
         this.audioEpoch = anchored;
@@ -1122,6 +1138,7 @@ export class CmafAssembler {
       const anchored = this.anchorEpoch(mediaType, bmd, false);
       if (mediaType === 'video') {
         this.videoEpoch = anchored;
+        this.videoEpochHasKnownTimescale = this.videoTimescale !== null;
         this.videoTrackIdentity = trackIdentity;
         this.lastVideoBmd = null;
         this.videoOutputOffset = this.outputOffsetFor('video', bmd, anchored);
@@ -1157,6 +1174,7 @@ export class CmafAssembler {
         const anchored = this.anchorEpoch(mediaType, bmd, reestablish);
         if (mediaType === 'video') {
           this.videoEpoch = anchored;
+          this.videoEpochHasKnownTimescale = this.videoTimescale !== null;
           this.lastVideoBmd = bmd;
           this.videoOutputOffset = this.outputOffsetFor('video', bmd, anchored);
           this.videoEpochGroupFloor = groupId;

@@ -8781,49 +8781,88 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
-    it('selectVideoTrack() uses AbsoluteStart{startGroup:1n} when currentGroup is 0n', async () => {
+    it('selectVideoTrack() uses legacy LargestObject and joins from group 1 when currentGroup is 0', async () => {
       const adapter = createMockAdapter();
       const player = await loadMultitrack(adapter);
+      const joiningFetch = vi.fn<MoqtConnection['joiningFetch']>(async options => {
+        options.onRequestId?.(999n);
+        return 999n;
+      });
+      adapter.joiningFetch = joiningFetch;
 
-      // Force the no-pipeline-currentGroup path explicitly: stub
-      // videoPipeline to expose currentGroupId === 0n. This skips the
-      // LOC pipeline-creation flow but exercises the exact branch
-      // selectVideoTrack reads.
+      // Keep the original current-group seam; assert the required next-group
+      // floor on the historical request, not on the legacy live filter.
       (player as unknown as { videoPipeline: { currentGroupId: bigint } }).videoPipeline = {
         currentGroupId: 0n,
       };
 
-      await player.selectVideoTrack('video-0');
+      try {
+        expect(adapter.draftVersion).toBe(16);
+        await player.selectVideoTrack('video-0');
+        const opts = lastSubscribeOptions(adapter) as { subscriptionFilter?: { type?: string } } | undefined;
+        expect(opts?.subscriptionFilter).toEqual({ type: 'LargestObject' });
+        expect(joiningFetch).not.toHaveBeenCalled();
 
-      const opts = lastSubscribeOptions(adapter) as {
-        subscriptionFilter?: { type?: string; startGroup?: bigint; startObject?: bigint };
-      } | undefined;
-      expect(opts?.subscriptionFilter?.type).toBe('AbsoluteStart');
-      expect(opts?.subscriptionFilter?.startGroup).toBe(1n);
-      expect(opts?.subscriptionFilter?.startObject).toBe(0n);
+        const targetRequestId = BigInt(await adapter.subscribe.mock.results.at(-1)!.value);
+        const { locationEncodingLength, writeLocation } = await import('@openmoq/transport');
+        const largest = { group: varint(2n), object: varint(1n) };
+        const encoded = new Uint8Array(locationEncodingLength(largest));
+        writeLocation(largest, encoded, 0);
+        adapter._triggerMessage({
+          type: 'SUBSCRIBE_OK', requestId: targetRequestId, trackAlias: varint(88n),
+          parameters: new Map([[0x09n, [encoded]]]),
+        });
 
-      await player.destroy();
+        expect(joiningFetch).toHaveBeenCalledTimes(1);
+        expect(joiningFetch.mock.calls[0]![0]).toMatchObject({
+          joiningFetchType: 'absolute', joiningRequestId: targetRequestId,
+          joiningStart: 1n, groupOrder: 'ascending',
+        });
+      } finally {
+        await player.destroy();
+      }
     });
 
-    it('selectVideoTrack() uses AbsoluteStart{startGroup:N+1} when currentGroup > 0n', async () => {
+    it('selectVideoTrack() uses legacy LargestObject and joins from group 43 when currentGroup is 42', async () => {
       const adapter = createMockAdapter();
       const player = await loadMultitrack(adapter);
+      const joiningFetch = vi.fn<MoqtConnection['joiningFetch']>(async options => {
+        options.onRequestId?.(999n);
+        return 999n;
+      });
+      adapter.joiningFetch = joiningFetch;
 
+      // Keep the original current-group seam; assert the required next-group
+      // floor on the historical request, not on the legacy live filter.
       (player as unknown as { videoPipeline: { currentGroupId: bigint } }).videoPipeline = {
         currentGroupId: 42n,
       };
 
-      await player.selectVideoTrack('video-0');
+      try {
+        expect(adapter.draftVersion).toBe(16);
+        await player.selectVideoTrack('video-0');
+        const opts = lastSubscribeOptions(adapter) as { subscriptionFilter?: { type?: string } } | undefined;
+        expect(opts?.subscriptionFilter).toEqual({ type: 'LargestObject' });
+        expect(joiningFetch).not.toHaveBeenCalled();
 
-      const opts = lastSubscribeOptions(adapter) as {
-        subscriptionFilter?: { type?: string; startGroup?: bigint; startObject?: bigint };
-      } | undefined;
-      expect(opts?.subscriptionFilter?.type).toBe('AbsoluteStart');
-      // Avoid replaying the in-flight group: start at currentGroup + 1.
-      expect(opts?.subscriptionFilter?.startGroup).toBe(43n);
-      expect(opts?.subscriptionFilter?.startObject).toBe(0n);
+        const targetRequestId = BigInt(await adapter.subscribe.mock.results.at(-1)!.value);
+        const { locationEncodingLength, writeLocation } = await import('@openmoq/transport');
+        const largest = { group: varint(44n), object: varint(1n) };
+        const encoded = new Uint8Array(locationEncodingLength(largest));
+        writeLocation(largest, encoded, 0);
+        adapter._triggerMessage({
+          type: 'SUBSCRIBE_OK', requestId: targetRequestId, trackAlias: varint(88n),
+          parameters: new Map([[0x09n, [encoded]]]),
+        });
 
-      await player.destroy();
+        expect(joiningFetch).toHaveBeenCalledTimes(1);
+        expect(joiningFetch.mock.calls[0]![0]).toMatchObject({
+          joiningFetchType: 'absolute', joiningRequestId: targetRequestId,
+          joiningStart: 43n, groupOrder: 'ascending',
+        });
+      } finally {
+        await player.destroy();
+      }
     });
 
     /**

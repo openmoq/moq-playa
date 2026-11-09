@@ -486,3 +486,30 @@ describe('native playback state on an owned seek sample', () => {
     expect(successor!.sample()).toMatchObject({ currentTime: 0 });
   });
 });
+
+describe('switch recovery reservation and owned seeks', () => {
+  const target = { mediaType: 'video' as const, trackName: 'next' };
+
+  it('is refused while an owned seek has not been released to playback', async () => {
+    const { adapter, video } = fixture(), resource = adapter.beginSeek({}), source = await initialized(resource);
+    coverage(video, source);
+    expect(adapter.reserveSwitchRecovery(target), 'attached, not positioned').toBeNull();
+    await resource.position(0);
+    expect(adapter.reserveSwitchRecovery(target), 'positioned, playback not released').toBeNull();
+  });
+
+  it('is available once a seek resource is released into live playback', async () => {
+    const { adapter, video } = fixture();
+    await playing(adapter, video);
+    expect(adapter.reserveSwitchRecovery(target)).not.toBeNull();
+  });
+
+  it('a seek begun after the reservation ends it', async () => {
+    const { adapter, video } = fixture();
+    await playing(adapter, video);
+    const recovery = adapter.reserveSwitchRecovery(target)!;
+    const next = adapter.beginSeek({}); const source = await initialized(next); coverage(video, source);
+    recovery.activate();
+    expect((adapter as unknown as { switchRecovery: unknown }).switchRecovery, 'no reservation survives the replacement resource').toBeNull();
+  });
+});

@@ -104,6 +104,8 @@ interface WarmMediaOwner {
   registration: (() => boolean) | null;
   head: WarmStartHead<WarmMediaRoute> | null;
   prefixFetch: MediaFetchInfo | null;
+  readonly prefixStart?: { readonly group: bigint; readonly object: bigint };
+  prefixCancelled?: boolean;
 }
 
 interface MediaFetchInfo {
@@ -128,7 +130,7 @@ interface LocmafChunkDetails {
   readonly timescale: number;
   readonly baseMediaDecodeTime: bigint;
 }
-import type { MediaSourceLike, MediaAppendQueueLease, VideoPresentation, AudioOutputLike } from './interfaces.js';
+import type { MediaSourceLike, MediaAppendQueueLease, MediaSwitchRecovery, VideoPresentation, AudioOutputLike } from './interfaces.js';
 import { CommandDispatcher, type DispatcherOutputObserver } from './command-dispatcher.js';
 import { StatsAccumulator } from './stats.js';
 import type { PlayerStats } from './stats.js';
@@ -1259,6 +1261,9 @@ export class MoqtPlayer {
    */
   private readonly announcedNamespaces = new Map<bigint, Uint8Array[]>();
 
+  /** The media source's permission to cross the hole a live restart leaves, held for one switch. */
+  private videoSwitchRecovery: { readonly owner: object; readonly handle: MediaSwitchRecovery } | null = null;
+
   /**
    * Pending track switch — defers old subscription teardown until the
    * new track's keyframe is ready (make-before-break switching).
@@ -1276,6 +1281,8 @@ export class MoqtPlayer {
     oldSourceKey?: string;
     newTrackName: string;
     newSourceKey?: string;
+    /** History retrieval failed; the target restarts on its next independent live Object. */
+    liveRestart?: boolean;
     newRequestId: bigint | null;
     newTrackPackaging: TrackPackaging;
     targetTrack: CatalogTrack;
@@ -1446,16 +1453,36 @@ export class MoqtPlayer {
       if (owner.connection !== connection) continue;
       this.warmMediaOwners.delete(subscription);
       owner.head?.retire();
+      this.cancelWarmRange(owner);
     }
   }
 
-  private armWarmMediaOwner(connection: MoqtConnection, requestId: bigint): WarmMediaOwner | null {
+  private armWarmMediaOwner(connection: MoqtConnection, requestId: bigint, prefixStart?: { group: bigint; object: bigint }): WarmMediaOwner | null {
     const subscription = this.activeSubscriptions.get(requestId);
     if (!subscription) return null;
-    const owner: WarmMediaOwner = { connection, requestId, subscription, registration: null, head: null, prefixFetch: null };
+    const owner: WarmMediaOwner = { connection, requestId, subscription, registration: null, head: null, prefixFetch: null,
+      ...(prefixStart ? { prefixStart: { ...prefixStart } } : {}) };
     this.warmMediaOwners.set(subscription, owner);
     const head = new WarmStartHead<WarmMediaRoute>({
       clock: this.clock,
+      ...(prefixStart ? { prefixStart, maxObjects: 400,
+        onPrefixReady: () => {
+          const sw = this.pendingVideoSwitch;
+          if (sw?.connection === owner.connection && sw.newRequestId === owner.requestId
+              && this.usesMse(sw.newTrackPackaging) && this.cmafSwitchStagingBuffer.some(entry => entry.sync)) {
+            this.completePendingVideoSwitch();
+          }
+        },
+        onAbandon: () => {
+          const sw = this.pendingVideoSwitch;
+          if (sw?.connection === owner.connection && sw.newRequestId === owner.requestId
+              && this.usesMse(sw.newTrackPackaging) && !this.switchInProgress) {
+            // A partial history cannot become the fallback's independent head.
+            this.discardCmafStaging('warm start incomplete');
+            sw.liveRestart = true;
+          }
+          this.cancelWarmRange(owner);
+        } } : {}),
       isCurrent: () => this.warmMediaOwnerCurrent(owner),
       deliver: (route, delivery) => {
         route.permit({ kind: 'deliver', backfill: delivery.backfill, isLive: () => route.isLive() && delivery.isLive() });
@@ -1471,6 +1498,42 @@ export class MoqtPlayer {
     owner.head = head;
     if (!this.warmMediaOwnerCurrent(owner)) head.retire();
     return owner;
+  }
+
+  /** Retire only the bounded history request; its live subscription stays usable. */
+  private cancelWarmRange(owner: WarmMediaOwner): void {
+    if (!owner.prefixStart || owner.prefixCancelled) return;
+    owner.prefixCancelled = true;
+    const info = owner.prefixFetch;
+    owner.prefixFetch = null;
+    if (info && this.activeFetches.get(info.requestId) === info) this.quarantineFetchRequest(info.requestId);
+    try {
+      const work = owner.connection.draftVersion === 22 ? owner.connection.cancelFill(owner.requestId)
+        : info ? owner.connection.fetchCancel(info.requestId) : undefined;
+      void work?.catch(() => {});
+    } catch { /* A retired prefix cannot revoke the retained live subscription. */ }
+  }
+
+  private requestWarmRange(owner: WarmMediaOwner, trackName: string): void {
+    const start = owner.prefixStart;
+    if (!start || owner.prefixCancelled || !this.warmMediaOwnerCurrent(owner)) return;
+    let registered = false;
+    const register = (id: bigint): void => {
+      if (registered) return;
+      if (owner.prefixCancelled || !this.warmMediaOwnerCurrent(owner)) throw new Error('Switch history retired before emission');
+      registered = true;
+      this.registerMediaFetch(id, { trackName, mediaType: 'video', subscriptionRequestId: owner.requestId,
+        trackAlias: null, warmStart: true, warmOwner: owner }, owner.connection);
+    };
+    const failed = (): void => {
+      owner.head?.finishPrefix('error');
+      this.cancelWarmRange(owner);
+    };
+    try {
+      void owner.connection.joiningFetch({ joiningFetchType: 'absolute', joiningRequestId: owner.requestId,
+        joiningStart: start.group, groupOrder: 'ascending', onRequestId: register,
+      }).then(id => register(BigInt(id))).catch(failed);
+    } catch { failed(); }
   }
 
   private finishWarmMediaPrefix(info: Pick<MediaFetchInfo, 'connection' | 'warmOwner' | 'warmStart'>, terminal: 'fin' | 'reset' | 'error'): void {
@@ -1738,7 +1801,7 @@ export class MoqtPlayer {
 
   private quarantineFetchRequest(reqId: bigint): void {
     const info = this.activeFetches.get(reqId);
-    if (info) { info.retired = true; this.finishWarmMediaPrefix(info, 'error'); }
+    if (info) info.retired = true;
     this.activeFetches.delete(reqId);
     for (const [streamId, requestId] of this.fetchStreamRequestIds) {
       if (requestId !== reqId) continue;
@@ -1758,6 +1821,10 @@ export class MoqtPlayer {
         if (pending.terminal === undefined) this.droppedFetchStreams.add(streamId);
       }
     }
+    // Finishing an admission can synchronously cancel its transport and let
+    // application code replace the session. Complete all old map/tombstone
+    // mutations first; no bare request/stream IDs are used after this callback.
+    if (info) this.finishWarmMediaPrefix(info, 'error');
   }
   /** Entry-count bound for pendingFetchStreams (FIFO eviction of the oldest). */
   private static readonly MAX_PENDING_FETCH_STREAMS = 8;
@@ -1788,6 +1855,9 @@ export class MoqtPlayer {
     }
     try { this.reconsiderMseTrackEnds(); }
     catch (error) { try { this.log.warn('Track completion observer failed: %s', String(error)); } catch { /* observer failure */ } }
+    // A backend cancellation callback can reenter. Finish local retirement
+    // before invoking it, so it cannot remove a successor's registration.
+    if (warmOwner?.connection === conn) this.cancelWarmRange(warmOwner);
     return sub;
   }
 
@@ -3338,6 +3408,7 @@ export class MoqtPlayer {
       phase: 'preparing', requestReleased: false, failure: undefined, stagedBytes: 0, stagedObjects: 0, stagedSamples: 0, done, settle, reason,
       ...(abrAction ? { abrAction } : {}),
     };
+    this.revokeVideoSwitchRecovery();
     this.pendingVideoSwitch = sw;
     this.armVideoSwitchTimeout(sw, this.config.connectionTimeoutMs || SWITCH_STAGING_TIMEOUT_MS, true);
     this.emitQualityEvent('quality_switching', {
@@ -3421,8 +3492,34 @@ export class MoqtPlayer {
       const nameBytes = this.enc.encode(trackName);
       const currentGroup = this.videoPipeline?.currentGroupId ?? -1n;
       const nextGroup = currentGroup >= 0n ? currentGroup + 1n : undefined;
-      const subscribeOptions = nextGroup !== undefined
-        ? { subscriptionFilter: { type: 'AbsoluteStart' as const, startGroup: varint(nextGroup), startObject: varint(0n) } }
+      // One committed fragment proves only part of its Group. Retrieve that
+      // whole independent Group on the replacement, preserving its missing tail
+      // (CMSF §3.2/§3.4 align Group starts, not fragment completion).
+      const mseFloor = this.usesMse(currentTrack.packaging) && this.usesMse(targetTrack.packaging)
+        ? sw.oldSourceKey === undefined
+          ? sw.mediaSource?.getCommittedGroupFloor?.('video', sw.oldTrackName)
+          : sw.mediaSource?.getCommittedGroupFloor?.('video', sw.oldTrackName, sw.oldSourceKey)
+        : undefined;
+      if (!this.switchIsCurrent(sw)) return;
+      const startGroup = mseFloor ?? nextGroup;
+      // A subscription filter does not retrieve previously published media.
+      // Join the saved head (d18 §10.12.2), or request the initial fill (d22 §3.4).
+      const explicitFilter = this.config.subscriptionFilter !== undefined;
+      // An explicit caller filter owns the range; automatic gap repair must
+      // neither replace it nor add a historical request outside that intent.
+      const prefixStart = !explicitFilter && startGroup !== undefined && targetTrack.isLive === true
+        ? { group: startGroup, object: 0n } : undefined;
+      const fill = prefixStart !== undefined && isDraft22(switchConn.draftVersion);
+      let rangeOwner: WarmMediaOwner | null = null;
+      // Drafts 14/16 §9.16.2 require LargestObject for Joining FETCH.
+      // The FETCH still starts at the required group; the local prefix gate
+      // rejects live Objects below that floor when the publisher is behind it.
+      const legacyJoin = prefixStart !== undefined
+        && (switchConn.draftVersion === 14 || switchConn.draftVersion === 16);
+      const subscribeOptions = explicitFilter ? buildSubscribeOptions(this.config) : startGroup !== undefined
+        ? { subscriptionFilter: legacyJoin ? { type: 'LargestObject' as const }
+          : { type: 'AbsoluteStart' as const, startGroup: varint(startGroup), startObject: varint(0n) },
+          ...(fill ? { fill: { filter: { type: 'AbsoluteStart' as const, startGroup, startObject: 0n }, groupOrder: 'ascending' as const } } : {}) }
         : (buildSubscribeOptions(this.config) ?? defaultMediaSubscriptionFilter(targetTrack.isLive === true));
       const register = (id: bigint): void => {
         if (sw.newRequestId !== null) return;
@@ -3437,6 +3534,10 @@ export class MoqtPlayer {
         this.pendingAliasBinds.add(id);
         this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null, namespace: targetNamespace });
         this.pendingMediaSubs.set(id, { trackName, mediaType: 'video', packaging: sw.newTrackPackaging });
+        if (prefixStart) rangeOwner = this.armWarmMediaOwner(switchConn, id, prefixStart);
+        if (!this.switchIsCurrent(sw)) throw new Error('Switch retired during history preparation');
+        if (fill && rangeOwner) this.registerMediaFetch(id, { trackName, mediaType: 'video',
+          subscriptionRequestId: id, trackAlias: null, warmStart: true, warmOwner: rangeOwner }, switchConn);
       };
       const sending = switchConn.subscribe(nsBytes, nameBytes,
         { ...subscribeOptions, ...this.mediaTerminalOptions(switchConn), onRequestId: (id: bigint) => register(BigInt(id)) } as never,
@@ -3547,6 +3648,13 @@ export class MoqtPlayer {
     if (this.switchInProgress) return;
     const sw = this.pendingVideoSwitch;
     if (!sw || sw.newRequestId === null || !this.switchIsCurrent(sw)) return;
+    if (this.usesMse(sw.newTrackPackaging)) {
+      const subscription = this.activeSubscriptions.get(sw.newRequestId);
+      const owner = subscription ? this.warmMediaOwners.get(subscription) : undefined;
+      // FIN only closes reception. The head settles each async transform before
+      // reporting preparation complete, while the old output remains owned.
+      if (owner?.prefixStart && owner.head?.state === 'prefix') return;
+    }
     sw.phase = 'committing';
     this.switchInProgress = true;
 
@@ -3663,8 +3771,12 @@ export class MoqtPlayer {
     // the sync controller keeps the old track's timing reference, and the
     // keyframe wait gap (decoder in NEEDS_KEYFRAME, audio keeps playing)
     // becomes a permanent A/V offset.
+    const targetSubscription = sw.newRequestId === null ? undefined : this.activeSubscriptions.get(sw.newRequestId);
+    const retainedPrefix = targetSubscription !== undefined && this.warmMediaOwners.get(targetSubscription)?.prefixStart !== undefined;
     if (!this.audioTimingMapped && !this.videoTimingMapped) {
-      this.resetMediaClock();
+      // Keep the switch's existing sync policy, but do not revoke target
+      // inputs already retained by this owner-local history retrieval.
+      this.resetMediaClock(retainedPrefix);
     }
 
     this.log.info('[SWITCH] complete (sync): "%s" → "%s" (LOC staged=%d, firstGroup=%s)',
@@ -3711,11 +3823,31 @@ export class MoqtPlayer {
     let committed = false;
     try {
       if (!this.switchIsCurrent(sw)) return;
+      if (sw.liveRestart) {
+        // The restart may begin well past the outgoing media. Unless the media source can own
+        // that crossing, decline now, while the outgoing rendition is still the output.
+        const handle = source?.reserveSwitchRecovery?.({ mediaType: 'video', trackName: sw.newTrackName,
+          ...(sw.newSourceKey !== undefined ? { sourceKey: sw.newSourceKey } : {}) }) ?? null;
+        // The media source ran: this switch may have been cancelled or replaced meanwhile.
+        if (!this.switchIsCurrent(sw)) {
+          try { handle?.revoke(); } catch { /* Never installed; nothing else to undo. */ }
+          return;
+        }
+        if (!handle) throw new Error('Media source cannot recover a live restart of this video switch');
+        // Installing a pending switch already released its predecessor's handle, so none is normally held here.
+        // Releasing one calls the media source again, so this switch is rechecked before its own handle is kept.
+        this.revokeVideoSwitchRecovery();
+        if (!this.switchIsCurrent(sw)) {
+          try { handle.revoke(); } catch { /* Never installed; nothing else to undo. */ }
+          return;
+        }
+        this.videoSwitchRecovery = { owner: sw, handle };
+      }
       if (initData !== undefined) {
         if (source?.changeType) {
           if (previous === undefined) throw new Error('Cannot reconfigure video without its running initialization');
           const offset = source.getTimestampOffset?.('video');
-          if (!this.switchIsCurrent(sw)) return;
+          if (!this.switchIsCurrent(sw)) { this.revokeVideoSwitchRecovery(sw); return; }
           await this.applyMediaRetype(sw, { source, mediaType: 'video', codec: track.codec ?? '', next: initData,
             previousCodec, previous, offset });
         } else if (previous === undefined || !bytesEqual(previous, initData)
@@ -3724,6 +3856,7 @@ export class MoqtPlayer {
         }
       }
       if (!this.switchIsCurrent(sw)) {
+        this.revokeVideoSwitchRecovery(sw);
         await this.restorePendingRetypes(sw);
         if (this.pendingVideoSwitch === sw) this.abortPendingVideoSwitch(sw, sw.failure ?? new Error('Video switch retired'));
         return;
@@ -3750,9 +3883,11 @@ export class MoqtPlayer {
       if (initData !== undefined && source) this.installedCmafInit.set('video', { source, bytes: initData.slice() });
       this.unsubscribeOldVideoTrack(sw);
       this.currentVideoCodec = track.codec ?? null;
+      if (this.videoSwitchRecovery?.owner === sw) this.videoSwitchRecovery.handle.activate();
       this.flushCmafStagedBuffer(sw);
     } catch (error) {
       const cause = error instanceof Error ? error : new Error(String(error));
+      this.revokeVideoSwitchRecovery(sw);
       if (committed) {
         this.failCatalogPlayback(createPlayerError('fatal', 'decoder', PlayerErrorCode.VIDEO_DECODE_ERROR,
           'Video switch failed after retiring the previous rendition', { cause }));
@@ -3873,6 +4008,14 @@ export class MoqtPlayer {
     });
   }
 
+  /** End the held recovery; with `owner`, only if that switch holds it. Cleared before the media source is called. */
+  private revokeVideoSwitchRecovery(owner?: object): void {
+    const held = this.videoSwitchRecovery;
+    if (!held || (owner !== undefined && held.owner !== owner)) return;
+    this.videoSwitchRecovery = null;
+    try { held.handle.revoke(); } catch { /* A media source fault here must not interrupt teardown. */ }
+  }
+
   /**
    * Roll back a pending switch when the codec pivot can't proceed
    * (changeType rejected, or init bytes missing). The old track stays
@@ -3884,6 +4027,7 @@ export class MoqtPlayer {
     sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>, cause: Error,
   ): boolean {
     if (sw.phase === 'retired' || sw.phase === 'committed') return false;
+    this.revokeVideoSwitchRecovery(sw);
     sw.phase = 'retired';
     sw.failure = cause;
     sw.settle();
@@ -3906,6 +4050,7 @@ export class MoqtPlayer {
   }
 
   private abortPendingVideoSwitch(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>, cause: Error): void {
+    this.revokeVideoSwitchRecovery(sw);
     if (this.pendingVideoSwitch === sw && this.pendingRetypes.get('video')?.owner === sw) {
       sw.phase = 'restoring';
       sw.failure = cause;
@@ -6167,8 +6312,8 @@ export class MoqtPlayer {
     }
   }
 
-  private resetMediaClock(): void {
-    this.subscriptionManager?.invalidateMediaInputs();
+  private resetMediaClock(preserveMediaInputs = false): void {
+    if (!preserveMediaInputs) this.subscriptionManager?.invalidateMediaInputs();
     this.audioTimelineRecord = null;
     this.videoTimelineRecord = null;
     this.syncController?.reset();
@@ -8156,9 +8301,9 @@ export class MoqtPlayer {
     const refused = this.refusedFetchRequests.get(fetchReqId);
     if (refused) {
       info.retired = true;
-      this.finishWarmMediaPrefix(info, 'error');
       this.refusedFetchRequests.delete(fetchReqId);
       this.quarantineFetchRequest(fetchReqId);
+      this.finishWarmMediaPrefix(info, 'error');
       this.log.warn('[%s] media FETCH %s for "%s" was refused before registration: %s (code=0x%s) — continuing live-only',
         info.warmStart ? 'warm-start' : 'fetch',
         fetchReqId, info.trackName, refused.reason, refused.code.toString(16));
@@ -8174,8 +8319,9 @@ export class MoqtPlayer {
     const subscription = info.subscriptionRequestId === null
       ? undefined : this.activeSubscriptions.get(info.subscriptionRequestId);
     if (!subscription || info.warmOwner && subscription !== info.warmOwner.subscription) {
-      info.retired = true; this.finishWarmMediaPrefix(info, 'error');
+      info.retired = true;
       this.quarantineFetchRequest(fetchReqId);
+      this.finishWarmMediaPrefix(info, 'error');
       return;
     }
     info.trackAlias = subscription.trackAlias;
@@ -8207,11 +8353,11 @@ export class MoqtPlayer {
       }
       if (this.connection !== conn) return;
       if (pending.terminal !== undefined && this.activeFetches.get(fetchReqId) === info) {
-        this.finishWarmMediaPrefix(info, pending.terminal === 'fin' ? 'fin' : pending.terminal === 'reset' ? 'reset' : 'error');
-        // The stream already ended — however it ended, no live routing maps
-        // are needed and the fetch bookkeeping ends with it. Only the
-        // BOOTSTRAP path below needs the terminal to be a peer FIN.
+        // Retire request bookkeeping before admission/cancellation callbacks.
+        // The retained owner still carries this FIN's admitted work to completion.
         this.activeFetches.delete(fetchReqId);
+        this.finishWarmMediaPrefix(info, pending.terminal === 'fin' ? 'fin' : pending.terminal === 'reset' ? 'reset' : 'error');
+        if (this.connection !== conn) return;
       }
     }
   }
@@ -10159,6 +10305,7 @@ export class MoqtPlayer {
       this.cmafAssembler?.destroy();
       this.cmafAssembler = null;
       this.keyedCmafIdentity = false;
+      this.revokeVideoSwitchRecovery();
       this.mediaSource?.destroy();
       this.mediaSource = null;
       // Retire the buffers before releases can re-drain accepted appends. The
@@ -11998,6 +12145,8 @@ export class MoqtPlayer {
         if (owner?.connection === conn && subscription?.trackAlias !== null && subscription?.trackAlias !== undefined) {
           owner.registration = this.subscriptionManager?.captureRoute(subscription.trackAlias) ?? null;
           owner.head?.acceptLargest(largest);
+          if (owner.prefixStart && !isDraft22(conn.draftVersion) && largest
+              && largest.group >= owner.prefixStart.group) this.requestWarmRange(owner, _trackName);
         }
       },
       onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode) => {
@@ -12193,6 +12342,14 @@ export class MoqtPlayer {
       },
       onMediaFetchError: (requestId, errorReason, errorCode) => {
         const fetchInfo = this.activeFetches.get(requestId);
+        const warmOwner = fetchInfo?.warmOwner;
+        if (warmOwner?.connection === conn && warmOwner.prefixFetch === fetchInfo) {
+          // REQUEST_ERROR ends the FETCH (draft16 §5.2). Legacy callbacks can
+          // precede local session reclamation: abandonment must not send a
+          // FETCH_CANCEL after the peer has already refused this request.
+          warmOwner.prefixCancelled = true;
+          warmOwner.prefixFetch = null;
+        }
         if (!fetchInfo) {
           // Refusal raced the fetch()/joiningFetch() continuation — remember
           // it (bounded) so registration honors the refusal, and drop any
@@ -12824,6 +12981,7 @@ export class MoqtPlayer {
     this.recoveryController = pipelines.recoveryController;
     this.commandDispatcher = pipelines.commandDispatcher;
     owningDispatcher = pipelines.commandDispatcher;
+    this.revokeVideoSwitchRecovery();
     this.mediaSource = pipelines.mediaSource;
     this.bindLocDiagnostics(this.mediaDiagnosticRuntime);
     try { this.mediaDiagnosticRuntime?.bindMediaSource(this.mediaSource); } catch { /* Diagnostics are optional. */ }
@@ -14967,6 +15125,7 @@ export class MoqtPlayer {
         else finish();
       } catch (error) { fail(error); }
     };
+    this.revokeVideoSwitchRecovery();
     this.pendingVideoSwitch = sw;
     this.armVideoSwitchTimeout(sw, this.config.connectionTimeoutMs || SWITCH_STAGING_TIMEOUT_MS, true);
     try {
@@ -16079,6 +16238,8 @@ export class MoqtPlayer {
           void connection.unsubscribe(varint(id)).catch(() => {});
         }
         source.cancelStallEpisode?.();
+        // The seek now replaces the output; a refused or still-preparing seek leaves playback, and this, as they were.
+        this.revokeVideoSwitchRecovery();
       },
       adopt: owned => {
         // Transfer first: cleanup, observers and injected adapters may reenter.

@@ -17,6 +17,14 @@
   // `*.test.ts` corpus predates any typecheck gate and does not compile clean
   // under these options; widening this include is a separate cleanup.
   "include": [
+    "packages/player/src/player-switch-history-drain.test.ts",
+    "packages/player/src/player-switch-history-retirement.test.ts",
+    "packages/player/src/warm-start-range-boundaries.test.ts",
+    "packages/player/src/warm-start-range.test.ts",
+    "packages/player/src/player-switch-behind-live.loopback.test.ts",
+    "packages/player/src/player-switch-explicit-range.loopback.test.ts",
+    "packages/player/src/player-switch-partial-group-mse.loopback.test.ts",
+    "packages/player/src/player-switch-fallback-wide-hole-mse.loopback.test.ts",
     "packages/devtools/src/player.test.ts",
     "packages/browser/src/audio-output-timing-consumed-match.test.ts",
     "packages/player/src/loc-group-cadence.test.ts",
@@ -246,6 +254,7 @@
     "packages/transport/src/control/draft14-fetch-ok.test.ts",
     "packages/player/src/seek-cmaf-proof-budget.test.ts",
     "packages/browser/src/mse-seek.test.ts",
+    "packages/browser/src/mse-switch-recovery.test.ts",
     "packages/browser/src/mse-seek-initialize-ownership.test.ts",
     "packages/player/src/mse-seek-group-cut.loopback.test.ts",
     "packages/player/src/mse-seek-playback.test.ts",

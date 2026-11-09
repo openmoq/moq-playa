@@ -15,7 +15,7 @@
  * @module
  */
 
-import type { MediaSourceLike, MediaAppendToken, MediaAppendReason, MediaAppendObserver, MediaSeekResource, MediaSeekSample, VideoPlaybackQualityStats } from '@openmoq/player';
+import type { MediaSourceLike, MediaAppendToken, MediaAppendReason, MediaAppendObserver, MediaSeekResource, MediaSeekSample, MediaSwitchRecovery, VideoPlaybackQualityStats } from '@openmoq/player';
 import {
   filterInitSegment,
   describeBoxes,
@@ -31,6 +31,8 @@ import { mediaTrackIdentity } from './media-track-identity.js';
 interface AppendEntry {
   data: Uint8Array; trackName: string; trackIdentity: string; sourceKey?: string;
   groupId?: bigint; token?: MediaAppendToken;
+  /** Submission order across both queues. */
+  seq?: number;
   ranges?: readonly SegmentTimeRange[] | null;
   waitUntil?: number;
   waitStartedAt?: number;
@@ -39,6 +41,24 @@ interface AppendEntry {
 interface TrackTimeline {
   readonly trackName: string;
   readonly index: TimelineIndex;
+}
+type NativeRanges = Array<[number, number]>;
+/** See MediaSwitchRecovery. Times are seconds on the media element timeline, read from the native video SourceBuffer. */
+interface SwitchRecoveryState {
+  readonly handle: MediaSwitchRecovery;
+  readonly generation: number;
+  readonly trackIdentity: string;
+  /** End of the old video output under the playhead when reserved. */
+  readonly reservedEdge: number;
+  state: 'reserved' | 'activated' | 'binding' | 'armed';
+  /** Only entries submitted after activation may bind. */
+  afterSeq: number;
+  operation: BufferOperation | null;
+  before: NativeRanges | null;
+  playhead: number;
+  oldEdge: number;
+  boundStart: number;
+  timestampOffset: number;
 }
 interface AppendGapWait {
   entry: AppendEntry;
@@ -890,6 +910,9 @@ export class MseMediaSource implements MediaSourceLike {
    */
   private diagSeq = 0;
   private opSeq = 0;
+  /** Orders append submissions; distinct from the diagnostic ring's counter. */
+  private submitSeq = 0;
+  private switchRecovery: SwitchRecoveryState | null = null;
   /** Generation of the current SourceBuffer set; bumped on reset/destroy. */
   private bufferGen = 0;
   /** Ownership lasts through updateend, including the updating=false interval. */
@@ -1514,6 +1537,7 @@ export class MseMediaSource implements MediaSourceLike {
     const entry: AppendEntry = groupId === undefined ? { data, trackName, trackIdentity } : { data, trackName, trackIdentity, groupId };
     if (token !== undefined) entry.token = token;
     if (sourceKey !== undefined) entry.sourceKey = sourceKey;
+    entry.seq = ++this.submitSeq;
     return entry;
   }
 
@@ -1825,6 +1849,8 @@ export class MseMediaSource implements MediaSourceLike {
     if (!buffer) {
       throw new Error(`MseMediaSource.changeType: ${mediaType} SourceBuffer not initialized`);
     }
+    // The adoption prepares its target before activating; any later video reconfiguration is not its own.
+    if (mediaType === 'video' && this.switchRecovery && this.switchRecovery.state !== 'reserved') this.revokeSwitchRecovery();
     const sb = buffer as SourceBuffer & { changeType?: (mime: string) => void };
     const mimeType = `${mediaType}/mp4; codecs="${codec}"`;
     const retype = this.bufferMime[mediaType] !== mimeType;
@@ -1968,6 +1994,7 @@ export class MseMediaSource implements MediaSourceLike {
     if (!buffer) return;
     try {
       if (!this.bufferBusy(mediaType, buffer)) {
+        if (mediaType === 'video' && this.switchRecovery?.state === 'armed' && offset !== this.switchRecovery.timestampOffset) this.revokeSwitchRecovery();
         buffer.timestampOffset = offset;
       }
     } catch (err) {
@@ -2082,6 +2109,7 @@ export class MseMediaSource implements MediaSourceLike {
     }
     this.diag('reset (buffer generation %d → %d)', this.bufferGen, this.bufferGen + 1);
     this.bufferGen++;
+    this.revokeSwitchRecovery();
     this.appendQueueHold = null;
     this.clearAppendGap('video'); this.clearAppendGap('audio');
     this.clearReceivingGroups('video'); this.clearReceivingGroups('audio');
@@ -2150,6 +2178,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.cancelStallEpisode();
     this.diag('destroy');
     this.destroyed = true;
+    this.revokeSwitchRecovery();
     this.cancelStartup();
     if (this.wedgeTimer !== null) {
       clearInterval(this.wedgeTimer);
@@ -2930,6 +2959,114 @@ export class MseMediaSource implements MediaSourceLike {
 
   // ─── Buffered-hole gap-jump ──────────────────────────────────────
 
+  /** See {@link MediaSourceLike.reserveSwitchRecovery}. One reservation at a time; a new one replaces the last. */
+  reserveSwitchRecovery(target: { mediaType: 'video'; trackName: string; sourceKey?: string }): MediaSwitchRecovery | null {
+    if (this.destroyed || target.mediaType !== 'video' || !this.videoBuffer || this.gapJumpMs <= 0) return null;
+    // An owned seek that has not been released to playback still owns positioning.
+    if (this.seekResource && !this.seekResource.released) return null;
+    const ranges = this.nativeRanges(this.videoBuffer);
+    const old = MseMediaSource.rangeAtOrBelow(ranges, this.video.currentTime);
+    // Video already buffered ahead could absorb the target append without changing any range,
+    // leaving nothing to attribute it by.
+    if (!old || ranges!.some(range => range[0] > old[1])) return null;
+    this.revokeSwitchRecovery();
+    const handle: MediaSwitchRecovery = {
+      activate: () => {
+        if (this.switchRecovery !== record || record.state !== 'reserved') return;
+        record.state = 'activated'; record.afterSeq = this.submitSeq;
+      },
+      revoke: () => { this.revokeSwitchRecovery(record); },
+    };
+    const record: SwitchRecoveryState = { handle, generation: this.bufferGen, trackIdentity: mediaTrackIdentity(target.trackName, target.sourceKey),
+      reservedEdge: old[1], state: 'reserved', afterSeq: 0, operation: null, before: null, playhead: 0, oldEdge: 0, boundStart: 0, timestampOffset: 0 };
+    this.switchRecovery = record;
+    return handle;
+  }
+
+  /** Ends the outstanding reservation, or only `record` when given. Nothing is crossed afterwards. */
+  private revokeSwitchRecovery(record?: SwitchRecoveryState): void {
+    if (record === undefined || this.switchRecovery === record) this.switchRecovery = null;
+  }
+
+  private nativeRanges(buffer: SourceBuffer | null): NativeRanges | null {
+    if (!buffer) return null;
+    try {
+      const ranges = buffer.buffered;
+      return Array.from({ length: ranges.length }, (_, i) => [ranges.start(i), ranges.end(i)] as [number, number]);
+    } catch { return null; }
+  }
+
+  /** The range under the playhead, else the nearest one that starts below it. */
+  private static rangeAtOrBelow(ranges: NativeRanges | null, time: number): [number, number] | null {
+    let found: [number, number] | null = null;
+    for (const range of ranges ?? []) if (range[0] <= time + MseMediaSource.GAP_IDENTITY_TOLERANCE_SEC) found = range;
+    return found;
+  }
+
+  /** The activated reservation when `entry` is the append it binds to; records the ranges before the native call. */
+  private switchRecoveryBinding(entry: AppendEntry, buffer: SourceBuffer): SwitchRecoveryState | null {
+    const record = this.switchRecovery;
+    if (!record || record.state !== 'activated' || entry.trackIdentity !== record.trackIdentity
+        || entry.seq === undefined || entry.seq <= record.afterSeq) return null;
+    const before = record.generation === this.bufferGen ? this.nativeRanges(buffer) : null;
+    if (!before) { this.revokeSwitchRecovery(record); return null; }
+    record.before = before; record.playhead = this.video.currentTime;
+    return record;
+  }
+
+  /**
+   * A video operation ended. For the bound append, arm only when it created
+   * exactly one new range that starts its own native range ahead of the old
+   * output; an append that changed no range proves nothing about where it
+   * landed and is not bound. Once armed, a fill that joins both edges uses
+   * the reservation up without a seek.
+   */
+  private settleSwitchRecovery(record: SwitchRecoveryState, completing: BufferOperation | null, appended: boolean): void {
+    const tol = MseMediaSource.GAP_IDENTITY_TOLERANCE_SEC;
+    const after = this.nativeRanges(this.videoBuffer);
+    if (record.state === 'armed') {
+      if (appended && after?.some(([start, end]) => start <= record.oldEdge + tol && end > record.boundStart)) this.revokeSwitchRecovery(record);
+      return;
+    }
+    if (record.state !== 'binding' || completing === null || record.operation !== completing) return;
+    record.operation = null;
+    const before = record.before; record.before = null;
+    const old = MseMediaSource.rangeAtOrBelow(before, record.playhead);
+    if (!appended || !after || !before || !old || record.generation !== this.bufferGen || old[1] < record.reservedEdge - tol
+        || !before.every(([start, end]) => after.some(([s, e]) => s <= start + tol && e >= end - tol))) {
+      this.revokeSwitchRecovery(record); return;
+    }
+    const added: NativeRanges = [];
+    for (const [start, end] of after) {
+      let at = start;
+      for (const [s, e] of before) {
+        if (e <= at || s >= end) continue;
+        if (s - at > tol) added.push([at, s]);
+        at = Math.max(at, e);
+      }
+      if (end - at > tol) added.push([at, end]);
+    }
+    const start = added.length === 1 ? added[0]![0] : null;
+    // Contiguous with the old output: no hole. Otherwise it must begin a native range of its own, ahead.
+    if (start === null || start <= old[1] + tol || !after.some(range => Math.abs(range[0] - start) <= tol)) {
+      this.revokeSwitchRecovery(record); return;
+    }
+    record.oldEdge = old[1]; record.boundStart = start;
+    record.timestampOffset = this.videoBuffer?.timestampOffset ?? 0;
+    record.state = 'armed';
+  }
+
+  /** Whether the armed reservation owns exactly this hole, re-read from the native buffers now. */
+  private switchRecoveryCovers(curEnd: number, nextStart: number): boolean {
+    const record = this.switchRecovery, tol = MseMediaSource.GAP_IDENTITY_TOLERANCE_SEC;
+    if (!record || record.state !== 'armed' || record.generation !== this.bufferGen || Math.abs(curEnd - record.oldEdge) > tol) return false;
+    const bound = this.nativeRanges(this.videoBuffer)?.find(range => Math.abs(range[0] - record.boundStart) <= tol);
+    if (!bound) { this.revokeSwitchRecovery(record); return false; }
+    if (nextStart < bound[0] - tol || nextStart >= bound[1]) return false;
+    return !this.audioBuffer
+      || (this.nativeRanges(this.audioBuffer)?.some(([start, end]) => start <= nextStart + tol && end > nextStart) ?? false);
+  }
+
   /** Drop the armed hole candidate (wait restarts on the next sighting). */
   private disarmGap(): void {
     this.gapCandidate = null;
@@ -3045,6 +3182,7 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
     const ct = v.currentTime;
+    if (this.switchRecovery?.state === 'armed' && ct > this.switchRecovery.boundStart) this.switchRecovery = null;
     const quality = this.getVideoPlaybackQuality();
     if (this.destroyed || generation !== this.bufferGen || !this.playTriggered || !this.playbackIntent || v.paused || v.seeking) return;
     const qualityMoved = quality !== null && this.gapLastQuality !== null
@@ -3138,7 +3276,8 @@ export class MseMediaSource implements MediaSourceLike {
     // Unjumpable width: warn once; escalate once if it persists.
     // Strictly the advertised bound; 1e-9 guards float subtraction noise
     // only — the 10ms identity tolerance must never widen the policy.
-    if (holeSec > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9) {
+    const wide = holeSec > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9;
+    if (wide && !this.switchRecoveryCovers(curEnd!, nextStart!)) {
       if (!c.wideWarned) {
         c.wideWarned = true;
         this.logWarn(
@@ -3183,6 +3322,7 @@ export class MseMediaSource implements MediaSourceLike {
     const stallDur = nowMs - (this.stallStartTime ?? c.armedAtMs);
 
     // Commit first…
+    if (wide) this.switchRecovery = null; // one crossing
     this.gapCandidate = null;
     this.gapLastPlayheadTime = null;
     this.gapLastQuality = null;
@@ -3484,6 +3624,7 @@ export class MseMediaSource implements MediaSourceLike {
   private handleWatchdogSeek = (): void => {
     if (this.wedgeSeekTarget !== null
         && Math.abs(this.video.currentTime - this.wedgeSeekTarget) <= MseMediaSource.GAP_MOVE_TOLERANCE_SEC) return;
+    this.revokeSwitchRecovery();
     this.handleWatchdogSeeked();
     this.wedgeLastTime = null;
     this.wedgeFrozenSinceMs = null;
@@ -3512,6 +3653,7 @@ export class MseMediaSource implements MediaSourceLike {
    * and the wedge could persist indefinitely behind periodic seeks.
    */
   private noteSelfSeek(): void {
+    this.revokeSwitchRecovery();
     this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
     if (this.wedgeLastTime !== null) this.wedgeLastTime = this.video.currentTime;
   }
@@ -3683,9 +3825,12 @@ export class MseMediaSource implements MediaSourceLike {
       this.pendingAudioGroupId = groupId;
     }
 
+    const binding = mediaType === 'video' ? this.switchRecoveryBinding(entry, buffer) : null;
     try {
-      this.runMutation(mediaType, 'append', () => buffer.appendBuffer(data.buffer as ArrayBuffer), token);
+      const operation = this.runMutation(mediaType, 'append', () => buffer.appendBuffer(data.buffer as ArrayBuffer), token);
+      if (binding) { binding.operation = operation; binding.state = 'binding'; }
     } catch (err) {
+      if (binding) this.revokeSwitchRecovery(binding);
       // runMutation already recorded mutation-sync-failure.
       this.pendingGapSkip[mediaType] = false;
       // Synchronous throw — the append never happened. Clear pending
@@ -3847,8 +3992,10 @@ export class MseMediaSource implements MediaSourceLike {
       }
     }
 
-    if (completing?.cause === 'append' && completing.succeeded === true
-        && !completing.errored && !completing.aborted && !this.appendErrored[mediaType]) {
+    const appended = completing?.cause === 'append' && completing.succeeded === true
+      && !completing.errored && !completing.aborted && !this.appendErrored[mediaType];
+    if (mediaType === 'video' && this.switchRecovery) this.settleSwitchRecovery(this.switchRecovery, completing, appended);
+    if (appended) {
       const pending =
         mediaType === 'video' ? this.pendingVideoRanges : this.pendingAudioRanges;
       const pendingTrack =

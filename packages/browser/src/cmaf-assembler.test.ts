@@ -1141,6 +1141,102 @@ describe('CmafAssembler — shared cross-track epoch (RED5DEV-2315)', () => {
       .toEqual([0n, BigInt(VIDEO_TS), BigInt(2 * VIDEO_TS), BigInt(3 * VIDEO_TS)]);
   });
 
+  it.each([false, true])('preserves aligned replacement overlap after restart=%s', restarted => {
+    const onSegment = vi.fn();
+    const assembler = new CmafAssembler({ onSegment });
+    assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+    const segment = (bmd: number, sequence: number) =>
+      concat(buildMoof(bmd, sequence, VIDEO_TS), buildMdat(new Uint8Array([sequence])));
+    assembler.push('video', 'videoA', 100n, segment(10 * VIDEO_TS, 1));
+    assembler.push('video', 'videoA', 101n, segment(11 * VIDEO_TS, 2));
+    if (restarted) assembler.push('video', 'videoA', 102n, segment(0, 3));
+    const sourceStart = restarted ? 0 : 11 * VIDEO_TS;
+    const previousStart = outBmd(onSegment, onSegment.mock.calls.length - 1);
+    assembler.selectTrack('video', 'videoB');
+    assembler.push('video', 'videoB', restarted ? 102n : 101n, segment(sourceStart, 4));
+    assembler.push('video', 'videoB', 103n, segment(sourceStart + VIDEO_TS, 5));
+    expect(outBmd(onSegment, onSegment.mock.calls.length - 2)).toBe(previousStart);
+    expect(outBmd(onSegment, onSegment.mock.calls.length - 1)).toBe(previousStart + BigInt(VIDEO_TS));
+  });
+
+  it.each([90000, 60000])('keeps a startup-clamped video mapping across an aligned switch to %s ticks', targetScale => {
+    const { assembler, onSegment } = assemblerWithInits();
+    const segment = (bmd: number, duration: number, sequence: number) =>
+      concat(buildMoof(bmd, sequence, duration), buildMdat(new Uint8Array([sequence])));
+    assembler.push('audio', 'audio0', 4n, segment(24 * AUDIO_TS + 4096, AUDIO_TS / 2, 1));
+    assembler.push('video', 'videoA', 4n, segment(24 * VIDEO_TS, VIDEO_TS / 2, 2));
+    assembler.push('video', 'videoA', 5n, segment(30.5 * VIDEO_TS, VIDEO_TS / 2, 3));
+    expect(outBmd(onSegment, 2)).toBe(BigInt(6.5 * VIDEO_TS));
+    assembler.setInitSegment('video', initWithTimescale(targetScale));
+    assembler.selectTrack('video', 'videoB');
+    assembler.push('video', 'videoB', 5n, segment(30 * targetScale, targetScale / 2, 4));
+    assembler.push('video', 'videoB', 5n, segment(30.5 * targetScale, targetScale / 2, 5));
+    expect(outBmd(onSegment, 3)).toBe(BigInt(6 * targetScale));
+    expect(outBmd(onSegment, 4)).toBe(BigInt(6.5 * targetScale));
+    assembler.push('audio', 'audio0', 5n, segment(30 * AUDIO_TS + 4096, AUDIO_TS / 2, 6));
+    expect(outBmd(onSegment, 5)).toBe(BigInt(6 * AUDIO_TS));
+  });
+
+  it('keeps the video continuation offset when an aligned switch follows an asymmetric restart', () => {
+    const { assembler, onSegment } = assemblerWithInits();
+    const segment = (bmd: number, duration: number, sequence: number) =>
+      concat(buildMoof(bmd, sequence, duration), buildMdat(new Uint8Array([sequence])));
+    assembler.push('audio', 'audio0', 100n, segment(100 * AUDIO_TS, AUDIO_TS, 1));
+    assembler.push('video', 'videoA', 100n, segment(100.75 * VIDEO_TS, VIDEO_TS, 2));
+    assembler.push('audio', 'audio0', 101n, segment(101 * AUDIO_TS, AUDIO_TS, 3));
+    assembler.push('video', 'videoA', 102n, segment(102.75 * VIDEO_TS, VIDEO_TS, 4));
+    assembler.push('audio', 'audio0', 103n, segment(AUDIO_TS, AUDIO_TS, 5));
+    assembler.push('video', 'videoA', 103n, segment(1.75 * VIDEO_TS, VIDEO_TS, 6));
+    expect(outBmd(onSegment, 5)).toBe(BigInt(3.75 * VIDEO_TS));
+    assembler.selectTrack('video', 'videoB');
+    assembler.push('video', 'videoB', 103n, segment(1.75 * VIDEO_TS, VIDEO_TS, 7));
+    expect(outBmd(onSegment, 6)).toBe(BigInt(3.75 * VIDEO_TS));
+  });
+
+  it('adopts a newer shared epoch when switching before video has observed the restart', () => {
+    const { assembler, onSegment } = assemblerWithInits();
+    const segment = (bmd: number, duration: number, sequence: number) =>
+      concat(buildMoof(bmd, sequence, duration), buildMdat(new Uint8Array([sequence])));
+    assembler.push('audio', 'audio0', 100n, segment(100 * AUDIO_TS, AUDIO_TS, 1));
+    assembler.push('video', 'videoA', 100n, segment(100.75 * VIDEO_TS, VIDEO_TS, 2));
+    assembler.push('audio', 'audio0', 101n, segment(101 * AUDIO_TS, AUDIO_TS, 3));
+    assembler.push('audio', 'audio0', 102n, segment(AUDIO_TS, AUDIO_TS, 4));
+    assembler.selectTrack('video', 'videoB');
+    assembler.push('video', 'videoB', 102n, segment(1.75 * VIDEO_TS, VIDEO_TS, 5));
+    expect(outBmd(onSegment, 4)).toBe(BigInt(2.75 * VIDEO_TS));
+  });
+
+  it.each([false, true])('reanchors an unknown-unit video epoch when a replacement init arrives (shared audio=%s)', audioFirst => {
+    const onSegment = vi.fn();
+    const assembler = new CmafAssembler({ onSegment });
+    const segment = (bmd: number, duration: number) =>
+      concat(buildMoof(bmd, 1, duration), buildMdat(new Uint8Array([1])));
+    if (audioFirst) {
+      assembler.setInitSegment('audio', initWithTimescale(AUDIO_TS));
+      assembler.push('audio', 'audio0', 0n, segment(AUDIO_TS, AUDIO_TS / 2));
+    }
+    assembler.push('video', 'videoA', 0n, segment(90000, 45000));
+    assembler.setInitSegment('video', initWithTimescale(60000));
+    assembler.selectTrack('video', 'videoB');
+    assembler.push('video', 'videoB', 0n, segment(60000, 30000));
+    expect(onSegment).toHaveBeenCalledTimes(audioFirst ? 3 : 2);
+    expect(outBmd(onSegment, onSegment.mock.calls.length - 1)).toBe(0n);
+  });
+
+  it('does not preserve epoch units across an unknown-timescale initialization', () => {
+    const onSegment = vi.fn();
+    const assembler = new CmafAssembler({ onSegment });
+    const segment = (bmd: number) => concat(buildMoof(bmd, 1, 30000), buildMdat(new Uint8Array([1])));
+    assembler.setInitSegment('video', initWithTimescale(90000));
+    assembler.push('video', 'videoA', 0n, segment(90000));
+    assembler.setInitSegment('video', new Uint8Array());
+    assembler.setInitSegment('video', initWithTimescale(60000));
+    assembler.selectTrack('video', 'videoB');
+    assembler.push('video', 'videoB', 0n, segment(60000));
+    expect(onSegment).toHaveBeenCalledTimes(2);
+    expect(outBmd(onSegment, 1)).toBe(0n);
+  });
+
   it('reset clears an explicitly selected track', () => {
     const onSegment = vi.fn();
     const assembler = new CmafAssembler({ onSegment });

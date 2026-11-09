@@ -131,6 +131,7 @@ export type {
   AudioOutputLike,
   MediaSourceLike,
   MediaSeekResource,
+  MediaSwitchRecovery,
   MediaSeekSample,
   MediaAppendQueueLease,
   CmafSourceReceipt,

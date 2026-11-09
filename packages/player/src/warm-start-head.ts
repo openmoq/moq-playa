@@ -14,13 +14,17 @@
  * item's terminal outcome: this helper calls discard ONLY for unstarted items.
  * A fulfilled delivery promise proves settlement, not append/decode success.
  *
- * Only [Largest.group:0, Largest] is made contiguous. Afterwards a bounded live
+ * By default only [Largest.group:0, Largest] is made contiguous. An explicit
+ * prefixStart retains a bounded multi-group range until retrieval FIN, then
+ * drains its available Objects in Location order; FIN is not a decoding proof.
+ * Afterwards a bounded live
  * handoff selects held items in location order, then ordinary live delivery
  * passes directly through. An arrival cannot reorder already dispatched live
  * data; repairs outside the prefix remain the caller's normal gap policy.
  * A compact prefix fence remains; steady-state gap policy stays in LOC
- * and MSE. Expiry/failure abandons the head group and waits for a future live
- * group at object 0 classified as group-start by its caller. Group-start means
+ * and MSE. Expiry/failure waits for a live group at object 0 beyond the
+ * abandoned head, except an explicit finite range with no dispatched history
+ * may restart inside that range. Group-start means
  * nonempty DATA at object 0; the format pipeline still validates independence.
  * EOG and other gaps are ordinary, never a restart. Unknown-Largest failure
  * discards data until a cutoff or empty is supplied.
@@ -71,10 +75,16 @@ export interface WarmStartDelivery {
 
 export interface WarmStartHeadOptions<T> {
   readonly clock: ClockSource;
+  /** Optional finite range. Unlike the current-group default, it requires FIN
+   * before delivery: the requested ascending FETCH range is complete only at
+   * FIN (draft18 §10.12). Bounds and fallback policy remain receiver choices. */
+  readonly prefixStart?: WarmStartLocation;
   /** Pure ownership predicate, independent of diagnostic attachment. */
   readonly isCurrent: () => boolean;
   readonly deliver: (value: T, delivery: WarmStartDelivery) => void | Promise<void>;
   readonly discard: (value: T, reason: WarmStartDiscardReason) => void;
+  /** Finite prefix deliveries have settled; this does not prove decode or append. */
+  readonly onPrefixReady?: () => void;
   readonly onAbandon?: (reason: WarmStartAbandonReason) => void;
   readonly onError?: (error: unknown) => void;
   readonly maxWaitUs?: number;
@@ -104,6 +114,8 @@ export class WarmStartHead<T> {
   private phase: WarmStartPhase = 'prefix';
   private largest: WarmStartLocation | null | undefined;
   private nextObject = 0n;
+  private readonly prefixStart: WarmStartLocation | undefined;
+  private lastPrefix: WarmStartLocation | null = null;
   private prefixFin = false;
   private abandoned = false;
   private minimumGroup: bigint | null = null;
@@ -123,6 +135,8 @@ export class WarmStartHead<T> {
   private readonly maxBytes: number;
 
   constructor(private readonly options: WarmStartHeadOptions<T>) {
+    if (options.prefixStart !== undefined) checkLocation(options.prefixStart);
+    this.prefixStart = options.prefixStart === undefined ? undefined : { ...options.prefixStart };
     const integer = (name: string, value: number, minimum: number) => {
       if (!Number.isSafeInteger(value) || value < minimum) throw new TypeError(`${name} must be a safe integer >= ${minimum}`);
       return value;
@@ -154,7 +168,7 @@ export class WarmStartHead<T> {
       throw new Error('Warm-start Largest Location was already accepted');
     }
     this.largest = location === null ? null : { ...location };
-    if (location === null) {
+    if (location === null || this.prefixStart && compare(location, this.prefixStart) < 0) {
       this.phase = 'handoff';
       this.clearTimer();
     }
@@ -236,17 +250,26 @@ export class WarmStartHead<T> {
     return false;
   }
 
+  /** No delivered prefix can be rewound. Before any finite-prefix dispatch,
+   * a live group can still restart inside the requested range; the fallback
+   * pump and format pipeline must establish the independent starting point. */
+  private canRestartWithinRange(item: WarmStartItem<T>): boolean {
+    return this.abandoned && this.prefixStart !== undefined && this.lastPrefix === null && item.source === 'live';
+  }
+
   private rejection(item: WarmStartItem<T>): WarmStartDiscardReason | null {
     const largest = this.largest;
     if (this.phase === 'retired') return 'retired';
+    if (this.prefixStart && compare(item, this.prefixStart) < 0) return 'outside prefix';
+    if (this.lastPrefix && this.phase === 'prefix' && compare(item, this.lastPrefix) <= 0) return 'duplicate';
     if (this.abandoned && largest === undefined) return 'awaiting largest';
     if (this.minimumGroup !== null && item.group < this.minimumGroup) return 'stale prefix';
-    if (largest && this.abandoned && item.group <= largest.group) return 'stale prefix';
-    if (largest && this.phase !== 'prefix' && compare(item, largest) <= 0) return 'stale prefix';
-    if (this.phase === 'prefix' && largest && item.group === largest.group && item.object < this.nextObject) return 'duplicate';
+    if (largest && this.abandoned && !this.canRestartWithinRange(item) && item.group <= largest.group) return 'stale prefix';
+    if (largest && this.phase !== 'prefix' && !this.canRestartWithinRange(item) && compare(item, largest) <= 0) return 'stale prefix';
+    if (!this.prefixStart && this.phase === 'prefix' && largest && item.group === largest.group && item.object < this.nextObject) return 'duplicate';
     if (item.source === 'prefix' && (this.phase !== 'prefix' || largest === null
-        || largest !== undefined && (item.group !== largest.group || item.object > largest.object))) return 'outside prefix';
-    if (this.phase === 'prefix' && largest && item.group < largest.group) return 'stale prefix';
+        || largest !== undefined && (this.prefixStart ? compare(item, largest) > 0 : item.group !== largest.group || item.object > largest.object))) return 'outside prefix';
+    if (!this.prefixStart && this.phase === 'prefix' && largest && item.group < largest.group) return 'stale prefix';
     return null;
   }
 
@@ -299,7 +322,8 @@ export class WarmStartHead<T> {
     const dropped = this.takeAll();
     const keep: WarmStartItem<T>[] = [];
     for (const item of dropped) {
-      if (this.largest && item.source === 'live' && item.group > this.largest.group) keep.push(item);
+      if (this.largest && item.source === 'live'
+          && (item.group > this.largest.group || this.canRestartWithinRange(item))) keep.push(item);
     }
     const kept = new Set(keep);
     for (const item of keep) { this.queued.set(this.key(item), item); this.queuedBytes += item.bytes; }
@@ -320,6 +344,19 @@ export class WarmStartHead<T> {
         if (this.phase === 'prefix') {
           const largest = this.largest;
           if (largest === undefined || largest === null) return;
+          if (this.prefixStart) {
+            if (!this.prefixFin) return;
+            const retained = [...this.queued.values()].filter(item => compare(item, largest) <= 0);
+            if (this.terminal && compare(this.terminal, largest) <= 0) retained.push(this.terminal);
+            const item = retained.sort(compare)[0];
+            if (!item) {
+              this.phase = 'handoff'; this.clearTimer(); this.removeRejected();
+              if (this.current()) this.notify(() => this.options.onPrefixReady?.());
+              continue;
+            }
+            this.start(item, true);
+            continue;
+          }
           if (this.nextObject > largest.object) {
             this.phase = 'handoff'; this.clearTimer(); this.removeRejected(); continue;
           }
@@ -368,6 +405,9 @@ export class WarmStartHead<T> {
     const op: Delivery<T> = { item, generation: this.generation, prefix };
     this.deliveries.add(op); this.deliveryBytes += item.bytes;
     this.active = op;
+    // Establish the dispatch fence before external delivery: an overlapping
+    // live arrival during an await/reentrant callback cannot move us backwards.
+    if (prefix && this.prefixStart) this.lastPrefix = { group: item.group, object: item.object };
     try {
       const result = this.options.deliver(item.value, { backfill: item.source === 'prefix',
         isLive: item.continuation === 'terminal' ? () => this.current() : () => this.valid(op.generation) });
@@ -389,7 +429,7 @@ export class WarmStartHead<T> {
     const current = this.valid(op.generation);
     if (current) {
       if (failure) this.abandon('error');
-      else if (op.prefix) this.nextObject++;
+      else if (op.prefix && !this.prefixStart) this.nextObject++;
     }
     if (failure && current) this.error(failure.error);
     this.pump();
