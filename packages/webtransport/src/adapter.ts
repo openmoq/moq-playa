@@ -790,6 +790,7 @@ export class MoqtConnection {
     this.draft16NamespaceContexts.clear();
     this.objectReceiptObservers = undefined;
     this.reboundSubscribers = undefined;
+    this.reboundAliases = undefined;
     this.authorization?.close();
     this.authorizationUpdateTails.clear();
     const incomingUniRouter = this.incomingUniRouter;
@@ -2489,7 +2490,7 @@ export class MoqtConnection {
     const stampedOk = { ...message, requestId } as ControlMessage;
     // The old generation's complete guard (if any) is safe to clear now.
     if (this.terminatedAliases.get(alias)?.strict === false) {
-      (this.reboundSubscribers ??= new WeakSet()).add(this.session.getSubscription(requestId)!);
+      this.markRebound(alias, this.session.getSubscription(requestId)!);
     }
     this.clearTerminatedAlias(alias, true);
     const suppress = this.handleRawSubControlMessage(stampedOk);
@@ -3074,6 +3075,7 @@ export class MoqtConnection {
     retained.cancelTimer();
     await this.cancelFill(requestId);
     if (this._terminated) return;
+    if (retained.sub.trackAlias !== undefined) this.pruneReboundAlias(retained.sub.trackAlias);
     const cfg = this.drainConfigs.get(requestId);
     this.drainConfigs.delete(requestId);
     try { cfg?.onDrained?.(requestId); }
@@ -3136,12 +3138,33 @@ export class MoqtConnection {
   // retain their existing per-receipt behavior. No history or timer is retained
   // after the owner is reclaimed.
   private reboundSubscribers: WeakSet<SubscriptionStateMachine> | undefined;
+  /**
+   * Aliases that may still have a rebound owner, so objects on every other
+   * alias skip the owner lookup. An alias leaves once no owner is rebound.
+   */
+  private reboundAliases: Set<bigint> | undefined;
+
+  private markRebound(alias: bigint, owner: SubscriptionStateMachine): void {
+    (this.reboundSubscribers ??= new WeakSet()).add(owner);
+    (this.reboundAliases ??= new Set()).add(alias);
+  }
+
+  /** Reclaim quiet aliases without removing a paused or shared successor's fence. */
+  private pruneReboundAlias(alias: bigint): void {
+    if (this.reboundAliases?.has(alias)
+        && !this.session.getSubscriberRequestsForAlias(alias).some(owner => this.reboundSubscribers?.has(owner))) {
+      this.reboundAliases.delete(alias);
+    }
+  }
 
   private reboundAllowsObject(alias: bigint, group: bigint, object: bigint): boolean {
     const rebound = this.reboundSubscribers;
-    if (!rebound) return true;
+    if (!rebound || this.reboundAliases?.has(alias) !== true) return true;
     const owners = this.session.getSubscriberRequestsForAlias(alias);
-    if (!owners.some(owner => rebound.has(owner))) return true;
+    if (!owners.some(owner => rebound.has(owner))) {
+      this.reboundAliases.delete(alias);
+      return true;
+    }
     return owners.some(owner => owner.isActive
       && (!owner.locationWindow || windowContains(owner.locationWindow, group, object)));
   }
@@ -3585,6 +3608,8 @@ export class MoqtConnection {
   private clearTerminatedAlias(alias: bigint, binding = false): void {
     const t = this.terminatedAliases.get(alias);
     if (t) { t.cancelTimer(); this.terminatedAliases.delete(alias); }
+    // Preserve the index while a paused or shared rebound owner remains.
+    this.pruneReboundAlias(alias);
     if (!t && isDraft22(this.session.draftVersion) && this.deliverySubscribers22(alias).length > 1) return;
     if (!binding || t) this.aliasStreamsSeen.delete(alias);
     this.aliasTerminalTotals.delete(alias);
@@ -3725,6 +3750,7 @@ export class MoqtConnection {
     for (const [id, retained] of [...this.terminalSubscribers]) {
       if (retained.sub.trackAlias === alias) await this.finishTerminalSubscriber(id);
     }
+    this.pruneReboundAlias(alias);
     // Deliberately NO tombstone: the drain window WAS the §10.11 retention.
     // The alias is now free, and a same-alias stream arriving next may be the
     // REUSED alias's first data (racing its SUBSCRIBE_OK) — it must reach the
@@ -7268,7 +7294,7 @@ export class MoqtConnection {
     }
     // The old generation's complete guard (if any) is safe to clear now.
     if (this.terminatedAliases.get(pubAlias)?.strict === false) {
-      (this.reboundSubscribers ??= new WeakSet()).add(this.session.getIncomingSubscription(requestId)!);
+      this.markRebound(pubAlias, this.session.getIncomingSubscription(requestId)!);
     }
     this.clearTerminatedAlias(pubAlias, true);
     const incoming: IncomingPublish = {
