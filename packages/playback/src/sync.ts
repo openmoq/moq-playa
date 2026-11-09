@@ -256,6 +256,31 @@ export class SyncController {
         this.localBaselineUs += byUs;
     }
 
+    /**
+     * Move the established timeline earlier by `byUs` — the inverse of
+     * {@link slipReference}: playout latency delivery no longer needs is
+     * given back, for audio and video alike. Media now behind the timeline
+     * is late; the caller decides what to keep. No-op without a reference,
+     * or for a non-positive amount.
+     */
+    advanceReference(byUs: number): void {
+        if (this.localBaselineUs === undefined || !(byUs > 0)) return;
+        this.localBaselineUs -= byUs;
+    }
+
+    /**
+     * The capture time (µs) the timeline maps to the current local time: where
+     * playout is. Null without a reference. Excludes the video join offset,
+     * which only delays video against this timeline.
+     */
+    playheadCaptureUs(): number | null {
+        if (this.localBaselineUs === undefined || this.captureBaselineUs === undefined) return null;
+        const revision = this.referenceRevision;
+        const now = this.clock.now();
+        if (revision !== this.referenceRevision || this.localBaselineUs === undefined || this.captureBaselineUs === undefined) return null;
+        return Number(this.captureBaselineUs) + (now - this.localBaselineUs);
+    }
+
     /** Current video join offset in microseconds. 0 = no offset active. */
     get videoJoinOffsetUs(): number {
         return this._videoJoinOffsetUs;

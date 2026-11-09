@@ -439,6 +439,10 @@ interface Scenario {
   readonly playerConfig?: Partial<MoqtPlayerConfig>;
   /** Draft the relay speaks (default 16). */
   readonly draft?: 16 | 22;
+  /** LOC: the mock decoder outputs each frame, so the renderer sees render times. */
+  readonly decoderOutput?: boolean;
+  /** Slip the player's playout clock by this much at this time, as absorbing late audio does. */
+  readonly slipAt?: { readonly atUs: number; readonly byUs: number };
   /** How the relay answers a Joining FETCH (default 'serve'). */
   readonly joiningFetch?: 'serve' | 'refuse' | 'stall';
   /** Whether the relay honours subscriber priority (default true). */
@@ -472,6 +476,12 @@ interface Run {
   readonly assembledGroups: ReadonlyMap<string, readonly bigint[]>;
   /** CMAF: the first chunk handed to the assembler per track — its group, and whether it starts with a sync sample. */
   readonly firstAssembled: ReadonlyMap<string, { readonly group: bigint; readonly sync: boolean }>;
+  /** LOC with `decoderOutput`: each frame's playout latency (render time − capture time) when queued for rendering. */
+  readonly enqueuedLatency: readonly { readonly atUs: number; readonly latencyUs: number }[];
+  /** Every recovery action the player reported. */
+  readonly recoveryActions: readonly { readonly atUs: number; readonly action: any }[];
+  /** LOC: each frame's capture age (decode time − capture time) when handed to the decoder. */
+  readonly decodedAges: readonly { readonly atUs: number; readonly ageUs: number }[];
   /** LOC: each keyframe handed to the decoder — its group, and when (µs). */
   readonly decodedKeys: readonly { readonly group: bigint; readonly atUs: number }[];
   /** Requests the player attempted after the relay closed the session. */
@@ -497,16 +507,24 @@ async function runScenario(s: Scenario): Promise<Run> {
   const clock = { now: () => clockUs };
   const setClock = (us: number) => { clockUs = us; relay.nowUs = us; };
 
+  // Playout latency of each frame the renderer was given: render time − capture time.
+  const enqueuedLatency: { atUs: number; latencyUs: number }[] = [];
   const renderer = {
-    enqueue: vi.fn(), flush: vi.fn(), destroy: vi.fn(),
+    enqueue: vi.fn((frame: { timestamp: number }, renderTimeUs: number) => {
+      enqueuedLatency.push({ atUs: clockUs, latencyUs: renderTimeUs - (frame.timestamp - PUBLISHER_EPOCH_US) });
+    }),
+    flush: vi.fn(), destroy: vi.fn(), retime: vi.fn(),
     onFirstFrame: null as (() => void) | null,
     onFrameRendered: null as ((ts: bigint, r: number) => void) | null,
     onStall: null as ((ms: number) => void) | null,
   };
   const decodedKeys: { group: bigint; atUs: number }[] = [];
+  const decodedAges: { atUs: number; ageUs: number }[] = [];
   const decoder = {
     configure: vi.fn(),
-    decode: vi.fn((chunk: { type: string; timestamp: number }) => {
+    decode: vi.fn((chunk: { type: string; timestamp: number }, renderTimeUs: number, token?: object, timing?: unknown) => {
+      decodedAges.push({ atUs: clockUs, ageUs: clockUs - (chunk.timestamp - PUBLISHER_EPOCH_US) });
+      if (s.decoderOutput) decoder.onFrame?.({ timestamp: chunk.timestamp, close() {} }, renderTimeUs, undefined, token, timing);
       if (chunk.type !== 'key') return;
       const frame = Math.round((chunk.timestamp - PUBLISHER_EPOCH_US) / FRAME_US);
       decodedKeys.push({ group: BigInt(Math.floor(frame / GOP_FRAMES)), atUs: clockUs });
@@ -562,6 +580,8 @@ async function runScenario(s: Scenario): Promise<Run> {
   };
 
   const switches: Array<{ atUs: number; from: string; to: string; reason: string }> = [];
+  const recoveryActions: { atUs: number; action: any }[] = [];
+  player.on('recovery_action', e => recoveryActions.push({ atUs: clockUs, action: e.action }));
   player.on('quality_switched', e => switches.push({ atUs: clockUs, from: e.fromTrackName, to: e.toTrackName, reason: e.reason }));
   const failedSwitches: Array<{ atUs: number; from: string; to: string; error: string }> = [];
   player.on('quality_switch_failed', e => failedSwitches.push({ atUs: clockUs, from: e.fromTrackName, to: e.toTrackName, error: e.error.message }));
@@ -599,6 +619,9 @@ async function runScenario(s: Scenario): Promise<Run> {
   try {
     for (let t = TICK_US; t <= s.durationUs; t += TICK_US) {
       if (s.closeAtUs !== undefined && !relay.closed && t >= s.closeAtUs) relay.close();
+      if (s.slipAt !== undefined && t >= s.slipAt.atUs && t < s.slipAt.atUs + TICK_US) {
+        (player as unknown as { syncController: { slipReference(us: number): void } }).syncController.slipReference(s.slipAt.byUs);
+      }
       relay.advanceTo(t, setClock);
       vi.advanceTimersByTime(TICK_US / 1000);
       player.tick();
@@ -616,6 +639,9 @@ async function runScenario(s: Scenario): Promise<Run> {
       assembledGroups,
       firstAssembled,
       decodedKeys,
+      decodedAges,
+      enqueuedLatency,
+      recoveryActions,
       rejectedAfterClose: relay.rejectedAfterClose,
       joiningFetches: relay.joiningFetches,
       fills: relay.fills,
@@ -809,6 +835,37 @@ describe('ABR under source-paced live delivery', () => {
       expect(run.failedSwitches).toEqual([]);
       expect(LADDER[rungIndex(run.finalTrack)]!.bitrateBps).toBeLessThan(1_000_000);
       for (const sw of run.switches) expect(run.firstAssembled.get(sw.to)?.sync).toBe(true);
+    });
+
+    it.each([[1_000_000, undefined], [1_000_000, 0], [850_000, undefined]] as const)('PROBEAGE %s %s', async (cap, startLevel) => {
+      const run = await runScenario({ packaging: 'loc', capacityBps: cap, durationUs: SECONDS(60), ...(startLevel !== undefined ? { startLevel } : {}) });
+      const at = (sec: number) => run.decodedAges.filter(a => a.atUs >= SECONDS(sec)).at(0)?.ageUs;
+      console.log('AGE', cap, startLevel, JSON.stringify(run.switches.map(x => [(x.atUs / 1e6).toFixed(1), x.to])), [10, 20, 30, 40, 50, 59].map(t => ((at(t) ?? NaN) / 1e6).toFixed(2)).join(' '), 'stalls', run.stallsAtUs.length);
+    });
+
+    it.each([3000, 0])('LOC: playout latency added under congestion is given back (liveJumpThresholdMs %s)', async threshold => {
+      // At 10 s the clock slips 6 s later, as absorbing late audio does; the
+      // link is ample, so the media then stands buffered well ahead of playout.
+      const run = await runScenario({
+        packaging: 'loc', capacityBps: AMPLE_BPS, durationUs: SECONDS(30), decoderOutput: true,
+        slipAt: { atUs: SECONDS(10), byUs: 6_000_000 }, playerConfig: { liveJumpThresholdMs: threshold },
+      });
+      const latencyAt = (sec: number) => run.enqueuedLatency.filter(f => f.atUs >= SECONDS(sec)).at(0)!.latencyUs;
+      expect(latencyAt(9)).toBeLessThan(1_000_000);
+      expect(latencyAt(10.5)).toBeGreaterThan(6_000_000);
+      const jumps = run.recoveryActions.filter(r => r.action.type === 'jump_to_live');
+      if (threshold === 0) {
+        expect(jumps).toEqual([]);
+        expect(latencyAt(29)).toBeGreaterThan(6_000_000);
+      } else {
+        expect(jumps).toHaveLength(1);
+        expect(jumps[0]!.action).toMatchObject({ trigger: 'latency' });
+        // Sustained for a second past the threshold, then the jump.
+        expect(jumps[0]!.atUs).toBeGreaterThan(SECONDS(11));
+        expect(jumps[0]!.atUs).toBeLessThan(SECONDS(12));
+        expect(latencyAt(20)).toBeLessThan(1_000_000);
+        expect(latencyAt(29)).toBeLessThan(1_000_000);
+      }
     });
 
     it('LOC: a downshift continues decoding from the group after the current one', async () => {

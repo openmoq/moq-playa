@@ -983,6 +983,18 @@ export class CommandDispatcher {
     this._getPlaybackDelayUs = playbackDelayUs;
   }
 
+  /**
+   * The playout timeline moved by `deltaUs` (negative: earlier, a jump toward
+   * live). Queued video is retimed, or flushed by a renderer that cannot
+   * retime. Scheduled audio is stopped: a started source cannot move, and
+   * audio decoded from here on is scheduled on the new timeline.
+   */
+  retimeOutputs(deltaUs: number): void {
+    if (this.renderer?.retime) this.renderer.retime(deltaUs);
+    else this.renderer?.flush();
+    this.audioOutput?.flush();
+  }
+
   /** Release all adapter resources. */
   destroy(): void {
     if (this.renderFeedbackRetired) return;

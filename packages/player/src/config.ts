@@ -373,6 +373,15 @@ export interface LatencyConfig {
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */
   readonly catchUpRecoveryMs?: number;
+
+  /**
+   * Media buffered ahead of the playhead, in ms, past which playback jumps
+   * toward live: audio and video move together to the newest media both
+   * have received, less a short cushion. Latency added to ride out
+   * congestion is given back once delivery catches up. Default: 3000.
+   * 0 disables the jump. LOC only.
+   */
+  readonly liveJumpThresholdMs?: number;
 }
 
 /** Quality / ABR options. */
@@ -795,6 +804,7 @@ export const DEFAULT_PLAYER_CONFIG = {
   maxCatchUpRate: 1.0,
   catchUpThresholdMs: 500,
   catchUpRecoveryMs: 50,
+  liveJumpThresholdMs: 3000,
   lateFrameThresholdMs: 100,
   maxDriftMs: 500,
 
@@ -961,6 +971,10 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   // maxCatchUpRate >= 1.0
   if (config.maxCatchUpRate !== undefined && config.maxCatchUpRate < 1.0) {
     throw new RangeError(`maxCatchUpRate must be >= 1.0, got ${config.maxCatchUpRate}`);
+  }
+
+  if (config.liveJumpThresholdMs !== undefined && !(config.liveJumpThresholdMs >= 0)) {
+    throw new RangeError(`liveJumpThresholdMs must be >= 0, got ${config.liveJumpThresholdMs}`);
   }
 
   // reconnectAttempts >= 0

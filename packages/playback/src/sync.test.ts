@@ -418,6 +418,38 @@ describe('SyncController', () => {
         });
     });
 
+    describe('advanceReference', () => {
+        it('moves the playhead and render times earlier together, undoing a slip', () => {
+            const clock = new MockClock();
+            clock.set(5_000_000);
+            const sync = new SyncController({ driftThresholdUs: DRIFT_THRESHOLD, clock });
+            sync.setAudioReference(1_000_000_000n);
+            sync.slipReference(4_000_000);
+            clock.advance(5_000_000);
+            // Five seconds since the reference, four of them slipped: playout is one second in.
+            expect(sync.playheadCaptureUs()).toBe(1_001_000_000);
+
+            sync.advanceReference(3_000_000);
+
+            expect(sync.playheadCaptureUs()).toBe(1_004_000_000);
+            const audio = sync.computeAudioRenderTime(1_004_500_000n)!;
+            expect(audio.renderTimeUs).toBe(10_000_000 + 500_000);
+            expect(sync.computeVideoRenderTime(1_004_500_000n)!.renderTimeUs).toBe(audio.renderTimeUs);
+            // What the timeline passed over is now late.
+            expect(sync.computeAudioRenderTime(1_002_000_000n)!.shouldDrop).toBe(true);
+        });
+
+        it('is a no-op without a reference or for a non-positive amount', () => {
+            const clock = new MockClock();
+            const sync = new SyncController({ driftThresholdUs: DRIFT_THRESHOLD, clock });
+            sync.advanceReference(1_000_000);
+            expect(sync.playheadCaptureUs()).toBeNull();
+            sync.setAudioReference(0n);
+            sync.advanceReference(-1_000_000);
+            expect(sync.playheadCaptureUs()).toBe(0);
+        });
+    });
+
     describe('video join re-anchor', () => {
         it('shifts first video frame render time to the future', () => {
             const clock = new MockClock();

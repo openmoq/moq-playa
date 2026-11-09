@@ -212,6 +212,19 @@ const LATE_AUDIO_HEADROOM_US = 500_000;
 const LATE_AUDIO_SUSTAINED_FRAMES = 6;
 const LATE_AUDIO_SUSTAINED_WINDOW_US = 300_000;
 
+/** How long buffered media must stay past the jump threshold before playback jumps toward live. */
+const LIVE_JUMP_SUSTAIN_US = 1_000_000;
+/** Media left ahead of the playhead after a jump: room for delivery jitter. */
+const LIVE_JUMP_CUSHION_US = 500_000;
+/** Shortest interval between jumps. */
+const LIVE_JUMP_COOLDOWN_US = 5_000_000;
+/**
+ * After a jump, audio still in flight from before it arrives behind the new
+ * timeline. It was skipped, not delivered late: for this long it is dropped,
+ * not absorbed by slipping the clock back.
+ */
+const LIVE_JUMP_SETTLE_US = 2_000_000;
+
 /** One current route's receiving admission; no payload or group history. */
 interface ReceivingVideoOwner {
   readonly token: object;
@@ -894,6 +907,12 @@ export class MoqtPlayer {
   } | null = null;
   /** Times (µs) of recent late-audio decisions, for telling sustained lateness from jitter. */
   private readonly lateAudioAsksUs: number[] = [];
+  /** Newest capture time (µs) received per media type: how far playout could move toward live. */
+  private readonly newestCaptureUs: { video: number | null; audio: number | null } = { video: null, audio: null };
+  /** Since when (µs) buffered media has stood past the jump threshold. */
+  private liveJumpExcessSinceUs: number | null = null;
+  /** When (µs) playback last jumped toward live. */
+  private lastLiveJumpUs = -Infinity;
   /** CMAF Header context of the playing CMAF video track, for chunk decode times. */
   private cmafLagContext: { readonly track: CatalogTrack; readonly context: LocmafTrackContext | null } | null = null;
   private evaluatingBandwidth = false;
@@ -4564,6 +4583,11 @@ export class MoqtPlayer {
       // stale state and fresh objects arrive via REQUEST_UPDATE forward:1.
       if (this.stateMachine.state === PlayerState.PAUSED) { this.discardMediaInput(input, 'paused'); return; }
       const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
+      if (pipeline && obj.kind === 'data' && headers.captureTimestamp !== undefined) {
+        const captureUs = Number(headers.captureTimestamp);
+        const newest = this.newestCaptureUs[mediaType];
+        if (newest === null || captureUs > newest) this.newestCaptureUs[mediaType] = captureUs;
+      }
       if (pipeline && mediaType === 'video' && !delivery?.backfill && !delivery?.fetched) {
         this.recordLocGroupCadence(obj, headers, cadenceOwner);
         this.recordVideoDeliveryLag(obj, headers, cadenceOwner, obj.kind === 'data' ? obj.payload.byteLength : 0);
@@ -10057,6 +10081,8 @@ export class MoqtPlayer {
     // 1.5× the current track's bitrate, downshift before stalls occur.
     this.checkBandwidthAdaptation();
 
+    this.checkLiveJump();
+
     // Media liveness: reconcile monitored tracks with the live subscription
     // map (a handful of entries — cheap at tick rate, and immune to drift
     // across subscribe/unsubscribe/switch paths), then evaluate starvation.
@@ -10238,6 +10264,7 @@ export class MoqtPlayer {
   private absorbLateAudio(offsetUs: number): boolean {
     if (!this.syncController?.hasReference) return false;
     const now = this.clock.now();
+    if (now - this.lastLiveJumpUs < LIVE_JUMP_SETTLE_US) return false;
     // Audio's own lateness is the primary evidence: the clock was anchored
     // before the queue built, and a delivery-lag baseline that restarted on a
     // track switch cannot see a queue that was already standing. A standing
@@ -10255,6 +10282,49 @@ export class MoqtPlayer {
     this.log.info('Late audio %s: playout slipped %.0fms',
       standingQueue ? `behind a standing queue (+${Math.round(excessUs! / 1000)}ms lag)` : 'sustained', slipUs / 1000);
     return true;
+  }
+
+  /**
+   * Give back playout latency delivery no longer needs. Late audio slips the
+   * shared clock later (absorbLateAudio) and nothing moves it back, so once
+   * the link recovers playback would stay as far behind live as congestion
+   * left it. When the media received runs more than `liveJumpThresholdMs`
+   * ahead of the playhead, sustained, move audio and video together to the
+   * newest media both have, less a cushion. A jump can only use what has
+   * arrived: a backlog still queued upstream is not skipped here.
+   */
+  private checkLiveJump(): void {
+    const thresholdUs = (this.config.liveJumpThresholdMs ?? 0) * 1000;
+    const sync = this.syncController;
+    const dispatcher = this.commandDispatcher;
+    const playhead = sync?.playheadCaptureUs() ?? null;
+    const state = this.stateMachine.state;
+    if (thresholdUs <= 0 || !sync || !dispatcher || playhead === null || this.pendingVideoSwitch
+        || state === PlayerState.PAUSED || state === PlayerState.ERROR) {
+      this.liveJumpExcessSinceUs = null;
+      return;
+    }
+    const received = [
+      ...(this.videoPipeline ? [this.newestCaptureUs.video] : []),
+      ...(this.audioPipeline && this._selection.audio !== null ? [this.newestCaptureUs.audio] : []),
+    ];
+    if (received.length === 0 || received.includes(null)) return;
+    const aheadUs = Math.min(...(received as number[])) - playhead;
+    const now = this.clock.now();
+    if (aheadUs <= thresholdUs) { this.liveJumpExcessSinceUs = null; return; }
+    this.liveJumpExcessSinceUs ??= now;
+    if (now - this.liveJumpExcessSinceUs < LIVE_JUMP_SUSTAIN_US || now - this.lastLiveJumpUs < LIVE_JUMP_COOLDOWN_US) return;
+    const byUs = aheadUs - LIVE_JUMP_CUSHION_US;
+    sync.advanceReference(byUs);
+    dispatcher.retimeOutputs(-byUs);
+    this.lastLiveJumpUs = now;
+    this.liveJumpExcessSinceUs = null;
+    this.log.warn('Jump to live: %.1fs of media buffered ahead of playout — moving %.1fs forward',
+      aheadUs / 1_000_000, byUs / 1_000_000);
+    this.emitter.emit('recovery_action', {
+      type: 'recovery_action',
+      action: { type: 'jump_to_live', trigger: 'latency', byMs: Math.round(byUs / 1000) },
+    });
   }
 
   /**
@@ -13091,7 +13161,7 @@ export class MoqtPlayer {
 
           this.emitter.emit('recovery_action', {
             type: 'recovery_action',
-            action: { type: 'jump_to_live' },
+            action: { type: 'jump_to_live', trigger: 'stalls' },
           });
           return;
         }

@@ -24,7 +24,7 @@ import { validateStallThresholdMs } from './mse-adapter.js';
 /** A queued frame awaiting presentation. */
 interface QueuedFrame {
   readonly frame: VideoFrame;
-  readonly renderTimeUs: number;
+  renderTimeUs: number;
   token?: object;
   outputTiming?: VideoProducedTiming;
 }
@@ -159,6 +159,15 @@ export class CanvasRenderer implements VideoRendererLike {
     }
     this.queue.push(entry);
     this.observeFrame(entry, 'scheduled', null);
+  }
+
+  /**
+   * Shift every queued frame's render time by `deltaUs` (negative: earlier),
+   * when the playout timeline itself moves. Frames moved into the past are
+   * dropped as late on the next tick, the newest kept.
+   */
+  retime(deltaUs: number): void {
+    for (const entry of this.queue) entry.renderTimeUs += deltaUs;
   }
 
   /**
