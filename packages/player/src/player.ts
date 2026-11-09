@@ -289,8 +289,8 @@ function namespaceFields(ns: string | readonly string[]): readonly string[] {
 }
 
 /** Keep deferred stream release handles independent of their route's closure. */
-function streamRelease(release: () => void): () => void {
-  return () => { try { release(); } catch { /* Stream retirement must still finish. */ } };
+function streamRelease(release: (outcome?: 'complete' | 'abandoned') => void): (outcome?: 'complete' | 'abandoned') => void {
+  return outcome => { try { release(outcome); } catch { /* Stream retirement must still finish. */ } };
 }
 
 /**
@@ -1503,7 +1503,7 @@ export class MoqtPlayer {
     connection: MoqtConnection; trackAlias: bigint; groupId: bigint;
     receivingRegistration?: { manager: SubscriptionManager; isCurrent: () => boolean };
     receivingOwner?: object;
-    releaseReceiving?: () => void;
+    releaseReceiving?: (outcome?: 'complete' | 'abandoned') => void;
     whenIdle?: () => Promise<void> | undefined;
   }>();
   private readonly receivingVideoOwners = new Map<bigint, ReceivingVideoOwner>();
@@ -4112,10 +4112,9 @@ export class MoqtPlayer {
       this.log.info('[SWITCH] CMAF flush: "%s" → "%s" (staged=%d)',
         sw.oldTrackName, sw.newTrackName, cmafStaged.length);
     }
-    // The target starts at the group after the committed one, and the rest of
-    // a partly committed group is retired with the outgoing track: that hole
-    // is this switch's own, so let playback cross it.
-    this.mediaSource?.allowSwitchDiscontinuity?.();
+    // The outgoing track is retired: whatever of its open groups had not
+    // arrived never will, so a hole after them is the switch's own to cross.
+    this.abandonOutgoingVideoGroups(sw);
     this.commitVideoSwitch(sw);
   }
 
@@ -10212,6 +10211,9 @@ export class MoqtPlayer {
     if (sw.oldRequestId === null || !this.activeSubscriptions.has(sw.oldRequestId) || this.closedConns.has(sw.connection)) return false;
     sw.oldPaused = true;
     sw.oldPausedAtUs = this.clock.now();
+    // Paused, the outgoing track's open groups will not finish: let MSE cross
+    // the hole after them rather than wait on it.
+    this.abandonOutgoingVideoGroups(sw);
     this.log.warn('[SWITCH] target "%s" not through by its deadline; pausing "%s" to drain the link',
       sw.newTrackName, sw.oldTrackName);
     this.updateOutgoingVideoTrack(sw, { forward: 0 });
@@ -10235,6 +10237,16 @@ export class MoqtPlayer {
   private noteOutgoingVideoArrival(trackName: string): void {
     const sw = this.pendingVideoSwitch;
     if (sw?.oldPaused && trackName === sw.oldTrackName) sw.oldLastArrivalUs = this.clock.now();
+  }
+
+  /** CMAF: the outgoing track's open groups will never finish; tell MSE so. */
+  private abandonOutgoingVideoGroups(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
+    if (this.videoPipeline || !this.mediaSource?.abandonReceivingGroups) return;
+    // The switch's own record of the outgoing source identity: by commit its
+    // subscription may already be retired.
+    const sourceKey = this.keyedCmafIdentity ? sw.oldSourceKey : undefined;
+    if (sourceKey === undefined) this.mediaSource.abandonReceivingGroups('video', sw.oldTrackName);
+    else this.mediaSource.abandonReceivingGroups('video', sw.oldTrackName, sourceKey);
   }
 
   /** Undo the outgoing track's lowered priority and pause when it stays. */
@@ -11816,9 +11828,12 @@ export class MoqtPlayer {
           // Capture the ORIGINAL registration's stream-specific work now; a
           // reused alias cannot add work to it. Reset invalidates LOCMAF below,
           // while complete CMAF objects already accepted may still be delivered.
+          // A FIN completes the stream's group; a reset loses its tail for good.
+          const outcome = terminal === 'fin' ? 'complete' as const : 'abandoned' as const;
+          const release = () => subgroup.releaseReceiving?.(outcome);
           const idle = subgroup.whenIdle?.();
-          if (idle) void idle.then(subgroup.releaseReceiving, subgroup.releaseReceiving);
-          else subgroup.releaseReceiving?.();
+          if (idle) void idle.then(release, release);
+          else release();
           if (terminal === 'reset' && conn === this.connection) {
             this.livenessMonitor?.noteStreamReset(subgroup.trackAlias, performance.now());
             this.subscriptionManager?.invalidateLocmafGroup(subgroup.trackAlias, subgroup.groupId, conn);

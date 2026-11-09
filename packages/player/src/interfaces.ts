@@ -473,10 +473,12 @@ export interface MediaSourceLike {
    * No payload ownership, completion, or presentation is implied. This only
    * extends an already-known positive DTS gap, with a bounded deadline.
    * When supplied, sourceKey is the same opaque identity used for appendChunk
-   * and clearTimeline; trackName remains the human-readable label.
+   * and clearTimeline; trackName remains the human-readable label. The release
+   * may say how the stream ended: 'complete' (FIN) or 'abandoned' (its tail
+   * is lost, e.g. reset); without it nothing is implied.
    */
   retainReceivingGroup?(mediaType: 'video' | 'audio', trackName: string,
-    groupId: bigint, isCurrent: () => boolean, sourceKey?: string): () => void;
+    groupId: bigint, isCurrent: () => boolean, sourceKey?: string): (outcome?: 'complete' | 'abandoned') => void;
 
   /**
    * Re-initialize a SourceBuffer for a new codec / init segment.
@@ -568,12 +570,12 @@ export interface MediaSourceLike {
   getBufferAheadUs?(): number | null;
 
   /**
-   * Optional: a video switch just committed, possibly starting at a group the
-   * outgoing track had not finished. A hole that leaves on the video timeline
-   * is crossed rather than treated as unrecoverable. Without it, such a hole
-   * is held to the ordinary gap-jump bound.
+   * Optional: the player paused or retired this track, so nothing it had not
+   * delivered will arrive, including groups whose streams never opened. A
+   * hole where its appended media ends is crossed however wide, rather than
+   * treated as unrecoverable.
    */
-  allowSwitchDiscontinuity?(): void;
+  abandonReceivingGroups?(mediaType: 'video' | 'audio', trackName: string, sourceKey?: string): void;
 
   /**
    * Optional: play at this rate (live catch-up). The media element keeps

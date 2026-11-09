@@ -45,15 +45,24 @@ interface AppendGapWait {
   generation: number;
   timer: ReturnType<typeof setTimeout> | null;
 }
+/** How a receiving subgroup stream ended: finished (FIN), or its tail is lost for good. */
+export type ReceivingOutcome = 'complete' | 'abandoned';
 interface ReceivingGroup {
   readonly trackName: string;
   readonly trackIdentity: string;
   readonly groupId: bigint;
   isCurrent: (() => boolean) | null;
-  release: (() => void) | null;
+  release: ((outcome?: ReceivingOutcome) => void) | null;
 }
-function receivingHandle(group: ReceivingGroup): () => void {
-  return () => group.release?.();
+function readRanges(buffer: SourceBuffer): Array<readonly [number, number]> {
+  try {
+    const b = buffer.buffered;
+    return Array.from({ length: b.length }, (_, i) => [b.start(i), b.end(i)] as const);
+  } catch { return []; }
+}
+
+function receivingHandle(group: ReceivingGroup): (outcome?: ReceivingOutcome) => void {
+  return outcome => group.release?.(outcome);
 }
 
 /** Queue ownership only; the caller owns codec, timestamp and recovery-point restoration. */
@@ -803,10 +812,12 @@ export class MseMediaSource implements MediaSourceLike {
   private static readonly GAP_JUMP_MIN_INTERVAL_MS = 5_000;
   /** A persistent unjumpable hole escalates to a fatal error after this long. */
   private static readonly GAP_WIDE_HOLE_FATAL_MS = 10_000;
-  /** After a video switch, how long its own discontinuity may still be crossed. */
-  private static readonly SWITCH_DISCONTINUITY_WINDOW_MS = 15_000;
-  /** Widest switch discontinuity crossed; anything wider still escalates. */
-  private static readonly SWITCH_DISCONTINUITY_MAX_SEC = 30;
+  /** Widest hole crossed on evidence that the group before it was abandoned. */
+  private static readonly ABANDONED_HOLE_MAX_SEC = 30;
+  /** How close (s) a hole's start must be to an abandoned group's buffered end. */
+  private static readonly ABANDONED_HOLE_EDGE_SEC = 0.05;
+  /** Groups whose buffered span is remembered per track. */
+  private static readonly GROUP_SPANS_PER_TRACK = 64;
   /** Playhead must be this close to its range's end to count as "at the hole". */
   private static readonly GAP_EDGE_WINDOW_SEC = 0.5;
   /** Playhead movement below this is "stuck" (gap detection only). */
@@ -825,8 +836,22 @@ export class MseMediaSource implements MediaSourceLike {
   private gapLastPlayheadTime: number | null = null;
   private gapLastQuality: Readonly<VideoPlaybackQualityStats> | null = null;
   private lastGapJumpAtMs = Number.NEGATIVE_INFINITY;
-  /** Until when (performance.now ms) a wide video hole is a switch's own discontinuity. */
-  private switchDiscontinuityUntilMs = Number.NEGATIVE_INFINITY;
+  /**
+   * Video groups by track identity: where each group's appended media lies on
+   * the buffered timeline (seconds), and whether its tail is known lost
+   * (abandoned: a subgroup stream of it was reset).
+   */
+  private readonly videoGroupEvidence = new Map<string, Map<bigint, {
+    start: number; end: number; abandoned: boolean;
+  }>>();
+  /**
+   * Video tracks paused or retired before they finished. What they had not
+   * delivered never will be, including groups whose streams never opened, so
+   * a hole where their appended media ends is crossed.
+   */
+  private readonly abandonedVideoTracks = new Set<string>();
+  /** Video buffered ranges (s) when the pending append was issued. */
+  private pendingVideoBufferedBefore: Array<readonly [number, number]> | null = null;
   /** Suppresses ONE seek-generated waiting/timeupdate episode after a jump. */
   private gapStallEpisode = false;
   /** Watchdog-tick fallback so an undecodable landing can't mute stalls forever. */
@@ -1631,14 +1656,15 @@ export class MseMediaSource implements MediaSourceLike {
     return true;
   }
 
-  retainReceivingGroup(mediaType: 'video' | 'audio', trackName: string, groupId: bigint, isCurrent: () => boolean, sourceKey?: string): () => void {
+  retainReceivingGroup(mediaType: 'video' | 'audio', trackName: string, groupId: bigint, isCurrent: () => boolean, sourceKey?: string): (outcome?: ReceivingOutcome) => void {
     const generation = this.bufferGen;
     const groups = this.receivingGroups[mediaType];
     this.currentReceivingGroups(mediaType);
     if (this.destroyed || this.reorderWindowMs === 0 || generation !== this.bufferGen || groups.size >= this.maxQueuedChunks) return () => {};
     const group: ReceivingGroup = { trackName, trackIdentity: mediaTrackIdentity(trackName, sourceKey), groupId, isCurrent, release: null };
     groups.add(group);
-    group.release = () => {
+    group.release = outcome => {
+      if (outcome !== undefined) this.noteGroupOutcome(mediaType, group, outcome);
       this.retireReceivingGroup(mediaType, group);
       if (this.destroyed) return;
       this.clearAppendGap(mediaType);
@@ -1668,7 +1694,11 @@ export class MseMediaSource implements MediaSourceLike {
       if (floor !== undefined && group.groupId < floor) { this.retireReceivingGroup(mediaType, group); continue; }
       let current = false;
       try { current = group.isCurrent?.() === true; } catch { /* Retired owner cannot hold playback. */ }
-      if (!current) this.retireReceivingGroup(mediaType, group);
+      if (current) continue;
+      // Its route is gone (the track was retired or replaced) before the
+      // stream finished: what it had not delivered never will be.
+      this.noteGroupOutcome(mediaType, group, 'abandoned');
+      this.retireReceivingGroup(mediaType, group);
     }
     return [...groups];
   }
@@ -2013,12 +2043,92 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /**
-   * A video switch just committed. The next hole on the video timeline,
-   * within a short window, is the switch's own discontinuity and is crossed
-   * like a gap however wide it is (up to a bound).
+   * The player has paused or retired this track: nothing it had not
+   * delivered will arrive, including groups whose streams never opened. A
+   * hole where its appended media ends is crossed; its open groups are no
+   * longer waited for.
    */
-  allowSwitchDiscontinuity(): void {
-    this.switchDiscontinuityUntilMs = performance.now() + MseMediaSource.SWITCH_DISCONTINUITY_WINDOW_MS;
+  abandonReceivingGroups(mediaType: 'video' | 'audio', trackName: string, sourceKey?: string): void {
+    const trackIdentity = mediaTrackIdentity(trackName, sourceKey);
+    if (mediaType === 'video') this.abandonedVideoTracks.add(trackIdentity);
+    let released = false;
+    for (const group of [...this.receivingGroups[mediaType]]) {
+      if (group.trackIdentity !== trackIdentity) continue;
+      this.noteGroupOutcome(mediaType, group, 'abandoned');
+      this.retireReceivingGroup(mediaType, group);
+      released = true;
+    }
+    if (released && !this.destroyed) { this.clearAppendGap(mediaType); this.drainQueue(mediaType); }
+  }
+
+  private noteGroupOutcome(mediaType: 'video' | 'audio', group: ReceivingGroup, outcome: ReceivingOutcome): void {
+    if (mediaType !== 'video') return;
+    const groups = this.videoGroupEvidence.get(group.trackIdentity) ?? new Map();
+    this.videoGroupEvidence.set(group.trackIdentity, groups);
+    // A FIN finishes one subgroup stream, not necessarily its group: only a
+    // lost tail is evidence.
+    if (outcome !== 'abandoned') return;
+    const entry = groups.get(group.groupId) ?? { start: Number.NaN, end: Number.NaN, abandoned: false };
+    entry.abandoned = true;
+    groups.set(group.groupId, entry);
+    this.pruneGroupEvidence(groups);
+  }
+
+  private pruneGroupEvidence(groups: Map<bigint, unknown>): void {
+    while (groups.size > MseMediaSource.GROUP_SPANS_PER_TRACK) {
+      let oldest: bigint | undefined;
+      for (const id of groups.keys()) if (oldest === undefined || id < oldest) oldest = id;
+      groups.delete(oldest!);
+    }
+  }
+
+  /**
+   * Where a committed append of `groupId` landed on the buffered timeline: the
+   * part of the after-ranges not covered before it. Extends the group's span.
+   */
+  private recordGroupSpan(trackIdentity: string, groupId: bigint,
+    before: Array<readonly [number, number]> | null, after: Array<readonly [number, number]>): void {
+    if (before === null) return;
+    let start = Number.POSITIVE_INFINITY, end = Number.NEGATIVE_INFINITY;
+    for (const [s0, e0] of after) {
+      // Pieces of [s0, e0] not inside any before-range.
+      let cursor = s0;
+      for (const [s1, e1] of before) {
+        if (e1 <= cursor || s1 >= e0) continue;
+        if (s1 > cursor) { start = Math.min(start, cursor); end = Math.max(end, s1); }
+        cursor = Math.max(cursor, e1);
+      }
+      if (cursor < e0) { start = Math.min(start, cursor); end = Math.max(end, e0); }
+    }
+    if (!(end > start)) return;
+    const groups = this.videoGroupEvidence.get(trackIdentity) ?? new Map();
+    this.videoGroupEvidence.set(trackIdentity, groups);
+    const entry = groups.get(groupId) ?? { start, end, abandoned: false };
+    entry.start = Number.isFinite(entry.start) ? Math.min(entry.start, start) : start;
+    entry.end = Number.isFinite(entry.end) ? Math.max(entry.end, end) : end;
+    groups.set(groupId, entry);
+    this.pruneGroupEvidence(groups);
+  }
+
+  /** Whether a video hole starting at `holeStart` follows a group whose tail is known lost. */
+  private holeFollowsAbandonedGroup(holeStart: number): boolean {
+    this.currentReceivingGroups('video'); // a retired track's open groups become abandoned
+    // Where an abandoned track's media ends, counting appends that were
+    // already queued when it was abandoned.
+    for (const trackIdentity of this.abandonedVideoTracks) {
+      let end = Number.NEGATIVE_INFINITY;
+      for (const group of this.videoGroupEvidence.get(trackIdentity)?.values() ?? []) {
+        if (Number.isFinite(group.end)) end = Math.max(end, group.end);
+      }
+      if (Math.abs(end - holeStart) <= MseMediaSource.ABANDONED_HOLE_EDGE_SEC) return true;
+    }
+    for (const groups of this.videoGroupEvidence.values()) {
+      for (const group of groups.values()) {
+        if (group.abandoned && Number.isFinite(group.end)
+            && Math.abs(group.end - holeStart) <= MseMediaSource.ABANDONED_HOLE_EDGE_SEC) return true;
+      }
+    }
+    return false;
   }
 
   /** Live catch-up: play at `rate`. The element preserves pitch by default. */
@@ -2064,6 +2174,7 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.appendGapWait[mediaType]?.entry.trackIdentity === trackIdentity) this.clearAppendGap(mediaType);
     this.lateAppendFloor[mediaType].delete(trackIdentity);
     this.clearReceivingGroups(mediaType, trackIdentity);
+    if (mediaType === 'video') { this.videoGroupEvidence.delete(trackIdentity); this.abandonedVideoTracks.delete(trackIdentity); }
     this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
     // The assembler notifies after delivering the rebased restart segment.
     // Keep accepted media, including that segment, and reset only its wait/index.
@@ -2137,6 +2248,9 @@ export class MseMediaSource implements MediaSourceLike {
     this.videoTimelines.clear();
     this.audioTimelines.clear();
     this.committedGroupFloor.clear();
+    this.videoGroupEvidence.clear();
+    this.abandonedVideoTracks.clear();
+    this.pendingVideoBufferedBefore = null;
     this.pendingVideoRanges = [];
     this.pendingAudioRanges = [];
     this.pendingVideoTrackName = null;
@@ -3155,15 +3269,15 @@ export class MseMediaSource implements MediaSourceLike {
     }
     if (c.spent) return;
 
-    // A video switch that began at a group the outgoing track had not
-    // finished leaves a hole of its own making: cross it, whatever its width,
-    // once and only shortly after the switch.
-    const switchHole = kind === 'video' && nowMs < this.switchDiscontinuityUntilMs
-      && holeSec <= MseMediaSource.SWITCH_DISCONTINUITY_MAX_SEC;
+    // A hole after a group whose tail is known lost (its stream was reset, or
+    // its track paused or retired before it finished) will never fill: cross
+    // it whatever its width. Without that evidence the ordinary bound holds.
+    const abandonedHole = kind === 'video' && holeSec <= MseMediaSource.ABANDONED_HOLE_MAX_SEC
+      && this.holeFollowsAbandonedGroup(curEnd!);
     // Unjumpable width: warn once; escalate once if it persists.
     // Strictly the advertised bound; 1e-9 guards float subtraction noise
     // only — the 10ms identity tolerance must never widen the policy.
-    if (!switchHole && holeSec > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9) {
+    if (!abandonedHole && holeSec > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9) {
       if (!c.wideWarned) {
         c.wideWarned = true;
         this.logWarn(
@@ -3208,7 +3322,6 @@ export class MseMediaSource implements MediaSourceLike {
     const stallDur = nowMs - (this.stallStartTime ?? c.armedAtMs);
 
     // Commit first…
-    if (switchHole) this.switchDiscontinuityUntilMs = Number.NEGATIVE_INFINITY;
     this.gapCandidate = null;
     this.gapLastPlayheadTime = null;
     this.gapLastQuality = null;
@@ -3702,6 +3815,7 @@ export class MseMediaSource implements MediaSourceLike {
       this.pendingVideoTrackName = trackName;
       this.pendingVideoTrackIdentity = trackIdentity;
       this.pendingVideoGroupId = groupId;
+      this.pendingVideoBufferedBefore = groupId === undefined ? null : readRanges(buffer);
     } else {
       this.pendingAudioRanges = safeRanges;
       this.pendingAudioTrackName = trackName;
@@ -3897,6 +4011,9 @@ export class MseMediaSource implements MediaSourceLike {
         if (this.pendingGapSkip[mediaType] || this.lateAppendFloor[mediaType].has(pendingTrack)) {
           const end = timeline.extent?.end;
           if (end !== undefined) this.lateAppendFloor[mediaType].set(pendingTrack, end);
+        }
+        if (mediaType === 'video' && pendingGroup !== undefined && this.videoBuffer) {
+          this.recordGroupSpan(pendingTrack, pendingGroup, this.pendingVideoBufferedBefore, readRanges(this.videoBuffer));
         }
         // Advance committed group floor on successful append.
         if (pendingGroup !== undefined) {

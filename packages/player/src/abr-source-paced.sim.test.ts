@@ -481,8 +481,8 @@ interface Run {
   /** Every catch_up_changed event, and the rates set on the media element (CMAF). */
   readonly catchUps: readonly { readonly atUs: number; readonly active: boolean; readonly rate: number }[];
   readonly elementRates: readonly number[];
-  /** CMAF: when the player told the media source a switch's discontinuity is coming. */
-  readonly switchDiscontinuities: readonly number[];
+  /** CMAF: tracks whose open groups the player told the media source were abandoned. */
+  readonly abandonedTracks: readonly string[];
   /** Every recovery action the player reported. */
   readonly recoveryActions: readonly { readonly atUs: number; readonly action: any }[];
   /** LOC: each frame's capture age (decode time − capture time) when handed to the decoder. */
@@ -538,7 +538,7 @@ async function runScenario(s: Scenario): Promise<Run> {
     reset: vi.fn(), queueDepth: 0, onFrame: null as any, onError: null as any, destroy: vi.fn(),
   };
   const elementRates: number[] = [];
-  const switchDiscontinuities: number[] = [];
+  const abandonedTracks: string[] = [];
   const mediaSource = {
     initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
     mediaElement: null,
@@ -548,7 +548,7 @@ async function runScenario(s: Scenario): Promise<Run> {
     changeType: vi.fn(() => Promise.resolve()),
     getBufferAheadUs: vi.fn(() => firstVideoUs === null ? null : s.bufferAheadUs?.(clockUs) ?? null),
     setPlaybackRate: vi.fn((rate: number) => { elementRates.push(rate); }),
-    allowSwitchDiscontinuity: vi.fn(() => { switchDiscontinuities.push(clockUs); }),
+    abandonReceivingGroups: vi.fn((_mt: string, trackName: string) => { abandonedTracks.push(trackName); }),
     // The highest group handed to the assembler stands in for what MSE committed.
     getCommittedGroupFloor: vi.fn((_mt: string, trackName: string) => assembledGroups.get(trackName)?.at(-1)),
   };
@@ -655,7 +655,7 @@ async function runScenario(s: Scenario): Promise<Run> {
       recoveryActions,
       catchUps,
       elementRates,
-      switchDiscontinuities,
+      abandonedTracks,
       rejectedAfterClose: relay.rejectedAfterClose,
       joiningFetches: relay.joiningFetches,
       fills: relay.fills,
@@ -838,8 +838,9 @@ describe('ABR under source-paced live delivery', () => {
         expect(run.joiningFetches.length).toBe(run.switches.length);
       }
       for (const sw of run.switches) expect(run.firstAssembled.get(sw.to)?.sync).toBe(true);
-      // Each committed switch lets MSE cross a hole of its own making.
-      expect(run.switchDiscontinuities).toHaveLength(run.switches.length);
+      // Each committed switch abandons the outgoing track's open groups, so MSE
+      // may cross a hole they leave.
+      for (const sw of run.switches) expect(run.abandonedTracks).toContain(sw.from);
     });
 
     it.each(['refuse', 'stall'] as const)('CMAF: when the relay %ss the gap fill, downshifts still land from the live edge', async mode => {

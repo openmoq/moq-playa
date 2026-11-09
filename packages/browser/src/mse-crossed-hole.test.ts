@@ -67,32 +67,66 @@ it('never seeks into or over an untraversed wide hole', async () => {
   } finally { f.adapter.destroy(); }
 });
 
-it('crosses a wide hole a video switch has just made, once', async () => {
+/** Commit a group-8 append that lands at [1, 2] s, with a receiving stream held for group 8. */
+async function appendGroup8(f: Awaited<ReturnType<typeof ready>>) {
+  const release = f.adapter.retainReceivingGroup('video', 'video', 8n, () => true);
+  const vb = source.videoBuffer;
+  vb.buffered = makeTimeRanges([[0, 1]]); vb.autoComplete = false;
+  f.adapter.appendChunk('video', segment(1), 'video', 8n); await settle();
+  vb.buffered = makeTimeRanges([[0, 2]]); vb.updating = false; vb.fire('update'); vb.fire('updateend'); await settle();
+  vb.autoComplete = true;
+  return release;
+}
+const holeAfterGroup8 = async (f: Awaited<ReturnType<typeof ready>>) => {
+  source.videoBuffer.buffered = makeTimeRanges([[0, 2], [4.5, 12]]);
+  f.video.buffered = makeTimeRanges([[0, 2], [4.5, 12]]);
+  f.video.advancePlayback(2.4); f.video.readyState = 2;
+  await vi.advanceTimersByTimeAsync(12000);
+};
+
+it('crosses a wide hole after a group whose tail was abandoned', async () => {
   const f = await ready();
   try {
-    // The switch committed at a group the outgoing track had not finished.
-    f.adapter.allowSwitchDiscontinuity();
-    f.hole(); f.video.advancePlayback(1.4); f.video.readyState = 2;
-    await vi.advanceTimersByTimeAsync(12000);
+    const release = await appendGroup8(f);
+    release('abandoned');
+    await holeAfterGroup8(f);
     expect(f.errors).toEqual([]);
     expect(f.jumps).toHaveLength(1);
-    expect(f.video.currentTime).toBeGreaterThanOrEqual(3.5);
+    expect(f.video.currentTime).toBeGreaterThanOrEqual(4.5);
   } finally { f.adapter.destroy(); }
 });
 
-it('still escalates a second wide hole after a switch\'s own has been crossed', async () => {
+it('abandons a paused or retired track\'s open groups on request', async () => {
   const f = await ready();
   try {
-    f.adapter.allowSwitchDiscontinuity();
-    f.hole(); f.video.advancePlayback(1.4); f.video.readyState = 2;
-    await vi.advanceTimersByTimeAsync(6000);
+    await appendGroup8(f);
+    f.adapter.abandonReceivingGroups('video', 'video');
+    await holeAfterGroup8(f);
+    expect(f.errors).toEqual([]);
     expect(f.jumps).toHaveLength(1);
-    source.videoBuffer.buffered = makeTimeRanges([[0, 1], [3.5, 5], [8, 12]]);
-    f.video.buffered = makeTimeRanges([[0, 1], [3.5, 5], [8, 12]]);
-    f.video.advancePlayback(5.4);
-    await vi.advanceTimersByTimeAsync(12000);
-    expect(f.jumps).toHaveLength(1);
+  } finally { f.adapter.destroy(); }
+});
+
+it('keeps the gap-jump bound for a wide hole after a group that finished', async () => {
+  const f = await ready();
+  try {
+    const release = await appendGroup8(f);
+    release('complete');
+    await holeAfterGroup8(f);
+    expect(f.jumps).toEqual([]);
     expect(f.errors.map(error => error.name)).toEqual(['MediaGapUnrecoverableError']);
+  } finally { f.adapter.destroy(); }
+});
+
+it('crosses the hole where a paused track\'s media ends, though no stream of the lost groups opened', async () => {
+  const f = await ready();
+  try {
+    const release = await appendGroup8(f);
+    release('complete'); // group 8's only stream finished; the next groups' never opened
+    f.adapter.abandonReceivingGroups('video', 'video');
+    await holeAfterGroup8(f);
+    expect(f.errors).toEqual([]);
+    expect(f.jumps).toHaveLength(1);
   } finally { f.adapter.destroy(); }
 });
 
