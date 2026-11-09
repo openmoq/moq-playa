@@ -803,6 +803,10 @@ export class MseMediaSource implements MediaSourceLike {
   private static readonly GAP_JUMP_MIN_INTERVAL_MS = 5_000;
   /** A persistent unjumpable hole escalates to a fatal error after this long. */
   private static readonly GAP_WIDE_HOLE_FATAL_MS = 10_000;
+  /** After a video switch, how long its own discontinuity may still be crossed. */
+  private static readonly SWITCH_DISCONTINUITY_WINDOW_MS = 15_000;
+  /** Widest switch discontinuity crossed; anything wider still escalates. */
+  private static readonly SWITCH_DISCONTINUITY_MAX_SEC = 30;
   /** Playhead must be this close to its range's end to count as "at the hole". */
   private static readonly GAP_EDGE_WINDOW_SEC = 0.5;
   /** Playhead movement below this is "stuck" (gap detection only). */
@@ -821,6 +825,8 @@ export class MseMediaSource implements MediaSourceLike {
   private gapLastPlayheadTime: number | null = null;
   private gapLastQuality: Readonly<VideoPlaybackQualityStats> | null = null;
   private lastGapJumpAtMs = Number.NEGATIVE_INFINITY;
+  /** Until when (performance.now ms) a wide video hole is a switch's own discontinuity. */
+  private switchDiscontinuityUntilMs = Number.NEGATIVE_INFINITY;
   /** Suppresses ONE seek-generated waiting/timeupdate episode after a jump. */
   private gapStallEpisode = false;
   /** Watchdog-tick fallback so an undecodable landing can't mute stalls forever. */
@@ -2006,6 +2012,15 @@ export class MseMediaSource implements MediaSourceLike {
     } catch { return null; }
   }
 
+  /**
+   * A video switch just committed. The next hole on the video timeline,
+   * within a short window, is the switch's own discontinuity and is crossed
+   * like a gap however wide it is (up to a bound).
+   */
+  allowSwitchDiscontinuity(): void {
+    this.switchDiscontinuityUntilMs = performance.now() + MseMediaSource.SWITCH_DISCONTINUITY_WINDOW_MS;
+  }
+
   /** Live catch-up: play at `rate`. The element preserves pitch by default. */
   setPlaybackRate(rate: number): void {
     this.video.playbackRate = rate;
@@ -3140,10 +3155,15 @@ export class MseMediaSource implements MediaSourceLike {
     }
     if (c.spent) return;
 
+    // A video switch that began at a group the outgoing track had not
+    // finished leaves a hole of its own making: cross it, whatever its width,
+    // once and only shortly after the switch.
+    const switchHole = kind === 'video' && nowMs < this.switchDiscontinuityUntilMs
+      && holeSec <= MseMediaSource.SWITCH_DISCONTINUITY_MAX_SEC;
     // Unjumpable width: warn once; escalate once if it persists.
     // Strictly the advertised bound; 1e-9 guards float subtraction noise
     // only — the 10ms identity tolerance must never widen the policy.
-    if (holeSec > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9) {
+    if (!switchHole && holeSec > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9) {
       if (!c.wideWarned) {
         c.wideWarned = true;
         this.logWarn(
@@ -3188,6 +3208,7 @@ export class MseMediaSource implements MediaSourceLike {
     const stallDur = nowMs - (this.stallStartTime ?? c.armedAtMs);
 
     // Commit first…
+    if (switchHole) this.switchDiscontinuityUntilMs = Number.NEGATIVE_INFINITY;
     this.gapCandidate = null;
     this.gapLastPlayheadTime = null;
     this.gapLastQuality = null;

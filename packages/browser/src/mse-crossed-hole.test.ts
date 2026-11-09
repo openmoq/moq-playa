@@ -67,6 +67,35 @@ it('never seeks into or over an untraversed wide hole', async () => {
   } finally { f.adapter.destroy(); }
 });
 
+it('crosses a wide hole a video switch has just made, once', async () => {
+  const f = await ready();
+  try {
+    // The switch committed at a group the outgoing track had not finished.
+    f.adapter.allowSwitchDiscontinuity();
+    f.hole(); f.video.advancePlayback(1.4); f.video.readyState = 2;
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(f.errors).toEqual([]);
+    expect(f.jumps).toHaveLength(1);
+    expect(f.video.currentTime).toBeGreaterThanOrEqual(3.5);
+  } finally { f.adapter.destroy(); }
+});
+
+it('still escalates a second wide hole after a switch\'s own has been crossed', async () => {
+  const f = await ready();
+  try {
+    f.adapter.allowSwitchDiscontinuity();
+    f.hole(); f.video.advancePlayback(1.4); f.video.readyState = 2;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(f.jumps).toHaveLength(1);
+    source.videoBuffer.buffered = makeTimeRanges([[0, 1], [3.5, 5], [8, 12]]);
+    f.video.buffered = makeTimeRanges([[0, 1], [3.5, 5], [8, 12]]);
+    f.video.advancePlayback(5.4);
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(f.jumps).toHaveLength(1);
+    expect(f.errors.map(error => error.name)).toEqual(['MediaGapUnrecoverableError']);
+  } finally { f.adapter.destroy(); }
+});
+
 it('preserves narrow post-hole recovery through the existing wedge ladder', async () => {
   const f = await ready();
   try {

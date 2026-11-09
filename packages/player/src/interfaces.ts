@@ -568,6 +568,14 @@ export interface MediaSourceLike {
   getBufferAheadUs?(): number | null;
 
   /**
+   * Optional: a video switch just committed, possibly starting at a group the
+   * outgoing track had not finished. A hole that leaves on the video timeline
+   * is crossed rather than treated as unrecoverable. Without it, such a hole
+   * is held to the ordinary gap-jump bound.
+   */
+  allowSwitchDiscontinuity?(): void;
+
+  /**
    * Optional: play at this rate (live catch-up). The media element keeps
    * pitch. Without it, CMAF live catch-up is unavailable.
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)

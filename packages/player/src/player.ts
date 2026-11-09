@@ -4112,6 +4112,10 @@ export class MoqtPlayer {
       this.log.info('[SWITCH] CMAF flush: "%s" → "%s" (staged=%d)',
         sw.oldTrackName, sw.newTrackName, cmafStaged.length);
     }
+    // The target starts at the group after the committed one, and the rest of
+    // a partly committed group is retired with the outgoing track: that hole
+    // is this switch's own, so let playback cross it.
+    this.mediaSource?.allowSwitchDiscontinuity?.();
     this.commitVideoSwitch(sw);
   }
 
