@@ -1,7 +1,7 @@
 import { parseLocHeaders, resolveLocHeaders, toAudioChunkInit, toVideoChunkInit } from '@openmoq/loc';
 import type { LocHeaders, LocTrackContext, SourceTimestamp } from '@openmoq/loc';
 import type { MediaTimelineEntry } from '@openmoq/msf';
-import type { AudioTimingSource, ClockSource, DecoderCommand, PlaybackEvent, PlaybackPipeline } from '@openmoq/playback';
+import type { AudioTimingSource, ClockSource, DecoderCommand, PlaybackEvent, PlaybackPipeline, SyncController } from '@openmoq/playback';
 import { LocmafFrameReader, type LocmafFrameHeader } from '@openmoq/locmaf';
 import { locmafPlaybackSamples } from './locmaf-playback-samples.js';
 import type { MoqtObject, PropertyWireProfile, TrackPropertyValue } from '@openmoq/transport';
@@ -32,6 +32,46 @@ type DecoderSeed = Pick<InstalledDecoderConfiguration, 'requested' | 'configured
 export type LocSeekTrack = ({ readonly role: 'video'; readonly info: NonNullable<TrackInfo['video']>; readonly seed: DecoderSeed }
   | { readonly role: 'audio'; readonly info: NonNullable<TrackInfo['audio']>; readonly seed: DecoderSeed })
   & { readonly frameInit?: Uint8Array };
+export type LocVideoRoleTrack = Omit<Extract<LocSeekTrack, { role: 'video' }>, 'seed'> & { readonly seed?: DecoderSeed };
+type ActorTrack = LocSeekTrack | LocVideoRoleTrack;
+/** Exact actor-local video candidate. Retrieval remains engine-owned. */
+export interface LocVideoRoleCandidate {
+  readonly owner: object;
+  /** Historical publication fact, not current output authority. */
+  readonly promoted: boolean;
+  readonly current: boolean;
+  readonly ready: boolean;
+  readonly graph: PreparedFramePipelines | null;
+  readonly configuration: InstalledDecoderConfiguration | null;
+  beginPage(identity: object): SeekInputReceiver;
+  acceptPage(identity: object, endOfTrack: boolean, receipt?: SeekGroupPageAcceptance): void;
+  beginLive(owner: object, properties: ReadonlyMap<bigint, readonly TrackPropertyValue[]>): SeekLiveInput;
+  preparingGroup(): bigint | null;
+  endInput(): void;
+  /** Synchronous publication; callers must recheck current after callback reentry. */
+  commit(): void;
+  cancel(): void;
+}
+export interface LocVideoCutFrontier { readonly owner: object; readonly positionMs: number; }
+export interface LocVideoRolePreparation {
+  readonly expectedOwner: object;
+  readonly track: LocVideoRoleTrack;
+  readonly location: { readonly groupId: bigint; readonly objectId: bigint };
+  readonly mediaPts: number;
+  readonly cutMs: number;
+  readonly getTimelineEntries: () => readonly MediaTimelineEntry[] | null;
+  readonly isCurrent: () => boolean;
+  readonly onReady: () => void;
+  readonly onPresented: (positionMs: number) => void;
+  readonly onGraphCreated: () => void;
+  readonly onGraphRetiring: (graph: PreparedFramePipelines) => void;
+  readonly onGraphRetired: (graph: PreparedFramePipelines) => void;
+  readonly onCommand: (command: DecoderCommand) => void;
+  readonly onConfiguration: (configuration: InstalledDecoderConfiguration) => void;
+  readonly onPageDrained: (identity: object) => void;
+  readonly onPageError: (identity: object, error: Error) => void;
+  readonly onError: (error: Error) => void;
+}
 interface Page {
   readonly identity: object;
   readonly queue: SeekLiveQueue;
@@ -42,7 +82,7 @@ interface Page {
   pushing: boolean;
 }
 interface RoleState {
-  readonly track: LocSeekTrack;
+  readonly track: ActorTrack;
   input: LocSeekInput;
   group: bigint;
   groupClosed: boolean;
@@ -50,6 +90,7 @@ interface RoleState {
   readonly prefix: LocSeekItem[];
   readonly samplePrefix: LocSeekSampleObject[];
   frameReader: LocmafFrameReader | null;
+  frameConfig: Uint8Array | null;
   page: Page | null;
   live: { readonly owner: object; readonly context: LocTrackContext; closed: boolean } | null;
   anchor: SourceTimestamp | null;
@@ -71,7 +112,7 @@ interface Options {
   readonly wireProfile: PropertyWireProfile;
   readonly clock: ClockSource;
   readonly borrowed: Readonly<FrameOutputAdapters> | readonly object[];
-  readonly tracks: readonly LocSeekTrack[];
+  readonly tracks: readonly ActorTrack[];
   readonly location: { readonly groupId: bigint; readonly objectId: bigint };
   readonly mediaPts: number;
   readonly targetMs: number;
@@ -80,6 +121,12 @@ interface Options {
   readonly getTimelineEntries: () => readonly MediaTimelineEntry[] | null;
   readonly playing: boolean;
   readonly resume?: LocSeekResume;
+  /** Internal child graph: independently budgeted video, borrowing only clock mapping. */
+  readonly videoReplacement?: {
+    readonly sync: SyncController; readonly placement: LocIndexedPlacement;
+    readonly playbackDelayUs: () => number;
+    readonly onReady: () => void;
+  };
   /** Called after graph acquisition, before any retained input is decoded. */
   readonly onGraphCreated: () => void;
   /** Cleanup retains its observation owner even after functional routing ends. */
@@ -117,6 +164,16 @@ const frameReadLimits = Object.freeze({ maxGroups: 8, maxSamples: 512, maxEntrie
 /** Frame preparation/output only; the shared role retrieval owns every request. */
 export class LocSeekPlayback {
   private graph: PreparedFramePipelines | null = null;
+  private videoOwner: object = {};
+  private videoCandidate: LocVideoRoleCandidate | null = null;
+  private activeVideo: LocSeekPlayback | null = null;
+  private preparingVideo: LocSeekPlayback | null = null;
+  private checkVideoCut: (() => void) | null = null;
+  private readonly retiringVideos = new Set<LocSeekPlayback>();
+  private initialVideoRetired = false;
+  private replacementReady = false;
+  private changingPlayback = false;
+  private clockPlacement: LocIndexedPlacement | null = null;
   private output: LocSeekVideoOutput | null = null;
   private readonly roles = new Map<Role, RoleState>();
   private readonly audioEpoch = {};
@@ -154,7 +211,7 @@ export class LocSeekPlayback {
         maxObjects: 512, maxBytes: 8 * 1024 * 1024, onDiscard: options.onDiscard }),
       group: options.location.groupId, groupClosed: false, prepared: false, prefix: [], samplePrefix: [],
       frameReader: track.info.packaging === 'locmaf' ? new LocmafFrameReader(track.frameInit, frameReadLimits) : null,
-      page: null, live: null,
+      frameConfig: null, page: null, live: null,
       anchor: null, placement: null, resume,
       mapping: options.resume?.[track.role === 'video' ? 'videoMapping' : 'audioMapping'] === undefined ? undefined
         : snapshotLocTimelineMapping(options.resume[track.role === 'video' ? 'videoMapping' : 'audioMapping']!),
@@ -166,6 +223,182 @@ export class LocSeekPlayback {
     if (!this.roles.size) throw new Error('LOC seek has no selected output');
   }
 
+  videoRoleOwner(): object | null {
+    return this.current() && this.adopted && !this.frozen && this.roles.has('video') ? this.videoOwner : null;
+  }
+  /** Read-only planner hint; hold/commit independently revalidate exact authority. */
+  videoCutFrontier(): LocVideoCutFrontier | null {
+    const owner = this.videoRoleOwner(), output = (this.activeVideo ?? this).output;
+    if (!owner || !output) return null;
+    const positionMs = output.cutFrontierMs();
+    return positionMs !== null && this.current() && !this.frozen && this.videoOwner === owner
+      && (this.activeVideo ?? this).output === output ? Object.freeze({ owner, positionMs }) : null;
+  }
+  get videoDiagnosticGraph(): PreparedFramePipelines | null {
+    return this.current() ? this.activeVideo?.diagnosticGraph ?? this.graph : null;
+  }
+
+  /** All owned video graph lifetimes, including pending and displaced output. */
+  get videoDiagnosticGraphs(): readonly PreparedFramePipelines[] {
+    if (!this.current()) return [];
+    return [...new Set([!this.initialVideoRetired ? this.graph : null, this.preparingVideo?.graph,
+      this.activeVideo?.graph, ...[...this.retiringVideos].map(actor => actor.graph)].filter((graph): graph is PreparedFramePipelines => graph != null))];
+  }
+
+  prepareVideoRole(request: LocVideoRolePreparation): LocVideoRoleCandidate {
+    const options = { ...request, location: { ...request.location } };
+    const expected = options.expectedOwner, old = this.activeVideo ?? this;
+    const placement = this.clockPlacement, graph = this.graph;
+    if (this.changingPlayback || !this.current() || !this.adopted || this.frozen || !this.playing || this.videoCandidate
+        || expected !== this.videoOwner || !placement || !graph || !old.output) throw new Error('Video role is not accepting preparation');
+    if (options.track.role !== 'video' || !Number.isSafeInteger(options.cutMs) || options.cutMs !== options.mediaPts) throw new Error('Video cut requires an indexed boundary');
+    const hasAnchor = () => options.getTimelineEntries()?.some(entry => entry.mediaPts === options.cutMs
+      && Number.isSafeInteger(entry.location[0]) && Number.isSafeInteger(entry.location[1])
+      && BigInt(entry.location[0]) === options.location.groupId && BigInt(entry.location[1]) === options.location.objectId) === true;
+    if (!hasAnchor()) throw new Error('Video cut has no current timeline anchor');
+    const isHostCurrent = () => {
+      if (!this.current() || this.frozen || !this.playing) return false;
+      const accepted = options.isCurrent();
+      return accepted && this.current() && !this.stopped && !this.frozen && this.playing;
+    };
+    if (!isHostCurrent() || expected !== this.videoOwner || this.videoCandidate) throw abortError();
+    const cutRaw = sourceUs(placement.sourceAnchor) + BigInt(options.cutMs - placement.mediaPts) * 1000n;
+    const future = () => {
+      const timing = graph.pipelines.syncController.computeVideoRenderTime(cutRaw);
+      const now = this.options.clock.now(), observed = this.readPositionMs();
+      return timing !== null && Number.isFinite(now) && timing.renderTimeUs > now
+        && (observed === null || observed < options.cutMs) && isHostCurrent();
+    };
+    if (!future() || expected !== this.videoOwner || this.videoCandidate) throw new Error('Video cut is no longer in the future');
+    const hold = old.output.holdCut(options.cutMs), owner = {}, thisParent = this;
+    let cancelled = false, committed = false;
+    let child!: LocSeekPlayback, handle!: LocVideoRoleCandidate;
+    const current = () => !cancelled && isHostCurrent() && !cancelled
+      && (committed ? (this.activeVideo === child && this.videoOwner === owner || this.retiringVideos.has(child)) : this.videoCandidate === handle && this.videoOwner === expected);
+    const cancel = () => {
+      if (cancelled) return;
+      cancelled = true;
+      if (this.videoCandidate === handle) { this.videoCandidate = null; this.preparingVideo = null; this.checkVideoCut = null; }
+      const failures: unknown[] = [];
+      for (const release of [() => child?.cancel(), () => { if (!committed) hold.release(); }]) {
+        try { release(); } catch (error) { failures.push(error); }
+      }
+      if (failures.length === 1) throw failures[0];
+      if (failures.length) throw new AggregateError(failures, 'Video candidate cancellation failed');
+    };
+    const retireOld = () => {
+      if (old === this) this.retireInitialVideo();
+      else { this.retiringVideos.delete(old); old.cancel(); }
+    };
+    try {
+      const borrowed = [...graph.resources, ...(this.activeVideo?.graph?.resources ?? []),
+        ...[...this.retiringVideos].flatMap(actor => actor.graph?.resources ?? [])];
+      const { resume: _resume, ...inherited } = this.options;
+      child = new LocSeekPlayback({ ...inherited, tracks: [options.track], borrowed,
+        location: options.location, mediaPts: options.mediaPts, targetMs: options.cutMs, requiredPositionMs: options.cutMs,
+        playing: true, getTimelineEntries: options.getTimelineEntries,
+        videoReplacement: { sync: graph.pipelines.syncController, placement, playbackDelayUs: () => graph.pipelines.getRenderCushionUs?.() ?? 0, onReady: options.onReady },
+        isCurrent: current, adopt() {}, onPosition: time => {
+          const failures: unknown[] = [];
+          try { retireOld(); } catch (error) { failures.push(error); }
+          if (current()) { try { options.onPresented(time); } catch (error) { failures.push(error); } }
+          if (failures.length) {
+            const cause = failures.length === 1 && failures[0] instanceof Error ? failures[0]
+              : new AggregateError(failures, 'Video presentation settlement failed');
+            // Renderer observers isolate exceptions. Report cleanup after the
+            // proved picture settles, without cancelling the promoted child.
+            options.onError(cause);
+          }
+        }, onGraphCreated: options.onGraphCreated, onGraphRetiring: options.onGraphRetiring, onGraphRetired: options.onGraphRetired,
+        onCommand: options.onCommand, onConfiguration: (_role, configured) => options.onConfiguration(configured),
+        onPageDrained: (_role, identity) => options.onPageDrained(identity), onPageError: (_role, identity, error) => {
+          let cause = error;
+          try { cancel(); } catch (cleanup) { cause = new AggregateError([error, cleanup], 'Video candidate page failed'); }
+          options.onPageError(identity, cause);
+        },
+        onError: error => {
+          let cause = error;
+          try { cancel(); } catch (cleanup) { cause = new AggregateError([error, cleanup], 'Video candidate failed'); }
+          options.onError(cause);
+        },
+      });
+      handle = Object.freeze({ owner,
+        get promoted() { return committed; },
+        get current() { return current() && (!committed || thisParent.activeVideo === child && thisParent.videoOwner === owner); },
+        get ready() { return current() && child.replacementReady && child.output?.hasTargetOutput === true; },
+        get graph() { return current() ? child.graph : null; },
+        get configuration() { return current() ? child.installedConfiguration('video') : null; },
+        beginPage: (identity: object) => child.beginPage('video', identity),
+        acceptPage: (identity: object, end: boolean, receipt?: SeekGroupPageAcceptance) => child.acceptPage('video', identity, end, receipt),
+        beginLive: (identity: object, properties: ReadonlyMap<bigint, readonly TrackPropertyValue[]>) => child.beginLive('video', identity, properties),
+        preparingGroup: () => child.preparingGroup('video'), endInput: () => child.endInput('video'), cancel,
+        commit: () => {
+          if (committed) { if (!current()) throw abortError(); return; }
+          if (!current() || !hold.current || !handle.ready || !hasAnchor() || !future() || !current()
+              || this.videoOwner !== expected || this.videoCandidate !== handle) throw new Error('Video candidate cannot commit at its cut');
+          // Publication precedes all callback-bearing retirement and adoption.
+          committed = true; this.videoCandidate = null; this.preparingVideo = null; this.checkVideoCut = null; this.videoOwner = owner; this.activeVideo = child;
+          if (old !== this) this.retiringVideos.add(old);
+          const failures: unknown[] = [];
+          try { old.detachVideoInput(); } catch (error) { failures.push(error); }
+          if (current()) { try { child.adoptReplacement(); } catch (error) { failures.push(error); } }
+          if (failures.length === 1) throw failures[0];
+          if (failures.length) throw new AggregateError(failures, 'Video role adoption failed');
+        },
+      });
+      this.videoCandidate = handle; this.preparingVideo = child;
+      this.checkVideoCut = () => {
+        if (cancelled || committed || this.videoCandidate !== handle) return;
+        if (!current()) { cancel(); return; }
+        let cause: Error | null = null;
+        try { if (!future()) cause = new Error('Video preparation cut reached before commit'); }
+        catch (error) { cause = error instanceof Error ? error : new Error('Video cut clock failed', { cause: error }); }
+        if (!cause || cancelled || committed || this.videoCandidate !== handle) return;
+        // Withdraw first. Cancellation releases the old admission hold before
+        // notifying the engine, which may synchronously replan a successor.
+        try { cancel(); } catch (cleanup) { cause = new AggregateError([cause, cleanup], 'Video cut expiry cleanup failed'); }
+        if (this.current()) options.onError(cause);
+      };
+      if (!current()) { cancel(); throw abortError(); }
+      child.start();
+      return handle;
+    } catch (error) { cancel(); throw error; }
+  }
+
+  private detachVideoInput(): void {
+    const state = this.roles.get('video');
+    if (!state) return;
+    if (state.live) state.live.closed = true;
+    state.live = null;
+    const page = state.page; state.page = null;
+    page?.queue.cancel();
+  }
+  private retireInitialVideo(): void {
+    if (this.initialVideoRetired) return;
+    this.initialVideoRetired = true;
+    const state = this.roles.get('video'), failures: unknown[] = [];
+    const discarded = state ? new Set([...state.prefix.splice(0).map(item => item.input), ...state.samplePrefix.splice(0).map(item => item.input)].filter((input): input is object => input !== undefined)) : new Set<object>();
+    for (const release of [() => this.detachVideoInput(), () => this.output?.stop(),
+      () => this.graph?.pipelines.commandDispatcher?.retireVideo(), () => this.pipeline('video')?.reset(), () => state?.input.cancel(),
+      () => state?.frameReader?.retire(), ...[...discarded].map(input => () => this.options.onDiscard(input, 'decoder reset'))]) {
+      try { release(); } catch (error) { failures.push(error); }
+    }
+    state?.indexedSamples.clear();
+    if (state) { state.frameReader = null; state.releaseEnd = null; }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length) throw new AggregateError(failures, 'Displaced video retirement failed');
+  }
+  private adoptReplacement(): void {
+    if (!this.current() || !this.replacementReady || !this.output?.hasTargetOutput) throw abortError();
+    this.adopted = true;
+    if (this.timer !== null) { clearTimeout(this.timer); this.timer = null; }
+    this.deadline = null;
+    this.graph!.adopt(this.playing);
+    if (!this.current()) return;
+    this.output.activate();
+    if (this.current()) this.graph!.output.renderer?.renderTick?.(this.options.clock.now());
+  }
+
   get committed(): boolean { return this.adopted; }
   get suspended(): boolean { return this.frozen; }
   /** Only an owned graph may participate in an installed diagnostic lifetime. */
@@ -175,12 +408,15 @@ export class LocSeekPlayback {
     if (!this.current()) return null;
     return this.frozen ? this.frozenResume : this.snapshotResumePoint();
   }
-  installedConfiguration(role: Role): InstalledDecoderConfiguration | null { return this.roles.get(role)?.configuration ?? null; }
-  isEnding(role: Role): boolean { return this.current() && this.roles.get(role)?.inputEnding === true; }
+  installedConfiguration(role: Role): InstalledDecoderConfiguration | null { if (role === 'video' && this.activeVideo) return this.activeVideo.installedConfiguration(role); return this.roles.get(role)?.configuration ?? null; }
+  isEnding(role: Role): boolean { if (role === 'video' && this.activeVideo) return this.activeVideo.isEnding(role); return this.current() && this.roles.get(role)?.inputEnding === true; }
   /** Check raw updates before location deduplication can hide a conflicting anchor. */
   observeTimeline(entries: readonly MediaTimelineEntry[]): void {
     if (!this.current()) return;
     try {
+      this.activeVideo?.observeTimeline(entries);
+      this.preparingVideo?.observeTimeline(entries);
+      for (const actor of this.retiringVideos) actor.observeTimeline(entries);
       for (const state of this.roles.values()) for (const entry of entries) {
         const sample = state.indexedSamples.get(JSON.stringify(entry.location));
         if (sample) state.mapping = constrainLocTimelineMapping(state.mapping, sample, entry.mediaPts, this.options.timestampRounding);
@@ -195,6 +431,7 @@ export class LocSeekPlayback {
     }
   }
   preparingGroup(role: Role): bigint | null {
+    if (role === 'video' && this.activeVideo) return this.activeVideo.preparingGroup(role);
     const state = this.roles.get(role);
     return state && !state.prepared && !state.groupClosed ? state.group : null;
   }
@@ -216,7 +453,7 @@ export class LocSeekPlayback {
     }
     // Once audio owns the running clock, a temporary lack of an occupied
     // native buffer holds the last observation instead of reverting to video.
-    return this.lastAudioPoint || this.options.resume?.reference === 'audio' ? null : this.output?.readPositionMs() ?? null;
+    return this.lastAudioPoint || this.options.resume?.reference === 'audio' ? null : (this.activeVideo?.readPositionMs() ?? this.output?.readPositionMs()) ?? null;
   }
 
   start(): void {
@@ -234,9 +471,11 @@ export class LocSeekPlayback {
           onFeedback: feedback => { this.pipeline(feedback.mediaType)?.handleFeedback(feedback); this.wake(); },
           onCommand: command => this.command(command),
           onEvent: (role, event) => { if (this.adopted && this.current() && !this.frozen) this.options.onEvent(role, event); },
-        }, this.borrowed ?? [], undefined, { retainDeferred: true, onPrepared: () => { this.maybeAdopt(); this.wake(); } });
+        }, this.borrowed ?? [], undefined, { retainDeferred: true, onPrepared: () => { this.maybeAdopt(); this.wake(); } }, this.options.videoReplacement ? 'video' : undefined);
       } finally { this.borrowed = null; }
       this.graph = graph;
+      if (this.options.videoReplacement) graph.pipelines.commandDispatcher?.setVideoReferenceGate(
+        () => this.current() && this.options.videoReplacement!.sync.hasReference, this.options.videoReplacement.playbackDelayUs);
       if (!this.current()) { graph.retire(); return; }
       for (const state of this.roles.values()) {
         const pipeline = this.pipeline(state.track.role);
@@ -250,6 +489,7 @@ export class LocSeekPlayback {
   }
 
   beginPage(role: Role, identity: object): SeekInputReceiver {
+    if (role === 'video' && this.activeVideo) return this.activeVideo.beginPage(role, identity);
     this.assertCurrent();
     const state = this.roles.get(role)!;
     if (state.page) throw new Error('Previous LOC seek page has not drained');
@@ -293,6 +533,7 @@ export class LocSeekPlayback {
   }
 
   acceptPage(role: Role, identity: object, _endOfTrack: boolean, receipt?: SeekGroupPageAcceptance): void {
+    if (role === 'video' && this.activeVideo) { this.activeVideo.acceptPage(role, identity, _endOfTrack, receipt); return; }
     const page = this.roles.get(role)?.page;
     if (!this.current() || !page || page.identity !== identity || page.receipt) return;
     try {
@@ -303,6 +544,7 @@ export class LocSeekPlayback {
   }
 
   beginLive(role: Role, owner: object, properties: ReadonlyMap<bigint, readonly TrackPropertyValue[]>): SeekLiveInput {
+    if (role === 'video' && this.activeVideo) return this.activeVideo.beginLive(role, owner, properties);
     this.assertCurrent();
     const state = this.roles.get(role);
     if (!state?.prepared || state.page || state.live || state.inputEnding) throw new Error('LOC live input has no prepared role');
@@ -323,12 +565,17 @@ export class LocSeekPlayback {
 
   tick(): void {
     if (!this.current() || this.frozen) return;
+    this.checkVideoCut?.();
+    if (!this.current() || this.frozen) return;
+    this.preparingVideo?.tick();
+    this.activeVideo?.tick();
+    for (const actor of this.retiringVideos) actor.tick();
     try {
       if (this.pipeline('video')?.throttled || this.pipeline('audio')?.throttled) this.graph?.pipelines.commandDispatcher?.resampleQueuePressure();
       if (!this.current() || this.frozen) return;
       this.maybeAdopt();
       if (this.adopted) {
-        for (const role of this.roles.keys()) this.pipeline(role)?.tick();
+        for (const role of this.roles.keys()) if (role !== 'video' || !this.initialVideoRetired) this.pipeline(role)?.tick();
         // Draining input is progress even with a synchronous decoder that
         // has no separate queue-depth notification.
         this.wake();
@@ -342,25 +589,40 @@ export class LocSeekPlayback {
   }
   setPlaying(playing: boolean, positionMs?: number | null): void {
     if (!this.current()) return;
-    this.playing = playing;
-    if (!this.adopted) { this.output?.setMode(playing ? 'playing' : 'preview'); return; }
-    if (playing || this.frozen) return;
-    const observed = this.positioned || this.options.resume ? positionMs ?? this.readPositionMs() : null;
-    this.frozenPositionMs = observed !== null && Number.isFinite(observed) && observed >= 0 ? observed : null;
-    this.frozenResume = this.snapshotResumePoint();
-    // Flushed native state cannot be revived. Resume uses a new historical
-    // preparation; this epoch retains only its last observed position/image.
-    this.frozen = true;
-    this.wake();
-    const failures: unknown[] = [];
-    for (const state of this.roles.values()) {
-      const page = state.page; state.page = null;
-      try { page?.queue.cancel(); } catch (error) { failures.push(error); }
-      try { this.pipeline(state.track.role)?.reset(); } catch (error) { failures.push(error); }
-    }
-    if (failures.length) throw new AggregateError(failures, 'LOC pause cleanup failed');
+    // Releasing a cut can synchronously call the renderer. Refuse new
+    // preparation until existing children have completed their pause cleanup.
+    const priorTransition = this.changingPlayback;
+    this.changingPlayback = true;
+    try {
+      const failures: unknown[] = [];
+      for (const release of [() => this.videoCandidate?.cancel(), () => this.activeVideo?.setPlaying(playing, positionMs),
+        ...[...this.retiringVideos].map(actor => () => actor.setPlaying(playing, positionMs))]) {
+        try { release(); } catch (error) { failures.push(error); }
+      }
+      const finish = () => { if (failures.length) throw new AggregateError(failures, 'LOC pause cleanup failed'); };
+      this.playing = playing;
+      if (!this.adopted) { this.output?.setMode(playing ? 'playing' : 'preview'); finish(); return; }
+      if (playing || this.frozen) { finish(); return; }
+      const observed = this.positioned || this.options.resume ? positionMs ?? this.readPositionMs() : null;
+      this.frozenPositionMs = observed !== null && Number.isFinite(observed) && observed >= 0 ? observed : null;
+      this.frozenResume = this.snapshotResumePoint();
+      // Flushed native state cannot be revived. Resume uses a new historical
+      // preparation; this epoch retains only its last observed position/image.
+      this.frozen = true;
+      this.wake();
+      if (this.options.videoReplacement) {
+        try { this.graph?.pipelines.commandDispatcher?.flush(); } catch (error) { failures.push(error); }
+      }
+      for (const state of this.roles.values()) {
+        const page = state.page; state.page = null;
+        try { page?.queue.cancel(); } catch (error) { failures.push(error); }
+        try { this.pipeline(state.track.role)?.reset(); } catch (error) { failures.push(error); }
+      }
+      finish();
+    } finally { this.changingPlayback = priorTransition; }
   }
   endInput(role: Role): void {
+    if (role === 'video' && this.activeVideo) { this.activeVideo.endInput(role); return; }
     const state = this.roles.get(role);
     if (!this.current() || this.frozen || !state) return;
     void this.finishRoleInput(state).catch(() => {});
@@ -373,6 +635,10 @@ export class LocSeekPlayback {
     if (this.timer !== null) { clearTimeout(this.timer); this.timer = null; }
     const failures: unknown[] = [];
     const release = (run: () => void) => { try { run(); } catch (error) { failures.push(error); } };
+    release(() => this.videoCandidate?.cancel());
+    release(() => this.activeVideo?.cancel());
+    for (const actor of this.retiringVideos) release(() => actor.cancel());
+    this.retiringVideos.clear();
     const graph = this.graph;
     if (graph) release(() => this.options.onGraphRetiring(graph));
     this.wake();
@@ -441,6 +707,7 @@ export class LocSeekPlayback {
     if (ready.kind === 'need-more') return;
     state.anchor = ready.anchor;
     state.placement = ready.placement ?? null;
+    if (role === 'video' && !this.clockPlacement && state.placement) this.clockPlacement = snapshotLocIndexedPlacement(state.placement);
     if (ready.sampleObjects) state.samplePrefix.push(...ready.sampleObjects);
     else state.prefix.push(...ready.items);
     const graph = this.graph!, pipeline = this.pipeline(role)!;
@@ -452,9 +719,10 @@ export class LocSeekPlayback {
       }
       state.selected = { selected, ...(ready.placement ? { placement: ready.placement } : {}) };
       this.output = new LocSeekVideoOutput({ dispatcher: graph.pipelines.commandDispatcher!, renderer: graph.output.renderer!,
-        sync: graph.pipelines.syncController, selected: ready.selected.sourceTimestamp,
+        sync: this.options.videoReplacement?.sync ?? graph.pipelines.syncController,
+        ...(this.options.videoReplacement ? { syncPlacement: this.options.videoReplacement.placement } : {}), selected: ready.selected.sourceTimestamp,
         ...(ready.placement ? { placement: ready.placement } : {}), mode: this.playing ? 'playing' : 'preview',
-        reference: this.options.resume?.reference === 'audio' ? 'external' : 'video',
+        reference: this.options.videoReplacement || this.options.resume?.reference === 'audio' ? 'external' : 'video',
         maxQueuedFrames: 8, isCurrent: () => this.current() && !this.frozen, onPrepared: () => { this.maybeAdopt(); this.wake(); },
         onPresented: time => {
           if (this.options.resume?.reference !== 'audio') this.reportPosition(time, selected.location);
@@ -468,9 +736,9 @@ export class LocSeekPlayback {
     state.releaseEnd = pipeline.holdTrackEnd();
     if (role === 'video') pipeline.setVideoTimingSource(this.output!.timingSource);
     else pipeline.setAudioTimingSource(this.audioTimingSource(state));
-    const initData = btoa(String.fromCharCode(...state.track.seed.requested));
-    const info = state.track.role === 'video' ? { video: { ...state.track.info, initData }, audio: undefined }
-      : { video: undefined, audio: { ...state.track.info, initData } };
+    const initData = state.track.seed ? btoa(String.fromCharCode(...state.track.seed.requested)) : state.track.info.initData;
+    const info = state.track.role === 'video' ? { video: { ...state.track.info, ...(initData === undefined ? {} : { initData }) }, audio: undefined }
+      : { video: undefined, audio: { ...state.track.info, ...(initData === undefined ? {} : { initData }) } };
     configurePipelines(graph.pipelines, info);
     while (state.samplePrefix.length) {
       while (pipeline.throttled && this.current() && !this.frozen) { this.maybeAdopt(); await this.waitForQueueProgress(pipeline); }
@@ -593,11 +861,15 @@ export class LocSeekPlayback {
 
   private validateFrameHeader(state: RoleState, header: LocmafFrameHeader): void {
     const expected = state.track.role === 'video' ? 'vide' : 'soun';
-    if (header.context.handlerType !== expected || header.context.codecFourcc !== state.track.seed.format.codec?.split('.')[0]
-        || !equalBytes(header.description ?? new Uint8Array(), state.track.seed.requested)) {
-      throw new Error(`Historical ${state.track.role} initialization differs from the installed decoder configuration`);
+    const seed = state.track.seed, description = header.description ?? new Uint8Array();
+    if (header.context.handlerType !== expected || header.context.codecFourcc !== (seed?.format.codec ?? state.track.info.codec)?.split('.')[0]
+        || seed && !equalBytes(description, seed.requested)
+        || state.frameConfig && !equalBytes(description, state.frameConfig)) {
+      throw new Error(`Historical ${state.track.role} initialization differs from its declared configuration`);
     }
+    state.frameConfig = new Uint8Array(description);
   }
+
   private frameSamples(state: RoleState, object: Extract<MoqtObject, { kind: 'data' }>) {
     let result = state.frameReader!.push(object.groupId, object.objectId, object.payload);
     if (result.kind === 'reconfigure') {
@@ -609,7 +881,7 @@ export class LocSeekPlayback {
     }
     if (result.header) this.validateFrameHeader(state, result.header);
     if (!state.prepared && result.continuity === 'gap') throw new Error('LOCMAF history has a missing metadata dependency');
-    return locmafPlaybackSamples(state.track.role, result.units, state.track.seed.requested);
+    return locmafPlaybackSamples(state.track.role, result.units, state.frameConfig ?? state.track.seed?.requested ?? null);
   }
   private async drainSampleInput(pipeline: PlaybackPipeline): Promise<void> {
     while (pipeline.pendingSampleCount > 0 && this.current() && !this.frozen) {
@@ -632,24 +904,29 @@ export class LocSeekPlayback {
     if (state) state.configurationCall = call;
     const requested = command.type === 'configure' ? new Uint8Array(command.config) : undefined;
     const current = () => this.current() && !this.frozen && (!state || state.configurationCall === call);
-    const restore = state && !state.seeded && command.type === 'configure' && equalBytes(command.config, state.track.seed.requested);
+    const seed = state?.track.seed;
+    const restore = state && seed && !state.seeded && command.type === 'configure' && equalBytes(command.config, seed.requested);
     if (restore) state.seeded = true;
     let dispatched: DecoderCommand | undefined;
-    const format = handlePipelineCommand(restore && command.type === 'configure' ? { ...command, config: new Uint8Array(state.track.seed.configured) } : command,
+    const format = handlePipelineCommand(restore && command.type === 'configure' ? { ...command, config: new Uint8Array(seed!.configured) } : command,
       restore ? undefined : this.options.config.commandTransform, dispatcher, null,
       event => { dispatched = event.command as DecoderCommand; this.options.onCommand(dispatched); }, undefined, current);
     const actual = dispatched as DecoderCommand | undefined;
     if (current() && state && requested && actual?.type === 'configure' && actual.mediaType === state.track.role && format?.mediaType === state.track.role) {
       state.configuration = { dispatcher, requested, configured: format.config, format };
-      if (this.adopted) this.options.onConfiguration(state.track.role, state.configuration);
+      if (this.adopted || this.options.videoReplacement) this.options.onConfiguration(state.track.role, state.configuration);
     }
   }
 
   private maybeAdopt(): void {
     if (!this.current() || this.adopted) return;
-    if (this.roles.has('video') && !this.output?.hasTargetOutput) return;
+    if (this.roles.has('video') && (!this.output?.hasTargetOutput || !this.roles.get('video')!.configuration)) return;
     if (this.roles.has('audio') && !this.graph?.audioPreparation?.snapshotPrepared().some(item => item.timing.context.epoch === this.audioEpoch)) return;
     this.assertPreparationTime();
+    if (this.options.videoReplacement) {
+      if (!this.replacementReady) { this.replacementReady = true; this.options.videoReplacement.onReady(); }
+      return;
+    }
     // Preparation is bounded; waiting for a user-enabled output clock is not
     // preparation success and must not manufacture a position or a timeout.
     if (this.timer !== null) { clearTimeout(this.timer); this.timer = null; }
@@ -681,8 +958,8 @@ export class LocSeekPlayback {
     this.options.onPosition(time, location);
   }
   private snapshotResumePoint(): LocSeekResume | null {
-    const video = this.roles.get('video'), audio = this.roles.get('audio');
-    const source = this.output?.captureSourcePosition();
+    const video = this.activeVideo?.roles.get('video') ?? this.roles.get('video'), audio = this.roles.get('audio');
+    const source = (this.activeVideo?.output ?? this.output)?.captureSourcePosition();
     if (!this.current()) return null;
     const audioReference = this.lastAudioPoint ?? (this.options.resume?.reference === 'audio' ? this.options.resume.point : null);
     const point = audioReference ?? (source && video?.placement ? snapshotLocResumePoint({ source, placement: video.placement }) : null);
@@ -692,7 +969,7 @@ export class LocSeekPlayback {
       ...this.snapshotMappings() }) : null;
   }
   private snapshotMappings(): Pick<LocSeekResume, 'videoMapping' | 'audioMapping'> {
-    const video = this.roles.get('video')?.mapping, audio = this.roles.get('audio')?.mapping;
+    const video = (this.activeVideo?.roles.get('video') ?? this.roles.get('video'))?.mapping, audio = this.roles.get('audio')?.mapping;
     return { ...(video ? { videoMapping: snapshotLocTimelineMapping(video) } : {}),
       ...(audio ? { audioMapping: snapshotLocTimelineMapping(audio) } : {}) };
   }

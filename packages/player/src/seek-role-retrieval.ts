@@ -55,6 +55,8 @@ interface Options {
   readonly consume: (object: MoqtObject, captured: object | undefined, current: () => boolean,
     deliver: (object: MoqtObject, input?: object) => Promise<void>) => Promise<void>;
   readonly liveObservation?: (owner: SeekRoleBridgeOwner) => NonNullable<ConstructorParameters<typeof SeekLiveBridge>[1]['liveObservation']>;
+  /** First FETCH registration, after authorization and before its bytes are sent. */
+  readonly onFirstRequest?: () => void;
   readonly onBridgeAdded: (owner: SeekRoleBridgeOwner) => void;
   readonly onBridgeRemoved: (owner: SeekRoleBridgeOwner) => void;
   readonly onEnded: () => void;
@@ -88,7 +90,10 @@ export class SeekRoleRetrieval {
     void this.firstIssued.catch(() => {});
     this.draft = draft;
     this.cut = { kind: 'before', ...options.location };
-    this.requests = new SeekFetchRequests(options.connection, { isCurrent: () => this.current(), onError: (error, receiver) => {
+    this.requests = new SeekFetchRequests(options.connection, { isCurrent: () => this.current(),
+      ...(options.onFirstRequest ? { onRegister: (receiver: FetchReceiver) => {
+        if (receiver === this.firstReceiver) options.onFirstRequest!();
+      } } : {}), onError: (error, receiver) => {
       if (receiver === this.firstReceiver) this.settleFirst(error);
       const page = this.page;
       if (page?.transport === receiver) this.failPage(page, error);

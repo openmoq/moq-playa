@@ -5,6 +5,9 @@ import { buildChunk, videoInit, SYNC_FLAGS, NON_SYNC_FLAGS } from '../../locmaf/
 import { concat } from '../../locmaf/test-support/bytes.js';
 import { flush } from '../../webtransport/src/testkit/loopback.js';
 import { locSeekFixture } from '../test-support/loc-seek.js';
+import { CanvasRenderer } from '../../browser/src/canvas-renderer.js';
+import type { QualityController } from './quality-controller.js';
+import { PlayerErrorCode } from './errors.js';
 
 type Fixture = Awaited<ReturnType<typeof locSeekFixture>>;
 type Format = 'loc' | 'locmaf';
@@ -201,10 +204,47 @@ describe.each(cases)('paused frame rendition selection draft$draft / $format', (
     }
   });
 
-  it('refuses a running positioned video owner without starting candidate work', async () => {
+  it('refuses playing video-role replacement when the legacy factory omits scope acknowledgement', async () => {
     const f = await land(format, draft);
-    try { const observation = observeSelection(f); expect((await refused(f, observation)).message).toMatch(/paused video-only/); expect(f.player.state).toBe('playing'); expect(f.player.playbackPositionMs).toBe(2100); }
-    finally { await f.destroy(); }
+    try {
+      const observation = observeSelection(f);
+      const rendererDestroy = vi.spyOn(CanvasRenderer.prototype, 'destroy');
+      const failure = vi.fn(); f.player.on('error', failure);
+      const controller = (f.player as unknown as { qualityController: QualityController }).qualityController;
+      const manual = vi.spyOn(controller, 'lockManual');
+      const oldDraws = observation.old.draw.mock.calls.length;
+      expect(observation.before.selection.autoQuality).toBe(true);
+      const error: unknown = await f.player.selectVideoTrack(target).then(() => null, failure => failure);
+      await flush(256);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe('Frame output scope must match the requested adoption scope');
+      expect(observation.hook).toHaveBeenCalledOnce();
+      expect(observation.switching).toHaveBeenCalledOnce();
+      expect(observation.switched).not.toHaveBeenCalled();
+      expect(observation.fetch).not.toHaveBeenCalled(); expect(observation.subscribe).not.toHaveBeenCalled();
+      expect(f.fetches).toHaveLength(observation.before.fetches); expect(f.requests).toHaveLength(observation.before.requests);
+      expect(f.outputs).toHaveLength(observation.before.graphs + 1);
+      expect(f.audioOutputs).toHaveLength(observation.before.audioGraphs);
+      const candidate = f.outputs.at(-1)!;
+      expect(candidate.decoder).not.toBe(observation.old.decoder); expect(candidate.renderer).not.toBe(observation.old.renderer);
+      expect(candidate.decoder.destroy).toHaveBeenCalledOnce();
+      expect(rendererDestroy).toHaveBeenCalledOnce(); expect(rendererDestroy.mock.contexts[0]).toBe(candidate.renderer);
+      expect(candidate.decoder.decode).not.toHaveBeenCalled(); expect(candidate.draw).not.toHaveBeenCalled();
+      expect(observation.old.draw).toHaveBeenCalledTimes(oldDraws);
+      expect(f.player.selection.video).toEqual(observation.before.selection.video);
+      expect(f.player.selection.audio).toEqual(observation.before.selection.audio);
+      // Manual intent is applied even though no replacement media owner is adopted.
+      expect(manual).toHaveBeenCalledOnce(); expect(controller.isAutoQuality).toBe(false);
+      expect(f.player.selection.autoQuality).toBe(observation.before.selection.autoQuality);
+      expect(failure).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ error: expect.objectContaining({
+        severity: 'degraded', source: 'decoder', code: PlayerErrorCode.VIDEO_DECODE_ERROR,
+        message: `Track switch to "${target.name}" failed: Frame output scope must match the requested adoption scope`,
+      }) }));
+      expect(f.errors).toEqual([...observation.before.errors,
+        `Track switch to "${target.name}" failed: Frame output scope must match the requested adoption scope`]);
+      unchangedNative(f, observation);
+      expect(f.player.state).toBe('playing'); expect(f.player.playbackPositionMs).toBe(2100);
+    } finally { await f.destroy(); }
   });
 
   it('refuses a paused audio/video owner without replacing either output graph', async () => {

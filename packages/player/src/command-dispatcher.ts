@@ -167,6 +167,8 @@ export class CommandDispatcher {
   private videoQueuePressureHigh = false;
   private audioQueuePressureHigh = false;
   private renderFeedbackRetired = false;
+  private videoOutputRetired = false;
+  private get videoRetired(): boolean { return this.renderFeedbackRetired || this.videoOutputRetired; }
 
   /** Hold queue for video frames decoded before sync reference exists. */
   private readonly videoHoldQueue: HeldVideo[] = [];
@@ -191,12 +193,12 @@ export class CommandDispatcher {
    * Decisions may repeat for a held proof; reservations must be idempotent.
    * The caller still owns retirement of frames already handed to the renderer. */
   installVideoOutputAdmission(owner: VideoOutputAdmission): VideoOutputAdmissionLease {
-    if (this.renderFeedbackRetired) throw new Error('Video output is destroyed');
+    if (this.videoRetired) throw new Error('Video output is destroyed');
     const previous = this.videoAdmission;
     const decide = owner.decide, discarded = owner.discarded;
     // Registration reads are external code; neither destruction nor a newer
     // binding can be overwritten when those reads return.
-    if (this.renderFeedbackRetired) throw new Error('Video output is destroyed');
+    if (this.videoRetired) throw new Error('Video output is destroyed');
     if (this.videoAdmission !== previous) throw new Error('Video output admission changed during registration');
     if (typeof decide !== 'function' || typeof discarded !== 'function') {
       throw new TypeError('Expected synchronous video admission and a discard handler');
@@ -205,7 +207,7 @@ export class CommandDispatcher {
     const dispatcher = this;
     let released = false;
     const lease: VideoOutputAdmissionLease = Object.freeze({
-      get current() { return !released && !dispatcher.renderFeedbackRetired && dispatcher.videoAdmission === binding; },
+      get current() { return !released && !dispatcher.videoRetired && dispatcher.videoAdmission === binding; },
       release() {
         if (released) return;
         released = true;
@@ -216,7 +218,7 @@ export class CommandDispatcher {
     this.videoAdmission = binding;
     try {
       this.retireVideoAdmissionFrames(previous);
-      if (!this.renderFeedbackRetired && this.videoAdmission === binding && this.videoDecoder) {
+      if (!this.videoRetired && this.videoAdmission === binding && this.videoDecoder) {
         this.checkQueuePressure('video', this.videoDecoder);
       }
     } catch (error) {
@@ -234,7 +236,7 @@ export class CommandDispatcher {
     let failed = false, failure: unknown;
     try { this.retireVideoAdmissionFrames(binding); }
     catch (error) { failed = true; failure = error; }
-    if (!this.renderFeedbackRetired && this.videoAdmission === undefined && this.videoDecoder) {
+    if (!this.videoRetired && this.videoAdmission === undefined && this.videoDecoder) {
       try { this.checkQueuePressure('video', this.videoDecoder); }
       catch (error) { if (!failed) { failed = true; failure = error; } }
     }
@@ -256,10 +258,10 @@ export class CommandDispatcher {
 
   /** Reconsider existing held outputs after the owner's readiness/intent changes. */
   refreshVideoOutputs(): void {
-    if (this.renderFeedbackRetired || !this.renderer || !this.videoHoldQueue.length) return;
+    if (this.videoRetired || !this.renderer || !this.videoHoldQueue.length) return;
     const revision = this.outputRevision, admission = this.videoAdmission;
     this.drainVideoHoldQueue(this.renderer, revision);
-    if (!this.renderFeedbackRetired && this.outputRevision === revision && this.videoAdmission === admission && this.videoDecoder) {
+    if (!this.videoRetired && this.outputRevision === revision && this.videoAdmission === admission && this.videoDecoder) {
       this.checkQueuePressure('video', this.videoDecoder);
     }
   }
@@ -312,9 +314,9 @@ export class CommandDispatcher {
     this.releaseOutputFrame(held.frame, ownership, reason, admission, held.outputTiming);
   }
   private static readonly MAX_HOLD_QUEUE = 30; // 1 GOP at 30fps
-  private readonly _hasSyncReference: (() => boolean) | undefined;
+  private _hasSyncReference: (() => boolean) | undefined;
   private readonly _recomputeVideoRenderTime: ((captureTimestampUs: bigint) => number) | undefined;
-  private readonly _getPlaybackDelayUs: (() => number) | undefined;
+  private _getPlaybackDelayUs: (() => number) | undefined;
 
   constructor(opts: CommandDispatcherOptions) {
     this.videoDecoder = opts.videoDecoder;
@@ -359,19 +361,19 @@ export class CommandDispatcher {
       const vd = this.videoDecoder;
       const recompute = opts.recomputeVideoRenderTime;
       this.videoDecoder.onFrame = (frame, renderTimeUs, sourceTimestamp, inputToken, renderTiming) => {
-        if (this.renderFeedbackRetired) { (frame as { close?: () => void }).close?.(); return; }
+        if (this.videoRetired) { (frame as { close?: () => void }).close?.(); return; }
         const revision = this.outputRevision, binding = this.videoAdmission;
         const captureTs = renderTiming === undefined ? BigInt((frame as { timestamp: number }).timestamp) : undefined;
         const observation = this.decodedOutput('video', inputToken, renderer);
-        if (this.renderFeedbackRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
+        if (this.videoRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
           this.releaseOutputFrame(frame, observation, this.outputRevision !== revision ? this.outputRetirementReason : 'output refused'); return;
         }
         if (renderTiming === null) {
           this.releaseOutputFrame(frame, observation, 'output failed');
-          if (binding && this.videoAdmission === binding && !this.renderFeedbackRetired && this.outputRevision === revision) {
+          if (binding && this.videoAdmission === binding && !this.videoRetired && this.outputRevision === revision) {
             this.reportVideoAdmissionError(new Error('Video producing context is unavailable'));
           }
-          if (!this.renderFeedbackRetired && this.outputRevision === revision) this.checkQueuePressure('video', vd);
+          if (!this.videoRetired && this.outputRevision === revision) this.checkQueuePressure('video', vd);
           return;
         }
         let outputTiming: VideoProducedTiming | undefined;
@@ -380,12 +382,12 @@ export class CommandDispatcher {
             outputTiming = this.videoProducingTiming(renderTiming, sourceTimestamp);
           }
         } catch (error) { this.releaseOutputFrame(frame, observation, 'output failed'); throw error; }
-        if (this.renderFeedbackRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
+        if (this.videoRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
           this.releaseOutputFrame(frame, observation, this.outputRevision !== revision ? this.outputRetirementReason : 'output refused', binding, outputTiming); return;
         }
         if (binding && outputTiming === undefined) {
           this.releaseOutputFrame(frame, observation, 'output failed');
-          if (this.videoAdmission === binding && !this.renderFeedbackRetired && this.outputRevision === revision) {
+          if (this.videoAdmission === binding && !this.videoRetired && this.outputRevision === revision) {
             this.reportVideoAdmissionError(new Error('Video producing source is unavailable'));
           }
           return;
@@ -395,15 +397,15 @@ export class CommandDispatcher {
         try { if (admission) decision = this.decideVideoOutput(admission, outputTiming!); }
         catch (error) {
           this.releaseOutputFrame(frame, observation, 'output failed', admission, outputTiming);
-          if (!this.renderFeedbackRetired && this.outputRevision === revision && this.videoAdmission === admission) this.reportVideoAdmissionError(error);
+          if (!this.videoRetired && this.outputRevision === revision && this.videoAdmission === admission) this.reportVideoAdmissionError(error);
           return;
         }
-        if (this.renderFeedbackRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
+        if (this.videoRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
           this.releaseOutputFrame(frame, observation, this.outputRevision !== revision ? this.outputRetirementReason : 'output refused', admission, outputTiming); return;
         }
         if (decision === 'discard') {
           this.releaseOutputFrame(frame, observation, 'output refused', admission, outputTiming);
-          if (!this.renderFeedbackRetired && this.outputRevision === revision && this.videoAdmission === binding) {
+          if (!this.videoRetired && this.outputRevision === revision && this.videoAdmission === binding) {
             this.checkQueuePressure('video', vd);
           }
           return;
@@ -411,7 +413,7 @@ export class CommandDispatcher {
         let syncReady: boolean;
         try { syncReady = this._hasSyncReference?.() ?? true; }
         catch (error) { this.releaseOutputFrame(frame, observation, 'output failed', admission, outputTiming); throw error; }
-        if (this.renderFeedbackRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
+        if (this.videoRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
           this.releaseOutputFrame(frame, observation, this.outputRevision !== revision ? this.outputRetirementReason : 'output refused', admission, outputTiming); return;
         }
         if (decision === 'hold' || !syncReady) {
@@ -420,28 +422,28 @@ export class CommandDispatcher {
             ? { frame, renderTiming, ...(outputTiming ? { outputTiming } : {}), ...(admission ? { admission } : {}), ...(observation ? { observation } : {}) }
             : { frame, captureTimestampUs: captureTs!, ...(observation ? { observation } : {}) });
           if (oldest) this.releaseHeld(oldest, 'hold queue overflow');
-          if (!this.renderFeedbackRetired && this.outputRevision === revision) this.checkQueuePressure('video', vd);
+          if (!this.videoRetired && this.outputRevision === revision) this.checkQueuePressure('video', vd);
           return;
         }
         try { this.drainVideoHoldQueue(renderer, revision); }
         catch (error) { this.releaseOutputFrame(frame, observation, 'output failed', admission, outputTiming); throw error; }
-        if (this.renderFeedbackRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
+        if (this.videoRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
           this.releaseOutputFrame(frame, observation, this.outputRevision !== revision ? this.outputRetirementReason : 'output refused', admission, outputTiming); return;
         }
         let actualRenderTime: number | null;
         try { actualRenderTime = renderTiming ? this.mappedVideoRenderTime(renderTiming, revision)
           : recompute ? recompute(captureTs!) : renderTimeUs; }
         catch (error) { this.releaseOutputFrame(frame, observation, 'output failed', admission, outputTiming); throw error; }
-        if (this.renderFeedbackRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
+        if (this.videoRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
           this.releaseOutputFrame(frame, observation, this.outputRevision !== revision ? this.outputRetirementReason : 'output refused', admission, outputTiming); return;
         }
         if (actualRenderTime === null) {
           this.releaseOutputFrame(frame, observation, 'output failed', admission, outputTiming);
-          if (!this.renderFeedbackRetired && this.outputRevision === revision) this.checkQueuePressure('video', vd);
+          if (!this.videoRetired && this.outputRevision === revision) this.checkQueuePressure('video', vd);
           return;
         }
         this.enqueueVideo(renderer, frame, observation, actualRenderTime, outputTiming, admission);
-        if (!this.renderFeedbackRetired && this.outputRevision === revision) this.checkQueuePressure('video', vd);
+        if (!this.videoRetired && this.outputRevision === revision) this.checkQueuePressure('video', vd);
       };
     }
 
@@ -451,9 +453,9 @@ export class CommandDispatcher {
     // Wire decoder errors — fires BOTH onError and onFeedback (different purposes)
     if (this.videoDecoder) {
       this.videoDecoder.onError = (err) => {
-        if (this.renderFeedbackRetired) return;
+        if (this.videoRetired) return;
         opts.onError?.('video', err);
-        if (this.renderFeedbackRetired) return;
+        if (this.videoRetired) return;
         this.onFeedback?.({ type: 'decode_error', mediaType: 'video', message: err.message });
       };
     }
@@ -470,34 +472,34 @@ export class CommandDispatcher {
     if (this.renderer) {
       if (opts.onFirstFrame) {
         const onFirstFrame = opts.onFirstFrame;
-        this.renderer.onFirstFrame = () => { if (!this.renderFeedbackRetired) onFirstFrame(); };
+        this.renderer.onFirstFrame = () => { if (!this.videoRetired) onFirstFrame(); };
       }
       if (opts.onStall) {
         const onStall = opts.onStall;
-        this.renderer.onStall = (durationMs) => { if (!this.renderFeedbackRetired) onStall(durationMs); };
+        this.renderer.onStall = (durationMs) => { if (!this.videoRetired) onStall(durationMs); };
       }
       if (opts.onStallRecovered) {
         const onStallRecovered = opts.onStallRecovered;
-        this.renderer.onStallRecovered = (durationMs) => { if (!this.renderFeedbackRetired) onStallRecovered(durationMs); };
+        this.renderer.onStallRecovered = (durationMs) => { if (!this.videoRetired) onStallRecovered(durationMs); };
       }
       // Always wire onFrameRendered when renderer exists — for feedback path.
       // User callback is also fired if provided.
       const audioOutput = this.audioOutput;
       this.renderer.onFrameRendered = (captureTimestampUs, actualRenderUs, scheduledRenderUs) => {
-        if (this.renderFeedbackRetired) return;
+        if (this.videoRetired) return;
         opts.onFrameRendered?.(captureTimestampUs, actualRenderUs);
-        if (this.renderFeedbackRetired) return;
+        if (this.videoRetired) return;
         // A/V skew observability: compare the rendered frame's capture
         // timestamp against what the speakers are playing RIGHT NOW.
         // Measurement only — no scheduling/render behavior depends on it.
         if (opts.onAvSkew && audioOutput?.playheadCaptureUs) {
           const playheadUs = audioOutput.playheadCaptureUs();
-          if (this.renderFeedbackRetired) return;
+          if (this.videoRetired) return;
           if (playheadUs !== null) {
             opts.onAvSkew(Number(captureTimestampUs) - playheadUs);
           }
         }
-        if (this.renderFeedbackRetired) return;
+        if (this.videoRetired) return;
         this.onFeedback?.({
           type: 'frame_rendered', mediaType: 'video', captureTimestampUs, actualRenderUs,
           ...(scheduledRenderUs !== undefined ? { scheduledRenderUs } : {}),
@@ -509,26 +511,26 @@ export class CommandDispatcher {
   /** Whether this dispatcher actually owns that decoder-to-output callback. */
   canObserveDecodedOutputs(mediaType: 'video' | 'audio'): boolean {
     return !this.renderFeedbackRetired && (mediaType === 'video'
-      ? this.videoDecoder !== undefined && this.renderer !== undefined
+      ? !this.videoOutputRetired && this.videoDecoder !== undefined && this.renderer !== undefined
       : this.audioDecoder !== undefined && this.audioOutput !== undefined);
   }
 
   /** A mapped selection requires the decoder to preserve each input's producing context. */
   get supportsVideoOutputTiming(): boolean {
-    return !this.renderFeedbackRetired && this.videoDecoder?.supportsOutputTiming === true;
+    return !this.videoRetired && this.videoDecoder?.supportsOutputTiming === true;
   }
 
   /** Historical draw evidence; unavailable without the optional renderer hook. */
   get videoPresentation(): VideoPresentation | null {
-    if (this.renderFeedbackRetired) return null;
+    if (this.videoRetired) return null;
     const observation = this.renderer?.videoPresentation;
-    if (!observation || this.renderFeedbackRetired) return null;
+    if (!observation || this.videoRetired) return null;
     const snapshot: VideoPresentation = {
       frameTimestampUs: observation.frameTimestampUs,
       timestampDomain: observation.timestampDomain,
       renderedAtUs: observation.renderedAtUs,
     };
-    return this.renderFeedbackRetired ? null : Object.freeze(snapshot);
+    return this.videoRetired ? null : Object.freeze(snapshot);
   }
 
   /**
@@ -649,10 +651,10 @@ export class CommandDispatcher {
 
   private wireVideoQueueChange(): void {
     const decoder = this.videoDecoder;
-    if (!decoder || this.renderFeedbackRetired) return;
+    if (!decoder || this.videoRetired) return;
     const binding = { callback: () => { if (current()) this.checkQueuePressure('video', decoder, current); },
       unsubscribe: undefined as (() => void) | undefined };
-    const current = () => !this.renderFeedbackRetired && this.videoDecoder === decoder && this.videoQueueChangeBinding === binding;
+    const current = () => !this.videoRetired && this.videoDecoder === decoder && this.videoQueueChangeBinding === binding;
     const previous = this.videoQueueChangeBinding;
     this.videoQueueChangeBinding = binding;
     const release = previous?.unsubscribe;
@@ -683,8 +685,8 @@ export class CommandDispatcher {
   /** Resample legacy adapters lacking queue events; this proves no output. */
   resampleQueuePressure(): void {
     const video = this.videoDecoder, audio = this.audioDecoder;
-    if (video && !this.renderFeedbackRetired) this.checkQueuePressure('video', video,
-      () => !this.renderFeedbackRetired && this.videoDecoder === video);
+    if (video && !this.videoRetired) this.checkQueuePressure('video', video,
+      () => !this.videoRetired && this.videoDecoder === video);
     if (audio && !this.renderFeedbackRetired) this.checkQueuePressure('audio', audio,
       () => !this.renderFeedbackRetired && this.audioDecoder === audio);
   }
@@ -701,6 +703,8 @@ export class CommandDispatcher {
    * @see draft-ietf-moq-loc-01 §2.3.2.1 (configure video)
    */
   dispatch(cmd: DecoderCommand, options?: { readonly preserveDecoder?: boolean; readonly isCurrent?: () => boolean }): ConfiguredDecoder | undefined {
+    if (this.renderFeedbackRetired || (this.videoOutputRetired && (cmd.type === 'decode_video'
+      || ('mediaType' in cmd && cmd.mediaType === 'video')))) return;
     switch (cmd.type) {
       case 'configure':
         if (this.renderFeedbackRetired || options?.isCurrent?.() === false) return;
@@ -718,7 +722,7 @@ export class CommandDispatcher {
           Object.freeze(receipt);
           // Argument acquisition may synchronously install a newer command.
           // Check mutation authority after every acquired argument is owned.
-          if (this.renderFeedbackRetired || options?.isCurrent?.() === false) return;
+          if (this.videoRetired || options?.isCurrent?.() === false) return;
           // An adapter function may itself carry a `call` property. Invoke the
           // captured callable through the intrinsic operation instead.
           Function.prototype.call.call(configure, decoder, config, codec, width, height);
@@ -782,7 +786,7 @@ export class CommandDispatcher {
       case 'flush':
         if (cmd.mediaType === 'video') {
           const p = this.videoDecoder?.flush();
-          if (p) p.then(() => this.onFeedback?.({ type: 'flush_complete', mediaType: 'video' }));
+          if (p) p.then(() => { if (!this.videoRetired) this.onFeedback?.({ type: 'flush_complete', mediaType: 'video' }); });
         } else {
           const p = this.audioDecoder?.flush();
           if (p) p.then(() => this.onFeedback?.({ type: 'flush_complete', mediaType: 'audio' }));
@@ -830,10 +834,10 @@ export class CommandDispatcher {
     decoder: { readonly queueDepth: number },
     isCurrent?: () => boolean,
   ): void {
-    if (!this.onFeedback) return;
+    if (!this.onFeedback || (mediaType === 'video' && this.videoRetired)) return;
     const revision = mediaType === 'video' ? this.outputRevision : this.audioOutputRevision;
     let depth = decoder.queueDepth;
-    if (this.renderFeedbackRetired || revision !== (mediaType === 'video' ? this.outputRevision : this.audioOutputRevision)) return;
+    if (this.renderFeedbackRetired || (mediaType === 'video' && this.videoOutputRetired) || revision !== (mediaType === 'video' ? this.outputRevision : this.audioOutputRevision)) return;
     if (isCurrent && !isCurrent()) return;
     if (mediaType === 'video') for (const held of this.videoHoldQueue) if (held.admission) depth++;
     const isVideo = mediaType === 'video';
@@ -880,7 +884,7 @@ export class CommandDispatcher {
 
   private mappedVideoRenderTime(timing: VideoRenderTiming, revision: number): number | null {
     const nominal = timing.recomputeRenderTimeUs();
-    if (this.renderFeedbackRetired || this.outputRevision !== revision || nominal === null || !Number.isFinite(nominal)) return null;
+    if (this.videoRetired || this.outputRevision !== revision || nominal === null || !Number.isFinite(nominal)) return null;
     const cushion = this._getPlaybackDelayUs?.() ?? 0;
     const result = nominal + cushion;
     return Number.isFinite(cushion) && Number.isFinite(result) ? result : null;
@@ -889,27 +893,27 @@ export class CommandDispatcher {
   /** Remove before delivery so reentrant flush owns only the not-yet-submitted entries. */
   private drainVideoHoldQueue(renderer: VideoRendererLike, revision: number): void {
     const binding = this.videoAdmission;
-    while (this.videoHoldQueue.length && !this.renderFeedbackRetired && this.outputRevision === revision && this.videoAdmission === binding) {
+    while (this.videoHoldQueue.length && !this.videoRetired && this.outputRevision === revision && this.videoAdmission === binding) {
       const held = this.videoHoldQueue[0]!;
       let decision: 'enqueue' | 'hold' | 'discard' = 'enqueue';
       try { if (held.admission) decision = this.decideVideoOutput(held.admission, held.outputTiming!); }
       catch (error) {
         if (this.videoHoldQueue[0] === held) { this.videoHoldQueue.shift(); this.releaseHeld(held, 'output failed'); }
-        if (!this.renderFeedbackRetired && this.outputRevision === revision && this.videoAdmission === binding) this.reportVideoAdmissionError(error);
+        if (!this.videoRetired && this.outputRevision === revision && this.videoAdmission === binding) this.reportVideoAdmissionError(error);
         return;
       }
-      if (this.renderFeedbackRetired || this.outputRevision !== revision || this.videoAdmission !== binding || this.videoHoldQueue[0] !== held) return;
+      if (this.videoRetired || this.outputRevision !== revision || this.videoAdmission !== binding || this.videoHoldQueue[0] !== held) return;
       if (decision === 'hold') return;
       if (decision === 'discard') { this.videoHoldQueue.shift(); this.releaseHeld(held, 'output refused'); continue; }
       const ready = this._hasSyncReference?.() ?? true;
-      if (this.renderFeedbackRetired || this.outputRevision !== revision || this.videoAdmission !== binding || this.videoHoldQueue[0] !== held) return;
+      if (this.videoRetired || this.outputRevision !== revision || this.videoAdmission !== binding || this.videoHoldQueue[0] !== held) return;
       if (!ready) return;
       this.videoHoldQueue.shift();
       let renderTimeUs: number | null;
       try { renderTimeUs = held.renderTiming ? this.mappedVideoRenderTime(held.renderTiming, revision)
         : this._recomputeVideoRenderTime ? this._recomputeVideoRenderTime(held.captureTimestampUs!) : 0; }
       catch (error) { this.releaseHeld(held, 'output failed'); throw error; }
-      if (this.renderFeedbackRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
+      if (this.videoRetired || this.outputRevision !== revision || this.videoAdmission !== binding) {
         this.releaseHeld(held, this.outputRevision !== revision ? this.outputRetirementReason : 'output refused'); return;
       }
       if (renderTimeUs === null) { this.releaseHeld(held, 'output failed'); continue; }
@@ -948,10 +952,35 @@ export class CommandDispatcher {
     if (this.renderFeedbackRetired || this.audioOutputRevision !== audioRevision) return;
     // Cancel BEFORE the fallible flush: a custom renderer whose flush throws
     // would otherwise leave the episode live across an intentional pause.
-    this.renderer?.cancelStallEpisode?.();
-    this.closeVideoHoldQueue('flushed');
-    this.renderer?.flush();
+    if (!this.videoOutputRetired) {
+      this.renderer?.cancelStallEpisode?.();
+      this.closeVideoHoldQueue('flushed');
+      this.renderer?.flush();
+    }
     this.audioOutput?.flush();
+  }
+
+  /** Retire only video; audio callbacks, timing contexts and adapters remain owned. */
+  retireVideo(): void {
+    if (this.videoOutputRetired) return;
+    this.videoOutputRetired = true;
+    this.videoAdmission = undefined;
+    this.outputRevision++;
+    this.outputRetirementReason = 'destroyed';
+    const failures: unknown[] = [];
+    for (const release of [() => this.clearVideoQueueChange(), () => this.closeVideoHoldQueue('destroyed'),
+      () => this.videoDecoder?.destroy(), () => this.renderer?.destroy()]) {
+      try { release(); } catch (error) { failures.push(error); }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length) throw new AggregateError(failures, 'Video output destruction failed');
+  }
+
+  /** A video-role graph schedules against its retained actor's clock reference. */
+  setVideoReferenceGate(hasReference: () => boolean, playbackDelayUs: () => number): void {
+    if (this.videoRetired) throw new Error('Video output is destroyed');
+    this._hasSyncReference = hasReference;
+    this._getPlaybackDelayUs = playbackDelayUs;
   }
 
   /** Release all adapter resources. */
@@ -964,11 +993,8 @@ export class CommandDispatcher {
     // when cleanup reenters through a custom output callback.
     for (const release of [
       () => this.clearAudioQueueChange(),
-      () => this.clearVideoQueueChange(),
-      () => this.closeVideoHoldQueue('destroyed'),
-      () => this.videoDecoder?.destroy(),
+      () => this.retireVideo(),
       () => this.audioDecoder?.destroy(),
-      () => this.renderer?.destroy(),
       () => this.audioOutput?.destroy(),
     ]) {
       try { release(); } catch (error) { failures.push(error); }

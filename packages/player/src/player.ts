@@ -3,11 +3,11 @@ import type { MediaSeekResource, MediaSeekSample } from './interfaces.js';
 import { nativeTimeUs, nativeRangeMayReachBoundary } from './presentation-placement.js';
 import { PlaybackPosition } from './playback-position.js';
 import { MseSeekPlayback, type SeekTrack, type SeekRoleCandidate, type SeekRoleCutHold, type MseSeekAdoption, type CmafAppendObservation } from './mse-seek-playback.js';
-import { selectSeekQualityCut } from './seek-fetch-pages.js';
+import { selectSeekQualityCut, selectFrameQualityCut } from './seek-fetch-pages.js';
 import type { SeekFetchRequests } from './seek-fetch-requests.js';
 import type { SeekLiveBridge } from './seek-live-bridge.js';
 import { SeekRoleRetrieval, type SeekRoleBridgeOwner, type SeekRetrievalTrack } from './seek-role-retrieval.js';
-import { LocSeekPlayback, locSeekTrackContext, type LocSeekTrack, type LocSeekResume } from './loc-seek-playback.js';
+import { LocSeekPlayback, locSeekTrackContext, type LocSeekTrack, type LocSeekResume, type LocVideoRoleCandidate, type LocVideoRoleTrack } from './loc-seek-playback.js';
 import type { PreparedFramePipelines } from './player-frame-output.js';
 import { locmafPlaybackSamples } from './locmaf-playback-samples.js';
 import { LocGroupCadence } from './loc-group-cadence.js';
@@ -42,7 +42,7 @@ import { MoqtConnectionError } from '@openmoq/webtransport';
 import type { DataStreamTerminal, ObjectReceipt, GoawayNotice, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
 import type { DataStreamHeader, MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
-import { PlaybackPipeline, SyncController, isKeyframePayload } from '@openmoq/playback';
+import { PlaybackPipeline, SyncController, DeliveryLagDetector, isKeyframePayload } from '@openmoq/playback';
 import { BufferBasedController } from '@openmoq/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback, PlaybackInputObserver, AudioTimingSource, VideoTimingSource, PlaybackSample } from '@openmoq/playback';
 import type { AltGroup, CatalogState, CatalogTrack, ResolvedTrackNamespace } from '@openmoq/msf';
@@ -696,7 +696,7 @@ function createCatalogSlots(): CatalogSlots {
 
 
 type SeekRole = 'video' | 'audio';
-type CadenceObject = Pick<MoqtObject, 'kind' | 'trackAlias' | 'groupId' | 'objectId'>;
+type CadenceObject = Pick<MoqtObject, 'kind' | 'trackAlias' | 'groupId' | 'objectId'> & { readonly payloadBytes?: number };
 
 type SeekRoleConsumer = Pick<SeekRoleCandidate, 'beginPage' | 'acceptPage' | 'beginLive'>;
 
@@ -730,7 +730,8 @@ interface LocSeekAttempt {
   readonly epoch: object;
   readonly reason: 'seek' | 'resume' | 'quality';
   readonly quality?: LocSeekQuality;
-  readonly tracks: readonly SeekRetrievalTrack[];
+  readonly tracks: SeekRetrievalTrack[];
+  readonly preparingRetrievals: Set<SeekRoleRetrieval>;
   initialDispatcher: CommandDispatcher | null;
   readonly connection: MoqtConnection;
   readonly timelineSource: object;
@@ -738,6 +739,7 @@ interface LocSeekAttempt {
   readonly retrievals: Map<'video' | 'audio', SeekRoleRetrieval>;
   readonly bridges: Set<SeekRoleBridgeOwner>;
   output: PreparedFramePipelines | null;
+  videoOutput: PreparedFramePipelines | null;
   positioned: boolean;
   retired: boolean;
 }
@@ -826,6 +828,15 @@ export class MoqtPlayer {
     };
     rate: ReceivedPayloadRate;
   } | null = null;
+  private videoDeliveryLag: {
+    readonly owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'];
+    readonly timescale: bigint | null;
+    readonly sourceOriginUs: bigint;
+    readonly arrivalOriginUs: number;
+    readonly detector: DeliveryLagDetector;
+    lastAttemptUs: number | null;
+  } | null = null;
+  private evaluatingBandwidth = false;
   private bufferAbrController: BufferBasedController | null = null;
   private readonly cadenceInputOwners = new WeakMap<object, NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner']>();
   private readonly seekCadenceInputs = new WeakMap<ObjectReceipt, {
@@ -1259,6 +1270,7 @@ export class MoqtPlayer {
     mediaSource: MediaSourceLike | null;
     oldRequestId: bigint | null;
     historical?: { readonly attempt: MseSeekAttempt; readonly cancel: () => void; readonly checkCoast: () => void };
+    frame?: { readonly attempt: LocSeekAttempt; readonly cancel: () => void; readonly cancelPending: () => void };
     deadlineMs?: number | undefined;
     oldTrackName: string;
     oldSourceKey?: string;
@@ -1568,7 +1580,7 @@ export class MoqtPlayer {
     if (!manager) return Promise.resolve();
     const inputGeneration = manager.mediaInputGeneration;
     // Measurement ownership travels through transforms independently of playback validity.
-    const cadenceOwner = fetchInfo === undefined && obj.kind === 'data' && BigInt(obj.objectId) === 0n
+    const cadenceOwner = fetchInfo === undefined && obj.kind === 'data'
       ? this.captureVideoMeasurementOwner() : null;
     const selected = this._selection.video;
     const cadenceIdentity = cadenceOwner && cadenceOwner.connection === sourceConnection
@@ -2247,7 +2259,7 @@ export class MoqtPlayer {
    */
   get videoPresentation(): VideoPresentation | null {
     if (this._destroyed) return null;
-    const observation = this.commandDispatcher?.videoPresentation ?? null;
+    const observation = this.videoCommandDispatcher()?.videoPresentation ?? null;
     return this._destroyed ? null : observation;
   }
 
@@ -3238,7 +3250,12 @@ export class MoqtPlayer {
       && this.videoPipeline === automaticPipeline);
     if (!automaticAllowed()) return;
     let automaticWithdrawal: Error | undefined;
-    if (this.activeLocSeek || this.preparingLocSeek) return this.selectPausedLocVideoTrack(reference, reason);
+    if (this.activeLocSeek || this.preparingLocSeek) {
+      if (this.activeLocSeek && !this.preparingLocSeek && this.state === PlayerState.PLAYING && this.playbackIntent === true) {
+        return this.selectPlayingLocVideoTrack(reference, reason, abrAction, automaticAllowed);
+      }
+      return this.selectPausedLocVideoTrack(reference, reason);
+    }
     if (this._destroyed || this.isTerminalState() || this.currentMigration || this.mediaSelection || this.seekIsPreparing()) {
       throw new Error('Cannot switch track: playback is not accepting selections');
     }
@@ -3506,6 +3523,7 @@ export class MoqtPlayer {
 
   private retireVideoSwitchTarget(sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>): void {
     sw.historical?.cancel();
+    sw.frame?.cancel();
     if (sw.newRequestId === null || sw.requestReleased) return;
     sw.requestReleased = true;
     if (sw.connection === this.connection) this.clearLocmafDecoderForRequest(sw.newRequestId);
@@ -3971,13 +3989,13 @@ export class MoqtPlayer {
       this.locDiagnosticBindings = binding;
     }
     const graphs = [...this.retiringLocDiagnosticGraphs ?? [], ...[this.preparingLocSeek, this.activeLocSeek].flatMap(attempt => {
-      const graph = attempt?.playback.diagnosticGraph;
-      return graph ? [graph] : [];
+      return attempt ? [...attempt.playback.videoDiagnosticGraphs, ...(attempt.output ? [attempt.output] : []),
+        ...(attempt.videoOutput ? [attempt.videoOutput] : [])] : [];
     })];
     const pipelines = [...new Set([this.videoPipeline, this.audioPipeline,
       ...graphs.flatMap(graph => [graph.pipelines.videoPipeline, graph.pipelines.audioPipeline])]
       .filter((pipeline): pipeline is PlaybackPipeline => pipeline !== null))];
-    const dispatchers = [...new Set([this.commandDispatcher, ...graphs.map(graph => graph.pipelines.commandDispatcher)]
+    const dispatchers = [...new Set([this.commandDispatcher, this.videoCommandDispatcher(), ...graphs.map(graph => graph.pipelines.commandDispatcher)]
       .filter((dispatcher): dispatcher is CommandDispatcher => dispatcher !== null))];
     for (const previous of binding.pipelines) if (!pipelines.includes(previous)) {
       binding.refused += previous.inputEvidenceLossCount;
@@ -4067,7 +4085,7 @@ export class MoqtPlayer {
     let mediaStages: PlayerDiagnosticSnapshot['mediaStages'];
     const runtime = this.mediaDiagnosticRuntime;
     if (runtime) try { mediaStages = { evidenceLossCount: runtime.evidenceLossCount, unobservableAppendCount: runtime.unobservableAppendCount, unattributedInputCount: runtime.unattributedInputCount,
-      decodedVideoCount: this.commandDispatcher?.canObserveDecodedOutputs('video') ? runtime.decodedVideoCount : null,
+      decodedVideoCount: this.videoCommandDispatcher()?.canObserveDecodedOutputs('video') ? runtime.decodedVideoCount : null,
       decodedAudioCount: this.commandDispatcher?.canObserveDecodedOutputs('audio') ? runtime.decodedAudioCount : null,
       unobservableVideoCount: runtime.unobservableVideoCount, unobservableAudioCount: runtime.unobservableAudioCount,
       refusedReconstructionCount: runtime.refusedReconstructionCount, refusedVideoCount: runtime.refusedVideoCount, refusedAudioCount: runtime.refusedAudioCount,
@@ -4224,7 +4242,8 @@ export class MoqtPlayer {
     this.subscriptionManager.onObject = (mediaType, trackName, obj, headers, input, delivery) => {
       const cadenceOwner = mediaType === 'video' && !delivery?.backfill && !delivery?.fetched && delivery?.identity
         ? this.cadenceInputOwners.get(delivery.identity) ?? null : null;
-      const inputGeneration = this.subscriptionManager?.mediaInputGeneration;
+      const inputManager = this.subscriptionManager;
+      const inputGeneration = inputManager?.mediaInputGeneration;
       if ((mediaType === 'audio' || mediaType === 'video') && this.stagePreparedMediaInput(obj, headers, input, () =>
         this.subscriptionManager?.onObject?.(mediaType, trackName, obj, headers, input, delivery), delivery)) return;
       // Liveness: ANY object on this track (data, gap, or staged-for-switch)
@@ -4311,6 +4330,18 @@ export class MoqtPlayer {
       const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
       if (pipeline && mediaType === 'video' && !delivery?.backfill && !delivery?.fetched) {
         this.recordLocGroupCadence(obj, headers, cadenceOwner);
+        this.recordVideoDeliveryLag(obj, headers, cadenceOwner, obj.kind === 'data' ? obj.payload.byteLength : 0);
+        // Observation clocks may reenter the player. Measurement refusal alone
+        // does not revoke the media work captured before that callback.
+        const deliveryCurrent = delivery?.isLive?.() !== false;
+        const deliveryState = this.state;
+        if (!deliveryCurrent || this._destroyed || this.subscriptionManager !== inputManager
+            || inputManager?.mediaInputGeneration !== inputGeneration
+            || pipeline !== (mediaType === 'video' ? this.videoPipeline : this.audioPipeline)
+            || deliveryState === PlayerState.PAUSED
+            || deliveryState === PlayerState.ENDED || deliveryState === PlayerState.ERROR) {
+          this.discardMediaInput(input, deliveryState === PlayerState.PAUSED ? 'paused' : 'route retired'); return;
+        }
       }
       if (!pipeline) this.discardMediaInput(input, 'not attached');
       else if (delivery?.backfill) pipeline.pushObject(obj, headers, input, { backfill: true });
@@ -5038,6 +5069,7 @@ export class MoqtPlayer {
     const fromState = this.applyState(PlayerState.PAUSED);
     this.subscriptionManager?.invalidateMediaInputs();
     this.playbackIntent = false;
+    this.pendingVideoSwitch?.frame?.cancelPending();
     this.seekPosition?.setPlaying(false);
     this.activeMseSeek?.playback.setPlaying(false);
     this.preparingMseSeek?.playback.setPlaying(false);
@@ -5858,7 +5890,7 @@ export class MoqtPlayer {
         if (placed === null) throw new Error('MSE presentation anchor is not representable');
         msePlacement = { assembler: assembler!, referenceRole, reference, oldPlacementToken: oldPlacement.token,
           referenceOffset, targetOffset, sourceKey: targetKey, anchor: placed };
-      } else if (role === 'video' && !this.commandDispatcher?.supportsVideoOutputTiming) {
+      } else if (role === 'video' && !this.videoCommandDispatcher()?.supportsVideoOutputTiming) {
         throw new Error('Video decoder cannot preserve producing output timing');
       }
       const capturedOffset = offset;
@@ -9834,60 +9866,142 @@ export class MoqtPlayer {
     return true;
   }
 
+  private videoLagOwner(): ReturnType<MoqtPlayer['captureVideoMeasurementOwner']> {
+    const owner = this.captureVideoMeasurementOwner();
+    if (!owner?.automatic || !this.videoPipeline) return null;
+    const selected = this._selection.video;
+    const track = selected && this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
+    return track?.isLive === true && track.packaging === 'loc' && owner.route() ? owner : null;
+  }
+
+  private recordVideoDeliveryLag(object: CadenceObject, headers: LocHeaders,
+    owner: ReturnType<MoqtPlayer['captureVideoMeasurementOwner']>, payloadBytes: number): void {
+    if (payloadBytes <= 0 || !owner || object.kind !== 'data' || BigInt(object.trackAlias) !== owner.alias
+        || !this.sameVideoMeasurementOwner(owner, this.videoLagOwner()) || headers.captureTimestamp === undefined) return;
+    const timescale = headers.timescale ?? null;
+    if (timescale === null ? headers.timestampIsWallClock === false
+      : timescale <= 0n || headers.timestampIsWallClock === true) {
+      this.videoDeliveryLag = null; return;
+    }
+    // Consumer admission includes transform and application work, not just network transit.
+    const now = this.clock.now();
+    if (!this.sameVideoMeasurementOwner(owner, this.videoLagOwner())) return;
+    if (!Number.isFinite(now)) { this.videoDeliveryLag = null; return; }
+    let state = this.videoDeliveryLag;
+    if (!state || !this.sameVideoMeasurementOwner(state.owner, owner) || state.timescale !== timescale) {
+      state = { owner, timescale, sourceOriginUs: headers.captureTimestamp, arrivalOriginUs: now,
+        detector: new DeliveryLagDetector(), lastAttemptUs: null };
+      this.videoDeliveryLag = state;
+    }
+    const source = headers.captureTimestamp - state.sourceOriginUs, arrival = now - state.arrivalOriginUs;
+    if (source < BigInt(Number.MIN_SAFE_INTEGER) || source > BigInt(Number.MAX_SAFE_INTEGER)
+        || !Number.isFinite(arrival) || arrival < 0) { this.videoDeliveryLag = null; return; }
+    try { state.detector.record(Number(source), arrival); }
+    catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      if (this.videoDeliveryLag === state) this.videoDeliveryLag = null;
+    }
+  }
+
+  private risingVideoDeliveryLag(): { state: NonNullable<MoqtPlayer['videoDeliveryLag']>; nowUs: number; excessUs: number } | null {
+    const state = this.videoDeliveryLag;
+    if (!state) return null;
+    if (!this.sameVideoMeasurementOwner(state.owner, this.videoLagOwner())) {
+      if (this.videoDeliveryLag === state) this.videoDeliveryLag = null;
+      return null;
+    }
+    const nowUs = this.clock.now() - state.arrivalOriginUs;
+    if (this.videoDeliveryLag !== state || !this.sameVideoMeasurementOwner(state.owner, this.videoLagOwner())) return null;
+    if (!Number.isFinite(nowUs) || nowUs < 0) { this.videoDeliveryLag = null; return null; }
+    try {
+      if (!state.detector.isCongested(nowUs)) return null;
+      if (state.lastAttemptUs !== null && nowUs - state.lastAttemptUs < this.config.qualitySwitchCooldownMs! * 1000) return null;
+      const excessUs = state.detector.excessLagUs(nowUs);
+      return excessUs === null ? null : { state, nowUs, excessUs };
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      if (this.videoDeliveryLag === state) this.videoDeliveryLag = null;
+      return null;
+    }
+  }
+
   private checkBandwidthAdaptation(): void {
-    if (!this.bufferAbrController || !this.qualityController) return;
+    if (this.evaluatingBandwidth) return;
+    this.evaluatingBandwidth = true;
+    try { this.evaluateBandwidthAdaptation(); }
+    finally { this.evaluatingBandwidth = false; }
+  }
+
+  private evaluateBandwidthAdaptation(): void {
+    if (!this.bufferAbrController || !this.qualityController || !this.connection
+        || this.state !== PlayerState.PLAYING || this.playbackIntent !== true) return;
+    const connection = this.connection, controller = this.qualityController, selection = this._selection;
+    const abr = this.bufferAbrController, pipeline = this.videoPipeline, source = this.mediaSource;
+    const manager = this.subscriptionManager, generation = manager?.mediaInputGeneration;
+    const track = controller.currentVideoTrack, mode = this.videoMeasurementMode;
+    const live = () => !this._destroyed && this.state === PlayerState.PLAYING && this.playbackIntent === true
+      && this.connection === connection && connection.session?.state === SessionState.ESTABLISHED
+      && this.qualityController === controller && controller.isAutoQuality && controller.currentVideoTrack === track
+      && this._selection === selection && this.videoPipeline === pipeline && this.mediaSource === source
+      && this.bufferAbrController === abr && this.subscriptionManager === manager
+      && manager?.mediaInputGeneration === generation && this.videoMeasurementMode === mode
+      && !this.pendingVideoSwitch && !this.switchInProgress && !this.mediaSelection && !this.currentMigration && (!this.seekIsPreparing() || this.playingLocQualityAvailable());
+    if (!live()) return;
+    const lag = this.risingVideoDeliveryLag();
+    if (!live()) return;
     // Don't trigger ABR while a switch is in flight — give the current
     // switch time to deliver data before deciding to switch again.
-    if (this.pendingVideoSwitch || this.switchInProgress || this.mediaSelection || this.seekIsPreparing()) return;
+    if (this.pendingVideoSwitch || this.switchInProgress || this.mediaSelection || this.seekIsPreparing() && !this.playingLocQualityAvailable()) return;
 
     let effectiveBufferUs: number;
 
-    if (this.videoPipeline) {
+    if (pipeline) {
       // LOC path: health gates all upshift decisions. When unhealthy,
       // cap to hold zone regardless of buffer depth — prevents upshift
       // after stalls, decode errors, or partial group abandonment.
-      const bufferedGroups = this.videoPipeline.bufferedGroupCount;
+      const bufferedGroups = pipeline.bufferedGroupCount;
       const healthy = this.isLocDeliveryHealthy();
       if (!healthy) {
-        effectiveBufferUs = this.bufferAbrController.lowThresholdUs;
+        effectiveBufferUs = abr.lowThresholdUs;
       } else if (bufferedGroups === 0) {
-        effectiveBufferUs = this.bufferAbrController.highThresholdUs;
+        effectiveBufferUs = abr.highThresholdUs;
       } else {
         effectiveBufferUs = bufferedGroups * this.estimatedGopDurationUs;
       }
-    } else if (this.mediaSource?.getBufferAheadUs) {
+    } else if (source?.getBufferAheadUs) {
       // CMAF path: read buffer depth from MSE.
       // MSE buffers are naturally thin on fast networks — data arrives
       // and is consumed almost simultaneously, keeping buffered.end near
       // currentTime. A thin buffer with high bandwidth is healthy (data
       // arrives on demand), not starving. Only report low buffer when
       // bandwidth can't sustain the current track.
-      const bufferUs = this.mediaSource.getBufferAheadUs();
+      const bufferUs = source.getBufferAheadUs();
       if (bufferUs === null) return; // no trustworthy signal yet — hold
       if (bufferUs === 0) {
         // Truly empty — always report emergency, don't let stale
         // bandwidth estimates suppress the downshift.
         effectiveBufferUs = 0;
-      } else if (bufferUs < this.bufferAbrController.lowThresholdUs) {
+      } else if (bufferUs < abr.lowThresholdUs) {
         // Thin but not empty — check if bandwidth sustains.
         // On fast networks MSE buffers are naturally thin; a thin
         // buffer with high bandwidth is healthy, not starving.
         const bwKbps = this.readVideoReceivedRate() ?? 0;
-        const currentTrack = this.bufferAbrController.currentTrack;
+        const currentTrack = abr.currentTrack;
         const currentBitrateKbps = currentTrack ? currentTrack.bitrateKbps : 0;
         effectiveBufferUs = bwKbps > currentBitrateKbps * 1.5
-          ? this.bufferAbrController.lowThresholdUs
+          ? abr.lowThresholdUs
           : bufferUs;
       } else {
         effectiveBufferUs = bufferUs;
       }
     } else {
-      effectiveBufferUs = this.bufferAbrController.lowThresholdUs;
+      effectiveBufferUs = abr.lowThresholdUs;
     }
 
     const bandwidthKbps = this.readVideoReceivedRate() ?? 0;
 
-    const decision = this.bufferAbrController.evaluate({
+    if (!live()) return;
+    const decision = lag ? { action: 'downshift' as const } : abr.evaluate({
       bufferDepthUs: effectiveBufferUs,
       bandwidthEstimateKbps: bandwidthKbps,
     });
@@ -9901,18 +10015,25 @@ export class MoqtPlayer {
       if (sinceDownshift < MoqtPlayer.ABR_UPSHIFT_STABILITY_US) return;
     }
 
+    if (!live()) return;
     const isDown = decision.action === 'downshift';
-    const isEmergency = isDown && effectiveBufferUs < this.bufferAbrController.lowThresholdUs;
+    const isEmergency = !lag && isDown && effectiveBufferUs < abr.lowThresholdUs;
     // Non-mutating peek — state only changes on commit.
     const newTrack = isDown
-      ? this.qualityController.peekLowerVideoQuality(isEmergency)
-      : this.qualityController.peekHigherVideoQuality();
+      ? controller.peekLowerVideoQuality(isEmergency)
+      : controller.peekHigherVideoQuality();
 
     if (newTrack) {
-      if (isDown) this.lastAbrDownshiftUs = this.clock.now();
+      const nowUs = this.clock.now();
+      if (!live()) return;
       const verb = isDown ? 'downshift' : 'upshift';
-      this.log.warn('Buffer %.1fs, BW %.0fkbps → %s to %s',
+      if (lag) this.log.warn('Video delivery trend +%.0fms and rising → downshift to %s', lag.excessUs / 1000, newTrack.name);
+      else this.log.warn('Buffer %.1fs, BW %.0fkbps → %s to %s',
         effectiveBufferUs / 1_000_000, bandwidthKbps, verb, newTrack.name);
+      const freshLag = lag ? this.risingVideoDeliveryLag() : null;
+      if (!live() || lag && freshLag?.state !== lag.state) return;
+      if (isDown) this.lastAbrDownshiftUs = nowUs;
+      if (freshLag) freshLag.state.lastAttemptUs = freshLag.nowUs;
       // No stats or controller mutation here — deferred to completePendingVideoSwitch.
       this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'bandwidth', isDown ? 'downshift' : 'upshift')
         .catch((err) => {
@@ -14035,8 +14156,10 @@ export class MoqtPlayer {
     const attempt = loc && !loc.retired && loc.output ? loc : mse;
     if (!attempt || attempt.retired || attempt.connection !== connection) return null;
     const frameOutput = attempt === loc ? loc.output : null;
+    const frameVideo = frameOutput ? loc!.videoOutput ?? loc!.playback.videoDiagnosticGraph : null;
+    const videoOwner = frameOutput ? loc!.playback.videoRoleOwner() : null;
     const mseOutput = frameOutput ? null : this.ownedSeekOutput;
-    const output = frameOutput ?? mseOutput;
+    const output = frameVideo ?? mseOutput;
     if (!output) return null;
     const sourceKey = identityKey(selected.namespaceFields, selected.name);
     const owners = [...attempt.bridges].filter(owner => owner.role === 'video' && !owner.ending
@@ -14072,7 +14195,8 @@ export class MoqtPlayer {
           && (frameOutput !== null
             ? this.activeLocSeek === attempt && loc?.output === frameOutput
               && this.commandDispatcher === frameOutput.pipelines.commandDispatcher
-              && this.videoPipeline === frameOutput.pipelines.videoPipeline
+              && (loc.videoOutput ?? loc.playback.videoDiagnosticGraph) === frameVideo && loc.playback.videoRoleOwner() === videoOwner
+              && this.videoPipeline === frameVideo?.pipelines.videoPipeline
               && loc.tracks.includes(track)
             : this.activeMseSeek === attempt && this.ownedSeekOutput === mseOutput
               && this.mediaSource === mse?.source && this.mseOutputEpoch === epoch
@@ -14086,7 +14210,7 @@ export class MoqtPlayer {
     return { kind: 'seek-live', attempt, bridgeOwner, track, epoch, selection: selected, configuration,
       connection, manager, generation, requestId: subscription.requestId, alias: subscription.trackAlias,
       subscription, sourceKey, output, pipeline, source, assembler, automatic, mode,
-      frameReader: undefined, decoder: frameOutput?.output.videoDecoder, header: undefined, route };
+      frameReader: undefined, decoder: frameVideo?.output.videoDecoder, header: undefined, route };
   }
 
   private seekLiveObservation(bridgeOwner: SeekRoleBridgeOwner):
@@ -14107,7 +14231,7 @@ export class MoqtPlayer {
         const receipt = captures.get(token); captures.delete(token);
         if (!receipt || !this.sameVideoMeasurementOwner(receipt.owner, this.captureVideoMeasurementOwner())) return;
         this.recordVideoPayload(receipt);
-        if (object.kind !== 'data' || BigInt(object.objectId) !== 0n
+        if (object.kind !== 'data'
             || this.catalogTrackFor(bridgeOwner.track.name, bridgeOwner.track.namespace, 'video')?.packaging !== 'loc') return;
         const subscription = bridgeOwner.bridge?.acceptedLiveSubscription;
         if (!subscription) return;
@@ -14117,7 +14241,7 @@ export class MoqtPlayer {
         });
         if (this.sameVideoMeasurementOwner(receipt.owner, this.captureVideoMeasurementOwner())) {
           this.seekCadenceInputs.set(receipt.receipt, {
-            object: { kind: object.kind, trackAlias: object.trackAlias, groupId: object.groupId, objectId: object.objectId },
+            object: { kind: object.kind, trackAlias: object.trackAlias, groupId: object.groupId, objectId: object.objectId, payloadBytes: receipt.bytes },
             owner: receipt.owner, headers,
           });
         }
@@ -14195,6 +14319,7 @@ export class MoqtPlayer {
     this.videoMeasurementMode = {};
     this.videoPayloadMeasurement = null;
     this.videoGroupCadence = null;
+    this.videoDeliveryLag = null;
   }
 
   /** Cancel waiting recovery and release its cached session reference before retirement. */
@@ -14611,9 +14736,313 @@ export class MoqtPlayer {
   }
 
 
+  /** A role replacement never borrows the composite dispatcher's audio authority. */
+  private videoCommandDispatcher(): CommandDispatcher | null {
+    const attempt = this.activeLocSeek;
+    if (attempt && !attempt.retired && attempt.output
+        && this.commandDispatcher === attempt.output.pipelines.commandDispatcher) {
+      return (attempt.videoOutput ?? attempt.playback.videoDiagnosticGraph)?.pipelines.commandDispatcher ?? null;
+    }
+    return this.commandDispatcher;
+  }
+
+  private refreshLocFrameResources(attempt: LocSeekAttempt): void {
+    if (this.activeLocSeek !== attempt || attempt.retired) return;
+    this.frameOutputResources = [...new Set([...(attempt.output?.resources ?? []), ...(attempt.videoOutput?.resources ?? []),
+      ...attempt.playback.videoDiagnosticGraphs.flatMap(graph => graph.resources)])];
+  }
+
+  private playingLocQualityAvailable(): boolean {
+    const attempt = this.activeLocSeek, selected = this._selection.video;
+    if (!attempt || attempt.retired || !attempt.positioned || !attempt.output || this.preparingLocSeek
+        || this.state !== PlayerState.PLAYING || this.playbackIntent !== true || !selected
+        || !attempt.playback.videoRoleOwner()) return false;
+    const owner = this.captureVideoMeasurementOwner();
+    return owner?.kind === 'seek-live' && owner.attempt === attempt
+      && this.catalogTrackFor(selected.name, selected.namespaceFields, 'video')?.isLive === true;
+  }
+
+  private async selectPlayingLocVideoTrack(reference: string | TrackRefConfig, reason: string,
+    abrAction: 'downshift' | 'upshift' | undefined, automaticAllowed: () => boolean): Promise<void> {
+    const attempt = this.activeLocSeek, output = attempt?.output, selection = this._selection;
+    const connection = this.connection, manager = this.subscriptionManager, sync = this.syncController;
+    const source = this.timelineSource, generation = this.bootstrapGeneration;
+    if (!attempt || !output || attempt.retired || !attempt.positioned || !connection || !manager || !sync
+        || this.preparingLocSeek || this.currentMigration || this.mediaSelection || this.pendingVideoSwitch
+        || this.switchInProgress || this.pendingRetypes.size || this.state !== PlayerState.PLAYING
+        || this.playbackIntent !== true || this.commandDispatcher !== output.pipelines.commandDispatcher) {
+      throw new Error('Playing frame video output is not accepting a rendition');
+    }
+    if (connection.draftVersion !== 18 && connection.draftVersion !== 22) {
+      throw new Error('Playing frame rendition requires draft18 or22');
+    }
+    const selected = selection.video;
+    const old = selected && this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
+    const oldTrack = attempt.tracks.find(track => track.role === 'video');
+    const previous = attempt.retrievals.get('video'), oldOwner = attempt.playback.videoRoleOwner();
+    if (!selected || !old || !oldTrack || !previous || !oldOwner || oldTrack.name !== selected.name
+        || !sameNamespaceFields(oldTrack.namespace, selected.namespaceFields)) throw new Error('Playing frame video owner is unavailable');
+    const name = typeof reference === 'string' ? reference : reference.name;
+    const namespace = typeof reference === 'string' ? undefined : namespaceFields(reference.namespace ?? this.config.namespace);
+    const matches = this.qualityController?.eligibleLadder(this.activeVideoSet(old)).filter(track => track.name === name
+      && (namespace === undefined || sameNamespaceFields(trackNamespaceFields(track, this.config.namespace), namespace))) ?? [];
+    if (matches.length > 1) throw new Error(`Ambiguous video track: "${name}"`);
+    const declared = matches[0];
+    if (!declared || old.altGroup === undefined || declared.altGroup !== old.altGroup
+        || !isTrackPackagingSupported(declared) || declared.packaging !== 'loc' && !(declared.packaging === 'locmaf' && this.locmafFramePath)) {
+      throw new Error('Playing frame rendition requires a supported member of the same declared alternate set');
+    }
+    if (this.initKey(old) === this.initKey(declared)) return;
+    const target = structuredClone(declared), targetNs = [...trackNamespaceFields(target, this.config.namespace)];
+    const timeline = this.timelineState;
+    const common = () => source !== null && this.timelineSource === source && this.timelineState !== null
+      && sameNamespaceFields(source.namespace, oldTrack.namespace) && sameNamespaceFields(source.namespace, targetNs)
+      && (source.wireFormat === 'msf-00' || source.wireFormat === 'msf-01')
+      && this.timelineState.depends.includes(oldTrack.name) && this.timelineState.depends.includes(target.name);
+    const selectionCurrent = () => (['video', 'audio'] as const).every(role => {
+      const before = selection[role], now = this._selection[role];
+      return before === null ? now === null : now !== null
+        && identityKey(before.namespaceFields, before.name) === identityKey(now.namespaceFields, now.name);
+    });
+    const baseCurrent = () => !this._destroyed && !this.isTerminalState() && this.activeLocSeek === attempt && !attempt.retired
+      && attempt.output === output && this.connection === connection && this.bootstrapGeneration === generation
+      && this.subscriptionManager === manager && this.commandDispatcher === output.pipelines.commandDispatcher
+      && this.syncController === sync && this.timelineSource === source;
+    const observed = this.playbackPositionMs, frontier = attempt.playback.videoCutFrontier();
+    if (!timeline || !common() || !baseCurrent() || observed === null || !frontier || frontier.owner !== oldOwner) {
+      throw new Error('Playing frame rendition has no current common indexed frontier');
+    }
+    const plan = selectFrameQualityCut({ draftVersion: connection.draftVersion, trackName: target.name, timeline,
+      afterContentMs: Math.max(observed, frontier.positionMs) });
+    if (plan.kind !== 'candidate') throw new Error(`No declared future frame boundary: ${plan.reason}`);
+    if (!baseCurrent() || !selectionCurrent() || attempt.playback.videoRoleOwner() !== oldOwner) throw new Error('Playing frame rendition was superseded');
+    if (!automaticAllowed()) return;
+    if (reason === 'manual') this.qualityController?.lockManual();
+    let settle!: () => void;
+    const done = new Promise<void>(resolve => { settle = resolve; });
+    const sw: NonNullable<MoqtPlayer['pendingVideoSwitch']> = {
+      connection, generation, mediaSource: this.mediaSource, oldRequestId: null, oldTrackName: old.name,
+      newTrackName: target.name, newRequestId: null, newTrackPackaging: mediaTrackPackaging(target.packaging),
+      targetTrack: target, catalog: this._catalogState!, initData: undefined, cmafContext: undefined,
+      phase: 'preparing', requestReleased: false, failure: undefined, stagedBytes: 0, stagedObjects: 0, stagedSamples: 0,
+      done, settle, reason, ...(abrAction ? { abrAction } : {}),
+    };
+    let phase: 'preparing' | 'committing' | 'adopted' | 'retired' = 'preparing';
+    let candidate: LocVideoRoleCandidate | null = null, retrieval: SeekRoleRetrieval | null = null;
+    let issued = false, withdrawn = false, published = false, presented = false, suspended = false;
+    let automaticWithdrawal: Error | undefined;
+    const current = () => baseCurrent() && phase !== 'retired'
+      && (phase === 'adopted' || this.state === PlayerState.PLAYING && this.playbackIntent === true && this.switchIsCurrent(sw));
+    const promoted = () => candidate?.promoted === true;
+    const causeOf = (error: unknown): Error => error instanceof Error ? error : new Error('Playing frame rendition failed', { cause: error });
+    const failOwned = (cause: Error) => {
+      if (!baseCurrent()) return;
+      this.failCatalogPlayback(createPlayerError('fatal', 'decoder', PlayerErrorCode.VIDEO_DECODE_ERROR,
+        `Playing frame rendition failed after video adoption: ${cause.message}`, { cause }), () => this.retireLocSeek(attempt, cause));
+    };
+    const cancel = () => {
+      if (phase === 'retired') return;
+      // The actor publishes ownership before fallible factory/adoption callbacks.
+      // A throwing commit may already have consumed the old video cut.
+      if (promoted()) { failOwned(sw.failure ?? new Error('Playing frame rendition retired after adoption')); return; }
+      phase = 'retired';
+      const failures: unknown[] = [];
+      if (retrieval) attempt.preparingRetrievals.delete(retrieval);
+      for (const release of [() => retrieval?.cancel(), () => candidate?.cancel()]) {
+        try { release(); } catch (error) { failures.push(error); }
+      }
+      this.refreshLocFrameResources(attempt); this.bindLocDiagnostics(this.mediaDiagnosticRuntime);
+      if (failures.length) throw new AggregateError(failures, 'Playing frame rendition cancellation failed');
+    };
+    const releaseSlot = (status: 'committed' | 'retired' = 'committed') => {
+      if (this.pendingVideoSwitch !== sw) return;
+      sw.phase = status; sw.settle();
+      if (this.switchStagingTimeout !== null) { clearTimeout(this.switchStagingTimeout); this.switchStagingTimeout = null; }
+      this.pendingVideoSwitch = null; this.switchInProgress = false;
+      this.videoSwitchSettled();
+    };
+    const suspendPublished = () => {
+      if (!published || !promoted() || !baseCurrent() || this.pendingVideoSwitch !== sw) return;
+      sw.failure = Object.assign(new Error('Video role was adopted but presentation was suspended by pause'), { name: 'AbortError' });
+      // The accepted role stays adopted. Do not report rollback or cancel it.
+      releaseSlot();
+    };
+    sw.frame = { attempt, cancel, cancelPending: () => {
+      if (this.pendingVideoSwitch !== sw) return;
+      if (promoted()) { suspended = true; suspendPublished(); return; }
+      const cause = Object.assign(new Error('Playing frame rendition cancelled by pause'), { name: 'AbortError' });
+      this.discardPendingVideoSwitch(sw, cause);
+    } };
+    const fail = (error: unknown) => {
+      if (automaticWithdrawal !== undefined && error === automaticWithdrawal && this.switchIsCurrent(sw)) {
+        withdrawn = true; this.discardPendingVideoSwitch(sw, automaticWithdrawal); return;
+      }
+      const cause = causeOf(error);
+      if (phase === 'adopted' || promoted()) { failOwned(cause); return; }
+      if (this.switchIsCurrent(sw)) this.abortPendingVideoSwitch(sw, cause);
+    };
+    const profile = ['packaging', 'codec', 'width', 'height', 'altGroup', 'renderGroup', 'locmafVersion', 'initData', 'initRef', 'initTrack'] as const;
+    const validate = (): CatalogTrack => {
+      const actual = this.catalogTrackFor(target.name, targetNs, 'video');
+      const indexed = this.timelineState?.entries.some(entry => entry.mediaPts === plan.indexedPts
+        && BigInt(entry.location[0]) === plan.location.groupId && BigInt(entry.location[1]) === plan.location.objectId);
+      const nowMs = performance.now();
+      if (!Number.isFinite(nowMs) || sw.deadlineMs === undefined || nowMs >= sw.deadlineMs
+          || !current() || !common() || !indexed || !actual || profile.some(field => actual[field] !== target[field])
+          || !this.qualityController?.eligibleLadder(this.activeVideoSet(old)).includes(actual)) {
+        throw new Error('Playing frame rendition declaration or index changed');
+      }
+      const nowInit = target.packaging === 'locmaf' ? this.locSeekFrameInit(actual) : this.decodeResolvedInlineInitData(actual);
+      if (sw.initData === undefined ? nowInit !== undefined : nowInit === undefined || !MoqtPlayer.sameBytes(sw.initData, nowInit)) {
+        throw new Error('Playing frame rendition initialization changed');
+      }
+      if (!current()) throw new Error('Playing frame rendition validation retired');
+      return actual;
+    };
+    const finish = () => {
+      if (!published || !presented || phase !== 'adopted' || !baseCurrent() || !candidate?.current
+          || attempt.playback.videoRoleOwner() !== candidate.owner || this.pendingVideoSwitch !== sw) return;
+      releaseSlot();
+      if (baseCurrent()) this.emitQualityEvent('quality_switched', { type: 'quality_switched',
+        fromTrackName: old.name, toTrackName: target.name, reason });
+    };
+    const targetTrack: SeekRetrievalTrack = { role: 'video', name: target.name, namespace: targetNs };
+    const onFirstRequest = () => {
+      if (issued) return;
+      if (!current()) throw new Error('Playing frame request retired before emission');
+      if (!automaticAllowed()) {
+        automaticWithdrawal = new Error('Automatic quality request withdrawn before emission');
+        withdrawn = true;
+        // Retire this page before SDK rollback terminal delivery can report a
+        // secondary stream error through the prepared actor's receiver.
+        try { this.discardPendingVideoSwitch(sw, automaticWithdrawal); }
+        catch (error) {
+          withdrawn = false; sw.failure = causeOf(error); releaseSlot('retired'); throw error;
+        }
+        throw automaticWithdrawal;
+      }
+      issued = true;
+    };
+    const commit = () => {
+      if (!candidate?.ready || phase !== 'preparing') return;
+      try {
+        const actual = validate(), retained = candidate;
+        if (!selectionCurrent() || attempt.playback.videoRoleOwner() !== oldOwner || !retained.current) throw new Error('Playing frame video cut owner changed');
+        const configuration = retained.configuration, graph = retained.graph;
+        if (!graph?.pipelines.videoPipeline || !configuration || configuration.dispatcher !== graph.pipelines.commandDispatcher
+            || configuration.format.mediaType !== 'video' || configuration.format.codec !== target.codec
+            || target.width !== undefined && configuration.format.width !== target.width
+            || target.height !== undefined && configuration.format.height !== target.height) {
+          throw new Error('Playing frame target configuration is not proved');
+        }
+        if (!current()) throw new Error('Playing frame rendition retired before adoption');
+        phase = 'committing'; sw.phase = 'committing'; this.switchInProgress = true;
+        retained.commit();
+        if (!baseCurrent()) return;
+        if (!promoted() || !retained.current && this.state !== PlayerState.PAUSED) throw new Error('Promoted frame video authority is unavailable');
+        if (!retrieval) throw new Error('Promoted frame video retrieval is unavailable');
+        const index = attempt.tracks.findIndex(track => track.role === 'video');
+        if (index < 0) throw new Error('Playing frame video track map retired');
+        // Publish only video. The original dispatcher/sync/audio graph stay owned.
+        attempt.tracks.splice(index, 1, targetTrack);
+        attempt.retrievals.set('video', retrieval); attempt.preparingRetrievals.delete(retrieval);
+        attempt.preparingRetrievals.add(previous); attempt.videoOutput = graph;
+        this.videoPipeline = graph.pipelines.videoPipeline;
+        this.installedDecoderConfigurations.set('video', configuration);
+        this.currentVideoCodec = target.codec ?? null;
+        phase = 'adopted'; published = true;
+        this.retireVideoMeasurement(); this.refreshLocFrameResources(attempt);
+        try {
+          // Match the paused-quality contract: controller/configuration follow
+          // adopted output; public success still waits for the actual picture.
+          this.commitVideoQuality(actual);
+          if (!baseCurrent()) return;
+          this.refreshMediaSelection({ video: { name: actual.name, namespaceFields: targetNs } });
+        } finally {
+          try { previous.cancel(); } finally { attempt.preparingRetrievals.delete(previous); }
+        }
+        if (!baseCurrent()) return;
+        this.bindLocDiagnostics(this.mediaDiagnosticRuntime);
+        if (suspended || this.state === PlayerState.PAUSED) suspendPublished();
+        else finish();
+      } catch (error) { fail(error); }
+    };
+    this.pendingVideoSwitch = sw;
+    this.armVideoSwitchTimeout(sw, this.config.connectionTimeoutMs || SWITCH_STAGING_TIMEOUT_MS, true);
+    try {
+      this.emitQualityEvent('quality_switching', { type: 'quality_switching', fromTrackName: old.name, toTrackName: target.name, reason });
+      if (!current()) return;
+      let init = target.packaging === 'locmaf' ? this.locSeekFrameInit(target) : this.decodeResolvedInlineInitData(target);
+      if (target.packaging === 'locmaf' && !init && target.initTrack) {
+        await this.awaitVideoSwitch(sw, this.ensureInitTrack(target.initTrack, targetNs));
+        if (!current()) return;
+        init = this.locSeekFrameInit(target);
+      }
+      sw.initData = init?.slice();
+      if (this.hooks.beforeSubscribe.run({ trackName: target.name, namespace: targetNs, mediaType: 'video' }) === null) {
+        withdrawn = true; this.discardPendingVideoSwitch(sw, new Error('Switch retrieval declined by beforeSubscribe'));
+      } else if (current()) {
+        if (!automaticAllowed()) {
+          withdrawn = true; this.discardPendingVideoSwitch(sw, new Error('Automatic quality request withdrawn before emission'));
+        } else {
+          validate();
+          const config = target.packaging === 'locmaf' && init ? codecDescriptionFromInit(init) : init;
+          if (config === null) throw new Error('Target frame initialization has no video codec description');
+          const track: LocVideoRoleTrack = { role: 'video', info: { packaging: target.packaging,
+            ...(target.codec === undefined ? {} : { codec: target.codec }), ...(target.width === undefined ? {} : { width: target.width }),
+            ...(target.height === undefined ? {} : { height: target.height }),
+            ...(config === undefined ? {} : { initData: btoa(String.fromCharCode(...config)) }) },
+            ...(target.packaging === 'locmaf' && init ? { frameInit: init } : {}) };
+          candidate = attempt.playback.prepareVideoRole({ expectedOwner: oldOwner, track, location: plan.location,
+            mediaPts: plan.indexedPts, cutMs: plan.indexedPts,
+            getTimelineEntries: () => this.timelineSource === source ? this.timelineState?.entries ?? null : null,
+            isCurrent: current, onReady: commit,
+            onPresented: () => { presented = true; finish(); },
+            onGraphCreated: () => { this.refreshLocFrameResources(attempt); this.bindLocDiagnostics(this.mediaDiagnosticRuntime); },
+            onGraphRetiring: graph => { (this.retiringLocDiagnosticGraphs ??= new Set()).add(graph); },
+            onGraphRetired: graph => { this.retiringLocDiagnosticGraphs?.delete(graph); this.refreshLocFrameResources(attempt); this.bindLocDiagnostics(this.mediaDiagnosticRuntime); },
+            onCommand: command => {
+              if (!current()) return;
+              if (command.type === 'configure') this._stats.recordDecoderConfigured();
+              if (command.type === 'decode_video') this._stats.recordFrameDecoded();
+              this.emitter.emit('decoder_command', { type: 'decoder_command', command });
+            },
+            onConfiguration: configured => {
+              if (phase === 'adopted' && current() && configured.dispatcher === this.videoCommandDispatcher()) this.installedDecoderConfigurations.set('video', configured);
+            },
+            onPageDrained: identity => retrieval?.onPageDrained(identity),
+            onPageError: (identity, error) => { retrieval?.onPageError(identity, error); fail(error); }, onError: fail,
+          });
+          const retained = candidate;
+          retrieval = new SeekRoleRetrieval({ connection, track: targetTrack, location: plan.location,
+            timeoutMs: this.config.connectionTimeoutMs!, maxObjects: 512, maxBytes: 8 * 1024 * 1024,
+            isCurrent: () => current() && (phase !== 'adopted' || retained.current),
+            getTimeline: () => this.timelineSource === source ? this.timelineState : null,
+            getPreparingGroup: () => retained.preparingGroup(), canProbeLive: () => phase === 'adopted', admitHead: () => current(),
+            beforeSubscribe: () => this.hooks.beforeSubscribe.run({ trackName: target.name, namespace: targetNs, mediaType: 'video' }) !== null,
+            beginPage: identity => retained.beginPage(identity), acceptPage: (identity, end, receipt) => retained.acceptPage(identity, end, receipt),
+            beginLive: (owner, properties) => retained.beginLive(owner, properties),
+            liveObservation: owner => this.seekLiveObservation(owner),
+            capture: object => this.captureSeekObject(connection, object), discard: captured => this.discardSeekObject(captured, 'route retired'),
+            consume: (object, captured, live, deliver) => this.consumeSeekObject(targetTrack, object, captured, live, deliver),
+            onBridgeAdded: owner => { attempt.bridges.add(owner); }, onBridgeRemoved: owner => { attempt.bridges.delete(owner); },
+            onEnded: () => retained.endInput(), onProgress() {}, onFailure: error => fail(error),
+            onFirstRequest,
+          });
+          attempt.preparingRetrievals.add(retrieval);
+          if (!current() || !retained.current) throw new Error('Playing frame preparation retired before retrieval');
+          retrieval.pump();
+          void retrieval.firstIssued.catch(fail);
+        }
+      }
+    } catch (error) { fail(error); }
+    await done;
+    if (sw.failure && !withdrawn) throw sw.failure;
+  }
+
   private async selectPausedLocVideoTrack(reference: string | TrackRefConfig, reason: string): Promise<void> {
     const previous = this.activeLocSeek, output = previous?.output, selection = this._selection;
-    const connection = this.connection, dispatcher = this.commandDispatcher, source = this.timelineSource;
+    const connection = this.connection, dispatcher = this.videoCommandDispatcher(), source = this.timelineSource;
     if (this._destroyed || this.isTerminalState() || this.preparingLocSeek || !previous?.positioned || !output
         || previous.retired || this.currentMigration || this.mediaSelection || this.pendingVideoSwitch
         || this.switchInProgress || this.pendingRetypes.size) throw new Error('Cannot switch track: frame output is busy');
@@ -14661,7 +15090,7 @@ export class MoqtPlayer {
     const validate = () => {
       if (this._destroyed || this.isTerminalState() || this.activeLocSeek !== previous || previous.retired
           || previous.output !== output || this.connection !== connection || this._selection !== selection
-          || this.commandDispatcher !== dispatcher || this.videoPipeline !== output.pipelines.videoPipeline
+          || this.videoCommandDispatcher() !== dispatcher || this.videoPipeline !== output.pipelines.videoPipeline
           || this.frameOutputResources !== output.resources || this.installedDecoderConfigurations.get('video') !== seed
           || this.state !== PlayerState.PAUSED || this.playbackIntent !== false
           || this.currentMigration || this.mediaSelection || this.pendingVideoSwitch || this.switchInProgress || this.pendingRetypes.size) {
@@ -15005,7 +15434,9 @@ export class MoqtPlayer {
       }
     }
     for (const attempt of [this.preparingLocSeek, this.activeLocSeek]) {
-      if (attempt?.connection === conn && !attempt.retired) for (const owner of attempt.retrievals.values()) owners.push(owner.requests);
+      if (attempt?.connection === conn && !attempt.retired) {
+        for (const owner of [...attempt.retrievals.values(), ...attempt.preparingRetrievals]) owners.push(owner.requests);
+      }
     }
     return owners;
   }
@@ -15116,7 +15547,7 @@ export class MoqtPlayer {
     // Finish native terminal observations before retrieval cancellation can
     // publish discarded queued inputs and reenter a replacement graph.
     try { attempt.playback.cancel(); } catch (error) { failures.push(error); }
-    for (const owner of attempt.retrievals.values()) { try { owner.cancel(); } catch (error) { failures.push(error); } }
+    for (const owner of [...attempt.retrievals.values(), ...attempt.preparingRetrievals]) { try { owner.cancel(); } catch (error) { failures.push(error); } }
     if (prior && !attempt.output && !prior.retired && this.activeLocSeek === prior && !this._destroyed
         && this.connection === prior.connection && this.seekPosition?.owns(attempt.epoch)) {
       const position = prior.playback.readPositionMs();
@@ -15177,7 +15608,8 @@ export class MoqtPlayer {
         : this.subscribedTrack(role) ?? this.catalogTrackFor(selected.name, selected.namespaceFields, role);
       if (!track || track.packaging !== 'loc' && !(track.packaging === 'locmaf' && this.locmafFramePath)) throw new Error('Cannot prepare this frame output combination');
       const seed = this.installedDecoderConfigurations.get(role);
-      if (!seed || seed.dispatcher !== oldDispatcher || seed.format.mediaType !== role || !seed.format.codec) {
+      if (!seed || seed.dispatcher !== (role === 'video' ? this.videoCommandDispatcher() : oldDispatcher)
+          || seed.format.mediaType !== role || !seed.format.codec) {
         throw new Error(`Cannot seek: installed ${role} decoder configuration is unavailable`);
       }
       tracks.push({ role, name: track.name, namespace: [...trackNamespaceFields(track, this.config.namespace)] });
@@ -15259,7 +15691,7 @@ export class MoqtPlayer {
     const playback = new LocSeekPlayback({ config: this.config, wireProfile: locWireProfileForDraft(connection.draftVersion),
       clock: this.clock, borrowed: this.frameOutputResources,
       tracks: outputs,
-      onGraphCreated: () => { if (live()) this.bindLocDiagnostics(this.mediaDiagnosticRuntime); },
+      onGraphCreated: () => { if (live()) { this.refreshLocFrameResources(attempt); this.bindLocDiagnostics(this.mediaDiagnosticRuntime); } },
       onGraphRetiring: graph => {
         const dispatcher = graph.pipelines.commandDispatcher;
         if (dispatcher && this.locDiagnosticBindings?.dispatchers.includes(dispatcher)) {
@@ -15269,6 +15701,7 @@ export class MoqtPlayer {
       onGraphRetired: graph => {
         this.retiringLocDiagnosticGraphs?.delete(graph);
         if (this.retiringLocDiagnosticGraphs?.size === 0) this.retiringLocDiagnosticGraphs = undefined;
+        this.refreshLocFrameResources(attempt);
         this.bindLocDiagnostics(this.mediaDiagnosticRuntime);
       },
       getTimelineEntries: () => this.timelineSource === context.source ? this.timelineState?.entries ?? null : null,
@@ -15289,7 +15722,7 @@ export class MoqtPlayer {
         }
         const previous = this.activeLocSeek, oldVideo = this.videoPipeline, oldAudio = this.audioPipeline;
         const initialDispatcher = attempt.initialDispatcher; attempt.initialDispatcher = null;
-        attempt.output = output; this.activeLocSeek = attempt;
+        attempt.output = output; attempt.videoOutput = output; this.activeLocSeek = attempt;
         if (this.preparingLocSeek === attempt) this.preparingLocSeek = null;
         this.videoPipeline = output.pipelines.videoPipeline; this.audioPipeline = output.pipelines.audioPipeline;
         this.commandDispatcher = output.pipelines.commandDispatcher; this.syncController = output.pipelines.syncController;
@@ -15390,7 +15823,7 @@ export class MoqtPlayer {
     }
     attempt = { epoch, reason: continuation?.reason ?? 'seek', ...(quality ? { quality } : {}), tracks, initialDispatcher: oldDispatcher,
       connection, timelineSource: context.source,
-      playback, retrievals, bridges: new Set(), output: null, positioned: false, retired: false };
+      playback, retrievals, preparingRetrievals: new Set(), bridges: new Set(), output: null, videoOutput: null, positioned: false, retired: false };
     oldDispatcher = null;
     this.retireLocSeek(this.preparingLocSeek); this.preparingLocSeek = attempt;
     (this.seekPosition ??= new PlaybackPosition(() => !this._destroyed
@@ -15465,7 +15898,10 @@ export class MoqtPlayer {
     catch (error) { this.discardSeekObject(captured, 'object processing failed'); throw error; }
     if (token?.epoch !== this.mediaDiagnosticEpoch) input = undefined;
     if (!current()) { this.discardSeekObject(captured, 'route retired'); return; }
-    if (cadence) this.recordLocGroupCadence(cadence.object, cadence.headers, cadence.owner);
+    if (cadence) {
+      this.recordLocGroupCadence(cadence.object, cadence.headers, cadence.owner);
+      this.recordVideoDeliveryLag(cadence.object, cadence.headers, cadence.owner, cadence.object.payloadBytes ?? 0);
+    }
     if (!current()) { this.discardSeekObject(captured, 'route retired'); return; }
     await deliver(transformed, input);
   }

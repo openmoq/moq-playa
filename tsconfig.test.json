@@ -199,6 +199,7 @@
     "packages/msf/src/video-alt-group.test.ts",
     "packages/player/src/player-video-alt-group.test.ts",
     "scripts/**/*.test.ts",
+    "packages/playback/src/delivery-lag-detector.test.ts",
     "packages/playback/src/pipeline-video-reorder.test.ts",
     "packages/playback/src/pipeline-group-wait-clock.test.ts",
     "packages/playback/src/pipeline-reorder-reentry.test.ts",
@@ -292,11 +293,18 @@
     "scripts/player-acceptance/group-tail.test.ts",
     "scripts/render-feedback-types.test.ts",
     "packages/player/src/player-switch-automatic-authority.loopback.test.ts",
+    "packages/player/src/player-delivery-lag.loopback.test.ts",
+    "packages/player/src/player-delivery-lag-boundaries.loopback.test.ts",
     "packages/player/src/player-post-seek-measurement.loopback.test.ts",
     "packages/player/src/player-post-seek-measurement-boundaries.loopback.test.ts",
     "packages/player/src/seek-live-measurement.loopback.test.ts",
     "packages/player/src/seek-retrieval-measurement.loopback.test.ts",
     "packages/player/src/player-seek-measurement-route.loopback.test.ts",
     "packages/player/src/loc-audio-continuity.loopback.test.ts",
+    "packages/player/src/loc-role-candidate.test.ts",
+    "packages/player/src/output-role-candidate.test.ts",
+    "packages/player/src/dispatcher-role-candidate.test.ts",
+    "packages/player/src/frame-quality-cut.test.ts",
+    "packages/player/src/player-playing-frame-quality.loopback.test.ts"
   ]
 }

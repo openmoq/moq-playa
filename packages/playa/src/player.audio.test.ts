@@ -323,6 +323,45 @@ describe('Player fresh frame output ownership', () => {
     output.videoDecoder?.destroy(); output.renderer?.destroy(); output.audioDecoder?.destroy(); output.audioOutput?.destroy();
     output.onRetire?.();
   }
+  it.each([false, true])('replaces only video while preserving audio (activated=%s)', async activated => {
+    const player = createPlayer(), first = acquire();
+    first.onAdopt?.({ playing: false });
+    if (activated) await player.unmute();
+    const before = audioContextConstructorCalls;
+    const state = player as unknown as { renderer: unknown; deferredAudio: unknown; webAudioRequired: boolean };
+    const next = capturedFrameOutputFactory!(Object.assign({ video: true, audio: false, clock }, { scope: 'video' as const }));
+    expect(Reflect.get(next, 'scope')).toBe('video');
+    next.onAdopt?.({ playing: false });
+    expect(state.renderer).toBe(next.renderer);
+    expect(state.deferredAudio).toBe(first.audioOutput);
+    expect(state.webAudioRequired).toBe(true);
+    expect((first.audioOutput as DeferredAudioOutput).isActive).toBe(activated);
+    expect(audioContextConstructorCalls).toBe(before);
+    retire(next);
+    expect(state.deferredAudio).toBe(first.audioOutput);
+    expect(state.webAudioRequired).toBe(true);
+    retire(first); await player.destroy();
+  });
+  it('rechecks video ownership after renderer start and never retires the new owner', async () => {
+    const player = createPlayer(), first = acquire(); first.onAdopt?.({ playing: false });
+    const next = capturedFrameOutputFactory!(Object.assign({ video: true, audio: false, clock }, { scope: 'video' as const }));
+    const successor = acquire();
+    vi.spyOn(next.renderer as CanvasRenderer, 'start').mockImplementation(() => successor.onAdopt?.({ playing: false }));
+    expect(() => next.onAdopt?.({ playing: true })).toThrow(/retired/);
+    retire(next);
+    const state = player as unknown as { renderer: unknown; deferredAudio: unknown };
+    expect(state.renderer).toBe(successor.renderer);
+    expect(state.deferredAudio).toBe(successor.audioOutput);
+    retire(first); retire(successor); await player.destroy();
+  });
+  it('refuses a stale video-only candidate without displacing its successor', async () => {
+    const player = createPlayer(), first = acquire(); first.onAdopt?.({ playing: false });
+    const next = capturedFrameOutputFactory!(Object.assign({ video: true, audio: false, clock }, { scope: 'video' as const }));
+    const successor = acquire(); successor.onAdopt?.({ playing: false });
+    expect(() => next.onAdopt?.({ playing: false })).toThrow(/displaced/);
+    expect((player as unknown as { renderer: unknown }).renderer).toBe(successor.renderer);
+    retire(next); retire(first); retire(successor); await player.destroy();
+  });
   it('prepares independent inactive adapters without allocating an AudioContext or changing current output', async () => {
     const player = createPlayer(), before = audioContextConstructorCalls;
     const current = capturedRendererFactory!();

@@ -5,7 +5,7 @@ import { usesMsePath } from './packaging.js';
 import { FrameAudioOutput } from './frame-audio-output.js';
 
 const roles = ['videoDecoder', 'renderer', 'audioDecoder', 'audioOutput'] as const;
-const properties = [...roles, 'onAdopt', 'onRetire'] as const;
+const properties = [...roles, 'scope', 'onAdopt', 'onRetire'] as const;
 type Destroyable = { destroy(): void };
 
 function isResourceList(value: Readonly<FrameOutputAdapters> | readonly object[]): value is readonly object[] {
@@ -48,6 +48,7 @@ export function createFramePipelines(
   borrowed: Readonly<FrameOutputAdapters> | readonly object[],
   handshakeRttMs?: number,
   audioOptions?: { readonly retainDeferred?: boolean; readonly onPrepared?: () => void },
+  scope?: 'video',
 ): PreparedFramePipelines {
   const factory = config.createFrameOutput;
   if (!factory) throw new Error('Frame-mode seek requires createFrameOutput');
@@ -56,11 +57,14 @@ export function createFramePipelines(
       || usesMsePath(info.audio?.packaging, config.locmafDecoding)) {
     throw new Error('Frame output requires frame-decoded tracks');
   }
+  if (scope !== undefined && (scope !== 'video' || !video || audio)) {
+    throw new Error('Video-only frame output scope requires only video');
+  }
   const held = new Set<unknown>((isResourceList(borrowed) ? borrowed : roles.map(role => borrowed[role]))
     .filter(value => value !== undefined));
   const fresh = new Set<Destroyable>();
   // A throwing factory still owns allocations it did not return.
-  const result: unknown = factory(Object.freeze({ video, audio, clock }));
+  const result: unknown = factory(Object.freeze({ video, audio, clock, ...(scope ? { scope } : {}) }));
   const snapshot: Record<string, unknown> = Object.create(null);
   try {
     if (result === null || typeof result !== 'object') throw new Error('Frame output must be a plain record');
@@ -84,6 +88,7 @@ export function createFramePipelines(
       if (descriptor && !('value' in descriptor)) throw new Error(`Frame output ${property} must be a data property`);
       if (descriptor) snapshot[property] = descriptor.value;
     }
+    if (snapshot['scope'] !== scope) throw new Error('Frame output scope must match the requested adoption scope');
     const seen = new Set<unknown>();
     for (const role of roles) {
       const value = snapshot[role];

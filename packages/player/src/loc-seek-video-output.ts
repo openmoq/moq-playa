@@ -4,6 +4,7 @@ import type { VideoFrameObservation, VideoProducedTiming, VideoRendererLike } fr
 import type { DispatcherOutputReason, VideoOutputAdmission } from './command-dispatcher.js';
 import { locIndexedPositionMs, snapshotLocIndexedPlacement, type LocIndexedPlacement } from './loc-seek-input.js';
 
+export interface LocVideoCutLease { readonly current: boolean; release(): void; }
 interface AdmissionLease { readonly current: boolean; release(): void; }
 interface AdmissionHost {
   installVideoOutputAdmission(owner: VideoOutputAdmission): AdmissionLease;
@@ -17,6 +18,8 @@ interface Options {
   readonly selected: SourceTimestamp;
   /** Host-validated relative source/content relation; omission keeps exact media PTS. */
   readonly placement?: LocIndexedPlacement;
+  /** Map this role into the retained clock without resetting its reference. */
+  readonly syncPlacement?: LocIndexedPlacement;
   readonly mode: 'preview' | 'playing';
   readonly reference: 'video' | 'external';
   readonly maxQueuedFrames: number;
@@ -44,6 +47,8 @@ export class LocSeekVideoOutput implements VideoOutputAdmission {
   private readonly options: Options;
   private readonly selected: SourceTimestamp;
   private readonly placement: LocIndexedPlacement | undefined;
+  private cut: { readonly ms: number } | undefined;
+  private readonly syncPlacement: LocIndexedPlacement | undefined;
   private readonly contexts = new WeakMap<VideoRenderTiming, bigint>();
   private readonly pending = new Set<VideoProducedTiming>();
   private readonly outstanding = new Set<VideoProducedTiming>();
@@ -69,6 +74,8 @@ export class LocSeekVideoOutput implements VideoOutputAdmission {
     }
     const selected = Object.freeze({ ticks, ticksPerSecond, domain });
     this.placement = placement;
+    this.syncPlacement = options.syncPlacement === undefined ? undefined : snapshotLocIndexedPlacement(options.syncPlacement);
+    if (this.syncPlacement && !placement) throw new Error('Clock mapping requires candidate placement');
     if (this.positionMs(selected) === null) throw new Error('LOC seek position is not representable');
     if (!Number.isSafeInteger(options.maxQueuedFrames) || options.maxQueuedFrames <= 0) throw new RangeError('Invalid video output budget');
     if (options.mode !== 'preview' && options.mode !== 'playing') throw new Error('Unknown LOC output mode');
@@ -85,7 +92,7 @@ export class LocSeekVideoOutput implements VideoOutputAdmission {
       // Coded preroll must reach the decoder even before an output reference exists.
       computeVideoRenderTime: (raw: bigint) => {
         if (!this.live()) return null;
-        const timing = this.options.sync.hasReference ? this.options.sync.computeVideoRenderTime(raw) : null;
+        const timing = this.options.sync.hasReference ? this.options.sync.computeVideoRenderTime(this.syncRaw(raw)) : null;
         return this.live() ? { renderTimeUs: timing?.renderTimeUs ?? 0, offsetUs: timing?.offsetUs ?? 0, shouldDrop: false } : null;
       },
     });
@@ -119,6 +126,43 @@ export class LocSeekVideoOutput implements VideoOutputAdmission {
     if (!point || !this.live()) return null;
     const value = this.positionMs(point);
     return this.live() && this.last === point ? value : null;
+  }
+
+  /** Scheduling frontier, excluding decoder submissions and unadmitted held frames. */
+  cutFrontierMs(): number | null {
+    if (!this.live()) return null;
+    let frontier = this.last ? this.positionMs(this.last) : null;
+    for (const proof of this.pending) {
+      const point = this.positionMs(proof.sourceTimestamp);
+      if (point !== null) frontier = frontier === null ? point : Math.max(frontier, point);
+    }
+    return this.live() ? frontier : null;
+  }
+
+  /** Reserve before candidate decode. Already enqueued/presented output cannot be recalled safely. */
+  holdCut(cutMs: number): LocVideoCutLease {
+    if (!Number.isSafeInteger(cutMs) || cutMs < 0 || !this.live() || !this.active || this.cut) throw new Error('Invalid video cut');
+    if (this.last && this.positionMs(this.last)! >= cutMs) throw new Error('Video cut precedes presented output');
+    for (const proof of this.pending) if (this.positionMs(proof.sourceTimestamp)! >= cutMs) throw new Error('Video cut precedes queued output');
+    const cut = Object.freeze({ ms: cutMs });
+    this.cut = cut;
+    const output = this;
+    return Object.freeze({
+      get current() { return output.live() && output.cut === cut; },
+      release() {
+        if (output.cut !== cut) return;
+        output.cut = undefined;
+        if (output.live()) output.options.dispatcher.refreshVideoOutputs();
+      },
+    });
+  }
+
+  private syncRaw(raw: bigint): bigint {
+    const target = this.syncPlacement, source = this.placement;
+    if (!target || !source) return raw;
+    return raw - source.sourceAnchor.ticks * 1_000_000n / source.sourceAnchor.ticksPerSecond
+      + BigInt(source.mediaPts - target.mediaPts) * 1000n
+      + target.sourceAnchor.ticks * 1_000_000n / target.sourceAnchor.ticksPerSecond;
   }
 
   /** Source identity of the actual last draw, for a same-selection resume. */
@@ -181,6 +225,7 @@ export class LocSeekVideoOutput implements VideoOutputAdmission {
     }
     if ((!this.positioned || this.mode === 'preview') && relative > 0n) return 'hold';
     if (this.positioned && this.mode === 'preview') return 'discard';
+    if (this.cut && this.positionMs(point)! >= this.cut.ms) return 'hold';
     if (this.pending.has(proof)) return 'enqueue';
     if (this.pending.size >= this.options.maxQueuedFrames) return 'hold';
     // Reference establishment reads the injected clock and may reenter output.
@@ -216,7 +261,7 @@ export class LocSeekVideoOutput implements VideoOutputAdmission {
 
   private schedule(raw: bigint): number | null {
     if (!this.live() || !this.active || !this.options.sync.hasReference) return null;
-    const timing = this.options.sync.computeVideoRenderTime(raw);
+    const timing = this.options.sync.computeVideoRenderTime(this.syncRaw(raw));
     return this.live() ? timing?.renderTimeUs ?? null : null;
   }
   private positionMs(point: SourceTimestamp): number | null {

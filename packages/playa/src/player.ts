@@ -682,16 +682,32 @@ export class Player {
 
   private createFrameOutput(context: Readonly<FrameOutputContext>): FrameOutput {
     if (this.presentationRetired) throw new Error('Cannot prepare output after player destruction');
-    const { video, audio, clock } = context;
+    const { video, audio, clock, scope } = context;
+    if (scope !== undefined && (scope !== 'video' || !video || audio)) {
+      throw new Error('Video-only frame output scope requires only video');
+    }
+    const previousRenderer = this.renderer, previousAudio = this.deferredAudio;
     const renderer = video ? new CanvasRenderer(this.canvas!, { clock }) : undefined;
     const audioOutput = audio ? new DeferredAudioOutput() : undefined;
     let adopted = false, retired = false;
     return {
+      ...(scope ? { scope } : {}),
       ...(video ? { videoDecoder: new WebCodecsVideoDecoder(), renderer: renderer! } : {}),
       ...(audio ? { audioDecoder: new WebCodecsAudioDecoder(), audioOutput: audioOutput! } : {}),
       onAdopt: ({ playing }) => {
         if (retired || this.presentationRetired) throw new Error('Prepared output is retired');
         if (adopted) return;
+        if (scope === 'video') {
+          if (this.renderer !== previousRenderer || this.deferredAudio !== previousAudio) {
+            throw new Error('Prepared video output was displaced');
+          }
+          adopted = true;
+          this.renderer = renderer!;
+          if (playing) renderer!.start();
+          if (retired || this.presentationRetired || this.renderer !== renderer
+              || this.deferredAudio !== previousAudio) throw new Error('Prepared output is retired');
+          return;
+        }
         adopted = true;
         this.renderer = renderer ?? null;
         this.webAudioRequired = audio;

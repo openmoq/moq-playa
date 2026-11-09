@@ -28,11 +28,11 @@ async function fixture(draft: 16 | 18 | 22, options: {
   noIndex?: boolean;
 } = {}) {
   const { a, b } = createLoopback();
-  let armed = false, writes = 0;
+  let armed = false, writes = 0, emittedWrites = 0;
   const wrap = (stream: WritableStream<Uint8Array>) => {
     const writer = stream.getWriter();
     return new WritableStream<Uint8Array>({
-      async write(bytes) { await writer.write(bytes); if (armed && ++writes === 1 && options.write) await options.write.promise; },
+      async write(bytes) { if (armed) emittedWrites++; await writer.write(bytes); if (armed && ++writes === 1 && options.write) await options.write.promise; },
       close: () => writer.close(), abort: reason => writer.abort(reason),
     });
   };
@@ -57,13 +57,13 @@ async function fixture(draft: 16 | 18 | 22, options: {
   const timeline: TimelineState = { trackName: 'timeline', trackDuration: undefined, isLive: options.liveIndex ?? false,
     depends: ['video', 'audio'], entries: options.noIndex ? [] : [4000, 6000, 8000, 10000].map((mediaPts, i) => ({ mediaPts, location: [3, i], wallclockTime: 0 })) };
   function helper() { const errors = vi.fn(); const owner = new SeekFetchRequests(client, { isCurrent: () => true, onError: errors }); helpers.push(owner); return { owner, errors }; }
-  function role(name: 'video' | 'audio' = 'video', onFailure?: () => void) {
+  function role(name: 'video' | 'audio' = 'video', onFailure?: () => void, onFirstRequest?: () => void) {
     const roleTrack: SeekTrack = { ...track, name, role: name, sourceKey: name, packaging: 'cmaf', codec: 'fixture', init: new Uint8Array() };
     const pages = new Map<object, { accepted: boolean; fin: boolean; drained: boolean }>();
     const received: bigint[] = [], accepted = vi.fn(), failed = vi.fn(), ended = vi.fn();
     let current = true, withdrawNext = false;
     const drain = (identity: object) => { const page = pages.get(identity)!; if (page.accepted && page.fin && !page.drained) { page.drained = true; owner.onPageDrained(identity); } };
-    const owner = new SeekRoleRetrieval({ connection: client, track: roleTrack, location: start,
+    const owner = new SeekRoleRetrieval({ ...(onFirstRequest ? { onFirstRequest } : {}), connection: client, track: roleTrack, location: start,
       timeoutMs: 1000, maxObjects: 16, maxBytes: 1024, isCurrent: () => { if (withdrawNext) { withdrawNext = false; queueMicrotask(() => { current = false; }); } return current; }, getTimeline: () => { if (options.timelineFailure) throw options.timelineFailure; return timeline; },
       canProbeLive: () => false, admitHead: () => false, beforeSubscribe: () => true,
       beginPage: identity => { pages.set(identity, { accepted: false, fin: false, drained: false }); return {
@@ -86,7 +86,7 @@ async function fixture(draft: 16 | 18 | 22, options: {
     await server.closeFetchStream(stream); await flush(512); return stream;
   }
   cleanups.push(async () => { for (const role of roles) role.cancel(); for (const owner of helpers) owner.dispose(); options.authorization?.resolve(); options.write?.resolve(); await client.close(); await server.close(); });
-  return { client, server, a, b, requests, transportErrors, role, helper, body, authCalls: () => authCalls };
+  return { client, server, a, b, requests, transportErrors, role, helper, body, emittedWrites: () => emittedWrites, authCalls: () => authCalls };
 }
 
 describe.each([16, 18, 22] as const)('first request issuance draft %i', draft => {
@@ -263,4 +263,33 @@ describe('failure normalization first winner',()=>{
     await f.server.acceptFetch(f.requests[0]!.id,{endLocation:{group:3n,object:1n}});await flush(512);
     await expect(attempt.issued).rejects.toBe(cause);expect(f.transportErrors).toEqual([]);
   });
+});
+
+describe.each([16,18,22] as const)('pre-send first request admission draft %i', draft=>{
+ it('can withdraw after authorization without emitting FETCH, leaving the connection usable',async()=>{
+  const authorization=deferred(),f=await fixture(draft,{authorization});
+  let permitted=true;const refusal=new Error('automatic selection withdrawn');
+  const admit=vi.fn(()=>{expect(f.emittedWrites()).toBe(0);expect(f.requests).toEqual([]);if(!permitted)throw refusal;});
+  const r=f.role('video',undefined,admit);r.owner.pump();await flush(256);
+  expect(admit).not.toHaveBeenCalled();permitted=false;authorization.resolve();
+  await expect(r.owner.firstIssued).rejects.toBe(refusal);await flush(256);
+  expect(admit).toHaveBeenCalledOnce();expect(f.requests).toEqual([]);
+  const healthy=f.role('audio');healthy.owner.pump();await healthy.owner.firstIssued;await flush(256);
+  expect(f.requests.map(r=>r.name)).toEqual(['audio']);expect(f.transportErrors).toEqual([]);
+ });
+ it('rechecks retirement after the registration callback returns',async()=>{
+  const f=await fixture(draft);const admit=vi.fn(()=>r.owner.cancel());const r=f.role('video',undefined,admit);
+  r.owner.pump();await expect(r.owner.firstIssued).rejects.toMatchObject({name:'AbortError'});await flush(256);
+  expect(admit).toHaveBeenCalledOnce();expect(f.requests).toEqual([]);expect(r.failed).not.toHaveBeenCalled();
+ });
+ it('registers before first bytes and keeps issuance separate from response acceptance',async()=>{
+  const f=await fixture(draft);const admit=vi.fn(()=>{expect(f.emittedWrites()).toBe(0);expect(f.requests).toEqual([]);});
+  const r=f.role('video',undefined,admit);r.owner.pump();await r.owner.firstIssued;await flush(256);
+  expect(admit).toHaveBeenCalledOnce();expect(f.requests).toHaveLength(1);expect(r.accepted).not.toHaveBeenCalled();
+ });
+});
+it.each([18,22] as const)('does not readmit continuation pages on draft %i',async draft=>{
+ const f=await fixture(draft,{liveIndex:true});const admit=vi.fn();const r=f.role('video',undefined,admit);
+ r.owner.pump();await r.owner.firstIssued;await flush(256);await f.body(0,[0n,1n],0,2n);await flush(256);
+ expect(f.requests).toHaveLength(2);expect(admit).toHaveBeenCalledOnce();expect(r.failed).not.toHaveBeenCalled();
 });

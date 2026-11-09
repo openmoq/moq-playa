@@ -1101,6 +1101,8 @@ export interface FrameOutputAdapters {
 }
 
 export interface FrameOutputContext {
+  /** Replace only video, preserving the current audio graph; absent means whole-output adoption. */
+  readonly scope?: 'video';
   readonly video: boolean;
   readonly audio: boolean;
   readonly clock: ClockSource;
@@ -1108,6 +1110,8 @@ export interface FrameOutputContext {
 
 /** A fresh, initially inactive graph for preparing a frame-mode seek. */
 export interface FrameOutput extends FrameOutputAdapters {
+  /** Must acknowledge a video-only request before its adoption callback may run. */
+  readonly scope?: 'video';
   /** Synchronously update the embedding's output pointer after adoption; Promise returns are refused. */
   readonly onAdopt?: (state: Readonly<{ playing: boolean }>) => void;
   /** Synchronously release that pointer after retirement, including a throwing onAdopt. */

@@ -34,7 +34,12 @@ interface Owner {
   cleanupQueued: boolean;
 }
 type ReceiverOptions = Required<Pick<Parameters<MoqtConnection['fetch']>[2], 'onRequestId' | 'receiver'>>;
-interface Options { readonly isCurrent: () => boolean; readonly onError: (error: Error, receiver: FetchReceiver) => void; }
+interface Options {
+  readonly isCurrent: () => boolean;
+  readonly onError: (error: Error, receiver: FetchReceiver) => void;
+  /** Before bytes are sent; throwing leaves rollback to the SDK. */
+  readonly onRegister?: (receiver: FetchReceiver) => void;
+}
 
 /** One seek attempt's ordered historical requests; live continuation belongs to the engine. */
 export class SeekFetchRequests {
@@ -119,9 +124,17 @@ export class SeekFetchRequests {
     if (!this.current(owner)) { issuance?.reject(aborted()); return () => {}; }
     this.owners.add(owner);
     const cancel = () => this.cancel(owner);
+    let registrationRejected = false;
     try {
       const pending = send({
         onRequestId: id => {
+          const register = this.options.onRegister;
+          if (register) {
+            if (!this.current(owner)) throw aborted();
+            try { register(receiver); }
+            catch (error) { registrationRejected = true; throw error; }
+            if (!this.current(owner)) throw aborted();
+          }
           owner.requestId = id;
           this.requests.set(id, owner);
           if (!this.current(owner)) { this.cancel(owner); return; }
@@ -138,6 +151,9 @@ export class SeekFetchRequests {
             if (!this.current(owner) || context.signal.aborted) this.cancel(owner);
           },
           onClosed: (terminal, context) => {
+            // SDK rollback may close the receiver before its rejected FETCH
+            // promise delivers the actual local registration refusal.
+            if (registrationRejected) return;
             this.noteStream(owner, context);
             if (owner.terminal) return;
             owner.terminal = true;

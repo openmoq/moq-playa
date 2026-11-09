@@ -293,3 +293,28 @@ export function selectSeekQualityCut(options: SeekQualityCutInput): SeekQualityC
   }
   return { kind: 'unavailable', reason: 'no-unsubmitted-future-entry' };
 }
+
+
+export interface FrameQualityCutInput {
+  readonly draftVersion: Draft;
+  readonly trackName: string;
+  /** Caller proves shared source, namespace, alternate set and current output ownership. */
+  readonly timeline: Pick<TimelineState, 'entries' | 'depends'>;
+  /** Maximum observed playhead and committed video output position, in indexed content time. */
+  readonly afterContentMs: number;
+}
+export type FrameQualityCutPlan =
+  | Extract<SeekQualityCandidatePlan, { readonly kind: 'candidate' }>
+  | { readonly kind: 'unavailable'; readonly reason: QualityIndexRefusal | 'no-future-content-entry' };
+
+/** Candidate selection only; the actor must prove independent output and a still-future mapped cut. */
+export function selectFrameQualityCut(options: FrameQualityCutInput): FrameQualityCutPlan {
+  maximum(options.draftVersion);
+  if (!Number.isFinite(options.afterContentMs) || options.afterContentMs < 0) throw new RangeError('Invalid frame content frontier');
+  const starts = qualityGroupStarts(options);
+  if (typeof starts === 'string') return { kind: 'unavailable', reason: starts };
+  starts.sort((a, b) => a.mediaPts === b.mediaPts ? compareLocations(a, b) : a.mediaPts < b.mediaPts ? -1 : 1);
+  const next = starts.find(entry => entry.mediaPts > options.afterContentMs);
+  return next ? { kind: 'candidate', location: { groupId: next.groupId, objectId: next.objectId }, indexedPts: next.mediaPts }
+    : { kind: 'unavailable', reason: 'no-future-content-entry' };
+}

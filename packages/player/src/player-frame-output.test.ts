@@ -326,3 +326,35 @@ describe('decoder error callback reentry', () => {
     for (const adapter of Object.values(fresh)) expect(adapter.destroy).toHaveBeenCalledTimes(1);
   });
 });
+
+
+describe('video-only output adoption scope', () => {
+  function scoped(factory: NonNullable<MoqtPlayerConfig['createFrameOutput']>, info = videoInfo) {
+    return createFramePipelines(config(factory), clock, info, callbacks(), {}, undefined, undefined, 'video');
+  }
+  it('requires explicit factory acknowledgement before wiring or adoption', () => {
+    const fresh = video(), onAdopt = vi.fn();
+    expect(() => scoped(() => ({ ...fresh, onAdopt }))).toThrow(/scope/);
+    expect(onAdopt).not.toHaveBeenCalled();
+    expect(fresh.videoDecoder.onFrame).toBeNull();
+    expect(fresh.videoDecoder.destroy).toHaveBeenCalledTimes(1);
+    expect(fresh.renderer.destroy).toHaveBeenCalledTimes(1);
+  });
+  it('passes the scope to an acknowledging factory and retires once', () => {
+    const fresh = video(), factory = vi.fn(() => ({ ...fresh, scope: 'video' as const }));
+    const prepared = scoped(factory);
+    expect(factory).toHaveBeenCalledExactlyOnceWith({ video: true, audio: false, clock, scope: 'video' });
+    prepared.adopt(false); prepared.retire(); prepared.retire();
+    expect(fresh.renderer.destroy).toHaveBeenCalledTimes(1);
+  });
+  it('refuses an audio role before calling a video-only factory', () => {
+    const factory = vi.fn(() => ({ ...video(), ...audio(), scope: 'video' as const }));
+    expect(() => scoped(factory, avInfo)).toThrow(/scope/);
+    expect(factory).not.toHaveBeenCalled();
+  });
+  it('does not accept a scoped result for a whole-output request', () => {
+    const fresh = video();
+    expect(() => prepare(Object.assign(fresh, { scope: 'video' as const }))).toThrow(/scope/);
+    expect(fresh.renderer.destroy).toHaveBeenCalledTimes(1);
+  });
+});
