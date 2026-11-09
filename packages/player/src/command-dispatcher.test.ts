@@ -1027,6 +1027,22 @@ describe('unified playout cushion — audio consumes the shared pipeline delay',
     expect(audioOutput.schedule).toHaveBeenCalledWith(expect.anything(), 3000);
   });
 
+  it('setCatchUpRate() sets the audio rate; retimeVideo() moves queued video where the renderer can', () => {
+    const calls: string[] = [];
+    const renderer: any = {
+      enqueue: () => {}, destroy: () => {}, flush: () => calls.push('video flush'),
+      retime: (us: number) => calls.push(`video retime ${us}`),
+      onFirstFrame: null, onFrameRendered: null, onStall: null,
+    };
+    const audioOutput: any = { schedule: () => {}, flush: () => {}, destroy: () => {}, setPlaybackRate: (r: number) => calls.push(`audio rate ${r}`) };
+    const dispatcher = new CommandDispatcher({ renderer, audioOutput });
+    dispatcher.setCatchUpRate(1.05);
+    dispatcher.retimeVideo(-1_000);
+    delete renderer.retime;
+    dispatcher.retimeVideo(-1_000);
+    expect(calls).toEqual(['audio rate 1.05', 'video retime -1000']);
+  });
+
   it('retimeOutputs() retimes queued video and stops scheduled audio', () => {
     const calls: string[] = [];
     const renderer: any = {
