@@ -225,6 +225,13 @@ const LIVE_JUMP_COOLDOWN_US = 5_000_000;
  * not absorbed by slipping the clock back.
  */
 const LIVE_JUMP_SETTLE_US = 2_000_000;
+/**
+ * Window over which live catch-up takes the least media buffered ahead. A
+ * buffer refilled in bursts (one CMAF fragment, or one LOC group, at a time)
+ * swings above the floor between arrivals; only what stands ahead throughout
+ * is excess.
+ */
+const CATCH_UP_WINDOW_US = 2_000_000;
 
 /** One current route's receiving admission; no payload or group history. */
 interface ReceivingVideoOwner {
@@ -916,6 +923,8 @@ export class MoqtPlayer {
   private liveCatchUp: LiveCatchUp | null = null;
   /** Previous catch-up tick (µs), to advance the timeline by elapsed time. */
   private lastCatchUpTickUs: number | null = null;
+  /** Media buffered ahead (µs) at recent catch-up ticks, oldest first. */
+  private readonly catchUpAheadUs: Array<{ readonly atUs: number; readonly aheadUs: number }> = [];
   /** Catalog targetLatency (ms) of the selected video, used when the config sets none. */
   private catalogTargetLatencyMs: number | undefined;
   /** Since when (µs) buffered media has stood past the jump threshold. */
@@ -10370,16 +10379,20 @@ export class MoqtPlayer {
     const loc = sync !== null && dispatcher !== null && playhead !== null;
     const aheadUs = loc ? this.locAheadOfPlayoutUs(playhead!) : this.mediaSource?.setPlaybackRate ? this.mediaSource.getBufferAheadUs?.() ?? null : null;
     if (aheadUs === null) return;
+    const window = this.catchUpAheadUs;
+    window.push({ atUs: now, aheadUs });
+    while (window.length > 0 && window[0]!.atUs <= now - CATCH_UP_WINDOW_US) window.shift();
+    const standingAheadUs = Math.min(...window.map(sample => sample.aheadUs));
     const latencyUs = loc ? sync!.measureLatency(BigInt(Math.round(playhead!)), this.captureIsWallClock) : null;
     const targetMs = this.config.targetLatencyMs ?? this.catalogTargetLatencyMs;
     const previousRate = catchUp.currentRate;
-    const decision = catchUp.evaluate(aheadUs, latencyUs, targetMs === undefined ? undefined : targetMs * 1000);
+    const decision = catchUp.evaluate(standingAheadUs, latencyUs, targetMs === undefined ? undefined : targetMs * 1000);
     if (decision.rate !== previousRate) {
       if (loc) dispatcher!.setCatchUpRate(decision.rate);
       else this.mediaSource!.setPlaybackRate!(decision.rate);
-      const latencyMs = Math.round((latencyUs ?? aheadUs) / 1000);
+      const latencyMs = Math.round((latencyUs ?? standingAheadUs) / 1000);
       this._stats.recordLatency(latencyMs);
-      this.log.info('Catch-up %s: rate %.2f (%.1fs buffered ahead)', decision.active ? 'active' : 'off', decision.rate, aheadUs / 1_000_000);
+      this.log.info('Catch-up %s: rate %.2f (%.1fs buffered ahead)', decision.active ? 'active' : 'off', decision.rate, standingAheadUs / 1_000_000);
       this.emitter.emit('catch_up_changed', {
         type: 'catch_up_changed', active: decision.active, rate: decision.rate, latencyMs, targetMs: targetMs ?? 0,
       });

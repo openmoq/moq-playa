@@ -899,6 +899,17 @@ describe('ABR under source-paced live delivery', () => {
       }
     });
 
+    it('CMAF: a buffer refilled in bursts does not toggle catch-up', async () => {
+      // Each fragment lifts the buffer from 0.5 s to 1.1 s; between arrivals it
+      // drains back. Nothing stands ahead beyond the floor, so the rate stays 1.
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(20),
+        bufferAheadUs: now => 500_000 + (now % 600_000),
+      });
+      expect(run.catchUps).toEqual([]);
+      expect(run.elementRates).toEqual([]);
+    });
+
     it('CMAF: catch-up sets the media element\'s rate while the buffer stands high', async () => {
       const run = await runScenario({
         packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(20), bufferAheadUs: now => (now > SECONDS(10) ? 2_500_000 : 300_000),
