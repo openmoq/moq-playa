@@ -174,7 +174,7 @@ function scanMdatNals(segment: Uint8Array): { nalTypes: number[]; mdatHead: stri
  * recovery rung. Mirrors the manual console capture this replaces.
  */
 export interface PlayheadWedgeInfo {
-  /** Recovery rung: 1 nudge, 2 pause/play pulse, 3 live-edge seek, 4 onError. */
+  /** Recovery rung: 1 seek nudge, 2 pause/play pulse, 3 live-edge seek, 4 onError. */
   readonly rung: number;
   readonly currentTime: number;
   readonly readyState: number;
@@ -512,7 +512,7 @@ export class MseMediaSource implements MediaSourceLike {
       // not preserve an old deadline, and an intentional pause must never
       // ripen into a landing-failure fatal.
       this.disarmGap();
-      this.wedgeVideoHole = null; this.handleWatchdogSeeked(); this.wedgeLastQuality = null;
+      this.clearVideoHoleEvidence(); this.handleWatchdogSeeked(); this.wedgeLastQuality = null;
       this.wedgeLastTime = null; this.wedgeFrozenSinceMs = null;
       this.gapStallEpisode = false;
       this.retireGapLanding();
@@ -768,6 +768,11 @@ export class MseMediaSource implements MediaSourceLike {
     readonly end: number; readonly start: number; readonly generation: number;
     readonly videoBuffer: SourceBuffer; readonly audioBuffer: SourceBuffer | null;
   } | null = null;
+  /** One native covered position, retained while a later range is not visible. */
+  private wedgeCoveredPosition: {
+    readonly time: number; readonly generation: number;
+    readonly videoBuffer: SourceBuffer; readonly audioBuffer: SourceBuffer | null;
+  } | null = null;
   private wedgeSeekTarget: number | null = null;
 
   // ── Buffered-hole gap-jump state (fully separate from wedge state) ──
@@ -1004,6 +1009,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.addEventListener('playing', this.handlePlaying);
     this.video.addEventListener('waiting', this.handleWaiting);
     this.video.addEventListener('seeking', this.handleWatchdogSeek);
+    this.video.addEventListener('pause', this.handleCoveredPositionPause);
     this.video.addEventListener('timeupdate', this.handleTimeUpdate);
     this.video.addEventListener('error', this.handleVideoError);
 
@@ -1513,7 +1519,7 @@ export class MseMediaSource implements MediaSourceLike {
 
     this.changingType[mediaType] = true;
     this.clearReceivingGroups(mediaType);
-    this.wedgeVideoHole = null; this.handleWatchdogSeeked();
+    this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
     this.endRequested = false;
     try {
       const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
@@ -1720,7 +1726,7 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.appendGapWait[mediaType]?.entry.trackIdentity === trackIdentity) this.clearAppendGap(mediaType);
     this.lateAppendFloor[mediaType].delete(trackIdentity);
     this.clearReceivingGroups(mediaType, trackIdentity);
-    this.wedgeVideoHole = null; this.handleWatchdogSeeked();
+    this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
     // The assembler notifies after delivering the rebased restart segment.
     // Keep accepted media, including that segment, and reset only its wait/index.
     for (const entry of queue) if (entry.trackIdentity === trackIdentity) {
@@ -1753,7 +1759,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.appendQueueHold = null;
     this.clearAppendGap('video'); this.clearAppendGap('audio');
     this.clearReceivingGroups('video'); this.clearReceivingGroups('audio');
-    this.wedgeVideoHole = null; this.handleWatchdogSeeked(); this.wedgeLastQuality = null;
+    this.clearVideoHoleEvidence(); this.handleWatchdogSeeked(); this.wedgeLastQuality = null;
     this.wedgeLastTime = null; this.wedgeFrozenSinceMs = null;
     this.lateAppendFloor.video.clear(); this.lateAppendFloor.audio.clear();
     this.pendingGapSkip.video = false; this.pendingGapSkip.audio = false;
@@ -1828,6 +1834,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.removeEventListener('playing', this.handlePlaying);
     this.video.removeEventListener('waiting', this.handleWaiting);
     this.video.removeEventListener('seeking', this.handleWatchdogSeek);
+    this.video.removeEventListener('pause', this.handleCoveredPositionPause);
     this.video.removeEventListener('seeked', this.handleWatchdogSeeked);
     this.video.removeEventListener('timeupdate', this.handleTimeUpdate);
     this.video.removeEventListener('error', this.handleVideoError);
@@ -2890,6 +2897,9 @@ export class MseMediaSource implements MediaSourceLike {
    *   2. pause()/play() pulse
    *   3. live-edge seek (rangeEnd − targetAheadSec)
    *   4. onError — the app must rebuild the MediaSource/session
+   * A crossed hole wider than the jump bound permits only a same-position
+   * nudge. Continued freeze reaches rung 4 after the normal landing deadline;
+   * neither the pulse nor the forward-seek rungs apply to that episode.
    *
    * A seek WE perform must not read as recovery — wedgeLastTime is
    * re-stamped after each action, so only ORGANIC playhead movement
@@ -2913,7 +2923,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.wedgeLastQuality = quality;
 
     if (qualityReset) {
-      this.wedgeVideoHole = null; this.handleWatchdogSeeked();
+      this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
       this.wedgeLastTime = null;
       this.wedgeFrozenSinceMs = null;
       this.wedgeRung = 0;
@@ -2922,7 +2932,10 @@ export class MseMediaSource implements MediaSourceLike {
     // Counter progress always vetoes recovery on this sample. A crossing
     // interval has no frame timestamps, so it may record potential traversal.
     // Retire it on later progress whose interval starts in its successor range.
-    if (v.paused || (v.seeking && !ownSeek) || !this.playbackIntent) this.wedgeVideoHole = null;
+    if (quality === null || v.paused || (v.seeking && !ownSeek) || !this.playbackIntent
+        || v.error !== null || v.ended || this.wedgeLastTime !== null && ct < this.wedgeLastTime) {
+      this.clearVideoHoleEvidence();
+    }
 
     // Organic clock movement resets the freeze deadline, but one observed hole
     // may span several samples before the clock finally freezes after it.
@@ -2933,15 +2946,19 @@ export class MseMediaSource implements MediaSourceLike {
         ? null : this.observeVideoHole(from, ct);
       if (this.destroyed || generation !== this.bufferGen) return;
       this.wedgeVideoHole = qualityMoved && witness !== null && from !== null && from >= witness.start ? null : witness;
+      // Observe the old covered point before replacing it with an upper-range
+      // point. The upper range may arrive after playback left the lower one.
+      if (quality !== null && !v.paused && !v.seeking && this.playbackIntent
+          && v.error === null && !v.ended) this.rememberCoveredVideoPosition(ct);
       this.handleWatchdogSeeked();
       this.wedgeLastTime = ct;
       this.wedgeFrozenSinceMs = null;
       this.wedgeRung = 0;
       return;
     }
-    if (this.wedgeVideoHole !== null) this.wedgeVideoHole = this.observeVideoHole(ct, ct);
+    this.wedgeVideoHole = this.observeVideoHole(ct, ct);
     if (qualityMoved) {
-      if (this.wedgeVideoHole !== null && from >= this.wedgeVideoHole.start) this.wedgeVideoHole = null;
+      if (this.wedgeVideoHole !== null && from >= this.wedgeVideoHole.start) this.clearVideoHoleEvidence();
       this.handleWatchdogSeeked();
       this.wedgeFrozenSinceMs = null;
       this.wedgeRung = 0;
@@ -2953,6 +2970,12 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.hasPendingNativeWork()) {
       this.wedgeFrozenSinceMs = null;
       this.handleWatchdogSeeked();
+      return;
+    }
+    const hole = this.wedgeVideoHole;
+    const wideHole = hole !== null && hole.start - hole.end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC;
+    if (wideHole && (v.ended || v.error !== null || this.appendQueueHold !== null)) {
+      this.wedgeFrozenSinceMs = null;
       return;
     }
 
@@ -2971,17 +2994,12 @@ export class MseMediaSource implements MediaSourceLike {
       }
     } catch { /* detached element */ }
     let postHole = false;
-    if (this.gapJumpMs > 0 && this.wedgeVideoHole !== null && quality !== null && (v.readyState ?? 0) === 2) {
-      try {
-        const ranges = this.videoBuffer?.buffered;
-        const audio = this.audioBuffer?.buffered;
-        postHole = ranges !== undefined && Array.from({ length: ranges.length }, (_, i) => i).some(i =>
-          ranges.start(i) === this.wedgeVideoHole!.start && ranges.start(i) <= ct && ranges.end(i) - ct > 1)
-          && (!audio || Array.from({ length: audio.length }, (_, i) => i).some(i => audio.start(i) <= ct && audio.end(i) - ct > 1));
-      } catch { /* A detached/evicted range retires the witness. */ }
-      if (!postHole) { this.wedgeVideoHole = null; this.handleWatchdogSeeked(); }
+    if (this.gapJumpMs > 0 && hole !== null && quality !== null && ((v.readyState ?? 0) === 2 || wideHole)) {
+      postHole = this.hasPostHoleCoverage(ct, wideHole);
+      if (!postHole) { this.clearVideoHoleEvidence(); this.handleWatchdogSeeked(); }
     }
-    if (v.paused || (v.seeking && !ownSeek) || !this.playbackIntent || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec <= 1) {
+    if (v.paused || (v.seeking && !ownSeek) || !this.playbackIntent || (wideHole && (!postHole || (v.readyState ?? 0) < 2))
+        || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec <= 1) {
       this.wedgeFrozenSinceMs = null;
       return;
     }
@@ -2992,9 +3010,11 @@ export class MseMediaSource implements MediaSourceLike {
     }
     if (nowMs - this.wedgeFrozenSinceMs < MseMediaSource.WEDGE_FROZEN_MS) return;
     if (this.wedgeRung >= 4) return; // exhausted — error already surfaced
+    if (wideHole && nowMs - this.lastGapJumpAtMs < (this.wedgeRung === 0
+        ? MseMediaSource.GAP_JUMP_MIN_INTERVAL_MS : MseMediaSource.GAP_WIDE_HOLE_FATAL_MS)) return;
 
-    this.wedgeRung++;
-    const rung = this.wedgeRung;
+    const rung = wideHole && this.wedgeRung > 0 ? 4 : this.wedgeRung + 1;
+    if (!wideHole) this.wedgeRung = rung;
 
     // Diagnostic snapshot — this is the capture we used to ask humans for.
     const q = (v as { getVideoPlaybackQuality?: () => VideoPlaybackQuality }).getVideoPlaybackQuality?.();
@@ -3015,13 +3035,25 @@ export class MseMediaSource implements MediaSourceLike {
     this.logWarn('[MSE] playhead wedged at t=%s (rung %d): %s',
       ct.toFixed(2), rung, JSON.stringify(info));
     try { this.onWedge?.(info); } catch { /* Diagnostics must not stop recovery. */ }
+    // A diagnostics callback can retire media or expose fresh output. Recheck
+    // both native targets and the freeze before resetting every decoder.
+    const currentQuality = wideHole ? this.getVideoPlaybackQuality() : quality;
     if (this.destroyed || generation !== this.bufferGen || !this.playbackIntent
         || v.paused || v.currentTime !== ct || this.wedgeLastTime !== ct || this.hasPendingNativeWork()) return;
+    if (wideHole && (v.ended || v.error !== null || (v.seeking && !ownSeek) || this.appendQueueHold !== null
+        || this.wedgeVideoHole !== hole || !this.hasPostHoleCoverage(ct, true)
+        || currentQuality === null || currentQuality.totalVideoFrames !== quality!.totalVideoFrames
+        || currentQuality.droppedVideoFrames !== quality!.droppedVideoFrames)) {
+      this.wedgeFrozenSinceMs = null;
+      return;
+    }
+    if (wideHole) this.wedgeRung = rung;
 
     switch (rung) {
       case 1: { // gentle nudge inside the containing range (hls.js-classic)
-        const target = Math.min(ct + 0.1, ct + aheadSec - 0.05);
-        if (target > ct) { this.seekForWedge(target); }
+        const target = wideHole ? ct : Math.min(ct + 0.1, ct + aheadSec - 0.05);
+        if (wideHole) this.lastGapJumpAtMs = nowMs;
+        if (wideHole || target > ct) { this.seekForWedge(target); }
         break;
       }
       case 2: // pause/play pulse
@@ -3042,7 +3074,7 @@ export class MseMediaSource implements MediaSourceLike {
         const err = new Error(
           `playhead wedge unrecoverable: frozen at t=${ct.toFixed(2)} with `
           + `${aheadSec.toFixed(1)}s buffered ahead (readyState=${v.readyState}) `
-          + `after nudge/pulse/seek — MediaSource rebuild required`,
+          + `after ${wideHole ? 'same-position seek' : 'nudge/pulse/seek'} — MediaSource rebuild required`,
         );
         err.name = 'PlayheadWedgeError';
         this.onError?.(err);
@@ -3055,6 +3087,39 @@ export class MseMediaSource implements MediaSourceLike {
     this.wedgeFrozenSinceMs = nowMs;
   }
 
+  private clearVideoHoleEvidence(): void {
+    this.wedgeVideoHole = null;
+    this.wedgeCoveredPosition = null;
+  }
+
+  private rememberCoveredVideoPosition(time: number): void {
+    const videoBuffer = this.videoBuffer, audioBuffer = this.audioBuffer, generation = this.bufferGen;
+    if (!videoBuffer || !Number.isFinite(time)) { this.wedgeCoveredPosition = null; return; }
+    try {
+      const ranges = videoBuffer.buffered;
+      for (let i = 0; i < ranges.length; i++) {
+        if (time < ranges.start(i) || time > ranges.end(i)) continue;
+        if (!this.destroyed && generation === this.bufferGen && videoBuffer === this.videoBuffer
+            && audioBuffer === this.audioBuffer) {
+          this.wedgeCoveredPosition = { time, generation, videoBuffer, audioBuffer };
+        }
+        return;
+      }
+    } catch { this.wedgeCoveredPosition = null; }
+  }
+
+  private hasPostHoleCoverage(ct: number, requireAudio: boolean): boolean {
+    const hole = this.wedgeVideoHole;
+    if (hole === null || this.observeVideoHole(ct, ct) !== hole) return false;
+    try {
+      const ranges = this.videoBuffer?.buffered, audio = this.audioBuffer?.buffered;
+      return ranges !== undefined && Array.from({ length: ranges.length }, (_, i) => i).some(i =>
+        ranges.start(i) === hole.start && ranges.start(i) <= ct && ranges.end(i) - ct > 1)
+        && ((!requireAudio && !audio) || (audio !== undefined && Array.from({ length: audio.length }, (_, i) => i)
+          .some(i => audio.start(i) <= ct && audio.end(i) - ct > 1)));
+    } catch { return false; /* Detached/evicted native media cannot justify a seek. */ }
+  }
+
   private observeVideoHole(from: number, to: number): typeof this.wedgeVideoHole {
     const videoBuffer = this.videoBuffer, audioBuffer = this.audioBuffer;
     if (this.gapJumpMs === 0 || to < from || !videoBuffer) return null;
@@ -3064,22 +3129,29 @@ export class MseMediaSource implements MediaSourceLike {
       for (let i = 0; i + 1 < ranges.length; i++) {
         const end = ranges.end(i), start = ranges.start(i + 1);
         if (start - end <= MseMediaSource.GAP_IDENTITY_TOLERANCE_SEC
-            || start - end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC
             || to <= end || to >= ranges.end(i + 1)) continue;
         const same = prior !== null && prior.videoBuffer === videoBuffer && prior.audioBuffer === audioBuffer
           && prior.generation === this.bufferGen && prior.end === end && prior.start === start;
-        // A fresh witness starts with an actual lower buffered sample. Once
-        // entered, it survives samples inside the hole and its successor range.
-        if (!same && (from < ranges.start(i) || from > end)) continue;
+        // A fresh witness needs an observed lower buffered point. A late upper
+        // range can make the immediately preceding sample already be in the gap.
+        const point = this.wedgeCoveredPosition;
+        const anchor = from >= ranges.start(i) && from <= end ? from
+          : point !== null && point.videoBuffer === videoBuffer && point.audioBuffer === audioBuffer
+            && point.generation === this.bufferGen && point.time <= from ? point.time : null;
+        if (!same && (anchor === null || anchor < ranges.start(i) || anchor > end || to <= anchor)) continue;
+        const coverageFrom = same ? from : anchor!;
         let covered = audio === undefined;
         if (audio) for (let j = 0; j < audio.length; j++) {
-          if (audio.start(j) <= Math.min(from, end) && audio.end(j) >= to) { covered = true; break; }
+          if (audio.start(j) <= Math.min(coverageFrom, end) && audio.end(j) >= to) { covered = true; break; }
         }
         if (covered) return same ? prior : { end, start, generation: this.bufferGen, videoBuffer, audioBuffer };
       }
     } catch { /* Detached, evicted or replaced ranges cannot retain a witness. */ }
     return null;
   }
+
+  /** A native pause retires a point whose later range has not yet been observed. */
+  private handleCoveredPositionPause = (): void => { this.wedgeCoveredPosition = null; };
 
   /** A user seek that settles between watchdog samples is not organic playback. */
   private handleWatchdogSeek = (): void => {
@@ -3089,7 +3161,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.wedgeLastTime = null;
     this.wedgeFrozenSinceMs = null;
     this.wedgeLastQuality = null;
-    this.wedgeVideoHole = null;
+    this.clearVideoHoleEvidence();
     this.disarmGap();
   };
 
@@ -3113,7 +3185,7 @@ export class MseMediaSource implements MediaSourceLike {
    * and the wedge could persist indefinitely behind periodic seeks.
    */
   private noteSelfSeek(): void {
-    this.wedgeVideoHole = null; this.handleWatchdogSeeked();
+    this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
     if (this.wedgeLastTime !== null) this.wedgeLastTime = this.video.currentTime;
   }
 
@@ -3384,7 +3456,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.audioQueue.length = 0;
     this.clearAppendGap('video'); this.clearAppendGap('audio');
     this.clearReceivingGroups('video'); this.clearReceivingGroups('audio');
-    this.wedgeVideoHole = null; this.handleWatchdogSeeked(); this.wedgeLastQuality = null;
+    this.clearVideoHoleEvidence(); this.handleWatchdogSeeked(); this.wedgeLastQuality = null;
     this.wedgeLastTime = null; this.wedgeFrozenSinceMs = null;
     this.lateAppendFloor.video.clear(); this.lateAppendFloor.audio.clear();
     this.videoTimelines.clear();
