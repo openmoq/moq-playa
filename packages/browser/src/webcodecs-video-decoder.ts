@@ -131,6 +131,20 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
 
   onFrame: VideoDecoderLike['onFrame'] = null;
   onError: ((error: Error) => void) | null = null;
+  private queueObservers: Set<() => void> | undefined;
+
+  /** Native queue progress can precede VideoFrames; each observer owns its removal. */
+  observeQueueDepth(observer: () => void): () => void {
+    if (this.destroyed) return () => {};
+    const observers = this.queueObservers ??= new Set();
+    // A registration is distinct even when another uses the same observer.
+    const notify = () => observer();
+    observers.add(notify);
+    return () => {
+      observers.delete(notify);
+      if (!observers.size && this.queueObservers === observers) this.queueObservers = undefined;
+    };
+  }
 
   // ─── VideoDecoderLike ───────────────────────────────────────────
 
@@ -189,6 +203,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
     if (codecChanged && this.decoder && this.decoder.state === 'configured') {
       const dyingDecoder = this.decoder;
       const dyingOwner = this.owner!;
+      dyingDecoder.ondequeue = null;
       this.decoder = null; // prevent createDecoder() from closing it
       this.owner = null;
 
@@ -355,6 +370,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
     this.lifecycleRevision++;
     this.onFrame = null;
     this.onError = null;
+    this.queueObservers?.clear(); this.queueObservers = undefined;
     this.retireAllOwners();
   }
 
@@ -429,14 +445,40 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
     owner = { decoder, renderTimes: new Map(), sourceTimes: new Map(), retiredTimestampFloor: -Infinity, active: true };
     if (this.destroyed || revision !== this.lifecycleRevision) {
       owner.active = false;
+      decoder.ondequeue = null;
       if (decoder.state !== 'closed') decoder.close();
       return false;
     }
     this.owners.add(owner);
     this.owner = owner;
     this.decoder = decoder;
+    // WebCodecs §4.6 queues dequeue when decodeQueueSize decreases, separately
+    // from VideoFrame output (which the native decoder emits in presentation order).
+    decoder.ondequeue = () => {
+      if (!this.ownsQueue(owner, revision)) return;
+      const observers = this.queueObservers;
+      if (!observers) return;
+      let failures: unknown[] | undefined;
+      for (const notify of [...observers]) {
+        if (!this.ownsQueue(owner, revision)) break;
+        if (observers.has(notify)) {
+          try { notify(); } catch (error) { (failures ??= []).push(error); }
+        }
+      }
+      // Match independent native listeners: one exception must not suppress
+      // another current observer's progress. Surface failures after dispatch.
+      if (failures?.length === 1) throw failures[0];
+      if (failures?.length) throw new AggregateError(failures, 'Video queue observers failed');
+    };
     while (this.owners.size > MAX_DECODER_OWNERS) this.retireOwner(this.owners.values().next().value!);
     return !this.destroyed && revision === this.lifecycleRevision;
+  }
+
+  private ownsQueue(owner: DecoderOwner, revision: number): boolean {
+    if (this.destroyed || !owner.active || this.owner !== owner || revision !== this.lifecycleRevision) return false;
+    const configured = owner.decoder.state === 'configured';
+    // A native getter or an earlier observer may synchronously replace ownership.
+    return configured && !this.destroyed && owner.active && this.owner === owner && revision === this.lifecycleRevision;
   }
 
   private rememberSource(owner: DecoderOwner, timestamp: number, source: SourceTimestamp | null): boolean {
@@ -461,6 +503,7 @@ export class WebCodecsVideoDecoder implements VideoDecoderLike {
 
   private retireOwner(owner: DecoderOwner): void {
     owner.active = false;
+    owner.decoder.ondequeue = null;
     owner.sourceTimes.clear();
     owner.renderTimes.clear();
     owner.inputTokens?.clear();

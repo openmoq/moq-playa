@@ -70,6 +70,30 @@ export class TypedEmitter<M> {
     if (failed) throw error;
   }
 
+  /**
+   * Notify application listeners without feeding their failures back into a
+   * media operation. Report the original exception through the host's normal
+   * uncaught-error channel, as DOM event dispatch does. Other emit modes retain
+   * their synchronous exception contract.
+   */
+  emitReported<K extends keyof M>(event: K, data: M[K]): void {
+    const set = this.listeners.get(event);
+    if (!set) return;
+    for (const fn of [...set]) {
+      if (this.listeners.get(event) !== set) break;
+      if (!set.has(fn)) continue;
+      try { fn(data); }
+      catch (error) {
+        let reported = false;
+        try {
+          const report = globalThis.reportError;
+          if (typeof report === 'function') { report.call(globalThis, error); reported = true; }
+        } catch { /* A replaced host reporter cannot turn this into media failure. */ }
+        if (!reported) queueMicrotask(() => { throw error; });
+      }
+    }
+  }
+
   /** Remove all listeners for all events. */
   removeAllListeners(): void {
     this.listeners.clear();

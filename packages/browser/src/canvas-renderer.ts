@@ -17,7 +17,7 @@
  * @module
  */
 
-import type { VideoRendererLike, VideoPresentation, VideoFrameObservation, VideoFrameObserver, VideoFrameReason } from '@openmoq/player';
+import type { VideoRendererLike, VideoPresentation, VideoFrameObservation, VideoFrameObserver, VideoFrameReason, VideoProducedTiming } from '@openmoq/player';
 import type { ClockSource } from '@openmoq/playback';
 import { validateStallThresholdMs } from './mse-adapter.js';
 
@@ -26,6 +26,7 @@ interface QueuedFrame {
   readonly frame: VideoFrame;
   readonly renderTimeUs: number;
   token?: object;
+  outputTiming?: VideoProducedTiming;
 }
 
 /** Default stall threshold: 500ms without rendering a frame. */
@@ -48,6 +49,7 @@ const FALLBACK_INTERVAL_MS = 16;
  * 5. First frame and stall detection fire lifecycle callbacks
  */
 export class CanvasRenderer implements VideoRendererLike {
+  readonly supportsOutputTiming = true;
   private readonly ctx: CanvasRenderingContext2D;
   private readonly queue: QueuedFrame[] = [];
   private readonly stallThresholdMs: number;
@@ -127,14 +129,15 @@ export class CanvasRenderer implements VideoRendererLike {
   private observeFrame(entry: QueuedFrame, state: VideoFrameObservation['state'], reason: VideoFrameReason | null): void {
     const token = entry.token;
     if (token === undefined) return;
+    const outputTiming = entry.outputTiming;
     // Forget terminal ownership before any reentrant callback can flush/destroy.
-    if (state !== 'scheduled') delete entry.token;
+    if (state !== 'scheduled') { delete entry.token; delete entry.outputTiming; }
     const listeners = this.frameObservers;
     if (!listeners) return;
     for (const listener of [...listeners]) {
       if (this.frameObservers !== listeners || !listeners.has(listener)) continue;
       if (state === 'scheduled' && entry.token !== token) break;
-      try { const pending = listener({ token, state, reason }); if (pending) void Promise.resolve(pending).catch(() => {}); }
+      try { const pending = listener({ token, state, reason, ...(outputTiming ? { outputTiming } : {}) }); if (pending) void Promise.resolve(pending).catch(() => {}); }
       catch { /* Optional outcomes cannot change presentation. */ }
     }
   }
@@ -145,14 +148,15 @@ export class CanvasRenderer implements VideoRendererLike {
    * Frames are held until renderTick() presents them at the right time.
    * The frame WILL be closed by this renderer — callers must NOT close it.
    */
-  enqueue(frame: unknown, renderTimeUs: number, token?: object): void {
+  enqueue(frame: unknown, renderTimeUs: number, token?: object, outputTiming?: VideoProducedTiming): void {
     const observed = this.frameObservers?.size ? token : undefined;
+    const entry: QueuedFrame = { frame: frame as VideoFrame, renderTimeUs,
+      ...(observed === undefined ? {} : { token: observed, ...(outputTiming ? { outputTiming } : {}) }) };
     if (this.destroyed) {
       (frame as VideoFrame).close();
-      if (observed !== undefined) this.observeFrame({ frame: frame as VideoFrame, renderTimeUs, token: observed }, 'discarded', 'destroyed');
+      this.observeFrame(entry, 'discarded', 'destroyed');
       return;
     }
-    const entry: QueuedFrame = { frame: frame as VideoFrame, renderTimeUs, ...(observed === undefined ? {} : { token: observed }) };
     this.queue.push(entry);
     this.observeFrame(entry, 'scheduled', null);
   }
@@ -235,13 +239,9 @@ export class CanvasRenderer implements VideoRendererLike {
           if (episode.detected) recoveredMs = performance.now() - episode.startedMs;
         }
 
-        // First frame lifecycle
-        if (!this.firstFrameRendered) {
-          this.firstFrameRendered = true;
-          this.onFirstFrame?.();
-        }
+        const first = !this.firstFrameRendered;
+        this.firstFrameRendered = true;
 
-        this.onFrameRendered?.(captureTimestampUs, nowUs, entry.renderTimeUs);
         // Render-timing diagnostic: logs every 30th frame's scheduling
         // jitter (scheduled vs actual render time, inter-frame delta).
         // Enable via ?debug=render in the URL.
@@ -259,8 +259,20 @@ export class CanvasRenderer implements VideoRendererLike {
         }
         this.lastActualRenderUs = nowUs;
         this.lastRenderTimeMs = performance.now();
-        // All frame state committed — safe to publish.
-        if (recoveredMs !== null) this.onStallRecovered?.(recoveredMs);
+        // Complete accounting before first-frame publication. A listener may
+        // throw or retire this output, but cannot undo the completed draw.
+        let failed = false, failure: unknown;
+        try { this.onFrameRendered?.(captureTimestampUs, nowUs, entry.renderTimeUs); }
+        catch (error) { failed = true; failure = error; }
+        if (!this.destroyed && this.queueRevision === queueRevision && first) {
+          try { this.onFirstFrame?.(); }
+          catch (error) { if (!failed) { failed = true; failure = error; } }
+        }
+        if (!this.destroyed && this.queueRevision === queueRevision && recoveredMs !== null) {
+          try { this.onStallRecovered?.(recoveredMs); }
+          catch (error) { if (!failed) { failed = true; failure = error; } }
+        }
+        if (failed) throw failure;
       } else {
         // Future frame — stop processing
         break;

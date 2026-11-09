@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { placePresentationAnchor } from './presentation-placement.js';
+import * as nativeTime from './presentation-placement.js';
 
 const placement = { token: {}, toRebasedTimeUs: (source: bigint) => ({ numerator: source - 990_000_000n, denominator: 1n }) };
 
@@ -49,5 +50,37 @@ describe('canonical presentation placement', () => {
   it.each([0n, -1n])('rejects an invalid placement denominator %s', denominator => {
     expect(() => placePresentationAnchor({ token: {}, toRebasedTimeUs: () => ({ numerator: 1n, denominator }) },
       0n, 0n, 0, 0)).toThrow(/placement/);
+  });
+});
+
+describe('shared exact native time conversion', () => {
+  const convert = (seconds: number | undefined) => {
+    expect(nativeTime.nativeTimeUs).toBeTypeOf('function');
+    return nativeTime.nativeTimeUs(seconds);
+  };
+
+  it.each([undefined, NaN, Infinity, -Infinity])('returns unavailable for %s', seconds => {
+    expect(convert(seconds)).toBeNull();
+  });
+
+  it('keeps zero, negative offsets and binary fractional seconds exact', () => {
+    expect(convert(0)).toEqual({ numerator: 0n, denominator: 1n });
+    expect(convert(-0)).toEqual({ numerator: 0n, denominator: 1n });
+    expect(convert(1)).toEqual({ numerator: 1_000_000n, denominator: 1n });
+    expect(convert(-0.25)).toEqual({ numerator: -250_000n, denominator: 1n });
+    expect(convert(1.25)).toEqual({ numerator: 1_250_000n, denominator: 1n });
+    const positive = convert(0.1)!, negative = convert(-0.1)!;
+    const numerator = 3_602_879_701_896_397n * 1_000_000n, denominator = 1n << 55n;
+    expect(positive.numerator * denominator).toBe(numerator * positive.denominator);
+    expect(negative.numerator * denominator).toBe(-numerator * negative.denominator);
+  });
+
+  it('preserves finite extremes and subnormal seconds without rounding to zero or infinity', () => {
+    const tiny = convert(Number.MIN_VALUE)!, negativeTiny = convert(-Number.MIN_VALUE)!;
+    expect(tiny.numerator * (1n << 1074n)).toBe(1_000_000n * tiny.denominator);
+    expect(negativeTiny.numerator * (1n << 1074n)).toBe(-1_000_000n * negativeTiny.denominator);
+    const largest = ((1n << 1024n) - (1n << 971n)) * 1_000_000n;
+    expect(convert(Number.MAX_VALUE)).toEqual({ numerator: largest, denominator: 1n });
+    expect(convert(-Number.MAX_VALUE)).toEqual({ numerator: -largest, denominator: 1n });
   });
 });

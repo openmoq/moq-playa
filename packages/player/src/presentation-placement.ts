@@ -16,7 +16,7 @@ function fraction(numerator: bigint, denominator: bigint): FractionUs {
 }
 
 /** Preserve the actual finite native double; do not round offsets before target-tick conversion. */
-function nativeOffsetUs(seconds: number | undefined): FractionUs | null {
+export function nativeTimeUs(seconds: number | undefined): FractionUs | null {
   if (seconds === undefined || !Number.isFinite(seconds)) return null;
   if (seconds === 0) return fraction(0n, 1n);
   const view = new DataView(new ArrayBuffer(8));
@@ -30,6 +30,26 @@ function nativeOffsetUs(seconds: number | undefined): FractionUs | null {
 }
 
 /**
+ * Native range readback policy, not an exact coded-coverage proof. Separately
+ * quantized presentation times and durations can lose nearly two microseconds.
+ * Allow that conversion loss plus one binary64 endpoint ULP, only while that
+ * ULP is at most one microsecond. Coded joins and sample floors stay exact.
+ */
+export function nativeRangeMayReachBoundary(endSeconds: number, boundaryUs: FractionUs): boolean {
+  const end = nativeTimeUs(endSeconds);
+  if (!end || endSeconds < 0 || boundaryUs.denominator <= 0n || boundaryUs.numerator < 0n) return false;
+  const shortfall = boundaryUs.numerator * end.denominator - end.numerator * boundaryUs.denominator;
+  if (shortfall <= 0n) return true;
+  const view = new DataView(new ArrayBuffer(8));
+  view.setFloat64(0, endSeconds === 0 ? 0 : endSeconds);
+  view.setBigUint64(0, view.getBigUint64(0) + 1n);
+  const ulp = nativeTimeUs(view.getFloat64(0) - endSeconds);
+  if (!ulp || ulp.numerator <= 0n || ulp.numerator > ulp.denominator) return false;
+  const allowance = 2n * ulp.denominator + ulp.numerator;
+  return shortfall * ulp.denominator <= allowance * boundaryUs.denominator * end.denominator;
+}
+
+/**
  * Place a target on the reference output's element timeline. Token validation
  * belongs to the operation owner before adoption; this helper only composes
  * captured evidence. The target assembler performs the one tick-rounding step.
@@ -39,7 +59,7 @@ export function placePresentationAnchor(
   referenceOffsetSeconds: number | undefined, targetOffsetSeconds: number | undefined,
 ): { readonly sourceTimeUs: bigint; readonly rebasedTimeUs: FractionUs } | null {
   if (typeof sourceTimeUs !== 'bigint' || typeof referenceTimeUs !== 'bigint') throw new TypeError('Expected bigint presentation anchors');
-  const referenceOffset = nativeOffsetUs(referenceOffsetSeconds), targetOffset = nativeOffsetUs(targetOffsetSeconds);
+  const referenceOffset = nativeTimeUs(referenceOffsetSeconds), targetOffset = nativeTimeUs(targetOffsetSeconds);
   if (!referenceOffset || !targetOffset) return null;
   const placed = reference.toRebasedTimeUs(referenceTimeUs);
   if (placed === null) return null;

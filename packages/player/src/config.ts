@@ -630,6 +630,15 @@ export interface FactoryConfig {
   readonly createAudioOutput?: () => AudioOutputLike;
 
   /**
+   * Return fresh videoDecoder/renderer and/or audioDecoder/audioOutput pairs
+   * for the requested roles. Keep them inactive until onAdopt; the engine
+   * owns their destruction. Neither preparation nor onRetire may destroy or
+   * reset the current graph. Return a plain record with own data properties;
+   * allocations not returned remain the factory's responsibility.
+   */
+  readonly createFrameOutput?: (context: Readonly<FrameOutputContext>) => FrameOutput;
+
+  /**
    * Factory for the MseMediaSource (CMAF/MSE fallback).
    * When provided, CMAF-packaged tracks are routed directly to the
    * MseMediaSource instead of through the PlaybackPipeline.
@@ -1081,4 +1090,26 @@ export function validateConfig(config: MoqtPlayerConfig): void {
       throw new RangeError(`capLevelToResolution dimensions must be > 0, got ${config.capLevelToResolution.width}x${config.capLevelToResolution.height}`);
     }
   }
+}
+
+/** Adapters owned by one frame-decoding output graph. */
+export interface FrameOutputAdapters {
+  readonly videoDecoder?: VideoDecoderLike;
+  readonly renderer?: VideoRendererLike;
+  readonly audioDecoder?: AudioDecoderLike;
+  readonly audioOutput?: AudioOutputLike;
+}
+
+export interface FrameOutputContext {
+  readonly video: boolean;
+  readonly audio: boolean;
+  readonly clock: ClockSource;
+}
+
+/** A fresh, initially inactive graph for preparing a frame-mode seek. */
+export interface FrameOutput extends FrameOutputAdapters {
+  /** Synchronously update the embedding's output pointer after adoption; Promise returns are refused. */
+  readonly onAdopt?: (state: Readonly<{ playing: boolean }>) => void;
+  /** Synchronously release that pointer after retirement, including a throwing onAdopt. */
+  readonly onRetire?: () => void;
 }

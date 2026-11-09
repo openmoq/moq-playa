@@ -53,7 +53,11 @@ export function createTimelineState(track: CatalogTrack): TimelineState {
  * @see draft-ietf-moq-msf-00 §7.3 (timeline updating)
  */
 export function processTimelineObject(state: TimelineState, payload: Uint8Array): TimelineState {
-  const newEntries = parseMediaTimeline(payload);
+  return mergeTimelineEntries(state, parseMediaTimeline(payload));
+}
+
+/** Merge already parsed records after their declaring owner has checked them. */
+export function mergeTimelineEntries(state: TimelineState, newEntries: MediaTimelineEntry[]): TimelineState {
   return {
     ...state,
     entries: mergeMediaTimeline(state.entries, newEntries),

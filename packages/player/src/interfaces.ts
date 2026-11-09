@@ -15,7 +15,7 @@
  */
 
 import type { VideoChunkInit, AudioChunkInit, SourceTimestamp } from '@openmoq/loc';
-import type { VideoRenderTiming } from '@openmoq/playback';
+import type { VideoRenderTiming, AudioRenderTiming } from '@openmoq/playback';
 import type { FractionUs, PresentationPlacement } from './presentation-placement.js';
 
 // ─── Layer 3: Decoder Backend (Swappable) ────────────────────────────
@@ -69,6 +69,13 @@ export interface VideoDecoderLike {
   readonly queueDepth: number;
 
   /**
+   * Optional native queue progress, independent of VideoFrames or output readiness.
+   * Each registration owns its unsubscribe; ending one must not remove another.
+   * Notify only for the current configured native decoder generation.
+   */
+  observeQueueDepth?(observer: () => void): () => void;
+
+  /**
    * Callback: decoded frame ready for rendering. Optional source time belongs to
    * this output's decode input; null/omitted means unavailable, never guessed from
    * the latest input or catalog. It is not a render observation or track identity.
@@ -91,6 +98,8 @@ export interface VideoDecoderLike {
  * @see draft-ietf-moq-loc-01 §4.1 (audio object mapping)
  */
 export interface AudioDecoderLike {
+  /** Preserves producing timing or explicitly reports an unproven association. */
+  readonly supportsOutputTiming?: true;
   /**
    * Configure the decoder with codec parameters.
    *
@@ -110,7 +119,7 @@ export interface AudioDecoderLike {
    * Decode an audio chunk. Data is delivered via the onData callback.
    * @see draft-ietf-moq-loc-01 §2 (LOC payload = EncodedAudioChunk.data)
    */
-  decode(chunk: AudioChunkInit, renderTimeUs: number, inputToken?: object): void;
+  decode(chunk: AudioChunkInit, renderTimeUs: number, inputToken?: object, renderTiming?: AudioRenderTiming): void;
 
   /** Flush pending audio data. */
   flush(): Promise<void>;
@@ -121,8 +130,17 @@ export interface AudioDecoderLike {
   /** Current decode queue depth. */
   readonly queueDepth: number;
 
+  /**
+   * Optional native queue progress, independent of PCM or output readiness.
+   * Each registration owns its unsubscribe; ending one must not remove another.
+   * Notify only for the current native decoder generation.
+   */
+  observeQueueDepth?(observer: () => void): () => void;
+
   /** Callback: decoded audio data ready for playout. */
-  onData: ((data: unknown, renderTimeUs: number, inputToken?: object) => void) | null;
+  // Omitted = ordinary scheduling; null = armed producing association unavailable.
+  onData: ((data: unknown, renderTimeUs: number, inputToken?: object,
+    outputTiming?: AudioProducedTiming | null) => void) | null;
 
   /** Callback: decode error occurred. */
   onError: ((error: Error) => void) | null;
@@ -150,19 +168,32 @@ export interface VideoPresentation {
  * MUST call frame.close() after rendering (GPU memory management).
  */
 export type VideoFrameReason = 'destroyed' | 'flushed' | 'late frame' | 'draw failed' | 'completion unproven';
+/** Actual decoded output association; presentation still needs the renderer's draw witness. */
+export interface VideoProducedTiming {
+  readonly context: VideoRenderTiming;
+  readonly sourceTimestamp: SourceTimestamp;
+}
+
 export interface VideoFrameObservation {
   readonly token: object;
   readonly state: 'scheduled' | 'presented' | 'discarded' | 'unavailable';
   readonly reason: VideoFrameReason | null;
+  /** Present only when the decoded output supplied its producing association. */
+  readonly outputTiming?: VideoProducedTiming;
 }
 export type VideoFrameObserver = (event: VideoFrameObservation) => void | Promise<void>;
 
 export interface VideoRendererLike {
+  /** Preserves producing timing in actual queue/draw outcomes. */
+  readonly supportsOutputTiming?: true;
   /** Most recent successful render observation; null when draw order or timing is unavailable. */
   readonly videoPresentation?: VideoPresentation | null;
 
   /** Enqueue a decoded frame for presentation at the specified time. */
-  enqueue(frame: unknown, renderTimeUs: number, token?: object): void;
+  enqueue(frame: unknown, renderTimeUs: number, token?: object, outputTiming?: VideoProducedTiming): void;
+
+  /** Optional single presentation tick while the embedding's automatic loop is stopped. */
+  renderTick?(nowUs: number): void;
 
   /** Optional real queue/draw outcomes. No token or event history is retained without observation. */
   observeFrames?(observer: VideoFrameObserver): () => void;
@@ -197,7 +228,22 @@ export interface VideoRendererLike {
  *
  * Implementations: WebAudio AudioContext, MediaRecorder, NullOutput.
  */
-export type AudioScheduleReason = 'destroyed' | 'flushed' | 'schedule failed';
+/** Proven first decoded PCM point relative to its exact producing input. */
+export interface AudioProducedTiming {
+  readonly context: AudioRenderTiming;
+  /** Safe integral microseconds, including proven native priming advancement. */
+  readonly sourceOffsetUs: number;
+}
+
+/** Source position at the occupied audio graph head, not literal speaker output. */
+export interface AudioSourcePosition {
+  readonly epoch: object;
+  readonly sourceTimestampUs: bigint;
+  /** Bounded fractional offset: decoded start + integer-frame trim + graph progress. */
+  readonly sourceOffsetUs: number;
+}
+
+export type AudioScheduleReason = 'destroyed' | 'flushed' | 'schedule failed' | 'preroll' | 'timing unavailable';
 export interface AudioScheduleObservation {
   readonly token: object;
   readonly state: 'scheduled' | 'discarded' | 'released';
@@ -206,8 +252,15 @@ export interface AudioScheduleObservation {
 export type AudioScheduleObserver = (event: AudioScheduleObservation) => void | Promise<void>;
 
 export interface AudioOutputLike {
+  /** Producing timing, decoded PCM trim and owned head sampling. */
+  readonly supportsOutputTiming?: true;
+  /** Explicit activation may enable producing timing later; this is not readiness or a playhead. */
+  readonly outputTimingDeferred?: true;
   /** Schedule an audio chunk for playout. */
-  schedule(data: unknown, renderTimeUs: number, token?: object): void;
+  schedule(data: unknown, renderTimeUs: number, token?: object, outputTiming?: AudioProducedTiming | null): void;
+
+  /** Null for wrong/retired epoch, unproven source, future data or starvation. */
+  sampleSourcePosition?(epoch: object): AudioSourcePosition | null;
 
   /** Optional scheduling evidence. Released ends ownership, not proof of audible output. */
   observeSchedules?(observer: AudioScheduleObserver): () => void;
@@ -276,6 +329,49 @@ export interface MediaAppendQueueLease {
   discard(): void;
 }
 
+/** Actual native position and containing buffered interval, in seconds. Not a source PTS or paint. */
+export interface MediaSeekSample {
+  readonly epoch: object;
+  readonly resource: object;
+  readonly currentTime: number;
+  readonly buffered: { readonly start: number; readonly end: number };
+  /** Native paused flag when observable; false alone does not prove clock progress. */
+  readonly paused?: boolean;
+  /** Native effective rate when observable, without assuming forward or 1x playback. */
+  readonly playbackRate?: number;
+}
+
+/** Bound operations on one fresh native MediaSource; stale views cannot mutate a successor. */
+export interface MediaSeekResource {
+  readonly epoch: object;
+  readonly resource: object;
+  readonly current: boolean;
+  readonly initialize: MediaSourceLike['initialize'];
+  /** After accepted initialize(), wait for this resource's SourceBuffers to exist.
+   * Not an append/position/presentation witness. Retirement or initialization failure rejects. */
+  whenAttached(): Promise<void>;
+  readonly appendChunk: MediaSourceLike['appendChunk'];
+  observeAppends(observer: MediaAppendObserver): () => void;
+  readonly getTimestampOffset: NonNullable<MediaSourceLike['getTimestampOffset']>;
+  readonly setTimestampOffset: NonNullable<MediaSourceLike['setTimestampOffset']>;
+  /**
+   * Position in native seconds, finite and nonnegative. Returns the actual
+   * native sample after owned seek completion, !seeking, current data and
+   * buffered coverage. An already-ready fresh zero needs no seeked event.
+   * Native clamping/approximation is returned; the caller owns target policy.
+   * Supersession/cancellation rejects AbortError. Unproven positioning rejects
+   * TimeoutError after a bounded application deadline; native failures reject.
+   * Never starts playback. Completion proves native positioning, not a paint.
+   */
+  position(currentTime: number): Promise<MediaSeekSample>;
+  /** Null before positioning or without current-resource native data/coverage. No extrapolation. */
+  sample(): MediaSeekSample | null;
+  /** Explicit true requires successful positioning; false preserves pause. */
+  setPlaybackIntent(intent: boolean): void;
+  /** Idempotent retirement, including pending native work; never affects a successor. */
+  cancel(): void;
+}
+
 /**
  * MediaSource adapter interface for CMAF-packaged tracks.
  *
@@ -295,6 +391,17 @@ export interface MediaAppendQueueLease {
  * @see draft-ietf-moq-cmsf-00 §3.5.1 (packaging: "cmaf" in catalog)
  */
 export interface MediaSourceLike {
+  /**
+   * Replace the native MediaSource with a fresh resource, retiring old append
+   * work with existing terminal observations. Keeps element/DRM ownership and
+   * implementation/attachment choices. Initialization/appending/positioning do
+   * not play; request playback explicitly through the positioned resource.
+   * Epoch is opaque caller metadata. No source-clock mapping is inferred.
+   * reset/destroy/new beginSeek retire the view. Stale writes throw AbortError;
+   * stale appends first report an eligible observed discard (decoder reset).
+   */
+  beginSeek?(epoch: object): MediaSeekResource;
+
   /** Preserves the optional source key through append ordering, replay and timeline state. */
   readonly supportsTrackIdentity?: true;
   /**

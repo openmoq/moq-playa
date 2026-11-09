@@ -49,18 +49,22 @@ describe('render feedback types', () => {
 
   it('does not erase constructor option checking through defined()', () => {
     const returns = definedCalls();
-    expect(returns).toHaveLength(2);
-    expect(returns.map((type) => Boolean(type.flags & ts.TypeFlags.Any))).toEqual([false, false]);
+    expect(returns).toHaveLength(3);
+    expect(returns.map((type) => Boolean(type.flags & ts.TypeFlags.Any))).toEqual([false, false, false]);
   });
 
   it('preserves required options and makes only possibly undefined options optional', () => {
-    const [syncOptions, dispatcherOptions] = definedCalls();
+    const [syncOptions, dispatcherOptions, frameOutput] = definedCalls();
     const cases = [
       [syncOptions!, 'clock', false],
       [syncOptions!, 'driftThresholdUs', false],
       [syncOptions!, 'targetLatencyMs', true],
       [dispatcherOptions!, 'onFrameRendered', false],
       [dispatcherOptions!, 'renderer', true],
+      [frameOutput!, 'videoDecoder', true],
+      [frameOutput!, 'renderer', true],
+      [frameOutput!, 'audioDecoder', true],
+      [frameOutput!, 'audioOutput', true],
     ] as const;
     for (const [type, name, optional] of cases) {
       const property = type.getProperty(name);

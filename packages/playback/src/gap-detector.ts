@@ -162,4 +162,9 @@ export class GapDetector {
 
         return { action: GapAction.WAIT };
     }
+
+    hasObservedGroup(groupId: bigint): boolean {
+        return this.groupFirstSeenUs.has(groupId);
+    }
+
 }

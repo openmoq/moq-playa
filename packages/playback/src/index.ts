@@ -12,6 +12,7 @@
 // ─── Types ───────────────────────────────────────────────────────────
 
 export type {
+    PlaybackSample,
     PlaybackInputObserver,
     PlaybackInputDiscardReason,
     ClockSource,
@@ -19,6 +20,7 @@ export type {
     ConfigureCommand,
     DecodeVideoCommand,
     VideoRenderTiming,
+    AudioRenderTiming,
     AudioTimingSource,
     VideoTimingSource,
     DecodeAudioCommand,

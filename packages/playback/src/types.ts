@@ -9,9 +9,23 @@
  * @module
  */
 
-import type { VideoChunkInit, AudioChunkInit } from '@openmoq/loc';
+import type { VideoChunkInit, AudioChunkInit, LocHeaders } from '@openmoq/loc';
 import type { RecoveryAction } from './recovery.js';
 import type { RenderTiming } from './sync.js';
+
+/**
+ * Host-parsed coded unit in one actual wire Object, in decode order.
+ * sampleIndex is local to this batch (0..length-1), never a wire Object ID.
+ * Records are snapshotted on admission. Bytes (including config and chunk.data)
+ * are borrowed immutable, including backing sizes, until batch retirement.
+ * The pipeline bounds retained backing bytes; hosts bound other storage/native
+ * ownership separately. sourceTimestamp retains the exact signed PTS and scale.
+ */
+export interface PlaybackSample {
+    readonly sampleIndex: number;
+    readonly headers: LocHeaders;
+    readonly chunk: VideoChunkInit | AudioChunkInit;
+}
 
 // ─── Clock ──────────────────────────────────────────────────────────
 
@@ -30,12 +44,19 @@ export interface ClockSource {
 
 /** Mapped input timing; queries never establish a clock or rewrite raw metadata. */
 export interface AudioTimingSource {
+    /** Capture the immutable producing context before timing computation.
+     * Null refuses this armed input; omission retains ordinary scheduling. */
+    captureOutputTiming?(rawSourceUs: bigint): AudioRenderTiming | null;
     computeAudioRenderTime(sourceTimeUs: bigint): RenderTiming | null;
     /** Called only for a current input when the shared reference is absent. */
     establishReference?(sourceTimeUs: bigint): void;
 }
 
 export interface VideoTimingSource {
+    /** Capture a producing input context before timing computation.
+     * Null refuses this armed input; omission preserves mapped scheduling.
+     * The context is not itself proof that a decoded frame was presented. */
+    captureVideoOutputTiming?(rawSourceUs: bigint): VideoRenderTiming | null;
     computeVideoRenderTime(sourceTimeUs: bigint): RenderTiming | null;
     /** Output-time recomputation never calls this input-only hook. */
     establishReference?(sourceTimeUs: bigint): void;
@@ -68,6 +89,18 @@ export interface VideoRenderTiming {
     readonly recomputeRenderTimeUs: () => number | null;
 }
 
+/** Producing audio input context; raw encoded bytes/timestamps stay unchanged. */
+export interface AudioRenderTiming {
+    readonly epoch: object;
+    readonly sourceTimestampUs: bigint;
+    /** Decoded PCM before this raw source boundary must not be presented. */
+    readonly presentFromSourceUs: bigint;
+    /** Output-stage schedule, including the engine's intended playout cushion.
+     * Offset from this input's source point. Null retires the context.
+     * Pure query, parallel to VideoRenderTiming; never establishes a clock. */
+    readonly recomputeRenderTimeUs: (sourceOffsetUs: number) => number | null;
+}
+
 /** Decode a video chunk at the specified render time. @see draft-ietf-moq-loc-01 §2.1 */
 export interface DecodeVideoCommand {
     readonly type: 'decode_video';
@@ -93,6 +126,8 @@ export interface DecodeAudioCommand {
     readonly renderTimeUs: number;
     /** Optional application-local identity; never a wire field or payload. */
     readonly inputToken?: object;
+    /** Captured producing context; distinct from optional diagnostic identity. */
+    readonly renderTiming?: AudioRenderTiming;
 }
 
 /** Flush the decoder (drain pending frames). */
@@ -231,7 +266,12 @@ export type DecoderFeedback =
     | QueuePressureFeedback
     | DecodeErrorFeedback
     | FrameRenderedFeedback
-    | FlushCompleteFeedback;
+    | FlushCompleteFeedback
+    | {
+        readonly type: 'audio_timing_unavailable';
+        readonly mediaType: 'audio';
+        readonly reason: 'decoder unsupported' | 'output unsupported' | 'output unproven' | 'context retired';
+    };
 
 /** Decoder queue getting deep — signal to throttle draining. */
 export interface QueuePressureFeedback {
@@ -294,6 +334,7 @@ export interface PlaybackConfig {
     // ── Bounded release ───────────────────────────────────────────
     /**
      * Maximum objects to release from the jitter buffer per tick (video only).
+     * Optional sample batches count each coded sample as one release unit.
      * Prevents greedy drain from flooding the decoder with backlog.
      * 0 = unlimited (greedy drain, legacy behavior). Default: 5.
      */

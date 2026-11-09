@@ -96,7 +96,7 @@ describe('timeline-manager', () => {
       ]));
 
       expect(second.entries).toHaveLength(4);
-      expect(second.entries[3].mediaPts).toBe(6006);
+      expect(second.entries[3]!.mediaPts).toBe(6006);
     });
   });
 

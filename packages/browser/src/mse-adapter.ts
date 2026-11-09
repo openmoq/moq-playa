@@ -15,7 +15,7 @@
  * @module
  */
 
-import type { MediaSourceLike, MediaAppendToken, MediaAppendReason, MediaAppendObserver, VideoPlaybackQualityStats } from '@openmoq/player';
+import type { MediaSourceLike, MediaAppendToken, MediaAppendReason, MediaAppendObserver, MediaSeekResource, MediaSeekSample, VideoPlaybackQualityStats } from '@openmoq/player';
 import {
   filterInitSegment,
   describeBoxes,
@@ -373,6 +373,21 @@ const STARTUP_SEEK_TOLERANCE_SEC = 0.1;
  */
 const STARTUP_SEEK_TIMEOUT_MS = 2000;
 
+interface SeekResourceState {
+  readonly epoch: object;
+  readonly resource: object;
+  readonly source: MediaSource;
+  readonly revision: number;
+  url: string | null;
+  retired: boolean;
+  positioned: boolean;
+  released: boolean;
+  cancelPosition: ((error: Error) => void) | null;
+  attachmentError: Error | null;
+  initializationAttempt: number;
+  attachmentWaiters?: Set<{ resolve: () => void; reject: (error: Error) => void }>;
+}
+
 /**
  * How an awaited positioning operation ended. `timeout-accepted` is a timeout
  * whose postcondition nevertheless held (not seeking, landed at target) — it
@@ -468,6 +483,9 @@ export class MseMediaSource implements MediaSourceLike {
   readonly supportsTrackIdentity = true;
 
   private ms: MediaSource;
+  private readonly mediaSourceConstructor: typeof MediaSource;
+  private resourceRevision = 0;
+  private seekResource: SeekResourceState | null = null;
   private videoBuffer: SourceBuffer | null = null;
   private audioBuffer: SourceBuffer | null = null;
 
@@ -499,6 +517,7 @@ export class MseMediaSource implements MediaSourceLike {
   setPlaybackIntent(intent: boolean): void {
     if (this.playbackIntent === intent) return;
     this.playbackIntent = intent;
+    if (!intent && this.seekResource) this.seekResource.released = false;
     this.diag('playback-intent %s', String(intent));
     if (!intent) {
       // Withdrawn intent supersedes playback rather than recovering it: an
@@ -521,6 +540,7 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
     if (this.destroyed) return;
+    if (this.seekResource && !this.seekResource.released) return;
     // Already started: this is a resume, not a new startup transaction.
     if (this.playTriggered) {
       this.resumeElement();
@@ -538,6 +558,7 @@ export class MseMediaSource implements MediaSourceLike {
    */
   resumePlayback(): void {
     if (this.destroyed || !this.playbackIntent) return;
+    if (this.seekResource && !this.seekResource.released) return;
     if (!this.playTriggered) {
       void this.requestStartup().catch(() => { /* contained */ });
       return;
@@ -975,6 +996,7 @@ export class MseMediaSource implements MediaSourceLike {
     const usingManaged = MMS !== undefined && MSConstructor === MMS;
     this.selectedImplementation = usingManaged ? 'managed' : 'standard';
     this.implementationRequested = options.mseImplementation ?? 'auto';
+    this.mediaSourceConstructor = MSConstructor;
     this.ms = new MSConstructor();
 
     // Attachment is INDEPENDENT of the implementation. `auto` keeps the
@@ -1034,6 +1056,284 @@ export class MseMediaSource implements MediaSourceLike {
 
   // ─── MediaSourceLike ───────────────────────────────────────────
 
+  /** Fresh native resource; source-clock policy belongs to the caller. */
+  beginSeek(epoch: object): MediaSeekResource {
+    if (this.destroyed) throw new DOMException('MediaSource destroyed', 'AbortError');
+    const revision = ++this.resourceRevision;
+    const reserved = () => !this.destroyed && this.resourceRevision === revision;
+    const check = () => { if (!reserved()) throw new DOMException('Seek resource superseded', 'AbortError'); };
+    const oldUrl = this.objectUrl, oldSrc = this.video.src, oldObject = this.video.srcObject;
+    const checkAttachment = (src = oldSrc, object: unknown = oldObject) => {
+      check();
+      let attached = false;
+      try { attached = this.video.src === src && this.video.srcObject === object; } catch { /* Ownership unproven. */ }
+      check();
+      if (!attached) {
+        this.revokeOwnedUrl(oldUrl);
+        throw new DOMException('Seek attachment replaced', 'AbortError');
+      }
+    };
+    checkAttachment();
+    const source = new this.mediaSourceConstructor();
+    checkAttachment();
+    this.cancelStallEpisode();
+    this.retireSeek();
+    checkAttachment();
+    this.resetBuffers();
+    // Reset publishes append terminals; their observers can replace the DOM
+    // attachment without going through this adapter's resource revision.
+    checkAttachment();
+    this.video.pause();
+    checkAttachment();
+    this.revokeOwnedUrl(oldUrl);
+    checkAttachment();
+    this.video.removeAttribute('src');
+    checkAttachment('', oldObject);
+    this.video.srcObject = null;
+    checkAttachment('', null);
+    this.video.load();
+    checkAttachment('', null);
+    this.ms = source;
+    this.playTriggered = false;
+    this.firstFrameFired = false;
+    this.videoErrorDumped = false;
+    const state: SeekResourceState = { epoch, resource: {}, source, revision, url: null,
+      retired: false, positioned: false, released: false, cancelPosition: null, attachmentError: null, initializationAttempt: 0 };
+    this.seekResource = state;
+    try {
+      if (this.selectedAttachment === 'src-object') this.video.srcObject = source;
+      else {
+        const url = URL.createObjectURL(source);
+        if (!reserved()) { URL.revokeObjectURL(url); check(); }
+        state.url = this.objectUrl = url;
+        this.video.src = url;
+      }
+      check();
+      if (!this.seekCurrent(state)) throw new DOMException('Seek attachment replaced', 'AbortError');
+    } catch (error) {
+      if (reserved()) this.cancelSeek(state);
+      throw error;
+    }
+    const observers = new Set<{ tokens: WeakSet<object>; detach: () => void }>();
+    const current = () => this.seekCurrent(state);
+    const assertCurrent = () => { if (!current()) throw new DOMException('Seek resource retired', 'AbortError'); };
+    return {
+      epoch, resource: state.resource,
+      get current() { return current(); },
+      initialize: config => {
+        assertCurrent();
+        // A validation refusal creates no buffers, so the inherited initialize
+        // contract permits a corrected retry. An error observer may start that
+        // retry before the refused outer call returns.
+        const attempt = this.initialized ? state.initializationAttempt : ++state.initializationAttempt;
+        if (!this.initialized) state.attachmentError = null;
+        try {
+          // Read application-owned values before initialization can capture a
+          // source. A getter may replace this lease while supplying a value.
+          const snapshot: Parameters<MediaSourceLike['initialize']>[0] = {};
+          for (const role of ['video', 'audio'] as const) {
+            const entry = config[role];
+            assertCurrent();
+            if (entry) {
+              const codec = entry.codec;
+              const initData = new Uint8Array(entry.initData);
+              assertCurrent();
+              snapshot[role] = { codec, initData };
+            }
+          }
+          const accepted = this.initialize(snapshot);
+          assertCurrent();
+          if (accepted === false && state.initializationAttempt === attempt) {
+            this.settleSeekAttachment(state, new Error('Seek initialization refused'));
+          }
+          return accepted;
+        } catch (error) {
+          if (state.initializationAttempt === attempt) this.settleSeekAttachment(state, error instanceof Error ? error : new Error(String(error)));
+          throw error;
+        }
+      },
+      whenAttached: () => {
+        try {
+          assertCurrent();
+          if (state.attachmentError) return Promise.reject(state.attachmentError);
+          if (!this.initialized) return Promise.reject(new DOMException('Seek initialize() has not been accepted', 'InvalidStateError'));
+          if (this._attached) return Promise.resolve();
+          return new Promise<void>((resolve, reject) => { (state.attachmentWaiters ??= new Set()).add({ resolve, reject }); });
+        } catch (error) { return Promise.reject(error); }
+      },
+      appendChunk: (...args) => {
+        const token = args[4];
+        if (token) for (const observer of observers) observer.tokens.add(token);
+        if (!current()) {
+          this.appendOutcome(token, 'discarded', 'decoder reset');
+          assertCurrent();
+        }
+        this.appendChunk(...args);
+      },
+      observeAppends: observer => {
+        if (typeof observer !== 'function') throw new TypeError('Expected an append observer');
+        const tokens = new WeakSet<object>();
+        const detach = this.observeAppends(event => { if (tokens.delete(event.token)) return observer(event); });
+        const entry = { tokens, detach }; observers.add(entry);
+        return () => { observers.delete(entry); detach(); };
+      },
+      getTimestampOffset: role => { assertCurrent(); return this.getTimestampOffset(role); },
+      setTimestampOffset: (role, offset) => { assertCurrent(); this.setTimestampOffset(role, offset); },
+      position: time => this.positionSeek(state, time),
+      sample: () => state.positioned ? this.seekSample(state) : null,
+      setPlaybackIntent: intent => {
+        assertCurrent();
+        if (intent && (!state.positioned || !this.seekSample(state))) {
+          throw new DOMException('Seek positioning is pending or unavailable', 'InvalidStateError');
+        }
+        if (intent) {
+          state.released = true;
+          this.playTriggered = true;
+          this.startupPhase = 'started';
+          if (this.playbackIntent) this.resumePlayback();
+          else this.setPlaybackIntent(true);
+          this.startWedgeWatchdog();
+        } else this.setPlaybackIntent(false);
+      },
+      cancel: () => this.cancelSeek(state),
+    };
+  }
+
+  private seekCurrent(state: SeekResourceState): boolean {
+    const owned = () => !this.destroyed && !state.retired && this.seekResource === state
+      && this.ms === state.source && this.resourceRevision === state.revision;
+    if (!owned()) return false;
+    return this.seekAttached(state) && owned();
+  }
+
+  /** Attachment ownership remains relevant after a view has been retired. */
+  private seekAttached(state: SeekResourceState): boolean {
+    try {
+      const attached = state.url === null ? this.video.srcObject === state.source
+        : this.video.src === state.url && this.video.srcObject == null && this.objectUrl === state.url;
+      return attached && this.ms === state.source;
+    } catch { return false; }
+  }
+
+  private revokeOwnedUrl(url: string | null): void {
+    if (url !== null && this.objectUrl === url) {
+      this.objectUrl = null;
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  private seekSample(state: SeekResourceState): MediaSeekSample | null {
+    if (!this.seekCurrent(state) || !this._attached || state.source.readyState === 'closed') return null;
+    try {
+      if (this.video.seeking || this.video.readyState < 2 || this.video.error) return null;
+      const time = this.video.currentTime, ranges = this.video.buffered;
+      if (!Number.isFinite(time) || time < 0) return null;
+      // Optional playback state must not hide an otherwise observable clock.
+      let paused: boolean | undefined, playbackRate: number | undefined;
+      try { const value = this.video.paused; if (typeof value === 'boolean') paused = value; } catch { /* Unavailable. */ }
+      try { const value = this.video.playbackRate; if (typeof value === 'number' && Number.isFinite(value)) playbackRate = value; } catch { /* Unavailable. */ }
+      for (let i = 0; i < ranges.length; i++) {
+        const start = ranges.start(i), end = ranges.end(i);
+        if (Number.isFinite(start) && Number.isFinite(end) && start <= time && time <= end
+            && this.seekCurrent(state) && !this.video.seeking && this.video.readyState >= 2 && !this.video.error) {
+          if (!this.seekCurrent(state)) return null;
+          return { epoch: state.epoch, resource: state.resource, currentTime: time, buffered: { start, end },
+            ...(paused === undefined ? {} : { paused }), ...(playbackRate === undefined ? {} : { playbackRate }) };
+        }
+      }
+    } catch { /* Detached or reentrant native reads cannot prove a position. */ }
+    return null;
+  }
+
+  private settleSeekAttachment(state: SeekResourceState, error?: Error): void {
+    if (error) state.attachmentError = error;
+    const waiters = state.attachmentWaiters;
+    delete state.attachmentWaiters;
+    if (waiters) for (const waiter of waiters) {
+      if (error) waiter.reject(error); else waiter.resolve();
+    }
+  }
+
+  private retireSeek(): void {
+    const state = this.seekResource;
+    if (!state) return;
+    state.retired = true; state.positioned = false; state.released = false;
+    this.settleSeekAttachment(state, new DOMException('Seek resource retired', 'AbortError'));
+    state.cancelPosition?.(new DOMException('Seek resource retired', 'AbortError'));
+  }
+
+  private cancelSeek(state: SeekResourceState): void {
+    if (state.retired || this.seekResource !== state) return;
+    const revision = ++this.resourceRevision;
+    this.cancelStallEpisode();
+    this.retireSeek();
+    if (this.resourceRevision !== revision) return;
+    this.resetBuffers();
+    if (this.resourceRevision !== revision) return;
+    // Terminal append observers may install an external attachment without
+    // calling this adapter. Revision checks alone cannot authorize detachment.
+    if (!this.seekAttached(state)) { this.revokeOwnedUrl(state.url); return; }
+    this.video.pause();
+    if (this.resourceRevision !== revision) return;
+    if (!this.seekAttached(state)) { this.revokeOwnedUrl(state.url); return; }
+    this.video.removeAttribute('src');
+    if (this.resourceRevision !== revision) return;
+    this.video.srcObject = null;
+    if (this.resourceRevision !== revision) return;
+    this.video.load();
+    if (this.resourceRevision !== revision) return;
+    this.revokeOwnedUrl(state.url);
+  }
+
+  private positionSeek(state: SeekResourceState, time: number): Promise<MediaSeekSample> {
+    if (!Number.isFinite(time) || time < 0) return Promise.reject(new TypeError('Expected finite nonnegative native seconds'));
+    if (!this.seekCurrent(state)) return Promise.reject(new DOMException('Seek resource retired', 'AbortError'));
+    state.cancelPosition?.(new DOMException('Positioning superseded', 'AbortError'));
+    if (!this.seekCurrent(state)) return Promise.reject(new DOMException('Seek resource retired', 'AbortError'));
+    state.positioned = false;
+    return new Promise((resolve, reject) => {
+      let done = false, assigning = false, completed = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const wakes = ['loadeddata', 'canplay', 'progress', 'timeupdate'];
+      const cleanup = () => {
+        done = true;
+        if (timer !== undefined) clearTimeout(timer);
+        this.video.removeEventListener('seeked', onSeeked);
+        this.video.removeEventListener('error', evaluate);
+        for (const event of wakes) this.video.removeEventListener(event, evaluate);
+        if (state.cancelPosition === fail) state.cancelPosition = null;
+      };
+      const fail = (error: Error) => { if (!done) { cleanup(); reject(error); } };
+      const evaluate = () => {
+        if (done || assigning) return;
+        if (!this.seekCurrent(state)) { fail(new DOMException('Seek resource retired', 'AbortError')); return; }
+        try {
+          const error = this.video.error;
+          if (error) { fail(new Error(`Native media error ${error.code}: ${error.message}`)); return; }
+          if (!completed) return;
+          const sample = this.seekSample(state);
+          if (done) return;
+          if (!this.seekCurrent(state)) { fail(new DOMException('Seek resource retired', 'AbortError')); return; }
+          if (sample) { state.positioned = true; cleanup(); resolve(sample); }
+        } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
+      };
+      const onSeeked = () => { completed = true; evaluate(); };
+      state.cancelPosition = fail;
+      this.video.addEventListener('seeked', onSeeked);
+      this.video.addEventListener('error', evaluate);
+      for (const event of wakes) this.video.addEventListener(event, evaluate);
+      // Application policy shared with startup, not an HTML seek-time guarantee.
+      timer = setTimeout(() => { evaluate(); if (!done) fail(new DOMException('Native seek completion unproven', 'TimeoutError')); }, STARTUP_SEEK_TIMEOUT_MS);
+      try {
+        // Fresh zero may already be ready; setting the official position alone
+        // does not prove a changed seek complete. Its seeked witness is required.
+        if (time === 0 && this.video.currentTime === 0 && !this.video.seeking) completed = true;
+        else { assigning = true; this.video.currentTime = time; assigning = false; }
+        evaluate();
+      } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
+    });
+  }
+
   get mediaElement(): HTMLVideoElement {
     return this.video;
   }
@@ -1047,6 +1347,7 @@ export class MseMediaSource implements MediaSourceLike {
     audio?: { codec: string; initData: Uint8Array };
   }): boolean {
     if (this.initialized) return true;
+    const generation = this.bufferGen, source = this.ms;
 
     // Logged here rather than in the constructor: `debug` is assigned by the
     // caller after construction, so a constructor-time log would never print.
@@ -1091,15 +1392,26 @@ export class MseMediaSource implements MediaSourceLike {
       for (const e of failures) this.onError?.(e);
       return false;
     }
+    // Capability checks and logging can invoke application code too. Never
+    // latch an earlier initialization onto a replacement MediaSource.
+    if (this.destroyed || this.ms !== source || this.bufferGen !== generation) {
+      throw new DOMException('Initialization resource retired', 'AbortError');
+    }
     this.initialized = true;
 
-    const generation = this.bufferGen;
     const doInit = () => {
       if (this.sourceOpenListener === doInit) {
-        this.ms.removeEventListener('sourceopen', doInit);
+        source.removeEventListener('sourceopen', doInit);
         this.sourceOpenListener = null;
       }
-      if (this.destroyed || this.bufferGen !== generation || !this.initialized) return;
+      if (this.destroyed || this.ms !== source || this.bufferGen !== generation || !this.initialized) return;
+      const openingSeek = this.seekResource;
+      // Native sourceopen is queued. DOM replacement can detach its source
+      // before dispatch without changing this adapter's generation fields.
+      if (openingSeek?.source === source && (!this.seekCurrent(openingSeek) || source.readyState !== 'open')) {
+        this.settleSeekAttachment(openingSeek, new DOMException('Seek attachment replaced', 'AbortError'));
+        return;
+      }
       try {
         if (config.video) {
           const mimeType = `video/mp4; codecs="${config.video.codec}"`;
@@ -1149,9 +1461,15 @@ export class MseMediaSource implements MediaSourceLike {
         }
         // SourceBuffers exist from here on: appendChunk() can take effect.
         this._attached = true;
+        const seek = this.seekResource;
+        if (seek?.source === source) this.settleSeekAttachment(seek, this.seekCurrent(seek)
+          ? undefined : new DOMException('Seek attachment replaced', 'AbortError'));
         this.onAttached?.();
       } catch (err) {
-        this.onError?.(err instanceof Error ? err : new Error(String(err)));
+        const error = err instanceof Error ? err : new Error(String(err));
+        const seek = this.seekResource;
+        if (!this._attached && seek?.source === source) this.settleSeekAttachment(seek, error);
+        this.onError?.(error);
       }
     };
 
@@ -1747,6 +2065,14 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   reset(): void {
+    const revision = ++this.resourceRevision;
+    this.retireSeek();
+    if (this.resourceRevision !== revision) return;
+    this.seekResource = null;
+    this.resetBuffers();
+  }
+
+  private resetBuffers(): void {
     // Cancel any in-flight startup FIRST: a late seeked/play from the
     // superseded generation must not resurrect playback against new buffers.
     this.cancelStartup();
@@ -2332,7 +2658,7 @@ export class MseMediaSource implements MediaSourceLike {
   private async requestStartup(): Promise<void> {
     try {
       // Buffering continues regardless; only STARTUP waits for intent.
-      if (this.destroyed || !this.playbackIntent || this.playTriggered || this.startupPhase !== 'idle') return;
+      if (this.destroyed || this.seekResource || !this.playbackIntent || this.playTriggered || this.startupPhase !== 'idle') return;
       const position = this.selectStartPosition();
       if (position === null) return;
 
@@ -2525,12 +2851,13 @@ export class MseMediaSource implements MediaSourceLike {
    * to the caller so the autoplay ladder can retry muted.
    */
   private async playElement(generation: number): Promise<boolean> {
+    const source = this.ms;
     await this.video.play();
     if (this.startupLive(generation)) return true;
     // Withdrawn/destroyed while the promise was pending: the element started
     // anyway. Undo it — this is the late-playback hole a generation check alone
     // cannot close.
-    if (this.video.paused === false) this.video.pause();
+    if (this.ms === source && this.video.paused === false) this.video.pause();
     return false;
   }
 
@@ -3704,6 +4031,7 @@ export class MseMediaSource implements MediaSourceLike {
   // ─── Event handlers ────────────────────────────────────────────
 
   private handlePlaying = (): void => {
+    if (this.seekResource && !this.seekResource.released) return;
     this.gapStallEpisode = false;                 // post-jump churn episode over
     // `playing` is the only genuine resumption signal: it is queued when ready
     // state recovers. A sub-threshold wait clears silently.
@@ -3725,6 +4053,7 @@ export class MseMediaSource implements MediaSourceLike {
   };
 
   private handleWaiting = (): void => {
+    if (this.seekResource && !this.seekResource.released) return;
     // A gap-jump's own seek emits a waiting; the adapter already reported
     // that stall itself (cause 'media-gap') — don't arm a duplicate. The
     // episode ends on the first playing/timeupdate or, unconditionally,
@@ -3773,6 +4102,7 @@ export class MseMediaSource implements MediaSourceLike {
   };
 
   private handleTimeUpdate = (): void => {
+    if (this.seekResource && !this.seekResource.released) return;
     if (!this.firstFrameFired && this.video.currentTime > 0) {
       this.firstFrameFired = true;
       this.onFirstFrame?.();
@@ -3798,6 +4128,7 @@ export class MseMediaSource implements MediaSourceLike {
    * of downstream failures buries it.
    */
   private handleVideoError = (): void => {
+    if (this.seekResource && (!this.seekCurrent(this.seekResource) || this.video.error === null)) return;
     // A video-element error kills the whole media pipeline — both
     // tracks. Mark both errored and clear pending ranges so no phantom
     // coverage is committed by a trailing updateend.

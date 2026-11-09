@@ -14,7 +14,7 @@
 
 import type { MoqtObject, MoqtObjectData } from '@openmoq/transport';
 import { ObjectStatus } from '@openmoq/transport';
-import type { LocHeaders, VideoFrameMarking } from '@openmoq/loc';
+import type { LocHeaders, VideoFrameMarking, VideoChunkInit, AudioChunkInit } from '@openmoq/loc';
 import { toVideoChunkInit, toAudioChunkInit } from '@openmoq/loc';
 
 import { isKeyframePayload } from './keyframe-validator.js';
@@ -25,8 +25,8 @@ import { SyncController } from './sync.js';
 import { AdaptiveToleranceController, DEFAULT_TOLERANCE_CONFIG } from './adaptive-tolerance.js';
 import type { RecoveryController } from './recovery.js';
 import { PipelineInputs } from './pipeline-inputs.js';
-import type { PlaybackInputObserver } from './types.js';
-import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig, DecoderFeedback, AudioTimingSource, VideoTimingSource } from './types.js';
+import type { PlaybackInputObserver, PlaybackInputDiscardReason, PlaybackSample } from './types.js';
+import type { ClockSource, DecoderCommand, PlaybackEvent, PlaybackConfig, DecoderFeedback, AudioTimingSource, VideoTimingSource, AudioRenderTiming, VideoRenderTiming } from './types.js';
 
 // ─── Pipeline ────────────────────────────────────────────────────────
 
@@ -48,6 +48,104 @@ export interface PipelineOptions {
     readonly videoOnly?: boolean;
     /** Live stream: enables bounded release + backlog shedding. Default: true. */
     readonly isLive?: boolean;
+    /** Total pending logical samples across optional batches. Default: 1024. */
+    readonly maxPendingSamples?: number;
+    /** Sum of retained backing-byte charges for optional batches. Default: 8 MiB. */
+    readonly maxPendingSampleBytes?: number;
+}
+
+interface SampleBatch {
+    readonly wireObject: MoqtObjectData;
+    readonly samples: (PlaybackSample | undefined)[];
+    cursor: number;
+    processing: boolean;
+    inputs: PipelineInputs | undefined;
+    input: object | undefined;
+    discardReported: boolean;
+    readonly backfill: boolean;
+    readonly allowIndependentGap: boolean;
+    byteCharge: number;
+}
+
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const typedByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
+const bufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!;
+const sharedByteLength = typeof SharedArrayBuffer === 'undefined' ? undefined
+    : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')!.get!;
+
+/** Charge each distinct backing once per batch, even for small/overlapping views. */
+function sampleBatchByteCharge(obj: MoqtObjectData, samples: readonly PlaybackSample[], limit: number): number | undefined {
+    const buffers = new Set<ArrayBufferLike>();
+    const retain = (bytes: Uint8Array | undefined) => {
+        if (bytes === undefined) return;
+        if (!(bytes instanceof Uint8Array)) throw new TypeError('Expected sample byte view');
+        buffers.add(typedBuffer.call(bytes) as ArrayBufferLike);
+    };
+    retain(obj.payload);
+    retain(obj.extensions);
+    for (const sample of samples) {
+        retain(sample.chunk.data);
+        retain(sample.headers.videoConfig);
+        retain(sample.headers.audioConfig);
+        if (sample.headers.unknown) for (const value of sample.headers.unknown.values()) {
+            if (typeof value !== 'bigint') retain(value);
+        }
+    }
+    // All callback-bearing record reads precede the intrinsic size reads.
+    let total = 0;
+    for (const buffer of buffers) {
+        let length: number;
+        try { length = bufferByteLength.call(buffer); }
+        catch {
+            if (!sharedByteLength) throw new TypeError('Invalid sample backing');
+            length = sharedByteLength.call(buffer);
+        }
+        if (length > limit - total) return undefined;
+        total += length;
+    }
+    return total;
+}
+
+/** Read host accessors once before admission; bytes remain borrowed immutable. */
+function snapshotSample(value: PlaybackSample, index: number, mediaType: 'video' | 'audio'): PlaybackSample {
+    const { sampleIndex, headers: rawHeaders, chunk: rawChunk } = value;
+    if (sampleIndex !== index) throw new RangeError('Sample indexes must be 0..length-1');
+    if (!rawHeaders || typeof rawHeaders !== 'object' || !rawChunk || typeof rawChunk !== 'object') throw new TypeError('Expected sample headers and chunk');
+    const headers = { ...rawHeaders };
+    if (headers.videoFrameMarking) headers.videoFrameMarking = Object.freeze({ ...headers.videoFrameMarking });
+    if (headers.audioLevel) headers.audioLevel = Object.freeze({ ...headers.audioLevel });
+    if (headers.unknown) headers.unknown = new Map(headers.unknown);
+    const { type, timestamp, duration, data, sourceTimestamp: rawSource } = rawChunk;
+    if ((type !== 'key' && type !== 'delta') || (mediaType === 'audio' && type !== 'key')
+        || !Number.isFinite(timestamp) || !(data instanceof Uint8Array) || typedByteLength.call(data) === 0
+        || (duration !== undefined && (!Number.isFinite(duration) || duration < 0))) {
+        throw new TypeError('Invalid coded sample');
+    }
+    if (headers.captureTimestamp !== undefined && typeof headers.captureTimestamp !== 'bigint') throw new TypeError('Invalid sample time');
+    if ((headers.videoConfig !== undefined && !(headers.videoConfig instanceof Uint8Array))
+        || (headers.audioConfig !== undefined && !(headers.audioConfig instanceof Uint8Array))
+        || (headers.timestampIsWallClock !== undefined && typeof headers.timestampIsWallClock !== 'boolean')) {
+        throw new TypeError('Invalid sample headers');
+    }
+    const marking = headers.videoFrameMarking;
+    if (marking && (typeof marking.startOfFrame !== 'boolean' || typeof marking.endOfFrame !== 'boolean'
+        || typeof marking.independent !== 'boolean' || typeof marking.discardable !== 'boolean'
+        || typeof marking.baseLayerSync !== 'boolean' || !Number.isInteger(marking.temporalId)
+        || marking.temporalId < 0 || marking.temporalId > 7)) throw new TypeError('Invalid sample marking');
+    if (mediaType === 'video' && headers.videoFrameMarking
+        && headers.videoFrameMarking.independent !== (type === 'key')) throw new TypeError('Conflicting sample marking');
+    let sourceTimestamp;
+    if (rawSource !== undefined) {
+        const { ticks, ticksPerSecond, domain } = rawSource;
+        if (typeof ticks !== 'bigint' || typeof ticksPerSecond !== 'bigint' || ticksPerSecond <= 0n
+            || (domain !== 'media' && domain !== 'unix' && domain !== 'unknown')) throw new TypeError('Invalid sample source time');
+        sourceTimestamp = Object.freeze({ ticks, ticksPerSecond, domain });
+    }
+    return Object.freeze({ sampleIndex, headers: Object.freeze(headers), chunk: Object.freeze({
+        type, timestamp, data, ...(duration !== undefined ? { duration } : {}),
+        ...(sourceTimestamp ? { sourceTimestamp } : {}),
+    }) });
 }
 
 /**
@@ -74,6 +172,32 @@ export class PlaybackPipeline {
     private readonly headerMap = new Map<string, LocHeaders>();
     /** Allocated only for backfilled inputs; ownership follows the jitter buffer. */
     private backfillObjects: Set<string> | undefined;
+    /** Absent on the ordinary LOC path. Keys are original wire G/O only. */
+    private sampleBatches: Map<string, SampleBatch> | undefined;
+    private pendingBatch: SampleBatch | undefined;
+    private pendingSamples = 0;
+    private readonly maxPendingSamples: number;
+    private pendingSampleBytes = 0;
+    private readonly maxPendingSampleBytes: number;
+    /** One-shot startup cursor retained until its admitted carrier is extracted/discarded. */
+    private initialSampleKey: string | undefined;
+    private ticking = false;
+
+    /**
+     * Pending optional sample units across queued Objects and the active batch,
+     * including a unit currently in a command callback. Pure observation: zero
+     * means this seam has no encoded suffix awaiting tick/native feedback. The
+     * host must wait for zero before native flush; it is not output readiness.
+     * Ordinary LOC Objects remain governed by the existing jitter-buffer policy.
+     */
+    get pendingSampleCount(): number { return this.pendingSamples; }
+
+    /**
+     * Retained backing-byte charges of queued/active optional batches. Shared
+     * backing is charged once within each batch, conservatively again across
+     * batches; no partial-unit refund. This is not native/output readiness.
+     */
+    get pendingSampleByteCount(): number { return this.pendingSampleBytes; }
 
     private inputState: PipelineInputs | undefined;
     private playbackRevision = 0;
@@ -88,13 +212,17 @@ export class PlaybackPipeline {
     set inputObserver(observer: PlaybackInputObserver | undefined) {
         if (observer !== undefined && typeof observer !== 'function') throw new TypeError('Expected a pipeline input observer');
         this.inputState?.clear();
+        if (this.pendingBatch) {
+            this.pendingBatch.inputs = undefined;
+            this.pendingBatch.input = undefined;
+        }
         if (!observer) { this.inputState = undefined; return; }
         let state: PipelineInputs;
         state = new PipelineInputs(observer, () => this.inputState === state);
         this.inputState = state;
     }
 
-    /** Group reference counts in the jitter buffer. */
+    /** Group reference counts for queued and extracted unfinished wire Objects. */
     private readonly bufferedGroupCounts = new Map<bigint, number>();
 
     /** Next expected objectId within the current group for contiguity check. */
@@ -170,7 +298,7 @@ export class PlaybackPipeline {
     /** Adaptive jitter tolerance controller (null if disabled). */
     private readonly adaptiveTolerance: AdaptiveToleranceController | null;
 
-    /** Max objects to release per tick (video only). 0 = unlimited. */
+    /** Max LOC Objects or explicit samples per tick (video only). 0 = unlimited. */
     private readonly maxReleasePerTick: number;
     /** Max groups before shedding old ones. 0 = unlimited. */
     private readonly maxBacklogGroups: number;
@@ -185,6 +313,12 @@ export class PlaybackPipeline {
             throw new TypeError('Expected an audio playout delay query');
         }
         this.getAudioPlayoutDelayUs = getAudioPlayoutDelayUs;
+        const maxPendingSamples = opts.maxPendingSamples ?? 1024;
+        if (!Number.isSafeInteger(maxPendingSamples) || maxPendingSamples <= 0) throw new RangeError('maxPendingSamples must be a positive safe integer');
+        this.maxPendingSamples = maxPendingSamples;
+        const maxPendingSampleBytes = opts.maxPendingSampleBytes ?? 8 * 1024 * 1024;
+        if (!Number.isSafeInteger(maxPendingSampleBytes) || maxPendingSampleBytes <= 0) throw new RangeError('maxPendingSampleBytes must be a positive safe integer');
+        this.maxPendingSampleBytes = maxPendingSampleBytes;
         this.mediaType = opts.mediaType;
         this.clock = opts.clock;
         this.sync = opts.sync;
@@ -284,7 +418,7 @@ export class PlaybackPipeline {
         return this.minAcceptGroupId;
     }
 
-    /** Number of distinct groups currently in the jitter buffer. */
+    /** Distinct Groups with queued Objects or an unfinished sample cursor. */
     get bufferedGroupCount(): number {
         return this.bufferedGroupCounts.size;
     }
@@ -349,6 +483,11 @@ export class PlaybackPipeline {
                 }
                 break;
 
+            case 'audio_timing_unavailable':
+                // A refused producing/output context is not a native decoder
+                // failure and must not reset its FSM or trigger fatal recovery.
+                break;
+
             case 'flush_complete':
                 // No-op — included for forward compatibility (quality switch gating).
                 break;
@@ -385,14 +524,55 @@ export class PlaybackPipeline {
  * @param delivery Backfilled objects are excluded from arrival-jitter estimation.
  */
     pushObject(obj: MoqtObject, headers?: LocHeaders, input?: object, delivery?: { readonly backfill?: boolean }): void {
+        this.admitObject(obj, headers, input, delivery);
+    }
+
+    /**
+     * Optional host-parsed batch on the original wire Object. Invalid records
+     * throw before ownership/admission; capacity refusal reports 'buffer full'
+     * and returns void. A refused suffix cannot establish host readiness.
+     * One receipt/token follows the Object, shared by its decode commands;
+     * discarding any untransferred suffix reports that receipt at most once.
+     * The host must keep the wire Object, borrowed bytes and their backing sizes
+     * immutable until consumed/discarded. Distinct backing buffers of the Object
+     * payload/extensions and sample data/config/unknown headers are charged once
+     * per batch, held through final retirement, and bounded across this pipeline.
+     * An empty batch advances wire contiguity without media readiness or sync.
+     * allowIndependentGap is host permission for parsed container input to resume
+     * at an independently coded first sample, never a claim about metadata fullness.
+     */
+    pushSampleObject(obj: MoqtObjectData, samples: readonly PlaybackSample[], input?: object, delivery?: { readonly backfill?: boolean; readonly allowIndependentGap?: boolean }): void {
+        const revision = this.playbackRevision, inputs = this.inputState;
+        const backfill = delivery?.backfill === true, requestedRecovery = delivery?.allowIndependentGap === true;
+        if (obj.kind !== 'data' || !Array.isArray(samples)) throw new TypeError('Expected wire DATA and sample array');
+        const length = samples.length;
+        if (length > this.maxPendingSamples) {
+            if (revision === this.playbackRevision && inputs === this.inputState) inputs?.report(input, 'buffer full');
+            return;
+        }
+        const snapshot: PlaybackSample[] = [];
+        for (let i = 0; i < length; i++) snapshot.push(snapshotSample(samples[i]!, i, this.mediaType));
+        const byteCharge = sampleBatchByteCharge(obj, snapshot, this.maxPendingSampleBytes);
+        // Host getters may reset/reassign the pipeline while snapshotting.
+        if (revision !== this.playbackRevision) return;
+        if (byteCharge === undefined) { if (inputs === this.inputState) inputs?.report(input, 'buffer full'); return; }
+        const first = snapshot[0];
+        // Container framing is host-owned. Do not reinterpret parsed sample
+        // bytes as four-byte-length AVC here; independence was established
+        // against the container's actual codec configuration.
+        const allowIndependentGap = requestedRecovery && this.mediaType === 'video' && first?.chunk.type === 'key';
+        if (revision !== this.playbackRevision) return;
+        this.admitObject(obj, undefined, inputs === this.inputState ? input : undefined,
+            { backfill, allowIndependentGap }, snapshot, byteCharge);
+    }
+
+    private admitObject(obj: MoqtObject, headers?: LocHeaders, input?: object, delivery?: { readonly backfill?: boolean; readonly allowIndependentGap?: boolean }, samples?: PlaybackSample[], byteCharge = 0): void {
         const inputs = this.inputState;
         const token = inputs ? input : undefined;
         if (obj.kind === 'gap') {
             // Gap signals — notify gap detector
             if (obj.status === ObjectStatus.END_OF_GROUP) {
-                this.gapDetector.observeEndOfGroup(obj.groupId);
-                this.endedGroups.add(obj.groupId as bigint);
-                if (obj.groupId === this.lastConsumedGroupId) this.activeGroupWaitStartUs = null;
+                this.endGroup(obj.groupId);
             } else if (obj.status === ObjectStatus.END_OF_TRACK) {
                 this.gapDetector.observeEndOfTrack();
             }
@@ -405,12 +585,19 @@ export class PlaybackPipeline {
         // order and cause blockiness.
         if (obj.groupId < this.minAcceptGroupId) { inputs?.report(token, 'stale group'); return; }
         if (this.lastConsumedGroupId >= 0n && obj.groupId < this.lastConsumedGroupId) { inputs?.report(token, 'stale group'); return; }
+        if (this.pendingBatch && obj.groupId < this.pendingBatch.wireObject.groupId) { inputs?.report(token, 'stale group'); return; }
+        const initialObject = this.initialSampleKey === undefined ? undefined : this.sampleBatches?.get(this.initialSampleKey)?.wireObject;
+        if (initialObject && obj.groupId < initialObject.groupId) { inputs?.report(token, 'stale group'); return; }
+        if (initialObject && obj.groupId === initialObject.groupId && obj.objectId < initialObject.objectId) { inputs?.report(token, 'treated as a replay'); return; }
         // Reject already-consumed objects from the current group.
         if (obj.groupId === this.lastConsumedGroupId && obj.objectId < this.nextExpectedObjectId) { inputs?.report(token, 'treated as a replay'); return; }
 
         // Dedup: reject if this (groupId, objectId) is already buffered.
         const key = `${obj.groupId}:${obj.objectId}`;
-        if (this.headerMap.has(key)) { inputs?.report(token, 'treated as a replay'); return; }
+        if (this.headerMap.has(key) || (this.pendingBatch?.wireObject.groupId === obj.groupId
+            && this.pendingBatch.wireObject.objectId === obj.objectId)) { inputs?.report(token, 'treated as a replay'); return; }
+        if (samples && samples.length > this.maxPendingSamples - this.pendingSamples) { inputs?.report(token, 'buffer full'); return; }
+        if (samples && byteCharge > this.maxPendingSampleBytes - this.pendingSampleBytes) { inputs?.report(token, 'buffer full'); return; }
 
         let discarded: object[] | undefined, refused = false;
         // Data object — try to buffer it
@@ -425,6 +612,17 @@ export class PlaybackPipeline {
             refused = !this.tryEvictAndInsert(obj, headers, inputs, token, discarded);
         } else {
             refused = true;
+        }
+
+        // Install before clock/recovery/discard callbacks can drain or reset it.
+        if (!refused && samples) {
+            (this.sampleBatches ??= new Map()).set(key, {
+                wireObject: obj, samples, cursor: 0, processing: false, inputs: undefined, input: undefined, discardReported: false,
+                backfill: delivery?.backfill === true, allowIndependentGap: delivery?.allowIndependentGap === true,
+                byteCharge,
+            });
+            this.pendingSamples += samples.length;
+            this.pendingSampleBytes += byteCharge;
         }
 
         if (!refused && delivery?.backfill && this.headerMap.has(key)) {
@@ -457,6 +655,23 @@ export class PlaybackPipeline {
                 }
             } finally { inputs?.report(token, 'buffer full'); }
         }
+    }
+
+    /** Caller-established Group closure, without inventing a wire Object Location. */
+    endGroup(groupId: bigint): void {
+        this.gapDetector.observeEndOfGroup(groupId);
+        this.endedGroups.add(groupId);
+        if (groupId === this.lastConsumedGroupId) this.activeGroupWaitStartUs = null;
+    }
+
+    /** Intake has settled: close observed groups without releasing TrackEnd holds. */
+    endBufferedGroups(): void {
+        // A discarded Group may have an empty object cursor too. Use actual
+        // input observation to distinguish it from a reset's synthetic cursor.
+        if (this.lastConsumedGroupId >= 0n && this.gapDetector.hasObservedGroup(this.lastConsumedGroupId)) {
+            this.endGroup(this.lastConsumedGroupId);
+        }
+        for (const groupId of this.bufferedGroupCounts.keys()) this.endGroup(groupId);
     }
 
     /**
@@ -496,6 +711,10 @@ export class PlaybackPipeline {
         // survive into the new decoder configuration. Without this,
         // stale P-frames from the old track drain under the new codec
         // and produce decode errors.
+        const pending = this.pendingBatch;
+        const pendingInput = pending?.inputs === inputs && !pending?.discardReported ? pending?.input : undefined;
+        if (pendingInput) dropped?.push(pendingInput);
+        this.clearSampleBatches();
         this.buffer.clear();
         this.headerMap.clear();
         this.backfillObjects = undefined;
@@ -505,6 +724,7 @@ export class PlaybackPipeline {
         this.nextExpectedObjectId = 0n;
         this.minAcceptGroupId = firstGroupId;
         this.lastKeyframeWaitingGroupId = -1n;
+        if (this.mediaType === 'video') this.resetPending = true;
         this._throttled = false;
         this.activeGroupWaitStartUs = null;
         this.objectWait = undefined;
@@ -513,13 +733,17 @@ export class PlaybackPipeline {
         // Force decoder back to NEEDS_KEYFRAME so partial-group deltas
         // from a mid-stream subscription are skipped, not decoded.
         const decision = this.decoderState.notifyTrackSwitch();
-        this.emitFsmDecision(decision);
-        inputs?.reportAll(dropped, 'track superseded');
+        try { this.emitFsmDecision(decision); }
+        finally { inputs?.reportAll(dropped, 'track superseded'); }
     }
 
     reset(targetGroupId?: bigint): void {
         this.playbackRevision++;
         const inputs = this.inputState, dropped = inputs?.clear();
+        const pending = this.pendingBatch;
+        const pendingInput = pending?.inputs === inputs && !pending?.discardReported ? pending?.input : undefined;
+        if (pendingInput) dropped?.push(pendingInput);
+        this.clearSampleBatches();
         this.buffer.clear();
         this.headerMap.clear();
         this.backfillObjects = undefined;
@@ -539,8 +763,8 @@ export class PlaybackPipeline {
         this.gapDetector.reset();
         this.adaptiveTolerance?.reset();
         const decision = this.decoderState.notifyGap();
-        this.emitFsmDecision(decision);
-        inputs?.reportAll(dropped, 'decoder reset');
+        try { this.emitFsmDecision(decision); }
+        finally { inputs?.reportAll(dropped, 'decoder reset'); }
     }
 
     /**
@@ -549,7 +773,22 @@ export class PlaybackPipeline {
  * Call this on a regular interval (e.g., requestAnimationFrame or timer).
  */
     tick(): void {
+        if (this.ticking) return;
+        this.ticking = true;
+        try { this.tickInternal(); } finally { this.ticking = false; }
+    }
+
+    private tickInternal(): void {
         const revision = this.playbackRevision;
+        let released = 0;
+        const budget = this.maxReleasePerTick;
+        // An extracted wire Object still owns its undecoded suffix. Neither a
+        // gap timeout, backlog shedding nor TrackEnd may overtake those units.
+        if (this.pendingBatch) {
+            released = this.drainPendingBatch(budget);
+            if (revision !== this.playbackRevision || this.pendingBatch || this._throttled) return;
+            if (budget > 0 && released >= budget) return;
+        }
         // Update adaptive tolerance → push auto-calibrated thresholds to gap detector and sync
         if (this.adaptiveTolerance) {
             const nowMs = this.clock.now() / 1000;
@@ -560,14 +799,13 @@ export class PlaybackPipeline {
             }
         }
 
-        // After reset (pause→resume, jump-to-live), sync up to the first
-        // group that starts with a keyframe (objectId 0). Stale P-frames
-        // from the old subscription that arrive after the reset must not
-        // become the new starting point — they lack keyframe context and
-        // would produce artifacts.
+        // One initial batch can establish the actual wire cursor. Its full
+        // sample list still passes the decoder's keyframe gate. Ordinary LOC
+        // retains the Object0 startup rule; later groups/gaps retain theirs too.
         if (this.resetPending && this.buffer.size > 0) {
             const top = this.buffer.peek()!;
-            if (top.objectId !== 0n) {
+            const initialBatch = this.sampleBatches?.has(`${top.groupId}:${top.objectId}`) === true;
+            if (!initialBatch && top.objectId !== 0n) {
                 if (this.mediaType === 'audio') {
                     this.buffer.extract();
                     this.decrementGroupCount(top.groupId);
@@ -584,6 +822,10 @@ export class PlaybackPipeline {
             this.objectWait = undefined;
             this.lastConsumedGroupId = top.groupId - 1n;
             this.endedGroups.add(this.lastConsumedGroupId);
+            if (initialBatch) {
+                this.initialSampleKey = `${top.groupId}:${top.objectId}`;
+                this.nextExpectedObjectId = top.objectId;
+            }
             this.resetPending = false;
         }
 
@@ -593,7 +835,7 @@ export class PlaybackPipeline {
         if (revision !== this.playbackRevision) return;
 
         // 2. Handle gap decision
-        if (gapDecision.action === GapAction.TRACK_ENDED && this.buffer.size === 0) {
+        if (gapDecision.action === GapAction.TRACK_ENDED && this.buffer.size === 0 && !this.pendingBatch) {
             if (this.trackEndHolds > 0) return;
             if (!this._trackEnded) {
                 this._trackEnded = true;
@@ -718,11 +960,9 @@ export class PlaybackPipeline {
         // reference is absent — decoding later objects produces artifacts.
         // Cross-subgroup arrival order is not decode order (LOC §4.3).
         // Wait under the existing gap policy before abandoning a dependency.
-        let released = 0;
-        const budget = this.maxReleasePerTick;
 
         while (this.buffer.size > 0) {
-            // Bounded release: stop after budget objects (0 = unlimited).
+            // Bounded release: one unit per LOC Object or explicit sample.
             if (budget > 0 && released >= budget) break;
             // Mid-tick throttle: decoder feedback during processDataObject
             // may set _throttled via handleFeedback(queue_pressure).
@@ -755,12 +995,15 @@ export class PlaybackPipeline {
             }
 
             const expectedObjectId = top.groupId > this.lastConsumedGroupId
-                ? 0n
+                ? this.initialSampleKey === `${top.groupId}:${top.objectId}` ? top.objectId : 0n
                 : this.nextExpectedObjectId;
 
             // A later LOC Object alone does not prove its predecessor lost.
             // Audio retains its independent per-Object release policy.
             if (this.mediaType === 'video' && top.objectId > expectedObjectId) {
+                const recovery = this.resumeIndependentSample(top, revision);
+                if (recovery === 'changed') return;
+                if (recovery === 'ready') continue;
                 const wait = this.waitForVideoObject(top, expectedObjectId, revision);
                 if (wait === 'expired') this.abandonVideoGroup(top.groupId);
                 break;
@@ -773,12 +1016,25 @@ export class PlaybackPipeline {
             }
 
             const obj = this.buffer.extract()!;
-            this.decrementGroupCount(obj.groupId);
 
             if (obj.kind === 'data') {
+                const batch = this.sampleBatches ? this.takeSampleBatch(`${obj.groupId}:${obj.objectId}`) : undefined;
+                if (batch) {
+                    const key = `${obj.groupId}:${obj.objectId}`;
+                    // Extraction transfers unfinished wire ownership to the
+                    // cursor; retain its Group reference until final retirement.
+                    this.forgetHeaders(key);
+                    batch.inputs = this.inputState;
+                    batch.input = batch.inputs?.take(key);
+                    this.pendingBatch = batch;
+                    released += this.drainPendingBatch(budget > 0 ? budget - released : 0);
+                    if (revision !== this.playbackRevision || this.pendingBatch) return;
+                    continue; // The batch advances its original wire frontier once.
+                }
+                this.decrementGroupCount(obj.groupId);
                 this.processDataObject(obj);
                 if (revision !== this.playbackRevision) return;
-            }
+            } else this.decrementGroupCount(obj.groupId);
 
             this.nextExpectedObjectId = obj.objectId + 1n;
             released++;
@@ -792,6 +1048,37 @@ export class PlaybackPipeline {
     }
 
     // ─── Internal ───────────────────────────────────────────────────
+
+    /** Parsed container input may explicitly resume at an independently coded
+     * carrier. Ordinary LOC never opts in; full container metadata alone is not
+     * permission. Keep earlier queued media and other Groups intact. */
+    private resumeIndependentSample(top: MoqtObject, revision: number): 'none' | 'ready' | 'changed' {
+        const batches = this.sampleBatches;
+        if (!batches) return 'none';
+        let recovery: SampleBatch | undefined;
+        for (const batch of batches.values()) {
+            if (!batch.allowIndependentGap || batch.wireObject.groupId !== top.groupId
+                || batch.wireObject.objectId < top.objectId) continue;
+            if (!recovery || batch.wireObject.objectId < recovery.wireObject.objectId) recovery = batch;
+        }
+        if (!recovery) return 'none';
+        const objectId = recovery.wireObject.objectId;
+        // Publish the acceptance cursor before discard observers can reenter.
+        if (top.groupId === this.lastConsumedGroupId) this.nextExpectedObjectId = objectId;
+        else this.initialSampleKey = `${top.groupId}:${objectId}`;
+        this.objectWait = undefined;
+        const loss = this.locallyDroppedObjects.get(top.groupId);
+        if (loss !== undefined && loss < objectId) this.locallyDroppedObjects.delete(top.groupId);
+        const inputs = this.inputState, dropped: object[] | undefined = inputs ? [] : undefined;
+        while (this.buffer.peek()?.groupId === top.groupId && this.buffer.peek()!.objectId < objectId) {
+            const old = this.buffer.extract()!, key = `${old.groupId}:${old.objectId}`;
+            this.forgetHeaders(key);
+            this.decrementGroupCount(old.groupId);
+            const input = inputs?.take(key); if (input) dropped?.push(input);
+        }
+        inputs?.reportAll(dropped, 'awaiting keyframe');
+        return revision === this.playbackRevision ? 'ready' : 'changed';
+    }
 
     private waitForVideoObject(top: MoqtObject, objectId: bigint, revision: number): 'waiting' | 'expired' | 'changed' {
         if (this.locallyDroppedObjects.get(top.groupId) === objectId) return 'expired';
@@ -849,12 +1136,96 @@ export class PlaybackPipeline {
     }
 
 
+    private takeSampleBatch(key: string): SampleBatch | undefined {
+        const batches = this.sampleBatches, batch = batches?.get(key);
+        batches?.delete(key);
+        if (batches?.size === 0) this.sampleBatches = undefined;
+        return batch;
+    }
+
+    private releaseBatchSamples(batch: SampleBatch): void {
+        this.pendingSampleBytes -= batch.byteCharge;
+        batch.byteCharge = 0;
+        this.pendingSamples -= batch.samples.length - batch.cursor + (batch.processing ? 1 : 0);
+        batch.processing = false;
+        batch.samples.length = 0;
+        batch.cursor = 0;
+    }
+
+    private clearSampleBatches(): void {
+        this.initialSampleKey = undefined;
+        if (this.pendingBatch) {
+            this.releaseBatchSamples(this.pendingBatch);
+            this.pendingBatch.input = undefined;
+            this.pendingBatch.inputs = undefined;
+        }
+        if (this.sampleBatches) for (const batch of this.sampleBatches.values()) this.releaseBatchSamples(batch);
+        this.pendingBatch = undefined;
+        this.sampleBatches = undefined;
+    }
+
+    private reportBatch(batch: SampleBatch, reason: PlaybackInputDiscardReason): void {
+        if (batch.discardReported) return;
+        batch.discardReported = true; // Reserve notification before observer reentry.
+        const input = batch.input;
+        // A receipt can describe discarded AND surviving samples. Its association
+        // lasts through the remaining units, independently of this notification.
+        batch.inputs?.report(input, reason);
+    }
+
+    private advanceWireObject(obj: MoqtObjectData): void {
+        this.decrementGroupCount(obj.groupId);
+        this.nextExpectedObjectId = obj.objectId + 1n;
+        if (obj.groupId > this.lastConsumedGroupId) this.lastConsumedGroupId = obj.groupId;
+    }
+
+    private drainPendingBatch(budget: number): number {
+        const batch = this.pendingBatch!;
+        const revision = this.playbackRevision;
+        let released = 0;
+        try {
+            while (batch.cursor < batch.samples.length && !this._throttled && (budget === 0 || released < budget)) {
+                const sample = batch.samples[batch.cursor]!;
+                batch.samples[batch.cursor++] = undefined;
+                batch.processing = true;
+                released++;
+                const inputs = batch.inputs === this.inputState ? batch.inputs : undefined;
+                this.processSample(batch.wireObject, sample.headers, batch.backfill,
+                    inputs, inputs ? batch.input : undefined, sample.chunk, batch);
+                if (batch.processing) {
+                    batch.processing = false;
+                    this.pendingSamples--;
+                }
+                if (revision !== this.playbackRevision || this.pendingBatch !== batch) return released;
+            }
+        } catch (error) {
+            if (revision === this.playbackRevision && this.pendingBatch === batch) {
+                this.releaseBatchSamples(batch);
+                this.pendingBatch = undefined;
+                this.advanceWireObject(batch.wireObject);
+                // An exception does not prove native admission of a keyframe.
+                this.decoderState.notifyGap();
+                this.reportBatch(batch, 'decoder policy');
+            }
+            throw error;
+        }
+        if (batch.cursor === batch.samples.length) {
+            this.pendingBatch = undefined;
+            this.releaseBatchSamples(batch);
+            this.advanceWireObject(batch.wireObject);
+            batch.input = undefined;
+            batch.inputs = undefined;
+        }
+        return released;
+    }
+
     /**
  * Drop oldest whole groups when backlog exceeds maxBacklogGroups.
  * Keeps the newest maxBacklogGroups groups, discards the rest.
  * After shedding, notifies decoder that a gap occurred (needs keyframe).
  */
     private shedBacklog(): void {
+        const revision = this.playbackRevision;
         const inputs = this.inputState, dropped: object[] | undefined = inputs ? [] : undefined;
         const groupIds = [...this.bufferedGroupCounts.keys()].sort((a, b) =>
             a < b ? -1 : a > b ? 1 : 0,
@@ -885,15 +1256,16 @@ export class PlaybackPipeline {
 
         // Decoder needs a fresh keyframe after shedding
         const decision = this.decoderState.notifyGap();
-        this.emitFsmDecision(decision);
-
-        this.onEvent({
-            type: 'backlog_shed',
-            droppedGroups: excess,
-            remainingGroups: this.bufferedGroupCounts.size,
-            reason: `backlog exceeded ${this.maxBacklogGroups} groups`,
-        });
-        inputs?.reportAll(dropped, 'backlog shed');
+        try {
+            this.emitFsmDecision(decision);
+            if (revision !== this.playbackRevision) return;
+            this.onEvent({
+                type: 'backlog_shed',
+                droppedGroups: excess,
+                remainingGroups: this.bufferedGroupCounts.size,
+                reason: `backlog exceeded ${this.maxBacklogGroups} groups`,
+            });
+        } finally { inputs?.reportAll(dropped, 'backlog shed'); }
     }
 
     /**
@@ -950,7 +1322,10 @@ export class PlaybackPipeline {
     }
 
     private forgetHeaders(key: string): void {
+        if (this.initialSampleKey === key) this.initialSampleKey = undefined;
         this.headerMap.delete(key);
+        const batch = this.takeSampleBatch(key);
+        if (batch) this.releaseBatchSamples(batch);
         const backfill = this.backfillObjects;
         backfill?.delete(key);
         if (backfill?.size === 0) this.backfillObjects = undefined;
@@ -961,7 +1336,21 @@ export class PlaybackPipeline {
         const headers = this.headerMap.get(key) ?? {};
         const backfill = this.backfillObjects?.has(key) === true;
         this.forgetHeaders(key);
-        const inputs = this.inputState, input = inputs?.take(key), revision = this.playbackRevision;
+        const inputs = this.inputState, input = inputs?.take(key);
+        this.processSample(obj, headers, backfill, inputs, input);
+    }
+
+    private reportSample(inputs: PipelineInputs | undefined, input: object | undefined,
+        batch: SampleBatch | undefined, reason: PlaybackInputDiscardReason): void {
+        if (batch) this.reportBatch(batch, reason);
+        else inputs?.report(input, reason);
+    }
+
+    /** The one sync/timing/decoder/FSM path for LOC and explicit coded units. */
+    private processSample(obj: MoqtObjectData, headers: LocHeaders, backfill: boolean,
+        inputs: PipelineInputs | undefined, input: object | undefined,
+        codedChunk?: VideoChunkInit | AudioChunkInit, batch?: SampleBatch): void {
+        const revision = this.playbackRevision;
 
         // 1. Configure decoder if the object carries codec config for this
         //    media type. DecoderStateMachine.configure dedupes equal bytes.
@@ -978,7 +1367,7 @@ export class PlaybackPipeline {
             }
         }
 
-        if (revision !== this.playbackRevision) { inputs?.report(input, 'decoder reset'); return; }
+        if (revision !== this.playbackRevision) { this.reportSample(inputs, input, batch, 'decoder reset'); return; }
 
         // 2. Establish sync reference.
         //    Audio-master: first audio sample sets the reference (ONCE).
@@ -986,8 +1375,44 @@ export class PlaybackPipeline {
         const videoTimingSource = this.videoTimingSource;
         const audioTimingSource = this.audioTimingSource;
         const captureTimestamp = headers.captureTimestamp;
+        let audioRenderTiming: AudioRenderTiming | undefined;
+        if (this.mediaType === 'audio') {
+            try {
+                const capture = audioTimingSource.captureOutputTiming;
+                if (capture !== undefined) {
+                    const captured = captureTimestamp === undefined ? null : capture.call(audioTimingSource, captureTimestamp);
+                    if (revision !== this.playbackRevision || audioTimingSource !== this.audioTimingSource) { this.reportSample(inputs, input, batch, 'decoder reset'); return; }
+                    if (captured == null) { this.reportSample(inputs, input, batch, 'decoder policy'); return; }
+                    audioRenderTiming = captured;
+                }
+            } catch {
+                this.reportSample(inputs, input, batch, revision === this.playbackRevision ? 'decoder policy' : 'decoder reset'); return;
+            }
+        }
         const originalTimeline = this.mediaType === 'video'
-            ? videoTimingSource === this.sync : this.audioTimingSource === this.sync;
+            ? videoTimingSource === this.sync : audioTimingSource === this.sync;
+        let videoRenderTiming: VideoRenderTiming | undefined;
+        if (this.mediaType === 'video' && !originalTimeline) {
+            try {
+                const capture = videoTimingSource.captureVideoOutputTiming;
+                if (capture !== undefined) {
+                    const captured = captureTimestamp === undefined ? null : capture.call(videoTimingSource, captureTimestamp);
+                    if (revision !== this.playbackRevision || this.videoTimingSource !== videoTimingSource) {
+                        this.reportSample(inputs, input, batch, 'decoder reset'); return;
+                    }
+                    if (captured == null) { this.reportSample(inputs, input, batch, 'decoder policy'); return; }
+                    const recompute = captured.recomputeRenderTimeUs;
+                    if (revision !== this.playbackRevision || this.videoTimingSource !== videoTimingSource) {
+                        this.reportSample(inputs, input, batch, 'decoder reset'); return;
+                    }
+                    if (typeof recompute !== 'function') { this.reportSample(inputs, input, batch, 'decoder policy'); return; }
+                    videoRenderTiming = captured;
+                }
+            } catch {
+                this.reportSample(inputs, input, batch, revision !== this.playbackRevision || this.videoTimingSource !== videoTimingSource
+                    ? 'decoder reset' : 'decoder policy'); return;
+            }
+        }
         if (originalTimeline && headers.captureTimestamp !== undefined && !this.sync.hasReference) {
             if (this.mediaType === 'audio') {
                 this.sync.setAudioReference(headers.captureTimestamp);
@@ -996,10 +1421,14 @@ export class PlaybackPipeline {
             }
         }
         if (!originalTimeline && captureTimestamp !== undefined && !this.sync.hasReference) {
-            if (this.mediaType === 'audio') this.audioTimingSource.establishReference?.(captureTimestamp);
+            if (this.mediaType === 'audio') audioTimingSource.establishReference?.(captureTimestamp);
             else videoTimingSource.establishReference?.(captureTimestamp);
         }
-        if (revision !== this.playbackRevision) { inputs?.report(input, 'decoder reset'); return; }
+        if (revision !== this.playbackRevision) { this.reportSample(inputs, input, batch, 'decoder reset'); return; }
+
+        if (audioRenderTiming !== undefined && audioTimingSource !== this.audioTimingSource) {
+            this.reportSample(inputs, input, batch, 'decoder reset'); return;
+        }
 
         // 3. Compute render time.
         //    Returns null when no reference — CommandDispatcher holds the frame.
@@ -1007,7 +1436,7 @@ export class PlaybackPipeline {
         // drop policy and DecoderStateMachine see the same marking.
         const videoMarking = this.mediaType === 'video'
             ? (headers.videoFrameMarking
-                ?? (obj.objectId === 0n
+                ?? ((codedChunk ? codedChunk.type === 'key' : obj.objectId === 0n)
                     ? { independent: true, startOfFrame: true, endOfFrame: true,
                         discardable: false, baseLayerSync: false, temporalId: 0 }
                     : undefined))
@@ -1021,26 +1450,26 @@ export class PlaybackPipeline {
                     outputDelayUs = this.getAudioPlayoutDelayUs();
                     if (!Number.isFinite(outputDelayUs) || outputDelayUs < 0) throw new RangeError('Invalid audio playout delay');
                 } catch {
-                    inputs?.report(input, revision === this.playbackRevision ? 'decoder policy' : 'decoder reset');
+                    this.reportSample(inputs, input, batch, revision === this.playbackRevision ? 'decoder policy' : 'decoder reset');
                     return;
                 }
                 if (revision !== this.playbackRevision || audioTimingSource !== this.audioTimingSource) {
-                    inputs?.report(input, 'decoder reset'); return;
+                    this.reportSample(inputs, input, batch, 'decoder reset'); return;
                 }
             }
             const timing = this.mediaType === 'video'
                 ? videoTimingSource.computeVideoRenderTime(headers.captureTimestamp)
                 : originalTimeline && this.getAudioPlayoutDelayUs
                     ? this.sync.computeAudioRenderTime(headers.captureTimestamp, outputDelayUs)
-                    : this.audioTimingSource.computeAudioRenderTime(headers.captureTimestamp);
-            if (this.mediaType === 'audio' && originalTimeline && this.getAudioPlayoutDelayUs
+                    : (audioRenderTiming === undefined ? this.audioTimingSource : audioTimingSource).computeAudioRenderTime(headers.captureTimestamp);
+            if (this.mediaType === 'audio' && ((originalTimeline && this.getAudioPlayoutDelayUs) || audioRenderTiming !== undefined)
                 && (revision !== this.playbackRevision || audioTimingSource !== this.audioTimingSource)) {
-                inputs?.report(input, 'decoder reset'); return;
+                this.reportSample(inputs, input, batch, 'decoder reset'); return;
             }
 
             if (timing === null) {
                 // An unavailable mapped schedule cannot become speculative "play now".
-                if (!originalTimeline) { inputs?.report(input, 'decoder policy'); return; }
+                if (!originalTimeline) { this.reportSample(inputs, input, batch, 'decoder policy'); return; }
                 // No reference yet — use placeholder. CommandDispatcher will
                 // hold this frame and recompute when the reference is ready.
                 renderTimeUs = 0;
@@ -1057,7 +1486,7 @@ export class PlaybackPipeline {
                     // drops sufficiently late frames while keeping the newest.
                     renderTimeUs = originalTimeline ? this.clock.now() : timing.renderTimeUs;
                 } else {
-                    inputs?.report(input, 'late frame');
+                    this.reportSample(inputs, input, batch, 'late frame');
                     return; // Genuinely late and safe to discard — skip
                 }
             } else if (originalTimeline && timing.offsetUs > 5_000_000) {
@@ -1066,7 +1495,7 @@ export class PlaybackPipeline {
                 renderTimeUs = timing.renderTimeUs;
             }
         } else {
-            if (!originalTimeline) { inputs?.report(input, 'decoder policy'); return; }
+            if (!originalTimeline) { this.reportSample(inputs, input, batch, 'decoder policy'); return; }
             renderTimeUs = this.clock.now();
         }
 
@@ -1080,11 +1509,12 @@ export class PlaybackPipeline {
             if (catchUp !== null && catchUp.currentRate !== this._lastEmittedRate) {
                 this._lastEmittedRate = catchUp.currentRate;
                 this.onEvent({ type: 'catch_up_changed', state: catchUp });
+                if (revision !== this.playbackRevision) { this.reportSample(inputs, input, batch, 'decoder reset'); return; }
                 this.onCommand({ type: 'set_playback_rate', rate: catchUp.currentRate });
             }
         }
 
-        if (revision !== this.playbackRevision) { inputs?.report(input, 'decoder reset'); return; }
+        if (revision !== this.playbackRevision) { this.reportSample(inputs, input, batch, 'decoder reset'); return; }
 
         // 4. Create chunk init and feed through decoder FSM
         if (this.mediaType === 'video') {
@@ -1095,8 +1525,9 @@ export class PlaybackPipeline {
             // when the LOC header claims independent. Catches broken publishers.
             // Only check payloads > 5 bytes (too short = can't determine).
             // @see draft-ietf-moq-loc-01 §4.2
-            if (marking?.independent && this._videoCodec && obj.payload.length > 5) {
-                const isKeyframe = isKeyframePayload(this._videoCodec, obj.payload);
+            const payload = codedChunk?.data ?? obj.payload;
+            if (marking?.independent && this._videoCodec && payload.length > 5) {
+                const isKeyframe = isKeyframePayload(this._videoCodec, payload);
                 if (isKeyframe === false) {
                     this.onEvent({
                         type: 'keyframe_validation_failed',
@@ -1110,27 +1541,32 @@ export class PlaybackPipeline {
             const headersWithMarking = marking !== undefined
                 ? { ...headers, videoFrameMarking: marking }
                 : headers;
-            const chunk = toVideoChunkInit(obj.payload, headersWithMarking);
-            const prevState = this.decoderState.state;
-            const decision = this.decoderState.processVideoChunk(chunk, marking);
-
-            // Detect live join: NEEDS_KEYFRAME → DECODING (first keyframe decoded)
-            // Apply video join re-anchor to prevent startup stutter.
-            if (originalTimeline && !backfill && prevState === 'needs_keyframe' && this.decoderState.state === 'decoding'
-                && headers.captureTimestamp !== undefined) {
+            const chunk = codedChunk ?? toVideoChunkInit(obj.payload, headersWithMarking);
+            if (revision !== this.playbackRevision) { this.reportSample(inputs, input, batch, 'decoder reset'); return; }
+            // Join timing can read an injected clock. Prepare it before the
+            // keyframe admission that would authorize subsequent deltas.
+            if (originalTimeline && !backfill && this.decoderState.state === 'needs_keyframe'
+                && marking?.independent === true && headers.captureTimestamp !== undefined) {
                 this.sync.onVideoJoin(headers.captureTimestamp);
-                // Recompute render time with the offset applied
                 const recomputed = this.sync.computeVideoRenderTime(headers.captureTimestamp);
-                if (recomputed) {
-                    renderTimeUs = recomputed.renderTimeUs;
-                }
+                if (recomputed) renderTimeUs = recomputed.renderTimeUs;
             }
 
+            // Refusing an input must not let its keyframe authorize later deltas.
+            // Timing and validation callbacks can replace this input's provider.
+            if (revision !== this.playbackRevision || this.videoTimingSource !== videoTimingSource) {
+                this.reportSample(inputs, input, batch, 'decoder reset'); return;
+            }
+            const decision = this.decoderState.processVideoChunk(chunk, marking);
+
             if (decision.action === 'decode') {
-                const renderTiming = !originalTimeline && captureTimestamp !== undefined
+                if (revision !== this.playbackRevision || this.videoTimingSource !== videoTimingSource) {
+                    this.reportSample(inputs, input, batch, 'decoder reset'); return;
+                }
+                const renderTiming = videoRenderTiming ?? (!originalTimeline && captureTimestamp !== undefined
                     ? Object.freeze({ recomputeRenderTimeUs: () =>
                         videoTimingSource.computeVideoRenderTime(captureTimestamp)?.renderTimeUs ?? null })
-                    : undefined;
+                    : undefined);
                 const command = {
                     type: 'decode_video' as const,
                     ...(input && inputs === this.inputState ? { inputToken: input } : {}),
@@ -1142,7 +1578,8 @@ export class PlaybackPipeline {
                 };
                 this.onCommand(renderTiming ? { ...command, renderTiming } : command);
             } else if (decision.action === 'skip') {
-                inputs?.report(input, decision.reason === 'waiting for keyframe' ? 'awaiting keyframe' : 'decoder policy');
+                this.reportSample(inputs, input, batch, decision.reason === 'waiting for keyframe' ? 'awaiting keyframe' : 'decoder policy');
+                if (revision !== this.playbackRevision) return;
                 // Emit keyframe_waiting once per group (avoid per-object spam)
                 if (decision.reason === 'waiting for keyframe' && obj.groupId !== this.lastKeyframeWaitingGroupId) {
                     this.lastKeyframeWaitingGroupId = obj.groupId;
@@ -1150,17 +1587,19 @@ export class PlaybackPipeline {
                 }
             }
         } else {
-            const chunk = toAudioChunkInit(obj.payload, headers);
+            const chunk = (codedChunk as AudioChunkInit | undefined) ?? toAudioChunkInit(obj.payload, headers);
+            if (revision !== this.playbackRevision) { this.reportSample(inputs, input, batch, 'decoder reset'); return; }
             const decision = this.decoderState.processAudioChunk(chunk);
 
             if (decision.action === 'decode') {
                 this.onCommand({
                     type: 'decode_audio',
+                    ...(audioRenderTiming ? { renderTiming: audioRenderTiming } : {}),
                     ...(input && inputs === this.inputState ? { inputToken: input } : {}),
                     chunk: decision.chunk as typeof chunk,
                     renderTimeUs,
                 });
-            } else { inputs?.report(input, 'decoder policy'); }
+            } else { this.reportSample(inputs, input, batch, 'decoder policy'); }
         }
     }
 

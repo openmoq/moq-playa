@@ -19,10 +19,10 @@ import type {
   RecoveryController,
   DecoderFeedback,
 } from '@openmoq/playback';
-import type { MoqtPlayerConfig } from './config.js';
+import type { FrameOutputAdapters, MoqtPlayerConfig } from './config.js';
 import type { CatalogTrack } from '@openmoq/msf';
 import type { MediaSourceLike } from './interfaces.js';
-import { CommandDispatcher } from './command-dispatcher.js';
+import { CommandDispatcher, type ConfiguredDecoder } from './command-dispatcher.js';
 import type { LoggerLike } from './logger.js';
 import type { LocDiagnosticKind } from './stats.js';
 import { RenderCushionSmoother } from './render-cushion.js';
@@ -108,6 +108,8 @@ export interface PipelineSet {
   recoveryController: RecoveryController;
   commandDispatcher: CommandDispatcher | null;
   mediaSource: MediaSourceLike | null;
+  /** Actual adapters, for checking fresh output ownership before wiring callbacks. */
+  frameOutput?: Readonly<FrameOutputAdapters>;
   /**
    * READ-ONLY view of the SMOOTHED render cushion (µs) last applied to LOC
    * video render times and audio scheduling — slew-limited and clamped,
@@ -181,6 +183,7 @@ export function createPipelines(
   trackInfo: TrackInfo,
   callbacks: PipelineCallbacks,
   handshakeRttMs?: number,
+  preparedFrameOutput?: Readonly<FrameOutputAdapters>,
 ): PipelineSet {
   let mediaSource: MediaSourceLike | null = null;
 
@@ -242,10 +245,14 @@ export function createPipelines(
 
   // ── CommandDispatcher + browser adapters ────────────────────────
   // Only create WebCodecs adapters for LOC media types — CMAF goes through MSE.
-  const videoDecoder = !hasCmafVideo ? config.createVideoDecoder?.() : undefined;
-  const audioDecoder = !hasCmafAudio ? config.createAudioDecoder?.() : undefined;
-  const renderer    = !hasCmafVideo ? config.createRenderer?.()     : undefined;
-  const audioOutput = !hasCmafAudio ? config.createAudioOutput?.()  : undefined;
+  const videoDecoder = !hasCmafVideo
+    ? preparedFrameOutput ? preparedFrameOutput.videoDecoder : config.createVideoDecoder?.() : undefined;
+  const audioDecoder = !hasCmafAudio
+    ? preparedFrameOutput ? preparedFrameOutput.audioDecoder : config.createAudioDecoder?.() : undefined;
+  const renderer = !hasCmafVideo
+    ? preparedFrameOutput ? preparedFrameOutput.renderer : config.createRenderer?.() : undefined;
+  const audioOutput = !hasCmafAudio
+    ? preparedFrameOutput ? preparedFrameOutput.audioOutput : config.createAudioOutput?.() : undefined;
 
   let commandDispatcher: CommandDispatcher | null = null;
 
@@ -253,9 +260,12 @@ export function createPipelines(
   // scheduling. Gap detection continues to use the raw value.
   const hasLoc = (trackInfo.video !== undefined && !hasCmafVideo)
     || (trackInfo.audio !== undefined && !hasCmafAudio);
-  const cushionFloorUs = handshakeRttMs !== undefined && handshakeRttMs < 5
+  const cushionFloorUs = preparedFrameOutput ? 0 : handshakeRttMs !== undefined && handshakeRttMs < 5
     ? 50_000 : 200_000;
-  const renderCushion = hasLoc ? new RenderCushionSmoother({ floorUs: cushionFloorUs }, clock) : null;
+  // An owned historical graph already retains its independently decoded
+  // target. A live-network startup cushion would delay a paused preview with
+  // no running render loop; later pictures still follow the source cadence.
+  const renderCushion = hasLoc && !preparedFrameOutput ? new RenderCushionSmoother({ floorUs: cushionFloorUs }, clock) : null;
 
   if (videoDecoder || audioDecoder) {
     commandDispatcher = new CommandDispatcher(defined({
@@ -347,11 +357,12 @@ export function createPipelines(
     recoveryController,
     commandDispatcher,
     mediaSource,
-    ...(renderCushion ? {
+    frameOutput: Object.freeze(defined({ videoDecoder, renderer, audioDecoder, audioOutput })),
+    ...(hasLoc ? {
       // Observability contract: PEEK the smoothed value. Only the scheduling
       // paths (video recompute, audio getPlaybackDelayUs) advance the
       // smoother — polling player.stats must never mutate playback timing.
-      getRenderCushionUs: () => renderCushion.currentUs,
+      getRenderCushionUs: () => renderCushion?.currentUs ?? 0,
     } : {}),
   };
 }
@@ -411,7 +422,7 @@ export function handlePipelineCommand(
   emitEvent: (event: Record<string, unknown>) => void,
   preparedDecoder?: 'video' | 'audio',
   isLive?: () => boolean,
-): void {
+): ConfiguredDecoder | undefined {
   if (isLive && !isLive()) return;
   const transformed = commandTransform ? commandTransform(cmd) : cmd;
   if (transformed && (!isLive || isLive())) {
@@ -421,8 +432,10 @@ export function handlePipelineCommand(
     });
     if (isLive && !isLive()) return;
     if (transformed.type === 'reset' && transformed.mediaType === preparedDecoder) {
-      dispatcher?.dispatch(transformed, { preserveDecoder: true });
-    } else dispatcher?.dispatch(transformed);
+      return dispatcher?.dispatch(transformed, { preserveDecoder: true, ...(isLive ? { isCurrent: isLive } : {}) });
+    } else if (isLive && transformed.type === 'configure') {
+      return dispatcher?.dispatch(transformed, { isCurrent: isLive });
+    } else return dispatcher?.dispatch(transformed);
   }
 }
 

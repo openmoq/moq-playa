@@ -130,6 +130,8 @@ export type {
   VideoPresentation,
   AudioOutputLike,
   MediaSourceLike,
+  MediaSeekResource,
+  MediaSeekSample,
   MediaAppendQueueLease,
   CmafSourceReceipt,
   VideoPlaybackQualityStats,
@@ -197,3 +199,6 @@ export type { MediaStageObservation, MediaStageObserver, MediaDiagnosticsFactory
 export type { VideoFrameObservation, VideoFrameObserver, VideoFrameReason } from './interfaces.js';
 
 export type { AudioScheduleObservation, AudioScheduleObserver, AudioScheduleReason } from './interfaces.js';
+
+export type { FrameOutputAdapters, FrameOutputContext, FrameOutput } from './config.js';
+export type { AudioProducedTiming, AudioSourcePosition, VideoProducedTiming } from './interfaces.js';
