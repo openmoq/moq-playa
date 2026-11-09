@@ -422,6 +422,12 @@ interface MigrationTxn {
     | undefined;
 }
 
+/** A source-bound handover intent also owns terminal evidence while media settles. */
+type PendingGoaway = Pick<MigrationTxn, 'oldTerminal'> & {
+  readonly uri: string;
+  readonly sourceConnection: MoqtConnection;
+};
+
 /** Media preparation is shared by session replacement and same-session selection. */
 type PreparedMediaAttempt = Pick<MigrationTxn, 'conn' | 'aborted' | 'committed'> & { prep?: PreparedMediaSelection };
 
@@ -1022,7 +1028,7 @@ export class MoqtPlayer {
    *  session (see {@link processPendingGoaway}). The source matters: during
    *  candidate establishment the OLD session is still current and its GOAWAY would
    *  otherwise migrate away from the caller's chosen replacement after commit. */
-  private pendingGoaway: { readonly uri: string; readonly sourceConnection: MoqtConnection } | null = null;
+  private pendingGoaway: PendingGoaway | null = null;
   /** Max staged candidate events before the transaction aborts (bounds closures). */
   private static readonly MAX_STAGED_EVENTS = 512;
   /** Max total retained bytes across staged events before aborting. */
@@ -3287,6 +3293,7 @@ export class MoqtPlayer {
     if (!this.connection || !this.subscriptionManager) {
       this.pendingVideoSwitch = null;
       this.switchInProgress = false;
+      this.videoSwitchSettled();
       this.discardLocStaging('decoder reset');
       this.discardCmafStaging('decoder reset');
       return;
@@ -3506,6 +3513,7 @@ export class MoqtPlayer {
       } else if (this.pendingVideoSwitch === sw) {
         this.pendingVideoSwitch = null;
         this.switchInProgress = false;
+        this.videoSwitchSettled();
         this.discardLocStaging('decoder reset');
         this.discardCmafStaging('decoder reset');
       }
@@ -3580,6 +3588,7 @@ export class MoqtPlayer {
     }
     this.pendingVideoSwitch = null;
     this.switchInProgress = false;
+    this.videoSwitchSettled();
 
     // Switch is now committed — commit controllers, record stat, fire event.
     // All mutation is deferred to this point. ABR/recovery initiation paths
@@ -3635,6 +3644,7 @@ export class MoqtPlayer {
     if (this.pendingVideoSwitch !== sw) return false;
     this.pendingVideoSwitch = null;
     this.switchInProgress = false;
+    this.videoSwitchSettled();
     if (this.switchStagingTimeout !== null) {
       clearTimeout(this.switchStagingTimeout);
       this.switchStagingTimeout = null;
@@ -4991,11 +5001,14 @@ export class MoqtPlayer {
     makeTransport: () => Promise<WebTransportLike>,
     setupOptions: ReturnType<typeof buildSetupOptions>,
     target?: string,
+    pending?: PendingGoaway,
   ): Promise<void> {
     if (this._destroyed) throw new Error('Cannot migrate: player is destroyed');
     if (this.isTerminalState()) throw new Error('Cannot migrate: playback has terminated');
     if (this.currentMigration) throw new Error('Cannot migrate: a migration is already in progress');
-    if (this.mediaSelection) throw new Error('Cannot migrate: media selection is busy');
+    if (this.mediaSelection || this.pendingVideoSwitch || this.switchInProgress) {
+      throw new Error('Cannot migrate: media selection is busy');
+    }
     // A previous attempt's `changeType` has not settled, so the media source
     // is not in a known state. Adopting a replacement onto a buffer another
     // attempt can still mutate would hand it an initialization that is about
@@ -5009,7 +5022,9 @@ export class MoqtPlayer {
       conn: newConnection, events: [], retainedBytes: 0,
       aborted: false, committed: false, terminated: false,
       ...(target !== undefined ? { target } : {}),
+      oldTerminal: pending?.sourceConnection === oldConnection ? pending.oldTerminal : undefined,
     };
+    if (pending) pending.oldTerminal = undefined; // Evidence now belongs to the attempt.
     this.currentMigration = txn; // reserve single-flight BEFORE creating the transport
     this.wireConnection(newConnection);
     this.assertMigrationLive(txn);
@@ -7539,7 +7554,7 @@ export class MoqtPlayer {
    * attempt fails it is the session's real outcome and the application has to
    * hear it.
    */
-  private reportHeldOldTerminal(txn: MigrationTxn): void {
+  private reportHeldOldTerminal(txn: Pick<MigrationTxn, 'oldTerminal'>): void {
     const held = txn.oldTerminal;
     if (held === undefined) return;
     txn.oldTerminal = undefined;
@@ -7621,7 +7636,7 @@ export class MoqtPlayer {
    * attempted — so a queued/aborted GOAWAY leaks nothing. Failures are surfaced
    * through the error channel rather than left as an unhandled rejection.
    */
-  private startGoawayMigration(uri: string): void {
+  private startGoawayMigration(uri: string, pending?: PendingGoaway): void {
     if (this._destroyed || this.isTerminalState() || !this.config.createConnection) return;
     // The URI is peer-controlled text — validate BEFORE creating any candidate
     // connection or transport. A non-empty invalid URI must not silently fall
@@ -7630,14 +7645,20 @@ export class MoqtPlayer {
     // quarantine installed at receipt stays in place.
     const invalidReason = invalidGoawayUriReason(uri);
     if (invalidReason !== null) {
+      if (pending) this.reportHeldOldTerminal(pending);
       this.emitError(createPlayerError(
         'degraded', 'connection', PlayerErrorCode.CONNECTION_LOST,
         `Automatic GOAWAY migration rejected: ${invalidReason}`,
       ));
       return;
     }
-    const newConnection = this.config.createConnection();
-    this.migrateToUrl(newConnection, uri).catch((err) => {
+    // The factory can throw too, including from a deferred settlement microtask.
+    void (async () => {
+      const newConnection = this.config.createConnection!();
+      await this.migrateToUrl(newConnection, uri, pending);
+    })().catch((err) => {
+      // Entry/factory failures never acquired a transaction to report this evidence.
+      if (pending) this.reportHeldOldTerminal(pending);
       this.emitError(createPlayerError(
         'degraded', 'connection', PlayerErrorCode.CONNECTION_LOST,
         `Automatic GOAWAY migration failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -7655,19 +7676,30 @@ export class MoqtPlayer {
    * it) and must be discarded rather than migrating off the caller's replacement.
    */
   private processPendingGoaway(): void {
-    if (this.currentMigration || this.mediaSelection || this.pendingRetypes.size) return;
+    if (this.handoverBlocked()) return;
     const pending = this.pendingGoaway;
     this.pendingGoaway = null;
     if (pending !== null && !this._destroyed && !this.currentMigration && pending.sourceConnection === this.connection) {
-      this.startGoawayMigration(pending.uri);
+      this.startGoawayMigration(pending.uri, pending);
     }
   }
 
-  private async migrateToUrl(newConnection: MoqtConnection, url: string): Promise<void> {
+  /** Media state a handover cannot start under: it would capture a selection about to change. */
+  private handoverBlocked(): boolean {
+    return this.currentMigration !== null || this.mediaSelection !== null || this.pendingRetypes.size > 0
+      || this.pendingVideoSwitch !== null || this.switchInProgress;
+  }
+
+  /** A video switch released its slot; act on a GOAWAY it deferred once its settlement finishes. */
+  private videoSwitchSettled(): void {
+    if (this.pendingGoaway !== null) queueMicrotask(() => this.processPendingGoaway());
+  }
+
+  private async migrateToUrl(newConnection: MoqtConnection, url: string, pending?: PendingGoaway): Promise<void> {
     const createTransport = this.config.createTransport!;
     const setupOptions = buildSetupOptions(this.config, url);
     await this.runMigrationTransaction(
-      newConnection, () => createTransport(buildConnectUrl(this.config, url)), setupOptions, url,
+      newConnection, () => createTransport(buildConnectUrl(this.config, url)), setupOptions, url, pending,
     );
 
     this._stats.recordReconnect();
@@ -10189,9 +10221,11 @@ export class MoqtPlayer {
         // healthy candidate. The event is held — announced only if the attempt
         // then fails, where it is the real outcome.
         const preparing = this.currentMigration;
-        if (preparing !== null && !preparing.committed && !preparing.aborted) {
+        const handover = preparing !== null && !preparing.committed && !preparing.aborted ? preparing
+          : this.pendingGoaway?.sourceConnection === conn ? this.pendingGoaway : null;
+        if (handover !== null) {
           this.log.info('[SESSION] replaced session closed while its replacement prepares — held');
-          preparing.oldTerminal = { kind: 'close', ...defined({ error, reason }) };
+          handover.oldTerminal ??= { kind: 'close', ...defined({ error, reason }) };
           // NOT cancelCatalogBootstrap(): that bumps the shared generation,
           // which the preparing candidate's own coordinator captured.
           this.retireCatalogHolder(this.catalogSlots);
@@ -10255,11 +10289,12 @@ export class MoqtPlayer {
         // is held while its replacement is still being prepared, so a dying
         // old relay cannot fail playback that is about to be handed over.
         const preparingErr = this.currentMigration;
-        if (classified.severity === 'fatal' && preparingErr !== null
-            && !preparingErr.committed && !preparingErr.aborted) {
+        const handover = preparingErr !== null && !preparingErr.committed && !preparingErr.aborted ? preparingErr
+          : this.pendingGoaway?.sourceConnection === conn ? this.pendingGoaway : null;
+        if (classified.severity === 'fatal' && handover !== null) {
           this.log.info('[SESSION] replaced session errored while its replacement prepares — held: %s',
             error.message);
-          preparingErr.oldTerminal = {
+          handover.oldTerminal = {
             kind: 'error', error, severity: classified.severity, code: classified.code,
             ...defined({ context: classified.context }),
           };
@@ -11070,7 +11105,7 @@ export class MoqtPlayer {
     // §9.4 / §10.4 / §9.2: an empty New Session URI reuses the CURRENT session
     // URI — the endpoint we are actually on, not the configured origin.
     const uri = newSessionUri || this.activeEndpoint;
-    if (this.currentMigration || this.mediaSelection || this.pendingRetypes.size) {
+    if (this.handoverBlocked()) {
       // A handoff is in flight (staged-event drain or old-session retirement
       // still holds the single-flight slot). Starting a migration now would be
       // rejected and the GOAWAY lost. QUEUE the target WITH its source session

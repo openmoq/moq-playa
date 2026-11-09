@@ -183,6 +183,8 @@ async function fixture(draft: Draft, options: {
   silentCandidate?: boolean;
   defaultBootstrap?: boolean;
   oldSeparateInit?: boolean;
+  oldCatalog?: Uint8Array;
+  replacementFactoryError?: Error;
   config?: Partial<MoqtPlayerConfig>;
 } = {}) {
   const catalogName = options.config?.catalogTrackName ?? 'catalog';
@@ -202,7 +204,11 @@ async function fixture(draft: Draft, options: {
   let connections = 0;
   const player = new MoqtPlayer({
     url: OLD_URL, namespace: 'live/handover', draftVersion: draft,
-    createConnection: () => [old, next, third][connections++]!.client as unknown as PlayerConnection,
+    createConnection: () => {
+      const connection = [old, next, third][connections++]!.client as unknown as PlayerConnection;
+      if (connections > 1 && options.replacementFactoryError) throw options.replacementFactoryError;
+      return connection;
+    },
     createTransport: url => {
       transportCalls.push(url);
       if (transportCalls.length === 1) return Promise.resolve(old.start());
@@ -244,7 +250,7 @@ async function fixture(draft: Draft, options: {
     if (options.defaultBootstrap) await old.bootstrap(catalog(options.oldSeparateInit, 'draft-01'));
     else {
       await old.accept(catalogName, 100n);
-      await old.send(catalogName, catalog(options.oldSeparateInit));
+      await old.send(catalogName, options.oldCatalog ?? catalog(options.oldSeparateInit));
     }
     if (options.oldSeparateInit) {
       await old.accept('init-video', 202n);
@@ -1654,4 +1660,175 @@ describe('root public-assembler partial-adoption cleanup', () => {
         expect(h.next.close, 'later destroy cannot close the same candidate again').toHaveBeenCalledTimes(1);
       } finally { capture.mockRestore(); await h.destroy(); }
     });
+});
+
+/** SDK lifecycle evidence through controlled media interfaces; no native playback claim. */
+function selectionHandoverCatalog() {
+  const base = JSON.parse(dec.decode(catalog())) as { version: number; tracks: Array<Record<string, unknown>> };
+  const video = { ...base.tracks.find(track => track['role'] === 'video')!, altGroup: 1 };
+  return enc.encode(JSON.stringify({ ...base, tracks: [video,
+    { ...video, name: 'video-lo', width: 320, height: 180, bitrate: 300_000 },
+    ...base.tracks.filter(track => track['role'] !== 'video'),
+  ] }));
+}
+
+describe.each([16, 18, 22] as const)('draft-%i GOAWAY during rendition selection', draft => {
+  it('prerequisite: defers GOAWAY while an accepted video target still awaits media', async () => {
+    const h = await fixture(draft, { oldCatalog: selectionHandoverCatalog(),
+      config: { autoQuality: false, selection: { videoTrack: { name: 'video' } } } });
+    try {
+      await h.player.selectVideoTrack('video-lo');
+      await h.old.accept('video-lo', 210n);
+      expect(h.player.selection.video?.name).toBe('video');
+      expect(h.transportCalls).toEqual([OLD_URL]);
+      await h.old.goaway();
+      expect(h.transportCalls, 'target acceptance alone must not start a competing session handover').toEqual([OLD_URL]);
+      expect(h.next.requests).toEqual([]);
+      await h.old.send('video-lo', chunk('video', 2n), 2n);
+      await flush(512);
+      expect(h.player.selection.video?.name).toBe('video-lo');
+      expect(h.next.requests.map(row => row.name)).toEqual(['catalog']);
+    } finally { await h.destroy(); }
+  });
+
+  it('control: GOAWAY without a selection owner completes a usable replacement', async () => {
+    const h = await fixture(draft);
+    try {
+      await h.old.goaway();
+      await h.next.accept('catalog', 100n); await h.next.send('catalog', catalog());
+      await h.next.accept('video', 200n); await h.next.accept('audio', 201n);
+      await flush(512);
+      expect(h.migrated).toHaveBeenCalledTimes(1);
+      expect(h.old.close).toHaveBeenCalledTimes(1);
+      expect(h.fatalErrors).toEqual([]); expect(h.closed).not.toHaveBeenCalled();
+      await h.next.send('video', chunk('video', 3n), 3n);
+      expect(h.received).toContainEqual({ name: 'video', group: 3n });
+    } finally { await h.destroy(); }
+  });
+
+  it('control: the held public retype settles the accepted rendition without GOAWAY', async () => {
+    const gate = deferred<void>(); let changes = 0;
+    const h = await fixture(draft, { oldCatalog: selectionHandoverCatalog(), config: {
+      autoQuality: false, selection: { videoTrack: { name: 'video' } },
+      createMediaSource: () => ({ initialize: () => true, appendChunk() {}, reset() {}, endOfStream() {}, destroy() {},
+        mediaElement: null, onFirstFrame: null, onError: null, onStall: null,
+        changeType: () => { changes++; return gate.promise; },
+      }),
+    } });
+    try {
+      await h.player.selectVideoTrack('video-lo'); await h.old.accept('video-lo', 210n);
+      await h.old.send('video-lo', chunk('video', 2n), 2n);
+      expect(changes).toBe(1);
+      expect(h.player.selection.video?.name).toBe('video');
+      gate.resolve(); await flush(512);
+      expect(h.player.selection.video?.name).toBe('video-lo');
+      expect(h.fatalErrors).toEqual([]);
+      await h.old.send('video-lo', chunk('video', 3n), 3n);
+      expect(h.received).toContainEqual({ name: 'video-lo', group: 3n });
+    } finally { gate.resolve(); await flush(256); await h.destroy(); }
+  });
+
+  it.each([
+    { terminal: 'close', outcome: 'success' },
+    { terminal: 'error', outcome: 'success' },
+    { terminal: 'error', outcome: 'refusal' },
+  ] as const)('queued $terminal is held until replacement $outcome', async ({ terminal, outcome }) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const gate = deferred<void>(); let changes = 0;
+    const h = await fixture(draft, { oldCatalog: selectionHandoverCatalog(), config: {
+      autoQuality: false, selection: { videoTrack: { name: 'video' } },
+      createMediaSource: () => ({ initialize: () => true, appendChunk() {}, reset() {}, endOfStream() {}, destroy() {},
+        mediaElement: null, onFirstFrame: null, onError: null, onStall: null,
+        changeType: () => { changes++; return gate.promise; },
+      }),
+    } });
+    const observed = h.player as unknown as {
+      pendingGoaway: { sourceConnection: PlayerConnection; uri: string } | null;
+      currentMigration: unknown;
+    };
+    try {
+      await h.player.selectVideoTrack('video-lo'); await h.old.accept('video-lo', 210n);
+      await h.old.send('video-lo', chunk('video', 2n), 2n);
+      expect(changes, 'actual target input entered the public retype gate').toBe(1);
+      expect(h.player.selection.video?.name).toBe('video');
+      await h.old.goaway();
+      expect(observed.pendingGoaway?.sourceConnection, 'premise: real GOAWAY owns the current old connection').toBe(h.old.client);
+      expect(observed.pendingGoaway?.uri).toBe(NEW_URL);
+      expect(observed.currentMigration, 'premise: queued, not an already preparing candidate').toBeNull();
+      expect(h.transportCalls).toEqual([OLD_URL]); expect(h.next.requests).toEqual([]);
+
+      if (terminal === 'close') h.old.transport.close({ closeCode: 0, reason: 'relay drained' });
+      else h.old.transport.failClosed(new Error('old relay network lost'));
+      await flush(256);
+      expect(h.fatalErrors, 'owned queued error is not yet the replacement outcome').toEqual([]);
+      expect(h.closed, 'owned queued closure is not yet a public session loss').not.toHaveBeenCalled();
+
+      gate.resolve(); await flush(512);
+      expect(h.transportCalls).toEqual([OLD_URL, NEW_URL]);
+      expect(h.player.selection.video?.name, 'handover must preserve the rendition selected by settled retype').toBe('video-lo');
+      if (outcome === 'refusal') {
+        await h.next.reject('catalog'); await flush(512);
+        expect(h.fatalErrors).toEqual(['old relay network lost']);
+        expect(h.migrated).not.toHaveBeenCalled();
+        expect(h.next.close).toHaveBeenCalledTimes(1);
+      } else {
+        await h.next.accept('catalog', 100n); await h.next.send('catalog', selectionHandoverCatalog());
+        expect(h.next.requests.filter(row => row.name.startsWith('video')).map(row => row.name)).toEqual(['video-lo']);
+        await h.next.accept('video-lo', 210n); await h.next.accept('audio', 201n);
+        await flush(512);
+        expect(h.migrated).toHaveBeenCalledTimes(1);
+        expect(h.fatalErrors).toEqual([]); expect(h.closed).not.toHaveBeenCalled();
+        await h.next.send('video-lo', chunk('video', 3n), 3n);
+        expect(h.received).toContainEqual({ name: 'video-lo', group: 3n });
+      }
+    } finally {
+      gate.resolve(); await flush(256); vi.useRealTimers(); await h.destroy();
+    }
+  });
+});
+
+describe('queued GOAWAY entry rejection', () => {
+  it.each(['invalid URI', 'factory throws'] as const)('reports the held terminal once when %s rejects entry', async failure => {
+    const gate = deferred<void>(); let changes = 0;
+    const h = await fixture(18, { oldCatalog: selectionHandoverCatalog(),
+      ...(failure === 'factory throws' ? { replacementFactoryError: new Error('replacement factory fault') } : {}),
+      config: {
+        autoQuality: false, selection: { videoTrack: { name: 'video' } },
+        createMediaSource: () => ({ initialize: () => true, appendChunk() {}, reset() {}, endOfStream() {}, destroy() {},
+          mediaElement: null, onFirstFrame: null, onError: null, onStall: null,
+          changeType: () => { changes++; return gate.promise; },
+        }),
+      },
+    });
+    const owner = h.player as unknown as {
+      pendingGoaway: { sourceConnection: PlayerConnection; uri: string } | null;
+      currentMigration: unknown;
+    };
+    try {
+      await h.player.selectVideoTrack('video-lo'); await h.old.accept('video-lo', 210n);
+      await h.old.send('video-lo', chunk('video', 2n), 2n);
+      expect(changes).toBe(1);
+      const uri = failure === 'invalid URI' ? 'http://invalid-replacement.example/moq' : NEW_URL;
+      await h.old.goaway(uri);
+      expect(owner.pendingGoaway?.sourceConnection).toBe(h.old.client);
+      expect(owner.pendingGoaway?.uri).toBe(uri);
+      expect(owner.currentMigration).toBeNull();
+      expect(h.transportCalls).toEqual([OLD_URL]); expect(h.next.requests).toEqual([]);
+      h.old.transport.failClosed(new Error('old relay network lost'));
+      await flush(256);
+      expect(h.fatalErrors).toEqual([]); expect(h.closed).not.toHaveBeenCalled();
+
+      gate.resolve(); await flush(512);
+      expect(h.fatalErrors).toEqual(['old relay network lost']);
+      expect(h.errors.filter(message => message.startsWith('Automatic GOAWAY migration '))).toHaveLength(1);
+      expect(h.errors.some(message => failure === 'invalid URI'
+        ? message.startsWith('Automatic GOAWAY migration rejected:')
+        : message.includes('replacement factory fault'))).toBe(true);
+      expect(owner.pendingGoaway).toBeNull(); expect(owner.currentMigration).toBeNull();
+      expect(h.transportCalls).toEqual([OLD_URL]); expect(h.next.requests).toEqual([]);
+      expect(h.migrated).not.toHaveBeenCalled();
+      await flush(512);
+      expect(h.fatalErrors).toEqual(['old relay network lost']);
+    } finally { gate.resolve(); await flush(256); await h.destroy(); }
+  });
 });

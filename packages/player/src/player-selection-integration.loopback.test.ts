@@ -1368,7 +1368,16 @@ describe('prepared handover adoption', () => {
       void h.player.selectVideoTrack('future').then(() => { result = 'resolved'; }, () => { result = 'rejected'; });
       await flush(256);
       expect(h.old.names()).toContain('future-init');
-      await h.migrate(cf01([video]));
+      await h.old.goaway();
+      expect(h.next.requests).toEqual([]);
+      expect(result).toBe('pending');
+      // GOAWAY defers to the pending switch. Losing its source must reject
+      // the init waiter and release that deferral before replacement starts.
+      h.old.transport.close({ closeCode: 0, reason: 'source retired' });
+      await flush(512);
+      expect(result).toBe('rejected');
+      await h.next.accept(ref('catalog'), 300n);
+      await h.next.send(ref('catalog'), cf01([video]));
       await h.next.accept(ref('video'), 400n);
       await h.next.accept(ref('init'), 401n);
       await h.next.send(ref('init'), videoInit());
