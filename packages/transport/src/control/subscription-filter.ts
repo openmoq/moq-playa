@@ -258,15 +258,17 @@ export function encodeSubscriptionFilter(filter: SubscriptionFilter, draftVersio
   if (filter.type === 'AbsoluteRange' && filter.endObject !== undefined) {
     throw new RangeError(`AbsoluteRange endObject has no draft-${draftVersion} SUBSCRIPTION_FILTER form`);
   }
+  // draft-14 §9.7; draft-16/18 §5.1.2: End Group MUST NOT precede Start
+  // Group. Reject before sending a filter that our own decoder would refuse.
+  if (filter.type === 'AbsoluteRange' && filter.endGroup < filter.startGroup) {
+    throw new RangeError(`AbsoluteRange endGroup ${filter.endGroup} < startGroup ${filter.startGroup}`);
+  }
   const filterType = FILTER_TYPE[filter.type];
 
   // draft-18 §5.1.2: vi64 internals; AbsoluteRange carries an End Group DELTA.
   if (isRequestStreamDraft(draftVersion)) {
     let endGroupDelta = 0n;
     if (filter.type === 'AbsoluteRange') {
-      if (filter.endGroup < filter.startGroup) {
-        throw new RangeError(`AbsoluteRange endGroup ${filter.endGroup} < startGroup ${filter.startGroup}`);
-      }
       // The semantic endGroup is ABSOLUTE; the wire carries only the delta, so the
       // absolute end group must itself fit uint64 — otherwise the encoded bytes
       // (Start Group + Delta) would overflow and the receiver would reject them.
