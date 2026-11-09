@@ -836,6 +836,8 @@ export class MoqtPlayer {
     readonly detector: DeliveryLagDetector;
     lastAttemptUs: number | null;
   } | null = null;
+  /** CMAF Header context of the playing CMAF video track, for chunk decode times. */
+  private cmafLagContext: { readonly track: CatalogTrack; readonly context: LocmafTrackContext | null } | null = null;
   private evaluatingBandwidth = false;
   private bufferAbrController: BufferBasedController | null = null;
   private readonly cadenceInputOwners = new WeakMap<object, NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner']>();
@@ -4443,6 +4445,9 @@ export class MoqtPlayer {
           return;
         }
       }
+
+      // Backfill was captured before it was requested; its lag says nothing about the link.
+      if (mediaType === 'video' && !delivery?.backfill && !delivery?.fetched) this.recordCmafVideoDeliveryLag(obj, trackName);
 
       // Keep target data separate until its initialization and splice are
       // ready. The old track remains selected throughout preparation.
@@ -9868,10 +9873,62 @@ export class MoqtPlayer {
 
   private videoLagOwner(): ReturnType<MoqtPlayer['captureVideoMeasurementOwner']> {
     const owner = this.captureVideoMeasurementOwner();
-    if (!owner?.automatic || !this.videoPipeline) return null;
+    if (!owner?.automatic) return null;
+    if (!this.videoPipeline) return this.cmafVideoLagOwner(owner);
     const selected = this._selection.video;
     const track = selected && this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
     return track?.isLive === true && track.packaging === 'loc' && owner.route() ? owner : null;
+  }
+
+  /**
+   * CMAF: the playing video track's measurement owner, when its chunks carry
+   * a decode time the lag detector can use in place of a capture timestamp.
+   */
+  private cmafVideoLagOwner(owner = this.captureVideoMeasurementOwner()): ReturnType<MoqtPlayer['captureVideoMeasurementOwner']> {
+    if (!owner?.automatic || this.videoPipeline || !this.mediaSource) return null;
+    const selected = this._selection.video;
+    const track = selected && this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
+    return track?.isLive === true && this.usesMse(track.packaging) && owner.route() ? owner : null;
+  }
+
+  /**
+   * Feed the delivery-lag detector from a CMAF video chunk. Its first-sample
+   * decode time (tfdt over the CMAF Header timescale) stands in for LOC's
+   * capture timestamp: only the lag's trend is used, so the timeline's origin
+   * is irrelevant. Skipped when the header or the chunk cannot be read (an
+   * in-band header, a split moof/mdat object).
+   */
+  private recordCmafVideoDeliveryLag(obj: MoqtObject, trackName: string): void {
+    if (obj.kind !== 'data' || obj.payload.byteLength === 0) return;
+    const owner = this.cmafVideoLagOwner();
+    const track = this.subscribedTrack('video');
+    if (!owner || track?.name !== trackName || BigInt(obj.trackAlias) !== owner.alias) return;
+    if (this.cmafLagContext?.track !== track) {
+      let context: LocmafTrackContext | null = null;
+      try {
+        const init = this.decodeResolvedInlineInitData(track)
+          ?? (track.initTrack ? this.initSegmentByTrack.get(this.initKey(track, track.initTrack)) : undefined);
+        context = init === undefined ? null : parseLocmafTrackContext(init);
+      } catch { context = null; }
+      this.cmafLagContext = { track, context };
+    }
+    const { context } = this.cmafLagContext;
+    if (context === null || !(context.timescale > 0)) return;
+    let decodeUs: number;
+    try {
+      decodeUs = Number(readCmafChunkSamples(obj.payload, context).effective.baseMediaDecodeTime) * 1_000_000 / context.timescale;
+    } catch { return; }
+    if (!Number.isFinite(decodeUs)) return;
+    this.recordVideoDeliveryLag(obj, { captureTimestamp: BigInt(Math.round(decodeUs)) }, owner, obj.payload.byteLength);
+  }
+
+  /** Whether the delivery-lag detector has enough history to judge the link. */
+  private videoDeliveryLagKnown(): boolean {
+    const state = this.videoDeliveryLag;
+    if (!state) return false;
+    const nowUs = this.clock.now() - state.arrivalOriginUs;
+    try { return Number.isFinite(nowUs) && nowUs >= 0 && state.detector.excessLagUs(nowUs) !== null; }
+    catch { return false; }
   }
 
   private recordVideoDeliveryLag(object: CadenceObject, headers: LocHeaders,
@@ -9982,15 +10039,21 @@ export class MoqtPlayer {
         // bandwidth estimates suppress the downshift.
         effectiveBufferUs = 0;
       } else if (bufferUs < abr.lowThresholdUs) {
-        // Thin but not empty — check if bandwidth sustains.
-        // On fast networks MSE buffers are naturally thin; a thin
-        // buffer with high bandwidth is healthy, not starving.
-        const bwKbps = this.readVideoReceivedRate() ?? 0;
-        const currentTrack = abr.currentTrack;
-        const currentBitrateKbps = currentTrack ? currentTrack.bitrateKbps : 0;
-        effectiveBufferUs = bwKbps > currentBitrateKbps * 1.5
-          ? abr.lowThresholdUs
-          : bufferUs;
+        // Thin but not empty. Near the live edge a thin buffer is the design,
+        // not starvation: it is starving only if the link is falling behind.
+        // Delivery lag says so directly. Without it, fall back to bandwidth —
+        // which, under source-paced delivery, reads the encoding rate and
+        // rarely clears the bar.
+        if (this.videoDeliveryLagKnown()) {
+          effectiveBufferUs = lag ? bufferUs : abr.lowThresholdUs;
+        } else {
+          const bwKbps = this.readVideoReceivedRate() ?? 0;
+          const currentTrack = abr.currentTrack;
+          const currentBitrateKbps = currentTrack ? currentTrack.bitrateKbps : 0;
+          effectiveBufferUs = bwKbps > currentBitrateKbps * 1.5
+            ? abr.lowThresholdUs
+            : bufferUs;
+        }
       } else {
         effectiveBufferUs = bufferUs;
       }

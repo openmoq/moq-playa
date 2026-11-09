@@ -464,6 +464,25 @@ describe('ABR under source-paced live delivery', () => {
       expect(run.stallsAtUs).toEqual([]);
     });
 
+    it('CMAF: a thin low-latency buffer on an ample link does not downshift', async () => {
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(60), bufferAheadUs: LL_BUFFER,
+      });
+      // Formerly v1500 → v800 → v400 within ~4s: the `bw > 1.5 × current`
+      // exemption for thin-but-fed buffers never applies at the live edge.
+      // Delivery lag now shows the link keeping up.
+      expect(run.switches.filter(sw => rungIndex(sw.to) > rungIndex(sw.from))).toEqual([]);
+    });
+
+    it('CMAF: a thin low-latency buffer on an ample link does not ratchet down', async () => {
+      const run = await runScenario({
+        packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(90), bufferAheadUs: LL_BUFFER,
+      });
+      // Formerly ended on v400, the lowest rung, with no stall to justify it.
+      expect(run.stallsAtUs).toEqual([]);
+      expect(rungIndex(run.finalTrack)).toBeLessThanOrEqual(rungIndex(START));
+    });
+
     it('CMAF: a thin buffer still steps down when delivery lag shows the link falling behind', async () => {
       const run = await runScenario({
         packaging: 'cmaf', capacityBps: 1_000_000, durationUs: SECONDS(60), bufferAheadUs: LL_BUFFER,
