@@ -42,6 +42,8 @@ export interface PipelineOptions {
     readonly onEvent: (evt: PlaybackEvent) => void;
     /** Optional recovery controller for escalation decisions. */
     readonly recovery?: RecoveryController;
+    /** Prospective downstream cushion for shared-clock audio admission only. */
+    readonly getAudioPlayoutDelayUs?: () => number;
     /** Video-only mode: set video reference from first CaptureTimestamp. */
     readonly videoOnly?: boolean;
     /** Live stream: enables bounded release + backlog shedding. Default: true. */
@@ -62,6 +64,7 @@ export class PlaybackPipeline {
     private readonly onCommand: (cmd: DecoderCommand) => void;
     private readonly onEvent: (evt: PlaybackEvent) => void;
     private readonly recovery: RecoveryController | undefined;
+    private readonly getAudioPlayoutDelayUs: (() => number) | undefined;
 
     private readonly buffer: JitterBuffer;
     private readonly gapDetector: GapDetector;
@@ -177,6 +180,11 @@ export class PlaybackPipeline {
     private _videoOnly: boolean;
 
     constructor(opts: PipelineOptions) {
+        const getAudioPlayoutDelayUs = opts.getAudioPlayoutDelayUs;
+        if (getAudioPlayoutDelayUs !== undefined && typeof getAudioPlayoutDelayUs !== 'function') {
+            throw new TypeError('Expected an audio playout delay query');
+        }
+        this.getAudioPlayoutDelayUs = getAudioPlayoutDelayUs;
         this.mediaType = opts.mediaType;
         this.clock = opts.clock;
         this.sync = opts.sync;
@@ -976,6 +984,7 @@ export class PlaybackPipeline {
         //    Audio-master: first audio sample sets the reference (ONCE).
         //    Video-only: first video CaptureTimestamp sets the reference.
         const videoTimingSource = this.videoTimingSource;
+        const audioTimingSource = this.audioTimingSource;
         const captureTimestamp = headers.captureTimestamp;
         const originalTimeline = this.mediaType === 'video'
             ? videoTimingSource === this.sync : this.audioTimingSource === this.sync;
@@ -1006,9 +1015,28 @@ export class PlaybackPipeline {
 
         let renderTimeUs: number;
         if (headers.captureTimestamp !== undefined) {
+            let outputDelayUs = 0;
+            if (this.mediaType === 'audio' && originalTimeline && this.getAudioPlayoutDelayUs) {
+                try {
+                    outputDelayUs = this.getAudioPlayoutDelayUs();
+                    if (!Number.isFinite(outputDelayUs) || outputDelayUs < 0) throw new RangeError('Invalid audio playout delay');
+                } catch {
+                    inputs?.report(input, revision === this.playbackRevision ? 'decoder policy' : 'decoder reset');
+                    return;
+                }
+                if (revision !== this.playbackRevision || audioTimingSource !== this.audioTimingSource) {
+                    inputs?.report(input, 'decoder reset'); return;
+                }
+            }
             const timing = this.mediaType === 'video'
                 ? videoTimingSource.computeVideoRenderTime(headers.captureTimestamp)
-                : this.audioTimingSource.computeAudioRenderTime(headers.captureTimestamp);
+                : originalTimeline && this.getAudioPlayoutDelayUs
+                    ? this.sync.computeAudioRenderTime(headers.captureTimestamp, outputDelayUs)
+                    : this.audioTimingSource.computeAudioRenderTime(headers.captureTimestamp);
+            if (this.mediaType === 'audio' && originalTimeline && this.getAudioPlayoutDelayUs
+                && (revision !== this.playbackRevision || audioTimingSource !== this.audioTimingSource)) {
+                inputs?.report(input, 'decoder reset'); return;
+            }
 
             if (timing === null) {
                 // An unavailable mapped schedule cannot become speculative "play now".

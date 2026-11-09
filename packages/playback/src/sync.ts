@@ -313,9 +313,14 @@ export class SyncController {
      * Compute render timing for an audio sample.
      *
      * @param captureTimestampUs CaptureTimestamp in microseconds
+     * @param outputDelayUs Downstream delay used only for late admission.
+     * Returned render time and offset stay nominal; callers add the delay once.
      */
-    computeAudioRenderTime(captureTimestampUs: bigint): RenderTiming | null {
-        return this.computeRenderTime(captureTimestampUs);
+    computeAudioRenderTime(captureTimestampUs: bigint, outputDelayUs = 0): RenderTiming | null {
+        if (!Number.isFinite(outputDelayUs) || outputDelayUs < 0) {
+            throw new RangeError('Audio output delay must be finite and nonnegative');
+        }
+        return this.computeRenderTime(captureTimestampUs, outputDelayUs);
     }
 
     /**
@@ -457,7 +462,7 @@ export class SyncController {
 
     // ─── Internal ───────────────────────────────────────────────────
 
-    private computeRenderTime(captureTimestampUs: bigint): RenderTiming | null {
+    private computeRenderTime(captureTimestampUs: bigint, outputDelayUs = 0): RenderTiming | null {
         if (this.localBaselineUs === undefined || this.captureBaselineUs === undefined) {
             return null;
         }
@@ -470,7 +475,7 @@ export class SyncController {
             Number(captureTimestampUs - this.captureBaselineUs);
 
         const offsetUs = renderTimeUs - now;
-        const shouldDrop = offsetUs < -this.dropThresholdUs;
+        const shouldDrop = offsetUs + outputDelayUs < -this.dropThresholdUs;
 
         return { renderTimeUs, offsetUs, shouldDrop };
     }

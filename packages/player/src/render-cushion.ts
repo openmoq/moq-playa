@@ -84,6 +84,11 @@ export class RenderCushionSmoother {
     return this._currentUs ?? this.floorUs;
   }
 
+  /** Evaluate the admission-time target without advancing scheduling state. */
+  preview(rawAdaptiveUs: number | undefined): number {
+    return this.valueAt(this.clock.now(), rawAdaptiveUs);
+  }
+
   /**
    * Advance toward `clamp(max(rawAdaptiveUs, floor), floor, max)` at the
    * slew limits. The FIRST call snaps to the clamped target — no frames are
@@ -92,22 +97,21 @@ export class RenderCushionSmoother {
    */
   update(rawAdaptiveUs: number | undefined): number {
     const nowUs = this.clock.now();
+    this._currentUs = this.valueAt(nowUs, rawAdaptiveUs);
+    this.lastUpdateUs = nowUs;
+    return this._currentUs;
+  }
+
+  private valueAt(nowUs: number, rawAdaptiveUs: number | undefined): number {
     const targetUs = Math.min(Math.max(rawAdaptiveUs ?? 0, this.floorUs), this.maxUs);
 
-    if (this._currentUs === null) {
-      this._currentUs = targetUs;
-      this.lastUpdateUs = nowUs;
-      return this._currentUs;
-    }
+    if (this._currentUs === null) return targetUs;
 
     const dtSec = Math.max(0, (nowUs - this.lastUpdateUs) / 1_000_000);
-    this.lastUpdateUs = nowUs;
 
     if (targetUs > this._currentUs) {
-      this._currentUs = Math.min(targetUs, this._currentUs + this.riseUsPerSec * dtSec);
-    } else if (targetUs < this._currentUs) {
-      this._currentUs = Math.max(targetUs, this._currentUs - this.fallUsPerSec * dtSec);
+      return Math.min(targetUs, this._currentUs + this.riseUsPerSec * dtSec);
     }
-    return this._currentUs;
+    return Math.max(targetUs, this._currentUs - this.fallUsPerSec * dtSec);
   }
 }

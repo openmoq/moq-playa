@@ -336,6 +336,7 @@ export function createPipelines(
       onCommand: (cmd) => callbacks.onCommand(cmd),
       onEvent: (evt) => callbacks.onEvent('audio', evt),
       recovery: recoveryController,
+      getAudioPlayoutDelayUs: () => renderCushion?.preview(videoPipeline?.effectiveGapTimeoutUs) ?? cushionFloorUs,
     });
   }
 
