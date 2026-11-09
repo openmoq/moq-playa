@@ -106,6 +106,11 @@ export class PlaybackPipeline {
     /** Timestamp when we first started waiting for active group completion. */
     private activeGroupWaitStartUs: number | null = null;
 
+    /** One missing LOC dependency; unrelated arrivals cannot renew its deadline. */
+    private objectWait: { groupId: bigint; objectId: bigint; sinceUs: number } | undefined;
+    /** Earliest locally discarded Object, retained only for queued/active Groups. */
+    private readonly locallyDroppedObjects = new Map<bigint, bigint>();
+
     /**
  * Minimum group ID accepted by pushObject().
  * Set after SKIP_FORWARD to reject stale objects from pre-skip groups
@@ -374,6 +379,7 @@ export class PlaybackPipeline {
             if (obj.status === ObjectStatus.END_OF_GROUP) {
                 this.gapDetector.observeEndOfGroup(obj.groupId);
                 this.endedGroups.add(obj.groupId as bigint);
+                if (obj.groupId === this.lastConsumedGroupId) this.activeGroupWaitStartUs = null;
             } else if (obj.status === ObjectStatus.END_OF_TRACK) {
                 this.gapDetector.observeEndOfTrack();
             }
@@ -404,26 +410,19 @@ export class PlaybackPipeline {
             // Buffer full — try priority-aware eviction (§7)
             if (inputs) discarded = [];
             refused = !this.tryEvictAndInsert(obj, headers, inputs, token, discarded);
-            if (refused && this.recovery) {
-                this.onEvent({
-                    type: 'recovery',
-                    action: this.recovery.evaluate({ type: 'buffer_overflow' }),
-                });
-            }
         } else {
             refused = true;
-            if (this.recovery) {
-                // No priority info, can't evict — notify recovery
-                this.onEvent({
-                    type: 'recovery',
-                    action: this.recovery.evaluate({ type: 'buffer_overflow' }),
-                });
-            }
         }
 
         if (!refused && delivery?.backfill && this.headerMap.has(key)) {
             (this.backfillObjects ??= new Set()).add(key);
         }
+
+        if (refused) this.rememberDroppedObject(obj);
+        else if (this.locallyDroppedObjects.get(obj.groupId) === obj.objectId) {
+            this.locallyDroppedObjects.delete(obj.groupId);
+        }
+        this.pruneDroppedObjects();
 
         // Interarrival jitter uses transit differences, so the timestamp epoch
         // cancels out. Media time is suitable here, but not for latency/catch-up.
@@ -436,7 +435,15 @@ export class PlaybackPipeline {
         // Observe group for gap timeout tracking
         this.gapDetector.observeGroup(obj.groupId);
         inputs?.reportAll(discarded, 'buffer eviction');
-        if (refused) inputs?.report(token, 'buffer full');
+        if (refused) {
+            try {
+                if (this.recovery) {
+                    const revision = this.playbackRevision;
+                    const action = this.recovery.evaluate({ type: 'buffer_overflow' });
+                    if (revision === this.playbackRevision) this.onEvent({ type: 'recovery', action });
+                }
+            } finally { inputs?.report(token, 'buffer full'); }
+        }
     }
 
     /**
@@ -487,6 +494,8 @@ export class PlaybackPipeline {
         this.lastKeyframeWaitingGroupId = -1n;
         this._throttled = false;
         this.activeGroupWaitStartUs = null;
+        this.objectWait = undefined;
+        this.locallyDroppedObjects.clear();
         this.gapDetector.reset();
         // Force decoder back to NEEDS_KEYFRAME so partial-group deltas
         // from a mid-stream subscription are skipped, not decoded.
@@ -512,6 +521,8 @@ export class PlaybackPipeline {
         this.trackEndHolds = 0;
         this.endedGroups.clear();
         this.activeGroupWaitStartUs = null;
+        this.objectWait = undefined;
+        this.locallyDroppedObjects.clear();
         this.gapDetector.reset();
         this.adaptiveTolerance?.reset();
         const decision = this.decoderState.notifyGap();
@@ -543,16 +554,21 @@ export class PlaybackPipeline {
         // would produce artifacts.
         if (this.resetPending && this.buffer.size > 0) {
             const top = this.buffer.peek()!;
-            // Only accept a group that starts with objectId 0 (keyframe).
-            // Stale mid-group objects from the old subscription are
-            // discarded by extracting + dropping them.
             if (top.objectId !== 0n) {
-                this.buffer.extract();
-                this.decrementGroupCount(top.groupId);
-                const key = `${top.groupId}:${top.objectId}`; this.forgetHeaders(key);
-                this.inputState?.report(this.inputState.take(key), 'awaiting keyframe');
-                return; // wait for a keyframe-starting group
+                if (this.mediaType === 'audio') {
+                    this.buffer.extract();
+                    this.decrementGroupCount(top.groupId);
+                    const key = `${top.groupId}:${top.objectId}`; this.forgetHeaders(key);
+                    this.inputState?.report(this.inputState.take(key), 'awaiting keyframe');
+                    return;
+                }
+                // LOC §4.3 orders Objects across subgroup streams. A delta
+                // arriving before Object0 does not establish that RAP's loss.
+                const wait = this.waitForVideoObject(top, 0n, revision);
+                if (wait === 'expired') this.abandonVideoGroup(top.groupId);
+                return;
             }
+            this.objectWait = undefined;
             this.lastConsumedGroupId = top.groupId - 1n;
             this.endedGroups.add(this.lastConsumedGroupId);
             this.resetPending = false;
@@ -561,6 +577,7 @@ export class PlaybackPipeline {
         // 1. Evaluate gap state
         const availableGroupIds = [...this.bufferedGroupCounts.keys()];
         const gapDecision = this.gapDetector.evaluate(this.lastConsumedGroupId, availableGroupIds);
+        if (revision !== this.playbackRevision) return;
 
         // 2. Handle gap decision
         if (gapDecision.action === GapAction.TRACK_ENDED && this.buffer.size === 0) {
@@ -569,6 +586,7 @@ export class PlaybackPipeline {
                 this._trackEnded = true;
                 const decision = this.decoderState.notifyTrackEnded();
                 this.emitFsmDecision(decision);
+                if (revision !== this.playbackRevision) return;
                 this.onEvent({ type: 'track_ended' });
             }
             return;
@@ -588,6 +606,7 @@ export class PlaybackPipeline {
                     toGroupId: target,
                     reason: 'gap timeout',
                 } as PlaybackEvent);
+                if (revision !== this.playbackRevision) return;
             }
             // Clean up ended-group tracking for skipped groups
             for (const gid of this.endedGroups) {
@@ -599,11 +618,14 @@ export class PlaybackPipeline {
                 fromGroupId: this.lastConsumedGroupId,
                 toGroupId: target,
             });
+            if (revision !== this.playbackRevision) return;
 
             // Notify recovery controller for potential escalation
             if (this.recovery) {
                 const action = this.recovery.evaluate({ type: 'gap', groupId: target });
+                if (revision !== this.playbackRevision) return;
                 this.onEvent({ type: 'recovery', action });
+                if (revision !== this.playbackRevision) return;
             }
 
             // Reject future pushObject() calls for groups before the target
@@ -622,6 +644,7 @@ export class PlaybackPipeline {
             // Notify decoder of gap
             const decision = this.decoderState.notifyGap();
             this.emitFsmDecision(decision);
+            if (revision !== this.playbackRevision) return;
 
             // Advance consumed position so we start from the target group
             this.lastConsumedGroupId = target - 1n;
@@ -654,8 +677,12 @@ export class PlaybackPipeline {
         // is present but N is incomplete — the gap detector won't fire because
         // the next group IS available.
         if (this.mediaType === 'video' && this.activeGroupWaitStartUs !== null) {
-            const elapsed = this.clock.now() - this.activeGroupWaitStartUs;
-            if (elapsed > this.gapDetector.gapTimeoutUs) {
+            const started = this.activeGroupWaitStartUs, groupId = this.lastConsumedGroupId;
+            const front = this.buffer.peek(), now = this.clock.now();
+            if (revision !== this.playbackRevision) return;
+            if (started === this.activeGroupWaitStartUs && groupId === this.lastConsumedGroupId
+                && front === this.buffer.peek() && !this.endedGroups.has(groupId)
+                && now - started > this.gapDetector.gapTimeoutUs) {
                 const nextGroupId = this.lastConsumedGroupId + 1n;
                 this.onEvent({
                     type: 'partial_group_abandoned',
@@ -663,9 +690,11 @@ export class PlaybackPipeline {
                     toGroupId: nextGroupId,
                     reason: 'intra-group timeout',
                 } as PlaybackEvent);
+                if (revision !== this.playbackRevision) return;
                 this.endedGroups.add(this.lastConsumedGroupId);
                 const decision = this.decoderState.notifyGap();
                 this.emitFsmDecision(decision);
+                if (revision !== this.playbackRevision) return;
                 this.activeGroupWaitStartUs = null;
             }
         }
@@ -674,8 +703,8 @@ export class PlaybackPipeline {
         // Within a group, objects MUST be contiguous (0, 1, 2, ...) before
         // decoding. A missing objectId means a frame the decoder needs for
         // reference is absent — decoding later objects produces artifacts.
-        // Wait for the missing object (QUIC delivers in-order per stream)
-        // or let the gap detector timeout and skip the group.
+        // Cross-subgroup arrival order is not decode order (LOC §4.3).
+        // Wait under the existing gap policy before abandoning a dependency.
         let released = 0;
         const budget = this.maxReleasePerTick;
 
@@ -703,43 +732,31 @@ export class PlaybackPipeline {
             if (top.groupId > this.lastConsumedGroupId && this.lastConsumedGroupId >= 0n) {
                 if (this.mediaType === 'video' && !this.endedGroups.has(this.lastConsumedGroupId)) {
                     if (this.activeGroupWaitStartUs === null) {
-                        this.activeGroupWaitStartUs = this.clock.now();
+                        const groupId = this.lastConsumedGroupId, now = this.clock.now();
+                        if (revision !== this.playbackRevision || groupId !== this.lastConsumedGroupId
+                            || this.buffer.peek() !== top || this.endedGroups.has(groupId)) return;
+                        this.activeGroupWaitStartUs = now;
                     }
                     break;
                 }
+            }
+
+            const expectedObjectId = top.groupId > this.lastConsumedGroupId
+                ? 0n
+                : this.nextExpectedObjectId;
+
+            // A later LOC Object alone does not prove its predecessor lost.
+            // Audio retains its independent per-Object release policy.
+            if (this.mediaType === 'video' && top.objectId > expectedObjectId) {
+                const wait = this.waitForVideoObject(top, expectedObjectId, revision);
+                if (wait === 'expired') this.abandonVideoGroup(top.groupId);
+                break;
+            }
+            this.objectWait = undefined;
+            if (top.groupId > this.lastConsumedGroupId) {
                 this.activeGroupWaitStartUs = null;
                 this.endedGroups.delete(this.lastConsumedGroupId);
-            }
-
-            // New group: reset objectId contiguity tracker
-            if (top.groupId > this.lastConsumedGroupId) {
-                this.nextExpectedObjectId = 0n;
-            }
-
-            // Intra-group contiguity (video only): if object N is missing
-            // but N+1 is available, skip the rest of this group — decoding
-            // N+1 without N's reference produces artifacts. Audio chunks
-            // are independently decodable (LOC §4.1) so gaps are harmless.
-            if (this.mediaType === 'video' && top.objectId > this.nextExpectedObjectId) {
-                // Discard remaining objects in this group — they can't
-                // decode correctly without the missing reference.
-                const skipGroupId = top.groupId;
-                const inputs = this.inputState, dropped: object[] | undefined = inputs ? [] : undefined;
-                while (this.buffer.size > 0) {
-                    const peek = this.buffer.peek();
-                    if (!peek || peek.groupId !== skipGroupId) break;
-                    this.buffer.extract();
-                    const key = `${peek.groupId}:${peek.objectId}`; this.forgetHeaders(key);
-                    const input = inputs?.take(key); if (input) dropped?.push(input);
-                    this.decrementGroupCount(skipGroupId);
-                }
-                this.lastConsumedGroupId = skipGroupId;
-                this.nextExpectedObjectId = 0n;
-                // Let decoder know it needs a fresh keyframe
-                const decision = this.decoderState.notifyGap();
-                this.emitFsmDecision(decision);
-                inputs?.reportAll(dropped, 'skipped');
-                break;
+                this.nextExpectedObjectId = expectedObjectId;
             }
 
             const obj = this.buffer.extract()!;
@@ -757,10 +774,67 @@ export class PlaybackPipeline {
             if (obj.groupId > this.lastConsumedGroupId) {
                 this.lastConsumedGroupId = obj.groupId;
             }
+            this.pruneDroppedObjects();
         }
     }
 
     // ─── Internal ───────────────────────────────────────────────────
+
+    private waitForVideoObject(top: MoqtObject, objectId: bigint, revision: number): 'waiting' | 'expired' | 'changed' {
+        if (this.locallyDroppedObjects.get(top.groupId) === objectId) return 'expired';
+        const now = this.clock.now();
+        // An injected clock can reenter intake/reset. Do not attach old wait
+        // ownership to a new playback lifetime or a newly arrived predecessor.
+        if (revision !== this.playbackRevision || this.buffer.peek() !== top) return 'changed';
+        const wait = this.objectWait;
+        if (!wait || wait.groupId !== top.groupId || wait.objectId !== objectId) {
+            this.objectWait = { groupId: top.groupId, objectId, sinceUs: now };
+        }
+        return now - this.objectWait!.sinceUs >= this.gapDetector.gapTimeoutUs ? 'expired' : 'waiting';
+    }
+
+    private abandonVideoGroup(groupId: bigint): void {
+        // Publish the floor before reset/discard observers can reenter. A late
+        // RAP cannot resurrect a Group whose dependants were abandoned.
+        if (this.minAcceptGroupId <= groupId) this.minAcceptGroupId = groupId + 1n;
+        this.objectWait = undefined;
+        this.locallyDroppedObjects.delete(groupId);
+        const inputs = this.inputState, dropped: object[] | undefined = inputs ? [] : undefined;
+        while (this.buffer.peek()?.groupId === groupId) {
+            const obj = this.buffer.extract()!;
+            const key = `${obj.groupId}:${obj.objectId}`;
+            this.forgetHeaders(key);
+            const input = inputs?.take(key); if (input) dropped?.push(input);
+            this.decrementGroupCount(groupId);
+        }
+        this.lastConsumedGroupId = groupId;
+        this.nextExpectedObjectId = 0n;
+        // Its local lifetime is over; the next RAP must not wait again for
+        // a wire EOG from the Group we deliberately abandoned.
+        this.endedGroups.add(groupId);
+        this.activeGroupWaitStartUs = null;
+        this.pruneDroppedObjects();
+        const decision = this.decoderState.notifyGap();
+        try { this.emitFsmDecision(decision); }
+        finally { inputs?.reportAll(dropped, 'skipped'); }
+    }
+
+    private rememberDroppedObject(obj: MoqtObjectData): void {
+        if (this.mediaType !== 'video'
+            || (!this.bufferedGroupCounts.has(obj.groupId) && obj.groupId !== this.lastConsumedGroupId)) return;
+        const previous = this.locallyDroppedObjects.get(obj.groupId);
+        if (previous === undefined || obj.objectId < previous) this.locallyDroppedObjects.set(obj.groupId, obj.objectId);
+    }
+
+    private pruneDroppedObjects(): void {
+        for (const groupId of this.locallyDroppedObjects.keys()) {
+            if (groupId < this.minAcceptGroupId
+                || (!this.bufferedGroupCounts.has(groupId) && groupId !== this.lastConsumedGroupId)) {
+                this.locallyDroppedObjects.delete(groupId);
+            }
+        }
+    }
+
 
     /**
  * Drop oldest whole groups when backlog exceeds maxBacklogGroups.
@@ -793,6 +867,8 @@ export class PlaybackPipeline {
             this.lastConsumedGroupId = lastShed;
         }
         this.minAcceptGroupId = lastShed + 1n;
+        this.objectWait = undefined;
+        this.pruneDroppedObjects();
 
         // Decoder needs a fresh keyframe after shedding
         const decision = this.decoderState.notifyGap();
@@ -851,6 +927,7 @@ export class PlaybackPipeline {
             inputs?.remember(key, token);
             const count = this.bufferedGroupCounts.get(obj.groupId) ?? 0;
             this.bufferedGroupCounts.set(obj.groupId, count + 1);
+            this.rememberDroppedObject(evicted);
             return true;
         } else {
             // Evicted is equally or more important — put it back, drop incoming
@@ -1070,6 +1147,7 @@ export class PlaybackPipeline {
     }
 
     private discardBefore(groupId: bigint): void {
+        this.objectWait = undefined;
         const inputs = this.inputState, dropped: object[] | undefined = inputs ? [] : undefined;
         // Remove from buffer
         this.buffer.discardBefore(groupId);
@@ -1090,6 +1168,7 @@ export class PlaybackPipeline {
                 const input = inputs?.take(key); if (input) dropped?.push(input);
             }
         }
+        this.pruneDroppedObjects();
         inputs?.reportAll(dropped, 'skipped');
     }
 

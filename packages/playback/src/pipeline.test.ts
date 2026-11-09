@@ -1807,31 +1807,25 @@ describe('PlaybackPipeline', () => {
             expect([...ts].sort((a, b) => Number(a - b))).toEqual(ts);
         });
 
-        it('DOCUMENTED LIMITATION: a tick between live tail and fetched head discards one tail object per tick', () => {
-            // The reset-sync path (initial join / pause-resume) extracts and
-            // drops the buffer top when it is not a keyframe, one object per
-            // tick, until a keyframe-starting group appears. Under warm start
-            // this means live-tail objects racing ahead of the FETCH head can
-            // be discarded, leaving a gap the existing gap-timeout recovery
-            // must skip. This test pins that exact behavior so any future
-            // keyframe-wait relaxation shows up as a deliberate change.
-            const clock = new MockClock();
-            clock.set(5_000_000);
+        it('retains live tail across ticks until the fetched head establishes decode order', () => {
+            const clock = new MockClock(); clock.set(5_000_000);
             const { pipeline, commands, sync } = createPipeline({ mediaType: 'video', clock });
             sync.setAudioReference(1_000_000_000n);
-
-            pipeline.pushObject(makeData(0, 2), videoHeaders(1_000_066_000n, false));
-            pipeline.pushObject(makeData(0, 3), videoHeaders(1_000_100_000n, false));
-            pipeline.tick(); // discards object 2 (top, not a keyframe)
-
+            const tail2 = {}, tail3 = {}, discarded = vi.fn(); pipeline.inputObserver = discarded;
+            pipeline.pushObject(makeData(0, 2), videoHeaders(1_000_066_000n, false), tail2);
+            pipeline.pushObject(makeData(0, 3), videoHeaders(1_000_100_000n, false), tail3);
+            pipeline.tick();
+            expect(pipeline.bufferedGroupCount).toBe(1);
+            expect(commands).toEqual([]); expect(discarded).not.toHaveBeenCalled();
             pipeline.pushObject(makeData(0, 0), videoHeaders(1_000_000_000n, true, new Uint8Array([0x01, 0x64])));
             pipeline.pushObject(makeData(0, 1), videoHeaders(1_000_033_000n, false));
             pipeline.tick();
-
-            // Head decodes; object 3 is stranded behind the discarded 2 (gap
-            // recovery, not this test's scope, would eventually skip forward).
-            const decoded = commands.filter((c) => c.type === 'decode_video');
-            expect(decoded.length).toBe(2);
+            const decoded = commands.filter(c => c.type === 'decode_video');
+            expect(decoded).toHaveLength(4);
+            expect(decoded.map(c => c.chunk.timestamp)).toEqual([1_000_000_000, 1_000_033_000, 1_000_066_000, 1_000_100_000]);
+            expect(decoded[2]?.inputToken).toBe(tail2); expect(decoded[3]?.inputToken).toBe(tail3);
+            expect(commands.filter(c => c.type === 'reset')).toEqual([]);
+            expect(discarded).not.toHaveBeenCalled(); expect(pipeline.bufferedGroupCount).toBe(0);
         });
     });
 
@@ -2223,9 +2217,10 @@ describe('backfill timing on the shared playback clock', () => {
         if (action === 'reset') pipeline.reset();
         else {
             pipeline.pushObject(makeData(0, 1, undefined, 0, 1), videoHeaders(999_533_333n, false));
-            pipeline.tick(); // A nonzero object without its anchor is discarded normally.
+            // Keep the replacement queued until a higher-priority ordinary
+            // Object0 can re-admit before abandonment seals this Group.
         }
-        pipeline.pushObject(makeData(0, 0), videoHeaders(999_500_000n, true, new Uint8Array([1])));
+        pipeline.pushObject(makeData(0, 0, undefined, 0, 0), videoHeaders(999_500_000n, true, new Uint8Array([1])));
         pipeline.tick();
         expect(commands.filter(command => command.type === 'decode_video')).toHaveLength(1);
         expect(sync.videoJoinOffsetUs).toBe(516_000);

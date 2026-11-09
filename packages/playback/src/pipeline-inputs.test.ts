@@ -3,7 +3,8 @@ import { PlaybackPipeline } from './pipeline.js';
 import { SyncController } from './sync.js';
 import { varint } from '@openmoq/transport';
 function fixture(mediaType: 'video' | 'audio' = 'audio', maxBufferDepth = 100) {
-  const clock = { now: () => 1_000_000 }, commands: Array<{ type: string; inputToken?: object }> = [];
+  let nowUs = 1_000_000;
+  const clock = { now: () => nowUs }, commands: Array<{ type: string; inputToken?: object }> = [];
   const pipeline = new PlaybackPipeline({ mediaType, clock,
     config: { gapTimeoutUs: 200_000, driftThresholdUs: 500_000, maxBufferDepth },
     sync: new SyncController({ clock, driftThresholdUs: 500_000 }),
@@ -11,7 +12,7 @@ function fixture(mediaType: 'video' | 'audio' = 'audio', maxBufferDepth = 100) {
   pipeline.configure(Uint8Array.of(1)); pipeline.inputObserver = () => {};
   const obj = (id: number, group = 0, priority = 128) => ({ kind: 'data' as const, trackAlias: varint(1), groupId: varint(group), subgroupId: varint(group),
     objectId: varint(id), publisherPriority: priority, payload: Uint8Array.of(1), extensions: undefined });
-  return { pipeline, commands, obj };
+  return { pipeline, commands, obj, advance: () => { nowUs += 300_000; } };
 }
 describe('LOC input identity carried by the admitted pipeline entry', () => {
   it('carries the accepted input identity with the decode command', () => {
@@ -84,20 +85,21 @@ it('contains discard-listener rejection while preserving the original admitted c
   await Promise.resolve(); expect(f.commands.find(command => command.type === 'decode_audio')?.inputToken).toBe(input);
 });
 
-it('removes admission metadata for a pre-keyframe drop so a later valid copy is not suppressed', () => {
-  const f = fixture('video'), rejected = {}, replayed = {}, observer = vi.fn(); f.pipeline.inputObserver = observer;
-  f.pipeline.pushObject(f.obj(1), { captureTimestamp: 1_020_000n }, rejected); f.pipeline.tick();
-  expect(observer).toHaveBeenCalledExactlyOnceWith(rejected, 'awaiting keyframe');
-  f.pipeline.pushObject(f.obj(0), { captureTimestamp: 1_000_000n }, {});
+it('removes admission metadata when a waiting startup Object is evicted so a later valid copy is not suppressed', () => {
+  const f = fixture('video', 1), rejected = {}, replayed = {}, observer = vi.fn(); f.pipeline.inputObserver = observer;
+  f.pipeline.pushObject(f.obj(1, 0, 200), { captureTimestamp: 1_020_000n }, rejected); f.pipeline.tick();
+  expect(observer).not.toHaveBeenCalled();
+  f.pipeline.pushObject(f.obj(0, 0, 10), { captureTimestamp: 1_000_000n }, {});
+  expect(observer).toHaveBeenCalledExactlyOnceWith(rejected, 'buffer eviction'); f.pipeline.tick();
   f.pipeline.pushObject(f.obj(1), { captureTimestamp: 1_020_000n }, replayed); f.pipeline.tick();
   const decoded = f.commands.filter(command => command.type === 'decode_video');
   expect(decoded).toHaveLength(2); expect(decoded[1]?.inputToken).toBe(replayed);
 });
 
-it('does not retain stale header admission after dropping a pre-keyframe Object without diagnostics', () => {
-  const f = fixture('video'); f.pipeline.inputObserver = undefined;
-  f.pipeline.pushObject(f.obj(1), { captureTimestamp: 1_020_000n }); f.pipeline.tick();
-  f.pipeline.pushObject(f.obj(0), { captureTimestamp: 1_000_000n });
+it('does not retain stale header admission after evicting a waiting startup Object without diagnostics', () => {
+  const f = fixture('video', 1); f.pipeline.inputObserver = undefined;
+  f.pipeline.pushObject(f.obj(1, 0, 200), { captureTimestamp: 1_020_000n }); f.pipeline.tick();
+  f.pipeline.pushObject(f.obj(0, 0, 10), { captureTimestamp: 1_000_000n }); f.pipeline.tick();
   f.pipeline.pushObject(f.obj(1), { captureTimestamp: 1_020_000n }); f.pipeline.tick();
   expect(f.commands.filter(command => command.type === 'decode_video')).toHaveLength(2);
 });
@@ -114,6 +116,7 @@ it('reports the actual buffered suffix discarded for a missing video dependency'
   const f = fixture('video'), missingSuffix = {}, observer = vi.fn(); f.pipeline.inputObserver = observer;
   f.pipeline.pushObject(f.obj(0), { captureTimestamp: 1_000_000n }, {});
   f.pipeline.pushObject(f.obj(2), { captureTimestamp: 1_040_000n }, missingSuffix); f.pipeline.tick();
+  expect(observer).not.toHaveBeenCalled(); f.advance(); f.pipeline.tick();
   expect(observer).toHaveBeenCalledExactlyOnceWith(missingSuffix, 'skipped');
   expect(f.commands.filter(command => command.type === 'decode_video')).toHaveLength(1);
 });
