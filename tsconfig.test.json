@@ -17,6 +17,7 @@
   // `*.test.ts` corpus predates any typecheck gate and does not compile clean
   // under these options; widening this include is a separate cleanup.
   "include": [
+    "packages/browser/src/audio-output-timing-consumed-match.test.ts",
     "packages/browser/src/mse-crossed-hole.test.ts",
     "packages/playback/src/pipeline-video-reorder.test.ts",
     "packages/playback/src/pipeline-group-wait-clock.test.ts",

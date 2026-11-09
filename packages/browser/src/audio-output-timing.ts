@@ -83,13 +83,12 @@ export class AudioOutputTiming {
         this.lastOwner = owner;
         return { renderTimeUs: matched.renderTimeUs, input: matched.input };
       }
-      // A match on an input already consumed is only trusted for the input the
-      // previous output matched by timestamp (one chunk can yield several
-      // outputs). Any other is a stale
-      // collision: Chrome stamps outputs from frame counts, so after a gap in
-      // input timestamps an output can land exactly on an earlier input. Use
-      // the submission order instead, and claim no identity.
-      if (owner === this.lastOwner || this.pending.length === 0) {
+      // Common timing does not require a unique input: priming can move the
+      // first output inside several unknown-duration spans that agree on time.
+      // The agreed interval must still contain a pending submission; ambiguity
+      // alone cannot make an already-consumed schedule current again.
+      // Repeated outputs from the last matched input still belong to it.
+      if (matched.pendingInterval === true || owner === this.lastOwner || this.pending.length === 0) {
         return { renderTimeUs: matched.renderTimeUs, input: matched.input };
       }
       const stale = this.takePending(timestamp);
@@ -106,8 +105,13 @@ export class AudioOutputTiming {
       let best = Infinity;
       this.pending.forEach((entry, i) => {
         const distance = Math.abs(entry.timestamp - timestamp);
-        if (entry.duration !== null && distance < entry.duration && distance < best) { best = distance; index = i; }
+        if (distance < best) { best = distance; index = i; }
       });
+      // Select the timestamp before testing its span. Rounded durations can
+      // differ for equal timestamps; a longer later span must not skip the
+      // earlier submission when the decoder advances its own sample clock.
+      const nearest = this.pending[index];
+      if (!nearest || nearest.duration === null || best >= nearest.duration) index = -1;
     }
     if (index < 0) index = this.pending.findIndex(entry => entry.renderTimeUs !== null);
     if (index < 0) { this.pending.length = 0; return; }
@@ -119,7 +123,7 @@ export class AudioOutputTiming {
     return entry;
   }
 
-  private match(timestamp: number): { renderTimeUs: number | null; input: AudioTimingInput | null } {
+  private match(timestamp: number): { renderTimeUs: number | null; input: AudioTimingInput | null; pendingInterval?: boolean } {
     const canTrim = !this.outputSeen || !this.initialPrimingOnly;
     // The native callback proves positive output, even when association is refused.
     this.outputSeen = true;
@@ -131,15 +135,17 @@ export class AudioOutputTiming {
         input: input && !input.ambiguous ? input : null };
     }
     let matched: AudioTimingInput | null = null, count = 0, commonTime: number | null | undefined;
+    let pendingInterval = false;
     for (const input of this.inputs.values()) {
       const contains = timestamp >= input.timestamp && (input.duration === null || timestamp < input.timestamp + input.duration);
       if (!contains) continue;
       count++; matched = input;
+      if (!pendingInterval) pendingInterval = this.pending.some(entry => entry.timestamp === input.timestamp);
       const time = input.renderTimeUs === null ? null : input.renderTimeUs + (timestamp - input.timestamp);
       commonTime = commonTime === undefined ? time : commonTime === time ? commonTime : null;
     }
     return { renderTimeUs: commonTime !== undefined && commonTime !== null && Number.isFinite(commonTime) ? commonTime : null,
-      input: count === 1 && matched && !matched.ambiguous ? matched : null };
+      input: count === 1 && matched && !matched.ambiguous ? matched : null, pendingInterval };
   }
 
   clear(): void {

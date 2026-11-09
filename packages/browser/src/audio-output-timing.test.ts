@@ -81,6 +81,30 @@ describe('AudioDecoder timestamp ownership', () => {
 describe('AudioDecoder render-time fallback to submission order', () => {
   const FRAME_US = 21_333; // 1024 samples at 48 kHz
 
+  it('does not skip equal-timestamp submissions when rounded durations differ', () => {
+    const timing = new AudioOutputTiming();
+    timing.remember(0, 21_333, 1_000_000);
+    timing.remember(0, 21_333, 1_021_333);
+    timing.remember(0, 21_334, 1_042_666);
+    expect([0, 21_333, 42_666].map(timestamp => timing.resolve(timestamp)))
+      .toEqual([1_000_000, 1_021_333, 1_042_666].map(renderTimeUs => ({ renderTimeUs, input: null })));
+  });
+
+  it('does not use a later tied duration to displace the oldest unknown-duration input', () => {
+    const timing = new AudioOutputTiming();
+    timing.remember(0, undefined, 100_000);
+    timing.remember(0, FRAME_US, 120_000);
+    expect(timing.resolve(1)).toEqual({ renderTimeUs: 100_000, input: null });
+    expect(timing.resolve(FRAME_US)).toEqual({ renderTimeUs: 120_000, input: null });
+  });
+
+
+  it('keeps an already-common trimmed schedule despite unknown individual spans', () => {
+    const timing = new AudioOutputTiming();
+    timing.remember(0, undefined, 100_000); timing.remember(20_000, undefined, 120_000);
+    expect(timing.resolve(25_000)).toEqual({ renderTimeUs: 125_000, input: null });
+  });
+
   it('keeps distinct render times when every input timestamp is 0 (no LOC capture timestamp)', () => {
     const timing = new AudioOutputTiming();
     for (let i = 0; i < 5; i++) timing.remember(0, FRAME_US, 100_000 + i * FRAME_US);
