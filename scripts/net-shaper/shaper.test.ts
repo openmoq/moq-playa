@@ -112,17 +112,22 @@ describe('net shaper', () => {
 
   it('applies a schedule step at its time', async () => {
     const { arrivals, down } = await run({ rateBps: 4_000_000, queueBytes: 64 * 1024 * 1024,
-      schedule: [{ atMs: 600, rateBps: 1_000_000 }] }, 5_000_000, 1200);
+      schedule: [{ atMs: 600, rateBps: 1_000_000 }] }, 5_000_000, 1200, { recordPackets: true });
     // The step is relative to the link's first packet, which is the first offered one.
     const origin = arrivals[0]!.atMs;
     const before = arrivals.filter(item => item.atMs - origin > 50 && item.atMs - origin < 550);
     const after = arrivals.filter(item => item.atMs - origin > 650 && item.atMs - origin < 1150);
     expect(Math.abs(receivedBps(before) / 4_000_000 - 1)).toBeLessThan(0.05);
     expect(Math.abs(receivedBps(after) / 1_000_000 - 1)).toBeLessThan(0.05);
-    // The serializer's change of pace lands at the scheduled instant.
-    const gaps = arrivals.slice(1).map((item, i) => ({ atMs: item.atMs - origin, gapMs: item.atMs - arrivals[i]!.atMs }));
-    const slowFrom = gaps.find(gap => gap.atMs > 300 && gap.gapMs > 5)!.atMs;
-    expect(Math.abs(slowFrom - 600)).toBeLessThan(15);
+    // The serializer's change of pace lands at the scheduled instant. Read it
+    // from the shaper's own serialization times, not from arrivals: those
+    // bunch whenever the test process's event loop stalls. A packet that
+    // found the queue non-empty was serialized back to back with the one
+    // before, so their spacing is its size at the rate then in force.
+    const packets = down.packets!.filter(item => item.dropped === undefined);
+    const slow = packets.find((item, i) => i > 0 && item.queueBytes! > 0
+      && item.finishMs! - packets[i - 1]!.finishMs! > 5)!;
+    expect(Math.abs(slow.finishMs! - packets[0]!.finishMs! - 600)).toBeLessThan(15);
     expect(down.timeline.some(sample => sample.rateBps === 1_000_000)).toBe(true);
   });
 
