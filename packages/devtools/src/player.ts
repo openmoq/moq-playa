@@ -380,6 +380,9 @@ export function installPlayerDiagnostics(target: PlayerDiagnosticSource | Player
     if (!started) { started = true; return; }
     stop(); capture.dispose(); unregister(); delivery = 0n; trackSequence = 0; observationDrops = 0; makeCapture();
   })));
+  // Destruction can suppress a queued final state event. Keep the state probe
+  // for diagnostic sources that do not offer the explicit lifetime hook.
+  if (player.observeDestroy) removers.push(player.observeDestroy(() => guarded(() => installation.dispose())));
   removers.push(player.on('state_changed', () => guarded(() => { if (player.diagnosticSnapshot().destroyed) installation.dispose(); })));
   return installation;
 }

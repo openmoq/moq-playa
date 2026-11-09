@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MoqtPlayer } from '@openmoq/player';
 import { DiagnosticRegistry } from './registry.js';
 import { decodeMessage, encodeMessage, PROTOCOL_VERSION } from '@openmoq/devtools-protocol';
@@ -235,4 +235,136 @@ it.each([null, 0xffffffffffffffffn])('keeps live-player FIN bounds representable
     ]);
     expect(observed.filter(fact => fact.kind === 'object')).toHaveLength(last === null ? 0 : 1);
   } finally { writer.releaseLock(); attached.owner.close(); installed.dispose(); registry.dispose(); await h.close(); }
+});
+
+import { liveLocFixture } from '../../player/test-support/live-loc.js';
+import { videoInit } from '../../locmaf/test-support/cmaf.js';
+import { CmafAssembler } from '../../browser/src/cmaf-assembler.js';
+
+describe('destroy lifecycle finalization', () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
+
+function inspect(engine: Parameters<typeof installPlayerDiagnostics>[0]) {
+    const registry = new DiagnosticRegistry();
+    const installation = installPlayerDiagnostics(engine, { registry, exposure: 'development' });
+    const owner = registry.open('owner');
+    const discover = () => decodeMessage(owner.request(encodeMessage({
+        channel: 'openmoq-devtools', version: PROTOCOL_VERSION,
+        kind: 'discover', requestId: 'd', ownerId: 'owner',
+    }))[0]!);
+    expect(discover()).toMatchObject({ ok: true, message: { sources: [{ sourceId: installation.source.sourceId }] } });
+    return { discover, close() { installation.dispose(); owner.close(); registry.dispose(); } };
+}
+
+it('normal destroy removes the registry source', async () => {
+    const engine = new MoqtPlayer({ url: 'https://relay.invalid/moq', namespace: 'live' });
+    const view = inspect(engine);
+    try {
+        await engine.destroy();
+        expect(engine.diagnosticSnapshot().destroyed).toBe(true);
+        expect(view.discover()).toMatchObject({ ok: true, message: { sources: [] } });
+    } finally { view.close(); await engine.destroy(); }
+});
+
+it('reentrant load destruction removes the registry without a delivered ENDED event', async () => {
+    const transport = vi.fn(async () => { throw new Error('No transport is needed after destruction'); });
+    const engine = new MoqtPlayer({ url: 'https://relay.invalid/moq', namespace: 'live', createTransport: transport });
+    const view = inspect(engine);
+    let destroyed: Promise<void> | undefined;
+    engine.on('state_changed', ({ to }) => { if (to === 'loading') destroyed = engine.destroy(); });
+    try {
+        await engine.load().catch(() => {}); await destroyed;
+        expect(destroyed).toBeDefined();
+        expect(engine.diagnosticSnapshot().destroyed).toBe(true);
+        expect(transport).not.toHaveBeenCalled();
+        expect(view.discover()).toMatchObject({ ok: true, message: { sources: [] } });
+    } finally { view.close(); await engine.destroy(); }
+});
+
+it('a throwing ENDED listener cannot retain the destroyed registry source', async () => {
+    const engine = new MoqtPlayer({ url: 'https://relay.invalid/moq', namespace: 'live' });
+    engine.on('state_changed', ({ to }) => { if (to === 'ended') throw new Error('application ENDED fault'); });
+    const view = inspect(engine);
+    try {
+        await expect(engine.destroy()).rejects.toThrow('application ENDED fault');
+        await engine.destroy();
+        expect(engine.diagnosticSnapshot().destroyed).toBe(true);
+        expect(view.discover()).toMatchObject({ ok: true, message: { sources: [] } });
+    } finally { view.close(); await engine.destroy(); }
+});
+
+it('a public media adapter teardown fault cannot retain the destroyed registry source', async () => {
+    let armed = false, faults = 0;
+    const f = await liveLocFixture({ disableAudio: true,
+        createCmafAssembler: callbacks => new CmafAssembler(callbacks),
+        catalog: { tracks: [{ name: 'v', role: 'video', isLive: true, codec: 'avc1.640028',
+            packaging: 'cmaf', altGroup: 7, bitrate: 100,
+            initData: Buffer.from(videoInit()).toString('base64'),
+        }] },
+        createMediaSource: () => ({
+            initialize: () => true, appendChunk() {}, reset() {}, endOfStream() {}, destroy() {},
+            mediaElement: null, onFirstFrame: null, onError: null, onStall: null,
+            setPlaybackIntent(intent) {
+                if (armed && !intent) { faults++; throw new Error('custom media teardown fault'); }
+            },
+        }),
+    });
+    const view = inspect(f.player);
+    try {
+        armed = true;
+        await expect(f.player.destroy()).rejects.toThrow('custom media teardown fault');
+        await f.player.destroy();
+        expect(faults).toBe(1);
+        expect(f.player.diagnosticSnapshot().destroyed).toBe(true);
+        expect(view.discover()).toMatchObject({ ok: true, message: { sources: [] } });
+    } finally {
+        armed = false; view.close();
+        await f.client.close(); await f.close();
+    }
+});
+
+it('destroy observers run once; detached and late observers stay detached', async () => {
+    const engine = player();
+    const detached = vi.fn(), late = vi.fn();
+    const remove = engine.observeDestroy(detached);
+    remove(); remove();
+    const observed = vi.fn(() => {
+        void engine.destroy();
+        engine.observeDestroy(late);
+    });
+    const removeObserved = engine.observeDestroy(observed);
+    try {
+        await engine.destroy(); await engine.destroy();
+        removeObserved();
+        expect(observed).toHaveBeenCalledTimes(1);
+        expect(detached).not.toHaveBeenCalled();
+        expect(late).not.toHaveBeenCalled();
+    } finally { await engine.destroy(); }
+});
+
+it('a throwing destroy observer cannot block a later observer or repeated teardown', async () => {
+    const engine = player();
+    const failure = vi.fn(() => { throw new Error('observer fault'); });
+    const later = vi.fn();
+    engine.observeDestroy(failure); engine.observeDestroy(later);
+    try {
+        await expect(engine.destroy()).resolves.toBeUndefined();
+        await engine.destroy();
+        expect(failure).toHaveBeenCalledTimes(1);
+        expect(later).toHaveBeenCalledTimes(1);
+    } finally { await engine.destroy(); }
+});
+
+it('the destroy hook runs once even when final ENDED publication throws', async () => {
+    const engine = player(), observed = vi.fn();
+    engine.observeDestroy(observed);
+    engine.on('state_changed', ({ to }) => { if (to === 'ended') throw new Error('ENDED publication fault'); });
+    try {
+        await expect(engine.destroy()).rejects.toThrow('ENDED publication fault');
+        await engine.destroy();
+        expect(observed).toHaveBeenCalledTimes(1);
+    } finally { await engine.destroy(); }
+});
+
 });

@@ -50,6 +50,8 @@ export interface PlayerDiagnosticSource {
   readonly mediaStageCapabilities?: readonly ('cmaf-append-stages' | 'loc-video-stages' | 'loc-audio-stages')[];
   observeMediaStages?(listener: import('./media-diagnostic-types.js').MediaStageObserver, options?: { createTracker?: import('./media-diagnostic-types.js').MediaDiagnosticsFactory }): () => void;
   diagnosticSnapshot(): PlayerDiagnosticSnapshot;
+  /** Notify once on destruction, even if the final state event is not delivered. */
+  observeDestroy?(listener: () => void): () => void;
 }
 export interface PlayerDiagnosticFacade {
   /** The same engine for every access; facade and engine represent one source. */

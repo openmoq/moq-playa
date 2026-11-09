@@ -688,6 +688,7 @@ export class MoqtPlayer {
     readonly output: DispatcherOutputObserver;
     refused: number;
   } | undefined;
+  private destroyObservers: Set<() => void> | undefined;
   private diagnosticConnectionListeners: Map<(event: PlayerConnectionObservation) => void | Promise<void>, Set<MoqtConnection>> | undefined;
   private readonly stateMachine = new PlayerStateMachine();
   private readonly _stats = new StatsAccumulator();
@@ -3825,6 +3826,17 @@ export class MoqtPlayer {
     }; }
     catch { /* A faulty custom diagnostics getter cannot break a player snapshot. */ }
     return { destroyed: this._destroyed, state: this.state, connections, tracks, subscriptions, ...(mediaStages ? { mediaStages } : {}) };
+  }
+
+  /**
+   * Run `listener` once when destroy() tears this player down. Unlike a
+   * state_changed for ENDED, this fires even when destroy() is re-entered
+   * from a state listener and the queued ENDED is never announced.
+   */
+  observeDestroy(listener: () => void): () => void {
+    if (this._destroyed) return () => {};
+    (this.destroyObservers ??= new Set()).add(listener);
+    return () => { this.destroyObservers?.delete(listener); };
   }
 
   /**
@@ -9482,160 +9494,168 @@ export class MoqtPlayer {
   async destroy(): Promise<void> {
     if (this._destroyed) return;
     this._destroyed = true;
-    this.receivingVideoOwners.clear();
-    this.audioOutput = null; this.lastAudioDomainOwner = null; this.lastAudioDomain = null;
-    this.installedDecoderConfigurations.clear(); this.preparedDecoderConfigurations.clear();
-    this.audioTimelineRecord = null; this.videoTimelineRecord = null; this.collectAudioTimeline = false; this.collectVideoTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.runtimeAudioLanguage = null; this.runtimeSelectionIntent = null; this.mappedClockOwner = null; this.videoPresentationOffsetUs = 0n; this.videoTimingMapped = false; this.videoTimingSource = undefined; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
-    this._selection = emptyMediaSelection(this._selection.revision + 1, this.config.autoQuality !== false);
-    if (this.mediaSelection) this.failMediaSelection(this.mediaSelection, new Error('Player destroyed during audio selection'));
-    for (const owner of this.warmMediaOwners.values()) owner.head?.retire();
-    this.warmMediaOwners.clear();
-    this.log.info('destroy()');
-    this.mediaStageObservers?.dispose();
-    this.mediaStageObservers = undefined;
-    // Withdraw playback intent first: a late arrival must not start playback
-    // on a player that is going away.
-    this.playbackIntent = false;
-    this.mediaSource?.setPlaybackIntent?.(false);
-    // Cancel any in-flight migration: a deferred candidate connect()/subscribe()
-    // must NOT resurrect this destroyed player by becoming this.connection. The
-    // in-flight transaction sees _destroyed at its next validation and rolls back;
-    // detaching + closing the candidate here stops its callbacks and unblocks it.
-    this.pendingGoaway = null; // never act on a queued GOAWAY after destruction
-    if (this.currentMigration) {
-      const txn = this.currentMigration;
-      this.currentMigration = null;
-      txn.aborted = true;
-      // Wake a pending attempt so its timer is cancelled and the slot released
-      // even if the transport factory never settles.
-      txn.wake?.();
-      txn.committed = true;
-      txn.events.length = 0;
-      this.detachConnectionCallbacks(txn.conn);
-      try { await txn.conn.close(); } catch { /* candidate transport already gone */ }
-    }
-    this._stats.recordPlayStop();
-    this.stopTicking();
-    // Liveness: quiet destroy — cancel any in-flight restart ladder (it must
-    // never emit MEDIA_STARVED for an intentional teardown) and disarm.
-    this.cancelLivenessRestarts();
-    this.livenessMonitor?.clear();
-    this.pendingMediaSubs.clear();
-    this.activeFetches.clear();
-    this.fetchStreamAliases.clear();
-    this.fetchStreamRequestIds.clear();
-    this.pendingFetchStreams.clear();
-    this.catalogSlots.catalogFillRequests.clear();
-    this.refusedFetchRequests.clear();
-    this.quarantinedFetchRequests.clear();
-    this.droppedFetchStreams.clear();
-    this.pendingAliasBinds.clear();
-    this.pendingObjectsByAlias.clear();
-    this.pendingResetOrdinal = 0;
-    this.pendingStreamEvents.clear();
-    // Wake pending preparation before dropping its session and source.
-    if (this.pendingVideoSwitch) this.discardPendingVideoSwitch(this.pendingVideoSwitch, new Error('Player destroyed'));
-    this.pendingVideoSwitch = null;
-    this.switchInProgress = false;
-    this.switchStagingBuffer = [];
-    this.cmafSwitchStagingBuffer = [];
-    if (this.switchStagingTimeout !== null) {
-      clearTimeout(this.switchStagingTimeout);
-      this.switchStagingTimeout = null;
-    }
-    // Reject any pending TRACK_STATUS queries
-    for (const [, pending] of this.pendingTrackStatuses) {
-      pending.reject(new Error('Player destroyed'));
-    }
-    this.pendingTrackStatuses.clear();
-    this.cancelCatalogBootstrap();
-    this.catalogSlots.catalogRecovery?.coord.abort();
-    this.catalogSlots.catalogRecovery = null;
-    this.catalogSlots.bootstrapFetch = null;
-    this.catalogSlots.bootstrapFetchStreams.clear();
-    this.rejectPendingCatalogFetches('Player destroyed');
-    for (const [name, pending] of this.pendingInitTrackSubs) {
-      pending.reject(new Error(`Player destroyed while awaiting init track "${name}"`));
-    }
-    this.pendingInitTrackSubs.clear();
-    this.announcedNamespaces.clear();
-    this.commandDispatcher?.destroy();
-    this.commandDispatcher = null;
-    this.cmafPendingInit = null;
-    this.installedCmafInit.clear();
-    this.cmafPreInitDropWarned.clear();
-    this.locmafDecoders.clear();
-    this.locmafDecoderInit.clear();
-    this.locmafHealth.clear();
-    this.locmafFrameIds.clear();
-    this.locmafDescriptions.clear();
-    this.locmafWarned.clear();
-    this.locmafBadInit.clear();
-    this.cmafInitDeadlineArmed = false;
-    this.cmafFirstFrameDeadlineStartedAt = undefined;
-    this.cmafFirstFrameHiddenAt = undefined;
-    this.cmafFirstFrameDeferredTimeoutMs = undefined;
-    this.removeVisibilityListener();
-    this.watchdog.destroy();
-    this.cmafAssembler?.destroy();
-    this.cmafAssembler = null;
-    this.keyedCmafIdentity = false;
-    this.mediaSource?.destroy();
-    this.mediaSource = null;
-    // Retire the buffers before releases can re-drain accepted appends. The
-    // adapter also severs guards held by already-closed async stream work.
-    for (const stream of this.subgroupStreams.values()) stream.releaseReceiving?.();
-    this.subgroupStreams.clear();
-    this.mseCompletions = null;
-    this.videoPipeline = null;
-    this.audioPipeline = null;
-    this.syncController = null;
-    this.recoveryController = null;
-    this.pipelinesCreated = false;
-    this.subscriptionManager?.clear();
-    this.subscriptionManager = null;
-    this.catalogSlots.catalogManager = null;
-    this.qualityController = null;
-    this.bandwidthEstimator = null;
-    if (this.connection) {
-      this.releaseMediaTerminals(this.connection);
-      if (this._adapterOwned) {
-        // Owned adapter: detach our callbacks FIRST so the intentional close's
-        // teardown (pending-subscription rejections, stream resets, onClose) is
-        // not surfaced back into the player as fatal/degraded connection errors —
-        // destroy() is a happy path. Then close (cleans up subscriptions implicitly).
-        // close() itself may reject when the underlying transport has already
-        // failed or closed — destroy() must still resolve quietly.
-        this.detachConnectionCallbacks(this.connection);
-        try { await this.connection.close(); } catch { /* transport already failed/closed */ }
-      } else {
-        // Externally owned: explicitly unsubscribe player's tracks, then detach.
-        // Don't close — the caller owns the adapter's lifecycle.
-        for (const [requestId] of this.activeSubscriptions) {
-          try { await this.connection.unsubscribe(varint(requestId)); } catch { /* ignore */ }
-        }
-        // Catalog subscription tracked separately
-        if (this.catalogSlots.catalogRequestId !== null) {
-          try { await this.connection.unsubscribe(varint(this.catalogSlots.catalogRequestId)); } catch { /* ignore */ }
-        }
-        this.detachConnectionCallbacks(this.connection);
+    try {
+      this.receivingVideoOwners.clear();
+      this.audioOutput = null; this.lastAudioDomainOwner = null; this.lastAudioDomain = null;
+      this.installedDecoderConfigurations.clear(); this.preparedDecoderConfigurations.clear();
+      this.audioTimelineRecord = null; this.videoTimelineRecord = null; this.collectAudioTimeline = false; this.collectVideoTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.runtimeAudioLanguage = null; this.runtimeSelectionIntent = null; this.mappedClockOwner = null; this.videoPresentationOffsetUs = 0n; this.videoTimingMapped = false; this.videoTimingSource = undefined; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
+      this._selection = emptyMediaSelection(this._selection.revision + 1, this.config.autoQuality !== false);
+      if (this.mediaSelection) this.failMediaSelection(this.mediaSelection, new Error('Player destroyed during audio selection'));
+      for (const owner of this.warmMediaOwners.values()) owner.head?.retire();
+      this.warmMediaOwners.clear();
+      this.log.info('destroy()');
+      this.mediaStageObservers?.dispose();
+      this.mediaStageObservers = undefined;
+      // Withdraw playback intent first: a late arrival must not start playback
+      // on a player that is going away.
+      this.playbackIntent = false;
+      this.mediaSource?.setPlaybackIntent?.(false);
+      // Cancel any in-flight migration: a deferred candidate connect()/subscribe()
+      // must NOT resurrect this destroyed player by becoming this.connection. The
+      // in-flight transaction sees _destroyed at its next validation and rolls back;
+      // detaching + closing the candidate here stops its callbacks and unblocks it.
+      this.pendingGoaway = null; // never act on a queued GOAWAY after destruction
+      if (this.currentMigration) {
+        const txn = this.currentMigration;
+        this.currentMigration = null;
+        txn.aborted = true;
+        // Wake a pending attempt so its timer is cancelled and the slot released
+        // even if the transport factory never settles.
+        txn.wake?.();
+        txn.committed = true;
+        txn.events.length = 0;
+        this.detachConnectionCallbacks(txn.conn);
+        try { await txn.conn.close(); } catch { /* candidate transport already gone */ }
       }
-      this.connection = null;
-    }
-    this.activeSubscriptions.clear();
-    if (this.stateMachine.state !== PlayerState.ENDED) {
-      this.transitionState(PlayerState.ENDED);
-    }
-    // Retire every handle this listener saw, including an overlap already
-    // detached before it attached. Membership makes retirement idempotent.
-    if (this.diagnosticConnectionListeners) {
-      for (const known of [...this.diagnosticConnectionListeners.values()]) {
-        for (const conn of [...known]) this.notifyConnectionObservation('retired', conn);
+      this._stats.recordPlayStop();
+      this.stopTicking();
+      // Liveness: quiet destroy — cancel any in-flight restart ladder (it must
+      // never emit MEDIA_STARVED for an intentional teardown) and disarm.
+      this.cancelLivenessRestarts();
+      this.livenessMonitor?.clear();
+      this.pendingMediaSubs.clear();
+      this.activeFetches.clear();
+      this.fetchStreamAliases.clear();
+      this.fetchStreamRequestIds.clear();
+      this.pendingFetchStreams.clear();
+      this.catalogSlots.catalogFillRequests.clear();
+      this.refusedFetchRequests.clear();
+      this.quarantinedFetchRequests.clear();
+      this.droppedFetchStreams.clear();
+      this.pendingAliasBinds.clear();
+      this.pendingObjectsByAlias.clear();
+      this.pendingResetOrdinal = 0;
+      this.pendingStreamEvents.clear();
+      // Wake pending preparation before dropping its session and source.
+      if (this.pendingVideoSwitch) this.discardPendingVideoSwitch(this.pendingVideoSwitch, new Error('Player destroyed'));
+      this.pendingVideoSwitch = null;
+      this.switchInProgress = false;
+      this.switchStagingBuffer = [];
+      this.cmafSwitchStagingBuffer = [];
+      if (this.switchStagingTimeout !== null) {
+        clearTimeout(this.switchStagingTimeout);
+        this.switchStagingTimeout = null;
       }
-      this.diagnosticConnectionListeners.clear();
-      this.diagnosticConnectionListeners = undefined;
+      // Reject any pending TRACK_STATUS queries
+      for (const [, pending] of this.pendingTrackStatuses) {
+        pending.reject(new Error('Player destroyed'));
+      }
+      this.pendingTrackStatuses.clear();
+      this.cancelCatalogBootstrap();
+      this.catalogSlots.catalogRecovery?.coord.abort();
+      this.catalogSlots.catalogRecovery = null;
+      this.catalogSlots.bootstrapFetch = null;
+      this.catalogSlots.bootstrapFetchStreams.clear();
+      this.rejectPendingCatalogFetches('Player destroyed');
+      for (const [name, pending] of this.pendingInitTrackSubs) {
+        pending.reject(new Error(`Player destroyed while awaiting init track "${name}"`));
+      }
+      this.pendingInitTrackSubs.clear();
+      this.announcedNamespaces.clear();
+      this.commandDispatcher?.destroy();
+      this.commandDispatcher = null;
+      this.cmafPendingInit = null;
+      this.installedCmafInit.clear();
+      this.cmafPreInitDropWarned.clear();
+      this.locmafDecoders.clear();
+      this.locmafDecoderInit.clear();
+      this.locmafHealth.clear();
+      this.locmafFrameIds.clear();
+      this.locmafDescriptions.clear();
+      this.locmafWarned.clear();
+      this.locmafBadInit.clear();
+      this.cmafInitDeadlineArmed = false;
+      this.cmafFirstFrameDeadlineStartedAt = undefined;
+      this.cmafFirstFrameHiddenAt = undefined;
+      this.cmafFirstFrameDeferredTimeoutMs = undefined;
+      this.removeVisibilityListener();
+      this.watchdog.destroy();
+      this.cmafAssembler?.destroy();
+      this.cmafAssembler = null;
+      this.keyedCmafIdentity = false;
+      this.mediaSource?.destroy();
+      this.mediaSource = null;
+      // Retire the buffers before releases can re-drain accepted appends. The
+      // adapter also severs guards held by already-closed async stream work.
+      for (const stream of this.subgroupStreams.values()) stream.releaseReceiving?.();
+      this.subgroupStreams.clear();
+      this.mseCompletions = null;
+      this.videoPipeline = null;
+      this.audioPipeline = null;
+      this.syncController = null;
+      this.recoveryController = null;
+      this.pipelinesCreated = false;
+      this.subscriptionManager?.clear();
+      this.subscriptionManager = null;
+      this.catalogSlots.catalogManager = null;
+      this.qualityController = null;
+      this.bandwidthEstimator = null;
+      if (this.connection) {
+        this.releaseMediaTerminals(this.connection);
+        if (this._adapterOwned) {
+          // Owned adapter: detach our callbacks FIRST so the intentional close's
+          // teardown (pending-subscription rejections, stream resets, onClose) is
+          // not surfaced back into the player as fatal/degraded connection errors —
+          // destroy() is a happy path. Then close (cleans up subscriptions implicitly).
+          // close() itself may reject when the underlying transport has already
+          // failed or closed — destroy() must still resolve quietly.
+          this.detachConnectionCallbacks(this.connection);
+          try { await this.connection.close(); } catch { /* transport already failed/closed */ }
+        } else {
+          // Externally owned: explicitly unsubscribe player's tracks, then detach.
+          // Don't close — the caller owns the adapter's lifecycle.
+          for (const [requestId] of this.activeSubscriptions) {
+            try { await this.connection.unsubscribe(varint(requestId)); } catch { /* ignore */ }
+          }
+          // Catalog subscription tracked separately
+          if (this.catalogSlots.catalogRequestId !== null) {
+            try { await this.connection.unsubscribe(varint(this.catalogSlots.catalogRequestId)); } catch { /* ignore */ }
+          }
+          this.detachConnectionCallbacks(this.connection);
+        }
+        this.connection = null;
+      }
+      this.activeSubscriptions.clear();
+      if (this.stateMachine.state !== PlayerState.ENDED) {
+        this.transitionState(PlayerState.ENDED);
+      }
+      // Retire every handle this listener saw, including an overlap already
+      // detached before it attached. Membership makes retirement idempotent.
+      if (this.diagnosticConnectionListeners) {
+        for (const known of [...this.diagnosticConnectionListeners.values()]) {
+          for (const conn of [...known]) this.notifyConnectionObservation('retired', conn);
+        }
+        this.diagnosticConnectionListeners.clear();
+        this.diagnosticConnectionListeners = undefined;
+      }
+    } finally {
+      const destroyObservers = this.destroyObservers;
+      this.destroyObservers = undefined;
+      for (const listener of destroyObservers ?? []) {
+        try { listener(); } catch (error) { try { this.log.warn('Destroy observer failed: %s', String(error)); } catch { /* observer failure */ } }
+      }
+      this.emitter.removeAllListeners();
     }
-    this.emitter.removeAllListeners();
   }
 
   /**
