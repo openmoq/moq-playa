@@ -95,6 +95,8 @@ import { MoqtConnectionError } from './adapter-error.js';
 import { FetchReceiverState, type FetchReceiver } from './fetch-receiver.js';
 import { ObjectReceiptObservers } from './object-receipts.js';
 import type { ObjectReceipt, ObjectReceiptObservation, ObjectReceiptDiscard } from './object-receipts.js';
+import { ObjectReceptionObservers, type ReceptionCarrier } from './object-reception.js';
+import type { ObjectReception, ObjectReceptionEvent, ObjectReceptionOptions } from './object-reception.js';
 import type { WebTransportLike, WebTransportBidirectionalStream, MoqtSetupRouting } from './types.js';
 import { isDraft22, isRequestStreamDraft, isWiredDraft } from '@openmoq/transport';
 import type { FetchOk } from '@openmoq/transport';
@@ -811,6 +813,10 @@ export class MoqtConnection {
     try { namespaceReader?.releaseLock(); } catch { /* already released */ }
     for (const ctx of this.draft16NamespaceContexts) this.swallow(() => ctx.abort());
     this.draft16NamespaceContexts.clear();
+    // Attempts still in flight end here, before any later close notification.
+    const reception = this.objectReception;
+    this.objectReception = undefined;
+    reception?.closeAll();
     this.objectReceiptObservers = undefined;
     this.reboundSubscribers = undefined;
     this.reboundAliases = undefined;
@@ -1180,6 +1186,9 @@ export class MoqtConnection {
 
   private qlogObservers: Set<(event: QlogEvent) => void | Promise<void>> | undefined;
   private objectReceiptObservers: ObjectReceiptObservers | undefined;
+  private objectReception: ObjectReceptionObservers | undefined;
+  /** Arrival identity of delivered Objects whose reception was observed; weak, and kept after the last listener leaves. */
+  private receptionTokens: WeakMap<object, ObjectReception> | undefined;
 
   /**
    * Observe copied scalar receipt metadata without replacing application data
@@ -1212,6 +1221,76 @@ export class MoqtConnection {
   /** Exact object identity only; unobserved objects have no receipt or invented history. */
   objectReceiptFor(object: object): ObjectReceipt | undefined {
     return this.objectReceiptObservers?.receiptFor(object);
+  }
+
+  /**
+   * Observe Objects while they are received, separately from application
+   * delivery. For each stream Object whose first bytes arrive after attachment:
+   * a `header` event as soon as its complete header has parsed, without waiting
+   * for the remaining payload (an Object received whole gets its header and end
+   * together), `progress` events with cumulative payload bytes (at most one per
+   * read, only while the Object is incomplete), and exactly one `end`, complete
+   * or interrupted. A whole datagram is one complete `end`. Reads are unchanged
+   * and nothing is buffered for observation.
+   *
+   * Times are `performance.now()` milliseconds at which this JavaScript realm
+   * observed the read that carried the bytes; they are not packet-arrival
+   * times, and bytes delivered by one read share one time. Callbacks may run
+   * later than that observation. Header metadata is pre-transform and not yet
+   * verified by the application: it establishes neither payload completeness,
+   * decoding, nor authenticity. Property bytes are opaque and copied per
+   * listener only when `includeProperties` is set.
+   *
+   * A receive outcome is settled before any listener sees it: a listener that
+   * tears the stream or connection down from a callback may stop later
+   * delivery, but an Object already received completely still ends complete,
+   * and an interrupted one reports every byte already received.
+   *
+   * Listener errors and rejected promises are contained. Detaching ends that
+   * listener's evidence: it receives no later events, including terminals.
+   * While nobody observes, no reception events, clock samples or per-reader
+   * observation state are created (the decoders' shared header parse is built
+   * regardless). Arrival identities already captured stay available through
+   * {@link objectReceptionFor} and receipts after the last listener leaves.
+   */
+  observeObjectReception(
+    listener: (event: ObjectReceptionEvent) => void | Promise<void>,
+    options?: ObjectReceptionOptions,
+  ): () => void {
+    if (typeof listener !== 'function') throw new TypeError('Expected an object reception observer');
+    const tokens = this.receptionTokens ??= new WeakMap();
+    const observers = this.objectReception ??= new ObjectReceptionObservers(undefined, tokens);
+    const remove = observers.observe(listener, options);
+    return () => {
+      remove();
+      if (this.objectReception === observers && observers.empty) this.objectReception = undefined;
+    };
+  }
+
+  /**
+   * The receive attempt of this exact delivered Object instance (the original
+   * object, not a remapped copy), when its reception was observed. Kept weakly
+   * for the connection's lifetime, including after the last listener detaches.
+   */
+  objectReceptionFor(object: object): ObjectReception | undefined {
+    return this.receptionTokens?.get(object);
+  }
+
+  private subgroupReceptionCarrier(streamId: bigint, header: SubgroupHeader, unresolvedFirstObject: boolean): ReceptionCarrier {
+    return {
+      origin: 'subgroup', streamId, trackAlias: header.trackAlias as bigint, requestId: null,
+      groupId: header.groupId as bigint, subgroupId: header.subgroupId as bigint,
+      publisherPriority: header.publisherPriority ?? null,
+      subgroupFromFirstObject: unresolvedFirstObject && getSubgroupIdMode(header.typeByte) === SubgroupIdMode.FIRST_OBJECT,
+    };
+  }
+
+  private fetchReceptionCarrier(streamId: bigint, header: FetchHeader): ReceptionCarrier {
+    const fill = this.fillStreams.get(header.requestId as bigint)?.streamId === streamId;
+    return {
+      origin: fill ? 'fill' : 'fetch', streamId, trackAlias: null, requestId: header.requestId as bigint,
+      groupId: null, subgroupId: null, publisherPriority: null, subgroupFromFirstObject: false,
+    };
   }
 
   /**
@@ -1710,6 +1789,7 @@ export class MoqtConnection {
         },
         onViolation: (reason, error) => this.handleIncomingUniViolation(reason, error),
         onTransportError: (error) => this.handleIncomingUniTransportError(error),
+        onRead: (reader, bytes) => { this.objectReception?.streamRead(reader, bytes); },
       });
       this.incomingUniRouter = router;
       try {
@@ -4635,7 +4715,7 @@ export class MoqtConnection {
     reader: ReadableStreamDefaultReader<Uint8Array>, receiver?: FetchReceiverState): boolean {
     const receipts = this.objectReceiptObservers;
     if (!receipts) return true;
-    receipts.receiveFetch(object, requestId, streamId);
+    receipts.receiveFetch(object, requestId, streamId, this.receptionTokens?.get(object) ?? null);
     // Receipt observers are external callbacks: cancellation/close must win
     // before either request-owned or generic delivery, including buffered data.
     if (this._terminated || this.locallyDiscardedReaders.has(reader)
@@ -6880,6 +6960,8 @@ export class MoqtConnection {
       while (!this._terminated) {
         const { value: bytes, done } = await reader.read();
         if (done || this._terminated) break;
+        const reception = this.objectReception;
+        const datagramRead = reception?.datagramRead();
         try {
           // Classify by the (vi64 in draft-18) datagram type first. Padding
           // datagrams (draft-18 §11.5.2, type 0x132B3E29) are discarded rather
@@ -6889,6 +6971,8 @@ export class MoqtConnection {
             continue;
           }
           const { datagram } = this.dataCodec!.decodeObjectDatagram(bytes, 0);
+          // A whole datagram is one complete receive, whatever routing decides next.
+          if (datagramRead !== undefined) reception!.datagram(datagramRead, datagram);
           // §10.11 early-discard: a datagram for an alias whose PUBLISH_DONE
           // already arrived is dropped (datagrams do not count toward the
           // Stream Count, so the tombstone is not decremented).
@@ -6915,7 +6999,7 @@ export class MoqtConnection {
           if (this._terminated) break;
           if (this.terminatedAliases.has(datagram.trackAlias as bigint)) continue;
           const receipts = this.objectReceiptObservers;
-          receipts?.receive(datagram, 'datagram');
+          receipts?.receive(datagram, 'datagram', null, this.receptionTokens?.get(datagram) ?? null);
           if (this._terminated) { receipts?.discard(datagram, 'late'); break; }
           if (this.terminatedAliases.has(datagram.trackAlias as bigint)) {
             receipts?.discard(datagram, 'late');
@@ -7975,6 +8059,7 @@ export class MoqtConnection {
           }
           this.onDataStream?.(streamId, { type: 'fetch', header, fill: true });
           readTerminal = await this.readFetchObjects18(reader, buf, streamId, header);
+          this.endStreamReception(reader, readTerminal);
           this.onStreamClosed?.(streamId, undefined, terminalKind(readTerminal));
           return;
         }
@@ -8036,12 +8121,14 @@ export class MoqtConnection {
           : await this.readFetchObjects(reader, buf, streamId, header, fetchReceiver);
       }
 
+      this.endStreamReception(reader, readTerminal);
       if (fetchReceiver) this.finishFetchReceiverData(fetchReceiver, streamId, terminalKind(readTerminal));
       this.onStreamClosed?.(streamId, undefined, terminalKind(readTerminal));
     } catch (err) {
       // §10.4, §10.4.2, §10.4.4, §10.2.1.2: Protocol violations on data
       // streams MUST close the session with PROTOCOL_VIOLATION.
       if (err instanceof ProtocolViolationError) {
+        this.objectReception?.interrupt(reader, 'protocol-violation');
         this.closeSessionFatal(err.message);
         return;
       }
@@ -8064,6 +8151,10 @@ export class MoqtConnection {
       const terminal: DataStreamTerminal = locallyDiscarded
         ? 'local-discard'
         : streamErrorCode !== undefined ? 'reset' : 'error';
+      // An attempt cut off here ends before the error and stream-close notifications.
+      this.objectReception?.interrupt(reader,
+        locallyDiscarded ? 'local-discard' : terminated ? 'connection-closed' : terminal === 'reset' ? 'reset' : 'error',
+        terminal === 'reset' ? streamErrorCode! : null);
       if (terminal === 'error' && !terminated) {
         // Not a RESET_STREAM and not our own teardown — a genuine failure.
         this.onError?.(new MoqtConnectionError(
@@ -8084,6 +8175,8 @@ export class MoqtConnection {
         terminal,
       );
     } finally {
+      // Releases this reader's observation state; every classified exit above already ended its attempt.
+      this.objectReception?.interrupt(reader, 'error');
       this.dataStreamReaders.delete(streamId);
       const completedAlias = this.incomingSubgroupAliases.get(streamId);
       this.incomingSubgroupAliases.delete(streamId);
@@ -8113,6 +8206,11 @@ export class MoqtConnection {
       }
       if (completedAlias !== undefined) this.maybeCompleteStreamDrain(completedAlias);
     }
+  }
+
+  /** A read loop returned: a local discard cut off any attempt in flight; a peer FIN cannot. */
+  private endStreamReception(reader: ReadableStreamDefaultReader<Uint8Array>, terminal: DataStreamReadTerminal): void {
+    if (terminal === 'local-discard') this.objectReception?.interrupt(reader, 'local-discard');
   }
 
   /**
@@ -8213,6 +8311,7 @@ export class MoqtConnection {
         }
         return { type: 'terminal', terminal: 'peer-fin' };
       }
+      this.objectReception?.streamRead(reader, value.length);
       buf = this.appendBuffer(buf, value);
     }
   }
@@ -8229,6 +8328,7 @@ export class MoqtConnection {
   ): Promise<DataStreamReadTerminal> {
     let previousObjectId: bigint = 0n;
     let isFirstObject = true;
+    this.objectReception?.objectsBegin(reader, buf.length, () => this.subgroupReceptionCarrier(streamId, header, true));
 
     while (true) {
       // Gate: see `locallyDiscardedReaders`.
@@ -8236,13 +8336,14 @@ export class MoqtConnection {
       // Try to decode an object from the buffer
       if (buf.length > 0) {
         try {
-          const { object, bytesRead } = this.dataCodec!.decodeSubgroupObject(
+          const { object, bytesRead, header: objectHeader } = this.dataCodec!.decodeSubgroupObject(
             buf,
             0,
             header.hasExtensions,
             previousObjectId,
             isFirstObject,
           );
+          const objectStart = buf;
           buf = buf.subarray(bytesRead);
 
           // §10.4.2: "0b01: The Subgroup ID field is absent and the Subgroup ID
@@ -8289,6 +8390,11 @@ export class MoqtConnection {
                 payload: object.payload,
               } satisfies MoqtObjectData;
 
+          // The receive terminal precedes the parsed-object qlog event; the
+          // gates after that event cover a reception listener's teardown too.
+          this.objectReception?.complete(reader, delivered, buf.length, objectHeader, objectStart,
+            () => this.subgroupReceptionCarrier(streamId, header, false));
+
           // -06 §4.9: emit object_id_delta (raw delta, not resolved absolute ID)
           const objectIdDelta = isFirstObject
             ? (object.objectId as bigint)
@@ -8310,7 +8416,7 @@ export class MoqtConnection {
             return 'local-discard';
           }
           const receipts = this.objectReceiptObservers;
-          receipts?.receive(delivered, 'subgroup');
+          receipts?.receive(delivered, 'subgroup', null, this.receptionTokens?.get(delivered) ?? null);
           if (this._terminated || this.locallyDiscardedReaders.has(reader)) {
             receipts?.discard(delivered, 'late');
             return 'local-discard';
@@ -8324,6 +8430,14 @@ export class MoqtConnection {
         } catch (e) {
           if (!(e instanceof RangeError)) throw e;
           // Not enough bytes — read more
+        }
+        const reception = this.objectReception;
+        if (reception) {
+          const hasExtensions = header.hasExtensions, previous = previousObjectId, first = isFirstObject;
+          reception.pending(reader, buf,
+            pending => this.dataCodec!.decodeSubgroupObjectHeader(pending, 0, hasExtensions, previous, first),
+            () => this.subgroupReceptionCarrier(streamId, header, first));
+          if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
         }
       }
 
@@ -8368,6 +8482,11 @@ export class MoqtConnection {
         this.onSubgroupFin?.(streamId, header);
         return 'peer-fin';
       }
+      const reception = this.objectReception;
+      if (reception) {
+        const first = isFirstObject;
+        reception.objectRead(reader, buf.length, value.length, () => this.subgroupReceptionCarrier(streamId, header, first));
+      }
       buf = this.appendBuffer(buf, value);
     }
   }
@@ -8385,18 +8504,34 @@ export class MoqtConnection {
   ): Promise<DataStreamReadTerminal> {
     let prior: FetchPriorContext | undefined;
     let isFirstObject = true;
+    this.objectReception?.objectsBegin(reader, buf.length, () => this.fetchReceptionCarrier(streamId, header));
 
     while (true) {
       // Gate: see `locallyDiscardedReaders`.
       if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
       if (buf.length > 0) {
         try {
-          const { item, bytesRead } = this.dataCodec!.decodeFetchObject(buf, 0, prior, isFirstObject);
+          const { item, bytesRead, header: itemHeader } = this.dataCodec!.decodeFetchObject(buf, 0, prior, isFirstObject);
+          const itemStart = buf;
           buf = buf.subarray(bytesRead);
 
           // Distinguish between FetchObject and FetchEndOfRange
           if ('payload' in item) {
             // FetchObject
+            const delivered: MoqtObjectData = {
+              kind: 'data',
+              trackAlias: varint(0), // Fetch objects don't carry track alias
+              groupId: item.groupId,
+              subgroupId: item.subgroupId,
+              objectId: item.objectId,
+              publisherPriority: item.publisherPriority,
+              extensions: item.extensions,
+              properties: item.extensions,
+              payload: item.payload,
+            };
+            // The receive terminal precedes the parsed-object qlog event.
+            this.objectReception?.complete(reader, delivered, buf.length, itemHeader, itemStart,
+              () => this.fetchReceptionCarrier(streamId, header));
             // -06 §4.13: fetch object with flag bools and optional fields
             this.observedQlogEvent?.({
               type: 'fetch_object_parsed',
@@ -8411,17 +8546,6 @@ export class MoqtConnection {
               ...(item.extensions ? { extension_headers_length: item.extensions.byteLength } : {}),
               object_payload_length: item.payload.byteLength,
             });
-            const delivered: MoqtObjectData = {
-              kind: 'data',
-              trackAlias: varint(0), // Fetch objects don't carry track alias
-              groupId: item.groupId,
-              subgroupId: item.subgroupId,
-              objectId: item.objectId,
-              publisherPriority: item.publisherPriority,
-              extensions: item.extensions,
-              properties: item.extensions,
-              payload: item.payload,
-            };
             // FETCH objects have no Track Alias. Alias 0 here is synthetic and
             // must never be confused with a subgroup racing SUBSCRIBE_OK.
             if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
@@ -8459,6 +8583,11 @@ export class MoqtConnection {
               objectId: item.objectId,
               status: gapStatus,
             };
+            // A draft-14 status Object is an Object; a draft-16 End-of-Range is not.
+            if (item.rawStatus !== undefined) {
+              this.objectReception?.complete(reader, delivered, buf.length, itemHeader, itemStart,
+                () => this.fetchReceptionCarrier(streamId, header));
+            } else this.objectReception?.skip(reader, buf.length);
             if (!this.observeFetchObject(header.requestId, streamId, delivered, reader, receiver)) return 'local-discard';
             if (receiver) {
               if (!await this.receiveFetchObject(receiver, delivered)) return 'local-discard';
@@ -8469,6 +8598,14 @@ export class MoqtConnection {
           continue;
         } catch (e) {
           if (!(e instanceof RangeError)) throw e;
+        }
+        const reception = this.objectReception;
+        if (reception) {
+          const priorNow = prior, first = isFirstObject;
+          reception.pending(reader, buf,
+            pending => this.dataCodec!.decodeFetchObjectHeader(pending, 0, priorNow, first),
+            () => this.fetchReceptionCarrier(streamId, header));
+          if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
         }
       }
 
@@ -8483,6 +8620,7 @@ export class MoqtConnection {
         }
         return 'peer-fin';
       }
+      this.objectReception?.objectRead(reader, buf.length, value.length, () => this.fetchReceptionCarrier(streamId, header));
       buf = this.appendBuffer(buf, value);
     }
   }
@@ -8533,6 +8671,7 @@ export class MoqtConnection {
     }
     let prior: FetchObjectPrior18 | undefined;
     let isFirstObject = true;
+    this.objectReception?.objectsBegin(reader, buf.length, () => this.fetchReceptionCarrier(streamId, header));
 
     while (true) {
       // Gate: see `locallyDiscardedReaders`.
@@ -8549,13 +8688,28 @@ export class MoqtConnection {
       }
       if (buf.length > 0) {
         try {
-          const { item, bytesRead, nextPrior } =
+          const { item, bytesRead, nextPrior, header: itemHeader } =
             this.dataCodec!.decodeFetchObject18(buf, 0, prior, isFirstObject, groupOrder);
+          const itemStart = buf;
           buf = buf.subarray(bytesRead);
           prior = nextPrior;
           isFirstObject = false;
 
           if ('payload' in item) {
+            const delivered: MoqtObjectData = {
+              kind: 'data',
+              trackAlias: 0n, // fetch objects carry no track alias
+              groupId: item.groupId,
+              subgroupId: item.subgroupId,
+              objectId: item.objectId,
+              publisherPriority: item.publisherPriority,
+              extensions: item.extensions,
+              properties: item.extensions,
+              payload: item.payload,
+            };
+            // The receive terminal precedes the parsed-object qlog event.
+            this.objectReception?.complete(reader, delivered, buf.length, itemHeader, itemStart,
+              () => this.fetchReceptionCarrier(streamId, header));
             this.observedQlogEvent?.({
               type: 'fetch_object_parsed',
               stream_id: streamId,
@@ -8569,17 +8723,6 @@ export class MoqtConnection {
               ...(item.extensions ? { extension_headers_length: item.extensions.byteLength } : {}),
               object_payload_length: item.payload.byteLength,
             });
-            const delivered: MoqtObjectData = {
-              kind: 'data',
-              trackAlias: 0n, // fetch objects carry no track alias
-              groupId: item.groupId,
-              subgroupId: item.subgroupId,
-              objectId: item.objectId,
-              publisherPriority: item.publisherPriority,
-              extensions: item.extensions,
-              properties: item.extensions,
-              payload: item.payload,
-            };
             if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
             const propertyFault = this.objectPropertyFault(item.extensions);
             if (propertyFault) {
@@ -8599,6 +8742,8 @@ export class MoqtConnection {
               if (!await this.receiveFetchObject(receiver, delivered)) return 'local-discard';
             } else this.onObject?.(streamId, delivered); // no alias routing for fetch
           } else {
+            // End-of-Range indicators describe ranges, never receive attempts.
+            this.objectReception?.skip(reader, buf.length);
             const delivered: MoqtObjectGap = {
               kind: 'gap',
               trackAlias: 0n,
@@ -8616,6 +8761,14 @@ export class MoqtConnection {
         } catch (e) {
           if (!(e instanceof RangeError)) throw e;
         }
+        const reception = this.objectReception;
+        if (reception) {
+          const priorNow = prior, first = isFirstObject;
+          reception.pending(reader, buf,
+            pending => this.dataCodec!.decodeFetchObjectHeader18(pending, 0, priorNow, first, groupOrder),
+            () => this.fetchReceptionCarrier(streamId, header));
+          if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
+        }
       }
 
       const { value, done } = await reader.read();
@@ -8626,6 +8779,7 @@ export class MoqtConnection {
         }
         return 'peer-fin';
       }
+      this.objectReception?.objectRead(reader, buf.length, value.length, () => this.fetchReceptionCarrier(streamId, header));
       buf = this.appendBuffer(buf, value);
     }
   }

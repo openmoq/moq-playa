@@ -35,7 +35,8 @@ export interface TailStage { seq: number; atMs: number; unit: number | null; inp
 export type TailCheckpoint = 'baseline-settled' | 'observations-settled' | 'before-player-destroy' | 'after-player-destroy';
 export interface TailDiagnostics { seq: number; atMs: number; lifetime: 'before-load-through-player-destroy';
   checkpoint: TailCheckpoint; destroyed: boolean | null; counters: PlayerDiagnosticSnapshot['mediaStages'] | null }
-type ReceiptMetadata = Omit<Parameters<Parameters<MoqtConnection['observeObjectReceipts']>[0]>[0], 'receipt'> & { readonly receipt: object };
+type ReceiptMetadata = Omit<Parameters<Parameters<MoqtConnection['observeObjectReceipts']>[0]>[0], 'receipt' | 'reception'>
+  & { readonly receipt: object; readonly reception: object | null };
 export interface TailConnection {
   subscribe: MoqtConnection['subscribe'];
   fetch: MoqtConnection['fetch'];

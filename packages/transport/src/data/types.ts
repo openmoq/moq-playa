@@ -117,6 +117,36 @@ export interface FetchEndOfRange {
 }
 
 /**
+ * Byte layout of one data-stream object up to its payload: everything the
+ * complete-object decoders parse before slicing payload bytes. Header parsers
+ * return this, and the complete decoders return the one they used, so decoders
+ * and early observers share one grammar and one parse.
+ *
+ * `kind` separates Objects (normal data or a status) from FETCH End-of-Range
+ * indicators, which describe ranges rather than Objects. `payloadLength` is the
+ * exact wire value. `headerBytes` is relative to the parser's offset and runs
+ * through the end of the header, including an Object Status field when one is
+ * present. `propertiesOffset` is an ABSOLUTE index into the supplied buffer of
+ * the extension/property bytes exactly as the complete decoder slices them; it
+ * is undefined when that decoder leaves them undefined, and `propertiesLength`
+ * is then 0. Fields the stream header supplies (a subgroup object's group) are
+ * undefined here.
+ */
+export interface ObjectHeaderLayout {
+  readonly kind: 'object' | 'range';
+  readonly headerBytes: number;
+  readonly payloadLength: bigint;
+  readonly objectStatus: bigint | undefined;
+  readonly propertiesOffset: number | undefined;
+  readonly propertiesLength: number;
+  readonly groupId: bigint | undefined;
+  readonly subgroupId: bigint | undefined;
+  readonly objectId: bigint;
+  readonly publisherPriority: number | undefined;
+  readonly isDatagram: boolean;
+}
+
+/**
  * OBJECT_DATAGRAM parsed from a datagram.
  * @see draft-ietf-moq-transport-16 §10.3.1
  */

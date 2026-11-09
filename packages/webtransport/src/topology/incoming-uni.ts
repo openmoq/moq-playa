@@ -38,6 +38,12 @@ export interface IncomingUniHandlers {
   onViolation(reason: string, error: Error): void;
   /** Surface failure of the transport's stream-accept channel unchanged. */
   onTransportError(error: Error): void;
+  /**
+   * A classifier read delivered `bytes` on `reader`. Its bytes after the stream
+   * type all belong to the final classifier read, which is what lets an owner
+   * time the first data bytes of a prefix honestly. Must not throw.
+   */
+  onRead?(reader: ReadableStreamDefaultReader<Uint8Array>, bytes: number): void;
 }
 
 export interface IncomingUniRouterOptions {
@@ -178,7 +184,7 @@ export class IncomingUniRouter {
     const reader = stream.getReader();
     this.classifyingReaders.add(reader);
     try {
-      const classified = await classifyIncomingStream(reader);
+      const classified = await classifyIncomingStream(reader, this.handlers.onRead);
       if (this.terminal) {
         if (this.releaseStreamReaders) {
           try { classified.reader.releaseLock(); } catch { /* already released */ }
@@ -269,6 +275,7 @@ export class IncomingUniRouter {
 /** Read enough bytes to classify a vi64 stream type, then replay every byte. */
 async function classifyIncomingStream(
   reader: ReadableStreamDefaultReader<Uint8Array>,
+  onRead?: (reader: ReadableStreamDefaultReader<Uint8Array>, bytes: number) => void,
 ): Promise<ClassifiedStream> {
   const codec = createDataCodec(18);
   let prefix: Uint8Array = new Uint8Array(0);
@@ -293,6 +300,7 @@ async function classifyIncomingStream(
             : 'unidirectional stream FIN received mid-type',
         );
       }
+      onRead?.(reader, value.length);
       prefix = append(prefix, value);
       try {
         const kind = codec.classifyStream(prefix, 0);

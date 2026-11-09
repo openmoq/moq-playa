@@ -29,6 +29,7 @@ import type {
   FetchObject,
   FetchEndOfRange,
   ObjectDatagram,
+  ObjectHeaderLayout,
 } from './types.js';
 
 /**
@@ -157,6 +158,68 @@ export function decodeSubgroupHeader(
 }
 
 /**
+ * Parse a subgroup object up to its payload: the header grammar of
+ * {@link decodeSubgroupObject}, including the Object Status that follows a zero
+ * payload length. `previousObjectId` is read, never updated.
+ * @throws {RangeError} When `buf` ends before the header does — and, as in the
+ *   complete decoder, when a derived Object ID exceeds the varint range
+ * @see draft-ietf-moq-transport-16 §10.4.2
+ * @see draft-ietf-moq-transport-14 §10.4.2
+ */
+export function decodeSubgroupObjectHeader(
+  buf: Uint8Array,
+  offset: number,
+  hasExtensions: boolean,
+  previousObjectId: bigint,
+  isFirstObject: boolean = true,
+  version: 14 | 16 = 16,
+): ObjectHeaderLayout {
+  let pos = offset;
+
+  const { value: delta, bytesRead: deltaBytes } = readVarint(buf, pos);
+  pos += deltaBytes;
+  const objectId: Varint = isFirstObject ? delta : varint(previousObjectId + delta + 1n);
+
+  // §10.4.2: "Objects with no extensions set Extension Headers Length to 0"
+  let propertiesOffset: number | undefined, propertiesLength = 0;
+  if (hasExtensions) {
+    const { value: extLen, bytesRead: extLenBytes } = readVarint(buf, pos);
+    pos += extLenBytes;
+    const extensionsLength = Number(extLen);
+    if (pos + extensionsLength > buf.length) {
+      throw new RangeError(
+        `Extension length ${extensionsLength} exceeds remaining buffer (${buf.length - pos} bytes)`,
+      );
+    }
+    propertiesOffset = pos; propertiesLength = extensionsLength;
+    pos += extensionsLength;
+  }
+
+  const { value: payloadLength, bytesRead: plBytes } = readVarint(buf, pos);
+  pos += plBytes;
+
+  // The Object Status field is only present when the payload length is zero.
+  let objectStatus: Varint | undefined;
+  if (payloadLength === 0n) {
+    const { value: st, bytesRead: stBytes } = readVarint(buf, pos);
+    pos += stBytes;
+    objectStatus = st;
+    validateObjectStatus(st, version);
+    // §10.2.1.2: Extensions on non-Normal status objects is PROTOCOL_VIOLATION
+    if (propertiesLength > 0 && st !== ObjectStatus.NORMAL) {
+      throw new ProtocolViolationError(
+        `Extensions present on status object (status=0x${st.toString(16)}) per §10.2.1.2`,
+      );
+    }
+  }
+
+  return {
+    kind: 'object', headerBytes: pos - offset, payloadLength, objectStatus, propertiesOffset, propertiesLength,
+    groupId: undefined, subgroupId: undefined, objectId, publisherPriority: undefined, isDatagram: false,
+  };
+}
+
+/**
  * Decode a single object from a subgroup stream.
  * @param buf Buffer containing the object
  * @param offset Starting position
@@ -175,87 +238,37 @@ export function decodeSubgroupObject(
   previousObjectId: bigint,
   isFirstObject: boolean = true,
   version: 14 | 16 = 16,
-): { object: SubgroupObject; bytesRead: number } {
-  let pos = offset;
+): { object: SubgroupObject; bytesRead: number; header: ObjectHeaderLayout } {
+  const header = decodeSubgroupObjectHeader(buf, offset, hasExtensions, previousObjectId, isFirstObject, version);
+  let pos = offset + header.headerBytes;
+  const extensions = header.propertiesOffset === undefined
+    ? undefined
+    : buf.slice(header.propertiesOffset, header.propertiesOffset + header.propertiesLength);
 
-  // Read object ID delta
-  const { value: delta, bytesRead: deltaBytes } = readVarint(buf, pos);
-  pos += deltaBytes;
-
-  // Compute actual object ID
-  // First object: ID = delta
-  // Subsequent: ID = previousObjectId + delta + 1
-  let objectId: Varint;
-  if (isFirstObject) {
-    objectId = delta;
-  } else {
-    objectId = varint(previousObjectId + delta + 1n);
-  }
-
-  // Read extensions if present
-  // §10.4.2: "Objects with no extensions set Extension Headers Length to 0"
-  let extensions: Uint8Array | undefined;
-  let extensionsLength = 0;
-  if (hasExtensions) {
-    const { value: extLen, bytesRead: extLenBytes } = readVarint(buf, pos);
-    pos += extLenBytes;
-    extensionsLength = Number(extLen);
-
-    // Bounds check
-    if (pos + extensionsLength > buf.length) {
-      throw new RangeError(
-        `Extension length ${extensionsLength} exceeds remaining buffer (${buf.length - pos} bytes)`,
-      );
-    }
-
-    extensions = buf.slice(pos, pos + extensionsLength);
-    pos += extensionsLength;
-  }
-
-  // Read payload length
-  const { value: payloadLen, bytesRead: plBytes } = readVarint(buf, pos);
-  pos += plBytes;
-  const numPayloadLen = Number(payloadLen);
-
-  // Read status if payload length is 0, otherwise read payload
+  // A zero payload length carried an Object Status (part of the header);
+  // otherwise read the payload.
+  const numPayloadLen = Number(header.payloadLength);
   let payload: Uint8Array;
-  let status: Varint | undefined;
-
   if (numPayloadLen === 0) {
     payload = new Uint8Array(0);
-    const { value: st, bytesRead: stBytes } = readVarint(buf, pos);
-    pos += stBytes;
-    status = st;
-
-    // Validate status code (version-aware: draft-14 allows 0x1)
-    validateObjectStatus(status, version);
-
-    // §10.2.1.2: Extensions on non-Normal status objects is PROTOCOL_VIOLATION
-    if (extensionsLength > 0 && status !== ObjectStatus.NORMAL) {
-      throw new ProtocolViolationError(
-        `Extensions present on status object (status=0x${status.toString(16)}) per §10.2.1.2`,
-      );
-    }
   } else {
-    // Bounds check for payload
     if (pos + numPayloadLen > buf.length) {
       throw new RangeError(
         `Payload length ${numPayloadLen} exceeds remaining buffer (${buf.length - pos} bytes)`,
       );
     }
-
     payload = buf.slice(pos, pos + numPayloadLen);
     pos += numPayloadLen;
   }
 
   const object: SubgroupObject = {
-    objectId,
+    objectId: header.objectId,
     extensions,
     payload,
-    status,
+    status: header.objectStatus,
   };
 
-  return { object, bytesRead: pos - offset };
+  return { object, bytesRead: pos - offset, header };
 }
 
 /**
@@ -381,70 +394,46 @@ function validateFirstFetchObject(flags: Varint): void {
   }
 }
 
+/** Header layout of a FETCH stream item, with its Serialization Flags (0 in draft-14). */
+export interface FetchObjectHeaderLayout extends ObjectHeaderLayout {
+  readonly flags: Varint;
+}
+
 /**
- * Decode a single object from a fetch stream.
- * @param buf Buffer containing the object
- * @param offset Starting position
- * @param prior Context from prior object for inheritance (undefined for first object)
- * @param isFirstObject True if this is the first object in the fetch stream
- * @returns Decoded item (FetchObject or FetchEndOfRange) and bytes consumed
- * @throws {RangeError} If extension or payload length exceeds buffer
- * @throws {Error} If flags are invalid or first object tries to inherit
+ * Parse a draft-16 FETCH stream item up to its payload: the header grammar of
+ * {@link decodeFetchObject}. `prior` is read, never updated.
+ * @throws {RangeError} When `buf` ends before the header does — and, as in the
+ *   complete decoder, when an inherited ID exceeds the varint range
  * @see draft-ietf-moq-transport-16 §10.4.4
  */
-export function decodeFetchObject(
+export function decodeFetchObjectHeader(
   buf: Uint8Array,
   offset: number,
   prior: FetchPriorContext | undefined,
   isFirstObject: boolean,
-): { item: DecodedFetchItem; bytesRead: number } {
+): FetchObjectHeaderLayout {
   let pos = offset;
 
-  // Read serialization flags
   const { value: flags, bytesRead: flagsBytes } = readVarint(buf, pos);
   pos += flagsBytes;
-
-  // Validate flags are in allowed range
   validateFetchFlags(flags);
 
-  // Handle End of Range markers (§10.4.4.2)
-  // Group ID and Object ID are present; Subgroup/Priority/Extensions are NOT present
-  // Object Payload Length is still present per §10.4.4 (always present in Fetch objects)
+  // End of Range markers (§10.4.4.2): Group ID and Object ID are present;
+  // Subgroup/Priority/Extensions are NOT. Object Payload Length is still present.
   if (isEndOfRangeFlags(flags)) {
-    // Read Group ID and Object ID
     const { value: groupId, bytesRead: gidBytes } = readVarint(buf, pos);
     pos += gidBytes;
-
     const { value: objectId, bytesRead: oidBytes } = readVarint(buf, pos);
     pos += oidBytes;
-
-    // Read Object Payload Length (should be 0 for End of Range, but must be present)
-    const { value: payloadLen, bytesRead: plBytes } = readVarint(buf, pos);
+    const { value: payloadLength, bytesRead: plBytes } = readVarint(buf, pos);
     pos += plBytes;
-
-    // End of Range should have no payload - warn if non-zero but still consume it
-    const numPayloadLen = Number(payloadLen);
-    if (numPayloadLen > 0) {
-      // Bounds check and skip payload if present
-      if (pos + numPayloadLen > buf.length) {
-        throw new RangeError(
-          `End of Range payload length ${numPayloadLen} exceeds remaining buffer (${buf.length - pos} bytes)`,
-        );
-      }
-      pos += numPayloadLen;
-    }
-
-    const endOfRange: FetchEndOfRange = {
-      flags,
-      groupId,
-      objectId,
-      nonExistent: flags === BigInt(FetchSpecialFlags.END_NON_EXISTENT),
+    return {
+      kind: 'range', flags, headerBytes: pos - offset, payloadLength, objectStatus: undefined,
+      propertiesOffset: undefined, propertiesLength: 0,
+      groupId, subgroupId: undefined, objectId, publisherPriority: undefined, isDatagram: false,
     };
-
-    return { item: endOfRange, bytesRead: pos - offset };
   }
 
-  // Normal object - validate first object constraints
   if (isFirstObject) {
     validateFirstFetchObject(flags);
   } else if (prior === undefined) {
@@ -457,18 +446,15 @@ export function decodeFetchObject(
   const numFlags = Number(flags);
   const isDatagram = (numFlags & FetchFlags.DATAGRAM) !== 0;
 
-  // Read Group ID (if present) or inherit
   let groupId: Varint;
   if ((numFlags & FetchFlags.GROUP_ID) !== 0) {
     const { value: gid, bytesRead: gidBytes } = readVarint(buf, pos);
     pos += gidBytes;
     groupId = gid;
   } else {
-    // Inherit from prior (already validated not first object)
     groupId = varint(prior!.groupId);
   }
 
-  // Determine subgroup ID based on mode
   let subgroupId: Varint;
   if (isDatagram) {
     // DATAGRAM flag: ignore subgroup bits, subgroup = 0
@@ -496,18 +482,15 @@ export function decodeFetchObject(
     }
   }
 
-  // Read Object ID (if present) or inherit + 1
   let objectId: Varint;
   if ((numFlags & FetchFlags.OBJECT_ID) !== 0) {
     const { value: oid, bytesRead: oidBytes } = readVarint(buf, pos);
     pos += oidBytes;
     objectId = oid;
   } else {
-    // Inherit from prior + 1
     objectId = varint(prior!.objectId + 1n);
   }
 
-  // Read Priority (if present) or inherit
   let publisherPriority: number | undefined;
   if ((numFlags & FetchFlags.PRIORITY) !== 0) {
     const { value: prio } = readUint8(buf, pos);
@@ -517,51 +500,145 @@ export function decodeFetchObject(
     publisherPriority = prior.priority;
   }
 
-  // Read Extensions (if present)
-  let extensions: Uint8Array | undefined;
+  let propertiesOffset: number | undefined, propertiesLength = 0;
   if ((numFlags & FetchFlags.EXTENSIONS) !== 0) {
     const { value: extLen, bytesRead: extLenBytes } = readVarint(buf, pos);
     pos += extLenBytes;
     const extensionsLength = Number(extLen);
-
-    // Bounds check
     if (pos + extensionsLength > buf.length) {
       throw new RangeError(
         `Extension length ${extensionsLength} exceeds remaining buffer (${buf.length - pos} bytes)`,
       );
     }
-
-    extensions = buf.slice(pos, pos + extensionsLength);
+    propertiesOffset = pos; propertiesLength = extensionsLength;
     pos += extensionsLength;
   }
 
-  // Read payload length and payload
-  const { value: payloadLen, bytesRead: plBytes } = readVarint(buf, pos);
+  const { value: payloadLength, bytesRead: plBytes } = readVarint(buf, pos);
   pos += plBytes;
-  const numPayloadLen = Number(payloadLen);
 
-  // Bounds check for payload
+  return {
+    kind: 'object', flags, headerBytes: pos - offset, payloadLength, objectStatus: undefined, propertiesOffset, propertiesLength,
+    groupId, subgroupId, objectId, publisherPriority, isDatagram,
+  };
+}
+
+/**
+ * Parse a draft-14 FETCH object up to its payload: the header grammar of
+ * {@link decodeFetchObjectV14}. A zero payload length is followed by an Object
+ * Status, which is part of the header; such an item is still an Object.
+ * @throws {RangeError} When `buf` ends before the header does
+ * @see draft-ietf-moq-transport-14 §10.4.4
+ */
+export function decodeFetchObjectHeaderV14(
+  buf: Uint8Array,
+  offset: number,
+): FetchObjectHeaderLayout {
+  let pos = offset;
+
+  const { value: groupId, bytesRead: gidBytes } = readVarint(buf, pos);
+  pos += gidBytes;
+  const { value: subgroupId, bytesRead: sgidBytes } = readVarint(buf, pos);
+  pos += sgidBytes;
+  const { value: objectId, bytesRead: oidBytes } = readVarint(buf, pos);
+  pos += oidBytes;
+  const { value: publisherPriority } = readUint8(buf, pos);
+  pos += 1;
+
+  const { value: extLen, bytesRead: extLenBytes } = readVarint(buf, pos);
+  pos += extLenBytes;
+  const extensionsLength = Number(extLen);
+  let propertiesOffset: number | undefined, propertiesLength = 0;
+  if (extensionsLength > 0) {
+    if (pos + extensionsLength > buf.length) {
+      throw new RangeError(
+        `Extension length ${extensionsLength} exceeds remaining buffer (${buf.length - pos} bytes)`,
+      );
+    }
+    propertiesOffset = pos; propertiesLength = extensionsLength;
+    pos += extensionsLength;
+  }
+
+  const { value: payloadLength, bytesRead: plBytes } = readVarint(buf, pos);
+  pos += plBytes;
+
+  let objectStatus: Varint | undefined;
+  if (payloadLength === 0n) {
+    const { value: status, bytesRead: stBytes } = readVarint(buf, pos);
+    pos += stBytes;
+    validateObjectStatus(status, 14);
+    objectStatus = status;
+  }
+
+  return {
+    kind: 'object', flags: varint(0n), headerBytes: pos - offset, payloadLength, objectStatus, propertiesOffset, propertiesLength,
+    groupId, subgroupId, objectId, publisherPriority, isDatagram: false,
+  };
+}
+
+/**
+ * Decode a single object from a fetch stream.
+ * @param buf Buffer containing the object
+ * @param offset Starting position
+ * @param prior Context from prior object for inheritance (undefined for first object)
+ * @param isFirstObject True if this is the first object in the fetch stream
+ * @returns Decoded item (FetchObject or FetchEndOfRange) and bytes consumed
+ * @throws {RangeError} If extension or payload length exceeds buffer
+ * @throws {Error} If flags are invalid or first object tries to inherit
+ * @see draft-ietf-moq-transport-16 §10.4.4
+ */
+export function decodeFetchObject(
+  buf: Uint8Array,
+  offset: number,
+  prior: FetchPriorContext | undefined,
+  isFirstObject: boolean,
+): { item: DecodedFetchItem; bytesRead: number; header: FetchObjectHeaderLayout } {
+  const header = decodeFetchObjectHeader(buf, offset, prior, isFirstObject);
+  let pos = offset + header.headerBytes;
+  const numPayloadLen = Number(header.payloadLength);
+
+  if (header.kind === 'range') {
+    // End of Range should have no payload - warn if non-zero but still consume it
+    if (numPayloadLen > 0) {
+      if (pos + numPayloadLen > buf.length) {
+        throw new RangeError(
+          `End of Range payload length ${numPayloadLen} exceeds remaining buffer (${buf.length - pos} bytes)`,
+        );
+      }
+      pos += numPayloadLen;
+    }
+    const endOfRange: FetchEndOfRange = {
+      flags: header.flags,
+      groupId: header.groupId!,
+      objectId: header.objectId,
+      nonExistent: header.flags === BigInt(FetchSpecialFlags.END_NON_EXISTENT),
+    };
+    return { item: endOfRange, bytesRead: pos - offset, header };
+  }
+
+  const extensions = header.propertiesOffset === undefined
+    ? undefined
+    : buf.slice(header.propertiesOffset, header.propertiesOffset + header.propertiesLength);
   if (pos + numPayloadLen > buf.length) {
     throw new RangeError(
       `Payload length ${numPayloadLen} exceeds remaining buffer (${buf.length - pos} bytes)`,
     );
   }
-
   const payload = buf.slice(pos, pos + numPayloadLen);
   pos += numPayloadLen;
 
   const object: FetchObject = {
-    flags,
-    groupId,
-    subgroupId,
-    objectId,
-    publisherPriority,
-    isDatagram,
+    flags: header.flags,
+    groupId: header.groupId!,
+    subgroupId: header.subgroupId!,
+    objectId: header.objectId,
+    publisherPriority: header.publisherPriority,
+    isDatagram: header.isDatagram,
     extensions,
     payload,
   };
 
-  return { item: object, bytesRead: pos - offset };
+  return { item: object, bytesRead: pos - offset, header };
 }
 
 /**
@@ -577,64 +654,25 @@ export function decodeFetchObject(
 export function decodeFetchObjectV14(
   buf: Uint8Array,
   offset: number,
-): { item: DecodedFetchItem; bytesRead: number } {
-  let pos = offset;
+): { item: DecodedFetchItem; bytesRead: number; header: FetchObjectHeaderLayout } {
+  const header = decodeFetchObjectHeaderV14(buf, offset);
+  let pos = offset + header.headerBytes;
 
-  // Group ID
-  const { value: groupId, bytesRead: gidBytes } = readVarint(buf, pos);
-  pos += gidBytes;
-
-  // Subgroup ID
-  const { value: subgroupId, bytesRead: sgidBytes } = readVarint(buf, pos);
-  pos += sgidBytes;
-
-  // Object ID
-  const { value: objectId, bytesRead: oidBytes } = readVarint(buf, pos);
-  pos += oidBytes;
-
-  // Publisher Priority (always present)
-  const { value: publisherPriority } = readUint8(buf, pos);
-  pos += 1;
-
-  // Extension Headers Length
-  const { value: extLen, bytesRead: extLenBytes } = readVarint(buf, pos);
-  pos += extLenBytes;
-  const extensionsLength = Number(extLen);
-
-  let extensions: Uint8Array | undefined;
-  if (extensionsLength > 0) {
-    if (pos + extensionsLength > buf.length) {
-      throw new RangeError(
-        `Extension length ${extensionsLength} exceeds remaining buffer (${buf.length - pos} bytes)`,
-      );
-    }
-    extensions = buf.slice(pos, pos + extensionsLength);
-    pos += extensionsLength;
-  }
-
-  // Object Payload Length
-  const { value: payloadLen, bytesRead: plBytes } = readVarint(buf, pos);
-  pos += plBytes;
-  const numPayloadLen = Number(payloadLen);
-
-  if (numPayloadLen === 0) {
-    // Status object — read status varint and return as FetchEndOfRange
-    // so the adapter emits it as a gap signal.
+  if (header.objectStatus !== undefined) {
+    // Status object — return as FetchEndOfRange so the adapter emits it as a
+    // gap signal, preserving the exact wire status.
     // @see draft-ietf-moq-transport-14 §10.4.4
-    const { value: status, bytesRead: stBytes } = readVarint(buf, pos);
-    pos += stBytes;
-    validateObjectStatus(status, 14);
-
     const endOfRange: FetchEndOfRange = {
       flags: varint(0n),
-      groupId,
-      objectId,
-      nonExistent: status === ObjectStatus.OBJECT_DOES_NOT_EXIST,
-      rawStatus: status,
+      groupId: header.groupId!,
+      objectId: header.objectId,
+      nonExistent: header.objectStatus === ObjectStatus.OBJECT_DOES_NOT_EXIST,
+      rawStatus: varint(header.objectStatus),
     };
-    return { item: endOfRange, bytesRead: pos - offset };
+    return { item: endOfRange, bytesRead: pos - offset, header };
   }
 
+  const numPayloadLen = Number(header.payloadLength);
   if (pos + numPayloadLen > buf.length) {
     throw new RangeError(
       `Payload length ${numPayloadLen} exceeds remaining buffer (${buf.length - pos} bytes)`,
@@ -645,16 +683,18 @@ export function decodeFetchObjectV14(
 
   const object: FetchObject = {
     flags: varint(0n), // No flags in draft-14
-    groupId,
-    subgroupId,
-    objectId,
-    publisherPriority,
+    groupId: header.groupId!,
+    subgroupId: header.subgroupId!,
+    objectId: header.objectId,
+    publisherPriority: header.publisherPriority,
     isDatagram: false,
-    extensions,
+    extensions: header.propertiesOffset === undefined
+      ? undefined
+      : buf.slice(header.propertiesOffset, header.propertiesOffset + header.propertiesLength),
     payload,
   };
 
-  return { item: object, bytesRead: pos - offset };
+  return { item: object, bytesRead: pos - offset, header };
 }
 
 /**

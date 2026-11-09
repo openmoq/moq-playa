@@ -25,10 +25,14 @@ import {
   decodeFetchObject,
   decodeFetchObjectV14,
   decodeObjectDatagram,
+  decodeSubgroupObjectHeader,
+  decodeFetchObjectHeader,
+  decodeFetchObjectHeaderV14,
   type FetchPriorContext,
   type DecodedFetchItem,
+  type FetchObjectHeaderLayout,
 } from './decoder.js';
-import type { FetchObjectPrior18 } from './decoder-18.js';
+import type { FetchObjectPrior18, FetchObjectHeaderLayout18 } from './decoder-18.js';
 import {
   DataStreamType,
   isSubgroupHeaderType,
@@ -40,6 +44,7 @@ import type {
   FetchHeader,
   ObjectDatagram,
   GroupOrder,
+  ObjectHeaderLayout,
 } from './types.js';
 
 /** Coarse classification of an incoming unidirectional data stream by its first byte. */
@@ -64,7 +69,7 @@ export interface DataCodec {
     hasExtensions: boolean,
     previousObjectId: bigint,
     isFirstObject?: boolean,
-  ): { object: SubgroupObject; bytesRead: number };
+  ): { object: SubgroupObject; bytesRead: number; header: ObjectHeaderLayout };
 
   decodeFetchHeader(buf: Uint8Array, offset: number): { header: FetchHeader; bytesRead: number };
 
@@ -74,7 +79,7 @@ export interface DataCodec {
     offset: number,
     prior: FetchPriorContext | undefined,
     isFirstObject: boolean,
-  ): { item: DecodedFetchItem; bytesRead: number };
+  ): { item: DecodedFetchItem; bytesRead: number; header: FetchObjectHeaderLayout };
 
   /**
    * Decode a draft-18 fetch object (or End-of-Range marker). Distinct from
@@ -89,9 +94,41 @@ export interface DataCodec {
     prior: FetchObjectPrior18 | undefined,
     isFirstObject: boolean,
     groupOrder: GroupOrder,
-  ): { item: DecodedFetchItem; bytesRead: number; nextPrior: FetchObjectPrior18 };
+  ): { item: DecodedFetchItem; bytesRead: number; nextPrior: FetchObjectPrior18; header: FetchObjectHeaderLayout18 };
 
   decodeObjectDatagram(buf: Uint8Array, offset: number): { datagram: ObjectDatagram; bytesRead: number };
+
+  /**
+   * Parse a subgroup object up to its payload with the grammar
+   * {@link decodeSubgroupObject} uses, which returns the same layout for the
+   * Object it decodes. Reads, never updates, the caller's state.
+   * @throws {RangeError} when `buf` ends before the header does (read more), and
+   *   wherever the complete decoder raises RangeError for an out-of-range value.
+   */
+  decodeSubgroupObjectHeader(
+    buf: Uint8Array,
+    offset: number,
+    hasExtensions: boolean,
+    previousObjectId: bigint,
+    isFirstObject?: boolean,
+  ): ObjectHeaderLayout;
+
+  /** Draft-14/16 FETCH counterpart of {@link decodeSubgroupObjectHeader}; draft-18/22 throw. */
+  decodeFetchObjectHeader(
+    buf: Uint8Array,
+    offset: number,
+    prior: FetchPriorContext | undefined,
+    isFirstObject: boolean,
+  ): FetchObjectHeaderLayout;
+
+  /** Draft-18/22 FETCH counterpart of {@link decodeSubgroupObjectHeader}; draft-14/16 throw. */
+  decodeFetchObjectHeader18(
+    buf: Uint8Array,
+    offset: number,
+    prior: FetchObjectPrior18 | undefined,
+    isFirstObject: boolean,
+    groupOrder: GroupOrder,
+  ): FetchObjectHeaderLayout18;
 
   /**
    * Identify a data stream from its leading type. Buffer-based (not a single
@@ -143,6 +180,18 @@ export function createDataCodec(version: DraftVersion = 16): DataCodec {
     },
 
     decodeObjectDatagram: (buf, offset) => decodeObjectDatagram(buf, offset, v),
+
+    decodeSubgroupObjectHeader: (buf, offset, hasExtensions, previousObjectId, isFirstObject = true) =>
+      decodeSubgroupObjectHeader(buf, offset, hasExtensions, previousObjectId, isFirstObject, v),
+
+    decodeFetchObjectHeader: (buf, offset, prior, isFirstObject) =>
+      v === 14
+        ? decodeFetchObjectHeaderV14(buf, offset)
+        : decodeFetchObjectHeader(buf, offset, prior, isFirstObject),
+
+    decodeFetchObjectHeader18: () => {
+      throw new Error(`DataCodec: decodeFetchObjectHeader18 is draft-18 only (this codec is draft-${v})`);
+    },
 
     classifyStream: (buf, offset = 0) => {
       // draft-14/16 stream types are a single byte; read it directly.

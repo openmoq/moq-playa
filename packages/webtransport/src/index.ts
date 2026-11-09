@@ -5,6 +5,19 @@
 
 export { MoqtConnection } from './adapter.js';
 export type { ObjectReceipt, ObjectReceiptObservation, ObjectReceiptDiscard } from './object-receipts.js';
+export { OBSERVED_PROPERTIES_LIMIT } from './object-reception.js';
+export type {
+  ObjectReception,
+  ObjectReceptionEvent,
+  ObjectReceptionHeader,
+  ObjectReceptionProgress,
+  ObjectReceptionEnd,
+  ObjectReceptionDatagram,
+  ObjectReceptionOrigin,
+  ObjectReceptionInterruption,
+  ObjectReceptionPropertiesOmission,
+  ObjectReceptionOptions,
+} from './object-reception.js';
 export type { TrackSubscription, TrackSubscribeOptions, IncomingPublish, ConnectOptions } from './adapter.js';
 export { catToken, AuthorizationError } from './authorization.js';
 export type { AuthorizationToken, AuthorizationContext, AuthorizationOperation, AuthorizationProvider, ConnectionAuthorization } from './authorization.js';

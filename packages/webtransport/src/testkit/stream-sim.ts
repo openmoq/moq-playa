@@ -117,6 +117,15 @@ export class SimStream implements WebTransportBidirectionalStream {
     return this;
   }
 
+  /** RESET the readable side with an application error code, as WebTransport reports RESET_STREAM. */
+  resetReadableWithCode(code: number): this {
+    if (!this.readClosed) {
+      this.readClosed = true;
+      this.ctrl.error(Object.assign(new Error(`simulated RESET_STREAM (code ${code})`), { streamErrorCode: code }));
+    }
+    return this;
+  }
+
   /** Concatenate all written chunks (for assertions). */
   writtenBytes(): Uint8Array {
     const total = this.written.reduce((n, c) => n + c.length, 0);

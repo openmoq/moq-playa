@@ -18,6 +18,8 @@ import {
   decodeObjectDatagram18,
   decodeFetchHeader18,
   decodeFetchObject18,
+  decodeSubgroupObjectHeader18,
+  decodeFetchObjectHeader18,
 } from './decoder-18.js';
 import { classifyStream18, classifyDatagram18 } from './stream-type-18.js';
 import type { RequestStreamDraft } from '../versions.js';
@@ -42,6 +44,16 @@ export function createDataCodec18(version: RequestStreamDraft = 18): DataCodec {
       decodeFetchObject18(buf, offset, prior, isFirstObject, groupOrder, version),
 
     decodeObjectDatagram: (buf, offset) => decodeObjectDatagram18(buf, offset),
+
+    decodeSubgroupObjectHeader: (buf, offset, hasProperties, previousObjectId, isFirstObject = true) =>
+      decodeSubgroupObjectHeader18(buf, offset, hasProperties, previousObjectId, isFirstObject),
+
+    decodeFetchObjectHeader: () => {
+      throw new Error('Draft18DataCodec: use decodeFetchObjectHeader18 for draft-18 fetch streams');
+    },
+
+    decodeFetchObjectHeader18: (buf, offset, prior, isFirstObject, groupOrder) =>
+      decodeFetchObjectHeader18(buf, offset, prior, isFirstObject, groupOrder, version),
 
     classifyStream: (buf, offset = 0): StreamClass => classifyStream18(buf, offset).kind,
 

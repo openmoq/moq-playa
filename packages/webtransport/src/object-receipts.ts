@@ -1,4 +1,5 @@
 import type { MoqtObject, ObjectDatagram } from '@openmoq/transport';
+import type { ObjectReception } from './object-reception.js';
 
 declare const receiptIdentity: unique symbol;
 
@@ -14,6 +15,12 @@ interface ObjectReceiptFields {
   readonly objectId: bigint;
   readonly objectStatus: bigint;
   readonly payloadBytes: number;
+  /**
+   * The receive attempt that produced this exact Object when its reception was
+   * observed, even if every reception listener has since detached; null when it
+   * was not observed, and for FIN-derived group ends, which have no wire Object.
+   */
+  readonly reception: ObjectReception | null;
 }
 
 type AliasReceiptOrigin = 'subgroup' | 'datagram' | 'group-end';
@@ -84,11 +91,12 @@ export class ObjectReceiptObservers {
     return receipt;
   }
 
-  receive(object: MoqtObject | ObjectDatagram, origin: AliasReceiptOrigin, lastObjectId: bigint | null = null): void {
+  receive(object: MoqtObject | ObjectDatagram, origin: AliasReceiptOrigin, lastObjectId: bigint | null = null,
+    reception: ObjectReception | null = null): void {
     const receipt = this.register(object);
     if (!receipt) return;
     const observation: ObjectReceiptObservation = {
-      receipt, origin, lastObjectId: origin === 'group-end' ? lastObjectId : null, trackAlias: object.trackAlias, groupId: object.groupId, objectId: object.objectId,
+      receipt, reception, origin, lastObjectId: origin === 'group-end' ? lastObjectId : null, trackAlias: object.trackAlias, groupId: object.groupId, objectId: object.objectId,
       subgroupId: 'subgroupId' in object ? object.subgroupId : null,
       objectStatus: 'kind' in object ? object.kind === 'gap' ? object.status : 0n : object.status ?? 0n,
       payloadBytes: 'kind' in object && object.kind === 'gap' ? 0 : object.payload.byteLength,
@@ -96,11 +104,11 @@ export class ObjectReceiptObservers {
     this.publish(observation);
   }
 
-  receiveFetch(object: MoqtObject, requestId: bigint, streamId: bigint): void {
+  receiveFetch(object: MoqtObject, requestId: bigint, streamId: bigint, reception: ObjectReception | null = null): void {
     const receipt = this.register(object);
     if (!receipt) return;
     this.publish({
-      receipt, origin: 'fetch', lastObjectId: null, trackAlias: null, requestId, streamId,
+      receipt, reception, origin: 'fetch', lastObjectId: null, trackAlias: null, requestId, streamId,
       groupId: object.groupId, objectId: object.objectId, subgroupId: object.subgroupId,
       objectStatus: object.kind === 'gap' ? object.status : 0n,
       payloadBytes: object.kind === 'gap' ? 0 : object.payload.byteLength,

@@ -17,7 +17,7 @@ function fixture(limits = {}) {
     receive(input: MoqtObject, origin: Exclude<ObjectReceiptObservation['origin'], 'fetch'>, lastObjectId: bigint | null = null) {
       if (!listeners.size || tokens.has(input)) return;
       const receipt = Object.freeze({}) as ObjectReceipt; tokens.set(input, receipt);
-      const event = { receipt, origin, lastObjectId, trackAlias: input.trackAlias, groupId: input.groupId,
+      const event = { receipt, reception: null, origin, lastObjectId, trackAlias: input.trackAlias, groupId: input.groupId,
         subgroupId: input.subgroupId, objectId: input.objectId, objectStatus: 0n, payloadBytes: 1 };
       for (const fn of listeners) fn(event);
     },

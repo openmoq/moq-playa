@@ -31,7 +31,7 @@ import {
 } from './codes-18.js';
 import { StreamType18 } from './codes-18.js';
 import { FetchFlags, FetchSubgroupMode, FetchSpecialFlags } from './codes.js';
-import type { SubgroupHeader, SubgroupObject, ObjectDatagram, FetchHeader, FetchObject, FetchEndOfRange, GroupOrder } from './types.js';
+import type { SubgroupHeader, SubgroupObject, ObjectDatagram, FetchHeader, FetchObject, FetchEndOfRange, GroupOrder, ObjectHeaderLayout } from './types.js';
 import type { DecodedFetchItem } from './decoder.js';
 import type { RequestStreamDraft } from '../versions.js';
 
@@ -125,14 +125,43 @@ export function decodeSubgroupHeader18(
   return { header, bytesRead: pos - offset };
 }
 
-/** Decode a draft-18 subgroup object. `hasProperties` comes from the header. */
-export function decodeSubgroupObject18(
+/** Locate an optional vi64-prefixed Properties block without copying it. */
+function locateOptionalProperties(
+  buf: Uint8Array,
+  offset: number,
+  present: boolean,
+  rejectEmpty: boolean,
+): { offset: number | undefined; length: number; bytesRead: number } {
+  if (!present) return { offset: undefined, length: 0, bytesRead: 0 };
+  const { value: len, bytesRead } = readVi64(buf, offset);
+  const start = offset + bytesRead;
+  const n = Number(len);
+  if (start + n > buf.length) {
+    throw new RangeError(`vi64 length-prefixed block (${n}) exceeds remaining buffer`);
+  }
+  if (n === 0) {
+    if (rejectEmpty) {
+      throw new ProtocolViolationError('PROPERTIES flag set but the Properties block is empty');
+    }
+    return { offset: undefined, length: 0, bytesRead: bytesRead + n };
+  }
+  return { offset: start, length: n, bytesRead: bytesRead + n };
+}
+
+/**
+ * Parse a draft-18 subgroup object up to its payload: the header grammar of
+ * {@link decodeSubgroupObject18}, including the Object Status that follows a
+ * zero payload length.
+ * @throws {RangeError} When `buf` ends before the header does
+ * @see draft-ietf-moq-transport-18 §11.4.2
+ */
+export function decodeSubgroupObjectHeader18(
   buf: Uint8Array,
   offset: number,
   hasProperties: boolean,
   previousObjectId: bigint,
   isFirstObject: boolean = true,
-): { object: SubgroupObject; bytesRead: number } {
+): ObjectHeaderLayout {
   let pos = offset;
   const d = readVi64(buf, pos); pos += d.bytesRead;
   const objectId = isFirstObject ? d.value : previousObjectId + d.value + 1n;
@@ -144,31 +173,56 @@ export function decodeSubgroupObject18(
     );
   }
 
-  // Subgroup objects always carry a Properties Length field when the header's
-  // PROPERTIES bit is set, but that length MAY be 0 — objects with no properties
-  // encode Properties Length = 0 (§11.4.2). Empty is NOT rejected here (unlike a
-  // datagram's PROPERTIES flag, which is contradictory when empty).
-  const props = readOptionalProperties(buf, pos, hasProperties, /*rejectEmpty*/ false);
+  // A PROPERTIES-flagged subgroup object always carries a Properties Length,
+  // which MAY be 0 (§11.4.2); unlike a datagram, empty is not rejected.
+  const props = locateOptionalProperties(buf, pos, hasProperties, /*rejectEmpty*/ false);
   pos += props.bytesRead;
 
   const pl = readVi64(buf, pos); pos += pl.bytesRead;
-  const n = Number(pl.value);
+  let objectStatus: bigint | undefined;
+  if (pl.value === 0n) {
+    const st = readVi64(buf, pos); pos += st.bytesRead;
+    objectStatus = st.value;
+    validateStatus18(st.value);
+    if (st.value !== 0n && props.offset !== undefined) {
+      throw new ProtocolViolationError(
+        `Properties present on a non-Normal status object (status 0x${st.value.toString(16)})`,
+      );
+    }
+  }
+
+  return {
+    kind: 'object', headerBytes: pos - offset, payloadLength: pl.value, objectStatus,
+    propertiesOffset: props.offset, propertiesLength: props.length,
+    groupId: undefined, subgroupId: undefined, objectId, publisherPriority: undefined, isDatagram: false,
+  };
+}
+
+/** Decode a draft-18 subgroup object. `hasProperties` comes from the header. */
+export function decodeSubgroupObject18(
+  buf: Uint8Array,
+  offset: number,
+  hasProperties: boolean,
+  previousObjectId: bigint,
+  isFirstObject: boolean = true,
+): { object: SubgroupObject; bytesRead: number; header: ObjectHeaderLayout } {
+  const header = decodeSubgroupObjectHeader18(buf, offset, hasProperties, previousObjectId, isFirstObject);
+  let pos = offset + header.headerBytes;
+  const n = Number(header.payloadLength);
 
   let payload: Uint8Array;
-  let status: bigint | undefined;
   if (n === 0) {
     payload = new Uint8Array(0);
-    const st = readVi64(buf, pos); pos += st.bytesRead;
-    status = st.value;
-    validateStatus18(status);
-    rejectPropertiesOnNonNormal(status, props.value);
   } else {
     if (pos + n > buf.length) throw new RangeError(`object payload (${n}) exceeds remaining buffer`);
     payload = buf.slice(pos, pos + n);
     pos += n;
   }
 
-  return { object: { objectId, extensions: props.value, payload, status }, bytesRead: pos - offset };
+  const extensions = header.propertiesOffset === undefined
+    ? undefined
+    : buf.slice(header.propertiesOffset, header.propertiesOffset + header.propertiesLength);
+  return { object: { objectId: header.objectId, extensions, payload, status: header.objectStatus }, bytesRead: pos - offset, header };
 }
 
 /** Decode a draft-18 OBJECT_DATAGRAM. @throws on invalid form / flag combo. */
@@ -329,22 +383,32 @@ function validateFetchFlags18(flags: bigint, version: RequestStreamDraft = 18): 
 }
 
 /**
- * Decode a single object (or End-of-Range marker) from a draft-18 FETCH stream.
- *
- * Returns the decoded item, bytes consumed, and the `nextPrior` to thread into
- * the following call. `groupOrder` is the FETCH's requested Group Order; it is
- * Ascending by default when the request omitted GROUP_ORDER (§11.4.4.1).
- *
- * @see draft-ietf-moq-transport-18 §11.4.4
+ * Header layout of a draft-18/22 FETCH stream item, with the `nextPrior` its
+ * complete decode would thread into the following item. Returning it never
+ * commits it: the caller decides whether the item was actually consumed.
  */
-export function decodeFetchObject18(
+export interface FetchObjectHeaderLayout18 extends ObjectHeaderLayout {
+  readonly flags: bigint;
+  readonly nextPrior: FetchObjectPrior18;
+}
+
+/**
+ * Parse a draft-18/22 FETCH stream item up to its payload: the header grammar
+ * of {@link decodeFetchObject18}. An End-of-Range marker has no payload; its
+ * draft-18 form carries a payload length that MUST be zero, while the draft-22
+ * marker-only form carries none.
+ * @throws {RangeError} When `buf` ends before the header does
+ * @see draft-ietf-moq-transport-18 §11.4.4
+ * @see draft-ietf-moq-transport-22 §11.4.1
+ */
+export function decodeFetchObjectHeader18(
   buf: Uint8Array,
   offset: number,
   prior: FetchObjectPrior18 | undefined,
   isFirstObject: boolean,
   groupOrder: GroupOrder,
   version: RequestStreamDraft = 18,
-): { item: DecodedFetchItem; bytesRead: number; nextPrior: FetchObjectPrior18 } {
+): FetchObjectHeaderLayout18 {
   let pos = offset;
   const fl = readVi64(buf, pos); pos += fl.bytesRead;
   const flags = fl.value;
@@ -364,12 +428,6 @@ export function decodeFetchObject18(
         throw new ProtocolViolationError(`End-of-Range marker has a non-zero payload length (${pl.value})`);
       }
     }
-    const item: FetchEndOfRange = {
-      flags: varint(flags),
-      groupId: gid.value,
-      objectId: oid.value,
-      nonExistent: flags === BigInt(FetchSpecialFlags.END_NON_EXISTENT),
-    };
     // Position prior comes from the marker; field priors are UNCHANGED.
     const nextPrior: FetchObjectPrior18 = {
       groupId: gid.value,
@@ -377,10 +435,15 @@ export function decodeFetchObject18(
       lastObjectSubgroupId: prior?.lastObjectSubgroupId,
       lastObjectPriority: prior?.lastObjectPriority,
     };
-    return { item, bytesRead: pos - offset, nextPrior };
+    return {
+      kind: 'range', flags, headerBytes: pos - offset, payloadLength: 0n, objectStatus: undefined,
+      propertiesOffset: undefined, propertiesLength: 0,
+      groupId: gid.value, subgroupId: undefined, objectId: oid.value, publisherPriority: undefined, isDatagram: false,
+      nextPrior,
+    };
   }
 
-  // ── Normal object ────────────────────────────────────────────────────
+  // ── Normal object ────────────────────────────────────────────────
   const numFlags = Number(flags);
   const isDatagram = (numFlags & FetchFlags.DATAGRAM) !== 0;
   const groupPresent = (numFlags & FetchFlags.GROUP_ID) !== 0;
@@ -408,7 +471,6 @@ export function decodeFetchObject18(
     throw new ProtocolViolationError('Non-first fetch object requires prior-object context');
   }
 
-  // Group ID
   let groupId: bigint;
   if (groupPresent) {
     const gd = readVi64(buf, pos); pos += gd.bytesRead;
@@ -430,7 +492,6 @@ export function decodeFetchObject18(
     groupId = prior!.groupId; // not first (guaranteed by validation)
   }
 
-  // Subgroup ID
   let subgroupId: bigint;
   if (isDatagram) {
     subgroupId = 0n; // §11.4.4.1: Datagram forwarding preference has no Subgroup
@@ -477,7 +538,6 @@ export function decodeFetchObject18(
     if (objectId > MAX_VI64) throw new ProtocolViolationError(`Fetch Object ID overflow: ${objectId} > 2^64-1`);
   }
 
-  // Priority
   let publisherPriority: number | undefined;
   if (priorityPresent) {
     publisherPriority = readUint8(buf, pos).value;
@@ -489,27 +549,11 @@ export function decodeFetchObject18(
     publisherPriority = prior.lastObjectPriority;
   }
 
-  // Properties
-  const props = readOptionalProperties(buf, pos, propertiesPresent, /*rejectEmpty*/ false);
+  const props = locateOptionalProperties(buf, pos, propertiesPresent, /*rejectEmpty*/ false);
   pos += props.bytesRead;
 
-  // Payload
   const pl = readVi64(buf, pos); pos += pl.bytesRead;
-  const n = Number(pl.value);
-  if (pos + n > buf.length) throw new RangeError(`Fetch object payload (${n}) exceeds remaining buffer`);
-  const payload = buf.slice(pos, pos + n);
-  pos += n;
 
-  const item: FetchObject = {
-    flags: varint(flags),
-    groupId,
-    subgroupId,
-    objectId,
-    publisherPriority,
-    isDatagram,
-    extensions: props.value,
-    payload,
-  };
   const nextPrior: FetchObjectPrior18 = {
     groupId,
     objectId,
@@ -519,5 +563,58 @@ export function decodeFetchObject18(
     lastObjectSubgroupId: isDatagram ? undefined : subgroupId,
     lastObjectPriority: publisherPriority,
   };
-  return { item, bytesRead: pos - offset, nextPrior };
+  return {
+    kind: 'object', flags, headerBytes: pos - offset, payloadLength: pl.value, objectStatus: undefined,
+    propertiesOffset: props.offset, propertiesLength: props.length, groupId, subgroupId, objectId, publisherPriority, isDatagram, nextPrior,
+  };
+}
+
+/**
+ * Decode a single object (or End-of-Range marker) from a draft-18 FETCH stream.
+ *
+ * Returns the decoded item, bytes consumed, and the `nextPrior` to thread into
+ * the following call. `groupOrder` is the FETCH's requested Group Order; it is
+ * Ascending by default when the request omitted GROUP_ORDER (§11.4.4.1).
+ *
+ * @see draft-ietf-moq-transport-18 §11.4.4
+ */
+export function decodeFetchObject18(
+  buf: Uint8Array,
+  offset: number,
+  prior: FetchObjectPrior18 | undefined,
+  isFirstObject: boolean,
+  groupOrder: GroupOrder,
+  version: RequestStreamDraft = 18,
+): { item: DecodedFetchItem; bytesRead: number; nextPrior: FetchObjectPrior18; header: FetchObjectHeaderLayout18 } {
+  const header = decodeFetchObjectHeader18(buf, offset, prior, isFirstObject, groupOrder, version);
+  let pos = offset + header.headerBytes;
+
+  if (header.kind === 'range') {
+    const item: FetchEndOfRange = {
+      flags: varint(header.flags),
+      groupId: header.groupId!,
+      objectId: header.objectId,
+      nonExistent: header.flags === BigInt(FetchSpecialFlags.END_NON_EXISTENT),
+    };
+    return { item, bytesRead: pos - offset, nextPrior: header.nextPrior, header };
+  }
+
+  const n = Number(header.payloadLength);
+  if (pos + n > buf.length) throw new RangeError(`Fetch object payload (${n}) exceeds remaining buffer`);
+  const payload = buf.slice(pos, pos + n);
+  pos += n;
+
+  const item: FetchObject = {
+    flags: varint(header.flags),
+    groupId: header.groupId!,
+    subgroupId: header.subgroupId!,
+    objectId: header.objectId,
+    publisherPriority: header.publisherPriority,
+    isDatagram: header.isDatagram,
+    extensions: header.propertiesOffset === undefined
+      ? undefined
+      : buf.slice(header.propertiesOffset, header.propertiesOffset + header.propertiesLength),
+    payload,
+  };
+  return { item, bytesRead: pos - offset, nextPrior: header.nextPrior, header };
 }

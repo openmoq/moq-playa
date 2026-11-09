@@ -186,6 +186,7 @@ export type {
   MoqtObject,
   MoqtObjectData,
   MoqtObjectGap,
+  ObjectHeaderLayout,
 } from './data/types.js';
 
 export {
@@ -196,7 +197,7 @@ export {
   decodeFetchObjectV14,
   decodeObjectDatagram,
 } from './data/decoder.js';
-export type { FetchPriorContext, DecodedFetchItem } from './data/decoder.js';
+export type { FetchPriorContext, DecodedFetchItem, FetchObjectHeaderLayout } from './data/decoder.js';
 
 export {
   decodeSubgroupHeader18,
@@ -206,7 +207,7 @@ export {
   decodeFetchObject18,
 } from './data/decoder-18.js';
 // GroupOrder is exported above from the neutral './data/types.js' (its home).
-export type { FetchObjectPrior18 } from './data/decoder-18.js';
+export type { FetchObjectPrior18, FetchObjectHeaderLayout18 } from './data/decoder-18.js';
 
 export { createDataCodec } from './data/data-codec.js';
 export type { DataCodec, StreamClass, DatagramClass } from './data/data-codec.js';
