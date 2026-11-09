@@ -39,4 +39,47 @@ describe('capture timestamp age observability', () => {
     sync.evaluateCatchUp(0n);
     expect(sync.captureTimestampAgeUs).toBeNull();
   });
+
+  it('does not let an unmeasurable track null out another track\'s measured age', () => {
+    const { now, sync } = controller();
+    // Video carries wall-clock capture timestamps; audio carries media time.
+    sync.evaluateCatchUp(BigInt(now - 250_000), true, 'video');
+    sync.evaluateCatchUp(500_000n, false, 'audio');
+    expect(sync.captureTimestampAgeUs).toBe(250_000);
+    expect(sync.latencyUs).toBe(250_000);
+    sync.evaluateCatchUp(0n, undefined, 'audio');
+    expect(sync.captureTimestampAgeUs).toBe(250_000);
+    sync.evaluateCatchUp(BigInt(now - 100_000), true, 'video');
+    expect(sync.captureTimestampAgeUs).toBe(100_000);
+  });
+
+  it('reports the most recent measurement among tracks that are measurable', () => {
+    const { now, sync } = controller();
+    sync.evaluateCatchUp(BigInt(now - 250_000), true, 'video');
+    sync.evaluateCatchUp(BigInt(now - 200_000), true, 'audio');
+    expect(sync.captureTimestampAgeUs).toBe(200_000);
+    // Audio becomes unmeasurable: fall back to video's still-valid age.
+    sync.evaluateCatchUp(500_000n, false, 'audio');
+    expect(sync.captureTimestampAgeUs).toBe(250_000);
+    // Once no track is measurable, the age is unavailable again.
+    sync.evaluateCatchUp(500_000n, false, 'video');
+    expect(sync.captureTimestampAgeUs).toBeNull();
+  });
+});
+
+describe('capture timestamp source bounds', () => {
+  it('rejects arbitrary JavaScript source keys without replacing a valid observation', () => {
+    const { now, sync } = controller();
+    sync.evaluateCatchUp(BigInt(now - 250_000), true, 'video');
+    for (const source of ['track-1', 'track-2', 'constructor']) {
+      expect(() => sync.evaluateCatchUp(BigInt(now), true, source as never)).toThrow(TypeError);
+      expect(sync.captureTimestampAgeUs).toBe(250_000);
+    }
+    // The legacy two-argument API still owns an independent default slot.
+    sync.evaluateCatchUp(BigInt(now - 100_000), true);
+    sync.evaluateCatchUp(0n);
+    expect(sync.captureTimestampAgeUs).toBe(250_000);
+    sync.reset();
+    expect(sync.captureTimestampAgeUs).toBeNull();
+  });
 });

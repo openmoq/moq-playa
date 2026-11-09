@@ -1043,7 +1043,7 @@ export class PlaybackPipeline {
         // @see draft-ietf-moq-loc-01 §2.3.1.1 (latency measurement)
         // @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
         if (originalTimeline && !backfill && headers.captureTimestamp !== undefined) {
-            const catchUp = this.sync.evaluateCatchUp(headers.captureTimestamp, headers.timestampIsWallClock);
+            const catchUp = this.sync.evaluateCatchUp(headers.captureTimestamp, headers.timestampIsWallClock, this.mediaType);
             if (catchUp !== null && catchUp.currentRate !== this._lastEmittedRate) {
                 this._lastEmittedRate = catchUp.currentRate;
                 this.onEvent({ type: 'catch_up_changed', state: catchUp });

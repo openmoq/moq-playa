@@ -2081,6 +2081,27 @@ describe('PlaybackPipeline', () => {
             expect(run(false)).toBeCloseTo(run(true), 0);
         });
 
+        it('keeps video capture age when shared-sync audio uses media timestamps', () => {
+            const clock = new MockClock();
+            const now = 1_800_000_000_000_000;
+            const sync = new SyncController({ driftThresholdUs: 500_000, clock, wallClock: { now: () => now } });
+            const video = createPipeline({ mediaType: 'video', clock, sync });
+            const audio = createPipeline({ mediaType: 'audio', clock, sync });
+            video.pipeline.configure(new Uint8Array([1]));
+            audio.pipeline.configure(new Uint8Array([1]));
+            video.pipeline.pushObject(makeData(1, 0), {
+                ...videoHeaders(BigInt(now - 250_000), true), timestampIsWallClock: true,
+            });
+            video.pipeline.tick();
+            expect(sync.captureTimestampAgeUs).toBe(250_000);
+            expect(video.commands.some(command => command.type === 'decode_video')).toBe(true);
+            audio.pipeline.pushObject(makeData(1, 0), {
+                captureTimestamp: 500_000n, timestampIsWallClock: false,
+            });
+            audio.pipeline.tick();
+            expect(sync.captureTimestampAgeUs).toBe(250_000);
+        });
+
         it('does not measure wall-clock latency when timestampIsWallClock is false', () => {
             const clock = new MockClock();
             clock.set(5_000_000);
@@ -2091,7 +2112,7 @@ describe('PlaybackPipeline', () => {
             pipeline.pushObject(makeData(1, 0), { captureTimestamp: 1_000_000n, timestampIsWallClock: false });
             pipeline.tick();
 
-            expect(spy).toHaveBeenCalledWith(1_000_000n, false);
+            expect(spy).toHaveBeenCalledWith(1_000_000n, false, 'audio');
             expect(sync.latencyUs).toBe(0);
         });
 
