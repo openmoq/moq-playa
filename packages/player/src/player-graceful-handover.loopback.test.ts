@@ -1546,3 +1546,112 @@ describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft
     } finally { await h.destroy(); }
   });
 });
+
+type RetainedAttempt = {
+  events: Array<{ obj?: { groupId: bigint } }>;
+  retainedBytes: number;
+  prep?: unknown;
+  slots?: unknown;
+};
+
+describe('root public-assembler partial-adoption cleanup', () => {
+  it.each(['healthy', 'fault', 'fault-reentrant-destroy'] as const)(
+    'owns prepared requests and candidate close after adoption: %s', async mode => {
+      const nextInit = buildInit({ trackId: 1, timescale: 60000, handler: 'vide' });
+      let armed = false;
+      let h!: Awaited<ReturnType<typeof fixture>>;
+      let destroyed: Promise<void> | undefined;
+      let retained: RetainedAttempt | undefined;
+      const pushed: bigint[] = [];
+      const faultPremises: Array<{ currentIsCandidate: boolean; activeRequests: string[] }> = [];
+      const initializations: Array<{ role: string; bytes: Uint8Array }> = [];
+      h = await fixture(18, { config: {
+        createMediaSource: () => ({ initialize: () => true, appendChunk: () => {}, changeType: async () => {},
+          reset: () => {}, endOfStream: () => {}, destroy: () => {}, mediaElement: null,
+          onFirstFrame: null, onError: null, onStall: null }),
+        createCmafAssembler: callbacks => ({
+          push: (mediaType, track, group, payload) => {
+            pushed.push(group); callbacks.onSegment(mediaType, payload, track, group);
+          },
+          getEpoch: () => null, reset() {}, destroy() {},
+          setInitSegment: (role, bytes) => {
+            initializations.push({ role, bytes: bytes.slice() });
+            if (!armed || mode === 'healthy') return;
+            const connection = Reflect.get(h.player, 'connection') as unknown;
+            const activeRequests = h.next.requests.filter(request =>
+              h.next.client.session.getSubscription(varint(request.id))?.isActive === true).map(request => request.name).sort();
+            faultPremises.push({ currentIsCandidate: connection === h.next.client, activeRequests });
+            if (mode === 'fault-reentrant-destroy') destroyed = h.player.destroy();
+            throw new Error('public assembler init fault');
+          },
+        }),
+      } });
+      const internal = h.player as unknown as {
+        commitMigration(txn: RetainedAttempt, connection: PlayerConnection): void;
+        currentMigration: unknown;
+      };
+      const original = internal.commitMigration.bind(h.player);
+      const commitPremises: Array<{ events: number; bytes: number; video61: boolean }> = [];
+      const capture = vi.spyOn(internal, 'commitMigration').mockImplementation((txn, connection) => {
+        retained = txn;
+        commitPremises.push({ events: txn.events.length, bytes: txn.retainedBytes,
+          video61: txn.events.some(event => event.obj?.groupId === 61n) });
+        original(txn, connection); // Observation only; the public assembler throws.
+      });
+      try {
+        await h.old.goaway();
+        await h.next.accept('catalog', 100n);
+        await h.next.send('catalog', catalog(true));
+        await h.next.accept('video', 200n);
+        await h.next.send('video', chunk('video', 61n), 61n);
+        await h.next.accept('audio', 201n);
+        expect(h.migrated).not.toHaveBeenCalled();
+        expect(h.received).not.toContainEqual({ name: 'video', group: 61n });
+        expect(h.next.close).not.toHaveBeenCalled();
+        armed = true;
+        await h.next.accept('init-video', 202n);
+        await h.next.send('init-video', nextInit);
+        await flush(512);
+        await destroyed;
+        expect(commitPremises).toHaveLength(1);
+        expect(commitPremises[0]!.events).toBeGreaterThan(0);
+        expect(commitPremises[0]!.bytes).toBeGreaterThan(0);
+        expect(commitPremises[0]!.video61).toBe(true);
+        expect(initializations.some(item => item.role === 'video'
+          && Buffer.from(item.bytes).equals(Buffer.from(nextInit)))).toBe(true);
+        expect(h.next.requests.map(request => request.name).sort()).toEqual(['audio', 'catalog', 'init-video', 'video']);
+        if (mode === 'healthy') {
+          expect(faultPremises).toEqual([]);
+          expect(h.fatalErrors).toEqual([]);
+          expect(h.errors).toEqual([]);
+          expect(h.migrated).toHaveBeenCalledOnce();
+          expect(h.received).toContainEqual({ name: 'video', group: 61n });
+          expect(pushed).toContain(61n);
+          expect(h.next.close).not.toHaveBeenCalled();
+          await h.player.destroy();
+          expect(h.next.close).toHaveBeenCalledTimes(1);
+          return;
+        }
+        expect(faultPremises).toEqual([{ currentIsCandidate: true,
+          activeRequests: ['audio', 'catalog', 'init-video', 'video'] }]);
+        expect.soft(h.player.state).toBe(mode === 'fault-reentrant-destroy' ? 'ended' : 'error');
+        if (mode === 'fault') {
+          expect.soft(h.fatalErrors).toEqual(['Session handover failed while committing the replacement: public assembler init fault']);
+        }
+        expect.soft(h.migrated).not.toHaveBeenCalled();
+        expect.soft(h.received).not.toContainEqual({ name: 'video', group: 61n });
+        expect.soft(pushed).not.toContain(61n);
+        expect.soft(h.next.close, 'the adopted failed candidate has one close owner').toHaveBeenCalledTimes(1);
+        for (const request of h.next.requests) {
+          expect.soft(h.next.client.session.getSubscription(varint(request.id)), `retire prepared ${request.name}`).toBeUndefined();
+        }
+        expect.soft(retained?.events).toEqual([]);
+        expect.soft(retained?.retainedBytes).toBe(0);
+        expect.soft(retained?.prep).toBeUndefined();
+        expect.soft(retained?.slots).toBeUndefined();
+        expect.soft(internal.currentMigration).toBeNull();
+        await h.player.destroy();
+        expect(h.next.close, 'later destroy cannot close the same candidate again').toHaveBeenCalledTimes(1);
+      } finally { capture.mockRestore(); await h.destroy(); }
+    });
+});

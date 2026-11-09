@@ -367,6 +367,7 @@ function errorRetainedBytes(err: unknown, context: unknown, depth = 0): number {
  * commit can prove ownership rather than clobbering a global slot.
  */
 interface MigrationTxn {
+  closing?: Promise<void>;
   readonly conn: MoqtConnection;
   /** The endpoint this attempt is moving TO, recorded at adoption so a
    *  replacement that sends an empty New Session URI during retirement
@@ -5132,18 +5133,30 @@ export class MoqtPlayer {
     // mark txn.terminated. Cleanup runs in `finally` even if something throws — a
     // stranded transaction would leave a permanent "migration in progress" lock.
     // (drainStagedCandidate never throws; retireMigratedSession never throws.)
+    // commitMigration CAN throw part-way (an application listener it emits to,
+    // a media adapter it calls). Adoption is then half-applied and cannot be
+    // trusted either way, so the handover fails fatally instead.
+    let commitFault: { error: unknown } | undefined;
     try {
-      this.commitMigration(txn, newConnection);
-      this.drainStagedCandidate(txn);
+      try {
+        this.commitMigration(txn, newConnection);
+      } catch (error) {
+        commitFault = { error };
+        this.failMigrationCommit(txn, newConnection, error);
+      }
+      if (commitFault === undefined) this.drainStagedCandidate(txn);
     } finally {
       try {
-        await this.retireMigratedSession(oldConnection);
+        // Never retire a session the player is still holding: a commit that
+        // threw before switching left `this.connection` on the old one.
+        if (this.connection !== oldConnection) await this.retireMigratedSession(oldConnection);
         this.pruneSupersededSubscriptions(txn);
       } finally {
         if (this.currentMigration === txn) this.currentMigration = null;
         this.processPendingGoaway();
       }
     }
+    if (commitFault !== undefined) throw commitFault.error;
     // The single-flight slot is now released — a GOAWAY queued during drain or
     // retirement can be acted on (a fresh migration to its target). Done before
     // the termination check so a GOAWAY that raced a dying session still drives
@@ -7103,6 +7116,16 @@ export class MoqtPlayer {
     }
   }
 
+  /** Reserve shutdown before calling the adapter, which may re-enter destroy. */
+  private closeMigrationCandidate(txn: MigrationTxn): Promise<void> {
+    if (txn.closing) return txn.closing;
+    let settled!: () => void;
+    txn.closing = new Promise<void>(resolve => { settled = resolve; });
+    try { void txn.conn.close().then(settled, settled); }
+    catch { settled(); }
+    return txn.closing;
+  }
+
   /**
    * Abort an in-flight transaction from an out-of-band signal (candidate close /
    * error, or staging overflow): mark it terminal, drop its staged events,
@@ -7118,7 +7141,7 @@ export class MoqtPlayer {
     txn.events.length = 0;
     txn.retainedBytes = 0;
     this.detachConnectionCallbacks(txn.conn);
-    void txn.conn.close().catch(() => { /* candidate closing/closed */ });
+    void this.closeMigrationCandidate(txn);
   }
 
   /**
@@ -7148,7 +7171,7 @@ export class MoqtPlayer {
     txn.retainedBytes = 0;
     this.detachConnectionCallbacks(txn.conn);
     this.purgePendingForConnection(txn.conn);
-    void txn.conn.close().catch(() => { /* candidate already dead */ });
+    void this.closeMigrationCandidate(txn);
   }
 
   /**
@@ -7200,6 +7223,54 @@ export class MoqtPlayer {
     }
     txn.events.length = 0;
     txn.retainedBytes = 0;
+  }
+
+  /**
+   * A commit that threw part-way is terminal, including after connection adoption.
+   * Dispose its candidate and retained evidence; no rollback of partly installed
+   * media is promised. The still-current old session is never retired underneath it.
+   */
+  private failMigrationCommit(txn: MigrationTxn, newConnection: MoqtConnection, error: unknown): void {
+    txn.terminated = true;
+    txn.aborted = true; // Captured callbacks are inert before request cancellation.
+    const requests = new Set<bigint>([
+      ...(txn.prep?.media.keys() ?? []),
+      ...[...(txn.prep?.initTracks.values() ?? [])].flatMap(init => init.reqId === null ? [] : [init.reqId]),
+      ...(txn.slots?.catalogRequestId == null ? [] : [txn.slots.catalogRequestId]),
+    ]);
+    // These ids belong to the candidate, including init requests absent from the
+    // half-installed live maps. Retire them before close makes stream I/O inert.
+    for (const id of requests) void newConnection.unsubscribe(varint(id)).catch(() => {});
+    this.abandonCandidate(txn);
+    // Commit runs only after preparation's mutations have settled. Release our
+    // records without undoing the partially adopted initialization.
+    for (const [type, record] of this.pendingRetypes) {
+      if (record.owner !== txn) continue;
+      this.pendingRetypes.delete(type);
+      this.retypingMedia.delete(type);
+    }
+    const cause = error instanceof Error ? error : new Error(String(error));
+    try {
+      this.failCatalogPlayback(createPlayerError('fatal', 'connection', PlayerErrorCode.CONNECTION_LOST,
+        `Session handover failed while committing the replacement: ${cause.message}`, { cause }));
+    } catch (reportErr) {
+      // A listener threw while the failure was published; the state is committed.
+      try {
+        this.log.warn('Reporting a handover commit failure threw (ignored): %s',
+          reportErr instanceof Error ? reportErr.message : String(reportErr));
+      } catch { /* logger itself threw */ }
+    } finally {
+      // A failed, owned candidate must not look current or be closed again by
+      // a later destroy. Fatal reporting above still sees its live registrations.
+      if (this.connection === newConnection) {
+        this.releaseMediaTerminals(newConnection);
+        this.retireInitWaiters(newConnection);
+        this.connection = null;
+      }
+      delete txn.prep;
+      delete txn.slots;
+      txn.oldTerminal = undefined;
+    }
   }
 
   /**
@@ -9494,6 +9565,7 @@ export class MoqtPlayer {
   async destroy(): Promise<void> {
     if (this._destroyed) return;
     this._destroyed = true;
+    let closedCandidate: MoqtConnection | null = null;
     try {
       this.receivingVideoOwners.clear();
       this.audioOutput = null; this.lastAudioDomainOwner = null; this.lastAudioDomain = null;
@@ -9525,7 +9597,8 @@ export class MoqtPlayer {
         txn.committed = true;
         txn.events.length = 0;
         this.detachConnectionCallbacks(txn.conn);
-        try { await txn.conn.close(); } catch { /* candidate transport already gone */ }
+        closedCandidate = txn.conn;
+        await this.closeMigrationCandidate(txn);
       }
       this._stats.recordPlayStop();
       this.stopTicking();
@@ -9620,7 +9693,9 @@ export class MoqtPlayer {
           // close() itself may reject when the underlying transport has already
           // failed or closed — destroy() must still resolve quietly.
           this.detachConnectionCallbacks(this.connection);
-          try { await this.connection.close(); } catch { /* transport already failed/closed */ }
+          if (this.connection !== closedCandidate) {
+            try { await this.connection.close(); } catch { /* transport already failed/closed */ }
+          }
         } else {
           // Externally owned: explicitly unsubscribe player's tracks, then detach.
           // Don't close — the caller owns the adapter's lifecycle.
