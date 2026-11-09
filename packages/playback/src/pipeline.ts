@@ -271,6 +271,11 @@ export class PlaybackPipeline {
         return this.lastConsumedGroupId;
     }
 
+    /** Earliest group admitted after reset, retirement or buffer shedding. */
+    get minimumAcceptedGroupId(): bigint {
+        return this.minAcceptGroupId;
+    }
+
     /** Number of distinct groups currently in the jitter buffer. */
     get bufferedGroupCount(): number {
         return this.bufferedGroupCounts.size;

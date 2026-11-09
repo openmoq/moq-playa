@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { SubscriptionManager } from './subscription-manager.js';
+import { SubscriptionManager, type ObjectDeliveryOptions } from './subscription-manager.js';
 import type { ObjectRoutingProvenance } from './subscription-manager.js';
 import type { MoqtObject } from '@openmoq/transport';
 
@@ -28,7 +28,8 @@ describe('input provenance across object transformation', () => {
     expect(capture).toHaveBeenCalledExactlyOnceWith(source, input); expect(callback).not.toHaveBeenCalled();
     release(); await pending;
     expect(callback).toHaveBeenCalledOnce(); expect(callback.mock.calls[0]![2]).toBe(output);
-    expect(callback.mock.calls[0]!.at(-1)).toBe(context); expect(discarded).not.toHaveBeenCalled();
+    expect(packaging === 'locmaf' ? callback.mock.calls[0]![3] : callback.mock.calls[0]!.at(-1)).toBe(context);
+    if (packaging === 'locmaf') { expect(callback.mock.calls[0]).toHaveLength(5); checkedDelivery(manager, callback.mock.calls[0]![4]); } expect(discarded).not.toHaveBeenCalled();
   });
 
   it('does not join different input contexts when transforms return the same output instance', async () => {
@@ -108,7 +109,7 @@ it.each([true, false])('keeps LOCMAF transform cancellation scoped to the actual
   manager.invalidateLocmafGroup(1n, 2n, matches ? source : {});
   release(); await pending;
   if (matches) { expect(callback).not.toHaveBeenCalled(); expect(discarded).toHaveBeenCalledExactlyOnceWith(context, 'transform cancelled'); }
-  else { expect(callback).toHaveBeenCalledExactlyOnceWith('video', 'video', input, context); expect(discarded).not.toHaveBeenCalled(); }
+  else { expect(callback).toHaveBeenCalledExactlyOnceWith('video', 'video', input, context, checkedDelivery(manager, callback.mock.calls[0]![4])); expect(discarded).not.toHaveBeenCalled(); }
 });
 
 it('captures no media provenance for unknown aliases or init/metadata tracks', async () => {
@@ -153,3 +154,13 @@ const asynchronousCapture: ObjectRoutingProvenance = {
   discarded: () => {},
 };
 void asynchronousCapture;
+
+function checkedDelivery(manager: SubscriptionManager, value: unknown): ObjectDeliveryOptions {
+  const delivery = value as ObjectDeliveryOptions;
+  expect(delivery).toBeDefined();
+  expect(typeof delivery.isLive).toBe('function');
+  expect(delivery.isLive!()).toBe(true);
+  manager.invalidateMediaInputs();
+  expect(delivery.isLive!()).toBe(false);
+  return delivery;
+}

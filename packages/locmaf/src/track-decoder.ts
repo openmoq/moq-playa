@@ -69,6 +69,16 @@ export class LocmafTrackDecoder {
         this.context = parseLocmafTrackContext(init);
     }
 
+    /**
+     * Last successfully reconstructed chunk/rawBoxes Object in a retained group.
+     * Rejection clears its reference but preserves this input frontier. An
+     * explicit reset or normal group-state eviction removes the frontier too.
+     */
+    getLastObjectId(groupId: bigint): bigint | undefined {
+        const id = this.states.get(groupId)?.lastObjectId;
+        return id === -1n ? undefined : id;
+    }
+
     /** Decode one MOQT Object payload. Objects of a group must arrive in Object ID order. */
     push(groupId: bigint, objectId: bigint, payload: Uint8Array): LocmafDecodeResult {
         let state = this.states.get(groupId);

@@ -17,6 +17,15 @@
   // `*.test.ts` corpus predates any typecheck gate and does not compile clean
   // under these options; widening this include is a separate cleanup.
   "include": [
+    "packages/webtransport/src/adapter-rebound-lifetime.test.ts",
+    "packages/webtransport/src/adapter-rebound-drain.test.ts",
+    "packages/browser/src/cmaf-legacy-order.test.ts",
+    "packages/player/src/player-locmaf-replay-lifecycle.loopback.test.ts",
+    "packages/player/src/player-object-replay.loopback.test.ts",
+    "packages/player/src/subscription-manager-delivery-identity.test.ts",
+    "packages/player/src/subscription-manager-replay.test.ts",
+    "packages/player/src/subscription-manager.test.ts",
+    "packages/transport/src/session/subscription-filter-boundary.test.ts",
     "packages/devtools/src/player.test.ts",
     "packages/player/src/config.test.ts",
     "packages/browser/src/audio-output-timing-consumed-match.test.ts",

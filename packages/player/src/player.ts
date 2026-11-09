@@ -989,7 +989,7 @@ export class MoqtPlayer {
   private runtimeAudioIntent: TrackIdentity | null = null;
   private runtimeAudioLanguage: string | null = null;
   private runtimeSelectionIntent: SelectionIntent | null = null;
-  private readonly preparedMediaDeliveries = new WeakMap<() => boolean, { preparation: MediaSelectionTxn; output: PreparedMediaOutput; alias: bigint }>();
+  private readonly preparedMediaDeliveries = new WeakMap<object, { preparation: MediaSelectionTxn; output: PreparedMediaOutput; alias: bigint }>();
   private audioPresentationOffsetUs = 0n;
   private audioTimingMapped = false;
   private audioTimingSource: AudioTimingSource | undefined;
@@ -1176,6 +1176,7 @@ export class MoqtPlayer {
     sourceKey?: string;
     mediaType: 'video' | 'audio';
     groupId: bigint;
+    objectId?: bigint;
     payload: Uint8Array;
     sync: boolean;
     input?: ObjectRoutingContext;
@@ -1463,8 +1464,9 @@ export class MoqtPlayer {
       const isLive = () => manager.mediaInputGeneration === inputGeneration && registration?.() === true && this.mediaSelectionRouteCurrent(operation);
       const admission = output.serial.then((): ObjectDeliveryAdmission => isLive()
         ? { kind: 'deliver', isLive, backfill: false } : { kind: 'discard', reason: 'route retired' });
-      this.preparedMediaDeliveries.set(isLive, { preparation: operation, output, alias: BigInt(obj.trackAlias) });
-      const work = manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput, { admission, isLive });
+      const identity = {};
+      this.preparedMediaDeliveries.set(identity, { preparation: operation, output, alias: BigInt(obj.trackAlias) });
+      const work = manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput, { admission, isLive, identity });
       output.serial = work;
       return work;
     }
@@ -2277,7 +2279,7 @@ export class MoqtPlayer {
     const inputGeneration = this.subscriptionManager?.mediaInputGeneration;
     const sourceKey = this.keyedCmafIdentity ? this.subscriptionManager?.getSourceKey(BigInt(obj.trackAlias)) : undefined;
     if (mediaType === 'eventtimeline') {
-      this.onLocmafEventObject(trackName, obj);
+      this.onLocmafEventObject(trackName, obj, input, delivery);
       return;
     }
     // Liveness: stamp before every early return (gates, staging, drops).
@@ -2315,9 +2317,23 @@ export class MoqtPlayer {
       return;
     }
     if (!obj.payload) return;
+    const groupId = BigInt(obj.groupId);
+    if (this.locmafFramePath) {
+      const selected = this._selection[mediaType];
+      const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
+      const floor = pipeline ? (pipeline.minimumAcceptedGroupId > pipeline.currentGroupId
+        ? pipeline.minimumAcceptedGroupId : pipeline.currentGroupId) : undefined;
+      if (selected && identityKey(selected.namespaceFields, selected.name) === this.mediaKey(trackName, mediaType, BigInt(obj.trackAlias))
+          && floor !== undefined && groupId < floor) { this.discardMediaInput(input, 'stale group'); return; }
+    } else if (!(this.pendingVideoSwitch && mediaType === 'video' && this.isVideoSwitchAlias(BigInt(obj.trackAlias), 'new'))) {
+      const floor = sourceKey === undefined ? this.mediaSource?.getCommittedGroupFloor?.(mediaType, trackName)
+        : this.mediaSource?.getCommittedGroupFloor?.(mediaType, trackName, sourceKey);
+      if (floor !== undefined && groupId < floor) { this.discardMediaInput(input, 'stale group'); return; }
+    }
+    if (!this.admitLocmafConsumerInput(mediaType, trackName, obj, input)) return;
 
     // §9: a rawBoxes Object carries complete ISO boxes, possibly a CMAF Header.
-    const rawBoxes = this.locmafRawBoxes(mediaType, trackName, obj);
+    const rawBoxes = this.locmafRawBoxes(mediaType, trackName, obj, delivery);
     if (rawBoxes === undefined) { this.discardMediaInput(input, 'invalid media'); return; }
 
     // §16 frame interface: no MSE gates apply; the LOC pipeline takes the samples.
@@ -2354,11 +2370,10 @@ export class MoqtPlayer {
 
     // A later in-band CMAF Header re-seeds this track's reconstruction (§6, §9.3).
     if (rawBoxes && MoqtPlayer.looksLikeCmafInitSegment(rawBoxes)) {
-      this.noteLocmafInBandHeader(trackName, rawBoxes, BigInt(obj.trackAlias));
+      this.noteLocmafInBandHeader(trackName, rawBoxes, BigInt(obj.trackAlias), delivery);
       return;
     }
 
-    const groupId = BigInt(obj.groupId);
     const decoded = this.decodeLocmafObject(mediaType, trackName, BigInt(obj.trackAlias), groupId,
       BigInt(obj.objectId), obj.payload);
     if (!decoded) { this.discardMediaInput(input, 'invalid media'); return; }
@@ -2599,11 +2614,15 @@ export class MoqtPlayer {
    * reconstruction; repeating the same one must not discard the in-flight
    * groups' references.
    */
-  private noteLocmafInBandHeader(trackName: string, header: Uint8Array, alias?: bigint): void {
+  private noteLocmafInBandHeader(trackName: string, header: Uint8Array, alias?: bigint, preserveDelivery?: ObjectDeliveryOptions): void {
     const key = this.mediaKey(trackName, undefined, alias);
     this.initSegmentByTrack.set(key, header);
     const current = this.locmafDecoderInit.get(key);
     if (!current || !MoqtPlayer.sameBytes(current, header)) {
+      if (this.locmafDecoders.has(key) && alias !== undefined) {
+        const mediaType = this.subscriptionManager?.getMediaType(alias);
+        if (mediaType) this.retireLocmafConsumerInputs(trackName, mediaType, alias, undefined, preserveDelivery);
+      }
       this.locmafDecoders.delete(key);
       this.locmafDecoderInit.delete(key);
       this.locmafBadInit.delete(key);
@@ -2629,7 +2648,7 @@ export class MoqtPlayer {
   ): void {
     const inputGeneration = this.subscriptionManager?.mediaInputGeneration;
     if (rawBoxes && isCmafHeader(rawBoxes)) {
-      this.noteLocmafInBandHeader(trackName, rawBoxes, BigInt(obj.trackAlias));
+      this.noteLocmafInBandHeader(trackName, rawBoxes, BigInt(obj.trackAlias), delivery);
       return;
     }
     const key = this.mediaKey(trackName, mediaType, BigInt(obj.trackAlias));
@@ -2744,12 +2763,13 @@ export class MoqtPlayer {
    * reaches a media sink; a version-0 emsg's presentation time is relative to
    * the chunk's base media decode time, which the event carries.
    */
-  private onLocmafEventObject(trackName: string, obj: MoqtObject): void {
+  private onLocmafEventObject(trackName: string, obj: MoqtObject, input?: ObjectRoutingContext, delivery?: ObjectDeliveryOptions): void {
     if (obj.kind !== 'data' || !obj.payload) return;
-    const rawBoxes = this.locmafRawBoxes('eventtimeline', trackName, obj);
+    if (!this.admitLocmafConsumerInput('eventtimeline', trackName, obj, input)) return;
+    const rawBoxes = this.locmafRawBoxes('eventtimeline', trackName, obj, delivery);
     if (rawBoxes === undefined) return;
     if (rawBoxes && isCmafHeader(rawBoxes)) {
-      this.noteLocmafInBandHeader(trackName, rawBoxes, BigInt(obj.trackAlias));
+      this.noteLocmafInBandHeader(trackName, rawBoxes, BigInt(obj.trackAlias), delivery);
       return;
     }
     const groupId = BigInt(obj.groupId);
@@ -2773,6 +2793,35 @@ export class MoqtPlayer {
       baseMediaDecodeTime: decoded.chunk.baseMediaDecodeTime,
       events,
     });
+  }
+
+  /**
+   * LOCMAF is an ordered consumer (§3). Its actual decoder, shared by aliases
+   * of one resolved track, already owns the bounded per-group input frontier.
+   * Older input is locally stale, not proof that every earlier ID was seen.
+   * Failed attempts never advance it; a native consumer reset removes it.
+   */
+  private admitLocmafConsumerInput(mediaType: 'video' | 'audio' | 'eventtimeline', trackName: string,
+    obj: MoqtObject, input?: ObjectRoutingContext): boolean {
+    const last = this.locmafDecoders.get(this.mediaKey(trackName, mediaType, BigInt(obj.trackAlias)))
+      ?.getLastObjectId(BigInt(obj.groupId));
+    if (last === undefined || obj.objectId > last) return true;
+    this.discardMediaInput(input, obj.objectId === last ? 'treated as a replay' : 'object processing failed');
+    return false;
+  }
+
+  /** Cancel accepted inputs for the aliases that feed this same decoder. */
+  private retireLocmafConsumerInputs(trackName: string, mediaType: string, alias: bigint, groupId?: bigint, preserveDelivery?: ObjectDeliveryOptions): void {
+    const key = this.mediaKey(trackName, mediaType, alias);
+    const track = this._catalogState?.tracks.find(track => this.initKey(track) === key);
+    if (track ? track.packaging !== 'locmaf' : !this.locmafDecoders.has(key)) return;
+    this.subscriptionManager?.resetMediaConsumer(alias, groupId, preserveDelivery);
+    for (const sub of this.activeSubscriptions.values()) {
+      if (sub.trackAlias !== null && sub.trackAlias !== alias && sub.mediaType === mediaType
+          && this.mediaKey(sub.trackName, sub.mediaType, sub.trackAlias) === key) {
+        this.subscriptionManager?.resetMediaConsumer(sub.trackAlias, groupId, preserveDelivery);
+      }
+    }
   }
 
   /** The track's LOCMAF decoder, created from its CMAF Header on first use. */
@@ -2841,6 +2890,7 @@ export class MoqtPlayer {
     mediaType: 'video' | 'audio' | 'eventtimeline',
     trackName: string,
     obj: MoqtObject & { kind: 'data' },
+    preserveDelivery?: ObjectDeliveryOptions,
   ): Uint8Array | null | undefined {
     const payload = obj.payload;
     let elementType: bigint;
@@ -2852,8 +2902,16 @@ export class MoqtPlayer {
     if (elementType !== 4n) return null;
     const groupId = BigInt(obj.groupId);
     // Even a repeated in-band Header ends this group's delta chain (§9.3).
-    this.subscriptionManager?.invalidateLocmafGroup(BigInt(obj.trackAlias), groupId, this.connection);
-    this.locmafDecoders.get(this.mediaKey(trackName, mediaType, BigInt(obj.trackAlias)))?.resetGroup(groupId);
+    this.retireLocmafConsumerInputs(trackName, mediaType, BigInt(obj.trackAlias), groupId, preserveDelivery);
+    const decoder = this.locmafDecoders.get(this.mediaKey(trackName, mediaType, BigInt(obj.trackAlias)));
+    if (decoder) {
+      const result = decoder.push(groupId, BigInt(obj.objectId), payload);
+      if (result.kind === 'rejected') {
+        this.recordLocmafObjectResult(mediaType, trackName, BigInt(obj.trackAlias), groupId, BigInt(obj.objectId), result.error);
+        return undefined;
+      }
+      return result.kind === 'raw' ? result.bytes : null;
+    }
     try {
       const object = deserializeLocmafObject(payload);
       return object.kind === 'rawBoxes' ? object.boxes : null;
@@ -3565,9 +3623,9 @@ export class MoqtPlayer {
     for (const entry of firstSync < 0 ? staged : staged.slice(0, firstSync)) this.discardMediaInput(entry.input, 'awaiting keyframe');
     let replayed = 0;
     try {
-      for (const { trackName: stagedTrack, sourceKey, mediaType: stagedMt, groupId, payload, input } of cmafStaged) {
+      for (const { trackName: stagedTrack, sourceKey, mediaType: stagedMt, groupId, objectId, payload, input } of cmafStaged) {
         if (!this.switchIsCurrent(sw)) break;
-        this.pushCmafInput(stagedMt, stagedTrack, groupId, payload, input, sourceKey);
+        this.pushCmafInput(stagedMt, stagedTrack, groupId, payload, input, sourceKey, objectId);
         replayed++;
       }
     } finally {
@@ -3768,13 +3826,14 @@ export class MoqtPlayer {
   }
 
   private pushCmafInput(mediaType: 'video' | 'audio', trackName: string, groupId: bigint, payload: Uint8Array,
-    input?: ObjectRoutingContext, sourceKey?: string): void {
+    input?: ObjectRoutingContext, sourceKey?: string, objectId?: bigint): void {
     const assembler = this.cmafAssembler;
     if (this.keyedCmafIdentity && sourceKey === undefined) {
       this.discardMediaInput(input, 'route retired'); return;
     }
     if (!(mediaType === 'audio' ? this.collectAudioTimeline : this.collectVideoTimeline)) {
-      if (sourceKey !== undefined) assembler?.push(mediaType, trackName, groupId, payload, input, undefined, sourceKey);
+      if (objectId !== undefined) assembler?.push(mediaType, trackName, groupId, payload, input, undefined, sourceKey, objectId);
+      else if (sourceKey !== undefined) assembler?.push(mediaType, trackName, groupId, payload, input, undefined, sourceKey);
       else if (input === undefined) assembler?.push(mediaType, trackName, groupId, payload);
       else assembler?.push(mediaType, trackName, groupId, payload, input);
       return;
@@ -3785,7 +3844,8 @@ export class MoqtPlayer {
     const owned = [...this.activeSubscriptions.values()].find(sub => sub.mediaType === mediaType && sub.trackAlias !== null
       && sub.trackName === selected?.name && sameNamespaceFields(sub.namespace ?? namespaceFields(this.config.namespace), selected.namespaceFields));
     const route = owned?.trackAlias === null || owned?.trackAlias === undefined ? null : this.subscriptionManager?.captureRoute(owned.trackAlias);
-    const receipt = sourceKey === undefined ? assembler?.push(mediaType, trackName, groupId, payload, input, true)
+    const receipt = objectId !== undefined ? assembler?.push(mediaType, trackName, groupId, payload, input, true, sourceKey, objectId)
+      : sourceKey === undefined ? assembler?.push(mediaType, trackName, groupId, payload, input, true)
       : assembler?.push(mediaType, trackName, groupId, payload, input, true, sourceKey);
     if (receipt?.state === 'emitted' && !this._destroyed && this.connection === conn && this.mediaSource === source
         && this.cmafAssembler === assembler && route?.() && [...this.activeSubscriptions.values()].includes(owned!)
@@ -4197,7 +4257,7 @@ export class MoqtPlayer {
         const sync = this.cmafSwitchSync(this.pendingVideoSwitch, obj.payload)
           ?? BigInt(obj.objectId) === 0n;
         this.cmafSwitchStagingBuffer.push({
-          trackName, ...(sourceKey === undefined ? {} : { sourceKey }), mediaType, groupId: BigInt(obj.groupId), payload: obj.payload, sync,
+          trackName, ...(sourceKey === undefined ? {} : { sourceKey }), mediaType, groupId: BigInt(obj.groupId), objectId: BigInt(obj.objectId), payload: obj.payload, sync,
           ...(input ? { input } : {}),
         });
 
@@ -4220,7 +4280,7 @@ export class MoqtPlayer {
       }
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
-      this.pushCmafInput(mediaType, trackName, groupId, obj.payload, input, sourceKey);
+      this.pushCmafInput(mediaType, trackName, groupId, obj.payload, input, sourceKey, BigInt(obj.objectId));
     };
 
     // §2.4.2: Malformed Track — MUST UNSUBSCRIBE, SHOULD deliver error
@@ -4867,6 +4927,9 @@ export class MoqtPlayer {
     for (const sub of this.activeSubscriptions.values()) {
       if (sub.trackAlias !== null) this.subscriptionManager?.setMinimumMediaLocation(sub.trackAlias, undefined);
     }
+    this.subscriptionManager?.resetMediaConsumer();
+    for (const decoder of this.locmafDecoders.values()) decoder.reset();
+    this.locmafFrameIds.clear();
     this.videoPipeline?.reset(targetGroupBigInt);
     this.audioPipeline?.reset(targetGroupBigInt);
     this.resetMediaClock();
@@ -5941,7 +6004,7 @@ export class MoqtPlayer {
   private stagePreparedMediaInput(obj: MoqtObject, headers: LocHeaders | undefined, input: ObjectRoutingContext | undefined,
     run: () => void, delivery?: ObjectDeliveryOptions): boolean {
     // The owner was captured before transformation; a returned alias is not routing authority.
-    const captured = delivery?.isLive ? this.preparedMediaDeliveries.get(delivery.isLive) : undefined;
+    const captured = delivery?.identity ? this.preparedMediaDeliveries.get(delivery.identity) : undefined;
     const txn = captured?.preparation;
     if (!txn) return false;
     const output = captured.output;
@@ -10728,6 +10791,7 @@ export class MoqtPlayer {
             this.subscriptionManager?.invalidateLocmafGroup(subgroup.trackAlias, subgroup.groupId, conn);
             for (const subscription of this.activeSubscriptions.values()) {
               if (subscription.trackAlias === subgroup.trackAlias) {
+                this.retireLocmafConsumerInputs(subscription.trackName, subscription.mediaType, subgroup.trackAlias, subgroup.groupId);
                 this.locmafDecoders.get(this.mediaKey(subscription.trackName, subscription.mediaType, subgroup.trackAlias))?.resetGroup(subgroup.groupId);
               }
             }
@@ -11779,6 +11843,7 @@ export class MoqtPlayer {
       this.subscriptionManager?.invalidateLocmafGroup(alias, groupId, resolvingConnection);
       for (const subscription of this.activeSubscriptions.values()) {
         if (subscription.trackAlias === alias) {
+          this.retireLocmafConsumerInputs(subscription.trackName, subscription.mediaType, alias, groupId);
           this.locmafDecoders.get(this.mediaKey(subscription.trackName, subscription.mediaType, alias))?.resetGroup(groupId);
         }
       }
@@ -12492,6 +12557,7 @@ export class MoqtPlayer {
     }
     this.cmafVideoSynced = false;
     // Held LOCMAF objects never reached their decoders: restart each group reference.
+    this.subscriptionManager?.resetMediaConsumer();
     for (const decoder of this.locmafDecoders.values()) decoder.reset();
     this.log.info('[CMAF] MediaSource attached — resuming at the next group start (live edge)');
   }
@@ -13660,9 +13726,12 @@ export class MoqtPlayer {
    * where recovery only flushed if a stall happened to fire first).
    */
   private flushForLivenessRestart(track: LivenessTrack): void {
-    const catalogTrack = this._catalogState?.tracks.find((t: CatalogTrack) => t.name === track.trackName);
+    this.subscriptionManager?.resetMediaConsumer(track.trackAlias);
+    const key = this.mediaKey(track.trackName, track.mediaType, track.trackAlias);
+    const catalogTrack = this._catalogState?.tracks.find(t => this.initKey(t) === key);
     // LOCMAF on either path: drop the in-group reference; the restarted delivery begins at a full header.
     if (catalogTrack?.packaging === 'locmaf') {
+      this.retireLocmafConsumerInputs(track.trackName, track.mediaType, track.trackAlias);
       this.locmafDecoders.get(this.mediaKey(track.trackName, track.mediaType, track.trackAlias))?.reset();
       this.locmafFrameIds.delete(this.mediaKey(track.trackName, track.mediaType, track.trackAlias));
     }

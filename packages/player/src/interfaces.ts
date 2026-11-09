@@ -537,7 +537,7 @@ export interface MediaSourceLike {
  *
  * @see draft-ietf-moq-cmsf-01 §3.3 (Object Packaging — moof+mdat)
  */
-export type CmafAssemblyDiscardReason = 'track superseded' | 'invalid media' | 'orphaned media' | 'epoch refused' | 'superseded pending moof' | 'decoder reset';
+export type CmafAssemblyDiscardReason = 'track superseded' | 'invalid media' | 'orphaned media' | 'epoch refused' | 'superseded pending moof' | 'decoder reset' | 'out of order legacy object';
 
 export type CmafSourceReceipt =
   | { readonly state: 'emitted'; readonly sourcePresentationTimeUs: bigint }
@@ -554,6 +554,8 @@ export interface CmafAssemblerLike {
     input?: object,
     sourceTiming?: true,
     sourceKey?: string,
+    /** Optional raw Object ID for ordering pending legacy split halves only. */
+    objectId?: bigint,
   ): void | CmafSourceReceipt;
   /**
    * Hand the assembler an init segment so it can extract trex defaults

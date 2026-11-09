@@ -162,6 +162,8 @@ export class CmafAssembler {
   private readonly onSegment: CmafAssemblerOptions['onSegment'];
   private readonly onDiscard: CmafAssemblerOptions['onDiscard'];
   private pendingInputs: WeakMap<Uint8Array, object> | undefined;
+  /** Identity belongs to a pending legacy half, never to completed history. */
+  private pendingObjectIds: WeakMap<Uint8Array, bigint> | undefined;
   private readonly onDiscontinuity: CmafAssemblerOptions['onDiscontinuity'];
 
   /**
@@ -539,6 +541,7 @@ export class CmafAssembler {
     input?: object,
     sourceTiming?: true,
     sourceKey?: string,
+    objectId?: bigint,
   ): void | CmafSourceReceipt {
     const trackIdentity = mediaTrackIdentity(trackName, sourceKey);
     this.placementState(mediaType).patched = -1;
@@ -617,11 +620,17 @@ export class CmafAssembler {
       }
 
       // Legacy: moof-only object — buffer and wait for a separate mdat.
+      const previous = this.pendingMoofs.get(key);
+      const previousId = previous && this.pendingObjectIds?.get(previous);
+      if (objectId !== undefined && previousId !== undefined && objectId <= previousId) {
+        this.discardInput(input, 'out of order legacy object');
+        return sourceTiming ? SOURCE_REFUSED : undefined;
+      }
       // Copy — the original Uint8Array may share its ArrayBuffer with other
       // QUIC stream data. In-place tfdt patching would corrupt it.
       const copy = new Uint8Array(payload.byteLength);
       copy.set(payload);
-      const previous = this.pendingMoofs.get(key);
+      if (objectId !== undefined) (this.pendingObjectIds ??= new WeakMap()).set(copy, objectId);
       if (input !== undefined) (this.pendingInputs ??= new WeakMap()).set(copy, input);
       this.pendingMoofs.set(key, copy);
       if (previous) this.discardPending(previous, 'superseded pending moof');
@@ -631,7 +640,13 @@ export class CmafAssembler {
     if (type === 'mdat') {
       const pending = this.pendingMoofs.get(key);
       if (!pending) { this.discardInput(input, 'orphaned media'); return sourceTiming ? SOURCE_REFUSED : undefined; }
+      const pendingId = this.pendingObjectIds?.get(pending);
+      if (objectId !== undefined && pendingId !== undefined && objectId <= pendingId) {
+        this.discardInput(input, 'out of order legacy object');
+        return sourceTiming ? SOURCE_REFUSED : undefined;
+      }
       this.pendingMoofs.delete(key);
+      this.pendingObjectIds?.delete(pending);
 
       const priorInput = this.pendingInputs?.get(pending);
       this.pendingInputs?.delete(pending);
@@ -789,7 +804,7 @@ export class CmafAssembler {
   clearPending(mediaType: 'video' | 'audio'): void {
     const removed: Uint8Array[] | undefined = this.pendingInputs ? [] : undefined;
     for (const [key, bytes] of this.pendingMoofs) {
-      if (key.startsWith(`${mediaType}:`)) { this.pendingMoofs.delete(key); removed?.push(bytes); }
+      if (key.startsWith(`${mediaType}:`)) { this.pendingMoofs.delete(key); this.pendingObjectIds?.delete(bytes); removed?.push(bytes); }
     }
     if (removed) for (const bytes of removed) this.discardPending(bytes, 'decoder reset');
   }
@@ -800,6 +815,7 @@ export class CmafAssembler {
   }
 
   private discardPending(bytes: Uint8Array, reason: CmafAssemblyDiscardReason): void {
+    this.pendingObjectIds?.delete(bytes);
     const input = this.pendingInputs?.get(bytes); this.pendingInputs?.delete(bytes);
     this.discardInput(input, reason);
   }
@@ -813,6 +829,7 @@ export class CmafAssembler {
     }
     const removed = this.pendingInputs ? [...this.pendingMoofs.values()] : undefined;
     this.pendingMoofs.clear();
+    this.pendingObjectIds = undefined;
     this.videoEpoch = null;
     this.audioEpoch = null;
     this.lastVideoBmd = null;

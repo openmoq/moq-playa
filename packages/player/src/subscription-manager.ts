@@ -50,6 +50,11 @@ interface PendingLocmafTransform {
 interface PendingRoute {
   /** Datagram receipts belong to the track, but never to a stream's terminal. */
   readonly streamId: bigint | undefined;
+  readonly groupId: bigint;
+  readonly source: unknown;
+  readonly data: boolean;
+  valid: boolean;
+  delivery?: ObjectDeliveryOptions;
   done: boolean;
   promise?: Promise<void>;
   resolve?: () => void;
@@ -76,6 +81,8 @@ export type ObjectDeliveryAdmission =
 
 /** Internal processing policy, captured by the owner before asynchronous work. */
 export interface ObjectDeliveryOptions {
+  /** Captured owner identity, independent of replaceable liveness predicates. */
+  readonly identity?: object;
   readonly isLive?: () => boolean;
   readonly backfill?: boolean;
   /** Register/capture now, but defer transformation until the owner admits it. */
@@ -89,6 +96,20 @@ export class SubscriptionManager {
   /** Map of track alias (bigint) → track info. */
   private readonly tracks = new Map<bigint, TrackInfo>();
   private readonly pendingRoutes = new WeakMap<TrackInfo, Set<PendingRoute>>();
+
+  /**
+   * Retire data accepted before a consumer reset, including deferred admission.
+   * Registration and terminal barriers continue owning that work until it settles.
+   */
+  resetMediaConsumer(alias?: bigint, groupId?: bigint, preserveDelivery?: ObjectDeliveryOptions): void {
+    for (const [trackAlias, info] of this.tracks) {
+      if (alias !== undefined && trackAlias !== alias) continue;
+      for (const pending of this.pendingRoutes.get(info) ?? []) {
+        if (pending.data && (groupId === undefined || pending.groupId === groupId)
+            && (preserveDelivery === undefined || pending.delivery !== preserveDelivery)) pending.valid = false;
+      }
+    }
+  }
 
   /**
    * Capture the original registration, then snapshot its accepted work when
@@ -366,6 +387,12 @@ export class SubscriptionManager {
 
   /** In-flight work received before a reset cannot re-anchor its group afterwards. */
   invalidateLocmafGroup(alias: bigint, groupId: bigint, source?: unknown): void {
+    const info = this.tracks.get(alias);
+    if (info?.packaging === 'locmaf') {
+      for (const pending of this.pendingRoutes.get(info) ?? []) {
+        if (pending.data && pending.groupId === groupId && pending.source === source) pending.valid = false;
+      }
+    }
     for (const pending of this.pendingLocmafTransforms) {
       if (pending.alias === alias && pending.groupId === groupId && pending.source === source) {
         pending.valid = false;
@@ -439,7 +466,8 @@ export class SubscriptionManager {
     if (!pending) { pending = new Set(); this.pendingRoutes.set(info, pending); }
     // Register before ALL application callbacks, including a synchronous transform that reenters with EOT.
     const earlier = obj.kind === 'gap' && obj.status === 4n ? [...pending] : [];
-    const route: PendingRoute = { streamId: 'kind' in (receiptInput ?? obj) ? streamId : undefined, done: false }; pending.add(route);
+    const route: PendingRoute = { streamId: 'kind' in (receiptInput ?? obj) ? streamId : undefined,
+      groupId: BigInt(obj.groupId), source, data: obj.kind === 'data', valid: true, done: false }; pending.add(route);
     let provenance: ObjectRoutingProvenance | null = null;
     let provenanceGeneration = 0;
     let context: ObjectRoutingContext | undefined;
@@ -483,7 +511,7 @@ export class SubscriptionManager {
           } else context = captured;
         } catch { /* Optional evidence cannot affect media. */ }
       }
-      if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+      if (!route.valid || this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
         this.discardContext(context, provenance, provenanceGeneration, 'route retired');
         return;
       }
@@ -499,8 +527,8 @@ export class SubscriptionManager {
           this.discardContext(context, provenance, provenanceGeneration, admission.reason);
           return;
         }
-        delivery = admission;
-        if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+        delivery = delivery.identity === undefined ? admission : { ...admission, identity: delivery.identity };
+        if (!route.valid || this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
           this.discardContext(context, provenance, provenanceGeneration, 'route retired');
           return;
         }
@@ -508,7 +536,7 @@ export class SubscriptionManager {
 
       if (earlier.length) {
         await Promise.all(earlier.map(waitForRoute));
-        if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+        if (!route.valid || this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
           this.discardContext(context, provenance, provenanceGeneration, 'route retired'); return;
         }
       }
@@ -537,13 +565,13 @@ export class SubscriptionManager {
           return;
         }
         // The route may have changed hands while the transform was awaited.
-        if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+        if (!route.valid || this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
           this.discardContext(context, provenance, provenanceGeneration, 'route retired');
           return;
         }
       }
 
-      if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+      if (!route.valid || this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
         this.discardContext(context, provenance, provenanceGeneration, 'route retired');
         return;
       }
@@ -567,9 +595,16 @@ export class SubscriptionManager {
         // that reconstructs to a CMAF chunk (moof+mdat).
         // @see draft-einarsson-moq-locmaf-01 §7, §15
         const input = this.activeContext(context, provenance, provenanceGeneration);
-        if (delivery) this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed, input, delivery);
-        else if (input === undefined) this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed);
-        else this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed, input);
+        // The callback may synchronously reset this consumer before it resumes.
+        // Retain the original policy separately so the validity check cannot recurse.
+        const originalDelivery = delivery;
+        const scopedDelivery: ObjectDeliveryOptions = {
+          ...originalDelivery,
+          isLive: () => route.valid && this.mediaInputOwner === inputOwner
+            && this.tracks.get(alias) === info && this.deliveryIsLive(source, alias, originalDelivery),
+        };
+        route.delivery = scopedDelivery;
+        this.onLocmafObject?.(info.mediaType as 'video' | 'audio' | 'eventtimeline', info.trackName, transformed, input, scopedDelivery);
       } else {
         // LOC path: parse extension headers and route to PlaybackPipeline
         const extensions = transformed.kind === 'data' ? transformed.extensions : undefined;
@@ -588,7 +623,7 @@ export class SubscriptionManager {
         const parse = this.extensionParser
           ?? ((ext: Uint8Array | undefined) => parseLocHeaders(ext, opts));
         const headers = parse(extensions);
-        if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+        if (!route.valid || this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
           this.discardContext(context, provenance, provenanceGeneration, 'route retired');
           return;
         }
@@ -598,7 +633,7 @@ export class SubscriptionManager {
         else this.onObject?.(mediaType, info.trackName, transformed, headers, input);
       }
     } catch (error) {
-      if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
+      if (!route.valid || this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
         this.discardContext(context, provenance, provenanceGeneration, 'route retired');
         return;
       }
@@ -610,11 +645,11 @@ export class SubscriptionManager {
         this.discardContext(context, provenance, provenanceGeneration, 'transform cancelled');
         return;
       }
-      if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || this.routeStillValid !== null && !this.routeStillValid(source, alias)) {
+      if (!route.valid || this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || this.routeStillValid !== null && !this.routeStillValid(source, alias)) {
         this.discardContext(context, provenance, provenanceGeneration, 'route retired'); return;
       }
       this.discardContext(context, provenance, provenanceGeneration, 'object processing failed');
-      if (this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) return;
+      if (!route.valid || this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) return;
       // §2.4.2: Malformed Track — signal to player for UNSUBSCRIBE, tagged with
       // the source session so recovery does not cancel a request on another.
       this.onMalformedTrack?.(
