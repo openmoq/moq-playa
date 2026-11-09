@@ -1,3 +1,4 @@
+import type { PlaybackSample } from '@openmoq/playback';
 /** LOCMAF §6/§15: each issued identity owns its Header and reconstruction state.
  * Real peers + real LOCMAF codec; MSE/assembler are stubs, not rendering proof. */
 import { describe, expect, it, vi } from 'vitest';
@@ -136,15 +137,15 @@ describe('LOCMAF same-name namespace isolation', () => {
     } finally { await h.destroy(); }
   });
 
-  it('frame IDs start independently for audio/video sharing a group and display name', async () => {
+  it('wire carriers retain separate audio/video sample timescales for the same group and display name', async () => {
     const h = await fixture(true);
     // Observe the frame-interface boundary without claiming decoder/render output.
     const routed = vi.spyOn(h.player as unknown as {
-      routeLocmafFrame: (media: Media, name: string, obj: MoqtObject, headers: LocHeaders) => void;
+      routeLocmafFrame: (media: Media, name: string, obj: MoqtObject, headers: LocHeaders, input?: object, delivery?: object, samples?: readonly PlaybackSample[]) => void;
     }, 'routeLocmafFrame');
     try {
       for (const media of ['video', 'audio'] as const) await h.send(media, 0n, sequence(media)[0]!.payload);
-      expect(routed.mock.calls.map(([media, name, obj, headers]) => ({ media, name, id: BigInt(obj.objectId), timescale: headers.timescale })))
+      expect(routed.mock.calls.map(([media, name, obj, , , , samples]) => ({ media, name, id: BigInt(obj.objectId), timescale: samples?.[0]?.headers.timescale })))
         .toEqual([
           { media: 'video', name: 'shared', id: 0n, timescale: 90000n },
           { media: 'audio', name: 'shared', id: 0n, timescale: 48000n },

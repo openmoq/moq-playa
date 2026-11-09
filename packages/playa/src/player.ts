@@ -37,7 +37,7 @@ import {
   MoqtPlayer, QualityController, TypedEmitter, checkSupport, usesMsePath,
   composeSelection, selectionIntentFromConfig, PlayerErrorCode, buildCatalogSelection,
 } from '@openmoq/player';
-import type { AudioSelectionOptions, AudioTimelineReference, MediaSelectionOptions, MediaTimelineReference, LocmafDecoding, MediaSelectionSnapshot, MoqtPlayerConfig, SupportReport, TrackIdentity, VideoPresentation } from '@openmoq/player';
+import type { AudioSelectionOptions, AudioTimelineReference, FrameOutput, FrameOutputContext, MediaSelectionOptions, MediaTimelineReference, LocmafDecoding, MediaSelectionSnapshot, MoqtPlayerConfig, SupportReport, TrackIdentity, VideoPresentation } from '@openmoq/player';
 import { MoqtConnection } from '@openmoq/webtransport';
 import {
   AudioAlignedClock,
@@ -104,6 +104,7 @@ export class Player {
 
   private readonly engine: MoqtPlayer;
   private presentationRetired = false;
+  private destroyWork: Promise<void> | null = null;
   private readonly emitter = new TypedEmitter<PlayerEventMap>();
   private readonly container: HTMLElement | null;
   private readonly options: PlayerOptions;
@@ -131,7 +132,7 @@ export class Player {
 
   // Adapter instances (held for lifecycle)
   private readonly audioClock = new AudioAlignedClock();
-  private readonly deferredAudio = new DeferredAudioOutput();
+  private deferredAudio = new DeferredAudioOutput();
   private renderer: CanvasRenderer | null = null;
   private audioCtx: AudioContext | null = null;
   private _prepareAudioPromise: Promise<void> | null = null;
@@ -226,23 +227,9 @@ export class Player {
 
     // Time controller for timeupdate events
     this.timeCtrl = new TimeController(() => {
-      // Use the video element's native currentTime when it is the active sink.
-      // For owned elements we check the hidden flag; for borrowed elements we
-      // rely on _activeMediaType (set after catalog_received), falling back to
-      // the capability-detected strategy before the catalog arrives.
-      let videoIsActive: boolean;
-      if (this.ownsVideo) {
-        videoIsActive = this.videoElement != null && !this.videoElement.hidden;
-      } else {
-        const effectiveType = this._activeMediaType ?? (this.strategy === 'webcodecs' ? 'canvas' : 'video');
-        videoIsActive = effectiveType === 'video';
-      }
-      if (videoIsActive && this.videoElement) {
-        this._currentTime = this.videoElement.currentTime * 1000;
-      } else {
-        this._currentTime = this.engine.stats.playbackDurationMs;
-      }
-      this.emitter.emit('timeupdate', { currentTime: this._currentTime });
+      if (this.presentationRetired) return;
+      const currentTime = this.currentTime;
+      if (!this.presentationRetired) this.emitter.emit('timeupdate', { currentTime });
     });
   }
 
@@ -262,8 +249,41 @@ export class Player {
    */
   get activeMediaType(): 'canvas' | 'video' | null { return this._activeMediaType; }
 
-  /** Current playback position in ms. */
-  get currentTime(): number { return this._currentTime; }
+  /**
+   * Playback position in ms, sampled on access without waiting for an animation
+   * frame. An owned seek holds its target until media output establishes the
+   * new position. Other playback samples the active video or elapsed playback
+   * time while playing, retaining the last value otherwise.
+   */
+  get currentTime(): number {
+    if (this.presentationRetired) return this._currentTime;
+    // The engine owns seek admission, pending targets and native activation.
+    // Read it directly even when hidden, paused, or no RAF tick has run.
+    const owned = this.engine.playbackPositionMs;
+    if (this.presentationRetired) return this._currentTime;
+    if (typeof owned === 'number') {
+      if (Number.isFinite(owned) && owned >= 0) this._currentTime = owned;
+      return this._currentTime;
+    }
+    if (this._state !== 'playing') return this._currentTime;
+
+    // Legacy playback uses the active native sink only while playing.
+    // Borrowed visibility belongs to the caller; selection determines its sink.
+    const videoIsActive = this.ownsVideo
+      ? this.videoElement != null && !this.videoElement.hidden
+      : (this._activeMediaType ?? (this.strategy === 'webcodecs' ? 'canvas' : 'video')) === 'video';
+    let sampled: number;
+    if (videoIsActive && this.videoElement) {
+      try { sampled = this.videoElement.currentTime * 1000; }
+      catch { return this._currentTime; }
+    } else {
+      sampled = this.engine.stats.playbackDurationMs;
+    }
+    if (!this.presentationRetired && this._state === 'playing' && Number.isFinite(sampled) && sampled >= 0) {
+      this._currentTime = sampled;
+    }
+    return this._currentTime;
+  }
 
   /** Last video draw evidence, not content position; null for unsupported outputs. */
   get videoPresentation(): VideoPresentation | null {
@@ -275,7 +295,7 @@ export class Player {
   /** Stream duration in ms, or undefined for live. */
   get duration(): number | undefined { return this._duration; }
 
-  /** Whether seek is available (timeline loaded). */
+  /** Whether the current timeline covers the selected media identities. */
   get seekable(): boolean { return this.engine.seekable; }
 
   /** Current volume (0–1). */
@@ -379,6 +399,7 @@ export class Player {
 
   /** Pause playback (REQUEST_UPDATE forward:0). */
   pause(): void {
+    this._currentTime = this.currentTime;
     this.engine.pause();
     this.renderer?.stop();
     this.timeCtrl?.stop();
@@ -392,12 +413,12 @@ export class Player {
     else this.play();
   }
 
-  /** Seek to a position in ms (requires timeline). */
+  /**
+   * Request a position in ms from the current media timeline. Resolution means
+   * admission; use seeked for output landing on the built-in MSE and frame paths.
+   */
   async seek(timeMs: number): Promise<void> {
-    this.emitter.emit('seeking', { targetTime: timeMs });
     await this.engine.seek(timeMs);
-    this._currentTime = timeMs;
-    this.emitter.emit('seeked', { currentTime: timeMs });
   }
 
   /**
@@ -509,6 +530,7 @@ export class Player {
    */
   async unmute(): Promise<void> {
     await this.prepareAudio();
+    if (this.presentationRetired) return;
     this._muted = false;
     this.applyVolumeState();
     this.emitter.emit('volumechange', { volume: this.volume, muted: this.muted });
@@ -541,6 +563,7 @@ export class Player {
    * Retries on failure (does not latch on rejected resume).
    */
   async prepareAudio(): Promise<void> {
+    if (this.presentationRetired) return;
     if (this._activeMediaType === 'video' && !this.webAudioRequired) return;
 
     if (this._prepareAudioPromise) return this._prepareAudioPromise;
@@ -548,6 +571,7 @@ export class Player {
     this._prepareAudioPromise = (async () => {
       this.ensureAudioContext();
       await this.audioCtx!.resume();
+      if (this.presentationRetired) return;
 
       // Activate deferred audio output — real WebAudioOutput starts receiving data.
       // The deferred output may or may not have been wired into the pipeline yet
@@ -602,16 +626,35 @@ export class Player {
   // ─── Cleanup ─────────────────────────────────────────────────────
 
   /** Destroy the player and release all resources. */
-  async destroy(): Promise<void> {
+  destroy(): Promise<void> {
+    if (this.destroyWork) return this.destroyWork;
     this.presentationRetired = true;
-    this.timeCtrl?.stop();
-    this.stopStatsTimer();
-    this.renderer?.destroy();
-    if (this.audioCtx && this.audioCtx.state !== 'closed') {
-      await this.audioCtx.close();
-    }
-    this.audioClock.detachAudioContext();
-    await this.engine.destroy();
+    let resolve!: () => void, reject!: (error: unknown) => void;
+    const work = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    // Reserve the one cleanup owner before a supplied DOM/native method can
+    // synchronously call destroy again.
+    this.destroyWork = work;
+    void this.destroyResources().then(resolve, reject);
+    return work;
+  }
+
+  private async destroyResources(): Promise<void> {
+    const failures: unknown[] = [];
+    const release = (run: () => void) => {
+      try { run(); } catch (error) { failures.push(error); }
+    };
+    release(() => this.timeCtrl?.stop());
+    release(() => this.stopStatsTimer());
+    // Stop the embedding's render loop immediately; the engine owns the
+    // renderer/decoder graph and performs its one native destruction.
+    release(() => this.renderer?.stop());
+    try {
+      if (this.audioCtx && this.audioCtx.state !== 'closed') await this.audioCtx.close();
+    } catch (error) { failures.push(error); }
+    release(() => this.audioClock.detachAudioContext());
+    // The engine is the sole native graph destructor, even if the separately
+    // owned audio context or embedding render loop failed to close.
+    try { await this.engine.destroy(); } catch (error) { failures.push(error); }
     this.adoptedSelection = null;
     this.latestCatalog = null;
     this._currentAudioTrack = -1;
@@ -624,16 +667,67 @@ export class Player {
     // ownsCanvas/ownsVideo are only true when container was non-null (invariant),
     // so the optional chaining on container is a safety net only.
     if (this.ownsCanvas && this.canvas?.parentNode === this.container) {
-      this.container?.removeChild(this.canvas);
+      release(() => this.container?.removeChild(this.canvas!));
     }
     if (this.ownsVideo && this.videoElement?.parentNode === this.container) {
-      this.container?.removeChild(this.videoElement);
+      release(() => this.container?.removeChild(this.videoElement!));
     }
 
-    this.setState('idle');
+    release(() => this.setState('idle'));
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, 'Player cleanup failed');
   }
 
   // ─── Private: MoqtPlayer Config ──────────────────────────────────────
+
+  private createFrameOutput(context: Readonly<FrameOutputContext>): FrameOutput {
+    if (this.presentationRetired) throw new Error('Cannot prepare output after player destruction');
+    const { video, audio, clock } = context;
+    const renderer = video ? new CanvasRenderer(this.canvas!, { clock }) : undefined;
+    const audioOutput = audio ? new DeferredAudioOutput() : undefined;
+    let adopted = false, retired = false;
+    return {
+      ...(video ? { videoDecoder: new WebCodecsVideoDecoder(), renderer: renderer! } : {}),
+      ...(audio ? { audioDecoder: new WebCodecsAudioDecoder(), audioOutput: audioOutput! } : {}),
+      onAdopt: ({ playing }) => {
+        if (retired || this.presentationRetired) throw new Error('Prepared output is retired');
+        if (adopted) return;
+        adopted = true;
+        this.renderer = renderer ?? null;
+        this.webAudioRequired = audio;
+        const adoptedAudio = audioOutput ?? new DeferredAudioOutput();
+        this.deferredAudio = adoptedAudio;
+        const assertCurrent = () => {
+          if (retired || this.presentationRetired || this.renderer !== (renderer ?? null)
+              || this.deferredAudio !== adoptedAudio) throw new Error('Prepared output is retired');
+        };
+        if (audioOutput) {
+          // Preparation must not create or resume an AudioContext. At adoption
+          // eager mode may create one; gesture mode only borrows an existing one.
+          if (this.options.audioActivation !== 'gesture') this.ensureAudioContext();
+          assertCurrent();
+          if (this.audioCtx && this.audioCtx.state !== 'closed') {
+            audioOutput.activate(new WebAudioOutput(this.audioCtx, this.volumeCtrl?.destinationNode, 0, clock));
+            assertCurrent();
+          }
+        }
+        this.applyVolumeState();
+        assertCurrent();
+        if (renderer && playing) renderer.start();
+        assertCurrent();
+      },
+      onRetire: () => {
+        if (retired) return;
+        retired = true;
+        if (!adopted) return;
+        if (this.renderer === renderer) this.renderer = null;
+        if (audioOutput && this.deferredAudio === audioOutput) {
+          this.deferredAudio = new DeferredAudioOutput();
+          this.webAudioRequired = false;
+        }
+      },
+    };
+  }
 
   private buildMoqtPlayerConfig(): MoqtPlayerConfig {
     const opts = this.options;
@@ -656,6 +750,7 @@ export class Player {
 
     if (this.strategy === 'webcodecs') {
       Object.assign(base, {
+        createFrameOutput: (context: Readonly<FrameOutputContext>) => this.createFrameOutput(context),
         createVideoDecoder: () => new WebCodecsVideoDecoder(),
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
         createRenderer: () => {
@@ -711,6 +806,13 @@ export class Player {
 
     // Power-user escape hatch: merge moqtPlayerConfig overrides last
     if (opts.moqtPlayerConfig) {
+      const customFrames = ['createVideoDecoder', 'createAudioDecoder', 'createRenderer', 'createAudioOutput']
+        .some(name => Object.hasOwn(opts.moqtPlayerConfig!, name));
+      if (customFrames && !Object.hasOwn(opts.moqtPlayerConfig, 'createFrameOutput')) {
+        // Startup overrides do not promise that another graph is fresh. A
+        // custom backend must provide its own preparation factory as well.
+        Reflect.deleteProperty(base, 'createFrameOutput');
+      }
       Object.assign(base, opts.moqtPlayerConfig);
     }
 
@@ -909,6 +1011,8 @@ export class Player {
     });
 
     this.engine.on('state_changed', (e) => {
+      // Error filtering may hide the notification, not the terminal state.
+      if (e.to === 'error' && !this.presentationRetired) this.setState('error');
       if (e.to === 'ended') {
         this.timeCtrl?.stop();
         this.stopStatsTimer();
@@ -932,16 +1036,31 @@ export class Player {
       this.emitter.emit('durationchange', { duration: e.durationMs });
     });
 
+    this.engine.on('seeking', (e) => {
+      if (this.presentationRetired) return;
+      this.emitter.emit('seeking', { targetTime: e.targetTimeMs });
+    });
+
+    this.engine.on('seeked', (e) => {
+      if (this.presentationRetired) return;
+      this._currentTime = e.actualTimeMs;
+      this.emitter.emit('seeked', { currentTime: e.actualTimeMs });
+    });
+
     this.engine.on('error', (e) => {
       const severity = e.error.severity === 'fatal' ? 'fatal' as const : 'recoverable' as const;
-      this.emitter.emit('error', {
-        severity,
-        code: e.error.code,
-        message: e.error.message,
-      });
-      if (severity === 'fatal') {
-        this.setState('error');
+      const changed = severity === 'fatal' && this._state !== 'error';
+      // Commit the hold before application callbacks can read or throw.
+      if (severity === 'fatal') this._state = 'error';
+      let failed = false, firstFailure: unknown;
+      try {
+        this.emitter.emit('error', { severity, code: e.error.code, message: e.error.message });
+      } catch (error) { failed = true; firstFailure = error; }
+      if (changed && this._state === 'error' && !this.presentationRetired) {
+        try { this.emitter.emit('statechange', { state: 'error' }); }
+        catch (error) { if (!failed) { failed = true; firstFailure = error; } }
       }
+      if (failed) throw firstFailure;
     });
   }
 

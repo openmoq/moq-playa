@@ -20,7 +20,7 @@ import type { MoqtPlayerConfig } from './config.js';
 import type { MoqtConnection } from '@openmoq/webtransport';
 import type { ControlMessage, MoqtObject } from '@openmoq/transport';
 import { ObjectStatus, varint } from '@openmoq/transport';
-import type { ClockSource } from '@openmoq/playback';
+import type { PlaybackPipeline, ClockSource } from '@openmoq/playback';
 import type { AudioChunkInit, VideoChunkInit } from '@openmoq/loc';
 import { LocmafEncoder, LocmafGroupState, parseLocmafTrackContext, serializeLocmafObject, ticksToMicros } from '@openmoq/locmaf';
 import { NON_SYNC_FLAGS, SYNC_FLAGS, audioInit, buildChunk, cencVideoInit, videoInit } from '../../locmaf/test-support/cmaf.js';
@@ -119,7 +119,7 @@ async function bootPlayer(catalogJson: string, cfg: Partial<MoqtPlayerConfig> = 
   adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: catalogReqId, trackAlias: catalogReqId, parameters: new Map() } as unknown as ControlMessage);
   adapter._triggerObject(0n, {
     kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
-    objectId: varint(0), payload: new TextEncoder().encode(catalogJson),
+    objectId: varint(0), publisherPriority: 128, payload: new TextEncoder().encode(catalogJson),
   } as MoqtObject);
   await sleep(30);
 
@@ -305,7 +305,7 @@ describe('LOCMAF frame-path regressions', () => {
     }
   });
 
-  it.each<[string, Parameters<typeof buildChunk>[0]]>([
+  it.each<[string, Partial<Parameters<typeof buildChunk>[0]>]>([
     ['base data offset', { baseDataOffset: true }],
     ['sample groups in the traf', { extraTrafBoxes: [fullBox('sbgp', 0, 0, u32(0))] }],
     ['a trailing box', { trailing: [isoBox('free')] }],
@@ -505,7 +505,7 @@ describe('LOCMAF frame path (draft-einarsson-moq-locmaf-01 §16) — locmafDecod
       { locmafDecoding: 'frame' },
     );
     const alias = await reqIdFor('video');
-    const pushObject = vi.spyOn((player as any).videoPipeline, 'pushObject');
+    const pushObject = vi.spyOn((player as unknown as { videoPipeline: PlaybackPipeline }).videoPipeline, 'pushSampleObject');
 
     const { objects, samples } = locmafGroup(init, 90000, 2);
     objects.forEach((payload, i) => sendLocmaf(adapter, alias, 5, i, payload));
@@ -515,7 +515,7 @@ describe('LOCMAF frame path (draft-einarsson-moq-locmaf-01 §16) — locmafDecod
       await sleep(0);
     }
 
-    const pushed = pushObject.mock.calls.map((c: any[]) => c[1]);
+    const pushed = pushObject.mock.calls.flatMap(([, batch]) => batch.map(sample => sample.headers));
     const headers = pushed.find((h) => h?.captureTimestamp !== undefined)!;
     expect(headers).toBeDefined();
     expect(headers.timestampIsWallClock).toBe(false);

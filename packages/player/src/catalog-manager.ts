@@ -46,6 +46,7 @@ export class CatalogManager {
 
     /** Current materialized catalog state. Null until first catalog received. */
     private state: CatalogState | null = null;
+    private _wireFormat: 'msf-00' | 'msf-01' | 'catalogformat-01' | null = null;
 
     /** Number of catalog objects processed. */
     private _objectCount = 0;
@@ -78,6 +79,9 @@ export class CatalogManager {
         return this.state;
     }
 
+    /** Last accepted independent format; normalized version 1 does not identify its wire dialect. */
+    get wireFormat() { return this._wireFormat; }
+
     /** Number of catalog objects processed. */
     get objectCount(): number {
         return this._objectCount;
@@ -102,6 +106,7 @@ export class CatalogManager {
      */
     reset(): void {
         this.state = null;
+        this._wireFormat = null;
         this._objectCount = 0;
         this.cf01DeltaSupport = false;
         this.lastRawDocument = null;
@@ -278,6 +283,7 @@ export class CatalogManager {
                     version: result.catalog.version,
                     tracks: [...result.catalog.tracks],
                 };
+                this._wireFormat = 'catalogformat-01';
             } else {
                 // MSF-00
                 const catalog = parseMsfCatalog(payload, this.catalogNamespace);
@@ -306,6 +312,7 @@ export class CatalogManager {
                         ? { publishTracks: catalog.publishTracks }
                         : {}),
                 };
+                this._wireFormat = typeof obj['version'] === 'number' ? 'msf-00' : 'msf-01';
             }
         }
 

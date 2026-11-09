@@ -420,13 +420,14 @@ describe('finite media terminal delivery through the real player', () => {
     const source = { initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), mediaElement: null,
       destroy: vi.fn(), onFirstFrame: null, onError: null, onStall: null };
     const internal = player as unknown as {
-      connection: MoqtConnection; mediaSource: typeof source;
-      mseCompletions: Map<'video' | 'audio', { conn: MoqtConnection; source: typeof source; selection: object; key: string; emitted: boolean }>;
+      connection: MoqtConnection; mediaSource: typeof source; mseOutputEpoch: object | null;
+      mseCompletions: Map<'video' | 'audio', { conn: MoqtConnection; source: typeof source; outputEpoch: object | null; selection: object; key: string; emitted: boolean }>;
       reconsiderMseTrackEnds(): void;
     };
     internal.connection = conn; internal.mediaSource = source;
+    // Completion is scoped to the native output epoch: the deliberately injected records carry the current one.
     internal.mseCompletions = new Map((['video', 'audio'] as const).map(type => [type,
-      { conn, source, selection: known[type], key: identityKey(['finite'], known[type].name), emitted: false }]));
+      { conn, source, outputEpoch: internal.mseOutputEpoch, selection: known[type], key: identityKey(['finite'], known[type].name), emitted: false }]));
     const seen: string[] = [];
     player.on('track_ended', () => { throw new Error('listener refused'); });
     player.on('track_ended', event => { seen.push(event.mediaType); });
@@ -434,6 +435,32 @@ describe('finite media terminal delivery through the real player', () => {
       expect(() => internal.reconsiderMseTrackEnds()).not.toThrow();
       expect(seen).toEqual(['video', 'audio']);
       internal.reconsiderMseTrackEnds(); expect(seen).toEqual(['video', 'audio']);
+    } finally { await player.destroy(); await conn.close(); }
+  });
+
+  it('control — a completion recorded under a stale native output epoch is dropped, never notified', async () => {
+    const known = { video: { name: 'video', codec: 'avc1.640029' }, audio: { name: 'audio', codec: 'opus' } };
+    const player = new MoqtPlayer({ url: 'https://unused.example/moq', namespace: 'finite', knownTracks: known });
+    const conn = new MoqtConnection(18);
+    const source = { initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), mediaElement: null,
+      destroy: vi.fn(), onFirstFrame: null, onError: null, onStall: null };
+    const internal = player as unknown as {
+      connection: MoqtConnection; mediaSource: typeof source; mseOutputEpoch: object | null;
+      mseCompletions: Map<'video' | 'audio', { conn: MoqtConnection; source: typeof source; outputEpoch: object | null; selection: object; key: string; emitted: boolean }>;
+      reconsiderMseTrackEnds(): void;
+    };
+    internal.connection = conn; internal.mediaSource = source;
+    const stale = {};   // an output lifetime that has since been replaced
+    internal.mseCompletions = new Map([
+      ['video', { conn, source, outputEpoch: stale, selection: known.video, key: identityKey(['finite'], 'video'), emitted: false }],
+      ['audio', { conn, source, outputEpoch: internal.mseOutputEpoch, selection: known.audio, key: identityKey(['finite'], 'audio'), emitted: false }],
+    ]);
+    const seen: string[] = [];
+    player.on('track_ended', event => { seen.push(event.mediaType); });
+    try {
+      internal.reconsiderMseTrackEnds();
+      expect(seen, 'only the current-epoch completion is notified').toEqual(['audio']);
+      expect(internal.mseCompletions.has('video'), 'the stale record is dropped').toBe(false);
     } finally { await player.destroy(); await conn.close(); }
   });
 

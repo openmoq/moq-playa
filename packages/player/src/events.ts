@@ -645,8 +645,9 @@ export interface LocmafEventReceivedEvent {
 // ─── Seek Events ────────────────────────────────────────────────────
 
 /**
- * Seek operation initiated — pipelines being reset, REQUEST_UPDATE being sent.
- * @see draft-ietf-moq-transport-16 §9.2.2.5 (SUBSCRIPTION_FILTER in REQUEST_UPDATE)
+ * Seek preparation initiated for the requested content position. Built-in MSE
+ * and frame paths prepare owned historical output; the legacy fallback updates
+ * subscription filters in place. This event does not prove output readiness.
  * @see draft-ietf-moq-msf-00 §7 (Media Timeline for PTS→location lookup)
  */
 export interface SeekingEvent {
@@ -655,8 +656,11 @@ export interface SeekingEvent {
 }
 
 /**
- * Seek operation complete — REQUEST_UPDATE sent, awaiting objects at new position.
- * @see draft-ietf-moq-transport-16 §9.2.2.5 (SUBSCRIPTION_FILTER)
+ * Built-in MSE/frame seek output established this content position. Native
+ * MSE positioning and producing frame/audio timing do not prove paint or literal
+ * speaker output. The legacy subscription-update fallback emits this event
+ * optimistically after dispatch, before output is proven.
+ * @see draft-ietf-moq-msf-01 §7.2 (Media Timeline)
  */
 export interface SeekedEvent {
   readonly type: 'seeked';

@@ -22,8 +22,10 @@ import { MseMediaSource } from '../../browser/src/mse-adapter.js';
 import { MockMediaSource, MockVideoElement } from '../../browser/test-support/mse-native.js';
 import { decodeSubscriptionFilter, MessageParam, varint } from '@openmoq/transport';
 import { MoqtPlayer } from './player.js';
+import { createMediaDiagnostics } from './media-diagnostics.js';
+import type { MediaStageObservation } from './media-diagnostic-types.js';
 import type { LivenessTrack } from './media-liveness.js';
-import type { MediaSourceLike } from './interfaces.js';
+import type { MediaSourceLike, MediaSeekResource, MediaSeekSample, MediaAppendObserver } from './interfaces.js';
 
 type Packaging = 'cmaf' | 'locmaf';
 const enc = new TextEncoder();
@@ -313,16 +315,6 @@ describe('replayed Object locations on the MSE paths', () => {
     } finally { await h.destroy(); }
   });
 
-  it('public seek starts a native LOCMAF consumer lifetime that accepts the requested locations again', async () => {
-    const h = await fixture('locmaf', false, 18, { timeline: true });
-    try {
-      const objects = locmafObjects(4), current = await h.openVideoStream();
-      await current(0n, objects[0]!.payload); await current(1n, objects[1]!.payload);
-      h.player.play(); await h.player.seek(1000); await h.finishSeekDelivery();
-      expect(mdats(h.appended)).toEqual([...objects.slice(0, 2), ...objects].map(object => split(object.bytes)[1]));
-      expect(h.errors).toEqual([]);
-    } finally { await h.destroy(); }
-  });
   it('complete CMAF replays are idempotent at the actual MSE/native append and terminal boundary', async () => {
     const h = await fixture('cmaf', true), ended: string[] = [];
     h.player.on('track_ended', event => { ended.push(event.mediaType); });
@@ -629,23 +621,133 @@ it('a changed video Header leaves the independent audio decoder and accepted tra
   } finally { release?.(); if (stream !== undefined) await h.server.closeSubgroup(stream); await h.destroy(); }
 });
 
-it('prepares fresh LOCMAF history when seek is requested from a media callback', async () => {
-  const h = await fixture('locmaf', false, 18, { timeline: true });
+
+/**
+ * Owned-output historical seek for LOCMAF (MSE path): the requested locations are retrieved by a standalone FETCH into a
+ * fresh owned output lifetime; the live subscription is never rewritten. Dedicated fixture, so the replay cases above keep
+ * their live-delivery model untouched.
+ */
+async function ownedLocmafFixture() {
+  const { a, b } = createLoopback();
+  const client = new MoqtConnection(18), server = new MoqtConnection(18, { role: 'server' });
+  const requests: Array<{ id: bigint; name: string }> = [], fetches: Array<{ id: bigint; name: string; group: bigint; object: bigint }> = [];
+  const errors: string[] = [], liveAppended: Uint8Array[] = [], historyAppended: Uint8Array[] = [];
+  const liveUpdates: Array<ReturnType<typeof decodeSubscriptionFilter> | null> = [];
+  const observers = new Set<MediaAppendObserver>(), tokens: object[] = [];
+  let current: MediaSeekResource | null = null, sample: MediaSeekSample | null = null, land: ((sample: MediaSeekSample) => void) | undefined;
+  const source: MediaSourceLike = { mediaElement: {}, supportsTrackIdentity: true, onFirstFrame: null, onError: null, onStall: null,
+    initialize: () => true, appendChunk: (media, bytes) => { if (media === 'video') liveAppended.push(bytes.slice()); },
+    endOfStream() {}, reset() {}, destroy() {},
+    observeAppends(observer) { observers.add(observer); return () => { observers.delete(observer); }; },
+    setTimestampOffset() {}, getTimestampOffset: () => 0, setPlaybackIntent() {},
+    beginSeek(epoch) {
+      current?.cancel(); sample = null;
+      const identity = {};
+      const resource: MediaSeekResource = { epoch, resource: identity, get current() { return current === resource; },
+        initialize: () => true, whenAttached: async () => {},
+        // Each owned append completes asynchronously like a native SourceBuffer update, so serialized appends proceed.
+        appendChunk: (media, bytes, _name, _group, token) => { if (media === 'video') historyAppended.push(bytes.slice()); tokens.push(token!); queueMicrotask(() => { for (const observer of [...observers]) observer({ token: token!, state: 'appended', reason: null }); }); },
+        observeAppends(observer) { observers.add(observer); return () => { observers.delete(observer); }; },
+        getTimestampOffset: () => 0, setTimestampOffset() {},
+        position: () => new Promise<MediaSeekSample>(resolve => { land = resolve; }),
+        sample: () => sample, setPlaybackIntent() {}, cancel: () => { if (current === resource) current = null; } };
+      current = resource; return resource;
+    } };
+  server.onSubscribe = (id, _ns, name) => { requests.push({ id, name: dec.decode(name) }); };
+  server.onFetch = (id, message) => {
+    if (message.fetch.fetchType !== 1) throw new Error('Expected standalone history');
+    fetches.push({ id, name: dec.decode(message.fetch.trackName), group: message.fetch.startLocation.group, object: message.fetch.startLocation.object });
+  };
+  server.onMessage = message => {
+    if (message.type !== 'REQUEST_UPDATE' || requests.find(r => r.id === message.existingRequestId)?.name !== 'video') return;
+    const encoded = message.parameters.get(MessageParam.SUBSCRIPTION_FILTER)?.[0];
+    liveUpdates.push(encoded instanceof Uint8Array ? decodeSubscriptionFilter(encoded, 18) : null);
+  };
+  server.onError = error => { errors.push(error.message); };
+  const connected = server.connect(b, {}); void connected.catch(error => errors.push(String(error)));
+  const player = new MoqtPlayer({ url: 'https://replay.example/moq', namespace: ['live', 'show'], draftVersion: 18,
+    catalogBootstrap: 'subscribe', locmafDecoding: 'mse', disableAudio: true, logLevel: 'none',
+    createConnection: () => client, createTransport: async () => a,
+    createMediaSource: () => source, createCmafAssembler: options => new CmafAssembler(options) });
+  const seeked = vi.fn(), seeking = vi.fn(); player.on('seeked', seeked); player.on('seeking', seeking);
+  player.on('error', event => errors.push(event.error.message));
+  const stages: MediaStageObservation[] = []; const offStages = player.observeMediaStages(event => { stages.push(event); }, { createTracker: createMediaDiagnostics });
+  const streams: bigint[] = [];
+  const destroy = async () => { offStages(); for (const stream of streams) await server.closeSubgroup(stream); await player.destroy(); await flush(128); await server.close(); await connected.catch(() => {}); };
   try {
-    const chunks = videoChunks(4), objects = locmafObjects(4);
-    const full = serializeLocmafObject(new LocmafEncoder().encode(chunks[1]!, new LocmafGroupState(), parseLocmafTrackContext(init.video), false, 1n));
-    h.player.play();
-    const current = await h.openVideoStream(); await current(0n, objects[0]!.payload);
-    let seeking: Promise<void> | undefined, once = false;
-    h.player.on('media_object', event => {
-      if (event.mediaType === 'video' && event.objectId === 1n && !once) {
-        once = true; seeking = h.player.seek(1000);
-      }
-    });
-    await current(1n, full); await seeking; await h.finishSeekDelivery();
-    expect(once).toBe(true); expect(h.errors).toEqual([]);
-    // The old callback may complete while replacement input is preparing.
-    // The requested history itself must enter a fresh reconstruction lifetime.
-    expect(mdats(h.appended.slice(-objects.length))).toEqual(objects.map(object => split(object.bytes)[1]));
-  } finally { await h.destroy(); }
+    await player.load(); await flush(256);
+    await server.acceptSubscribe(requests.find(r => r.name === 'catalog')!.id, 100n); await flush(128);
+    const catalogStream = await server.openSubgroup(100n, 0n, 0n, { publisherPriority: 128 }); streams.push(catalogStream);
+    await server.sendObject(catalogStream, 0n, enc.encode(JSON.stringify({ version: '1', initDataList: [{ id: 'video', type: 'inline', data: b64(init.video) }],
+      tracks: [{ name: 'video', role: 'video', packaging: 'locmaf', locmafVersion: '0.3', isLive: false, renderGroup: 1, initRef: 'video', codec: 'avc1.640028', width: 640, height: 360, bitrate: 500000 },
+        { name: 'timeline', packaging: 'mediatimeline', isLive: false, mimeType: 'application/json', depends: ['video'] }] }))); await flush(256);
+    await server.acceptSubscribe(requests.find(r => r.name === 'video')!.id, VIDEO_ALIAS); await flush(128);
+    await server.acceptSubscribe(requests.find(r => r.name === 'timeline')!.id, 300n); await flush(128);
+    const timelineStream = await server.openSubgroup(300n, 0n, 0n, { publisherPriority: 128 }); streams.push(timelineStream);
+    await server.sendObject(timelineStream, 0n, enc.encode(JSON.stringify([[1000, [1, 0], 0]]))); await flush(256);   // both fixture objects start at source PTS 1 s in Group 1 / Object 0
+    expect(player.seekable).toBe(true); expect(errors).toEqual([]);
+  } catch (error) { await destroy(); throw error; }
+  const videoId = requests.find(r => r.name === 'video')!.id;
+  const liveFilter = () => server.session.getIncomingSubscription(videoId)?.currentFilter === undefined ? undefined : Array.from(server.session.getIncomingSubscription(videoId)!.currentFilter!);
+  const openVideoStream = async (group = 1n) => {
+    const stream = await server.openSubgroup(VIDEO_ALIAS, group, 0n, { publisherPriority: 128 }); streams.push(stream);
+    return async (id: bigint, payload: Uint8Array) => { await server.sendObject(stream, id, payload); await flush(256); };
+  };
+  /** Answer the owned seek's standalone FETCH with the requested LOCMAF history (Group 1, Objects 0..3), then land it. */
+  const deliverHistory = async () => {
+    await flush(256);
+    expect(fetches, 'the target location is requested through a standalone FETCH').toHaveLength(1);
+    expect(fetches[0]).toMatchObject({ name: 'video', group: 1n, object: 0n });
+    await server.acceptFetch(fetches[0]!.id, { endOfTrack: 1, endLocation: { group: 1n, object: 4n } });   // draft-18 end object is exclusive
+    const stream = await server.openFetchStream(fetches[0]!.id); await flush(128);
+    for (const [id, object] of locmafObjects(4).entries()) {
+      await server.sendFetchObject(stream, { groupId: 1n, subgroupId: 0n, objectId: BigInt(id), publisherPriority: 128, payload: object.payload });
+    }
+    await server.closeFetchStream(stream); await flush(256);
+    const resource = current!; sample = { epoch: resource.epoch, resource: resource.resource, currentTime: 1, buffered: { start: 1, end: 1.2 } };
+    await vi.waitFor(() => expect(land).toBeTypeOf('function'));
+    land!(sample); await vi.waitFor(() => expect(seeked).toHaveBeenCalledOnce());
+  };
+  return { player, errors, liveAppended, historyAppended, liveUpdates, liveFilter, fetches, seeked, seeking, stages, openVideoStream, deliverHistory, destroy };
+}
+
+describe('owned-output LOCMAF seek (MSE path, real SDK)', () => {
+  it('requested LOCMAF locations are consumed again in a fresh owned output lifetime; the live subscription is not rewritten', async () => {
+    const h = await ownedLocmafFixture();
+    try {
+      const objects = locmafObjects(4), current = await h.openVideoStream();
+      await current(0n, objects[0]!.payload); await current(1n, objects[1]!.payload);
+      expect(mdats(h.liveAppended), 'premise: live delivery reached the live source').toEqual(objects.slice(0, 2).map(object => split(object.bytes)[1]));
+      const filterBefore = h.liveFilter();
+      h.player.play(); await h.player.seek(1000);
+      await h.deliverHistory();
+      expect(mdats(h.historyAppended), `the requested history is reconstructed into the NEW owned output (markers ${JSON.stringify(mdats(h.historyAppended).map(m => m[m.length - 1]))}, live markers ${JSON.stringify(mdats(h.liveAppended).map(m => m[m.length - 1]))}, errors ${JSON.stringify(h.errors)}, fetches ${h.fetches.length}, stages ${JSON.stringify(h.stages.map(st => ({ stage: st.stage, reason: (st as { reason?: unknown }).reason ?? null, inputs: st.inputs.length })))})`).toEqual(objects.map(object => split(object.bytes)[1]));
+      expect(mdats(h.liveAppended), 'the live source did not receive the historical replay').toEqual(objects.slice(0, 2).map(object => split(object.bytes)[1]));
+      expect(h.liveUpdates, 'no REQUEST_UPDATE rewrote the live video subscription').toEqual([]);
+      // Whether the owned seek later retires the live request is its own lifecycle; the claim here is only that the
+      // original subscription was never rewritten. Witness recorded, not pinned.
+      const after = h.liveFilter();
+      if (after !== undefined) expect(after, 'a still-live original subscription keeps its accepted filter').toEqual(filterBefore);
+      else console.info('[owned LOCMAF seek] the original live video request was retired by the owned seek (not rewritten)');
+      expect(h.seeking, 'the seeking event names the requested target').toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ type: 'seeking', targetTimeMs: 1000 }));
+      expect(h.seeked).toHaveBeenCalledTimes(1); expect(h.errors).toEqual([]);
+    } finally { await h.destroy(); }
+  });
+  it('a seek requested from a media callback still starts the fresh owned lifetime for the requested history', async () => {
+    const h = await ownedLocmafFixture();
+    try {
+      const objects = locmafObjects(4);
+      h.player.play();
+      const current = await h.openVideoStream(); await current(0n, objects[0]!.payload);
+      let seeking: Promise<void> | undefined, once = false;
+      h.player.on('media_object', event => { if (event.mediaType === 'video' && event.objectId === 1n && !once) { once = true; seeking = h.player.seek(1000); } });
+      await current(1n, objects[1]!.payload); await seeking;
+      await h.deliverHistory();
+      expect(once).toBe(true);
+      // The old callback may complete while the replacement output is preparing; the requested history itself must
+      // enter the fresh owned lifetime.
+      expect(mdats(h.historyAppended)).toEqual(objects.map(object => split(object.bytes)[1]));
+      expect(h.liveUpdates).toEqual([]); expect(h.errors).toEqual([]);
+    } finally { await h.destroy(); }
+  });
 });

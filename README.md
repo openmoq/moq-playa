@@ -159,14 +159,14 @@ const player = new Player(container, options);
 await player.load();        // connect, subscribe to catalog, subscribe to tracks
 player.play();              // start rendering
 player.pause();             // pause rendering
-await player.seek(30_000);  // seek to 30s when a media timeline is loaded
+await player.seek(30_000);  // request a seek; see completion semantics below
 await player.destroy();     // tear down connection and clean up
 
 // State
 player.state          // 'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'error'
-player.currentTime    // ms
+player.currentTime    // ms; sampled on access, including hidden/no-RAF reads
 player.duration       // known timeline duration in ms, otherwise undefined
-player.seekable       // true when media timeline entries are loaded
+player.seekable       // current timeline covers the selected media identities
 player.volume         // 0–1
 player.muted          // boolean
 player.levels         // available video quality levels
@@ -208,6 +208,25 @@ player.on('statechange',    ({ state }) => console.log(state));
 
 Register event listeners before `load()` to observe startup events. The lifecycle,
 state and event lines above illustrate separate API calls, not a playback script.
+
+On the built-in MSE and frame paths, `seek()` resolves after admission of bounded
+historical retrieval, not after output lands. `currentTime` holds the admitted
+target until the owned output establishes its position, then samples that output
+without requiring a visible tab or animation tick. `seeked` reports that position:
+MSE uses actual native positioning and buffered coverage; frame playback uses
+producing video/audio timing. Neither proves a painted MSE frame or literal speaker
+output. LOC mapping is relative to the indexed sample; the MSF timestamp rounding
+limits nominal content precision to approximately 1 ms, not universal browser
+landing accuracy or capture-clock synchronization.
+
+`seekable` describes timeline coverage; custom outputs must also supply owned seek
+capabilities (`beginSeek` for MSE, `createFrameOutput` for frame playback). Unsupported
+capabilities or unproven mappings refuse the request. The legacy fallback for other
+output configurations updates subscription filters in place and emits `seeked`
+optimistically, before output is proven. Historical frame quality selection is
+limited to paused, video-only draft-18/22 playback in the same declared alternate
+set, configuration, shape and common index; historical MSE quality requires matching
+codec and initialization. These limits do not expand ordinary live selection.
 
 ### Options
 

@@ -63,6 +63,7 @@ describe('public video presentation', () => {
       expect(engine.videoPresentation).toBeNull();
       const renderer = internals.config.createRenderer!() as CanvasRenderer;
       internals.commandDispatcher = new CommandDispatcher({ renderer });
+      (player as unknown as { _state: 'playing' })._state = 'playing';
       internals._stats.recordPlayStart();
       nowMs = 100;
       renderer.enqueue({ timestamp: 5_000_000, close: vi.fn() }, 100_000);
