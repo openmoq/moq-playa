@@ -1765,6 +1765,8 @@ export class MoqtConnection {
             frames = this.framer.drain();
           }
           for (const { message } of frames) {
+            // Closed before the observer ran: not an observation-driven close.
+            if (this._terminated) throw new Error('Connection closed during setup');
             this.containObserver(() => this.observedQlogEvent?.({ type: 'control_message_parsed',
               stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID, message: structuredClone(message) as ControlMessage }));
             if (this._terminated) throw new Error('Connection closed during setup observation');
@@ -1797,6 +1799,8 @@ export class MoqtConnection {
         if (done) throw new ProtocolViolationError('Control stream closed before setup complete');
         this.framer.push(value);
         for (const { message } of this.framer.drain()) {
+          // Closed before the observer ran: not an observation-driven close.
+          if (this._terminated) throw new Error('Connection closed during setup');
           this.containObserver(() => this.observedQlogEvent?.({ type: 'control_message_parsed',
             stream_id: MoqtConnection.CONTROL_STREAM_QLOG_ID, message: structuredClone(message) as ControlMessage }));
           if (this._terminated) throw new Error('Connection closed during setup observation');
