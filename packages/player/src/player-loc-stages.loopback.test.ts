@@ -50,7 +50,7 @@ async function fixture(options: { observed?: boolean; dropToken?: boolean; trans
   const events: MediaStageObservation[] = [], receipts: Array<{ alias: bigint; token: object }> = [];
   const trackerFactory: MediaDiagnosticsFactory = options.oneUnit ? (host, emit) => createMediaDiagnostics(host, emit, { maxUnits: 1 }) : createMediaDiagnostics;
   const remove = options.observed === false ? () => {} : player.observeMediaStages(e => { events.push(e); }, { createTracker: trackerFactory });
-  const off = client.observeObjectReceipts(e => { if (e.origin !== 'group-end') receipts.push({ alias: e.trackAlias, token: e.receipt }); });
+  const off = client.observeObjectReceipts(e => { if (e.origin !== 'group-end' && e.origin !== 'fetch') receipts.push({ alias: e.trackAlias, token: e.receipt }); });
   await player.load(); await flush(128);
   for (const request of requests) await server.acceptSubscribe(request.id, request.name === 'v' ? 77n : 78n);
   await flush(128);

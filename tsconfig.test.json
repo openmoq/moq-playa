@@ -19,6 +19,17 @@
   "include": [
     "packages/devtools/src/player.test.ts",
     "packages/browser/src/audio-output-timing-consumed-match.test.ts",
+    "packages/webtransport/src/adapter-fetch-receiver.test.ts",
+    "packages/locmaf/src/chunk-samples-budget.test.ts",
+    "packages/locmaf/src/deserializer-budget.test.ts",
+    "packages/locmaf/src/esds-boundaries.test.ts",
+    "packages/locmaf/src/frame-budget.test.ts",
+    "packages/locmaf/src/frame-reader.test.ts",
+    "packages/locmaf/src/group-state-budget.test.ts",
+    "packages/locmaf/src/init-budget.test.ts",
+    "packages/locmaf/src/read-budget.test.ts",
+    "packages/locmaf/src/reconstruct-budget.test.ts",
+    "packages/locmaf/src/reconstruct-samples.test.ts",
     "packages/player/src/subscription-manager.test.ts",
     "packages/player/src/player-object-replay.loopback.test.ts",
     "packages/player/src/subscription-manager-replay.test.ts",
@@ -183,6 +194,11 @@
     "packages/playback/src/pipeline-group-wait-clock.test.ts",
     "packages/playback/src/pipeline-reorder-reentry.test.ts",
     "packages/transport/src/session/subscription-filter-boundary.test.ts",
-    "_migration/**/*.test.ts"
+    "packages/webtransport/src/adapter-track-ownership.test.ts",
+    "packages/webtransport/src/adapter-track-ownership-boundaries.test.ts",
+    "packages/transport/src/control/draft14-fetch-ok.test.ts",
+    "_migration/**/*.test.ts",
+    "packages/locmaf/src/frame-reader-committed.test.ts",
+    "scripts/player-acceptance/group-tail.test.ts"
   ]
 }

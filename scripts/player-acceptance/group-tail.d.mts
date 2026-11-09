@@ -9,12 +9,13 @@ interface CatalogRequest { seq: number; atMs: number; connection: number; reques
   status: 'reserved' | 'issued' | 'failed' }
 interface CatalogHeader { seq: number; atMs: number; connection: number; stream: string; requestId: string }
 export interface TailCatalogFetch { expectedIdentity: { namespace: string[]; name: string } | null;
-  receiptCapability: 'unavailable'; disclosure: string; unavailableReceiptCount: number;
+  // available means at least one actual FETCH receipt was observed, not that all deliveries have one.
+  receiptCapability: 'unobserved' | 'unavailable' | 'available'; disclosure: string; unavailableReceiptCount: number;
   requests: CatalogRequest[]; headers: CatalogHeader[];
   deliveries: Array<{ seq: number; atMs: number; connection: number; stream: string; request: number; header: number;
     requestId: string; identity: { namespace: string[]; name: string } }> }
-export interface TailReceipt { seq: number; atMs: number; connection: number; stream: string | null; alias: string; group: string; object: string;
-  origin: 'subgroup' | 'datagram' | 'group-end'; subgroup: string | null; status: string; payloadBytes: number;
+export interface TailReceipt { seq: number; atMs: number; connection: number; stream: string | null; alias: string | null; requestId?: string; group: string; object: string;
+  origin: 'subgroup' | 'datagram' | 'group-end' | 'fetch'; subgroup: string | null; status: string; payloadBytes: number;
   identity: { namespace: string[]; name: string } | null }
 export interface TailTarget extends TailReceipt { heldAtMs: number; releaseIssuedAtMs: number | null; returnedAtMs: number | null;
   cancelled: boolean; raw: TailTiming; fin?: { atMs: number; terminal: string; error: string | null; whilePending: boolean } }

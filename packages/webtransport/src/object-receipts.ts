@@ -7,19 +7,33 @@ export interface ObjectReceipt {
   readonly [receiptIdentity]: true;
 }
 
-export interface ObjectReceiptObservation {
+interface ObjectReceiptFields {
   readonly receipt: ObjectReceipt;
-  /** group-end is a bound derived from a flagged subgroup's graceful FIN. */
-  readonly origin: 'subgroup' | 'datagram' | 'group-end';
-  /** Actual last parsed Object ID for a FIN-derived bound; null for an empty stream or other origins. */
-  readonly lastObjectId: bigint | null;
-  readonly trackAlias: bigint;
   readonly groupId: bigint;
   readonly subgroupId: bigint | null;
   readonly objectId: bigint;
   readonly objectStatus: bigint;
   readonly payloadBytes: number;
 }
+
+type AliasReceiptOrigin = 'subgroup' | 'datagram' | 'group-end';
+export type ObjectReceiptObservation = ObjectReceiptFields & (
+  | {
+      /** group-end is a bound derived from a flagged subgroup's graceful FIN. */
+      readonly origin: AliasReceiptOrigin;
+      /** Actual last parsed Object ID for a FIN-derived bound; null for other origins. */
+      readonly lastObjectId: bigint | null;
+      readonly trackAlias: bigint;
+    }
+  | {
+      /** FETCH stream identity, including Joining FETCH and draft-22 FILL. */
+      readonly origin: 'fetch';
+      readonly lastObjectId: null;
+      readonly trackAlias: null;
+      readonly requestId: bigint;
+      readonly streamId: bigint;
+    }
+);
 
 export interface ObjectReceiptDiscard {
   readonly receipt: ObjectReceipt;
@@ -63,16 +77,37 @@ export class ObjectReceiptObservers {
 
   receiptFor(object: object): ObjectReceipt | undefined { return this.receipts.get(object); }
 
-  receive(object: MoqtObject | ObjectDatagram, origin: ObjectReceiptObservation['origin'], lastObjectId: bigint | null = null): void {
+  private register(object: object): ObjectReceipt | undefined {
     if (this.empty || this.receipts.has(object)) return;
     const receipt = Object.freeze({}) as ObjectReceipt;
     this.receipts.set(object, receipt);
+    return receipt;
+  }
+
+  receive(object: MoqtObject | ObjectDatagram, origin: AliasReceiptOrigin, lastObjectId: bigint | null = null): void {
+    const receipt = this.register(object);
+    if (!receipt) return;
     const observation: ObjectReceiptObservation = {
       receipt, origin, lastObjectId: origin === 'group-end' ? lastObjectId : null, trackAlias: object.trackAlias, groupId: object.groupId, objectId: object.objectId,
       subgroupId: 'subgroupId' in object ? object.subgroupId : null,
       objectStatus: 'kind' in object ? object.kind === 'gap' ? object.status : 0n : object.status ?? 0n,
       payloadBytes: 'kind' in object && object.kind === 'gap' ? 0 : object.payload.byteLength,
     };
+    this.publish(observation);
+  }
+
+  receiveFetch(object: MoqtObject, requestId: bigint, streamId: bigint): void {
+    const receipt = this.register(object);
+    if (!receipt) return;
+    this.publish({
+      receipt, origin: 'fetch', lastObjectId: null, trackAlias: null, requestId, streamId,
+      groupId: object.groupId, objectId: object.objectId, subgroupId: object.subgroupId,
+      objectStatus: object.kind === 'gap' ? object.status : 0n,
+      payloadBytes: object.kind === 'gap' ? 0 : object.payload.byteLength,
+    });
+  }
+
+  private publish(observation: ObjectReceiptObservation): void {
     for (const listener of [...this.listeners]) {
       if (!this.listeners.has(listener)) continue;
       try {

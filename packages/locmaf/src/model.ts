@@ -7,6 +7,7 @@
  */
 
 import { LocmafFieldId, fieldKind } from './fields.js';
+import type { LocmafReadBudget } from './read-budget.js';
 
 /**
  * A header field value in wire form. Scalars and list elements are the raw
@@ -96,13 +97,24 @@ export class LocmafHeader {
         return this.fields.size;
     }
 
+    /** Logical field/list slots retained, excluding byte payload size and heap overhead. */
+    get retainedEntryCount(): number {
+        let count = this.fields.size;
+        for (const value of this.fields.values()) {
+            if (value.kind === 'list') count += value.values.length;
+        }
+        return count;
+    }
+
     /** Present field IDs in ascending order, the canonical emission order (section 15.9). */
-    ids(): number[] {
+    ids(budget?: LocmafReadBudget): number[] {
+        budget?.claimEntries(this.fields.size);
         return [...this.fields.keys()].sort((a, b) => a - b);
     }
 
     /** A shallow copy (values are immutable). */
-    copy(full: boolean = this.full): LocmafHeader {
+    copy(full: boolean = this.full, budget?: LocmafReadBudget): LocmafHeader {
+        budget?.claimEntries(this.fields.size);
         const out = new LocmafHeader(full);
         for (const [id, v] of this.fields) out.fields.set(id, v);
         return out;

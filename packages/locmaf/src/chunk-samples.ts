@@ -31,6 +31,7 @@ import { childBoxes, viewOf, type IsoBoxHeader } from './iso-box.js';
 import type { GenBox } from './model.js';
 import { MAX_SAMPLE_COUNT } from './reconstruct.js';
 import type { LocmafTrackContext } from './track-context.js';
+import type { LocmafReadBudget } from './read-budget.js';
 
 /** The samples of a verbatim chunk, in the shape the frame slicer consumes. */
 export interface CmafChunkSamples {
@@ -44,6 +45,11 @@ export interface CmafChunkSamples {
 
 const S = '16';
 
+// Entry allowances count logical records/slots, not exact JS heap bytes:
+// ISO headers and child slots, moof indices, genBox records/slots, range
+// endpoints/slots, four sample-vector slots, and chunk result records/slots.
+// Only a noncontiguous gather claims bytes; borrowed sample views do not.
+
 /**
  * Read successive complete CMAF chunks carried by one MOQT Object (CMSF §3.3).
  * All chunks and trailing boxes are validated before any result is returned.
@@ -51,12 +57,15 @@ const S = '16';
  * legacy separately delivered mdat. Buffering that partial input is the caller's
  * responsibility. An incomplete later chunk is an error, never a partial success.
  */
-export function readCmafObjectSamples(bytes: Uint8Array, context: LocmafTrackContext): readonly CmafChunkSamples[] | null {
-    const top = childBoxes(bytes, 0, bytes.length, S);
+export function readCmafObjectSamples(bytes: Uint8Array, context: LocmafTrackContext, budget?: LocmafReadBudget): readonly CmafChunkSamples[] | null {
+    const top = childBoxes(bytes, 0, bytes.length, S, budget);
     const moofs: number[] = [];
-    for (let i = 0; i < top.length; i++) if (top[i]!.type === 'moof') moofs.push(i);
+    for (let i = 0; i < top.length; i++) if (top[i]!.type === 'moof') {
+        budget?.claimEntries(1);
+        moofs.push(i);
+    }
     if (!moofs.length) throw new LocmafFormatError(S, 0, 'object has no moof');
-    if (top.slice(0, moofs[0]!).some(box => box.type === 'mdat')) {
+    for (let i = 0; i < moofs[0]!; i++) if (top[i]!.type === 'mdat') {
         throw new LocmafFormatError(S, 0, 'mdat precedes the first moof');
     }
     if (moofs.length === 1 && !top.some(box => box.type === 'mdat')) return null;
@@ -77,7 +86,9 @@ export function readCmafObjectSamples(bytes: Uint8Array, context: LocmafTrackCon
         // Reuse the same sample reader on the ORIGINAL object coordinates.
         // This preserves explicit base_data_offset values while restricting
         // sample ranges to this chunk's own mdats, never a neighbour's media.
-        reads.push(readCmafSamplesInBoxes(bytes, context, top.slice(start, end)));
+        const read = readCmafSamplesInBoxes(bytes, context, top, start, end, budget);
+        budget?.claimEntries(1);
+        reads.push(read);
         start = end;
     }
     return reads;
@@ -91,43 +102,52 @@ export function readCmafObjectSamples(bytes: Uint8Array, context: LocmafTrackCon
  *   outside every mdat payload, or sample runs totalling more bytes than the
  *   mdat payloads carry, or a tfhd, tfdt or trun of an unimplemented version.
  */
-export function readCmafChunkSamples(chunk: Uint8Array, context: LocmafTrackContext): CmafChunkSamples {
-    return readCmafSamplesInBoxes(chunk, context, childBoxes(chunk, 0, chunk.length, S));
+export function readCmafChunkSamples(chunk: Uint8Array, context: LocmafTrackContext, budget?: LocmafReadBudget): CmafChunkSamples {
+    const top = childBoxes(chunk, 0, chunk.length, S, budget);
+    return readCmafSamplesInBoxes(chunk, context, top, 0, top.length, budget);
 }
 
-function readCmafSamplesInBoxes(chunk: Uint8Array, context: LocmafTrackContext, top: readonly IsoBoxHeader[]): CmafChunkSamples {
+function readCmafSamplesInBoxes(chunk: Uint8Array, context: LocmafTrackContext,
+    top: readonly IsoBoxHeader[], start: number, end: number, budget?: LocmafReadBudget): CmafChunkSamples {
     const view = viewOf(chunk);
-    const moofs = top.filter((b) => b.type === 'moof');
-    if (moofs.length !== 1) throw new LocmafFormatError(S, 0, `chunk has ${moofs.length} moof boxes`);
-    const moof = moofs[0]!;
-    const moofIndex = top.indexOf(moof);
-    // Sample data lives in an mdat after the moof: those payloads are the only
-    // byte ranges a sample may occupy. Top-level boxes tile the chunk, so the
-    // list is in ascending order and disjoint, which `within` relies on.
-    const mdatPayloads = top.slice(moofIndex + 1).filter((b) => b.type === 'mdat').map((b) => [b.contentStart, b.end] as const);
+    let moof: IsoBoxHeader | undefined;
+    let moofIndex = -1;
+    let moofCount = 0;
+    for (let i = start; i < end; i++) if (top[i]!.type === 'moof') {
+        moof = top[i]; moofIndex = i; moofCount++;
+    }
+    if (moofCount !== 1 || !moof) throw new LocmafFormatError(S, 0, `chunk has ${moofCount} moof boxes`);
+    // Keep ranges in complete Object coordinates; never borrow a neighbour mdat.
+    const mdatPayloads: Array<readonly [number, number]> = [];
+    let mdatBytes = 0;
+    for (let i = moofIndex + 1; i < end; i++) {
+        const box = top[i]!;
+        if (box.type !== 'mdat') continue;
+        budget?.claimEntries(3); // two range endpoints and its collection slot
+        mdatPayloads.push([box.contentStart, box.end]);
+        mdatBytes += box.end - box.contentStart;
+    }
     if (mdatPayloads.length === 0) throw new LocmafFormatError(S, moof.end, 'no mdat follows the moof');
-    const mdatBytes = mdatPayloads.reduce((n, [s, e]) => n + (e - s), 0);
 
     const genBoxes: GenBox[] = [];
-    for (const box of top.slice(0, moofIndex)) {
-        // Section 8.1: the payload is what follows the size + type header, so a
-        // uuid box's usertype leads its payload. A largesize header is 16 bytes.
+    for (let i = start; i < moofIndex; i++) {
+        const box = top[i]!;
         const headerBytes = view.getUint32(box.start) === 1 ? 16 : 8;
+        budget?.claimEntries(2); // genBox record and collection slot
         genBoxes.push({ type: box.type, payload: chunk.subarray(box.start + headerBytes, box.end) });
     }
 
-    const traf = selectTraf(chunk, moof, context);
-    const children = childBoxes(chunk, traf.contentStart, traf.end, S);
-    const tfhds = children.filter((b) => b.type === 'tfhd');
-    const tfdts = children.filter((b) => b.type === 'tfdt');
-    const truns = children.filter((b) => b.type === 'trun');
-    // CMAF needs a tfhd and tfdt to place the samples. Reject duplicate headers
-    // rather than choosing which one governs the run.
-    if (tfhds.length !== 1) throw new LocmafFormatError(S, traf.start, `traf has ${tfhds.length} tfhd boxes`);
-    if (tfdts.length === 0) throw new LocmafFormatError(S, traf.start, 'traf has no tfdt: samples cannot be placed in time');
-    if (tfdts.length > 1) throw new LocmafFormatError(S, traf.start, `traf has ${tfdts.length} tfdt boxes`);
-    const tfhd = tfhds[0]!;
-    const tfdt = tfdts[0]!;
+    const traf = selectTraf(chunk, moof, context, budget);
+    const children = childBoxes(chunk, traf.contentStart, traf.end, S, budget);
+    let tfhd: IsoBoxHeader | undefined, tfdt: IsoBoxHeader | undefined;
+    let tfhdCount = 0, tfdtCount = 0;
+    for (const box of children) {
+        if (box.type === 'tfhd') { tfhd = box; tfhdCount++; }
+        if (box.type === 'tfdt') { tfdt = box; tfdtCount++; }
+    }
+    if (tfhdCount !== 1 || !tfhd) throw new LocmafFormatError(S, traf.start, `traf has ${tfhdCount} tfhd boxes`);
+    if (tfdtCount === 0 || !tfdt) throw new LocmafFormatError(S, traf.start, 'traf has no tfdt: samples cannot be placed in time');
+    if (tfdtCount > 1) throw new LocmafFormatError(S, traf.start, `traf has ${tfdtCount} tfdt boxes`);
 
     const need = (box: IsoBoxHeader, bytes: number): void => {
         if (box.end - box.contentStart < bytes) throw new LocmafFormatError(S, box.start, `'${box.type}' box too short for its fields`);
@@ -179,7 +199,8 @@ function readCmafSamplesInBoxes(chunk: Uint8Array, context: LocmafTrackContext, 
     const ranges: Array<readonly [number, number]> = [];
     let cursor = base;
     let sampleBytes = 0;
-    for (const trun of truns) {
+    for (const trun of children) {
+        if (trun.type !== 'trun') continue;
         need(trun, 8);
         const version = supportedVersion(trun, [0, 1]);
         const trFlags = view.getUint32(trun.contentStart) & 0xffffff;
@@ -187,11 +208,13 @@ function readCmafSamplesInBoxes(chunk: Uint8Array, context: LocmafTrackContext, 
         if (durations.length + n > MAX_SAMPLE_COUNT) {
             throw new LocmafFormatError(S, trun.start, `trun sample_count ${n} exceeds the implementation limit`);
         }
-        const perSample = [0x100, 0x200, 0x400, 0x800].filter((bit) => trFlags & bit).length * 4;
+        const perSample = ((trFlags & 0x100 ? 1 : 0) + (trFlags & 0x200 ? 1 : 0)
+            + (trFlags & 0x400 ? 1 : 0) + (trFlags & 0x800 ? 1 : 0)) * 4;
         const fixed = 8 + (trFlags & 0x001 ? 4 : 0) + (trFlags & 0x004 ? 4 : 0);
         if (fixed + n * perSample > trun.end - trun.contentStart) {
             throw new LocmafFormatError(S, trun.start, `trun declares ${n} samples but is too short to carry them`);
         }
+        budget?.claimSamples(n);
         let q = trun.contentStart + 8;
         if (trFlags & 0x001) {
             cursor = base + view.getInt32(q);
@@ -219,6 +242,7 @@ function readCmafSamplesInBoxes(chunk: Uint8Array, context: LocmafTrackContext, 
             if (sampleBytes > mdatBytes) {
                 throw new LocmafFormatError(S, trun.start, `samples total more than the ${mdatBytes} bytes the mdat payload carries`);
             }
+            budget?.claimEntries(7); // four vector slots, two range endpoints and its slot
             durations.push(duration);
             sizes.push(size);
             flags.push(f);
@@ -228,10 +252,11 @@ function readCmafSamplesInBoxes(chunk: Uint8Array, context: LocmafTrackContext, 
         }
     }
 
+    budget?.claimEntries(1); // chunk result record
     return {
         genBoxes,
         effective: { baseMediaDecodeTime, sampleDescriptionIndex, durations, sizes, flags, compositionTimeOffsets, cenc: null },
-        mdat: gather(chunk, ranges),
+        mdat: gather(chunk, ranges, budget),
     };
 }
 
@@ -243,27 +268,32 @@ function readCmafSamplesInBoxes(chunk: Uint8Array, context: LocmafTrackContext, 
  * fails explicitly on two trafs for the track rather than guessing how to
  * combine their decode times.
  */
-function selectTraf(chunk: Uint8Array, moof: IsoBoxHeader, context: LocmafTrackContext): IsoBoxHeader {
+function selectTraf(chunk: Uint8Array, moof: IsoBoxHeader, context: LocmafTrackContext, budget?: LocmafReadBudget): IsoBoxHeader {
     const view = viewOf(chunk);
-    const trafs = childBoxes(chunk, moof.contentStart, moof.end, S).filter((b) => b.type === 'traf');
-    if (trafs.length === 0) throw new LocmafFormatError(S, moof.start, 'moof has no traf');
-    const matching: IsoBoxHeader[] = [];
+    let trafCount = 0, matchingCount = 0;
+    let matching: IsoBoxHeader | undefined;
     const ids: number[] = [];
-    for (const traf of trafs) {
-        const tfhds = childBoxes(chunk, traf.contentStart, traf.end, S).filter((b) => b.type === 'tfhd');
-        if (tfhds.length !== 1) throw new LocmafFormatError(S, traf.start, `traf has ${tfhds.length} tfhd boxes`);
-        const tfhd = tfhds[0]!;
+    for (const traf of childBoxes(chunk, moof.contentStart, moof.end, S, budget)) {
+        if (traf.type !== 'traf') continue;
+        trafCount++;
+        let tfhdCount = 0, tfhd: IsoBoxHeader | undefined;
+        for (const box of childBoxes(chunk, traf.contentStart, traf.end, S, budget)) {
+            if (box.type === 'tfhd') { tfhd = box; tfhdCount++; }
+        }
+        if (tfhdCount !== 1 || !tfhd) throw new LocmafFormatError(S, traf.start, `traf has ${tfhdCount} tfhd boxes`);
         if (tfhd.end - tfhd.contentStart < 8) throw new LocmafFormatError(S, tfhd.start, `'tfhd' box too short for its fields`);
         const id = view.getUint32(tfhd.contentStart + 4);
+        budget?.claimEntries(1);
         ids.push(id);
-        if (id === context.trackId) matching.push(traf);
+        if (id === context.trackId) { matching = traf; matchingCount++; }
     }
-    if (matching.length === 1) return matching[0]!;
-    if (matching.length === 0) {
+    if (trafCount === 0) throw new LocmafFormatError(S, moof.start, 'moof has no traf');
+    if (matchingCount === 1 && matching) return matching;
+    if (matchingCount === 0) {
         throw new LocmafFormatError(S, moof.start,
             `no traf carries track_ID ${context.trackId} of the CMAF Header (moof has track_ID ${ids.join(', ')})`);
     }
-    throw new LocmafFormatError(S, moof.start, `moof has ${matching.length} trafs for track_ID ${context.trackId}`);
+    throw new LocmafFormatError(S, moof.start, `moof has ${matchingCount} trafs for track_ID ${context.trackId}`);
 }
 
 /**
@@ -286,12 +316,14 @@ function within(intervals: ReadonlyArray<readonly [number, number]>, start: numb
 }
 
 /** The sample bytes in order: a subarray when contiguous, otherwise a copy. */
-function gather(chunk: Uint8Array, ranges: ReadonlyArray<readonly [number, number]>): Uint8Array {
+function gather(chunk: Uint8Array, ranges: ReadonlyArray<readonly [number, number]>, budget?: LocmafReadBudget): Uint8Array {
     if (ranges.length === 0) return chunk.subarray(0, 0);
     let contiguous = true;
     for (let i = 1; i < ranges.length && contiguous; i++) contiguous = ranges[i]![0] === ranges[i - 1]![1];
     if (contiguous) return chunk.subarray(ranges[0]![0], ranges[ranges.length - 1]![1]);
-    const out = new Uint8Array(ranges.reduce((n, [s, e]) => n + (e - s), 0));
+    const length = ranges.reduce((n, [s, e]) => n + (e - s), 0);
+    budget?.claimBytes(length);
+    const out = new Uint8Array(length);
     let pos = 0;
     for (const [s, e] of ranges) {
         out.set(chunk.subarray(s, e), pos);

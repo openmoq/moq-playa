@@ -11,6 +11,7 @@
 import { LocmafFormatError } from './errors.js';
 import { LocmafElementType, LocmafFieldId, fieldKind } from './fields.js';
 import { LocmafHeader, type GenBox, type LocmafObject } from './model.js';
+import type { LocmafReadBudget } from './read-budget.js';
 import { readVi64 } from './vi64.js';
 
 /** Largest genBox box_size: L = 4 + box_size must fit 32 bits (section 8.3). */
@@ -18,9 +19,12 @@ export const MAX_GEN_BOX_SIZE = 0xfffffffbn;
 
 /**
  * Parse one LOCMAF Object payload (section 7.1).
+ * An optional budget charges metadata records/list values as they are consumed;
+ * borrowed payload bytes and later sample expansion are charged by the caller.
  * @throws {LocmafFormatError} for any structural violation.
+ * @throws {import('./read-budget.js').LocmafReadLimitError} for a local allocation refusal.
  */
-export function deserializeLocmafObject(payload: Uint8Array): LocmafObject {
+export function deserializeLocmafObject(payload: Uint8Array, budget?: LocmafReadBudget): LocmafObject {
     if (payload.length === 0) {
         throw new LocmafFormatError('7.1', 0, 'empty payload');
     }
@@ -40,7 +44,7 @@ export function deserializeLocmafObject(payload: Uint8Array): LocmafObject {
                 }
                 return { kind: 'rawBoxes', boxes: validateRawBoxes(payload.subarray(pos), pos) };
             case BigInt(LocmafElementType.GEN_BOX): {
-                const { box, next } = readGenBox(payload, pos, elementStart);
+                const { box, next } = readGenBox(payload, pos, elementStart, budget);
                 genBoxes.push(box);
                 pos = next;
                 break;
@@ -48,7 +52,7 @@ export function deserializeLocmafObject(payload: Uint8Array): LocmafObject {
             case BigInt(LocmafElementType.FULL_HEADER):
             case BigInt(LocmafElementType.DELTA_HEADER): {
                 const full = type.value === BigInt(LocmafElementType.FULL_HEADER);
-                const { header, end } = readHeader(payload, pos, full, elementStart);
+                const { header, end } = readHeader(payload, pos, full, elementStart, budget);
                 return { kind: 'moof', genBoxes, header, mdat: payload.subarray(end) };
             }
             default:
@@ -57,7 +61,7 @@ export function deserializeLocmafObject(payload: Uint8Array): LocmafObject {
     }
 }
 
-function readGenBox(payload: Uint8Array, pos: number, elementStart: number): { box: GenBox; next: number } {
+function readGenBox(payload: Uint8Array, pos: number, elementStart: number, budget?: LocmafReadBudget): { box: GenBox; next: number } {
     const size = readVi64(payload, pos);
     pos += size.bytesRead;
     if (size.value < 4n) {
@@ -70,6 +74,7 @@ function readGenBox(payload: Uint8Array, pos: number, elementStart: number): { b
         throw new LocmafFormatError('8.1', elementStart, 'genBox exceeds the object payload');
     }
     const end = pos + Number(size.value);
+    budget?.claimEntries(1);
     let type = '';
     for (let i = 0; i < 4; i++) type += String.fromCharCode(payload[pos + i]!);
     return { box: { type, payload: payload.subarray(pos + 4, end) }, next: end };
@@ -106,6 +111,7 @@ function readHeader(
     pos: number,
     full: boolean,
     elementStart: number,
+    budget?: LocmafReadBudget,
 ): { header: LocmafHeader; end: number } {
     const length = readVi64(payload, pos);
     pos += length.bytesRead;
@@ -123,6 +129,8 @@ function readHeader(
         if (seen.has(idv.value)) {
             throw new LocmafFormatError('7.3', fieldStart, `field ${idv.value} repeated`);
         }
+        // One field claim bounds its seen entry and optional known-field record.
+        budget?.claimEntries(1);
         seen.add(idv.value);
         const known = idv.value <= 64n ? fieldKind(Number(idv.value)) : undefined;
         const id = Number(idv.value);
@@ -147,7 +155,7 @@ function readHeader(
         if (known === 'bytes') {
             header.set(id, { kind: 'bytes', bytes });
         } else {
-            header.set(id, { kind: 'list', values: readVi64List(bytes, valueStart) });
+            header.set(id, { kind: 'list', values: readVi64List(bytes, valueStart, budget) });
         }
     }
     return { header, end };
@@ -167,12 +175,13 @@ function checkRestriction(full: boolean, id: number, offset: number): void {
  * length (every vi64 is at least one byte), so allocation is bounded by the
  * payload (section 18).
  */
-function readVi64List(bytes: Uint8Array, baseOffset: number): bigint[] {
+function readVi64List(bytes: Uint8Array, baseOffset: number, budget?: LocmafReadBudget): bigint[] {
     const out: bigint[] = [];
     let pos = 0;
     while (pos < bytes.length) {
         try {
             const v = readVi64(bytes, pos);
+            budget?.claimEntries(1);
             out.push(v.value);
             pos += v.bytesRead;
         } catch (e) {

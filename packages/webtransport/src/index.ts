@@ -32,3 +32,5 @@ export type { BidiControlTopology } from './topology/bidi-control.js';
 export { createUniPairTopology, UniPairTopology } from './topology/uni-pair.js';
 /** @experimental */
 export type { RequestStream } from './topology/uni-pair.js';
+
+export type { FetchReceiver, FetchReceiveContext } from './fetch-receiver.js';

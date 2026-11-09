@@ -21,6 +21,7 @@ import type { LocmafGroupState } from './group-state.js';
 import type { GenBox, LocmafHeader, LocmafObject } from './model.js';
 import type { LocmafTrackContext } from './track-context.js';
 import { MAX_VI64, zigzagDecode, zigzagEncode } from './vi64.js';
+import { LocmafReadLimitError, type LocmafReadBudget } from './read-budget.js';
 
 /**
  * Implementation bound on trunSampleCount, checked before any per-sample
@@ -49,6 +50,12 @@ export type LocmafReconstruction =
           readonly bytes: Uint8Array;
       };
 
+/** Effective samples without canonical ISO serialization (section 16). */
+export type LocmafSampleReconstruction =
+    | { readonly kind: 'chunk'; readonly effective: LocmafEffectiveSamples;
+        readonly mdat: Uint8Array; readonly genBoxes: readonly GenBox[] }
+    | { readonly kind: 'raw'; readonly bytes: Uint8Array };
+
 export class LocmafReconstructor {
     /**
      * Reconstruct one Object against the group state and update the state.
@@ -59,12 +66,49 @@ export class LocmafReconstructor {
      *
      * @throws {LocmafFormatError} when the Object must be rejected.
      */
-    reconstruct(object: LocmafObject, state: LocmafGroupState, context: LocmafTrackContext, objectId: bigint): LocmafReconstruction {
+    reconstruct(object: LocmafObject, state: LocmafGroupState, context: LocmafTrackContext, objectId: bigint, budget?: LocmafReadBudget): LocmafReconstruction {
         if (object.kind === 'rawBoxes') {
-            state.clear();
-            state.noteObject(objectId);
-            return { kind: 'raw', bytes: validateRawBoxes(object.boxes) };
+            return this.readRaw(object, state, objectId);
         }
+        try {
+            const { represented, effective } = this.prepareChunk(object, state, context, objectId, budget);
+            const bytes = buildCanonicalChunk(object.genBoxes, effective, object.mdat, context, budget);
+            state.anchor(represented, effective, objectId, budget);
+            return { kind: 'chunk', bytes, effective };
+        } catch (e) {
+            if (e instanceof LocmafFormatError || e instanceof LocmafReadLimitError) state.clear();
+            throw e;
+        }
+    }
+
+    /**
+     * Resolve the same metadata for frame consumption, without constructing
+     * canonical CMAF bytes. Updates the supplied group state on success.
+     * A caller preparing a batch must keep that state private until admission.
+     */
+    reconstructSamples(object: LocmafObject, state: LocmafGroupState, context: LocmafTrackContext, objectId: bigint, budget?: LocmafReadBudget): LocmafSampleReconstruction {
+        if (object.kind === 'rawBoxes') return this.readRaw(object, state, objectId);
+        try {
+            const { represented, effective } = this.prepareChunk(object, state, context, objectId, budget);
+            state.anchor(represented, effective, objectId, budget);
+            return { kind: 'chunk', effective, mdat: object.mdat, genBoxes: object.genBoxes };
+        } catch (e) {
+            if (e instanceof LocmafFormatError || e instanceof LocmafReadLimitError) state.clear();
+            throw e;
+        }
+    }
+
+    private readRaw(object: Extract<LocmafObject, { kind: 'rawBoxes' }>, state: LocmafGroupState, objectId: bigint): LocmafSampleReconstruction & { kind: 'raw' } {
+        state.clear();
+        state.noteObject(objectId);
+        return { kind: 'raw', bytes: validateRawBoxes(object.boxes) };
+    }
+
+    private prepareChunk(
+        object: Extract<LocmafObject, { kind: 'moof' }>, state: LocmafGroupState,
+        context: LocmafTrackContext, objectId: bigint, budget?: LocmafReadBudget,
+    ): { represented: LocmafHeader; effective: LocmafEffectiveSamples } {
+        validateChunkCarriers(object.genBoxes, object.mdat);
         const header = object.header;
         if (!header.full) {
             if (!state.hasReference) {
@@ -77,13 +121,11 @@ export class LocmafReconstructor {
             }
         }
         try {
-            const represented = header.full ? header.copy(true) : this.applyDelta(header, state);
-            const effective = this.effectiveValues(represented, object.mdat.length, state, context, header.full);
-            const bytes = buildCanonicalChunk(object.genBoxes, effective, object.mdat, context);
-            state.anchor(represented, effective, objectId);
-            return { kind: 'chunk', bytes, effective };
+            const represented = header.full ? header.copy(true, budget) : this.applyDelta(header, state, budget);
+            const effective = this.effectiveValues(represented, object.mdat.length, state, context, header.full, budget);
+            return { represented, effective };
         } catch (e) {
-            if (e instanceof LocmafFormatError) state.clear();
+            if (e instanceof LocmafFormatError || e instanceof LocmafReadLimitError) state.clear();
             throw e;
         }
     }
@@ -95,12 +137,11 @@ export class LocmafReconstructor {
      * Returns the chunk's represented fields in full form, without field 10
      * (a delta chunk's BMDT is derived).
      */
-    applyDelta(delta: LocmafHeader, state: LocmafGroupState): LocmafHeader {
-        const reference = state.reference;
-        if (reference === null) {
+    applyDelta(delta: LocmafHeader, state: LocmafGroupState, budget?: LocmafReadBudget): LocmafHeader {
+        const result = state.copyReference(budget);
+        if (result === null) {
             throw new LocmafFormatError('3', 0, 'delta header without an in-group reference');
         }
-        const result = reference.copy(true);
 
         if (delta.has(F.DELTA_DELETED_LOCMAF_IDS)) {
             for (const id of delta.list(F.DELTA_DELETED_LOCMAF_IDS)) {
@@ -117,6 +158,7 @@ export class LocmafReconstructor {
             if (value < 0n || value > MAX_VI64) {
                 throw new LocmafFormatError('12.1', 0, `field ${id} delta yields out-of-range value ${value}`);
             }
+            budget?.claimEntries(result.has(id) ? 1 : 2);
             result.set(id, { kind: 'scalar', value });
         };
 
@@ -129,6 +171,7 @@ export class LocmafReconstructor {
             throw new LocmafFormatError('12.1', 0, `trunSampleCount delta yields out-of-range count ${count}`);
         }
         const n = Number(count);
+        budget?.checkSamples(n);
         for (const id of [F.TFHD_SAMPLE_DESCRIPTION_INDEX, F.TFHD_DEFAULT_SAMPLE_DURATION, F.TFHD_DEFAULT_SAMPLE_SIZE,
             F.TFHD_DEFAULT_SAMPLE_FLAGS, F.TRUN_FIRST_SAMPLE_FLAGS, F.SENC_PER_SAMPLE_IV_SIZE]) {
             applyScalar(id);
@@ -141,6 +184,7 @@ export class LocmafReconstructor {
                 // Inherited: keep the prefix at the new length (section 12.1.1).
                 if (previous === undefined) return;
                 if (previous.length > want) {
+                    budget?.claimEntries(want + 1);
                     result.set(id, { kind: 'list', values: previous.slice(0, want) });
                 } else if (previous.length < want) {
                     throw new LocmafFormatError('12.1.1', 0, `inherited field ${id} has ${previous.length} elements, need ${want}`);
@@ -151,6 +195,7 @@ export class LocmafReconstructor {
             if (deltas.length !== want) {
                 throw new LocmafFormatError('12.1.1', 0, `field ${id} carries ${deltas.length} elements, expected ${want}`);
             }
+            budget?.claimEntries(want + (result.has(id) ? 1 : 2));
             const values = deltas.map((z, i) => {
                 const base = previous !== undefined && i < previous.length ? previous[i]! : 0n;
                 if (signed) {
@@ -185,7 +230,10 @@ export class LocmafReconstructor {
         applyList(F.SENC_BYTES_OF_PROTECTED_DATA, subsamples, false);
 
         const iv = delta.get(F.SENC_INITIALIZATION_VECTOR);
-        if (iv !== undefined) result.set(F.SENC_INITIALIZATION_VECTOR, iv);
+        if (iv !== undefined) {
+            if (!result.has(F.SENC_INITIALIZATION_VECTOR)) budget?.claimEntries(1);
+            result.set(F.SENC_INITIALIZATION_VECTOR, iv);
+        }
 
         result.delete(F.TFDT_BASE_MEDIA_DECODE_TIME);
         return result;
@@ -201,9 +249,10 @@ export class LocmafReconstructor {
         state: LocmafGroupState,
         context: LocmafTrackContext,
         full: boolean,
+        budget?: LocmafReadBudget,
     ): LocmafEffectiveSamples {
         if (!context.isProtected) {
-            const cenc = r.ids().find(isCencField);
+            const cenc = r.ids(budget).find(isCencField);
             if (cenc !== undefined) {
                 throw new LocmafFormatError('10.3', 0, `CENC field ${cenc} on an unprotected track`);
             }
@@ -216,6 +265,7 @@ export class LocmafReconstructor {
             throw new LocmafFormatError(full ? '11.2' : '12.1', 0, `trunSampleCount ${count} exceeds the implementation limit`);
         }
         const n = Number(count);
+        budget?.claimSamples(n);
 
         let bmdt: bigint;
         if (full) {
@@ -236,35 +286,45 @@ export class LocmafReconstructor {
 
         const sampleDescriptionIndex = u32Scalar(r, F.TFHD_SAMPLE_DESCRIPTION_INDEX, context.defaultSampleDescriptionIndex);
         const defaultDuration = u32Scalar(r, F.TFHD_DEFAULT_SAMPLE_DURATION, context.defaultSampleDuration);
-        const durations = r.has(F.TRUN_SAMPLE_DURATIONS)
-            ? u32List(requireLength(r, F.TRUN_SAMPLE_DURATIONS, n), F.TRUN_SAMPLE_DURATIONS)
-            : new Array<number>(n).fill(defaultDuration);
+        let durations: number[];
+        if (r.has(F.TRUN_SAMPLE_DURATIONS)) {
+            durations = u32List(requireLength(r, F.TRUN_SAMPLE_DURATIONS, n), F.TRUN_SAMPLE_DURATIONS, budget);
+        } else {
+            budget?.claimEntries(n);
+            durations = new Array<number>(n).fill(defaultDuration);
+        }
 
-        const sizes = deriveSizes(r, n, payloadLength, context);
+        const sizes = deriveSizes(r, n, payloadLength, context, budget);
 
         const defaultFlags = u32Scalar(r, F.TFHD_DEFAULT_SAMPLE_FLAGS, context.defaultSampleFlags);
         const firstFlags = r.has(F.TRUN_FIRST_SAMPLE_FLAGS) ? u32Scalar(r, F.TRUN_FIRST_SAMPLE_FLAGS, 0) : undefined;
         let flags: number[];
         if (r.has(F.TRUN_SAMPLE_FLAGS)) {
-            flags = u32List(requireLength(r, F.TRUN_SAMPLE_FLAGS, n), F.TRUN_SAMPLE_FLAGS);
+            flags = u32List(requireLength(r, F.TRUN_SAMPLE_FLAGS, n), F.TRUN_SAMPLE_FLAGS, budget);
         } else {
+            budget?.claimEntries(n);
             flags = new Array<number>(n).fill(defaultFlags);
             if (n > 0 && firstFlags !== undefined) flags[0] = firstFlags;
         }
 
-        let compositionTimeOffsets: number[] = new Array<number>(n).fill(0);
+        let compositionTimeOffsets: number[];
         if (r.has(F.TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS)) {
-            const signed = requireLength(r, F.TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS, n).map(zigzagDecode);
-            const anyNegative = signed.some((c) => c < 0n);
-            compositionTimeOffsets = signed.map((c) => {
+            const encoded = requireLength(r, F.TRUN_SAMPLE_COMPOSITION_TIME_OFFSETS, n);
+            const anyNegative = encoded.some((c) => zigzagDecode(c) < 0n);
+            budget?.claimEntries(n);
+            compositionTimeOffsets = encoded.map((value) => {
+                const c = zigzagDecode(value);
                 if (c < I32_MIN || c > (anyNegative ? I32_MAX : U32_MAX)) {
                     throw new LocmafFormatError('18', 0, `composition time offset ${c} does not fit the trun field`);
                 }
                 return Number(c);
             });
+        } else {
+            budget?.claimEntries(n);
+            compositionTimeOffsets = new Array<number>(n).fill(0);
         }
 
-        const cenc = context.isProtected ? cencValues(r, n, sizes, context) : null;
+        const cenc = context.isProtected ? cencValues(r, n, sizes, context, budget) : null;
         return { baseMediaDecodeTime: bmdt, sampleDescriptionIndex, durations, sizes, flags, compositionTimeOffsets, cenc };
     }
 }
@@ -284,7 +344,8 @@ function u32Scalar(r: LocmafHeader, id: number, fallback: number): number {
     return Number(v);
 }
 
-function u32List(values: readonly bigint[], id: number): number[] {
+function u32List(values: readonly bigint[], id: number, budget?: LocmafReadBudget): number[] {
+    budget?.claimEntries(values.length);
     return values.map((v) => {
         if (v > U32_MAX) throw new LocmafFormatError('18', 0, `field ${id} element ${v} does not fit 32 bits`);
         return Number(v);
@@ -295,7 +356,7 @@ function u32List(values: readonly bigint[], id: number): number[] {
  * Section 11.2 sample-size derivation. Zero-size samples make n > P legal, so
  * the count is bounded by {@link MAX_SAMPLE_COUNT}, not by the payload length.
  */
-function deriveSizes(r: LocmafHeader, n: number, p: number, context: LocmafTrackContext): number[] {
+function deriveSizes(r: LocmafHeader, n: number, p: number, context: LocmafTrackContext, budget?: LocmafReadBudget): number[] {
     if (n === 0) {
         if (p !== 0) throw new LocmafFormatError('11.2', 0, 'trunSampleCount 0 with a non-empty mdat payload');
         return [];
@@ -306,6 +367,7 @@ function deriveSizes(r: LocmafHeader, n: number, p: number, context: LocmafTrack
         if (listed.length !== n - 1) {
             throw new LocmafFormatError('11.2', 0, `trunSampleSizes carries ${listed.length} entries, expected ${n - 1}`);
         }
+        budget?.claimEntries(n);
         const sizes = new Array<number>(n);
         let sum = 0n;
         for (let i = 0; i < n - 1; i++) {
@@ -336,11 +398,12 @@ function deriveSizes(r: LocmafHeader, n: number, p: number, context: LocmafTrack
         throw new LocmafFormatError('11.2', 0, `${n} x ${uniform} != payload length ${p}`);
     }
     if (uniform > U32_MAX) throw new LocmafFormatError('18', 0, 'sample size does not fit 32 bits');
+    budget?.claimEntries(n);
     return new Array<number>(n).fill(Number(uniform));
 }
 
 /** CENC effective values for a protected track (sections 10.2, 13, 15.8, 18). */
-function cencValues(r: LocmafHeader, n: number, sizes: readonly number[], context: LocmafTrackContext): LocmafCencSamples | null {
+function cencValues(r: LocmafHeader, n: number, sizes: readonly number[], context: LocmafTrackContext, budget?: LocmafReadBudget): LocmafCencSamples | null {
     const ivSizeValue = r.has(F.SENC_PER_SAMPLE_IV_SIZE) ? r.scalar(F.SENC_PER_SAMPLE_IV_SIZE) : BigInt(context.perSampleIvSize);
     if (ivSizeValue !== 0n && ivSizeValue !== 8n && ivSizeValue !== 16n) {
         throw new LocmafFormatError('10.2', 0, `sencPerSampleIVSize must be 0, 8 or 16, got ${ivSizeValue}`);
@@ -358,6 +421,7 @@ function cencValues(r: LocmafHeader, n: number, sizes: readonly number[], contex
     let clearBytes: number[] | null = null;
     let protectedBytes: number[] | null = null;
     if (r.has(F.SENC_SUBSAMPLE_COUNT)) {
+        budget?.claimEntries(n);
         subsampleCounts = requireLength(r, F.SENC_SUBSAMPLE_COUNT, n).map((c) => {
             if (c > U16_MAX) throw new LocmafFormatError('18', 0, `subsample count ${c} does not fit 16 bits`);
             return Number(c);
@@ -368,6 +432,7 @@ function cencValues(r: LocmafHeader, n: number, sizes: readonly number[], contex
         if (clear.length !== total || prot.length !== total) {
             throw new LocmafFormatError('10.2', 0, `subsample lists (${clear.length}, ${prot.length}) must total ${total} entries`);
         }
+        budget?.claimEntries(total * 2);
         clearBytes = clear.map((v) => {
             if (v > U16_MAX) throw new LocmafFormatError('18', 0, `BytesOfClearData ${v} does not fit 16 bits`);
             return Number(v);
@@ -396,6 +461,16 @@ function cencValues(r: LocmafHeader, n: number, sizes: readonly number[], contex
     return { perSampleIvSize: ivSize, ivs, subsampleCounts, clearBytes, protectedBytes };
 }
 
+function validateChunkCarriers(genBoxes: readonly GenBox[], mdat: Uint8Array): void {
+    if (mdat.length > 0xfffffff7) {
+        throw new LocmafFormatError('15.7', 0, 'mdat payload does not fit a 32-bit box size');
+    }
+    for (const box of genBoxes) {
+        if (box.type.length !== 4) throw new LocmafFormatError('8.1', 0, `genBox type "${box.type}" is not a FourCC`);
+        if (box.payload.length + 8 > 0xffffffff) throw new LocmafFormatError('8.3', 0, `genBox ${box.type} exceeds a 32-bit box size`);
+    }
+}
+
 /**
  * Build the canonical chunk (sections 15.2 to 15.8): each genBox wrapped
  * verbatim, then moof { mfhd, traf { tfhd, tfdt, trun [, saiz, saio, senc] } },
@@ -408,14 +483,13 @@ export function buildCanonicalChunk(
     e: LocmafEffectiveSamples,
     mdat: Uint8Array,
     context: LocmafTrackContext,
+    budget?: LocmafReadBudget,
 ): Uint8Array {
     const n = e.durations.length;
     if (e.sizes.length !== n || e.flags.length !== n || e.compositionTimeOffsets.length !== n) {
         throw new LocmafFormatError('15.1', 0, 'effective per-sample vectors disagree on the sample count');
     }
-    if (mdat.length > 0xfffffff7) {
-        throw new LocmafFormatError('15.7', 0, 'mdat payload does not fit a 32-bit box size');
-    }
+    validateChunkCarriers(genBoxes, mdat);
 
     // tfhd (15.4): no optional default for an event-only chunk (15.6).
     const sdiPresent = n > 0 && e.sampleDescriptionIndex !== context.defaultSampleDescriptionIndex;
@@ -453,6 +527,7 @@ export function buildCanonicalChunk(
     let sencSize = 0;
     const saioSize = c ? 20 : 0;
     if (c) {
+        budget?.claimEntries(n);
         auxSizes = new Array<number>(n);
         for (let i = 0; i < n; i++) {
             const aux = c.perSampleIvSize + (c.subsampleCounts ? 2 + 6 * c.subsampleCounts[i]! : 0);
@@ -471,10 +546,9 @@ export function buildCanonicalChunk(
 
     let total = moofSize + 8 + mdat.length;
     for (const box of genBoxes) {
-        if (box.type.length !== 4) throw new LocmafFormatError('8.1', 0, `genBox type "${box.type}" is not a FourCC`);
-        if (box.payload.length + 8 > 0xffffffff) throw new LocmafFormatError('8.3', 0, `genBox ${box.type} exceeds a 32-bit box size`);
         total += 8 + box.payload.length;
     }
+    budget?.claimBytes(total);
     const w = new ByteWriter(total);
 
     for (const box of genBoxes) {

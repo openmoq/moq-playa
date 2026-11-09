@@ -34,6 +34,7 @@ import type {
   RequestErrorMsg,
   RequestErrorKind,
   Fetch,
+  FetchOk,
   RequestUpdate,
   TrackExtensions,
   Publish,
@@ -122,6 +123,7 @@ export class Draft14Codec implements ControlCodec {
       case 'UNSUBSCRIBE_NAMESPACE': return this.encodeUnsubscribeNamespace(msg);
       case 'UNSUBSCRIBE': return this.encodeSimpleRequestId(D14.UNSUBSCRIBE, msg.requestId);
       case 'FETCH': return this.encodeFetch(msg);
+      case 'FETCH_OK': return this.encodeFetchOk(msg);
       case 'FETCH_CANCEL': return this.encodeSimpleRequestId(D14.FETCH_CANCEL, msg.requestId);
       case 'TRACK_STATUS': return this.encodeTrackStatus(msg);
       case 'PUBLISH_NAMESPACE': return this.encodePublishNamespace(msg);
@@ -402,6 +404,38 @@ export class Draft14Codec implements ControlCodec {
     pos += this.writeParams(remainingParams, payload, pos);
 
     return this.frame16(D14.SUBSCRIBE, payload);
+  }
+
+  private assertControlLength(total: number): void {
+    // Section 9.2 bounds the entire message, including either framing header.
+    if (total > 0xffff) throw new RangeError('Draft-14 control message exceeds the 65535-byte total limit');
+  }
+
+  private encodeFetchOk(msg: FetchOk): Uint8Array {
+    // Section 9.17 carries Group Order inline, without a Track Properties block.
+    const values = msg.parameters.get(MessageParam.GROUP_ORDER);
+    const groupOrder = values === undefined ? 1n : values[0];
+    if (values !== undefined && values.length !== 1
+        || typeof groupOrder !== 'bigint' || groupOrder !== 1n && groupOrder !== 2n) {
+      throw new ProtocolViolationError('FETCH_OK: Group Order must be ascending (1) or descending (2)');
+    }
+    if (msg.endOfTrack !== 0 && msg.endOfTrack !== 1) {
+      throw new ProtocolViolationError('FETCH_OK: End Of Track must be 0 or 1');
+    }
+    if (msg.trackProperties?.size || msg.trackExtensions?.size) {
+      throw new RangeError('Draft-14 FETCH_OK has no Track Properties block');
+    }
+    const parameters = this.cloneParamsWithout(msg.parameters, [MessageParam.GROUP_ORDER]);
+    const payloadLength = varintEncodingLength(msg.requestId) + 2
+      + locationEncodingLength(msg.endLocation) + this.paramsLength(parameters);
+    this.assertControlLength(varintEncodingLength(varint(D14.FETCH_OK)) + 2 + payloadLength);
+    const payload = new Uint8Array(payloadLength);
+    let pos = writeVarint(msg.requestId, payload, 0);
+    payload[pos++] = Number(groupOrder);
+    payload[pos++] = msg.endOfTrack;
+    pos += writeLocation(msg.endLocation, payload, pos);
+    this.writeParams(parameters, payload, pos);
+    return this.frame16(D14.FETCH_OK, payload);
   }
 
   private encodeFetch(msg: Fetch): Uint8Array {

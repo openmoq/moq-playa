@@ -213,7 +213,8 @@ async function heldFixture() {
 
 const fixtureCatalog: TailCatalogIdentity = { namespace: ['tail-proof', 'catalog-scope'], name: 'catalog' };
 async function catalogFetchFixture(options: { expected?: TailCatalogIdentity | null;
-  actual?: { namespace: readonly string[]; name: string }; standalone?: boolean } = {}) {
+  actual?: { namespace: readonly string[]; name: string }; standalone?: boolean;
+  receiptMode?: 'native' | 'unavailable'; omitProbeHeader?: boolean; bindAliasZero?: boolean; mediaTailCollision?: boolean } = {}) {
     const expected = options.expected === undefined ? fixtureCatalog : options.expected;
     const identity = options.actual ?? fixtureCatalog;
     const probe = createGroupTailProbe(expected ? { catalogIdentity: expected } : {});
@@ -224,10 +225,28 @@ async function catalogFetchFixture(options: { expected?: TailCatalogIdentity | n
     const errors: string[] = [];
     let sequence = 0;
     const record = (row: Omit<typeof trace[number], 'seq'>) => { const event = { seq: ++sequence, ...row }; trace.push(event); return event; };
+    // Legacy-capability controls hide only actual FETCH observations/tokens.
+    // Subgroup receipt behavior and real wire/header delivery stay unchanged.
+    const masked = new WeakSet<object>();
+    const originalReceipts = client.observeObjectReceipts, originalReceiptFor = client.objectReceiptFor;
+    const receiptsSpy = vi.spyOn(client, 'observeObjectReceipts').mockImplementation(function (this: MoqtConnection, listener) {
+      return originalReceipts.call(this, event => {
+        if (options.receiptMode !== 'native' && event.origin === 'fetch') { masked.add(event.receipt); return; }
+        return listener(event);
+      });
+    });
+    const receiptSpy = vi.spyOn(client, 'objectReceiptFor').mockImplementation(function (this: MoqtConnection, object) {
+      const receipt = originalReceiptFor.call(this, object);
+      return receipt && masked.has(receipt) ? undefined : receipt;
+    });
     const qlogs: Array<Parameters<MoqtConnection['observeQlogEvents']>[0]> = [];
     const originalObserve = client.observeQlogEvents;
     const spy = vi.spyOn(client, 'observeQlogEvents').mockImplementation(function (this: MoqtConnection, observer) {
-      qlogs.push(observer); return originalObserve.call(this, observer);
+      const probeObserver = qlogs.length === 0; qlogs.push(observer);
+      return originalObserve.call(this, event => {
+        if (probeObserver && options.omitProbeHeader && event.type === 'fetch_header_parsed') return;
+        return observer(event);
+      });
     });
     probe.connection(client);
     const off = client.observeQlogEvents(event => {
@@ -240,14 +259,18 @@ async function catalogFetchFixture(options: { expected?: TailCatalogIdentity | n
     client.onStreamClosed = stream => { record({ type: 'stream-closed', stream: String(stream) }); };
     client.onError = error => { errors.push(String(error)); }; server.onError = error => { errors.push(String(error)); };
     server.onSubscribe = () => {}; server.onFetch = () => {};
-    cleanups.push(async () => { await client.close(); await server.close(); off(); probe.restore(); spy.mockRestore(); });
+    cleanups.push(async () => { await client.close(); await server.close(); off(); probe.restore(); spy.mockRestore(); receiptSpy.mockRestore(); receiptsSpy.mockRestore(); });
       await Promise.all([client.connect(a), server.connect(b)]);
       const subscription = await client.subscribe(identity.namespace.map(field => encode.encode(field)), encode.encode(identity.name), {
         onRequestId: requestId => { record({ type: 'issued-subscribe', requestId: String(requestId), identity }); },
       });
       await flush(128);
-      await server.acceptSubscribe(subscription, 100n, { parameters: new Map([[0x09n, [{ group: 0n, object: 0n }]]]) });
+      await server.acceptSubscribe(subscription, options.mediaTailCollision ? 0n : 100n, { parameters: new Map([[0x09n, [{ group: 0n, object: 0n }]]]) });
       await flush(128);
+      if (options.bindAliasZero) {
+        const other = await client.subscribe([encode.encode('unrelated')], encode.encode('audio-en'));
+        await flush(128); await server.acceptSubscribe(other, 0n); await flush(128);
+      }
       const onRequestId = (requestId: bigint) => { record({ type: 'issued-fetch', requestId: String(requestId),
         ...(!options.standalone ? { joiningRequestId: String(subscription) } : {}), identity }); };
       const fetch = options.standalone
@@ -257,26 +280,32 @@ async function catalogFetchFixture(options: { expected?: TailCatalogIdentity | n
       await flush(128);
       const range = options.standalone ? { endLocation: { group: 1n, object: 0n } } : server.resolveJoiningFetch(fetch);
       await server.acceptFetch(fetch, { endLocation: range.endLocation }); await flush(128);
+      if (options.mediaTailCollision) {
+        probe.arm('held');
+        const live = await server.openSubgroup(0n, 0n, 0n, { publisherPriority: 128 });
+        await server.sendObject(live, 0n, bytes()); await flush(128);
+        await server.closeSubgroup(live); await flush(128);
+      }
       const stream = await server.openFetchStream(fetch);
-      await server.sendFetchObject(stream, { groupId: 0n, subgroupId: 0n, objectId: 0n, publisherPriority: 128,
+      await server.sendFetchObject(stream, { groupId: 0n, subgroupId: 0n, objectId: options.mediaTailCollision ? 11n : 0n, publisherPriority: 128,
         payload: encode.encode('{"fixture":"catalog"}') });
       await server.closeFetchStream(stream); await flush(128);
       const issued = trace.find(row => row.type === 'issued-fetch');
       const header = trace.find(row => row.type === 'fetch_header_parsed');
-      const callback = trace.find(row => row.type === 'onObject');
+      const callback = trace.find(row => row.type === 'onObject' && row.stream === header?.stream);
       expect(issued).toMatchObject({ requestId: String(fetch), identity,
         ...(!options.standalone ? { joiningRequestId: String(subscription) } : {}) });
       expect(header).toMatchObject({ requestId: String(fetch) });
-      expect(callback).toMatchObject({ stream: header?.stream, receiptPresent: false });
+      expect(callback).toMatchObject({ stream: header?.stream, receiptPresent: options.receiptMode === 'native' });
       expect(issued!.seq).toBeLessThan(header!.seq); expect(header!.seq).toBeLessThan(callback!.seq);
       expect(trace.some(row => row.type === 'stream-closed' && row.stream === header?.stream)).toBe(true);
-      const delivered = deliveries.find(row => row.object.kind === 'data');
+      const delivered = deliveries.find(row => row.object.kind === 'data' && String(row.stream) === header?.stream);
       if (!delivered) throw new Error('Expected actual FETCH object');
       expect(errors).toEqual([]);
       return { probe, client, server, subscription, fetch, delivered, trace, qlog: qlogs[0]! };
 }
 
-describe('public catalog FETCH receipt capability', () => {
+describe('catalog FETCH when public receipt capability is unavailable', () => {
   it('does not classify a proven catalog FETCH as missing subgroup-tail evidence', async () => {
     const f = await catalogFetchFixture();
     await f.probe.settleObservations('baseline-settled');
@@ -348,6 +377,66 @@ describe('public catalog FETCH receipt capability', () => {
     expect(probe.snapshot().catalogFetch.unavailableReceiptCount).toBe(0);
     expect(probe.snapshot().losses.missingReceipt).toBe(1);
     expect(probe.snapshot().errors).toContain('Object delivery has no exact public receipt');
+  });
+});
+
+describe('actual public FETCH receipt capability', () => {
+  it.each([false, true])('records direct FETCH receipt/owner identity without borrowing alias zero, standalone=%s', async standalone => {
+    const f = await catalogFetchFixture({ receiptMode: 'native', standalone, bindAliasZero: true });
+    await f.probe.settleObservations('baseline-settled');
+    const snapshot = f.probe.snapshot();
+    expect(snapshot.errors).toEqual([]);
+    expect(snapshot.catalogFetch.receiptCapability).toBe('available');
+    expect(snapshot.catalogFetch.unavailableReceiptCount).toBe(0);
+    expect(snapshot.catalogFetch.deliveries).toEqual([]);
+    expect(snapshot.receipts).toHaveLength(1);
+    expect(snapshot.receipts[0]).toMatchObject({ origin: 'fetch', alias: null, requestId: String(f.fetch),
+      stream: String(f.delivered.stream), identity: fixtureCatalog });
+    expect(f.client.objectReceiptFor(f.delivered.object)).toBeDefined();
+    expect(snapshot.target).toBeNull();
+  });
+  it('direct receipt proof does not require the legacy fallback catalog identity or header exception', async () => {
+    const f = await catalogFetchFixture({ receiptMode: 'native', expected: null, omitProbeHeader: true });
+    await f.probe.settleObservations('baseline-settled');
+    const snapshot = f.probe.snapshot();
+    expect(snapshot.catalogFetch.headers).toEqual([]);
+    expect(snapshot.catalogFetch.expectedIdentity).toBeNull();
+    expect(snapshot.catalogFetch.unavailableReceiptCount).toBe(0);
+    expect(snapshot.receipts[0]).toMatchObject({ origin: 'fetch', requestId: String(f.fetch), stream: String(f.delivered.stream), identity: fixtureCatalog });
+    expect(snapshot.errors).toEqual([]);
+  });
+  it('missing receipt and missing parsed header still fail despite a matching configured catalog identity', async () => {
+    const f = await catalogFetchFixture({ omitProbeHeader: true });
+    expect(f.probe.snapshot().catalogFetch.unavailableReceiptCount).toBe(0);
+    expect(f.probe.snapshot().losses.missingReceipt).toBe(1);
+    expect(f.probe.snapshot().errors).toContain('Object delivery has no exact public receipt');
+  });
+  it('a real media FETCH receipt is retained as FETCH evidence, never subgroup-tail evidence', async () => {
+    const actual = {namespace: ['other', 'video'], name: 'video-360'};
+    const f = await catalogFetchFixture({ receiptMode: 'native', actual, standalone: true, mediaTailCollision: true });
+    surface(f.probe);
+    const live = f.probe.snapshot().receipts.find(row => row.origin === 'subgroup');
+    expect(live).toMatchObject({alias: '0', group: '0', object: '0', identity: actual});
+    expect(f.delivered.object).toMatchObject({trackAlias: 0n, groupId: 0n, objectId: 11n});
+    expect(f.probe.transform(f.delivered.object)).toBe(f.delivered.object);
+    const snapshot = f.probe.snapshot();
+    expect(snapshot.receipts.find(row => row.origin === 'fetch')).toMatchObject({origin: 'fetch', identity: actual, requestId: String(f.fetch)});
+    expect(snapshot.target).toBeNull(); expect(snapshot.successor).toBeNull();
+    expect(snapshot.catalogFetch.unavailableReceiptCount).toBe(0); expect(snapshot.errors).toEqual([]);
+  });
+  it('a clone cannot borrow a real FETCH receipt after FIN or use its request tuple as a replacement', async () => {
+    const f = await catalogFetchFixture({ receiptMode: 'native' });
+    f.client.onObject!(f.delivered.stream, {...f.delivered.object});
+    f.client.onObject!(999n, {...f.delivered.object});
+    expect(f.probe.snapshot().receipts).toHaveLength(1);
+    expect(f.probe.snapshot().catalogFetch.unavailableReceiptCount).toBe(0);
+    expect(f.probe.snapshot().losses.missingReceipt).toBe(2);
+  });
+  it('a callback cannot relocate an exact FETCH receipt to another stream', async () => {
+    const f = await catalogFetchFixture({ receiptMode: 'native' });
+    f.client.onObject!(999n, f.delivered.object);
+    expect(f.probe.snapshot().receipts[0]!.stream).toBe(String(f.delivered.stream));
+    expect(f.probe.snapshot().errors).toContain('Object callback disagrees with its exact public FETCH stream');
   });
 });
 

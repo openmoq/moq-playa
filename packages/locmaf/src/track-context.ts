@@ -7,6 +7,7 @@
  */
 
 import { LocmafFormatError } from './errors.js';
+import type { LocmafReadBudget } from './read-budget.js';
 import { childBoxes, findChild, readBoxHeader, viewOf, fourccAt, type IsoBoxHeader } from './iso-box.js';
 
 /** Reconstruction inputs from the CMAF Header (section 15.1, last paragraph). */
@@ -67,13 +68,13 @@ function requireContent(box: IsoBoxHeader, bytes: number): void {
  *   a missing or malformed moov, trak, tkhd, mdhd or matching trex; section 13
  *   for a malformed protection scheme box.
  */
-export function parseLocmafTrackContext(init: Uint8Array): LocmafTrackContext {
+export function parseLocmafTrackContext(init: Uint8Array, budget?: LocmafReadBudget): LocmafTrackContext {
     if (init.length < 8) {
         throw new LocmafFormatError(SECTION, 0, 'empty initialization segment');
     }
     let moov: IsoBoxHeader | undefined;
     for (let pos = 0; pos < init.length && moov === undefined;) {
-        const box = readBoxHeader(init, pos, init.length, SECTION);
+        const box = readBoxHeader(init, pos, init.length, SECTION, budget);
         if (box.type === 'moov') moov = box;
         pos = box.end;
     }
@@ -81,20 +82,23 @@ export function parseLocmafTrackContext(init: Uint8Array): LocmafTrackContext {
         throw new LocmafFormatError(SECTION, 0, 'no moov box in initialization segment');
     }
     const view = viewOf(init);
-    const moovChildren = childBoxes(init, moov.contentStart, moov.end, SECTION);
-    const traks = moovChildren.filter((b) => b.type === 'trak');
-    if (traks.length !== 1) {
-        throw new LocmafFormatError('4.1', moov.start, `LOCMAF requires exactly one trak, found ${traks.length}`);
+    const moovChildren = childBoxes(init, moov.contentStart, moov.end, SECTION, budget);
+    let trak: IsoBoxHeader | undefined;
+    let trakCount = 0;
+    for (const child of moovChildren) {
+        if (child.type === 'trak') { trak = child; trakCount++; }
     }
-    const trak = traks[0]!;
+    if (trakCount !== 1 || trak === undefined) {
+        throw new LocmafFormatError('4.1', moov.start, `LOCMAF requires exactly one trak, found ${trakCount}`);
+    }
 
-    const tkhd = need(findChild(init, trak.contentStart, trak.end, 'tkhd', SECTION), 'tkhd', trak.start);
+    const tkhd = need(findChild(init, trak.contentStart, trak.end, 'tkhd', SECTION, budget), 'tkhd', trak.start);
     const tkhdV1 = init[tkhd.contentStart] === 1;
     requireContent(tkhd, tkhdV1 ? 24 : 16);
     const trackId = view.getUint32(tkhd.contentStart + (tkhdV1 ? 20 : 12));
 
-    const mdia = need(findChild(init, trak.contentStart, trak.end, 'mdia', SECTION), 'mdia', trak.start);
-    const mdiaChildren = childBoxes(init, mdia.contentStart, mdia.end, SECTION);
+    const mdia = need(findChild(init, trak.contentStart, trak.end, 'mdia', SECTION, budget), 'mdia', trak.start);
+    const mdiaChildren = childBoxes(init, mdia.contentStart, mdia.end, SECTION, budget);
     const mdhd = need(mdiaChildren.find((b) => b.type === 'mdhd'), 'mdhd', mdia.start);
     const mdhdV1 = init[mdhd.contentStart] === 1;
     requireContent(mdhd, mdhdV1 ? 24 : 16);
@@ -107,13 +111,13 @@ export function parseLocmafTrackContext(init: Uint8Array): LocmafTrackContext {
     }
 
     const minf = mdiaChildren.find((b) => b.type === 'minf');
-    const stbl = minf && findChild(init, minf.contentStart, minf.end, 'stbl', SECTION);
-    const stsd = stbl && findChild(init, stbl.contentStart, stbl.end, 'stsd', SECTION);
+    const stbl = minf && findChild(init, minf.contentStart, minf.end, 'stbl', SECTION, budget);
+    const stsd = stbl && findChild(init, stbl.contentStart, stbl.end, 'stsd', SECTION, budget);
     let entry: IsoBoxHeader | undefined;
     if (stsd !== undefined) {
         requireContent(stsd, 8);
         if (view.getUint32(stsd.contentStart + 4) !== 0) {
-            entry = childBoxes(init, stsd.contentStart + 8, stsd.end, SECTION)[0];
+            entry = childBoxes(init, stsd.contentStart + 8, stsd.end, SECTION, budget)[0];
         }
     }
 
@@ -125,15 +129,15 @@ export function parseLocmafTrackContext(init: Uint8Array): LocmafTrackContext {
     let schemeType: string | null = null;
     const fixed = entry === undefined ? undefined : protectedEntryFieldsLength(init, entry);
     if (entry !== undefined && fixed !== undefined) {
-        const sinf = childBoxes(init, entry.contentStart + fixed, entry.end, '13').find((b) => b.type === 'sinf');
+        const sinf = childBoxes(init, entry.contentStart + fixed, entry.end, '13', budget).find((b) => b.type === 'sinf');
         if (sinf !== undefined) {
-            const sinfChildren = childBoxes(init, sinf.contentStart, sinf.end, '13');
+            const sinfChildren = childBoxes(init, sinf.contentStart, sinf.end, '13', budget);
             const frma = sinfChildren.find((b) => b.type === 'frma');
             if (frma !== undefined && frma.end - frma.contentStart >= 4) codecFourcc = fourccAt(init, frma.contentStart);
             const schm = sinfChildren.find((b) => b.type === 'schm');
             if (schm !== undefined && schm.end - schm.contentStart >= 8) schemeType = fourccAt(init, schm.contentStart + 4);
             const schi = sinfChildren.find((b) => b.type === 'schi');
-            const tenc = schi && findChild(init, schi.contentStart, schi.end, 'tenc', '13');
+            const tenc = schi && findChild(init, schi.contentStart, schi.end, 'tenc', '13', budget);
             if (tenc !== undefined) {
                 const c = tenc.contentStart;
                 if (tenc.end - c < 24) {
@@ -141,11 +145,13 @@ export function parseLocmafTrackContext(init: Uint8Array): LocmafTrackContext {
                 }
                 isProtected = init[c + 6] === 1;
                 perSampleIvSize = init[c + 7]!;
+                budget?.claimBytes(16);
                 defaultKid = init.slice(c + 8, c + 24);
                 if (isProtected && perSampleIvSize === 0) {
                     if (tenc.end - c < 25 || tenc.end - c < 25 + init[c + 24]!) {
                         throw new LocmafFormatError('13', tenc.start, 'tenc constant IV truncated');
                     }
+                    budget?.claimBytes(init[c + 24]!);
                     constantIv = init.slice(c + 25, c + 25 + init[c + 24]!);
                 }
             }
@@ -153,9 +159,8 @@ export function parseLocmafTrackContext(init: Uint8Array): LocmafTrackContext {
     }
 
     const mvex = need(moovChildren.find((b) => b.type === 'mvex'), 'mvex', moov.start);
-    const trex = childBoxes(init, mvex.contentStart, mvex.end, SECTION)
-        .filter((b) => b.type === 'trex' && b.end - b.contentStart >= 24)
-        .find((b) => view.getUint32(b.contentStart + 4) === trackId);
+    const trex = childBoxes(init, mvex.contentStart, mvex.end, SECTION, budget)
+        .find((b) => b.type === 'trex' && b.end - b.contentStart >= 24 && view.getUint32(b.contentStart + 4) === trackId);
     if (trex === undefined) {
         throw new LocmafFormatError(SECTION, mvex.start, `no trex for track ${trackId}`);
     }

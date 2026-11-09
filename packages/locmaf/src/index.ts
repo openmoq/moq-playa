@@ -14,6 +14,8 @@
 // ─── Errors ─────────────────────────────────────────────────────────
 
 export { LocmafFormatError } from './errors.js';
+export { LocmafReadBudget, LocmafReadLimitError } from './read-budget.js';
+export type { LocmafReadBudgetLimits, LocmafReadBudgetUsage } from './read-budget.js';
 
 // ─── vi64 and zigzag ────────────────────────────────────────────────
 
@@ -40,7 +42,7 @@ export type { LocmafTrackContext } from './track-context.js';
 
 export { LocmafGroupState } from './group-state.js';
 export { LocmafReconstructor, MAX_SAMPLE_COUNT, buildCanonicalChunk } from './reconstruct.js';
-export type { LocmafReconstruction } from './reconstruct.js';
+export type { LocmafReconstruction, LocmafSampleReconstruction } from './reconstruct.js';
 export { SAMPLE_IS_NON_SYNC, isSyncSampleFlags, totalDuration } from './effective.js';
 export type { LocmafCencSamples, LocmafEffectiveSamples } from './effective.js';
 
@@ -61,5 +63,8 @@ export { sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader } fr
 export { readCmafChunkSamples, readCmafObjectSamples } from './chunk-samples.js';
 export type { CmafChunkSamples } from './chunk-samples.js';
 export type { LocmafFrame, LocmafFrameCenc, LocmafFrameSubsample } from './frame.js';
+export { LocmafFrameReader, LocmafFrameReadError } from './frame-reader.js';
+export type { LocmafFrameReaderLimits, LocmafFrameLocation, LocmafFrameHeader,
+    LocmafFrameUnit, LocmafFrameContinuity, LocmafFrameRead } from './frame-reader.js';
 export { parseEmsgPayload, parseEmsgBoxes } from './emsg.js';
 export type { EmsgEvent } from './emsg.js';

@@ -14,7 +14,7 @@ function fixture(limits = {}) {
   const receipts = {
     observe(fn: (event: ObjectReceiptObservation) => void | Promise<void>) { listeners.add(fn); return () => { listeners.delete(fn); }; },
     receiptFor(input: object) { return tokens.get(input); },
-    receive(input: MoqtObject, origin: ObjectReceiptObservation['origin'], lastObjectId: bigint | null = null) {
+    receive(input: MoqtObject, origin: Exclude<ObjectReceiptObservation['origin'], 'fetch'>, lastObjectId: bigint | null = null) {
       if (!listeners.size || tokens.has(input)) return;
       const receipt = Object.freeze({}) as ObjectReceipt; tokens.set(input, receipt);
       const event = { receipt, origin, lastObjectId, trackAlias: input.trackAlias, groupId: input.groupId,

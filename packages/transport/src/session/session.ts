@@ -3821,6 +3821,7 @@ export class Session {
     const range = resolveJoiningFetchRange(
       { fetchType: joining.fetchType, joiningStart: joining.joiningStart },
       anchor,
+      { draftVersion: this.draftVersion },
     );
     fetchSm.setResolvedRange(
       range.startLocation.group,

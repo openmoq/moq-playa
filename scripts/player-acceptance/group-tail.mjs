@@ -54,8 +54,8 @@ export function createGroupTailProbe({ now = () => performance.now(), delayMs = 
     && request.namespaceFields.every((field, i) => sameBytes(field, expectedCatalog.namespaceFields[i]))
     && sameBytes(request.trackNameBytes, expectedCatalog.trackNameBytes);
   const state = { instrumentation: 'Explicit createMediaDiagnostics before load through player destruction; stage outcomes and unchanged engine tokens; no helper append observer or token creation.',
-    catalogFetch: { expectedIdentity: expectedCatalog?.identity ?? null, receiptCapability: 'unavailable',
-      disclosure: 'Only an exactly configured catalog FETCH, owned by our public request callback and matched to an actual FETCH-header stream, is outside subgroup-tail receipt evidence. No FETCH receipt or media stage is invented.',
+    catalogFetch: { expectedIdentity: expectedCatalog?.identity ?? null, receiptCapability: 'unobserved',
+      disclosure: 'Actual public FETCH receipts retain their request/stream identity and are never subgroup-tail stimulus. Only when no receipt exists may an exactly configured catalog FETCH use the owned-request and parsed-header exception. No receipt or media stage is invented.',
       unavailableReceiptCount: 0, requests: [], headers: [], deliveries: [] },
     armed: false, mode: null, target: null, successor: null, receipts: [], stages: [], diagnostics: [], submissions: [], operations: [],
     losses: { overflow: 0, missingReceipt: 0, missingUnit: 0, missingToken: 0, changedInputs: 0, duplicateTerminal: 0 }, errors: [], closed: false };
@@ -160,10 +160,14 @@ export function createGroupTailProbe({ now = () => performance.now(), delayMs = 
       }));
       listeners.push(connection.observeObjectReceipts(event => {
         if (event.origin === 'group-end') return;
-        const row = record(state.receipts, { connection: id, stream: null, alias: String(event.trackAlias),
+        const fetch = event.origin === 'fetch';
+        if (fetch) state.catalogFetch.receiptCapability = 'available';
+        const row = record(state.receipts, { connection: id, stream: fetch ? String(event.streamId) : null,
+          alias: event.trackAlias === null ? null : String(event.trackAlias),
+          ...(fetch ? { requestId: String(event.requestId) } : {}),
           group: String(event.groupId), object: String(event.objectId), origin: event.origin,
           subgroup: event.subgroupId === null ? null : String(event.subgroupId), status: String(event.objectStatus),
-          payloadBytes: event.payloadBytes, identity: null });
+          payloadBytes: event.payloadBytes, identity: fetch ? fetches.get(String(event.requestId))?.identity ?? null : null });
         if (row) receipts.set(event.receipt, row);
       }));
       restores.push(tee(connection, 'onMessage', message => {
@@ -175,10 +179,19 @@ export function createGroupTailProbe({ now = () => performance.now(), delayMs = 
         const token = connection.objectReceiptFor(object), row = token && receipts.get(token);
         if (!row) {
           const header = fetchStreams.get(String(streamId)), request = header && fetches.get(header.requestId);
+          if (header && state.catalogFetch.receiptCapability !== 'available') state.catalogFetch.receiptCapability = 'unavailable';
           if (request && request.status !== 'failed' && isCatalog(request)) {
             if (record(state.catalogFetch.deliveries, { connection: id, stream: String(streamId), request: request.seq,
               header: header.seq, requestId: request.requestId, identity: request.identity })) state.catalogFetch.unavailableReceiptCount++;
           } else lost('missingReceipt', 'Object delivery has no exact public receipt');
+          return;
+        }
+        if (row.origin === 'fetch') {
+          // The public receipt already owns this stream/request. Its placeholder
+          // Object alias must not borrow a subscription's identity or need the
+          // legacy missing-receipt exception (including its qlog prerequisite).
+          if (row.stream !== String(streamId)) { error('Object callback disagrees with its exact public FETCH stream'); return; }
+          receiptObjects.set(object, row);
           return;
         }
         row.stream = String(streamId); row.identity = identity ?? null;

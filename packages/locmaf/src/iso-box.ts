@@ -10,6 +10,7 @@
  */
 
 import { LocmafFormatError } from './errors.js';
+import type { LocmafReadBudget } from './read-budget.js';
 
 export interface IsoBoxHeader {
     /** FourCC. */
@@ -39,10 +40,11 @@ export function viewOf(buf: Uint8Array): DataView {
 /**
  * Read one box header at `offset`, bounded by `limit`.
  * @param section draft section to report on malformation.
+ * An optional budget charges one entry before creating the header record.
  * @throws {LocmafFormatError} when the header is truncated or its size is
  *   smaller than its header or extends past `limit`.
  */
-export function readBoxHeader(buf: Uint8Array, offset: number, limit: number, section: string): IsoBoxHeader {
+export function readBoxHeader(buf: Uint8Array, offset: number, limit: number, section: string, budget?: LocmafReadBudget): IsoBoxHeader {
     const avail = limit - offset;
     if (avail < 8) {
         throw new LocmafFormatError(section, offset, 'truncated box header');
@@ -74,15 +76,17 @@ export function readBoxHeader(buf: Uint8Array, offset: number, limit: number, se
     if (size < headerSize) {
         throw new LocmafFormatError(section, offset, `box '${type}' size ${size} is smaller than its header`);
     }
+    budget?.claimEntries(1);
     return { type, start: offset, headerSize, size, contentStart: offset + headerSize, end: offset + size };
 }
 
-/** All boxes tiling `[start, end)`. */
-export function childBoxes(buf: Uint8Array, start: number, end: number, section: string): IsoBoxHeader[] {
+/** All boxes tiling `[start, end)`; budgets charge each header and collection slot. */
+export function childBoxes(buf: Uint8Array, start: number, end: number, section: string, budget?: LocmafReadBudget): IsoBoxHeader[] {
     const out: IsoBoxHeader[] = [];
     let pos = start;
     while (pos < end) {
-        const box = readBoxHeader(buf, pos, end, section);
+        const box = readBoxHeader(buf, pos, end, section, budget);
+        budget?.claimEntries(1);
         out.push(box);
         pos = box.end;
     }
@@ -90,6 +94,6 @@ export function childBoxes(buf: Uint8Array, start: number, end: number, section:
 }
 
 /** First child of the given type in `[start, end)`, or undefined. */
-export function findChild(buf: Uint8Array, start: number, end: number, type: string, section: string): IsoBoxHeader | undefined {
-    return childBoxes(buf, start, end, section).find((b) => b.type === type);
+export function findChild(buf: Uint8Array, start: number, end: number, type: string, section: string, budget?: LocmafReadBudget): IsoBoxHeader | undefined {
+    return childBoxes(buf, start, end, section, budget).find((b) => b.type === type);
 }

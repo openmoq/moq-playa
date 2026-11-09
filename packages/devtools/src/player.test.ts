@@ -52,7 +52,7 @@ describe('optional live player adapter',()=>{
 });
 
 // Real protocol loopback: synthetic object bytes are observed, not decoded.
-import { encodeObjectDatagram18, encodeSubgroupHeader18, encodeSubgroupObject18 } from '@openmoq/transport';
+import { varint, encodeObjectDatagram18, encodeSubgroupHeader18, encodeSubgroupObject18 } from '@openmoq/transport';
 import { MoqtConnection, catToken } from '@openmoq/webtransport';
 import { createLoopback, flush } from '../../webtransport/src/testkit/loopback.js';
 import type { Fact, Message } from '@openmoq/devtools-protocol';
@@ -367,4 +367,35 @@ it('the destroy hook runs once even when final ENDED publication throws', async 
     } finally { await engine.destroy(); }
 });
 
+});
+
+it('does not invent an alias binding for an observed FETCH receipt', async () => {
+  const h = await live(), registry = new DiagnosticRegistry();
+  const installed = installPlayerDiagnostics(h.engine, { registry, exposure: 'development' });
+  const attached = attach(registry, installed.source);
+  const received: unknown[] = [];
+  try {
+    const id = await h.client.fetch([text.encode('live/show')], text.encode('video'), {
+      startGroup: varint(7n), startObject: varint(0n), endGroup: varint(7n), endObject: varint(1n),
+      receiver: { onObject: object => { received.push(object); } },
+    });
+    await flush(100);
+    await h.server.acceptFetch(id, { endLocation: { group: 7n, object: 1n } });
+    const stream = await h.server.openFetchStream(id);
+    await h.server.sendFetchObject(stream, { groupId: 7n, subgroupId: 0n, objectId: 0n,
+      publisherPriority: 128, payload: Uint8Array.of(1) });
+    await h.server.closeFetchStream(stream); await flush(200);
+    expect(received).toHaveLength(1);
+    expect(h.client.objectReceiptFor(received[0] as object)).toBeDefined();
+    const observed = attached.drain();
+    expect(facts(observed).filter(fact => fact.kind === 'object')).toEqual([]);
+    for (const message of observed) if (message.kind === 'batch') {
+      expect(message.dropped).toEqual({ dense: '0', sparse: '0' });
+    }
+    // Subscription-backed observations still retain their proven alias.
+    await h.send();
+    expect(facts(attached.drain()).filter(fact => fact.kind === 'object')).toEqual([
+      expect.objectContaining({ trackAlias: '77' }),
+    ]);
+  } finally { attached.owner.close(); installed.dispose(); registry.dispose(); await h.close(); }
 });

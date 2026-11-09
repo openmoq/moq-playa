@@ -9,6 +9,7 @@
 
 import type { LocmafEffectiveSamples } from './effective.js';
 import type { LocmafHeader } from './model.js';
+import type { LocmafReadBudget } from './read-budget.js';
 
 export class LocmafGroupState {
     private ref: LocmafHeader | null = null;
@@ -23,7 +24,12 @@ export class LocmafGroupState {
 
     /** A copy of the previous chunk's represented fields, in full (absolute) form. */
     get reference(): LocmafHeader | null {
-        return this.ref === null ? null : this.ref.copy(true);
+        return this.copyReference();
+    }
+
+    /** Mutable private snapshot; list/byte values remain borrowed. */
+    copyReference(budget?: LocmafReadBudget): LocmafHeader | null {
+        return this.ref === null ? null : this.ref.copy(true, budget);
     }
 
     /** Effective values of the previous chunk. */
@@ -41,6 +47,31 @@ export class LocmafGroupState {
         return this.objectId;
     }
 
+    /** Logical Header/effective-vector slots, not byte backing or exact heap size. */
+    get retainedEntryCount(): number {
+        let count = this.ref?.retainedEntryCount ?? 0;
+        const effective = this.effective;
+        if (effective) {
+            count += effective.durations.length + effective.sizes.length
+                + effective.flags.length + effective.compositionTimeOffsets.length;
+            const cenc = effective.cenc;
+            if (cenc) count += (cenc.subsampleCounts?.length ?? 0)
+                + (cenc.clearBytes?.length ?? 0) + (cenc.protectedBytes?.length ?? 0);
+        }
+        return count;
+    }
+
+    /** Independent Header map/frontier; immutable list and effective values stay shared. */
+    fork(budget?: LocmafReadBudget): LocmafGroupState {
+        budget?.claimEntries(1);
+        const out = new LocmafGroupState();
+        out.ref = this.ref === null ? null : this.ref.copy(true, budget);
+        out.effective = this.effective;
+        out.bmdt = this.bmdt;
+        out.objectId = this.objectId;
+        return out;
+    }
+
     /** Discard the reference: the next moof-carrying Object must carry a full header. */
     clear(): void {
         this.ref = null;
@@ -49,8 +80,8 @@ export class LocmafGroupState {
     }
 
     /** Record the represented fields and effective values of the chunk just processed. */
-    anchor(represented: LocmafHeader, effective: LocmafEffectiveSamples, objectId: bigint): void {
-        this.ref = represented.copy(true);
+    anchor(represented: LocmafHeader, effective: LocmafEffectiveSamples, objectId: bigint, budget?: LocmafReadBudget): void {
+        this.ref = represented.copy(true, budget);
         this.effective = effective;
         this.bmdt = effective.baseMediaDecodeTime;
         this.objectId = objectId;

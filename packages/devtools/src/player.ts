@@ -173,6 +173,8 @@ export function installPlayerDiagnostics(target: PlayerDiagnosticSource | Player
   };
   const receipt = (context: Context, event: ObjectReceiptObservation) => {
     if (!active || disposed) return;
+    // FETCH has request/stream identity, not a subscription alias binding.
+    if (event.trackAlias === null) return;
     if (event.origin === 'group-end') {
       if (event.lastObjectId === null) return; // Empty subgroup: no last Object to bound.
       const exclusive = event.lastObjectId < 0xffffffffffffffffn;

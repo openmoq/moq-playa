@@ -16,6 +16,7 @@
 import { LocmafFormatError } from './errors.js';
 import { isSyncSampleFlags, type LocmafEffectiveSamples } from './effective.js';
 import { childBoxes, findChild, readBoxHeader, viewOf, type IsoBoxHeader } from './iso-box.js';
+import type { LocmafReadBudget } from './read-budget.js';
 
 /** One CENC subsample range of a protected frame (section 15.8). */
 export interface LocmafFrameSubsample {
@@ -60,7 +61,7 @@ export interface LocmafFrame {
  *
  * @throws {LocmafFormatError} when the sizes do not cover exactly the payload.
  */
-export function sliceFrames(effective: LocmafEffectiveSamples, mdat: Uint8Array): LocmafFrame[] {
+export function sliceFrames(effective: LocmafEffectiveSamples, mdat: Uint8Array, budget?: LocmafReadBudget): LocmafFrame[] {
     const n = effective.durations.length;
     if (effective.sizes.length !== n || effective.flags.length !== n || effective.compositionTimeOffsets.length !== n) {
         throw new LocmafFormatError('15.1', 0, 'effective per-sample vectors disagree on the sample count');
@@ -74,6 +75,9 @@ export function sliceFrames(effective: LocmafEffectiveSamples, mdat: Uint8Array)
         throw new LocmafFormatError('15.8', 0, 'subsample counts disagree with the sample count');
     }
 
+    // Sample expansion is charged by the effective-value reader. These are
+    // additional frame records; their byte views borrow the same payload.
+    budget?.claimEntries(n);
     const frames: LocmafFrame[] = new Array<LocmafFrame>(n);
     let offset = 0;
     let decodeTime = effective.baseMediaDecodeTime;
@@ -84,10 +88,12 @@ export function sliceFrames(effective: LocmafEffectiveSamples, mdat: Uint8Array)
         const flags = effective.flags[i]!;
         let cenc: LocmafFrameCenc | null = null;
         if (c !== null) {
+            budget?.claimEntries(1);
             const iv = c.ivs.subarray(i * c.perSampleIvSize, (i + 1) * c.perSampleIvSize);
             let subsamples: LocmafFrameSubsample[] | null = null;
             if (c.subsampleCounts !== null) {
                 const count = c.subsampleCounts[i]!;
+                budget?.claimEntries(count);
                 subsamples = new Array<LocmafFrameSubsample>(count);
                 for (let s = 0; s < count; s++) {
                     subsamples[s] = {
@@ -157,32 +163,35 @@ const DESCRIPTION_BOXES = new Set(['avcC', 'hvcC', 'av1C', 'vpcC', 'dOps', 'dfLa
  *
  * @throws {LocmafFormatError} when the Header's box structure is unreadable.
  */
-export function codecDescriptionFromInit(init: Uint8Array): Uint8Array | null {
+export function codecDescriptionFromInit(init: Uint8Array, budget?: LocmafReadBudget): Uint8Array | null {
     const SECTION = '6';
     const view = viewOf(init);
-    const top = childBoxes(init, 0, init.length, SECTION);
+    const top = childBoxes(init, 0, init.length, SECTION, budget);
     const moov = top.find((b) => b.type === 'moov');
     if (moov === undefined) return null;
-    const trak = findChild(init, moov.contentStart, moov.end, 'trak', SECTION);
-    const mdia = trak && findChild(init, trak.contentStart, trak.end, 'mdia', SECTION);
+    const trak = findChild(init, moov.contentStart, moov.end, 'trak', SECTION, budget);
+    const mdia = trak && findChild(init, trak.contentStart, trak.end, 'mdia', SECTION, budget);
     if (mdia === undefined) return null;
-    const mdiaChildren = childBoxes(init, mdia.contentStart, mdia.end, SECTION);
+    const mdiaChildren = childBoxes(init, mdia.contentStart, mdia.end, SECTION, budget);
     const hdlr = mdiaChildren.find((b) => b.type === 'hdlr');
     const handler = hdlr !== undefined && hdlr.end - hdlr.contentStart >= 12
         ? String.fromCharCode(...init.subarray(hdlr.contentStart + 8, hdlr.contentStart + 12))
         : '';
     const minf = mdiaChildren.find((b) => b.type === 'minf');
-    const stbl = minf && findChild(init, minf.contentStart, minf.end, 'stbl', SECTION);
-    const stsd = stbl && findChild(init, stbl.contentStart, stbl.end, 'stsd', SECTION);
+    const stbl = minf && findChild(init, minf.contentStart, minf.end, 'stbl', SECTION, budget);
+    const stsd = stbl && findChild(init, stbl.contentStart, stbl.end, 'stsd', SECTION, budget);
     if (stsd === undefined || stsd.end - stsd.contentStart < 8 || view.getUint32(stsd.contentStart + 4) === 0) return null;
-    const entry = childBoxes(init, stsd.contentStart + 8, stsd.end, SECTION)[0];
+    const entry = childBoxes(init, stsd.contentStart + 8, stsd.end, SECTION, budget)[0];
     if (entry === undefined) return null;
     const fixed = sampleEntryFieldsLength(init, entry, handler);
     if (fixed === undefined || entry.contentStart + fixed > entry.end) return null;
 
-    for (const child of childBoxes(init, entry.contentStart + fixed, entry.end, SECTION)) {
-        if (DESCRIPTION_BOXES.has(child.type)) return init.slice(child.contentStart, child.end);
-        if (child.type === 'esds') return decoderSpecificInfo(init, child);
+    for (const child of childBoxes(init, entry.contentStart + fixed, entry.end, SECTION, budget)) {
+        if (DESCRIPTION_BOXES.has(child.type)) {
+            budget?.claimBytes(child.end - child.contentStart);
+            return init.slice(child.contentStart, child.end);
+        }
+        if (child.type === 'esds') return decoderSpecificInfo(init, child, budget);
     }
     return null;
 }
@@ -190,42 +199,64 @@ export function codecDescriptionFromInit(init: Uint8Array): Uint8Array | null {
 /**
  * The DecoderSpecificInfo of an esds box: ES_Descriptor (tag 3) contains a
  * DecoderConfigDescriptor (tag 4), which contains the DecoderSpecificInfo
- * (tag 5). Descriptor lengths use the expandable 1 to 4 byte form
- * (ISO 14496-1 section 8.3.3).
+ * (tag 5). Lengths use expandable 7-bit continuation groups (ISO 14496-1
+ * section 8.3.3); this reader supports the existing 1 to 4 byte profile.
  */
-function decoderSpecificInfo(buf: Uint8Array, esds: IsoBoxHeader): Uint8Array | null {
+function decoderSpecificInfo(buf: Uint8Array, esds: IsoBoxHeader, budget?: LocmafReadBudget): Uint8Array | null {
     let pos = esds.contentStart + 4; // full box version and flags
     const end = esds.end;
-    const readDescriptor = (): { tag: number; start: number; end: number } | null => {
-        if (pos >= end) return null;
+    if (pos > end) throw new LocmafFormatError('6', esds.contentStart, 'truncated esds full-box fields');
+    const need = (count: number, limit: number): void => {
+        if (count > limit - pos) throw new LocmafFormatError('6', pos, 'truncated esds descriptor fields');
+    };
+    const readDescriptor = (limit: number): { tag: number; start: number; end: number } | null => {
+        if (pos >= limit) return null;
+        const offset = pos;
         const tag = buf[pos++]!;
         let length = 0;
-        for (let i = 0; i < 4 && pos < end; i++) {
+        let terminated = false;
+        for (let i = 0; i < 4; i++) {
+            if (pos >= limit) throw new LocmafFormatError('6', offset, 'unterminated esds descriptor length');
             const b = buf[pos++]!;
             length = (length << 7) | (b & 0x7f);
-            if ((b & 0x80) === 0) break;
+            if ((b & 0x80) === 0) { terminated = true; break; }
+        }
+        if (!terminated) {
+            if (pos === limit) throw new LocmafFormatError('6', offset, 'unterminated esds descriptor length');
+            return null; // A wider length encoding is outside this reader's profile.
         }
         const start = pos;
-        return { tag, start, end: Math.min(end, start + length) };
+        if (length > limit - start) throw new LocmafFormatError('6', offset, 'esds descriptor exceeds its parent');
+        budget?.claimEntries(1);
+        return { tag, start, end: start + length };
     };
-    const es = readDescriptor();
+    const es = readDescriptor(end);
     if (es === null || es.tag !== 0x03) return null;
     // ES_ID (2), flags (1) plus optional dependsOn (2), URL (1 + n), OCR (2).
-    pos = es.start + 2;
-    const flags = buf[pos++] ?? 0;
-    if (flags & 0x80) pos += 2;
-    if (flags & 0x40) pos += 1 + (buf[pos] ?? 0);
-    if (flags & 0x20) pos += 2;
+    need(3, es.end);
+    pos += 2;
+    const flags = buf[pos++]!;
+    if (flags & 0x80) { need(2, es.end); pos += 2; }
+    if (flags & 0x40) {
+        need(1, es.end);
+        const urlLength = buf[pos++]!;
+        need(urlLength, es.end); pos += urlLength;
+    }
+    if (flags & 0x20) { need(2, es.end); pos += 2; }
     while (pos < es.end) {
-        const d = readDescriptor();
+        const d = readDescriptor(es.end);
         if (d === null) return null;
         if (d.tag === 0x04) {
             // objectTypeIndication (1), streamType (1), bufferSizeDB (3), maxBitrate (4), avgBitrate (4).
-            pos = d.start + 13;
+            need(13, d.end);
+            pos += 13;
             while (pos < d.end) {
-                const inner = readDescriptor();
+                const inner = readDescriptor(d.end);
                 if (inner === null) return null;
-                if (inner.tag === 0x05) return buf.slice(inner.start, inner.end);
+                if (inner.tag === 0x05) {
+                    budget?.claimBytes(inner.end - inner.start);
+                    return buf.slice(inner.start, inner.end);
+                }
                 pos = inner.end;
             }
             return null;
