@@ -23,6 +23,7 @@ interface Page {
 }
 
 export interface SeekRoleBridgeOwner {
+  readonly track: SeekRetrievalTrack;
   readonly role: SeekRetrievalTrack['role'];
   bridge: SeekLiveBridge | null;
   input: SeekLiveInput | null;
@@ -53,6 +54,7 @@ interface Options {
   readonly discard: (input: object | undefined) => void;
   readonly consume: (object: MoqtObject, captured: object | undefined, current: () => boolean,
     deliver: (object: MoqtObject, input?: object) => Promise<void>) => Promise<void>;
+  readonly liveObservation?: (owner: SeekRoleBridgeOwner) => NonNullable<ConstructorParameters<typeof SeekLiveBridge>[1]['liveObservation']>;
   readonly onBridgeAdded: (owner: SeekRoleBridgeOwner) => void;
   readonly onBridgeRemoved: (owner: SeekRoleBridgeOwner) => void;
   readonly onEnded: () => void;
@@ -242,7 +244,7 @@ export class SeekRoleRetrieval {
       clearDeadline();
       if (current()) timer = setTimeout(() => refused(new Error('Live catch-up peer wait timed out')), this.options.timeoutMs);
     };
-    const owner: SeekRoleBridgeOwner = { role: track.role, bridge: null, input: null, accepted: false, ending: false, drained: null, cancel };
+    const owner: SeekRoleBridgeOwner = { track, role: track.role, bridge: null, input: null, accepted: false, ending: false, drained: null, cancel };
     this.bridge = owner; this.options.onBridgeAdded(owner);
     try {
       if (!this.options.beforeSubscribe()) { refused(); return; }
@@ -252,6 +254,7 @@ export class SeekRoleRetrieval {
         maxObjects: this.options.maxObjects, maxBytes: this.options.maxBytes, isCurrent: current, signal: abort.signal,
         admitHead: async () => current() && this.options.admitHead(),
         capture: this.options.capture, onDiscard: this.options.discard,
+        ...(this.options.liveObservation ? { liveObservation: this.options.liveObservation(owner) } : {}),
         consumePrefix: async (object, input, admitted) => {
           clearDeadline();
           const page = this.page;

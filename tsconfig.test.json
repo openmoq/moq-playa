@@ -19,6 +19,15 @@
   "include": [
     "packages/devtools/src/player.test.ts",
     "packages/browser/src/audio-output-timing-consumed-match.test.ts",
+    "packages/player/src/loc-group-cadence.test.ts",
+    "packages/player/src/player-cadence-callback.loopback.test.ts",
+    "packages/player/src/player-cadence-transform.loopback.test.ts",
+    "packages/player/src/player-loc-group-cadence.loopback.test.ts",
+    "packages/player/src/player-received-payload-rate.loopback.test.ts",
+    "packages/player/src/player-received-payload-reset.loopback.test.ts",
+    "packages/player/src/player-received-payload-tick.loopback.test.ts",
+    "packages/player/src/received-payload-rate.test.ts",
+    "packages/player/src/subscription-manager-fetched-origin.test.ts",
     "packages/webtransport/src/adapter-fetch-receiver.test.ts",
     "packages/locmaf/src/chunk-samples-budget.test.ts",
     "packages/locmaf/src/deserializer-budget.test.ts",
@@ -282,6 +291,12 @@
     "packages/player/src/player.test.ts",
     "scripts/player-acceptance/group-tail.test.ts",
     "scripts/render-feedback-types.test.ts",
+    "packages/player/src/player-switch-automatic-authority.loopback.test.ts",
+    "packages/player/src/player-post-seek-measurement.loopback.test.ts",
+    "packages/player/src/player-post-seek-measurement-boundaries.loopback.test.ts",
+    "packages/player/src/seek-live-measurement.loopback.test.ts",
+    "packages/player/src/seek-retrieval-measurement.loopback.test.ts",
+    "packages/player/src/player-seek-measurement-route.loopback.test.ts",
     "packages/player/src/loc-audio-continuity.loopback.test.ts",
   ]
 }

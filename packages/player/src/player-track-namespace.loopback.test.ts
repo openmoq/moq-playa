@@ -185,6 +185,7 @@ describe('selected-track namespace public loopback regressions', () => {
   });
 
   it('resolves public manual and bandwidth switches inside the eligible set and keeps target namespace', async () => {
+    const setPlaybackIntent = vi.fn();
     const h = await fixture([
       // First name match is outside the selected render scope, despite the
       // same altGroup number. Public name resolution must skip it.
@@ -192,7 +193,11 @@ describe('selected-track namespace public loopback regressions', () => {
       video('low'),
       video('high', { namespace: 'camera/hd', bitrate: 2_000_000 }),
       video('outside', { namespace: 'other/view', renderGroup: 2 }),
-    ]);
+    ], { createMediaSource: () => ({
+      initialize: () => true, appendChunk: () => {}, reset: () => {},
+      endOfStream: () => {}, destroy: () => {}, mediaElement: null,
+      onFirstFrame: null, onError: null, onStall: null, setPlaybackIntent,
+    }) });
     try {
       expect(h.media()).toEqual([ref('low')]);
       const low = await h.accept(ref('low'), 200n);
@@ -210,6 +215,11 @@ describe('selected-track namespace public loopback regressions', () => {
       // Exercise the same public entry used by ABR, without claiming the
       // bandwidth estimator itself is driven by these synthetic payloads.
       const afterHigh = h.requests.length;
+      h.player.setAutoQuality(true);
+      expect(h.player.selection.autoQuality).toBe(true);
+      h.player.play();
+      expect(h.player.state).toBe('playing');
+      expect(setPlaybackIntent).toHaveBeenLastCalledWith(true);
       await h.player.selectVideoTrack('low', 'bandwidth', 'downshift');
       await flush(256);
       expect(h.requests.slice(afterHigh).map(({ name, namespace }) => ({ name, namespace })))

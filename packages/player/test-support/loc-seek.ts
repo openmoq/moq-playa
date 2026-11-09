@@ -15,6 +15,7 @@ export async function locSeekFixture(draft: 14 | 16 | 18 | 22, audio = false, co
   frameVideo?: boolean; frameAudio?: boolean; frameAlternative?: boolean; reorderVideoOutput?: boolean;
   isLive?: boolean; namespace?: string; audioNamespace?: string; shadowTimeline?: boolean; timelineBeforeOk?: boolean; catalogVersion?: 1 | '1';
   producingOutput?: boolean; audioOnly?: boolean; alternative?: boolean; singleTimelineEntry?: boolean; beforeFactoryReturn?: () => void; connectionTimeoutMs?: number;
+  objectTransform?: MoqtPlayerConfig['objectTransform'];
   commandTransform?: MoqtPlayerConfig['commandTransform'];
   timeline?: readonly (readonly [number, readonly [number, number], number])[];
 } = {}) {
@@ -30,6 +31,7 @@ export async function locSeekFixture(draft: 14 | 16 | 18 | 22, audio = false, co
   const fetches: Array<{ namespace: string[]; name: string; group: bigint; object: bigint }> = [];
   const fetchIds: bigint[] = [];
   let now = 100_000;
+  let clockHook: (() => void) | undefined;
   server.onFetch = (id, message) => {
     if (message.fetch.fetchType !== 1) {
       if (message.fetch.fetchType !== 3) throw new Error('Expected standalone or absolute Joining FETCH');
@@ -65,11 +67,12 @@ export async function locSeekFixture(draft: 14 | 16 | 18 | 22, audio = false, co
     url: 'https://seek.example/moq', namespace: ['live', 'show'],
     ...(options.configuredDraft === null ? {} : { draftVersion: options.configuredDraft ?? draft }),
     ...(options.frameVideo || options.frameAudio || options.frameAlternative ? { locmafDecoding: 'frame' as const } : {}),
-    clock: { now: () => now },
+    clock: { now: () => { const hook = clockHook; clockHook = undefined; hook?.(); return now; } },
     ...(options.alternative ? { selection: { videoTrack: { name: 'video' } } } : {}),
     catalogBootstrap: 'subscribe', disableAudio: !audio, disableVideo: options.audioOnly === true, logLevel: 'none',
     ...(options.connectionTimeoutMs === undefined ? {} : { connectionTimeoutMs: options.connectionTimeoutMs }),
     createConnection: () => client, createTransport: async () => a,
+    ...(options.objectTransform ? { objectTransform: options.objectTransform } : {}),
     ...(options.commandTransform ? { commandTransform: options.commandTransform } : {}),
     createVideoDecoder: () => decoder, createRenderer: () => renderer,
     createAudioDecoder: () => audioDecoder, createAudioOutput: () => audioOutput,
@@ -188,6 +191,8 @@ export async function locSeekFixture(draft: 14 | 16 | 18 | 22, audio = false, co
     };
     return { draft, player, client, server, update, seeking, seeked, decoder, renderer, errors, destroy, unchanged, requests, fetches, fetchIds, outputs, audioOutputs, joins, wire, a, b,
       publishHead: (name: string, value: { group: bigint; object: bigint }) => { published.set(name, { ...value }); },
+      setClockHook: (hook: () => void) => { clockHook = hook; },
+      setNow: (value: number) => { now = value; },
       advance: (value: number) => { now = value; player.tick(); for (const output of outputs) output.renderer.renderTick?.(now); },
       updateTimeline: async (entries: readonly (readonly [number, readonly [number, number], number])[]) => {
         await server.sendObject(timelineStream, ++timelineObjectId, enc.encode(JSON.stringify(entries))); await flush(256);

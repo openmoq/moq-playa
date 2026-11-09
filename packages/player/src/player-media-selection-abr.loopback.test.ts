@@ -45,6 +45,8 @@ it.each([
     expect(f.player.selection.audio).toEqual(audio);
     expect(f.sourceAppends.at(-1)).toMatchObject({ media: 'video', sourceKey: sourceKey(mseMediaRefs.viewVideo), presentationTimeUs: 80_000n });
 
+    f.player.play();
+    expect(f.player.state).toBe('playing');
     const before = f.wire.requests.length;
     f.source.getBufferAheadUs = () => depthUs;
     f.player.tick(); await flush(512);

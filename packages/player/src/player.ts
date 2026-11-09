@@ -1,4 +1,4 @@
-import { locWireProfileForDraft } from '@openmoq/loc';
+import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import type { MediaSeekResource, MediaSeekSample } from './interfaces.js';
 import { nativeTimeUs, nativeRangeMayReachBoundary } from './presentation-placement.js';
 import { PlaybackPosition } from './playback-position.js';
@@ -7,9 +7,11 @@ import { selectSeekQualityCut } from './seek-fetch-pages.js';
 import type { SeekFetchRequests } from './seek-fetch-requests.js';
 import type { SeekLiveBridge } from './seek-live-bridge.js';
 import { SeekRoleRetrieval, type SeekRoleBridgeOwner, type SeekRetrievalTrack } from './seek-role-retrieval.js';
-import { LocSeekPlayback, type LocSeekTrack, type LocSeekResume } from './loc-seek-playback.js';
+import { LocSeekPlayback, locSeekTrackContext, type LocSeekTrack, type LocSeekResume } from './loc-seek-playback.js';
 import type { PreparedFramePipelines } from './player-frame-output.js';
 import { locmafPlaybackSamples } from './locmaf-playback-samples.js';
+import { LocGroupCadence } from './loc-group-cadence.js';
+import { ReceivedPayloadRate } from './received-payload-rate.js';
 /**
  * MoqtPlayer — convenience facade for MOQT playback.
  *
@@ -37,10 +39,10 @@ import { varint, PublishDoneCode, PublishDoneCode18, RequestError, ObjectStatus,
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import { MoqtConnectionError } from '@openmoq/webtransport';
-import type { DataStreamTerminal, GoawayNotice, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
+import type { DataStreamTerminal, ObjectReceipt, GoawayNotice, MoqtConnection, WebTransportLike, MoqtConnectionErrorSource } from '@openmoq/webtransport';
 import type { DataStreamHeader, MoqtObject, ObjectDatagram, SubgroupHeader } from '@openmoq/transport';
 import { getSubgroupIdMode, SubgroupIdMode } from '@openmoq/transport';
-import { PlaybackPipeline, SyncController, BandwidthEstimator, isKeyframePayload } from '@openmoq/playback';
+import { PlaybackPipeline, SyncController, isKeyframePayload } from '@openmoq/playback';
 import { BufferBasedController } from '@openmoq/playback';
 import type { ClockSource, DecoderCommand, PlaybackEvent, RecoveryAction, RecoveryController, DecoderFeedback, PlaybackInputObserver, AudioTimingSource, VideoTimingSource, PlaybackSample } from '@openmoq/playback';
 import type { AltGroup, CatalogState, CatalogTrack, ResolvedTrackNamespace } from '@openmoq/msf';
@@ -694,6 +696,7 @@ function createCatalogSlots(): CatalogSlots {
 
 
 type SeekRole = 'video' | 'audio';
+type CadenceObject = Pick<MoqtObject, 'kind' | 'trackAlias' | 'groupId' | 'objectId'>;
 
 type SeekRoleConsumer = Pick<SeekRoleCandidate, 'beginPage' | 'acceptPage' | 'beginLive'>;
 
@@ -808,12 +811,41 @@ export class MoqtPlayer {
   private connection: MoqtConnection | null = null;
   private _adapterOwned = true;
   private qualityController: QualityController | null = null;
-  private bandwidthEstimator: BandwidthEstimator | null = null;
+  private videoMeasurementMode: object = {};
+  private videoPayloadMeasurement: {
+    owner: ({ readonly kind: 'ordinary' } | {
+      readonly kind: 'seek-live'; readonly attempt: LocSeekAttempt | MseSeekAttempt;
+      readonly bridgeOwner: SeekRoleBridgeOwner; readonly track: SeekRetrievalTrack;
+      readonly epoch: object; readonly selection: object; readonly configuration: object | undefined;
+    }) & {
+      connection: MoqtConnection; manager: SubscriptionManager; generation: object;
+      requestId: bigint; alias: bigint; subscription: object; sourceKey: string;
+      output: object | undefined; pipeline: PlaybackPipeline | null;
+      source: MediaSourceLike | null; assembler: CmafAssemblerLike | null;
+      automatic: boolean; mode: object; frameReader: object | undefined; decoder: object | undefined; header: Uint8Array | undefined; route: () => boolean;
+    };
+    rate: ReceivedPayloadRate;
+  } | null = null;
   private bufferAbrController: BufferBasedController | null = null;
-  private bwEstimatorGroupId: bigint = -1n;
-  private bwEstimatorGroupBytes = 0;
-  /** Estimated GOP duration in µs, computed from first two group arrivals. */
-  private estimatedGopDurationUs = 2_000_000; // default 2s
+  private readonly cadenceInputOwners = new WeakMap<object, NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner']>();
+  private readonly seekCadenceInputs = new WeakMap<ObjectReceipt, {
+    readonly object: CadenceObject;
+    readonly owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'];
+    readonly headers: LocHeaders;
+  }>();
+  private videoGroupCadence: {
+    owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'];
+    cadence: LocGroupCadence;
+  } | null = null;
+  /** Group-count buffer depth remains an approximation, with a two-second fallback. */
+  private get estimatedGopDurationUs(): number {
+    const current = this.videoGroupCadence;
+    if (current && this.sameVideoMeasurementOwner(current.owner, this.captureVideoMeasurementOwner())) {
+      return current.cadence.durationUs ?? 2_000_000;
+    }
+    this.videoGroupCadence = null;
+    return 2_000_000;
+  }
   private subscriptionManager: SubscriptionManager | null = null;
 
   /**
@@ -1535,6 +1567,14 @@ export class MoqtPlayer {
     const manager = this.subscriptionManager;
     if (!manager) return Promise.resolve();
     const inputGeneration = manager.mediaInputGeneration;
+    // Measurement ownership travels through transforms independently of playback validity.
+    const cadenceOwner = fetchInfo === undefined && obj.kind === 'data' && BigInt(obj.objectId) === 0n
+      ? this.captureVideoMeasurementOwner() : null;
+    const selected = this._selection.video;
+    const cadenceIdentity = cadenceOwner && cadenceOwner.connection === sourceConnection
+      && cadenceOwner.alias === BigInt(obj.trackAlias) && selected
+      && this.catalogTrackFor(selected.name, selected.namespaceFields, 'video')?.packaging === 'loc' ? {} : undefined;
+    if (cadenceIdentity && cadenceOwner) this.cadenceInputOwners.set(cadenceIdentity, cadenceOwner);
     // Datagram routing IDs are not stream identities. Only a real subgroup
     // receipt may establish receiving evidence; FETCH has its own ownership.
     if ('kind' in receiptInput && fetchInfo === undefined && sourceConnection !== undefined
@@ -1560,28 +1600,30 @@ export class MoqtPlayer {
       const isLive = () => manager.mediaInputGeneration === inputGeneration && registration?.() === true && this.mediaSelectionRouteCurrent(operation);
       const admission = output.serial.then((): ObjectDeliveryAdmission => isLive()
         ? { kind: 'deliver', isLive, backfill: false } : { kind: 'discard', reason: 'route retired' });
-      const identity = {};
+      const identity = cadenceIdentity ?? {};
       this.preparedMediaDeliveries.set(identity, { preparation: operation, output, alias: BigInt(obj.trackAlias) });
-      const work = manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput, { admission, isLive, identity });
+      const work = manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput, { admission, isLive, identity, fetched: fetchInfo !== undefined });
       output.serial = work;
       return work;
     }
     if (this.warmMediaOwners.size === 0) {
       return manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput,
-        fetchInfo?.warmStart ? { isLive: () => false } : undefined);
+        fetchInfo ? { fetched: true, ...(fetchInfo.warmStart ? { isLive: () => false } : {}) }
+          : cadenceIdentity ? { identity: cadenceIdentity } : undefined);
     }
     const alias = BigInt(obj.trackAlias);
     const owner = fetchInfo ? (fetchInfo.warmStart ? fetchInfo.warmOwner : undefined)
       : [...this.warmMediaOwners.values()].find(candidate => candidate.connection === sourceConnection && candidate.subscription.trackAlias === alias);
     if (!owner || owner.connection !== sourceConnection || owner.subscription.trackAlias !== alias
         || this.warmMediaOwners.get(owner.subscription) !== owner) return manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput,
-      fetchInfo?.warmStart ? { isLive: () => false } : undefined);
+      fetchInfo ? { fetched: true, ...(fetchInfo.warmStart ? { isLive: () => false } : {}) }
+          : cadenceIdentity ? { identity: cadenceIdentity } : undefined);
     const registration = manager.captureRoute(alias);
     const isLive = () => this.subscriptionManager === manager && manager.mediaInputGeneration === inputGeneration
       && registration?.() === true && this.warmMediaOwnerCurrent(owner);
     let permit!: WarmMediaRoute['permit'];
     const admission = new Promise<ObjectDeliveryAdmission>(resolve => { permit = resolve; });
-    const work = manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput, { isLive, admission });
+    const work = manager.routeObject(streamId, obj, sourceDraft, sourceConnection, receiptInput, { isLive, admission, fetched: fetchInfo !== undefined, ...(cadenceIdentity ? { identity: cadenceIdentity } : {}) });
     const head = owner.head;
     if (!head) permit({ kind: 'discard', reason: 'route retired' });
     else head.push({ group: BigInt(obj.groupId), object: BigInt(obj.objectId),
@@ -2323,11 +2365,12 @@ export class MoqtPlayer {
 
   /**
    * Enable or disable automatic quality switching (ABR).
-   * When disabled, the player stays at the current quality until
-   * selectVideoTrack() is called manually.
+   * Disabling prevents new automatic requests; already-issued switches may finish.
+   * Manual selections remain available.
    */
   setAutoQuality(enabled: boolean): void {
     if (!this.qualityController) return;
+    if (this.qualityController.isAutoQuality !== enabled) this.retireVideoMeasurement();
     if (enabled) {
       this.qualityController.unlockAuto();
     } else {
@@ -2397,9 +2440,7 @@ export class MoqtPlayer {
     if (obj.kind === 'data') {
       const bytes = obj.payload ? obj.payload.byteLength : 0;
       this._stats.recordMediaObject(bytes);
-      if (mediaType === 'video' && bytes > 0) {
-        this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
-      }
+
     } else {
       this._stats.recordGapObject();
     }
@@ -3186,6 +3227,17 @@ export class MoqtPlayer {
     if (!this._catalogState || !this.connection || !this.subscriptionManager) {
       throw new Error('Cannot switch track: player not loaded');
     }
+    const automatic = reason === 'bandwidth' && abrAction !== undefined;
+    const automaticController = this.qualityController, automaticSelection = this._selection;
+    const automaticManager = this.subscriptionManager, automaticPipeline = this.videoPipeline;
+    const automaticGeneration = automaticManager.mediaInputGeneration;
+    const automaticAllowed = (): boolean => !automatic || (automaticController !== null
+      && this.qualityController === automaticController && automaticController.isAutoQuality
+      && this.state === PlayerState.PLAYING && this.playbackIntent === true && this._selection === automaticSelection
+      && this.subscriptionManager === automaticManager && automaticManager.mediaInputGeneration === automaticGeneration
+      && this.videoPipeline === automaticPipeline);
+    if (!automaticAllowed()) return;
+    let automaticWithdrawal: Error | undefined;
     if (this.activeLocSeek || this.preparingLocSeek) return this.selectPausedLocVideoTrack(reference, reason);
     if (this._destroyed || this.isTerminalState() || this.currentMigration || this.mediaSelection || this.seekIsPreparing()) {
       throw new Error('Cannot switch track: playback is not accepting selections');
@@ -3340,6 +3392,10 @@ export class MoqtPlayer {
         return;
       }
       if (!this.switchIsCurrent(sw)) return;
+      if (!automaticAllowed()) {
+        this.discardPendingVideoSwitch(sw, new Error('Automatic quality request withdrawn before emission'));
+        return;
+      }
       if (historical && currentVideoRequestId === null) {
         await this.prepareHistoricalVideoSwitch(sw, historical);
         return;
@@ -3354,6 +3410,10 @@ export class MoqtPlayer {
       const register = (id: bigint): void => {
         if (sw.newRequestId !== null) return;
         if (!this.switchIsCurrent(sw) || !this.subscriptionManager) throw new Error('Video switch retired before emission');
+        if (!automaticAllowed()) {
+          automaticWithdrawal = new Error('Automatic quality request withdrawn before emission');
+          throw automaticWithdrawal;
+        }
         sw.newRequestId = id;
         sw.phase = 'staging';
         this.armVideoSwitchTimeout(sw, SWITCH_STAGING_TIMEOUT_MS, true);
@@ -3376,6 +3436,10 @@ export class MoqtPlayer {
       if (!this.switchIsCurrent(sw)) return;
       register(requestId);
     } catch (error) {
+      if (automaticWithdrawal !== undefined && error === automaticWithdrawal) {
+        this.discardPendingVideoSwitch(sw, automaticWithdrawal);
+        return;
+      }
       if (this.switchIsCurrent(sw)) this.abortPendingVideoSwitch(sw, error instanceof Error ? error : new Error(String(error)));
       if (sw.phase !== 'committed') throw error;
     }
@@ -4128,7 +4192,7 @@ export class MoqtPlayer {
     });
     this.subscriptionManager = new SubscriptionManager();
     if (this.mediaDiagnosticRuntime) this.subscriptionManager.objectProvenance = this.mediaDiagnosticRuntime;
-    this.bandwidthEstimator = new BandwidthEstimator();
+    this.retireVideoMeasurement();
 
     // Set draft version for version-aware KVP encoding
     // Draft-14 §1.4.2: absolute type IDs
@@ -4158,6 +4222,8 @@ export class MoqtPlayer {
 
     // Wire object delivery → media_object events + pipeline routing
     this.subscriptionManager.onObject = (mediaType, trackName, obj, headers, input, delivery) => {
+      const cadenceOwner = mediaType === 'video' && !delivery?.backfill && !delivery?.fetched && delivery?.identity
+        ? this.cadenceInputOwners.get(delivery.identity) ?? null : null;
       const inputGeneration = this.subscriptionManager?.mediaInputGeneration;
       if ((mediaType === 'audio' || mediaType === 'video') && this.stagePreparedMediaInput(obj, headers, input, () =>
         this.subscriptionManager?.onObject?.(mediaType, trackName, obj, headers, input, delivery), delivery)) return;
@@ -4202,20 +4268,7 @@ export class MoqtPlayer {
       if (obj.kind === 'data') {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
-        if (mediaType === 'video' && bytes > 0) {
-          const gid = BigInt(obj.groupId);
-          if (gid !== this.bwEstimatorGroupId) {
-            if (this.bwEstimatorGroupBytes > 0) {
-              this.bandwidthEstimator?.recordGroup(
-                this.bwEstimatorGroupBytes, this.clock.now(),
-              );
-            }
-            this.bwEstimatorGroupId = gid;
-            this.bwEstimatorGroupBytes = bytes;
-          } else {
-            this.bwEstimatorGroupBytes += bytes;
-          }
-        }
+
       } else {
         this._stats.recordGapObject();
       }
@@ -4256,6 +4309,9 @@ export class MoqtPlayer {
       // stale state and fresh objects arrive via REQUEST_UPDATE forward:1.
       if (this.stateMachine.state === PlayerState.PAUSED) { this.discardMediaInput(input, 'paused'); return; }
       const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
+      if (pipeline && mediaType === 'video' && !delivery?.backfill && !delivery?.fetched) {
+        this.recordLocGroupCadence(obj, headers, cadenceOwner);
+      }
       if (!pipeline) this.discardMediaInput(input, 'not attached');
       else if (delivery?.backfill) pipeline.pushObject(obj, headers, input, { backfill: true });
       else if (input) pipeline.pushObject(obj, headers, input);
@@ -4287,10 +4343,7 @@ export class MoqtPlayer {
       if (obj.kind === 'data') {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
-        // CMAF: one moof+mdat per group — each object IS a group
-        if (mediaType === 'video' && bytes > 0) {
-          this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
-        }
+
       } else {
         this._stats.recordGapObject();
       }
@@ -9724,6 +9777,9 @@ export class MoqtPlayer {
       this.videoPipeline?.tick();
     }
 
+    // Observation continues during silence even when a pending operation suppresses ABR decisions.
+    this.readVideoReceivedRate();
+
     // Proactive quality adaptation: if estimated bandwidth is below
     // 1.5× the current track's bitrate, downshift before stalls occur.
     this.checkBandwidthAdaptation();
@@ -9816,7 +9872,7 @@ export class MoqtPlayer {
         // Thin but not empty — check if bandwidth sustains.
         // On fast networks MSE buffers are naturally thin; a thin
         // buffer with high bandwidth is healthy, not starving.
-        const bwKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
+        const bwKbps = this.readVideoReceivedRate() ?? 0;
         const currentTrack = this.bufferAbrController.currentTrack;
         const currentBitrateKbps = currentTrack ? currentTrack.bitrateKbps : 0;
         effectiveBufferUs = bwKbps > currentBitrateKbps * 1.5
@@ -9829,7 +9885,7 @@ export class MoqtPlayer {
       effectiveBufferUs = this.bufferAbrController.lowThresholdUs;
     }
 
-    const bandwidthKbps = this.bandwidthEstimator?.getEstimateKbps() ?? 0;
+    const bandwidthKbps = this.readVideoReceivedRate() ?? 0;
 
     const decision = this.bufferAbrController.evaluate({
       bufferDepthUs: effectiveBufferUs,
@@ -9998,7 +10054,7 @@ export class MoqtPlayer {
       this.subscriptionManager = null;
       this.catalogSlots.catalogManager = null;
       this.qualityController = null;
-      this.bandwidthEstimator = null;
+      this.retireVideoMeasurement();
       if (this.connection) {
         this.releaseMediaTerminals(this.connection);
         if (this._adapterOwned) {
@@ -10430,11 +10486,15 @@ export class MoqtPlayer {
     /** As {@link stageable}, but records WHAT was retained so a later binding
      *  can take it back out as evidence instead of only replaying it. */
     const stageableObject = (
-      fn: (streamId: bigint, obj: MoqtObject) => void,
+      fn: (streamId: bigint, obj: MoqtObject, receipt?: ReturnType<MoqtPlayer['captureVideoPayload']>) => void,
       source: MoqtConnectionErrorSource,
       cost: (args: unknown[]) => number,
       buffer: (args: unknown[]) => boolean,
     ) => (streamId: bigint, obj: MoqtObject): void => {
+      // Capture before parking, callbacks or transforms. Replayed data is not
+      // a new receipt, and data received before ownership is never re-attributed.
+      const receipt = obj.kind === 'data'
+        ? this.captureVideoPayload(BigInt(obj.trackAlias), obj.payload.byteLength, conn) : undefined;
       if (owningTxn) {
         if (owningTxn.aborted) return;
         if (!owningTxn.committed && buffer([streamId, obj])) {
@@ -10444,7 +10504,18 @@ export class MoqtPlayer {
           return;
         }
       }
-      fn(streamId, obj);
+      fn(streamId, obj, receipt);
+    };
+    const stageableDatagram = (
+      fn: (datagram: ObjectDatagram, receipt?: ReturnType<MoqtPlayer['captureVideoPayload']>) => void,
+      source: MoqtConnectionErrorSource, cost: (args: unknown[]) => number, buffer: (args: unknown[]) => boolean,
+    ) => {
+      const deliver = stageable(fn, source, cost, buffer);
+      return (datagram: ObjectDatagram): void => {
+        const receipt = datagram.status === undefined
+          ? this.captureVideoPayload(BigInt(datagram.trackAlias), datagram.payload.byteLength, conn) : undefined;
+        deliver(datagram, receipt);
+      };
     };
     const objBytes = (a: unknown[]): number => {
       const obj = a[1] as MoqtObject;
@@ -10610,7 +10681,7 @@ export class MoqtPlayer {
         ));
       },
 
-      onObject: stageableObject((streamId, obj) => {
+      onObject: stageableObject((streamId, obj, receipt) => {
         if (this.seekFillStreams.get(conn)?.get(streamId)?.handleObject(streamId, obj)) return;
         // The catalog retrieval that owns evidence on THIS connection, or null
         // when none does. Media evidence below is not catalog-owned, so this is
@@ -10770,6 +10841,7 @@ export class MoqtPlayer {
         // when SUBSCRIBE_OK resolves the alias via onAliasResolved → replayPendingObjects.
         // At replay time, the new track is registered and onObject fires normally.
         if (this.subscriptionManager?.getMediaType(alias) !== undefined) {
+          this.recordVideoPayload(receipt);
           this.watchdog.fulfill('first_media_object');
           // Bind the LOC wire profile AND the malformed-recovery target to THIS
           // connection — a cross-draft migration must not decode a late
@@ -11273,11 +11345,12 @@ export class MoqtPlayer {
       }, 'control', msgBytes),
 
       // §10.3: Datagram objects — convert to MoqtObject for routing
-      onDatagram: stageable((datagram) => {
+      onDatagram: stageableDatagram((datagram, receipt) => {
         if (this.seekBridgesFor(conn).some(owner => owner.handleDatagram(datagram))) return;
         const alias = BigInt(datagram.trackAlias);
         if (!this.mediaRouteBelongsTo(conn, alias)) return;
         if (this.subscriptionManager?.getMediaType(alias) === undefined) return;
+        this.recordVideoPayload(receipt);
         this.log.debug('Datagram alias=%s group=%s obj=%s', alias, datagram.groupId, datagram.objectId);
 
         const obj: MoqtObject = datagram.status !== undefined
@@ -12820,6 +12893,7 @@ export class MoqtPlayer {
   private handleCmafMediaSourceAttached(): void {
     if (!this.cmafHoldingForAttach) return;
     this.cmafHoldingForAttach = false;
+    this.retireVideoMeasurement();
     this.cmafAssembler?.reset();
     for (const mt of ['video', 'audio'] as const) {
       const bytes = this.runningInitBytes(mt);
@@ -13914,6 +13988,215 @@ export class MoqtPlayer {
     }
   }
 
+  /** One selected accepted route, including finite media and frame-mode carriers. */
+  private captureVideoMeasurementOwner(): NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'] | null {
+    const connection = this.connection, manager = this.subscriptionManager, selected = this._selection.video;
+    if (this._destroyed || this.state !== PlayerState.PLAYING || this.playbackIntent !== true
+        || !connection || connection.session?.state !== SessionState.ESTABLISHED
+        || !manager || !selected) return null;
+    const seekOwner = this.captureSeekVideoMeasurementOwner(connection, manager);
+    if (seekOwner) return seekOwner;
+    if (this.videoDeliveryEnding()) return null;
+    let requestId: bigint | null = null, alias: bigint | null = null, subscription: object | null = null;
+    for (const [id, sub] of this.activeSubscriptions) {
+      if (sub.mediaType !== 'video' || sub.trackAlias === null || sub.trackName !== selected.name
+          || this.terminalMediaSubscriptions.has(sub) || this.supersededRouting?.aliases.has(sub.trackAlias)
+          || !sameNamespaceFields(sub.namespace ?? namespaceFields(this.config.namespace), selected.namespaceFields)) continue;
+      if (requestId !== null) return null;
+      requestId = id; alias = sub.trackAlias; subscription = sub;
+    }
+    if (requestId === null || alias === null || subscription === null) return null;
+    const sourceKey = manager.getSourceKey(alias);
+    if (sourceKey !== identityKey(selected.namespaceFields, selected.name)) return null;
+    const generation = manager.mediaInputGeneration, output = this.selectedOutputOwners.get('video');
+    const pipeline = this.videoPipeline, source = this.mediaSource, assembler = this.cmafAssembler;
+    const automatic = this.qualityController?.isAutoQuality ?? false;
+    const mode = this.videoMeasurementMode;
+    const key = this.mediaKey(selected.name, 'video', alias);
+    const decoder = this.locmafDecoders.get(key);
+    const header = this.locmafDecoderInit.get(key);
+    const frameReader = this.locmafFrameReaders.get(key);
+    const old = this.videoPayloadMeasurement?.owner;
+    if (old?.kind === 'ordinary' && old.connection === connection && old.manager === manager && old.generation === generation
+        && old.subscription === subscription && old.requestId === requestId && old.alias === alias && old.sourceKey === sourceKey
+        && old.output === output && old.pipeline === pipeline && old.source === source && old.assembler === assembler
+        && old.automatic === automatic && old.mode === mode && old.frameReader === frameReader && old.decoder === decoder && old.header === header && old.route()) return old;
+    const route = manager.captureRoute(alias);
+    return route ? { kind: 'ordinary', connection, manager, generation, requestId, alias, subscription, sourceKey,
+      output, pipeline, source, assembler, automatic, mode, frameReader, decoder, header, route } : null;
+  }
+
+  /** Accepted live bridge identity is independent of its not-yet-installed input lease. */
+  private captureSeekVideoMeasurementOwner(connection: MoqtConnection, manager: SubscriptionManager):
+    NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'] | null {
+    const selected = this._selection.video;
+    if (!selected) return null;
+    const loc = this.activeLocSeek, mse = this.activeMseSeek;
+    const attempt = loc && !loc.retired && loc.output ? loc : mse;
+    if (!attempt || attempt.retired || attempt.connection !== connection) return null;
+    const frameOutput = attempt === loc ? loc.output : null;
+    const mseOutput = frameOutput ? null : this.ownedSeekOutput;
+    const output = frameOutput ?? mseOutput;
+    if (!output) return null;
+    const sourceKey = identityKey(selected.namespaceFields, selected.name);
+    const owners = [...attempt.bridges].filter(owner => owner.role === 'video' && !owner.ending
+      && owner.track.name === selected.name && sameNamespaceFields(owner.track.namespace, selected.namespaceFields)
+      && (attempt === loc ? loc.tracks.includes(owner.track) : mse?.tracks.get('video') === owner.track)
+      && owner.bridge?.acceptedLiveSubscription !== null && owner.bridge !== null);
+    if (owners.length !== 1) return null;
+    const bridgeOwner = owners[0]!, bridge = bridgeOwner.bridge!;
+    const subscription = bridge.acceptedLiveSubscription;
+    if (!subscription) return null;
+    const track = bridgeOwner.track, epoch = attempt.epoch;
+    const generation = manager.mediaInputGeneration, mode = this.videoMeasurementMode;
+    const automatic = this.qualityController?.isAutoQuality ?? false;
+    const configuration = this.installedDecoderConfigurations.get('video');
+    const pipeline = this.videoPipeline, source = this.mediaSource, assembler = this.cmafAssembler;
+    const mseSelection = frameOutput ? null : this.mseSelection('video');
+    const route = (): boolean => {
+      try {
+        // Resolve callback-bearing evidence before comparing engine-owned identities.
+        const accepted = bridge.acceptedLiveSubscription === subscription;
+        const available = frameOutput !== null
+          ? !loc!.playback.isEnding('video')
+          : mseOutput !== null && mseOutput.resource.epoch === epoch && mseOutput.resource.current;
+        const selectionCurrent = frameOutput !== null
+          || this.mseSelection('video')?.selection === mseSelection?.selection;
+        return accepted && available && selectionCurrent && !this._destroyed && !attempt.retired
+          && this.state === PlayerState.PLAYING && this.playbackIntent === true && this.connection === connection
+          && this.subscriptionManager === manager && manager.mediaInputGeneration === generation
+          && this.videoMeasurementMode === mode && this._selection.video === selected
+          && attempt.bridges.has(bridgeOwner) && bridgeOwner.track === track && !bridgeOwner.ending
+          && bridgeOwner.bridge === bridge
+          && this.installedDecoderConfigurations.get('video') === configuration
+          && (frameOutput !== null
+            ? this.activeLocSeek === attempt && loc?.output === frameOutput
+              && this.commandDispatcher === frameOutput.pipelines.commandDispatcher
+              && this.videoPipeline === frameOutput.pipelines.videoPipeline
+              && loc.tracks.includes(track)
+            : this.activeMseSeek === attempt && this.ownedSeekOutput === mseOutput
+              && this.mediaSource === mse?.source && this.mseOutputEpoch === epoch
+              && mse?.tracks.get('video') === track && !mse.ended.has('video')
+              && !mse.retiringRoles.has('video') && mse.videoSelection?.selection === mseSelection?.selection
+              && mse.videoSelection?.key === sourceKey
+              && this.cmafAssembler === mseOutput?.assembler);
+      } catch { return false; }
+    };
+    if (!route()) return null;
+    return { kind: 'seek-live', attempt, bridgeOwner, track, epoch, selection: selected, configuration,
+      connection, manager, generation, requestId: subscription.requestId, alias: subscription.trackAlias,
+      subscription, sourceKey, output, pipeline, source, assembler, automatic, mode,
+      frameReader: undefined, decoder: frameOutput?.output.videoDecoder, header: undefined, route };
+  }
+
+  private seekLiveObservation(bridgeOwner: SeekRoleBridgeOwner):
+    NonNullable<ConstructorParameters<typeof SeekLiveBridge>[1]['liveObservation']> {
+    // Only tokens issued by this observer can be delivered back into the engine.
+    const captures = new WeakMap<object, NonNullable<ReturnType<MoqtPlayer['captureVideoPayload']>> & { receipt: ObjectReceipt }>();
+    return {
+      capture: event => {
+        const owner = this.captureVideoMeasurementOwner();
+        if (owner?.kind !== 'seek-live' || owner.bridgeOwner !== bridgeOwner) return;
+        const nowUs = this.clock.now();
+        if (!this.sameVideoMeasurementOwner(owner, this.captureVideoMeasurementOwner())) return;
+        const token = {};
+        captures.set(token, { owner, bytes: event.payloadBytes, nowUs, receipt: event.receipt });
+        return token;
+      },
+      deliver: (object, token) => {
+        const receipt = captures.get(token); captures.delete(token);
+        if (!receipt || !this.sameVideoMeasurementOwner(receipt.owner, this.captureVideoMeasurementOwner())) return;
+        this.recordVideoPayload(receipt);
+        if (object.kind !== 'data' || BigInt(object.objectId) !== 0n
+            || this.catalogTrackFor(bridgeOwner.track.name, bridgeOwner.track.namespace, 'video')?.packaging !== 'loc') return;
+        const subscription = bridgeOwner.bridge?.acceptedLiveSubscription;
+        if (!subscription) return;
+        const headers = parseLocHeaders(object.properties ?? object.extensions, {
+          wireProfile: locWireProfileForDraft(receipt.owner.connection.draftVersion),
+          track: locSeekTrackContext(subscription.initialTrackProperties),
+        });
+        if (this.sameVideoMeasurementOwner(receipt.owner, this.captureVideoMeasurementOwner())) {
+          this.seekCadenceInputs.set(receipt.receipt, {
+            object: { kind: object.kind, trackAlias: object.trackAlias, groupId: object.groupId, objectId: object.objectId },
+            owner: receipt.owner, headers,
+          });
+        }
+      },
+    };
+  }
+
+  private sameVideoMeasurementOwner(a: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'],
+    b: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'] | null): boolean {
+    return b !== null && a.kind === b.kind
+      && (a.kind !== 'seek-live' || (b.kind === 'seek-live' && a.attempt === b.attempt
+        && a.bridgeOwner === b.bridgeOwner && a.track === b.track && a.epoch === b.epoch
+        && a.selection === b.selection && a.configuration === b.configuration))
+      && a.connection === b.connection && a.manager === b.manager && a.generation === b.generation
+      && a.subscription === b.subscription && a.requestId === b.requestId && a.alias === b.alias && a.sourceKey === b.sourceKey
+      && a.output === b.output && a.pipeline === b.pipeline && a.source === b.source && a.assembler === b.assembler
+      && a.automatic === b.automatic && a.mode === b.mode && a.frameReader === b.frameReader && a.decoder === b.decoder && a.header === b.header && a.route() && b.route();
+  }
+
+  private captureVideoPayload(alias: bigint, bytes: number, connection: MoqtConnection): {
+    readonly owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'];
+    readonly bytes: number; readonly nowUs: number;
+  } | undefined {
+    const owner = this.captureVideoMeasurementOwner();
+    if (!owner) { this.videoPayloadMeasurement = null; return; }
+    if (owner.kind !== 'ordinary' || owner.connection !== connection || owner.alias !== alias) return;
+    const nowUs = this.clock.now();
+    // An application clock may synchronously replace the selected output.
+    if (!this.sameVideoMeasurementOwner(owner, this.captureVideoMeasurementOwner())) return;
+    return { owner, bytes, nowUs };
+  }
+
+  private recordVideoPayload(receipt: ReturnType<MoqtPlayer['captureVideoPayload']>): void {
+    if (!receipt) return;
+    const { owner, bytes, nowUs } = receipt;
+    if (!this.sameVideoMeasurementOwner(owner, this.captureVideoMeasurementOwner())) return;
+    let measurement = this.videoPayloadMeasurement;
+    if (!measurement || !this.sameVideoMeasurementOwner(measurement.owner, owner)) {
+      measurement = { owner, rate: new ReceivedPayloadRate() };
+      this.videoPayloadMeasurement = measurement;
+    }
+    measurement.rate.observe(bytes, nowUs);
+  }
+
+  private readVideoReceivedRate(): number | null {
+    const measurement = this.videoPayloadMeasurement;
+    if (!measurement) return null;
+    if (!this.sameVideoMeasurementOwner(measurement.owner, this.captureVideoMeasurementOwner())) {
+      if (this.videoPayloadMeasurement === measurement) this.videoPayloadMeasurement = null;
+      return null;
+    }
+    const nowUs = this.clock.now();
+    if (this.videoPayloadMeasurement !== measurement
+        || !this.sameVideoMeasurementOwner(measurement.owner, this.captureVideoMeasurementOwner())) return null;
+    return measurement.rate.read(nowUs);
+  }
+
+  private recordLocGroupCadence(obj: CadenceObject, headers: LocHeaders, owner: ReturnType<MoqtPlayer['captureVideoMeasurementOwner']>): void {
+    if (obj.kind !== 'data' || BigInt(obj.objectId) !== 0n) return;
+    if (!owner || !this.sameVideoMeasurementOwner(owner, this.captureVideoMeasurementOwner())) return;
+    if (BigInt(obj.trackAlias) !== owner.alias) return;
+    const selected = this._selection.video;
+    if (!selected || this.catalogTrackFor(selected.name, selected.namespaceFields, 'video')?.packaging !== 'loc') return;
+    let current = this.videoGroupCadence;
+    if (!current || !this.sameVideoMeasurementOwner(current.owner, owner)) {
+      current = { owner, cadence: new LocGroupCadence() };
+      this.videoGroupCadence = current;
+    }
+    // An explicitly dependent start cannot establish an independently playable Group.
+    current.cadence.observe(BigInt(obj.groupId), headers.videoFrameMarking?.independent === false ? {} : headers);
+  }
+
+  /** Retire receipts captured before a whole-output reset without changing media policy. */
+  private retireVideoMeasurement(): void {
+    this.videoMeasurementMode = {};
+    this.videoPayloadMeasurement = null;
+    this.videoGroupCadence = null;
+  }
+
   /** Cancel waiting recovery and release its cached session reference before retirement. */
   private cancelLivenessRestarts(connection?: MoqtConnection): void {
     for (const [key, restart] of this.livenessRestarts) {
@@ -13975,6 +14258,8 @@ export class MoqtPlayer {
    * where recovery only flushed if a stall happened to fire first).
    */
   private flushForLivenessRestart(track: LivenessTrack): void {
+    const measured = this.captureVideoMeasurementOwner();
+    if (track.mediaType === 'video' && measured?.alias === track.trackAlias) this.retireVideoMeasurement();
     this.subscriptionManager?.resetMediaConsumer(track.trackAlias);
     const key = this.mediaKey(track.trackName, track.mediaType, track.trackAlias);
     const catalogTrack = this._catalogState?.tracks.find(t => this.initKey(t) === key);
@@ -15088,6 +15373,7 @@ export class MoqtPlayer {
       beforeSubscribe: () => this.hooks.beforeSubscribe.run({ trackName: track.name, namespace: track.namespace, mediaType: track.role }) !== null,
       beginPage: identity => { const receiver = playback.beginPage(track.role, identity); firstPage = false; return receiver; }, acceptPage: (identity, end, receipt) => playback.acceptPage(track.role, identity, end, receipt),
       beginLive: (owner, properties) => playback.beginLive(track.role, owner, properties),
+      ...(track.role === 'video' ? { liveObservation: (owner: SeekRoleBridgeOwner) => this.seekLiveObservation(owner) } : {}),
       capture: object => this.captureSeekObject(connection, object),
       discard: captured => this.discardSeekObject(captured, 'route retired'),
       consume: (object, captured, current, deliver) => this.consumeSeekObject(track, object, captured, current, deliver, alias ?? undefined),
@@ -15132,31 +15418,40 @@ export class MoqtPlayer {
     });
   }
 
-  private captureSeekObject(connection: MoqtConnection, object: MoqtObject | ObjectDatagram): object | undefined {
+  private captureSeekObject(connection: MoqtConnection, object: MoqtObject | ObjectDatagram): {
+    readonly input?: ObjectRoutingContext; readonly epoch: object | undefined;
+    readonly cadence?: { readonly object: CadenceObject;
+      readonly owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner']; readonly headers: LocHeaders };
+  } | undefined {
+    const receipt = connection.objectReceiptFor(object);
+    const cadence = receipt ? this.seekCadenceInputs.get(receipt) : undefined;
+    if (receipt) this.seekCadenceInputs.delete(receipt);
     this.watchdog.fulfill('first_media_object');
     const runtime = this.mediaDiagnosticRuntime, diagnosticEpoch = this.mediaDiagnosticEpoch;
-    if (!runtime) return undefined;
+    const evidence = cadence ? { cadence, epoch: diagnosticEpoch } : undefined;
+    if (!runtime) return evidence;
     try {
       const input = runtime.capture(connection, object);
-      if (input && typeof Reflect.get(input, 'then') === 'function') { void Promise.resolve(input).catch(() => {}); return undefined; }
-      if (input && diagnosticEpoch === this.mediaDiagnosticEpoch) return { input, epoch: diagnosticEpoch };
+      if (input && typeof Reflect.get(input, 'then') === 'function') { void Promise.resolve(input).catch(() => {}); return evidence; }
+      if (input && diagnosticEpoch === this.mediaDiagnosticEpoch) return { input, epoch: diagnosticEpoch, ...(cadence ? { cadence } : {}) };
     } catch { /* Optional receipt evidence cannot affect media. */ }
-    return undefined;
+    return evidence;
   }
 
 
   private discardSeekObject(captured: object | undefined, reason: ObjectRoutingDiscardReason): void {
-    const token = captured as { input: ObjectRoutingContext; epoch: object | undefined } | undefined;
-    if (token && token.epoch === this.mediaDiagnosticEpoch) this.discardMediaInput(token.input, reason);
+    const token = captured as ReturnType<MoqtPlayer['captureSeekObject']>;
+    if (token?.input && token.epoch === this.mediaDiagnosticEpoch) this.discardMediaInput(token.input, reason);
   }
 
 
   private async consumeSeekObject(track: { readonly role: 'video' | 'audio'; readonly name: string },
     object: MoqtObject, captured: object | undefined, current: () => boolean,
     deliver: (object: MoqtObject, input?: object) => Promise<void>, alias?: bigint): Promise<void> {
-    const token = captured as { input: ObjectRoutingContext; epoch: object | undefined } | undefined;
+    const token = captured as ReturnType<MoqtPlayer['captureSeekObject']>;
     let input = token?.epoch === this.mediaDiagnosticEpoch ? token?.input : undefined;
     if (!current()) { this.discardSeekObject(captured, 'route retired'); return; }
+    const cadence = token?.cadence;
     // Logical transform compatibility does not create a wire alias binding.
     const logical = alias === undefined ? object : { ...object, trackAlias: varint(alias) };
     let transformed: MoqtObject | null;
@@ -15169,6 +15464,8 @@ export class MoqtPlayer {
     try { this.recordSeekObject(track.role, track.name, transformed); }
     catch (error) { this.discardSeekObject(captured, 'object processing failed'); throw error; }
     if (token?.epoch !== this.mediaDiagnosticEpoch) input = undefined;
+    if (!current()) { this.discardSeekObject(captured, 'route retired'); return; }
+    if (cadence) this.recordLocGroupCadence(cadence.object, cadence.headers, cadence.owner);
     if (!current()) { this.discardSeekObject(captured, 'route retired'); return; }
     await deliver(transformed, input);
   }
@@ -15285,6 +15582,7 @@ export class MoqtPlayer {
           ? consumer.acceptPage(identity, endOfTrack, receipt) : consumer.acceptPage(identity, endOfTrack),
         ...(getPreparingGroup ? { getPreparingGroup } : {}),
         beginLive: owner => consumer.beginLive(owner),
+        ...(role === 'video' ? { liveObservation: (owner: SeekRoleBridgeOwner) => this.seekLiveObservation(owner) } : {}),
         capture: captureObject, discard: captured => discardCaptured(captured, 'route retired'),
         consume: (object, captured, admitted, deliver) => consumeObject(track, object, captured, admitted, deliver),
         onBridgeAdded: owner => { attempt.bridges.add(owner); },

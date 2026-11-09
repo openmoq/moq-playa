@@ -101,7 +101,7 @@ interface Options {
 const abortError = () => Object.assign(new Error('LOC seek output retired'), { name: 'AbortError' });
 const equalBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((value, i) => value === b[i]);
 const sourceUs = (point: SourceTimestamp) => point.ticks * 1_000_000n / point.ticksPerSecond;
-function trackContext(properties: ReadonlyMap<bigint, readonly TrackPropertyValue[]> | undefined): LocTrackContext {
+export function locSeekTrackContext(properties: ReadonlyMap<bigint, readonly TrackPropertyValue[]> | undefined): LocTrackContext {
   const headers = resolveLocHeaders([...properties ?? []].flatMap(([id, values]) => values.map(value => ({ id, value }))));
   return { ...(headers.timescale === undefined ? {} : { timescale: headers.timescale }),
     ...(headers.videoConfig === undefined ? {} : { videoConfig: headers.videoConfig }),
@@ -297,7 +297,7 @@ export class LocSeekPlayback {
     if (!this.current() || !page || page.identity !== identity || page.receipt) return;
     try {
       if (!receipt || receipt.groupOrder !== 'ascending' || receipt.rangeFilters !== false) throw new Error('LOC history lacks ordered unfiltered request provenance');
-      page.context = trackContext(receipt.trackProperties);
+      page.context = locSeekTrackContext(receipt.trackProperties);
       page.receipt = receipt; page.queue.acceptPrefix();
     } catch (error) { this.fail(error); }
   }
@@ -306,7 +306,7 @@ export class LocSeekPlayback {
     this.assertCurrent();
     const state = this.roles.get(role);
     if (!state?.prepared || state.page || state.live || state.inputEnding) throw new Error('LOC live input has no prepared role');
-    const live = { owner, context: trackContext(properties), closed: false };
+    const live = { owner, context: locSeekTrackContext(properties), closed: false };
     state.live = live;
     const current = () => this.current() && !this.frozen && state.live === live && !live.closed;
     return {

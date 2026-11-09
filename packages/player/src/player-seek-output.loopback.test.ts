@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 import { MoqtConnection } from '@openmoq/webtransport';
-import type { BandwidthEstimator } from '@openmoq/playback';
 import { createLoopback, flush } from '../../webtransport/src/testkit/loopback.js';
 import { CmafAssembler } from '../../browser/src/cmaf-assembler.js';
 import { buildInit, buildChunk, SYNC_FLAGS } from '../../locmaf/test-support/cmaf.js';
@@ -190,9 +189,9 @@ describe.each([18, 22] as const)('player-owned seek output draft %s', draft => {
     const f = await fixture(draft);
     const internals = f.player as unknown as {
       stampMediaArrival(alias: bigint): void;
-      bandwidthEstimator: BandwidthEstimator;
+      recordVideoPayload(...args: unknown[]): void;
     };
-    const live = vi.spyOn(internals, 'stampMediaArrival'), bandwidth = vi.spyOn(internals.bandwidthEstimator, 'recordGroup');
+    const live = vi.spyOn(internals, 'stampMediaArrival'), bandwidth = vi.spyOn(internals, 'recordVideoPayload');
     try {
       await f.send(200n, buildChunk({ trackId: 1, bmdt: 4000n,
         samples: [{ duration: 2000, size: 4, flags: SYNC_FLAGS }], mdat: Uint8Array.of(1, 2, 3, 4) }));

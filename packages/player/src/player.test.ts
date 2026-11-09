@@ -8405,6 +8405,9 @@ describe('MoqtPlayer', () => {
 
     // ── seek() tests (§9.2.2.5 — REQUEST_UPDATE with SUBSCRIPTION_FILTER) ──
 
+    // The three REQUEST_UPDATE / pipeline.reset seek mechanism cases that lived here are retired: seeking is
+    // output-owned historical retrieval (FETCH into a fresh owned output), not an optimistic live-subscription update.
+    // Their user-facing claims live in the owned-seek suites.
     it('an otherwise eligible LOC seek without createFrameOutput is refused before any output, REQUEST_UPDATE or FETCH mutation', async () => {
       const adapter = createMockAdapter();
       const player = await loadVodPlayer(adapter);
@@ -9871,14 +9874,26 @@ describe('MoqtPlayer', () => {
       simulateRenderedFrames(10);
       const subsBefore = (adapter.subscribe as any).mock.calls.length;
 
-      advanceClock(16_000_000);
+      feedGroups(16, 8);
       player.tick();
 
       expect(hasSubscribeTo('video-0', subsBefore)).toBe(true);
       await player.destroy();
     });
 
+    it('LOC: does not upshift from an estimate retained across an unobserved gap', async () => {
+      const { player, feedGroups, simulateRenderedFrames, hasSubscribeTo, adapter } = await setupAbrTest();
 
+      feedGroups(8);
+      simulateRenderedFrames(10);
+      const subsBefore = vi.mocked(adapter.subscribe).mock.calls.length;
+
+      advanceClock(16_000_000);
+      player.tick();
+
+      expect(hasSubscribeTo('video-0', subsBefore)).toBe(false);
+      await player.destroy();
+    });
 
     it('LOC: no upshift when recent stall within stability window (timestamp proves it)', async () => {
       const { player, renderer, feedGroups, simulateRenderedFrames, hasSubscribeTo } = await setupAbrTest();
@@ -10433,7 +10448,7 @@ describe('MoqtPlayer', () => {
 
     it('downshifts when CMAF buffer is starved (getBufferAheadUs returns 0)', async () => {
       const adapter = createMockAdapter();
-      const ms = createMockMediaSource(0); // 0 = starvation
+      const ms = { ...createMockMediaSource(0), setPlaybackIntent: vi.fn() }; // 0 = starvation
       const player = new MoqtPlayer({
         url: 'https://relay.example.com/moq',
         namespace: 'live/broadcast',
@@ -10461,6 +10476,10 @@ describe('MoqtPlayer', () => {
       await new Promise(r => setTimeout(r, 0));
 
       const subsBeforeTicks = (adapter.subscribe as any).mock.calls.length;
+
+      player.play();
+      expect(player.state).toBe('playing');
+      expect(ms.setPlaybackIntent).toHaveBeenCalledExactlyOnceWith(true);
 
       // Tick to trigger ABR evaluation
       for (let i = 0; i < 5; i++) player.tick();

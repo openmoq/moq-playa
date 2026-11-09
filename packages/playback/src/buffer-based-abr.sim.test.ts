@@ -204,4 +204,59 @@ describe('Buffer-based ABR — hybrid buffer depth + bandwidth', () => {
 
         expect(decision.action).toBe('hold'); // can't go higher
     });
+
+    it.each([
+        { label: 'unknown zero', bitrateKbps: 0 },
+        { label: 'negative', bitrateKbps: -1 },
+        { label: 'negative infinity', bitrateKbps: -Infinity },
+        { label: 'NaN', bitrateKbps: NaN },
+        { label: 'positive infinity', bitrateKbps: Infinity },
+    ])('holds when the upshift target bitrate is $label', ({ bitrateKbps }) => {
+        const ctrl = new BufferBasedController({
+            clock: new SimClock(),
+            ladder: [{ name: 'target', bitrateKbps }, { name: 'current', bitrateKbps: 500 }],
+            initialIndex: 1,
+            lowThresholdUs: 500_000,
+            highThresholdUs: 4_000_000,
+        });
+
+        expect(ctrl.evaluate({ bufferDepthUs: 6_000_000, bandwidthEstimateKbps: 600 }))
+            .toEqual({ action: 'hold' });
+        expect(ctrl.index).toBe(1);
+    });
+
+    it.each([
+        { bandwidthEstimateKbps: 3375, expected: { action: 'hold' } },
+        { bandwidthEstimateKbps: 3376, expected: { action: 'upshift', targetIndex: 0 } },
+    ])('preserves the strict bandwidth boundary for a positive target at $bandwidthEstimateKbps kbps',
+        ({ bandwidthEstimateKbps, expected }) => {
+            const ctrl = new BufferBasedController({
+                clock: new SimClock(),
+                ladder: [{ name: 'higher', bitrateKbps: 1500 }, { name: 'current', bitrateKbps: 500 }],
+                initialIndex: 1,
+                lowThresholdUs: 500_000,
+                highThresholdUs: 4_000_000,
+            });
+
+            expect(ctrl.evaluate({ bufferDepthUs: 6_000_000, bandwidthEstimateKbps })).toEqual(expected);
+            expect(ctrl.index).toBe(1);
+        });
+
+    it('still recommends emergency downshift when the higher target has unknown bitrate', () => {
+        const ctrl = new BufferBasedController({
+            clock: new SimClock(),
+            ladder: [
+                { name: 'unknown-higher', bitrateKbps: 0 },
+                { name: 'current', bitrateKbps: 500 },
+                { name: 'lower', bitrateKbps: 200 },
+            ],
+            initialIndex: 1,
+            lowThresholdUs: 500_000,
+            highThresholdUs: 4_000_000,
+        });
+
+        expect(ctrl.evaluate({ bufferDepthUs: 300_000, bandwidthEstimateKbps: 600 }))
+            .toEqual({ action: 'downshift', targetIndex: 2 });
+        expect(ctrl.index).toBe(1);
+    });
 });

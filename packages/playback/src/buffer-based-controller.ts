@@ -23,6 +23,7 @@ import type { ClockSource } from './types.js';
 /** One entry in the ABR quality ladder. */
 export interface AbrTrack {
     readonly name: string;
+    /** Zero is unknown; an upshift target must be positive and finite. */
     readonly bitrateKbps: number;
 }
 
@@ -106,7 +107,9 @@ export class BufferBasedController {
         // AND bandwidth must corroborate.
         if (this.currentIndex > 0 && signals.bufferDepthUs >= this.highThresholdUs) {
             const higherTrack = this.ladder[this.currentIndex - 1]!;
-            if (signals.bandwidthEstimateKbps > higherTrack.bitrateKbps * this.upshiftMultiple) {
+            const targetBitrate = higherTrack.bitrateKbps;
+            if (Number.isFinite(targetBitrate) && targetBitrate > 0
+                && signals.bandwidthEstimateKbps > targetBitrate * this.upshiftMultiple) {
                 return { action: 'upshift', targetIndex: this.currentIndex - 1 };
             }
         }

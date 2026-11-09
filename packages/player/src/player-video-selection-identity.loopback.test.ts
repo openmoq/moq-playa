@@ -124,6 +124,11 @@ it.each([false, true])('preserves the exact lower-rung identity during automatic
     // presentation claim. Zero invokes the existing emergency ABR policy.
     let depthReads = 0;
     f.source.getBufferAheadUs = () => { depthReads++; return 0; };
+    const setPlaybackIntent = vi.fn();
+    f.source.setPlaybackIntent = setPlaybackIntent;
+    f.player.play();
+    expect(f.player.state).toBe('playing');
+    expect(setPlaybackIntent).toHaveBeenCalledExactlyOnceWith(true);
     f.player.tick(); await flush(512);
     expect(depthReads).toBeGreaterThan(0);
     expect(next.requests.filter(request => request.name === f.target.name

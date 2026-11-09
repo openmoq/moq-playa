@@ -85,6 +85,8 @@ export interface ObjectDeliveryOptions {
   readonly identity?: object;
   readonly isLive?: () => boolean;
   readonly backfill?: boolean;
+  /** Actual FETCH origin, independent of whether playback is admitting backfill. */
+  readonly fetched?: boolean;
   /** Register/capture now, but defer transformation until the owner admits it. */
   readonly admission?: Promise<ObjectDeliveryAdmission>;
 }
@@ -527,7 +529,10 @@ export class SubscriptionManager {
           this.discardContext(context, provenance, provenanceGeneration, admission.reason);
           return;
         }
-        delivery = delivery.identity === undefined ? admission : { ...admission, identity: delivery.identity };
+        delivery = { ...admission,
+          ...(delivery.identity !== undefined ? { identity: delivery.identity } : {}),
+          ...(delivery.fetched !== undefined ? { fetched: delivery.fetched } : {}),
+        };
         if (!route.valid || this.mediaInputOwner !== inputOwner || this.tracks.get(alias) !== info || !this.deliveryIsLive(source, alias, delivery)) {
           this.discardContext(context, provenance, provenanceGeneration, 'route retired');
           return;

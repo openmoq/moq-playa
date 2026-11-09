@@ -1,5 +1,5 @@
 import { MAX_VARINT, MAX_VI64, varint, type ControlMessage, type DataStreamHeader, type MoqtObject, type ObjectDatagram, type TrackPropertyValue } from '@openmoq/transport';
-import type { DataStreamTerminal, MoqtConnection, TrackSubscription } from '@openmoq/webtransport';
+import type { DataStreamTerminal, MoqtConnection, ObjectReceipt, ObjectReceiptObservation, TrackSubscription } from '@openmoq/webtransport';
 import { SeekFetchRequests, type SeekFetchResponse } from './seek-fetch-requests.js';
 import { SeekLiveQueue } from './seek-live-queue.js';
 
@@ -39,6 +39,11 @@ interface Options {
   /** Validated timeline policy, not a Location-to-time guess or a cache claim. */
   readonly admitHead: (head: Location, signal: AbortSignal) => Promise<boolean>;
   readonly capture?: (object: MoqtObject | ObjectDatagram) => object | undefined;
+  /** Optional receipt-time measurement, separate from queued media provenance. */
+  readonly liveObservation?: {
+    capture(receipt: ObjectReceiptObservation): object | undefined;
+    deliver(object: MoqtObject, captured: object): void;
+  };
   readonly onDiscard: (input: object) => void | Promise<void>;
   readonly consumePrefix: (object: MoqtObject, input: object | undefined, stillAdmitted: () => boolean) => Promise<void>;
   readonly consumeLive: Options['consumePrefix'];
@@ -83,6 +88,15 @@ export class SeekLiveBridge {
   private drained = false;
   private prefixDrained = false;
   private unsubscribeSent = false;
+  private accepted = false;
+  private stopLiveObservation: (() => void) | null = null;
+  private liveReceipts: WeakMap<ObjectReceipt, { boundary: Boundary; captured: object }> | null = null;
+
+  /** Stable accepted identity, available while the prefix still drains. */
+  get acceptedLiveSubscription(): TrackSubscription | null {
+    return this.accepted && !this.done && !this.boundary?.endOfTrack && this.current()
+      ? this.boundary?.subscription ?? null : null;
+  }
 
   constructor(private readonly connection: MoqtConnection, private readonly options: Options) {
     const draft = connection.draftVersion;
@@ -120,6 +134,12 @@ export class SeekLiveBridge {
     this.live = this.queue.openLiveStream();
     options.signal.addEventListener('abort', this.interrupt, { once: true });
     if (options.signal.aborted) this.cancel();
+    if (options.liveObservation && this.current()) {
+      this.liveReceipts = new WeakMap();
+      const stop = connection.observeObjectReceipts(event => this.captureLiveReceipt(event));
+      if (this.current()) this.stopLiveObservation = stop;
+      else stop();
+    }
   }
 
   start(): void {
@@ -133,7 +153,7 @@ export class SeekLiveBridge {
     if (message.type !== 'PUBLISH_DONE' || message.requestId !== this.requestId) return false;
     if (this.current()) {
       if (message.statusCode !== 2n) this.fail(new Error(`Seek live subscription ended with status ${message.statusCode}`));
-      else { this.done = true; this.maybeEnd(); }
+      else { this.done = true; this.releaseLiveObservation(); this.maybeEnd(); }
     }
     return true;
   }
@@ -162,7 +182,10 @@ export class SeekLiveBridge {
         properties: object.extensions, extensions: object.extensions }
       : { kind: 'gap', ...common, status: object.status };
     this.datagramInputs?.set(normalized, object);
-    try { void this.live.push(normalized); }
+    try {
+      this.claimLiveReceipt(object, normalized);
+      if (this.current()) void this.live.push(normalized);
+    }
     finally { this.datagramInputs?.delete(normalized); }
     return true;
   }
@@ -177,6 +200,7 @@ export class SeekLiveBridge {
   cancel(): void {
     if (this.closed) return;
     this.closed = true;
+    this.releaseLiveObservation();
     this.options.signal.removeEventListener('abort', this.interrupt);
     this.interruption.abort(aborted());
     this.queue.cancel(); this.requests.dispose();
@@ -202,7 +226,11 @@ export class SeekLiveBridge {
           try { this.requestId = id; if (!this.current()) throw aborted(); }
           finally { this.registering = false; }
         },
-        onObject: object => { if (this.current()) void this.live.push(object); },
+        onObject: object => {
+          if (!this.current()) return;
+          this.claimLiveReceipt(object, object);
+          if (this.current()) void this.live.push(object);
+        },
         // Stream Count excludes datagrams. Keep the SDK's effective late-delivery
         // window instead of claiming that processed streams prove all intake ended.
         terminalDelivery: 'drain', terminalDeliveryStatuses: [varint(2n)],
@@ -248,8 +276,40 @@ export class SeekLiveBridge {
   }
   private accept(boundary: Boundary): void {
     this.options.onPrefixAccepted(copyBoundary(boundary));
-    if (this.current()) this.queue.acceptPrefix();
+    if (this.current() && this.boundary === boundary) {
+      this.accepted = true;
+      this.queue.acceptPrefix();
+    }
   }
+  private captureLiveReceipt(event: ObjectReceiptObservation): void {
+    const boundary = this.boundary, receipts = this.liveReceipts;
+    if (!boundary || !receipts || this.acceptedLiveSubscription !== boundary.subscription
+        || (event.origin !== 'subgroup' && event.origin !== 'datagram') || event.objectStatus !== 0n
+        || event.trackAlias !== boundary.subscription.trackAlias || compare(event, boundary.head) <= 0) return;
+    const captured = this.options.liveObservation?.capture(event);
+    if (captured !== undefined && this.liveReceipts === receipts && this.boundary === boundary
+        && this.acceptedLiveSubscription === boundary.subscription) receipts.set(event.receipt, { boundary, captured });
+  }
+
+  private claimLiveReceipt(object: MoqtObject | ObjectDatagram, delivered: MoqtObject): void {
+    if (this.liveReceipts === null) return;
+    const receipt = this.connection.objectReceiptFor(object);
+    const observation = receipt && this.liveReceipts?.get(receipt);
+    if (!receipt || !observation) return;
+    this.liveReceipts?.delete(receipt);
+    if (this.boundary !== observation.boundary
+        || this.acceptedLiveSubscription !== observation.boundary.subscription) return;
+    try { this.options.liveObservation?.deliver(delivered, observation.captured); }
+    catch { /* Optional measurement cannot reject accepted media. */ }
+  }
+
+  private releaseLiveObservation(): void {
+    const stop = this.stopLiveObservation;
+    this.stopLiveObservation = null;
+    this.liveReceipts = null;
+    stop?.();
+  }
+
   private maybeEnd(): void {
     // SDK drain owns SUB/FILL, not the separate Joining FETCH or our async
     // prefix work. Sealing intake before that barrier would lose later bytes.
