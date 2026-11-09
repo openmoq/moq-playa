@@ -15,7 +15,7 @@
 import type { MoqtConnection, WebTransportLike, ConnectionAuthorization } from '@openmoq/webtransport';
 import type { QlogEvent, MoqtObject, DraftVersion } from '@openmoq/transport';
 import type { TrackConstraints, CatalogTrack, CatalogState } from '@openmoq/msf';
-import { assertUtf8EncodableIdentity, contextFields } from '@openmoq/msf';
+import { assertUtf8EncodableIdentity, contextFields, fieldsFromCatalogText } from '@openmoq/msf';
 import type { ClockSource, DecoderCommand, RecoveryController } from '@openmoq/playback';
 import type { VideoDecoderLike, AudioDecoderLike, VideoRendererLike, AudioOutputLike, MediaSourceLike, CmafAssemblerLike } from './interfaces.js';
 import type { PlayerError } from './errors.js';
@@ -887,12 +887,37 @@ function validateSelection(config: MoqtPlayerConfig): void {
   }
 }
 
+/** Full Track Name payload bound: drafts 16/18 §2.4.1; draft 22 §8.7. */
+const MAX_FULL_TRACK_NAME_BYTES = 4096;
+
+/**
+ * Refuse a catalog Full Track Name that could never be subscribed, before
+ * connecting rather than inside the first SUBSCRIBE. Lengths are UTF-8
+ * bytes, the form they take on the wire. An empty name is valid.
+ */
+function assertCatalogFullTrackNameFits(config: MoqtPlayerConfig): void {
+  const ns = config.namespace;
+  const fields = typeof ns === 'string' ? fieldsFromCatalogText(ns)
+    : Array.isArray(ns) && ns.every(field => typeof field === 'string') ? ns : undefined;
+  if (fields === undefined) return;
+  const enc = new TextEncoder();
+  const name = config.catalogTrackName ?? 'catalog';
+  const total = fields.reduce((sum, field) => sum + enc.encode(field).length, 0) + enc.encode(name).length;
+  if (total > MAX_FULL_TRACK_NAME_BYTES) {
+    throw new RangeError(
+      `catalog Full Track Name is ${total} bytes (namespace + catalogTrackName); `
+      + `the maximum is ${MAX_FULL_TRACK_NAME_BYTES} bytes`,
+    );
+  }
+}
+
 /** Validate configuration before opening a connection. */
 export function validateConfig(config: MoqtPlayerConfig): void {
   if (config.catalogTrackName !== undefined) {
     if (typeof config.catalogTrackName !== 'string') throw new TypeError('catalogTrackName must be a string');
     assertUtf8EncodableIdentity(undefined, config.catalogTrackName);
   }
+  assertCatalogFullTrackNameFits(config);
   if (config.videoAltGroup !== undefined) {
     if (!Number.isSafeInteger(config.videoAltGroup)) {
       throw new RangeError('videoAltGroup must be a safe integer');

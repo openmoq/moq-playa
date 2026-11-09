@@ -21,6 +21,26 @@ describe('catalog track name configuration', () => {
     expect(() => validateConfig(minConfig({ catalogTrackName }))).toThrow(/UTF-8|surrogate/);
   });
 
+  it('accepts a name that fills the Full Track Name limit exactly', () => {
+    // 'live' (4 bytes) + 4092 bytes = 4096 (§2.4.1).
+    expect(() => validateConfig(minConfig({ catalogTrackName: 'c'.repeat(4092) }))).not.toThrow();
+  });
+
+  it('rejects a name whose Full Track Name exceeds 4096 bytes before connecting', () => {
+    expect(() => validateConfig(minConfig({ catalogTrackName: 'c'.repeat(4093) }))).toThrow(/4096/);
+  });
+
+  it('counts UTF-8 bytes, not UTF-16 code units', () => {
+    // 'é' is one code unit but two UTF-8 bytes: 2047 * 2 + 4 = 4098.
+    expect(() => validateConfig(minConfig({ catalogTrackName: 'é'.repeat(2047) }))).toThrow(/4096/);
+  });
+
+  it('counts every namespace field toward the limit', () => {
+    const namespace = ['a'.repeat(2000), 'b'.repeat(2000)];
+    expect(() => validateConfig(minConfig({ namespace, catalogTrackName: 'c'.repeat(96) }))).not.toThrow();
+    expect(() => validateConfig(minConfig({ namespace, catalogTrackName: 'c'.repeat(97) }))).toThrow(/4096/);
+  });
+
   it.each([42, null])('rejects non-string name %j from an untyped caller', value => {
     expect(() => validateConfig(minConfig({ catalogTrackName: value as unknown as string }))).toThrow(/catalogTrackName/);
   });
