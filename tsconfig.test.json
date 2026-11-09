@@ -281,6 +281,7 @@
     "packages/player/src/player-timeline-lifecycle.loopback.test.ts",
     "packages/player/src/player.test.ts",
     "scripts/player-acceptance/group-tail.test.ts",
-    "scripts/render-feedback-types.test.ts"
+    "scripts/render-feedback-types.test.ts",
+    "packages/player/src/loc-audio-continuity.loopback.test.ts",
   ]
 }

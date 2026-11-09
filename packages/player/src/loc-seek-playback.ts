@@ -491,7 +491,12 @@ export class LocSeekPlayback {
     pipeline.endGroup(state.group);
     await this.drainSampleInput(pipeline);
     if (this.frozen) return;
-    await this.decoder(role)!.flush(); this.assertCurrent(); this.maybeAdopt();
+    // A group boundary is not an audio decoder lifetime boundary. Draining
+    // Opus here can reapply native pre-skip before the next accepted page.
+    // Actual PCM wakes readiness through audioPreparation.onPrepared; return
+    // to the page queue so continuation can provide delayed decoder output.
+    if (role === 'video') await this.decoder(role)!.flush();
+    this.assertCurrent(); this.maybeAdopt();
   }
 
   private audioTimingSource(state: RoleState): AudioTimingSource {
