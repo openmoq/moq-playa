@@ -9958,6 +9958,21 @@ describe('MoqtPlayer', () => {
       await player.destroy();
     });
 
+    it('does not absorb late audio just after a jump to live: what the jump skipped is dropped', async () => {
+      const { player } = await setupAbrTest(1_000);
+      const p = player as any;
+      const slips: number[] = [];
+      p.syncController = { hasReference: true, slipReference: (us: number) => slips.push(us) };
+      p.deliveryLag = { excessLagUs: () => 800_000 };
+      p.lastLiveJumpUs = p.clock.now();
+      advanceClock(1_000_000);
+      expect(p.absorbLateAudio(-3_000_000)).toBe(false);
+      advanceClock(1_500_000);
+      expect(p.absorbLateAudio(-1_200_000)).toBe(true);
+      expect(slips).toEqual([1_700_000]);
+      await player.destroy();
+    });
+
     it('LOC: measures GOP duration from the capture times of group starts', async () => {
       const { player, adapter } = await setupAbrTest(1_000);
       const videoAlias = varint(BigInt(await (adapter.subscribe as any).mock.results[1]?.value) + 100n);

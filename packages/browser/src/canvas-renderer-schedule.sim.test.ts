@@ -77,4 +77,22 @@ describe('CanvasRenderer — reports the queued schedule', () => {
 
     expect(scheduled).toEqual([1_000_000, 1_250_000]);
   });
+
+  it('retime() moves queued frames: those now in the past drop as late, the newest kept', () => {
+    const clock = new SimClock();
+    const renderer = new CanvasRenderer(stubCanvas(), { clock });
+    const rendered: bigint[] = [];
+    const scheduled: (number | undefined)[] = [];
+    renderer.onFrameRendered = (captureUs, _a, scheduledRenderUs) => { rendered.push(captureUs); scheduled.push(scheduledRenderUs); };
+    // Four frames due 5 s from now; the timeline then moves 4.9 s earlier.
+    for (let i = 0; i < 4; i++) renderer.enqueue(frame(i * 33_333), 5_000_000 + i * 1_000_000);
+    renderer.retime(-4_900_000);
+
+    clock.set(1_200_000);
+    renderer.renderTick(clock.now());
+    // The first frame is now 1.1 s late, with newer frames behind it: dropped.
+    // The second is due now.
+    expect(rendered).toEqual([33_333n]);
+    expect(scheduled).toEqual([1_100_000]);
+  });
 });

@@ -1026,4 +1026,22 @@ describe('unified playout cushion — audio consumes the shared pipeline delay',
     audioDecoder._triggerData({ sampleRate: 48000 }, 3000);
     expect(audioOutput.schedule).toHaveBeenCalledWith(expect.anything(), 3000);
   });
+
+  it('retimeOutputs() retimes queued video and stops scheduled audio', () => {
+    const calls: string[] = [];
+    const renderer: any = {
+      enqueue: () => {}, destroy: () => {}, flush: () => calls.push('video flush'),
+      retime: (us: number) => calls.push(`video retime ${us}`),
+      onFirstFrame: null, onFrameRendered: null, onStall: null,
+    };
+    const audioOutput: any = { schedule: () => {}, flush: () => calls.push('audio flush'), destroy: () => {} };
+    new CommandDispatcher({ renderer, audioOutput }).retimeOutputs(-2_000_000);
+    expect(calls).toEqual(['video retime -2000000', 'audio flush']);
+
+    // A renderer that cannot retime is flushed instead.
+    calls.length = 0;
+    delete renderer.retime;
+    new CommandDispatcher({ renderer, audioOutput }).retimeOutputs(-2_000_000);
+    expect(calls).toEqual(['video flush', 'audio flush']);
+  });
 });

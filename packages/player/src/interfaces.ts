@@ -170,6 +170,13 @@ export interface VideoRendererLike {
   /** Discard all queued frames. MUST close() all held frames. */
   flush(): void;
 
+  /**
+   * Optional: shift every queued frame's render time by `deltaUs` (negative:
+   * earlier) when the playout timeline moves. Without it, a timeline jump
+   * flushes the queue instead.
+   */
+  retime?(deltaUs: number): void;
+
   /** Release resources. MUST close() all held frames. */
   destroy(): void;
 

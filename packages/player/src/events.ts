@@ -288,8 +288,10 @@ export interface PartialGroupAbandonedEvent {
  * Player-level recovery actions, layered on top of the pipeline's
  * {@link RecoveryAction} union:
  *
- * - `jump_to_live` — persistent stalls flushed the backlog and resubscribed
- *   from the live edge.
+ * - `jump_to_live` — playback moved to the live edge. `trigger: 'stalls'`:
+ *   persistent stalls flushed the backlog and resubscribed. `trigger:
+ *   'latency'`: media had arrived far ahead of playout, and audio and video
+ *   moved forward together by `byMs`.
  * - `track_restart` — the media-liveness ladder restarted a starved track's
  *   delivery (REQUEST_UPDATE refresh or full resubscribe).
  * - `track_resubscribe` — the publisher ended the subscription for a reason
@@ -299,7 +301,7 @@ export interface PartialGroupAbandonedEvent {
  */
 export type PlayerRecoveryAction =
   | RecoveryAction
-  | { readonly type: 'jump_to_live' }
+  | { readonly type: 'jump_to_live'; readonly trigger?: 'stalls' | 'latency'; readonly byMs?: number }
   | {
     readonly type: 'track_restart';
     readonly mediaType: 'video' | 'audio';
