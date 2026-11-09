@@ -162,6 +162,9 @@ import { isDraft22, isRequestStreamDraft } from '@openmoq/transport';
 /** Object limit for a make-before-break video's retained input. */
 const SWITCH_STAGING_MAX_OBJECTS = 100;
 
+/** Subscriber priority a SUBSCRIBE without the parameter is treated as (the transport codecs' default). */
+const DEFAULT_SUBSCRIBER_PRIORITY = 128;
+
 /** draft-22 FILL_PARAMETERS for joining the current group: a LOCATION_FILTER
  *  of [1] (the current group: Largest.Group + 1 - 1), the
  *  counterpart of a relative Joining FETCH at offset 0. */
@@ -1858,6 +1861,18 @@ export class MoqtPlayer {
   }
 
   /** Retain normal completion data, not errors or stale live-edge recovery (§9.15 / §10.11 / §9.9). */
+  /**
+   * Subscriber priority for a media subscription. Audio goes ahead of video by
+   * default: on a congested link a relay that schedules by priority sends the
+   * small audio objects first, and audio is what listeners notice. Video keeps
+   * whatever the configured parameters say (or none: the relay's default).
+   */
+  private subscriberPriorityFor(mediaType: string): { subscriberPriority?: ReturnType<typeof varint> } {
+    if (mediaType !== 'audio') return {};
+    const base = this.config.subscriberPriority ?? DEFAULT_SUBSCRIBER_PRIORITY;
+    return { subscriberPriority: varint(BigInt(this.config.audioSubscriberPriority ?? Math.max(0, base - 1))) };
+  }
+
   private mediaTerminalOptions(conn: MoqtConnection) {
     return {
       terminalDelivery: 'drain' as const,
@@ -4839,7 +4854,7 @@ export class MoqtPlayer {
           try {
             const reqId = await conn.subscribe(
               nsBytes, this.enc.encode(track.name),
-              { ...(knownTrackOptions ?? {}), ...this.mediaTerminalOptions(conn), onRequestId: (id: bigint) => { knownRegisteredId = id; registerKnownSub(id); } } as never,
+              { ...(knownTrackOptions ?? {}), ...this.subscriberPriorityFor(mediaType), ...this.mediaTerminalOptions(conn), onRequestId: (id: bigint) => { knownRegisteredId = id; registerKnownSub(id); } } as never,
             );
             if (this._destroyed || this.isTerminalState() || this.connection !== conn) {
               if (knownRegisteredId === null) void conn.unsubscribe(varint(BigInt(reqId))).catch(() => { /* best effort */ });
@@ -6988,7 +7003,8 @@ export class MoqtPlayer {
         onClaim?.(id);
       };
       const reqId = await conn.subscribe(namespace.map(field => this.enc.encode(field)), this.enc.encode(name),
-        { ...options, ...(initKey === null ? this.mediaTerminalOptions(conn) : {}), onRequestId: claim } as never);
+        { ...options, ...(initKey === null ? { ...this.subscriberPriorityFor(mediaType), ...this.mediaTerminalOptions(conn) } : {}),
+          onRequestId: claim } as never);
       if (allocated === null) claim(BigInt(reqId));
       assertLive();
     };
@@ -13479,7 +13495,8 @@ export class MoqtPlayer {
       let reqIdBigInt: bigint;
       try {
         const reqId = await conn.subscribe(nsBytes, nameBytes,
-          { ...mediaOptions, ...this.mediaTerminalOptions(conn), onRequestId: (id: bigint) => { registeredId = id; registerMediaSub(id); } } as never);
+          { ...mediaOptions, ...this.subscriberPriorityFor(mediaType), ...this.mediaTerminalOptions(conn),
+            onRequestId: (id: bigint) => { registeredId = id; registerMediaSub(id); } } as never);
         reqIdBigInt = BigInt(reqId);
         if (!live()) {
           if (registeredId === null) void conn.unsubscribe(varint(reqIdBigInt)).catch(() => { /* best effort */ });
@@ -13750,7 +13767,8 @@ export class MoqtPlayer {
     };
     try {
       const reqId = await conn.subscribe(nsBytes, nameBytes,
-        { ...((options as object | undefined) ?? {}), ...(info.packaging !== 'init' ? this.mediaTerminalOptions(conn) : {}), onRequestId: (id: bigint) => register(BigInt(id)) } as never);
+        { ...((options as object | undefined) ?? {}),
+          ...(info.packaging !== 'init' ? { ...this.subscriberPriorityFor(info.mediaType), ...this.mediaTerminalOptions(conn) } : {}), onRequestId: (id: bigint) => register(BigInt(id)) } as never);
       if (!live()) {
         if (registered === null) void conn.unsubscribe(varint(BigInt(reqId))).catch(() => { /* best effort */ });
         throw new Error('Auxiliary subscription retired during emission');
@@ -14552,7 +14570,8 @@ export class MoqtPlayer {
     // player, and `this.connection` is mutable. Announcing afterwards also
     // makes the event's contract true — the replacement has really started.
     const pending = resubConn.subscribe(nsBytes, nameBytes,
-      { ...(filter ?? {}), ...this.mediaTerminalOptions(resubConn), onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
+      { ...(filter ?? {}), ...this.subscriberPriorityFor(mediaType), ...this.mediaTerminalOptions(resubConn),
+        onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
     ).then((reqId) => {
       const reqIdBigInt = BigInt(reqId);
       if (!live()) return;

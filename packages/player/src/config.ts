@@ -285,6 +285,15 @@ export interface PlaybackTuningConfig {
   readonly subscriberPriority?: number;
 
   /**
+   * Subscriber priority for audio subscriptions (0 = highest, 255 = lowest).
+   * Default: one more urgent than `subscriberPriority` (127 when that is
+   * unset, against the relay default of 128 for video), so a relay that
+   * schedules by priority sends audio ahead of video on a congested link.
+   * @see draft-ietf-moq-transport-16 §9.2.2.3 (SUBSCRIBER_PRIORITY)
+   */
+  readonly audioSubscriberPriority?: number;
+
+  /**
    * Group ordering: 'ascending' (0x1) or 'descending' (0x2).
    * Default: omitted (publisher's preference from the Track is used).
    * @see draft-ietf-moq-transport-16 §9.2.2.4 (GROUP_ORDER)
@@ -950,6 +959,10 @@ export function validateConfig(config: MoqtPlayerConfig): void {
   }
   if (config.authorization && config.connection) {
     throw new TypeError('Configure authorization when connecting an externally owned connection, not on its player');
+  }
+  if (config.audioSubscriberPriority !== undefined && (!Number.isInteger(config.audioSubscriberPriority)
+      || config.audioSubscriberPriority < 0 || config.audioSubscriberPriority > 255)) {
+    throw new RangeError(`audioSubscriberPriority must be 0–255, got ${config.audioSubscriberPriority}`);
   }
   // subscriberPriority: 0–255 (§9.2.2.3)
   if (config.subscriberPriority !== undefined) {

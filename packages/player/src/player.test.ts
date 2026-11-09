@@ -2523,6 +2523,30 @@ describe('MoqtPlayer', () => {
       expect(videoCall[2].subscriberPriority).toEqual(varint(64n));
     });
 
+    it.each([
+      [{}, undefined, 127n],
+      [{ subscriberPriority: 64 }, 64n, 63n],
+      [{ audioSubscriberPriority: 10 }, undefined, 10n],
+    ] as const)('audio subscribes ahead of video by default (config %o)', async (config, video, audio) => {
+      const adapter = createMockAdapter();
+      const player = new MoqtPlayer({ ...createConfig(adapter), ...config });
+      const loadPromise = player.load();
+      await resolveConnect(adapter);
+      await loadPromise;
+      const catalogReqId = await (adapter.subscribe as any).mock.results[0]?.value;
+      ackCatalog(adapter);
+      adapter._triggerObject(0n, { publisherPriority: 128,
+        kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0), objectId: varint(0),
+        payload: new TextEncoder().encode(CATALOG_JSON),
+      } as MoqtObject);
+      await vi.waitFor(() => expect((adapter.subscribe as any).mock.calls.length).toBeGreaterThanOrEqual(3));
+      const priorityOf = (name: string) => (adapter.subscribe as any).mock.calls
+        .find((c: any) => new TextDecoder().decode(c[1]) === name)?.[2]?.subscriberPriority;
+      expect(priorityOf('video')).toEqual(video === undefined ? undefined : varint(video));
+      expect(priorityOf('audio')).toEqual(varint(audio));
+      await player.destroy();
+    });
+
     it('passes groupOrder to adapter.subscribe as options (§9.2.2.4)', async () => {
       // §9.2.2.4: "It is an enum indicating how to prioritize Objects
       // from different groups [...] Ascending (0x1) or Descending (0x2)."

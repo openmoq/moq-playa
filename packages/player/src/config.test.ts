@@ -155,6 +155,10 @@ describe('validateConfig', () => {
     expect(() => validateConfig(minConfig({ subscriberPriority: 255 }))).not.toThrow();
   });
 
+  it.each([-1, 256, 1.5])('rejects audioSubscriberPriority %s', value => {
+    expect(() => validateConfig(minConfig({ audioSubscriberPriority: value }))).toThrow(RangeError);
+  });
+
   // ── maxCatchUpRate ──
 
   it('rejects maxCatchUpRate < 1.0', () => {
