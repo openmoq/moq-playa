@@ -147,7 +147,7 @@ interface LocmafChunkDetails {
 import type { MediaSourceLike, MediaAppendQueueLease, MediaSwitchRecovery, VideoPresentation, AudioOutputLike } from './interfaces.js';
 import { CommandDispatcher, type DispatcherOutputObserver } from './command-dispatcher.js';
 import { StatsAccumulator } from './stats.js';
-import type { PlayerStats } from './stats.js';
+import type { PlayerStats, VideoEncodeObservation } from './stats.js';
 import type { CmafAssemblerLike } from './interfaces.js';
 import { buildConnectUrl, buildSetupOptions, buildSubscribeOptions, invalidGoawayUriReason } from './player-connect.js';
 import { computePlaybackDelayUs,
@@ -166,6 +166,7 @@ import {
 import { wireConnectionCallbacks } from './player-wiring.js';
 import {
   createTimelineState,
+  findEncodeAnchor,
   mergeTimelineEntries,
   findSeekTarget,
   getTimelineDuration,
@@ -843,6 +844,11 @@ export class MoqtPlayer {
       automatic: boolean; mode: object; frameReader: object | undefined; decoder: object | undefined; header: Uint8Array | undefined; route: () => boolean;
     };
     rate: ReceivedPayloadRate;
+  } | null = null;
+  private videoEncodeRecord: {
+    readonly observation: VideoEncodeObservation;
+    readonly current: () => boolean;
+    readonly captured?: () => boolean;
   } | null = null;
   private videoDeliveryLag: {
     readonly owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'];
@@ -2402,6 +2408,7 @@ export class MoqtPlayer {
       currentLatencyMs: captureTimestampAgeMs ?? 0,
       captureTimestampAgeMs,
       videoPlaybackQuality,
+      videoEncodeObservation: this.readVideoEncodeObservation(),
       ...(this.audioTimingMapped ? { avSkewMs: null, avSkewEwmaMs: null } : {}),
     });
   }
@@ -10773,7 +10780,8 @@ export class MoqtPlayer {
       // Capture before parking, callbacks or transforms. Replayed data is not
       // a new receipt, and data received before ownership is never re-attributed.
       const receipt = obj.kind === 'data'
-        ? this.captureVideoPayload(BigInt(obj.trackAlias), obj.payload.byteLength, conn) : undefined;
+        ? this.captureVideoPayload(BigInt(obj.trackAlias), obj.payload.byteLength, conn,
+          { groupId: BigInt(obj.groupId), objectId: BigInt(obj.objectId) }) : undefined;
       if (owningTxn) {
         if (owningTxn.aborted) return;
         if (!owningTxn.committed && buffer([streamId, obj])) {
@@ -10792,7 +10800,8 @@ export class MoqtPlayer {
       const deliver = stageable(fn, source, cost, buffer);
       return (datagram: ObjectDatagram): void => {
         const receipt = datagram.status === undefined
-          ? this.captureVideoPayload(BigInt(datagram.trackAlias), datagram.payload.byteLength, conn) : undefined;
+          ? this.captureVideoPayload(BigInt(datagram.trackAlias), datagram.payload.byteLength, conn,
+            { groupId: BigInt(datagram.groupId), objectId: BigInt(datagram.objectId) }) : undefined;
         deliver(datagram, receipt);
       };
     };
@@ -14458,17 +14467,21 @@ export class MoqtPlayer {
       && a.automatic === b.automatic && a.mode === b.mode && a.frameReader === b.frameReader && a.decoder === b.decoder && a.header === b.header && a.route() && b.route();
   }
 
-  private captureVideoPayload(alias: bigint, bytes: number, connection: MoqtConnection): {
+  private captureVideoPayload(alias: bigint, bytes: number, connection: MoqtConnection,
+    location?: { groupId: bigint; objectId: bigint }): {
     readonly owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'];
     readonly bytes: number; readonly nowUs: number;
+    readonly encode?: NonNullable<MoqtPlayer['videoEncodeRecord']>;
   } | undefined {
     const owner = this.captureVideoMeasurementOwner();
     if (!owner) { this.videoPayloadMeasurement = null; return; }
     if (owner.kind !== 'ordinary' || owner.connection !== connection || owner.alias !== alias) return;
+    // Bind the already-known entry before either callback-bearing clock runs.
+    const encode = location ? this.captureVideoEncodeObservation(owner, location) : undefined;
     const nowUs = this.clock.now();
     // An application clock may synchronously replace the selected output.
     if (!this.sameVideoMeasurementOwner(owner, this.captureVideoMeasurementOwner())) return;
-    return { owner, bytes, nowUs };
+    return { owner, bytes, nowUs, ...(encode && encode.captured?.() && encode.current() ? { encode } : {}) };
   }
 
   private recordVideoPayload(receipt: ReturnType<MoqtPlayer['captureVideoPayload']>): void {
@@ -14481,6 +14494,74 @@ export class MoqtPlayer {
       this.videoPayloadMeasurement = measurement;
     }
     measurement.rate.observe(bytes, nowUs);
+    // Only the direct live branches call this with a captured receipt; FETCH
+    // routing and parked/candidate replay never forward that token here.
+    if (receipt.encode?.captured?.() && receipt.encode.current()) {
+      this.videoEncodeRecord = { observation: receipt.encode.observation, current: receipt.encode.current };
+    }
+  }
+
+  /** Reuse the original selected receipt boundary; never date transformed/replayed input. */
+  private captureVideoEncodeObservation(owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'],
+    location: { groupId: bigint; objectId: bigint }): NonNullable<MoqtPlayer['videoEncodeRecord']> | undefined {
+    const selected = this._selection.video, source = this.timelineSource, timeline = this.timelineState;
+    const request = this.timelineRequestId, catalog = this._catalogState;
+    const configuration = this.installedCmafInit.get('video');
+    const epoch = this.mseOutputEpoch;
+    if (owner.kind !== 'ordinary' || !selected || !source || !timeline || request === null || !catalog
+        || !configuration || configuration.source !== owner.source || !owner.output || !owner.assembler
+        || source.connection !== owner.connection || !timeline.isLive
+        || (source.wireFormat !== 'msf-00' && source.wireFormat !== 'msf-01')) return;
+    const track = this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
+    const applicable = () => this._catalogState?.tracks.filter(t => t.packaging === 'mediatimeline'
+      && t.depends?.includes(selected.name) && sameNamespaceFields(trackNamespaceFields(t, this.config.namespace), selected.namespaceFields));
+    const candidates = applicable();
+    if (!track?.isLive || track.packaging !== 'cmaf' || candidates?.length !== 1
+        || candidates[0]!.name !== source.trackName || !sameNamespaceFields(source.namespace, selected.namespaceFields)
+        || !timeline.depends.includes(selected.name)) return;
+    const subscription = this.activeSubscriptions.get(request);
+    if (!subscription || subscription.trackAlias === null || subscription.trackName !== source.trackName
+        || !sameNamespaceFields(subscription.namespace ?? [], source.namespace)) return;
+    const route = owner.manager.captureRoute(subscription.trackAlias);
+    if (!route) return;
+    const entry = findEncodeAnchor(timeline, location.groupId, location.objectId);
+    if (!entry) return;
+    const applicableNow = () => {
+      const tracks = applicable(), video = this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
+      return video?.isLive === true && video.packaging === 'cmaf' && tracks?.length === 1
+        && tracks[0]!.name === source.trackName && tracks[0]!.isLive;
+    };
+    const current = () => this.timelineSource === source && this.timelineRequestId === request
+      && this.activeSubscriptions.get(request) === subscription && !this.terminalMediaSubscriptions.has(subscription)
+      && applicableNow() && this.installedCmafInit.get('video') === configuration
+      && this.mseOutputEpoch === epoch && !this.retypingMedia.has('video')
+      && !this.preparingMseSeek && !this.activeMseSeek && !this.preparingLocSeek && !this.activeLocSeek
+      && route() && this.sameVideoMeasurementOwner(owner, this.captureVideoMeasurementOwner());
+    if (!current()) return;
+    const receivedWallclockMs = Date.now();
+    const encodeToReceiptMs = receivedWallclockMs - entry.wallclockTime;
+    if (!Number.isFinite(receivedWallclockMs) || !Number.isFinite(encodeToReceiptMs)
+        || this.timelineState !== timeline || !current()) return;
+    const observation: VideoEncodeObservation = Object.freeze({
+      source: Object.freeze({ name: selected.name, namespaceFields: Object.freeze([...selected.namespaceFields]) }),
+      timeline: Object.freeze({ name: source.trackName, namespaceFields: Object.freeze([...source.namespace]) }),
+      location: Object.freeze({ groupId: location.groupId.toString(), objectId: location.objectId.toString() }),
+      mediaPtsMs: entry.mediaPts,
+      encodedWallclockMs: entry.wallclockTime, receivedWallclockMs, encodeToReceiptMs,
+    });
+    // State replacement during the second (monotonic) clock also cancels capture.
+    // Once committed, ordinary incremental timeline updates do not refresh it.
+    return { observation, current, captured: () => this.timelineState === timeline };
+  }
+
+  private readVideoEncodeObservation(): VideoEncodeObservation | null {
+    const record = this.videoEncodeRecord;
+    if (!record) return null;
+    if (!record.current()) {
+      if (this.videoEncodeRecord === record) this.videoEncodeRecord = null;
+      return null;
+    }
+    return record.observation;
   }
 
   private readVideoReceivedRate(): number | null {
@@ -14514,6 +14595,7 @@ export class MoqtPlayer {
   /** Retire receipts captured before a whole-output reset without changing media policy. */
   private retireVideoMeasurement(): void {
     this.videoMeasurementMode = {};
+    this.videoEncodeRecord = null;
     this.videoPayloadMeasurement = null;
     this.videoGroupCadence = null;
     this.videoDeliveryLag = null;

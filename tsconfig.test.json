@@ -24,6 +24,8 @@
     "scripts/net-shaper/schedule-test-artifacts.test.ts",
     "scripts/player-acceptance/observer.test.ts",
     "examples/_tests/player-acceptance/main.ts",
+    "packages/player/src/player-encode-observation.loopback.test.ts",
+    "packages/player/src/encode-anchor.test.ts",
     "vitest.config.ts",
     "vitest.shaper-performance.config.ts",
     "scripts/net-shaper/cli.test.ts",

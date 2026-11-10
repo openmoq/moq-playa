@@ -18,6 +18,25 @@
 
 import type { VideoPlaybackQualityStats } from './interfaces.js';
 
+/** Publisher-declared explicit encode anchor at an ordinary playing selected live
+ * CMAF Object receipt. Excludes FETCH, local replay, staged candidates, seek-live,
+ * paused playback, and ambiguous timelines. Receipt precedes transforms and is
+ * not proof of media usability, capture time, decoding, presentation, or clock
+ * synchronization. The fixed signed difference may be negative. Unknown or
+ * unindexed Objects do not refresh this historical record; owner retirement
+ * clears it.
+ */
+export interface VideoEncodeObservation {
+  readonly source: { readonly namespaceFields: readonly string[]; readonly name: string };
+  readonly timeline: { readonly namespaceFields: readonly string[]; readonly name: string };
+  /** Exact decimal IDs keep the public stats snapshot JSON-serializable. */
+  readonly location: { readonly groupId: string; readonly objectId: string };
+  readonly mediaPtsMs: number;
+  readonly encodedWallclockMs: number;
+  readonly receivedWallclockMs: number;
+  readonly encodeToReceiptMs: number;
+}
+
 // ─── TTFF Breakdown ──────────────────────────────────────────────────
 
 /**
@@ -73,6 +92,8 @@ export interface PlayerStats {
    * May be negative. Null without a measurement; not end-to-end latency.
    */
   readonly captureTimestampAgeMs?: number | null;
+  /** Exact explicit anchor already known at original receipt; null without qualified evidence. */
+  readonly videoEncodeObservation?: VideoEncodeObservation | null;
   /** Target latency from MSF catalog (ms). @see draft-ietf-moq-msf-00 §5.1.16 */
   readonly targetLatencyMs: number;
   /** Cumulative active playback time (ms). Excludes paused/stalled time. */
