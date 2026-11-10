@@ -109,7 +109,7 @@ to start audio. `Player` exposes `audioActivation: 'gesture'` and
 `prepareAudio()` / `unmute()` for application-controlled activation.
 
 **Decode paths:**
-- **LOC (Low Overhead Container)** — WebCodecs direct path, lowest latency. H.264, HEVC, AV1. Parses LOC-04 and LOC-01 properties; preserves LOC-01 output unless `locVersion: 4` is selected.
+- **LOC (Low Overhead Container)** — WebCodecs direct path, lowest latency. H.264, HEVC, AV1. Parses LOC-05, LOC-04 and LOC-01 properties; preserves LOC-01 output unless `locVersion: 4` or `5` is selected.
 - **CMAF (fragmented MP4)** — MSE + `<video>` path, broader compatibility.
 - **LOCMAF (Low Overhead CMAF)** - reconstructs CMAF chunks for MSE by default,
   or extracts coded samples for WebCodecs with `locmafDecoding: 'frame'` in
@@ -409,6 +409,7 @@ object; the higher-level `Player` instead emits `severity`, `code` and `message`
 - **draft-ietf-moq-transport-14** — Red5/moq-rs interop (`draftVersion: 14`)
 - **draft-ietf-moq-msf-00** — Catalog, track selection, ABR (`altGroup`), timeline
 - **draft-ietf-moq-msf-01** - Independent catalogs, op-array deltas and referenced initialization data; catalog bootstrap uses Joining FETCH on drafts 14/16/18 and fills on draft 22
+- **draft-ietf-moq-loc-05** — Low Overhead Container, LOC-04 plus the Codec String property (0x11); `locVersion: 5` to emit
 - **draft-ietf-moq-loc-04** — Low Overhead Container (Timestamp + Timescale, Video Frame Marking, Audio Config); `locVersion: 4` to emit
 - **draft-ietf-moq-loc-01** — Low Overhead Container (CaptureTimestamp, VideoFrameMarking); auto-detected on parse, default on encode
 - **draft-ietf-moq-cmsf-00** — CMAF Streaming Format (moof+mdat, MSE path)
@@ -423,7 +424,7 @@ supported profiles and security boundaries.
 ### Draft version selection
 
 LOC and transport versions are independent. The broadcast example explicitly
-selects LOC-04; `?loc=1` selects LOC-01. Library encoding remains LOC-01 by
+selects LOC-04; `?loc=1` selects LOC-01 and `?loc=5` selects LOC-05, which repeats the catalog's codec string on every object. Library encoding remains LOC-01 by
 default. A LOC-04 Timescale makes timestamps media-relative; conversion to
 LOC-01 requires an application-provided wall-clock anchor, not just unit scaling.
 LOC support here covers public properties and clear payloads. Secure Objects,

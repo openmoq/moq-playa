@@ -743,6 +743,37 @@ describe('MediaPublisher — LOC version', () => {
     expect(parseLocHeaders(ext).version).toBe(4);
   });
 
+  it('emits the LOC-05 Codec String on every object of each track', async () => {
+    const conn = recordingConnection();
+    const pub = makePublisher(conn, { locVersion: 5, codecStrings: { video: 'avc1.42001f', audio: 'opus' } });
+    pub.setVideoAlias(2n);
+    pub.setAudioAlias(3n);
+    pub.publishVideo(chunk(1), kf());
+    pub.publishVideo(chunk(2), delta());
+    pub.publishAudio(Uint8Array.from([1]), { timestampUs: 1_000_000 });
+    await settle();
+    const parsed = conn.sends.map((send) => parseLocHeaders(send.extensions!));
+    expect(parsed.length).toBe(3);
+    expect(parsed.every((headers) => headers.version === 5)).toBe(true);
+    expect(parsed.filter((headers) => headers.codecString === 'avc1.42001f').length).toBe(2);
+    expect(parsed.filter((headers) => headers.codecString === 'opus').length).toBe(1);
+  });
+
+  it('leaves the Codec String out of LOC-04 and when no codec string is given', async () => {
+    const withLoc4 = recordingConnection();
+    const pub4 = makePublisher(withLoc4, { locVersion: 4, codecStrings: { audio: 'opus' } });
+    pub4.setAudioAlias(3n);
+    pub4.publishAudio(Uint8Array.from([1]), { timestampUs: 1_000_000 });
+    const withoutCodec = recordingConnection();
+    const pub5 = makePublisher(withoutCodec, { locVersion: 5 });
+    pub5.setAudioAlias(3n);
+    pub5.publishAudio(Uint8Array.from([1]), { timestampUs: 1_000_000 });
+    await settle();
+    expect(parseLocHeaders(withLoc4.sends[0]!.extensions!)).toMatchObject({ version: 4 });
+    expect(parseLocHeaders(withLoc4.sends[0]!.extensions!).codecString).toBeUndefined();
+    expect(parseLocHeaders(withoutCodec.sends[0]!.extensions!).codecString).toBeUndefined();
+  });
+
   it('emits LOC-01 when locVersion is 1', async () => {
     const conn = recordingConnection();
     const pub = makePublisher(conn, { locVersion: 1 });

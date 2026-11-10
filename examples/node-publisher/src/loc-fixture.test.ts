@@ -168,6 +168,21 @@ describe('prepared LOC samples', () => {
     expect(headers.timescale).toBeUndefined();
   });
 
+  it('carries the catalog codec as the LOC-05 Codec String on every object', () => {
+    for (const track of [video(), opusTrack()]) {
+      const prepared = prepareLocTrack(track);
+      for (const independent of [true, false]) {
+        const headers = parseLocHeaders(locFrameProperties(prepared, { offsetTicks: 0n, independent }, 0, 5, 'media', epoch), wire);
+        expect(headers).toMatchObject({ version: 5, codecString: track.meta.codec });
+      }
+    }
+  });
+
+  it('emits no Codec String before LOC-05', () => {
+    const prepared = prepareLocTrack(video());
+    expect(parseLocHeaders(locFrameProperties(prepared, { offsetTicks: 0n, independent: true }, 0, 4, 'media', epoch), wire).codecString).toBeUndefined();
+  });
+
   it('rejects media time for LOC-01 before anything can be emitted', () => {
     expect(() => locFrameProperties(prepareLocTrack(video()), { offsetTicks: 0n, independent: true }, 0, 1, 'media', epoch)).toThrow(/LOC-01/);
   });

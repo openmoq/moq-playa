@@ -2,7 +2,7 @@
  * LOC (Low Overhead Container) type definitions.
  *
  * All types correspond to fields defined in draft-ietf-moq-loc-01 and
- * draft-ietf-moq-loc-04.
+ * draft-ietf-moq-loc-04 and draft-ietf-moq-loc-05.
  * Each field is annotated with the spec section that defines it.
  *
  * @see draft-ietf-moq-loc-01
@@ -12,7 +12,7 @@
 // ─── Versions and property IDs ──────────────────────────────────────
 
 /** Supported LOC draft dialects. */
-export type LocVersion = 1 | 4;
+export type LocVersion = 1 | 4 | 5;
 
 /**
  * LOC-01 property IDs. Even IDs carry integer values; odd IDs carry
@@ -49,6 +49,17 @@ export const Loc04PropertyId = {
     AUDIO_CONFIG: 0x0f,
     /** Frame timestamp in Timescale units. @see loc-04 §2.3.1.1 */
     TIMESTAMP: 0x10,
+} as const;
+
+/**
+ * Property IDs that LOC-05 adds to the LOC-04 set. The LOC-04 ids keep their
+ * meaning.
+ *
+ * @see draft-ietf-moq-loc-05 §6.1
+ */
+export const Loc05PropertyId = {
+    /** UTF-8 WebCodecs codec string. Odd ID: carries bytes. @see loc-05 §2.3.1.3 */
+    CODEC_STRING: 0x11,
 } as const;
 
 /** @deprecated Use {@link Loc01PropertyId}. Kept so existing imports compile. */
@@ -181,6 +192,12 @@ export interface LocHeaders {
      */
     readonly audioConfig?: Uint8Array;
     /**
+     * WebCodecs codec string (for example `avc1.42001f`), carried as UTF-8.
+     * LOC-05 only: encoding it under another version throws.
+     * @see draft-ietf-moq-loc-05 §2.3.1.3
+     */
+    readonly codecString?: string;
+    /**
      * Raw Timestamp value as carried on the wire, in {@link timescale} units.
      * Under LOC-01 this equals {@link captureTimestamp}.
      * @see draft-ietf-moq-loc-04 §2.3.1.1
@@ -199,8 +216,9 @@ export interface LocHeaders {
      */
     readonly timestampIsWallClock?: boolean;
     /**
-     * Dialect detected on parse: 4 if any LOC-04-only id was present, 1 if
-     * only LOC-01 ids were present, undefined otherwise. Ignored on encode.
+     * Dialect detected on parse: 5 if a LOC-05-only id was present, else 4 if
+     * any LOC-04-only id was present, 1 if only LOC-01 ids were present,
+     * undefined otherwise. Ignored on encode.
      */
     readonly version?: LocVersion;
     /**
@@ -277,7 +295,7 @@ export interface AudioChunkInit {
 // ─── Track context ──────────────────────────────────────────────────
 
 /**
- * Track-scoped defaults for properties that draft-04 allows at Track scope.
+ * Track-scoped defaults for properties that draft-04 and draft-05 allow at Track scope.
  * Object-level values always win; these fill only what the object omitted.
  *
  * @see draft-ietf-moq-loc-04 §6.1 (Scope column)
@@ -286,4 +304,5 @@ export interface LocTrackContext {
     readonly timescale?: bigint;
     readonly videoConfig?: Uint8Array;
     readonly audioConfig?: Uint8Array;
+    readonly codecString?: string;
 }

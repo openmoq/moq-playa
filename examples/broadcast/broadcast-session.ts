@@ -72,7 +72,15 @@ export class BroadcastSession {
     this.connection = connection;
     this.opts = opts;
     this.wrapInt = opts.publisher.wrapInt;
-    this.publisher = new MediaPublisher(connection, opts.publisher);
+    // The catalog's codecs ride as the LOC-05 Codec String unless the caller set them.
+    this.publisher = new MediaPublisher(connection, {
+      ...opts.publisher,
+      codecStrings: {
+        video: opts.catalog.videoCodec,
+        ...(opts.catalog.audio ? { audio: 'opus' } : {}),
+        ...opts.publisher.codecStrings,
+      },
+    });
   }
 
   /**

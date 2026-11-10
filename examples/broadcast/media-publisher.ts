@@ -74,8 +74,15 @@ export interface MediaPublisherOptions {
    *  the mandatory FIRST_OBJECT subgroup bit. Typed (not `number`) so an
    *  unsupported draft cannot silently inherit draft-16 LOC behavior. */
   draft: DraftVersion;
-  /** LOC draft to emit: 1 (default) or 4. */
+  /** LOC draft to emit: 1 (default), 4 or 5. */
   locVersion?: LocVersion;
+  /**
+   * WebCodecs codec strings for the LOC-05 Codec String property, which rides
+   * on every object of the track. Ignored for LOC-01 and LOC-04. Pass the
+   * strings the catalog advertises so the two agree.
+   * @see draft-ietf-moq-loc-05 §2.3.1.3
+   */
+  codecStrings?: { video?: string; audio?: string };
   /**
    * Wall clock in microseconds since the Unix epoch, used to anchor each
    * track's capture timestamp. Injectable for tests. Default:
@@ -118,6 +125,7 @@ export class MediaPublisher {
   private readonly wrapInt: (n: bigint) => unknown;
   private readonly draft: DraftVersion;
   private readonly locVersion: LocVersion;
+  private readonly codecStrings: { video?: string; audio?: string };
   private readonly wallClockUs: () => number;
   /** Per-track WebCodecs-to-wall-clock offset, fixed at the first capture observation. */
   private videoTsOffsetUs: number | null = null;
@@ -173,7 +181,8 @@ export class MediaPublisher {
     this.wrapInt = options.wrapInt;
     this.draft = options.draft;
     this.locVersion = options.locVersion ?? 1;
-    if (this.locVersion !== 1 && this.locVersion !== 4) throw new Error('Unsupported LOC version');
+    if (this.locVersion !== 1 && this.locVersion !== 4 && this.locVersion !== 5) throw new Error('Unsupported LOC version');
+    this.codecStrings = options.codecStrings ?? {};
     this.wallClockUs = options.wallClockUs ?? (() => Date.now() * 1000);
     this.onError = options.onError ?? (() => {});
     this.onCounts = options.onCounts ?? null;
@@ -377,6 +386,12 @@ export class MediaPublisher {
     if (!this.stopped) this.toWallClockUs(track, timestampUs);
   }
 
+  /** The LOC-05 Codec String of a track; no other LOC version carries one. */
+  private codecStringFor(track: 'video' | 'audio'): { codecString?: string } {
+    const codecString = this.codecStrings[track];
+    return this.locVersion === 5 && codecString ? { codecString } : {};
+  }
+
   private locOptions() {
     return { wireProfile: locWireProfileForDraft(this.draft), locVersion: this.locVersion };
   }
@@ -411,6 +426,7 @@ export class MediaPublisher {
         temporalId: 0,
       },
       ...(meta.videoConfig ? { videoConfig: meta.videoConfig } : {}),
+      ...this.codecStringFor('video'),
     }, this.locOptions());
   }
 
@@ -472,6 +488,7 @@ export class MediaPublisher {
     if (alias === null) return;
     const extensions = encodeLocHeaders({
       captureTimestamp: this.toWallClockUs('audio', meta.timestampUs),
+      ...this.codecStringFor('audio'),
     }, this.locOptions());
     // Audio: one object per group (independently decodable, LOC §4.1);
     // audio gets higher priority (lower value) than video.

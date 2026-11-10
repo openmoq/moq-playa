@@ -55,7 +55,7 @@ export function prepareLocTrack(track: LoadedTrack) {
   }
   if (!groups.length) throw new Error(`${track.meta.name}: no encoded samples`);
   return { name: track.meta.name, video, groups, timescale: context.timescale,
-    spanTicks: nextDecode! - firstDecode!, videoConfig,
+    spanTicks: nextDecode! - firstDecode!, videoConfig, codec: track.meta.codec,
     mediaOriginTicks: track.meta.preserveMediaTimeOrigin ? firstDecode! : 0n };
 }
 
@@ -71,6 +71,8 @@ export function locFrameProperties(track: ReturnType<typeof prepareLocTrack>, fr
         discardable: false, baseLayerSync: false, temporalId: 0 },
       ...(frame.independent ? { videoConfig: track.videoConfig! } : {}),
     } : {}),
+    // LOC-05 repeats the codec on every object, as the catalog advertises it.
+    ...(version === 5 ? { codecString: track.codec } : {}),
   }, { locVersion: version, wireProfile: 'd18-delta-vi64' })!;
 }
 

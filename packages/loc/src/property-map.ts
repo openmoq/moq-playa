@@ -16,11 +16,12 @@
  *
  * @see draft-ietf-moq-loc-01 §2.3
  * @see draft-ietf-moq-loc-04 §2.3
+ * @see draft-ietf-moq-loc-05 §2.3
  * @module
  */
 
 import type { PropertyEntry, PropertyMap } from '@openmoq/transport';
-import { Loc01PropertyId, Loc04PropertyId } from './types.js';
+import { Loc01PropertyId, Loc04PropertyId, Loc05PropertyId } from './types.js';
 import type { LocHeaders, LocExtensionValue, LocTrackContext, LocVersion, VideoFrameMarking, AudioLevel } from './types.js';
 import { parseVideoFrameMarking, encodeVideoFrameMarking, parseVideoFrameMarkingBytes, encodeVideoFrameMarkingBytes } from './video.js';
 import { parseAudioLevel, encodeAudioLevel } from './audio.js';
@@ -42,15 +43,24 @@ const ID04 = {
   timestamp: BigInt(Loc04PropertyId.TIMESTAMP),
 } as const;
 
+const ID05 = {
+  codecString: BigInt(Loc05PropertyId.CODEC_STRING),
+} as const;
+
 const MICROS_PER_SECOND = 1_000_000n;
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
+const UTF8_ENCODER = new TextEncoder();
+// A UTF-16 surrogate without its pair: TextEncoder would silently turn it into U+FFFD.
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 
 type Mutable = { -readonly [K in keyof LocHeaders]: LocHeaders[K] };
 
 /**
- * Interpret an ordered {@link PropertyMap} as LOC headers from either draft.
+ * Interpret an ordered {@link PropertyMap} as LOC headers from any supported draft.
  *
  * One pass collects LOC-01 and LOC-04 candidates separately. Any LOC-04-only id
- * makes the block version 4, and LOC-01 candidates then go to `unknown`, since
+ * makes the block version 4, and the LOC-05 Codec String (0x11) makes it
+ * version 5, which reads like version 4 otherwise. LOC-01 candidates then go to `unknown`, since
  * they no longer identify those fields in LOC-04 (0x02 is a Secure Objects
  * KeyID, for example). Only LOC-01 ids means
  * version 1. Duplicate known ids resolve last-wins. Track context fills only
@@ -58,6 +68,7 @@ type Mutable = { -readonly [K in keyof LocHeaders]: LocHeaders[K] };
  *
  * @see draft-ietf-moq-loc-01 §2.3
  * @see draft-ietf-moq-loc-04 §2.3, §6.1
+ * @see draft-ietf-moq-loc-05 §2.3.1.3
  */
 export function resolveLocHeaders(propertyMap: PropertyMap, track?: LocTrackContext): LocHeaders {
   // LOC-01 candidates
@@ -70,11 +81,14 @@ export function resolveLocHeaders(propertyMap: PropertyMap, track?: LocTrackCont
   let vfm04: Uint8Array | undefined;
   let al04: bigint | undefined;
   let audioConfig: Uint8Array | undefined;
+  // LOC-05
+  let codecBytes: Uint8Array | undefined;
   // Shared
   let videoConfig: Uint8Array | undefined;
   let unknown: Map<bigint, LocExtensionValue> | undefined;
   let saw01 = false;
   let saw04 = false;
+  let saw05 = false;
 
   for (const { id, value } of propertyMap) {
     if (typeof value === 'bigint') {
@@ -92,6 +106,7 @@ export function resolveLocHeaders(propertyMap: PropertyMap, track?: LocTrackCont
         case ID04.videoConfig: videoConfig = value; break;
         case ID04.videoFrameMarking: vfm04 = value; saw04 = true; break;
         case ID04.audioConfig: audioConfig = value; saw04 = true; break;
+        case ID05.codecString: codecBytes = value; saw05 = true; break;
         default: (unknown ??= new Map()).set(id, value); break;
       }
     }
@@ -104,8 +119,8 @@ export function resolveLocHeaders(propertyMap: PropertyMap, track?: LocTrackCont
   let videoFrameMarking: VideoFrameMarking | undefined;
   let audioLevel: AudioLevel | undefined;
 
-  if (saw04) {
-    version = 4;
+  if (saw04 || saw05) {
+    version = saw05 ? 5 : 4;
     if (saw01) {
       if (ts01 !== undefined) (unknown ??= new Map()).set(ID01.captureTimestamp, ts01);
       if (vfm01 !== undefined) (unknown ??= new Map()).set(ID01.videoFrameMarking, vfm01);
@@ -126,6 +141,14 @@ export function resolveLocHeaders(propertyMap: PropertyMap, track?: LocTrackCont
 
   videoConfig ??= track?.videoConfig;
   audioConfig ??= track?.audioConfig;
+  let codecString = track?.codecString;
+  if (codecBytes !== undefined && codecBytes.length > 0) {
+    try {
+      codecString = UTF8_DECODER.decode(codecBytes);
+    } catch {
+      throw new LocHeaderError('codecString', 'must be valid UTF-8');
+    }
+  }
 
   if (version !== undefined) out.version = version;
   if (timestamp !== undefined) {
@@ -147,6 +170,7 @@ export function resolveLocHeaders(propertyMap: PropertyMap, track?: LocTrackCont
   if (audioLevel !== undefined) out.audioLevel = audioLevel;
   if (videoConfig !== undefined) out.videoConfig = videoConfig;
   if (audioConfig !== undefined) out.audioConfig = audioConfig;
+  if (codecString !== undefined) out.codecString = codecString;
   if (unknown !== undefined) out.unknown = unknown;
   return out;
 }
@@ -156,17 +180,24 @@ export function resolveLocHeaders(propertyMap: PropertyMap, track?: LocTrackCont
  * the given LOC version. Layer A canonicalises the order, so entry order here
  * is not significant.
  *
- * Version 4: `timestamp` (else `captureTimestamp`) into 0x10; `timescale` into
+ * Versions 4 and 5: `timestamp` (else `captureTimestamp`) into 0x10; `timescale` into
  * 0x08 only when `timestamp` was the source. Version 1: wall-clock microseconds
  * into 0x02. Media time cannot be converted to wall-clock time without an anchor.
- * Fields that version 1 cannot carry throw {@link LocEncodeError}.
+ * Fields that version 1 cannot carry throw {@link LocEncodeError}. Version 5
+ * adds the Codec String (0x11), which no earlier version can carry.
  *
  * @see draft-ietf-moq-loc-01 §2.3
  * @see draft-ietf-moq-loc-04 §2.3
+ * @see draft-ietf-moq-loc-05 §2.3.1.3
  */
 export function locHeadersToPropertyMap(headers: LocHeaders, version: LocVersion = 1): PropertyEntry[] {
-  if (version !== 1 && version !== 4) {
-    throw new LocEncodeError('locVersion', 'must be 1 or 4');
+  if (version !== 1 && version !== 4 && version !== 5) {
+    throw new LocEncodeError('locVersion', 'must be 1, 4 or 5');
+  }
+  if (headers.codecString !== undefined) {
+    if (version !== 5) throw new LocEncodeError('codecString', 'requires LOC-05');
+    if (headers.codecString.length === 0) throw new LocEncodeError('codecString', 'must not be empty');
+    if (LONE_SURROGATE.test(headers.codecString)) throw new LocEncodeError('codecString', 'must be valid UTF-8');
   }
   if (headers.timescale !== undefined && headers.timescale <= 0n) {
     throw new LocEncodeError('timescale', 'must be positive');
@@ -184,7 +215,7 @@ export function locHeadersToPropertyMap(headers: LocHeaders, version: LocVersion
     emitted.add(id);
   };
 
-  if (version === 4) {
+  if (version === 4 || version === 5) {
     if (headers.timestamp !== undefined) {
       emit(ID04.timestamp, headers.timestamp);
       if (headers.timescale !== undefined) emit(ID04.timescale, headers.timescale);
@@ -204,6 +235,7 @@ export function locHeadersToPropertyMap(headers: LocHeaders, version: LocVersion
     }
     if (headers.videoConfig !== undefined) emit(ID04.videoConfig, headers.videoConfig);
     if (headers.audioConfig !== undefined) emit(ID04.audioConfig, headers.audioConfig);
+    if (headers.codecString !== undefined) emit(ID05.codecString, UTF8_ENCODER.encode(headers.codecString));
   } else {
     const micros = headers.captureTimestamp ?? headers.timestamp;
     if (micros !== undefined) emit(ID01.captureTimestamp, micros);

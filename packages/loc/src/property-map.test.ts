@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { PropertyEntry } from '@openmoq/transport';
-import { resolveLocHeaders } from './property-map.js';
-import { LocHeaderError } from './errors.js';
+import { locHeadersToPropertyMap, resolveLocHeaders } from './property-map.js';
+import { LocEncodeError, LocHeaderError } from './errors.js';
 
 const e = (id: number, value: bigint | Uint8Array): PropertyEntry => ({ id: BigInt(id), value });
 
@@ -135,5 +135,82 @@ describe('resolveLocHeaders — track context', () => {
 
     it('does not set version on its own', () => {
         expect(resolveLocHeaders([], { timescale: 1n }).version).toBeUndefined();
+    });
+});
+
+describe('LOC-05 Codec String (0x11)', () => {
+    const utf8 = (text: string) => new TextEncoder().encode(text);
+
+    it('0x11 makes the block version 5 and decodes as UTF-8', () => {
+        const h = resolveLocHeaders([e(0x10, 42n), e(0x11, utf8('avc1.42001f'))]);
+        expect(h.version).toBe(5);
+        expect(h.codecString).toBe('avc1.42001f');
+        expect(h.captureTimestamp).toBe(42n);
+        expect(h.unknown).toBeUndefined();
+    });
+
+    it('0x11 alone is version 5, and LOC-01 ids beside it become unknown', () => {
+        const h = resolveLocHeaders([e(0x02, 7n), e(0x11, utf8('opus'))]);
+        expect(h.version).toBe(5);
+        expect(h.codecString).toBe('opus');
+        expect(h.captureTimestamp).toBeUndefined();
+        expect(h.unknown?.get(0x02n)).toBe(7n);
+    });
+
+    it('a duplicate 0x11 resolves last-wins like other known ids', () => {
+        expect(resolveLocHeaders([e(0x11, utf8('opus')), e(0x11, utf8('mp4a.40.2'))]).codecString).toBe('mp4a.40.2');
+    });
+
+    it('decodes non-ASCII UTF-8', () => {
+        expect(resolveLocHeaders([e(0x11, utf8('caf\u00e9'))]).codecString).toBe('caf\u00e9');
+    });
+
+    it.each([
+        ['an invalid lead byte', [0xff]],
+        ['a truncated sequence', [0xe2, 0x82]],
+        ['an overlong form', [0xc0, 0x80]],
+        ['a surrogate', [0xed, 0xa0, 0x80]],
+    ])('rejects %s as malformed', (_name, bytes) => {
+        expect(() => resolveLocHeaders([e(0x11, Uint8Array.from(bytes))])).toThrow(LocHeaderError);
+    });
+
+    it('treats an empty value as absent', () => {
+        const h = resolveLocHeaders([e(0x10, 1n), e(0x11, new Uint8Array())]);
+        expect(h.version).toBe(5);
+        expect(h.codecString).toBeUndefined();
+    });
+
+    it('track context fills an omitted codec string; the object wins', () => {
+        expect(resolveLocHeaders([e(0x10, 1n)], { codecString: 'opus' }).codecString).toBe('opus');
+        expect(resolveLocHeaders([e(0x11, utf8('avc1.42001f'))], { codecString: 'opus' }).codecString).toBe('avc1.42001f');
+        expect(resolveLocHeaders([e(0x10, 1n)], { codecString: 'opus' }).version).toBe(4);
+    });
+
+    it('LOC-05 encodes 0x11 beside the LOC-04 properties', () => {
+        const entries = locHeadersToPropertyMap({ captureTimestamp: 5n, codecString: 'avc1.42001f' }, 5);
+        expect(entries).toEqual([
+            { id: 0x10n, value: 5n },
+            { id: 0x11n, value: utf8('avc1.42001f') },
+        ]);
+    });
+
+    it('only LOC-05 can carry a codec string', () => {
+        expect(() => locHeadersToPropertyMap({ codecString: 'opus' }, 4)).toThrow(/requires LOC-05/);
+        expect(() => locHeadersToPropertyMap({ codecString: 'opus' }, 1)).toThrow(LocEncodeError);
+    });
+
+    it('rejects an empty or non-UTF-8 codec string on encode', () => {
+        expect(() => locHeadersToPropertyMap({ codecString: '' }, 5)).toThrow(/empty/);
+        expect(() => locHeadersToPropertyMap({ codecString: 'a\ud800' }, 5)).toThrow(/UTF-8/);
+        expect(() => locHeadersToPropertyMap({ codecString: '\udc00a' }, 5)).toThrow(/UTF-8/);
+    });
+
+    it('LOC-05 without a codec string encodes exactly like LOC-04', () => {
+        const headers = { captureTimestamp: 5n, audioConfig: Uint8Array.from([1]) };
+        expect(locHeadersToPropertyMap(headers, 5)).toEqual(locHeadersToPropertyMap(headers, 4));
+    });
+
+    it('rejects an unknown LOC version', () => {
+        expect(() => locHeadersToPropertyMap({}, 6 as never)).toThrow(/1, 4 or 5/);
     });
 });
