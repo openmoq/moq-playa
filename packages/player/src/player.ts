@@ -91,6 +91,20 @@ import type { ObjectRoutingContext, ObjectRoutingDiscardReason, ObjectDeliveryAd
 import { SubscriptionManager, type TrackPackaging } from './subscription-manager.js';
 import { WarmStartHead } from './warm-start-head.js';
 
+interface LivenessRestart {
+  attempts: number;
+  active: boolean;
+  cancelled: boolean;
+  readonly connection: MoqtConnection;
+  readonly namespace: readonly string[];
+  readonly mediaType: 'video' | 'audio';
+  readonly trackName: string;
+  readonly ownsOutput: () => boolean;
+  requestId: bigint;
+  refusal: { retryInterval: bigint | null; atMs: number } | null;
+  failure: string | null;
+}
+
 interface WarmMediaRoute {
   readonly permit: (admission: ObjectDeliveryAdmission) => void;
   readonly work: Promise<void>;
@@ -1409,15 +1423,10 @@ export class MoqtPlayer {
   private readonly receivingVideoOwners = new Map<bigint, ReceivingVideoOwner>();
 
   /**
-   * Restart-ladder state per track, keyed `${mediaType}:${trackName}`
-   * (survives requestId/alias changes across full resubscribes).
+   * Restart state keyed by namespace fields, name and media type. A replacement
+   * keeps that identity while its request ID changes; the connection is owned.
    */
-  private readonly livenessRestarts = new Map<string, {
-    attempts: number;
-    active: boolean;
-    cancelled: boolean;
-    connection: MoqtConnection;
-  }>();
+  private readonly livenessRestarts = new Map<string, LivenessRestart>();
 
   /**
    * Media subscriptions pending SUBSCRIBE_OK: requestId → track info.
@@ -1973,8 +1982,10 @@ export class MoqtPlayer {
         };
         terminals.set(id, terminal);
         this.terminalMediaSubscriptions.add(sub);
-        const restart = this.livenessRestarts.get(`${sub.mediaType}:${sub.trackName}`);
-        if (restart) restart.cancelled = true;
+        const restart = this.livenessRestarts.get(JSON.stringify([
+          sub.namespace ?? namespaceFields(this.config.namespace), sub.trackName, sub.mediaType,
+        ]));
+        if (restart?.connection === conn && restart.requestId === id) restart.cancelled = true;
         this.livenessMonitor?.reconcile(this.collectLivenessTracks());
         return true;
 
@@ -12149,7 +12160,18 @@ export class MoqtPlayer {
               && largest.group >= owner.prefixStart.group) this.requestWarmRange(owner, _trackName);
         }
       },
-      onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode) => {
+      onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode, retryInterval) => {
+        // Latch the owning response before application callbacks can replace or
+        // cancel recovery. Errors for another request/session cannot end its probe.
+        for (const restart of this.livenessRestarts.values()) {
+          if (restart.connection === conn && restart.requestId === requestId
+              && restart.active && this.livenessLadderMayContinue(restart)) {
+            // Draft14 SUBSCRIBE_ERROR has no Retry Interval; its codec's zero
+            // placeholder is not a peer instruction against retry (draft14 §9.9).
+            restart.refusal = { retryInterval: conn.session.draftVersion === 14 ? null : retryInterval,
+              atMs: performance.now() };
+          }
+        }
         this._mediaSubsFailed++;
         this.emitter.emit('track_subscribe_failed', {
           type: 'track_subscribe_failed', trackName, mediaType, requestId, errorCode, reason,
@@ -14180,11 +14202,21 @@ export class MoqtPlayer {
   ): Promise<void> {
     const connection = this.connection;
     if (!this.mediaRecoveryOwnsConnection(connection)) return;
-    const key = `${track.mediaType}:${track.trackName}`;
+    const issued = this.activeSubscriptions.get(track.requestId);
+    if (!issued || this.terminalMediaSubscriptions.has(issued)) return;
+    const namespace = [...(issued.namespace ?? namespaceFields(this.config.namespace))];
+    const key = JSON.stringify([namespace, track.trackName, track.mediaType]);
     let restart = this.livenessRestarts.get(key);
-    if (!restart || restart.connection !== connection) {
+    if (!restart || restart.connection !== connection || !restart.ownsOutput()) {
       if (restart) restart.cancelled = true;
-      restart = { attempts: 0, active: false, cancelled: false, connection };
+      const output = this.selectedOutputOwners.get(track.mediaType);
+      const generation = this.bootstrapGeneration;
+      restart = { attempts: 0, active: false, cancelled: false, connection,
+        namespace, mediaType: track.mediaType, trackName: track.trackName,
+        requestId: track.requestId, refusal: null, failure: null,
+        ownsOutput: () => this.bootstrapGeneration === generation
+          && this.selectedOutputOwners.get(track.mediaType) === output,
+      };
       this.livenessRestarts.set(key, restart);
     }
     if (restart.active) return;
@@ -14217,6 +14249,8 @@ export class MoqtPlayer {
           if (!this.livenessLadderMayContinue(restart)) return;
         }
         const attemptStartMs = performance.now();
+        restart.refusal = null;
+        restart.failure = null;
         restart.attempts++;
         this.emitter.emit('recovery_action', {
           type: 'recovery_action',
@@ -14231,32 +14265,37 @@ export class MoqtPlayer {
         if (!this.livenessLadderMayContinue(restart)) return;
         this.flushForLivenessRestart(track);
         if (!this.livenessLadderMayContinue(restart)) return;
-        const refreshed = attempt === 1 && await this.tryRefreshSubscription(track);
+        const refreshed = attempt === 1 && await this.tryRefreshSubscription(track, restart);
         if (!this.livenessLadderMayContinue(restart)) return;
         if (refreshed) {
           this.log.info('Liveness: refreshed %s "%s" via REQUEST_UPDATE (attempt %d)',
             track.mediaType, track.trackName, attempt);
         } else {
           // Refresh unavailable/failed or a later attempt — full resubscribe.
-          this.fullResubscribeForLiveness(track);
+          await this.fullResubscribeForLiveness(track, restart);
         }
 
-        // Probe: did delivery resume? (A full resubscribe registers a new
-        // requestId — the probe matches by track name, not identity.)
-        if (await this.waitForTrackArrival(track, attemptStartMs, this.config.livenessTimeoutMs!, restart)) {
+        // A replacement updates the owned request ID before it reaches the wire.
+        if (await this.waitForTrackArrival(attemptStartMs, this.config.livenessTimeoutMs!, restart)) {
           this.log.info('Liveness: %s "%s" recovered on attempt %d',
             track.mediaType, track.trackName, attempt);
           return;
         }
+        // REQUEST_ERROR Retry Interval 0 advises against retrying as sent
+        // (draft18 §10.6, draft22 §9.4). Do not turn it into a fresh incident.
+        if (restart.failure || this.livenessRetryRefused(restart)) break;
       }
 
       if (this.livenessLadderMayContinue(restart)) {
+        const detail = restart.failure ?? (this.livenessRetryRefused(restart)
+          ? 'publisher refused automatic retry'
+          : `${restart.attempts} restart attempts failed`);
         this.emitError(createPlayerError(
           'fatal', 'connection', PlayerErrorCode.MEDIA_STARVED,
-          `Media delivery starved: ${track.mediaType} "${track.trackName}" — ` +
-          `${this.config.livenessMaxRestarts} restart attempts failed`,
+          `Media delivery starved: ${track.mediaType} "${track.trackName}" — ${detail}`,
           { context: { mediaType: track.mediaType, trackName: track.trackName } },
         ));
+        if (!this.livenessLadderMayContinue(restart)) return;
         if (this.stateMachine.state !== PlayerState.ERROR) {
           this.transitionState(PlayerState.ERROR);
         }
@@ -14498,37 +14537,47 @@ export class MoqtPlayer {
   }
 
   /** A waiting ladder must not resume against a replacement connection. */
-  private livenessLadderMayContinue(restart: { cancelled: boolean; connection: MoqtConnection }): boolean {
-    return !restart.cancelled && !this._destroyed
+  private livenessLadderMayContinue(restart: LivenessRestart): boolean {
+    return !restart.cancelled && !this._destroyed && restart.ownsOutput()
       && this.stateMachine.state === PlayerState.PLAYING
       && this.mediaRecoveryOwnsConnection(restart.connection);
   }
 
+  private livenessRetryRefused(restart: LivenessRestart): boolean {
+    return restart.refusal?.retryInterval === 0n;
+  }
+
   /** Cancellation-aware sleep (checks every 250ms). */
-  private async livenessSleep(ms: number, restart: { cancelled: boolean; connection: MoqtConnection }): Promise<void> {
+  private async livenessSleep(ms: number, restart: LivenessRestart): Promise<void> {
     const deadline = performance.now() + ms;
-    while (performance.now() < deadline) {
+    for (;;) {
       if (!this.livenessLadderMayContinue(restart)) return;
-      const remaining = deadline - performance.now();
-      await new Promise((r) => setTimeout(r, Math.min(250, Math.max(0, remaining))));
+      const now = performance.now();
+      const remaining = deadline - now;
+      const refusal = restart.refusal;
+      // Keep the wire integer exact, including values beyond Number.MAX_SAFE_INTEGER.
+      const retryRemaining = refusal?.retryInterval == null ? 0n : refusal.retryInterval - 1n
+        - BigInt(Math.max(0, Math.floor(now - refusal.atMs)));
+      if (remaining <= 0 && retryRemaining <= 0n) return;
+      const wait = Math.max(0, remaining, Number(retryRemaining > 250n ? 250n : retryRemaining));
+      await new Promise((r) => setTimeout(r, Math.min(250, wait)));
     }
   }
 
-  /** Poll for a post-restart arrival on the track (by name — identity may change). */
+  /** Poll only the current recovery request; another same-name track cannot satisfy it. */
   private async waitForTrackArrival(
-    track: LivenessTrack,
     sinceMs: number,
     timeoutMs: number,
-    restart: { cancelled: boolean; connection: MoqtConnection },
+    restart: LivenessRestart,
   ): Promise<boolean> {
     const deadline = performance.now() + timeoutMs;
     const pollMs = Math.min(250, Math.max(10, timeoutMs / 5));
     // Arrival is checked AFTER each sleep too — an object landing between
     // the final poll and the deadline must count as recovery.
     for (;;) {
-      if (!this.livenessLadderMayContinue(restart)) return false;
-      const last = this.livenessMonitor?.lastArrivalForTrack(track.trackName, track.mediaType);
-      if (last !== undefined && last > sinceMs) return true;
+      if (!this.livenessLadderMayContinue(restart) || restart.refusal || restart.failure) return false;
+      const last = this.livenessMonitor?.lastArrivalForRequest(restart.requestId);
+      if (last !== undefined && last >= sinceMs) return true;
       const remaining = deadline - performance.now();
       if (remaining <= 0) return false;
       await new Promise((r) => setTimeout(r, Math.min(pollMs, remaining)));
@@ -14582,22 +14631,20 @@ export class MoqtPlayer {
    * refresh or the update fails — e.g. draft-18 throws when the
    * subscription's request stream died with the delivery path (§9.11).
    */
-  private async tryRefreshSubscription(track: LivenessTrack): Promise<boolean> {
-    const connection = this.connection;
-    if (!this.mediaRecoveryOwnsConnection(connection)) return false;
-    const matching = [...this.activeSubscriptions.entries()].filter(([, sub]) =>
-      sub.trackName === track.trackName && sub.mediaType === track.mediaType && !this.terminalMediaSubscriptions.has(sub));
-    if (matching.length === 0) return false;
+  private async tryRefreshSubscription(track: LivenessTrack, restart: LivenessRestart): Promise<boolean> {
+    const connection = restart.connection;
+    if (!this.livenessLadderMayContinue(restart)) return false;
+    const sub = this.activeSubscriptions.get(restart.requestId);
+    if (!sub || sub.trackName !== track.trackName || sub.mediaType !== track.mediaType
+        || !sameNamespaceFields(sub.namespace ?? namespaceFields(this.config.namespace), restart.namespace)
+        || this.terminalMediaSubscriptions.has(sub)) return false;
     try {
-      for (const [requestId] of matching) {
-        if (!this.mediaRecoveryOwnsConnection(connection)) return false;
-        await connection.requestUpdate(varint(requestId), {
-          subscriptionFilter: { type: 'NextGroupStart' },
-        });
-      }
-      return this.mediaRecoveryOwnsConnection(connection);
+      await connection.requestUpdate(varint(restart.requestId), {
+        subscriptionFilter: { type: 'NextGroupStart' },
+      });
+      return this.livenessLadderMayContinue(restart);
     } catch (err) {
-      if (!this.mediaRecoveryOwnsConnection(connection)) return false;
+      if (!this.livenessLadderMayContinue(restart)) return false;
       this.log.warn('Liveness: REQUEST_UPDATE refresh failed for %s "%s" (%s) — escalating to resubscribe',
         track.mediaType, track.trackName, err instanceof Error ? err.message : String(err));
       return false;
@@ -14609,26 +14656,49 @@ export class MoqtPlayer {
    * Reuses the PUBLISH_DONE resubscribe machinery for the new SUBSCRIBE +
    * pipeline reset; outcome is observed by the caller's arrival probe.
    */
-  private fullResubscribeForLiveness(track: LivenessTrack): void {
-    const connection = this.connection;
-    if (!this.mediaRecoveryOwnsConnection(connection) || !this.subscriptionManager) return;
-    const issued = this.activeSubscriptions.get(track.requestId);
-    if (issued && this.terminalMediaSubscriptions.has(issued)) return;
-    const catalogTrack = issued === undefined ? undefined : this.catalogTrackFor(track.trackName,
-      issued.namespace ?? namespaceFields(this.config.namespace), track.mediaType);
+  private async fullResubscribeForLiveness(track: LivenessTrack, restart: LivenessRestart): Promise<void> {
+    const connection = restart.connection;
+    if (!this.livenessLadderMayContinue(restart) || !this.subscriptionManager) return;
+    const issued = this.activeSubscriptions.get(restart.requestId);
+    if (issued && this.terminalMediaSubscriptions.has(issued)) { restart.cancelled = true; return; }
+    const catalogTrack = this.catalogTrackFor(track.trackName, restart.namespace, track.mediaType);
+    if (!catalogTrack) { restart.failure = 'track is no longer in the catalog'; return; }
+    const cancellations: Promise<void>[] = [];
     for (const [requestId, sub] of [...this.activeSubscriptions.entries()]) {
       if (sub.trackName !== track.trackName || sub.mediaType !== track.mediaType
-        || (issued !== undefined && !sameNamespaceFields(
-          sub.namespace ?? namespaceFields(this.config.namespace),
-          issued.namespace ?? namespaceFields(this.config.namespace)))) continue;
-      if (!this.mediaRecoveryOwnsConnection(connection)) return;
+          || !sameNamespaceFields(sub.namespace ?? namespaceFields(this.config.namespace), restart.namespace)) continue;
+      if (!this.livenessLadderMayContinue(restart)) return;
       this.retireMediaSubscription(requestId, connection);
-      if (!this.mediaRecoveryOwnsConnection(connection)) return;
-      // Async — a sync try/catch would let the rejection escape. Best-effort:
-      // the request stream may have died with the delivery path.
-      void connection.unsubscribe(varint(requestId)).catch(() => { /* gone */ });
+      if (!this.livenessLadderMayContinue(restart)) return;
+      // A peer-terminated request may already be absent from the SDK while
+      // its last player route is still armed. There is nothing left to cancel.
+      if (connection.session.getSubscription(requestId) !== undefined) {
+        cancellations.push(connection.unsubscribe(varint(requestId)));
+      }
     }
-    if (this.mediaRecoveryOwnsConnection(connection)) this.replaceSubscription(track.trackName, 'liveness', catalogTrack);
+    // This orders local cancellation before new emission, not peer processing:
+    // cancellation and the new request can still arrive on different streams.
+    const outcome: { value: 'pending' | 'done' | 'failed' } = { value: 'pending' };
+    let wake: (() => void) | undefined;
+    void Promise.all(cancellations).then(() => { outcome.value = 'done'; wake?.(); },
+      () => { outcome.value = 'failed'; wake?.(); });
+    // Zero disables starvation monitoring; it is not a zero-duration
+    // budget for retiring an already-issued request.
+    const retirementTimeoutMs = this.config.livenessTimeoutMs! > 0
+      ? this.config.livenessTimeoutMs!
+      : (this.config.connectionTimeoutMs! > 0 ? this.config.connectionTimeoutMs! : 10_000);
+    const deadline = performance.now() + retirementTimeoutMs;
+    while (outcome.value === 'pending' && this.livenessLadderMayContinue(restart)) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) break;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await new Promise<void>(resolve => { wake = resolve; timer = setTimeout(resolve, Math.min(250, remaining)); });
+      if (timer !== undefined) clearTimeout(timer);
+      wake = undefined;
+    }
+    if (!this.livenessLadderMayContinue(restart)) return;
+    if (outcome.value !== 'done') { restart.failure = 'local subscription retirement did not complete'; return; }
+    this.replaceSubscription(track.trackName, 'liveness', catalogTrack, restart);
   }
 
   /**
@@ -14647,13 +14717,16 @@ export class MoqtPlayer {
     trackName: string,
     cause: 'too_far_behind' | 'liveness',
     issuedTrack?: CatalogTrack,
+    restart?: LivenessRestart,
   ): void {
     if (!this.mediaRecoveryOwnsConnection(this.connection) || !this.subscriptionManager || !this._catalogState) return;
     const operationConn = this.connection;
     const generation = this.bootstrapGeneration;
+    const attempt = restart?.attempts;
     const live = (): boolean => this.connection === operationConn && this.bootstrapGeneration === generation
       && !this._destroyed && !this.isTerminalState() && this.subscriptionManager !== null
-      && this.mediaRecoveryOwnsConnection(operationConn);
+      && this.mediaRecoveryOwnsConnection(operationConn)
+      && (restart === undefined || (restart.active && restart.attempts === attempt && this.livenessLadderMayContinue(restart)));
 
     // Don't resurrect the OLD track during a make-before-break switch —
     // that would fight the switch by resubscribing to a track we're
@@ -14704,6 +14777,7 @@ export class MoqtPlayer {
       this.pendingAliasBinds.add(id);
       this.activeSubscriptions.set(id, { trackName, mediaType, trackAlias: null, namespace: ns });
       this.pendingMediaSubs.set(id, { trackName, mediaType, packaging });
+      if (restart) restart.requestId = id;
     };
     // Start through the CAPTURED connection and attach both observers before
     // publishing: a recovery listener may synchronously destroy or migrate the
@@ -14715,6 +14789,8 @@ export class MoqtPlayer {
       const reqIdBigInt = BigInt(reqId);
       if (!live()) return;
       registerResub(reqIdBigInt);
+      // A same-turn REQUEST_ERROR can retire the entry before the write settles.
+      if (!this.activeSubscriptions.has(reqIdBigInt)) return;
 
       this.log.info('Resubscribed %s "%s" requestId=%s after %s',
         mediaType, trackName, reqIdBigInt, cause);
@@ -14725,10 +14801,12 @@ export class MoqtPlayer {
         requestId: reqIdBigInt,
       });
     }).catch((err: unknown) => {
+      if (!live()) return;
       if (resubRegisteredId !== null) {
         this.retireMediaSubscription(resubRegisteredId, resubConn);
       }
-      const failure = err instanceof Error ? err : new Error(String(err));
+      if (restart) restart.failure = 'replacement subscription could not be sent';
+      const failure = err instanceof Error ? err : new Error('Subscription send failed');
       this.log.warn('Resubscribe "%s" failed: %s', trackName, failure.message);
       this.emitError(createPlayerError(
         'degraded', 'connection', PlayerErrorCode.CONNECTION_LOST,

@@ -17,6 +17,7 @@
   // `*.test.ts` corpus predates any typecheck gate and does not compile clean
   // under these options; widening this include is a separate cleanup.
   "include": [
+    "packages/player/src/player-publisher-return.loopback.test.ts",
     "packages/player/src/player-switch-history-drain.test.ts",
     "packages/player/src/player-switch-history-retirement.test.ts",
     "packages/player/src/warm-start-range-boundaries.test.ts",

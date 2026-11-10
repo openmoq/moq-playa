@@ -116,7 +116,7 @@ export interface ControlMessageContext {
   /** Called when SUBSCRIBE_OK matches a pending media subscription. @see §9.10 */
   onMediaSubscribeOk?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', largest: { group: bigint; object: bigint } | null) => void;
   /** Called when REQUEST_ERROR matches a pending media subscription. @see §9.8 */
-  onMediaSubscribeError?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', reason: string, errorCode: bigint) => void;
+  onMediaSubscribeError?: (requestId: bigint, trackName: string, mediaType: 'video' | 'audio', reason: string, errorCode: bigint, retryInterval: bigint) => void;
   /** Called when PUBLISH_DONE arrives — player can re-subscribe if needed. */
   onPublishDone?: (requestId: bigint, trackName: string, trackAlias: bigint | null, statusCode: bigint, errorReason: string) => void;
   /** Consume a media terminal while its accepted data is still draining. No default retirement/event when true. */
@@ -351,7 +351,7 @@ export function handleControlMessage(
         ctx.removeSubscription(errReqId);
         if (pendingMedia.mediaType === 'video' || pendingMedia.mediaType === 'audio') {
           ctx.onMediaSubscribeError?.(errReqId, pendingMedia.trackName, pendingMedia.mediaType,
-            msg.errorReason ?? '', BigInt(msg.errorCode));
+            msg.errorReason ?? '', BigInt(msg.errorCode), msg.retryInterval);
         }
       }
 

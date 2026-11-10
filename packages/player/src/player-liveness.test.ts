@@ -28,7 +28,7 @@ import type { DataStreamTerminal } from '@openmoq/webtransport';
 function createMockAdapter() {
   let nextRequestId = 1n;
   const adapter: any = {
-    session: { state: 'established', close: vi.fn(() => []) },
+    session: { state: 'established', close: vi.fn(() => []), getSubscription: vi.fn(() => ({ state: 'established' })) },
     onMessage: null,
     onClose: null,
     onError: null,

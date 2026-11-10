@@ -163,6 +163,11 @@ export class MediaLivenessMonitor {
     }
   }
 
+  /** Arrival stamp owned by one request, never borrowed from a same-name track. */
+  lastArrivalForRequest(requestId: bigint): number | undefined {
+    return this.entries.get(requestId)?.lastArrivalMs;
+  }
+
   /** Newest arrival stamp for a track name (restart-ladder probe). */
   lastArrivalForTrack(trackName: string, mediaType: 'video' | 'audio'): number | undefined {
     let newest: number | undefined;

@@ -329,7 +329,7 @@ describe('handleControlMessage', () => {
     ctx.activeSubscriptions.set(5n, { trackName: 'video', trackAlias: null });
 
     const msg: ControlMessage = {
-      type: 'REQUEST_ERROR', requestId: 5n,
+      type: 'REQUEST_ERROR', requestId: 5n, retryInterval: 0n,
       errorCode: 0x10n, errorReason: 'Track not found',
     };
     handleControlMessage(msg, ctx);
@@ -337,7 +337,7 @@ describe('handleControlMessage', () => {
     expect(ctx.pendingMediaSubs.size).toBe(0);
     expect(ctx.activeSubscriptions.size).toBe(0);
     expect(unregisterTrack).not.toHaveBeenCalled();
-    expect(onMediaSubscribeError).toHaveBeenCalledWith(5n, 'video', 'video', 'Track not found', 0x10n);
+    expect(onMediaSubscribeError).toHaveBeenCalledWith(5n, 'video', 'video', 'Track not found', 0x10n, 0n);
   });
 
   it('ignores unhandled message types', () => {
