@@ -54,7 +54,7 @@ describe('LOC version compatibility', () => {
             .toThrow(LocHeaderError);
     });
 
-    it.each([0, 2, 3, 5, NaN, Infinity])('rejects unsupported LOC version %s', (version) => {
+    it.each([0, 2, 3, 6, NaN, Infinity])('rejects unsupported LOC version %s', (version) => {
         expect(() => encodeLocHeaders({ captureTimestamp: 42n }, { locVersion: version as LocVersion }))
             .toThrow(LocEncodeError);
     });

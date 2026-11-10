@@ -67,14 +67,16 @@ export interface LocHeaderOptions {
     /**
      * LOC draft to emit. Encode only; parse auto-detects. Default 1.
      * Version 1 cannot carry Timescale, Audio Config, or TL0PICIDX and
-     * throws {@link LocEncodeError} for them.
+     * throws {@link LocEncodeError} for them. Only version 5 carries a
+     * Codec String.
      *
      * @see draft-ietf-moq-loc-04 §6.1
+     * @see draft-ietf-moq-loc-05 §6.1
      */
     readonly locVersion?: LocVersion;
 
     /**
-     * Track-scoped defaults (Timescale, Video Config, Audio Config). Parse
+     * Track-scoped defaults (Timescale, Video Config, Audio Config, Codec String). Parse
      * only. Object-level values always win.
      *
      * @see draft-ietf-moq-loc-04 §6.1 (Scope column)
@@ -112,7 +114,7 @@ export function locWireProfileForDraft(draft: number): PropertyWireProfile {
  * `{ deltaEncoded: false }` for draft-14 absolute type IDs, or
  * `{ wireProfile: 'd18-delta-vi64' }` for draft-18.
  *
- * Accepts LOC-01 and LOC-04 property sets; see `LocHeaders.version`.
+ * Accepts LOC-01, LOC-04 and LOC-05 property sets; see `LocHeaders.version`.
  *
  * @param extensions Raw extension bytes from `MoqtObjectData.extensions`
  * @param options Parsing options (defaults to draft-16 delta)
@@ -138,7 +140,8 @@ export function parseLocHeaders(
  * stable ascending-ID order, minimal integer encodings. Returns undefined if no
  * headers are present.
  *
- * Preserves LOC-01 output by default. Pass `locVersion: 4` for LOC-04.
+ * Preserves LOC-01 output by default. Pass `locVersion: 4` for LOC-04 or
+ * `locVersion: 5` for LOC-05.
  *
  * @param headers Structured LOC headers
  * @param options Encoding options (defaults to draft-16 delta)

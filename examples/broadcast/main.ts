@@ -36,7 +36,8 @@ const params = new URLSearchParams(window.location.search);
 const videoCodec = params.get('codec') ?? 'avc1.42001f'; // Baseline Level 3.1 (720p)
 const videoBitrate = parseInt(params.get('bitrate') ?? '2000', 10) * 1000;
 const keyframeInterval = parseInt(params.get('keyframe') ?? '60', 10);
-const locVersion = params.get('loc') === '1' ? 1 : 4;
+const locParam = params.get('loc');
+const locVersion = locParam === '1' ? 1 : locParam === '5' ? 5 : 4;
 
 // ─── Settings modal ──────────────────────────────────────────────────
 

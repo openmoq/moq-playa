@@ -24,7 +24,7 @@ export type {
     AudioChunkInit,
 } from './types.js';
 
-export { LocExtensionId, Loc01PropertyId, Loc04PropertyId } from './types.js';
+export { LocExtensionId, Loc01PropertyId, Loc04PropertyId, Loc05PropertyId } from './types.js';
 export { LocHeaderError, LocEncodeError } from './errors.js';
 
 // ─── Header parsing ─────────────────────────────────────────────────

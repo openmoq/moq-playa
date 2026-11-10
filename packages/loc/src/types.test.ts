@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { Loc01PropertyId, Loc04PropertyId, LocExtensionId } from './types.js';
+import { Loc01PropertyId, Loc04PropertyId, Loc05PropertyId, LocExtensionId } from './types.js';
 import { LocHeaderError, LocEncodeError } from './errors.js';
 
 describe('LOC property id tables', () => {
@@ -17,6 +17,10 @@ describe('LOC property id tables', () => {
         expect(Loc04PropertyId.AUDIO_LEVEL).toBe(0x0c);
         expect(Loc04PropertyId.VIDEO_CONFIG).toBe(0x0d);
         expect(Loc04PropertyId.AUDIO_CONFIG).toBe(0x0f);
+    });
+
+    it('LOC-05 adds the Codec String at 0x11 (odd: bytes)', () => {
+        expect(Loc05PropertyId.CODEC_STRING).toBe(0x11);
     });
 
     it('LocExtensionId is the LOC-01 table (deprecated alias)', () => {
