@@ -37,7 +37,8 @@ const tabId = chrome.devtools.inspectedWindow.tabId;
 /** view port → { frames, hostUnacked, pendingHost, stalled, stalledUnacked, exportUnacked, pendingExport } */
 const views = new Map();
 /** Everything before the carrier exists: capability, origin, permission, injection, connection. */
-let outer = { stage: 'idle', detail: null, origin: null, pattern: null, missing: [] };
+/** `granted`: whether the origin's host permission is known to be held (null until checked), so the panel can word the idle state truthfully. */
+let outer = { stage: 'idle', detail: null, origin: null, pattern: null, missing: [], granted: null };
 let core = null;
 let tabPort = null;
 let relayReady = false;
@@ -52,6 +53,84 @@ let lastHello = null;
 let pendingSwitch = null;
 let destroyed = false;
 let panelVisible = false;
+/**
+ * Automatic attachment. An origin the user has ALREADY granted attaches on its own as soon as the panel is open,
+ * once per inspected document (navigation, reload, same-origin replacement each count as a new document; the attempt
+ * is given back only when the last view closes before it completes), and the single exposed source is selected without
+ * a click (one automatic choice per discovery, never a per-source history). The first grant always comes from the panel's own Attach
+ * click, because Chrome shows the permission prompt only on a user gesture. Detach turns automatic attachment OFF
+ * for that origin for the rest of this DevTools document; the next manual Attach turns it back on. A failed
+ * automatic attempt is not retried: the manual path stays available.
+ */
+let autoEpoch = -1;
+const AUTO_LOAD_WAIT_MS = 250, AUTO_LOAD_WAIT_TRIES = 40;
+const detachedOrigins = new Set();
+/**
+ * The one automatic source choice for the CURRENT discovery (a hello), as that hello's sequence number: a discovery gets
+ * one automatic choice, a failed attach from it is not retried, and every fresh hello (manual re-arm, withdrawal
+ * refresh, source replacement) is a new decision. One number, never a history.
+ */
+let autoChoiceHello = -1;
+const AUTO_DETAIL_LOADING = 'attaching once the page has finished loading', AUTO_DETAIL_ATTACHING = 'attaching (origin already granted)';
+/**
+ * The one automatic preparatory operation (permission check, load wait), or null. It is reserved BEFORE its first
+ * await (so overlapping triggers cannot start two), owns its timer, and is invalidated by a user Detach, the loss of
+ * the last view, a navigation and the owner's destruction; every await re-checks it is still the current one.
+ */
+let autoOp = null;
+/** Count of page-lane hello frames: a withdrawal decides only on a hello that arrived AFTER its rediscover. */
+let helloSeq = 0;
+/** One coalesced rediscover per withdrawal; `decided` once the fresh hello has been judged (no retry loop). */
+let withdrawal = null;
+function cancelAutoOp(releaseReservation, only = null) {
+  // `only`: cancel just THAT operation; a late failure of a superseded operation must never touch its successor.
+  if (!autoOp || (only !== null && autoOp !== only)) return;
+  const op = autoOp; autoOp = null;
+  if (op.timer) clearTimeout(op.timer);
+  if (releaseReservation && autoEpoch === op.epoch) autoEpoch = -1;
+  clearAutoDetail();
+  publish();
+}
+/** A detail the automatic operation wrote describes nothing once that operation is gone. */
+function clearAutoDetail() { if (outer.detail === AUTO_DETAIL_LOADING || outer.detail === AUTO_DETAIL_ATTACHING) outer = { ...outer, detail: null }; }
+function autoCurrent(op) {
+  return autoOp === op && op.epoch === originEpoch && !destroyed && !attempt && !tabPort && views.size > 0
+    && outer.stage === 'ready' && outer.origin === op.origin && !detachedOrigins.has(op.origin);
+}
+async function maybeAutoAttach() {
+  if (autoOp || destroyed || attempt || tabPort || views.size === 0) return;
+  if (outer.stage !== 'ready' || !outer.origin || !outer.pattern) return;
+  if (detachedOrigins.has(outer.origin) || autoEpoch === originEpoch) return;
+  const op = { epoch: originEpoch, origin: outer.origin, pattern: outer.pattern, timer: null };
+  autoOp = op; autoEpoch = op.epoch; publish();   // this document's one automatic attempt is reserved from here
+  const drop = () => { if (autoOp === op) { autoOp = null; clearAutoDetail(); publish(); } };
+  let granted = false;
+  try { granted = await chrome.permissions.contains({ origins: [op.pattern] }); } catch { cancelAutoOp(true, op); return; }
+  if (!autoCurrent(op)) { drop(); return; }
+  if (!granted) { setOuter({ granted: false }); cancelAutoOp(true, op); return; }   // nothing consumed: the prompt needs the user's click
+  setOuter({ granted: true });
+  // The page's bridge installs with the page's own scripts; injecting while the document is still loading would
+  // discover nothing and spend the one automatic attempt. Wait (bounded) until the tab reports it has finished loading.
+  for (let i = 0; i < AUTO_LOAD_WAIT_TRIES; i++) {
+    let status = null;
+    try { status = (await chrome.tabs.get(tabId))?.status ?? null; } catch { drop(); return; }
+    if (!autoCurrent(op)) { drop(); return; }
+    if (status !== 'loading') break;
+    if (i === 0) setOuter({ detail: AUTO_DETAIL_LOADING });
+    await new Promise(r => { op.timer = setTimeout(() => { op.timer = null; r(); }, AUTO_LOAD_WAIT_MS); });
+    if (!autoCurrent(op)) { drop(); return; }
+  }
+  // Hand over to the attach itself, which stays an AUTOMATIC attempt: it is cancelled like the preparation was
+  // (last view gone, user Detach, navigation) until the relay answers and the carrier owns the connection.
+  autoOp = null;
+  outer = { ...outer, detail: AUTO_DETAIL_ATTACHING };
+  await attach(op.origin, true);
+}
+function autoSelect(source) {
+  if (!core || autoChoiceHello === helloSeq) return false;   // this discovery already had its one automatic choice
+  autoChoiceHello = helloSeq;
+  return core.attach(source.sourceId, source.runId);
+}
 /** The owner-local Probe (its own transport, registry and carrier loop); created on the first Start. */
 let probeOwner = null;
 let probeLastError = null;
@@ -66,7 +145,8 @@ let originEpoch = 0;
 
 function setOuter(patch) { outer = { ...outer, ...patch }; publish(); }
 function publish() {
-  const payload = { kind: 'host', ownerId, tabId, panelVisible, outer, core: core ? core.state : null, probe: probeOwner ? probeOwner.state : null, probeLastError };
+  // `detached`: the user pressed Detach on this origin; automatic attachment is off for it until a manual Attach.
+  const payload = { kind: 'host', ownerId, tabId, panelVisible, outer: { ...outer, detached: outer.origin !== null && detachedOrigins.has(outer.origin), auto: autoOp !== null || attempt?.automatic === true }, core: core ? core.state : null, probe: probeOwner ? probeOwner.state : null, probeLastError };
   for (const [port, v] of views) sendHost(port, v, payload);
 }
 function sendExport(port, v, payload) {
@@ -82,7 +162,15 @@ function sendHost(port, v, payload) {
 function post(port, message) {
   try { port.postMessage(message); } catch { dropView(port); }
 }
-function dropView(port) { views.delete(port); try { port.disconnect(); } catch { /* already gone */ } }
+function dropView(port) { views.delete(port); try { port.disconnect(); } catch { /* already gone */ } viewsChanged(); }
+/** Nobody is watching: automatic work (preparation or attempt) stops; manual attempts and an established carrier continue. */
+function viewsChanged() {
+  if (views.size !== 0) return;
+  cancelAutoOp(true);
+  // View loss is not a failure: the document's automatic attempt is given back, so the next view that opens starts it
+  // afresh. A failed attempt stays spent (no automatic loop) and a user Detach stays sticky.
+  if (attempt?.automatic) { cancelAttempt('the panel went away'); autoEpoch = -1; }
+}
 
 // ── Capability and origin ───────────────────────────────────────────────────
 function missingApis() {
@@ -123,7 +211,10 @@ async function refreshOrigin(retries = 5) {
   if (destroyed) return null;
   if (origin === null) { setOuter({ stage: 'unsupported-origin', origin: null, pattern: null, detail: 'the inspected document has no canonical http(s) origin' }); return null; }
   const settled = ['idle', 'unsupported', 'unsupported-origin', 'origin-mismatch'].includes(outer.stage) ? 'ready' : outer.stage;
-  setOuter({ stage: settled, origin, pattern: `${origin}/*`, missing: [] });
+  // A navigation's transitional detail does not describe the settled new document; the grant is re-checked per origin.
+  const detail = settled === 'ready' && outer.detail === 'the page navigated' ? null : outer.detail;
+  setOuter({ stage: settled, origin, pattern: `${origin}/*`, missing: [], detail, granted: origin === outer.origin ? outer.granted : null });
+  void maybeAutoAttach();
   return origin;
 }
 
@@ -132,9 +223,12 @@ function cancelAttempt(why) {
   if (!attempt) return;
   const a = attempt; attempt = null;
   a.cancelled = why;
-  if (a.port && tabPort !== a.port) { try { a.port.disconnect(); } catch { /* already gone */ } }
+  // A port the attempt opened but the relay has not yet answered on belongs to the attempt: close it with the attempt,
+  // so a late relay-ready cannot bootstrap a carrier nobody asked for. (A ready carrier has no attempt any more.)
+  if (a.port) { if (tabPort === a.port) { tabPort = null; relayReady = false; } try { a.port.disconnect(); } catch { /* already gone */ } }
   // The panel must not stay "Attaching…" for an attempt that can no longer complete.
   if (outer.stage === 'injecting' || outer.stage === 'connecting') setOuter({ stage: 'ready', detail: why });
+  else if (a.automatic) { clearAutoDetail(); setOuter({ detail: why }); }
 }
 /** True when this attempt may still act; otherwise it must stop without touching state. */
 function current(a) { return attempt === a && !a.cancelled && !destroyed; }
@@ -143,10 +237,10 @@ function current(a) { return attempt === a && !a.cancelled && !destroyed; }
  * @param requestedOrigin the origin the panel showed and requested permission for; it must equal the
  *   origin this owner currently believes it is inspecting, or nothing happens.
  */
-async function attach(requestedOrigin) {
+async function attach(requestedOrigin, automatic = false) {
   if (attempt) { setOuter({ detail: 'an attach attempt is already in progress' }); return; }
   if (tabPort && relayReady) { rebootstrap(); return; }
-  const a = { id: ++attemptSerial, origin: null, pattern: null, cancelled: null, port: null };
+  const a = { id: ++attemptSerial, origin: null, pattern: null, cancelled: null, port: null, automatic };
   attempt = a;
   const origin = await refreshOrigin();
   if (!current(a)) return;
@@ -161,7 +255,8 @@ async function attach(requestedOrigin) {
   try { granted = await chrome.permissions.contains({ origins: [a.pattern] }); }
   catch (e) { if (current(a)) { attempt = null; setOuter({ stage: 'unsupported', detail: `permissions.contains failed: ${e?.message ?? e}` }); } return; }
   if (!current(a)) return;
-  if (!granted) { attempt = null; setOuter({ stage: 'needs-permission', detail: `grant access to ${origin} to attach` }); return; }
+  if (!granted) { attempt = null; setOuter({ stage: 'needs-permission', detail: `grant access to ${origin} to attach`, granted: false }); return; }
+  setOuter({ granted: true });
   // The ACTUAL current top URL must still have the granted origin before anything is injected.
   let tab;
   try { tab = await chrome.tabs.get(tabId); } catch (e) { if (current(a)) { attempt = null; setOuter({ stage: 'origin-unverified', detail: `tabs.get failed: ${e?.message ?? e}` }); } return; }
@@ -171,6 +266,7 @@ async function attach(requestedOrigin) {
   if (actual === null) { attempt = null; setOuter({ stage: 'origin-unverified', detail: 'the tab URL is not readable even after the grant; attach refused' }); return; }
   if (actual !== a.origin) { attempt = null; setOuter({ stage: 'origin-mismatch', detail: `the page is now ${actual}; discovery restarted`, origin: null, pattern: null }); void refreshOrigin(); return; }
   setOuter({ stage: 'injecting', detail: null });
+  if (!current(a)) return;   // publishing may have dropped the last view and, for an automatic attempt, cancelled it
   let documentId;
   try {
     const results = await chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ['relay.js'] });
@@ -179,6 +275,7 @@ async function attach(requestedOrigin) {
   // A navigation, disconnect or destruction during the injection invalidates this attempt entirely.
   if (!current(a)) return;
   setOuter({ stage: 'connecting' });
+  if (!current(a)) return;
   relayReady = false;
   let port;
   try { port = chrome.tabs.connect(tabId, documentId ? { documentId, name: RELAY_CHANNEL } : { frameId: 0, name: RELAY_CHANNEL }); }
@@ -249,13 +346,26 @@ function onCoreState(s, port) {
   if (s.phase === 'discovered' && pendingSwitch && core) {
     const sw = pendingSwitch; pendingSwitch = null;
     core.attach(sw.sourceId, sw.runId);
+  } else if (s.phase === 'discovered' && core && s.sources.length === 1 && outer.origin && !detachedOrigins.has(outer.origin)) {
+    // Exactly one exposed source and nothing attached: select it (once per source run). Several sources still ask.
+    autoSelect(s.sources[0]);
   }
+  if (s.phase === 'withdrawn' && core && tabPort === port) {
+    // The hello list in hand is the OLD one (it still names the withdrawn source). Ask the page once for a fresh
+    // list; choose only from the hello that answers, and only when exactly one source remains. A repeated notice,
+    // an empty fresh hello or a failed refresh never asks again: the pick list stays for the user.
+    if (!withdrawal) { withdrawal = { helloSeq, decided: false }; core.rediscover(); }
+    else if (!withdrawal.decided && helloSeq > withdrawal.helloSeq) {
+      withdrawal.decided = true;
+      if (s.sources.length === 1 && outer.origin && !detachedOrigins.has(outer.origin)) autoSelect(s.sources[0]);
+    }
+  } else if (s.phase !== 'withdrawn') withdrawal = null;
   publish();
 }
 function forwardFrame(encoded, lane) {
   // Classify by the decoded discriminant, never by a substring of the serialized text.
   const decoded = decodeMessage(encoded);
-  if (lane === 'page' && decoded.ok && decoded.message.kind === 'hello') lastHello = encoded;
+  if (lane === 'page' && decoded.ok && decoded.message.kind === 'hello') { lastHello = encoded; helloSeq++; }
   for (const [port, v] of views) {
     if (v.stalled) continue;
     if (v.frames >= VIEW_FRAME_BUDGET) {
@@ -290,7 +400,7 @@ chrome.runtime.onConnect.addListener(port => {
   if (!legitimateView(port) || views.size >= MAX_VIEWS) { try { port.disconnect(); } catch { /* already gone */ } return; }
   const v = { frames: 0, hostUnacked: false, pendingHost: null, stalled: false, stalledUnacked: false, exportUnacked: false, pendingExport: null };
   views.set(port, v);
-  port.onDisconnect.addListener(() => views.delete(port));
+  port.onDisconnect.addListener(() => { views.delete(port); viewsChanged(); });   // no view: no automatic start; the next view may begin one
   port.onMessage.addListener(m => {
     if (!m || typeof m !== 'object' || destroyed) return;
     switch (m.kind) {
@@ -310,9 +420,11 @@ chrome.runtime.onConnect.addListener(port => {
         if (v.stalled && !v.stalledUnacked && v.frames === 0) { v.stalled = false; core?.refresh(); probeOwner?.refresh(); }
         break;
       }
-      case 'attach': void attach(m.origin); break;
-      case 'reconnect': if (tabPort && relayReady) rebootstrap(); else void attach(m.origin); break;
-      case 'disconnect': disconnect('detached by the user'); break;
+      // A manual Attach/Reconnect is an explicit re-arm: it lifts a Detach for that origin, lets the single source be
+      // selected again, and supersedes any automatic preparation (the document's one automatic attempt stays spent).
+      case 'attach': if (typeof m.origin === 'string') detachedOrigins.delete(m.origin); autoChoiceHello = -1; cancelAutoOp(false); void attach(m.origin); break;
+      case 'reconnect': if (typeof m.origin === 'string') detachedOrigins.delete(m.origin); autoChoiceHello = -1; cancelAutoOp(false); if (tabPort && relayReady) rebootstrap(); else void attach(m.origin); break;
+      case 'disconnect': if (outer.origin) detachedOrigins.add(outer.origin); cancelAutoOp(false); disconnect('detached by the user'); break;
       case 'select': core?.attach(String(m.sourceId), String(m.runId)); break;
       case 'switch':
         if (!core) break;
@@ -342,17 +454,18 @@ chrome.runtime.onConnect.addListener(port => {
   if (core && lastHello) { v.frames++; post(port, { kind: 'frame', encoded: lastHello, lane: 'page' }); }
   if (core?.state.target) core.refresh();
   probeOwner?.resync();
+  void maybeAutoAttach();   // a panel that opens on an already granted origin attaches by itself
 });
 
 chrome.devtools.network.onNavigated.addListener(() => {
   // A navigation (also a same-origin replacement) ends the inspected document: no pending attempt, in-flight
   // origin read, receipt or attachment may apply to its successor.
-  originEpoch++;
+  originEpoch++; autoChoiceHello = -1; withdrawal = null; cancelAutoOp(true);
   cancelAttempt('the page navigated');
   disconnect('the page navigated');
   void refreshOrigin();
 });
-window.addEventListener('pagehide', () => { destroyed = true; cancelAttempt('DevTools closed'); disconnect('DevTools closed'); void probeOwner?.destroy(); });
+window.addEventListener('pagehide', () => { destroyed = true; cancelAutoOp(false); cancelAttempt('DevTools closed'); disconnect('DevTools closed'); void probeOwner?.destroy(); });
 
 chrome.devtools.panels.create('Playa', '', `panel.html?owner=${ownerId}&tab=${tabId}`, panel => {
   // Chrome keeps the iframe document visible even when another DevTools tab is selected. Carry the panel's

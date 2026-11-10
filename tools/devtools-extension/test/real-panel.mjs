@@ -217,8 +217,8 @@ if (evidence.fatal === null) {
         return { label: label?.textContent, value: value?.textContent, labelTitle: label?.title, valueTitle: value?.title };
       })()`);
       report.metricMeaning = meaning;
-      const expected = 'Observed receive bitrate for this source. (250 ms window)';
-      if (meaning.labelTitle !== expected || meaning.valueTitle !== expected || meaning.value !== '64000 bps') {
+      const expected = 'Observed receive bitrate for this source. (250 ms window) · exact 64000 bps';   // the tooltip keeps the unrounded value
+      if (meaning.labelTitle !== expected || meaning.valueTitle !== expected || meaning.value !== '64.0 kbps') {
         throw new Error(`available metric must expose its source definition and window on label and value: ${JSON.stringify(meaning)}`);
       }
 
@@ -234,13 +234,13 @@ if (evidence.fatal === null) {
       const hiddenState = await evaluate(panelSession, `({ hidden: document.hidden, metric: window.__playaPanel.vm.sparks.find(s => s.name === 'receive bitrate')?.now, applied: window.__playaPanel.applied.at(-1) })`);
       const whileHidden = await evaluate(panelSession, metricDom);
       report.visibility = { beforeHidden, whileHidden, hiddenState };
-      if (hiddenState.metric !== '128000 bps' || hiddenState.applied?.seq !== '12-12') throw new Error(`hidden panel stopped consuming observations: ${JSON.stringify(report.visibility)}`);
+      if (hiddenState.metric !== '128.0 kbps' || hiddenState.applied?.seq !== '12-12') throw new Error(`hidden panel stopped consuming observations: ${JSON.stringify(report.visibility)}`);
       if (whileHidden !== beforeHidden) throw new Error(`hidden panel updated its DOM: ${JSON.stringify(report.visibility)}`);
       await evaluate(hostSession, `(async () => { const UI = await import('./ui/legacy/legacy.js'); await UI.InspectorView.InspectorView.instance().showPanel(${JSON.stringify(opened.panelId)}); })()`);
       let shown;
-      for (let i = 0; i < 40; i++) { shown = await evaluate(panelSession, `({ hidden: document.hidden, value: ${metricDom} })`); if (!shown.hidden && shown.value === '128000 bps') break; await pause(50); }
+      for (let i = 0; i < 40; i++) { shown = await evaluate(panelSession, `({ hidden: document.hidden, value: ${metricDom} })`); if (!shown.hidden && shown.value === '128.0 kbps') break; await pause(50); }
       report.visibility.shown = shown;
-      if (shown.hidden || shown.value !== '128000 bps') throw new Error(`shown panel did not paint the latest observation: ${JSON.stringify(report.visibility)}`);
+      if (shown.hidden || shown.value !== '128.0 kbps') throw new Error(`shown panel did not paint the latest observation: ${JSON.stringify(report.visibility)}`);
     }
 
     // 4. Paint, let asynchronous errors surface, then screenshot the actual DevTools window.
@@ -287,11 +287,16 @@ if (evidence.fatal === null) {
       const wideFrom = 18446744073709551615n - 255n;
       // Batches must be contiguous: the restored snapshot is watermark 30 and its batch seq 31, so this one starts at 32.
       const base = 32;
-      const wide = { ...batchFixture, fromSeq: String(base), toSeq: String(base + 257), events: [
+      const wide = { ...batchFixture, fromSeq: String(base), toSeq: String(base + 258), events: [
         { ...batchFixture.events[0], seq: String(base), fact: { kind: 'track', trackId: 'video-long', identity: { namespace: ['6d65646961', '61766e'], name: '766964656f2d6c6f6e67' }, displayName: 'video-' + 'longexactlabel'.repeat(5), mediaType: 'video', codec: 'avc1.640028', packaging: 'cmaf' } },
         ...Array.from({ length: 256 }, (_, i) => ({ ...batchFixture.events[0], seq: String(base + 1 + i), fact: { ...batchFixture.events[0].fact, groupId: '3', objectId: (wideFrom + BigInt(i)).toString(), deliveryId: 'wide256-' + i, streamId: '18446744073709551615', subgroupId: '18446744073709551614' } })),
         // A FIN-derived bound at the top of the domain gives the wide row a genuinely long metadata value.
-        { ...batchFixture.events[0], seq: String(base + 257), fact: { kind: 'group_bound', sessionId: batchFixture.events[0].fact.sessionId, requestId: batchFixture.events[0].fact.requestId, trackId: batchFixture.events[0].fact.trackId, trackAlias: batchFixture.events[0].fact.trackAlias, groupId: '3', objectId: '18446744073709551615', bound: 'exclusive', evidence: 'end-of-group' } } ] };
+        { ...batchFixture.events[0], seq: String(base + 257), fact: { kind: 'group_bound', sessionId: batchFixture.events[0].fact.sessionId, requestId: batchFixture.events[0].fact.requestId, trackId: batchFixture.events[0].fact.trackId, trackAlias: batchFixture.events[0].fact.trackAlias, groupId: '3', objectId: '18446744073709551615', bound: 'exclusive', evidence: 'end-of-group' } },
+        // A reported-but-unavailable metric (joins the collapsed disclosure) with the source's exact reason wording.
+        { ...batchFixture.events[0], seq: String(base + 258), fact: { kind: 'metric', name: 'frames_decoded', sessionId: batchFixture.events[0].fact.sessionId, trackId: null, value: null, unavailable: 'unsupported', unit: 'count', windowMs: null, uncertaintyMs: null, definition: 'Actual video decoder output callbacks during the engine diagnostic tracker lifetime; unavailable without that callback, including MSE' } } ],
+        // The real-stream loss counters observed on the public showcase: this batch declares them as dropped events.
+        dropped: { dense: '38305', sparse: '4578' } };
+      wide.toSeq = String(base + 258 + 38305 + 4578);
       { const d = decodeMessage(encodeMessage(wide)); if (!d.ok) throw new Error(`wide fixture rejected: ${d.error.code}`); }
       await evaluate(panelSession, apply(encodeMessage(wide)));
       const columns = await evaluate(panelSession, `(() => [...document.querySelectorAll('#rows .row .cells')].map(c => c.querySelectorAll('.cell').length))()`);
@@ -319,13 +324,17 @@ if (evidence.fatal === null) {
         const selectedTracks = getComputedStyle(document.getElementById('selected')).gridTemplateColumns.trim().split(/\s+/).length;
         const metaWhiteSpace = getComputedStyle(document.querySelector('#rows .row .meta')).whiteSpace;
         const longestMeta = Math.max(...[...document.querySelectorAll('#rows .row .meta')].map(e => e.textContent.length));
-        return { innerWidth, innerHeight, tracks, rowsTop: rows.top, rowsBottom: rows.bottom, gridIntersects: rows.height > 0 && rows.top < innerHeight && rows.bottom > 0,
+        const bar = document.querySelector('.bar').getBoundingClientRect();
+        const chrome = { colsTop: cols.getBoundingClientRect().top, legendTop: document.getElementById('legend').getBoundingClientRect().top, ringTop: document.getElementById('ring').getBoundingClientRect().top, hostLineShown: !document.getElementById('hostLine').classList.contains('hidden') && getComputedStyle(document.getElementById('hostLine')).display !== 'none' };
+        return { innerWidth, innerHeight, tracks, chrome, rowsTop: rows.top, rowsBottom: rows.bottom, gridIntersects: rows.height > 0 && rows.top < innerHeight && rows.bottom > 0,
+          docScrollHeight: de.scrollHeight, docClientHeight: de.clientHeight, barTop: bar.top, regionOverflow: ['.left', '.center', '.right'].map(sel => getComputedStyle(document.querySelector(sel)).overflowY),
           docScrollWidth: de.scrollWidth, docClientWidth: de.clientWidth, bodyScrollWidth: document.body.scrollWidth, scrollTop: de.scrollTop, rows: rowInfo, order, clipped, clippedValues, selectedTracks, metaWhiteSpace, longestMeta }; })()`;
       const selectedExpr = `(() => { const s = document.getElementById('selected'); s.scrollIntoView({ block: 'nearest' }); const r = s.getBoundingClientRect();
         return { text: s.textContent.trim().slice(0, 160), inView: r.height > 0 && r.top >= 0 && r.bottom <= innerHeight, top: r.top, bottom: r.bottom }; })()`;
       const region = w => (w > 980 ? 3 : w > 640 ? 2 : 1);
       report.layout = { dock, passes: [] };
       let inset = null;   // window chrome: outer width − panel CSS width, derived once from the first pass
+      let passIndex = 0;
       for (const target of [1200, 800, 550]) {
         const requested = inset === null ? target : target + inset;
         const before = await evaluate(panelSession, 'innerWidth');
@@ -356,6 +365,9 @@ if (evidence.fatal === null) {
         if (m.tracks !== region(target)) problems.push(`.cols has ${m.tracks} column tracks, expected ${region(target)}`);
         if (!m.gridIntersects) problems.push(`the grid does not intersect the viewport at scrollTop 0 (rows top ${m.rowsTop}, viewport height ${m.innerHeight})`);
         if (m.docScrollWidth > m.docClientWidth || m.bodyScrollWidth > m.docClientWidth) problems.push(`the document overflows horizontally (${m.docScrollWidth}/${m.bodyScrollWidth} > ${m.docClientWidth})`);
+        // A pane: the document never scrolls; the toolbar is pinned at the top; regions scroll internally.
+        if (m.docScrollHeight > m.docClientHeight + 1) problems.push(`the document scrolls vertically (${m.docScrollHeight} > ${m.docClientHeight}); the panel must be a pane with internal region scrolling`);
+        if (Math.round(m.barTop) !== 0) problems.push(`the toolbar must stay pinned at the top (top ${m.barTop})`);
         if (m.rows.some(r => r.minCell < 3.5)) problems.push(`a cell collapsed below --cellMin: ${JSON.stringify(m.rows.map(r => r.minCell))}`);
         if (!m.rows.every(r => r.internalScroll)) problems.push(`a 256-column row has no internal horizontal scroller: ${JSON.stringify(m.rows)}`);
         if (region(target) === 1) { const top = Object.fromEntries(m.order.map(o => [o.region, o.top])); if (!(top.center < top.left && top.left < top.right)) problems.push(`narrow order must be center → left → right, got ${JSON.stringify(m.order)}`); }
@@ -373,7 +385,100 @@ if (evidence.fatal === null) {
         if (cascade.longestSelected < 20 || m.longestMeta < 40) problems.push(`the fixture's long values are missing (selected ${cascade.longestSelected} chars, meta ${m.longestMeta} chars)`);
         if (m.clipped.length) problems.push(`header text is clipped by its container (exact labels must wrap, never vanish): ${JSON.stringify(m.clipped)}`);
         if (!selected.text || !selected.inView) problems.push(`selected-object details unreachable after a real cell click: ${JSON.stringify(selected)}`);
+        // Loss disclosure: the hook stats carry the large real-stream counters at this width without clipping.
+        const stats = await evaluate(panelSession, `(() => { const e = document.getElementById('hookStats'); const r = e.getBoundingClientRect(); return { text: e.textContent, clipped: e.scrollWidth > e.clientWidth + 1, inViewport: r.left >= 0 && r.right <= innerWidth, title: e.title }; })()`);
+        if (!/drops 38305 dense · 4578 sparse · 1 batch/.test(stats.text) || stats.clipped || !stats.inViewport) problems.push(`loss counters must be visible and unclipped at ${target}px: ${JSON.stringify(stats)}`);
+        if (/panel evicted (\d+)/.test(stats.title) && !new RegExp(`panel ${RegExp.$1}`).test(stats.text)) problems.push(`the panel eviction count must stay visible: ${JSON.stringify(stats)}`);
+        if (!/delivery drops: 38305 dense · 4578 sparse/.test(stats.title)) problems.push(`the exact loss wording must remain the tooltip: ${stats.title}`);
+        // Metric reasons: a keyboard-operable disclosure, opened with a REAL key press (Tab focus + Enter via CDP), shows
+        // each unavailable metric's name and its exact reason without any hover.
+        const disclosure = await evaluate(panelSession, `(() => { const d = document.querySelector('.sparkNa'); const w = document.querySelector('.spark.na details.why'); return { list: d && d.tagName === 'DETAILS' ? { open: d.open, text: d.querySelector('summary')?.textContent ?? null } : null, why: w ? { open: w.open } : null }; })()`);
+        if (!disclosure.list || disclosure.list.open || !disclosure.why || disclosure.why.open) problems.push(`unavailable-metric disclosures must exist and start closed: ${JSON.stringify(disclosure)}`);
+        if (!problems.length) {   // the disclosures exist: operate them with real key presses
+        await evaluate(panelSession, `document.querySelector('.spark.na details.why > summary').focus(); document.activeElement.tagName`);
+        await rpc(panelSession, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' });
+        await rpc(panelSession, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+        await evaluate(panelSession, `document.querySelector('.sparkNa > summary').focus(); true`);
+        await rpc(panelSession, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' });
+        await rpc(panelSession, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+        const opened = await evaluate(panelSession, `(() => { const d = document.querySelector('.sparkNa'); const w = document.querySelector('.spark.na details.why'); const vm = window.__playaPanel.vms.page;
+          const first = vm.sparks.find(s => s.na); const extras = vm.sparks.slice(3).filter(s => s.na);
+          return { whyOpen: w.open, whyText: w.querySelector('.reason').textContent, whyExpected: first.na, whyDefinition: w.querySelector('.definition')?.textContent ?? null, whyDefinitionExpected: first.definition ?? null, listOpen: d.open,
+            items: [...d.querySelectorAll('.item')].map(i => ({ name: i.querySelector('.n').textContent, reason: i.querySelector('.reason').textContent, definition: i.querySelector('.definition')?.textContent ?? null })), expected: extras.map(s => ({ name: s.name, reason: s.na, definition: s.definition ?? null })),
+            clipped: [...d.querySelectorAll('.item > *')].some(e => e.scrollWidth > e.clientWidth + 1) }; })()`);
+        if (opened.whyDefinition !== opened.whyDefinitionExpected) problems.push(`the canonical unavailable disclosure must show the source definition: ${JSON.stringify({ shown: opened.whyDefinition, expected: opened.whyDefinitionExpected })}`);
+        if (opened.items.some(i => i.definition === null)) problems.push(`every listed unavailable metric must show its definition in the open body: ${JSON.stringify(opened.items)}`);
+        if (!opened.whyOpen || opened.whyText !== opened.whyExpected) problems.push(`the canonical unavailable reason must open from the keyboard with the exact source wording: ${JSON.stringify({ open: opened.whyOpen, text: opened.whyText, expected: opened.whyExpected })}`);
+        if (!opened.listOpen || JSON.stringify(opened.items) !== JSON.stringify(opened.expected) || opened.items.length === 0 || opened.clipped) problems.push(`the collapsed unavailable list must open from the keyboard and list every metric with its exact reason: ${JSON.stringify({ open: opened.listOpen, items: opened.items.length, expected: opened.expected.length, clipped: opened.clipped })}`);
+        // Lifetime: a REAL encoded continuation batch (the next contiguous seq, new metric samples for this source)
+        // must not close an opened explanation nor steal the keyboard focus from its summary.
+        const contSeq = Number(wide.toSeq) + 1 + 2 * passIndex;
+        const cont = { ...batchFixture, fromSeq: String(contSeq), toSeq: String(contSeq + 1), dropped: { dense: '0', sparse: '0' }, events: [
+          { ...batchFixture.events[0], seq: String(contSeq), fact: { kind: 'metric', name: 'receive_bitrate', sessionId: batchFixture.events[0].fact.sessionId, trackId: null, value: 96000 + passIndex * 100, unavailable: null, unit: 'bps', definition: 'bytes received per second', windowMs: 1000, uncertaintyMs: null } },
+          { ...batchFixture.events[0], seq: String(contSeq + 1), fact: { kind: 'metric', name: 'frames_decoded', sessionId: batchFixture.events[0].fact.sessionId, trackId: null, value: null, unavailable: 'unsupported', unit: 'count', windowMs: null, uncertaintyMs: null, definition: 'Actual video decoder output callbacks during the engine diagnostic tracker lifetime; unavailable without that callback, including MSE' } } ] };
+        { const dc = decodeMessage(encodeMessage(cont)); if (!dc.ok) throw new Error(`continuation fixture rejected: ${dc.error.code}`); }
+        await evaluate(panelSession, `document.querySelector('.sparkNa > summary').focus(); true`);   // focus rests on the list summary while the batch lands
+        await evaluate(panelSession, apply(encodeMessage(cont)));
+        await evaluate(panelSession, `new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))`);
+        const after = await evaluate(panelSession, `(() => { const d = document.querySelector('.sparkNa'); const w = document.querySelector('.spark.na details.why'); const a = document.activeElement;
+          return { listOpen: d?.open ?? null, whyOpen: w?.open ?? null, focusOnListSummary: !!(a && d && a === d.querySelector('summary')), bitrate: [...document.querySelectorAll('.spark')].find(s => s.querySelector('h4')?.textContent === 'receive bitrate')?.querySelector('.now')?.textContent ?? null }; })()`);
+        if (after.listOpen !== true || after.whyOpen !== true) problems.push(`an opened explanation must survive an accepted continuation batch: ${JSON.stringify(after)}`);
+        if (!after.focusOnListSummary) problems.push(`keyboard focus must stay on the disclosure summary across an accepted batch: ${JSON.stringify(after)}`);
+        if (after.bitrate !== `${(96 + passIndex / 10).toFixed(1)} kbps`) problems.push(`the continuation batch must still update the charts: ${JSON.stringify(after)}`);
+        await evaluate(panelSession, `document.querySelectorAll('details[open]').forEach(d => { d.open = false; }); true`);
+        }
         if (problems.length) throw new Error(`layout at ${target} CSS px: ${problems.join('; ')} — ${JSON.stringify(pass)}`);
+        passIndex++;
+      }
+      // 5c. SHORT DRAWER (a bottom dock) at the wide and the medium width, 450 px tall. The toolbar stays at the top, the
+      //     document never scrolls, the long left column scrolls inside its own region, and the grid is visible INSIDE
+      //     its clipping ancestors (.center and .cols), not merely inside the viewport: a present cell must lie within
+      //     that clip intersection and hit-test to itself (genuinely painted).
+      report.layout.short = [];
+      for (const width of [1200, 800]) {
+        await root.send('Browser.setWindowBounds', { windowId: devWindow, bounds: { windowState: 'normal', width: width + inset, height: 450 } });
+        for (let i = 0; i < 60; i++) { await pause(100); const d = await evaluate(panelSession, '({ w: innerWidth, h: innerHeight })'); if (d.h < 600 && d.w === width) break; }
+        await pause(300);
+        await evaluate(panelSession, `new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))`);
+        const short = await evaluate(panelSession, `(() => { const de = document.documentElement; de.scrollTop = 0; const rows = document.getElementById('rows').getBoundingClientRect(); const bar = document.querySelector('.bar').getBoundingClientRect();
+          const left = document.querySelector('.left'), center = document.querySelector('.center'), cols = document.querySelector('.cols'), right = document.querySelector('.right');
+          const clip = (a, b) => ({ top: Math.max(a.top, b.top), bottom: Math.min(a.bottom, b.bottom), left: Math.max(a.left, b.left), right: Math.min(a.right, b.right) });
+          const c = clip(clip(center.getBoundingClientRect(), cols.getBoundingClientRect()), { top: 0, bottom: innerHeight, left: 0, right: innerWidth });
+          const visible = clip(rows, c); const gridVisibleHeight = Math.max(0, visible.bottom - visible.top);
+          const cells = [...document.querySelectorAll('#rows .cell.key, #rows .cell.fast, #rows .cell.mid, #rows .cell.slow')];
+          const painted = cells.find(el => { const r = el.getBoundingClientRect(); const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+            return r.width > 0 && r.height > 0 && cx > c.left && cx < c.right && cy > c.top && cy < c.bottom && document.elementFromPoint(cx, cy) === el; });
+          const rr = right.getBoundingClientRect(), cr = center.getBoundingClientRect();
+          return { width: innerWidth, innerHeight, docScrollHeight: de.scrollHeight, docClientHeight: de.clientHeight, barTop: bar.top, rowsTop: rows.top, centerTop: cr.top, centerBottom: cr.bottom, rightTop: rr.top, rightBottom: rr.bottom,
+            gridVisibleHeight, paintedCell: painted ? painted.title : null, overlap: rr.top < cr.bottom && rr.left < cr.right && rr.right > cr.left && rr.bottom > cr.top && !(rr.left >= cr.right || rr.top >= cr.bottom),
+            leftScrolls: left.scrollHeight > left.clientHeight + 1, leftOverflow: getComputedStyle(left).overflowY, centerOverflow: getComputedStyle(center).overflowY, colsRows: getComputedStyle(cols).gridTemplateRows }; })()`);
+        // Internal scroll witness: the left region has a usable viewport, its scrollTop actually changes, previously
+        // offscreen content (the last decoder row) becomes reachable inside the region's rect, and the toolbar and
+        // document stay put. scrollHeight > clientHeight alone would accept a region collapsed to its padding.
+        const scrolled = await evaluate(panelSession, `(() => { const left = document.querySelector('.left'); const lr = left.getBoundingClientRect();
+          const last = document.querySelector('#decoder').lastElementChild; const before = last.getBoundingClientRect();
+          const inside = r => r.top >= lr.top - 0.5 && r.bottom <= lr.bottom + 0.5;
+          const wasInside = inside(before); const top0 = left.scrollTop; left.scrollTop = left.scrollHeight; const top1 = left.scrollTop;
+          const after = last.getBoundingClientRect(); const bar = document.querySelector('.bar').getBoundingClientRect();
+          const out = { clientHeight: left.clientHeight, scrollTop: [top0, top1], lastRowWasInside: wasInside, lastRowNowInside: inside(after), barTop: bar.top, docScrollTop: document.documentElement.scrollTop, docScrollHeight: document.documentElement.scrollHeight };
+          left.scrollTop = 0; return out; })()`);
+        short.leftScroll = scrolled;
+        const png = await rpc(hostSession, 'Page.captureScreenshot', { format: 'png' });
+        await writeFile(join(artifact, `actual-devtools-short-${width}.png`), Buffer.from(png.data, 'base64'));
+        report.layout.short.push(short);
+        const problems = [];
+        if (!(short.innerHeight < 600) || short.width !== width) problems.push(`the drawer did not become ${width}×short (got ${short.width}×${short.innerHeight})`);
+        if (short.docScrollHeight > short.docClientHeight + 1) problems.push(`short drawer: the document scrolls (${short.docScrollHeight} > ${short.docClientHeight})`);
+        if (Math.round(short.barTop) !== 0) problems.push(`short drawer: toolbar not pinned (top ${short.barTop})`);
+        if (short.gridVisibleHeight < 14) problems.push(`short drawer: the grid is clipped by its own region (visible ${short.gridVisibleHeight}px; rows top ${short.rowsTop}, center ${short.centerTop}–${short.centerBottom})`);
+        if (!short.paintedCell) problems.push(`short drawer: no present cell is painted inside the center's clip region`);
+        if (short.overlap) problems.push(`short drawer: the charts region overlaps the grid region (right top ${short.rightTop} < center bottom ${short.centerBottom})`);
+        if (!short.leftScrolls || short.leftOverflow !== 'auto') problems.push(`short drawer: the left column must scroll inside its own region: ${JSON.stringify({ leftScrolls: short.leftScrolls, leftOverflow: short.leftOverflow })}`);
+        const ls = short.leftScroll;
+        if (!(ls.clientHeight >= 80)) problems.push(`short drawer: the left region's viewport is not usable (${ls.clientHeight}px)`);
+        if (!(ls.scrollTop[1] > ls.scrollTop[0]) || ls.lastRowWasInside || !ls.lastRowNowInside) problems.push(`short drawer: scrolling the left region must reach previously offscreen content: ${JSON.stringify(ls)}`);
+        if (Math.round(ls.barTop) !== 0 || ls.docScrollTop !== 0 || ls.docScrollHeight > short.docClientHeight + 1) problems.push(`short drawer: region scrolling moved the toolbar or the document: ${JSON.stringify(ls)}`);
+        if (problems.length) throw new Error(`short drawer ${width}px: ${problems.join('; ')} — ${JSON.stringify(short)}`);
       }
     }
   } catch (e) { evidence.fatal = String(e && e.message || e); }

@@ -50,6 +50,16 @@ indexes preserve track and session identities across reattachment; they do
 not retain media. Detailed capture and its delivery queues have their own
 explicit event, byte and age limits.
 
+`receive_bitrate` targets a one-second span of cumulative payload-byte samples,
+with at most six samples retained. It keeps the baseline bracketing that target
+boundary so ordinary timer jitter cannot discard a whole burst. Its `windowMs`
+reports the actual interval: shorter at startup, or up to two seconds at a
+coarse sampling cadence. No first baseline, a counter reset, or a gap of more
+than one second between samples is `not-observed`, rather than a measured zero.
+An interval with unchanged bytes is zero. This rolling measurement smooths
+arrivals between quarter-second polls without interpolating bytes, claiming
+network capacity or constant object cadence, or diagnosing a playback stall.
+
 `sourceId` is stable for an engine lifetime; each connecting load attempt
 uses a fresh `runId` after the previous capture ends. Pausing and resuming an
 existing session does not start another run. A late attachment reads current

@@ -16,7 +16,7 @@ const bytes = (value: unknown): number => encoder.encode(JSON.stringify(value)).
 const defaults: CaptureLimits = {
   stateMaxEvents: 256, stateMaxBytes: 524288,
   historyMaxEvents: 2048, historyMaxBytes: 4194304, historyMaxAgeMs: 30000,
-  pendingMaxEvents: 128, pendingMaxBytes: 65536, maxAttachments: 8,
+  pendingMaxEvents: 1024, pendingMaxBytes: MAX_MESSAGE_BYTES - BATCH_ENVELOPE_BYTES, maxAttachments: 8,
 };
 
 interface Retained {

@@ -35,14 +35,15 @@ let receiptSerial = 0;
 const receipt = () => `${++receiptSerial}.${'ab'.repeat(16)}`;
 
 function ownerEnv() {
-  const runtimeConnect = event(), navigation = event(), panelShown = event(), panelHidden = event(), ports = [], injections = [], held = [], timers = [];
-  const state = { origin: 'https://a.example', url: 'https://a.example/', granted: true, hold: false };
+  const runtimeConnect = event(), navigation = event(), panelShown = event(), panelHidden = event(), ports = [], injections = [], held = [], timers = [], permissionHeld = [];
+  // `permissionHold`: permission checks are answered only when the test resolves them; `injectFail`: the next injection is refused once.
+  const state = { origin: 'https://a.example', url: 'https://a.example/', granted: true, hold: false, permissionHold: false, injectFail: false };
   const chrome = {
     runtime: { id: EXT, onConnect: runtimeConnect, lastError: undefined },
     // chrome.devtools.inspectedWindow.eval is replaced per test when a read must be held.
-    tabs: { get: async () => ({ url: state.url }), connect: (tab, opts) => { const p = port(opts.name, undefined); p.opts = opts; ports.push(p); return p; } },
-    scripting: { executeScript: async opts => { injections.push(opts); if (state.hold) { const d = deferred(); held.push(d); return d.promise; } return [{ frameId: 0, documentId: 'doc-a' }]; } },
-    permissions: { contains: async () => state.granted },
+    tabs: { get: async () => { if (state.tabGetReject) throw new Error('fake tabs.get failed'); return { url: state.url, ...(state.status ? { status: state.status } : {}) }; }, connect: (tab, opts) => { const p = port(opts.name, undefined); p.opts = opts; ports.push(p); return p; } },
+    scripting: { executeScript: async opts => { injections.push(opts); if (state.injectFail) { state.injectFail = false; throw new Error('fake injection refused'); } if (state.hold) { const d = deferred(); held.push(d); return d.promise; } return [{ frameId: 0, documentId: 'doc-a' }]; } },
+    permissions: { contains: async () => { if (state.permissionHold) { const d = deferred(); permissionHeld.push(d); return d.promise; } if (state.permissionReject) throw new Error('fake permissions.contains failed'); return state.granted; } },
     devtools: { inspectedWindow: { tabId: 7, eval: (expression, cb) => { assert.equal(expression, 'location.origin'); cb(state.origin, null); } },
       network: { onNavigated: navigation }, panels: { create: (a, b, c, cb) => cb({ onShown: panelShown, onHidden: panelHidden }) } },
   };
@@ -124,9 +125,11 @@ function ownerEnv() {
     await settle();
   };
   const fireWindow = name => { for (const fn of windowListeners[name] ?? []) fn({ type: name }); };
-  return { state, chrome, wt, view, legit, navigation, panelShown, panelHidden, ports, injections, held, timers, host, fire, pump, fireWindow, attachAndBind, lastRequest, requests, runtimeConnect };
+  return { state, chrome, wt, view, legit, navigation, panelShown, panelHidden, ports, injections, held, permissionHeld, timers, host, fire, pump, fireWindow, attachAndBind, lastRequest, requests, runtimeConnect };
 }
 
+/** An owner whose origin is granted but did NOT attach by itself: the grant arrives after the first origin read. */
+async function manualEnv() { const e = ownerEnv(); e.state.granted = false; await settle(); e.state.granted = true; return e; }
 const results = [];
 async function check(name, fn) {
   try { const evidence = await fn(); results.push({ name, pass: true, evidence }); }
@@ -140,12 +143,12 @@ await check('control: denied permission injects nothing and reports needs-permis
   return invariant(e.injections.length === 0 && e.host().outer.stage === 'needs-permission', 'denied grant injected', e.host().outer);
 });
 await check('attach for an origin other than the one inspected does nothing', async () => {
-  const e = ownerEnv(); await settle();
+  const e = await manualEnv();
   e.view.onMessage.fire({ kind: 'attach', origin: 'https://other.example' }); await settle();
   return invariant(e.injections.length === 0 && e.host().outer.stage === 'origin-mismatch', 'foreign origin attach proceeded', e.host().outer);
 });
 await check('navigation cancels a pending injection attempt', async () => {
-  const e = ownerEnv(); await settle(); e.state.hold = true;
+  const e = await manualEnv(); e.state.hold = true;
   e.view.onMessage.fire({ kind: 'attach', origin: e.state.origin }); await settle(); assert.equal(e.held.length, 1);
   e.state.origin = 'https://b.example'; e.state.url = 'https://b.example/'; e.navigation.fire(e.state.url); await settle();
   e.held[0].resolve([{ frameId: 0, documentId: 'doc-b' }]); await settle();
@@ -153,7 +156,7 @@ await check('navigation cancels a pending injection attempt', async () => {
   return invariant(e.ports.length === 0 && e.host().outer.origin === 'https://b.example', 'cancelled A attempt connected on B', { connects: e.ports.length, outer: e.host().outer });
 });
 await check('user disconnect cancels a pending injection attempt', async () => {
-  const e = ownerEnv(); await settle(); e.state.hold = true;
+  const e = await manualEnv(); e.state.hold = true;
   e.view.onMessage.fire({ kind: 'attach', origin: e.state.origin }); await settle(); assert.equal(e.held.length, 1);
   e.view.onMessage.fire({ kind: 'disconnect' }); await settle();
   e.held[0].resolve([{ frameId: 0, documentId: 'doc-a' }]); await settle();
@@ -172,7 +175,7 @@ await check('a relay port that closes before relay-ready is "not attached", not 
   return invariant(e.host().outer.stage === 'not-attached', 'wrong state', e.host().outer);
 });
 await check('view port with a tab sender, wrong owner or no extension identity is refused without host state', async () => {
-  const e = ownerEnv(); await settle();
+  const e = await manualEnv();
   const bad = [
     port('view:' + OWNER, { id: EXT, tab: { id: 7 }, url: `chrome-extension://${EXT}/panel.html?owner=${OWNER}` }),
     port('view:' + OWNER, { id: EXT, url: `chrome-extension://${EXT}/panel.html?owner=someone-else` }),
@@ -235,22 +238,319 @@ await check('a view that stops acknowledging has a TOTAL message bound (frames, 
     'view hop unbounded or no recovery', { total, frames, hosts, stalled, afterAck, resumedHost });
 });
 await check('first attach cancelled by navigation returns to a usable ready state', async () => {
-  const e = ownerEnv(); await settle(); e.state.hold = true;
+  const e = await manualEnv(); e.state.hold = true;
   e.view.onMessage.fire({ kind: 'attach', origin: e.state.origin }); await settle();
   assert.equal(e.held.length, 1);
   e.state.origin = 'https://b.example'; e.state.url = 'https://b.example/'; e.navigation.fire(e.state.url); await settle();
+  assert.equal(e.held.length, 2, 'granted origin B starts its own automatic attempt');
   e.held[0].resolve([{ frameId: 0, documentId: 'doc-b' }]); await settle();
-  return invariant(e.ports.length === 0 && e.host().outer.stage === 'ready' && e.host().outer.origin === 'https://b.example', 'cancelled first attach left the panel busy', { connects: e.ports.length, outer: e.host().outer });
+  assert.equal(e.ports.length, 0, 'the cancelled first attach must not connect');
+  e.held[1].resolve([{ frameId: 0, documentId: 'doc-b' }]); await settle();
+  return invariant(e.ports.length === 1 && e.host().outer.stage === 'connecting' && e.host().outer.origin === 'https://b.example', 'origin B did not attach by itself after the cancelled first attach', { connects: e.ports.length, outer: e.host().outer });
 });
-await check('same-origin document replacement during the first attach returns to ready', async () => {
-  const e = ownerEnv(); await settle(); e.state.hold = true;
+await check('same-origin document replacement during the first attach drops the dead attempt; the new document attaches by itself', async () => {
+  const e = await manualEnv(); e.state.hold = true;
   e.view.onMessage.fire({ kind: 'attach', origin: e.state.origin }); await settle();
   e.state.url = 'https://a.example/replaced'; e.navigation.fire(e.state.url); await settle();
+  assert.equal(e.held.length, 2, 'the replaced document (granted, not detached) starts its own automatic attempt');
   e.held[0].resolve([{ frameId: 0, documentId: 'new-a' }]); await settle();
-  return invariant(e.ports.length === 0 && e.host().outer.stage === 'ready', 'same-origin navigation left a dead attempt busy', { connects: e.ports.length, outer: e.host().outer });
+  assert.equal(e.ports.length, 0, 'the cancelled attempt must not connect');
+  e.held[1].resolve([{ frameId: 0, documentId: 'new-a' }]); await settle();
+  return invariant(e.ports.length === 1 && e.host().outer.stage === 'connecting' && e.injections.length === 2, 'the new document did not attach by itself exactly once', { connects: e.ports.length, injections: e.injections.length, outer: e.host().outer });
+});
+// ── Automatic attachment of an already granted origin ──
+await check('automatic attach: a granted origin attaches by itself once the view connects (one injection, one connect); a second view adds nothing', async () => {
+  const e = ownerEnv(); await settle();
+  const first = { injections: e.injections.length, connects: e.ports.length, stage: e.host().outer.stage };
+  e.runtimeConnect.fire(e.legit()); await settle();
+  return invariant(first.injections === 1 && first.connects === 1 && first.stage === 'connecting' && e.injections.length === 1 && e.ports.length === 1, 'automatic attach did not happen exactly once', { first, after: { injections: e.injections.length, connects: e.ports.length } });
+});
+await check('control: an ungranted origin never attaches by itself and stays quietly ready (the prompt needs the user\'s click)', async () => {
+  const e = ownerEnv(); e.state.granted = false; await settle();
+  e.runtimeConnect.fire(e.legit()); await settle();
+  return invariant(e.injections.length === 0 && e.host().outer.stage === 'ready', 'ungranted origin attached or complained', { injections: e.injections.length, outer: e.host().outer });
+});
+await check('automatic attach waits for a loading document and injects once it has loaded', async () => {
+  const e = ownerEnv(); e.state.status = 'loading'; await settle();
+  const whileLoading = e.injections.length;
+  e.fire(250); await settle(); const stillLoading = e.injections.length;
+  e.state.status = 'complete'; e.fire(250); await settle();
+  return invariant(whileLoading === 0 && stillLoading === 0 && e.injections.length === 1 && e.ports.length === 1, 'injected into a loading document or never after load', { whileLoading, stillLoading, after: e.injections.length });
+});
+await check('a user detach turns automatic attach off for that origin (new documents included); a manual attach turns it back on', async () => {
+  const e = ownerEnv(); await settle(); assert.equal(e.injections.length, 1);
+  e.view.onMessage.fire({ kind: 'disconnect' }); await settle();
+  e.state.url = 'https://a.example/next'; e.navigation.fire(e.state.url); await settle();
+  const afterDetachNav = e.injections.length;
+  e.view.onMessage.fire({ kind: 'attach', origin: e.state.origin }); await settle();
+  const afterManual = e.injections.length;
+  e.view.onMessage.fire({ kind: 'disconnect' }); await settle();
+  e.state.url = 'https://a.example/again'; e.navigation.fire(e.state.url); await settle();
+  const afterSecondDetachNav = e.injections.length;
+  return invariant(afterDetachNav === 1 && afterManual === 2 && afterSecondDetachNav === 2 && e.host().outer.stage === 'ready', 'detach did not stick / manual attach did not re-arm', { afterDetachNav, afterManual, afterSecondDetachNav, outer: e.host().outer });
+});
+await check('a detach on one origin does not stop another granted origin from attaching by itself', async () => {
+  const e = ownerEnv(); await settle();
+  e.view.onMessage.fire({ kind: 'disconnect' }); await settle();
+  e.state.origin = 'https://b.example'; e.state.url = 'https://b.example/'; e.navigation.fire(e.state.url); await settle();
+  return invariant(e.injections.length === 2 && e.host().outer.origin === 'https://b.example' && e.host().outer.stage === 'connecting', 'origin B did not attach by itself', { injections: e.injections.length, outer: e.host().outer });
+});
+await check('a failed automatic attempt is not retried for that document (the manual path stays)', async () => {
+  const e = ownerEnv(); await settle();
+  const p = e.ports.at(-1); p.onDisconnect.fire(); await settle(); await e.pump(10);
+  const stage = e.host().outer.stage;
+  e.view.onMessage.fire({ kind: 'attach', origin: e.state.origin }); await settle();
+  return invariant(stage === 'not-attached' && e.injections.length === 2 && e.ports.length === 2, 'automatic attempt retried on its own, or manual attach refused', { stage, injections: e.injections.length, connects: e.ports.length });
+});
+await check('the only exposed source is selected automatically; two sources wait for the user', async () => {
+  const run = async sources => {
+    const e = ownerEnv(); await settle();
+    const p = e.ports.at(-1); p.onMessage.fire({ t: 'relay-ready' }); await settle();
+    const boot = p.sent.find(m => m.t === 'bootstrap'); const d = proto.decodeMessage(boot.discover).message;
+    p.onMessage.fire({ t: 'packet', g: boot.g, data: proto.encodeCarrierReply({ kind: 'reply', receipt: receipt(), frames: [proto.encodeMessage({ ...common, kind: 'hello', requestId: d.requestId, ownerId: OWNER, sources })] }) }); await settle();
+    const kinds = e.requests(p); const last = kinds.length ? e.lastRequest(p) : null;
+    return { kinds, attach: last?.kind === 'attach' ? { sourceId: last.target.sourceId, runId: last.target.runId } : null, phase: e.host().core?.phase };
+  };
+  const one = await run([fixtures.fixtureSource]);
+  const two = await run([fixtures.fixtureSource, { ...fixtures.fixtureSource, sourceId: 'other-source', runId: 'other-run' }]);
+  return invariant(one.attach?.sourceId === fixtures.fixtureSource.sourceId && one.attach?.runId === fixtures.fixtureSource.runId
+    && two.attach === null && !two.kinds.includes('attach') && two.phase === 'discovered', 'single source not selected, or several sources selected without the user', { one, two });
+});
+await check('a permission check that fails AFTER a navigation cancels nothing: the new document\'s own automatic attempt still runs; a failing check for the current document releases its reservation', async () => {
+  const e = ownerEnv(); e.state.permissionHold = true; await settle();
+  assert.equal(e.permissionHeld.length, 1, 'origin A check held');
+  e.state.origin = 'https://b.example'; e.state.url = 'https://b.example/'; e.navigation.fire(e.state.url); await settle();
+  assert.equal(e.permissionHeld.length, 2, 'origin B starts its own automatic operation, its check also held');
+  const pendingB = e.host().outer;
+  // The superseded A check fails while B's operation is still pending; then B's check answers true.
+  e.permissionHeld[0].promise.catch(() => {});
+  e.permissionHeld[0].resolve(Promise.reject(new Error('late failure of the superseded check'))); await settle();
+  const afterLate = { auto: e.host().outer.auto };
+  e.state.permissionHold = false; e.permissionHeld[1].resolve(true); await settle(); await e.pump(3);
+  const late = { afterLate, injections: e.injections.length, connects: e.ports.length, outer: e.host().outer };
+  // Control: the CURRENT document's check fails → no injection, reservation released, the next view may start again.
+  const c = ownerEnv(); c.state.permissionReject = true; await settle();
+  const rejected = { injections: c.injections.length, auto: c.host().outer.auto, stage: c.host().outer.stage };
+  c.state.permissionReject = false; c.runtimeConnect.fire(c.legit()); await settle();
+  return invariant(pendingB.origin === 'https://b.example' && pendingB.auto === true && late.afterLate.auto === true && late.injections === 1 && late.connects === 1 && late.outer.origin === 'https://b.example'
+    && rejected.injections === 0 && rejected.auto === false && rejected.stage === 'ready' && c.injections.length === 1,
+    'a late rejection of a superseded check cancelled the successor, or a current rejection left no way back', { pendingB, late, rejected, after: c.injections.length });
+});
+await check('automatic ownership survives the handoff into attach: the last view leaving during the attach\'s own permission check or its held injection connects nothing; a manual attempt and an established carrier are untouched', async () => {
+  // Automatic, second permission check held.
+  const a = ownerEnv(); a.state.permissionHold = true; await settle();
+  a.permissionHeld[0].resolve(true); await settle();
+  assert.equal(a.permissionHeld.length, 2, 'the attach performs its own permission check');
+  assert.equal(a.host().outer.auto, true, 'still an automatic operation during the handoff');
+  a.view.onDisconnect.fire(); await settle();
+  a.permissionHeld[1].resolve(true); await settle(); await a.pump(3);
+  const atPermission = { injections: a.injections.length, connects: a.ports.length, stage: a.host().outer.stage };
+  // Automatic, injection held.
+  const b = ownerEnv(); b.state.hold = true; await settle();
+  assert.equal(b.held.length, 1, 'automatic injection held');
+  b.view.onDisconnect.fire(); await settle();
+  b.held[0].resolve([{ frameId: 0, documentId: 'doc-a' }]); await settle(); await b.pump(3);
+  const atInjection = { injections: b.injections.length, connects: b.ports.length };
+  // Automatic, port connected but the relay has not answered yet: the pending port closes with the attempt and a late
+  // relay-ready cannot bootstrap.
+  const d = ownerEnv(); await settle();
+  const pending = d.ports.at(-1); assert.ok(pending && !pending.disconnected, 'pending relay port open');
+  d.view.onDisconnect.fire(); await settle();
+  const closedWithAttempt = pending.disconnected;
+  pending.onMessage.fire({ t: 'relay-ready' }); await settle(); await d.pump(3);
+  const atPendingPort = { closedWithAttempt, bootstraps: pending.sent.filter(m => m.t === 'bootstrap').length, stage: d.host()?.outer?.stage ?? 'no-view' };
+  // Control: a MANUAL attempt keeps going without a view (the user asked for it).
+  const m = await manualEnv(); m.state.permissionHold = true;
+  m.view.onMessage.fire({ kind: 'attach', origin: m.state.origin }); await settle();
+  assert.equal(m.permissionHeld.length, 1);
+  m.view.onDisconnect.fire(); await settle();
+  m.permissionHeld[0].resolve(true); await settle();
+  const manual = { injections: m.injections.length, connects: m.ports.length };
+  // Control: an ESTABLISHED carrier is not torn down when the view goes away.
+  const c = ownerEnv(); await settle();
+  c.ports.at(-1).onMessage.fire({ t: 'relay-ready' }); await settle();
+  c.view.onDisconnect.fire(); await settle();
+  const established = { stage: c.host().outer.stage, portOpen: !c.ports.at(-1).disconnected };
+  return invariant(atPermission.injections === 0 && atPermission.connects === 0 && atInjection.injections === 1 && atInjection.connects === 0
+    && atPendingPort.closedWithAttempt && atPendingPort.bootstraps === 0
+    && manual.injections === 1 && manual.connects === 1 && established.stage === 'carrier' && established.portOpen,
+    'an automatic attempt outlived its last view, or a manual/established lifetime changed', { atPermission, atInjection, atPendingPort, manual, established });
+});
+await check('the last view failing on the host notification itself (post throws at `injecting`) stops an automatic attempt before injection and connection; the same loss leaves a manual attempt running', async () => {
+  const run = async manual => {
+    const e = manual ? await manualEnv() : ownerEnv();
+    const original = e.view.postMessage;
+    e.view.postMessage = m => { if (m.kind === 'host' && m.outer?.stage === 'injecting') throw new Error('view gone at the injecting notification'); return original(m); };
+    if (manual) e.view.onMessage.fire({ kind: 'attach', origin: e.state.origin });
+    await settle(); await e.pump(3);
+    return { views: e.chrome.runtime.onConnect === undefined ? null : undefined, injections: e.injections.length, connects: e.ports.length, stage: e.host()?.outer?.stage ?? null };
+  };
+  const automatic = await run(false); const manual = await run(true);
+  return invariant(automatic.injections === 0 && automatic.connects === 0 && manual.injections === 1 && manual.connects === 1,
+    'an automatic attempt ran its outbound effects after losing its last view at the notification, or a manual one was stopped', { automatic, manual });
+});
+await check('view loss during an automatic attempt gives the document\'s attempt back: the next view attaches afresh; a FAILED automatic attempt stays spent and a user Detach stays sticky', async () => {
+  const e = ownerEnv(); e.state.hold = true; await settle();
+  assert.equal(e.held.length, 1, 'automatic injection held');
+  e.view.onDisconnect.fire(); await settle();
+  e.held[0].resolve([{ frameId: 0, documentId: 'doc-a' }]); await settle();
+  e.state.hold = false; e.runtimeConnect.fire(e.legit()); await settle();
+  const reopened = { injections: e.injections.length, connects: e.ports.length };
+  // Control: a failed automatic attempt is not given back to the next view.
+  const f = ownerEnv(); f.state.injectFail = true; await settle(); await f.pump(3);
+  const failedStage = f.host().outer.stage;
+  f.view.onDisconnect.fire(); await settle(); f.runtimeConnect.fire(f.legit()); await settle();
+  const afterFailure = { stage: failedStage, injections: f.injections.length };
+  // Control: a user Detach is not undone by a view reload.
+  const d = ownerEnv(); await settle();
+  d.view.onMessage.fire({ kind: 'disconnect' }); await settle();
+  d.view.onDisconnect.fire(); await settle(); d.runtimeConnect.fire(d.legit()); await settle();
+  const afterDetach = { injections: d.injections.length, detached: d.host().outer.detached };
+  return invariant(reopened.injections === 2 && reopened.connects === 1 && afterFailure.stage === 'not-attached' && afterFailure.injections === 1 && afterDetach.injections === 1 && afterDetach.detached === true,
+    'view loss did not give the attempt back, or a failure/Detach was re-armed by a view reload', { reopened, afterFailure, afterDetach });
+});
+await check('a load-wait failure leaves no automatic detail behind (ready, auto:false, detail null); a stale failure still does not alter the next document', async () => {
+  const e = ownerEnv(); e.state.status = 'loading'; await settle();
+  assert.equal(e.host().outer.detail, 'attaching once the page has finished loading');
+  e.state.tabGetReject = true; e.fire(250); await settle();
+  const failed = { stage: e.host().outer.stage, auto: e.host().outer.auto, detail: e.host().outer.detail, injections: e.injections.length };
+  e.state.tabGetReject = false; e.state.status = 'complete';
+  e.state.origin = 'https://b.example'; e.state.url = 'https://b.example/'; e.navigation.fire(e.state.url); await settle();
+  return invariant(failed.stage === 'ready' && failed.auto === false && failed.detail === null && failed.injections === 0
+    && e.injections.length === 1 && e.host().outer.origin === 'https://b.example', 'stale automatic detail survived its operation, or B was affected', { failed, b: { injections: e.injections.length, outer: e.host().outer } });
+});
+await check('many source replacements without navigation each bind the fresh singleton, with one automatic choice per discovery and no retry of a refused attach', async () => {
+  const e = ownerEnv(); await settle();
+  const p = e.ports.at(-1); p.onMessage.fire({ t: 'relay-ready' }); await settle();
+  const boot = p.sent.find(m => m.t === 'bootstrap'); const d = proto.decodeMessage(boot.discover).message;
+  const reply = frames => p.onMessage.fire({ t: 'packet', g: boot.g, data: proto.encodeCarrierReply({ kind: 'reply', receipt: receipt(), frames: frames.map(proto.encodeMessage) }) });
+  const src = n => ({ ...fixtures.fixtureSource, sourceId: `source-${n}`, runId: `run-${n}` });
+  const tgt = n => ({ ownerId: OWNER, sourceId: `source-${n}`, runId: `run-${n}`, attachmentId: `attachment-${n}` });
+  reply([{ ...common, kind: 'hello', requestId: d.requestId, ownerId: OWNER, sources: [src(0)] }]); await settle();
+  let req = e.lastRequest(p); assert.equal(req.kind, 'attach');
+  reply([{ ...fixtures.snapshotFixture, requestId: req.requestId, target: tgt(0), source: src(0) }]); await settle();
+  const bound = [e.host().core.target.sourceId];
+  let discovers = e.requests(p).filter(k => k === 'discover').length;
+  for (let n = 1; n <= 12; n++) {
+    const prev = e.lastRequest(p);   // the attach that bound n-1 (its requestId is the lease's)
+    const attachReqId = e.host().core.target ? e.requests(p).length && (() => { const packets = p.sent.filter(m => m.t === 'packet').map(m => proto.decodeCarrierRequest(m.data).packet).filter(k => k.kind === 'request').map(k => proto.decodeMessage(k.message).message); return packets.filter(m => m.kind === 'attach').at(-1).requestId; })() : null;
+    await e.pump(3);
+    reply([{ ...common, kind: 'error', requestId: attachReqId, target: tgt(n - 1), code: 'not-found', message: 'replaced' }]); await settle();
+    const disc = e.lastRequest(p); if (disc.kind !== 'discover') return invariant(false, `replacement ${n}: no discover after withdrawal`, { last: disc.kind, phase: e.host().core.phase });
+    discovers++;
+    reply([{ ...common, kind: 'hello', requestId: disc.requestId, ownerId: OWNER, sources: [src(n)] }]); await settle();
+    req = e.lastRequest(p); if (req.kind !== 'attach') return invariant(false, `replacement ${n}: fresh singleton not chosen`, { last: req.kind });
+    if (n === 6) {
+      // The page refuses this attach: no automatic retry from the same discovery; the pick list is the user's.
+      reply([{ ...common, kind: 'error', requestId: req.requestId, target: tgt(n), code: 'invalid-state', message: 'refused' }]); await settle(); await e.pump(3);
+      const afterRefusal = e.requests(p).filter(k => k === 'attach').length;
+      await e.pump(3);
+      if (e.requests(p).filter(k => k === 'attach').length !== afterRefusal || e.host().core.phase !== 'discovered') return invariant(false, 'refused attach was retried automatically', { phase: e.host().core.phase });
+      // The user picks it explicitly; that binds.
+      e.view.onMessage.fire({ kind: 'select', sourceId: `source-${n}`, runId: `run-${n}` }); await settle();
+      req = e.lastRequest(p); assert.equal(req.kind, 'attach');
+    }
+    reply([{ ...fixtures.snapshotFixture, requestId: req.requestId, target: tgt(n), source: src(n) }]); await settle();
+    bound.push(e.host().core.target.sourceId);
+  }
+  return invariant(bound.length === 13 && bound.every((id, i) => id === `source-${i}`) && e.requests(p).filter(k => k === 'discover').length === discovers,
+    'replacements did not each bind once', { bound, discovers });
+});
+await check('automatic preparation is cancelled by a user Detach: a manual attach during the load wait, then Detach, then the load finishing injects nothing more', async () => {
+  const e = ownerEnv(); e.state.status = 'loading'; await settle();
+  assert.equal(e.injections.length, 0); assert.ok(e.timers.some(t => t.live && t.ms === 250), 'the load wait is pending');
+  e.view.onMessage.fire({ kind: 'attach', origin: e.state.origin }); await settle();
+  assert.equal(e.injections.length, 1, 'the manual attach injects');
+  e.view.onMessage.fire({ kind: 'disconnect' }); await settle();
+  e.state.status = 'complete';
+  const timerCancelled = !e.timers.some(t => t.live && t.ms === 250);
+  for (const t of e.timers.filter(t => t.ms === 250)) { if (t.live) { t.live = false; t.fn(); } }   // wake anything still armed
+  await settle(); await e.pump(5);
+  return invariant(timerCancelled && e.injections.length === 1 && e.ports.length === 1 && e.host().outer.stage === 'ready' && e.host().outer.auto === false, 'stranded automatic preparation regained authority after Detach', { timerCancelled, injections: e.injections.length, connects: e.ports.length, outer: e.host().outer });
+});
+await check('automatic preparation is cancelled when the last view goes away: a permission check answered afterwards injects nothing; the next view starts afresh', async () => {
+  const e = ownerEnv(); e.state.permissionHold = true; await settle();
+  assert.equal(e.permissionHeld.length, 1, 'permission check held');
+  e.view.onDisconnect.fire(); await settle();
+  e.permissionHeld[0].resolve(true); await settle();
+  const noView = { injections: e.injections.length, connects: e.ports.length };
+  e.state.permissionHold = false; e.runtimeConnect.fire(e.legit()); await settle();
+  return invariant(noView.injections === 0 && noView.connects === 0 && e.injections.length === 1 && e.ports.length === 1, 'injected with no view, or the next view could not start', { noView, after: { injections: e.injections.length, connects: e.ports.length } });
+});
+await check('overlapping permission checks cannot start two automatic attempts in one document, even when the first injection fails', async () => {
+  const e = ownerEnv(); e.state.permissionHold = true; await settle();
+  e.runtimeConnect.fire(e.legit()); await settle();           // a second trigger while the first check is pending
+  const heldChecks = e.permissionHeld.length;
+  e.state.permissionHold = false; e.state.injectFail = true;     // later checks answer at once; the first injection is refused
+  for (const d of e.permissionHeld) d.resolve(true);
+  await settle(); await e.pump(5);
+  const afterFailure = { stage: e.host().outer.stage, injections: e.injections.length, connects: e.ports.length };
+  e.view.onMessage.fire({ kind: 'attach', origin: e.state.origin }); await settle();
+  return invariant(heldChecks === 1 && afterFailure.stage === 'not-attached' && afterFailure.injections === 1 && afterFailure.connects === 0 && e.injections.length === 2 && e.ports.length === 1, 'a second automatic attempt ran in the same document, or manual recovery failed', { heldChecks, afterFailure, injections: e.injections.length, connects: e.ports.length });
+});
+await check('a manual Attach in the same document re-arms single-source selection: the same hello is answered with an attach and the snapshot binds again', async () => {
+  const e = ownerEnv(); await settle();
+  const bind = async p => {
+    p.onMessage.fire({ t: 'relay-ready' }); await settle();
+    const boot = p.sent.find(m => m.t === 'bootstrap'); const d = proto.decodeMessage(boot.discover).message;
+    const reply = frames => p.onMessage.fire({ t: 'packet', g: boot.g, data: proto.encodeCarrierReply({ kind: 'reply', receipt: receipt(), frames: frames.map(proto.encodeMessage) }) });
+    reply([{ ...common, kind: 'hello', requestId: d.requestId, ownerId: OWNER, sources: [fixtures.fixtureSource] }]); await settle();
+    const kinds = e.requests(p); if (!kinds.includes('attach')) return { kinds, phase: e.host().core?.phase, target: null };
+    const req = e.lastRequest(p); assert.equal(req.kind, 'attach');
+    reply([{ ...fixtures.snapshotFixture, requestId: req.requestId, target: { ...fixtures.fixtureTarget, ownerId: OWNER } }]); await settle();
+    return { kinds, phase: e.host().core?.phase, target: e.host().core?.target };
+  };
+  const first = await bind(e.ports.at(-1));
+  e.view.onMessage.fire({ kind: 'disconnect' }); await settle();
+  e.view.onMessage.fire({ kind: 'attach', origin: e.state.origin }); await settle();
+  assert.equal(e.ports.length, 2, 'the manual attach opened a new channel');
+  const second = await bind(e.ports.at(-1));
+  const bound = r => r.phase === 'attached' && r.target?.sourceId === fixtures.fixtureSource.sourceId && r.target?.runId === fixtures.fixtureSource.runId;
+  return invariant(bound(first) && bound(second), 'the re-armed channel did not select and bind the single source again', { first, second });
+});
+await check('after a withdrawal the owner asks the page for a fresh list once and binds the one remaining source from THAT hello; an empty fresh hello or a repeated notice never asks again', async () => {
+  const B = { ...fixtures.fixtureSource, sourceId: 'source-b', runId: 'run-b' };
+  const targetB = { ownerId: OWNER, sourceId: 'source-b', runId: 'run-b', attachmentId: 'attachment-b' };
+  const scenario = async (freshSources, repeatNotice) => {
+    const e = ownerEnv(); await settle();
+    const p = e.ports.at(-1); p.onMessage.fire({ t: 'relay-ready' }); await settle();
+    const boot = p.sent.find(m => m.t === 'bootstrap'); const d = proto.decodeMessage(boot.discover).message;
+    const reply = frames => p.onMessage.fire({ t: 'packet', g: boot.g, data: proto.encodeCarrierReply({ kind: 'reply', receipt: receipt(), frames: frames.map(proto.encodeMessage) }) });
+    reply([{ ...common, kind: 'hello', requestId: d.requestId, ownerId: OWNER, sources: [fixtures.fixtureSource, B] }]); await settle();
+    assert.equal(e.host().core.phase, 'discovered', 'two sources wait for the user');
+    e.view.onMessage.fire({ kind: 'select', sourceId: fixtures.fixtureSource.sourceId, runId: fixtures.fixtureSource.runId }); await settle();
+    const attachReq = e.lastRequest(p); assert.equal(attachReq.kind, 'attach');
+    const targetA = { ...fixtures.fixtureTarget, ownerId: OWNER };
+    reply([{ ...fixtures.snapshotFixture, requestId: attachReq.requestId, target: targetA }]); await settle();
+    assert.equal(e.host().core.phase, 'attached');
+    const before = e.requests(p).filter(k => k === 'discover').length;
+    const notice = { ...common, kind: 'error', requestId: attachReq.requestId, target: targetA, code: 'not-found', message: 'source withdrawn by the page' };
+    // The notice is unsolicited: it rides the reply to the pending poll (fired by the attached-cadence timer).
+    await e.pump(3); reply([notice]); await settle();
+    const afterNotice = { phase: e.host().core.phase, discovers: e.requests(p).filter(k => k === 'discover').length - before, sources: e.host().core.sources.map(x => x.sourceId) };
+    const disc = e.lastRequest(p);
+    if (disc.kind !== 'discover') return { afterNotice, fresh: null };
+    // The repeated-notice control delivers the same notice again beside the fresh hello (idempotent for the core).
+    reply([{ ...common, kind: 'hello', requestId: disc.requestId, ownerId: OWNER, sources: freshSources }, ...(repeatNotice ? [notice] : [])]); await settle();
+    const afterHello = { phase: e.host().core.phase, sources: e.host().core.sources.map(x => x.sourceId), last: e.lastRequest(p).kind };
+    if (afterHello.last === 'attach') {
+      const req = e.lastRequest(p);
+      reply([{ ...fixtures.snapshotFixture, requestId: req.requestId, target: targetB, source: B }]); await settle();   // the snapshot's source must match its target
+    }
+    await e.pump(5);
+    return { afterNotice, fresh: afterHello, final: { phase: e.host().core.phase, target: e.host().core.target, discovers: e.requests(p).filter(k => k === 'discover').length - before } };
+  };
+  const remaining = await scenario([B], false);
+  const empty = await scenario([], false);
+  const repeated = await scenario([B], true);
+  const okRemaining = remaining.afterNotice.phase === 'withdrawn' && remaining.afterNotice.discovers === 1 && remaining.afterNotice.sources.length === 2 && remaining.fresh?.last === 'attach'
+    && remaining.final.phase === 'attached' && remaining.final.target?.sourceId === 'source-b' && remaining.final.target?.runId === 'run-b' && remaining.final.discovers === 1;
+  const okEmpty = empty.afterNotice.discovers === 1 && empty.fresh?.last !== 'attach' && empty.final.phase === 'withdrawn' && empty.final.target === null && empty.final.discovers === 1;
+  const okRepeated = repeated.afterNotice.discovers === 1 && repeated.final.phase === 'attached' && repeated.final.target?.sourceId === 'source-b' && repeated.final.discovers === 1;
+  return invariant(okRemaining && okEmpty && okRepeated, 'withdrawal chose from the stale list, never refreshed, or refreshed more than once', { remaining, empty, repeated });
 });
 await check('a late origin read from before a navigation cannot overwrite the new document\'s origin', async () => {
-  const e = ownerEnv(); await settle(); const reads = [];
+  const e = await manualEnv(); const reads = [];
   e.chrome.devtools.inspectedWindow.eval = (expression, cb) => { const result = e.state.origin; reads.push(() => cb(result, null)); };
   e.view.onMessage.fire({ kind: 'attach', origin: e.state.origin }); await settle(); assert.equal(reads.length, 1);
   e.state.origin = 'https://b.example'; e.state.url = 'https://b.example/'; e.navigation.fire(e.state.url); await settle(); assert.equal(reads.length, 2);

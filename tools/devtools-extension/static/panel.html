@@ -55,7 +55,7 @@
   <div class="empty hidden" id="emptyState">
     <span class="emptyTitle" id="emptyTitle">No exposed Playa sources found on this page.</span>
     <span class="emptyBody hidden" id="emptyProbeBody">A probe is your own MoQT session to a relay: enter the WebTransport URL, the namespace tuple, optionally up to four track names, choose the draft, and press Start. Nothing is dialled until you do.</span>
-    <span class="emptyBody" id="emptyBody">A page exposes its player to this tab only when the application installs the optional diagnostics explicitly — <span class="mono light">installPlayerDiagnostics(player, { registry, exposure })</span> from <span class="mono light">@openmoq/devtools/player</span> plus <span class="mono light">installDiagnosticBridge(registry)</span>; nothing is included or collected otherwise. Attach asks for access to this page's origin, then injects a relay into its top frame only; frames and workers report separately. To check a relay without the page, switch to Probe.</span>
+    <span class="emptyBody" id="emptyBody">A page exposes its player to this tab only when the application installs the optional diagnostics explicitly — <span class="mono light">installPlayerDiagnostics(player, { registry, exposure })</span> from <span class="mono light">@openmoq/devtools/player</span> plus <span class="mono light">installDiagnosticBridge(registry)</span>; nothing is included or collected otherwise. The first Attach asks for access to this page's origin; once granted, the panel attaches by itself whenever it opens on that origin (and after a reload), selecting the only exposed source, until you press Detach. The relay is injected into the top frame only; frames and workers report separately. To check a relay without the page, switch to Probe.</span>
   </div>
 
   <!-- Attached body -->
@@ -66,13 +66,14 @@
       <span class="stats mono" id="ring">—</span>
       <div class="grow"></div>
       <div class="legend mono" id="legend">
-        <span><i class="sw key"></i><span id="legendKey">first object · SAP expected</span></span>
-        <span><i class="sw fast"></i>offset &lt;35 ms</span>
-        <span><i class="sw mid"></i>35–120</span>
-        <span><i class="sw slow"></i>&gt;120</span>
-        <span><i class="sw miss"></i>discarded (stage)</span>
-        <span><i class="sw none"></i>not observed</span>
-        <span id="legendNote" class="note hidden"></span>
+        <span><i class="sw key"></i><span id="legendKey">independent</span></span>
+        <span title="expected independent (hatched)"><i class="sw key hatched"></i>expected</span>
+        <span title="arrival offset below 35 ms"><i class="sw fast"></i>&lt;35 ms</span>
+        <span title="arrival offset 35–120 ms"><i class="sw mid"></i>35–120</span>
+        <span title="arrival offset above 120 ms"><i class="sw slow"></i>&gt;120</span>
+        <span title="discarded at a stage (reason in the cell)"><i class="sw miss"></i>discarded</span>
+        <span title="object id inside the window, not observed"><i class="sw none"></i>not observed</span>
+        <span id="legendNote" class="note hidden">stages ⓘ</span>
       </div>
     </div>
 

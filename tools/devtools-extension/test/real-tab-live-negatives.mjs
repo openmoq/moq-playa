@@ -266,7 +266,8 @@ try {
   const click = createNativeClick({ evaluate, rpc, session: () => ps });
   const recLabel = () => evaluate(ps, `document.getElementById('recLabel').textContent`);
   const ownerReadyFor = origin => until('owner ready for this document', async () => { const h = await hostState(); return h?.outer?.stage === 'ready' && h.outer.origin === origin ? h : null; }, 100);
-  const attachFirst = async () => { await click('#btnDev'); const d = await until('discovered', async () => { const h = await hostState(); return h?.core?.phase === 'discovered' ? h : null; }, 150); await click('#pickList .inst'); await until('attached', async () => (await hostState())?.core?.phase === 'attached', 100); return d; };
+  /** The granted origin attaches by itself and selects the page's single source; no click is sent. */
+  const attachFirst = async () => until('attached automatically', async () => { const h = await hostState(); return h?.core?.phase === 'attached' ? h : null; }, 200);
   const startRelayAndPublisher = async (name, fx, publisherArgs) => {
     const relay = launch(`relay-${name}`, 'pnpm', ['--filter', '@moqt/example-node-relay', 'relay-server'], { HOST: '127.0.0.1', PORT: '0', DEMO_NAMESPACE: fx.namespace, RELAY_CERT: certPath, RELAY_KEY: keyPath });
     const relayUrl = (await waitForLine(`relay-${name}`, /listening on (https:\/\/127\.0\.0\.1:\d+\/moq)/))[1];
@@ -309,10 +310,9 @@ try {
     const before = await page.evaluate(() => ({ wt: window.__wtConstructions, snapshot: window.live.diagnosticSnapshot ? window.live.diagnosticSnapshot() : null }));
     step('playing before attach', { t: p0.t, rvfc: p0.rvfc, ...before });
     await evaluate(ps, 'window.__pageFactCount = 0; true'); const plainMark = await resetRing();
-    await ownerReadyFor(new URL(prodBase).origin);
+    // The granted origin triggers ONE automatic attempt on this document (no click); it must settle without discovery.
     const phases = new Set();
-    await click('#btnDev');
-    const outcome = await until('attach attempt settled', async () => { const h = await hostState(); if (h?.core?.phase) phases.add(h.core.phase);
+    const outcome = await until('automatic attach attempt settled', async () => { const h = await hostState(); if (h?.core?.phase) phases.add(h.core.phase);
       return h?.outer?.stage === 'carrier-lost' || h?.outer?.stage === 'not-attached' || h?.core?.phase === 'discovered' || h?.core?.phase === 'attached' ? h : null; }, 150);
     if (phases.has('attached')) phases.add('discovered');
     const ui = await evaluate(ps, `({ pickListHidden: document.getElementById('pickList').classList.contains('hidden'), picks: document.querySelectorAll('#pickList .inst').length, title: document.getElementById('emptyTitle').textContent, notice: document.querySelector('.notice.host')?.textContent ?? null })`);
@@ -320,6 +320,7 @@ try {
     intended(INTENDED.plain, !phases.has('discovered'), `a source was discovered on the plain page: phases ${JSON.stringify([...phases])}, sources ${JSON.stringify(outcome.core?.sources)}`);
     assert.equal(outcome.outer.stage, 'carrier-lost', `expected the carrier to be given up (no bridge answered), got ${JSON.stringify(outcome.outer)}`);
     assert.equal(ui.picks, 0); assert.ok(ui.pickListHidden);
+    assert.equal(ui.title, 'No Playa diagnostics answered on this page.', 'the empty title must say nothing answered, not that sources were found absent');
     await pause(1500);
     const after = await page.evaluate(() => ({ wt: window.__wtConstructions, snapshot: window.live.diagnosticSnapshot ? window.live.diagnosticSnapshot() : null }));
     const p1 = await liveProgress(); await pause(1200); const p2 = await liveProgress();
@@ -346,9 +347,10 @@ try {
     step('both playing', { a: v0.a, b: v0.b });
     const expectFirst = control === 'swap-identity' ? v0.b : v0.a;      // the control expects the WRONG player
     await evaluate(ps, 'window.__pageFactCount = 0; true'); const attachMark = await resetRing();
-    await ownerReadyFor(new URL(devBase).origin);
-    await click('#btnDev');
-    const discovered = await until('discovered', async () => { const h = await hostState(); return h?.core?.phase === 'discovered' ? h : null; }, 150);
+    // Automatic attach discovers both players; with TWO sources nothing is selected until the user picks.
+    const discovered = await until('discovered automatically', async () => { const h = await hostState(); return h?.core?.phase === 'discovered' && h.outer.origin === new URL(devBase).origin ? h : null; }, 200);
+    await pause(300);
+    assert.equal((await hostState()).core.phase, 'discovered', 'two sources must not be auto-selected');
     assert.equal(discovered.core.sources.length, 2);
     assert.deepEqual(new Set(discovered.core.sources.map(s => s.sourceId)), new Set([v0.a.sourceId, v0.b.sourceId]));
     // Pick A by identity: the pick list renders the owner's sources in order (labels may be module names; both recorded).
@@ -411,12 +413,11 @@ try {
     const silentArgs = relayUrl => ['pnpm', ['--filter', '@moqt/example-node-publisher', 'exec', 'tsx', join(here, 'silent-publisher.ts'), relayUrl, fixture.dir, ...(control === 'objects-on-silent' ? [`--trigger=${trigger}`] : [])], { RELAY_CERT: certPath }];
     const { relay, relayUrl, publisher } = await startRelayAndPublisher('silent', fixture, silentArgs); procs.push(publisher, relay);
     const query = new URLSearchParams({ url: relayUrl, ns: fixture.namespace, hash: pinHex, exposure: 'development' });
+    await evaluate(ps, 'window.__pageFactCount = 0; true'); const silentMark = await resetRing();   // before load: the auto-attach snapshot must be retained
     await page.goto(`${devBase}index.html?${query}`, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => window.live?.installed && window.live?.bridgeInstalled);
     const t0 = Date.now();
     await page.click('#start');
-    await evaluate(ps, 'window.__pageFactCount = 0; true'); const silentMark = await resetRing();
-    await ownerReadyFor(new URL(devBase).origin);
     await attachFirst();
     // Accepted VIDEO and AUDIO subscriptions, identified from the source's own track facts (the fixture/player picks the
     // renditions; every advertised one is not required), well inside the engine's bootstrap fault.
@@ -476,13 +477,12 @@ try {
   if (cases.includes('freeze')) await runCase('freeze', async (step, procs) => {
     const { relay, relayUrl, publisher } = await startRelayAndPublisher('freeze', fixture, cmafPublisher(fixture)); procs.push(publisher, relay);
     const query = new URLSearchParams({ url: relayUrl, ns: fixture.namespace, hash: pinHex, exposure: 'development' });
+    await evaluate(ps, 'window.__pageFactCount = 0; true'); await resetRing();   // before load: the auto-attach snapshot must be retained
     await page.goto(`${devBase}index.html?${query}`, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => window.live?.installed && window.live?.bridgeInstalled);
     await page.click('#start');
     await page.waitForFunction(() => window.live.state === 'playing' || window.live.error, { timeout: 30000 });
     await until('media advancing', async () => { const p = await liveProgress(); return p.t > 0.5 ? p : null; }, 300);
-    await evaluate(ps, 'window.__pageFactCount = 0; true'); await resetRing();
-    await ownerReadyFor(new URL(devBase).origin);
     await attachFirst();
     const flowing = await until('video objects and appended stages flowing', async () => { const f = await pageFacts(); const t = tracksByType(f);
       return t.video.size >= 1 && f.some(x => x.kind === 'object' && t.video.has(x.trackId)) && f.some(x => x.kind === 'stage' && x.stage === 'appended') ? t : null; }, 200);

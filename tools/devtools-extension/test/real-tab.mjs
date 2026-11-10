@@ -235,6 +235,22 @@ try {
     assert.equal(Number(owner.tab), identity.tabId, 'panel tab must be the inspected tab');
     return owner;
   };
+  // Test-only instrumentation in the DevTools document (installed BEFORE the panel binds, since a granted origin
+  // attaches by itself as soon as a view connects): count injections/connects, hold injection on
+  // demand, and keep the last packet each relay port delivered so a stale frame can be replayed later.
+  await evaluate(dtSession, `(() => {
+    const race = window.__race = { injections: 0, connects: 0, hold: false, held: null, heldAll: [], ports: [] };
+    const origInject = chrome.scripting.executeScript.bind(chrome.scripting);
+    chrome.scripting.executeScript = opts => { race.injections++; if (!race.hold) return origInject(opts);
+      return new Promise((res, rej) => { race.held = { release: () => origInject(opts).then(res, rej) }; race.heldAll.push(race.held); }); };
+    const origConnect = chrome.tabs.connect.bind(chrome.tabs);
+    chrome.tabs.connect = (tabId, opts) => { race.connects++; const port = origConnect(tabId, opts);
+      const entry = { listeners: [], last: null }; race.ports.push(entry);
+      const origAdd = port.onMessage.addListener.bind(port.onMessage);
+      port.onMessage.addListener = fn => { entry.listeners.push(fn); origAdd(m => { if (m && m.t === 'packet') entry.last = m; fn(m); }); };
+      return port; };
+    race.replayStale = () => { const e = race.ports.at(-2); if (!e || !e.last) return false; for (const fn of e.listeners) fn(e.last); return true; };
+  })()`);
   const owner = await bindPanel();
   step('identity', { ownerId: identity.ownerId, tabId: identity.tabId, panelOwner: owner.id });
 
@@ -246,61 +262,78 @@ try {
   const click = createNativeClick({ evaluate, rpc, session: () => ps });
   const pageActive = () => page.evaluate(() => JSON.parse(JSON.stringify(window.gate.active)));
 
-  // Test-only instrumentation in the DevTools document: count injections/connects, hold injection on
-  // demand, and keep the last packet each relay port delivered so a stale frame can be replayed later.
-  await evaluate(dtSession, `(() => {
-    const race = window.__race = { injections: 0, connects: 0, hold: false, held: null, ports: [] };
-    const origInject = chrome.scripting.executeScript.bind(chrome.scripting);
-    chrome.scripting.executeScript = opts => { race.injections++; if (!race.hold) return origInject(opts);
-      return new Promise((res, rej) => { race.held = { release: () => origInject(opts).then(res, rej) }; }); };
-    const origConnect = chrome.tabs.connect.bind(chrome.tabs);
-    chrome.tabs.connect = (tabId, opts) => { race.connects++; const port = origConnect(tabId, opts);
-      const entry = { listeners: [], last: null }; race.ports.push(entry);
-      const origAdd = port.onMessage.addListener.bind(port.onMessage);
-      port.onMessage.addListener = fn => { entry.listeners.push(fn); origAdd(m => { if (m && m.t === 'packet') entry.last = m; fn(m); }); };
-      return port; };
-    race.replayStale = () => { const e = race.ports.at(-2); if (!e || !e.last) return false; for (const fn of e.listeners) fn(e.last); return true; };
-  })()`);
 
-  // 4. Before anything: owner ready, origin A shown, nothing injected, both page captures inert.
-  const ready = await until('owner ready', async () => { const h = await hostState(); return h?.outer?.stage === 'ready' ? h : null; });
-  assert.equal(ready.outer.origin, originA);
+  // 4. AUTOMATIC ATTACH: the test build pre-grants the loopback origin, so once the panel is open the owner attaches
+  //    by itself (no click): one injection, discovery of BOTH sources, no selection (two sources still ask the user),
+  //    captures inert. The button already reads Detach.
+  const auto = await until('automatic discovery on the granted origin', async () => { const h = await hostState(); return h?.core?.phase === 'discovered' && h.outer.origin === originA ? h : null; });
+  assert.equal(auto.core.sources.length, 2, 'both exposed sources must be discovered');
+  assert.equal(await evaluate(dtSession, 'window.__race.injections'), 1, 'exactly one automatic injection');
+  assert.equal(await evaluate(ps, `document.getElementById('btnDev').textContent`), 'Detach');
+  assert.deepEqual(await pageActive(), { player: null, second: null }, 'automatic discovery must not activate capture');
+  step('automatic attach', { origin: auto.outer.origin, sources: auto.core.sources.map(s => s.sourceId), pickListShown: await evaluate(ps, `!document.getElementById('pickList').classList.contains('hidden')`) });
+  // The user detaches: automatic attachment stays OFF for this origin until a manual Attach.
+  await click('#btnDev');
+  const ready = await until('owner ready after user detach', async () => { const h = await hostState(); return h?.outer?.stage === 'ready' ? h : null; });
+  await pause(500);
+  assert.equal((await hostState()).outer.stage, 'ready', 'no automatic re-attach after a user detach');
   assert.equal(await evaluate(ps, `document.getElementById('btnDev').textContent`), 'Attach to page');
-  assert.deepEqual(await pageActive(), { player: null, second: null }, 'page captures must be inert before attach');
-  step('ready', { origin: ready.outer.origin });
+  // Rendered idle wording after a user Detach: the line names the detached state (not a pending automatic attach,
+  // not a permission request) and the body does not claim a discovery that has not happened.
+  const idleText = await evaluate(ps, `({ line: document.getElementById('hostLine').textContent, title: document.getElementById('emptyTitle').textContent, auto: window.__playaPanel.host.outer.auto, granted: window.__playaPanel.host.outer.granted, detached: window.__playaPanel.host.outer.detached })`);
+  assert.equal(idleText.line, `detached · Attach attaches to ${originA} again`, JSON.stringify(idleText));
+  assert.equal(idleText.title, 'Not attached to this page.');
+  assert.deepEqual({ auto: idleText.auto, granted: idleText.granted, detached: idleText.detached }, { auto: false, granted: true, detached: true });
+  step('ready', { origin: ready.outer.origin, autoSuppressedAfterDetach: true, ...idleText });
 
   // 5. DENIAL CONTROL (labelled API wrapper, not the native prompt): the panel's request returns false.
   await evaluate(ps, `window.__origRequest = chrome.permissions.request; chrome.permissions.request = async () => false;`);
   await click('#btnDev');
   const deniedLine = await until('denial shown', async () => { const t = await evaluate(ps, `document.getElementById('hostLine').textContent`); return /was not granted/.test(t) ? t : null; });
+  assert.equal(deniedLine, `not attached · access to ${originA} was not granted`);
   await pause(300);
-  assert.equal(await evaluate(dtSession, 'window.__race.injections'), 0, 'a denied grant must inject nothing');
+  assert.equal(await evaluate(dtSession, 'window.__race.injections'), 1, 'a denied grant must inject nothing (the one injection is the earlier automatic attach)');
   assert.deepEqual(await pageActive(), { player: null, second: null });
   await evaluate(ps, `chrome.permissions.request = window.__origRequest;`);
   step('denial control', { line: deniedLine, injections: 0, note: 'API wrapper returning false; not a native prompt test' });
 
-  // 5b. FRESH-OWNER injection race: nothing attached yet, injection held, navigate A → A (same-origin
-  //     replacement), release: zero connects and the panel is immediately usable again.
-  await evaluate(dtSession, 'window.__race.hold = true; window.__race.held = null;');
+  // 5b. FRESH-OWNER injection race: the user's Attach (re-arming the detached origin) is held, the page navigates
+  //     A → A (same-origin replacement): the held attempt is cancelled and must never connect, while the NEW document,
+  //     granted and no longer detached, attaches by itself (its injection is held too and released second).
+  await evaluate(dtSession, 'window.__race.hold = true; window.__race.held = null; window.__race.heldAll = [];');
+  const connects0 = await evaluate(dtSession, 'window.__race.connects');
   await click('#btnDev');
-  await until('first injection held', () => evaluate(dtSession, 'window.__race.held !== null'));
+  await until('first injection held', () => evaluate(dtSession, 'window.__race.heldAll.length === 1'));
   await page.goto(`${originA}/?replaced=1`);
-  await until('owner ready after replacement', async () => { const h = await hostState(); return h?.outer?.stage === 'ready' && h.outer.origin === originA ? h : null; });
-  await evaluate(dtSession, 'window.__race.hold = false; window.__race.held.release()');
-  await pause(800);
-  const fresh = await evaluate(dtSession, '({ connects: window.__race.connects, injections: window.__race.injections })');
-  assert.equal(fresh.connects, 0, 'a cancelled first attach must not connect');
-  const freshUi = await evaluate(ps, `({ text: document.getElementById('btnDev').textContent, disabled: document.getElementById('btnDev').classList.contains('disabled'), stage: window.__playaPanel.host.outer.stage })`);
-  assert.deepEqual(freshUi, { text: 'Attach to page', disabled: false, stage: 'ready' }, 'the panel must be usable after a cancelled first attach');
+  await until('replacement document starts its own attempt', async () => (await evaluate(dtSession, 'window.__race.heldAll.length')) === 2 && (await hostState())?.outer?.origin === originA);
+  await evaluate(dtSession, 'window.__race.hold = false; window.__race.heldAll[0].release()');
+  await pause(500);
+  assert.equal(await evaluate(dtSession, 'window.__race.connects'), connects0, 'a cancelled first attach must not connect');
   assert.deepEqual(await pageActive(), { player: null, second: null });
-  step('fresh-owner injection race', { ...fresh, ...freshUi });
-
-  // 6. Attach: real click → request in the panel → owner verifies origin, injects, connects, bootstraps.
-  await click('#btnDev');
+  await evaluate(dtSession, 'window.__race.heldAll[1].release()');
+  // 6. The replacement document is discovered automatically: owner verified origin, injected, connected, bootstrapped.
   const discovered = await until('discovered', async () => { const h = await hostState(); return h?.core?.phase === 'discovered' ? h : null; });
   assert.equal(discovered.core.sources.length, 2);
+  assert.equal(await evaluate(dtSession, 'window.__race.connects'), connects0 + 1, 'exactly the new document\'s attempt connects');
   assert.deepEqual(await pageActive(), { player: null, second: null }, 'discovery must not activate capture');
+  const freshUi = await evaluate(ps, `({ text: document.getElementById('btnDev').textContent, stage: window.__playaPanel.host.outer.stage })`);
+  assert.deepEqual(freshUi, { text: 'Detach', stage: 'carrier' }, 'the panel must show the automatic attachment');
+  step('fresh-owner injection race', { connects0, connects: connects0 + 1, ...freshUi });
   step('discovered', { sources: discovered.core.sources.map(s => s.sourceId), generation: discovered.core.generation, injections: await evaluate(dtSession, 'window.__race.injections') });
+
+  // Short source labels fit on one row; the attach label must not inherit the yellow Probe button background.
+  const pickCards = await evaluate(ps, `(() => [...document.querySelectorAll('#pickList .inst')].map(card => {
+    const parts = [...card.children].map(el => el.getBoundingClientRect());
+    const go = getComputedStyle(card.querySelector('.go'));
+    return { direction: getComputedStyle(card).flexDirection, sameRow: Math.max(...parts.map(r => r.top)) < Math.min(...parts.map(r => r.bottom)), background: go.backgroundColor, text: card.textContent };
+  }))()`);
+  assert.equal(pickCards.length, 2);
+  const pickProblems = pickCards.flatMap((card, i) => [
+    ...(card.direction !== 'row' || !card.sameRow ? [`card ${i}: compact source card must use one row`] : []),
+    ...(card.background !== 'rgba(0, 0, 0, 0)' ? [`card ${i}: attach affordance inherited a button background (${card.background})`] : []),
+  ]);
+  assert.deepEqual(pickProblems, [], JSON.stringify(pickCards));
+  step('compact pick cards', { cards: pickCards });
 
   // 7. Pick the first source: lease bound, baseline snapshot, then batches applied and painted.
   await click('#pickList .inst');
@@ -313,7 +346,12 @@ try {
   assert.ok(painted.rows > 0 && painted.live, 'rows must paint and the indicator must be live');
   assert.ok(!/resnapshot/.test(painted.hookStats), 'no resnapshot loop expected');
   assert.ok((await applied()).every(a => a.outcome !== 'resnapshot'), 'no frame may have asked for a resnapshot');
-  step('attached', { target: attached.core.target, batches, ...painted });
+  // The healthy attached state folds its host line into the picker's tooltip (exact ids kept), so the pinned chrome
+  // stays compact; the line reappears for every other host state (denial, detach, loss are checked below).
+  const folded = await evaluate(ps, `({ display: getComputedStyle(document.getElementById('hostLine')).display, text: document.getElementById('hostLine').textContent, pickerTitle: document.getElementById('picker').title })`);
+  assert.equal(folded.display, 'none', `the attached host line must fold: ${JSON.stringify(folded)}`);
+  assert.ok(folded.pickerTitle.includes(`attached · ${attached.core.target.sourceId} · ${attached.core.target.attachmentId}`), `the picker tooltip must carry the exact attached line: ${JSON.stringify(folded)}`);
+  step('attached', { target: attached.core.target, batches, ...painted, hostLineFolded: folded });
 
   // 7b. RECORD on gate-player: start (page recorder created and started), stop, export (multi-chunk), download.
   const recorderCounts = () => page.evaluate(() => JSON.parse(JSON.stringify(window.gate.recorder)));
@@ -438,24 +476,27 @@ try {
   step('detached', { outer: detached.outer.stage, ...afterDetach });
 
   // 11. DETERMINISTIC injection race: grant checked, injection held, navigate to granted origin B, release.
-  await evaluate(dtSession, 'window.__race.hold = true; window.__race.held = null;');
+  await evaluate(dtSession, 'window.__race.hold = true; window.__race.held = null; window.__race.heldAll = [];');
   const connectsBefore = await evaluate(dtSession, 'window.__race.connects');
   await click('#btnDev');
-  await until('injection held', () => evaluate(dtSession, 'window.__race.held !== null'));
+  await until('injection held', () => evaluate(dtSession, 'window.__race.heldAll.length === 1'));
   await page.goto(`${originB}/`);
-  await until('owner shows B', async () => { const h = await hostState(); return h?.outer?.origin === originB && h.outer.stage === 'ready' ? h : null; });
-  await evaluate(dtSession, 'window.__race.hold = false; window.__race.held.release()');
-  await pause(800);
+  // Origin B is granted and was never detached, so the NEW document attaches by itself; its injection is held too.
+  await until('owner shows B and its automatic injection is held', async () => { const h = await hostState(); return h?.outer?.origin === originB && (await evaluate(dtSession, 'window.__race.heldAll.length')) === 2 ? h : null; });
+  // Release in order: the cancelled A attempt first (it must not connect), then B's own attempt (it must).
+  await evaluate(dtSession, 'window.__race.hold = false; window.__race.heldAll[0].release()');
+  await pause(500);
+  const afterA = await evaluate(dtSession, 'window.__race.connects');
+  assert.equal(afterA, connectsBefore, 'a cancelled origin-A attempt must not connect on origin B');
+  await evaluate(dtSession, 'window.__race.heldAll[1].release()');
+  const onB = await until('discovered on B (automatic)', async () => { const h = await hostState(); return h?.core?.phase === 'discovered' && h.outer.origin === originB ? h : null; });
   const race = await evaluate(dtSession, '({ connects: window.__race.connects, injections: window.__race.injections })');
-  assert.equal(race.connects, connectsBefore, 'a cancelled origin-A attempt must not connect on origin B');
-  const afterRace = await hostState();
-  assert.equal(afterRace.outer.stage, 'ready');
-  assert.deepEqual(await pageActive(), { player: null, second: null }, 'page B must be untouched');
-  step('injection race', { connectsBefore, ...race, outer: afterRace.outer });
+  assert.equal(race.connects, connectsBefore + 1, 'exactly B\'s own attempt connects');
+  assert.deepEqual(await pageActive(), { player: null, second: null }, 'discovery on B must not activate capture');
+  step('injection race', { connectsBefore, ...race, outer: onB.outer });
 
-  // 12. Fresh attach on B, then a held stale frame from the previous channel is replayed into the owner.
-  await click('#btnDev');
-  const onB = await until('discovered on B', async () => { const h = await hostState(); return h?.core?.phase === 'discovered' ? h : null; });
+  // 12. B was discovered automatically (two sources → the user picks); then a held stale frame from the previous
+  //     channel is replayed into the owner.
   assert.equal(onB.core.sources[0].runId, `run-${serverB.address().port}`);
   assert.ok(onB.core.generation > switched.core.generation, 'generation must advance across channels');
   await click('#pickList .inst');

@@ -47,6 +47,7 @@ const hex = (bytes: Uint8Array): string => Array.from(bytes, byte => byte.toStri
 const utf8 = new TextEncoder();
 const noop = () => {};
 const MAX_CONTEXTS = 8, MAX_TRACKS = 512;
+const RECEIVE_WINDOW_MS = 1000, RECEIVE_SAMPLES = 6;
 
 /** Explicit app-side opt-in. This entry is deliberately absent from the package root. */
 export function installPlayerDiagnostics(target: PlayerDiagnosticSource | PlayerDiagnosticFacade, options: PlayerDiagnosticsOptions): PlayerDiagnosticsInstallation {
@@ -71,7 +72,7 @@ export function installPlayerDiagnostics(target: PlayerDiagnosticSource | Player
   let unitSequence = 0n, unmappedStages = 0;
   let active = false, disposed = false, epoch = 0, delivery = 0n, trackSequence = 0;
   let timer: ReturnType<typeof setInterval> | undefined;
-  let previous: { time: number; bytes: number } | null = null;
+  let receiveSamples: Array<{ time: number; bytes: number }> = [];
   let started = player.state !== 'idle';
   let observationDrops = 0;
   let frameHandle: number | undefined;
@@ -99,10 +100,11 @@ export function installPlayerDiagnostics(target: PlayerDiagnosticSource | Player
     capture.emit(fact, lane);
     for (const write of writers) { try { write(fact); } catch { /* Recording cannot affect playback. */ } }
   };
-  const metric = (name: string, value: number | null, unit: 'ms' | 'seconds' | 'bytes' | 'bps' | 'count', definition: string, windowMs: number | null = null) => {
+  const metric = (name: string, value: number | null, unit: 'ms' | 'seconds' | 'bytes' | 'bps' | 'count', definition: string, windowMs: number | null = null,
+    unavailable: 'unsupported' | 'not-observed' = 'unsupported') => {
     const available = value !== null && Number.isFinite(value);
     emit({ kind: 'metric', name, sessionId: null, trackId: null, value: available ? value : null,
-      unavailable: available ? null : 'unsupported', unit, definition, windowMs, uncertaintyMs: null });
+      unavailable: available ? null : unavailable, unit, definition, windowMs, uncertaintyMs: null });
   };
   const stop = () => {
     active = false; epoch++;
@@ -115,7 +117,7 @@ export function installPlayerDiagnostics(target: PlayerDiagnosticSource | Player
     mediaOff(); mediaOff = noop;
     connectionOff(); connectionOff = noop;
     for (const context of contexts.values()) context.remove();
-    contexts.clear(); announcedTracks.clear(); stateCache.clear(); stateCacheBytes = 0; previous = null;
+    contexts.clear(); announcedTracks.clear(); stateCache.clear(); stateCacheBytes = 0; receiveSamples = [];
   };
   const guarded = (run: () => void) => {
     try { run(); } catch { stop(); capture.dispose(); }
@@ -269,6 +271,17 @@ export function installPlayerDiagnostics(target: PlayerDiagnosticSource | Player
       if (context.retired && context.connection.session.state === 'closed') { context.remove(); contexts.delete(context.connection); }
     }
     const stats = player.stats, time = clock.now();
+    const last = receiveSamples.at(-1);
+    if (!Number.isFinite(stats.bytesReceived) || stats.bytesReceived < 0
+      || (last && (stats.bytesReceived < last.bytes || time - last.time > RECEIVE_WINDOW_MS))) receiveSamples = [];
+    // Keep the sample bracketing the target boundary: discarding it on a slightly late tick would turn a
+    // one-second burst into a false zero. The reported window is the actual sampled span, not an interpolation.
+    while (receiveSamples.length > 1 && receiveSamples[1]!.time <= time - RECEIVE_WINDOW_MS) receiveSamples.shift();
+    const baseline = receiveSamples[0];
+    const window = baseline ? time - baseline.time : 0;
+    const receiveRate = baseline && window > 0 ? 8000 * (stats.bytesReceived - baseline.bytes) / window : null;
+    if (Number.isFinite(stats.bytesReceived) && stats.bytesReceived >= 0) receiveSamples.push({ time, bytes: stats.bytesReceived });
+    if (receiveSamples.length > RECEIVE_SAMPLES) receiveSamples.shift();
     metric('objects_received', stats.objectsReceived, 'count', 'Engine media-object receive counter for this playback run');
     metric('payload_bytes_received', stats.bytesReceived, 'bytes', 'Engine received media payload bytes for this playback run');
     metric('video_decode_submissions', stats.framesDecoded, 'count', 'Video decode commands emitted after transforms and before native dispatch over the engine lifetime; includes calls with no output');
@@ -276,10 +289,8 @@ export function installPlayerDiagnostics(target: PlayerDiagnosticSource | Player
     metric('audio_outputs_decoded', snapshot.mediaStages?.decodedAudioCount ?? null, 'count', 'Actual audio decoder output callbacks during the engine diagnostic tracker lifetime; unavailable without that callback, including MSE');
     metric('frames_rendered', stats.framesRendered, 'count', 'Engine-reported render callbacks; not a universal compositor frame count');
     metric('av_skew', stats.avSkewMs, 'ms', 'Measured video capture timestamp minus audible audio playhead; positive means video ahead');
-    const window = previous ? time - previous.time : 0;
-    metric('receive_bitrate', previous && window > 0 && stats.bytesReceived >= previous.bytes
-      ? 8000 * (stats.bytesReceived - previous.bytes) / window : null, 'bps', 'Media payload receive bitrate over the explicit sampling window', window > 0 ? window : null);
-    previous = { time, bytes: stats.bytesReceived };
+    metric('receive_bitrate', receiveRate, 'bps', 'Media payload receive bitrate between cumulative samples targeting one second; windowMs is the actual span including timer jitter',
+      window > 0 ? window : null, 'not-observed');
     metric('end_to_end_latency', null, 'ms', 'Unavailable without a verified sender-to-receiver clock relation');
     metric('arrival_jitter', null, 'ms', 'Unavailable without a declared expected object arrival cadence');
     metric('diagnostic_unattributed_stages', unmappedStages, 'count', 'Stage inputs not observed by this capture lifetime; no delivery identity is inferred');

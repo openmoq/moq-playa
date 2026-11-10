@@ -16,8 +16,11 @@ A Chrome DevTools panel that observes a Playa instance on the inspected page
   on every fact kind, evicted in observation order — so a peer-chosen
   identifier never sizes an allocation. Panel eviction is disclosed apart
   from source loss. In a real DevTools window it is fed by the owner over the
-  view port once the user attaches to a page that installs the diagnostic
-  bridge (page lane) or starts an owner-local Probe (probe lane). Record is
+  view port once attached to a page that installs the diagnostic bridge
+  (page lane: the first Attach click grants the origin; a granted origin then
+  attaches by itself whenever the panel is open on it, selecting the only
+  exposed source, until the user presses Detach) or once the user starts an
+  owner-local Probe (probe lane). Record is
   offered on sources that declare the `recording` capability; the Probe strip
   dials only on an explicit Start.
 - `src/mock-source.js` — `MockSource`, an explicit preview (`?source=mock`)
@@ -148,9 +151,14 @@ pre-declares `http://127.0.0.1/*` so `permissions.contains` is true without
 the native prompt) and two loopback origins serving a page that installs
 `DiagnosticRegistry` + two `DiagnosticCapture`s + `installDiagnosticBridge`
 from the BUILT backend packages. With real `Input` clicks it proves: owner and
-panel identity matching; a denial control (an API wrapper returning `false`,
-not the native prompt); the fresh-owner injection race (injection held,
-same-origin replacement, release → zero connects, panel usable); discovery
+panel identity matching; automatic attachment of the pre-granted origin as soon
+as the panel is open (one injection, both sources discovered, nothing selected
+because there are two, capture inert, compact one-row pick cards whose attach
+label has no button background), and that a user Detach keeps the origin
+detached; a denial control (an API wrapper returning `false`, not the native
+prompt); the fresh-owner injection race (the re-arming Attach held,
+same-origin replacement, the cancelled attempt released → zero connects, the
+replacement document's own automatic attempt released → discovered); discovery
 without activating capture; attach with batches applied and painted; instance
 switch holding one lease at a time; the Probe negative control (owner-local dial
 to a closed loopback port fails with its own facts, mode switch is view-only); Record start/stop/export/download against
@@ -349,14 +357,20 @@ about two minutes and is the only way to close that gap:
 2. Open any `http(s)` page that installs the diagnostic bridge (for a page
    without Playa, `node test/real-tab.mjs` prints the two loopback origins it
    serves; or serve the gate page yourself), open DevTools → **Playa**.
-3. The host line reads `ready · attach asks for access to <origin>`. Click
-   **Attach to page**. Chrome shows its prompt naming that origin.
+3. The host line reads `not attached · Attach asks Chrome for access to
+   <origin>` and the body `Not attached to this page.` Click **Attach to
+   page**. Chrome shows its prompt naming that origin.
    - **Deny** → the host line reads `not attached · access to <origin> was
      not granted`; nothing is injected (the page's capture stays inert).
-   - Click Attach again and **Allow** → the source pick list appears; pick
-     one → the grid fills.
-4. Reload the page: the panel shows `the page navigated`, then Attach works
-   again WITHOUT a second prompt (the grant is remembered per origin).
+   - Click Attach again and **Allow** → with one exposed source the panel
+     attaches to it at once (the grid fills); with several, the pick list
+     appears and you pick one.
+4. Reload the page: the panel shows `the page navigated`, then attaches BY
+   ITSELF once the page has loaded, WITHOUT a second prompt (the grant is
+   remembered per origin; the prompt itself always needs a click). Press
+   **Detach**: the panel stays detached for that origin, across reloads, until
+   you press Attach again (this is per DevTools window; closing and reopening
+   DevTools attaches by itself again).
 5. `chrome://extensions` → Playa DevTools → Details → Site access shows that
    origin only; remove it and Attach prompts again.
 

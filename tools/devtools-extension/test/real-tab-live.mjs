@@ -229,6 +229,7 @@ try {
   const progress = () => page.evaluate(() => ({ state: window.live.state, error: window.live.error, t: window.live.currentTime(),
     presentation: window.live.presentation(), rvfc: window.live.rvfc(), stats: JSON.parse(JSON.stringify(window.live.stats())), canvasVisible: window.live.canvasVisible() }));
 
+  let detachedByGate = false;   // set once an arm has pressed Detach: automatic attachment is then off for the origin
   for (const arm of arms) {
     const canvas = arm === 'loc';
     const locmaf = arm === 'locmaf-mse';
@@ -249,6 +250,7 @@ try {
 
     // 5. The REAL player page; codec preflight; playback starts on a click.
     const query = new URLSearchParams({ url: relayUrl, ns: fixture.namespace, hash: pinHex, exposure: production ? 'production' : 'development', ...(canvas ? { output: 'canvas' } : {}) });
+    await evaluate(ps, 'if (window.__pageFrames) window.__pageFrames.length = 0; true');   // before load: the granted origin attaches by itself and its snapshot must be retained
     await page.goto(`${pageBase}?${query}`, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => window.live?.installed && window.live?.bridgeInstalled);
     await page.waitForFunction(() => window.live.codecs.webCodecsH264 !== null);
@@ -276,19 +278,21 @@ try {
     }
     step('player playing', { ...installed, state: started.state, mediaTime: [sampleA.t, sampleB.t], framesRendered: [sampleA.stats.framesRendered, sampleB.stats.framesRendered], rvfc: [sampleA.rvfc, sampleB.rvfc], presentation: sampleB.presentation });
 
-    // 6. Attach from the panel: the page's one Playa source is discovered and attached. This arm's facts only.
-    await evaluate(ps, 'if (window.__pageFrames) window.__pageFrames.length = 0; true');
-    await until('owner ready for this document', async () => { const h = await hostState(); return h?.outer?.stage === 'ready' && h.outer.origin === new URL(pageBase).origin ? h : null; }, 100);
-    await click('#btnDev');
-    const discovered = await until('discovered', async () => { const h = await hostState(); return h?.core?.phase === 'discovered' ? h : null; }, 150);
+    // 6. The page's one Playa source is discovered and attached automatically (granted origin). This arm's facts only.
+    // The granted origin attaches by itself and selects the page's ONE source (no click); `discovered` is transient,
+    // so the sources are read from the attached state, which retains the hello's list.
+    // The earlier arm's Detach turned automatic attachment off for this origin (that is the user's choice, kept for
+    // the DevTools document); the next arm re-arms it with a manual Attach, after which the one source is still
+    // selected without a pick.
+    if (detachedByGate) { await until('owner ready for this document', async () => { const h = await hostState(); return h?.outer?.stage === 'ready' && h.outer.origin === new URL(pageBase).origin ? h : null; }, 100); await click('#btnDev'); }
+    const discovered = await until(detachedByGate ? 'attached after the manual re-arm' : 'attached automatically', async () => { const h = await hostState(); return h?.core?.phase === 'attached' && h.outer.origin === new URL(pageBase).origin ? h : null; }, 200);
     assert.equal(discovered.core.sources.length, 1);
     const source = discovered.core.sources[0];
     assert.equal(source.sourceId, installed.sourceId); assert.equal(source.runId, installed.runId);
     assert.equal(source.exposure, production ? 'production' : 'development');
     assert.ok(['session', 'requests', 'objects', 'metrics', 'recording'].every(c => source.capabilities.includes(c)), `capabilities ${source.capabilities}`);
     assert.equal(source.synthetic, false);
-    await click('#pickList .inst');
-    await until('attached', async () => (await hostState())?.core?.phase === 'attached', 100);
+    assert.deepEqual({ sourceId: discovered.core.target.sourceId, runId: discovered.core.target.runId }, { sourceId: source.sourceId, runId: source.runId }, 'the only source is the attached target');
 
     // 7. Live facts and rendering.
     const relayOrigin = new URL(relayUrl).origin;
@@ -604,7 +608,7 @@ try {
     // waited for beyond the progress check itself.
     const factCounter = () => evaluate(ps, '({ facts: window.__pageFactCount, frames: window.__pageFrameCount, last: window.__pageLastFrame })');
     const preRequest = await factCounter();
-    await click('#btnDev');
+    await click('#btnDev'); detachedByGate = true;
     const detachedHost = await until('detach completed (owner ready, no attachment)', async () => { const h = await hostState();
       // The Detach button sends the owner 'disconnect': the owner closes the carrier (HostCore.terminal('closed',
       // 'owner-closed'), which cancels timers and clears exchange, queue and recording but keeps the last target as

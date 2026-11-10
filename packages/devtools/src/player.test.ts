@@ -9,6 +9,92 @@ function player() { return new MoqtPlayer({url:'https://relay.example/moq',names
 afterEach(()=>vi.useRealTimers());
 
 describe('optional live player adapter',()=>{
+  it('reports the actual bracketing span at a coarse but still observed sampling cadence', async () => {
+    vi.useFakeTimers();
+    const engine = player(), registry = new DiagnosticRegistry(), baseline = engine.stats;
+    let time = 0, received = 0;
+    vi.spyOn(engine, 'stats', 'get').mockImplementation(() => ({ ...baseline, bytesReceived: received }));
+    const installed = installPlayerDiagnostics(engine, { registry, exposure: 'development', clock: { id: 'rate', now: () => time } });
+    const attached = attach(registry, installed.source);
+    try {
+      for (const t of [900, 1800]) { time = t; received += 9000; vi.advanceTimersByTime(250); }
+      expect(facts(attached.drain()).filter(f => f.kind === 'metric' && f.name === 'receive_bitrate').at(-1))
+        .toMatchObject({ value: 80_000, windowMs: 1800 });
+    } finally { attached.owner.close(); installed.dispose(); registry.dispose(); await engine.destroy(); }
+  });
+
+  it('keeps the bracketing receive baseline when real timer jitter crosses the one-second boundary', async () => {
+    vi.useFakeTimers();
+    const engine = player(), registry = new DiagnosticRegistry(), baseline = engine.stats;
+    let received = 0, time = 0;
+    vi.spyOn(engine, 'stats', 'get').mockImplementation(() => ({ ...baseline, bytesReceived: received }));
+    const installed = installPlayerDiagnostics(engine, { registry, exposure: 'development', clock: { id: 'rate', now: () => time } });
+    const attached = attach(registry, installed.source);
+    try {
+      received = 1_250_000;
+      for (let i = 1; i <= 4; i++) { time = i * 250.1; vi.advanceTimersByTime(250); }
+      const rate = facts(attached.drain()).filter(f => f.kind === 'metric' && f.name === 'receive_bitrate').at(-1);
+      expect(rate).toMatchObject({ windowMs: 1000.4 });
+      if (rate?.kind !== 'metric') throw new Error('Missing receive rate');
+      expect(rate.value).toBeCloseTo(10_000_000_000 / 1000.4, 5);
+    } finally { attached.owner.close(); installed.dispose(); registry.dispose(); await engine.destroy(); }
+  });
+
+  it('reports a rolling receive rate between media bursts and returns to zero when that window is idle', async () => {
+    vi.useFakeTimers(); vi.setSystemTime(0);
+    const engine = player(), registry = new DiagnosticRegistry();
+    const baseline = engine.stats;
+    let received = 0;
+    vi.spyOn(engine, 'stats', 'get').mockImplementation(() => ({ ...baseline, bytesReceived: received }));
+    const installed = installPlayerDiagnostics(engine, { registry, exposure: 'development', clock: { id: 'rate', now: () => Date.now() } });
+    const attached = attach(registry, installed.source);
+    const rate = () => facts(attached.drain()).filter(f => f.kind === 'metric' && f.name === 'receive_bitrate').at(-1);
+    try {
+      received = 1_250_000;
+      vi.advanceTimersByTime(250);
+      expect(rate()).toMatchObject({ value: 40_000_000, windowMs: 250 });
+      vi.advanceTimersByTime(250);
+      expect(rate()).toMatchObject({ value: 20_000_000, windowMs: 500 });
+      vi.advanceTimersByTime(500); rate();
+      received += 1_250_000;
+      for (let i = 0; i < 4; i++) {
+        vi.advanceTimersByTime(250);
+        expect(rate()).toMatchObject({ value: 10_000_000, windowMs: 1000 });
+      }
+      vi.advanceTimersByTime(250);
+      expect(rate()).toMatchObject({ value: 0, windowMs: 1000 });
+      received = 0;
+      vi.advanceTimersByTime(250);
+      expect(rate()).toMatchObject({ value: null, windowMs: null });
+      received = 1000;
+      vi.advanceTimersByTime(250);
+      expect(rate()).toMatchObject({ value: 32_000, windowMs: 250 });
+    } finally { attached.owner.close(); installed.dispose(); registry.dispose(); await engine.destroy(); }
+  });
+
+  it('does not invent a receive rate across sampling gaps or carry the previous lease window into reattachment', async () => {
+    vi.useFakeTimers(); vi.setSystemTime(0);
+    const engine = player(), registry = new DiagnosticRegistry(), baseline = engine.stats;
+    let received = 0;
+    vi.spyOn(engine, 'stats', 'get').mockImplementation(() => ({ ...baseline, bytesReceived: received }));
+    const installed = installPlayerDiagnostics(engine, { registry, exposure: 'development', clock: { id: 'rate', now: () => Date.now() } });
+    let attached = attach(registry, installed.source);
+    const rate = () => facts(attached.drain()).filter(f => f.kind === 'metric' && f.name === 'receive_bitrate').at(-1);
+    try {
+      received = 1000; vi.advanceTimersByTime(250);
+      expect(rate()).toMatchObject({ value: 32_000, windowMs: 250 });
+      vi.setSystemTime(5000); received = 2000; vi.advanceTimersByTime(250);
+      expect(rate()).toMatchObject({ value: null, unavailable: 'not-observed', windowMs: null });
+      received = 3000; vi.advanceTimersByTime(250);
+      expect(rate()).toMatchObject({ value: 32_000, windowMs: 250 });
+      attached.owner.close(); received = 100_000; vi.advanceTimersByTime(2000);
+      attached = attach(registry, installed.source);
+      expect(facts([attached.snapshot])).toContainEqual(expect.objectContaining({ kind: 'metric', name: 'receive_bitrate', value: null, unavailable: 'not-observed', windowMs: null }));
+      received += 1000; vi.advanceTimersByTime(250);
+      expect(rate()).toMatchObject({ value: 32_000, windowMs: 250 });
+    } finally { attached.owner.close(); installed.dispose(); registry.dispose(); await engine.destroy(); }
+  });
+
   it('registers explicit exposure without starting detailed observation or sampling', async()=>{
     vi.useFakeTimers(); const engine=player(), registry=new DiagnosticRegistry();
     const observe=vi.spyOn(engine,'observeConnections'), stats=vi.spyOn(engine,'stats','get'), now=vi.fn(()=>1);
@@ -368,6 +454,7 @@ it('the destroy hook runs once even when final ENDED publication throws', async 
 });
 
 });
+
 
 it('does not invent an alias binding for an observed FETCH receipt', async () => {
   const h = await live(), registry = new DiagnosticRegistry();

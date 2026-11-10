@@ -57,6 +57,13 @@ last delivered watermark and account for every sequence as a surviving event
 or a dense/sparse delivery drop. Source retention and delivery drops are separate.
 Every returned frame passes the shared codec and MAX_MESSAGE_BYTES limit.
 
+The default pending queue admits up to 1024 events and 254 KiB of serialized
+event data per lease. The remaining 2 KiB of the 256 KiB frame limit is reserved
+for the batch envelope. This accommodates ordinary media-stage bursts between
+the host's quarter-second polls; it is a bounded allowance, not lossless capture
+at every traffic rate. A slower reader or larger burst still receives exact
+delivery-drop counts. Applications may supply smaller explicit limits.
+
 A source refresh returns any pending batch first, then its snapshot with an
 equal or newer watermark. A detail refresh returns only a scoped snapshot;
 it does not drain the queue or advance the stream cursor. Snapshots prioritize

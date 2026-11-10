@@ -41,6 +41,66 @@ function current(lease: CaptureLease): Snapshot {
 }
 
 describe('bounded diagnostic capture', () => {
+  it('delivers a paced 10 Mbps observation workload at the host cadence with the default limits', () => {
+    const { source, at } = setup();
+    const attached = source.attach('owner', 'attach');
+    let cursor = cursorFromSnapshot(snapshot(attached.snapshot));
+    for (let quarter = 0; quarter < 12; quarter++) {
+      at(quarter * 250);
+      for (let i = 0; i < 100; i++) {
+        const deliveryId = `delivery-${quarter}-${i}`;
+        expect(source.emit(object(deliveryId, { groupId: String(1700000000000 + quarter), objectId: String(i), payloadBytes: 3125 }), 'dense')).toBe(true);
+        for (const stage of ['reconstructed', 'appended'] as const) expect(source.emit({ kind: 'stage', deliveryId, unitId: `unit-${quarter}-${i}`, stage, reason: null }, 'dense')).toBe(true);
+      }
+      for (let i = 0; i < 30; i++) expect(source.emit({ kind: 'metric', name: `counter_${i}`, sessionId: null, trackId: null,
+        value: quarter, unavailable: null, unit: 'count', definition: 'Cumulative diagnostic counter', windowMs: null, uncertaintyMs: null }, 'sparse')).toBe(true);
+      const frame = batch(attached.lease.pull());
+      expect(frame.dropped).toEqual({ dense: '0', sparse: '0' });
+      expect(frame.events).toHaveLength(330);
+      const next = advanceCursor(cursor, frame);
+      expect(next.kind).toBe('accept');
+      if (next.kind === 'accept') cursor = next.cursor;
+    }
+    attached.lease.close();
+  });
+
+  it('fits a quarter-second burst of large valid identities without hitting the old byte budget', () => {
+    const { source } = setup();
+    const attached = source.attach('owner', 'attach');
+    for (let i = 0; i < 100; i++) expect(source.emit(object(`delivery-${i}-${'d'.repeat(110)}`, {
+      sessionId: 's'.repeat(128), trackId: 't'.repeat(128), requestId: '18446744073709551615',
+      trackAlias: '18446744073709551615', groupId: '18446744073709551615', objectId: String(i),
+      subgroupId: '18446744073709551615', streamId: '18446744073709551615',
+    }), 'dense')).toBe(true);
+    const frame = batch(attached.lease.pull());
+    expect(frame.dropped).toEqual({ dense: '0', sparse: '0' });
+    expect(frame.events).toHaveLength(100);
+    attached.lease.close();
+  });
+
+  it('still bounds an overloaded default lease without making a draining reader lose observations', () => {
+    const { source } = setup();
+    const fast = source.attach('fast', 'attach-fast'), slow = source.attach('slow', 'attach-slow');
+    let cursor = cursorFromSnapshot(snapshot(fast.snapshot));
+    for (let i = 0; i < 2048; i++) {
+      source.emit(object(`load-${i}`, { objectId: String(i) }), 'dense');
+      if (i % 64 === 63) {
+        const frame = batch(fast.lease.pull());
+        expect(frame.dropped).toEqual({ dense: '0', sparse: '0' });
+        const next = advanceCursor(cursor, frame);
+        expect(next.kind).toBe('accept');
+        if (next.kind === 'accept') cursor = next.cursor;
+      }
+    }
+    const frame = batch(slow.lease.pull());
+    expect(BigInt(frame.dropped.dense)).toBeGreaterThan(0n);
+    expect(BigInt(frame.dropped.dense) + BigInt(frame.events.length)).toBe(2048n);
+    expect(frame.dropped.sparse).toBe('0');
+    expect(frame.events.length).toBeLessThanOrEqual(1024);
+    expect(advanceCursor(cursorFromSnapshot(snapshot(slow.snapshot)), frame).kind).toBe('accept');
+    fast.lease.close(); slow.lease.close();
+  });
+
   it('does no clock reads or fact access with no attachment', () => {
     const { source, now } = setup();
     const fact = new Proxy(control(), { get() { throw new Error('must not project'); } });

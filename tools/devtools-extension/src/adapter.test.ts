@@ -333,6 +333,30 @@ describe('sparkline history', () => {
     expect(bitrate(vm).range).toBe('3 samples · peak 50 bps');
   });
 
+  it('keeps exact latest and retained peak inspectable beside rounded labels', () => {
+    const { src, vm } = source();
+    src.applySnapshot(decoded(snapshotFixture));
+    src.applyBatch(decoded(metric(2738306.4848224605, 20, 6)));
+    src.applyBatch(decoded(metric(96000, 30, 7)));
+    const s = bitrate(vm());
+    expect(s.now).toBe('96.0 kbps');
+    expect(s.range).toBe('2 samples · peak 2.74 Mbps');
+    expect(s.definition).toContain('exact 96000 bps');
+    expect(s.definition).toContain('exact retained peak 2738306.4848224605 bps');
+  });
+
+  it('keeps the exact retained peak inspectable when the latest sample is unavailable', () => {
+    const { src, vm } = source();
+    src.applySnapshot(decoded(snapshotFixture));
+    src.applyBatch(decoded(metric(2738306.4848224605, 20, 6)));
+    src.applyBatch(decoded(metric(null, 30, 7)));
+    const s = bitrate(vm());
+    expect(s.now).toBe('unavailable');
+    expect(s.range).toBe('1 sample · peak 2.74 Mbps');
+    expect(s.definition).toContain('exact retained peak 2738306.4848224605 bps');
+    expect(s.definition).not.toContain('exact null');
+  });
+
   it('keeps history across a same-run refresh without duplicating the re-delivered sample, and clears it for a new run', () => {
     const { src, vm } = source();
     src.applySnapshot(decoded(snapshotFixture));

@@ -128,9 +128,19 @@ function hostLabel() {
   const o = host?.outer ?? { stage: 'idle' }; const c = host?.core ?? null;
   const detail = o.detail ? ` · ${o.detail}` : '';
   const deniedLine = denied && denied === o.origin ? `not attached · access to ${denied} was not granted` : null;
-  const historical = vm?.exposed ? ' · showing the last observed data' : '';
+  const historical = vm?.exposed ? ' · last observed data shown' : '';
   switch (o.stage) {
-    case 'idle': case 'ready': return { ...ATTACH, live: false, line: deniedLine ?? (o.origin ? `ready · attach asks for access to ${o.origin}${detail}${historical}` : null) };
+    case 'idle': case 'ready': {
+      if (deniedLine) return { ...ATTACH, live: false, line: deniedLine };
+      if (!o.origin) return { ...ATTACH, live: false, line: null };
+      // Worded by what is actually known: the user detached (automatic attach is off for this origin), the origin is
+      // granted (the owner attaches by itself; the detail says what it is waiting for), not granted (Attach asks
+      // Chrome), or not yet checked.
+      if (o.detached) return { ...ATTACH, live: false, line: `detached · Attach attaches to ${o.origin} again${historical}` };
+      if (o.granted === true) return { ...ATTACH, live: false, line: `ready · ${o.origin} is granted${detail || (o.auto ? ' · attaching by itself' : ' · press Attach')}${historical}` };
+      if (o.granted === false) return { ...ATTACH, live: false, line: `not attached · Attach asks Chrome for access to ${o.origin}${detail}${historical}` };
+      return { ...ATTACH, live: false, line: `ready · ${o.origin}${detail}${historical}` };
+    }
     case 'unsupported': case 'unsupported-origin': return { text: 'Attach unavailable', enabled: false, action: null, live: false, line: `attach unavailable${detail}` };
     case 'needs-permission': return { ...ATTACH, live: false, line: `not attached · permission for ${o.origin} was not granted` };
     case 'origin-unverified': case 'origin-mismatch': case 'not-attached': return { ...ATTACH, live: false, line: `not attached${detail}${historical}` };
@@ -145,7 +155,8 @@ function hostLabel() {
         case 'discovered': return { ...DETACH, live: false, line: `connected to the page · ${c.sources.length} source${c.sources.length === 1 ? '' : 's'} exposed · no lease${err}${historical}` };
         case 'attaching': return { ...DETACH, live: false, line: 'attaching to source…' };
         case 'attached': return { ...DETACH, live: true, line: `attached · ${c.target.sourceId} · ${c.target.attachmentId}${err}` };
-        case 'withdrawn': return { ...DETACH, live: false, line: `source withdrawn by the page${reason} · pick another source${historical}` };
+        // The page replaced or dropped its player: say so briefly; the registry's exact reason is the line's tooltip.
+        case 'withdrawn': return { ...DETACH, live: false, line: `source withdrawn by the page · pick a source below${historical}`, title: c.reason ?? '' };
         case 'closed': return { ...RECONNECT, live: false, line: `carrier closed${reason}${historical}` };
         case 'lost': return { ...RECONNECT, live: false, line: `carrier lost${reason}${historical}` };
       }
@@ -208,6 +219,10 @@ function probeStatusLine() {
 
 // Rendering keeps DOM nodes for the grid and rebuilds only what changed in
 // count; the cell set per row is bounded (ring of 8 groups × ≤60 objects).
+// The toolbar shows the adapter's hook stats in a compact form (the exact wording is the element's tooltip).
+function compactStats(text) {
+  return text.replace('delivery drops: ', 'drops ').replace(/ over (\d+ batch(?:es)?)/, ' · $1').replace('source evicted ', 'src evicted ').replace('panel evicted ', 'panel ').replace('snapshot omitted ', 'omitted ');
+}
 function render() {
   // Keep applying and acknowledging observations while hidden; the next shown host state paints the latest VM.
   // Losing the owner must still clear the live indicator, since that port can no longer send a shown state.
@@ -235,6 +250,12 @@ function render() {
   $('btnDev').classList.toggle('disabled', !hostUi.enabled);
   $('hostLine').classList.toggle('hidden', !hostUi.line);
   if (hostUi.line) $('hostLine').textContent = hostUi.line;
+  $('hostLine').title = hostUi.title ?? '';
+  // A healthy attached lease is routine: its line folds into the picker's tooltip (exact ids kept) so the pinned
+  // chrome is the mockup's two rows; any other host state keeps its visible line.
+  const folded = !mockPreview && host?.core?.phase === 'attached' && !host?.core?.lastError;
+  $('hostLine').classList.toggle('folded', folded);
+  $('picker').title = folded ? (hostUi.line ?? '') : '';
   $('btnPause').classList.toggle('disabled', !vm.actions.pause);
   $('btnAttach').classList.toggle('disabled', !vm.actions.mode);
   $('btnProbe').classList.toggle('disabled', !vm.actions.mode);
@@ -242,7 +263,7 @@ function render() {
   if (vm.needsResnapshot) $('resnap').textContent = `view incomplete · ${vm.needsResnapshot} · resnapshot pending`;
   $('ended').classList.toggle('hidden', !vm.sourceEnded);
   if (vm.sourceEnded) $('ended').textContent = `diagnostic capture ended · ${vm.sourceEnded.reason} · session values below are the last observed, not a transport close`;
-  $('hookStats').textContent = vm.hookStats;
+  $('hookStats').textContent = compactStats(vm.hookStats); $('hookStats').title = vm.hookStats;
   $('mockTag').classList.toggle('hidden', !vm.synthetic);
   document.title = vm.synthetic ? 'Playa · MOCK' : 'Playa';
 
@@ -268,14 +289,19 @@ function render() {
   const pickable = host?.core && (host.core.phase === 'discovered' || host.core.phase === 'withdrawn') ? host.core.sources : [];
   $('pickList').classList.toggle('hidden', pickable.length === 0);
   $('pickList').replaceChildren(...pickable.map(s => {
+    // One line per exposed source: its label and exposure, an explicit attach affordance; kind and run id in the tooltip.
     const d = el('div', 'inst mono');
-    d.append(el('span', 'name', s.label ?? s.sourceId), el('span', 'meta', `${s.kind}${s.exposure ? ' · ' + s.exposure : ''} · run ${s.runId}`));
+    d.append(el('span', 'name', s.label ?? s.sourceId), el('span', 'meta', s.exposure ?? s.kind), el('span', 'go', 'attach ▸'));
+    d.title = `${s.kind} source · run ${s.runId}${s.synthetic ? ' · SYNTHETIC' : ''}`;
     d.onclick = () => viewPort?.postMessage({ kind: 'select', sourceId: s.sourceId, runId: s.runId });
     return d;
   }));
   if (probe) $('emptyTitle').textContent = host?.probe ? `Probe ${host.probe.status}.` : 'No probe run.';
   else if (pickable.length) $('emptyTitle').textContent = `${pickable.length} exposed Playa source${pickable.length === 1 ? '' : 's'} on this page — pick one to attach.`;
-  else $('emptyTitle').textContent = 'No exposed Playa sources found on this page.';
+  // Only a completed discovery can say the page exposes nothing; before that the panel is simply not attached.
+  else if (host?.core?.phase === 'discovered' || host?.core?.phase === 'withdrawn') $('emptyTitle').textContent = 'No exposed Playa sources found on this page.';
+  else if (host?.outer?.stage === 'carrier-lost') $('emptyTitle').textContent = 'No Playa diagnostics answered on this page.';
+  else $('emptyTitle').textContent = 'Not attached to this page.';
   if (!live) return;
 
   // track tabs
@@ -286,7 +312,7 @@ function render() {
     b.onclick = () => active().selectTrack(t.id ?? t.name);
     return b;
   }));
-  $('ring').textContent = vm.ring;
+  $('ring').textContent = vm.ring.replace('ring buffer: ', '').replace('-object window', '-id window'); $('ring').title = vm.ring;   // compact; exact wording in the tooltip
 
   // left column
   $('instances').replaceChildren(...vm.instances.map(i => {
@@ -297,7 +323,9 @@ function render() {
     if (src && !i.on && viewPort) { d.style.cursor = 'pointer'; d.onclick = () => viewPort.postMessage({ kind: 'switch', sourceId: src.sourceId, runId: src.runId }); }
     return d;
   }));
-  $('session').replaceChildren(...vm.session.flatMap(([k, v, flag]) => [el('span', 'k', k), el('span', flag === 'na' ? 'na' : '', v)]));
+  // Long exact values (the session id, capability lists) take a full-width line under their key.
+  const wideKey = k => k === 'session' || k === 'capabilities' || k === 'append stages';
+  $('session').replaceChildren(...vm.session.flatMap(([k, v, flag]) => [el('span', 'k' + (wideKey(k) ? ' wide' : ''), k), el('span', (flag === 'na' ? 'na' : '') + (wideKey(k) ? ' wide' : ''), v)]));
   $('requests').replaceChildren(...vm.requests.map(r => {
     const d = el('div', 'req' + (r.state === 'gone' ? ' gone' : ''));
     const top = el('div', 'top'); top.append(el('span', '', `${r.id} · ${r.track}`), el('span', r.state === 'active' ? 'state' : '', r.label));
@@ -309,9 +337,11 @@ function render() {
     if (r.context) d.append(el('span', 'caption context', r.context));
     return d;
   }));
-  $('decoder').replaceChildren(...vm.decoder.flatMap(([k, v]) => [el('span', 'k', k), el('span', '', v)]));
-  $('legendKey').textContent = 'independent · expected (hatched)';
-  $('legendNote').textContent = vm.legendNote ?? '';
+  $('decoder').replaceChildren(...vm.decoder.flatMap(([k, v]) => [el('span', 'k' + (wideKey(k) ? ' wide' : ''), k), el('span', wideKey(k) ? 'wide' : '', v)]));
+  $('legendKey').textContent = 'independent';
+  // The per-capability stage wording is exact source information; it lives in the chip's tooltip (and in the
+  // decoder rows) rather than as a paragraph above the grid.
+  $('legendNote').title = vm.legendNote ?? '';
   $('legendNote').classList.toggle('hidden', !vm.legendNote);
 
   // grid
@@ -350,21 +380,54 @@ function render() {
   // responsive grid produces; five items side by side reproduce the wide five-column appearance.
   selHost.replaceChildren(...vm.selected.map(([k, v, cls]) => { const pair = el('div', 'pair'); pair.append(el('span', 'k', k), el('span', 'v ' + (cls || ''), v)); return pair; }));
 
-  // charts
-  $('sparks').replaceChildren(...vm.sparks.map(s => {
-    const d = el('div', 'spark'); const top = el('div', 'top');
+  // charts: the three canonical metrics always get a chart line (an unavailable one is a quiet line whose reason is
+  // its tooltip); further reported-but-unavailable metrics collapse into one list so the column stays readable.
+  const canonical = 3;
+  const sparkNode = s => {
+    const d = el('div', 'spark' + (s.na ? ' na' : '')); const top = el('div', 'top');
     const label = el('h4', '', s.name);
     const value = el('span', 'now' + (s.na ? ' na' : ''), s.now);
     label.title = value.title = s.definition ?? s.na ?? '';
     top.append(label, value);
     const bars = el('div', 'bars');
-    for (const b of s.bars) { const i = el('i'); i.style.height = b.h + 'px'; i.style.background = b.color; i.style.opacity = s.na ? 0.15 : b.op; bars.append(i); }
+    // The three canonical charts keep the mockup's hues; every other series stays neutral.
+    const hue = { 'end to end latency': 'var(--blue)', 'arrival jitter': 'var(--violet)', 'receive bitrate': 'var(--grn)' }[s.name] ?? null;
+    for (const b of s.bars) { const i = el('i'); i.style.height = b.h + 'px'; i.style.background = hue ?? b.color; i.style.opacity = s.na ? 0.15 : b.op; bars.append(i); }
     if (s.bars.length === 0) { const i = el('i'); i.style.height = '1px'; i.style.background = 'var(--line2)'; bars.append(i); }
     d.append(top, bars);
-    if (s.na) d.append(el('span', 'why', s.na));
+    if (s.na) {
+      // Reason behind a keyboard/touch-operable disclosure; the exact source wording is kept verbatim.
+      const why = document.createElement('details'); why.className = 'why'; why.dataset.key = `why:${s.name}`;
+      const summary = document.createElement('summary'); summary.textContent = 'why';
+      const body = el('div', ''); body.append(el('span', 'reason', s.na));
+      if (s.definition) body.append(el('span', 'definition', s.definition));
+      why.append(summary, body);
+      d.append(why);
+    }
     if (s.range) d.append(el('span', 'why', s.range));
     return d;
-  }));
+  };
+  const extras = vm.sparks.slice(canonical);
+  const unavailable = extras.filter(s => s.na);
+  const nodes = [...vm.sparks.slice(0, canonical), ...extras.filter(s => !s.na)].map(sparkNode);
+  if (unavailable.length) {
+    const list = document.createElement('details'); list.className = 'sparkNa'; list.dataset.key = 'unavailable-list';
+    const summary = document.createElement('summary');
+    summary.append(el('b', '', `unavailable (${unavailable.length}): `), unavailable.map(s => s.name).join(' · '));
+    list.append(summary, ...unavailable.map(s => { const item = el('div', 'item'); item.append(el('span', 'n', s.name), el('span', 'reason', s.na)); if (s.definition) item.append(el('span', 'definition', s.definition)); return item; }));
+    nodes.push(list);
+  }
+  // Disclosures survive the re-render that every accepted batch causes: the open state and keyboard focus of a
+  // details element are carried over by its metric key (bounded by the sparks list; a metric that is no longer
+  // present simply has nothing to restore), while its text is refreshed from the new view model.
+  const sparksHost = $('sparks');
+  const openKeys = new Set([...sparksHost.querySelectorAll('details[open][data-key]')].map(d => d.dataset.key));
+  const focusedKey = document.activeElement?.tagName === 'SUMMARY' ? document.activeElement.parentElement?.dataset.key ?? null : null;
+  sparksHost.replaceChildren(...nodes);
+  for (const d of sparksHost.querySelectorAll('details[data-key]')) {
+    if (openKeys.has(d.dataset.key)) d.open = true;
+    if (focusedKey === d.dataset.key) d.querySelector('summary')?.focus({ preventScroll: true });   // keep focus, never scroll the reader back
+  }
 
   // coalesced events
   $('events').replaceChildren(...vm.events.map(e => {

@@ -1,6 +1,11 @@
-/* Tokens from the mockup. Fonts: the mockup used IBM Plex from Google Fonts;
-   a DevTools panel must not fetch from the network, so Plex is used when
-   installed locally and falls back to the system stacks. */
+/* Tokens from the mockup. Fonts: the mockup used IBM Plex from Google Fonts; a DevTools panel must not fetch from
+   the network, so the Plex faces (SIL OFL 1.1; files and license in static/) ship with the extension and are declared here. */
+@font-face { font-family: 'IBM Plex Mono'; font-weight: 400; font-style: normal; font-display: swap; src: url('ibm-plex-mono-latin-400-normal.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-weight: 500; font-style: normal; font-display: swap; src: url('ibm-plex-mono-latin-500-normal.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-weight: 600; font-style: normal; font-display: swap; src: url('ibm-plex-mono-latin-600-normal.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-weight: 400; font-style: normal; font-display: swap; src: url('ibm-plex-sans-latin-400-normal.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-weight: 500; font-style: normal; font-display: swap; src: url('ibm-plex-sans-latin-500-normal.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-weight: 600; font-style: normal; font-display: swap; src: url('ibm-plex-sans-latin-600-normal.woff2') format('woff2'); }
 :root {
   --cellMin: 4px;   /* a cell never collapses below this; a wide window scrolls INSIDE its row instead */
   --bg: #0e1114; --bar: #15191d; --panel: #12161a; --card: #141a1f;
@@ -13,8 +18,11 @@
   --sans: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --mono: 'IBM Plex Mono', ui-monospace, Menlo, Consolas, monospace;
 }
-html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 12px var(--sans); }
-.root { min-height: 100vh; display: flex; flex-direction: column; }
+/* A DevTools PANE, not a page: the root fills the drawer and never scrolls; the toolbar, notices and track strip
+   stay pinned; the three regions scroll inside themselves (single-column: the body scrolls as one region). */
+html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font: 12px var(--sans); }
+.root { height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+* { scrollbar-width: thin; scrollbar-color: var(--line2) transparent; }
 .mono { font-family: var(--mono); }
 .dim { color: var(--dim); } .dimmer { color: var(--dimmer); } .light { color: var(--text); }
 .grow { flex: 1; } .ta-right { text-align: right; } .hidden { display: none !important; }
@@ -35,7 +43,8 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .recDot { width: 8px; height: 8px; border-radius: 50%; background: oklch(0.7 0.15 25); }
 .recDot.on { border-radius: 2px; animation: blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: .4; } }
-.stats { font-size: 11px; color: var(--dimmer); }
+.stats { font-size: 11px; color: var(--dimmer); max-width: 100%; overflow-wrap: anywhere; }
+.bar > .stats { flex: 0 0 auto; max-width: 100%; margin-left: auto; min-width: 0; text-align: right; }   /* inline at the right when it fits (the mockup); otherwise its own line at content width, wrapping inside the toolbar's width, never clipped */
 .mockTag { font: 600 10px var(--mono); letter-spacing: .08em; padding: 3px 7px; border-radius: 4px; background: oklch(0.35 0.12 25); color: #fff; }
 
 /* probe strip */
@@ -55,23 +64,27 @@ select.field { appearance: auto; }
 .presetList .inst:hover { background: var(--sel); }
 
 /* empty state */
-.empty { flex: 1; padding: 70px 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; text-align: center; }
+.empty { flex: 1; min-height: 0; overflow: auto; padding: 40px 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; text-align: center; }
 .emptyTitle { font: 600 16px var(--sans); }
 .emptyBody { font: 13px/1.5 var(--sans); color: var(--dim); max-width: 520px; text-wrap: pretty; }
 
 /* body */
-.body { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.body { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
 .legend { display: flex; gap: 10px; align-items: center; font-size: 11px; color: var(--dim); flex-wrap: wrap; }
 .legend > span { display: flex; gap: 5px; align-items: center; }
+.legend .note { padding: 1px 6px; border: 1px solid var(--line2); border-radius: 4px; color: var(--dim); cursor: help; white-space: nowrap; }
 .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
 .sw.key { background: var(--violet); } .sw.fast { background: var(--grn); } .sw.mid { background: var(--grnDim); } .sw.slow { background: var(--amber); }
+.sw.key.hatched { background: repeating-linear-gradient(45deg, var(--violet) 0 2px, transparent 2px 4px); }
 .sw.miss { width: 7px; height: 7px; box-shadow: inset 0 0 0 2px var(--red); background: transparent; }
 .sw.none { width: 9px; height: 9px; background: #171c21; border: 1px solid var(--line2); }
 
-.cols { flex: 1; display: grid; grid-template-columns: 220px minmax(0, 1fr) 300px; }
-@media (max-width: 980px) { .cols { grid-template-columns: 200px minmax(0, 1fr); } .right { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line); } }
+.cols { flex: 1; min-height: 0; display: grid; grid-template-columns: 220px minmax(0, 1fr) 300px; overflow: hidden; }
+/* Two-column drawer: the two ROW tracks share the definite height explicitly (55 % grid, 45 % charts) so neither
+   can starve the other; each region still scrolls inside itself. */
+@media (max-width: 980px) { .cols { grid-template-columns: 200px minmax(0, 1fr); grid-template-rows: minmax(0, 11fr) minmax(0, 9fr); } .right { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line); } }
 
-.left { border-right: 1px solid var(--line); padding: 14px; display: flex; flex-direction: column; gap: 18px; }
+.left { border-right: 1px solid var(--line); padding: 12px; display: flex; flex-direction: column; gap: 16px; min-height: 0; overflow: auto; }
 section { display: flex; flex-direction: column; gap: 6px; }
 h4 { margin: 0; font: 500 11px var(--sans); color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
 .inst { display: flex; flex-direction: column; gap: 2px; padding: 7px 8px; border-radius: 5px; border: 1px solid var(--line); cursor: pointer; }
@@ -81,6 +94,7 @@ h4 { margin: 0; font: 500 11px var(--sans); color: var(--dim); text-transform: u
 .inst .meta { font: 11px var(--mono); color: var(--dimmer); } .inst.on .meta { color: var(--dim); }
 .kv { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 10px; row-gap: 4px; font-size: 11.5px; }
 .kv > * { min-width: 0; overflow-wrap: anywhere; }
+.kv .wide { grid-column: 1 / -1; padding-left: 0; }   /* a long exact value on its own full-width line under its key */
 .kv .k { color: var(--dim); }
 .kv .na { color: var(--dimmer); font-style: italic; }
 .reqs { display: flex; flex-direction: column; gap: 8px; font-size: 11.5px; }
@@ -94,14 +108,14 @@ h4 { margin: 0; font: 500 11px var(--sans); color: var(--dim); text-transform: u
 .req .chain i.dash { flex: 2; height: 0; background: none; border-top: 1px dashed #3a444e; margin-top: 2px; }
 .req .caption { color: var(--dimmer); font-size: 10.5px; }
 
-.center { padding: 14px 16px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.gridHead, .row { display: grid; grid-template-columns: 76px minmax(0, 1fr) 150px; align-items: center; gap: 10px; }
+.center { padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; min-width: 0; min-height: 0; overflow: auto; }
+.gridHead, .row { display: grid; grid-template-columns: minmax(76px, max-content) minmax(0, 1fr) minmax(96px, 220px); align-items: center; gap: 10px; }
 #rows { display: flex; flex-direction: column; gap: 6px; }
 .gridHead { font-size: 10.5px; color: var(--dimmer); white-space: nowrap; }
 .gridHead > span { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .row .label { font: 11.5px var(--mono); color: var(--dim); white-space: nowrap; }
-.row .label { min-width: 0; } .row .label small { display: block; font-size: 9.5px; color: var(--dimmer); white-space: normal; overflow-wrap: anywhere; } .row.head .label { font-weight: 600; color: #fff; }
-.row .meta { font: 11px var(--mono); text-align: right; color: var(--dim); white-space: normal; min-width: 0; overflow-wrap: anywhere; }   /* a long summary (exact bound ids) wraps in its 150px box at every width */
+.row .label { min-width: 0; max-width: 180px; overflow-wrap: anywhere; white-space: normal; } .row .label small { display: block; font-size: 9.5px; color: var(--dimmer); white-space: normal; overflow-wrap: anywhere; } .row.head .label { font-weight: 600; color: #fff; }
+.row .meta { font: 11px var(--mono); text-align: right; color: var(--dim); white-space: normal; min-width: 0; overflow-wrap: anywhere; }   /* sized to its content up to 220px, then wraps (exact bound ids) */
 .row .meta.live { color: var(--grn); } .row .meta.loss { color: var(--redText); }
 /* A row's window may hold up to 256 ids: 255 gaps alone exceed a narrow center. Cells keep --cellMin and the
    row scrolls horizontally INSIDE itself (bounded to its own width); the document never overflows and nothing is
@@ -113,11 +127,12 @@ h4 { margin: 0; font: 500 11px var(--sans); color: var(--dim); text-transform: u
 .selected { margin-top: 14px; padding: 10px 12px; border-radius: 6px; background: var(--card); border: 1px solid var(--line); display: grid; grid-template-columns: repeat(5, auto); justify-content: start; column-gap: 28px; row-gap: 3px; font-size: 11.5px; }
 .selected > * { min-width: 0; overflow-wrap: anywhere; }
 .selected .pair { display: flex; flex-direction: column; gap: 3px; }   /* label over its own value: pairing is structural */
+.selected:empty { display: none; }
 .selected .k { color: var(--dim); }
 .selected .ok { color: var(--grn); } .selected .late { color: oklch(0.82 0.12 70); } .selected .lost { color: var(--redText); }
 .hint { font-size: 11px; color: var(--dimmer); margin-top: 4px; }
 
-.right { border-left: 1px solid var(--line); padding: 14px; display: flex; flex-direction: column; gap: 14px; background: var(--panel); }
+.right { border-left: 1px solid var(--line); padding: 12px; display: flex; flex-direction: column; gap: 12px; background: var(--panel); min-height: 0; overflow: auto; }
 .spark { display: flex; flex-direction: column; gap: 5px; }
 .spark .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; min-width: 0; overflow-wrap: anywhere; }
 .spark .now { font: 600 13px var(--mono); }
@@ -125,6 +140,25 @@ h4 { margin: 0; font: 500 11px var(--sans); color: var(--dim); text-transform: u
 .spark .bars { display: flex; align-items: flex-end; gap: 1px; height: 34px; }
 .spark .bars i { flex: 1 1 0; display: block; border-radius: 1px; }
 .spark .why { font: 11px var(--mono); color: var(--dimmer); }
+/* An unavailable chart is one quiet line; its reason opens from a keyboard/touch-operable disclosure (native
+   <details>), never only from a hover title. */
+.spark.na { gap: 0; } .spark.na .bars { display: none; }
+.spark details.why { font: 11px var(--mono); color: var(--dimmer); overflow-wrap: anywhere; }
+.spark details.why > summary { cursor: pointer; list-style: none; color: var(--dimmer); font-size: 10.5px; }
+.spark details.why > summary::-webkit-details-marker { display: none; }
+.spark details.why > summary::before { content: '▸ '; } .spark details.why[open] > summary::before { content: '▾ '; }
+.spark details.why > summary:focus-visible { outline: 1px solid var(--blue); outline-offset: 2px; }
+.spark details.why > div { padding: 4px 0 2px 12px; }
+/* Further unavailable metrics collapse into one disclosure listing each name, reason and definition. */
+.sparkNa { font: 11px var(--mono); color: var(--dimmer); border-top: 1px solid var(--line); padding-top: 8px; overflow-wrap: anywhere; }
+.sparkNa > summary { cursor: pointer; list-style: none; } .sparkNa > summary::-webkit-details-marker { display: none; }
+.sparkNa > summary::before { content: '▸ '; } .sparkNa[open] > summary::before { content: '▾ '; }
+.sparkNa > summary:focus-visible { outline: 1px solid var(--blue); outline-offset: 2px; }
+.sparkNa b { font-weight: 500; color: var(--dim); }
+.sparkNa .item { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; padding: 5px 0 3px 12px; border-top: 1px solid var(--line); }
+.sparkNa .item .n { color: var(--dim); }
+.spark details.why .definition, .sparkNa .item .definition { color: var(--dimmer); font-style: italic; display: block; }
+.spark details.why .reason, .sparkNa .item .reason { display: block; }
 .events { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--line); padding-top: 10px; }
 .ev { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; font: 11.5px var(--mono); align-items: baseline; }
 .ev > * { min-width: 0; overflow-wrap: anywhere; }
@@ -137,15 +171,20 @@ h4 { margin: 0; font: 500 11px var(--sans); color: var(--dim); text-transform: u
 
 /* host state (owner-side carrier) and the source pick list shown before a lease exists */
 .notice.host { background: oklch(0.22 0.03 250); color: var(--mid); }
+.notice.host.folded { display: none; }
 .pickList { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel); font: 12px var(--mono); }
-.pickList .inst { cursor: pointer; border: 1px solid var(--line2); border-radius: 5px; padding: 6px 10px; display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; max-width: 100%; }
+.pickList { padding: 6px 14px; }
+.pickList .inst { cursor: pointer; border: 1px solid var(--line2); border-radius: 5px; padding: 4px 10px; display: flex; flex-direction: row; align-items: baseline; gap: 10px; flex-wrap: wrap; max-width: 100%; font-size: 12px; }
+.pickList .inst .meta { color: var(--dim); font-size: 11px; }
+.pickList .inst .go { color: var(--grn); background: transparent; padding: 0; border-radius: 0; font: 500 11px var(--sans); margin-left: 4px; white-space: nowrap; }
 .pickList .inst:hover { background: var(--sel); }
 
 /* Narrow dock (one column): the group/object grid and the selected-object details come FIRST, then the session
    metadata, then charts and events. Order only — every section stays present and reachable by scrolling.
    This block stays LAST in the file: its rules share specificity with the base rules above and must win by order. */
 @media (max-width: 640px) {
-  .cols { grid-template-columns: minmax(0, 1fr); }
+  .cols { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-auto-rows: max-content; overflow: auto; }
+  .left, .center, .right { overflow: visible; min-height: auto; }
   .center { order: 1; }
   .left { order: 2; border-right: 0; border-top: 1px solid var(--line); gap: 12px; }
   .right { order: 3; }

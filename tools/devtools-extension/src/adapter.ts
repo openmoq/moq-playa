@@ -70,6 +70,26 @@ export interface Row {
   readonly window: { readonly from: string; readonly to: string; readonly beyond: number };
 }
 /** Bars are the retained sample history of ONE series (same session, track and name), oldest first, scaled to the series' own maximum; `range` states that scale. */
+/**
+ * Display form of a metric sample: rounded for reading, unit-aware (bps → kbps/Mbps, bytes → KB/MB), never the raw
+ * float. The exact value stays available to the view in the tooltip text.
+ */
+export function formatMetric(value: number, unit: string): string {
+  const fixed = (v: number, d: number) => {
+    // Format directly: multiplying by a decimal scale can overflow a valid finite sample.
+    const rounded = v.toFixed(d);
+    return Number.isInteger(Number(rounded)) ? String(Number(rounded)) : rounded;
+  };
+  switch (unit) {
+    case 'bps': return value >= 1e6 ? `${(value / 1e6).toFixed(2)} Mbps` : value >= 1e3 ? `${(value / 1e3).toFixed(1)} kbps` : `${Math.round(value)} bps`;
+    case 'bytes': return value >= 1e6 ? `${(value / 1e6).toFixed(1)} MB` : value >= 1e3 ? `${(value / 1e3).toFixed(1)} KB` : `${Math.round(value)} B`;
+    case 'ms': return `${Math.abs(value) >= 100 ? String(Math.round(value)) : fixed(value, 1)} ms`;
+    case 'seconds': return `${fixed(value, 2)} s`;
+    case 'percent': return `${fixed(value, 1)} %`;
+    case 'count': return `${Math.round(value).toLocaleString('en-US')} count`;
+    default: return `${value} ${unit}`;
+  }
+}
 export interface Spark { readonly name: string; readonly now: string; readonly na?: string; readonly definition?: string; readonly range?: string; readonly bars: readonly { h: number; color: string; op: number }[] }
 export interface ViewModel {
   readonly synthetic: boolean;
@@ -577,10 +597,14 @@ export class ProtocolSource {
       const series = this.metricHistory.get(key) ?? [];
       const peak = series.reduce((a, s) => Math.max(a, s.v), 0);
       const bars = series.map((s, i) => ({ h: peak > 0 ? Math.max(1, Math.round((s.v / peak) * 34)) : 1, color: GREY, op: 0.35 + 0.65 * ((i + 1) / series.length) }));
-      const range = series.length ? { range: `${series.length} sample${series.length === 1 ? '' : 's'} · peak ${peak} ${m.unit}` } : {};
-      if (m.value === null) return { name: label, now: 'unavailable', na: `${na(m.unavailable)}: ${m.definition}`, ...range, bars };
+      const range = series.length ? { range: `${series.length} sample${series.length === 1 ? '' : 's'} · peak ${formatMetric(peak, m.unit)}` } : {};
+      // If the latest value already is the peak, its exact-value tooltip also identifies the exact peak.
+      const peakDetail = series.length && peak !== m.value ? ` · exact retained peak ${peak} ${m.unit}` : '';
+      // An unavailable metric still carries the source's exact definition as its own field, so a view can show it
+      // beside the reason without parsing the reason text.
+      if (m.value === null) return { name: label, now: 'unavailable', na: `${na(m.unavailable)}: ${m.definition}`, definition: m.definition + (m.windowMs !== null ? ` (${m.windowMs} ms window)` : '') + peakDetail, ...range, bars };
       // Point samples as the source defined them — no median or interpolation implied.
-      return { name: label, now: `${m.value} ${m.unit}`, definition: m.definition + (m.windowMs !== null ? ` (${m.windowMs} ms window)` : ''), ...range, bars };
+      return { name: label, now: formatMetric(m.value, m.unit), definition: m.definition + (m.windowMs !== null ? ` (${m.windowMs} ms window)` : '') + ` · exact ${m.value} ${m.unit}` + peakDetail, ...range, bars };
     };
     // The three canonical charts are always shown (unavailable when not reported); any further metric the
     // source actually reports for this scope is shown too, in this fixed order, so new names from a live
