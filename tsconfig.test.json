@@ -17,6 +17,7 @@
   // `*.test.ts` corpus predates any typecheck gate and does not compile clean
   // under these options; widening this include is a separate cleanup.
   "include": [
+    "packages/transport/src/session/session-update-staging.test.ts",
     "packages/player/src/abr-source-paced.sim.test.ts",
     "packages/transport/src/control/fill-priority.test.ts",
     "packages/webtransport/src/adapter-fill-priority.test.ts",

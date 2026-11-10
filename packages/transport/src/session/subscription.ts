@@ -38,6 +38,8 @@ export interface Location {
 
 /**
  * Manages the state machine for a single subscription.
+ * Priority and filter retain initial values or the last accepted update; draft 14
+ * updates apply inline. These values do not prove remote scheduling or a data cutoff.
  */
 export class SubscriptionStateMachine {
   requestedGroupOrder: GroupOrder | undefined;
@@ -73,7 +75,7 @@ export class SubscriptionStateMachine {
    */
   private _streamCount: bigint = 0n;
   /**
-   * Last-sent SUBSCRIPTION_FILTER bytes for this subscription.
+   * Initial SUBSCRIPTION_FILTER bytes or the last accepted update (inline on draft 14).
    * Used by draft-14 codec to replay filter in SUBSCRIBE_UPDATE when
    * no new filter is specified (draft-14 inline fields are mandatory).
    * @see draft-ietf-moq-transport-14 §9.10
@@ -85,7 +87,7 @@ export class SubscriptionStateMachine {
    */
   fillRequested = false;
   /**
-   * Last-sent SUBSCRIBER_PRIORITY for this subscription.
+   * Initial SUBSCRIBER_PRIORITY or the last accepted update (inline on draft 14).
    * Used by draft-14 to replay unchanged values in SUBSCRIBE_UPDATE.
    * @see draft-ietf-moq-transport-14 §9.10
    */
@@ -285,22 +287,24 @@ export class SubscriptionStateMachine {
     return this._publishParameters;
   }
 
-  /** Last-sent SUBSCRIPTION_FILTER bytes (for draft-14 SUBSCRIBE_UPDATE replay). */
+  /** Initial or last accepted filter, not last sent; pending/refused updates leave it unchanged.
+   * Draft 14 applies updates inline. */
   get currentFilter(): Uint8Array | undefined {
     return this._currentFilter;
   }
 
-  /** Store the SUBSCRIPTION_FILTER bytes sent with SUBSCRIBE or REQUEST_UPDATE. */
+  /** Store initial or accepted filter bytes; draft 14 updates apply inline. */
   set currentFilter(filter: Uint8Array | undefined) {
     this._currentFilter = filter;
   }
 
-  /** Last-sent SUBSCRIBER_PRIORITY. */
+  /** Initial or last accepted priority, not last sent; pending/refused updates leave it unchanged.
+   * Draft 14 applies updates inline. */
   get currentPriority(): Varint | undefined {
     return this._currentPriority;
   }
 
-  /** Store the SUBSCRIBER_PRIORITY sent with SUBSCRIBE or REQUEST_UPDATE. */
+  /** Store initial or accepted priority; draft 14 updates apply inline. */
   set currentPriority(priority: Varint | undefined) {
     this._currentPriority = priority;
   }

@@ -666,6 +666,7 @@ export class Session {
     objectDeliveryTimeoutMs?: number;
     subgroupDeliveryTimeoutMs?: number;
     subscriptionFilter?: Uint8Array;
+    subscriberPriority?: Varint;
   }>();
 
   /**
@@ -1932,6 +1933,10 @@ export class Session {
     const pending = this.pendingUpdates.get(msg.requestId as bigint);
     if (pending) {
       this.pendingUpdates.delete(msg.requestId as bigint);
+      if (pending.subscriberPriority !== undefined) {
+        const sub = this.subscriptions.get(pending.existingRequestId) ?? this.incomingSubscriptions.get(pending.existingRequestId);
+        if (sub && !sub.isTerminated) sub.currentPriority = pending.subscriberPriority;
+      }
 
       // Apply the update to the subscription (outgoing or, for a draft-18
       // PUBLISH-initiated subscription, the incoming one).
@@ -3474,7 +3479,7 @@ export class Session {
     // SUBSCRIBER_PRIORITY parameter
     if (options.subscriberPriority !== undefined) {
       parameters.set(MessageParam.SUBSCRIBER_PRIORITY, [options.subscriberPriority]);
-      sub.currentPriority = options.subscriberPriority;
+      if (this._draftVersion === 14) sub.currentPriority = options.subscriberPriority;
     } else if (this._draftVersion === 14 && sub.currentPriority !== undefined) {
       // Draft-14 §9.10: Subscriber Priority is a mandatory inline field.
       // Replay current value to avoid resetting to codec default (128).
@@ -3485,7 +3490,7 @@ export class Session {
     if (filterBytes !== undefined) {
       parameters.set(MessageParam.SUBSCRIPTION_FILTER, [filterBytes]);
       // Update stored filter for future draft-14 replays
-      if (!isDraft22(this._draftVersion)) sub.currentFilter = filterBytes;
+      if (this._draftVersion === 14) sub.currentFilter = filterBytes;
     } else if (this._draftVersion === 14 && sub.currentFilter) {
       // Draft-14 §9.10: Start Location and End Group are mandatory inline fields.
       // If no new filter specified, replay the current filter to avoid widening.
@@ -3525,7 +3530,7 @@ export class Session {
       const pending: {
         existingRequestId: bigint; forward?: ForwardStateValue;
         objectDeliveryTimeoutMs?: number; subgroupDeliveryTimeoutMs?: number;
-        subscriptionFilter?: Uint8Array;
+        subscriptionFilter?: Uint8Array; subscriberPriority?: Varint;
       } = { existingRequestId: existingRequestId as bigint };
       if (requestedForward !== undefined) {
         pending.forward = requestedForward;
@@ -3535,6 +3540,7 @@ export class Session {
       if (options.subscriptionFilter !== undefined) {
         pending.subscriptionFilter = parameters.get(MessageParam.SUBSCRIPTION_FILTER)![0] as Uint8Array;
       }
+      if (options.subscriberPriority !== undefined) pending.subscriberPriority = options.subscriberPriority;
       this.pendingUpdates.set(requestId as bigint, pending);
     }
 
@@ -5448,7 +5454,8 @@ export class Session {
     // Stage ALL changes on the pending record — applied on REQUEST_OK, never at send.
     this.pendingUpdates.set(requestId as bigint, {
       existingRequestId,
-      ...(isDraft22(this._draftVersion) && filterBytes !== undefined ? { subscriptionFilter: filterBytes } : {}),
+      ...(filterBytes !== undefined ? { subscriptionFilter: filterBytes } : {}),
+      ...(options.subscriberPriority !== undefined ? { subscriberPriority: options.subscriberPriority } : {}),
       ...(requestedForward !== undefined
         ? { forward: requestedForward }
         : {}),
