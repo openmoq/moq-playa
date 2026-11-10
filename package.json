@@ -10,6 +10,7 @@
     "debug:h264": "node scripts/h264-debug.mjs",
     "debug:h264-rebuild": "node scripts/h264-rebuild.mjs",
     "test": "vitest run",
+    "test:ci": "pnpm test --project standard && pnpm test --project native-correctness --maxWorkers=1 --no-file-parallelism --retry=0",
     "test:watch": "vitest",
     "test:player:browser": "node scripts/player-acceptance/run.mjs",
     "test:corpus": "vitest run conformance/media/runner",
@@ -22,7 +23,8 @@
     "release": "node scripts/release.mjs",
     "release:dry": "node scripts/release.mjs",
     "test:corpus:diff": "vitest run --config vitest.diff.config.ts",
-    "test:player:audio-order": "node scripts/player-acceptance/mse-audio-order.mjs"
+    "test:player:audio-order": "node scripts/player-acceptance/mse-audio-order.mjs",
+    "test:shaper:performance": "vitest run --config vitest.shaper-performance.config.ts"
   },
   "devDependencies": {
     "@openmoq/transport": "workspace:*",

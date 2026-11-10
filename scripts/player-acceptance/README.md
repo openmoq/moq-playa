@@ -328,3 +328,8 @@ Shaper startup/acquisition and shutdown failures remain failing
 outcomes. A run containing a completed calibration has `status: 'trace'` and
 `completed: true`, without a top-level `passed` field. Mandatory assertion or
 cleanup failures produce `status: 'fail'` and a nonzero process exit.
+
+Run mandatory correctness with `pnpm test:ci`: the standard project followed by
+serialized native UDP startup/cleanup checks. Run host performance explicitly
+with `pnpm test:shaper:performance` (one worker, retry0).
+See [shaper tests](../net-shaper/README.md) for criteria and clock limitations.

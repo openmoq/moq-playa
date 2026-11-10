@@ -572,8 +572,17 @@ relay endpoint and should configure the complete URL.
 ## Testing
 
 ```bash
-# Run unit, loopback, codec-property and scenario tests
+# Discover and run standard and native UDP correctness projects
 pnpm test
+
+# Reproduce CI: standard tests, then serialized native UDP correctness
+pnpm test:ci
+
+# Run only the serialized native UDP correctness project
+pnpm test --project native-correctness --maxWorkers=1 --no-file-parallelism --retry=0
+
+# Explicit host-performance cases (single worker, retry0)
+pnpm test:shaper:performance
 
 # Watch mode
 pnpm test:watch
@@ -588,6 +597,13 @@ pnpm smoke:exports
 # Browser playback acceptance (requires ffmpeg and installed Google Chrome)
 pnpm test:player:browser
 ```
+
+`pnpm test [paths]` retains filename filtering across both correctness projects.
+Native UDP correctness requires local bind permission and runs without parallel
+test workers in CI. Use `pnpm test:ci` for the required scheduling; plain
+`pnpm test` discovers both projects but does not enforce isolated native worker
+limits. Host timing is separate: `pnpm test:shaper:performance` retains the
+strict p99 <2ms bound and runs with one worker and zero retries.
 
 Browser acceptance runs against a private local WebTransport relay with generated
 media. It checks moving video, browser audio-output samples, quality/view

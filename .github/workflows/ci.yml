@@ -1,5 +1,7 @@
-# PR gate. The main package checks are hermetic; the separate native QUIC image
-# job compiles the pinned experimental Node runtime and runs its native smoke.
+# PR gate. Shaper correctness uses controlled clocks and mocked socket cleanup;
+# real-UDP wall-clock qualification is explicit via test:shaper:performance.
+# The separate native QUIC image job compiles the pinned experimental Node runtime
+# and runs its native smoke.
 # The DevTools renderer has a local browser gate; expensive media lanes remain separate.
 name: ci
 
@@ -39,8 +41,11 @@ jobs:
       - name: Build all packages
         run: pnpm -r build
 
-      - name: Test
-        run: pnpm test
+      - name: Test standard
+        run: pnpm test --project standard
+
+      - name: Test native UDP correctness
+        run: pnpm test --project native-correctness --maxWorkers=1 --no-file-parallelism --retry=0
 
       - name: Typecheck (per package)
         run: |

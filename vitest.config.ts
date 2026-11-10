@@ -1,6 +1,23 @@
 import { defineConfig, configDefaults } from 'vitest/config';
 import { resolve } from 'path';
 
+const nativeCorrectnessFiles = ['scripts/net-shaper/startup.loopback.test.ts'];
+const performanceFiles = ['scripts/net-shaper/shaper.performance.test.ts'];
+const testIncludes = [
+  'packages/*/src/**/*.test.ts',
+  'tools/devtools-extension/src/**/*.test.ts',
+  'conformance/media/runner/src/**/*.test.ts',
+  'examples/node-relay/src/**/*.test.ts',
+  'examples/node-publisher/src/**/*.test.ts',
+  'examples/broadcast/**/*.test.ts',
+  'examples/player/**/*.test.ts',
+  'examples/shared/**/*.test.ts',
+  'scripts/**/*.test.ts',
+  '_migration/**/*.test.ts',
+];
+// External probe differential tests are opt-in and remain outside both projects.
+const testExcludes = [...configDefaults.exclude, '**/*.diff.test.ts'];
+
 export default defineConfig({
   resolve: {
     // Unit and simulation suites must exercise WORKSPACE SOURCE, not the
@@ -32,21 +49,26 @@ export default defineConfig({
     },
   },
   test: {
-    include: [
-      'packages/*/src/**/*.test.ts',
-      'tools/devtools-extension/src/**/*.test.ts',
-      'conformance/media/runner/src/**/*.test.ts',
-      'examples/node-relay/src/**/*.test.ts',
-      'examples/node-publisher/src/**/*.test.ts',
-      'examples/broadcast/**/*.test.ts',
-      'examples/player/**/*.test.ts',
-      'examples/shared/**/*.test.ts',
-      'scripts/**/*.test.ts',
-      '_migration/**/*.test.ts',
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: 'standard',
+          include: testIncludes,
+          exclude: [...testExcludes, ...nativeCorrectnessFiles, ...performanceFiles],
+          sequence: { groupOrder: 0 },
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'native-correctness',
+          include: nativeCorrectnessFiles,
+          exclude: testExcludes,
+          sequence: { groupOrder: 1 },
+          retry: 0,
+        },
+      },
     ],
-    // The external-probe differential lane (`*.diff.test.ts`) requires a built
-    // LibMoQ probe via MOQ_MEDIA_PROBE_BIN; it is opt-in via `test:corpus:diff`
-    // and must NEVER run in the default suite.
-    exclude: [...configDefaults.exclude, '**/*.diff.test.ts'],
   },
 });

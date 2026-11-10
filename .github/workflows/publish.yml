@@ -106,8 +106,11 @@ jobs:
       - name: Build all packages
         run: pnpm -r build
 
-      - name: Test
-        run: pnpm test
+      - name: Test standard
+        run: pnpm test --project standard
+
+      - name: Test native UDP correctness
+        run: pnpm test --project native-correctness --maxWorkers=1 --no-file-parallelism --retry=0
 
       - name: Package README check
         run: node scripts/generate-package-readmes.mjs --check
