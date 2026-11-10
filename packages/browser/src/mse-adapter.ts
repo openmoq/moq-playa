@@ -3221,6 +3221,48 @@ export class MseMediaSource implements MediaSourceLike {
     // video-only exception below also checks both native SourceBuffers.
     const tol = MseMediaSource.GAP_IDENTITY_TOLERANCE_SEC;
     let kind: 'combined' | 'video' = 'combined';
+    // Recognize only the immediately crossed BOTH-track gap. This is a
+    // bounded library policy, independent of the wider switch exception.
+    const source = this.ms, videoBuffer = this.videoBuffer, audioBuffer = this.audioBuffer;
+    const readCrossedGap = () => {
+      try {
+        if (!source || source.readyState === 'closed' || !videoBuffer || !audioBuffer
+            || v.ended || (v.readyState !== 1 && v.readyState !== 2)) return null;
+        const adjacent = (ranges: TimeRanges) => {
+          for (let i = 0; i + 1 < ranges.length; i++) {
+            const begin = ranges.start(i), end = ranges.end(i);
+            const start = ranges.start(i + 1), tail = ranges.end(i + 1);
+            if (![begin, end, start, tail].every(Number.isFinite)
+                || begin >= end || start >= tail) return null;
+            if (end < ct && ct < start) return { begin, end, start, tail };
+          }
+          return null;
+        };
+        const combined = adjacent(v.buffered);
+        if (!combined || !Number.isFinite(ct)
+            || ct - combined.end >= MseMediaSource.GAP_EDGE_WINDOW_SEC
+            || combined.start - combined.end <= tol
+            || combined.start - combined.end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9) return null;
+        const landing = combined.start + Math.min(0.01, (combined.tail - combined.start) / 2);
+        const duration = v.duration;
+        if (!Number.isFinite(landing) || landing <= combined.start || landing >= combined.tail
+            || !(duration === Infinity || Number.isFinite(duration) && landing < duration)) return null;
+        const vr = adjacent(videoBuffer.buffered), ar = adjacent(audioBuffer.buffered);
+        if (!vr || !ar || [vr, ar].some(r => r.begin > combined.end || r.end < combined.end
+            || r.start >= landing || r.tail <= landing)
+            || Math.abs(Math.max(vr.start, ar.start) - combined.start) > tol
+            || Math.abs(Math.min(vr.tail, ar.tail) - combined.tail) > tol) return null;
+        return combined;
+      } catch { return null; } // Detached or unreadable coverage grants no authority.
+    };
+    let crossed = false;
+    if (curEnd === null) {
+      const gap = readCrossedGap();
+      if (gap) {
+        curEnd = gap.end; nextStart = gap.start; nextEnd = gap.tail;
+        crossed = true;
+      }
+    }
     // A video hole can leave currentTime *inside* the gap while audio has
     // continuous coverage. Use that exact native shape only when readiness is
     // low and the audio buffer (if present) covers the landing. It shares this
@@ -3307,7 +3349,7 @@ export class MseMediaSource implements MediaSourceLike {
 
     // Re-validate the landing at jump time (the tail may have grown; the
     // range must be nonempty).
-    if (nextEnd === null || nextEnd - nextStart! <= tol) {
+    if (nextEnd === null || nextEnd - nextStart! <= (crossed ? 0 : tol)) {
       this.disarmGap();
       return;
     }
@@ -3320,6 +3362,39 @@ export class MseMediaSource implements MediaSourceLike {
       bufferedRanges: fmtRanges(buffered),
     };
     const stallDur = nowMs - (this.stallStartTime ?? c.armedAtMs);
+
+    if (crossed) {
+      // Native getters may re-enter. Re-read coverage after reporting ranges,
+      // then check attachment, accepted work and intent before committing.
+      const fresh = readCrossedGap();
+      let nativeCurrent = false;
+      try {
+        // Quality may be unsupported: attachment ownership is an independent
+        // requirement, using the same selected-attachment semantics as quality.
+        const attached = this.selectedAttachment === 'src-object'
+          ? v.srcObject === source
+          : v.srcObject == null && v.src === this.objectUrl
+            && (!v.currentSrc || v.currentSrc === this.objectUrl);
+        const duration = v.duration;
+        nativeCurrent = attached && source!.readyState !== 'closed'
+          && (v.readyState === 1 || v.readyState === 2)
+          && (duration === Infinity || Number.isFinite(duration) && to < duration)
+          && Array.from(source!.sourceBuffers).includes(videoBuffer!)
+          && Array.from(source!.sourceBuffers).includes(audioBuffer!)
+          && v.currentTime === ct && !v.paused && !v.seeking && !v.ended && v.error === null
+          && !this.hasPendingNativeWork();
+      } catch { /* A failed native read grants no positioning authority. */ }
+      // Check adapter-owned identities AFTER the native getters: cancellation
+      // followed by restoration must not resurrect the captured candidate c.
+      if (!fresh || fresh.end !== curEnd || fresh.start !== nextStart || fresh.tail !== nextEnd
+          || !nativeCurrent || this.gapCandidate !== c
+          || this.destroyed || this.ms !== source || this.bufferGen !== generation
+          || this.videoBuffer !== videoBuffer || this.audioBuffer !== audioBuffer
+          || !this.playTriggered || !this.playbackIntent || this.seekResource && !this.seekResource.released) {
+        this.disarmGap();
+        return;
+      }
+    }
 
     // Commit first…
     if (wide) this.switchRecovery = null; // one crossing

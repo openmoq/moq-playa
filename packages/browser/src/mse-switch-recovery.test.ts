@@ -377,3 +377,17 @@ describe('ownership after binding', () => {
     } finally { f.adapter.destroy(); }
   });
 });
+
+// Crossed BOTH-track recognition must not borrow the wider switch allowance.
+it('an armed wide switch hole remains ineligible after crossing both track edges', async () => {
+  const f = await ready();
+  try {
+    Object.assign(f.video, { duration: Infinity, ended: false });
+    await f.armed(); f.ranges(HOLE, HOLE);
+    await f.stall(3.6, 4000);
+    uncrossed(f, 3.6);
+    // The same reservation still authorizes the original containing-edge path.
+    await f.stall(3.5, 4000);
+    expect(f.jumps).toHaveLength(1); expect(f.video.currentTime).toBeCloseTo(6.01, 5);
+  } finally { f.adapter.destroy(); }
+});

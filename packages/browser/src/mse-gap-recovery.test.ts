@@ -15,7 +15,7 @@ const settle = async () => { for (let i = 0; i < 50; i++) await Promise.resolve(
 const segment = (pts: number) => buildChunk({ trackId: 1, bmdt: BigInt(pts * 1000),
   samples: [{ duration: 1000, size: 4, flags: SYNC_FLAGS }], mdat: Uint8Array.of(1, 2, 3, 4) });
 async function ready(gapJumpMs = 2000, options: { reorderWindowMs?: number; maxQueuedChunks?: number } = {}) {
-  const video = new MockVideoElement(); video.buffered = makeTimeRanges([[0, 7]]);
+  const video = Object.assign(new MockVideoElement(), { duration: Infinity, ended: false }); video.buffered = makeTimeRanges([[0, 7]]);
   const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { gapJumpMs, maxAheadSec: Infinity, ...options });
   const reports: unknown[] = [], jumps: unknown[] = [];
   adapter.onStartupReport = report => { reports.push(report); };
@@ -93,13 +93,13 @@ it('advancing native quality counters veto a video-hole recovery even if the pla
   } finally { f.adapter.destroy(); }
 });
 
-it('audio holes do not qualify as the video-only recovery shape', async () => {
+it.each([true, false])('symmetric holes use combined recovery only with a shared successor: %s', async shared => {
   const f = await ready();
   try {
-    f.setHole(); source.audioBuffer.buffered = makeTimeRanges([[0, 1], [2, 7]]);
+    f.setHole(); source.audioBuffer.buffered = makeTimeRanges(shared ? [[0, 1], [2, 7]] : [[0, 1]]);
     f.video.advancePlayback(1.4); f.video.readyState = 2;
     await vi.advanceTimersByTimeAsync(5000);
-    expect(f.video.seekCount).toBe(0); expect(f.jumps).toHaveLength(0);
+    expect(f.video.seekCount).toBe(shared ? 1 : 0); expect(f.jumps).toHaveLength(shared ? 1 : 0);
   } finally { f.adapter.destroy(); }
 });
 
