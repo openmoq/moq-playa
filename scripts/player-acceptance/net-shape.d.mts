@@ -2,7 +2,7 @@ import type { Page } from 'playwright';
 import type { LinkOptions, ShaperStats } from '../net-shaper/shaper.mjs';
 
 export interface NetShapeOption { preset: string; params: { down: LinkOptions; up: LinkOptions }; durationMs: number; seed: number }
-export interface AbrTrace { timeOrigin: number; events: { timeMs: number; type: string; data: any }[] }
+export interface AbrTrace { timeOrigin: number; events: { timeMs: number; type: string; data: Record<string, unknown> }[] }
 export interface AbrSummary {
   timeBase: string;
   switches: { atS: number; from: string; to: string; reason: string }[];
@@ -20,7 +20,23 @@ export function netShapeOption(argv: readonly string[], env: Record<string, stri
 export function shapedUrl(relayUrl: string, port: number): string;
 export function summarizeAbrTrace(trace: AbrTrace, shaper: Pick<ShaperStats, 'startedAtEpochMs' | 'down'> | null): AbrSummary;
 export function observeShapedAbr(page: Page, evidence: Record<string, unknown>, durationMs: number): Promise<unknown>;
+export interface AudioObservationWindow {
+  startMs: number;
+  endMs: number;
+  minimumDurationMs: number;
+  samplePeriodMs: number;
+}
+export interface AudioContinuity {
+  samples: number;
+  evidenceValid: boolean;
+  audibleFraction: number | null;
+  longestSilentObservationSpanMs: number | null;
+  maxObservedGapMs?: number;
+  requiredSlots?: number;
+  observedSlots?: number;
+  passed: boolean;
+  failures: string[];
+}
 export const AUDIBLE_RMS: number;
 export const MIN_AUDIBLE_FRACTION: number;
-export interface AudioContinuity { samples: number; audibleFraction: number; longestSilenceMs: number | null; passed: boolean }
-export function assessAudioContinuity(samples: readonly { audioRms: number; wallMs: number }[]): AudioContinuity;
+export function assessAudioContinuity(samples: unknown, observation: unknown): AudioContinuity;

@@ -274,36 +274,57 @@ that live-group evidence, report the wait separately, then run the normal
 These runs demonstrate initial ordering and playback; they do not measure
 physical A/V synchronization or certify a remote relay.
 
-## Shaped-link ABR runs
 
-`PLAYER_NET_SHAPE=<preset>` (or `--net-shape <preset>`) puts the userspace UDP
-shaper in `scripts/net-shaper/` between the browser and each case's relay. It
-is off by default; unset, every case runs exactly as above. Publishers still
-dial the relay directly; only the browser's URL port changes, so the pinned
-certificate hash is unchanged. The shaper queues, serializes and tail-drops real
-QUIC packets, so the relay's congestion controller sees the bottleneck.
+## Opt-in shaped ABR observations
 
-| Preset | Downlink (relay to browser) | Uplink |
+`--net-shape PRESET` (or `PLAYER_NET_SHAPE`) uses the userspace UDP shaper in
+`scripts/net-shaper/`. Unset, existing cases and their playback gates retain
+their ordinary behavior. The browser connects through the proxy using the same
+certificate pin; the publisher connects directly to the relay. Warm/handover
+relay launchers are not supported with shaping. Shaped ordinary relay children
+explicitly use 4096 objects / 32 MiB backlog limits; unshaped defaults stay
+256 objects / 4 MiB. These are scenario resource limits, not a guarantee that
+all constrained-link backlogs will drain.
+
+| Preset | Downlink | Uplink |
 | --- | --- | --- |
 | `cap-1m` | 1 Mbps, 20 ms | 20 ms |
-| `step-5m-1m` | 5 Mbps, 1 Mbps from 20 s after the first packet, 20 ms | 20 ms |
-| `jitter` | 10 Mbps, 20 ms ± 30 ms, never reordered | 20 ms |
+| `step-5m-1m` | 5 Mbps, 1 Mbps from 20 s after first packet, 20 ms | 20 ms |
+| `jitter` | 10 Mbps, 20 ms ±30 ms without reordering | 20 ms |
 | `ample` | 30 Mbps, 20 ms | 20 ms |
 
-Queues default to the larger of 100 ms at the initial rate and one BDP.
-Without `--case`, a shaped run selects `abr-net-shape`: the three-rung
-1080p/720p/360p CMAF ladder with ABR enabled for `PLAYER_NET_SHAPE_SECONDS`
-(default 45). `--case abr-net-shape-loc` runs the same ladder as LOC-04 with
-wall-clock capture timestamps, so delivery lag is observable. Either is a
-calibration trace, not a quality gate: startup and clean teardown are required,
-output defects are recorded. Other cases may be selected with a preset and keep
-all their usual assertions; handover cases are refused. Each shaped case writes
-`<case>-abr-trace.json` with the engine's `quality_switched` (from, to, reason),
-`stall` and `stall_recovered` events, 1 Hz player stats, the shaper's per-direction
-stats, and a summary on the shaper's time base. `PLAYER_NET_SHAPE_SEED` fixes
-jitter and loss draws.
+With no `--case`, shaping selects `abr-net-shape`, the three-rung CMAF ladder.
+`--case abr-net-shape-loc` selects LOC-04 with wall-clock capture timestamps.
+ABR is opt-in on the test page. `PLAYER_NET_SHAPE_SECONDS` declares the observation
+duration before sampling (default 45 seconds); `PLAYER_NET_SHAPE_SEED` defaults
+to 1. Named ordinary cases retain their normal output gates even when shaped.
 
-```bash
-PLAYER_NET_SHAPE=step-5m-1m node scripts/player-acceptance/run.mjs --skip-build
-node scripts/net-shaper/cli.mjs --upstream 127.0.0.1:4443 --down-rate 1500000 --down-delay 20 --stats-out stats.json
-```
+These ABR captures report **TRACE**, never a universal playback PASS. Their
+actual playback assessments, adaptation, capture age and defects are retained.
+Existing startup (20 seconds, eight frames, advancing playhead, RMS >0.015),
+public playback-quality, presentation/source, player-error and teardown gates
+remain required. Additionally, the two ABR cases fail if sampled audio evidence
+is invalid or fewer than 80% of valid observations have RMS >0.015. Audio success
+does not erase other failures or turn a calibration into a full quality claim.
+
+The page records `audioObservation` on the same `performance.now()` clock as
+`wallMs`: start immediately before begin's first sample, end after recording is
+stopped, requested minimum duration and the existing 250 ms timer period.
+`finish()` preserves that terminal window and returns copies. No silent prefix
+is trimmed and no minimum duration is inferred from surviving samples. Each
+nearest cadence slot admits at most one sample; complete interior slots must
+be observed. Missing, malformed, duplicated, burst-only or short observations
+fail. Adjacent observation gaps can approach twice the period; `maxObservedGapMs`
+reports them. `audibleFraction` is a fraction of RMS-positive observations;
+`longestSilentObservationSpanMs` spans observed silent points. Neither measures
+continuous audible time or physical speaker output.
+
+Artifacts include the declared scenario, page window, raw observations, audio
+assessment, per-case shaper statistics and ABR trace on the downlink-first-packet
+time base. The two calibration cases require their ABR trace capture; a lost
+capture is preserved as a null artifact with its evaluation error and fails
+finalization. For ordinary shaped cases, that auxiliary trace remains optional.
+Shaper startup/acquisition and shutdown failures remain failing
+outcomes. A run containing a completed calibration has `status: 'trace'` and
+`completed: true`, without a top-level `passed` field. Mandatory assertion or
+cleanup failures produce `status: 'fail'` and a nonzero process exit.

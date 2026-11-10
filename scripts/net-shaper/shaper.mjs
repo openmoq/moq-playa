@@ -274,61 +274,94 @@ export async function createShaper({ listen = 0, listenHost = '127.0.0.1', upstr
   if (!Number.isInteger(target.port) || target.port <= 0 || target.port > 65535) throw new Error(`Invalid upstream port: ${target.port}`);
   const family = target.host.includes(':') ? 'udp6' : 'udp4';
   const linkOptions = { recordPackets, ...(spinMs !== undefined ? { spinMs } : {}) };
-  const downlink = createLink(down, { ...linkOptions, seed });
-  const uplink = createLink(up, { ...linkOptions, seed: seed + 1 });
-  const sessions = new Map();
-  // Link times are relative to their creation, just above.
-  const startedAtEpochMs = Date.now();
-  const startedAt = new Date(startedAtEpochMs).toISOString();
-  const tune = (socket) => {
-    try { socket.setRecvBufferSize(socketBufferBytes); socket.setSendBufferSize(socketBufferBytes); } catch { /* best effort */ }
+  const releases = [];
+  let retiring = false;
+  let releasing;
+  const ownSocket = socket => {
+    releases.push(() => new Promise((resolve, reject) => {
+      try { socket.close(resolve); }
+      catch (error) {
+        if (error.code === 'ERR_SOCKET_DGRAM_NOT_RUNNING') resolve();
+        else reject(error);
+      }
+    }));
+    return socket;
   };
-  const errors = [];
-  const server = dgram.createSocket(listenHost.includes(':') ? 'udp6' : 'udp4');
-  server.on('error', error => errors.push(error.message));
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.bind(listen, listenHost, () => { server.off('error', reject); resolve(); });
-  });
-  tune(server);
-  const toClient = (address, port) => (packet) => server.send(packet, port, address);
-
-  server.on('message', (packet, client) => {
-    const key = `${client.address}:${client.port}`;
-    let session = sessions.get(key);
-    if (!session) {
-      const socket = dgram.createSocket(family);
-      socket.on('error', error => errors.push(`${key}: ${error.message}`));
-      const reply = toClient(client.address, client.port);
-      socket.on('message', (back, from) => {
-        if (from.port !== target.port) return;
-        downlink.enqueue(back, reply);
-      });
-      // Sends issued while binding are queued by dgram.
-      socket.bind(0, () => tune(socket));
-      session = { socket, send: (bytes) => socket.send(bytes, target.port, target.host) };
-      sessions.set(key, session);
-    }
-    uplink.enqueue(packet, session.send);
-  });
-
-  const stats = () => ({ startedAt, startedAtEpochMs, listen: { host: listenHost, port: server.address().port }, upstream: target,
-    seed, clients: sessions.size, errors: errors.slice(), down: downlink.stats(), up: uplink.stats() });
-  let closing;
-  return {
-    port: server.address().port,
-    stats,
-    close() {
-      closing ??= (async () => {
-        const final = stats();
-        downlink.close();
-        uplink.close();
-        await Promise.all([server, ...[...sessions.values()].map(session => session.socket)]
-          .map(socket => new Promise(resolve => socket.close(resolve))));
-        if (statsFile) await writeFile(statsFile, `${JSON.stringify(final, null, 2)}\n`);
-        return final;
-      })();
-      return closing;
-    },
+  const releaseResources = () => {
+    retiring = true;
+    releasing ??= (async () => {
+      const results = await Promise.allSettled(releases.splice(0).map(release => Promise.resolve().then(release)));
+      const errors = results.filter(result => result.status === 'rejected').map(result => result.reason);
+      if (errors.length === 1) throw errors[0];
+      if (errors.length) throw new AggregateError(errors, 'Net shaper cleanup failed');
+    })();
+    return releasing;
   };
+  const unwind = async error => {
+    try { await releaseResources(); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Net shaper startup and cleanup failed', { cause: error }); }
+    throw error;
+  };
+  try {
+    const downlink = createLink(down, { ...linkOptions, seed });
+    releases.push(() => downlink.close());
+    const uplink = createLink(up, { ...linkOptions, seed: seed + 1 });
+    releases.push(() => uplink.close());
+    const sessions = new Map();
+    releases.push(() => sessions.clear());
+    // Link times are relative to their creation, just above.
+    const startedAtEpochMs = Date.now();
+    const startedAt = new Date(startedAtEpochMs).toISOString();
+    const tune = (socket) => {
+      try { socket.setRecvBufferSize(socketBufferBytes); socket.setSendBufferSize(socketBufferBytes); } catch { /* best effort */ }
+    };
+    const errors = [];
+    const server = ownSocket(dgram.createSocket(listenHost.includes(':') ? 'udp6' : 'udp4'));
+    server.on('error', error => errors.push(error.message));
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.bind(listen, listenHost, () => { server.off('error', reject); resolve(); });
+    });
+    tune(server);
+    const toClient = (address, port) => (packet) => server.send(packet, port, address);
+
+    server.on('message', (packet, client) => {
+      if (retiring) return;
+      const key = `${client.address}:${client.port}`;
+      let session = sessions.get(key);
+      if (!session) {
+        const socket = ownSocket(dgram.createSocket(family));
+        socket.on('error', error => errors.push(`${key}: ${error.message}`));
+        const reply = toClient(client.address, client.port);
+        socket.on('message', (back, from) => {
+          if (retiring || from.port !== target.port) return;
+          downlink.enqueue(back, reply);
+        });
+        // Sends issued while binding are queued by dgram.
+        socket.bind(0, () => tune(socket));
+        session = { socket, send: (bytes) => socket.send(bytes, target.port, target.host) };
+        sessions.set(key, session);
+      }
+      uplink.enqueue(packet, session.send);
+    });
+
+    const stats = () => ({ startedAt, startedAtEpochMs, listen: { host: listenHost, port: server.address().port }, upstream: target,
+      seed, clients: sessions.size, errors: errors.slice(), down: downlink.stats(), up: uplink.stats() });
+    let closing;
+    return {
+      port: server.address().port,
+      stats,
+      close() {
+        closing ??= (async () => {
+          let final;
+          try { final = stats(); }
+          catch (error) { return unwind(error); }
+          await releaseResources();
+          if (statsFile) await writeFile(statsFile, `${JSON.stringify(final, null, 2)}\n`);
+          return final;
+        })();
+        return closing;
+      },
+    };
+  } catch (error) { return unwind(error); }
 }

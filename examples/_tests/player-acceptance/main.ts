@@ -2,6 +2,7 @@ import { Player } from '@openmoq/playa';
 import { createWebTransport, MseMediaSource, WebCodecsVideoDecoder } from '@openmoq/browser';
 import { MoqtConnection, type WebTransportLike } from '@openmoq/webtransport';
 import type { PlaybackSample } from '../../../scripts/player-acceptance/assessment.mjs';
+import type { AudioObservationWindow } from '../../../scripts/player-acceptance/net-shape.mjs';
 import { observeAudio, observeCanvas } from './sinks.js';
 import { observeLocmafDelivery, assessLocmafDelivery, observeConnectionObjects } from './received.js';
 import { observeDecodedSource } from './decoded.js';
@@ -53,6 +54,10 @@ let nativeFrameAtMs = 0;
 let callbackHandle = 0;
 let timer: ReturnType<typeof setInterval> | undefined;
 let recording = false;
+const SAMPLE_PERIOD_MS = 250;
+let observationStartMs: number | null = null;
+let observationEndMs: number | null = null;
+let minimumObservationDurationMs: number | null = null;
 let previousPixels: Uint8ClampedArray | undefined;
 let audioContext: AudioContext | undefined;
 let source: MediaElementAudioSourceNode | undefined;
@@ -252,7 +257,13 @@ function playbackQuality() {
 
 function snapshot() {
   const locmafDelivery = locmafObserver?.snapshot();
-  return { ...(groupTail ? { groupTail: groupTail.snapshot() } : {}), samples: [...samples], events: [...events], startupError, transportState: [...transportState],
+  const audioObservation: AudioObservationWindow | null = observationStartMs !== null
+    && observationEndMs !== null && minimumObservationDurationMs !== null
+    ? { startMs: observationStartMs, endMs: observationEndMs,
+      minimumDurationMs: minimumObservationDurationMs, samplePeriodMs: SAMPLE_PERIOD_MS } : null;
+  // Older snapshot producers carry no declared window; absence cannot qualify audio evidence.
+  const audioEvidence: { audioObservation?: AudioObservationWindow | null } = { audioObservation };
+  return { ...(groupTail ? { groupTail: groupTail.snapshot() } : {}), samples: [...samples], ...audioEvidence, events: [...events], startupError, transportState: [...transportState],
     nativeEvents: [...nativeEvents], nativeError: video.error ? { code: video.error.code, message: video.error.message } : null,
     nativeMse: nativeMse?.snapshot() ?? null,
     warmStart: warmObserver?.snapshot() ?? null,
@@ -338,26 +349,37 @@ const acceptance = {
   armTail(mode: 'ordinary' | 'held') { if (!groupTail) throw new Error('Tail probe not enabled'); return groupTail.arm(mode); },
   async settleTailHashes() { await groupTail?.settleHashes(); },
   async settleTailObservations(checkpoint: TailCheckpoint) { await groupTail?.settleObservations(checkpoint); },
-  begin(silent: boolean): void {
+  begin(silent: boolean, minimumDurationMs?: number): void {
+    if (recording) throw new Error('Observation already recording');
+    if (minimumDurationMs !== undefined && (!Number.isFinite(minimumDurationMs) || minimumDurationMs <= 0)) {
+      throw new Error('Observation duration must be finite and positive');
+    }
     if (webAudioOutput) { if (silent) player.mute(); }
     else gain!.gain.value = silent ? 0 : 1;
     samples.length = 0;
     nativeEvents.length = 0;
     previousPixels = undefined;
+    minimumObservationDurationMs = minimumDurationMs ?? null;
+    observationEndMs = null;
     recording = true;
+    observationStartMs = performance.now();
     sample();
-    timer = setInterval(sample, 250);
+    timer = setInterval(sample, SAMPLE_PERIOD_MS);
   },
   finish() {
+    const wasRecording = recording;
     recording = false;
     clearInterval(timer);
+    if (wasRecording) observationEndMs = performance.now();
     return snapshot();
   },
   setVolume(value: number) { player.setVolume(value); },
   async setMuted(value: boolean) { if (value) player.mute(); else await player.unmute(); },
   async destroy() {
+    const wasRecording = recording;
     recording = false;
     clearInterval(timer);
+    if (wasRecording) observationEndMs = performance.now();
     video.cancelVideoFrameCallback(callbackHandle);
     groupTail?.cancel();
     await groupTail?.settleObservations('before-player-destroy');

@@ -12,8 +12,10 @@ export async function netShapeOption(argv, env) {
     throw new Error(`Unknown net shape ${preset}; known: ${Object.keys(netShapePresets).join(', ')}`);
   }
   const seconds = Number(env.PLAYER_NET_SHAPE_SECONDS ?? 45);
-  if (!(seconds > 0)) throw new Error('PLAYER_NET_SHAPE_SECONDS must be positive');
-  return { preset, params: netShapePresets[preset], durationMs: seconds * 1000, seed: Number(env.PLAYER_NET_SHAPE_SEED ?? 1) };
+  if (!Number.isFinite(seconds * 1000) || !(seconds > 0)) throw new Error('PLAYER_NET_SHAPE_SECONDS must be finite and positive');
+  const seed = Number(env.PLAYER_NET_SHAPE_SEED ?? 1);
+  if (!Number.isSafeInteger(seed)) throw new Error('PLAYER_NET_SHAPE_SEED must be a safe integer');
+  return { preset, params: netShapePresets[preset], durationMs: seconds * 1000, seed };
 }
 
 /** The browser dials the shaper; only the port differs, so the pinned certificate hash is unchanged. */
@@ -73,31 +75,67 @@ export function summarizeAbrTrace(trace, shaper) {
 
 /** Audio level above which a sample counts as audible (the startup check's bound). */
 export const AUDIBLE_RMS = 0.015;
-/** Least fraction of samples, from the first audible one, that must be audible. */
+/** Required RMS-positive fraction of valid cadence observations. */
 export const MIN_AUDIBLE_FRACTION = 0.8;
 
 /**
- * Audio continuity over an observation: of the samples from the first audible
- * one on, the fraction that were audible, and the longest silent run. A single
- * audible sample is not evidence that audio played — on a congested link it
- * can come from a brief burst between long silences.
+ * Sampled output evidence for an already-playing, expected-audio fixture.
+ * The caller declares its clock window, minimum duration and timer cadence.
+ * Each nominal cadence slot admits at most one observation; every complete
+ * interior slot must be present. The final partial slot is optional. This
+ * tolerates nearest-slot scheduling skew without counting bursts as coverage.
+ * Boundary/adjacent gaps can approach twice the period; the result reports them.
+ * RMS-positive sample fraction is not an audible-time or speaker measurement.
  */
-export function assessAudioContinuity(samples) {
-  const first = samples.findIndex(sample => sample.audioRms > AUDIBLE_RMS);
-  if (first < 0) return { samples: samples.length, audibleFraction: 0, longestSilenceMs: null, passed: false };
-  const window = samples.slice(first);
-  let audible = 0, longestSilenceMs = 0, silenceStartMs = null;
-  for (const sample of window) {
-    if (sample.audioRms > AUDIBLE_RMS) {
-      audible++;
-      silenceStartMs = null;
-    } else {
-      silenceStartMs ??= sample.wallMs;
-      longestSilenceMs = Math.max(longestSilenceMs, sample.wallMs - silenceStartMs);
+export function assessAudioContinuity(samples, observation) {
+  const invalid = reason => ({samples: Array.isArray(samples) ? samples.length : 0,
+    evidenceValid: false, audibleFraction: null, longestSilentObservationSpanMs: null,
+    passed: false, failures: [reason]});
+  if (!observation) return invalid('observation window required');
+  const {startMs, endMs, minimumDurationMs, samplePeriodMs} = observation;
+  if (![startMs,endMs,minimumDurationMs,samplePeriodMs].every(Number.isFinite)
+      || startMs < 0 || endMs <= startMs || minimumDurationMs <= 0 || samplePeriodMs <= 0) {
+    return invalid('invalid observation window');
+  }
+  const durationMs = endMs - startMs;
+  if (durationMs < minimumDurationMs) return invalid('observation shorter than requested duration');
+  const requiredSlots = Math.floor((durationMs - samplePeriodMs / 2) / samplePeriodMs) + 1;
+  const lastSlot = Math.round(durationMs / samplePeriodMs);
+  if (!Number.isSafeInteger(requiredSlots) || requiredSlots < 2 || !Number.isSafeInteger(lastSlot)) {
+    return invalid('observation window cannot establish sampling cadence');
+  }
+  if (!Array.isArray(samples)) return invalid('observations must be an array');
+  const slots = new Set();
+  let requiredObserved = 0, previousMs = null, audible = 0;
+  let longestSilentObservationSpanMs = 0, silenceStartMs = null, maxObservedGapMs = 0;
+  for (const sample of samples) {
+    if (sample === null || typeof sample !== 'object') return invalid('invalid observation record');
+    const {wallMs, audioRms} = sample;
+    if (!Number.isFinite(wallMs) || !Number.isFinite(audioRms) || audioRms < 0) {
+      return invalid('invalid sample time or RMS');
+    }
+    if (wallMs < startMs || wallMs > endMs) return invalid('sample outside observation window');
+    if (previousMs !== null && wallMs <= previousMs) return invalid('sample time is not strictly increasing');
+    const slot = Math.round((wallMs - startMs) / samplePeriodMs);
+    if (!Number.isSafeInteger(slot) || slot < 0 || slot > lastSlot) return invalid('sample outside cadence range');
+    if (slots.has(slot)) return invalid('multiple observations in one cadence slot');
+    slots.add(slot);
+    if (slot < requiredSlots) requiredObserved++;
+    maxObservedGapMs = Math.max(maxObservedGapMs, wallMs - (previousMs ?? startMs));
+    previousMs = wallMs;
+    if (audioRms > AUDIBLE_RMS) { audible++; silenceStartMs = null; }
+    else {
+      silenceStartMs ??= wallMs;
+      longestSilentObservationSpanMs = Math.max(longestSilentObservationSpanMs, wallMs - silenceStartMs);
     }
   }
-  const audibleFraction = audible / window.length;
-  return { samples: window.length, audibleFraction, longestSilenceMs, passed: audibleFraction >= MIN_AUDIBLE_FRACTION };
+  if (requiredObserved !== requiredSlots) return invalid('observation window has uncovered cadence slots');
+  maxObservedGapMs = Math.max(maxObservedGapMs, endMs - previousMs);
+  const audibleFraction = audible / samples.length;
+  const passed = audibleFraction >= MIN_AUDIBLE_FRACTION;
+  return {samples: samples.length, evidenceValid: true, audibleFraction,
+    longestSilentObservationSpanMs, maxObservedGapMs, requiredSlots, observedSlots: slots.size,
+    passed, failures: passed ? [] : ['RMS-positive sample fraction below the required fraction']};
 }
 
 /**
@@ -105,8 +143,9 @@ export function assessAudioContinuity(samples) {
  * the configured time while the ordinary observer keeps sampling output.
  */
 export async function observeShapedAbr(page, evidence, durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs <= 0) throw new Error('Observation duration must be finite and positive');
   evidence.initialSelection = await page.evaluate(() => window.playerAcceptance.selection);
-  await page.evaluate(() => window.playerAcceptance.begin(false));
+  await page.evaluate(duration => window.playerAcceptance.begin(false, duration), durationMs);
   const deadline = Date.now() + durationMs;
   evidence.levels = [];
   while (Date.now() < deadline) {

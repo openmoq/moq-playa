@@ -17,6 +17,13 @@
   // `*.test.ts` corpus predates any typecheck gate and does not compile clean
   // under these options; widening this include is a separate cleanup.
   "include": [
+    "scripts/net-shaper/cli.test.ts",
+    "scripts/net-shaper/shaper.test.ts",
+    "scripts/net-shaper/startup.test.ts",
+    "scripts/player-acceptance/net-shape.test.ts",
+    "scripts/player-acceptance/case-result.test.ts",
+    "scripts/player-acceptance/observer.test.ts",
+    "examples/_tests/player-acceptance/main.ts",
     "packages/player/src/player-publisher-return.loopback.test.ts",
     "packages/player/src/player-switch-history-drain.test.ts",
     "packages/player/src/player-switch-history-retirement.test.ts",

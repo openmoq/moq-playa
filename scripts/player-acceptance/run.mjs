@@ -23,7 +23,8 @@ import { prepareProgramSwitchVariant } from './program-switch.fixture.mjs';
 import { mseProgramSwitchCases, checkMseProgramSwitch } from './mse-program-switch.mjs';
 import { checkGroupTail, assessTailDiagnostics } from './group-tail-check.mjs';
 import { isTailHarnessFile, isTailSupportFile } from './group-tail-cli.mjs';
-import { netShapeOption, shapedUrl, summarizeAbrTrace, observeShapedAbr, assessAudioContinuity, MIN_AUDIBLE_FRACTION } from './net-shape.mjs';
+import { netShapeOption, shapedUrl, summarizeAbrTrace, observeShapedAbr, assessAudioContinuity } from './net-shape.mjs';
+import { classifyCaseResult, classifyRunResult, formatCaseResult } from './case-result.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
@@ -350,8 +351,12 @@ try {
   ];
   if (caseArg >= 0 && !scenarios.some((s) => s.name === selectedCase)) throw new Error(`Unknown playback case: ${selectedCase}`);
   result.selectedCase = selectedCase;
-  if (netShape) result.netShape = { preset: netShape.preset, params: netShape.params, seed: netShape.seed };
+  if (netShape) result.netShape = { preset: netShape.preset, params: netShape.params, seed: netShape.seed,
+    durationMs: netShape.durationMs, relayLimits: { objects: 4096, bytes: 32 * 1024 * 1024 } };
   for (const scenario of scenarios.filter((s) => selectedCase === null || s.name === selectedCase)) {
+    if (netShape && (scenario.handover || scenario.warm !== undefined)) {
+      throw new Error('Net shaping does not cover special warm/handover relay launchers');
+    }
     const relay = launch(`${scenario.name}-relay`, 'pnpm', scenario.handover
       ? ['--filter', '@moqt/example-node-relay', 'exec', 'tsx', '../../scripts/player-acceptance/handover-relays.ts',
           ...(scenario.handover === 'reject' ? ['--reject-audio'] : []),
@@ -567,18 +572,13 @@ try {
         } else if (scenario.abrTrace) {
           caseResult.abr = {};
           observed = await observeShapedAbr(page, caseResult.abr, netShape.durationMs);
-          // Informational: under a constrained link output defects are the
-          // measurement, so they are recorded rather than asserted.
-          caseResult.assessment = { passed: true, failures: [], observed: assessPlayback(observed.samples, {
+          // Preserve the real adaptation measurement; completion is not a playback PASS.
+          caseResult.assessment = assessPlayback(observed.samples, {
             ...scenario.expected, videoWidth: 1920, videoHeight: 1080, audioHz: 440, videoFps: 24,
-            videoSizes: [{ width: 1920, height: 1080 }, { width: 1280, height: 720 }, { width: 640, height: 360 }] }) };
-          // Except audio continuity: a constrained link may cost latency and
-          // quality, but audio that plays only in fragments is a failure, and
-          // the startup check alone cannot see it.
-          caseResult.audioContinuity = assessAudioContinuity(observed.samples);
+            videoSizes: [{ width: 1920, height: 1080 }, { width: 1280, height: 720 }, { width: 640, height: 360 }] });
+          caseResult.audioContinuity = assessAudioContinuity(observed.samples, observed.audioObservation);
           assert.ok(caseResult.audioContinuity.passed,
-            `Audio audible in ${Math.round(caseResult.audioContinuity.audibleFraction * 100)}% of samples after it began `
-            + `(longest silence ${caseResult.audioContinuity.longestSilenceMs}ms); at least ${MIN_AUDIBLE_FRACTION * 100}% required`);
+            `Audio observation failed: ${caseResult.audioContinuity.failures.join(', ')}`);
         } else if (handover) {
           caseResult.handover = {};
           await checkHandover(page, handover.control, scenario.expected, scenario.handover, caseResult.handover,
@@ -598,15 +598,14 @@ try {
           assert.deepEqual(caseResult.warmStart.failures, [], 'Warm prefix processing and overtaking receipt evidence');
         }
         caseResult.playbackQuality = assessPlaybackQuality(observed.playbackQuality, scenario.expected?.outputKind !== 'canvas');
-        if (!scenario.abrTrace) assert.deepEqual(caseResult.playbackQuality.failures, [], 'Public playback quality must match its owned native video source');
+        assert.deepEqual(caseResult.playbackQuality.failures, [], 'Public playback quality must match its owned native video source');
         caseResult.assessment ??= scenario.manualSwitch ? caseResult.renditionSwitch.continuity
           : scenario.mseProgramSwitch ? caseResult.mseProgramSwitch.assessment
           : scenario.programSwitch ? caseResult.programSwitch.assessment
             : scenario.audioSwitch ? caseResult.audioSwitch.assessment : assessPlayback(observed.samples, scenario.expected);
         caseResult.presentationFailures = assessVideoPresentation(observed.samples);
-        if (!scenario.abrTrace) assert.deepEqual(caseResult.presentationFailures, [], 'Public video draw observation');
-        if (scenario.abrTrace) caseResult.decodedSource = observed.decodedSource;
-        else if (scenario.expected?.outputKind === 'canvas') {
+        assert.deepEqual(caseResult.presentationFailures, [], 'Public video draw observation');
+        if (scenario.expected?.outputKind === 'canvas') {
           assert.ok(observed.decodedSource?.matched > 0, 'No decoded source timestamp evidence');
           assert.deepEqual(observed.decodedSource.failures, [], 'Decoded source timestamp correlation');
         } else assert.equal(observed.decodedSource, null, 'MSE must not claim WebCodecs output evidence');
@@ -693,7 +692,7 @@ try {
       assert.ok(!relay.exited && !publisher.exited && !replacementPublisher?.exited, 'Media process exited before test teardown');
       if (scenario.expectedFailure) {
         assert.deepEqual(caseResult.assessment.failures, [scenario.expectedFailure], 'Control must fail only its intended output check');
-      } else assert.equal(caseResult.assessment.passed, true, `Playback failed: ${caseResult.assessment.failures.join(', ')}`);
+      } else if (!scenario.abrTrace) assert.equal(caseResult.assessment.passed, true, `Playback failed: ${caseResult.assessment.failures.join(', ')}`);
     } catch (error) {
       caseResult.error = error.message;
       await page.screenshot({ path: join(artifacts, `${scenario.name}-failure.png`) }).catch(() => {});
@@ -716,7 +715,7 @@ try {
       caseResult.httpErrors = { total: httpErrorCount, responses: httpErrors, truncated: Math.max(0, httpErrorCount - httpErrors.length) };
       await writeFile(join(artifacts, `${scenario.name}-console.json`), JSON.stringify(consoleLines, null, 2));
       const abrTrace = shaper ? await bounded(page.evaluate(() => window.playerAcceptance?.abrTrace ?? null), 5000,
-        'ABR trace', false).catch(() => null) : null;
+        'ABR trace', false).catch(error => { caseResult.abrTraceError = String(error); return null; }) : null;
       try {
         await bounded(context.close(), 5000, 'browser context close', false);
         assert.deepEqual(pageErrors, [], 'Uncaught browser error during context shutdown');
@@ -730,6 +729,9 @@ try {
             abrTrace, shaper: stats };
           caseResult.netShape.summary = trace.summary;
           await writeFile(join(artifacts, `${scenario.name}-abr-trace.json`), `${JSON.stringify(trace, null, 2)}\n`);
+          // The calibration's principal capture is mandatory, independently of its playback assessment.
+          if (scenario.abrTrace) assert.ok(abrTrace && Number.isFinite(abrTrace.timeOrigin) && Array.isArray(abrTrace.events),
+            'Required ABR trace capture is missing or invalid');
         }
         await stop(publisher);
         if (replacementPublisher) await stop(replacementPublisher);
@@ -739,10 +741,10 @@ try {
         throw error;
       }
     }
-    caseResult.passed = true;
-    console.log(`PASS ${scenario.name}: ${caseResult.assessment.failures.join(', ') || 'healthy output'}`);
+    delete caseResult.passed;
+    Object.assign(caseResult, classifyCaseResult(caseResult.assessment, !!scenario.abrTrace, scenario.expectedFailure ?? null));
+    console.log(formatCaseResult(scenario.name, caseResult));
   }
-  result.passed = true;
 } catch (error) {
   result.errors.push(error.stack ?? String(error));
   process.exitCode = 1;
@@ -753,9 +755,11 @@ try {
     try { await stop(child); } catch (error) { result.errors.push(error.message); process.exitCode = 1; }
   }
   for (const log of logs) { log.end(); await once(log, 'finish'); }
-  result.passed &&= result.errors.length === 0;
+  delete result.passed;
+  Object.assign(result, classifyRunResult(result.cases, result.errors));
+  if (result.status === 'fail') process.exitCode = 1;
   await writeFile(join(artifacts, 'result.json'), `${JSON.stringify(result, null, 2)}\n`);
   process.removeListener('SIGINT', onInterrupt);
   process.removeListener('SIGTERM', onInterrupt);
 }
-if (!result.passed) console.error(result.errors.join('\n'));
+if (result.status === 'fail') console.error(result.errors.join('\n'));
