@@ -4,16 +4,48 @@ import { assessPlayback } from './assessment.mjs';
 const sizes = [{ width: 1920, height: 1080 }, { width: 1280, height: 720 }, { width: 640, height: 360 }];
 const expected = { videoWidth: 1920, videoHeight: 1080, videoSizes: sizes, audioHz: 440, videoFps: 24 };
 
-export function assessSwitchContinuity(observed) {
+const sameSize = (a, b) => a.width === b.width && a.height === b.height;
+const elementSize = s => ({ width: s.videoWidth, height: s.videoHeight });
+const frameSize = s => ({ width: s.nativeFrameWidth, height: s.nativeFrameHeight });
+
+/**
+ * A timer sample reads two independent observations: the element's natural size now, and the
+ * metadata of the latest presented frame from the last requestVideoFrameCallback. Neither HTML nor
+ * rVFC orders a natural-size change against frame presentation, so during a size change the two can
+ * name different renditions. That disagreement is accepted only inside a recorded switch, from the
+ * request up to (not including) the sample that settled it, and only when one observation shows the
+ * switch's starting size and the other its settled size. Everywhere else they must agree. Equality of
+ * the two sizes assumes square pixels (rVFC reports media pixels, videoWidth CSS pixels); this
+ * fixture's video tracks declare pasp 1:1.
+ */
+function transitionalSize(sample, transitions) {
+  for (const [index, t] of transitions.entries()) {
+    const { before, settled } = t;
+    if (!before || !settled || !(t.requestedAtMs <= sample.wallMs && sample.wallMs < settled.wallMs)) continue;
+    const from = elementSize(before), to = elementSize(settled);
+    if (!sameSize(from, frameSize(before)) || !sameSize(to, frameSize(settled)) || sameSize(from, to)) continue;
+    const element = elementSize(sample), frame = frameSize(sample);
+    if ((sameSize(element, to) && sameSize(frame, from)) || (sameSize(element, from) && sameSize(frame, to))) return index;
+  }
+  return null;
+}
+
+export function assessSwitchContinuity(observed, transitions = []) {
   const { samples } = observed;
   const failures = new Set(assessPlayback(samples, expected).failures);
+  const transitional = [];
   if (observed.nativeError || observed.nativeEvents.length) failures.add('native-media-event');
   if (observed.events.some(event => event.type === 'error'
     || (event.type === 'stall' && event.timeMs >= samples[0]?.wallMs))) failures.add('player-error-or-stall');
   for (const [i, sample] of samples.entries()) {
-    if (sample.nativeFrameWidth !== sample.videoWidth || sample.nativeFrameHeight !== sample.videoHeight
-      || !Number.isFinite(sample.nativeFrameAtMs) || sample.wallMs - sample.nativeFrameAtMs < 0
+    if (!Number.isFinite(sample.nativeFrameAtMs) || sample.wallMs - sample.nativeFrameAtMs < 0
       || sample.wallMs - sample.nativeFrameAtMs > 1000) failures.add('native-frame-identity');
+    else if (!sameSize(elementSize(sample), frameSize(sample))) {
+      const transition = transitionalSize(sample, transitions);
+      if (transition === null) failures.add('native-frame-identity');
+      else transitional.push({ wallMs: sample.wallMs, transition, element: elementSize(sample), frame: frameSize(sample),
+        presentedFrames: sample.presentedFrames, nativeFrameAtMs: sample.nativeFrameAtMs });
+    }
     if (sample.bufferedRanges?.length !== 1) failures.add('split-buffer');
     if (!Number.isFinite(sample.audioContextTimeS)) failures.add('audio-clock');
     const previous = samples[i - 1];
@@ -31,7 +63,7 @@ export function assessSwitchContinuity(observed) {
     if (last.audioContextTimeS - first.audioContextTimeS < wallSeconds * 0.8) failures.add('audio-clock');
     if (!(last.bufferedRanges?.[0]?.end > first.bufferedRanges?.[0]?.end)) failures.add('buffer-not-extending');
   }
-  return { passed: failures.size === 0, failures: [...failures], samples: samples.length };
+  return { passed: failures.size === 0, failures: [...failures], samples: samples.length, transitional };
 }
 
 export function assessNativeRetypes(observed, retypes, baselineOffsets) {
@@ -111,7 +143,7 @@ export async function checkRenditionSwitch(page, evidence, bounded, nativeRetype
     previousCodec = codecs[level];
   }
   const observed = await page.evaluate(() => window.playerAcceptance.finish());
-  evidence.continuity = assessSwitchContinuity(observed);
+  evidence.continuity = assessSwitchContinuity(observed, evidence.transitions);
   evidence.nativeRetypes = assessNativeRetypes(observed, nativeRetypes, baselineOffsets);
   assert.deepEqual(evidence.continuity.failures, [], 'Native output failed across manual switches');
   assert.deepEqual(evidence.nativeRetypes.failures, [], 'Native retype/offset evidence failed');
