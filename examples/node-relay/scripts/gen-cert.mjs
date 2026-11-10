@@ -39,6 +39,8 @@ mkdirSync(certDir, { recursive: true });
 execFileSync('openssl', [
   'req', '-x509', '-nodes',
   '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
+  // RFC 5480 §2.1.1 requires namedCurve in PKIX SubjectPublicKeyInfo.
+  '-pkeyopt', 'ec_param_enc:named_curve',
   '-keyout', keyPath, '-out', certPath,
   '-days', String(DAYS),
   '-subj', '/CN=localhost',
