@@ -339,6 +339,7 @@
     "packages/player/src/output-role-candidate.test.ts",
     "packages/player/src/dispatcher-role-candidate.test.ts",
     "packages/player/src/frame-quality-cut.test.ts",
-    "packages/player/src/player-playing-frame-quality.loopback.test.ts"
+    "packages/player/src/player-playing-frame-quality.loopback.test.ts",
+    "packages/browser/src/webaudio-start-clamp.test.ts"
   ]
 }

@@ -283,6 +283,10 @@ export class WebAudioOutput implements AudioOutputLike {
       }
       // A reentrant cancellation already consumed this source and its terminal.
       if (!this.activeSources.includes(source)) return;
+      // Source setup and timing callbacks may advance the audio clock. A past
+      // start plays the whole buffer immediately, so chain from this fresh time.
+      startTime = Math.max(startTime, this.audioCtx.currentTime);
+      if (this.destroyed || this.scheduleRevision !== revision || !this.activeSources.includes(source)) return;
       source.start(startTime);
       starting = false;
       if (this.destroyed || this.scheduleRevision !== revision || !this.activeSources.includes(source)) return;
