@@ -174,7 +174,8 @@ describe('CMAF full track identity', () => {
       expect(assembler.push('video', 'raw-label', 1n, chunk(), undefined, undefined, keyA)).toBeUndefined();
       expect(onSegment).toHaveBeenCalledTimes(1); expect(read).not.toHaveBeenCalled();
       expect(assembler.push('video', 'raw-label', 2n, chunk(11_000n), undefined, true, keyA))
-        .toEqual({ state: 'emitted', sourcePresentationTimeUs: 11_000_000n });
+        .toEqual({ state: 'emitted', sourcePresentationTimeUs: 11_000_000n,
+          sourceDecodeTime: {timeUs:11_000_000n,timescale:1000,placementToken:assembler.capturePresentationPlacement('video')!.token} });
       expect(read).toHaveBeenCalledTimes(1);
     } finally { read.mockRestore(); }
   });

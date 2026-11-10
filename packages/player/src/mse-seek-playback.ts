@@ -6,7 +6,7 @@ import type { DataStreamTerminal } from '@openmoq/webtransport';
 import type { MoqtPlayerConfig } from './config.js';
 import type { CmafAssemblerLike, MediaAppendReason, MediaSeekResource, MediaSeekSample, MediaSourceLike } from './interfaces.js';
 import { MseSeekOutput, type MseSeekRoleSuspension } from './mse-seek-output.js';
-import { SEEK_INTERVAL_BYTES, SeekCmafInput, seekChunkCoverage, type SeekCmafChunk, type SeekSampleInterval } from './seek-cmaf-input.js';
+import { SEEK_INTERVAL_BYTES, SeekCmafInput, seekChunkCoverage, type SeekCmafChunk, type SeekCmafTimingObservation, type SeekSampleInterval } from './seek-cmaf-input.js';
 import type { SeekFetchCut } from './seek-fetch-pages.js';
 
 type Role = 'video' | 'audio';
@@ -138,6 +138,7 @@ interface InputWork {
 }
 function inputWork(): InputWork { return { rawObjects: 0, rawBytes: 0, rawCut: null, batchBytes: 0, batchCut: null }; }
 interface LiveItem {
+  readonly observation?: SeekCmafTimingObservation;
   readonly object: MoqtObject;
   readonly input: object | undefined;
   readonly admitted: (() => boolean) | undefined;
@@ -202,6 +203,7 @@ export interface CmafAppendObservation {
   discard(reason: MediaAppendReason): void;
 }
 interface Options {
+  readonly captureLiveTiming?: (role: Role, owner: object, object: MoqtObject) => SeekCmafTimingObservation | undefined;
   readonly epoch: object;
   readonly source: MediaSourceLike;
   readonly liveAssembler: CmafAssemblerLike;
@@ -585,7 +587,7 @@ export class MseSeekPlayback {
   }
 
   /** Runs at the serial consumer frontier, never on concurrent raw receipt. */
-  private async pushInput(output: Output, object: MoqtObject, input: object | undefined, assertOwner: () => void, take: () => void): Promise<SeekCmafChunk[]> {
+  private async pushInput(output: Output, object: MoqtObject, input: object | undefined, assertOwner: () => void, take: () => void, observation?: SeekCmafTimingObservation): Promise<SeekCmafChunk[]> {
     for (;;) {
       assertOwner();
       const hold = output.hold, group = BigInt(object.groupId);
@@ -619,11 +621,11 @@ export class MseSeekPlayback {
       if (hold?.cut?.credit && !this.chargeRaw(output, hold, 1, bytes)) continue;
       take();
       if (output.highestEnteredGroup === null || group > output.highestEnteredGroup) output.highestEnteredGroup = group;
-      if (output.live) return this.parseInput(output, object, input);
+      if (output.live) return this.parseInput(output, object, input, observation);
       const before = output.input.retainedObjectCount;
       output.work.rawObjects++; output.work.rawBytes += bytes;
       if (hold?.cut?.credit && output.hold === hold) output.work.rawCut = hold;
-      const chunks = this.parseInput(output, object, input);
+      const chunks = this.parseInput(output, object, input, observation);
       if (chunks.length) { output.retainedRawObjects = 0; output.retainedRawBytes = 0; }
       else if (output.input.retainedObjectCount > before) { output.retainedRawObjects++; output.retainedRawBytes += bytes; }
       else { output.work.rawObjects--; output.work.rawBytes -= bytes; }
@@ -633,8 +635,8 @@ export class MseSeekPlayback {
   private processingFailure(output: Output): void {
     if (output.candidate) output.candidate.processingFailed = true;
   }
-  private parseInput(output: Output, object: MoqtObject, input: object | undefined): SeekCmafChunk[] {
-    try { return output.input.push(object, input); }
+  private parseInput(output: Output, object: MoqtObject, input: object | undefined, observation?: SeekCmafTimingObservation): SeekCmafChunk[] {
+    try { return output.input.push(object, input, observation); }
     catch (error) { this.processingFailure(output); throw error; }
   }
   private commitRole(old: Output, hold: Hold, handle: SeekRoleCandidate): void {
@@ -969,9 +971,13 @@ export class MseSeekPlayback {
       try {
         try {
           this.checkGroupFloor(output, chunk);
-          this.assembler!.push(output.track.role, output.track.name, chunk.groupId, chunk.bytes,
-            undefined, undefined, output.track.sourceKey, chunk.objectId);
+          const receipt = this.assembler!.push(output.track.role, output.track.name, chunk.groupId, chunk.bytes,
+            undefined, chunk.observation ? true : undefined, output.track.sourceKey, chunk.objectId);
           if (!emissions.length) throw new Error('Seek assembler refused complete media');
+          assertOwner();
+          // Synchronous assembly admission, not native append completion or wire latency.
+          try { chunk.observation?.report(receipt); } catch { /* Optional measurement. */ }
+          assertOwner();
         } catch (error) { this.processingFailure(output); throw error; }
         assertOwner();
       } catch (error) {
@@ -1063,9 +1069,16 @@ export class MseSeekPlayback {
         this.stopLive(output, live, error, 'failed');
         throw error;
       }
+      let observation: SeekCmafTimingObservation | undefined;
+      try { observation = this.options.captureLiveTiming?.(output.track.role, live.owner, object); }
+      catch { /* Optional measurement cannot reject accepted media. */ }
+      this.assertLive(output, live);
+      if (admitted?.() === false) throw this.aborted();
+      this.assertLive(output, live);
       const snapshot = object.kind === 'data' ? { ...object, payload: object.payload.slice() } : { ...object };
       const promise = new Promise<void>((resolve, reject) => {
-        live.queued.push({ object: snapshot, input, admitted, bytes, resolve, reject, inputOwned: false });
+        live.queued.push({ object: snapshot, input, admitted, bytes, resolve, reject, inputOwned: false,
+          ...(observation ? { observation } : {}) });
       });
       live.retainedObjects++; live.retainedBytes += bytes; retained = true;
       this.pumpLive(output, live);
@@ -1087,7 +1100,7 @@ export class MseSeekPlayback {
         try {
           chunks = await this.pushInput(output, item.object, item.input, () => this.assertLive(output, live, item), () => {
             item.inputOwned = true; // The format consumer owns diagnostic outcomes from here.
-          });
+          }, item.observation);
           this.assertLive(output, live, item);
           for (const chunk of chunks) {
             if (output.queued.length >= this.options.maxObjects || chunk.bytes.length > this.options.maxBytes - output.queuedBytes) {

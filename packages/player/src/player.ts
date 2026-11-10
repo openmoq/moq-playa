@@ -6,6 +6,7 @@ import { MseSeekPlayback, type SeekTrack, type SeekRoleCandidate, type SeekRoleC
 import { selectSeekQualityCut, selectFrameQualityCut } from './seek-fetch-pages.js';
 import type { SeekFetchRequests } from './seek-fetch-requests.js';
 import type { SeekLiveBridge } from './seek-live-bridge.js';
+import type { SeekCmafTimingObservation } from './seek-cmaf-input.js';
 import { SeekRoleRetrieval, type SeekRoleBridgeOwner, type SeekRetrievalTrack } from './seek-role-retrieval.js';
 import { LocSeekPlayback, locSeekTrackContext, type LocSeekTrack, type LocSeekResume, type LocVideoRoleCandidate, type LocVideoRoleTrack } from './loc-seek-playback.js';
 import type { PreparedFramePipelines } from './player-frame-output.js';
@@ -148,7 +149,7 @@ import type { MediaSourceLike, MediaAppendQueueLease, MediaSwitchRecovery, Video
 import { CommandDispatcher, type DispatcherOutputObserver } from './command-dispatcher.js';
 import { StatsAccumulator } from './stats.js';
 import type { PlayerStats, VideoEncodeObservation } from './stats.js';
-import type { CmafAssemblerLike } from './interfaces.js';
+import type { CmafAssemblerLike, CmafSourceReceipt } from './interfaces.js';
 import { buildConnectUrl, buildSetupOptions, buildSubscribeOptions, invalidGoawayUriReason } from './player-connect.js';
 import { computePlaybackDelayUs,
   createPipelines,
@@ -853,6 +854,7 @@ export class MoqtPlayer {
   private videoDeliveryLag: {
     readonly owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'];
     readonly timescale: bigint | null;
+    readonly placementToken?: object;
     readonly sourceOriginUs: bigint;
     readonly arrivalOriginUs: number;
     readonly detector: DeliveryLagDetector;
@@ -861,6 +863,12 @@ export class MoqtPlayer {
   private evaluatingBandwidth = false;
   private bufferAbrController: BufferBasedController | null = null;
   private readonly cadenceInputOwners = new WeakMap<object, NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner']>();
+  private readonly seekCmafInputs = new WeakMap<ObjectReceipt, {
+    readonly owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner']; readonly authority: object;
+  }>();
+  private readonly seekCmafObservations = new WeakMap<MoqtObject, {
+    readonly owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner']; readonly authority: object;
+  }>();
   private readonly seekCadenceInputs = new WeakMap<ObjectReceipt, {
     readonly object: CadenceObject;
     readonly owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'];
@@ -1663,7 +1671,8 @@ export class MoqtPlayer {
     const selected = this._selection.video;
     const cadenceIdentity = cadenceOwner && cadenceOwner.connection === sourceConnection
       && cadenceOwner.alias === BigInt(obj.trackAlias) && selected
-      && this.catalogTrackFor(selected.name, selected.namespaceFields, 'video')?.packaging === 'loc' ? {} : undefined;
+      && (() => { const track = this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
+        return track?.packaging === 'loc' || track !== null && track !== undefined && this.usesMse(track.packaging); })() ? {} : undefined;
     if (cadenceIdentity && cadenceOwner) this.cadenceInputOwners.set(cadenceIdentity, cadenceOwner);
     // Datagram routing IDs are not stream identities. Only a real subgroup
     // receipt may establish receiving evidence; FETCH has its own ownership.
@@ -2527,6 +2536,7 @@ export class MoqtPlayer {
    * @see draft-einarsson-moq-locmaf-01 §3, §9, §15, §16
    */
   private onLocmafMediaObject(mediaType: 'video' | 'audio' | 'eventtimeline', trackName: string, obj: MoqtObject, input?: ObjectRoutingContext, delivery?: ObjectDeliveryOptions): void {
+    const lagOwner = this.captureCmafLagOwner(mediaType, obj, delivery);
     const inputGeneration = this.subscriptionManager?.mediaInputGeneration;
     const sourceKey = this.keyedCmafIdentity ? this.subscriptionManager?.getSourceKey(BigInt(obj.trackAlias)) : undefined;
     if (mediaType === 'eventtimeline') {
@@ -2652,7 +2662,7 @@ export class MoqtPlayer {
       if (floor !== undefined && groupId < floor) { this.discardMediaInput(input, 'stale group'); return; }
     }
 
-    this.pushCmafInput(mediaType, trackName, groupId, decoded.bytes, input, sourceKey);
+    this.pushCmafInput(mediaType, trackName, groupId, decoded.bytes, input, sourceKey, undefined, lagOwner);
   }
 
   /** Count reconstruction and pre-init rawBoxes validation through the same group-health policy. */
@@ -4186,12 +4196,14 @@ export class MoqtPlayer {
   }
 
   private pushCmafInput(mediaType: 'video' | 'audio', trackName: string, groupId: bigint, payload: Uint8Array,
-    input?: ObjectRoutingContext, sourceKey?: string, objectId?: bigint): void {
+    input?: ObjectRoutingContext, sourceKey?: string, objectId?: bigint,
+    lagOwner?: NonNullable<MoqtPlayer['videoDeliveryLag']>['owner']): void {
     const assembler = this.cmafAssembler;
     if (this.keyedCmafIdentity && sourceKey === undefined) {
       this.discardMediaInput(input, 'route retired'); return;
     }
-    if (!(mediaType === 'audio' ? this.collectAudioTimeline : this.collectVideoTimeline)) {
+    const collectTimeline = mediaType === 'audio' ? this.collectAudioTimeline : this.collectVideoTimeline;
+    if (!collectTimeline && lagOwner === undefined) {
       if (objectId !== undefined) assembler?.push(mediaType, trackName, groupId, payload, input, undefined, sourceKey, objectId);
       else if (sourceKey !== undefined) assembler?.push(mediaType, trackName, groupId, payload, input, undefined, sourceKey);
       else if (input === undefined) assembler?.push(mediaType, trackName, groupId, payload);
@@ -4207,10 +4219,21 @@ export class MoqtPlayer {
     const receipt = objectId !== undefined ? assembler?.push(mediaType, trackName, groupId, payload, input, true, sourceKey, objectId)
       : sourceKey === undefined ? assembler?.push(mediaType, trackName, groupId, payload, input, true)
       : assembler?.push(mediaType, trackName, groupId, payload, input, true, sourceKey);
-    if (receipt?.state === 'emitted' && !this._destroyed && this.connection === conn && this.mediaSource === source
+    if (collectTimeline && receipt?.state === 'emitted' && !this._destroyed && this.connection === conn && this.mediaSource === source
         && this.cmafAssembler === assembler && route?.() && [...this.activeSubscriptions.values()].includes(owned!)
         && (sourceKey === undefined || selected !== null && sourceKey === identityKey(selected.namespaceFields, selected.name))) {
       this.noteMediaTimeline(mediaType, receipt.sourcePresentationTimeUs, 'media-time');
+    }
+    if (lagOwner) this.recordCmafDeliveryReceipt(lagOwner, receipt);
+  }
+
+  private recordCmafDeliveryReceipt(lagOwner: NonNullable<MoqtPlayer['videoDeliveryLag']>['owner'], receipt: CmafSourceReceipt | void): void {
+    const decode = receipt?.state === 'emitted' ? receipt.sourceDecodeTime : undefined;
+    if (decode && typeof decode.timeUs === 'bigint'
+        && Number.isSafeInteger(decode.timescale) && decode.timescale > 0
+        && typeof decode.placementToken === 'object' && decode.placementToken !== null
+        && this.cmafLagPlacementIsCurrent(lagOwner, decode.placementToken)) {
+      this.recordVideoDeliveryPoint(lagOwner, decode.timeUs, BigInt(decode.timescale), decode.placementToken);
     }
   }
 
@@ -4523,6 +4546,7 @@ export class MoqtPlayer {
     // Wire CMAF object delivery → MediaSource adapter (pipeline bypass)
     // §3.3: CMAF objects are moof or mdat — concatenate then feed to MSE
     this.subscriptionManager.onCmafObject = (mediaType, trackName, obj, input, delivery?: ObjectDeliveryOptions) => {
+      const lagOwner = this.captureCmafLagOwner(mediaType, obj, delivery);
       const inputGeneration = this.subscriptionManager?.mediaInputGeneration;
       const sourceKey = this.keyedCmafIdentity ? this.subscriptionManager?.getSourceKey(BigInt(obj.trackAlias)) : undefined;
       if ((mediaType === 'audio' || mediaType === 'video') && this.stagePreparedMediaInput(obj, undefined, input, () =>
@@ -4642,7 +4666,7 @@ export class MoqtPlayer {
       }
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
-      this.pushCmafInput(mediaType, trackName, groupId, obj.payload, input, sourceKey, BigInt(obj.objectId));
+      this.pushCmafInput(mediaType, trackName, groupId, obj.payload, input, sourceKey, BigInt(obj.objectId), lagOwner);
     };
 
     // §2.4.2: Malformed Track — MUST UNSUBSCRIBE, SHOULD deliver error
@@ -10032,10 +10056,12 @@ export class MoqtPlayer {
 
   private videoLagOwner(): ReturnType<MoqtPlayer['captureVideoMeasurementOwner']> {
     const owner = this.captureVideoMeasurementOwner();
-    if (!owner?.automatic || !this.videoPipeline) return null;
+    if (!owner?.automatic) return null;
     const selected = this._selection.video;
     const track = selected && this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
-    return track?.isLive === true && track.packaging === 'loc' && owner.route() ? owner : null;
+    const supported = track && (track.packaging === 'loc' ? owner.pipeline !== null
+      : this.usesMse(track.packaging) && owner.source !== null && owner.assembler !== null);
+    return track?.isLive === true && supported && owner.route() ? owner : null;
   }
 
   private recordVideoDeliveryLag(object: CadenceObject, headers: LocHeaders,
@@ -10047,17 +10073,44 @@ export class MoqtPlayer {
       : timescale <= 0n || headers.timestampIsWallClock === true) {
       this.videoDeliveryLag = null; return;
     }
-    // Consumer admission includes transform and application work, not just network transit.
-    const now = this.clock.now();
+    this.recordVideoDeliveryPoint(owner, headers.captureTimestamp, timescale);
+  }
+
+  private captureCmafLagOwner(mediaType: string, obj: MoqtObject, delivery?: ObjectDeliveryOptions):
+    NonNullable<MoqtPlayer['videoDeliveryLag']>['owner'] | undefined {
+    if (mediaType !== 'video' || obj.kind !== 'data' || delivery?.backfill || delivery?.fetched || !delivery?.identity) return undefined;
+    const owner = this.cadenceInputOwners.get(delivery.identity);
+    const selected = this._selection.video;
+    const track = selected && this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
+    return owner && track && this.usesMse(track.packaging) && owner.alias === BigInt(obj.trackAlias)
+      && this.sameVideoMeasurementOwner(owner, this.videoLagOwner()) ? owner : undefined;
+  }
+
+  private cmafLagPlacementIsCurrent(owner: NonNullable<MoqtPlayer['videoDeliveryLag']>['owner'], token: object): boolean {
+    try { return owner.assembler?.capturePresentationPlacement?.('video')?.token === token; }
+    catch { return false; } // Optional custom timing must not become a playback failure.
+  }
+
+  private recordVideoDeliveryPoint(owner: NonNullable<MoqtPlayer['videoDeliveryLag']>['owner'],
+    sourceTimeUs: bigint, timescale: bigint | null, placementToken?: object): void {
     if (!this.sameVideoMeasurementOwner(owner, this.videoLagOwner())) return;
+    // Local consumer admission follows transforms, assembly and public callbacks.
+    // The trend can include application work; it is not isolated wire delay.
+    const now = this.clock.now();
+    if (!this.sameVideoMeasurementOwner(owner, this.videoLagOwner())
+        || placementToken !== undefined && !this.cmafLagPlacementIsCurrent(owner, placementToken)
+        || !this.sameVideoMeasurementOwner(owner, this.videoLagOwner())) return;
     if (!Number.isFinite(now)) { this.videoDeliveryLag = null; return; }
     let state = this.videoDeliveryLag;
-    if (!state || !this.sameVideoMeasurementOwner(state.owner, owner) || state.timescale !== timescale) {
-      state = { owner, timescale, sourceOriginUs: headers.captureTimestamp, arrivalOriginUs: now,
+    if (!state || !this.sameVideoMeasurementOwner(state.owner, owner) || state.timescale !== timescale || state.placementToken !== placementToken) {
+      state = { owner, timescale, ...(placementToken === undefined ? {} : {placementToken}), sourceOriginUs: sourceTimeUs, arrivalOriginUs: now,
         detector: new DeliveryLagDetector(), lastAttemptUs: null };
       this.videoDeliveryLag = state;
     }
-    const source = headers.captureTimestamp - state.sourceOriginUs, arrival = now - state.arrivalOriginUs;
+    // Rebase integer-microsecond source time before Number conversion. A whole
+    // Unix epoch or large media tfdt need not itself be exactly representable.
+    const source = sourceTimeUs - state.sourceOriginUs;
+    const arrival = now - state.arrivalOriginUs;
     if (source < BigInt(Number.MIN_SAFE_INTEGER) || source > BigInt(Number.MAX_SAFE_INTEGER)
         || !Number.isFinite(arrival) || arrival < 0) { this.videoDeliveryLag = null; return; }
     try { state.detector.record(Number(source), arrival); }
@@ -10070,12 +10123,15 @@ export class MoqtPlayer {
   private risingVideoDeliveryLag(): { state: NonNullable<MoqtPlayer['videoDeliveryLag']>; nowUs: number; excessUs: number } | null {
     const state = this.videoDeliveryLag;
     if (!state) return null;
-    if (!this.sameVideoMeasurementOwner(state.owner, this.videoLagOwner())) {
+    if (!this.sameVideoMeasurementOwner(state.owner, this.videoLagOwner())
+        || state.placementToken !== undefined && !this.cmafLagPlacementIsCurrent(state.owner, state.placementToken)) {
       if (this.videoDeliveryLag === state) this.videoDeliveryLag = null;
       return null;
     }
     const nowUs = this.clock.now() - state.arrivalOriginUs;
-    if (this.videoDeliveryLag !== state || !this.sameVideoMeasurementOwner(state.owner, this.videoLagOwner())) return null;
+    if (this.videoDeliveryLag !== state || !this.sameVideoMeasurementOwner(state.owner, this.videoLagOwner())
+        || state.placementToken !== undefined && !this.cmafLagPlacementIsCurrent(state.owner, state.placementToken)
+        || this.videoDeliveryLag !== state || !this.sameVideoMeasurementOwner(state.owner, this.videoLagOwner())) return null;
     if (!Number.isFinite(nowUs) || nowUs < 0) { this.videoDeliveryLag = null; return null; }
     try {
       if (!state.detector.isCongested(nowUs)) return null;
@@ -10140,7 +10196,7 @@ export class MoqtPlayer {
       // arrives on demand), not starving. Only report low buffer when
       // bandwidth can't sustain the current track.
       const bufferUs = source.getBufferAheadUs();
-      if (bufferUs === null) return; // no trustworthy signal yet — hold
+      if (bufferUs === null || !Number.isFinite(bufferUs) || bufferUs < 0) return;
       if (bufferUs === 0) {
         // Truly empty — always report emergency, don't let stale
         // bandwidth estimates suppress the downshift.
@@ -10152,9 +10208,12 @@ export class MoqtPlayer {
         const bwKbps = this.readVideoReceivedRate() ?? 0;
         const currentTrack = abr.currentTrack;
         const currentBitrateKbps = currentTrack ? currentTrack.bitrateKbps : 0;
-        effectiveBufferUs = bwKbps > currentBitrateKbps * 1.5
-          ? abr.lowThresholdUs
-          : bufferUs;
+        const owner = this.videoLagOwner();
+        // Thin positive coverage is normal for source-paced live media.
+        // It does not prove congestion or spare capacity; a rising delivery
+        // trend and genuinely empty coverage remain independently actionable.
+        effectiveBufferUs = (owner?.source === source && track?.isLive === true)
+          || bwKbps > currentBitrateKbps * 1.5 ? abr.lowThresholdUs : bufferUs;
       } else {
         effectiveBufferUs = bufferUs;
       }
@@ -14423,6 +14482,7 @@ export class MoqtPlayer {
     NonNullable<ConstructorParameters<typeof SeekLiveBridge>[1]['liveObservation']> {
     // Only tokens issued by this observer can be delivered back into the engine.
     const captures = new WeakMap<object, NonNullable<ReturnType<MoqtPlayer['captureVideoPayload']>> & { receipt: ObjectReceipt }>();
+    let cmafAuthority: { owner: NonNullable<MoqtPlayer['videoDeliveryLag']>['owner']; authority: object } | undefined;
     return {
       capture: event => {
         const owner = this.captureVideoMeasurementOwner();
@@ -14437,8 +14497,17 @@ export class MoqtPlayer {
         const receipt = captures.get(token); captures.delete(token);
         if (!receipt || !this.sameVideoMeasurementOwner(receipt.owner, this.captureVideoMeasurementOwner())) return;
         this.recordVideoPayload(receipt);
-        if (object.kind !== 'data'
-            || this.catalogTrackFor(bridgeOwner.track.name, bridgeOwner.track.namespace, 'video')?.packaging !== 'loc') return;
+        if (object.kind !== 'data') return;
+        const packaging = this.catalogTrackFor(bridgeOwner.track.name, bridgeOwner.track.namespace, 'video')?.packaging;
+        if (packaging && this.usesMse(packaging)) {
+          if (!this.sameVideoMeasurementOwner(receipt.owner, this.videoLagOwner())) return;
+          if (!cmafAuthority || !this.sameVideoMeasurementOwner(cmafAuthority.owner, receipt.owner)) {
+            cmafAuthority = { owner: receipt.owner, authority: {} };
+          }
+          this.seekCmafInputs.set(receipt.receipt, cmafAuthority);
+          return;
+        }
+        if (packaging !== 'loc') return;
         const subscription = bridgeOwner.bridge?.acceptedLiveSubscription;
         if (!subscription) return;
         const headers = parseLocHeaders(object.properties ?? object.extensions, {
@@ -16172,20 +16241,22 @@ export class MoqtPlayer {
 
   private captureSeekObject(connection: MoqtConnection, object: MoqtObject | ObjectDatagram): {
     readonly input?: ObjectRoutingContext; readonly epoch: object | undefined;
+    readonly cmaf?: { readonly owner: NonNullable<MoqtPlayer['videoDeliveryLag']>['owner']; readonly authority: object };
     readonly cadence?: { readonly object: CadenceObject;
       readonly owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner']; readonly headers: LocHeaders };
   } | undefined {
     const receipt = connection.objectReceiptFor(object);
     const cadence = receipt ? this.seekCadenceInputs.get(receipt) : undefined;
-    if (receipt) this.seekCadenceInputs.delete(receipt);
+    const cmaf = receipt ? this.seekCmafInputs.get(receipt) : undefined;
+    if (receipt) { this.seekCadenceInputs.delete(receipt); this.seekCmafInputs.delete(receipt); }
     this.watchdog.fulfill('first_media_object');
     const runtime = this.mediaDiagnosticRuntime, diagnosticEpoch = this.mediaDiagnosticEpoch;
-    const evidence = cadence ? { cadence, epoch: diagnosticEpoch } : undefined;
+    const evidence = cadence || cmaf ? { ...(cadence ? { cadence } : {}), ...(cmaf ? { cmaf } : {}), epoch: diagnosticEpoch } : undefined;
     if (!runtime) return evidence;
     try {
       const input = runtime.capture(connection, object);
       if (input && typeof Reflect.get(input, 'then') === 'function') { void Promise.resolve(input).catch(() => {}); return evidence; }
-      if (input && diagnosticEpoch === this.mediaDiagnosticEpoch) return { input, epoch: diagnosticEpoch, ...(cadence ? { cadence } : {}) };
+      if (input && diagnosticEpoch === this.mediaDiagnosticEpoch) return { input, epoch: diagnosticEpoch, ...(cadence ? { cadence } : {}), ...(cmaf ? { cmaf } : {}) };
     } catch { /* Optional receipt evidence cannot affect media. */ }
     return evidence;
   }
@@ -16222,7 +16293,17 @@ export class MoqtPlayer {
       this.recordVideoDeliveryLag(cadence.object, cadence.headers, cadence.owner, cadence.object.payloadBytes ?? 0);
     }
     if (!current()) { this.discardSeekObject(captured, 'route retired'); return; }
-    await deliver(transformed, input);
+    if (token?.cmaf) this.seekCmafObservations.set(transformed, token.cmaf);
+    try { await deliver(transformed, input); }
+    finally { this.seekCmafObservations.delete(transformed); }
+  }
+
+  private captureSeekCmafTiming(role: SeekRole, bridgeOwner: object, object: MoqtObject): SeekCmafTimingObservation | undefined {
+    const captured = this.seekCmafObservations.get(object);
+    this.seekCmafObservations.delete(object);
+    if (role !== 'video' || object.kind !== 'data' || !captured || captured.owner.kind !== 'seek-live'
+        || captured.owner.bridgeOwner !== bridgeOwner || !this.sameVideoMeasurementOwner(captured.owner, this.videoLagOwner())) return;
+    return { authority: captured.authority, report: receipt => this.recordCmafDeliveryReceipt(captured.owner, receipt) };
   }
 
 
@@ -16379,6 +16460,7 @@ export class MoqtPlayer {
     const sink = this.cmafOutputCallbacks(source, () => adopted !== null && adopted === this.ownedSeekOutput
       && adopted.resource.current && this.cmafAssembler === adopted.assembler, false);
     const playback = new MseSeekPlayback({ epoch, source, liveAssembler: oldAssembler,
+      captureLiveTiming: (role, owner, object) => this.captureSeekCmafTiming(role, owner, object),
       createAssembler: this.config.createCmafAssembler, tracks, location, mediaPts: entry.mediaPts,
       timestampRounding: wireFormat === 'msf-00' ? 'nearest' : 'floor', targetMs: timeMs,
       maxObjects: 512, maxBytes: 8 * 1024 * 1024, preparationTimeoutMs: this.config.connectionTimeoutMs!,

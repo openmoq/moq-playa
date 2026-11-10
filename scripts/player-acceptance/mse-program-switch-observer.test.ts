@@ -35,7 +35,10 @@ it.each([false, true])('binds actual raw/rebased bytes, native offset and only a
   const bytes = input(), before = bytes.slice();
   try {
     const result = assembler.push('video', 'video', 7n, bytes, producing, true, sourceKey);
-    expect(result).toEqual({ state: 'emitted', sourcePresentationTimeUs: 90_000_000n });
+    const placement=assembler.capturePresentationPlacement?.('video');
+    expect(placement?.token).toBeDefined();
+    expect(result).toEqual({ state: 'emitted', sourcePresentationTimeUs: 90_000_000n,
+      sourceDecodeTime: {timeUs:90_000_000n,timescale:90_000,placementToken:placement!.token} });
     expect(bytes).toEqual(before);
     expect(inputs?.[0]).toBe(producing);
     const call = f.append.mock.calls[0]!;

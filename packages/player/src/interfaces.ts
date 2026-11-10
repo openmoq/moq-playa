@@ -694,7 +694,17 @@ export interface MediaSourceLike {
 export type CmafAssemblyDiscardReason = 'track superseded' | 'invalid media' | 'orphaned media' | 'epoch refused' | 'superseded pending moof' | 'decoder reset' | 'out of order legacy object';
 
 export type CmafSourceReceipt =
-  | { readonly state: 'emitted'; readonly sourcePresentationTimeUs: bigint }
+  | { readonly state: 'emitted'; readonly sourcePresentationTimeUs: bigint;
+      /** First DTS of the last emitted chunk, normalized to integer microseconds.
+       * Optional when the source configuration cannot be proven. This is media
+       * time, potentially quantized, not a wall-clock capture timestamp. The
+       * token is the delivery-proven capturePresentationPlacement() token. */
+      readonly sourceDecodeTime?: {
+        readonly timeUs: bigint;
+        readonly timescale: number;
+        readonly placementToken: object;
+      };
+    }
   | { readonly state: 'partial' | 'refused' | 'unavailable' };
 
 export interface CmafAssemblerLike {

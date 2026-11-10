@@ -162,8 +162,12 @@ export class CmafAssembler {
   private readonly onSegment: CmafAssemblerOptions['onSegment'];
   private readonly onDiscard: CmafAssemblerOptions['onDiscard'];
   private pendingInputs: WeakMap<Uint8Array, object> | undefined;
-  /** Identity belongs to a pending legacy half, never to completed history. */
+  /** Metadata belongs only to an existing pending legacy half, never completed history. */
   private pendingObjectIds: WeakMap<Uint8Array, bigint> | undefined;
+  /** Opt-in configuration evidence keyed by the already owned moof copy. */
+  private pendingSourceConfigurations: WeakMap<Uint8Array, {
+    revision: number; timescale: number | null;
+  }> | undefined;
   private readonly onDiscontinuity: CmafAssemblerOptions['onDiscontinuity'];
 
   /**
@@ -535,6 +539,9 @@ export class CmafAssembler {
    * not append or presentation evidence. Omitted: no timing read or receipt.
    * @param sourceKey Optional opaque full track identity, separate from the
    * display name and from unkeyed legacy identities. Does not request timing.
+   * @param objectId Logical Object ID, when known. Legacy split halves must
+   * arrive in order within their source/group; an older half cannot replace
+   * a newer pending moof. Complete CMAF chunks do not use this ordering rule.
    */
   push(
     mediaType: 'video' | 'audio',
@@ -600,6 +607,8 @@ export class CmafAssembler {
         segment.set(payload);
         let pos = moofOffset;
         let sourcePresentationTimeUs: bigint | null = null;
+        let sourceDecodeTimeUs: bigint | null = null;
+        let sourceTimescale: number | null = null;
         let sourceTimingAvailable = true;
         while (pos + 8 <= segment.byteLength) {
           const size = boxSize(segment, pos);
@@ -609,6 +618,10 @@ export class CmafAssembler {
             if (sourceTiming) {
               const ticks = readFirstSamplePresentationTime(chunkMoof);
               const timescale = mediaType === 'audio' ? this.audioTimescale : this.videoTimescale;
+              const decodeTicks = readBaseMediaDecodeTime(chunkMoof);
+              sourceTimescale = timescale;
+              sourceDecodeTimeUs = decodeTicks !== null && timescale !== null
+                ? decodeTicks * 1_000_000n / BigInt(timescale) : null;
               if (ticks === null || timescale === null) sourceTimingAvailable = false;
               else sourcePresentationTimeUs = ticks * 1_000_000n / BigInt(timescale);
             }
@@ -616,10 +629,12 @@ export class CmafAssembler {
           }
           pos += size;
         }
+        const revision = sourceTiming ? this.placementState(mediaType).revision : -1;
         this.emitSegment(mediaType, segment, trackName, groupId, input === undefined ? undefined : [input], sourceKey);
         this.flushStartupGeometry();
-        return sourceTiming ? sourceTimingAvailable && sourcePresentationTimeUs !== null
-          ? { state: 'emitted', sourcePresentationTimeUs } : SOURCE_UNAVAILABLE : undefined;
+        return sourceTiming ? this.sourceTimingReceipt(mediaType,
+          sourceTimingAvailable ? sourcePresentationTimeUs : null,
+          sourceDecodeTimeUs, sourceTimescale, revision) : undefined;
       }
 
       // Legacy: moof-only object — buffer and wait for a separate mdat.
@@ -633,8 +648,12 @@ export class CmafAssembler {
       // QUIC stream data. In-place tfdt patching would corrupt it.
       const copy = new Uint8Array(payload.byteLength);
       copy.set(payload);
-      if (objectId !== undefined) (this.pendingObjectIds ??= new WeakMap()).set(copy, objectId);
       if (input !== undefined) (this.pendingInputs ??= new WeakMap()).set(copy, input);
+      if (objectId !== undefined) (this.pendingObjectIds ??= new WeakMap()).set(copy, objectId);
+      if (sourceTiming) (this.pendingSourceConfigurations ??= new WeakMap()).set(copy, {
+        revision: this.placementState(mediaType).revision,
+        timescale: mediaType === 'audio' ? this.audioTimescale : this.videoTimescale,
+      });
       this.pendingMoofs.set(key, copy);
       if (previous) this.discardPending(previous, 'superseded pending moof');
       return sourceTiming ? SOURCE_PARTIAL : undefined;
@@ -650,14 +669,24 @@ export class CmafAssembler {
       }
       this.pendingMoofs.delete(key);
       this.pendingObjectIds?.delete(pending);
+      const sourceConfiguration = this.pendingSourceConfigurations?.get(pending);
+      this.pendingSourceConfigurations?.delete(pending);
 
       const priorInput = this.pendingInputs?.get(pending);
       this.pendingInputs?.delete(pending);
       let sourcePresentationTimeUs: bigint | null = null;
+      let sourceDecodeTimeUs: bigint | null = null;
+      const timescale = mediaType === 'audio' ? this.audioTimescale : this.videoTimescale;
       if (sourceTiming) {
         const ticks = readFirstSamplePresentationTime(pending);
-        const timescale = mediaType === 'audio' ? this.audioTimescale : this.videoTimescale;
         if (ticks !== null && timescale !== null) sourcePresentationTimeUs = ticks * 1_000_000n / BigInt(timescale);
+        // Compare before patchEpoch: the first patch legitimately establishes
+        // a new placement revision. An intervening init cannot prove this half.
+        if (sourceConfiguration?.revision === this.placementState(mediaType).revision
+            && sourceConfiguration.timescale === timescale && timescale !== null) {
+          const decodeTicks = readBaseMediaDecodeTime(pending);
+          if (decodeTicks !== null) sourceDecodeTimeUs = decodeTicks * 1_000_000n / BigInt(timescale);
+        }
       }
       if (!this.patchEpoch(mediaType, trackName, pending, groupId, trackIdentity, sourceKey)) {
         this.discardInput(priorInput, 'epoch refused'); this.discardInput(input, 'epoch refused'); return sourceTiming ? SOURCE_REFUSED : undefined;
@@ -665,11 +694,12 @@ export class CmafAssembler {
 
       // Concatenate moof + mdat
       const segment = concatBuffers(pending, payload);
+      const revision = sourceTiming ? this.placementState(mediaType).revision : -1;
       this.emitSegment(mediaType, segment, trackName, groupId,
         priorInput === undefined && input === undefined ? undefined : [priorInput, input], sourceKey);
       this.flushStartupGeometry();
-      return sourceTiming ? sourcePresentationTimeUs !== null
-        ? { state: 'emitted', sourcePresentationTimeUs } : SOURCE_UNAVAILABLE : undefined;
+      return sourceTiming ? this.sourceTimingReceipt(mediaType, sourcePresentationTimeUs,
+        sourceDecodeTimeUs, timescale, revision) : undefined;
     }
 
     // Unknown box type — pass through as-is.
@@ -677,6 +707,20 @@ export class CmafAssembler {
     else if (input === undefined) this.onSegment(mediaType, payload, trackName, groupId);
     else this.onSegment(mediaType, payload, trackName, groupId, [input]);
     return sourceTiming ? SOURCE_UNAVAILABLE : undefined;
+  }
+
+  private sourceTimingReceipt(
+    mediaType: 'video' | 'audio', sourcePresentationTimeUs: bigint | null,
+    sourceDecodeTimeUs: bigint | null, timescale: number | null, revision: number,
+  ): CmafSourceReceipt {
+    if (sourcePresentationTimeUs === null) return SOURCE_UNAVAILABLE;
+    const receipt = { state: 'emitted' as const, sourcePresentationTimeUs };
+    const state = this.placementState(mediaType);
+    if (sourceDecodeTimeUs === null || timescale === null
+        || state.revision !== revision || state.proven !== revision) return receipt;
+    const placement = this.capturePresentationPlacement(mediaType);
+    if (placement === null || state.revision !== revision || state.proven !== revision) return receipt;
+    return { ...receipt, sourceDecodeTime: { timeUs: sourceDecodeTimeUs, timescale, placementToken: placement.token } };
   }
 
   /**
@@ -807,7 +851,10 @@ export class CmafAssembler {
   clearPending(mediaType: 'video' | 'audio'): void {
     const removed: Uint8Array[] | undefined = this.pendingInputs ? [] : undefined;
     for (const [key, bytes] of this.pendingMoofs) {
-      if (key.startsWith(`${mediaType}:`)) { this.pendingMoofs.delete(key); this.pendingObjectIds?.delete(bytes); removed?.push(bytes); }
+      if (key.startsWith(`${mediaType}:`)) {
+        this.pendingMoofs.delete(key); this.pendingObjectIds?.delete(bytes); removed?.push(bytes);
+        this.pendingSourceConfigurations?.delete(bytes);
+      }
     }
     if (removed) for (const bytes of removed) this.discardPending(bytes, 'decoder reset');
   }
@@ -819,6 +866,7 @@ export class CmafAssembler {
 
   private discardPending(bytes: Uint8Array, reason: CmafAssemblyDiscardReason): void {
     this.pendingObjectIds?.delete(bytes);
+    this.pendingSourceConfigurations?.delete(bytes);
     const input = this.pendingInputs?.get(bytes); this.pendingInputs?.delete(bytes);
     this.discardInput(input, reason);
   }
@@ -833,6 +881,7 @@ export class CmafAssembler {
     const removed = this.pendingInputs ? [...this.pendingMoofs.values()] : undefined;
     this.pendingMoofs.clear();
     this.pendingObjectIds = undefined;
+    this.pendingSourceConfigurations = undefined;
     this.videoEpoch = null;
     this.videoEpochHasKnownTimescale = false;
     this.audioEpoch = null;

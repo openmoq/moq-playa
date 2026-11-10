@@ -51,7 +51,8 @@ describe('CMAF presentation placement', () => {
     const receipt = f.assembler.push('video', 'new', 0n, bytes, undefined, true);
     expect(bytes).toEqual(original);
     if (accepted) {
-      expect(receipt).toEqual({ state: 'emitted', sourcePresentationTimeUs: 0n });
+      expect(receipt).toEqual({ state: 'emitted', sourcePresentationTimeUs: 0n,
+        sourceDecodeTime: {timeUs:0n,timescale:1_000_000,placementToken:f.assembler.capturePresentationPlacement('video')!.token} });
       expect(f.outputs).toHaveLength(count + 1);
       expect(mp4.readBaseMediaDecodeTime(f.last('video'))).toBe(patched);
       const current = f.assembler.capturePresentationPlacement('video')!;
@@ -81,7 +82,8 @@ describe('CMAF presentation placement', () => {
     expect(output.compositionTimeOffsets).toEqual([3600]);
     expect(output.baseMediaDecodeTime + BigInt(output.compositionTimeOffsets[0]!)).toBe(900_000n);
     expect(bytes).toEqual(original);
-    expect(receipt).toEqual({ state: 'emitted', sourcePresentationTimeUs: 90_000_000n });
+    expect(receipt).toEqual({ state: 'emitted', sourcePresentationTimeUs: 90_000_000n,
+      sourceDecodeTime: {timeUs:89_960_000n,timescale:90_000,placementToken:f.assembler.capturePresentationPlacement('video')!.token} });
     expect(f.assembler.capturePresentationPlacement('audio')?.token).toBe(audio.token);
     expect(video.toRebasedTimeUs(6_000_000n)).toEqual(atUs(6_000_000n));
   });

@@ -1,7 +1,7 @@
 import type { MoqtObject } from '@openmoq/transport';
 import { LocmafTrackDecoder, isCmafHeader, isSyncSampleFlags, parseLocmafTrackContext, readCmafObjectSamples } from '@openmoq/locmaf';
 import type { LocmafTrackContext } from '@openmoq/locmaf';
-import type { CmafAssemblyDiscardReason } from './interfaces.js';
+import type { CmafSourceReceipt, CmafAssemblyDiscardReason } from './interfaces.js';
 
 /** Deterministic retained-proof accounting, not a measurement of JS heap allocation. */
 export const SEEK_INTERVAL_BYTES = 64;
@@ -15,7 +15,13 @@ export interface SeekCmafTiming {
   readonly earliestPtsTicks: bigint;
   readonly intervals?: readonly SeekSampleInterval[];
 }
+/** Optional evidence, independent of diagnostic input ownership. */
+export interface SeekCmafTimingObservation {
+  readonly authority: object;
+  report(receipt: CmafSourceReceipt | void): void;
+}
 export interface SeekCmafChunk {
+  readonly observation?: SeekCmafTimingObservation;
   readonly bytes: Uint8Array;
   readonly groupId: bigint;
   readonly objectId: bigint;
@@ -75,20 +81,20 @@ export class SeekCmafInput {
   }
 
   /** Retains only bounded preroll before preparation; afterwards returns one input's complete media. */
-  push(object: MoqtObject, input?: object): SeekCmafChunk[] {
+  push(object: MoqtObject, input?: object, observation?: SeekCmafTimingObservation): SeekCmafChunk[] {
     // A completed pair leaves pending before sample/index validation. Retain its
     // diagnostic ownership locally until this call has actually returned it.
     const pendingInputs = this.pending?.inputs;
     try {
       if (this.retired !== null) throw new Error('Seek CMAF preparation is retired');
-      return this.prepare(object, input);
+      return this.prepare(object, input, observation);
     } catch (error) {
       this.retire(this.retired ?? 'invalid media', object.kind === 'data' ? input : undefined, pendingInputs);
       throw error;
     }
   }
 
-  private prepare(object: MoqtObject, input: object | undefined): SeekCmafChunk[] {
+  private prepare(object: MoqtObject, input: object | undefined, observation?: SeekCmafTimingObservation): SeekCmafChunk[] {
     if (object.kind !== 'data') {
       if (this.pending) throw new Error('Seek stream ended a group with incomplete CMAF media');
       return [];
@@ -126,12 +132,15 @@ export class SeekCmafInput {
         inputs = new Array<object | undefined>(inputCount).fill(undefined);
         inputs[inputCount - 1] = input;
       }
+      // Unknown or historical halves cannot borrow the completing live input's authority.
+      if (!this.pending.observation || this.pending.observation.authority !== observation?.authority) observation = undefined;
       this.pending = null;
     } else if (input !== undefined) inputs = [input];
     const reads = readCmafObjectSamples(bytes, this.context);
     if (reads === null) {
       if (bytes.length > this.options.maxBytes - this.stagedBytes) throw new Error('Seek partial media exceeds preparation byte budget');
       this.pending = { bytes: bytes.slice(), groupId, objectId: firstObjectId, inputCount,
+        ...(observation ? { observation } : {}),
         ...(inputs === undefined ? {} : { inputs }) };
       return [];
     }
@@ -184,6 +193,7 @@ export class SeekCmafInput {
     }
     this.independent ||= this.options.role === 'audio' || isSyncSampleFlags(first.effective.flags[0] ?? -1);
     const chunk: SeekCmafChunk = { bytes, groupId, objectId: firstObjectId,
+      ...(observation ? { observation } : {}),
       ...(this.options.retainTiming ? { timing: Object.freeze({ firstPtsTicks: firstPts,
         firstDurationTicks: BigInt(first.effective.durations[0]!),
         independent: this.options.role === 'audio' || isSyncSampleFlags(first.effective.flags[0] ?? -1),

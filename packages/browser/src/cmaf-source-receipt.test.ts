@@ -12,7 +12,8 @@ describe('opt-in CMAF source timing receipt', () => {
     assembler.setInitSegment('audio', init);
     const receipt = assembler.push('audio', 'a', 1n, chunk(90_000n), undefined, true);
     expect(delivered).toHaveBeenCalledOnce();
-    expect(receipt).toEqual({ state: 'emitted', sourcePresentationTimeUs: 90_020_000n });
+    expect(receipt).toEqual({ state: 'emitted', sourcePresentationTimeUs: 90_020_000n,
+      sourceDecodeTime: {timeUs:90_000_000n,timescale:1000,placementToken:assembler.capturePresentationPlacement('audio')!.token} });
   });
 
   it('leaves default call arity and return behavior unchanged', () => {
@@ -22,16 +23,19 @@ describe('opt-in CMAF source timing receipt', () => {
     expect(assembler.push('audio', 'a', 1n, chunk(90_000n))).toBeUndefined();
     expect(delivered.mock.calls[0]).toHaveLength(4);
     expect(timingRead).not.toHaveBeenCalled();
-    expect(assembler.push('audio', 'a', 2n, chunk(90_020n), undefined, true)).toEqual({ state: 'emitted', sourcePresentationTimeUs: 90_040_000n });
+    expect(assembler.push('audio', 'a', 2n, chunk(90_020n), undefined, true)).toEqual({ state: 'emitted', sourcePresentationTimeUs: 90_040_000n,
+      sourceDecodeTime: {timeUs:90_020_000n,timescale:1000,placementToken:assembler.capturePresentationPlacement('audio')!.token} });
     expect(timingRead).toHaveBeenCalledOnce();
   });
 
   it('reports a partial pair instead of repeating a preceding source timestamp', () => {
     const assembler = new CmafAssembler({ onSegment: () => {} }); assembler.setInitSegment('audio', init);
-    expect(assembler.push('audio', 'a', 1n, chunk(90_000n), undefined, true)).toEqual({ state: 'emitted', sourcePresentationTimeUs: 90_020_000n });
+    expect(assembler.push('audio', 'a', 1n, chunk(90_000n), undefined, true)).toEqual({ state: 'emitted', sourcePresentationTimeUs: 90_020_000n,
+      sourceDecodeTime: {timeUs:90_000_000n,timescale:1000,placementToken:assembler.capturePresentationPlacement('audio')!.token} });
     const bytes = chunk(90_020n), size = new DataView(bytes.buffer).getUint32(0);
     expect(assembler.push('audio', 'a', 2n, bytes.slice(0, size), undefined, true)).toEqual({ state: 'partial' });
-    expect(assembler.push('audio', 'a', 2n, bytes.slice(size), undefined, true)).toEqual({ state: 'emitted', sourcePresentationTimeUs: 90_040_000n });
+    expect(assembler.push('audio', 'a', 2n, bytes.slice(size), undefined, true)).toEqual({ state: 'emitted', sourcePresentationTimeUs: 90_040_000n,
+      sourceDecodeTime: {timeUs:90_020_000n,timescale:1000,placementToken:assembler.capturePresentationPlacement('audio')!.token} });
   });
 
   it('does not publish a receipt from the first chunk of an ultimately refused multi-chunk object', () => {

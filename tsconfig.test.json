@@ -340,6 +340,14 @@
     "packages/player/src/dispatcher-role-candidate.test.ts",
     "packages/player/src/frame-quality-cut.test.ts",
     "packages/player/src/player-playing-frame-quality.loopback.test.ts",
-    "packages/browser/src/webaudio-start-clamp.test.ts"
+    "packages/browser/src/webaudio-start-clamp.test.ts",
+    "packages/browser/src/cmaf-source-decode-receipt.test.ts",
+    "packages/player/src/player-cmaf-delivery-lag.loopback.test.ts",
+    "packages/player/src/player-cmaf-seek-live-trend.loopback.test.ts",
+    "packages/player/src/player-cmaf-seek-live-boundaries.loopback.test.ts",
+    "packages/player/src/seek-cmaf-input-observation.test.ts",
+    "packages/player/src/mse-seek-timing-observation.test.ts",
+    "packages/player/src/mse-seek-timing-enqueue-reentry.test.ts",
+    "scripts/player-acceptance/mse-program-switch-observer.test.ts"
   ]
 }
