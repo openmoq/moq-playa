@@ -1,29 +1,34 @@
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
+const execute = promisify(execFile);
+
 const script = resolve(import.meta.dirname, 'order-release-tarballs.mjs');
 type Manifest = { name: string; version: string; dependencies?: Record<string, string> };
 
-function tarballs(directory: string, packages: Manifest[]): string[] {
+async function tarballs(directory: string, packages: Manifest[]): Promise<string[]> {
   mkdirSync(join(directory, 'release'), { recursive: true });
-  return packages.map((manifest, index) => {
+  const paths: string[] = [];
+  for (const [index, manifest] of packages.entries()) {
     const source = join(directory, `source-${index}`);
     mkdirSync(join(source, 'package'), { recursive: true });
     writeFileSync(join(source, 'package/package.json'), JSON.stringify(manifest));
     const path = join(directory, 'release', `${index}.tgz`);
-    execFileSync('tar', ['-czf', path, '-C', source, 'package']);
-    return path;
-  });
+    await execute('tar', ['-czf', path, '-C', source, 'package']);
+    paths.push(path);
+  }
+  return paths;
 }
 
-function order(packages: Manifest[]): string[] {
+async function order(packages: Manifest[]): Promise<string[]> {
   const directory = mkdtempSync(join(tmpdir(), 'moq-publish-order-'));
   try {
-    const paths = tarballs(directory, packages);
-    return execFileSync(process.execPath, [script, ...paths], { encoding: 'utf8', stdio: 'pipe' })
+    const paths = await tarballs(directory, packages);
+    return (await execute(process.execPath, [script, ...paths], { encoding: 'utf8' })).stdout
       .trim().split('\n').map((path) => packages[paths.indexOf(path)]!.name);
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -36,10 +41,11 @@ describe('release publication order', () => {
     'metadata delayed', 'tarball delayed', 'already published',
     'last tarball unavailable', 'download forbidden', 'wrong download version',
     'download timeout', 'download hangs',
-  ] as const)('publishes dependencies before wrappers: %s', (condition) => {
+  ] as const)('publishes dependencies before wrappers: %s', async (condition) => {
     const directory = mkdtempSync(join(tmpdir(), 'moq-publish-workflow-'));
+    let pulse: ReturnType<typeof setInterval> | undefined;
     try {
-      tarballs(directory, [
+      await tarballs(directory, [
         { name: '@moqt/browser', version: '1.0.0', dependencies: { '@openmoq/browser': '1.0.0' } },
         { name: '@openmoq/browser', version: '1.0.0', dependencies: { '@openmoq/transport': '1.0.0' } },
         { name: '@openmoq/transport', version: '1.0.0' },
@@ -113,22 +119,26 @@ exec ${shellQuote(process.execPath)} "$@"
       const workflow = readFileSync(resolve(import.meta.dirname, '../.github/workflows/publish.yml'), 'utf8');
       const step = workflow.match(/- name: Publish to npm\n\s+run: \|\n([\s\S]*)$/)?.[1];
       expect(step).toBeDefined();
-      const run = () => execFileSync(condition === 'system bash' ? '/bin/bash' : 'bash', ['-c', step!.replace(/^          /gm, '')], {
+      const run = () => execute(condition === 'system bash' ? '/bin/bash' : 'bash', ['-c', step!.replace(/^          /gm, '')], {
         cwd: directory,
         env: { ...process.env, PATH: `${bin}:${condition === 'node version manager shim' ? `${shimBin}:` : ''}${process.env.PATH}`,
           NPM_PACKAGE_WAIT_MS: ['dependency unavailable', 'last tarball unavailable', 'download hangs'].includes(condition) ? '3000' : '30000',
           NPM_PACKAGE_POLL_MS: '1' },
-        stdio: 'pipe', timeout: 60_000,
+        timeout: 60_000,
       });
       const failure = ['publish fails', 'dependency unavailable', 'last tarball unavailable', 'download forbidden', 'wrong download version', 'download hangs'].includes(condition);
       let caught: unknown;
       const started = performance.now();
+      // Subprocess waits must leave the test worker free to acknowledge runner messages.
+      let heartbeat = false;
+      pulse = condition === 'download hangs' ? setInterval(() => { heartbeat = true; }, 10) : undefined;
       if (failure) {
-        try { run(); } catch (error) { caught = error; }
+        try { await run(); } catch (error) { caught = error; }
         expect(caught).toBeDefined();
-      } else run();
+      } else await run();
+      if (condition === 'download hangs') expect(heartbeat).toBe(true);
       if (['dependency unavailable', 'last tarball unavailable', 'download hangs'].includes(condition)) {
-        expect(caught).toMatchObject({ status: 1, signal: null });
+        expect(caught).toMatchObject({ code: 1, signal: null });
         expect((caught as { stderr: Buffer }).stderr.toString()).toContain('Timed out after 3000ms waiting for');
         expect(performance.now() - started).toBeLessThan(30_000);
       }
@@ -148,12 +158,13 @@ exec ${shellQuote(process.execPath)} "$@"
       if (condition === 'download forbidden') expect(packed).toEqual(['@openmoq/transport@1.0.0']);
       if (condition === 'download timeout') expect(packed.filter((spec) => spec === '@openmoq/transport@1.0.0').length).toBeGreaterThanOrEqual(6);
     } finally {
+      if (pulse !== undefined) clearInterval(pulse);
       rmSync(directory, { recursive: true, force: true });
     }
   }, 90_000);
 
-  it('places canonical dependencies before dependents and all compatibility packages last', () => {
-    expect(order([
+  it('places canonical dependencies before dependents and all compatibility packages last', async () => {
+    expect(await order([
       { name: '@moqt/browser', version: '1.0.0', dependencies: { '@openmoq/browser': '1.0.0' } },
       { name: '@openmoq/browser', version: '1.0.0', dependencies: { '@openmoq/transport': '1.0.0' } },
       { name: '@playa/player', version: '1.0.0', dependencies: { '@openmoq/playa': '1.0.0' } },
@@ -162,7 +173,7 @@ exec ${shellQuote(process.execPath)} "$@"
     ])).toEqual(['@openmoq/transport', '@openmoq/browser', '@openmoq/playa', '@moqt/browser', '@playa/player']);
   });
 
-  it.each(['missing', 'wrong version', 'cycle', 'duplicate'] as const)('rejects %s before emitting a publication plan', (condition) => {
+  it.each(['missing', 'wrong version', 'cycle', 'duplicate'] as const)('rejects %s before emitting a publication plan', async (condition) => {
     const packages = [
       { name: '@moqt/transport', version: '1.0.0', dependencies: { '@openmoq/transport': '1.0.0' } },
       { name: '@openmoq/transport', version: '1.0.0', dependencies: {} as Record<string, string> },
@@ -171,7 +182,7 @@ exec ${shellQuote(process.execPath)} "$@"
     if (condition === 'wrong version') packages[1]!.version = '0.9.0';
     if (condition === 'cycle') packages[1]!.dependencies['@openmoq/transport'] = '1.0.0';
     if (condition === 'duplicate') packages.push(packages[1]!);
-    expect(() => order(packages)).toThrow();
+    await expect(order(packages)).rejects.toThrow();
   });
 
   it('uses the combined smoke gate for local releases', () => {
