@@ -229,8 +229,14 @@ function filterFromTypedLocationFilter(bytes: Uint8Array): SubscriptionFilter {
  * parameters) holding its LOCATION_FILTER. An omitted filter inherits the
  * subscription's filter.
  */
-export function encodeFillParameters(filter?: SubscriptionFilter, groupOrder?: GroupOrder): Uint8Array {
+export function encodeFillParameters(filter?: SubscriptionFilter, groupOrder?: GroupOrder, subscriberPriority?: number): Uint8Array {
   const params = new Map<bigint, MessageParamValue[]>();
+  if (subscriberPriority !== undefined) {
+    if (!Number.isInteger(subscriberPriority) || subscriberPriority < 0 || subscriberPriority > 255) {
+      throw new RangeError('Fill Subscriber Priority must be an integer from 0 to 255');
+    }
+    params.set(0x20n, [{ kind: 'uint8', value: subscriberPriority }]);
+  }
   if (filter !== undefined) params.set(0x21n, [{ kind: 'locationFilter', value: encodeTypedLocationFilter(filter) }]);
   if (groupOrder !== undefined) {
     if (groupOrder !== 'ascending' && groupOrder !== 'descending') throw new RangeError('Invalid fill Group Order');

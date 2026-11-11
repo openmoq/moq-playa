@@ -3135,7 +3135,7 @@ export class Session {
     const filterBytes = options.subscriptionFilter === undefined
       ? undefined : encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
     const fillBytes = options.fill === undefined
-      ? undefined : encodeFillParameters(options.fill.filter, options.fill.groupOrder);
+      ? undefined : encodeFillParameters(options.fill.filter, options.fill.groupOrder, options.fill.subscriberPriority);
     const parameters = authorizationParameters(options);
 
     const requestId = this.requestIdAllocator.allocate();
@@ -3452,7 +3452,7 @@ export class Session {
     const filterBytes = options.subscriptionFilter === undefined ? undefined
       : encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
     const fillBytes = options.fill === undefined ? undefined
-      : encodeFillParameters(options.fill.filter, options.fill.groupOrder);
+      : encodeFillParameters(options.fill.filter, options.fill.groupOrder, options.fill.subscriberPriority);
     if (options.subgroupDeliveryTimeout !== undefined && !isRequestStreamDraft(this._draftVersion)) {
       throw new SessionError('subgroupDeliveryTimeout (SUBGROUP_DELIVERY_TIMEOUT, 0x06) is draft-18 only', 'INVALID_STATE');
     }
@@ -5415,7 +5415,7 @@ export class Session {
       if (BigInt(pending) >= this._peerMaxRequestUpdates) throw new SessionError('MAX_REQUEST_UPDATES exceeded', 'INVALID_STATE');
     }
     const filterBytes = options.subscriptionFilter === undefined ? undefined : encodeSubscriptionFilter(options.subscriptionFilter, this._draftVersion);
-    const fillBytes = options.fill === undefined ? undefined : encodeFillParameters(options.fill.filter, options.fill.groupOrder);
+    const fillBytes = options.fill === undefined ? undefined : encodeFillParameters(options.fill.filter, options.fill.groupOrder, options.fill.subscriberPriority);
     const parameters = authorizationParameters(options);
     const requestId = this.requestIdAllocator.allocate();
     if (filterBytes !== undefined) parameters.set(MessageParam.SUBSCRIPTION_FILTER, [filterBytes]);

@@ -5,6 +5,11 @@ import { ProtocolViolationError } from '../errors.js';
 
 /** Per-message overrides; omitted values inherit the subscription (9.20.15). */
 export interface FillOptions {
+  /**
+   * Draft 22 uint8 override for this fill only. Omission inherits the subscription's
+   * priority (d22 §9.20.15). When set, encoded inside FILL_PARAMETERS.
+   */
+  readonly subscriberPriority?: number;
   readonly filter?: SubscriptionFilter;
   readonly groupOrder?: GroupOrder;
 }
@@ -20,11 +25,12 @@ const repeatable = new Set([0x25n, 0x26n, 0x27n, 0x28n]);
 export function decodeFillParameters(bytes: Uint8Array): FillOptions & { parameters: MessageParams18 } {
   const { params: parameters, bytesRead } = decodeMessageParams18(bytes, 0, DRAFT22_MESSAGE_PARAM_REGISTRY);
   if (bytesRead !== bytes.length) throw new ProtocolViolationError('FILL_PARAMETERS length does not match its parameters (9.20.15)');
-  const result: { filter?: SubscriptionFilter; groupOrder?: GroupOrder; parameters: MessageParams18 } = { parameters };
+  const result: { subscriberPriority?: number; filter?: SubscriptionFilter; groupOrder?: GroupOrder; parameters: MessageParams18 } = { parameters };
   for (const [type, values] of parameters) {
     if (!allowed.has(type)) throw new ProtocolViolationError(`Parameter 0x${type.toString(16)} is not allowed in FILL_PARAMETERS (9.20.15)`);
     if (!repeatable.has(type) && values.length > 1) throw new ProtocolViolationError(`Duplicate fill parameter 0x${type.toString(16)}`);
     const value = values[0]!;
+    if (type === 0x20n && value.kind === 'uint8') result.subscriberPriority = value.value;
     if (type === 0x21n && value.kind === 'locationFilter') result.filter = decodeSubscriptionFilter(value.value, 22);
     if (type === 0x22n && value.kind === 'uint8') {
       if (value.value !== 1 && value.value !== 2) throw new ProtocolViolationError('Fill GROUP_ORDER must be 1 or 2');
