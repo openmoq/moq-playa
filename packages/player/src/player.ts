@@ -1954,11 +1954,9 @@ export class MoqtPlayer {
     if (terminals) for (const terminal of terminals.values()) terminal.releaseEnd();
   }
 
-  /** Retain normal completion data, not errors or stale live-edge recovery (§9.15 / §10.11 / §9.9). */
   /**
    * Subscriber priority for a media subscription. Audio goes ahead of video by
-   * default: on a congested link a relay that schedules by priority sends the
-   * small audio objects first, and audio is what listeners notice. Video keeps
+   * default, clamped at priority 0. This is a scheduling preference. Video keeps
    * whatever the configured parameters say (or none: the relay's default).
    */
   private subscriberPriorityFor(mediaType: string): { subscriberPriority?: ReturnType<typeof varint> } {
@@ -1967,6 +1965,7 @@ export class MoqtPlayer {
     return { subscriberPriority: varint(BigInt(this.config.audioSubscriberPriority ?? Math.max(0, base - 1))) };
   }
 
+  /** Retain normal completion data, not errors or stale live-edge recovery (§9.15 / §10.11 / §9.9). */
   private mediaTerminalOptions(conn: MoqtConnection) {
     return {
       terminalDelivery: 'drain' as const,

@@ -286,9 +286,9 @@ export interface PlaybackTuningConfig {
 
   /**
    * Subscriber priority for audio subscriptions (0 = highest, 255 = lowest).
-   * Default: one more urgent than `subscriberPriority` (127 when that is
-   * unset, against the relay default of 128 for video), so a relay that
-   * schedules by priority sends audio ahead of video on a congested link.
+   * Default: one step more urgent than `subscriberPriority`, clamped at 0
+   * (127 when unset, against the publisher default of 128 for video). This
+   * expresses a scheduling preference, not a delivery guarantee; priority 0 ties.
    * @see draft-ietf-moq-transport-16 §9.2.2.3 (SUBSCRIBER_PRIORITY)
    */
   readonly audioSubscriberPriority?: number;

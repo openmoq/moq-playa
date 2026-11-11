@@ -226,6 +226,22 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await player.destroy();
   });
 
+  it('audio liveness resubscribe retains the configured audio priority', async () => {
+    const adapter = createMockAdapter();
+    adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
+    const { player } = await startPlaying(adapter, { subscriberPriority: 64, audioSubscriberPriority: 7 });
+    try {
+      adapter._triggerObject(0n, {
+        kind: 'data', trackAlias: varint(AUDIO_ALIAS), groupId: varint(0), subgroupId: varint(0),
+        objectId: varint(0), payload: new Uint8Array([0x48, 1, 2]),
+      } as MoqtObject);
+      const audioCalls = () => adapter.subscribe.mock.calls.filter(
+        (call: unknown[]) => new TextDecoder().decode(call[1] as Uint8Array) === 'audio');
+      await vi.waitFor(() => expect(audioCalls().length).toBeGreaterThanOrEqual(2), { timeout: 2_000 });
+      expect(audioCalls()[1][2]).toEqual(expect.objectContaining({ subscriberPriority: 7n }));
+    } finally { await player.destroy(); }
+  });
+
   it('exhausted ladder → fatal MEDIA_STARVED + ERROR state', async () => {
     const adapter = createMockAdapter();
     adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
