@@ -208,3 +208,17 @@ describe('TimelineIndex — BigInt boundaries', () => {
         });
     });
 });
+
+
+describe('TimelineIndex — bounded slack', () => {
+    it('merges both neighbours within slack, preserves slack+1 and defaults to exact', () => {
+        const t = new TimelineIndex();
+        t.insert(0n, 100n); t.insert(101n, 200n);
+        expect(t.size).toBe(2); // Default still preserves a one-tick gap.
+        t.clear(); t.insert(0n, 100n); t.insert(290n, 400n); t.insert(490n, 600n);
+        t.insert(190n, 200n, 90n); // Bridge left and right, including the 90-tick boundary.
+        expect(t.getRanges()).toEqual([{ start: 0n, end: 600n }]);
+        t.insert(691n, 800n, 90n);
+        expect(t.getRanges()).toEqual([{ start: 0n, end: 600n }, { start: 691n, end: 800n }]);
+    });
+});

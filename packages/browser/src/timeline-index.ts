@@ -15,7 +15,7 @@
  * non-overlapping half-open intervals `[start, end)` that the caller
  * has committed after a successful updateend. Insert merges adjacent
  * and overlapping ranges so the index stays minimal (typical live
- * playback ends up with one entry).
+ * playback ends up with one entry). Each merged gap may include up to `slack` unrecorded ticks.
  *
  * Scope
  * ─────
@@ -53,7 +53,7 @@ export class TimelineIndex {
   }
 
   /**
-   * True if `[start, end)` lies entirely within a single recorded range.
+   * True if `[start, end)` lies within one indexed range, including tolerated unrecorded gaps.
    *
    * Because the index keeps ranges merged and non-adjacent, a range that
    * would only be covered by the UNION of two recorded ranges necessarily
@@ -69,12 +69,13 @@ export class TimelineIndex {
   }
 
   /**
-   * Insert `[start, end)`. Merges with adjacent or overlapping ranges
-   * so the index stays minimal. No-op if the range is empty.
+   * Insert `[start, end)`. Merges with adjacent or overlapping ranges, and
+   * with ranges at most `slack` ticks away, so the index stays minimal.
+   * No-op if the range is empty.
    *
    * Linear in the current size of the index, which is typically 1-2.
    */
-  insert(start: bigint, end: bigint): void {
+  insert(start: bigint, end: bigint, slack = 0n): void {
     if (start >= end) return;
 
     // Walk from the left; swallow any range that overlaps or touches
@@ -86,13 +87,13 @@ export class TimelineIndex {
 
     for (const r of this.ranges) {
       // r is fully left of the merging range and not adjacent — keep as-is.
-      if (r.end < mergedStart) {
+      if (r.end + slack < mergedStart) {
         kept.push(r);
         continue;
       }
       // r is fully right of the merging range and not adjacent — place
       // the merged range first (if not yet placed), then keep r.
-      if (r.start > mergedEnd) {
+      if (r.start > mergedEnd + slack) {
         if (!placed) {
           kept.push({ start: mergedStart, end: mergedEnd });
           placed = true;

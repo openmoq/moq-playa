@@ -20,6 +20,7 @@ import {
   filterInitSegment,
   describeBoxes,
   peekSegmentMetadata,
+  readMdhdTimescale,
   readSegmentTimeRanges,
   readTrexDefaults,
   type SegmentTimeRange,
@@ -927,6 +928,8 @@ export class MseMediaSource implements MediaSourceLike {
   /** trex defaults from the init segment, per media type. */
   private videoTrex: TrexDefaults | undefined;
   private audioTrex: TrexDefaults | undefined;
+  /** mdhd timescale from the same init, or null when it declares none. */
+  private readonly timescale: { video: number | null; audio: number | null } = { video: null, audio: null };
   /** MIME selected at SourceBuffer creation or by the last successful retype. */
   private readonly bufferMime: { video: string | null; audio: string | null } =
     { video: null, audio: null };
@@ -1456,6 +1459,7 @@ export class MseMediaSource implements MediaSourceLike {
             const trexMap = readTrexDefaults(videoInit);
             const first = trexMap.values().next();
             if (!first.done) this.videoTrex = first.value;
+            this.timescale.video = readMdhdTimescale(videoInit);
             const vb = this.videoBuffer;
             this.runMutation('video', 'init-append', () => vb.appendBuffer(videoInit.buffer as ArrayBuffer));
           }
@@ -1478,6 +1482,7 @@ export class MseMediaSource implements MediaSourceLike {
             const trexMap = readTrexDefaults(audioInit);
             const first = trexMap.values().next();
             if (!first.done) this.audioTrex = first.value;
+            this.timescale.audio = readMdhdTimescale(audioInit);
             const ab = this.audioBuffer;
             this.runMutation('audio', 'init-append', () => ab.appendBuffer(audioInit.buffer as ArrayBuffer));
           }
@@ -1609,6 +1614,13 @@ export class MseMediaSource implements MediaSourceLike {
     return chosen;
   }
 
+  // Receiver policy beyond CMAF contiguity (LOCMAF-01 §12.2): tolerate up to
+  // 1 ms, never a larger gap. Unknown timescales stay exact.
+  private contiguousSlack(mediaType: 'video' | 'audio'): bigint {
+    const timescale = this.timescale[mediaType];
+    return timescale === null ? 0n : BigInt(timescale) / 1000n;
+  }
+
   private holdAppendGap(mediaType: 'video' | 'audio', entry: AppendEntry): boolean {
     const generation = this.bufferGen;
     delete entry.skipsGap;
@@ -1619,6 +1631,9 @@ export class MseMediaSource implements MediaSourceLike {
     // The first segment anchors the clock. Unknown layouts retain the existing
     // fail-open policy; tick values are compared only within this track/context.
     if (!ranges?.length || end === undefined || ranges[0]!.startTime <= end) return false;
+    const media = ranges.filter(r => r.sampleCount > 0 && r.endTime > r.startTime);
+    const gaps = media.reduce((sum, r, i) => { const gap = r.startTime - (media[i - 1]?.endTime ?? end); return sum + (gap > 0n ? gap : 0n); }, 0n);
+    if (media.length && gaps <= this.contiguousSlack(mediaType)) return false;
     const previous = this.appendGapWait[mediaType];
     const now = performance.now();
     entry.waitStartedAt ??= now;
@@ -1902,6 +1917,7 @@ export class MseMediaSource implements MediaSourceLike {
       const trex = Array.from(trexMap.values())[0];
       if (mediaType === 'video') this.videoTrex = trex;
       else this.audioTrex = trex;
+      this.timescale[mediaType] = readMdhdTimescale(filtered);
 
       // Refresh init summary so failure dumps reflect the current codec.
       const boxes = describeBoxes(filtered);
@@ -2158,6 +2174,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.changingType.audio = false;
     this.videoTrex = undefined;
     this.audioTrex = undefined;
+    this.timescale.video = this.timescale.audio = null;
     this.seenDiagnostics.clear();
     this.quotaRetried.video = false;
     this.quotaRetried.audio = false;
@@ -4087,8 +4104,9 @@ export class MseMediaSource implements MediaSourceLike {
           timeline = new TimelineIndex();
           timelines.set(pendingTrack, { trackName: pendingTrackName, index: timeline });
         }
+        const slack = this.contiguousSlack(mediaType);
         for (const r of pending) {
-          timeline.insert(r.startTime, r.endTime);
+          timeline.insert(r.startTime, r.endTime, slack);
         }
         if (this.pendingGapSkip[mediaType] || this.lateAppendFloor[mediaType].has(pendingTrack)) {
           const end = timeline.extent?.end;
