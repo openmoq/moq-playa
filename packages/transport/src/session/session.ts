@@ -456,6 +456,8 @@ export interface FetchOptions extends AuthorizationOptions {
  * with (and never overlapping) the subscription's delivery.
  */
 export interface JoiningFetchOptions extends AuthorizationOptions {
+  /** d14 §9.16 / d16 §9.2.2.3 / d18 §10.2.7: 0-255, lower is higher priority. Omitted defaults to 128. */
+  subscriberPriority?: Varint;
   /** 'relative' = Fetch Type 0x2, 'absolute' = 0x3. */
   joiningFetchType: 'relative' | 'absolute';
   /** Request ID of OUR outbound SUBSCRIBE to join (NOT a track alias). */
@@ -3708,6 +3710,12 @@ export class Session {
   joiningFetch(options: JoiningFetchOptions): RequestResult {
     this.assertEstablishedOrDraining('joiningFetch');
     const parameters = authorizationParameters(options);
+    if (options.subscriberPriority !== undefined) {
+      if (options.subscriberPriority < 0n || options.subscriberPriority > 255n) {
+        throw new RangeError(`SUBSCRIBER_PRIORITY must be 0-255, got ${options.subscriberPriority}`);
+      }
+      parameters.set(MessageParam.SUBSCRIBER_PRIORITY, [options.subscriberPriority]);
+    }
 
     if (this._state === SessionState.DRAINING) {
       throw new SessionDrainingError(
