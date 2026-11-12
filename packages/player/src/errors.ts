@@ -77,8 +77,8 @@ export const PlayerErrorCode = {
   /**
    * Buffered-gap recovery was unrecoverable. Two conditions share this
    * code (the error message distinguishes them): a buffered hole exceeded
-   * the MSE adapter's bounded-skip policy and persisted at the playhead,
-   * or a bounded skip was performed but its landing never resumed
+   * the MSE adapter's bounded-skip policy and persisted at the playhead
+   * when live recovery declined or was not possible, or a skip's landing never resumed
    * playback. Either way the stream cannot proceed; the MediaSource must
    * be rebuilt (fresh tune-in). Fatal.
    */

@@ -207,7 +207,8 @@ const SWITCH_STAGING_TIMEOUT_MS = 3_000;
 const HISTORICAL_SWITCH_RESERVE_MS = 100;
 
 /** One current route's receiving admission; no payload or group history. */
-interface ReceivingVideoOwner {
+interface ReceivingMediaOwner {
+  readonly mediaType: 'video' | 'audio';
   readonly token: object;
   readonly alias: bigint;
   readonly trackName: string;
@@ -1550,7 +1551,7 @@ export class MoqtPlayer {
     releaseReceiving?: () => void;
     whenIdle?: () => Promise<void> | undefined;
   }>();
-  private readonly receivingVideoOwners = new Map<bigint, ReceivingVideoOwner>();
+  private readonly receivingMediaOwners = new Map<bigint, ReceivingMediaOwner>();
 
   /**
    * Restart state keyed by namespace fields, name and media type. A replacement
@@ -1731,7 +1732,7 @@ export class MoqtPlayer {
     info.streams.set(streamId, closed);
   }
 
-  private retainCurrentVideoStreams(manager: SubscriptionManager, streamId: bigint, obj: MoqtObject,
+  private retainCurrentMediaStreams(manager: SubscriptionManager, streamId: bigint, obj: MoqtObject,
     sourceConnection: MoqtConnection | undefined): void {
     const source = this.mediaSource;
     const retain = source?.retainReceivingGroup;
@@ -1739,7 +1740,8 @@ export class MoqtPlayer {
     if (!source || !retain || !sourceConnection || sourceConnection !== this.connection) return;
     const inputGeneration = manager.mediaInputGeneration;
     const alias = BigInt(obj.trackAlias);
-    if (manager.getMediaType(alias) !== 'video') return;
+    const mediaType = manager.getMediaType(alias);
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
     const stream = this.subgroupStreams.get(streamId);
     // Capture at actual object receipt, including preparation. A header alone
     // establishes neither a Group's existence nor a later alias owner's data.
@@ -1748,14 +1750,14 @@ export class MoqtPlayer {
       const registration = manager.captureRoute(alias);
       if (registration) stream.receivingRegistration = { manager, isCurrent: registration };
     }
-    const cached = this.receivingVideoOwners.get(alias);
+    const cached = this.receivingMediaOwners.get(alias);
     if (cached?.isCurrent()) {
-      this.retainVideoStream(cached, streamId); // O(1) for every subsequent stream/object.
+      this.retainMediaStream(cached, streamId); // O(1) for every subsequent stream/object.
       return;
     }
-    const sub = [...this.activeSubscriptions.values()].find(s => s.trackAlias === alias && s.mediaType === 'video');
+    const sub = [...this.activeSubscriptions.values()].find(s => s.trackAlias === alias && s.mediaType === mediaType);
     const registration = manager.captureRoute(alias);
-    const selection = this.mseSelection('video');
+    const selection = this.mseSelection(mediaType);
     const key = sub && identityKey(sub.namespace ?? namespaceFields(this.config.namespace), sub.trackName);
     if (!sub || !registration || !selection || selection.key !== key) return;
     const keyed = this.keyedCmafIdentity;
@@ -1763,31 +1765,31 @@ export class MoqtPlayer {
     if (keyed && sourceKey === undefined) return;
     // Prune retired routes only at an ownership transition. The cache contains
     // current registrations, not a history of aliases or observed groups.
-    for (const [oldAlias, owner] of this.receivingVideoOwners) {
-      if (!owner.isCurrent()) this.receivingVideoOwners.delete(oldAlias);
+    for (const [oldAlias, owner] of this.receivingMediaOwners) {
+      if (!owner.isCurrent()) this.receivingMediaOwners.delete(oldAlias);
     }
-    const owner: ReceivingVideoOwner = {
-      token: {}, alias, trackName: sub.trackName, manager, source, connection: sourceConnection, retain,
+    const owner: ReceivingMediaOwner = {
+      token: {}, mediaType, alias, trackName: sub.trackName, manager, source, connection: sourceConnection, retain,
       ...(sourceKey === undefined ? {} : { sourceKey }),
-      isCurrent: () => !this._destroyed && this.receivingVideoOwners.get(alias) === owner
+      isCurrent: () => !this._destroyed && this.receivingMediaOwners.get(alias) === owner
         && this.subscriptionManager === manager && this.mediaSource === source
         && manager.mediaInputGeneration === inputGeneration && this.keyedCmafIdentity === keyed
         && sourceConnection === this.connection
         && registration() && this.mediaRouteBelongsTo(sourceConnection, alias)
-        && this.mseSelection('video')?.selection === selection.selection,
+        && this.mseSelection(mediaType)?.selection === selection.selection,
     };
-    this.receivingVideoOwners.set(alias, owner); // Reserve before capability callbacks.
+    this.receivingMediaOwners.set(alias, owner); // Reserve before capability callbacks.
     // A preparation's SAP can adopt the track, followed immediately by a
     // successor stream. Acquire its ALREADY observed open streams before that
     // successor queues. Scan once per route owner, never once per new stream.
     const observed = [...this.subgroupStreams.keys()];
     for (const id of observed) {
       if (!owner.isCurrent()) break;
-      this.retainVideoStream(owner, id);
+      this.retainMediaStream(owner, id);
     }
   }
 
-  private retainVideoStream(owner: ReceivingVideoOwner, streamId: bigint): void {
+  private retainMediaStream(owner: ReceivingMediaOwner, streamId: bigint): void {
     if (!owner.isCurrent()) return;
     const stream = this.subgroupStreams.get(streamId);
     if (stream?.connection !== owner.connection || stream.trackAlias !== owner.alias
@@ -1800,8 +1802,8 @@ export class MoqtPlayer {
     previous?.();
     if (!owner.isCurrent() || this.subgroupStreams.get(streamId) !== stream) return;
     const release = streamRelease(owner.sourceKey === undefined
-      ? owner.retain.call(owner.source, 'video', owner.trackName, stream.groupId, owner.isCurrent)
-      : owner.retain.call(owner.source, 'video', owner.trackName, stream.groupId, owner.isCurrent, owner.sourceKey));
+      ? owner.retain.call(owner.source, owner.mediaType, owner.trackName, stream.groupId, owner.isCurrent)
+      : owner.retain.call(owner.source, owner.mediaType, owner.trackName, stream.groupId, owner.isCurrent, owner.sourceKey));
     if (!owner.isCurrent() || this.subgroupStreams.get(streamId) !== stream) release();
     else stream.releaseReceiving = release;
   }
@@ -1826,7 +1828,7 @@ export class MoqtPlayer {
     // receipt may establish receiving evidence; FETCH has its own ownership.
     if ('kind' in receiptInput && fetchInfo === undefined && sourceConnection !== undefined
         && this.subgroupStreams.get(streamId)?.connection === sourceConnection) {
-      this.retainCurrentVideoStreams(manager, streamId, obj, sourceConnection);
+      this.retainCurrentMediaStreams(manager, streamId, obj, sourceConnection);
     }
     // Receiving capabilities are external callbacks too. Preserve the input
     // generation boundary before continuing into generic preparation/routing.
@@ -10554,7 +10556,7 @@ export class MoqtPlayer {
     let closedCandidate: MoqtConnection | null = null;
     try {
       this.deliverySubscriptions.clear();
-      this.receivingVideoOwners.clear();
+      this.receivingMediaOwners.clear();
       this.audioOutput = null; this.lastAudioDomainOwner = null; this.lastAudioDomain = null;
       this.installedDecoderConfigurations.clear(); this.preparedDecoderConfigurations.clear(); this.decoderConfigurationCommands.clear();
       this.audioTimelineRecord = null; this.videoTimelineRecord = null; this.collectAudioTimeline = false; this.collectVideoTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.runtimeAudioLanguage = null; this.runtimeSelectionIntent = null; this.mappedClockOwner = null; this.videoPresentationOffsetUs = 0n; this.videoTimingMapped = false; this.videoTimingSource = undefined; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
@@ -13214,6 +13216,16 @@ export class MoqtPlayer {
       onDecodeError: (mediaType, error) => {
         if (!ownsCommands()) return;
         if (this.stateMachine.state === PlayerState.ERROR) return;
+        if (error.name === 'MediaGapUnrecoverableError') {
+          const selected = this._selection.video;
+          const track = selected && this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
+          if (track?.isLive === true && this.config.subscriptionFilter === undefined
+              && !this.pendingVideoSwitch && !this.switchInProgress && !this.mediaSelection && !this.currentMigration
+              && !this.seekIsPreparing() && !this.activeMseSeek && !this.ownedSeekOutput) {
+            try { if (this.mediaSource?.tryRecoverBufferedGap?.(error) === true) return; }
+            catch { /* A failed recovery attempt must not suppress fatal escalation. */ }
+          }
+        }
         this._stats.recordDecodeError();
 
         // MSE playhead-wedge ladder exhausted (Safari frozen-element class):

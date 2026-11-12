@@ -537,8 +537,9 @@ describe.each([18, 22] as const)('wide hole after a failed MSE switch history re
     } finally { await f.destroy(); }
   });
 
-  it('control: the same wide hole on one rendition, with no fallback decision, keeps the current policy (no crossing; fatal after its bound)', async () => {
+  it.each([true, false])('control: an unexplained wide hole crosses only with recovery capability (%s)', async recovery => {
     const f = await fixture(draft, { controlledClock: true });
+    if (!recovery) Object.defineProperty(f.adapter, 'tryRecoverBufferedGap', { value: undefined });
     try {
       const n = await playOldPartial(f);
       // The publisher itself skips: the old rendition continues at Group 5 with Groups 3-tail and 4 never published.
@@ -548,9 +549,10 @@ describe.each([18, 22] as const)('wide hole after a failed MSE switch history re
       f.stallAt(OLD_END);
       await sit(f, FATAL_AFTER_MS + 4_000);
       const seen = outcome(f);
-      expect(seen.seeks, 'no crossing of an unexplained wide hole').toBe(0);
-      expect(seen.currentTime).toBe(OLD_END);
-      expect(seen.fatal.some(m => m.includes('unrecoverable buffered hole')), 'current bounded policy escalates').toBe(true);
+      expect(seen.seeks, 'cross the unexplained hole at the escalation bound').toBe(recovery ? 1 : 0);
+      expect(seen.currentTime).toBeCloseTo(recovery ? TARGET_START + 0.01 : OLD_END, 5);
+      expect(seen.fatal).toHaveLength(recovery ? 0 : 1);
+      expect(f.player.stats.decodeErrorCount).toBe(recovery ? 0 : 1);
     } finally { await f.destroy(); }
   });
 
@@ -595,6 +597,158 @@ describe.each([18, 22] as const)('wide hole after a failed MSE switch history re
       expect(seen.seeks, 'finite media is not skipped under a live recovery policy').toBe(0);
       expect(seen.currentTime).toBe(OLD_END);
       expect(seen.jumps).toBe(0);
+    } finally { await f.destroy(); }
+  });
+});
+
+describe.each([18, 22] as const)('live delivery continues behind a frozen playhead, draft %s', draft => {
+  it.each([0, 250, 500, 750, 1000, 1250])('phase %i ms', async phaseMs => {
+    const f = await fixture(draft, { controlledClock: true });
+    try {
+      const n = await playOldPartial(f);
+      await f.pub.publishGroup('video', n + 2n); for (const g of [n + 1n, n + 2n]) await f.pub.publishGroup('audio', g);
+      await f.advance(3_000);
+      expect(f.rangesOf('video')).toEqual([[0, OLD_END], [TARGET_START, 7.5]]);
+      f.stallAt(OLD_END);
+      if (phaseMs) await f.advance(phaseMs);
+      let g = n + 3n, elapsed = phaseMs;
+      while (elapsed < FATAL_AFTER_MS + 4_000) {
+        for (let o = 0n; o < OBJECTS_PER_GROUP; o++) {
+          const last = o === OBJECTS_PER_GROUP - 1n;
+          await f.pub.publish('audio', g, o, { closeGroup: last });
+          await f.pub.publish('video', g, o, { closeGroup: last });
+          await f.advance(500); elapsed += 500;
+        }
+        g++;
+      }
+      const seen = outcome(f);
+      expect(seen.seeks).toBe(1);
+      expect(seen.jumps).toBe(1);
+      expect(seen.fatal).toEqual([]);
+    } finally { await f.destroy(); }
+  });
+});
+
+describe.each([18, 22] as const)('audio receiving during a hole, draft %s', draft => {
+  it('retains audio delivery evidence through escalation', async () => {
+    const f = await fixture(draft, { controlledClock: true });
+    try {
+      const n = await playOldPartial(f);
+      await f.pub.publishGroup('video', n + 2n);
+      await f.pub.publishGroup('audio', n + 1n);
+      await f.pub.publish('audio', n + 2n, 0n); // Keep the landing group's stream open.
+      await f.advance(3_000);
+      f.stallAt(OLD_END);
+      await sit(f, FATAL_AFTER_MS + 4_000);
+      expect(f.video.seekCount).toBe(0);
+      expect(f.fatal).toHaveLength(1);
+    } finally { await f.destroy(); }
+  });
+});
+
+describe.each([18, 22] as const)('throwing recovery d%s', draft => {
+  it('a throwing recovery adapter keeps fatal escalation', async () => {
+    const f = await fixture(draft, { controlledClock: true });
+    Object.defineProperty(f.adapter, 'tryRecoverBufferedGap', { value: () => { throw new Error('native seek failed'); } });
+    try {
+      const n = await playOldPartial(f);
+      // The publisher itself skips: the old rendition continues at Group 5 with Groups 3-tail and 4 never published.
+      await f.pub.publishGroup('video', n + 2n); for (const g of [n + 1n, n + 2n]) await f.pub.publishGroup('audio', g);
+      await f.advance(3_000); // the existing old-group tail wait releases the successor
+      expect(f.rangesOf('video'), 'same shape of hole, no switch').toEqual([[0, OLD_END], [TARGET_START, 7.5]]);
+      f.stallAt(OLD_END);
+      await sit(f, FATAL_AFTER_MS + 4_000);
+      const seen = outcome(f);
+      expect(seen.seeks, 'cross the unexplained hole at the escalation bound').toBe(0);
+      expect(seen.currentTime).toBeCloseTo(OLD_END, 5);
+      expect(seen.fatal).toHaveLength(1);
+    } finally { await f.destroy(); }
+  });
+});
+
+describe.each([18, 22] as const)('throwing recovery d%s', draft => {
+  it('a native seek failure keeps immediate fatal escalation', async () => {
+    const f = await fixture(draft, { controlledClock: true });
+    f.video.throwOnSeek = new Error('native seek failed');
+    try {
+      const n = await playOldPartial(f);
+      // The publisher itself skips: the old rendition continues at Group 5 with Groups 3-tail and 4 never published.
+      await f.pub.publishGroup('video', n + 2n); for (const g of [n + 1n, n + 2n]) await f.pub.publishGroup('audio', g);
+      await f.advance(3_000); // the existing old-group tail wait releases the successor
+      expect(f.rangesOf('video'), 'same shape of hole, no switch').toEqual([[0, OLD_END], [TARGET_START, 7.5]]);
+      f.stallAt(OLD_END);
+      await sit(f, FATAL_AFTER_MS + 4_000);
+      const seen = outcome(f);
+      expect(seen.seeks, 'cross the unexplained hole at the escalation bound').toBe(0);
+      expect(seen.currentTime).toBeCloseTo(OLD_END, 5);
+      expect(seen.fatal).toHaveLength(1);
+    } finally { await f.destroy(); }
+  });
+});
+
+describe.each([18, 22] as const)('gap recovery ownership, draft %s', draft => {
+  it('does not cross while a video switch is pending at the bound', async () => {
+    const f = await fixture(draft, { controlledClock: true });
+    try {
+      const n = await playOldPartial(f);
+      await f.pub.publishGroup('video', n + 2n);
+      for (const g of [n + 1n, n + 2n]) await f.pub.publishGroup('audio', g);
+      await f.advance(3_000); f.stallAt(OLD_END);
+      await sit(f, 9_000);
+      void f.player.selectVideoTrack('nextVideo').catch(() => {});
+      await settle();
+      expect(f.requests.at(-1)?.name).toBe('nextVideo');
+      await sit(f, 2_000);
+      expect(f.events.some(e => e.startsWith('quality_switched'))).toBe(false);
+      expect(f.video.seekCount).toBe(0); expect(f.fatal).toHaveLength(1);
+    } finally { await f.destroy(); }
+  });
+
+  it.each(['switch reservation', 'owned adapter seek'] as const)('does not cross with a %s', async owner => {
+    const f = await fixture(draft, { controlledClock: true });
+    try {
+      const n = await playOldPartial(f);
+      if (owner === 'switch reservation') {
+        expect(f.adapter.reserveSwitchRecovery({ mediaType: 'video', trackName: 'nextVideo' })).not.toBeNull();
+      }
+      await f.pub.publishGroup('video', n + 2n);
+      for (const g of [n + 1n, n + 2n]) await f.pub.publishGroup('audio', g);
+      await f.advance(3_000); f.stallAt(OLD_END);
+      if (owner === 'owned adapter seek') {
+        f.video.removeAttribute = name => { if (name === 'src') f.video.src = ''; };
+        const resource = f.adapter.beginSeek({});
+        resource.initialize({ video: { codec: 'avc1.640028', initData: INIT }, audio: { codec: 'mp4a.40.2', initData: AUDIO_INIT } });
+        f.native.open(); await settle(); f.stallAt(OLD_END);
+        f.video.modelSeekLifecycle = true;
+        await resource.position(OLD_END);
+        resource.setPlaybackIntent(true); await settle();
+        resource.setPlaybackIntent(false); // Seek owner takes positioning back.
+        f.adapter.setPlaybackIntent(true);
+        await f.video.play(); // Native play alone must not release the owned seek.
+        f.stallAt(OLD_END);
+      }
+      await sit(f, FATAL_AFTER_MS + 4_000);
+      expect(f.video.seekCount).toBe(0); expect(f.fatal).toHaveLength(1);
+    } finally { await f.destroy(); }
+  });
+});
+
+// Ordinary audio delivery: receiving evidence may veto recovery, but does not
+// extend the append reorder window when an older group's tail is still open.
+describe.each([18, 22] as const)('audio append hold behind an open older group, draft %s', draft => {
+  it('appends the successor after the ordinary 250 ms reorder window', async () => {
+    const f = await fixture(draft, { controlledClock: true });
+    try {
+      f.player.play();
+      for (const g of [1n, 2n, 3n]) { await f.pub.publishGroup('video', g); await f.pub.publishGroup('audio', g); }
+      await f.pub.publish('audio', 4n, 0n); // Keep group 4's stream open.
+      await f.pub.publishGroup('audio', 5n);
+      await f.advance(200);
+      expect(f.appended('audio')).not.toContain('5/0');
+      await f.advance(100);
+      expect(f.appended('audio')).toEqual(expect.arrayContaining(['5/0', '5/1', '5/2']));
+      expect(f.video.seekCount).toBe(0);
+      expect(f.fatal).toEqual([]);
     } finally { await f.destroy(); }
   });
 });
