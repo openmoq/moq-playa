@@ -46,6 +46,8 @@
     "packages/webtransport/src/adapter-rejected-done.test.ts",
     "packages/webtransport/src/adapter-reset-subgroup.loopback.test.ts",
 
+    "packages/webtransport/src/adapter-primary-priority.test.ts",
+    "packages/webtransport/src/send-order-setup.test.ts",
     "examples/node-relay/src/wt-adapter.test.ts",
     "packages/transport/src/session/session-update-staging.test.ts",
     "packages/player/src/abr-source-paced.sim.test.ts",

@@ -1,3 +1,4 @@
+import { setSendOrder } from './scheduling.js';
 import { PublisherTerminalFailure, type PublisherTerminalOptions } from './topology/publisher-terminal.js';
 import { RequestUpdateFailure, RequestUpdateError } from './request-update-confirmation.js';
 /**
@@ -631,6 +632,7 @@ export class MoqtConnection {
   private static readonly MAX_DEFERRED_UPDATE_RESPONSES = 4;
   /** Outgoing FETCH response data streams, keyed by synthetic stream ID. */
   private fetchOutgoingStreams = new Map<bigint, {
+    orderWritable: WritableStream<Uint8Array> | undefined;
     requestId: bigint;
     writer: WritableStreamDefaultWriter<Uint8Array>;
     groupOrder: GroupOrder;
@@ -1363,6 +1365,7 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-16 §10.4.2
    */
   private outgoingStreams = new Map<bigint, {
+    orderWritable: WritableStream<Uint8Array> | undefined;
     writer: WritableStreamDefaultWriter<Uint8Array>;
     groupId: bigint;
     hasExtensions: boolean;
@@ -1866,6 +1869,7 @@ export class MoqtConnection {
         this.draft16ControlAcceptor = acceptor;
         try {
           const control = await acceptor.start(incoming);
+          setSendOrder(control.stream.writable, 1024);
           if (this._terminated) {
             if (!this.localCloseIsGraceful) {
               this.swallow(() => control.reader.cancel());
@@ -1891,6 +1895,7 @@ export class MoqtConnection {
         const { value: bidiStream, done } = await incomingReader.read();
         incomingReader.releaseLock();
         if (done || !bidiStream) throw new ProtocolViolationError('server connect: no control stream from client');
+        setSendOrder(bidiStream.writable, 1024);
         this.controlWriter = bidiStream.writable.getWriter();
         reader = bidiStream.readable.getReader();
       }
@@ -1932,6 +1937,7 @@ export class MoqtConnection {
     } else {
       // Open control stream (first client-initiated bidirectional stream).
       const bidiStream = await transport.createBidirectionalStream();
+      setSendOrder(bidiStream.writable, 1024);
       this.controlWriter = bidiStream.writable.getWriter();
       reader = bidiStream.readable.getReader();
       await this.executeActions(this.session.initiateSetup(cleanOptions)); // CLIENT_SETUP
@@ -2580,7 +2586,9 @@ export class MoqtConnection {
     if (!suppress) this.onMessage?.(stamped);
     const fwdTarget = this.outboundPublishForwardTarget(stamped as { type: string; requestId?: bigint });
     const fwdBefore = fwdTarget === undefined ? undefined : this.getPublishForwardState(fwdTarget);
+    const refreshOrder = this.priorityChange(requestId);
     const actions = receiverErrorActions ?? this.session.handleControlMessage(message, { requestId });
+    refreshOrder();
     this.settleUpdateResponse(stamped);
     this.settleFillHeaders();
     await this.executeActions(actions);
@@ -2854,10 +2862,12 @@ export class MoqtConnection {
     const stamped = { ...message, existingRequestId: originalRequestId } as ControlMessage;
     this.onMessage?.(stamped);
     const fwdBefore = this.getPublishForwardState(originalRequestId);
+    const refreshOrder = this.priorityChange(originalRequestId);
     const actions = this.session.handleControlMessage(stamped, {
       requestId: updateId,
       existingRequestId: originalRequestId,
     });
+    refreshOrder();
     const fwdAfter = this.changedPublishForwardState(originalRequestId, fwdBefore);
     const closeAction = actions.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
     if (closeAction) {
@@ -6349,6 +6359,7 @@ export class MoqtConnection {
           { errorSource: 'transport', isFatal: false, ...(err instanceof Error ? { cause: err } : {}) },
         );
       }
+      const orderWritable = setSendOrder(writable, 255 - Number(assoc?.sub.currentPriority ?? 128n));
       const writer = writable.getWriter();
 
       // A cancellation or Forward=0 transition while the transport open was
@@ -6382,7 +6393,7 @@ export class MoqtConnection {
       // removed from the OPEN set, but its Stream Count is retained (§10.11).
       const streamId = this.nextOutgoingStreamId++;
       this.outgoingStreams.set(streamId, {
-        writer,
+        orderWritable, writer,
         groupId,
         hasExtensions: opts?.hasExtensions ?? false,
         previousObjectId: 0n,
@@ -6707,14 +6718,18 @@ export class MoqtConnection {
   private readonly openingFetches = new Map<bigint, Promise<unknown>>();
 
   async openFetchStream(requestId: bigint): Promise<bigint> {
+    return this.openFetchWithPriority(requestId);
+  }
+
+  private async openFetchWithPriority(requestId: bigint, priority?: number): Promise<bigint> {
     if (this.openingFetches.has(requestId)) throw new Error('FETCH already has its one response stream');
-    const opening = this.openFetchResponseStream(requestId);
+    const opening = this.openFetchResponseStream(requestId, priority);
     this.openingFetches.set(requestId, opening);
     try { return await opening; }
     finally { this.openingFetches.delete(requestId); this.fetchAbortReasons.delete(requestId); }
   }
 
-  private async openFetchResponseStream(requestId: bigint): Promise<bigint> {
+  private async openFetchResponseStream(requestId: bigint, priority?: number): Promise<bigint> {
     if (!isRequestStreamDraft(this.session.draftVersion)) {
       throw new MoqtConnectionError('openFetchStream is draft-18 only', { errorSource: 'data' });
     }
@@ -6744,6 +6759,7 @@ export class MoqtConnection {
       this.fetchServeReserved.delete(requestId);
       throw err;
     }
+    const orderWritable = setSendOrder(stream, 255 - (priority ?? Number(this.session.getIncomingFetch(requestId)?.currentPriority ?? 128n)));
     const writer = stream.getWriter();
     // §10.13: authorization was validated BEFORE the createUnidirectionalStream
     // await. A rejectFetch() or a request-stream close during that await
@@ -6758,7 +6774,7 @@ export class MoqtConnection {
     }
     const streamId = this.nextOutgoingStreamId++;
     this.fetchOutgoingStreams.set(streamId, {
-      requestId, writer, groupOrder, prior: undefined, isFirstObject: true,
+      requestId, orderWritable, writer, groupOrder, prior: undefined, isFirstObject: true,
       ...(fillOf === undefined ? {} : { fillOf }),
     });
     if (fillOf !== undefined) {
@@ -6825,7 +6841,7 @@ export class MoqtConnection {
     this.servedFills.set(requestId, subscriptionId);
     this.inboundFetchGroupOrder.set(requestId, options.groupOrder ?? sub.groupOrder);
     try {
-      const stream = await this.openFetchStream(requestId);
+      const stream = await this.openFetchWithPriority(requestId, options.subscriberPriority);
       const state = this.fetchOutgoingStreams.get(stream);
       if (!state) throw new MoqtConnectionError(`Fill ${requestId} was cancelled during stream open`, { errorSource: 'data' });
       state.fillWindow = fill.window;
@@ -6846,6 +6862,22 @@ export class MoqtConnection {
     }
   }
 
+  /** d14/16/18 §7.1, d22 §5.1.1: accepted changes include FIN-pending data. */
+  private priorityChange(requestId: bigint | undefined): () => void {
+    const owner = requestId === undefined ? undefined : this.publisherSubscriptionForRequest(requestId) ?? this.session.getIncomingFetch(requestId);
+    const before = owner?.currentPriority;
+    return () => {
+      if (!owner || owner.currentPriority === before) return;
+      const rank = 255 - Number(owner.currentPriority ?? 128n);
+      for (const state of this.outgoingStreams.values()) {
+        if (state.subscriptionRequestId === requestId) setSendOrder(state.orderWritable, rank);
+      }
+      for (const state of this.fetchOutgoingStreams.values()) {
+        if (state.fillOf === undefined && state.requestId === requestId) setSendOrder(state.orderWritable, rank);
+      }
+    };
+  }
+
   private rememberInboundFill(requestId: bigint, subscriptionId: bigint, parameters: Parameters): boolean {
     const bytes = parameters.get(FILL_PARAMETERS)?.[0];
     const sub = this.publisherSubscriptionForRequest(subscriptionId);
@@ -6860,6 +6892,8 @@ export class MoqtConnection {
     this.inboundFillRequests.set(requestId, {
       subscriptionId,
       options: {
+        ...(options.subscriberPriority !== undefined ? { subscriberPriority: options.subscriberPriority }
+          : requestId === subscriptionId ? {} : { subscriberPriority: Number(sub.currentPriority ?? 128n) }),
         ...(filter === undefined ? {} : { filter }),
         ...(groupOrder === undefined ? {} : { groupOrder }),
       },
@@ -6870,6 +6904,8 @@ export class MoqtConnection {
   private finalizeInboundFill(requestId: bigint, parameters?: Parameters): void {
     const fill = this.inboundFillRequests.get(requestId);
     if (!fill) return;
+    fill.options = { ...fill.options, subscriberPriority: fill.options.subscriberPriority
+      ?? Number(this.publisherSubscriptionForRequest(fill.subscriptionId)?.currentPriority ?? 128n) };
     const value = parameters?.get(0x09n)?.[0];
     const largest = value !== null && typeof value === 'object' && 'group' in value && 'object' in value
       ? value as { group: bigint; object: bigint } : undefined;
@@ -7283,7 +7319,9 @@ export class MoqtConnection {
             existingRequestId?: bigint;
           });
           const fwdBefore = fwdTarget === undefined ? undefined : this.getPublishForwardState(fwdTarget);
+          const refreshOrder = this.priorityChange(message.type === 'REQUEST_UPDATE' ? message.existingRequestId : (message as { requestId?: bigint }).requestId);
           const actions = terminalActions ?? receiverErrorActions ?? this.session.handleControlMessage(message);
+          refreshOrder();
           this.settleUpdateResponse(message);
           const fwdAfter = this.changedPublishForwardState(fwdTarget, fwdBefore);
           // Start protocol output before invoking application code. A pause
@@ -7575,6 +7613,7 @@ export class MoqtConnection {
           if (!this._terminated) this.containObserver(() => this.closeSessionInternalError('Pending namespace stream capacity exhausted'));
           break;
         }
+        setSendOrder(stream.writable, 512);
         const ctx = new InboundRequestStreamContext(stream, this.codec, {
           onMessage: (message, context) => this.rejectDraft16Namespace(message, context),
           onFailure: (error, context) => {
@@ -7665,6 +7704,7 @@ export class MoqtConnection {
 
   /** Wrap a peer-initiated bidi stream in an InboundRequestStreamContext and read it. */
   private handleIncomingBidiStream(stream: WebTransportBidirectionalStream): void {
+    setSendOrder(stream.writable, 512);
     const ctx = new InboundRequestStreamContext(stream, this.codec, {
       onMessage: (msg, c) => this.dispatchInboundRequestMessage(msg, c),
       onFailure: (err, c) => void this.onInboundStreamClosed(c, err),
@@ -7937,10 +7977,12 @@ export class MoqtConnection {
       }
       const stamped = { ...message, existingRequestId: originalId } as ControlMessage;
       this.onMessage?.(stamped);
+      const refreshOrder = this.priorityChange(originalId);
       const actions = this.session.handleControlMessage(stamped, {
         requestId: updateId,
         existingRequestId: originalId,
       });
+      refreshOrder();
       // §10.9: respond with exactly one REQUEST_OK / REQUEST_ERROR on THIS stream.
       // If handling produced a session close (e.g. unknown/invalid update), do
       // NOT also write a success response — close and stop.
@@ -9341,6 +9383,7 @@ export class MoqtConnection {
   ): Promise<void> {
     try {
       const bidiStream = await this.transport!.createBidirectionalStream();
+      setSendOrder(bidiStream.writable, 512);
       const writer = bidiStream.writable.getWriter();
 
       // Track the stream for future cancellation

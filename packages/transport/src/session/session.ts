@@ -2069,6 +2069,7 @@ export class Session {
     // Draft 22 PUBLISH_OK carries only EXPIRES; subscription parameters remain
     // those sent in PUBLISH until an accepted REQUEST_UPDATE changes them.
     if (isDraft22(this._draftVersion)) return;
+    sub.currentPriority = parameters?.get(MessageParam.SUBSCRIBER_PRIORITY)?.[0] as Varint ?? varint(128n);
     const fwd = parameters?.get(MessageParam.FORWARD)?.[0];
     // FORWARD omitted from an acceptance defaults to 1. Only omission from a
     // REQUEST_UPDATE preserves the existing state (§9.2.2.8 / d18 §10.2.12).
@@ -2262,6 +2263,7 @@ export class Session {
       return [this.sendControl(errorMsg), ...(validated.replenish ?? [])];
     }
 
+    sub.currentPriority = msg.parameters.get(MessageParam.SUBSCRIBER_PRIORITY)?.[0] as Varint ?? varint(128n);
     // §9.2.2.5: store the subscriber's filter type — the Joining Fetch gate
     // (§9.16.2) needs it. An omitted parameter = unfiltered (NOT Largest
     // Object). Malformed filter bytes were already rejected by the message
@@ -2438,6 +2440,7 @@ export class Session {
   }
 
   private initializePublishPolicy22(sub: SubscriptionStateMachine, parameters: Parameters, properties: TrackProperties | undefined): void {
+    sub.currentPriority = parameters.get(MessageParam.SUBSCRIBER_PRIORITY)?.[0] as Varint ?? varint(128n);
     const filter = parameters.get(MessageParam.SUBSCRIPTION_FILTER)?.[0];
     if (filter instanceof Uint8Array) sub.currentFilter = filter;
     const order = parameters.get(MessageParam.GROUP_ORDER)?.[0];
@@ -3327,6 +3330,7 @@ export class Session {
 
     const sub = SubscriptionStateMachine.createAsPublisher(requestId, namespace, name);
     sub.setOutboundPublishAlias(trackAlias);
+    sub.currentPriority = varint(128n);
     // §5.1 (d18:1948): "A publisher MUST save the Largest Location
     // communicated in ... PUBLISH" — it is this subscription's Joining
     // Location, exactly as with SUBSCRIBE_OK.

@@ -1,3 +1,4 @@
+import { setSendOrder } from '../scheduling.js';
 import { finishPublisherTerminal, type PublisherTerminalOptions } from './publisher-terminal.js';
 /**
  * UniPairTopology — draft-18 control-stream topology.
@@ -283,7 +284,9 @@ export class UniPairTopology {
     // control messages rather than FIN-ing after SETUP.
     let writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
     try {
-      writer = (await transport.createUnidirectionalStream()).getWriter();
+      const writable = await transport.createUnidirectionalStream();
+      setSendOrder(writable, 1024);
+      writer = writable.getWriter();
       if (this.controlOpenInvalid(epoch)) {
         throw new Error('UniPairTopology: control stream opened after session termination');
       }
@@ -464,6 +467,7 @@ export class UniPairTopology {
     }
     const requestId = message.requestId;
     const stream = await transport.createBidirectionalStream();
+    setSendOrder(stream.writable, 512);
     const ctx = new RequestStreamContext(stream, this.codec, message.type, requestId);
     this.contexts.set(requestId, ctx);
     // A peer-initiated REQUEST_UPDATE on this stream (§10.9, PUBLISH only) is
@@ -644,6 +648,7 @@ export class UniPairTopology {
     }
     const requestId = message.requestId;
     const stream = await transport.createBidirectionalStream();
+    setSendOrder(stream.writable, 512);
     const ctx = new ContinuingRequestStreamContext(stream, this.codec, allowedContinuation, (m, kind) => handler(requestId, m, kind));
     this.continuingContexts.set(requestId, ctx);
     // Clean up the context once the stream ends (either outcome).

@@ -16,6 +16,28 @@ re-exports. Use the new names for new integrations; see
 
 ---
 
+## WebTransport scheduling
+
+The adapter owns `sendOrder`: control streams use **1024**, request streams
+use **512** (including draft-16 SUBSCRIBE_NAMESPACE), and subgroup, FETCH,
+Joining FETCH and draft-22 fill streams use **255 − accepted subscriber priority**.
+Assignments happen before the first byte, only when `sendOrder` is present
+(including inherited properties), and replace any provider-assigned value.
+Probe or setter failures are advisory; `sendGroup` is untouched.
+Accepted priority changes re-rank open media streams, including pending FINs,
+before the acknowledgement is written. Refused updates leave ranks unchanged.
+
+A fill's `FillOptions.subscriberPriority` overrides inheritance for that fill only.
+An omitted value is frozen at SUBSCRIBE_OK for an initial fill, or at acceptance
+of its carrying update, including that update's priority even if its ACK is deferred.
+Later subscription updates never re-rank the fill or retain its override.
+
+This implements primary subscriber priority and the control/request bands from
+drafts 14/16/18 §7 and draft 22 §5.1. The SHOULD tie-breaks for publisher priority,
+group order (including draft-22 subscription-first when fill group order differs),
+and subgroup/object ID (including draft-22 fill-first) remain unimplemented.
+Datagram ordering and ordering within the request band are also unimplemented.
+
 ## Quick Start
 
 ### `@openmoq/playa` — Drop-in Player
