@@ -115,7 +115,7 @@ interface WarmMediaRoute {
 interface WarmMediaOwner {
   readonly connection: MoqtConnection;
   readonly requestId: bigint;
-  readonly subscription: { trackAlias: bigint | null };
+  readonly subscription: { trackAlias: bigint | null; subscriberPriority?: number };
   registration: (() => boolean) | null;
   head: WarmStartHead<WarmMediaRoute> | null;
   prefixFetch: MediaFetchInfo | null;
@@ -1413,6 +1413,7 @@ export class MoqtPlayer {
       mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline';
       trackAlias: bigint | null;
       namespace?: readonly string[];
+      subscriberPriority?: number;
     }
   >();
 
@@ -1558,6 +1559,8 @@ export class MoqtPlayer {
     try {
       void owner.connection.joiningFetch({ joiningFetchType: 'absolute', joiningRequestId: owner.requestId,
         joiningStart: start.group, groupOrder: 'ascending', onRequestId: register,
+        ...(owner.subscription.subscriberPriority === undefined ? {}
+          : { subscriberPriority: varint(BigInt(owner.subscription.subscriberPriority)) }),
       }).then(id => register(BigInt(id))).catch(failed);
     } catch { failed(); }
   }
@@ -3551,6 +3554,13 @@ export class MoqtPlayer {
       // neither replace it nor add a historical request outside that intent.
       const prefixStart = !explicitFilter && startGroup !== undefined && targetTrack.isLive === true
         ? { group: startGroup, object: 0n } : undefined;
+      const basePriority = this.config.subscriberPriority ?? DEFAULT_SUBSCRIBER_PRIORITY;
+      const outgoingPriority = (currentVideoRequestId === null ? undefined
+        : this.activeSubscriptions.get(currentVideoRequestId)?.subscriberPriority) ?? basePriority;
+      const audioPriority = this.config.audioSubscriberPriority ?? Math.max(0, basePriority - 2);
+      const targetPriority = (targetTrack.bitrate ?? 0) < (currentTrack.bitrate ?? 0)
+        ? outgoingPriority - 1 > audioPriority ? outgoingPriority - 1 : outgoingPriority
+        : basePriority;
       const fill = prefixStart !== undefined && isDraft22(switchConn.draftVersion);
       let rangeOwner: WarmMediaOwner | null = null;
       // Drafts 14/16 §9.16.2 require LargestObject for Joining FETCH.
@@ -3561,7 +3571,7 @@ export class MoqtPlayer {
       const subscribeOptions = explicitFilter ? buildSubscribeOptions(this.config) : startGroup !== undefined
         ? { subscriptionFilter: legacyJoin ? { type: 'LargestObject' as const }
           : { type: 'AbsoluteStart' as const, startGroup: varint(startGroup), startObject: varint(0n) },
-          ...(fill ? { fill: { filter: { type: 'AbsoluteStart' as const, startGroup, startObject: 0n }, groupOrder: 'ascending' as const } } : {}) }
+          ...(fill ? { fill: { subscriberPriority: targetPriority, filter: { type: 'AbsoluteStart' as const, startGroup, startObject: 0n }, groupOrder: 'ascending' as const } } : {}) }
         : (buildSubscribeOptions(this.config) ?? defaultMediaSubscriptionFilter(targetTrack.isLive === true));
       const register = (id: bigint): void => {
         if (sw.newRequestId !== null) return;
@@ -3574,7 +3584,7 @@ export class MoqtPlayer {
         sw.phase = 'staging';
         this.armVideoSwitchTimeout(sw, SWITCH_STAGING_TIMEOUT_MS, true);
         this.pendingAliasBinds.add(id);
-        this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null, namespace: targetNamespace });
+        this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null, namespace: targetNamespace, subscriberPriority: targetPriority });
         this.pendingMediaSubs.set(id, { trackName, mediaType: 'video', packaging: sw.newTrackPackaging });
         if (prefixStart) rangeOwner = this.armWarmMediaOwner(switchConn, id, prefixStart);
         if (!this.switchIsCurrent(sw)) throw new Error('Switch retired during history preparation');
@@ -3582,7 +3592,7 @@ export class MoqtPlayer {
           subscriptionRequestId: id, trackAlias: null, warmStart: true, warmOwner: rangeOwner }, switchConn);
       };
       const sending = switchConn.subscribe(nsBytes, nameBytes,
-        { ...subscribeOptions, ...this.mediaTerminalOptions(switchConn), onRequestId: (id: bigint) => register(BigInt(id)) } as never,
+        { ...subscribeOptions, subscriberPriority: varint(BigInt(targetPriority)), ...this.mediaTerminalOptions(switchConn), onRequestId: (id: bigint) => register(BigInt(id)) } as never,
       ).then(id => {
         const requestId = BigInt(id);
         if (sw.phase !== 'committed' && !this.switchIsCurrent(sw)) {

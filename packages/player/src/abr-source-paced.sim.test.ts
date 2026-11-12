@@ -191,7 +191,7 @@ class SourcePacedRelay {
           relay.fills.push({ atUs: relay.nowUs, requestId, startGroup: BigInt(opts.fill.filter.startGroup) });
           relay.fetches.push({
             requestId, streamId: requestId * 1_000_000n + 999_999n, sub, nextFrame: fillStart, lastFrame: sub.joiningFrame,
-            releaseAtUs: relay.nowUs + 2 * PATH_DELAY_US, priority: sub.priority, started: false, fill: true,
+            releaseAtUs: relay.nowUs + 2 * PATH_DELAY_US, priority: Number(opts.fill.subscriberPriority ?? sub.priority), started: false, fill: true,
           });
         }
         return varint(requestId);
@@ -422,6 +422,8 @@ const PLAYOUT_DELAY_US = 500_000;
 const REBUFFER_US = 500_000;
 
 interface Scenario {
+  /** Public manual selections on an ample link to exercise ladder boundaries. */
+  readonly selections?: readonly { atUs: number; track: string }[];
   readonly packaging: 'loc' | 'cmaf';
   readonly capacityBps: number;
   readonly durationUs: number;
@@ -483,6 +485,7 @@ interface Run {
   readonly fills: SourcePacedRelay['fills'];
   readonly errors: readonly PlayerError[];
   readonly lastDeliveryUs: ReadonlyMap<string, number>;
+  readonly recoveryReservations: number;
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -520,6 +523,7 @@ async function runScenario(s: Scenario): Promise<Run> {
     onError: null as ((e: Error) => void) | null,
     onStall: null as ((ms: number) => void) | null,
     changeType: vi.fn(() => Promise.resolve()),
+    reserveSwitchRecovery: vi.fn(() => null),
     getBufferAheadUs: vi.fn(() => firstVideoUs === null ? null : s.bufferAheadUs?.(clockUs) ?? null),
     // The highest group handed to the assembler stands in for what MSE committed.
     getCommittedGroupFloor: vi.fn((_mt: string, trackName: string) => assembledGroups.get(trackName)?.at(-1)),
@@ -602,13 +606,18 @@ async function runScenario(s: Scenario): Promise<Run> {
   try {
     for (let t = TICK_US; t <= s.durationUs; t += TICK_US) {
       if (s.closeAtUs !== undefined && !relay.closed && t >= s.closeAtUs) relay.close();
+      for (const selection of s.selections ?? []) {
+        if (selection.atUs > t - TICK_US && selection.atUs <= t) {
+          void player.selectVideoTrack(selection.track).catch(() => {});
+        }
+      }
       relay.advanceTo(t, setClock);
       vi.advanceTimersByTime(TICK_US / 1000);
       player.tick();
       await flushMicrotasks();
     }
     return {
-      errors, lastDeliveryUs,
+      errors, lastDeliveryUs, recoveryReservations: mediaSource.reserveSwitchRecovery.mock.calls.length,
       finalTrack: internals.subscribedTrack('video')?.name,
       switches,
       stallsAtUs,
@@ -735,6 +744,64 @@ describe('ABR under source-paced live delivery', () => {
         expect(healthy.switches).toEqual([]);
         expect(healthy.stallsAtUs).toEqual([]);
       }
+    });
+
+    for (const draft of [14, 16, 18, 22] as const) {
+      for (const packaging of ['loc', 'cmaf'] as const) {
+        it.each([undefined, 64, 200])(`draft ${draft} ${packaging}: a congested downshift lands with priority %s`, async subscriberPriority => {
+          const scenario = { packaging, draft, durationUs: SECONDS(30), bufferAheadUs: LL_BUFFER,
+            playerConfig: subscriberPriority === undefined ? {} : { subscriberPriority } };
+          const healthy = await runScenario({ ...scenario, capacityBps: AMPLE_BPS });
+          expect.soft(healthy.switches).toEqual([]);
+          expect.soft(healthy.stallsAtUs).toEqual([]);
+          expect.soft(healthy.failedSwitches).toEqual([]);
+          expect.soft(healthy.finalTrack).toBe(START);
+          const run = await runScenario({ ...scenario, capacityBps: 1_000_000 });
+          const outgoing = run.subscribes.find(sub => sub.trackName === START)!;
+          const target = switchSubscribes(run)[0]!;
+          const adoption = run.switches[0]?.atUs ?? Infinity;
+          const priority = BigInt((subscriberPriority ?? 128) - 1);
+          expect.soft(target.options.subscriberPriority).toBe(priority);
+          if (draft === 22) {
+            expect.soft(target.options.fill.subscriberPriority).toBe(Number(priority));
+            expect.soft(run.fills.map(fill => fill.requestId)).toContain(target.requestId);
+          } else {
+            const history = run.joiningFetches.filter(fetch => fetch.options.joiningRequestId === target.requestId);
+            expect.soft(history).toHaveLength(1);
+            expect.soft(history[0]?.options.subscriberPriority).toBe(priority);
+          }
+          // A declined recovery reservation must never be hidden by a permissive mock.
+          expect.soft(run.recoveryReservations).toBe(0);
+          expect.soft(target.trackName).toBe('v800');
+          expect.soft(run.switches.map(sw => [sw.from, sw.to])).toEqual([[START, 'v800']]);
+          expect.soft(run.failedSwitches).toEqual([]);
+          expect.soft(run.finalTrack).toBe('v800');
+          expect.soft(run.updates.filter(u => u.requestId === outgoing.requestId
+            && u.atUs >= target.atUs && u.atUs < adoption)).toEqual([]);
+          expect.soft(run.updates.filter(u => u.atUs >= adoption)).toEqual([]);
+          expect.soft(run.errors.filter(error => error.severity === 'fatal')).toEqual([]);
+          expect.soft(run.lastDeliveryUs.get('v800') ?? 0).toBeGreaterThan(SECONDS(29));
+        });
+      }
+    }
+
+    it.each([
+      { subscriberPriority: 0, expected: [0, 0, 0, 0, 0] },
+      { subscriberPriority: 1, expected: [1, 1, 1, 1, 1] },
+      { subscriberPriority: 64, expected: [64, 63, 63, 64, 63] },
+      { subscriberPriority: 64, audioSubscriberPriority: 63, expected: [64, 64, 64, 64, 64] },
+      { subscriberPriority: 64, audioSubscriberPriority: 255, expected: [64, 64, 64, 64, 64] },
+    ])('priority boundaries and up-switch reset: %o', async ({ expected, ...playerConfig }) => {
+      const run = await runScenario({ packaging: 'loc', draft: 22, capacityBps: AMPLE_BPS,
+        durationUs: SECONDS(25), playerConfig, selections: [
+          { atUs: SECONDS(4), track: 'v800' }, { atUs: SECONDS(9), track: 'v400' },
+          { atUs: SECONDS(14), track: START }, { atUs: SECONDS(19), track: 'v800' },
+        ] });
+      expect(run.failedSwitches).toEqual([]);
+      expect(run.switches.map(sw => sw.to)).toEqual(['v800', 'v400', START, 'v800']);
+      expect(run.subscribes.filter(sub => sub.trackName.startsWith('v'))
+        .map(sub => Number(sub.options?.subscriberPriority ?? 128))).toEqual(expected);
+      expect(run.updates).toEqual([]);
     });
 
     it('after the relay closes the session, ABR stops requesting switches', async () => {

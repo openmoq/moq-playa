@@ -280,6 +280,10 @@ export interface PlaybackTuningConfig {
   /**
    * Subscriber priority for media subscriptions. Range 0-255, lower = higher priority.
    * Default: omitted (publisher uses 128).
+   * Down-switch targets and their history use one step more urgent than the outgoing
+   * priority, only when still less urgent than audio; otherwise they tie.
+   * No outgoing or post-adoption update is sent. Consecutive down-switches
+   * tie once the audio boundary is reached; an up-switch restores this value.
    * @see draft-ietf-moq-transport-16 §9.2.2.3 (SUBSCRIBER_PRIORITY)
    */
   readonly subscriberPriority?: number;
