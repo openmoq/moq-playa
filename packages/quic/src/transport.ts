@@ -175,6 +175,10 @@ export class NodeQuicTransport implements MoqtQuicTransport {
     return wrapBidirectional(stream);
   }
 
+  createStreamError(code: number, cause?: unknown): Error {
+    return Object.assign(new Error('Stream cancelled', { cause }), { streamErrorCode: code });
+  }
+
   async createUnidirectionalStream(): Promise<WritableStream<Uint8Array>> {
     const stream = await this.session.createUnidirectionalStream();
     if (stream.direction !== 'uni') {

@@ -90,6 +90,12 @@ export interface WebTransportLike {
    */
   createUnidirectionalStream?(): Promise<WritableStream<Uint8Array>>;
 
+  /** Build a binding-native stream reset/STOP_SENDING reason, retaining `cause`.
+   * Called with this transport as receiver. Coded termination operations reject
+   * before changing ownership when this optional hook is absent or throws.
+   */
+  createStreamError?(code: number, cause?: unknown): Error;
+
   /**
    * Reset a send stream created by this transport. Fulfillment must prove that
    * sending was aborted; rejection or non-settlement leaves the reset unproven.

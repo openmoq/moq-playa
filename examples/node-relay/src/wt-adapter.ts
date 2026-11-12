@@ -79,6 +79,7 @@ export function nodeSessionToWebTransportLike(
       session.createBidirectionalStream() as Promise<WebTransportBidirectionalStream>,
     createUnidirectionalStream: () =>
       session.createUnidirectionalStream() as Promise<WritableStream<Uint8Array>>,
+    createStreamError: (code, cause) => Object.assign(new Error('Stream cancelled', { cause }), { code }),
     resetSendStream: resetWebTransportSendStream,
     close: (info?: WebTransportCloseInfo) => session.close(info),
   } satisfies WebTransportLike;

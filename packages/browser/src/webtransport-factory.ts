@@ -173,6 +173,18 @@ export function createWebTransport(
       get handshakeRttMs() { return handshakeRttMs; },
       createBidirectionalStream: () => wt.createBidirectionalStream(),
       createUnidirectionalStream: () => (transport as any).createUnidirectionalStream(),
+      createStreamError(code: number, cause?: unknown): Error {
+        const Constructor = (globalThis as unknown as {
+          WebTransportError?: new (message: string, options: { source: string; streamErrorCode: number }) => Error & { source: string; streamErrorCode: number };
+        }).WebTransportError;
+        if (!Constructor) throw new Error('WebTransportError is unavailable');
+        const reason = new Constructor('Stream cancelled', { source: 'stream', streamErrorCode: code });
+        if (!(reason instanceof Constructor) || reason.source !== 'stream' || reason.streamErrorCode !== code) {
+          throw new Error('WebTransportError did not retain the stream code');
+        }
+        Object.defineProperty(reason, 'cause', { value: cause, configurable: true });
+        return reason;
+      },
       async resetSendStream(
         writer: WritableStreamDefaultWriter<Uint8Array>,
         reason: unknown,

@@ -112,3 +112,16 @@ describe('Node WebTransport pending-FIN reset binding', () => {
     expect(close).toHaveBeenCalledExactlyOnceWith(info);
   });
 });
+
+it('constructs a Node-provider code reason once without changing pending-FIN identity', async () => {
+  const { binding } = fixture();
+  const cause = new Error('missing history');
+  const reason = binding.createStreamError!(6, cause);
+  expect(reason).toMatchObject({ code: 6, cause });
+  const fin = deferred();
+  const abort = vi.fn(async (value: unknown) => { throw value; });
+  const result = binding.resetSendStream!(writer(abort), reason, fin.promise);
+  fin.reject(reason);
+  await expect(result).resolves.toBeUndefined();
+  expect(abort).toHaveBeenCalledExactlyOnceWith(reason);
+});
