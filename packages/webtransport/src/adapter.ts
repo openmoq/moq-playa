@@ -295,6 +295,8 @@ function requestGoawayNotice(requestId: bigint, msg: Goaway): GoawayNotice {
  * track's data-plane lifecycle (delivered via the bound Track Alias), then
  * accept/reject via the connection.
  */
+export interface MalformedSourceCancellationResult { readonly status: 'cancel-issued' | 'already-terminal' }
+
 export interface MalformedPublicationTerminationResult { readonly status: 'done-written' | 'already-terminal' }
 
 export interface IncomingPublish {
@@ -1480,6 +1482,7 @@ export class MoqtConnection {
    */
   private terminatedAliases = new Map<bigint, {
     remaining: bigint | null;
+    reason?: Error;
     /** Cancels the (possibly chunked) guard-clear timer — see {@link armGuardTimer}. */
     cancelTimer: () => void;
     /**
@@ -3182,6 +3185,50 @@ export class MoqtConnection {
     this.sharedAliasSubs.set(alias, group);
   }
 
+  private readonly publications = new WeakSet<IncomingPublish>();
+  private readonly cancelledPublications = new WeakSet<SubscriptionStateMachine>();
+  private readonly sourceCancellations = new WeakMap<IncomingPublish, Promise<MalformedSourceCancellationResult>>();
+
+  cancelMalformedIncomingPublish(publication: IncomingPublish): Promise<MalformedSourceCancellationResult> {
+    if (!this.publications.has(publication)) return Promise.reject(new Error('Unknown incoming publication handle'));
+    const pending = this.sourceCancellations.get(publication);
+    if (pending) return pending;
+    const id = publication.requestId, alias = publication.trackAlias;
+    const owner = this.session.getIncomingSubscription(id);
+    if (!owner) return Promise.resolve({ status: 'already-terminal' });
+    if (!isRequestStreamDraft(this.session.draftVersion) || owner.isPending) return Promise.reject(new Error('Publication is not accepted'));
+    let reason: Error;
+    try {
+      if (!this.transport?.createStreamError) throw new Error('createStreamError is unavailable');
+      reason = this.transport.createStreamError(1, new Error('Malformed source'));
+    } catch (error) { return Promise.reject(error); }
+    this.cancelledPublications.add(owner);
+    const ctx = this.inboundRequestContexts.get(id)!;
+    this.inboundRequestContexts.delete(id);
+    const exclusive = !this.aliasHasOtherSubscriber(alias, id);
+    if (exclusive) this.armTerminatedAlias(alias, null, false);
+    this.session.handleInboundRequestClosed(id);
+    this.removePublishAliasMember(alias, id);
+    const readers: Promise<boolean>[] = [];
+    if (exclusive) {
+      this.terminatedAliases.get(alias)!.reason = reason;
+      for (const [sid, a] of this.incomingSubgroupAliases) {
+        const reader = this.dataStreamReaders.get(sid);
+        if (a === alias && reader) readers.push(this.discardLocalReader(sid, reader, reason, true).then(() => true, () => false));
+      }
+    }
+    const operation = Promise.all([
+      this.allFulfilledWithin([ctx.abort(reason, this.transport?.resetSendStream?.bind(this.transport)).then(() => true, () => false)], MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS),
+      this.allFulfilledWithin(readers, MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS),
+    ]).then(([request, data]) => {
+      if (!request) this.closeSessionInternalError('Incoming PUBLISH cancellation could not be proven');
+      if (!request || !data) throw new Error('Incoming PUBLISH cancellation could not be proven');
+      return { status: 'cancel-issued' } as const;
+    }).finally(() => { this.sourceCancellations.delete(publication); });
+    this.sourceCancellations.set(publication, operation);
+    return operation;
+  }
+
   private readonly publishLifetimes = new Map<bigint, { owner: SubscriptionStateMachine; finish(): void }>();
 
   private publicationLifetime(requestId: bigint): Pick<IncomingPublish, 'largestLocation' | 'closed'> {
@@ -3208,6 +3255,7 @@ export class MoqtConnection {
   }
 
   private bindPublishAlias(pub: IncomingPublish): void {
+    this.publications.add(pub);
     const members = isDraft22(this.session.draftVersion) ? this.publishAliasMaps.get(pub.trackAlias) ?? [] : [];
     members.push(pub);
     this.publishAliasMaps.set(pub.trackAlias, members);
@@ -5156,6 +5204,7 @@ export class MoqtConnection {
         const subSub = this.paramTimeoutMs(options?.parameters, 0x06n);
         const eff = this.combineDeliveryTimeoutMs(pub.obj, pub.sub, subObj, subSub);
         commitTimeout = () => {
+          if (this.session.getIncomingSubscription(requestId) !== incoming) return;
           if (eff > 0) this.aliasDeliveryTimeoutMs.set(trackAlias, eff);
           else this.aliasDeliveryTimeoutMs.delete(trackAlias);
         };
@@ -5179,10 +5228,11 @@ export class MoqtConnection {
     try {
       handled = await this.writeInboundRequestResponse(requestId, actions);
     } catch (err) {
-      await this.rollbackFailedAcceptance(requestId, trackAlias, isPublishInitiated);
+      if (this.session.getIncomingSubscription(requestId) === incoming) await this.rollbackFailedAcceptance(requestId, trackAlias, isPublishInitiated);
       throw err instanceof Error ? err : new Error(String(err));
     }
     if (handled) {
+      if (incoming && this.cancelledPublications.has(incoming)) throw new Error('Publication cancelled during acceptance');
       commitTimeout?.(); // PUBLISH_OK reached the peer — now commit the combined timeout
       await this.flushDeferredUpdateResponses(requestId);
       await this.settleParkedJoins(requestId, true);
@@ -8322,7 +8372,7 @@ export class MoqtConnection {
         const subgroupAlias = header.trackAlias as bigint;
         const discardReason = this.admitSubscriberStream(subgroupAlias);
         if (discardReason) {
-          await this.discardLocalReader(streamId, reader, new Error(discardReason));
+          await this.discardLocalReader(streamId, reader, this.terminatedAliases.get(subgroupAlias)?.reason ?? new Error(discardReason));
           this.onStreamClosed?.(streamId, undefined, 'local-discard');
           return;
         }
@@ -8562,13 +8612,15 @@ export class MoqtConnection {
     streamId: bigint,
     reader: ReadableStreamDefaultReader<Uint8Array>,
     reason: Error,
+    prove = false,
   ): Promise<void> {
     this.locallyDiscardedReaders.add(reader);
     if (this.dataStreamReaders.get(streamId) === reader) this.dataStreamReaders.delete(streamId);
     this.incomingSubgroupAliases.delete(streamId);
     try {
       await reader.cancel(reason);
-    } catch {
+    } catch (error) {
+      if (prove) throw error;
       // Already closed or failed. A backend may throw SYNCHRONOUSLY here as
       // well as reject; neither may escape into terminal processing or out of
       // a public teardown method.
