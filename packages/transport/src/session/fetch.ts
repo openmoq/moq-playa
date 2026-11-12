@@ -35,6 +35,8 @@ export interface JoiningFetchState {
  * Manages the state machine for a single fetch request.
  */
 export class FetchStateMachine {
+  /** Last accepted requester priority; omitted priorities default to 128. */
+  currentPriority: bigint = 128n;
   private _state: FetchStateValue = FetchState.PENDING;
   private _errorCode: bigint | undefined;
   private _errorReason: string | undefined;

@@ -2,7 +2,7 @@ import { it, expect } from 'vitest';
 import { varint } from '@openmoq/transport';
 import { connectedPair, ns, nm } from './testkit/pair.js';
 import { flush } from './testkit/loopback.js';
-for (const kind of ['subscription'] as const) it(`d16 unencodable ${kind} provider head refuses update without session loss`,async()=>{
+for (const kind of ['subscription','fetch'] as const) it(`d16 unencodable ${kind} provider head refuses update without session loss`,async()=>{
  const f=await connectedPair(16); const messages:string[]=[];
  f.client.onMessage=m=>{messages.push(m.type)};
  f.server.onSubscribe=id=>{void f.server.acceptSubscribe(id,41n)};

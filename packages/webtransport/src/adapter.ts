@@ -1675,7 +1675,12 @@ export class MoqtConnection {
     return { ...snapshot, authTokens };
   }
 
+  private readonly fetchUpdateTargets = new WeakMap<object, { namespace: Uint8Array[]; trackName: Uint8Array }>();
+
   private authorizationTarget(requestId: bigint): { owner: object; namespace: Uint8Array[]; trackName?: Uint8Array } {
+    const fetch = this.session.getFetch(requestId);
+    const track = fetch && this.fetchUpdateTargets.get(fetch);
+    if (fetch && !fetch.isCompleted && track) return { owner: fetch, ...track };
     const outbound = this.session.getSubscription(requestId);
     const inbound = this.session.getIncomingSubscription(requestId);
     const sub = outbound ?? (inbound?.isPublishInitiated ? inbound : undefined);
@@ -4683,6 +4688,7 @@ export class MoqtConnection {
     const { receiver, ...ownedOptions } = options;
     const { sessionOptions, onRequestId } = splitOwnership(ownedOptions);
     const { requestId, actions } = this.session.fetch(namespace, name, sessionOptions as FetchOptions);
+    this.fetchUpdateTargets.set(this.session.getFetch(requestId)!, { namespace: namespace.map(x => x.slice()), trackName: name.slice() });
     return this.startFetchRequest(requestId, actions, options.groupOrder, onRequestId, receiver);
   }
 
@@ -4752,6 +4758,8 @@ export class MoqtConnection {
     const { receiver, ...ownedOptions } = options;
     const { sessionOptions, onRequestId } = splitOwnership(ownedOptions);
     const { requestId, actions } = this.session.joiningFetch(sessionOptions as JoiningFetchOptions);
+    const target = this.authorizationTarget(options.joiningRequestId);
+    this.fetchUpdateTargets.set(this.session.getFetch(requestId)!, { namespace: target.namespace.map(x => x.slice()), trackName: target.trackName!.slice() });
     return this.startFetchRequest(requestId, actions, options.groupOrder, onRequestId, receiver);
   }
 
@@ -4775,6 +4783,10 @@ export class MoqtConnection {
   /** Publisher-side: supply the CURRENT Largest Location per subscription —
    *  required on draft-18 so a Forward 0→1 REQUEST_UPDATE_OK can communicate
    *  (and the session save) the new Joining Location (§5.1). */
+  setFetchLargestLocationProvider(provider: (fetchRequestId: bigint) => { group: bigint; object: bigint } | null): void {
+    this.session.setFetchLargestLocationProvider(provider);
+  }
+
   setLargestLocationProvider(provider: (subscriptionRequestId: bigint) => { group: bigint; object: bigint } | null): void {
     this.session.setLargestLocationProvider(provider);
   }
@@ -5410,6 +5422,28 @@ export class MoqtConnection {
   }
 
   /** Detach (synchronously) + abort every open FETCH response stream for `requestId`. */
+  private async failFetchUpdate(requestId: bigint): Promise<void> {
+    // d18 §10.9.1 / d22 §9.5.1: failed FETCH updates reset their data stream.
+    this.session.handleInboundRequestClosed(requestId);
+    this.inboundFetchGroupOrder.delete(requestId);
+    const resets: Promise<boolean>[] = [];
+    const opening = this.openingFetches.get(requestId);
+    if (opening) resets.push(opening.then(() => true, () => true));
+    for (const [id, state] of this.fetchOutgoingStreams) {
+      if (state.requestId !== requestId) continue;
+      this.removeOutgoingFetchStream(id);
+      const reason = new Error('FETCH update failed');
+      try {
+        resets.push((this.transport?.resetSendStream
+          ? this.transport.resetSendStream(state.writer, reason, state.closing)
+          : state.writer.abort(reason)).then(() => true, () => false));
+      } catch { resets.push(Promise.resolve(false)); }
+    }
+    if (!await this.allFulfilledWithin(resets, MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS)) {
+      this.closeSessionInternalError('Failed FETCH update could not reset its data stream');
+    }
+  }
+
   private async abortFetchStreamsForRequest(requestId: bigint, reason: string): Promise<void> {
     for (const writer of this.detachFetchStreamsForRequest(requestId)) {
       try { await writer.abort(reason); } catch { /* already torn down */ }
@@ -6383,7 +6417,17 @@ export class MoqtConnection {
    * @param requestId The Request ID of the admitted inbound FETCH.
    * @see draft-ietf-moq-transport-18 §11.4.4
    */
+  private readonly openingFetches = new Map<bigint, Promise<unknown>>();
+
   async openFetchStream(requestId: bigint): Promise<bigint> {
+    if (this.openingFetches.has(requestId)) throw new Error('FETCH already has its one response stream');
+    const opening = this.openFetchResponseStream(requestId);
+    this.openingFetches.set(requestId, opening);
+    try { return await opening; }
+    finally { this.openingFetches.delete(requestId); }
+  }
+
+  private async openFetchResponseStream(requestId: bigint): Promise<bigint> {
     if (!isRequestStreamDraft(this.session.draftVersion)) {
       throw new MoqtConnectionError('openFetchStream is draft-18 only', { errorSource: 'data' });
     }
@@ -6594,7 +6638,9 @@ export class MoqtConnection {
       state.closing = fin;
       return fin;
     }
-    try { await state.writer.close(); } catch { /* already closed */ }
+    state.closing = state.writer.close();
+    try { await state.closing; }
+    catch (error) { if (!this.fetchOutgoingStreams.has(streamId)) throw error; }
     this.fetchOutgoingStreams.delete(streamId);
     // §10.13: the publisher finished serving — RECLAIM the accepted incoming fetch in
     // the Session so serving-side state is bounded. Do NOT release the one-stream
@@ -6965,6 +7011,7 @@ export class MoqtConnection {
           if (message.type === 'REQUEST_UPDATE') {
             const refusal = actions.find((a): a is SendControlAction => a.type === 'send_control' && a.message.type === 'REQUEST_ERROR');
             const target = message.existingRequestId as bigint;
+            if (refusal && this.session.getIncomingFetch(target)) await this.failFetchUpdate(target);
             if (refusal && (this.session.getIncomingSubscription(target) || this.session.getOutgoingPublish(target))) {
               await this.completeFailedSubscriptionUpdate(target, 'subscription update failed');
             }
@@ -7648,6 +7695,14 @@ export class MoqtConnection {
         queued.push(send.message);
         this.deferredUpdateResponses.set(originalId, queued);
         await this.executeActions(actions.filter((a) => a.type !== 'send_control'));
+        return;
+      }
+      if (send?.message.type === 'REQUEST_ERROR' && ctx.openerKind === 'fetch') {
+        const stopped = this.failFetchUpdate(originalId);
+        const written = await this.allFulfilledWithin([ctx.writeMessage(send.message).then(() => true, () => false)], MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS);
+        if (!written) { this.closeSessionInternalError('Failed FETCH update response could not be written'); return; }
+        await stopped;
+        if (!this._terminated) { this.inboundRequestContexts.delete(originalId); await ctx.terminate(); }
         return;
       }
       if (send) await ctx.writeMessage(send.message);

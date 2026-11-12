@@ -2,7 +2,7 @@ import { it, expect } from 'vitest';
 import { varint } from '@openmoq/transport';
 import { connectedPair, ns, nm } from './testkit/pair.js';
 import { flush } from './testkit/loopback.js';
-for (const draft of [16,18,22] as const) for (const kind of ['subscription'] as const) it(`d${draft} long ordinary ${kind} provider exception refuses update without session loss`,async()=>{
+for (const draft of [16,18,22] as const) for (const kind of ['subscription','fetch'] as const) it(`d${draft} long ordinary ${kind} provider exception refuses update without session loss`,async()=>{
  const f=await connectedPair(draft); const messages:string[]=[];
  f.client.onMessage=m=>{messages.push(m.type)};
  f.server.onSubscribe=id=>{void f.server.acceptSubscribe(id,41n)};
