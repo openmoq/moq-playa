@@ -2,8 +2,8 @@ import type { IncomingPublish, MoqtConnection } from '@openmoq/webtransport';
 import type { Relay } from './relay.js';
 
 /** Payload-only test source; it remains live until the fixture is discarded. */
-export function publicationMetadata(): Pick<IncomingPublish, 'largestLocation' | 'closed'> {
-  return { largestLocation: null, closed: new Promise(() => {}) };
+export function publicationMetadata(): Pick<IncomingPublish, 'largestLocation' | 'closed' | 'initialTrackProperties'> {
+  return { initialTrackProperties: new Map(), largestLocation: null, closed: new Promise(() => {}) };
 }
 export async function acceptTestPublication(relay: Relay, publish: IncomingPublish): Promise<void> {
   const owner = { isTerminated: false, isPublishInitiated: true };

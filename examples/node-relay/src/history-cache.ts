@@ -7,6 +7,7 @@ export interface CachedObject {
   readonly subgroupId: bigint;
   readonly objectId: bigint;
   readonly payload: Uint8Array;
+  readonly publisherPriority: number;
   readonly extensions: Uint8Array | undefined;
 }
 export interface HistoryLimits { maxGroups: number; maxObjects: number; maxBytes: number }
@@ -50,7 +51,7 @@ export class HistoryCache {
   admit(object: CachedObject): 'added' | 'duplicate' | 'malformed' {
     const group = this.groups.get(object.groupId)!;
     const previous = group.objects.get(object.objectId);
-    if (previous) return previous.subgroupId !== object.subgroupId || previous.payload.length !== object.payload.length
+    if (previous) return previous.subgroupId !== object.subgroupId || previous.publisherPriority !== object.publisherPriority || previous.payload.length !== object.payload.length
       || previous.payload.some((byte, index) => byte !== object.payload[index]) ? 'malformed' : 'duplicate';
     const subgroupEnd = group.subgroupEnds.get(object.subgroupId);
     if ((group.final !== undefined && object.objectId > group.final)

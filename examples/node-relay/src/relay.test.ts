@@ -92,6 +92,7 @@ function incomingPublish(
     trackAlias: alias,
     // This payload-only mock stays live for its test; actual SDK retirement is
     // exercised by receive-head.test.ts rather than a fabricated closed event.
+    initialTrackProperties: new Map(),
     largestLocation: null,
     closed: new Promise(() => {}),
     onObject: null,
@@ -318,7 +319,7 @@ describe('Relay subgroup lifecycle', () => {
         const requestId = nextRequest++;
         owners.set(requestId, { isTerminated: false, trackNamespace: namespace, trackName: name, trackAlias: alias });
         const p: IncomingPublish = { requestId, trackNamespace: namespace, trackName: name,
-          trackAlias: alias, largestLocation: null, closed: new Promise(() => {}),
+          trackAlias: alias, initialTrackProperties: new Map(), largestLocation: null, closed: new Promise(() => {}),
           onObject: null, onSubgroupClosed: null };
         publications.set(alias, p);
         await acceptPublisher(relay, p);

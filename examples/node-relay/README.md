@@ -121,13 +121,17 @@ generate a CMAF fixture from an MP4, publish it (optionally looped) into
   example still runs on one Node event loop; sustained CPU saturation requires more
   capacity or a production relay. The namespace smoke measures a synthetic local
   workload, not browser playback quality or production capacity.
+- **Publisher properties** — live delivery and FETCH preserve the header priority,
+  falling back to DEFAULT_PUBLISHER_PRIORITY and then 128. PUBLISH requests with
+  MAX_CACHE_DURATION (including zero), or unavailable initial property metadata,
+  are refused with NOT_SUPPORTED before affecting the track or pending FETCHes.
 - **Bounded in-memory history** — `historyCache` configures positive safe-integer
   `maxGroups` (default 1), `maxObjects` (256) and `maxBytes` (4 MiB, including
   properties). The lowest Group is evicted first. First copies are kept, and
   history survives a publisher's completion or disconnect. Publishers of one
   track contribute to the same history. `maxActiveHistoryRequests` defaults to 32;
   excess requests are refused. No upstream gap recovery, DVR or persistence.
-- **Malformed tracks (drafts 18/22)** — conflicting payload/Subgroup duplicates,
+- **Malformed tracks (drafts 18/22)** — conflicting payload, priority or Subgroup duplicates,
   Objects beyond known subgroup or Group ends, and contradictory Group completion
   retire the offending publication. Downstream subscriptions and active FETCHes
   terminate, queued delivery stops, and the track's history is cleared. Sibling

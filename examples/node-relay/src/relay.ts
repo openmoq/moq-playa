@@ -27,7 +27,7 @@
  * All forwarding uses the public MoqtConnection API — no internals.
  */
 import type { MoqtConnection, IncomingPublish } from '@openmoq/webtransport';
-import { windowContains, MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@openmoq/transport';
+import { decodeTrackProperties18, windowContains, MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@openmoq/transport';
 import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, te, nsStr, hex } from './demo.js';
 import { SubgroupForwarder, type ForwardLimits } from './subgroup-forwarder.js';
 import { isRequestStreamDraft, decodeSubscriptionFilter, resolveFillWindow, MAX_VI64 } from '@openmoq/transport';
@@ -51,6 +51,7 @@ interface ForwardObjectFields {
   readonly subgroupId: bigint;
   readonly objectId: bigint;
   readonly payload: Uint8Array;
+  readonly publisherPriority: number;
   readonly extensions: Uint8Array | undefined;
 }
 
@@ -249,6 +250,13 @@ export class Relay {
       const fin = conn.onSubgroupFin; conn.onSubgroupFin = (id, header) => { this.finStreams.set(header, id); fin?.(id, header); };
     }
     try {
+      let properties: IncomingPublish['initialTrackProperties'];
+      try { properties = publish.initialTrackProperties; } catch { /* unavailable provenance */ }
+      for (const container of properties?.get(0x0bn) ?? []) if (container instanceof Uint8Array) properties = new Map([...decodeTrackProperties18(container, 0).properties, ...properties!]);
+      if (!properties || properties.has(0x04n)) {
+        await conn.rejectSubscribe(publish.requestId, 0x3n, 'cache lifetime unsupported or unavailable'); return;
+      }
+      const defaultPriority = Number(properties.get(0x0en)?.[0] ?? 128n);
       if (!this.isRegisteredTrack(publish.trackNamespace, publish.trackName)) {
         log(`PUBLISH ${nsStr(publish.trackNamespace)}/${td(publish.trackName)} — not registered; rejecting`);
         await conn.rejectSubscribe(publish.requestId, RequestError18.DOES_NOT_EXIST, 'unknown track');
@@ -282,6 +290,7 @@ export class Relay {
           track.largest = { groupId: obj.groupId, objectId: obj.objectId };
         }
         const extensions = obj.properties ?? obj.extensions;
+        const publisherPriority = obj.publisherPriority ?? defaultPriority;
         const firstObject = obj.isFirstObjectInSubgroup === true;
         const endOfGroup = obj.subgroupContainsEndOfGroup === true;
         const added = track.cache.admit({
@@ -291,6 +300,7 @@ export class Relay {
           subgroupId: obj.subgroupId,
           objectId: obj.objectId,
           payload: obj.payload,
+          publisherPriority,
           extensions,
         });
         if (added === 'malformed') { this.retireMalformed(track, conn, publish); return; }
@@ -301,7 +311,7 @@ export class Relay {
         const { groupId, subgroupId, objectId, payload } = obj;
         for (const sub of [...track.subscribers]) {
           this.enqueueObject(track, sub, {
-            groupId, subgroupId, objectId, payload, extensions, firstObject, endOfGroup,
+            groupId, subgroupId, objectId, payload, extensions, firstObject, endOfGroup, publisherPriority,
           });
         }
       };
@@ -366,7 +376,7 @@ export class Relay {
       const sid = await conn.openFetchStream(requestId);
       for (const row of rows) {
         if (response.malformed) return;
-        await conn.sendFetchObject(sid, { ...row, publisherPriority: 128 });
+        await conn.sendFetchObject(sid, row);
       }
       await conn.closeFetchStream(sid);
     } catch (err) {
@@ -502,7 +512,7 @@ async function forwardObject(
     if (subgroup === undefined) {
       const hasExtensions = extensions !== undefined;
       const streamId = await sub.conn.openSubgroup(sub.alias, groupId, subgroupId, {
-        publisherPriority: 128,
+        publisherPriority: fields.publisherPriority,
         firstObject,
         hasExtensions,
         ...(endOfGroup ? { endOfGroup: true } : {}),

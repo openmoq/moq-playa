@@ -133,7 +133,7 @@ async function handleSession(
     conn.onMessage = (m) => log('onMessage:', m.type);
 
     if (relay) {
-      // Relay mode: forward objects from one publisher to all subscribers.
+      // Relay mode: forward new objects from accepted publishers to subscribers.
       conn.onSubscribe = (requestId, namespace, trackName) => {
         void relay.handleSubscribe(conn, requestId, namespace, trackName);
       };
