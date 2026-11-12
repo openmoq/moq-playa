@@ -6781,7 +6781,7 @@ export class MoqtConnection {
           // down and late streams are bounded/discarded (parity with draft-18).
           // Capture the alias BEFORE the session reclaims the subscription.
           const doneAlias = message.type === 'PUBLISH_DONE'
-            ? this.session.getSubscription((message as { requestId: bigint }).requestId)?.trackAlias
+            ? (this.session.getSubscription((message as { requestId: bigint }).requestId) ?? this.session.getIncomingSubscription((message as { requestId: bigint }).requestId))?.trackAlias
             : undefined;
           // Intercept track subscription responses before onMessage.
           // Session still processes them (alias mapping, state machine).

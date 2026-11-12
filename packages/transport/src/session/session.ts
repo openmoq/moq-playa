@@ -2117,6 +2117,9 @@ export class Session {
   }
 
   private handlePublishDone(msg: PublishDone): SessionOutboundAction[] {
+    if (this._draftVersion === 16 && this.incomingSubscriptions.get(msg.requestId)?.isPublishInitiated) {
+      return this.handleInboundPublishDone(msg.requestId);
+    }
     // §9.19: "The publisher does not send PUBLISH_DONE for this request"
     if (this.pendingTrackStatuses.has(msg.requestId as bigint)) {
       return this.closeWithError(
@@ -2926,6 +2929,8 @@ export class Session {
         return failClosed('the Largest Location provider returned an invalid value');
       }
     }
+    const priority = msg.parameters.get(MessageParam.SUBSCRIBER_PRIORITY)?.[0];
+    if (sub && typeof priority === 'bigint') sub.currentPriority = varint(priority);
     // Apply FORWARD parameter if present
     if (forwardValues && forwardValues.length > 0 && sub) {
       const forwardVal = forwardValues[0];
@@ -3452,6 +3457,9 @@ export class Session {
       return this.requestUpdatePrefix(existingRequestId, options);
     }
 
+    if (this._draftVersion === 16 && this.incomingSubscriptions.get(existingRequestId)?.isPublishInitiated) {
+      return this.updateIncomingSubscription(existingRequestId, options);
+    }
     const sub = this.subscriptions.get(existingRequestId as bigint);
     if (!sub) {
       throw new SessionError(
@@ -5402,12 +5410,16 @@ export class Session {
    */
   handleInboundPublishDone(requestId: bigint): SessionOutboundAction[] {
     const sub = this.incomingSubscriptions.get(requestId as bigint);
-    if (!sub) {
+    if (!sub || !sub.isPublishInitiated) {
       return this.closeWithError(
         SessionErrorCode.INVALID_REQUEST_ID,
         `Unknown PUBLISH ${requestId} for PUBLISH_DONE`,
       );
     }
+    const pending = sub.isPending;
+    if (pending) sub.sendRequestError(0n, 'Publication ended before acceptance');
+    else sub.sendPublishDone(varint(0n), 'Publication ended');
+    this.dropPendingUpdatesFor(requestId);
     // Release the publisher-chosen Track Alias from the session registry so a
     // later PUBLISH may reuse it (the I/O layer keeps its own bounded tombstone
     // to discard late streams — that is a separate, adapter-level concern).
@@ -5416,7 +5428,9 @@ export class Session {
     this.incomingJoiningLocations.delete(requestId as bigint);
     // §5.1: PUBLISH ended before acceptance — discard any staged collision.
     this.pendingCollisions.delete(requestId as bigint);
-    return [];
+    // d16 §5.1: a pending PUBLISH still requires exactly one response.
+    return pending && this._draftVersion === 16
+      ? [this.sendControl({ type: 'REQUEST_ERROR', requestId, errorCode: varint(0n), retryInterval: varint(0n), errorReason: 'Publication ended before acceptance' })] : [];
   }
 
   /**
@@ -5437,6 +5451,10 @@ export class Session {
         `Unknown incoming subscription ${existingRequestId} for REQUEST_UPDATE`,
         'INVALID_STATE',
       );
+    }
+    if (!sub.isPublishInitiated || options.trackNamespacePrefix !== undefined
+        || (this._draftVersion === 16 && options.subgroupDeliveryTimeout !== undefined)) {
+      throw new SessionError('Invalid incoming publication update', 'INVALID_STATE');
     }
     if (sub.state !== 'established') {
       throw new SessionError(
