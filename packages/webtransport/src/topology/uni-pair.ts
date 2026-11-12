@@ -1097,11 +1097,8 @@ class RequestStreamContext {
                 'PUBLISH_DONE without a preceding SUBSCRIBE_OK',
               );
             }
-            if (this.queue.length > 0) {
-              throw new ProtocolViolationError(
-                'PUBLISH_DONE while update responses are still outstanding',
-              );
-            }
+            // d18 §10.9.1 / d22 §9.5.1: DONE can cross unanswered updates.
+            for (const pending of this.queue.splice(0)) pending.reject(new RequestCancelledError(StreamResetCode18.CANCELLED));
             this.terminalSeen = true;
             await this.onPeerRequest?.(message);
             if (!this.writerFinished) {

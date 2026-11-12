@@ -114,6 +114,7 @@ export class InboundRequestStreamContext {
    *  message is then a PROTOCOL_VIOLATION. */
   seal(): void {
     this.sealed = true;
+    this.rejectPendingUpdates(new Error('Publication ended'));
   }
 
   /** Send a LOCAL REQUEST_UPDATE; its REQUEST_OK / REQUEST_ERROR resolves the

@@ -2808,8 +2808,8 @@ export class MoqtConnection {
       const discard = !aliasDraining && doneAlias !== undefined
         ? this.applyTerminalStreamCount(doneAlias, BigInt(streamCount), originalRequestId)
         : Promise.resolve();
-      this.onMessage?.(stampedDone);
       await this.executeActions(this.session.handleControlMessage(stampedDone));
+      this.onMessage?.(stampedDone);
       await cancelFills;
       await discard;
       return;
@@ -4213,11 +4213,22 @@ export class MoqtConnection {
       this.routeRequestResponse(stream);
       return requestId;
     }
-    const { requestId, actions } = this.session.requestUpdate(
-      existingRequestId,
-      options,
-    );
-    await this.executeActions(actions);
+    if (this._terminated) throw new Error('Connection closed');
+    const owner = this.session.getSubscription(existingRequestId);
+    const before = owner && { currentPriority: owner.currentPriority, currentFilter: owner.currentFilter,
+      locationWindow: owner.locationWindow, requestedDeliveryTimeoutMs: owner.requestedDeliveryTimeoutMs };
+    const forward = owner?.forwardState;
+    const { requestId, actions } = this.session.requestUpdate(existingRequestId, options);
+    try {
+      await this.executeActions(actions);
+    } catch (error) {
+      this.session.rollbackRequestUpdate(requestId);
+      if (this.session.draftVersion === 14 && owner && before && !owner.isTerminated) {
+        Object.assign(owner, before);
+        owner.updateForwardState(forward!);
+      }
+      throw error;
+    }
     return requestId;
   }
 
@@ -6582,7 +6593,12 @@ export class MoqtConnection {
             length: bytes.byteLength,
             message: action.message,
           });
-          await this.controlWriter!.write(bytes);
+          try { await this.controlWriter!.write(bytes); }
+          catch (error) {
+            // d16 §3.3: losing the control stream ends the session.
+            this.closeSessionInternalError('Control-stream write failed');
+            throw error;
+          }
           break;
         }
         case 'close_connection': {
@@ -6796,6 +6812,7 @@ export class MoqtConnection {
                 BigInt((message as { streamCount?: bigint }).streamCount ?? 0n),
                 (message as { requestId: bigint }).requestId)
             : Promise.resolve();
+          const terminalActions = message.type === 'PUBLISH_DONE' ? this.session.handleControlMessage(message) : undefined;
           if (!suppressOnMessage) {
             this.onMessage?.(message);
           }
@@ -6815,7 +6832,7 @@ export class MoqtConnection {
             existingRequestId?: bigint;
           });
           const fwdBefore = fwdTarget === undefined ? undefined : this.getPublishForwardState(fwdTarget);
-          const actions = receiverErrorActions ?? this.session.handleControlMessage(message);
+          const actions = terminalActions ?? receiverErrorActions ?? this.session.handleControlMessage(message);
           const fwdAfter = this.changedPublishForwardState(fwdTarget, fwdBefore);
           // Start protocol output before invoking application code. A pause
           // observer may terminalize the PUBLISH reentrantly; queuing the update
@@ -7433,8 +7450,8 @@ export class MoqtConnection {
       const discard = !aliasDraining && doneAlias !== undefined
         ? this.applyTerminalStreamCount(doneAlias, BigInt(streamCount), originalId)
         : Promise.resolve();
-      this.onMessage?.(stamped);
       await this.executeActions(this.session.handleInboundPublishDone(originalId));
+      this.onMessage?.(stamped);
       ctx.seal();
       this.inboundRequestContexts.delete(originalId);
       await cancelledFills;
@@ -7443,6 +7460,7 @@ export class MoqtConnection {
     }
 
     if (message.type === 'REQUEST_UPDATE') {
+      if (this.inboundRequestContexts.get(originalId) !== ctx) return; // DONE crossed an in-flight update.
       // §10.14: TRACK_STATUS is one-shot — no REQUEST_UPDATE may follow it.
       if (ctx.openerKind === 'track-status') {
         throw new ProtocolViolationError('REQUEST_UPDATE is not valid on a TRACK_STATUS request stream');

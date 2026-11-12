@@ -3393,6 +3393,7 @@ export class Session {
    * send failure is a control-stream error handled session-fatally.)
    */
   rollbackRequestUpdate(requestId: bigint): void {
+    this.requestIdAllocator.releaseUnsent(requestId);
     this.pendingUpdates.delete(requestId as bigint);
     this.fillRequests.delete(requestId as bigint);
   }
