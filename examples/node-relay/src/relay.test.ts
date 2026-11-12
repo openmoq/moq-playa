@@ -631,6 +631,9 @@ describe('Relay subgroup lifecycle', () => {
         expect.stringMatching(/subgroup 4\/0 opened without properties/i),
       ));
       expect(subscriber.sendObject).toHaveBeenCalledOnce();
+      expect(subscriber.resetSubgroup).toHaveBeenCalledOnce();
+      expect(subscriber.closeSubgroup).not.toHaveBeenCalled();
+      expect(subscriber.activeStreams()).toBe(0);
     } finally {
       error.mockRestore();
     }

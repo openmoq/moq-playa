@@ -59,6 +59,7 @@ class Subscriber {
   stopped = false;
   terminalStatus?: bigint;
   initialStart = { group: 0n, object: 0n };
+  readonly blocked = new Set<string>();
   readonly subgroups = new Map<string, SubscriberSubgroup>();
   readonly forwarder: SubgroupForwarder<ForwardObjectFields>;
 
@@ -380,7 +381,7 @@ export class Relay {
   private retireMalformed(track: Track, conn: MoqtConnection, publish: IncomingPublish): void {
     if (!isRequestStreamDraft(conn.draftVersion)) return;
     track.sources.delete(publish); // Fence callbacks even if cancellation cannot be issued.
-    track.cache.clear(); delete track.largest;
+    track.cache.clear(); track.upstream.clear(); delete track.largest;
     for (const sub of [...track.subscribers]) {
       sub.terminalStatus = 0x12n; sub.forwarder.abort();
       if (!sub.pending) {
@@ -491,6 +492,12 @@ async function forwardObject(
     if (sub.conn.session.getIncomingSubscription(sub.requestId)?.isTerminated !== false) { sub.retire(); return; }
     const { groupId, subgroupId, objectId, payload, extensions, firstObject, endOfGroup } = fields;
     const skey = subgroupKey(groupId, subgroupId);
+    const owner = sub.conn.session.getIncomingSubscription(sub.requestId)!;
+    if (!owner.isActive || (owner.locationWindow && !windowContains(owner.locationWindow, groupId, objectId))) {
+      if (windowContains({ start: sub.initialStart }, groupId, objectId)) sub.blocked.add(skey);
+      return;
+    }
+    if (sub.blocked.has(skey)) return;
     let subgroup = sub.subgroups.get(skey);
     if (subgroup === undefined) {
       const hasExtensions = extensions !== undefined;
@@ -507,8 +514,16 @@ async function forwardObject(
         `subgroup ${skey} opened without Properties/Extensions, but object ${objectId} carries them`,
       );
     }
+    if (owner.isTerminated) { sub.retire(); return; }
+    if (!owner.isActive || (owner.locationWindow && !windowContains(owner.locationWindow, groupId, objectId))) {
+      if (windowContains({ start: sub.initialStart }, groupId, objectId)) sub.blocked.add(skey);
+      return;
+    }
     if (!sub.stopped) await sub.conn.sendObject(subgroup.streamId, objectId, payload, extensions);
   } catch (err) {
+    const skey = subgroupKey(fields.groupId, fields.subgroupId);
+    sub.blocked.add(skey);
+    await closeSubscriberSubgroup(sub, skey, false);
     console.error('[relay] FORWARD ERROR (object dropped):', (err as Error).message);
   }
 }
@@ -517,17 +532,18 @@ const subgroupKey = (groupId: bigint, subgroupId: bigint): string =>
   `${groupId}/${subgroupId}`;
 
 /** Close one outgoing subgroup after its queued objects have settled. */
-async function closeSubscriberSubgroup(sub: Subscriber, skey: string): Promise<void> {
+async function closeSubscriberSubgroup(sub: Subscriber, skey: string, terminal = true): Promise<void> {
   if (sub.conn.session.getIncomingSubscription(sub.requestId)?.isTerminated !== false) { sub.retire(); return; }
   const prefix = sub.prefix.get(skey);
   const missed = prefix && windowContains({ start: sub.initialStart }, prefix.groupId, prefix.objectId);
-  sub.prefix.delete(skey);
+  const incomplete = sub.blocked.has(skey) || missed;
+  if (terminal) { sub.prefix.delete(skey); sub.blocked.delete(skey); }
   const subgroup = sub.subgroups.get(skey);
   if (subgroup === undefined) return;
   sub.subgroups.delete(skey);
   try {
     // d18 §11.4.3: omitted eligible Objects require RESET, never a completion FIN.
-    if (missed) await sub.conn.resetSubgroup(subgroup.streamId);
+    if (incomplete) await sub.conn.resetSubgroup(subgroup.streamId);
     else await sub.conn.closeSubgroup(subgroup.streamId);
   } catch (err) {
     console.error('[relay] SUBGROUP CLOSE ERROR:', (err as Error).message);
