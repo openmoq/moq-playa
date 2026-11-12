@@ -152,6 +152,7 @@ class SourcePacedRelay {
   readonly joiningFetches: { atUs: number; requestId: bigint; options: any }[] = [];
   /** Draft 22: every fill served on a SUBSCRIBE. */
   readonly fills: { atUs: number; requestId: bigint; startGroup: bigint }[] = [];
+  congestedUntilUs = Infinity;
   private readonly fetches: JoiningFetch[] = [];
   private readonly cancelledFetches = new Set<bigint>();
 
@@ -291,7 +292,7 @@ class SourcePacedRelay {
         if (b === undefined || priority(q) < priority(b) || (priority(q) === priority(b) && q.releaseUs < b.releaseUs)) best = i;
       }
       const [q] = this.queued.splice(best, 1);
-      this.serverFreeUs = t + (q!.bytes * 8 * 1_000_000) / this.capacityBps;
+      this.serverFreeUs = t + (q!.bytes * 8 * 1_000_000) / (t < this.congestedUntilUs ? this.capacityBps : 30_000_000);
       this.inFlight.push({ ...q!, arrivalUs: Math.round(this.serverFreeUs + PATH_DELAY_US) });
     }
   }
@@ -422,6 +423,7 @@ const PLAYOUT_DELAY_US = 500_000;
 const REBUFFER_US = 500_000;
 
 interface Scenario {
+  readonly congestedUntilUs?: number;
   /** Public manual selections on an ample link to exercise ladder boundaries. */
   readonly selections?: readonly { atUs: number; track: string }[];
   readonly packaging: 'loc' | 'cmaf';
@@ -486,6 +488,8 @@ interface Run {
   readonly errors: readonly PlayerError[];
   readonly lastDeliveryUs: ReadonlyMap<string, number>;
   readonly recoveryReservations: number;
+  readonly latency: readonly { atUs: number; latencyUs: number }[];
+  readonly jumps: readonly number[];
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -499,6 +503,7 @@ async function runScenario(s: Scenario): Promise<Run> {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
   const relay = new SourcePacedRelay(s.capacityBps, catalogJson(s.packaging, s.cmafHeader), s.packaging, s.contentScale, s.captureTimestamps,
     s.relayPriority, s.joiningFetch, s.draft);
+  relay.congestedUntilUs = s.congestedUntilUs ?? Infinity;
   let clockUs = 0;
   let firstVideoUs: number | null = null;
   const clock = { now: () => clockUs };
@@ -578,7 +583,12 @@ async function runScenario(s: Scenario): Promise<Run> {
   const stallsAtUs: number[] = [];
   let playoutOffsetUs = PLAYOUT_DELAY_US;
   let rendered = 0n;
+  let newestCaptureUs: number | null = null;
+  const latency: { atUs: number; latencyUs: number }[] = [];
+  const jumps: number[] = [];
+  player.on('recovery_action', e => { if (e.action.type === 'jump_to_live' && e.action.trigger === 'latency') jumps.push(clockUs); });
   relay.onFrameDelivered = (trackName, captureUs) => {
+    if (trackName === internals.subscribedTrack('video')?.name) newestCaptureUs = captureUs;
     firstVideoUs ??= clockUs;
     lastDeliveryUs.set(trackName, clockUs);
     if (trackName !== internals.subscribedTrack('video')?.name) return;
@@ -615,9 +625,15 @@ async function runScenario(s: Scenario): Promise<Run> {
       vi.advanceTimersByTime(TICK_US / 1000);
       player.tick();
       await flushMicrotasks();
+      // Read the real shared timeline; the simulated renderer does not schedule frames.
+      const sync = (player as unknown as { syncController: import('@openmoq/playback').SyncController | null }).syncController;
+      if (sync?.hasReference && newestCaptureUs !== null && t % 500_000 < TICK_US) {
+        const timing = sync.computeAudioRenderTime(BigInt(PUBLISHER_EPOCH_US + newestCaptureUs));
+        if (timing) latency.push({ atUs: t, latencyUs: timing.renderTimeUs - newestCaptureUs });
+      }
     }
     return {
-      errors, lastDeliveryUs, recoveryReservations: mediaSource.reserveSwitchRecovery.mock.calls.length,
+      errors, lastDeliveryUs, latency, jumps, recoveryReservations: mediaSource.reserveSwitchRecovery.mock.calls.length,
       finalTrack: internals.subscribedTrack('video')?.name,
       switches,
       stallsAtUs,
@@ -832,5 +848,27 @@ describe('ABR under source-paced live delivery', () => {
       // bw is the current rung's own bitrate.
       expect(rungIndex(run.finalTrack)).toBeLessThan(rungIndex(START));
     });
+  });
+});
+
+describe('LOC latency give-back after real simulated congestion', () => {
+  it.each([14, 16, 18, 22] as const)('recovers on draft %i, with disabled and ample controls', async draft => {
+    const scenario = { draft, packaging: 'loc' as const, capacityBps: 700_000,
+      congestedUntilUs: SECONDS(30), durationUs: SECONDS(70) };
+    const enabled = await runScenario(scenario);
+    const disabled = await runScenario({ ...scenario, playerConfig: { liveJumpThresholdMs: 0 } });
+    const ample = await runScenario({ ...scenario, capacityBps: AMPLE_BPS });
+    const latencyAt69 = (run: Run) => run.latency.find(sample => sample.atUs >= SECONDS(69))!.latencyUs;
+    expect(disabled.jumps).toEqual([]);
+    expect(latencyAt69(disabled)).toBeGreaterThan(4_000_000);
+    expect(ample.jumps).toEqual([]);
+    expect(latencyAt69(ample)).toBeLessThan(100_000);
+    expect.soft(latencyAt69(enabled)).toBeLessThan(1_000_000);
+    expect(enabled.jumps).toHaveLength(1);
+    expect(enabled.jumps[0]).toBeGreaterThan(enabled.stallsAtUs.at(-1)!);
+    for (const run of [enabled, disabled, ample]) {
+      expect(run.stallsAtUs.at(-1) ?? 0).toBeLessThan(SECONDS(45));
+      expect(run.errors.filter(error => error.severity === 'fatal')).toEqual([]);
+    }
   });
 });

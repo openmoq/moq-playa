@@ -11,6 +11,7 @@ import { videoInit, audioInit } from '../../locmaf/test-support/cmaf.js';
 const enc = new TextEncoder(), dec = new TextDecoder();
 
 export async function locSeekFixture(draft: 14 | 16 | 18 | 22, audio = false, coverAudio = true, options: {
+  playerConfig?: Partial<MoqtPlayerConfig>;
   configuredDraft?: 14 | 16 | 18 | 22 | null; autoNegotiation?: boolean;
   frameVideo?: boolean; frameAudio?: boolean; frameAlternative?: boolean; reorderVideoOutput?: boolean;
   isLive?: boolean; namespace?: string; audioNamespace?: string; shadowTimeline?: boolean; timelineBeforeOk?: boolean; catalogVersion?: 1 | '1';
@@ -116,6 +117,7 @@ export async function locSeekFixture(draft: 14 | 16 | 18 | 22, audio = false, co
       options.beforeFactoryReturn?.();
       return { ...(needsVideo ? { videoDecoder: freshDecoder, renderer: freshRenderer } : {}), ...(needsAudio ? { audioDecoder: freshAudio, audioOutput: freshOutput } : {}) };
     },
+    ...options.playerConfig,
   });
   const update = vi.spyOn(client, 'requestUpdate');
   const seeking = vi.fn(), seeked = vi.fn(); player.on('seeking', seeking); player.on('seeked', seeked);

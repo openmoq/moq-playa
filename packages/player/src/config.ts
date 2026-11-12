@@ -345,6 +345,10 @@ export interface PlaybackTuningConfig {
 
 /** Latency and catch-up options. */
 export interface LatencyConfig {
+  /** Live LOC buffered-ahead threshold in ms. Default: 3000; 0 disables.
+   * After 1 s above it, jump toward received media with 500 ms headroom, at most
+   * once per 5 s. Flushes queued A/V. Never applies to seeks, VOD or caller ranges. */
+  readonly liveJumpThresholdMs?: number;
   /**
    * Target end-to-end latency in milliseconds.
    * When undefined, uses the catalog's targetLatency or disables catch-up.
@@ -818,6 +822,7 @@ export const DEFAULT_PLAYER_CONFIG = {
   driftThresholdMs: 200,
   maxBufferDepth: 500,
 
+  liveJumpThresholdMs: 3000,
   // Latency / catch-up
   maxCatchUpRate: 1.0,
   catchUpThresholdMs: 500,
@@ -1000,6 +1005,9 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     throw new RangeError(`reconnectAttempts must be a non-negative integer, got ${config.reconnectAttempts}`);
   }
 
+  if (config.liveJumpThresholdMs !== undefined && (!Number.isFinite(config.liveJumpThresholdMs) || config.liveJumpThresholdMs < 0)) {
+    throw new RangeError('liveJumpThresholdMs must be finite and nonnegative');
+  }
   // All *Ms timeouts > 0
   const msFields: Array<[string, number | undefined]> = [
     ['connectionTimeoutMs', config.connectionTimeoutMs],

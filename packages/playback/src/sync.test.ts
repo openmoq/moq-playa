@@ -27,6 +27,35 @@ class MockClock implements ClockSource {
 describe('SyncController', () => {
     const DRIFT_THRESHOLD = 500_000; // 500ms
 
+    it('advances audio and video together while preserving reference and drift', () => {
+        const clock = new MockClock();
+        clock.set(9_000_000);
+        const sync = new SyncController({ driftThresholdUs: DRIFT_THRESHOLD, clock });
+        sync.setAudioReference(1_000_000_000n);
+        sync.reportPresentationTiming(0, 123);
+        clock.advance(1_000_000);
+        expect(sync.computeAudioRenderTime(1_004_500_000n)!.offsetUs).toBe(3_500_000);
+        sync.advanceReference(3_000_000);
+        const audio = sync.computeAudioRenderTime(1_004_500_000n)!;
+        expect(audio.renderTimeUs).toBe(10_500_000);
+        expect(sync.computeVideoRenderTime(1_004_500_000n)!.renderTimeUs).toBe(audio.renderTimeUs);
+        expect(sync.computeAudioRenderTime(1_002_000_000n)!.shouldDrop).toBe(true);
+        expect(sync.currentDriftUs).toBe(123);
+        expect(sync.hasReference).toBe(true);
+    });
+
+    it('ignores reference movement without an anchor or a positive finite amount', () => {
+        const clock = new MockClock();
+        const sync = new SyncController({ driftThresholdUs: DRIFT_THRESHOLD, clock });
+        sync.advanceReference(1_000_000);
+        expect(sync.computeAudioRenderTime(0n)).toBeNull();
+        sync.setAudioReference(0n);
+        for (const amount of [0, -1_000_000, NaN, Infinity]) {
+            sync.advanceReference(amount);
+            expect(sync.computeAudioRenderTime(0n)!.renderTimeUs).toBe(0);
+        }
+    });
+
     it('no reference established — hasReference is false (§2.3.1.1)', () => {
         const clock = new MockClock();
         const sync = new SyncController({ driftThresholdUs: DRIFT_THRESHOLD, clock });

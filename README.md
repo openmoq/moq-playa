@@ -411,6 +411,7 @@ object; the higher-level `Player` instead emits `severity`, `code` and `message`
 | `knownTracks` | object | — | Pre-known codec metadata for TTFF optimization |
 | `catalog` | `{tracks}` | — | Inject catalog externally, skip catalog subscription |
 | `targetLatencyMs` | number | — | Live catch-up target |
+| `liveJumpThresholdMs` | number | 3000 | Live LOC jumps toward received media after 1 s of excess above this threshold; 0 disables |
 | `maxCatchUpRate` | number | 1.0 | Max playback rate for catch-up |
 | `authority` | string | — | CLIENT_SETUP AUTHORITY for tenant-routed relays (interop override; spec prohibits it over WebTransport) |
 | `warmStartCurrentGroup` | boolean | false | Join live LOC/CMAF/LOCMAF tracks mid-group via Joining FETCH on drafts 14/16/18, or a fill on draft 22; non-fatal if refused |

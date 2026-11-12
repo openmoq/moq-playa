@@ -182,6 +182,13 @@ import { isDraft22, isRequestStreamDraft } from '@openmoq/transport';
 
 // ─── Constants ──────────────────────────────────────────────────────
 
+/** Required duration of excess received media before a live jump. */
+const LIVE_JUMP_SUSTAIN_US = 1_000_000;
+/** Media left ahead on the advanced timeline for delivery jitter. */
+const LIVE_JUMP_CUSHION_US = 500_000;
+/** Minimum time between live latency jumps. */
+const LIVE_JUMP_COOLDOWN_US = 5_000_000;
+
 /** Object limit for a make-before-break video's retained input. */
 const SWITCH_STAGING_MAX_OBJECTS = 100;
 
@@ -836,6 +843,8 @@ export class MoqtPlayer {
     onRecovery: new HookChain<RecoveryAction>(),
   };
 
+  private liveJump: { current: () => boolean; newest: Map<'video' | 'audio', bigint>; since: number | null } | null = null;
+  private lastLiveJumpUs = -Infinity;
   private connection: MoqtConnection | null = null;
   private _adapterOwned = true;
   private qualityController: QualityController | null = null;
@@ -4693,6 +4702,11 @@ export class MoqtPlayer {
         }
       }
       if (pipeline) this.recordDeliveredObject(obj);
+      if (pipeline && (mediaType === 'video' || mediaType === 'audio') && obj.kind === 'data'
+          && !delivery?.backfill && !delivery?.fetched && headers.captureTimestamp !== undefined) {
+        const record = this.liveJumpRecord(), previous = record?.newest.get(mediaType);
+        if (record && (previous === undefined || headers.captureTimestamp > previous)) record.newest.set(mediaType, headers.captureTimestamp);
+      }
       if (!pipeline) this.discardMediaInput(input, 'not attached');
       else if (delivery?.backfill) pipeline.pushObject(obj, headers, input, { backfill: true });
       else if (input) pipeline.pushObject(obj, headers, input);
@@ -5422,6 +5436,7 @@ export class MoqtPlayer {
     // last. See play() for why the announcement cannot come earlier.
     const fromState = this.applyState(PlayerState.PAUSED);
     this.subscriptionManager?.invalidateMediaInputs();
+    this.liveJump = null;
     this.playbackIntent = false;
     this.pendingVideoSwitch?.frame?.cancelPending();
     this.seekPosition?.setPlaying(false);
@@ -5513,6 +5528,7 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-msf-01 §7.2 (Timeline dependency coverage)
    */
   async seek(timeMs: number): Promise<void> {
+    this.liveJump = null;
     if (!Number.isFinite(timeMs) || timeMs < 0) {
       throw new RangeError('Seek target must be finite and nonnegative');
     }
@@ -10202,11 +10218,65 @@ export class MoqtPlayer {
     // Proactive quality adaptation: if estimated bandwidth is below
     // 1.5× the current track's bitrate, downshift before stalls occur.
     this.checkBandwidthAdaptation();
+    this.checkLiveJump();
 
     // Media liveness: reconcile monitored tracks with the live subscription
     // map (a handful of entries — cheap at tick rate, and immune to drift
     // across subscribe/unsubscribe/switch paths), then evaluate starvation.
     this.syncAndCheckLiveness();
+  }
+
+  /** Observations belong to one ordinary live output graph, never a historical owner. */
+  private liveJumpRecord(): MoqtPlayer['liveJump'] {
+    if (!this.config.liveJumpThresholdMs || this._destroyed || this.state !== PlayerState.PLAYING || this.playbackIntent !== true
+        || this.activeLocSeek || this.activeMseSeek || this.seekIsPreparing() || this.pendingVideoSwitch || this.switchInProgress
+        || this.mediaSelection || this.currentMigration || this.pendingRetypes.size
+        || this.config.subscriptionFilter?.type === 'AbsoluteStart' || this.config.subscriptionFilter?.type === 'AbsoluteRange') {
+      this.liveJump = null; return null;
+    }
+    if (this.liveJump?.current()) return this.liveJump;
+    this.liveJump = null;
+    const selection = this._selection, manager = this.subscriptionManager, generation = manager?.mediaInputGeneration;
+    const sync = this.syncController, dispatcher = this.commandDispatcher, connection = this.connection;
+    const video = this.videoPipeline, audio = this.audioPipeline;
+    const roles = (['video', 'audio'] as const).filter(role => selection[role] !== null);
+    const subscriptions = [...this.activeSubscriptions].filter(([, sub]) => roles.includes(sub.mediaType as 'video' | 'audio'));
+    if (!sync || !dispatcher || !manager || !connection || roles.length === 0 || subscriptions.length !== roles.length
+        || roles.some(role => !(role === 'video' ? video : audio) || this.subscribedTrack(role)?.isLive !== true)
+        || subscriptions.some(([, sub]) => sub.trackAlias === null || sub.trackName !== selection[sub.mediaType as 'video' | 'audio']?.name)) return null;
+    const routes = subscriptions.map(([, sub]) => manager.captureRoute(sub.trackAlias!));
+    const current = () => this.connection === connection && this._selection === selection && this.subscriptionManager === manager
+      && manager.mediaInputGeneration === generation && this.syncController === sync && this.commandDispatcher === dispatcher
+      && this.videoPipeline === video && this.audioPipeline === audio && routes.every(route => route?.())
+      && roles.every(role => this.subscribedTrack(role)?.isLive === true)
+      && subscriptions.every(([id, sub]) => this.activeSubscriptions.get(id) === sub && !this.terminalMediaSubscriptions.has(sub));
+    return this.liveJump = { current, newest: new Map(), since: null };
+  }
+
+  private checkLiveJump(): void {
+    const record = this.liveJumpRecord(), sync = this.syncController;
+    if (!record || !sync?.hasReference) return;
+    const roles = (['video', 'audio'] as const).filter(role => this._selection[role] !== null);
+    const ahead = Math.min(...roles.map(role => {
+      const newest = record.newest.get(role);
+      return newest === undefined ? -Infinity : sync.computeAudioRenderTime(newest)?.offsetUs ?? -Infinity;
+    }));
+    const now = this.clock.now();
+    if (this.liveJumpRecord() !== record) return;
+    if (ahead <= this.config.liveJumpThresholdMs! * 1000) { record.since = null; return; }
+    record.since ??= now;
+    if (now - record.since < LIVE_JUMP_SUSTAIN_US || now - this.lastLiveJumpUs < LIVE_JUMP_COOLDOWN_US) return;
+    const byUs = ahead - LIVE_JUMP_CUSHION_US;
+    if (byUs <= 0) return;
+    sync.advanceReference(byUs);
+    this.lastLiveJumpUs = now;
+    record.since = null;
+    const dispatcher = this.commandDispatcher!;
+    dispatcher.flush();
+    // LOC audio is independently decodable; retire decodes carrying pre-jump render times.
+    dispatcher.dispatch({ type: 'reset', mediaType: 'audio', reason: 'live latency jump' });
+    this.emitter.emit('recovery_action', { type: 'recovery_action',
+      action: { type: 'jump_to_live', trigger: 'latency', byMs: Math.round(byUs / 1000) } });
   }
 
   /** Throttle for sync_skew diagnostic events (~1/s). */
@@ -13109,7 +13179,7 @@ export class MoqtPlayer {
 
           this.emitter.emit('recovery_action', {
             type: 'recovery_action',
-            action: { type: 'jump_to_live' },
+            action: { type: 'jump_to_live', trigger: 'stalls' },
           });
           return;
         }

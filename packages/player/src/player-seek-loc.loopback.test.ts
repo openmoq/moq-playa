@@ -4,7 +4,9 @@ import { flush } from '../../webtransport/src/testkit/loopback.js';
 import { createMediaDiagnostics } from './media-diagnostics.js';
 import type { MediaStageObservation } from './media-diagnostic-types.js';
 import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
-import { PlaybackPipeline } from '@openmoq/playback';
+import { PlaybackPipeline, SyncController } from '@openmoq/playback';
+import { WebAudioOutput } from '../../browser/src/webaudio-output.js';
+import type { AudioDecoderLike } from './interfaces.js';
 import { MessageParam, decodeSubscriptionFilter, decodeFillParameters, varint } from '@openmoq/transport';
 
 beforeEach(() => vi.stubGlobal('document', { hidden: false, addEventListener() {}, removeEventListener() {} }));
@@ -1500,4 +1502,286 @@ describe.each([18, 22] as const)('LOC negotiated historical profile draft%i', dr
       expect(f.seeked.mock.calls[0]![0].actualTimeMs).toBe(2100);
     } finally { await f.destroy(); }
   });
+});
+
+// Real transport and shared sync, with modeled native decoding/output.
+async function sendJumpMedia(f: Awaited<ReturnType<typeof fixture>>, group: bigint, offsetUs: bigint, audio = false) {
+  const stream = await f.server.openSubgroup(audio ? 201n : 200n, group, 0n, { publisherPriority: 128, hasExtensions: true, endOfGroup: true });
+  await f.server.sendObject(stream, 0n, audio ? Uint8Array.of(0xf8, 0xff, 0xfe) : Uint8Array.of(0, 0, 0, 2, 0x65, 0x88),
+    encodeLocHeaders({ captureTimestamp: 1_000_000_000n + offsetUs,
+      ...(!audio ? { videoFrameMarking: { independent: true, startOfFrame: true, endOfFrame: true,
+        discardable: false, baseLayerSync: false, temporalId: 0 } } : {}) },
+    { wireProfile: locWireProfileForDraft(f.draft), locVersion: 1 }));
+  await f.server.closeSubgroup(stream); await flush(128);
+}
+
+describe.each([18, 22] as const)('live jump ownership draft %i', draft => {
+  it('keeps historical, finite, caller-range and retired observations out, with a live control', async () => {
+    for (const mode of ['seek', 'finite', 'finite-update', 'range', 'headroom', 'pause', 'sync', 'pipeline', 'live'] as const) {
+      const f = await fixture(draft, false, true, { isLive: mode !== 'finite', producingOutput: true,
+        playerConfig: mode === 'range' ? { subscriptionFilter: { type: 'AbsoluteRange', startGroup: 0, endGroup: 100 } }
+          : mode === 'headroom' ? { liveJumpThresholdMs: 100 } : {} });
+      const jumps: unknown[] = [];
+      f.player.on('recovery_action', event => { if (event.action.type === 'jump_to_live') jumps.push(event.action); });
+      // Narrow boundary cast: only owner replacement controls change graph identity.
+      const graph = f.player as unknown as { syncController: SyncController; videoPipeline: PlaybackPipeline };
+      try {
+        await sendJumpMedia(f, 10n, 0n); f.advance(100_000);
+        await sendJumpMedia(f, 11n, mode === 'headroom' ? 1_400_000n : 10_000_000n); f.advance(100_000);
+        if (mode === 'seek') {
+          await f.player.seek(2000); await flush(128);
+          f.advance(1_200_000); expect(jumps).toEqual([]); // preparation owns playback
+          await sendPreparedGroup(f, 0, 2100n, 2300n);
+          f.advance(2_300_000); f.advance(3_400_000); // adopted history stays behind live
+          expect(f.errors).toEqual([]); expect(f.seeked).toHaveBeenCalledOnce();
+        } else if (mode === 'finite-update') {
+          const stream = await f.server.openSubgroup(100n, 1n, 0n, { publisherPriority: 128 });
+          await f.server.sendObject(stream, 0n, new TextEncoder().encode(JSON.stringify({ version: 1, tracks: [
+            { name: 'video', packaging: 'loc', role: 'video', isLive: false, renderGroup: 1,
+              codec: 'avc1.640028', width: 640, height: 360, bitrate: 500000 },
+            { name: 'timeline', packaging: 'mediatimeline', isLive: false, mimeType: 'application/json', depends: ['video'] },
+          ] })));
+          await f.server.closeSubgroup(stream); await flush(256);
+        } else if (mode === 'pause') {
+          f.player.pause(); f.player.play();
+          graph.syncController.setVideoReference(1_000_000_000n);
+        } else if (mode === 'sync') {
+          graph.syncController = new SyncController({ clock: { now: () => 100_000 }, driftThresholdUs: 500_000 });
+          graph.syncController.setVideoReference(1_000_000_000n);
+        } else if (mode === 'pipeline') {
+          // Replacement still shares the clock; stale observations must not transfer.
+          graph.videoPipeline = new PlaybackPipeline({ mediaType: 'video', clock: { now: () => 100_000 },
+            config: { gapTimeoutUs: 500_000, driftThresholdUs: 500_000, maxBufferDepth: 100 }, sync: graph.syncController, onCommand() {}, onEvent() {} });
+        }
+        if (mode !== 'seek') { f.advance(1_200_000); f.advance(2_300_000); }
+        if (mode === 'live') {
+          expect(jumps).toEqual([{ type: 'jump_to_live', trigger: 'latency', byMs: 8400 }]);
+          expect(f.renderer.flush).toHaveBeenCalledOnce();
+          expect(graph.syncController.computeAudioRenderTime(1_010_000_000n)!.offsetUs).toBe(-600_000);
+        } else expect(jumps, mode).toEqual([]);
+      } finally { await f.destroy(); }
+    }
+  });
+});
+
+it('flushes scheduled native audio and queued video, then schedules both on the advanced timeline', async () => {
+  let nowUs = 100_000;
+  const nodes: Array<{ stop: ReturnType<typeof vi.fn> }> = [];
+  const starts: number[] = [];
+  const context = {
+    state: 'running', destination: {}, get currentTime() { return nowUs / 1_000_000; },
+    createBuffer(channels: number, length: number, rate: number) {
+      const planes = Array.from({ length: channels }, () => new Float32Array(length));
+      return { duration: length / rate, getChannelData: (channel: number) => planes[channel]! };
+    },
+    createBufferSource() {
+      const node = { buffer: null, onended: null as (() => void) | null, playbackRate: { value: 1 },
+        connect() {}, disconnect() {}, start(when: number) { starts.push(when); }, stop: vi.fn(() => node.onended?.()) };
+      nodes.push(node); return node;
+    },
+  };
+  const output = new WebAudioOutput(context as unknown as AudioContext, undefined, 0, { now: () => nowUs });
+  const schedules = vi.spyOn(output, 'schedule'), flushOutput = vi.spyOn(output, 'flush');
+  const decoder: AudioDecoderLike = { configure() {}, queueDepth: 0, onData: null, onError: null,
+    decode(chunk, time, input, timing) {
+      decoder.onData!({ timestamp: chunk.timestamp, sampleRate: 48_000, numberOfChannels: 1, numberOfFrames: 960,
+        copyTo(plane: Float32Array) { plane.fill(0.25); }, close() {} }, time, input,
+      timing ? { context: timing, sourceOffsetUs: 0 } : undefined);
+    }, async flush() {}, reset() {}, destroy() {} };
+  const f = await fixture(18, true, true, { isLive: true,
+    playerConfig: { createAudioDecoder: () => decoder, createAudioOutput: () => output } });
+  f.decoder.decode = vi.fn((chunk, time, input, timing) => {
+    f.decoder.onFrame?.({ timestamp: chunk.timestamp, close() {} }, time, input,
+      timing ? { context: timing, sourceTimestamp: { ticks: BigInt(chunk.timestamp), ticksPerSecond: 1_000_000n, domain: 'unix' } } : undefined);
+  });
+  const jumps: unknown[] = [];
+  f.player.on('recovery_action', event => { if (event.action.type === 'jump_to_live') jumps.push(event.action); });
+  const advance = (us: number) => { nowUs = us; f.advance(us); };
+  try {
+    await sendJumpMedia(f, 10n, 0n, true); await sendJumpMedia(f, 10n, 0n); advance(100_000);
+    await sendJumpMedia(f, 11n, 10_000_000n); advance(100_000); advance(1_200_000);
+    expect(jumps).toEqual([]); // Every selected role must have received the excess.
+    await sendJumpMedia(f, 11n, 10_000_000n, true); advance(1_200_000); advance(2_300_000);
+    expect(jumps).toHaveLength(1);
+    expect(flushOutput).toHaveBeenCalledTimes(2); expect(f.renderer.flush).toHaveBeenCalledOnce();
+    expect(nodes[0]!.stop).toHaveBeenCalledOnce();
+    await sendJumpMedia(f, 12n, 10_020_000n, true); await sendJumpMedia(f, 12n, 10_020_000n); advance(2_300_000);
+    const audioTime = schedules.mock.calls.at(-1)![1];
+    const videoTime = vi.mocked(f.renderer.enqueue).mock.calls.at(-1)![1];
+    expect(audioTime).toBeCloseTo(videoTime, 6);
+    expect(audioTime).toBeGreaterThan(nowUs); expect(audioTime).toBeLessThan(nowUs + 1_000_000);
+    expect(starts.at(-1)! * 1_000_000).toBeCloseTo(audioTime, 6);
+    expect(f.errors).toEqual([]);
+  } finally { await f.destroy(); }
+});
+
+// Delayed native completion models preserve the adapter's reset generation semantics.
+it('keeps a delayed decoder completion aligned across the jump', async () => {
+  let nowUs = 100_000;
+  const nodes: Array<{ stop: ReturnType<typeof vi.fn> }> = [];
+  const starts: number[] = [];
+  const context = {
+    state: 'running', destination: {}, get currentTime() { return nowUs / 1_000_000; },
+    createBuffer(channels: number, length: number, rate: number) {
+      const planes = Array.from({ length: channels }, () => new Float32Array(length));
+      return { duration: length / rate, getChannelData: (channel: number) => planes[channel]! };
+    },
+    createBufferSource() {
+      const node = { buffer: null, onended: null as (() => void) | null, playbackRate: { value: 1 },
+        connect() {}, disconnect() {}, start(when: number) { starts.push(when); }, stop: vi.fn(() => node.onended?.()) };
+      nodes.push(node); return node;
+    },
+  };
+  const output = new WebAudioOutput(context as unknown as AudioContext, undefined, 0, { now: () => nowUs });
+  const schedules = vi.spyOn(output, 'schedule'), flushOutput = vi.spyOn(output, 'flush');
+  let generation = 0;
+  let audioDecodes = 0; let pending: (() => void) | undefined;
+  const decoder: AudioDecoderLike = { configure() {}, queueDepth: 0, onData: null, onError: null,
+    decode(chunk, time, input, timing) {
+      const admittedGeneration = generation;
+      const deliver = () => { if (admittedGeneration !== generation) return; decoder.onData!({ timestamp: chunk.timestamp, sampleRate: 48_000, numberOfChannels: 1, numberOfFrames: 960,
+        copyTo(plane: Float32Array) { plane.fill(0.25); }, close() {} }, time, input,
+      timing ? { context: timing, sourceOffsetUs: 0 } : undefined); };
+      if (++audioDecodes === 2) pending = deliver; else deliver();
+    }, async flush() {}, reset() { generation++; }, destroy() { generation++; } };
+  const f = await fixture(18, true, true, { isLive: true,
+    playerConfig: { createAudioDecoder: () => decoder, createAudioOutput: () => output } });
+  f.decoder.decode = vi.fn((chunk, time, input, timing) => {
+    f.decoder.onFrame?.({ timestamp: chunk.timestamp, close() {} }, time, input,
+      timing ? { context: timing, sourceTimestamp: { ticks: BigInt(chunk.timestamp), ticksPerSecond: 1_000_000n, domain: 'unix' } } : undefined);
+  });
+  const jumps: unknown[] = [];
+  f.player.on('recovery_action', event => { if (event.action.type === 'jump_to_live') jumps.push(event.action); });
+  const advance = (us: number) => { nowUs = us; f.advance(us); };
+  try {
+    await sendJumpMedia(f, 10n, 0n, true); await sendJumpMedia(f, 10n, 0n); advance(100_000);
+    await sendJumpMedia(f, 11n, 4_500_000n); await sendJumpMedia(f, 11n, 4_500_000n, true);
+    advance(100_000); advance(1_200_000);
+    expect(pending).toBeDefined(); const before = schedules.mock.calls.length; pending!();
+    expect(jumps).toHaveLength(1);
+    expect(schedules.mock.calls.length, 'pre-jump completion cannot schedule').toBe(before);
+    expect(flushOutput).toHaveBeenCalledTimes(2);
+    await sendJumpMedia(f, 12n, 4_520_000n, true);
+    await sendJumpMedia(f, 12n, 4_520_000n); advance(1_200_000);
+    const audioTime = schedules.mock.calls.at(-1)![1];
+    const videoTime = vi.mocked(f.renderer.enqueue).mock.calls.at(-1)![1];
+    expect(starts.at(-1)! * 1_000_000).toBeCloseTo(audioTime, 6);
+    expect(audioTime).toBeCloseTo(videoTime, 6);
+    expect(f.errors).toEqual([]);
+  } finally { await f.destroy(); }
+});
+
+async function runDelayedAudio(options: { asyncAudio: boolean; excessUs: bigint; threshold?: number }) {
+  let nowUs = 100_000;
+  const starts: number[] = [];
+  const context = {
+    state: 'running', destination: {}, get currentTime() { return nowUs / 1_000_000; },
+    createBuffer(channels: number, length: number, rate: number) {
+      const planes = Array.from({ length: channels }, () => new Float32Array(length));
+      return { duration: length / rate, getChannelData: (channel: number) => planes[channel]! };
+    },
+    createBufferSource() {
+      const node = { buffer: null, onended: null as (() => void) | null, playbackRate: { value: 1 },
+        connect() {}, disconnect() {}, start(when: number) { starts.push(when); }, stop: vi.fn(() => node.onended?.()) };
+      return node;
+    },
+  };
+  const output = new WebAudioOutput(context as unknown as AudioContext, undefined, 0, { now: () => nowUs });
+  const schedules = vi.spyOn(output, 'schedule');
+  const pending: Array<() => void> = [];
+  const decoder: AudioDecoderLike = { configure() {}, queueDepth: 0, onData: null, onError: null,
+    decode(chunk, time, input, timing) {
+      const emit = () => decoder.onData!({ timestamp: chunk.timestamp, sampleRate: 48_000, numberOfChannels: 1, numberOfFrames: 960,
+        copyTo(plane: Float32Array) { plane.fill(0.25); }, close() {} }, time, input,
+      timing ? { context: timing, sourceOffsetUs: 0 } : undefined);
+      if (options.asyncAudio) pending.push(emit); else emit();
+    }, async flush() {}, reset() { pending.length = 0; }, destroy() { pending.length = 0; } };
+  const f = await fixture(18, true, true, { isLive: true,
+    playerConfig: { createAudioDecoder: () => decoder, createAudioOutput: () => output,
+      ...(options.threshold === undefined ? {} : { liveJumpThresholdMs: options.threshold }) } });
+  f.decoder.decode = vi.fn((chunk, time, input, timing) => {
+    f.decoder.onFrame?.({ timestamp: chunk.timestamp, close() {} }, time, input,
+      timing ? { context: timing, sourceTimestamp: { ticks: BigInt(chunk.timestamp), ticksPerSecond: 1_000_000n, domain: 'unix' } } : undefined);
+  });
+  const jumps: unknown[] = [];
+  f.player.on('recovery_action', event => { if (event.action.type === 'jump_to_live') jumps.push(event.action); });
+  // Native output arrives in a later task than the tick that submitted the chunk.
+  const advance = (us: number) => { nowUs = us; f.advance(us); for (const emit of pending.splice(0)) emit(); };
+  try {
+    const x = options.excessUs;
+    await sendJumpMedia(f, 10n, 0n, true); await sendJumpMedia(f, 10n, 0n); advance(100_000);
+    await sendJumpMedia(f, 11n, x, true); await sendJumpMedia(f, 11n, x); advance(1_200_000);
+    // One more audio Object reaches the pipeline before the tick that jumps.
+    await sendJumpMedia(f, 12n, x + 20_000n, true); await sendJumpMedia(f, 12n, x + 20_000n); advance(2_300_000);
+    // First fresh media after that tick, the same capture on both roles.
+    // Steady delivery afterwards: one A/V pair every 20 ms for 200 ms.
+    for (let i = 0n; i < 10n; i++) {
+      await sendJumpMedia(f, 13n + i, x + 40_000n + i * 20_000n, true); await sendJumpMedia(f, 13n + i, x + 40_000n + i * 20_000n);
+      advance(2_310_000 + Number(i) * 20_000);
+    }
+    const capture = 1_000_000_000 + Number(x + 40_000n + 9n * 20_000n);
+    const videoCall = vi.mocked(f.renderer.enqueue).mock.calls.find(call => (call[0] as { timestamp: number }).timestamp === capture)!;
+    const audioIndex = schedules.mock.calls.findIndex(call => (call[0] as { timestamp: number }).timestamp === capture);
+    expect(videoCall, 'video for the fresh capture was enqueued').toBeDefined();
+    expect(audioIndex, 'audio for the fresh capture was scheduled').toBeGreaterThanOrEqual(0);
+    const videoUs = videoCall[1] as number;
+    expect(starts.length, 'every schedule started one source').toBe(schedules.mock.calls.length);
+    const audioStartUs = starts[audioIndex]! * 1_000_000;
+    return { jumps, videoUs, audioStartUs, skewMs: (audioStartUs - videoUs) / 1000, errors: [...f.errors] };
+  } finally { await f.destroy(); }
+}
+
+it.each([6_000_000n, 10_000_000n])('keeps subsequent audio buffers aligned after delayed output at excess %s', async excessUs => {
+  const delayed = await runDelayedAudio({ asyncAudio: true, excessUs });
+  const synchronous = await runDelayedAudio({ asyncAudio: false, excessUs });
+  for (const result of [delayed, synchronous]) {
+    expect(result.jumps).toHaveLength(1);
+    expect(result.errors).toEqual([]);
+    expect(Math.abs(result.skewMs)).toBeLessThan(20);
+  }
+  // Above five seconds the base has a separate scheduling clamp defect.
+  if (excessUs === 6_000_000n) {
+    const disabled = await runDelayedAudio({ asyncAudio: true, excessUs, threshold: 0 });
+    expect(disabled.jumps).toEqual([]);
+    expect(disabled.errors).toEqual([]);
+    expect(Math.abs(disabled.skewMs)).toBeLessThan(250);
+  }
+});
+
+it('waits five seconds between live jumps and reports whole milliseconds', async () => {
+  const f = await fixture(18, false, true, { isLive: true });
+  const jumps: Array<{ byMs?: number }> = [];
+  f.player.on('recovery_action', event => { if (event.action.type === 'jump_to_live') jumps.push(event.action); });
+  try {
+    await sendJumpMedia(f, 10n, 0n); f.advance(100_000);
+    await sendJumpMedia(f, 11n, 10_000_345n); f.advance(100_000); f.advance(1_200_000);
+    expect(jumps).toHaveLength(1);
+    await sendJumpMedia(f, 12n, 20_000_345n); f.advance(1_200_000);
+    f.advance(2_300_000); expect(jumps).toHaveLength(1);
+    f.advance(6_199_999); expect(jumps).toHaveLength(1);
+    f.advance(6_200_000); expect(jumps).toHaveLength(2);
+    expect(jumps[0]!.byMs).toBe(8400);
+    expect(jumps.every(jump => Number.isInteger(jump.byMs))).toBe(true);
+    expect(f.errors).toEqual([]);
+  } finally { await f.destroy(); }
+});
+
+it.each(['backfill', 'fetched'] as const)('ignores %s timestamps, then jumps on ordinary live delivery', async origin => {
+  const f = await fixture(18, false, true, { isLive: true });
+  // Classify real routed objects at the delivery boundary without altering their timestamps.
+  const manager = (f.player as unknown as { subscriptionManager: import('./subscription-manager.js').SubscriptionManager }).subscriptionManager;
+  const deliver = manager.onObject!;
+  const jumps: unknown[] = [];
+  f.player.on('recovery_action', event => { if (event.action.type === 'jump_to_live') jumps.push(event.action); });
+  try {
+    await sendJumpMedia(f, 10n, 0n); f.advance(100_000);
+    manager.onObject = (role, track, object, headers, input, delivery) =>
+      deliver(role, track, object, headers, input, { ...delivery, [origin]: true });
+    await sendJumpMedia(f, 11n, 10_000_000n); f.advance(100_000); f.advance(1_200_000);
+    expect(jumps).toEqual([]);
+    manager.onObject = deliver;
+    await sendJumpMedia(f, 12n, 10_020_000n); f.advance(1_200_000); f.advance(2_300_000);
+    expect(jumps).toHaveLength(1);
+    expect(f.errors).toEqual([]);
+  } finally { manager.onObject = deliver; await f.destroy(); }
 });

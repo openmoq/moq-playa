@@ -416,3 +416,13 @@ describe('catalogBootstrap option', () => {
     } as unknown as MoqtPlayerConfig)).toThrow(/catalogBootstrap/);
   });
 });
+
+it('defaults live jumps to 3000 ms, allows disabling and rejects invalid thresholds', () => {
+  expect(DEFAULT_PLAYER_CONFIG.liveJumpThresholdMs).toBe(3000);
+  for (const liveJumpThresholdMs of [0, 500, 3000]) {
+    expect(() => validateConfig(minConfig({ liveJumpThresholdMs }))).not.toThrow();
+  }
+  for (const liveJumpThresholdMs of [-1, NaN, Infinity]) {
+    expect(() => validateConfig(minConfig({ liveJumpThresholdMs }))).toThrow(/liveJumpThresholdMs/);
+  }
+});
