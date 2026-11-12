@@ -1,8 +1,8 @@
 // Evaluation probes (scratch only). Loopback through the real adapter; faults are
 // injected stream wrappers, not browser behavior.
 import { expect, it, vi } from 'vitest';
-import { SessionState, varint, createControlCodec, type ControlMessage } from '@openmoq/transport';
-import { MoqtConnection, type IncomingPublish } from './adapter.js';
+import { SessionState, type ControlMessage } from '@openmoq/transport';
+import { MoqtConnection } from './adapter.js';
 import { createLoopback, flush } from './testkit/loopback.js';
 import type { WebTransportBidirectionalStream } from './types.js';
 
@@ -10,7 +10,6 @@ const ns = (s: string): Uint8Array[] => [new TextEncoder().encode(s)];
 const nm = (s: string): Uint8Array => new TextEncoder().encode(s);
 
 interface Ctl { unsuppress?: () => void; suppressPeerFin?: boolean; cancelMode?: 'hold' | 'reject'; closeMode?: 'reject'; inject?: Uint8Array; armed: boolean; log: string[]; gateAfterWrite?: Promise<void>; gateBeforeWrite?: Promise<void>; peerGone: boolean; failWritesWhenPeerGone: boolean }
-function ctl(): Ctl { return { armed: false, log: [], peerGone: false, failWritesWhenPeerGone: false }; }
 
 function instrument(stream: WebTransportBidirectionalStream, c: Ctl, tag: string): WebTransportBidirectionalStream {
   const w = stream.writable.getWriter();
@@ -41,7 +40,7 @@ function instrument(stream: WebTransportBidirectionalStream, c: Ctl, tag: string
           if (next.done) controller.close();
           else {
             controller.enqueue(next.value);
-            if (c.inject) { const extra = c.inject; c.inject = undefined; controller.enqueue(extra); }
+            if (c.inject) { const extra = c.inject; delete c.inject; controller.enqueue(extra); }
           }
         } catch { /* cancelled locally */ }
       },

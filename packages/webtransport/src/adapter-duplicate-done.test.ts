@@ -1,5 +1,5 @@
-import { expect, it, vi } from 'vitest';
-import { SessionState, varint, type ControlMessage } from '@openmoq/transport';
+import { expect, it } from 'vitest';
+import { varint } from '@openmoq/transport';
 import { connectedPair, ns, nm } from './testkit/pair.js';
 import { flush } from './testkit/loopback.js';
 for (const draft of [18,22] as const) {

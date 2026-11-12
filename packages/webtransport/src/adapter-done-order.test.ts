@@ -1,7 +1,7 @@
 // Loopback through the real adapter with injected stream faults.
-import { expect, it, vi } from 'vitest';
-import { SessionState, varint, createControlCodec, type ControlMessage } from '@openmoq/transport';
-import { MoqtConnection, type IncomingPublish } from './adapter.js';
+import { expect, it } from 'vitest';
+import { varint, type ControlMessage } from '@openmoq/transport';
+import { MoqtConnection } from './adapter.js';
 import { createLoopback, flush } from './testkit/loopback.js';
 import type { WebTransportBidirectionalStream } from './types.js';
 
@@ -40,7 +40,7 @@ function instrument(stream: WebTransportBidirectionalStream, c: Ctl, tag: string
           if (next.done) controller.close();
           else {
             controller.enqueue(next.value);
-            if (c.inject) { const extra = c.inject; c.inject = undefined; controller.enqueue(extra); }
+            if (c.inject) { const extra = c.inject; delete c.inject; controller.enqueue(extra); }
           }
         } catch { /* cancelled locally */ }
       },

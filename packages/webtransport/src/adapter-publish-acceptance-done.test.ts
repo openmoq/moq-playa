@@ -1,5 +1,5 @@
 // Loopback through the real adapter with injected stream faults.
-import { expect, it, vi } from 'vitest';
+import { expect, it } from 'vitest';
 import { SessionState, varint, createControlCodec, type ControlMessage } from '@openmoq/transport';
 import { MoqtConnection, type IncomingPublish } from './adapter.js';
 import { createLoopback, flush } from './testkit/loopback.js';
@@ -40,7 +40,7 @@ function instrument(stream: WebTransportBidirectionalStream, c: Ctl, tag: string
           if (next.done) controller.close();
           else {
             controller.enqueue(next.value);
-            if (c.inject) { const extra = c.inject; c.inject = undefined; controller.enqueue(extra); }
+            if (c.inject) { const extra = c.inject; delete c.inject; controller.enqueue(extra); }
           }
         } catch { /* cancelled locally */ }
       },
@@ -73,7 +73,6 @@ async function pair(draft: 18 | 22, c?: Ctl) {
   return { a, b, client, server, messages, close: async () => { await client.close(); await server.close(); } };
 }
 
-const dones = (m: ControlMessage[]) => m.filter(x => x.type === 'PUBLISH_DONE') as Extract<ControlMessage, { type: 'PUBLISH_DONE' }>[];
 
 for (const draft of [18, 22] as const) {
   // the peer's PUBLISH_DONE lands while our PUBLISH_OK write promise is pending.

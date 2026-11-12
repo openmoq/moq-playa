@@ -155,7 +155,7 @@ class FakeSession implements NativeQuicSession {
 
   async close(options = {}): Promise<void> { this.closeCalls.push(options); }
   destroy(error?: unknown, options?: NativeQuicCloseOptions): void {
-    this.destroyCalls.push({ error, options });
+    this.destroyCalls.push({ error, ...(options === undefined ? {} : { options }) });
     this.closedGate.resolve();
   }
 }

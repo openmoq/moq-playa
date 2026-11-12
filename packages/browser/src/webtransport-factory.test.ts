@@ -265,7 +265,7 @@ describe('createWebTransport protocol fallback', () => {
           ? Promise.reject(Object.assign(new Error('refused'), { source: 'session' }))
           : Promise.resolve();
         this.ready.catch(() => {}); // park local copy
-        if (!reject && offered.length > 0) this.protocol = offered[0];
+        if (!reject && offered.length > 0) this.protocol = offered[0]!;
         this.closed = { catch: (_fn: unknown) => { rec.closedCatches++; return Promise.resolve(); } };
       }
     });
@@ -378,7 +378,7 @@ it.each(['wrong-code', 'wrong-source', 'throwing-code', 'unbranded'] as const)('
     readonly source = behavior === 'wrong-source' ? 'session' : 'stream';
     constructor(...args: unknown[]) {
       super('invalid', 'WebTransportError'); attempts.push(args);
-      if (behavior === 'unbranded') return Object.assign(new Error('duck'), { source: 'stream', streamErrorCode: 6 });
+      if (behavior === 'unbranded') return Object.assign(new DOMException('duck'), { source: 'stream' as const, streamErrorCode: 6 });
     }
     get streamErrorCode(): number {
       if (behavior === 'throwing-code') throw new Error('getter failed');
