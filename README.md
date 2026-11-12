@@ -24,6 +24,7 @@ Joining FETCH and draft-22 fill streams use **255 − accepted subscriber priori
 Assignments happen before the first byte, only when `sendOrder` is present
 (including inherited properties), and replace any provider-assigned value.
 Probe or setter failures are advisory; `sendGroup` is untouched.
+`onSchedulingWarning` reports the first failed hint per stream.
 Accepted priority changes re-rank open media streams, including pending FINs,
 before the acknowledgement is written. Refused updates leave ranks unchanged.
 

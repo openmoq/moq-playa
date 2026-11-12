@@ -285,7 +285,7 @@ export class UniPairTopology {
     let writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
     try {
       const writable = await transport.createUnidirectionalStream();
-      setSendOrder(writable, 1024);
+      setSendOrder(writable, 1024, this.session);
       writer = writable.getWriter();
       if (this.controlOpenInvalid(epoch)) {
         throw new Error('UniPairTopology: control stream opened after session termination');
@@ -319,6 +319,12 @@ export class UniPairTopology {
     }
   }
 
+  /** Retire an unregistered allocation if shutdown crossed its open or hint. */
+  private checkRequestOpen(stream: WebTransportBidirectionalStream, epoch: number): void {
+    if (!this.controlOpenInvalid(epoch)) return;
+    void Promise.allSettled([stream.readable.cancel(), stream.writable.abort()]);
+    throw new Error('Request stream opened after session termination');
+  }
   private controlOpenInvalid(epoch: number): boolean {
     return epoch !== this.controlEpoch || this.session.state === SessionState.CLOSED;
   }
@@ -466,8 +472,10 @@ export class UniPairTopology {
       );
     }
     const requestId = message.requestId;
+    const epoch = this.controlEpoch;
     const stream = await transport.createBidirectionalStream();
-    setSendOrder(stream.writable, 512);
+    setSendOrder(stream.writable, 512, this.session, requestId);
+    this.checkRequestOpen(stream, epoch);
     const ctx = new RequestStreamContext(stream, this.codec, message.type, requestId);
     this.contexts.set(requestId, ctx);
     // A peer-initiated REQUEST_UPDATE on this stream (§10.9, PUBLISH only) is
@@ -647,8 +655,10 @@ export class UniPairTopology {
       );
     }
     const requestId = message.requestId;
+    const epoch = this.controlEpoch;
     const stream = await transport.createBidirectionalStream();
-    setSendOrder(stream.writable, 512);
+    setSendOrder(stream.writable, 512, this.session, requestId);
+    this.checkRequestOpen(stream, epoch);
     const ctx = new ContinuingRequestStreamContext(stream, this.codec, allowedContinuation, (m, kind) => handler(requestId, m, kind));
     this.continuingContexts.set(requestId, ctx);
     // Clean up the context once the stream ends (either outcome).

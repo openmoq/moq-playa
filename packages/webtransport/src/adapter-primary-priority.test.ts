@@ -7,10 +7,10 @@ import type { WebTransportLike, WebTransportBidirectionalStream } from './types.
 const ns = [new TextEncoder().encode('live')], name = new TextEncoder().encode('video');
 const connections: MoqtConnection[] = [];
 afterEach(async () => { for (const c of connections.splice(0)) await c.close(); await flush(32); });
-type Witness = { rank: number; sets: number[]; writes: number[][]; ranks: number[]; group: object; aborts: number; gate?: Promise<void>; finGate?: Promise<void> };
+type Witness = { writable: WritableStream<Uint8Array>; rank: number; sets: number[]; writes: number[][]; ranks: number[]; group: object; aborts: number; gate?: Promise<void>; finGate?: Promise<void> };
 type Mode = 'get-throw' | 'absent';
 function instrument(w: WritableStream<Uint8Array>, rows: Witness[], mode: Mode = 'get-throw', reenter?: () => void) {
-  const row: Witness = { rank: 0, sets: [], writes: [], ranks: [], group: {}, aborts: 0 }; rows.push(row);
+  const row: Witness = { writable: w, rank: 0, sets: [], writes: [], ranks: [], group: {}, aborts: 0 }; rows.push(row);
   Object.defineProperty(w, 'sendGroup', { get: () => row.group, set: () => { throw new Error('group changed'); } });
   if (mode !== 'absent') {
     const prototype = Object.create(Object.getPrototypeOf(w));
@@ -31,9 +31,15 @@ function instrument(w: WritableStream<Uint8Array>, rows: Witness[], mode: Mode =
   };
   return row;
 }
-async function pair(draft: 14 | 16 | 18 | 22 = 18, mode: Mode = 'get-throw', onRank?: () => void) {
+async function pair(draft: 14 | 16 | 18 | 22 = 18, mode: Mode = 'get-throw', onRank?: () => void, witnessClient = false) {
   const { a, b } = createLoopback();
   const rows = { uni: [] as Witness[], outgoing: [] as Witness[], incoming: [] as Witness[] };
+  const clientRows = { uni: [] as Witness[], bidi: [] as Witness[] };
+  if (witnessClient) {
+    const uni = a.createUnidirectionalStream.bind(a), bidi = a.createBidirectionalStream.bind(a);
+    a.createUnidirectionalStream = async () => { const w = await uni(); instrument(w, clientRows.uni); return w; };
+    a.createBidirectionalStream = async () => { const stream = await bidi(); instrument(stream.writable, clientRows.bidi); return stream; };
+  }
   const incomingReader = b.incomingBidirectionalStreams.getReader();
   const transport: WebTransportLike = {
     incomingUnidirectionalStreams: b.incomingUnidirectionalStreams,
@@ -50,7 +56,7 @@ async function pair(draft: 14 | 16 | 18 | 22 = 18, mode: Mode = 'get-throw', onR
   const errors: Error[] = []; client.onError = server.onError = e => errors.push(e);
   await Promise.all([client.connect(a, {maxRequestId: varint(1000n)}), server.connect(transport, {maxRequestId: varint(1000n)})]);
   server.setLargestLocationProvider(() => ({group: 1n, object: 0n}));
-  return { client, server, a, b, transport, rows, errors };
+  return { client, server, a, b, transport, rows, clientRows, errors };
 }
 async function subscription(p: Awaited<ReturnType<typeof pair>>) {
   p.server.onSubscribe = id => { void p.server.acceptSubscribe(id, 42n); };
@@ -134,11 +140,21 @@ describe('primary scheduling integration', () => {
     const p = await pair(18, 'get-throw', () => { if (armed) throw hostile; });
     const id = (await subscription(p)).requestId;
     const sid = await p.server.openSubgroup(42n, 1n, 0n, {requestId: id});
+    const warnings: unknown[] = [];
+    p.server.onSchedulingWarning = warning => {
+      warnings.push(warning);
+      throw hostile;
+    };
     armed = true;
     await p.client.requestUpdateConfirmed(id, {subscriberPriority: varint(7n), timeoutMs: 2000});
     await p.client.requestUpdateConfirmed(id, {subscriberPriority: varint(9n), timeoutMs: 2000});
     await p.server.sendObject(sid, 0n, Uint8Array.of(1));
     expect(p.errors).toEqual([]); expect(p.rows.uni.at(-1)!.rank).toBe(246);
+    expect(warnings).toHaveLength(1);
+    const warning = warnings[0] as {stream: WritableStream<Uint8Array>; requestId: bigint; error: unknown};
+    expect(warning.stream).toBe(p.rows.uni.at(-1)!.writable);
+    expect(warning.requestId).toBe(id); expect(warning.error).toBe(hostile);
+    expect(p.rows.uni.at(-1)!.sets).toEqual([127, 248, 246]);
     expect(p.rows.uni.at(-1)!.aborts).toBe(0);
     expect(p.server.session.getIncomingSubscription(id)!.currentPriority).toBe(9n);
   });
@@ -202,8 +218,10 @@ it('draft22 SUBSCRIBE_TRACKS continuing request has request rank', async () => {
 
 it('hostile probe failure is advisory and cannot fail an accepted update', async () => {
   const p = await pair(); const id = (await subscription(p)).requestId;
-  let probes = 0;
+  let probes = 0, warnings = 0;
+  let warnedError: unknown, warnedRequest: bigint | undefined;
   const hostile = new Proxy({}, {get() { throw new Error('thrown value inspected'); }});
+  p.server.onSchedulingWarning = warning => { warnings++; warnedError = warning.error; warnedRequest = warning.requestId; throw hostile; };
   const create = p.transport.createUnidirectionalStream!;
   p.transport.createUnidirectionalStream = async () => {
     const target = await create();
@@ -215,6 +233,7 @@ it('hostile probe failure is advisory and cannot fail an accepted update', async
   const sid = await p.server.openSubgroup(42n, 1n, 0n, {requestId: id});
   await p.client.requestUpdateConfirmed(id, {subscriberPriority: varint(7n), timeoutMs: 1000});
   await p.server.sendObject(sid, 0n, Uint8Array.of(1));
+  expect(warnings).toBe(1); expect(warnedError).toBe(hostile); expect(warnedRequest).toBe(id);
   expect(probes).toBe(1); expect(p.errors).toEqual([]);
   expect(p.server.session.getIncomingSubscription(id)!.currentPriority).toBe(7n);
 });
@@ -307,4 +326,117 @@ it('a rejected UPDATE commits no fill priority snapshot or stream admission', as
   await expect(p.client.requestUpdateConfirmed(id, {subscriberPriority: varint(7n), fill: {subscriberPriority: 0},
     timeoutMs: 1000, onRequestId: value => {updateId = value;}})).rejects.toThrow();
   await expect(p.server.openFillStream(updateId)).rejects.toThrow(/No pending fill/);
+});
+
+// These placements already work on the parent; each has a removal-mutant check.
+it.each([14, 16, 18, 22] as const)('draft %s client control and request streams rank before their first byte', async draft => {
+  const p = await pair(draft, 'get-throw', undefined, true);
+  await subscription(p);
+  const control = draft < 18 ? p.clientRows.bidi[0]! : p.clientRows.uni[0]!;
+  expect(control.ranks[0]).toBe(1024);
+  if (draft >= 18) {
+    expect(p.clientRows.bidi[0]!.ranks[0]).toBe(512);
+    p.server.onSubscribeNamespace = id => { void p.server.acceptSubscribeNamespace(id); };
+    await p.client.subscribeNamespace(ns);
+    await flush(128);
+    expect(p.clientRows.bidi[1]!.ranks[0]).toBe(512);
+  }
+  expect(p.errors).toEqual([]);
+});
+
+it('draft16 inbound SUBSCRIBE_NAMESPACE ranks its refusal before the first byte', async () => {
+  const p = await pair(16);
+  await p.client.subscribeNamespace(ns);
+  await flush(128);
+  expect(p.rows.incoming[1]!.ranks[0]).toBe(512);
+  expect(p.errors).toEqual([]);
+});
+
+// Loopback witnesses for warning routing through both client topology paths.
+it.each([14, 16, 18, 22] as const)('draft %s client hint failures identify control and request streams', async draft => {
+  const { a, b } = createLoopback();
+  const client = new MoqtConnection(draft), server = new MoqtConnection(draft, {role: 'server'});
+  connections.push(client, server);
+  const errors: Error[] = [];
+  client.onError = server.onError = error => errors.push(error);
+  const failure = new Error('unsupported hint');
+  const streams: WritableStream<Uint8Array>[] = [];
+  const warnings: Array<{stream: WritableStream<Uint8Array>; requestId: bigint | undefined; error: unknown}> = [];
+  const failing = (writable: WritableStream<Uint8Array>) => {
+    streams.push(writable);
+    Object.defineProperty(writable, 'sendOrder', {set() { throw failure; }});
+    return writable;
+  };
+  const uni = a.createUnidirectionalStream.bind(a), bidi = a.createBidirectionalStream.bind(a);
+  a.createUnidirectionalStream = async () => failing(await uni());
+  a.createBidirectionalStream = async () => { const stream = await bidi(); failing(stream.writable); return stream; };
+  client.onSchedulingWarning = warning => { warnings.push(warning); throw failure; };
+  await Promise.all([client.connect(a, {maxRequestId: varint(1000n)}), server.connect(b, {maxRequestId: varint(1000n)})]);
+  server.onSubscribe = id => { void server.acceptSubscribe(id, 42n); };
+  const sub = await client.subscribeTrack(ns, name, {filter: {type: 'NextGroupStart'}});
+  expect(warnings[0]?.stream).toBe(streams[0]);
+  expect(warnings[0]?.requestId).toBeUndefined();
+  expect(warnings[0]?.error).toBe(failure);
+  if (draft >= 18) {
+    server.onSubscribeNamespace = id => { void server.acceptSubscribeNamespace(id); };
+    const namespaceId = await client.subscribeNamespace(ns);
+    await flush(128);
+    expect(warnings.map(warning => warning.requestId)).toEqual([undefined, sub.requestId, namespaceId]);
+    expect(warnings.map(warning => warning.stream)).toEqual(streams);
+    expect(warnings.every(warning => warning.error === failure)).toBe(true);
+  } else expect(warnings).toHaveLength(1);
+  expect(errors).toEqual([]);
+});
+
+// Evaluator reproductions: synchronous warning-driven close must fence new requests.
+it.each(['subscribe', 'namespace'] as const)('warning close during outgoing %s retires the allocation before writing', async kind => {
+  const p = await pair(18);
+  let writes = 0, attempts = 0, cancelled = 0, aborted = 0;
+  let shutdown: Promise<void> | undefined;
+  const create = p.a.createBidirectionalStream.bind(p.a);
+  p.a.createBidirectionalStream = async () => {
+    const stream = await create();
+    Object.defineProperty(stream.writable, 'sendOrder', {set() { attempts++; throw new Error('hint'); }});
+    const cancel = stream.readable.cancel.bind(stream.readable), abort = stream.writable.abort.bind(stream.writable);
+    stream.readable.cancel = reason => { cancelled++; return cancel(reason); };
+    stream.writable.abort = reason => { aborted++; return abort(reason); };
+    const getWriter = stream.writable.getWriter.bind(stream.writable);
+    stream.writable.getWriter = () => {
+      const writer = getWriter(), write = writer.write.bind(writer);
+      writer.write = chunk => { writes++; return write(chunk); };
+      return writer;
+    };
+    return stream;
+  };
+  p.client.onSchedulingWarning = () => { shutdown = p.client.close(); };
+  const opening = kind === 'subscribe' ? p.client.subscribe(ns, name) : p.client.subscribeNamespace(ns);
+  // Observe the outcome before asserting, so the unfixed stream is also cleaned up.
+  const outcome = await opening.then(() => 'sent', () => 'rejected');
+  await shutdown; await flush(128);
+  expect(attempts).toBe(1); expect(writes).toBe(0);
+  expect(outcome).toBe('rejected');
+  expect(cancelled).toBe(1); expect(aborted).toBe(1);
+});
+
+it.each(['subscribe', 'fetch', 'legacy'] as const)('warning close during %s refresh sends no acknowledgement', async kind => {
+  let armed = false;
+  const p = await pair(kind === 'legacy' ? 16 : 18, 'get-throw', () => { if (armed) throw new Error('hint'); });
+  let id: bigint;
+  if (kind === 'fetch') {
+    id = await fetchOwner(p);
+    p.server.setFetchLargestLocationProvider(() => ({group: 1n, object: 2n}));
+  } else id = (await subscription(p)).requestId;
+  if (kind === 'fetch') await p.server.openFetchStream(id);
+  else await p.server.openSubgroup(42n, 1n, 0n, {requestId: id});
+  const request = p.rows.incoming[0]!;
+  const before = request.writes.length;
+  if (kind !== 'legacy') expect(before).toBe(1);
+  let shutdown: Promise<void> | undefined;
+  let warnings = 0;
+  p.server.onSchedulingWarning = () => { warnings++; shutdown = p.server.close(varint(1n)); };
+  armed = true;
+  await p.client.requestUpdate(id, {subscriberPriority: varint(7n)});
+  await flush(128); await shutdown;
+  expect(warnings).toBe(1);
+  expect(request.writes).toHaveLength(before);
 });

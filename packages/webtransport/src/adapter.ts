@@ -1,4 +1,4 @@
-import { setSendOrder } from './scheduling.js';
+import { setSendOrder, schedulingWarnings } from './scheduling.js';
 import { PublisherTerminalFailure, type PublisherTerminalOptions } from './topology/publisher-terminal.js';
 import { RequestUpdateFailure, RequestUpdateError } from './request-update-confirmation.js';
 /**
@@ -664,6 +664,23 @@ export class MoqtConnection {
    */
   onMessage?: (msg: ControlMessage) => void;
 
+  /**
+   * Synchronous advisory notification of the first sendOrder probe or setter
+   * failure for a writable stream. `stream` is for identification only:
+   * do not lock, write to, or abort it.
+   * `requestId` is undefined for control streams or an inbound request whose
+   * opener has not yet been decoded. `error` is the original thrown value,
+   * passed through without inspection. No warning is emitted for absent support.
+   *
+   * Callback exceptions are contained. Explicit application actions such as
+   * close still take effect; a callback cannot revive a retired owner. Register
+   * before connect to observe setup failures; later registration does not replay
+   * warnings. Warnings do not disable later setter attempts. Clearing the callback
+   * stops notifications; stream identities are held weakly for deduplication.
+   */
+  onSchedulingWarning?: (warning: { stream: WritableStream<Uint8Array>; requestId: bigint | undefined; error: unknown }) => void;
+  private readonly setSendOrder = (writable: WritableStream<Uint8Array> | undefined, rank: number, requestId?: bigint) =>
+    setSendOrder(writable, rank, this.session, requestId);
   /**
    * Called for an ACCEPTED GOAWAY, carrying the scope the wire cannot express.
    *
@@ -1635,6 +1652,7 @@ export class MoqtConnection {
     // PATH/AUTHORITY are forbidden over WebTransport but carry native-QUIC
     // routing information. The sans-I/O gate enforces the selected binding.
     this.session = new Session(this._role, version, { webtransport: transportKind === 'webtransport' });
+    schedulingWarnings.set(this.session, (stream, requestId, error) => this.onSchedulingWarning?.({ stream, requestId, error }));
     if (isRequestStreamDraft(version)) {
       this.codec = createControlCodec(version);
       this.framer = new ControlStreamFramer(this.codec);
@@ -1869,14 +1887,14 @@ export class MoqtConnection {
         this.draft16ControlAcceptor = acceptor;
         try {
           const control = await acceptor.start(incoming);
-          setSendOrder(control.stream.writable, 1024);
+          this.setSendOrder(control.stream.writable, 1024);
           if (this._terminated) {
             if (!this.localCloseIsGraceful) {
               this.swallow(() => control.reader.cancel());
               this.swallow(() => control.stream.writable.abort());
             }
             try { control.reader.releaseLock(); } catch { /* already released */ }
-            throw new Error('Connection closed during setup');
+            throw new Error('Connection closed during setup: Control stream retired during scheduling hint');
           }
           this.controlWriter = control.stream.writable.getWriter();
           reader = control.reader;
@@ -1895,7 +1913,7 @@ export class MoqtConnection {
         const { value: bidiStream, done } = await incomingReader.read();
         incomingReader.releaseLock();
         if (done || !bidiStream) throw new ProtocolViolationError('server connect: no control stream from client');
-        setSendOrder(bidiStream.writable, 1024);
+        this.setSendOrder(bidiStream.writable, 1024);
         this.controlWriter = bidiStream.writable.getWriter();
         reader = bidiStream.readable.getReader();
       }
@@ -1937,7 +1955,7 @@ export class MoqtConnection {
     } else {
       // Open control stream (first client-initiated bidirectional stream).
       const bidiStream = await transport.createBidirectionalStream();
-      setSendOrder(bidiStream.writable, 1024);
+      this.setSendOrder(bidiStream.writable, 1024);
       this.controlWriter = bidiStream.writable.getWriter();
       reader = bidiStream.readable.getReader();
       await this.executeActions(this.session.initiateSetup(cleanOptions)); // CLIENT_SETUP
@@ -2868,6 +2886,7 @@ export class MoqtConnection {
       existingRequestId: originalRequestId,
     });
     refreshOrder();
+    if (this._terminated) return;
     const fwdAfter = this.changedPublishForwardState(originalRequestId, fwdBefore);
     const closeAction = actions.find((a) => a.type === 'close_connection') as CloseConnectionAction | undefined;
     if (closeAction) {
@@ -6359,7 +6378,7 @@ export class MoqtConnection {
           { errorSource: 'transport', isFatal: false, ...(err instanceof Error ? { cause: err } : {}) },
         );
       }
-      const orderWritable = setSendOrder(writable, 255 - Number(assoc?.sub.currentPriority ?? 128n));
+      const orderWritable = this.setSendOrder(writable, 255 - Number(assoc?.sub.currentPriority ?? 128n), assoc?.requestId);
       const writer = writable.getWriter();
 
       // A cancellation or Forward=0 transition while the transport open was
@@ -6759,7 +6778,7 @@ export class MoqtConnection {
       this.fetchServeReserved.delete(requestId);
       throw err;
     }
-    const orderWritable = setSendOrder(stream, 255 - (priority ?? Number(this.session.getIncomingFetch(requestId)?.currentPriority ?? 128n)));
+    const orderWritable = this.setSendOrder(stream, 255 - (priority ?? Number(this.session.getIncomingFetch(requestId)?.currentPriority ?? 128n)), requestId);
     const writer = stream.getWriter();
     // §10.13: authorization was validated BEFORE the createUnidirectionalStream
     // await. A rejectFetch() or a request-stream close during that await
@@ -6870,10 +6889,10 @@ export class MoqtConnection {
       if (!owner || owner.currentPriority === before) return;
       const rank = 255 - Number(owner.currentPriority ?? 128n);
       for (const state of this.outgoingStreams.values()) {
-        if (state.subscriptionRequestId === requestId) setSendOrder(state.orderWritable, rank);
+        if (state.subscriptionRequestId === requestId) this.setSendOrder(state.orderWritable, rank, requestId);
       }
       for (const state of this.fetchOutgoingStreams.values()) {
-        if (state.fillOf === undefined && state.requestId === requestId) setSendOrder(state.orderWritable, rank);
+        if (state.fillOf === undefined && state.requestId === requestId) this.setSendOrder(state.orderWritable, rank, requestId);
       }
     };
   }
@@ -7322,6 +7341,7 @@ export class MoqtConnection {
           const refreshOrder = this.priorityChange(message.type === 'REQUEST_UPDATE' ? message.existingRequestId : (message as { requestId?: bigint }).requestId);
           const actions = terminalActions ?? receiverErrorActions ?? this.session.handleControlMessage(message);
           refreshOrder();
+          if (this._terminated) return;
           this.settleUpdateResponse(message);
           const fwdAfter = this.changedPublishForwardState(fwdTarget, fwdBefore);
           // Start protocol output before invoking application code. A pause
@@ -7613,7 +7633,7 @@ export class MoqtConnection {
           if (!this._terminated) this.containObserver(() => this.closeSessionInternalError('Pending namespace stream capacity exhausted'));
           break;
         }
-        setSendOrder(stream.writable, 512);
+        this.setSendOrder(stream.writable, 512);
         const ctx = new InboundRequestStreamContext(stream, this.codec, {
           onMessage: (message, context) => this.rejectDraft16Namespace(message, context),
           onFailure: (error, context) => {
@@ -7704,7 +7724,7 @@ export class MoqtConnection {
 
   /** Wrap a peer-initiated bidi stream in an InboundRequestStreamContext and read it. */
   private handleIncomingBidiStream(stream: WebTransportBidirectionalStream): void {
-    setSendOrder(stream.writable, 512);
+    this.setSendOrder(stream.writable, 512);
     const ctx = new InboundRequestStreamContext(stream, this.codec, {
       onMessage: (msg, c) => this.dispatchInboundRequestMessage(msg, c),
       onFailure: (err, c) => void this.onInboundStreamClosed(c, err),
@@ -7983,6 +8003,7 @@ export class MoqtConnection {
         existingRequestId: originalId,
       });
       refreshOrder();
+      if (this._terminated) return;
       // §10.9: respond with exactly one REQUEST_OK / REQUEST_ERROR on THIS stream.
       // If handling produced a session close (e.g. unknown/invalid update), do
       // NOT also write a success response — close and stop.
@@ -9383,7 +9404,7 @@ export class MoqtConnection {
   ): Promise<void> {
     try {
       const bidiStream = await this.transport!.createBidirectionalStream();
-      setSendOrder(bidiStream.writable, 512);
+      this.setSendOrder(bidiStream.writable, 512, requestId);
       const writer = bidiStream.writable.getWriter();
 
       // Track the stream for future cancellation
