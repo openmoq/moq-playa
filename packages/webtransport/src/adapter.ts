@@ -294,6 +294,10 @@ function requestGoawayNotice(requestId: bigint, msg: Goaway): GoawayNotice {
  * accept/reject via the connection.
  */
 export interface IncomingPublish {
+  /** Monotonic receive head; each read returns a fresh frozen snapshot. */
+  readonly largestLocation: Readonly<{ groupId: bigint; objectId: bigint }> | null;
+  /** Resolves once at logical termination, including refusal and session closure. */
+  readonly closed: Promise<Readonly<{ largestLocation: IncomingPublish['largestLocation'] }>>;
   readonly requestId: bigint;
   readonly trackNamespace: Uint8Array[];
   readonly trackName: Uint8Array;
@@ -874,6 +878,7 @@ export class MoqtConnection {
     for (const ctx of this.inboundRequestContexts.values()) this.swallow(() => ctx.abort());
     this.inboundRequestContexts.clear();
     // Inbound PUBLISH / FETCH routing + group-order state.
+    this.settlePublicationLifetimes();
     this.publishAliasMaps.clear();
     this.fetchGroupOrder.clear();
     this.inboundFetchGroupOrder.clear();
@@ -3163,6 +3168,31 @@ export class MoqtConnection {
     this.sharedAliasSubs.set(alias, group);
   }
 
+  private readonly publishLifetimes = new Map<bigint, { owner: SubscriptionStateMachine; finish(): void }>();
+
+  private publicationLifetime(requestId: bigint): Pick<IncomingPublish, 'largestLocation' | 'closed'> {
+    const owner = this.session.getIncomingSubscription(requestId)!;
+    let final: IncomingPublish['largestLocation'] | undefined;
+    const snapshot = () => {
+      const head = final === undefined ? owner.largestLocation : final;
+      return head ? Object.freeze({ ...head }) : null;
+    };
+    let resolve!: (value: Readonly<{ largestLocation: IncomingPublish['largestLocation'] }>) => void;
+    const closed = new Promise<Readonly<{ largestLocation: IncomingPublish['largestLocation'] }>>(yes => { resolve = yes; });
+    this.publishLifetimes.set(requestId, { owner, finish: () => {
+      final = snapshot();
+      this.publishLifetimes.delete(requestId);
+      resolve(Object.freeze({ largestLocation: final }));
+    } });
+    return { get largestLocation() { return snapshot(); }, closed };
+  }
+
+  private settlePublicationLifetimes(): void {
+    for (const [id, life] of this.publishLifetimes) {
+      if (this._terminated || life.owner.isTerminated || this.session.getIncomingSubscription(id) !== life.owner) life.finish();
+    }
+  }
+
   private bindPublishAlias(pub: IncomingPublish): void {
     const members = isDraft22(this.session.draftVersion) ? this.publishAliasMaps.get(pub.trackAlias) ?? [] : [];
     members.push(pub);
@@ -3177,6 +3207,7 @@ export class MoqtConnection {
   }
 
   private removePublishAliasMember(alias: bigint, requestId: bigint): void {
+    this.publishLifetimes.get(requestId)?.finish();
     const members = this.publishAliasMaps.get(alias)?.filter((pub) => pub.requestId !== requestId) ?? [];
     if (members.length > 0) this.publishAliasMaps.set(alias, members);
     else this.publishAliasMaps.delete(alias);
@@ -4940,6 +4971,7 @@ export class MoqtConnection {
     trackAlias: bigint,
     options?: { parameters?: Parameters; trackProperties?: TrackProperties },
   ): Promise<void> {
+    if (this._terminated) throw new Error('Connection closed');
     // Role check: an inbound PUBLISH (publish-initiated) makes US the SUBSCRIBER —
     // accepting it must NOT authorize us to publish on its alias. Only an inbound
     // SUBSCRIBE (we are the publisher) grants publisher data-plane authority.
@@ -6490,6 +6522,7 @@ export class MoqtConnection {
   private async executeActions(
     actions: SessionOutboundAction[],
   ): Promise<void> {
+    this.settlePublicationLifetimes();
     const fetchDataStops = new Map<bigint, { opened: boolean; stopped: Promise<void> }>();
     for (const action of actions) {
       if (action.type === 'cancel_request' && action.fetchDataError) {
@@ -6822,14 +6855,14 @@ export class MoqtConnection {
             const pub = message as Publish;
             if (this.session.getIncomingSubscription(pub.requestId as bigint) !== undefined
                 && this.session.state !== SessionState.CLOSED) {
-              const incoming: IncomingPublish = {
+              const incoming = Object.assign(this.publicationLifetime(pub.requestId as bigint), {
                 requestId: pub.requestId as bigint,
                 trackNamespace: pub.trackNamespace,
                 trackName: pub.trackName,
                 trackAlias: pub.trackAlias as bigint,
                 onObject: null,
                 onSubgroupClosed: null,
-              };
+              });
               this.bindPublishAlias(incoming);
               this.onPublish(incoming);
             }
@@ -6978,6 +7011,9 @@ export class MoqtConnection {
             continue;
           }
           const { datagram } = this.dataCodec!.decodeObjectDatagram(bytes, 0);
+          for (const owner of this.session.getSubscriberRequestsForAlias(datagram.trackAlias)) {
+            owner.updateLargestLocation(datagram.groupId, datagram.objectId);
+          }
           // A whole datagram is one complete receive, whatever routing decides next.
           if (datagramRead !== undefined) reception!.datagram(datagramRead, datagram);
           // §10.11 early-discard: a datagram for an alias whose PUBLISH_DONE
@@ -7576,14 +7612,14 @@ export class MoqtConnection {
       this.markRebound(pubAlias, this.session.getIncomingSubscription(requestId)!);
     }
     this.clearTerminatedAlias(pubAlias, true);
-    const incoming: IncomingPublish = {
+    const incoming = Object.assign(this.publicationLifetime(requestId), {
       requestId,
       trackNamespace: pub.trackNamespace,
       trackName: pub.trackName,
       trackAlias: pubAlias,
       onObject: null,
       onSubgroupClosed: null,
-    };
+    });
     this.bindPublishAlias(incoming);
     // §8 applies to a PUBLISH-initiated subscription too. Capture the publisher's raw
     // OBJECT/SUBGROUP_DELIVERY_TIMEOUT Track Properties so acceptSubscribe can COMBINE
@@ -8335,6 +8371,11 @@ export class MoqtConnection {
   ): Promise<DataStreamReadTerminal> {
     let previousObjectId: bigint = 0n;
     let isFirstObject = true;
+    // d16/d18 §5.1.2: receipt starts at the first Object byte. A carrier
+    // that predates its binding never acquires head authority retroactively.
+    const streamBinding = this.session.getTrackByAlias(header.trackAlias);
+    let objectOwners: SubscriptionStateMachine[] | undefined;
+    let headObserved = false;
     this.objectReception?.objectsBegin(reader, buf.length, () => this.subgroupReceptionCarrier(streamId, header, true));
 
     while (true) {
@@ -8342,6 +8383,15 @@ export class MoqtConnection {
       if (this.locallyDiscardedReaders.has(reader)) return 'local-discard';
       // Try to decode an object from the buffer
       if (buf.length > 0) {
+        objectOwners ??= streamBinding && this.session.getTrackByAlias(header.trackAlias) === streamBinding
+          ? this.session.getSubscriberRequestsForAlias(header.trackAlias) : [];
+        if (!headObserved) {
+          try {
+            const head = this.dataCodec!.decodeSubgroupObjectHeader(buf, 0, header.hasExtensions, previousObjectId, isFirstObject);
+            for (const owner of objectOwners) owner.updateLargestLocation(header.groupId, head.objectId);
+            headObserved = true;
+          } catch { /* The full decoder below owns incomplete and invalid headers. */ }
+        }
         try {
           const { object, bytesRead, header: objectHeader } = this.dataCodec!.decodeSubgroupObject(
             buf,
@@ -8352,6 +8402,8 @@ export class MoqtConnection {
           );
           const objectStart = buf;
           buf = buf.subarray(bytesRead);
+          objectOwners = undefined;
+          headObserved = false;
 
           // §10.4.2: "0b01: The Subgroup ID field is absent and the Subgroup ID
           // is the Object ID of the first Object transmitted in this Subgroup."

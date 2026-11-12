@@ -70,6 +70,8 @@ function incomingPublish(
     trackNamespace: nsBytes([...namespace]),
     trackName: te(DEMO_TRACK),
     trackAlias: alias,
+    largestLocation: null,
+    closed: new Promise(() => {}),
     onObject: null,
     onSubgroupClosed: null,
   };
@@ -281,7 +283,8 @@ describe('Relay subgroup lifecycle', () => {
       async publish(namespace: Uint8Array[], name: Uint8Array, alias: bigint) {
         const requestId = nextRequest++;
         const p: IncomingPublish = { requestId, trackNamespace: namespace, trackName: name,
-          trackAlias: alias, onObject: null, onSubgroupClosed: null };
+          trackAlias: alias, largestLocation: null, closed: new Promise(() => {}),
+          onObject: null, onSubgroupClosed: null };
         publications.set(alias, p);
         await acceptPublisher(relay, p);
         setTimeout(() => origin.onMessage?.({ type: 'REQUEST_OK', requestId }), 0);

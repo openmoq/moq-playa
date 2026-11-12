@@ -534,6 +534,7 @@ export class SubscriptionStateMachine {
    * Only updates if the new location is larger.
    */
   updateLargestLocation(groupId: bigint, objectId: bigint): void {
+    if (this.isTerminated) return;
     if (!this._largestLocation) {
       this._largestLocation = { groupId, objectId };
       return;

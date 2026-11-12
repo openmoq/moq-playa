@@ -1549,6 +1549,8 @@ export class Session {
     if (propertyFault) return this.rejectMalformedTrackResponse(msg.requestId as bigint, propertyFault);
 
     sub.handleSubscribeOk(msg.trackAlias);
+    const head = this.extractLargestObjectParam(msg.parameters);
+    if (head) sub.updateLargestLocation(head.group, head.object);
     this.settleFillRequest(msg.requestId as bigint, msg.parameters);
     if (isDraft22(this._draftVersion)) {
       const properties = msg.trackProperties ?? msg.trackExtensions;
@@ -1933,6 +1935,9 @@ export class Session {
     const pending = this.pendingUpdates.get(msg.requestId as bigint);
     if (pending) {
       this.pendingUpdates.delete(msg.requestId as bigint);
+      const owner = this.subscriptions.get(pending.existingRequestId) ?? this.incomingSubscriptions.get(pending.existingRequestId);
+      const head = this.extractLargestObjectParam(msg.parameters);
+      if (head && owner && !owner.isTerminated) owner.updateLargestLocation(head.group, head.object);
       if (pending.subscriberPriority !== undefined) {
         const sub = this.subscriptions.get(pending.existingRequestId) ?? this.incomingSubscriptions.get(pending.existingRequestId);
         if (sub && !sub.isTerminated) sub.currentPriority = pending.subscriberPriority;
@@ -2271,6 +2276,10 @@ export class Session {
     if (order !== undefined) sub.requestedGroupOrder = order === 2n ? 'descending' : 'ascending';
 
     this.incomingSubscriptions.set(msg.requestId as bigint, sub);
+    if (sub.isPublishInitiated) {
+      const head = this.extractLargestObjectParam(msg.parameters);
+      if (head) sub.updateLargestLocation(head.group, head.object);
+    }
 
     return validated.replenish ?? [];
   }
@@ -2357,6 +2366,10 @@ export class Session {
     }
 
     this.incomingSubscriptions.set(msg.requestId as bigint, sub);
+    if (sub.isPublishInitiated) {
+      const head = this.extractLargestObjectParam(msg.parameters);
+      if (head) sub.updateLargestLocation(head.group, head.object);
+    }
 
     return validated.replenish ?? [];
   }

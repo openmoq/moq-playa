@@ -79,7 +79,7 @@ it('paused rebound owner survives clearing with another live owner; last retirem
   } finally { vi.useRealTimers(); writer.releaseLock(); await h.client.close(); await h.server.close(); }
 });
 
-it('ordinary aliases avoid owner lookup after another alias rebounds and close from receipt clears both indexes (draft 18)', async () => {
+it('ordinary aliases preserve successor receive heads after another alias rebounds and close from receipt clears both indexes (draft 18)', async () => {
   const h = await connectedPair(18);
   h.server.setLargestLocationProvider(() => null);
   h.server.onSubscribe = (id, _ns, name) => {
@@ -93,14 +93,12 @@ it('ordinary aliases avoid owner lookup after another alias rebounds and close f
     await h.client.subscribe(ns('live'), nm('video')); await flush(128);
     await h.client.subscribe(ns('live'), nm('ordinary')); await flush(128);
     expect(state(h.client).reboundAliases?.has(77n)).toBe(true);
-    const lookup = vi.spyOn(h.client.session, 'getSubscriberRequestsForAlias');
     for (let objectId = 0n; objectId < 3n; objectId++) {
       await writer.write(encodeObjectDatagram18({ typeByte: 0, trackAlias: 88n, groupId: 1n, objectId,
         publisherPriority: 128, payload: Uint8Array.of(4), extensions: undefined, status: undefined, isEndOfGroup: false }));
       await flush(128);
     }
-    expect(delivered).toHaveBeenCalledTimes(3); expect(lookup).not.toHaveBeenCalled();
-    lookup.mockRestore();
+    expect(delivered).toHaveBeenCalledTimes(3);
     let closing: Promise<void> | undefined;
     const off = h.client.observeObjectReceipts(() => { closing = h.client.close(); });
     await writer.write(encodeObjectDatagram18({ typeByte: 0, trackAlias: 77n, groupId: 1n, objectId: 0n,
