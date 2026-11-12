@@ -37,6 +37,22 @@ export interface VideoEncodeObservation {
   readonly encodeToReceiptMs: number;
 }
 
+/** The same explicit anchor at presentation of the first sample of its Object
+ * in the selected live CMAF media element. requestVideoFrameCallback mediaTime
+ * must match that sample's appended time (assembler placement plus native
+ * timestampOffset) within the engine's microsecond quantization, and its PTS
+ * must match the anchor's mediaPtsMs. The wallclock is read in the callback,
+ * not at display scan-out. Same qualification as VideoEncodeObservation; may
+ * be negative; frames without such an anchor do not refresh it.
+ */
+export interface VideoPresentationObservation extends Pick<VideoEncodeObservation,
+  'source' | 'timeline' | 'location' | 'mediaPtsMs' | 'encodedWallclockMs'> {
+  /** requestVideoFrameCallback mediaTime (element timeline, seconds). */
+  readonly presentedMediaTime: number;
+  readonly presentedWallclockMs: number;
+  readonly encodeToPresentationMs: number;
+}
+
 // ─── TTFF Breakdown ──────────────────────────────────────────────────
 
 /**
@@ -94,6 +110,8 @@ export interface PlayerStats {
   readonly captureTimestampAgeMs?: number | null;
   /** Exact explicit anchor already known at original receipt; null without qualified evidence. */
   readonly videoEncodeObservation?: VideoEncodeObservation | null;
+  /** Exact explicit anchor of the presented frame; null without qualified evidence. */
+  readonly videoPresentationObservation?: VideoPresentationObservation | null;
   /** Target latency from MSF catalog (ms). @see draft-ietf-moq-msf-00 §5.1.16 */
   readonly targetLatencyMs: number;
   /** Cumulative active playback time (ms). Excludes paused/stalled time. */

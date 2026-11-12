@@ -153,7 +153,7 @@ export type { CommandDispatcherOptions } from './command-dispatcher.js';
 
 /** @experimental Advanced API — may change between minor versions. */
 export { StatsAccumulator } from './stats.js';
-export type { PlayerStats, VideoEncodeObservation, TTFFBreakdown } from './stats.js';
+export type { PlayerStats, VideoEncodeObservation, VideoPresentationObservation, TTFFBreakdown } from './stats.js';
 
 // ─── Internal managers (exported for advanced use / testing) ─────────
 
