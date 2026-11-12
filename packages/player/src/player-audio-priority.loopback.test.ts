@@ -7,10 +7,11 @@ import type { MoqtPlayerConfig } from './config.js';
 
 type AudioPolicy = Partial<Pick<MoqtPlayerConfig, 'subscriberPriority' | 'audioSubscriberPriority'>>;
 const cases: Array<{ name: string; config: AudioPolicy; video: bigint; audio: bigint }> = [
-  { name: 'default', config: {}, video: 128n, audio: 127n },
-  { name: 'base64', config: { subscriberPriority: 64 }, video: 64n, audio: 63n },
+  { name: 'default', config: {}, video: 128n, audio: 126n },
+  { name: 'base64', config: { subscriberPriority: 64 }, video: 64n, audio: 62n },
+  { name: 'base1 clamp', config: { subscriberPriority: 1 }, video: 1n, audio: 0n },
   { name: 'base0 tie', config: { subscriberPriority: 0 }, video: 0n, audio: 0n },
-  { name: 'base255', config: { subscriberPriority: 255 }, video: 255n, audio: 254n },
+  { name: 'base255', config: { subscriberPriority: 255 }, video: 255n, audio: 253n },
   { name: 'override0', config: { subscriberPriority: 64, audioSubscriberPriority: 0 }, video: 64n, audio: 0n },
   { name: 'override255', config: { subscriberPriority: 64, audioSubscriberPriority: 255 }, video: 64n, audio: 255n },
 ];
@@ -51,7 +52,7 @@ describe.each([16, 18, 22] as const)('draft%d audio subscription priority', draf
       expect(f.scheduledAudio.at(-1)?.timestamp).toBe(10_040_000);
       expect(f.wire.request(refs.video).id).toBe(videoId);
       expect(receivedPriority(f, refs.video)).toBe(64n);
-      expect(receivedPriority(f, refs.spanish)).toBe(63n);
+      expect(receivedPriority(f, refs.spanish)).toBe(62n);
       expect(f.errors).toEqual([]);
       expect(f.wire.errors).toEqual([]);
     } finally { await f.destroy(); await selecting?.catch(() => {}); }

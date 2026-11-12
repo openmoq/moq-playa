@@ -1962,7 +1962,7 @@ export class MoqtPlayer {
   private subscriberPriorityFor(mediaType: string): { subscriberPriority?: ReturnType<typeof varint> } {
     if (mediaType !== 'audio') return {};
     const base = this.config.subscriberPriority ?? DEFAULT_SUBSCRIBER_PRIORITY;
-    return { subscriberPriority: varint(BigInt(this.config.audioSubscriberPriority ?? Math.max(0, base - 1))) };
+    return { subscriberPriority: varint(BigInt(this.config.audioSubscriberPriority ?? Math.max(0, base - 2))) };
   }
 
   /** Retain normal completion data, not errors or stale live-edge recovery (§9.15 / §10.11 / §9.9). */

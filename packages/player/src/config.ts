@@ -286,8 +286,8 @@ export interface PlaybackTuningConfig {
 
   /**
    * Subscriber priority for audio subscriptions (0 = highest, 255 = lowest).
-   * Default: one step more urgent than `subscriberPriority`, clamped at 0
-   * (127 when unset, against the publisher default of 128 for video). This
+   * Default: two steps more urgent than `subscriberPriority`, clamped at 0
+   * (126 when unset, against the publisher default of 128 for video). This
    * expresses a scheduling preference, not a delivery guarantee; priority 0 ties.
    * @see draft-ietf-moq-transport-16 §9.2.2.3 (SUBSCRIBER_PRIORITY)
    */

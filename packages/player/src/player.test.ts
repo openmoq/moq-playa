@@ -2524,8 +2524,8 @@ describe('MoqtPlayer', () => {
     });
 
     it.each([
-      [{}, undefined, 127n],
-      [{ subscriberPriority: 64 }, 64n, 63n],
+      [{}, undefined, 126n],
+      [{ subscriberPriority: 64 }, 64n, 62n],
       [{ audioSubscriberPriority: 10 }, undefined, 10n],
     ] as const)('audio subscribes ahead of video by default (config %o)', async (config, video, audio) => {
       const adapter = createMockAdapter();
