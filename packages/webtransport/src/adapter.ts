@@ -302,6 +302,14 @@ export interface MalformedPublicationTerminationResult { readonly status: 'done-
  * accept/reject via the connection.
  */
 export interface IncomingPublish {
+  /**
+   * Initial PUBLISH Track Properties, available before acceptance and after termination.
+   * Captured before semantic message observers run. SDK handles return a fresh
+   * deep copy on every read. An empty Map means observed
+   * absence (including drafts 14/16); undefined on external handles means unavailable
+   * provenance. Mutating a returned Map, value array or byte array cannot affect the handle.
+   */
+  readonly initialTrackProperties?: ReadonlyMap<bigint, readonly TrackPropertyValue[]>;
   /** Monotonic receive head; each read returns a fresh frozen snapshot. */
   readonly largestLocation: Readonly<{ groupId: bigint; objectId: bigint }> | null;
   /** Resolves once at logical termination, including refusal and session closure. */
@@ -3247,7 +3255,8 @@ export class MoqtConnection {
 
   private readonly publishLifetimes = new Map<bigint, { owner: SubscriptionStateMachine; finish(): void }>();
 
-  private publicationLifetime(requestId: bigint): Pick<IncomingPublish, 'largestLocation' | 'closed'> {
+  private publicationLifetime(requestId: bigint, properties: TrackProperties): Pick<IncomingPublish, 'largestLocation' | 'closed' | 'initialTrackProperties'> {
+    const initial = copyInitialTrackProperties(properties);
     const owner = this.session.getIncomingSubscription(requestId)!;
     let final: IncomingPublish['largestLocation'] | undefined;
     const snapshot = () => {
@@ -3261,7 +3270,8 @@ export class MoqtConnection {
       this.publishLifetimes.delete(requestId);
       resolve(Object.freeze({ largestLocation: final }));
     } });
-    return { get largestLocation() { return snapshot(); }, closed };
+    return { get largestLocation() { return snapshot(); }, closed,
+      get initialTrackProperties() { return copyInitialTrackProperties(initial); } };
   }
 
   private settlePublicationLifetimes(): void {
@@ -7315,7 +7325,7 @@ export class MoqtConnection {
             const pub = message as Publish;
             if (this.session.getIncomingSubscription(pub.requestId as bigint) !== undefined
                 && this.session.state !== SessionState.CLOSED) {
-              const incoming = Object.assign(this.publicationLifetime(pub.requestId as bigint), {
+              const incoming = Object.assign(this.publicationLifetime(pub.requestId as bigint, this.trackPropsOf(pub)), {
                 requestId: pub.requestId as bigint,
                 trackNamespace: pub.trackNamespace,
                 trackName: pub.trackName,
@@ -8057,6 +8067,7 @@ export class MoqtConnection {
       await this.writeInboundRequestResponse(requestId, actions, /* finalize */ true);
       return;
     }
+    const initialProperties = copyInitialTrackProperties(this.trackPropsOf(pub));
     this.onMessage?.(pub);
     // A semantic observer may cancel this request. Let its stream notification
     // revoke the context before publishing mutable application callbacks.
@@ -8081,7 +8092,7 @@ export class MoqtConnection {
       this.markRebound(pubAlias, this.session.getIncomingSubscription(requestId)!);
     }
     this.clearTerminatedAlias(pubAlias, true);
-    const incoming = Object.assign(this.publicationLifetime(requestId), {
+    const incoming = Object.assign(this.publicationLifetime(requestId, initialProperties), {
       requestId,
       trackNamespace: pub.trackNamespace,
       trackName: pub.trackName,
