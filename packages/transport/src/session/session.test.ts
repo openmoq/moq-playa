@@ -17,6 +17,16 @@ import type { ClientSetup, ServerSetup, Parameters, Setup, Subscribe, SubscribeO
 import type { NotifyNamespaceAction } from './types.js';
 import { AliasType, encodeAuthorizationToken, encodeAuthorizationToken18 } from '../control/auth-token.js';
 
+// Explicit empty source for metadata-only update scenarios; unknown owners refuse.
+function installEmptyUpdateSource(session: Session, requestId: bigint): void {
+  const owner = session.getIncomingSubscription(requestId) ?? session.getOutgoingPublish(requestId);
+  if (!owner) throw new Error('Fixture source unavailable');
+  session.setLargestLocationProvider(id => {
+    if (id !== requestId || (session.getIncomingSubscription(id) ?? session.getOutgoingPublish(id)) !== owner || owner.isTerminated) throw new Error('Fixture source unavailable');
+    return null;
+  });
+}
+
 describe('Session', () => {
   describe('client role', () => {
     let session: Session;
@@ -3203,6 +3213,7 @@ describe('Session', () => {
         // §9.11: "The receiver of a REQUEST_UPDATE MUST respond with exactly one REQUEST_OK"
         session.handleControlMessage(incomingSubscribe(0n));
         session.acceptSubscribe(varint(0n), varint(42n));
+        installEmptyUpdateSource(session, 0n);
 
         const actions = session.handleControlMessage({
           type: 'REQUEST_UPDATE',
@@ -3224,6 +3235,7 @@ describe('Session', () => {
       it('applies FORWARD=1 to resume and responds REQUEST_OK', () => {
         session.handleControlMessage(incomingSubscribe(0n));
         session.acceptSubscribe(varint(0n), varint(42n));
+        installEmptyUpdateSource(session, 0n);
 
         // Pause
         session.handleControlMessage({
@@ -3307,6 +3319,7 @@ describe('Session', () => {
         // in REQUEST_UPDATE, its value remains unchanged"
         session.handleControlMessage(incomingSubscribe(0n));
         session.acceptSubscribe(varint(0n), varint(42n));
+        installEmptyUpdateSource(session, 0n);
 
         // Pause with FORWARD=0
         session.handleControlMessage({
@@ -3450,6 +3463,7 @@ describe('Session', () => {
 
       it('pause round-trip updates forward state on both sides', () => {
         const subId = establishSubscription();
+        installEmptyUpdateSource(server, subId);
 
         // Client → Server: REQUEST_UPDATE (FORWARD=0)
         const { requestId: updateId, actions: updateActions } = client.requestUpdate(
@@ -6035,6 +6049,7 @@ describe('inbound PUBLISH lifecycle helpers (draft-18 §10.11, §10.9)', () => {
 
   it('a peer REQUEST_UPDATE applies to the original PUBLISH subscription, not the update id', () => {
     const { s, requestId } = established18Publish();
+    installEmptyUpdateSource(s, requestId);
     // Peer sends REQUEST_UPDATE (its own id 3) with FORWARD=0; existingRequestId
     // comes from the PUBLISH stream context (the original PUBLISH id 1).
     s.handleControlMessage(

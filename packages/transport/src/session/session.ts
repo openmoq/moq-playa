@@ -13,7 +13,7 @@
  */
 
 import { varint, type Varint } from '../primitives/varint.js';
-import { readLocation } from '../primitives/location.js';
+import { readLocation, writeLocation, locationEncodingLength } from '../primitives/location.js';
 
 /** vi64 ceiling (2^64 − 1) — the widest Location component any draft can
  *  encode; resume-provider results above it are unencodable, so they fail
@@ -2690,6 +2690,8 @@ export class Session {
    * publisher to save — the current head as the new Joining Location; without
    * this hook a paused track that advanced would resume with a stale one.
    */
+  private readonly updateRevisions = new WeakMap<SubscriptionStateMachine, number>();
+
   private largestLocationProvider: ((subscriptionRequestId: bigint) => { group: bigint; object: bigint } | null) | null = null;
 
   setLargestLocationProvider(provider: (subscriptionRequestId: bigint) => { group: bigint; object: bigint } | null): void {
@@ -2867,7 +2869,8 @@ export class Session {
       && prevForwardState === ForwardState.PAUSED
       && forwardValues !== undefined && forwardValues.length > 0
       && typeof forwardValues[0] === 'bigint' && forwardValues[0] !== 0n;
-    if (wantsResume || (isDraft22(this._draftVersion) && isSubscriptionScope)) {
+    if (this._draftVersion !== 14 && isSubscriptionScope) {
+      const revision = this.updateRevisions.get(sub!) ?? 0;
       // d18 §10.11: "PUBLISH_DONE ... UPDATE_FAILED": an unsuccessful
       // subscription update terminates the subscription. The SESSION emits
       // only the REQUEST_ERROR here — the I/O layer owns the termination
@@ -2876,6 +2879,7 @@ export class Session {
       // stream, none of which bare Session actions can do). The adapter
       // detects the REQUEST_ERROR update response and runs its publishDone.
       const failClosed = (why: string): SessionOutboundAction[] => {
+        if (sub!.isTerminated) return validated.replenish ?? [];
         const reason = `cannot update subscription ${msg.existingRequestId}: ${why} (REQUEST_UPDATE_OK requires the current Largest Location)`;
         return [this.sendControl({
           type: 'REQUEST_ERROR',
@@ -2891,15 +2895,19 @@ export class Session {
       let provided: { group: bigint; object: bigint } | null;
       try {
         provided = this.largestLocationProvider(msg.existingRequestId as bigint);
-      } catch (err) {
-        return failClosed(`the Largest Location provider threw (${err instanceof Error ? err.message : String(err)})`);
+      } catch {
+        return failClosed('the Largest Location provider failed');
       }
+      if (sub!.isTerminated) return validated.replenish ?? [];
+      if ((this.updateRevisions.get(sub!) ?? 0) !== revision) return failClosed('subscription changed during head lookup');
+      this.updateRevisions.set(sub!, revision + 1);
       if (provided === null) {
         resumeClearsStale = true;
       } else if (typeof provided === 'object' && provided !== null
           && typeof provided.group === 'bigint' && typeof provided.object === 'bigint'
           && provided.group >= 0n && provided.object >= 0n
-          && provided.group <= MAX_VI64 && provided.object <= MAX_VI64) {
+          && provided.group <= (this._draftVersion === 16 ? (1n << 62n) - 1n : MAX_VI64)
+          && provided.object <= (this._draftVersion === 16 ? (1n << 62n) - 1n : MAX_VI64)) {
         resumeLocation = { group: provided.group, object: provided.object };
       } else {
         return failClosed('the Largest Location provider returned an invalid value');
@@ -2954,9 +2962,12 @@ export class Session {
     // Communicate + SAVE the pre-validated resume location (see above).
     const requestOkParams: Parameters = new Map();
     if (resumeLocation) {
-      requestOkParams.set(MessageParam.LARGEST_OBJECT as bigint, [resumeLocation]);
-      this.incomingJoiningLocations.set(msg.existingRequestId as bigint, resumeLocation);
-    } else if (resumeClearsStale) {
+      const loc = resumeLocation;
+      const value = this._draftVersion === 16 ? new Uint8Array(locationEncodingLength(loc)) : loc;
+      if (value instanceof Uint8Array) writeLocation(loc, value, 0);
+      requestOkParams.set(MessageParam.LARGEST_OBJECT as bigint, [value]);
+      if (wantsResume && this._draftVersion === 18) this.incomingJoiningLocations.set(msg.existingRequestId as bigint, resumeLocation);
+    } else if (resumeClearsStale && wantsResume && this._draftVersion === 18) {
       this.incomingJoiningLocations.delete(msg.existingRequestId as bigint);
     }
 

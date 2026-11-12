@@ -1011,6 +1011,19 @@ async function publishAccepted(): Promise<{ conn: MoqtConnection; transport: Tra
   return { conn, transport, bidi };
 }
 
+// These metadata-only scenarios own a controlled empty source; no Object is
+// produced before their update. Unknown/retired request identity is not empty.
+function installEmptyUpdateSource(conn: MoqtConnection, requestId: bigint, direction: 'incoming' | 'outgoing'): void {
+  const current = () => direction === 'incoming'
+    ? conn.session.getIncomingSubscription(requestId) : conn.session.getOutgoingPublish(requestId);
+  const owner = current();
+  if (!owner) throw new Error('Fixture publication unavailable');
+  conn.setLargestLocationProvider(id => {
+    if (id !== requestId || current() !== owner || owner.isTerminated) throw new Error('Fixture publication unavailable');
+    return null;
+  });
+}
+
 describe('MoqtConnection(18) inbound PUBLISH — publisher authority (§10.11)', () => {
   it('accepting an inbound PUBLISH does NOT authorize us to publish on that alias', async () => {
     // We are the SUBSCRIBER for an inbound PUBLISH; accepting it must not let us
@@ -1166,7 +1179,8 @@ describe('MoqtConnection(18) inbound PUBLISH lifecycle', () => {
   });
 
   it('peer REQUEST_UPDATE: REQUEST_OK is written on the PUBLISH stream and NO uni control bytes are emitted', async () => {
-    const { transport, bidi } = await publishAccepted();
+    const { conn, transport, bidi } = await publishAccepted();
+    installEmptyUpdateSource(conn, 1n, 'incoming');
     const writtenBefore = bidi.writtenBytes().length;
     const controlBefore = transport.uniOut[0]!.writtenBytes().length;
 
@@ -1182,7 +1196,8 @@ describe('MoqtConnection(18) inbound PUBLISH lifecycle', () => {
   });
 
   it('a peer REQUEST_UPDATE that the session rejects closes the session and writes no success response', async () => {
-    const { transport, bidi } = await publishAccepted();
+    const { conn, transport, bidi } = await publishAccepted();
+    installEmptyUpdateSource(conn, 1n, 'incoming');
     const writtenBefore = bidi.writtenBytes().length;
 
     // Reuse the PUBLISH Request ID (1n) as the update id → DUPLICATE → close.
@@ -1289,6 +1304,7 @@ describe('MoqtConnection(18) inbound SUBSCRIBE (§10.7)', () => {
     bidi.push(subscribeReqBytes(1n));
     await flush();
     await conn.acceptSubscribe(1n, 99n);
+    installEmptyUpdateSource(conn, 1n, 'incoming');
     const before = bidi.writtenBytes().length;
 
     bidi.push(peerUpdateBytes(3n)); // subscriber updates the subscription
@@ -2193,6 +2209,7 @@ describe('MoqtConnection(18) outbound PUBLISH (§10.10)', () => {
       type: 'REQUEST_OK', requestId: 0n, parameters: new Map(),
     } as RequestOk));
     await flush();
+    installEmptyUpdateSource(conn, requestId, 'outgoing');
 
     const internal = conn as unknown as {
       uniPair: { writeOnRequest(requestId: bigint, message: unknown): Promise<void> };
@@ -2227,6 +2244,7 @@ describe('MoqtConnection(18) outbound PUBLISH (§10.10)', () => {
       type: 'REQUEST_OK', requestId: 0n, parameters: new Map(),
     } as RequestOk));
     await flush();
+    installEmptyUpdateSource(conn, requestId, 'outgoing');
 
     const writeOffset = transport.bidi[0]!.writtenBytes().length;
     let terminal: Promise<void> | undefined;

@@ -6793,6 +6793,13 @@ export class MoqtConnection {
             this.notifyPublishForwardChange(fwdTarget, false);
           }
           await actionExecution;
+          if (message.type === 'REQUEST_UPDATE') {
+            const refusal = actions.find((a): a is SendControlAction => a.type === 'send_control' && a.message.type === 'REQUEST_ERROR');
+            const target = message.existingRequestId as bigint;
+            if (refusal && (this.session.getIncomingSubscription(target) || this.session.getOutgoingPublish(target))) {
+              await this.completeFailedSubscriptionUpdate(target, 'subscription update failed');
+            }
+          }
           await doneDiscard;
           if (fwdTarget !== undefined && fwdAfter === true) {
             this.notifyPublishForwardChange(fwdTarget, true);

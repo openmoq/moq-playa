@@ -387,6 +387,12 @@ describe('REQUEST_UPDATE filter changes drive the joining gate (§9.2.2.5)', () 
       [encodeSubscriptionFilter({ type: 'NextGroupStart' }, 16)]]]);
     session.handleControlMessage(incomingSubscribe(0n, params));
     session.acceptSubscribe(0n, 9n);
+    const sourceOwner = session.getIncomingSubscription(0n)!;
+    // This filter-gate fixture publishes no Objects; only this exact owner is empty.
+    session.setLargestLocationProvider(id => {
+      if (id !== 0n || session.getIncomingSubscription(id) !== sourceOwner || sourceOwner.isTerminated) throw new Error('Unavailable source');
+      return null;
+    });
 
     updateFilter(session, 0n, 2n, { type: 'LargestObject' });
 
@@ -401,6 +407,12 @@ describe('REQUEST_UPDATE filter changes drive the joining gate (§9.2.2.5)', () 
       [encodeSubscriptionFilter({ type: 'LargestObject' }, 16)]]]);
     session.handleControlMessage(incomingSubscribe(0n, params));
     session.acceptSubscribe(0n, 9n);
+    const sourceOwner = session.getIncomingSubscription(0n)!;
+    // This filter-gate fixture publishes no Objects; only this exact owner is empty.
+    session.setLargestLocationProvider(id => {
+      if (id !== 0n || session.getIncomingSubscription(id) !== sourceOwner || sourceOwner.isTerminated) throw new Error('Unavailable source');
+      return null;
+    });
 
     updateFilter(session, 0n, 2n, { type: 'AbsoluteStart', startGroup: 5n, startObject: 0n });
 
@@ -416,6 +428,12 @@ describe('REQUEST_UPDATE filter changes drive the joining gate (§9.2.2.5)', () 
       [encodeSubscriptionFilter({ type: 'LargestObject' }, 16)]]]);
     session.handleControlMessage(incomingSubscribe(0n, params));
     session.acceptSubscribe(0n, 9n);
+    const sourceOwner = session.getIncomingSubscription(0n)!;
+    // This filter-gate fixture publishes no Objects; only this exact owner is empty.
+    session.setLargestLocationProvider(id => {
+      if (id !== 0n || session.getIncomingSubscription(id) !== sourceOwner || sourceOwner.isTerminated) throw new Error('Unavailable source');
+      return null;
+    });
 
     session.handleControlMessage({
       type: 'REQUEST_UPDATE', requestId: varint(2n),

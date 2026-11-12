@@ -37,7 +37,7 @@ export async function liveLocFixture(config: Partial<MoqtPlayerConfig> = {}, dra
   });
   player.on('error', e => { errors.push(e.error.message); });
   const largestByName = new Map<string, { group: bigint; object: bigint }>();
-  if (draft !== 16) server.setLargestLocationProvider(id => {
+  server.setLargestLocationProvider(id => {
     const name = requests.find(request => request.id === id)?.name;
     return name === undefined ? null : largestByName.get(name) ?? null;
   });

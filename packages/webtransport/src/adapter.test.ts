@@ -6272,6 +6272,18 @@ describe('terminal drain — review findings (alias reuse, completion race, shut
 // ─── Outbound PUBLISH Forward State (§5.1 / §8.5) ──────────────────────────
 
 describe('outbound PUBLISH forward state (draft-16)', () => {
+  function installEmptyUpdateSource(adapter: MoqtConnection, requestId: bigint): void {
+    // These scenarios produce no Objects; only the exact controlled publisher is empty.
+    const owner = adapter.session.getOutgoingPublish(requestId);
+    if (!owner) throw new Error('Fixture publication unavailable');
+    adapter.setLargestLocationProvider(id => {
+      if (id !== requestId || adapter.session.getOutgoingPublish(id) !== owner || owner.isTerminated) {
+        throw new Error('Fixture publication unavailable');
+      }
+      return null;
+    });
+  }
+
   const enc = (s: string) => new TextEncoder().encode(s);
   const forwardParams = (forward: bigint) => new Map([[MessageParam.FORWARD, [varint(forward)]]]);
 
@@ -6326,6 +6338,7 @@ describe('outbound PUBLISH forward state (draft-16)', () => {
 
   it('a later peer REQUEST_UPDATE with FORWARD=1 reports the resume (§8.5: relay had no subscriber at PUBLISH time)', async () => {
     const { adapter, mock, requestId, changes } = await publishedWithChanges();
+    installEmptyUpdateSource(adapter, requestId);
     mock.pushControlBytes(encodeControlMessage({
       type: 'PUBLISH_OK', requestId: varint(requestId), parameters: forwardParams(0n),
     } as ControlMessage));
@@ -6371,6 +6384,15 @@ describe('outbound PUBLISH forward state (draft-16)', () => {
     const { adapter, mock, requestId } = await publishedWithChanges();
     const streamId = await adapter.openSubgroup(0n, 0n, 0n);
     await adapter.sendObject(streamId, 0n, new Uint8Array([0x01]));
+    // The source's only admitted Object is the actual 0/0 write above. Paused
+    // submission below is refused and does not advance this publication head.
+    const owner = adapter.session.getOutgoingPublish(requestId)!;
+    adapter.setLargestLocationProvider(id => {
+      if (id !== requestId || adapter.session.getOutgoingPublish(id) !== owner || owner.isTerminated) {
+        throw new Error('Fixture publication unavailable');
+      }
+      return { group: 0n, object: 0n };
+    });
 
     mock.pushControlBytes(encodeControlMessage({
       type: 'PUBLISH_OK', requestId: varint(requestId), parameters: forwardParams(0n),
@@ -6416,6 +6438,7 @@ describe('outbound PUBLISH forward state (draft-16)', () => {
 
   it('reports a pause before waiting for the REQUEST_OK write', async () => {
     const { adapter, mock, requestId, changes } = await publishedWithChanges();
+    installEmptyUpdateSource(adapter, requestId);
     mock.pushControlBytes(encodeControlMessage({
       type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
     } as ControlMessage));
@@ -6437,6 +6460,7 @@ describe('outbound PUBLISH forward state (draft-16)', () => {
 
   it('queues REQUEST_OK before a pause observer terminalizes the publish', async () => {
     const { adapter, mock, requestId } = await publishedWithChanges();
+    installEmptyUpdateSource(adapter, requestId);
     mock.pushControlBytes(encodeControlMessage({
       type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
     } as ControlMessage));
@@ -6461,6 +6485,7 @@ describe('outbound PUBLISH forward state (draft-16)', () => {
 
   it('contains a throwing Forward State observer and keeps processing updates', async () => {
     const { adapter, mock, requestId } = await publishedWithChanges();
+    installEmptyUpdateSource(adapter, requestId);
     mock.pushControlBytes(encodeControlMessage({
       type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
     } as ControlMessage));
@@ -6489,6 +6514,7 @@ describe('outbound PUBLISH forward state (draft-16)', () => {
 
   it('reports and contains a rejected async Forward State observer', async () => {
     const { adapter, mock, requestId } = await publishedWithChanges();
+    installEmptyUpdateSource(adapter, requestId);
     mock.pushControlBytes(encodeControlMessage({
       type: 'PUBLISH_OK', requestId: varint(requestId), parameters: new Map(),
     } as ControlMessage));

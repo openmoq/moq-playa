@@ -51,19 +51,19 @@ describe.each([16, 18] as const)('draft %i', draft => {
     expect(range.endLocation).toEqual({ group: 3n, object: 6n });
   });
 
-  it('a publisher without a Largest Location provider accepts a NextGroupStart filter update', () => {
+  it('a publisher without a Largest Location provider refuses a NextGroupStart filter update', () => {
     const { client, server } = pair(draft);
     const opened = client.subscribe(ns, name, { subscriptionFilter: { type: 'LargestObject' } });
     deliver(opened.actions, server);
     deliver(server.acceptSubscribe(opened.requestId, varint(7n), { parameters: largest(draft, 3n, 5n) }), client);
     const update = client.requestUpdate(opened.requestId, { subscriptionFilter: { type: 'NextGroupStart' } });
     const response = sent(deliver(update.actions, server));
-    expect(response).toEqual(['REQUEST_OK']);
+    expect(response).toEqual(['REQUEST_ERROR']);
   });
 });
 
 for (const draft of [16, 18] as const) describe(`draft${draft} filter update wire response`, () => {
-  it.each([false, true])('accepts an empty-track update with provider=%s', provider => {
+  it.each([false, true])('reports a known head or refuses unknown head with provider=%s', provider => {
     const { client, server } = pair(draft);
     const opened = client.subscribe(ns, name, { subscriptionFilter: { type: 'AbsoluteStart', startGroup: 0n, startObject: 0n } });
     deliver(opened.actions, server);
@@ -71,7 +71,7 @@ for (const draft of [16, 18] as const) describe(`draft${draft} filter update wir
     if (provider) server.setLargestLocationProvider(() => ({ group: 5n, object: 0n }));
     const update = client.requestUpdate(opened.requestId, { subscriptionFilter: { type: 'NextGroupStart' } });
     const response = deliver(update.actions, server);
-    expect(sent(response)).toEqual(['REQUEST_OK']);
+    expect(sent(response)).toEqual([provider ? 'REQUEST_OK' : 'REQUEST_ERROR']);
     for (const action of response) if (action.type === 'send_control') {
       expect(() => createControlCodec(draft).encode(action.message)).not.toThrow();
     }
