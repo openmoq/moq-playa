@@ -14,6 +14,7 @@ type Location = { group: bigint; object: bigint };
 interface Group {
   objects: Map<bigint, CachedObject>;
   final?: bigint;
+  subgroupEnds: Map<bigint, bigint>;
   carriers: Map<object, Map<bigint, { last: bigint; clean: boolean; stream?: bigint | null | undefined; ambiguous: boolean }>>;
 }
 const compare = (a: bigint, b: bigint): number => a < b ? -1 : a > b ? 1 : 0;
@@ -33,7 +34,7 @@ export class HistoryCache {
       if (carrier) { carrier.ambiguous ||= carrier.stream !== stream || object.objectId <= carrier.last; carrier.clean = false; carrier.last = object.objectId; }
       return;
     }
-    if (!group) { group = { objects: new Map(), carriers: new Map() }; this.groups.set(object.groupId, group); }
+    if (!group) { group = { objects: new Map(), carriers: new Map(), subgroupEnds: new Map() }; this.groups.set(object.groupId, group); }
     let carriers = group.carriers.get(source);
     if (!carriers) { carriers = new Map(); group.carriers.set(source, carriers); }
     const previous = carriers.get(object.subgroupId);
@@ -46,9 +47,14 @@ export class HistoryCache {
     if (carrier && carrier.stream !== stream) carrier.ambiguous = true;
   }
 
-  admit(object: CachedObject): boolean {
+  admit(object: CachedObject): 'added' | 'duplicate' | 'malformed' {
     const group = this.groups.get(object.groupId)!;
-    if (group.objects.has(object.objectId)) return false;
+    const previous = group.objects.get(object.objectId);
+    if (previous) return previous.subgroupId !== object.subgroupId || previous.payload.length !== object.payload.length
+      || previous.payload.some((byte, index) => byte !== object.payload[index]) ? 'malformed' : 'duplicate';
+    const subgroupEnd = group.subgroupEnds.get(object.subgroupId);
+    if ((group.final !== undefined && object.objectId > group.final)
+      || (subgroupEnd !== undefined && object.objectId > subgroupEnd)) return 'malformed';
     group.objects.set(object.objectId, object);
     this.objects++; this.bytes += size(object);
     while (this.groups.size > this.limits.maxGroups || this.objects > this.limits.maxObjects || this.bytes > this.limits.maxBytes) {
@@ -56,18 +62,25 @@ export class HistoryCache {
       for (const row of this.groups.get(oldest)!.objects.values()) { this.objects--; this.bytes -= size(row); }
       this.groups.delete(oldest);
     }
-    return true;
+    return 'added';
   }
 
-  finish(source: object, header: SubgroupHeader, stream?: bigint | null): void {
+  finish(source: object, header: SubgroupHeader, stream?: bigint | null): boolean {
     const group = this.groups.get(header.groupId);
     const carrier = group?.carriers.get(source)?.get(header.subgroupId);
-    if (carrier && (carrier.ambiguous || carrier.stream !== stream)) { carrier.ambiguous = true; return; }
+    if (carrier && (carrier.ambiguous || carrier.stream !== stream)) { carrier.ambiguous = true; return false; }
     if (group && carrier) {
-      if (carrier.clean && header.isEndOfGroup) group.final = carrier.last;
+      group.subgroupEnds.set(header.subgroupId, carrier.last);
+      if (carrier.clean && header.isEndOfGroup) {
+        if ([...group.objects.keys()].some(id => id > carrier.last)) return true;
+        group.final = carrier.last;
+      }
     }
     group?.carriers.get(source)?.delete(header.subgroupId);
+    return false;
   }
+
+  clear(): void { this.groups.clear(); this.objects = 0; this.bytes = 0; }
 
   forgetSource(source: object): void { for (const group of this.groups.values()) group.carriers.delete(source); }
 

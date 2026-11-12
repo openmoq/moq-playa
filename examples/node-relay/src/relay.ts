@@ -129,7 +129,7 @@ export class Relay {
   private readonly receptionStreams = new WeakMap<object, bigint | null>();
   private readonly historyLimits: HistoryLimits;
   private readonly maxHistory: number;
-  private readonly historyResponses = new Set<{ conn: MoqtConnection; requestId: bigint; track: Track }>();
+  private readonly historyResponses = new Set<{ conn: MoqtConnection; requestId: bigint; track: Track; malformed: boolean }>();
   private readonly forwardLimits: ForwardLimits;
   private readonly registeredNamespaceKeys: ReadonlySet<string>;
 
@@ -231,7 +231,8 @@ export class Relay {
         sub.pending = false;
         if (sub.terminalStatus !== undefined) {
           sub.retire();
-          await conn.publishDone(requestId, varint(sub.terminalStatus), 'acceptance backlog exceeded');
+          if (sub.terminalStatus === 0x12n) await conn.terminateMalformedPublication(requestId);
+          else await conn.publishDone(requestId, varint(sub.terminalStatus), 'acceptance backlog exceeded');
         } else sub.forwarder.start();
       } catch (error) { sub.retire(); throw error; }
     } catch (err) {
@@ -291,7 +292,8 @@ export class Relay {
           payload: obj.payload,
           extensions,
         });
-        if (!added) return;
+        if (added === 'malformed') { this.retireMalformed(track, conn, publish); return; }
+        if (added === 'duplicate') return;
         track.upstream.set(subgroupKey(obj.groupId, obj.subgroupId), { groupId: obj.groupId, objectId: obj.objectId });
         // Live fanout (identity preserved), ordered per subgroup. Independent
         // subgroup streams may advance concurrently up to the configured bound.
@@ -305,7 +307,8 @@ export class Relay {
       publish.onSubgroupClosed = (header) => queueMicrotask(() => {
         const skey = subgroupKey(header.groupId, header.subgroupId);
         track.upstream.delete(skey);
-        track.cache.finish(publish, header, this.finStreams.get(header));
+        if (!track.sources.has(publish)) return;
+        if (track.cache.finish(publish, header, this.finStreams.get(header))) { this.retireMalformed(track, conn, publish); return; }
         // onSubgroupClosed follows the final onObject from this incoming stream.
         // Its lane keeps FIN behind that subgroup's final downstream send.
         for (const sub of [...track.subscribers]) {
@@ -324,7 +327,7 @@ export class Relay {
   async handleFetch(conn: MoqtConnection, requestId: bigint, fetch: Fetch): Promise<void> {
     conn.setFetchLargestLocationProvider(id => this.currentLargestFor(conn, id));
     const owner = conn.session.getIncomingFetch(requestId);
-    let response: { conn: MoqtConnection; requestId: bigint; track: Track } | undefined;
+    let response: { conn: MoqtConnection; requestId: bigint; track: Track; malformed: boolean } | undefined;
     try {
       if (conn.draftVersion <= 16) { await conn.rejectFetch(requestId, 0x3n, 'history FETCH requires draft18 or newer'); return; }
       let track: Track | undefined, start: { group: bigint; object: bigint }, end: { group: bigint; object: bigint };
@@ -355,11 +358,15 @@ export class Relay {
       if (!rows || this.historyResponses.size >= this.maxHistory) throw new Error('history unavailable');
       if (fetch.parameters.get(0x22n)?.[0] === 2n) rows.sort((a, b) => a.groupId === b.groupId ? 0 : a.groupId > b.groupId ? -1 : 1);
       this.fetchTracks.set(owner!, track);
-      response = { conn, requestId, track }; this.historyResponses.add(response);
+      response = { conn, requestId, track, malformed: false }; this.historyResponses.add(response);
       const endLocation = conn.draftVersion === 22 ? end : { group: end.group, object: end.object === MAX_VI64 ? 0n : end.object + 1n };
       await conn.acceptFetch(requestId, { endLocation });
+      if (response.malformed) { await conn.abortIncomingFetch(requestId, { streamErrorCode: 0x12 }); return; }
       const sid = await conn.openFetchStream(requestId);
-      for (const row of rows) await conn.sendFetchObject(sid, { ...row, publisherPriority: 128 });
+      for (const row of rows) {
+        if (response.malformed) return;
+        await conn.sendFetchObject(sid, { ...row, publisherPriority: 128 });
+      }
       await conn.closeFetchStream(sid);
     } catch (err) {
       if (!owner || conn.session.state !== 'established' || conn.session.getIncomingFetch(requestId) !== owner) return;
@@ -368,6 +375,26 @@ export class Relay {
         await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE, String(err)).catch(error => log('FETCH refusal failed', error));
       }
     } finally { if (response) this.historyResponses.delete(response); }
+  }
+
+  private retireMalformed(track: Track, conn: MoqtConnection, publish: IncomingPublish): void {
+    if (!isRequestStreamDraft(conn.draftVersion)) return;
+    track.sources.delete(publish); // Fence callbacks even if cancellation cannot be issued.
+    track.cache.clear(); delete track.largest;
+    for (const sub of [...track.subscribers]) {
+      sub.terminalStatus = 0x12n; sub.forwarder.abort();
+      if (!sub.pending) {
+        sub.retire();
+        void sub.conn.terminateMalformedPublication(sub.requestId).catch(error => console.error('[relay] malformed downstream', error));
+      }
+    }
+    for (const response of this.historyResponses) if (response.track === track) {
+      response.malformed = true;
+      if (response.conn.session.getIncomingFetch(response.requestId)?.responseSent) {
+        void response.conn.abortIncomingFetch(response.requestId, { streamErrorCode: 0x12 }).catch(error => console.error('[relay] malformed FETCH', error));
+      }
+    }
+    void conn.cancelMalformedIncomingPublish(publish).catch(error => console.error('[relay] malformed source', error));
   }
 
   /** Current upstream head for an exact live subscription or FETCH; null means known empty. */

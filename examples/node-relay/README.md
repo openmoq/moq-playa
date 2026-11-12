@@ -127,6 +127,11 @@ generate a CMAF fixture from an MP4, publish it (optionally looped) into
   history survives a publisher's completion or disconnect. Publishers of one
   track contribute to the same history. `maxActiveHistoryRequests` defaults to 32;
   excess requests are refused. No upstream gap recovery, DVR or persistence.
+- **Malformed tracks (drafts 18/22)** — conflicting payload/Subgroup duplicates,
+  Objects beyond known subgroup or Group ends, and contradictory Group completion
+  retire the offending publication. Downstream subscriptions and active FETCHes
+  terminate, queued delivery stops, and the track's history is cleared. Sibling
+  tracks continue even if the upstream cancellation fails.
 - **Fixed track registry** — only the names above are routed; a catalog-driven
   registry is a possible follow-up.
 - **Data objects and subgroup header flags** — the incoming `END_OF_GROUP` flag
