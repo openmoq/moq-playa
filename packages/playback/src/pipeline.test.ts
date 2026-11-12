@@ -2038,6 +2038,28 @@ describe('PlaybackPipeline', () => {
             expect(decodes.length).toBe(0);
         });
 
+        it('a late audio frame is dropped, unless the late-audio handler moves the clock', () => {
+            const run = (handler?: (offsetUs: number) => boolean) => {
+                const clock = new MockClock();
+                clock.set(5_000_000);
+                const { pipeline, commands, sync } = createPipeline({ mediaType: 'audio', clock });
+                pipeline.configure(new Uint8Array([0x01]));
+                sync.setAudioReference(1_000_000_000n);
+                if (handler) pipeline.lateAudioHandler = offsetUs => handler(offsetUs) && (sync.slipReference(-offsetUs + 500_000), true);
+                clock.advance(2_000_000); // delivery has fallen two seconds behind the clock
+                pipeline.pushObject(makeData(0, 0), audioHeaders(1_000_020_000n));
+                pipeline.tick();
+                return commands.filter(c => c.type === 'decode_audio').length;
+            };
+            expect(run()).toBe(0);
+            expect(run(() => false)).toBe(0);
+            expect(run(() => true)).toBe(1);
+            const validation = createPipeline({ mediaType: 'audio', clock: new MockClock() }).pipeline;
+            expect(() => Reflect.set(validation, 'lateAudioHandler', 42)).toThrow(TypeError);
+            validation.lateAudioHandler = undefined;
+
+        });
+
         it('audio is NOT affected by video group lifecycle (independently decodable)', () => {
             const clock = new MockClock();
             clock.set(5_000_000);
@@ -2270,4 +2292,16 @@ it.each([false, true])('a refused input cannot mark its reentrant replacement as
     expect(recoveries).toBe(1);
     expect(commands.filter(command => command.type === 'decode_video')).toHaveLength(1);
     expect(sync.videoJoinOffsetUs).toBe(516_000);
+});
+
+it('contains a late-audio handler exception as a dropped frame', () => {
+    const clock = new MockClock(); clock.set(100_000);
+    const sync = new SyncController({ clock, driftThresholdUs: 500_000 }); sync.setAudioReference(0n);
+    const { pipeline, commands } = createPipeline({ mediaType: 'audio', clock, sync });
+    pipeline.configure(new Uint8Array([1]));
+    pipeline.lateAudioHandler = () => { throw new Error('application handler'); };
+    clock.advance(1_000_000);
+    pipeline.pushObject(makeData(0, 0), audioHeaders(0n));
+    expect(() => pipeline.tick()).not.toThrow();
+    expect(commands.filter(command => command.type === 'decode_audio')).toEqual([]);
 });

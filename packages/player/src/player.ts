@@ -182,6 +182,10 @@ import { isDraft22, isRequestStreamDraft } from '@openmoq/transport';
 
 // ─── Constants ──────────────────────────────────────────────────────
 
+const LATE_AUDIO_WINDOW_US = 300_000;
+const LATE_AUDIO_HEADROOM_US = 500_000;
+const LATE_AUDIO_SETTLE_US = 2_000_000;
+
 /** Required duration of excess received media before a live jump. */
 const LIVE_JUMP_SUSTAIN_US = 1_000_000;
 /** Media left ahead on the advanced timeline for delivery jitter. */
@@ -846,6 +850,9 @@ export class MoqtPlayer {
 
   private liveJump: { current: () => boolean; newest: Map<'video' | 'audio', bigint>; since: number | null } | null = null;
   private lastLiveJumpUs = -Infinity;
+  private readonly lateAudioAsksUs: number[] = [];
+  private lateAudioDebtUs = 0;
+  private readonly liveAudioObjects = new WeakSet<object>();
   private connection: MoqtConnection | null = null;
   private _adapterOwned = true;
   private qualityController: QualityController | null = null;
@@ -4709,6 +4716,7 @@ export class MoqtPlayer {
         const record = this.liveJumpRecord(), previous = record?.newest.get(mediaType);
         if (record && (previous === undefined || headers.captureTimestamp > previous)) record.newest.set(mediaType, headers.captureTimestamp);
       }
+      if (mediaType === 'audio' && !delivery?.backfill && !delivery?.fetched) this.liveAudioObjects.add(obj);
       if (!pipeline) this.discardMediaInput(input, 'not attached');
       else if (delivery?.backfill) pipeline.pushObject(obj, headers, input, { backfill: true });
       else if (input) pipeline.pushObject(obj, headers, input);
@@ -6540,6 +6548,8 @@ export class MoqtPlayer {
   }
 
   private resetMediaClock(preserveMediaInputs = false): void {
+    this.lateAudioAsksUs.length = 0;
+    this.lateAudioDebtUs = 0;
     if (!preserveMediaInputs) this.subscriptionManager?.invalidateMediaInputs();
     this.audioTimelineRecord = null;
     this.videoTimelineRecord = null;
@@ -10271,6 +10281,7 @@ export class MoqtPlayer {
     const byUs = ahead - LIVE_JUMP_CUSHION_US;
     if (byUs <= 0) return;
     sync.advanceReference(byUs);
+    this.lateAudioDebtUs = Math.max(0, this.lateAudioDebtUs - byUs);
     this.lastLiveJumpUs = now;
     record.since = null;
     const dispatcher = this.commandDispatcher!;
@@ -10279,6 +10290,25 @@ export class MoqtPlayer {
     dispatcher.dispatch({ type: 'reset', mediaType: 'audio', reason: 'live latency jump' });
     this.emitter.emit('recovery_action', { type: 'recovery_action',
       action: { type: 'jump_to_live', trigger: 'latency', byMs: Math.round(byUs / 1000) } });
+  }
+
+  /** Require 300 ms of uninterrupted lateness; bound added latency until it is repaid. */
+  private absorbLateAudio(offsetUs: number, object: object, pipeline: PlaybackPipeline, sync: SyncController): boolean {
+    const now = this.clock.now(), dispatcher = this.commandDispatcher;
+    if (offsetUs >= 0 || this.audioPipeline !== pipeline || this.syncController !== sync || !sync.hasReference || !dispatcher
+        || this.state !== PlayerState.PLAYING || this.playbackIntent !== true || this.seekIsPreparing() || this.activeMseSeek
+        || this.pendingVideoSwitch || this.switchInProgress || this.mediaSelection || !this.liveAudioObjects.has(object)
+        || now - this.lastLiveJumpUs < LATE_AUDIO_SETTLE_US) { this.lateAudioAsksUs.length = 0; return false; }
+    this.lateAudioAsksUs[0] ??= now;
+    if (now - this.lateAudioAsksUs[0] < LATE_AUDIO_WINDOW_US) return false;
+    const byUs = Math.min(-offsetUs + LATE_AUDIO_HEADROOM_US, this.config.liveJumpThresholdMs! * 1000 - this.lateAudioDebtUs);
+    if (byUs <= -offsetUs) return false;
+    this.lateAudioAsksUs.length = 0;
+    this.lateAudioDebtUs += byUs;
+    sync.slipReference(byUs);
+    dispatcher.flush();
+    dispatcher.dispatch({ type: 'reset', mediaType: 'audio', reason: 'sustained late audio' });
+    return true;
   }
 
   /** Throttle for sync_skew diagnostic events (~1/s). */
@@ -13369,6 +13399,10 @@ export class MoqtPlayer {
     this.videoPipeline = pipelines.videoPipeline;
     this.audioPipeline = pipelines.audioPipeline;
     this.syncController = pipelines.syncController;
+    this.lateAudioAsksUs.length = 0;
+    this.lateAudioDebtUs = 0;
+    if (pipelines.audioPipeline) pipelines.audioPipeline.lateAudioHandler = (offset, object) =>
+      this.absorbLateAudio(offset, object, pipelines.audioPipeline!, pipelines.syncController!);
     this.recoveryController = pipelines.recoveryController;
     this.commandDispatcher = pipelines.commandDispatcher;
     owningDispatcher = pipelines.commandDispatcher;

@@ -347,7 +347,8 @@ export interface PlaybackTuningConfig {
 export interface LatencyConfig {
   /** Live LOC buffered-ahead threshold in ms. Default: 3000; 0 disables.
    * After 1 s above it, jump toward received media with 500 ms headroom, at most
-   * once per 5 s. Flushes queued A/V. Never applies to seeks, VOD or caller ranges. */
+   * once per 5 s. Flushes queued A/V. Never applies to seeks, VOD or caller ranges.
+   * Also caps cumulative late-audio slips until latency is repaid; 0 permits no slip. */
   readonly liveJumpThresholdMs?: number;
   /**
    * Target end-to-end latency in milliseconds.

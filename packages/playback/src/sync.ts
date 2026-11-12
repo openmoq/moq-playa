@@ -241,6 +241,13 @@ export class SyncController {
         this._currentDriftUs = 0;
     }
 
+    /** Move the shared reference later by positive finite microseconds, preserving drift.
+     * No-op without a reference or for other amounts. Retire old queued output before resuming. */
+    slipReference(byUs: number): void {
+        if (this.localBaselineUs === undefined || !Number.isFinite(byUs) || byUs <= 0) return;
+        this.localBaselineUs += byUs;
+    }
+
     /** Move the shared reference earlier for audio and video, giving back playout latency.
      * Positive finite microseconds only; otherwise, or without a reference, a no-op.
      * Preserves drift; the caller must retire output scheduled on the old timeline. */
