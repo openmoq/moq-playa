@@ -1,3 +1,4 @@
+import { publicationState } from '../../shared/publication-state.js';
 /**
  * Node WebTransport MoQT demo PUBLISHER (browser-free).
  *
@@ -48,6 +49,8 @@ export async function publishTrack(
   payloads: string[],
   opts: { endOfGroup?: boolean; extensions?: Uint8Array } = {},
 ): Promise<void> {
+  const state = publicationState(conn);
+  state.prepare(alias);
   const requestId = await conn.publish(nsBytes(DEMO_NAMESPACE), te(trackName), alias);
   await waitForPublishAccept(conn, requestId);
   const sid = await conn.openSubgroup(alias, 0n, 0n, {
@@ -57,6 +60,7 @@ export async function publishTrack(
     hasExtensions: opts.extensions !== undefined,
   });
   for (let i = 0; i < payloads.length; i++) {
+    state.sent(alias, 0n, BigInt(i));
     await conn.sendObject(sid, BigInt(i), te(payloads[i]!), opts.extensions);
   }
   await conn.closeSubgroup(sid);
@@ -73,6 +77,7 @@ export async function publishGroupObjects(
 ): Promise<void> {
   const sid = await conn.openSubgroup(alias, groupId, 0n, { publisherPriority: 128, firstObject: true });
   for (let i = 0; i < payloads.length; i++) {
+    publicationState(conn).sent(alias, groupId, BigInt(i));
     await conn.sendObject(sid, BigInt(i), te(payloads[i]!));
   }
   await conn.closeSubgroup(sid);

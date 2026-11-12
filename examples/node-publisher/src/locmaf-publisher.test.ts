@@ -1,3 +1,4 @@
+import { publicationOwners } from './test-support/publication-owner.js';
 /**
  * LOCMAF packaging mode of the node publisher (draft-einarsson-moq-locmaf-01
  * sections 3, 5, 6, 15.9): one LOCMAF Object per CMAF chunk, a full header on
@@ -242,6 +243,7 @@ interface Sent { alias: bigint; group: bigint; subgroup: bigint; objectId: bigin
 
 /** A connection double recording every object; PUBLISH is accepted immediately. */
 function recordingConn() {
+  const publication = publicationOwners();
   const sent: Sent[] = [];
   const opens: { alias: bigint; group: bigint; firstObject: boolean; endOfGroup: boolean; stream: number }[] = [];
   const closes: number[] = [];
@@ -249,9 +251,13 @@ function recordingConn() {
   let nextRequest = 1n;
   let nextStream = 1;
   const conn = {
+    session: publication.session,
+    setLargestLocationProvider: publication.setLargestLocationProvider,
     onMessage: undefined as ((m: unknown) => void) | undefined,
-    async publish() {
+    async publish(namespace: readonly Uint8Array[], name: Uint8Array, alias: bigint) {
       const id = nextRequest++;
+      publication.publish(id, namespace, name, alias);
+
       setTimeout(() => conn.onMessage?.({ type: 'REQUEST_OK', requestId: id }), 0);
       return id;
     },
@@ -262,7 +268,9 @@ function recordingConn() {
       return sid;
     },
     async sendObject(sid: number, objectId: bigint, payload: Uint8Array) {
-      sent.push({ ...streams.get(sid)!, objectId, payload, stream: sid });
+      const identity = streams.get(sid)!;
+      publication.sent(identity.alias, identity.group, objectId);
+      sent.push({ ...identity, objectId, payload, stream: sid });
     },
     async closeSubgroup(sid: number) { closes.push(sid); },
   };

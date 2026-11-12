@@ -1,3 +1,4 @@
+import type { PublicationOwner } from '../../shared/publication-state.js';
 import { describe, expect, it, vi } from 'vitest';
 import { RequestError18, SessionError, type Fetch, type MoqtObjectData, type SubgroupHeader } from '@openmoq/transport';
 import { MoqtConnection, type IncomingPublish } from '@openmoq/webtransport';
@@ -36,12 +37,20 @@ function subscriberHarness(streamLimit: number): SubscriberHarness {
   const close = vi.fn(async () => undefined);
   const acceptSubscribe = vi.fn(async () => undefined);
   const rejectSubscribe = vi.fn(async () => undefined);
+  const owners = new Map<bigint, { isTerminated: boolean; remoteFilterType: string }>();
   const conn = {
+    setLargestLocationProvider() {},
     draftVersion: 18,
     acceptSubscribe,
     rejectSubscribe,
     session: {
-      getIncomingSubscription: vi.fn(() => ({ remoteFilterType: 'AbsoluteStart' })),
+      draftVersion: 18,
+      getOutgoingPublish: () => undefined,
+      getIncomingSubscription: vi.fn((id: bigint) => {
+        let owner = owners.get(id);
+        if (!owner) { owner = { isTerminated: false, remoteFilterType: 'AbsoluteStart' }; owners.set(id, owner); }
+        return owner;
+      }),
     },
     openSubgroup,
     sendObject,
@@ -70,6 +79,8 @@ function incomingPublish(
     trackNamespace: nsBytes([...namespace]),
     trackName: te(DEMO_TRACK),
     trackAlias: alias,
+    // This payload-only mock stays live for its test; actual SDK retirement is
+    // exercised by receive-head.test.ts rather than a fabricated closed event.
     largestLocation: null,
     closed: new Promise(() => {}),
     onObject: null,
@@ -112,7 +123,11 @@ function subgroupHeader(alias: bigint, groupId: bigint, subgroupId = 0n): Subgro
 }
 
 async function acceptPublisher(relay: Relay, publish: IncomingPublish): Promise<void> {
-  const conn = { acceptSubscribe: vi.fn(async () => undefined) } as unknown as MoqtConnection;
+  const owner = { isPublishInitiated: true, isTerminated: false,
+    trackNamespace: publish.trackNamespace, trackName: publish.trackName, trackAlias: publish.trackAlias };
+  const conn = { acceptSubscribe: vi.fn(async () => undefined), session: {
+    state: 'established', getIncomingSubscription: (id: bigint) => id === publish.requestId ? owner : undefined,
+  } } as unknown as MoqtConnection;
   await relay.handlePublish(conn, publish);
 }
 
@@ -278,10 +293,14 @@ describe('Relay subgroup lifecycle', () => {
     const publications = new Map<bigint, IncomingPublish>();
     const streams = new Map<bigint, { alias: bigint; group: bigint; subgroup: bigint; first: boolean }>();
     let nextRequest = 0n;
+    const owners = new Map<bigint, PublicationOwner>();
     const origin = {
+      setLargestLocationProvider() {},
+      session: { draftVersion: 18, getOutgoingPublish: (id: bigint) => owners.get(id), getIncomingSubscription: () => undefined },
       onMessage: undefined as ((m: { type: string; requestId: bigint }) => void) | undefined,
       async publish(namespace: Uint8Array[], name: Uint8Array, alias: bigint) {
         const requestId = nextRequest++;
+        owners.set(requestId, { isTerminated: false, trackNamespace: namespace, trackName: name, trackAlias: alias });
         const p: IncomingPublish = { requestId, trackNamespace: namespace, trackName: name,
           trackAlias: alias, largestLocation: null, closed: new Promise(() => {}),
           onObject: null, onSubgroupClosed: null };
@@ -592,7 +611,11 @@ describe('Relay subgroup lifecycle', () => {
     publish.onObject?.(object(publish.trackAlias, 5n, 0n, locProperties));
 
     const sendFetchObject = vi.fn(async (_streamId: bigint, _fields: unknown) => undefined);
+    const fetchOwner = { isCompleted: false };
     const conn = {
+      setLargestLocationProvider() {}, setFetchLargestLocationProvider() {},
+      session: { draftVersion: 18, getIncomingFetch: (id: bigint) => id === 4n ? fetchOwner : undefined,
+        getIncomingSubscription: () => undefined, getOutgoingPublish: () => undefined },
       draftVersion: 18,
       acceptFetch: vi.fn(async () => undefined),
       openFetchStream: vi.fn(async () => 77n),

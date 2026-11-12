@@ -639,6 +639,27 @@ instead of Google Chrome.
 
 Raymond Lucke and the Red5 Team
 
+## Publication heads and confirmed updates
+
+Publishers serving REQUEST_UPDATE on drafts 16, 18 and 22 must install
+`setLargestLocationProvider` for subscription requests and
+`setFetchLargestLocationProvider` for FETCH requests. Return the current track
+head as `{ group, object }`, or `null` only for a known-empty track. Bind each
+lookup to its exact live request; throw for unknown or retired sources. Advance
+the head before sending each Object. Prepare outgoing publication heads before
+writing PUBLISH so immediate peer updates can resolve the live request. A FETCH's finite end is not its track head.
+Missing, throwing or invalid providers refuse the update and terminate its
+subscription (UPDATE_FAILED) or FETCH. This also applies to draft-16/18 publishers
+that previously accepted updates without a provider.
+
+`requestUpdateConfirmed(id, { timeoutMs, ...options })` resolves after the matching
+REQUEST_OK has been applied and returns a private copy of its parameters.
+`RequestUpdateError` preserves a peer refusal. Other `RequestUpdateFailure`s say
+`not-sent` or `possibly-sent`; a timeout or abort after dispatch does not undo an
+update, and a late acknowledgement can still apply. Draft 14 has no confirmation.
+`IncomingPublish.largestLocation` reports a frozen receive-head snapshot; `closed`
+resolves with the final snapshot when the publication ends.
+
 ## License
 
 Apache 2.0

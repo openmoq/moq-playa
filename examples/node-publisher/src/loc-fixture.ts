@@ -1,3 +1,4 @@
+import { publicationState } from '../../shared/publication-state.js';
 import { encodeLocHeaders, type LocVersion } from '@openmoq/loc';
 import { parseLocmafTrackContext, parseCmafChunk, sliceFrames, codecDescriptionFromInit, ticksToMicros } from '@openmoq/locmaf';
 import { buildCatalog } from '@openmoq/msf';
@@ -107,6 +108,7 @@ export async function publishLocFixture(conn: MoqtConnection, fixture: LoadedFix
           const stream = await conn.openSubgroup(BigInt(11 + index), BigInt(loop * track.groups.length + g), BigInt(object), {
             hasExtensions: true, firstObject: true, endOfGroup: object === group.frames.length - 1, publisherPriority: track.video ? 128 : 64,
           });
+          publicationState(conn).sent(BigInt(11 + index), BigInt(loop * track.groups.length + g), BigInt(object));
           await conn.sendObject(stream, BigInt(object), frame.payload, locFrameProperties(track, frame, loop, version, mode, epochUs));
           await conn.closeSubgroup(stream);
         }

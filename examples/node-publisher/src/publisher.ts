@@ -1,3 +1,4 @@
+import { publicationState } from '../../shared/publication-state.js';
 /**
  * Publish a LoadedFixture into the relay over MoQT draft-18, using public APIs only:
  *
@@ -57,6 +58,8 @@ export async function establishTrack(
   alias: bigint,
 ): Promise<void> {
   const ns = namespace.map((p) => te.encode(p));
+  const state = publicationState(conn);
+  state.prepare(alias);
   const requestId = await conn.publish(ns, te.encode(track), alias);
   await waitForPublishAccept(conn, requestId);
 }
@@ -88,6 +91,7 @@ async function sendGroup(
     const sid = sharedStream ?? await conn.openSubgroup(alias, groupId, BigInt(i), {
       publisherPriority: 128, firstObject: true, endOfGroup: i === objects.length - 1,
     });
+    publicationState(conn).sent(alias, groupId, BigInt(i));
     await conn.sendObject(sid, BigInt(i), objects[i]!);
     if (sharedStream === null) await conn.closeSubgroup(sid);
     if (!opts.timeline && paceMs > 0 && i < objects.length - 1) await sleep(paceMs);

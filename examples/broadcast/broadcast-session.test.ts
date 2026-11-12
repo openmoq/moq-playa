@@ -1,3 +1,4 @@
+import type { PublicationOwner } from '../shared/publication-state.js';
 import { describe, it, expect, vi } from 'vitest';
 import { BroadcastSession } from './broadcast-session.js';
 import type { BroadcastSessionConnection } from './broadcast-session.js';
@@ -15,12 +16,15 @@ const CATALOG: BroadcastCatalogParams = {
 };
 
 function recordingConnection() {
+  const requests = new Map<bigint, PublicationOwner>();
   const calls: string[] = [];
   const accepted: bigint[] = [];
   const sends: Uint8Array[] = [];
   let nextStream = 100n;
-  const conn: BroadcastSessionConnection & { calls: typeof calls; accepted: typeof accepted; sends: typeof sends } = {
-    calls, accepted, sends,
+  const conn: BroadcastSessionConnection & { calls: typeof calls; accepted: typeof accepted; sends: typeof sends; requests: typeof requests } = {
+    calls, accepted, sends, requests,
+    setLargestLocationProvider() {},
+    session: { draftVersion: 16, getOutgoingPublish: () => undefined, getIncomingSubscription: id => requests.get(id) },
     acceptSubscribe: async (_requestId, alias) => { calls.push('acceptSubscribe'); accepted.push(alias as bigint); },
     rejectSubscribe: async () => { calls.push('rejectSubscribe'); },
     openSubgroup: async () => { calls.push('openSubgroup'); return nextStream++; },
@@ -39,13 +43,21 @@ function makeSession(conn: BroadcastSessionConnection, hooks: {
   shutdownGraceMs?: number;
 } = {}) {
   const { catalog, shutdownGraceMs, ...rest } = hooks;
-  return new BroadcastSession(conn, {
+  const session = new BroadcastSession(conn, {
     catalog: catalog ?? CATALOG,
     publisher: { wrapInt, draft: 16 },
     log: () => {},
     ...(shutdownGraceMs !== undefined ? { shutdownGraceMs } : {}),
     ...rest,
   });
+  const handle = session.handleSubscribe.bind(session);
+  session.handleSubscribe = (id, name) => {
+    if ('requests' in conn && conn.requests instanceof Map) {
+      conn.requests.set(id, { isTerminated: false, trackNamespace: [new TextEncoder().encode('live')], trackName: new TextEncoder().encode(name) });
+    }
+    handle(id, name);
+  };
+  return session;
 }
 
 async function settle() { await new Promise((r) => setTimeout(r, 0)); }
@@ -223,6 +235,7 @@ describe('BroadcastSession — generation isolation', () => {
     conn.close = async () => { await realClose(); rejectSend(new Error('connection closed')); };
 
     const session = makeSession(conn);
+    conn.requests.set(1n, { isTerminated: false });
     session.handleSubscribe(1n, 'video');
     await settle();
     session.publisher.publishVideo(new Uint8Array([1]), { isKeyframe: true, timestampUs: 1 });
@@ -258,6 +271,7 @@ describe('BroadcastSession — shutdown transaction', () => {
   it('a normal stop FINs the active video subgroup BEFORE closing the connection', async () => {
     const conn = recordingConnection();
     const session = makeSession(conn);
+    conn.requests.set(1n, { isTerminated: false });
     session.handleSubscribe(1n, 'video');
     await settle();
     session.publisher.publishVideo(new Uint8Array([1]), { isKeyframe: true, timestampUs: 1 });
@@ -278,6 +292,7 @@ describe('BroadcastSession — shutdown transaction', () => {
     conn.close = async () => { await realClose(); rejectSend(new Error('connection closed')); };
 
     const session = makeSession(conn, { shutdownGraceMs: 30 });
+    conn.requests.set(1n, { isTerminated: false });
     session.handleSubscribe(1n, 'video');
     await settle();
     session.publisher.publishVideo(new Uint8Array([1]), { isKeyframe: true, timestampUs: 1 });
@@ -335,6 +350,7 @@ describe('BroadcastSession — shutdown is genuinely bounded', () => {
     const conn = recordingConnection();
     conn.sendObject = () => new Promise<void>(() => { /* never settles, ever */ });
     const session = makeSession(conn, { shutdownGraceMs: 30 });
+    conn.requests.set(1n, { isTerminated: false });
     session.handleSubscribe(1n, 'video');
     await settle();
     session.publisher.publishVideo(new Uint8Array([1]), { isKeyframe: true, timestampUs: 1 });
@@ -364,6 +380,7 @@ describe('BroadcastSession — shutdown is genuinely bounded', () => {
       log: () => { throw new Error('logger blew up'); },
       shutdownGraceMs: 20,
     });
+    conn.requests.set(1n, { isTerminated: false });
     session.handleSubscribe(1n, 'video');
     await settle();
     session.publisher.publishVideo(new Uint8Array([1]), { isKeyframe: true, timestampUs: 1 });

@@ -1,3 +1,4 @@
+import { publicationOwners } from './test-support/publication-owner.js';
 /**
  * `startLoop` — beginning a live loop at a real media origin.
  *
@@ -58,16 +59,21 @@ const oneTickFixture = (): LoadedFixture => ({
 
 /** Records the group, object id, payload and arrival time of everything sent. */
 function recorder() {
+  const publication = publicationOwners();
   const sent: { alias: bigint; group: bigint; object: bigint; payload: Uint8Array; atMs: number }[] = [];
   const streams = new Map<number, { alias: bigint; group: bigint }>();
   const startMs = performance.now();
   let request = 0n;
   let published = 0;
   const conn = {
+    session: publication.session,
+    setLargestLocationProvider: publication.setLargestLocationProvider,
     onMessage: undefined as ((m: { type: string; requestId: bigint }) => void) | undefined,
-    async publish() {
+    async publish(namespace: readonly Uint8Array[], name: Uint8Array, alias: bigint) {
       published++;
       const id = request++;
+      publication.publish(id, namespace, name, alias);
+
       setTimeout(() => conn.onMessage?.({ type: 'REQUEST_OK', requestId: id }), 0);
       return id;
     },
@@ -78,6 +84,7 @@ function recorder() {
     },
     async sendObject(stream: number, object: bigint, payload: Uint8Array) {
       const identity = streams.get(stream)!;
+      publication.sent(identity.alias, identity.group, object);
       sent.push({ ...identity, object, payload, atMs: performance.now() - startMs });
     },
     async closeSubgroup() {},

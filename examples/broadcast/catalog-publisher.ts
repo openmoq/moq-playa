@@ -120,7 +120,7 @@ export async function acceptCatalogSubscribe(
   requestId: bigint,
   alias: bigint,
   params: BroadcastCatalogParams,
-  wire: { draft: DraftVersion; terminalCloseDeadlineMs?: number },
+  wire: { draft: DraftVersion; terminalCloseDeadlineMs?: number; onObject?: (group: bigint) => void },
 ): Promise<number> {
   // Build BEFORE accepting: a build failure must never leave a subscription
   // ESTABLISHED with nothing to send it. The request is still ANSWERED —
@@ -155,6 +155,7 @@ export async function acceptCatalogSubscribe(
         ...(isRequestStreamDraft(wire.draft) ? { firstObject: true } : {}),
       },
     );
+    wire.onObject?.(catalogGroupId);
     await connection.sendObject(streamId, varint(0), catalogPayload);
     // The clean FIN is part of SUCCESS, not cleanup: without it the receiver
     // cannot tell the catalog group ended, so a FIN failure is a failure — and

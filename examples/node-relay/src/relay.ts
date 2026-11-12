@@ -104,6 +104,8 @@ const DEFAULT_FORWARD_LIMITS: ForwardLimits = {
 };
 
 interface Track {
+  largest?: { groupId: bigint; objectId: bigint };
+  sources: Set<IncomingPublish>;
   subscribers: Subscriber[];
   /** Latest group seen (for late-join replay), and that group's objects. */
   cacheGroupId: bigint | null;
@@ -157,6 +159,7 @@ export class Relay {
     let track = this.tracks.get(key);
     if (!track) {
       track = {
+        sources: new Set(),
         subscribers: [],
         cacheGroupId: null,
         cache: [],
@@ -179,6 +182,7 @@ export class Relay {
     namespace: Uint8Array[],
     trackName: Uint8Array,
   ): Promise<void> {
+    conn.setLargestLocationProvider(id => this.currentLargestFor(conn, id));
     try {
       if (!this.isRegisteredTrack(namespace, trackName)) {
         log(`SUBSCRIBE ${nsStr(namespace)}/${td(trackName)} — not registered; rejecting`);
@@ -192,7 +196,7 @@ export class Relay {
       // objects exist — the session SAVES it as the Joining Location, and any
       // Joining FETCH resolves against that exact snapshot (never the head at
       // fetch time, which may have advanced and would gap/overlap delivery).
-      const cachedLargest = latestCached(this.tracks.get(key));
+      const cachedLargest = this.trackHead(this.getTrack(key));
       let acceptParams: Parameters | undefined;
       if (cachedLargest) {
         const value = isRequestStreamDraft(conn.draftVersion)
@@ -205,6 +209,7 @@ export class Relay {
             })();
         acceptParams = new Map([[MessageParam.LARGEST_OBJECT as bigint, [value]]]) as Parameters;
       }
+      this.servedTracks.set(conn.session.getIncomingSubscription(requestId)!, this.getTrack(key));
       await conn.acceptSubscribe(requestId, alias, acceptParams ? { parameters: acceptParams } : undefined);
 
       const track = this.getTrack(key);
@@ -244,14 +249,18 @@ export class Relay {
       }
       const name = td(publish.trackName);
       const key = trackKeyOf(publish.trackNamespace, publish.trackName);
+      const track = this.getTrack(key);
+      track.sources.add(publish);
+      void publish.closed.then(() => { this.trackHead(track); track.sources.delete(publish); });
       await conn.acceptSubscribe(publish.requestId, publish.trackAlias);
       // Create the track on accepted PUBLISH so a publisher that publishes BEFORE any
       // viewer subscribes still populates the latest-group cache (the normal origin
       // case) — a late subscriber then gets the cached group via replay.
-      const track = this.getTrack(key);
       log(`publisher accepted for ${name} (alias=${publish.trackAlias})`);
 
       publish.onObject = (obj) => {
+        if (!track.sources.has(publish)) return;
+        this.trackHead(track);
         if (obj.kind !== 'data') return; // §see README: gap/status objects are not relayed
         // Maintain the latest-group cache for late joiners.
         if (track.cacheGroupId !== obj.groupId) {
@@ -313,7 +322,11 @@ export class Relay {
    * Joining Location → REQUEST_ERROR INVALID_RANGE ("If no Objects have been
    * published for the track").
    */
+  private readonly servedTracks = new WeakMap<object, Track>();
+  private readonly fetchTracks = new WeakMap<object, Track>();
+
   async handleFetch(conn: MoqtConnection, requestId: bigint, fetch: Fetch): Promise<void> {
+    conn.setFetchLargestLocationProvider(id => this.currentLargestFor(conn, id));
     try {
       if (fetch.fetch.fetchType === 0x1) {
         const sf = fetch.fetch as StandaloneFetch;
@@ -337,6 +350,7 @@ export class Relay {
             `start (${start.group},${start.object}) beyond largest (${largest.groupId},${largest.objectId})`);
           return;
         }
+        this.fetchTracks.set(conn.session.getIncomingFetch(requestId)!, track!);
         await serveFetchFromCache(conn, requestId, track!, start, sf.endLocation);
         return;
       }
@@ -365,6 +379,7 @@ export class Relay {
         return;
       }
       log(`joining FETCH requestId=${requestId} → serving [${range.startLocation.group},${range.startLocation.object}) .. (${range.endLocation.group},${range.endLocation.object})`);
+      this.fetchTracks.set(conn.session.getIncomingFetch(requestId)!, track);
       await serveFetchFromCache(conn, requestId, track, range.startLocation, range.endLocation);
     } catch (err) {
       console.error('[relay] FETCH handling failed:', (err as Error).message);
@@ -372,12 +387,24 @@ export class Relay {
     }
   }
 
-  /** The current cached Largest Location for the track a subscription joined —
-   *  the session's Forward-resume provider (§5.1). Null when nothing cached. */
+  /** Current upstream head for an exact live subscription or FETCH; null means known empty. */
   currentLargestFor(conn: MoqtConnection, subRequestId: bigint): { group: bigint; object: bigint } | null {
-    const track = this.findSubscriptionTrack(conn, subRequestId);
-    const largest = latestCached(track);
+    const fetch = conn.session.getIncomingFetch(subRequestId);
+    const owner = conn.session.getIncomingSubscription(subRequestId);
+    const track = fetch ? this.fetchTracks.get(fetch) : owner && !owner.isTerminated ? this.servedTracks.get(owner) : undefined;
+    if (!track) throw new Error('Publication unavailable');
+    const largest = this.trackHead(track);
     return largest ? { group: largest.groupId, object: largest.objectId } : null;
+  }
+
+  private trackHead(track: Track): Track['largest'] {
+    const merge = (head: IncomingPublish['largestLocation'] | undefined) => {
+      if (head && (!track.largest || head.groupId > track.largest.groupId
+          || (head.groupId === track.largest.groupId && head.objectId > track.largest.objectId))) track.largest = { ...head };
+    };
+    merge(latestCached(track));
+    for (const source of track.sources) merge(source.largestLocation);
+    return track.largest;
   }
 
   /** Reverse lookup: the track a given (conn, requestId) subscription belongs to. */

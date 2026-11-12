@@ -1,3 +1,4 @@
+import type { PublicationOwner } from '../../shared/publication-state.js';
 import { describe, expect, it, vi } from 'vitest';
 import { parseCatalogAuto, parseMsf01Delta, applyMsf01Delta } from '@openmoq/msf';
 import type { MoqtConnection } from '@openmoq/webtransport';
@@ -33,10 +34,13 @@ function connection() {
   const streams = new Map<number, { alias: bigint; group: bigint; subgroup: bigint }>();
   const opens: { stream: number; subgroup: bigint; firstObject: boolean; endOfGroup: boolean }[] = [];
   const closed: number[] = [];
+  const publications = new Map<bigint, PublicationOwner>();
   let request = 0n;
   const conn = {
+    setLargestLocationProvider() {},
+    session: { draftVersion: 18, getOutgoingPublish: (id: bigint) => publications.get(id), getIncomingSubscription: () => undefined },
     onMessage: undefined as ((m: { type: string; requestId: bigint }) => void) | undefined,
-    async publish() { const id = request++; setTimeout(() => conn.onMessage?.({ type: 'REQUEST_OK', requestId: id }), 0); return id; },
+    async publish(trackNamespace: Uint8Array[], trackName: Uint8Array, trackAlias: bigint) { const id = request++; publications.set(id, { isTerminated: false, trackNamespace, trackName, trackAlias }); setTimeout(() => conn.onMessage?.({ type: 'REQUEST_OK', requestId: id }), 0); return id; },
     async openSubgroup(alias: bigint, group: bigint, subgroup: bigint, options: { firstObject?: boolean; endOfGroup?: boolean }) {
       const stream = streams.size + 1; streams.set(stream, { alias, group, subgroup });
       opens.push({ stream, subgroup, firstObject: !!options.firstObject, endOfGroup: !!options.endOfGroup });
