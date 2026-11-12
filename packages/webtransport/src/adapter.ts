@@ -236,6 +236,13 @@ type PendingAliasEvent = {
   readonly ownerGeneration: bigint;
 };
 
+interface PublishHold {
+  pub?: IncomingPublish;
+  events: PendingAliasEvent[];
+  bytes: number;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 interface PendingAliasReplay {
   readonly requestId: bigint;
   readonly raw: RawSubState | null;
@@ -3297,6 +3304,9 @@ export class MoqtConnection {
     this.publishLifetimes.set(requestId, { owner, finish: () => {
       final = snapshot();
       this.publishLifetimes.delete(requestId);
+      if (owner.trackAlias !== undefined && this.publishHolds.get(owner.trackAlias)?.pub?.requestId === requestId) {
+        this.clearPublishHold(owner.trackAlias)!.events.length = 0;
+      }
       resolve(Object.freeze({ largestLocation: final }));
     } });
     return { get largestLocation() { return snapshot(); }, closed,
@@ -3309,8 +3319,85 @@ export class MoqtConnection {
     }
   }
 
+  // d16 §10.4.2, d18 §11.4.2, d22 §3.1.3: bounded reordering before PUBLISH.
+  private publishHoldTotalBytes = 0;
+  private static readonly MAX_PUBLISH_HOLD_BYTES = 8 * 1024 * 1024;
+  private readonly publishHolds = new Map<bigint, PublishHold>();
+
+  private clearPublishHold(alias: bigint): PublishHold | undefined {
+    const hold = this.publishHolds.get(alias);
+    if (!hold) return;
+    this.publishHolds.delete(alias);
+    clearTimeout(hold.timer);
+    this.publishHoldTotalBytes -= hold.bytes;
+    hold.bytes = 0;
+    return hold;
+  }
+
+  private retainPublishEvent(alias: bigint, event: PendingAliasEvent, pub?: IncomingPublish): boolean {
+    let hold = this.publishHolds.get(alias);
+    if (pub && hold?.pub !== pub) return false;
+    const bytes = event.kind === 'object' && event.object.kind === 'data'
+      ? event.object.payload.byteLength + (event.object.properties?.byteLength ?? event.object.extensions?.byteLength ?? 0)
+      : 0;
+    if ((hold?.events.length ?? 0) >= MoqtConnection.MAX_PENDING_EVENTS_PER_ALIAS
+        || this.publishHoldTotalBytes + bytes > MoqtConnection.MAX_PUBLISH_HOLD_BYTES) {
+      this.releasePublishHold(alias);
+      return false; // Overflow restores live delivery, including the retained prefix.
+    }
+    if (!hold) {
+      if (pub || event.kind === 'close' || this.session.draftVersion === 14
+          || this.publishHolds.size + this.pendingAliasTimers.size + this.pendingAliasReplays.size >= MoqtConnection.MAX_PENDING_ALIASES) return false;
+      const timer = setTimeout(() => this.releasePublishHold(alias), this.joiningFetchTimeoutMs);
+      (timer as { unref?: () => void }).unref?.();
+      hold = { events: [], bytes: 0, timer };
+      this.publishHolds.set(alias, hold);
+    }
+    hold.events.push(event);
+    hold.bytes += bytes;
+    this.publishHoldTotalBytes += bytes;
+    return true;
+  }
+
+  private deliverPublishEvent(pub: IncomingPublish, event: PendingAliasEvent): void {
+    if (this.retainPublishEvent(pub.trackAlias, event, pub)) return;
+    if (this._terminated || !this.publishAliasMaps.get(pub.trackAlias)?.includes(pub)) return;
+    if (isDraft22(this.session.draftVersion)) {
+      const owner = this.deliverySubscribers22(pub.trackAlias).find(sub => sub.requestId === pub.requestId);
+      if (!owner) return;
+      const window = owner.locationWindow;
+      if (event.kind === 'object') {
+        if (window && !windowContains(window, event.object.groupId, event.object.objectId)) return;
+        if (this.hasDeliveredObject(owner, event.object)) return;
+      } else if (window && !windowCoversGroup(window, event.header.groupId)) return;
+    }
+    if (event.kind === 'object') pub.onObject?.(event.object);
+    else pub.onSubgroupClosed?.(event.header);
+  }
+
+  private releasePublishHold(alias: bigint): void {
+    const hold = this.clearPublishHold(alias);
+    if (!hold) return;
+    try {
+      if (hold.pub) for (const event of hold.events) this.deliverPublishEvent(hold.pub, event);
+    } finally { hold.events.length = 0; }
+  }
+
+  private acceptPublishHold(requestId: bigint, alias: bigint): void {
+    const hold = this.publishHolds.get(alias);
+    if (hold?.pub?.requestId !== requestId) return;
+    clearTimeout(hold.timer);
+    // Let the continuation after await acceptSubscribe install its handlers.
+    hold.timer = setTimeout(() => {
+      if (this.publishHolds.get(alias) === hold) this.releasePublishHold(alias);
+    }, 0);
+    (hold.timer as { unref?: () => void }).unref?.();
+  }
+
   private bindPublishAlias(pub: IncomingPublish): void {
     this.publications.add(pub);
+    const hold = this.publishHolds.get(pub.trackAlias);
+    if (hold && !hold.pub) hold.pub = pub;
     const members = isDraft22(this.session.draftVersion) ? this.publishAliasMaps.get(pub.trackAlias) ?? [] : [];
     members.push(pub);
     this.publishAliasMaps.set(pub.trackAlias, members);
@@ -3487,13 +3574,15 @@ export class MoqtConnection {
           if (this._terminated || !this.deliverySubscribers22(alias).includes(member)) continue;
           const window = member.locationWindow;
           if (window && !windowContains(window, obj.groupId, obj.objectId)) continue;
+          if (member.isPublishInitiated) {
+            const pub = this.publishAliasMaps.get(alias)?.find(pub => pub.requestId === member.requestId);
+            if (pub) this.deliverPublishEvent(pub, { kind: 'object', streamId, object: obj, ownerGeneration: 0n });
+            continue;
+          }
           if (this.hasDeliveredObject(member, obj)) continue;
           const raw = this.rawSubscriptions.get(member.requestId);
           if (raw) raw.sub.onObject?.(obj);
-          else if (!member.isPublishInitiated) generic.push(member);
-          else {
-            this.publishAliasMaps.get(alias)?.find((pub) => pub.requestId === member.requestId)?.onObject?.(obj);
-          }
+          else generic.push(member);
         }
         if (!this._terminated && generic.some((sub) => this.deliverySubscribers22(alias).includes(sub))) this.onObject?.(streamId, obj);
         return true;
@@ -3514,7 +3603,7 @@ export class MoqtConnection {
     // draft-18 §10.10: objects for an accepted inbound PUBLISH route by alias.
     const pub = this.publishAliasMaps.get(alias)?.[0];
     if (pub) {
-      pub.onObject?.(obj);
+      this.deliverPublishEvent(pub, { kind: 'object', streamId, object: obj, ownerGeneration: 0n });
       return true;
     }
     // §11.1: the alias is tombstoned — its route was torn down synchronously,
@@ -3540,6 +3629,7 @@ export class MoqtConnection {
     // {@link bufferPendingAlias} for why this refuses aliases already claimed
     // by a torn-down subscription (§11.1) and fails closed on any limit.
     if (this.bufferPendingAlias(alias, obj, undefined, streamId)) return true;
+    this.retainPublishEvent(alias, { kind: 'object', streamId, object: obj, ownerGeneration: 0n });
     return false;
   }
 
@@ -3569,7 +3659,10 @@ export class MoqtConnection {
           if (window && !windowCoversGroup(window, header.groupId)) continue;
           const raw = this.rawSubscriptions.get(member.requestId);
           if (raw) raw.sub.onSubgroupClosed?.(header);
-          else this.publishAliasMaps.get(alias)?.find((pub) => pub.requestId === member.requestId)?.onSubgroupClosed?.(header);
+          else {
+            const pub = this.publishAliasMaps.get(alias)?.find(pub => pub.requestId === member.requestId);
+            if (pub) this.deliverPublishEvent(pub, { kind: 'close', header, ownerGeneration: 0n });
+          }
         }
         return;
       }
@@ -3592,11 +3685,11 @@ export class MoqtConnection {
     }
     const publications = this.publishAliasMaps.get(alias);
     if (publications) {
-      for (const pub of [...publications]) pub.onSubgroupClosed?.(header);
+      for (const pub of [...publications]) this.deliverPublishEvent(pub, { kind: 'close', header, ownerGeneration: 0n });
       return;
     }
     if (this.session.getTrackByAlias(alias) !== undefined) return;
-    this.bufferPendingAlias(alias, undefined, header);
+    if (!this.bufferPendingAlias(alias, undefined, header)) this.retainPublishEvent(alias, { kind: 'close', header, ownerGeneration: 0n });
   }
 
   private registerPendingSubscription(requestId: bigint): void {
@@ -3747,6 +3840,10 @@ export class MoqtConnection {
    * discarded.
    */
   private settlePendingAliasOwnership(requestId: bigint, boundAlias?: bigint): PendingAliasEvent[] {
+    if (boundAlias !== undefined && !this.publishHolds.get(boundAlias)?.pub) {
+      const hold = this.clearPublishHold(boundAlias);
+      if (hold) hold.events.length = 0;
+    }
     const requestGeneration = this.pendingSubscriptionGenerations.get(requestId);
     if (requestGeneration === undefined) return [];
     this.pendingSubscriptionGenerations.delete(requestId);
@@ -3857,6 +3954,7 @@ export class MoqtConnection {
 
   /** Clears every currently-buffered pending alias (session teardown, or the last pending subscribeTrack() settling). */
   private clearAllPendingAliases(): void {
+    for (const alias of this.publishHolds.keys()) this.clearPublishHold(alias)!.events.length = 0;
     for (const alias of [...this.pendingAliasTimers.keys()]) this.clearPendingAlias(alias);
     for (const alias of [...this.pendingAliasReplays.keys()]) this.cancelPendingAliasReplay(alias);
   }
@@ -3954,6 +4052,8 @@ export class MoqtConnection {
     // subscribe map (the latter matters for a legacy control-stream PUBLISH_DONE,
     // where no request-stream close tears rawAliasMaps down separately).
     this.publishAliasMaps.delete(alias);
+    const hold = this.clearPublishHold(alias);
+    if (hold) hold.events.length = 0;
     this.rawAliasMaps.delete(alias);
     this.sharedAliasSubs.delete(alias);
     this.cancelPendingAliasReplay(alias);
@@ -5291,6 +5391,7 @@ export class MoqtConnection {
       commitTimeout?.(); // PUBLISH_OK reached the peer — now commit the combined timeout
       await this.flushDeferredUpdateResponses(requestId);
       await this.settleParkedJoins(requestId, true);
+      this.acceptPublishHold(requestId, trackAlias);
       return;
     }
     // draft-14/16: the send_control response(s) ride the control stream (the
@@ -5317,6 +5418,7 @@ export class MoqtConnection {
     commitTimeout?.(); // control-stream PUBLISH_OK sent — commit the combined timeout
     await this.flushDeferredUpdateResponses(requestId);
     await this.settleParkedJoins(requestId, true);
+    this.acceptPublishHold(requestId, trackAlias);
   }
 
   /**
