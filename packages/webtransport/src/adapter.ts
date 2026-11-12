@@ -5478,7 +5478,57 @@ export class MoqtConnection {
   }
 
   /** Detach (synchronously) + abort every open FETCH response stream for `requestId`. */
-  private async failFetchUpdate(requestId: bigint): Promise<void> {
+  private readonly fetchAborts = new Map<bigint, Promise<{ status: 'aborted' | 'already-terminal' }>>();
+  private readonly fetchAbortReasons = new Map<bigint, Error>();
+  private readonly retiredIncomingFetches = new Set<bigint>();
+
+  private retireIncomingFetch(id: bigint): void {
+    this.retiredIncomingFetches.add(id);
+    if (this.retiredIncomingFetches.size > 256) this.retiredIncomingFetches.delete(this.retiredIncomingFetches.values().next().value!);
+  }
+
+  abortIncomingFetch(requestId: bigint, options?: { streamErrorCode?: number }): Promise<{ status: 'aborted' | 'already-terminal' }> {
+    const pending = this.fetchAborts.get(requestId);
+    if (pending) return pending;
+    const code = options?.streamErrorCode ?? 1;
+    if (!isRequestStreamDraft(this.session.draftVersion) || requestId < 0n || requestId > (1n << 64n) - 1n
+        || !Number.isSafeInteger(code) || code < 0 || code > 0xffffffff) return Promise.reject(new Error('Invalid FETCH abort'));
+    if (this.retiredIncomingFetches.has(requestId)) return Promise.resolve({ status: 'already-terminal' });
+    if (!this.session.getIncomingFetch(requestId)?.responseSent) return Promise.reject(new Error('Request is not an accepted incoming FETCH'));
+    let reason: Error;
+    try {
+      if (!this.transport?.createStreamError) throw new Error('createStreamError is unavailable');
+      reason = this.transport.createStreamError(code, new Error('Incoming FETCH aborted'));
+    } catch (error) { return Promise.reject(error); }
+    this.fetchAbortReasons.set(requestId, reason);
+    const ctx = this.inboundRequestContexts.get(requestId)!;
+    let finWon = false;
+    const closing = [...this.fetchOutgoingStreams.values()].some(state => state.requestId === requestId && state.closing);
+    const data = this.failFetchUpdate(requestId, reason, () => { finWon = true; });
+    let requestReset = false;
+    const abortRequest = () => ctx.abort(reason, this.transport?.resetSendStream?.bind(this.transport), () => { requestReset = true; });
+    const request = closing ? undefined : abortRequest();
+    void request?.catch(() => {});
+    const operation = data.then(async () => {
+      if (this._terminated) throw new Error('Could not prove FETCH reset');
+      if (finWon) return { status: 'already-terminal' } as const;
+      this.inboundRequestContexts.delete(requestId);
+      if (!await this.allFulfilledWithin([(request ?? abortRequest()).then(() => true, () => false)], MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS)) {
+        if (!requestReset) this.closeSessionInternalError('Could not prove FETCH request reset');
+        throw new Error('Could not prove FETCH request reset');
+      }
+      this.retireIncomingFetch(requestId);
+      this.fetchServeReserved.delete(requestId);
+      return { status: 'aborted' } as const;
+    }).finally(() => {
+      this.fetchAborts.delete(requestId);
+      if (!this.openingFetches.has(requestId)) this.fetchAbortReasons.delete(requestId);
+    });
+    this.fetchAborts.set(requestId, operation);
+    return operation;
+  }
+
+  private async failFetchUpdate(requestId: bigint, reason = new Error('FETCH update failed'), finWon?: () => void): Promise<void> {
     // d18 §10.9.1 / d22 §9.5.1: failed FETCH updates reset their data stream.
     this.session.handleInboundRequestClosed(requestId);
     this.inboundFetchGroupOrder.delete(requestId);
@@ -5488,7 +5538,7 @@ export class MoqtConnection {
     for (const [id, state] of this.fetchOutgoingStreams) {
       if (state.requestId !== requestId) continue;
       this.removeOutgoingFetchStream(id);
-      const reason = new Error('FETCH update failed');
+      if (state.closing && finWon) resets.push(state.closing.then(() => { finWon(); return true; }, () => true));
       try {
         resets.push((this.transport?.resetSendStream
           ? this.transport.resetSendStream(state.writer, reason, state.closing)
@@ -6576,7 +6626,7 @@ export class MoqtConnection {
     const opening = this.openFetchResponseStream(requestId);
     this.openingFetches.set(requestId, opening);
     try { return await opening; }
-    finally { this.openingFetches.delete(requestId); }
+    finally { this.openingFetches.delete(requestId); this.fetchAbortReasons.delete(requestId); }
   }
 
   private async openFetchResponseStream(requestId: bigint): Promise<bigint> {
@@ -6618,7 +6668,7 @@ export class MoqtConnection {
     // RESURRECT itself. Abort the freshly-opened stream and refuse.
     if (!this.inboundFetchGroupOrder.has(requestId)) {
       this.fetchServeReserved.delete(requestId); // no stream established — release the reservation
-      await this.abortFetchWriter(writer, new Error('inbound FETCH deauthorized during stream open'), fillOf);
+      await this.abortFetchWriter(writer, this.fetchAbortReasons.get(requestId) ?? new Error('inbound FETCH deauthorized during stream open'), fillOf, this.fetchAbortReasons.has(requestId));
       throw new MoqtConnectionError(`No admitted inbound FETCH for request ${requestId}`, { errorSource: 'data' });
     }
     const streamId = this.nextOutgoingStreamId++;
@@ -6637,7 +6687,6 @@ export class MoqtConnection {
     } catch (err) {
       // The FETCH_HEADER write failed: the stream is unusable — abort it so it is
       // not left half-open, and surface the failure (do not register a dead writer).
-      this.fetchServeReserved.delete(requestId); // no stream established — release the reservation
       await this.abortFetchWriter(writer, err instanceof Error ? err : new Error(String(err)), fillOf);
       this.removeOutgoingFetchStream(streamId);
       throw err instanceof Error ? err : new Error(String(err));
@@ -6647,16 +6696,16 @@ export class MoqtConnection {
     // landed during the header write itself.
     if (!this.inboundFetchGroupOrder.has(requestId)) {
       this.fetchServeReserved.delete(requestId);
-      await this.abortFetchWriter(writer, new Error('inbound FETCH deauthorized during stream open'), fillOf);
+      await this.abortFetchWriter(writer, this.fetchAbortReasons.get(requestId) ?? new Error('inbound FETCH deauthorized during stream open'), fillOf, this.fetchAbortReasons.has(requestId));
       this.removeOutgoingFetchStream(streamId);
       throw new MoqtConnectionError(`No admitted inbound FETCH for request ${requestId}`, { errorSource: 'data' });
     }
     return streamId;
   }
 
-  private async abortFetchWriter(writer: WritableStreamDefaultWriter<Uint8Array>, reason: Error, fillOf: bigint | undefined): Promise<void> {
-    if (fillOf === undefined) {
-      try { await writer.abort(reason); } catch { /* already down */ }
+  private async abortFetchWriter(writer: WritableStreamDefaultWriter<Uint8Array>, reason: Error, fillOf: bigint | undefined, forced = false): Promise<void> {
+    if (fillOf === undefined && !forced) {
+      try { await (this.transport?.resetSendStream ? this.transport.resetSendStream(writer, reason) : writer.abort(reason)); } catch { /* already down */ }
       return;
     }
     // A fill counts toward its subscription's terminal stream count. If its
@@ -6806,6 +6855,7 @@ export class MoqtConnection {
     // FETCH_OK and data FIN (closeCompletedFetchRequest). Draft 22 instead FINs
     // the response direction promptly (6.4.2.2); the fetcher retains its data
     // state across that FIN because the two streams have no delivery ordering.
+    this.retireIncomingFetch(state.requestId);
     this.session.reclaimServedFetch(state.requestId);
     await this.finishServedFetchRequest22(state.requestId);
   }

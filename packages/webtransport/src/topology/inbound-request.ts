@@ -174,7 +174,7 @@ export class InboundRequestStreamContext {
   }
 
   /** Abort the stream (rejected request / session teardown). Suppresses onFailure. */
-  async abort(reason?: Error, reset?: PublisherTerminalOptions['resetSendStream']): Promise<void> {
+  async abort(reason?: Error, reset?: PublisherTerminalOptions['resetSendStream'], sent?: () => void): Promise<void> {
     if (this.aborted) return;
     this.aborted = true;
     // Setting `aborted` makes the read loop return WITHOUT reaching its catch, so it
@@ -183,8 +183,9 @@ export class InboundRequestStreamContext {
     // stream is gone, so no response can ever arrive).
     this.rejectPendingUpdates(new Error('inbound request stream aborted'));
     if (reason) {
-      await Promise.all([Promise.resolve().then(() => this.reader.cancel(reason)),
-        Promise.resolve().then(() => reset ? reset(this.writer, reason, this.finishing ?? undefined) : this.writer.abort(reason))]);
+      const results = await Promise.allSettled([Promise.resolve().then(() => this.reader.cancel(reason)),
+        Promise.resolve().then(() => reset ? reset(this.writer, reason, this.finishing ?? undefined) : this.writer.abort(reason)).then(sent)]);
+      for (const result of results) if (result.status === 'rejected') throw result.reason;
       return;
     }
     try { await this.reader.cancel(); } catch { /* already closed */ }
