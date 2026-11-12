@@ -70,7 +70,9 @@ export async function checkHandover(page, controlUrl, expected, outcome, evidenc
     if (outcome === 'reject') {
       assert.ok(final.events.some(event => event.relay === 'target' && event.type === 'refused'), 'Refusal control never executed');
     } else {
-      assert.match(playerErrors[0].data.message, /catalog.*MSF-01.*Joining FETCH/i);
+      // A relay forwards only new Objects to SUBSCRIBE (d18 §10.7), so the
+      // subscription-only fallback never receives the published catalog.
+      assert.match(playerErrors[0].data.message, /Handover timeout/i);
       assert.equal(final.events.filter(event => event.relay === 'target' && event.type === 'subscribe' && event.name !== 'catalog').length,
         0, 'Nonconforming catalog retrieval reached media preparation');
     }

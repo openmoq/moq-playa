@@ -58,7 +58,7 @@ registered track set (a toy ABR ladder: `catalog`, `video-1080/720/360`,
 `groupId`/`subgroupId`/`objectId` and raw Object Properties/Extensions, while
 mirroring each graceful subgroup FIN. It
 supports multiple subscriptions per viewer connection (one alias each), a tiny
-latest-group cache replayed to late joiners, and per-subscription cleanup when a
+latest-group cache available through FETCH, and per-subscription cleanup when a
 viewer unsubscribes one track (ABR switch) without closing the connection.
 
 Namespace registration defaults to the `['demo']` tuple. An embedded relay can
@@ -70,9 +70,10 @@ The relay also answers **FETCH** from the latest-group cache (§9.16 / draft-18
 `INVALID_RANGE` / `DOES_NOT_EXIST` rejections, and a **relative joining FETCH**
 resolves its range from the joined subscription's largest cached object — the
 warm-start path a Largest Object subscriber uses to get the current group's
-head immediately. Largest Object subscriptions do **not** get the unconditional
-cache replay (that would violate the filter, §5.1.2); the joining FETCH is the
-way to backfill the current group.
+head immediately. Every SUBSCRIBE delivers only newly received Objects;
+FETCH is the way to retrieve history. Arrivals during acceptance are queued
+within the configured object and byte bounds. Overflow ends that subscription
+with TOO_FAR_BEHIND after SUBSCRIBE_OK, leaving the session open.
 
 ```bash
 # standalone relay-mode server (what the publisher example connects to):
@@ -118,15 +119,15 @@ generate a CMAF fixture from an MP4, publish it (optionally looped) into
   example still runs on one Node event loop; sustained CPU saturation requires more
   capacity or a production relay. The namespace smoke measures a synthetic local
   workload, not browser playback quality or production capacity.
-- **Live, latest-group cache only** — a late joiner gets the most-recent group, not
-  history (no DVR, no init-segment retention policy). FETCH is served from the same
+- **Live, latest-group cache only** — a late viewer can FETCH the most-recent group
+  only (no DVR, no init-segment retention policy). FETCH is served from the same
   single-group cache: ranges reaching further back truncate honestly (gaps in the
   response indicate objects that no longer exist, §9.16.3). The cache has no
   configurable byte limit.
 - **Fixed track registry** — only the names above are routed; a catalog-driven
   registry is a possible follow-up.
 - **Data objects and subgroup header flags** — the incoming `END_OF_GROUP` flag
-  is preserved for live forwarding and cached replay. Graceful FIN is mirrored,
+  is preserved for live forwarding. Graceful FIN is mirrored,
   so the receiver observes completion and downstream stream credit is returned.
   Viewer cancellation drops queued forwarding; the adapter resets unfinished
   streams rather than sending a misleading completion FIN.

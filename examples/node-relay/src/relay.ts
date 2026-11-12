@@ -9,19 +9,17 @@
  *   - per-subscription teardown via `onSubscribeClosed` — an ABR quality-switch
  *     resets one SUBSCRIBE stream and the relay drops only that subscription,
  *     WITHOUT closing the viewer connection;
- *   - a tiny per-track LIVE cache (the most-recent group) replayed to a late joiner
- *     (except Largest Object subscriptions, which start past the largest object
- *     per §5.1.2 and backfill the current group via a Joining FETCH instead);
+ *   - SUBSCRIBE forwards only newly received Objects, including arrivals during
+ *     acceptance; retrieve past Objects with FETCH (d18 §10.7);
  *   - standalone + joining FETCH served from the latest-group cache (§9.16 /
  *     draft-18 §10.12) — see handleFetch;
  *   - forwarding preserves the publisher's groupId/subgroupId/objectId and raw
- *     Object Properties/Extensions, and mirrors graceful subgroup FIN so
+ *     Object Properties/Extensions, and sends FIN only for complete subgroups so
  *     downstream stream credit is returned. The incoming END_OF_GROUP header
  *     bit is preserved before forwarding its first object.
  *
  * Deliberately a TOY — see README:
- *   - LIVE only: the cache holds just the latest group, so a late joiner gets that
- *     group, not full history (no DVR / no real init-segment retention policy).
+ *   - The cache holds just the latest group (no DVR / init-segment retention).
  *   - NO route authorization, fairness, reconnect/migration, or persistence.
  *     A bounded per-subscription forwarder sheds a subscriber that cannot keep up.
  *   - Forwards DATA objects and their subgroup header evidence. Explicit wire
@@ -29,7 +27,7 @@
  * All forwarding uses the public MoqtConnection API — no internals.
  */
 import type { MoqtConnection, IncomingPublish } from '@openmoq/webtransport';
-import { MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@openmoq/transport';
+import { windowContains, MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@openmoq/transport';
 import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, te, nsStr, hex } from './demo.js';
 import { SubgroupForwarder, type ForwardLimits } from './subgroup-forwarder.js';
 import { isRequestStreamDraft } from '@openmoq/transport';
@@ -67,6 +65,10 @@ interface ForwardObjectFields {
 }
 
 class Subscriber {
+  pending = true;
+  stopped = false;
+  terminalStatus?: bigint;
+  initialStart = { group: 0n, object: 0n };
   readonly subgroups = new Map<string, SubscriberSubgroup>();
   readonly forwarder: SubgroupForwarder<ForwardObjectFields>;
 
@@ -75,6 +77,8 @@ class Subscriber {
     readonly requestId: bigint,
     readonly alias: bigint,
     limits: ForwardLimits,
+    readonly retire: () => void,
+    readonly prefix: Map<string, { groupId: bigint; objectId: bigint }>,
   ) {
     this.forwarder = new SubgroupForwarder(limits, {
       forward: (fields) => forwardObject(this, fields),
@@ -82,7 +86,7 @@ class Subscriber {
       reportError: (err) => {
         console.error('[relay] FORWARD SCHEDULER ERROR:', (err as Error).message);
       },
-    });
+    }, false);
   }
 }
 
@@ -106,6 +110,7 @@ const DEFAULT_FORWARD_LIMITS: ForwardLimits = {
 interface Track {
   largest?: { groupId: bigint; objectId: bigint };
   sources: Set<IncomingPublish>;
+  upstream: Map<string, { groupId: bigint; objectId: bigint }>;
   subscribers: Subscriber[];
   /** Latest group seen (for late-join replay), and that group's objects. */
   cacheGroupId: bigint | null;
@@ -160,6 +165,7 @@ export class Relay {
     if (!track) {
       track = {
         sources: new Set(),
+        upstream: new Map(),
         subscribers: [],
         cacheGroupId: null,
         cache: [],
@@ -175,7 +181,7 @@ export class Relay {
       && REGISTERED_TRACKS.has(hex(trackName));
   }
 
-  /** A subscriber's SUBSCRIBE: accept with a fresh alias, register, replay live cache. */
+  /** Register before acceptance so newly received Objects are queued, never replay history. */
   async handleSubscribe(
     conn: MoqtConnection,
     requestId: bigint,
@@ -210,30 +216,23 @@ export class Relay {
         acceptParams = new Map([[MessageParam.LARGEST_OBJECT as bigint, [value]]]) as Parameters;
       }
       this.servedTracks.set(conn.session.getIncomingSubscription(requestId)!, this.getTrack(key));
-      await conn.acceptSubscribe(requestId, alias, acceptParams ? { parameters: acceptParams } : undefined);
-
       const track = this.getTrack(key);
-      const sub = new Subscriber(conn, requestId, alias, this.forwardLimits);
+      const sub = new Subscriber(conn, requestId, alias, this.forwardLimits, () => this.removeSubscription(conn, requestId), new Map(track.upstream));
       track.subscribers.push(sub);
       log(`subscriber joined ${name} (alias=${alias}, requestId=${requestId}); ${track.subscribers.length} now`);
 
-      // Late-join: replay the cached latest group BEFORE any future live object —
-      // but NOT for a Largest Object subscription (§5.1.2: it starts delivery at
-      // {Largest.Group, Largest.Object + 1}; replaying the cached group would
-      // violate the filter). Such a subscriber warm-starts the current group with
-      // a Joining FETCH instead (§10.12.2, see handleFetch).
-      const remoteFilter = conn.session.getIncomingSubscription(requestId)?.remoteFilterType;
-      if (remoteFilter === 'LargestObject') {
-        log(`Largest Object subscription on ${name} — no cache replay (join the group head via Joining FETCH)`);
-      } else if (track.cache.length > 0) {
-        log(`replaying ${track.cache.length} cached object(s) of group ${track.cacheGroupId} to the new ${name} subscriber`);
-        for (const c of track.cache) {
-          this.enqueueObject(track, sub, c);
+      try {
+        await conn.acceptSubscribe(requestId, alias, acceptParams ? { parameters: acceptParams } : undefined);
+        if (sub.stopped || conn.session.getIncomingSubscription(requestId)?.isTerminated !== false) {
+          sub.retire(); return;
         }
-        for (const skey of track.cacheClosedSubgroups) {
-          sub.forwarder.enqueueClose(skey);
-        }
-      }
+        sub.initialStart = conn.session.getIncomingSubscription(requestId)?.locationWindow?.start ?? sub.initialStart;
+        sub.pending = false;
+        if (sub.terminalStatus !== undefined) {
+          sub.retire();
+          await conn.publishDone(requestId, varint(sub.terminalStatus), 'acceptance backlog exceeded');
+        } else sub.forwarder.start();
+      } catch (error) { sub.retire(); throw error; }
     } catch (err) {
       console.error('[relay] SUBSCRIBE handling failed:', (err as Error).message);
     }
@@ -254,8 +253,7 @@ export class Relay {
       void publish.closed.then(() => { this.trackHead(track); track.sources.delete(publish); });
       await conn.acceptSubscribe(publish.requestId, publish.trackAlias);
       // Create the track on accepted PUBLISH so a publisher that publishes BEFORE any
-      // viewer subscribes still populates the latest-group cache (the normal origin
-      // case) — a late subscriber then gets the cached group via replay.
+      // viewer subscribes still populates the history available to FETCH.
       log(`publisher accepted for ${name} (alias=${publish.trackAlias})`);
 
       publish.onObject = (obj) => {
@@ -280,6 +278,7 @@ export class Relay {
           payload: obj.payload,
           extensions,
         });
+        track.upstream.set(subgroupKey(obj.groupId, obj.subgroupId), { groupId: obj.groupId, objectId: obj.objectId });
         // Live fanout (identity preserved), ordered per subgroup. Independent
         // subgroup streams may advance concurrently up to the configured bound.
         const { groupId, subgroupId, objectId, payload } = obj;
@@ -291,6 +290,7 @@ export class Relay {
       };
       publish.onSubgroupClosed = (header) => {
         const skey = subgroupKey(header.groupId, header.subgroupId);
+        track.upstream.delete(skey);
         if (track.cacheGroupId === header.groupId) {
           track.cacheClosedSubgroups.add(skey);
         }
@@ -416,10 +416,16 @@ export class Relay {
   }
 
   private enqueueObject(track: Track, sub: Subscriber, fields: ForwardObjectFields): void {
+    if (sub.conn.session.getIncomingSubscription(sub.requestId)?.isTerminated !== false) { sub.retire(); return; }
     const skey = subgroupKey(fields.groupId, fields.subgroupId);
     const retainedBytes = fields.payload.byteLength + (fields.extensions?.byteLength ?? 0);
     const result = sub.forwarder.enqueueObject(skey, fields, retainedBytes);
     if (result.status !== 'overloaded') return;
+    if (sub.pending) {
+      sub.terminalStatus = sub.conn.draftVersion <= 16 ? 0x6n : 0x5n;
+      sub.forwarder.abort();
+      return;
+    }
     const reason = `subscriber requestId=${sub.requestId} cannot keep up: ${result.reason}`;
     log(`${reason}; closing its connection`);
     // A WebTransport connection may own several track subscriptions. Once one
@@ -440,6 +446,7 @@ export class Relay {
       const [sub] = track.subscribers.splice(i, 1);
       // Cancellation is not completion. Stop queued writes; the adapter resets
       // this request's open data streams (§5.1.1), without inventing a FIN.
+      sub!.stopped = true;
       sub!.forwarder.abort();
       log(`subscription requestId=${requestId} unsubscribed; ${track.subscribers.length} subscriber(s) remain on this track`);
       return; // (conn, requestId) is unique to one subscription
@@ -451,7 +458,7 @@ export class Relay {
     for (const track of this.tracks.values()) {
       const removed = track.subscribers.filter((s) => s.conn === conn);
       if (removed.length > 0) {
-        for (const sub of removed) sub.forwarder.abort();
+        for (const sub of removed) { sub.stopped = true; sub.forwarder.abort(); }
         const kept = track.subscribers.filter((s) => s.conn !== conn);
         track.subscribers = kept;
         log(`removed ${removed.length} subscriber(s) on close; ${kept.length} remain on this track`);
@@ -516,6 +523,8 @@ async function forwardObject(
   fields: ForwardObjectFields,
 ): Promise<void> {
   try {
+    if (sub.stopped) return;
+    if (sub.conn.session.getIncomingSubscription(sub.requestId)?.isTerminated !== false) { sub.retire(); return; }
     const { groupId, subgroupId, objectId, payload, extensions, firstObject, endOfGroup } = fields;
     const skey = subgroupKey(groupId, subgroupId);
     let subgroup = sub.subgroups.get(skey);
@@ -534,7 +543,7 @@ async function forwardObject(
         `subgroup ${skey} opened without Properties/Extensions, but object ${objectId} carries them`,
       );
     }
-    await sub.conn.sendObject(subgroup.streamId, objectId, payload, extensions);
+    if (!sub.stopped) await sub.conn.sendObject(subgroup.streamId, objectId, payload, extensions);
   } catch (err) {
     console.error('[relay] FORWARD ERROR (object dropped):', (err as Error).message);
   }
@@ -545,11 +554,17 @@ const subgroupKey = (groupId: bigint, subgroupId: bigint): string =>
 
 /** Close one outgoing subgroup after its queued objects have settled. */
 async function closeSubscriberSubgroup(sub: Subscriber, skey: string): Promise<void> {
+  if (sub.conn.session.getIncomingSubscription(sub.requestId)?.isTerminated !== false) { sub.retire(); return; }
+  const prefix = sub.prefix.get(skey);
+  const missed = prefix && windowContains({ start: sub.initialStart }, prefix.groupId, prefix.objectId);
+  sub.prefix.delete(skey);
   const subgroup = sub.subgroups.get(skey);
   if (subgroup === undefined) return;
   sub.subgroups.delete(skey);
   try {
-    await sub.conn.closeSubgroup(subgroup.streamId);
+    // d18 §11.4.3: omitted eligible Objects require RESET, never a completion FIN.
+    if (missed) await sub.conn.resetSubgroup(subgroup.streamId);
+    else await sub.conn.closeSubgroup(subgroup.streamId);
   } catch (err) {
     console.error('[relay] SUBGROUP CLOSE ERROR:', (err as Error).message);
   }

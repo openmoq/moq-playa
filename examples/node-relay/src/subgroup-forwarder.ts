@@ -42,7 +42,10 @@ export class SubgroupForwarder<T> {
   constructor(
     private readonly limits: ForwardLimits,
     private readonly handlers: SubgroupForwarderHandlers<T>,
+    private started = true,
   ) {}
+
+  start(): void { this.started = true; this.pump(); }
 
   enqueueObject(subgroupKey: string, value: T, retainedBytes: number): EnqueueResult {
     if (this.stopped) return { status: 'inactive' };
@@ -92,7 +95,7 @@ export class SubgroupForwarder<T> {
   }
 
   private pump(): void {
-    if (this.stopped) return;
+    if (this.stopped || !this.started) return;
     for (const [subgroupKey, lane] of this.lanes) {
       if (lane.active || lane.tasks.length === 0) continue;
       if (this.activeLanes >= this.limits.maxConcurrentSubgroups) break;

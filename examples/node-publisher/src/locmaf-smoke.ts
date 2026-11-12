@@ -34,7 +34,6 @@ const log = (...a: unknown[]) => console.log('[locmaf-smoke]', ...a);
 const here = dirname(fileURLToPath(import.meta.url));
 /** Per-object publish pacing: keeps live forwarding under node-relay's per-subscriber backlog. */
 const PACE_MS = 50;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Spawn node-relay's relay-server entrypoint as a child; resolve its URL. */
 function spawnRelay(): Promise<{ child: ChildProcess; url: string }> {
@@ -101,21 +100,20 @@ async function main(): Promise<number> {
     publisher = await connectClient(url, 'publisher');
     viewer = await connectClient(url, 'viewer');
 
-    // Subscribe every media track BEFORE publishing so its objects are forwarded
-    // live. A late join makes node-relay replay the whole cached group at once, and
-    // a 1080p group is larger than its per-subscriber forwarding backlog, so it
-    // closes the viewer's connection (the same happens with CMAF; it is not LOCMAF).
-    const viewerConn = viewer.conn;
+    // Subscribe catalog and media before publishing: SUBSCRIBE has no history replay.
+    const ready: Promise<void>[] = [];
+    const collect = (track: string, count: number, timeout = 10_000) => { let accepted!: () => void, failed!: (error: unknown) => void; ready.push(new Promise<void>((resolve, reject) => { accepted = resolve; failed = reject; })); const result = subscribeCollect(viewer!.conn, ns, track, count, timeout, accepted); void result.catch(failed); return result; };
+    const catalogObjects = collect('catalog', 1);
     const collections = fixture.tracks.map((t) => ({
       track: t,
-      objects: subscribeCollect(viewerConn, ns, t.meta.name, t.chunks.length, 60_000),
+      objects: collect(t.meta.name, t.chunks.length, 60_000),
     }));
     for (const c of collections) c.objects.catch(() => { /* surfaced when awaited below */ });
-    await sleep(500); // let every SUBSCRIBE land before the first object is published
+    await Promise.all(ready);
     await publishFixture(publisher.conn, fixture, { packaging: 'locmaf', catalogFormat: 'cmsf-01', paceMs: PACE_MS });
 
     // 1. Catalog: every track LOCMAF, supported version, init by reference = fixture init.
-    const catObjs = await subscribeCollect(viewer.conn, ns, 'catalog', 1);
+    const catObjs = await catalogObjects;
     const catalog = parseCatalogAuto(catObjs[0]!.payload);
     const inits = new Map<string, Uint8Array>();
     for (const t of fixture.tracks) {

@@ -5,7 +5,9 @@ import { serveDemoSubscribe } from './demo-publication.js';
  * Accepts WebTransport sessions on a path, adapts each to Playa's `WebTransportLike`,
  * drives a `MoqtConnection(18, { role: 'server' })`, completes MoQT SETUP, and answers
  * a SUBSCRIBE for the fixed demo track with a tiny object stream (see
- * `serveDemoSubscribe`). This is a TOY publisher — no relay/fanout/cache/auth.
+ * `serveDemoSubscribe`). Relay mode instead forwards newly received Objects on
+ * registered tracks; viewers retrieve history with FETCH. Neither mode provides
+ * route authorization.
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

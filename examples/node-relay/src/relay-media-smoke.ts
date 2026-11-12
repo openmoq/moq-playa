@@ -1,12 +1,12 @@
 /**
- * Toy media-relay smoke: multi-track selective fanout + late-join replay + ABR-style
+ * Toy media-relay smoke: multi-track selective fanout + late-join FETCH + ABR-style
  * per-subscription cleanup. One process, no browser, no real media.
  *
  *   - publisher publishes a 6-track ladder (catalog + 3 video + 2 audio);
  *   - viewer1 subscribes catalog + video-720 + audio-en; viewer2 subscribes
  *     catalog + video-360 + audio-en — assert EACH subscription receives ONLY its
  *     track's objects (correct routing);
- *   - a late viewer subscribes catalog AFTER publish and gets the cached group (replay);
+ *   - a late viewer retrieves video-1080 AFTER publication using FETCH;
  *   - viewer1 unsubscribes video-720 (ABR switch); a later video-720 group is NOT
  *     delivered to it, while its other subscriptions stay live (connection open).
  *
@@ -16,7 +16,7 @@ import { startRelayServer } from './server.js';
 import { connectClient, beginSubscribe, type Subscription } from './client.js';
 import { publishTrack, publishGroupObjects } from './publisher.js';
 import { certsExist } from './cert.js';
-import { MEDIA_TRACKS, trackPayloads } from './demo.js';
+import { DEMO_NAMESPACE, nsBytes, te, td, MEDIA_TRACKS, trackPayloads } from './demo.js';
 
 const log = (...a: unknown[]) => console.log('[media-smoke]', ...a);
 
@@ -69,14 +69,21 @@ async function main(): Promise<number> {
     assertExactly('viewer2 audio-en', v2audio, trackPayloads('audio-en'));
     log('selective fanout ✓ (each subscription received only its track)');
 
-    // Phase 2 — publisher-before-viewer replay. video-1080 was published in Phase 1 but
-    // had NO subscribers at publish time, so the relay must have created the track on
-    // PUBLISH and cached its latest group. A viewer subscribing now gets that group.
+    // Phase 2 — history is retrieved with FETCH, even when publication preceded viewers.
     const viewer3 = await connectClient(srv.url);
-    const v3video = await beginSubscribe(viewer3.conn, 2, { track: 'video-1080', label: 'v3-late' });
-    await v3video.collected;
-    assertExactly('viewer3 (late, publisher-first) video-1080', v3video, trackPayloads('video-1080'));
-    log('publisher-before-viewer replay ✓ (video-1080 had no subscribers at publish; cached group delivered to the late viewer)');
+    const fetched: string[] = [];
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('late FETCH timed out')), 10_000);
+      void viewer3.conn.fetch(nsBytes(DEMO_NAMESPACE), te('video-1080'), {
+        startGroup: 0n, startObject: 0n, endGroup: 0n, endObject: 0n,
+        receiver: {
+          onObject: obj => { if (obj.kind === 'data') fetched.push(td(obj.payload)); },
+          onClosed: terminal => { clearTimeout(timer); terminal === 'fin' ? resolve() : reject(new Error(`FETCH ${terminal}`)); },
+        },
+      }).catch(error => { clearTimeout(timer); reject(error); });
+    });
+    if (JSON.stringify(fetched) !== JSON.stringify(trackPayloads('video-1080'))) throw new Error('late FETCH payload mismatch');
+    log('publisher-before-viewer FETCH ✓');
 
     // Phase 3 — ABR cleanup: viewer1 drops video-720, then a later video-720 group must
     // NOT reach it, while its other subscriptions stay live (connection still open).
@@ -96,7 +103,7 @@ async function main(): Promise<number> {
     }
     log('ABR cleanup ✓ (dropped only video-720; catalog/audio stayed live, connection open)');
 
-    log('RESULT: multi-track selective fanout + late-join replay + ABR per-sub cleanup. PASS.');
+    log('RESULT: multi-track selective fanout + late-join FETCH + ABR per-sub cleanup. PASS.');
     await viewer3.close();
     return 0;
   } catch (err) {

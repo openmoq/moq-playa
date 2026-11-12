@@ -63,6 +63,7 @@ export async function subscribeCollect(
   track: string,
   expected: number,
   timeoutMs = 10_000,
+  onReady?: () => void,
 ): Promise<ReceivedObject[]> {
   const got: ReceivedObject[] = [];
   let resolveDone!: () => void;
@@ -76,6 +77,7 @@ export async function subscribeCollect(
     },
   });
 
+  onReady?.();
   try {
     await Promise.race([
       done,

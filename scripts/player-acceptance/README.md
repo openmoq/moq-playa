@@ -39,7 +39,7 @@ The following scenarios are mandatory:
 | CMAF relay handover with changed video initialization | A replacement muxed at 60000 Hz instead of 12288 Hz keeps the ongoing presentation timeline and continuous audio |
 | CMAF relay handover from a nonzero media origin with changed video initialization | Both publishers start at loop 3 (~18 s of media), and the replacement's 60000 Hz initialization keeps one buffered range, a forward playhead inside it and advancing buffered end |
 | CMAF relay handover with a refused audio subscription | One recoverable diagnostic; the candidate closes and old picture/audio continue |
-| CMAF relay handover after catalog retrieval times out | Subscription-only fallback cannot admit a CMSF-01 catalog; the candidate closes and old playback continues |
+| CMAF relay handover after catalog retrieval times out | Subscription-only fallback receives no past catalog Object; the candidate closes at the handover deadline and old playback continues |
 | 360p, 720p and 1080p, each with both language signals | Correct decoded dimensions, moving pixels, and 440 Hz (`en`) or 880 Hz (`es`) PCM |
 | CMAF manual rendition switches from a nonzero origin | Native 1080p → 720p → 360p → 720p → 1080p frames with continuing 440 Hz audio and one advancing timeline |
 | CMAF manual AVC-level retypes | The same sequence crosses levels 4.0 → 3.0 → 4.0 with two actual native retypes and preserved nonzero offsets |
@@ -87,9 +87,9 @@ the source must not see an unsubscribe. After release, successful adoption must
 close the original transport, retain the replacement and continue output for
 another seven seconds. A required audio rejection must instead close the
 replacement, preserve the original and continue output. A separate negative
-case holds catalog retrieval through its five-second timeout: the subsequent
-subscription-only fallback must reject CMSF-01 rather than weaken its bootstrap
-requirement. Per-relay request and
+case holds catalog retrieval through its five-second timeout: the relay forwards
+only new Objects to SUBSCRIBE, so the subsequent subscription-only fallback
+receives no catalog and the candidate is refused at the handover deadline. Per-relay request and
 object counts, original transport close times and both output windows are
 retained. These checks cover draft-18 handover and output continuity, not exact
 sample alignment between the two publisher processes or arbitrary codec changes.

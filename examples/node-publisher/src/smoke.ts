@@ -64,12 +64,17 @@ async function main(): Promise<number> {
   let viewer: Awaited<ReturnType<typeof connectClient>> | null = null;
   try {
     publisher = await connectClient(url, 'publisher');
-    await publishFixture(publisher.conn, fixture); // unpaced for the smoke
 
     viewer = await connectClient(url, 'viewer');
+    const ready: Promise<void>[] = [];
+    const collect = (track: string, count: number, timeout = 10_000) => { let accepted!: () => void, failed!: (error: unknown) => void; ready.push(new Promise<void>((resolve, reject) => { accepted = resolve; failed = reject; })); const result = subscribeCollect(viewer!.conn, ns, track, count, timeout, accepted); void result.catch(failed); return result; };
+    const catalogObjects = collect('catalog', 1);
+    const collections = new Map(fixture.tracks.map(t => [t.meta.name, collect(t.meta.name, CHUNKS_PER_TRACK)]));
+    await Promise.all(ready);
+    await publishFixture(publisher.conn, fixture); // all verification subscriptions are accepted
 
     // 1. Catalog: subscribe, parse, assert track list + initData round-trip.
-    const catObjs = await subscribeCollect(viewer.conn, ns, 'catalog', 1);
+    const catObjs = await catalogObjects;
     const catalog = parseCatalogAuto(catObjs[0]!.payload);
     const wantNames = fixture.tracks.map((t) => t.meta.name);
     const gotNames = catalog.tracks.map((t) => t.name);
@@ -86,7 +91,7 @@ async function main(): Promise<number> {
 
     // 2. Every media track: assert the exact synthetic chunks, in order, with IDs.
     for (const t of fixture.tracks) {
-      const objs = await subscribeCollect(viewer.conn, ns, t.meta.name, CHUNKS_PER_TRACK);
+      const objs = await collections.get(t.meta.name)!;
       objs.forEach((o, i) => {
         const want = syntheticChunkPayload(t.meta.name, 0n, i);
         if (td.decode(o.payload) !== td.decode(want)) {
