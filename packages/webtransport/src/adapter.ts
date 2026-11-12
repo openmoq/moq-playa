@@ -1,3 +1,4 @@
+import { PublisherTerminalFailure, type PublisherTerminalOptions } from './topology/publisher-terminal.js';
 import { RequestUpdateFailure, RequestUpdateError } from './request-update-confirmation.js';
 /**
  * MoqtConnection — bridges stream/datagram transports to the sans-I/O Session.
@@ -294,6 +295,8 @@ function requestGoawayNotice(requestId: bigint, msg: Goaway): GoawayNotice {
  * track's data-plane lifecycle (delivered via the bound Track Alias), then
  * accept/reject via the connection.
  */
+export interface MalformedPublicationTerminationResult { readonly status: 'done-written' | 'already-terminal' }
+
 export interface IncomingPublish {
   /** Monotonic receive head; each read returns a fresh frozen snapshot. */
   readonly largestLocation: Readonly<{ groupId: bigint; objectId: bigint }> | null;
@@ -859,6 +862,7 @@ export class MoqtConnection {
     // cancelled/terminal, never as the default current generation — a late
     // completion aborts its fresh writer and repopulates nothing.
     this.publisherOpsTerminal = true;
+    for (const requests of this.publisherAliasRequests.values()) for (const id of requests) this.publisherTerminals.set(id, Promise.resolve());
     this.publisherAliasRequests.clear();
     this.retiredPublisherAliases.clear();
     this.openSubgroupsByRequest.clear();
@@ -1361,6 +1365,7 @@ export class MoqtConnection {
      *  observes the same success or failure. */
     closing?: Promise<void>;
     resetting?: Promise<void>;
+    fin?: Promise<void>;
   }>();
 
   /** Counter for synthetic outgoing stream IDs. */
@@ -5643,18 +5648,54 @@ export class MoqtConnection {
    * any other write/seal failure closes the session, because a peer left
    * believing the subscription is established would be split-brain.
    */
+  private readonly publisherTerminals = new Map<bigint, Promise<void>>();
+  private readonly malformedTerminations = new Map<bigint, Promise<MalformedPublicationTerminationResult>>();
+  private readonly publisherResetReasons = new Map<bigint, Error>();
+
+  terminateMalformedPublication(requestId: bigint): Promise<MalformedPublicationTerminationResult> {
+    const pending = this.malformedTerminations.get(requestId);
+    if (pending) return pending;
+    const terminal = this.publisherTerminals.get(requestId) ?? this.failedUpdateTerminations.get(requestId);
+    if (terminal) {
+      const status = this.failedUpdateTerminations.has(requestId) ? 'done-written' : 'already-terminal';
+      const joined = terminal.then<MalformedPublicationTerminationResult>(() => {
+        if (status === 'done-written' && this.publisherOpsTerminal) throw new Error('Session closed during terminal');
+        return { status };
+      }).finally(() => { this.malformedTerminations.delete(requestId); });
+      this.malformedTerminations.set(requestId, joined);
+      return joined;
+    }
+    if (!isRequestStreamDraft(this.session.draftVersion) || this.publishAliasForRequest(requestId) !== undefined
+        || this.publisherSubscriptionForRequest(requestId)?.state !== SubscriptionState.ESTABLISHED) return Promise.reject(new Error('Unknown downstream publication'));
+    let reason: Error;
+    try {
+      if (!this.transport?.createStreamError) throw new Error('createStreamError is unavailable');
+      reason = this.transport.createStreamError(0x12, new Error('Malformed track'));
+    } catch (error) { return Promise.reject(error); }
+    this.publisherResetReasons.set(requestId, reason);
+    const operation = this.runFailedUpdateTermination(requestId, 'Malformed track', 0x12n).then(() => {
+      if (this.publisherOpsTerminal) throw new Error('Session closed during malformed termination');
+      return { status: 'done-written' } as const;
+    }).finally(() => { this.malformedTerminations.delete(requestId); this.publisherResetReasons.delete(requestId); });
+    this.malformedTerminations.set(requestId, operation);
+    this.publisherTerminals.set(requestId, operation.then(() => {}));
+    void this.publisherTerminals.get(requestId)!.catch(() => {});
+    return operation;
+  }
+
   private completeFailedSubscriptionUpdate(existingRequestId: bigint, reason: string): Promise<void> {
     // SINGLE-FLIGHT: a concurrent invocation joins the in-flight transaction
     // — exactly one PUBLISH_DONE, no duplicate close, no leaked waiter.
-    const inFlight = this.failedUpdateTerminations.get(existingRequestId);
+    const inFlight = this.failedUpdateTerminations.get(existingRequestId) ?? this.publisherTerminals.get(existingRequestId);
     if (inFlight) return inFlight;
-    const txn = this.runFailedUpdateTermination(existingRequestId, reason)
-      .finally(() => { this.failedUpdateTerminations.delete(existingRequestId); });
+    const writing = this.runFailedUpdateTermination(existingRequestId, reason);
+    const txn = writing.catch(() => {}).finally(() => { this.failedUpdateTerminations.delete(existingRequestId); });
     this.failedUpdateTerminations.set(existingRequestId, txn);
+    this.publisherTerminals.set(existingRequestId, writing);
     return txn;
   }
 
-  private async runFailedUpdateTermination(existingRequestId: bigint, reason: string): Promise<void> {
+  private async runFailedUpdateTermination(existingRequestId: bigint, reason: string, statusCode = 0x8n): Promise<void> {
     // EVERY phase below is bounded: a reserved publisher operation that never
     // settles, or a terminal write that never completes, must not strand the
     // transaction — its only permitted outcomes are one PUBLISH_DONE or a
@@ -5706,9 +5747,9 @@ export class MoqtConnection {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([
-          this.publishDone(existingRequestId, varint(0x8n) /* UPDATE_FAILED */, reason),
+          this.writePublishDone(existingRequestId, varint(statusCode), reason, { reason: this.publisherResetReasons.get(existingRequestId) ?? new Error(reason), resetSendStream: this.transport?.resetSendStream?.bind(this.transport) }),
           new Promise<never>((_resolve, reject) => {
-            timer = setTimeout(
+            if (!isRequestStreamDraft(this.session.draftVersion)) timer = setTimeout(
               () => reject(new Error(`PUBLISH_DONE did not settle within ${MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS}ms`)),
               MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS,
             );
@@ -5718,16 +5759,27 @@ export class MoqtConnection {
         clearTimeout(timer);
       }
     } catch (err) {
-      if (existedBefore) {
+      if (existedBefore && !(err instanceof PublisherTerminalFailure && err.ended)) {
         this.closeSessionInternalError(
           `failed-update termination could not complete for request ${existingRequestId}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
+      throw err;
       // else: PROVEN already terminated before we started — the goal state held.
     }
   }
 
-  async publishDone(requestId: bigint, statusCode: Varint, reason: string): Promise<void> {
+  publishDone(requestId: bigint, statusCode: Varint, reason: string): Promise<void> {
+    if (this.malformedTerminations.has(requestId) || this.failedUpdateTerminations.has(requestId)) {
+      return Promise.reject(new Error('Publication is terminating'));
+    }
+    let admitted = false;
+    const completion = this.writePublishDone(requestId, statusCode, reason, undefined, () => { admitted = true; });
+    if (admitted) this.publisherTerminals.set(requestId, completion);
+    return completion;
+  }
+
+  private async writePublishDone(requestId: bigint, statusCode: Varint, reason: string, terminal?: PublisherTerminalOptions, admit?: () => void): Promise<void> {
     // §10.11: PUBLISH_DONE is the terminal message AND carries the total Stream
     // Count — it is refused while data streams for this subscription remain
     // open OR an open/datagram-write operation is still in flight (a
@@ -5742,6 +5794,7 @@ export class MoqtConnection {
       );
     }
     const actions = this.session.publishDone(requestId, statusCode, reason);
+    admit?.();
     this.openSubgroupsByRequest.delete(requestId);
     // Terminal — retire the alias into the bounded LRU (a later send is still
     // refused) so per-subscription churn does not accumulate for the session.
@@ -5754,9 +5807,12 @@ export class MoqtConnection {
       const ctx = this.inboundRequestContexts.get(requestId);
       if (ctx) {
         const send = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
-        if (send) await ctx.writeMessage(send.message);
-        ctx.seal();
-        await ctx.terminate();
+        if (terminal && send) await ctx.finishPublisher(send.message, terminal);
+        else {
+          if (send) await ctx.writeMessage(send.message);
+          ctx.seal();
+          await ctx.terminate();
+        }
         this.inboundRequestContexts.delete(requestId);
         return;
       }
@@ -5764,7 +5820,7 @@ export class MoqtConnection {
       // opened, then the stream is FIN'd and dropped. Not the uni control stream.
       if (this.uniPair!.hasRequestStream(requestId)) {
         const send = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
-        await this.uniPair!.finishRequest(requestId, send?.message);
+        await this.uniPair!.finishRequest(requestId, send?.message, terminal);
         return;
       }
     }
@@ -5828,6 +5884,10 @@ export class MoqtConnection {
    * subscription churn stays bounded.
    */
   private retirePublisherRequest(requestId: bigint): void {
+    if (!this.publisherTerminals.has(requestId)) this.publisherTerminals.set(requestId, Promise.resolve());
+    if (this.publisherTerminals.size > MoqtConnection.MAX_RETIRED_PUBLISHER_ALIASES) {
+      this.publisherTerminals.delete(this.publisherTerminals.keys().next().value!);
+    }
     this.revokePublisherFills(requestId);
     for (const [alias, requests] of this.publisherAliasRequests) {
       if (!requests.has(requestId)) continue;
@@ -6019,11 +6079,11 @@ export class MoqtConnection {
           // A backend can normalize its reset evidence (browser WebTransport
           // §7.4 rejects an interrupted FIN after a successful reset). Without
           // that contract, only abort fulfillment proves the reset (§5.1.1).
-          const reason = new Error('subscription cancelled — RESET_STREAM (§5.1.1)');
+          const reason = this.publisherResetReasons.get(requestId) ?? new Error('subscription cancelled — RESET_STREAM (§5.1.1)');
           try {
             aborts.push(
               (this.transport?.resetSendStream
-                ? this.transport.resetSendStream(st.writer, reason, st.closing)
+                ? this.transport.resetSendStream(st.writer, reason, 'fin' in st ? st.fin : st.closing)
                 : st.writer.abort(reason))
                 .then(() => true, () => false),
             );
@@ -6123,7 +6183,14 @@ export class MoqtConnection {
       // WITHOUT writing a header, registering the stream, or counting it.
       if (assoc && !this.publisherOpCurrent(assoc.requestId, assoc.generation)) {
         const paused = this.publisherSubscriptionForRequest(assoc.requestId)?.forwardState === ForwardState.PAUSED;
-        try { await writer.abort(new Error('subgroup open no longer permitted before header (§5.1)')); } catch { /* already gone */ }
+        const reason = this.publisherResetReasons.get(assoc.requestId) ?? new Error('subgroup open no longer permitted before header (§5.1)');
+        try {
+          await (this.transport.resetSendStream ? this.transport.resetSendStream(writer, reason) : writer.abort(reason));
+        } catch {
+          if (this.failedUpdateTerminations.has(assoc.requestId) || this.malformedTerminations.has(assoc.requestId)) {
+            this.closeSessionInternalError('Late publisher allocation could not be reset');
+          }
+        }
         throw new MoqtConnectionError(
           paused
             ? `openSubgroup: subscription for track alias ${trackAlias} changed to Forward State 0 while opening the stream (§5.1)`
@@ -6372,7 +6439,7 @@ export class MoqtConnection {
     } catch (error) { return Promise.reject(error); }
     state.resetting = Promise.resolve().then(async () => {
       const reset = Promise.resolve().then(() => this.transport?.resetSendStream
-        ? this.transport.resetSendStream(state.writer, reason, state.closing)
+        ? this.transport.resetSendStream(state.writer, reason, state.fin)
         : state.writer.abort(reason)).then(() => true, () => false);
       if (!await this.allFulfilledWithin([reset], MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS)) {
         this.closeSessionInternalError('Could not prove subgroup reset');
@@ -6404,6 +6471,7 @@ export class MoqtConnection {
     if (state.closing) return state.closing;
 
     const fin = (async () => {
+      let closed = false;
       try {
         // The stream stays REGISTERED in both maps until the FIN SETTLES. A
         // subgroup whose FIN is still in flight is not yet closed: §10.11's
@@ -6416,13 +6484,16 @@ export class MoqtConnection {
         // caller whose success criterion is "the group was delivered" (catalog
         // publication announcing readiness, for one) MUST be able to observe it.
         // Callers for whom the close is genuinely best-effort contain it locally.
-        await state.writer.close();
+        await (state.fin = state.writer.close());
+        closed = true;
+      } catch (error) {
+        try { if (this.outgoingStreams.has(streamId)) await this.resetSubgroup(streamId); }
+        catch { this.closeSessionInternalError('Could not prove subgroup reset'); }
+        throw error;
       } finally {
-        // Settled either way: release the slot so a failed FIN leaves no phantom
-        // open subgroup and a retry is a clean no-op. (Teardown may have removed
-        // these already — deletion is idempotent.)
-        if (!state.resetting) this.outgoingStreams.delete(streamId);
-        if (!state.resetting && state.subscriptionRequestId !== undefined) {
+        // Retain failed FIN ownership so a terminal must prove its reset.
+        if (closed && !state.resetting) this.outgoingStreams.delete(streamId);
+        if (closed && !state.resetting && state.subscriptionRequestId !== undefined) {
           const open = this.openSubgroupsByRequest.get(state.subscriptionRequestId);
           if (open) {
             open.delete(streamId);

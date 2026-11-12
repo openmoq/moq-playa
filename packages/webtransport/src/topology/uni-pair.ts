@@ -1,3 +1,4 @@
+import { finishPublisherTerminal, type PublisherTerminalOptions } from './publisher-terminal.js';
 /**
  * UniPairTopology — draft-18 control-stream topology.
  *
@@ -604,11 +605,13 @@ export class UniPairTopology {
    * writable and STOP_SENDINGs the readable, then drops the context. No response
    * is expected for the final message. No-op if no such stream is open.
    */
-  async finishRequest(requestId: bigint, finalMessage?: ControlMessage): Promise<void> {
+  /** @experimental `terminal` supplies one binding-owned reason and reset hook
+   * for forced publisher termination. Omission preserves existing behavior. */
+  async finishRequest(requestId: bigint, finalMessage?: ControlMessage, terminal?: PublisherTerminalOptions): Promise<void> {
     const ctx = this.contexts.get(requestId);
     if (!ctx) return;
     this.contexts.delete(requestId);
-    await ctx.finishWith(finalMessage);
+    await ctx.finishWith(finalMessage, terminal);
   }
 
   // ── continuing request streams (SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS) ──
@@ -996,9 +999,16 @@ class RequestStreamContext {
    * local PUBLISH_DONE on an outbound PUBLISH (§10.11). Resolves `closed` cleanly;
    * the read loop is suppressed from reporting the teardown as a failure.
    */
-  async finishWith(finalMessage?: ControlMessage): Promise<void> {
+  async finishWith(finalMessage?: ControlMessage, terminal?: PublisherTerminalOptions): Promise<void> {
     if (this.cancelled) return;
     this.cancelled = true; // suppress read-loop errors during teardown
+    if (terminal) {
+      try {
+        await finishPublisherTerminal(this.writer, this.reader,
+          () => finalMessage ? this.writer.write(this.codec.encode(finalMessage)) : Promise.resolve(), terminal);
+      } finally { this.closedDeferred.resolve(); }
+      return;
+    }
     if (finalMessage) {
       try { await this.writer.write(this.codec.encode(finalMessage)); } catch { /* already closed */ }
     }

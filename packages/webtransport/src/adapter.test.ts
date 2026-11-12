@@ -5002,7 +5002,7 @@ describe('MoqtConnection draft-14', () => {
         await Promise.all([firstSettled, secondSettled]);
       });
 
-      it('closeSubgroup PROPAGATES a failed FIN and still releases the stream slot', async () => {
+      it('closeSubgroup PROPAGATES a failed FIN and releases the slot after proven reset', async () => {
         // A caller whose success criterion is "the group reached the peer" —
         // catalog publication announcing readiness — must be able to observe a
         // FIN that failed. Suppressing it lets the app report success for a
@@ -5013,14 +5013,17 @@ describe('MoqtConnection draft-14', () => {
             write() { /* accept the header */ },
             close() { throw new Error('FIN failed: stream reset'); },
           }));
+        const reset = vi.fn(async () => {});
+        Object.assign(mock.transport, { createStreamError: () => new Error('reset'), resetSendStream: reset });
         const adapter = await connectPublisherWithAlias(mock, 42n);
 
         const streamId = await adapter.openSubgroup(varint(42n), varint(0n), varint(0n));
         await expect(adapter.closeSubgroup(streamId)).rejects.toThrow(/FIN failed/);
 
-        // The slot is released regardless, so a retry is a clean no-op rather
-        // than a second (also failing) close of a phantom stream.
+        expect(reset).toHaveBeenCalledOnce();
+        // Proven reset releases the slot, so retry is a no-op and ordinary DONE works.
         await expect(adapter.closeSubgroup(streamId)).resolves.toBeUndefined();
+        await expect(adapter.publishDone(varint(1n), varint(0n), 'failed')).resolves.toBeUndefined();
       });
 
       it('closeSubgroup on an unknown/already-closed stream stays an idempotent no-op', async () => {

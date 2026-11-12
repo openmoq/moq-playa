@@ -1,3 +1,4 @@
+import { finishPublisherTerminal, type PublisherTerminalOptions } from './publisher-terminal.js';
 /**
  * InboundRequestStreamContext — owns one peer-initiated (inbound) request stream
  * (draft-18 §3.3). The peer opens the stream and sends a first request message
@@ -142,6 +143,13 @@ export class InboundRequestStreamContext {
   /** Write a message (e.g. SUBSCRIBE_OK or a peer-update REQUEST_OK) on this stream. */
   async writeMessage(message: ControlMessage): Promise<void> {
     await this.writer.write(this.codec.encode(message));
+  }
+
+  async finishPublisher(message: ControlMessage, terminal: PublisherTerminalOptions): Promise<void> {
+    this.aborted = true;
+    this.seal();
+    this.rejectPendingUpdates(terminal.reason);
+    await finishPublisherTerminal(this.writer, this.reader, () => this.writeMessage(message), terminal);
   }
 
   /** FIN our writable — e.g. after writing PUBLISH_DONE (§10.11). */
