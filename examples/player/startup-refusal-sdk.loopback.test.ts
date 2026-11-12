@@ -33,7 +33,8 @@ const nodes = source.statements.filter(
   || ts.isExpressionStatement(n) && n.getText(source).startsWith('setInterval(') && n.getText(source).includes('No media for')
 );
 const code = ts.transpileModule(nodes.map(n => n.getText(source)).join('\n'), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-function fixture() {
+function fixture(acceptWatch = false) {
+  const namespaceRequests: Array<{ server: MoqtConnection; id: bigint }> = [];
   const peers: Array<{
     client: MoqtConnection;
     server: MoqtConnection;
@@ -52,6 +53,11 @@ function fixture() {
       }> = [];
       server.onSubscribe = (id, _ns, name) => {
         requests.push({ id, name: new TextDecoder().decode(name) });
+      };
+      server.onSubscribeNamespace = id => {
+        namespaceRequests.push({ server, id });
+        if (acceptWatch) void server.acceptSubscribeNamespace(id);
+        else void server.rejectSubscribeNamespace(id, 1n, 'discovery unavailable');
       };
       super({
         ...config,
@@ -147,6 +153,7 @@ function fixture() {
   runInContext(code, context);
   return {
     context,
+    namespaceRequests,
     peers,
     players,
     logs,
@@ -213,4 +220,42 @@ describe('actual example lifecycle with real core and SDK, no DOM/media implemen
       await f.close();
     }
   });
+});
+
+
+it('reconnects, waits without polling, and re-subscribes when the relay announces the publisher', async () => {
+  const f = fixture(true);
+  try {
+    await f.context.startPlayback(); await flush(128);
+    f.peers[0]!.a.failClosed(new Error('relay closed')); await flush(256);
+    await vi.advanceTimersByTimeAsync(1001); await flush(256);
+    expect(f.peers).toHaveLength(2);
+    const h = f.peers[1]!, catalogs = () => h.requests.filter(r => r.name === 'catalog');
+    expect(catalogs()).toHaveLength(1);
+    await h.server.rejectSubscribe(catalogs()[0]!.id, 0x10n, 'unroutable'); await flush(256);
+    await vi.advanceTimersByTimeAsync(3000); await flush(128);
+    expect(f.peers.slice(1).flatMap(p => p.requests.filter(r => r.name === 'catalog'))).toHaveLength(1);
+    for (const watch of f.namespaceRequests.filter(w => w.server === h.server)) {
+      await h.server.sendNamespace(watch.id, []);
+    }
+    await flush(256);
+    expect(catalogs()).toHaveLength(2); expect(f.context.isPlaying).toBe(true);
+    await vi.advanceTimersByTimeAsync(5000); await flush(128);
+    expect(catalogs()).toHaveLength(2); expect(f.peers).toHaveLength(2);
+  } finally { await f.close(); }
+});
+
+
+it('abandons a hung replacement tune-in at 15000 ms', async () => {
+  const f = fixture();
+  try {
+    await f.context.startPlayback(); await flush(128);
+    f.context.startPlayback = () => new Promise(() => {});
+    f.peers[0]!.a.failClosed(new Error('relay closed')); await flush(256);
+    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(14999);
+    expect(f.logs.some(line => line.includes('tune-in timed out'))).toBe(false);
+    await vi.advanceTimersByTimeAsync(1); await flush(128);
+    expect(f.logs.some(line => line.includes('tune-in timed out after 15000ms'))).toBe(true);
+  } finally { await f.close(); }
 });

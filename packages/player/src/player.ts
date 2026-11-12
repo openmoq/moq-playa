@@ -1297,6 +1297,37 @@ export class MoqtPlayer {
    */
   private readonly announcedNamespaces = new Map<bigint, Uint8Array[]>();
 
+  private publisherCatalogWait: { conn: MoqtConnection; waiting: boolean; retryInterval: bigint; atMs: number; timer: ReturnType<typeof setTimeout> } | null = null;
+
+  private async waitForPublisherCatalog(conn: MoqtConnection, reason: string, retryInterval: bigint): Promise<void> {
+    if (!this.mediaRecoveryOwnsConnection(conn) || this._destroyed || this.isTerminalState() || this.catalogSlots.catalogReceived) return;
+    const fatal = () => this.failCatalogPlayback(createPlayerError(
+      'fatal', 'catalog', PlayerErrorCode.SUBSCRIPTION_REFUSED, `Catalog subscription refused: ${reason} (code=0x${conn.draftVersion === 14 ? '4' : '10'})`));
+    // The refusal starts the bound, even if the local namespace send is blocked.
+    if (!this.publisherCatalogWait || this.publisherCatalogWait.conn !== conn) {
+      const wait = { conn, waiting: false, retryInterval, atMs: performance.now(), timer: setTimeout(() => {
+        if (this.publisherCatalogWait !== wait) return;
+        this.publisherCatalogWait = null;
+        if (wait.retryInterval === 0n && !this._destroyed && !this.isTerminalState() && this.mediaRecoveryOwnsConnection(conn)
+            && !this.catalogSlots.catalogReceived) fatal();
+      }, Math.min(this.config.publisherWaitMs!, 0x7fffffff)) };
+      this.publisherCatalogWait = wait;
+    }
+    this.publisherCatalogWait.retryInterval = retryInterval;
+    this.publisherCatalogWait.atMs = performance.now();
+    if (retryInterval > 0n) this.scheduleCatalogSubscribeRetry(conn, retryInterval);
+    const wait = this.publisherCatalogWait, watch = this.publisherWatches.get(conn), id = watch ? await watch.id : null;
+    if (this.publisherCatalogWait !== wait || !this.mediaRecoveryOwnsConnection(conn)
+        || this._destroyed || this.isTerminalState() || this.catalogSlots.catalogReceived) return;
+    if (id === null || conn.session.getNamespaceSubscription(id)?.isTerminated !== false) {
+      clearTimeout(wait.timer); this.publisherCatalogWait = null;
+      if (retryInterval === 0n) fatal(); else this.scheduleCatalogSubscribeRetry(conn, retryInterval);
+      return;
+    }
+    wait.waiting = true;
+
+  }
+
   private readonly publisherWatches = new WeakMap<MoqtConnection, {
     id: Promise<bigint | null>;
     withdrawn: Map<string, Set<string>>;
@@ -1347,6 +1378,14 @@ export class MoqtPlayer {
       watch.withdrawn.set(key, new Set(this.publisherRecoveryTracks()
         .filter(track => sameNamespaceFields(track.namespace, fields)).map(track => track.trackName)));
       return;
+    }
+    const waiting = this.publisherCatalogWait;
+    if (waiting?.conn === conn && waiting.waiting && !this.catalogSlots.catalogReceived
+        && BigInt(Math.max(0, Math.floor(performance.now() - waiting.atMs))) >= waiting.retryInterval - 1n
+        && sameNamespaceFields(fields, namespaceFields(this.config.namespace))) {
+      waiting.waiting = false;
+      this.cancelCatalogBootstrap();
+      if (this.mediaRecoveryOwnsConnection(conn)) void this.subscribeCatalog(conn).catch(() => {});
     }
     const silent = watch.withdrawn.get(key);
     watch.withdrawn.delete(key); // Consume before dispatch: at most one replacement per announcement.
@@ -2201,7 +2240,7 @@ export class MoqtPlayer {
           // not failed delivery. A deadline alone cannot reject a valid
           // progressing fetch or replace the MSF-01 bootstrap procedure.
           if (this._destroyed || this.isTerminalState() || this.catalogSlots.catalogReceived
-              || this.catalogSlots.catalogSubscribeRetryTimer !== null
+              || this.catalogSlots.catalogSubscribeRetryTimer !== null || this.publisherCatalogWait !== null
               || this.catalogSlots.catalogBootstrapCoord?.phase === 'empty-wait') return;
           this.emitError(createPlayerError(
             'transient', 'catalog', PlayerErrorCode.CATALOG_WAIT_TIMEOUT,
@@ -5196,6 +5235,7 @@ export class MoqtPlayer {
     const live = (): boolean => !this._destroyed && !this.isTerminalState() && this.connection === conn
       && gen === this.bootstrapGeneration && !this.catalogQuarantinedConns.has(conn);
     if (!live()) return;
+    if (this.publisherCatalogWait?.conn === conn) this.publisherCatalogWait.waiting = false;
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(this.config.catalogTrackName);
     const coord = this.resolvedCatalogMode(conn) === 'joining-fetch'
@@ -10630,6 +10670,9 @@ export class MoqtPlayer {
     delete conn.onDataStream;
     delete conn.onStreamClosed;
     delete conn.onDatagram;
+    if (this.publisherCatalogWait?.conn === conn) {
+      clearTimeout(this.publisherCatalogWait.timer); this.publisherCatalogWait = null;
+    }
     const watch = this.publisherWatches.get(conn);
     watch?.releasePublish();
     if (watch) void watch.id.then(id => { if (id !== null) return conn.cancelNamespace(id); }).catch(() => {});
@@ -12422,11 +12465,18 @@ export class MoqtPlayer {
         }
       },
       onCatalogSubscribeOk: (largest) => {
+        if (this.publisherCatalogWait?.conn === conn) {
+          clearTimeout(this.publisherCatalogWait.timer); this.publisherCatalogWait = null;
+        }
         slots?.catalogBootstrapCoord?.onSubscribeOk(largest);
       },
       onCatalogSubscribeError: (errorCode, reason, retryInterval) => {
         if (conn !== this.connection) return;
         this.cancelCatalogBootstrap();
+        if (errorCode === (conn.draftVersion === 14 ? 0x4n : BigInt(RequestError.DOES_NOT_EXIST)) && this.config.publisherWaitMs! > 0 && !this.catalogSlots.catalogReceived) {
+          void this.waitForPublisherCatalog(conn, reason, retryInterval);
+          return;
+        }
         // Only "not published yet" is retriable; other codes are real refusals.
         if (errorCode !== BigInt(RequestError.DOES_NOT_EXIST) || retryInterval === 0n) {
           this.failCatalogPlayback(createPlayerError(

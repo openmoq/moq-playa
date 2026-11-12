@@ -568,6 +568,7 @@ export interface RecoveryConfig {
    * Opens one extra SUBSCRIBE_NAMESPACE per session; applications' overlapping
    * namespace subscriptions can receive PREFIX_OVERLAP. Relay re-announcements
    * can immediately replace silent media subscriptions. Default: 0 (disabled).
+   * Also bounds the initial catalog announcement wait; positive Retry Intervals remain retryable.
    */
   readonly publisherWaitMs?: number;
 

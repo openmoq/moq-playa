@@ -13,6 +13,7 @@ import type { PlayerError } from './errors.js';
 import { MoqtPlayer } from './player.js';
 import { videoInit } from '../../locmaf/test-support/cmaf.js';
 import type { MediaSourceLike, AudioDecoderLike, AudioOutputLike } from './interfaces.js';
+import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { createLoopback, flush } from '../../webtransport/src/testkit/loopback.js';
 
 const decoder = new TextDecoder();
@@ -696,6 +697,213 @@ it('honors a positive media Retry Interval even on a new announcement', async ()
       requestId: varint(f.requests[1]!), errorCode: varint(0x10), retryInterval: varint(10_001), errorReason: 'not yet' })); await flush(128);
     await f.announce(true); await f.announce(); await f.advance(1000);
     expect(f.requests).toHaveLength(2);
+  } finally { await f.close(); }
+});
+
+// Initial catalog wait uses the same accepted session watch.
+async function waiting(draft: 18 | 22, mode: 'accepted' | 'refused' | 'off' | 'pending' = 'accepted', holdWatch = false) {
+  const pair = await connectedPair(draft);
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  if (holdWatch) {
+    const subscribe = pair.client.subscribeNamespace.bind(pair.client);
+    vi.spyOn(pair.client, 'subscribeNamespace').mockImplementation(async (...args) => {
+      const id = await subscribe(...args); await held; return id;
+    });
+  }
+  const requests: Array<{ id: bigint; name: string }> = [], watches: bigint[] = [], errors: string[] = [];
+  pair.server.onSubscribe = (id, _ns, name) => { requests.push({ id, name: new TextDecoder().decode(name) }); };
+  pair.server.onSubscribeNamespace = id => {
+    watches.push(id);
+    if (mode === 'refused') void pair.server.rejectSubscribeNamespace(id, 1n, 'unavailable');
+    else if (mode !== 'pending') void pair.server.acceptSubscribeNamespace(id);
+  };
+  const player = new MoqtPlayer({ connection: pair.client as unknown as MoqtConnection, url: 'https://relay.invalid/moq', namespace: 'live',
+    catalogBootstrap: 'subscribe', publisherWaitMs: mode === 'off' ? 0 : 20_000, disableAudio: true, autoQuality: false });
+  player.on('error', e => { if (e.error.severity === 'fatal') errors.push(e.error.message); });
+  await player.load(); await flush(128);
+  const catalogs = () => requests.filter(r => r.name === 'catalog');
+  return { ...pair, player, requests, watches, errors, catalogs,
+    async refuse(code = 0x10n, interval = 0n) {
+      if (interval === 0n) await pair.server.rejectSubscribe(catalogs().at(-1)!.id, code, 'unroutable');
+      else pair.a.bidiOut.at(-1)!.in.injectRead(createControlCodec(draft).encode({ type: 'REQUEST_ERROR',
+        requestId: varint(catalogs().at(-1)!.id), errorCode: varint(code), retryInterval: varint(interval), errorReason: 'unroutable' }));
+      await flush(128);
+    },
+    async announce() { await pair.server.sendNamespace(watches[0]!, []); await flush(128); },
+    async advance(ms: number) { await vi.advanceTimersByTimeAsync(ms); await flush(128); },
+    async close() { release(); await player.destroy(); await pair.client.close(); await pair.server.close(); },
+  };
+}
+
+describe.each([18, 22] as const)('announced catalog draft %i', draft => {
+  it('waits beyond the old watchdog, then re-subscribes once and delivers media', async () => {
+    const f = await waiting(draft);
+    const arrivals: unknown[] = [];
+    f.player.on('media_object', event => { arrivals.push(event); });
+    try {
+      await f.refuse(); await f.advance(12_000);
+      expect(f.errors).toEqual([]); expect(f.catalogs()).toHaveLength(1);
+      await f.announce(); expect(f.catalogs()).toHaveLength(2);
+      await f.server.sendNamespaceDone(f.watches[0]!, []); await f.announce();
+      expect(f.catalogs()).toHaveLength(2);
+      await f.server.acceptSubscribe(f.catalogs()[1]!.id, 50n); await flush(128);
+      const catalog = await f.server.openSubgroup(50n, 0n, 0n);
+      await f.server.sendObject(catalog, 0n, new TextEncoder().encode(JSON.stringify({ version: 1, tracks: [
+        { name: 'video', role: 'video', packaging: 'loc', isLive: true, codec: 'avc1.640028', width: 10, height: 10, renderGroup: 1 },
+      ] }))); await flush(256);
+      const media = f.requests.find(r => r.name === 'video'); expect(media).toBeDefined();
+      await f.server.acceptSubscribe(media!.id, 60n); await flush(128); f.player.play();
+      const stream = await f.server.openSubgroup(60n, 0n, 0n);
+      await f.server.sendObject(stream, 0n, Uint8Array.of(1)); await flush(128);
+      expect(arrivals).toHaveLength(1); expect(f.player.state).toBe('playing');
+      await f.advance(8001); expect(f.errors).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it('expires at the bound without polling', async () => {
+    const f = await waiting(draft);
+    try {
+      await f.refuse(); await f.advance(19_999); expect(f.errors).toEqual([]);
+      await f.advance(1); expect(f.errors).toHaveLength(1); expect(f.player.state).toBe('error');
+      expect(f.catalogs()).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it.each(['off', 'refused'] as const)('keeps the immediate fatal refusal when discovery is %s', async mode => {
+    const f = await waiting(draft, mode);
+    try { await f.refuse(); expect(f.player.state).toBe('error'); expect(f.catalogs()).toHaveLength(1); }
+    finally { await f.close(); }
+  });
+
+  it('keeps other catalog refusal codes fatal immediately', async () => {
+    const f = await waiting(draft);
+    try { await f.refuse(1n); expect(f.player.state).toBe('error'); expect(f.catalogs()).toHaveLength(1); }
+    finally { await f.close(); }
+  });
+
+  it('does not extend the original wait bound after a second refusal', async () => {
+    const f = await waiting(draft);
+    try {
+      await f.refuse(); await f.advance(19_000); await f.announce(); expect(f.catalogs()).toHaveLength(2);
+      await f.refuse(); await f.advance(1000); expect(f.player.state).toBe('error');
+      expect(f.catalogs()).toHaveLength(2);
+    } finally { await f.close(); }
+  });
+
+  it.each(['announcement', 'timer'] as const)('keeps the positive Retry Interval race single-shot when %s wins', async winner => {
+    const f = await waiting(draft);
+    try {
+      await f.refuse(0x10n, 5001n);
+      await f.advance(winner === 'timer' ? 5000 : 1000);
+      await f.announce(); expect(f.catalogs()).toHaveLength(winner === 'timer' ? 2 : 1);
+      if (winner === 'announcement') { await f.advance(3999); expect(f.catalogs()).toHaveLength(1); await f.advance(1); }
+      await f.advance(5001); expect(f.catalogs()).toHaveLength(2); expect(f.errors).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it('does not re-subscribe on an announcement from a draining session', async () => {
+    const f = await waiting(draft);
+    try {
+      await f.refuse(); expect(f.errors).toEqual([]);
+      await f.server.sendGoaway({ newSessionUri: '', requestId: 100n, timeout: 0n }); await flush(128);
+      await f.announce(); await f.advance(1000); expect(f.catalogs()).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+});
+
+
+it('bounds the catalog wait even while the namespace send promise is held', async () => {
+  const f = await waiting(18, 'accepted', true);
+  try {
+    await f.refuse(); await f.advance(19_999); expect(f.errors).toEqual([]);
+    await f.advance(1); expect(f.player.state).toBe('error'); expect(f.catalogs()).toHaveLength(1);
+  } finally { await f.close(); }
+});
+
+
+describe.each([18, 22] as const)('repair catalog wait draft %i', draft => {
+  it('keeps the positive retry after the announcement bound and receives the catalog', async () => {
+    const f = await waiting(draft);
+    const received: unknown[] = [];
+    f.player.on('catalog_received', event => received.push(event));
+    try {
+      await f.refuse(0x10n, 30_001n); await f.advance(20_000);
+      expect(f.errors).toEqual([]); expect(f.catalogs()).toHaveLength(1);
+      await f.advance(9999); expect(f.catalogs()).toHaveLength(1);
+      await f.advance(1); expect(f.catalogs()).toHaveLength(2);
+      await f.server.acceptSubscribe(f.catalogs()[1]!.id, 50n); await flush(128);
+      const stream = await f.server.openSubgroup(50n, 0n, 0n);
+      await f.server.sendObject(stream, 0n, new TextEncoder().encode(JSON.stringify({ version: 1, tracks: [
+        { name: 'video', role: 'video', packaging: 'loc', isLive: true, codec: 'avc1.640028', width: 10, height: 10, renderGroup: 1 },
+      ] }))); await flush(128);
+      expect(received).toHaveLength(1); expect(f.errors).toEqual([]);
+    } finally { await f.close(); }
+  });
+  it('allows the watch acceptance to follow the catalog refusal', async () => {
+    const f = await waiting(draft, 'pending');
+    try {
+      await f.refuse(); expect(f.errors).toEqual([]);
+      await f.server.acceptSubscribeNamespace(f.watches[0]!); await f.announce();
+      expect(f.catalogs()).toHaveLength(2); expect(f.errors).toEqual([]);
+    } finally { await f.close(); }
+  });
+  it('retires the refusal bound when the replacement catalog subscription is accepted', async () => {
+    const f = await waiting(draft);
+    try {
+      await f.refuse(); await f.advance(19_000); await f.announce();
+      await f.server.acceptSubscribe(f.catalogs()[1]!.id, 50n); await flush(128);
+      await f.advance(1500); expect(f.errors).toEqual([]); expect(f.player.state).not.toBe('error');
+    } finally { await f.close(); }
+  });
+  it('keeps catalog_received pending on the watchdog during the publisher wait', async () => {
+    const f = await waiting(draft);
+    const watchdog = (f.player as unknown as { watchdog: { fulfill(event: string): void } }).watchdog;
+    const fulfill = vi.spyOn(watchdog, 'fulfill');
+    try { await f.refuse(); expect(fulfill).not.toHaveBeenCalledWith('catalog_received'); }
+    finally { await f.close(); }
+  });
+});
+
+describe.each([[0x10n, 'MALFORMED_AUTH_TOKEN'], [0x4n, 'TRACK_DOES_NOT_EXIST']] as const)('draft-14 catalog refusal %s (%s)', (code, label) => {
+  it(code === 0x4n ? 'waits for an announcement on TRACK_DOES_NOT_EXIST' : 'fails immediately on MALFORMED_AUTH_TOKEN', async () => {
+    const { a, b } = createLoopback();
+    const client = new MoqtConnection(14), server = new MoqtConnection(14, { role: 'server' });
+    const requests: Array<{ id: bigint; name: string }> = [], watches: bigint[] = [], errors: string[] = [];
+    server.onSubscribe = (id, _ns, name) => { requests.push({ id, name: new TextDecoder().decode(name) }); };
+    const handle = server.session.handleControlMessage.bind(server.session);
+    vi.spyOn(server.session, 'handleControlMessage').mockImplementation(msg => {
+      if (msg.type === 'SUBSCRIBE_NAMESPACE') {
+        watches.push(msg.requestId);
+        (server.session as unknown as { validateAndReplenish(id: bigint): unknown }).validateAndReplenish(msg.requestId);
+        return [];
+      }
+      return handle(msg);
+    });
+    const player = new MoqtPlayer({ url: 'https://relay.invalid/moq', namespace: 'live', draftVersion: 14,
+      publisherWaitMs: 20_000, catalogBootstrap: 'subscribe', disableAudio: true, autoQuality: false,
+      createConnection: () => client,
+      createTransport: async () => { void server.connect(b, { maxRequestId: varint(1_000_000) }).catch(() => {}); return a; } });
+    player.on('error', e => { if (e.error.severity === 'fatal') errors.push(e.error.message); });
+    try {
+      await player.load(); await flush(128);
+      if (watches.length) { a.bidiOut[0]!.in.injectRead(Uint8Array.of(0x12, 0, 1, Number(watches[0]!))); await flush(128); }
+      const cat = requests.find(r => r.name === 'catalog')!;
+      await server.rejectSubscribe(cat.id, code, label); await flush(128);
+      const immediate = player.state;
+      await vi.advanceTimersByTimeAsync(5000); await flush(128);
+      expect(immediate).toBe(code === 0x4n ? 'loading' : 'error');
+    } finally { await player.destroy(); await client.close(); await server.close(); }
+  });
+});
+
+
+it('allows an announcement once a short positive minimum has elapsed, before base backoff', async () => {
+  const f = await waiting(18);
+  try {
+    await f.refuse(0x10n, 1n); await f.advance(500); expect(f.catalogs()).toHaveLength(1);
+    await f.announce(); expect(f.catalogs()).toHaveLength(2);
+    await f.advance(1000); expect(f.catalogs()).toHaveLength(2);
   } finally { await f.close(); }
 });
 
