@@ -7091,7 +7091,7 @@ export class MoqtPlayer {
     };
     prep.controller = chosen.controller;
 
-    await this.issuePreparedMedia(txn, required, catalog, () => this.assertMigrationLive(txn));
+    await this.issuePreparedMedia(txn, required, catalog, () => this.assertMigrationLive(txn), undefined, true);
     this.revalidateCandidateSelection(prep);
 
     // ── Changed initialization: reconfigure, or decline ─────────────────
@@ -7129,7 +7129,7 @@ export class MoqtPlayer {
   /** The same request, initialization and readiness authority for either preparation. */
   private async issuePreparedMedia(txn: PreparedMediaAttempt,
     required: ReadonlyArray<{ track: CatalogTrack; mediaType: 'video' | 'audio' }>, catalog: CatalogState,
-    assertLive: () => void, onClaim?: (id: bigint) => void): Promise<void> {
+    assertLive: () => void, onClaim?: (id: bigint) => void, continuing = false): Promise<void> {
     const prep = txn.prep!;
     const conn = txn.conn;
     const subscribeOptions = buildSubscribeOptions(this.config);
@@ -7186,7 +7186,11 @@ export class MoqtPlayer {
       }) === null) throw new Error(`replacement init subscription "${name}" cancelled by beforeSubscribe`);
       const options = initKey !== null
         ? { subscriptionFilter: { type: 'AbsoluteStart' as const, startGroup: varint(0n), startObject: varint(0n) } }
-        : (subscribeOptions ?? defaultMediaSubscriptionFilter(isLive));
+        // d14/16 §9.16.2: Joining FETCH requires LargestObject even when
+        // other subscribe options are configured; an explicit filter still wins.
+        : continuing && isLive && this.config.subscriptionFilter === undefined
+          ? { ...subscribeOptions, subscriptionFilter: { type: 'LargestObject' as const } }
+          : (subscribeOptions ?? defaultMediaSubscriptionFilter(isLive));
       let allocated: bigint | null = null;
       const claim = (id: bigint): void => {
         assertLive();

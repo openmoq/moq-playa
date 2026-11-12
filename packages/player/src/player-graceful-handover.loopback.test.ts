@@ -304,6 +304,19 @@ describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft
     } finally { await h.destroy(); }
   });
 
+  it('resumes replacement live media after its Largest Object', async () => {
+    const h = await fixture(draft);
+    const filters = (side: typeof h.old) => side.requests.filter(r => r.name === 'video' || r.name === 'audio')
+      .map(r => side.server.session.getIncomingSubscription(r.id)?.remoteFilterType);
+    try {
+      await h.old.goaway();
+      await h.next.accept('catalog', 100n);
+      await h.next.send('catalog', catalog());
+      expect(filters(h.old)).toEqual(['NextGroupStart', 'NextGroupStart']);
+      expect(filters(h.next)).toEqual(['LargestObject', 'LargestObject']);
+    } finally { await h.destroy(); }
+  });
+
   it('continues established media while the replacement transport is pending', async () => {
     const h = await fixture(draft, { holdTransport: true });
     try {
