@@ -47,3 +47,5 @@ export { createUniPairTopology, UniPairTopology } from './topology/uni-pair.js';
 export type { RequestStream } from './topology/uni-pair.js';
 
 export type { FetchReceiver, FetchReceiveContext } from './fetch-receiver.js';
+
+export { RequestUpdateFailure, RequestUpdateError } from './request-update-confirmation.js';

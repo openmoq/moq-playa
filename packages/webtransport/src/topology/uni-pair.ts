@@ -546,7 +546,7 @@ export class UniPairTopology {
       // stream it rode. The UNDERLYING request (SUBSCRIBE / PUBLISH) is therefore
       // gone — reclaim its context and notify the owner so its session state is
       // cleaned, else a later update would target an already-dead writer.
-      await this.terminateRequestContext(existingRequestId);
+      void this.terminateRequestContext(existingRequestId);
       throw err instanceof Error ? err : new Error(String(err));
     }
     return { requestId: message.requestId, response };

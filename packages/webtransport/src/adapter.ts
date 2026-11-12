@@ -1,3 +1,4 @@
+import { RequestUpdateFailure, RequestUpdateError } from './request-update-confirmation.js';
 /**
  * MoqtConnection — bridges stream/datagram transports to the sans-I/O Session.
  *
@@ -878,6 +879,7 @@ export class MoqtConnection {
     for (const ctx of this.inboundRequestContexts.values()) this.swallow(() => ctx.abort());
     this.inboundRequestContexts.clear();
     // Inbound PUBLISH / FETCH routing + group-order state.
+    this.settleEndedUpdates();
     this.settlePublicationLifetimes();
     this.publishAliasMaps.clear();
     this.fetchGroupOrder.clear();
@@ -2555,6 +2557,7 @@ export class MoqtConnection {
     const fwdTarget = this.outboundPublishForwardTarget(stamped as { type: string; requestId?: bigint });
     const fwdBefore = fwdTarget === undefined ? undefined : this.getPublishForwardState(fwdTarget);
     const actions = receiverErrorActions ?? this.session.handleControlMessage(message, { requestId });
+    this.settleUpdateResponse(stamped);
     this.settleFillHeaders();
     await this.executeActions(actions);
     const fwdAfter = this.changedPublishForwardState(fwdTarget, fwdBefore);
@@ -4097,7 +4100,101 @@ export class MoqtConnection {
     return this.sendRequestUpdate(existingRequestId, options);
   }
 
-  private async authorizedRequestUpdate(existingRequestId: bigint, options?: RequestUpdateOptions): Promise<bigint> {
+  private readonly updateDispatchChecks = new Map<bigint, () => void>();
+  private readonly updateWaits = new Set<{
+    target: bigint; owner: object; id?: bigint; sent: boolean;
+    fail(cause: unknown): void;
+    accept(parameters: Parameters): void;
+  }>();
+
+  /** Wait for the matching accepted update. Timeout/abort after dispatch leaves
+   * protocol processing alive: a late OK still applies to its live owner. */
+  async requestUpdateConfirmed(existingRequestId: bigint,
+    options: RequestUpdateOptions & { timeoutMs: number; signal?: AbortSignal; onRequestId?(id: bigint): void },
+  ): Promise<{ requestId: bigint; parameters: Parameters }> {
+    const { timeoutMs, signal, onRequestId, ...update } = options;
+    let owner: object;
+    try {
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RangeError('timeoutMs must be finite and positive');
+      if (this.session.draftVersion === 14) throw new Error('Draft 14 has no update acknowledgement');
+      if (signal?.aborted) throw new DOMException('Update aborted', 'AbortError');
+      if (this._terminated) throw new Error('Connection closed');
+      if (this.updateWaits.size >= 64) throw new Error('Too many pending confirmed updates');
+      owner = this.authorizationTarget(existingRequestId).owner;
+    } catch (error) { throw new RequestUpdateFailure('not-sent', error); }
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const finish = () => {
+        done = true; clearTimeout(timer); signal?.removeEventListener('abort', abort);
+        this.updateWaits.delete(wait);
+      };
+      const wait: { target: bigint; owner: object; id?: bigint; sent: boolean;
+        fail(cause: unknown): void; accept(parameters: Parameters): void } = {
+        target: existingRequestId, owner, sent: false,
+        fail: cause => {
+          if (done) return;
+          finish();
+          reject(cause instanceof RequestUpdateError ? cause : new RequestUpdateFailure(wait.sent ? 'possibly-sent' : 'not-sent', cause));
+        },
+        accept: parameters => {
+          if (done) return;
+          finish(); resolve({ requestId: wait.id!, parameters: structuredClone(parameters) });
+        },
+      };
+      const abort = () => wait.fail(new DOMException('Update aborted', 'AbortError'));
+      const timer = setTimeout(() => wait.fail(new DOMException('Update timed out', 'TimeoutError')), timeoutMs);
+      signal?.addEventListener('abort', abort, { once: true });
+      this.updateWaits.add(wait);
+      const check = () => {
+        if (done) throw new Error('Update wait ended before dispatch');
+        if (this._terminated || this.authorizationTarget(existingRequestId).owner !== owner) throw new Error('Update owner ended');
+      };
+      const admit = (id: bigint) => {
+        check();
+        const result: unknown = onRequestId?.(id);
+        if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
+          void Promise.resolve(result).catch(() => {});
+          throw new TypeError('onRequestId must be synchronous');
+        }
+        check(); wait.id = id;
+      };
+      const send = this.authorization ? this.authorizedRequestUpdate(existingRequestId, update, admit, check)
+        : this.sendRequestUpdate(existingRequestId, update, admit, check);
+      void send.catch(wait.fail);
+    });
+  }
+
+  private settleUpdateResponse(message: ControlMessage): void {
+    if (message.type !== 'REQUEST_OK' && message.type !== 'REQUEST_ERROR') return;
+    for (const wait of this.updateWaits) if (wait.id === message.requestId) {
+      if (message.type === 'REQUEST_OK') wait.accept(message.parameters ?? new Map());
+      else wait.fail(new RequestUpdateError(message.requestId, message.errorCode, message.errorReason, message.retryInterval ?? 0n));
+      break;
+    }
+  }
+
+  private settleEndedUpdates(): void {
+    for (const wait of this.updateWaits) {
+      try {
+        if (!this._terminated && this.authorizationTarget(wait.target).owner === wait.owner) continue;
+      } catch { /* terminal owner */ }
+      wait.fail(new Error('Update owner ended'));
+    }
+  }
+
+  private admitUpdate(id: bigint, admit?: (id: bigint) => void): void {
+    try { admit?.(id); }
+    catch (error) {
+      if (!this.session.rollbackRequestUpdate(id) && this.draftVersion <= 16) this.closeSessionInternalError('Unsent update ID cannot be reclaimed after reentrant allocation');
+      throw error;
+    }
+  }
+
+  private markUpdateDispatched(id: bigint): void {
+    for (const wait of this.updateWaits) if (wait.id === id) wait.sent = true;
+  }
+
+  private async authorizedRequestUpdate(existingRequestId: bigint, options?: RequestUpdateOptions, admit?: (id: bigint) => void, check?: () => void): Promise<bigint> {
     if (this.pendingAuthorizationUpdates >= 64) throw new AuthorizationError('Too many pending authorized updates');
     const authorization = this.authorization!;
     const target = this.authorizationTarget(existingRequestId);
@@ -4125,7 +4222,7 @@ export class MoqtConnection {
       }
       // sendRequestUpdate synchronously queues the write before its first await.
       // Release the turn there, not when the peer acknowledges the update.
-      return this.sendRequestUpdate(existingRequestId, acquired.value);
+      return this.sendRequestUpdate(existingRequestId, acquired.value, admit, check);
     } finally {
       this.pendingAuthorizationUpdates--;
       release();
@@ -4133,7 +4230,8 @@ export class MoqtConnection {
     }
   }
 
-  private async sendRequestUpdate(existingRequestId: bigint, options?: RequestUpdateOptions): Promise<bigint> {
+  private async sendRequestUpdate(existingRequestId: bigint, options?: RequestUpdateOptions, admit?: (id: bigint) => void, check?: () => void): Promise<bigint> {
+    check?.();
     if (isRequestStreamDraft(this.session.draftVersion)) {
       // Local REQUEST_UPDATE is only valid for an inbound PUBLISH (we are the
       // subscriber there). For an inbound SUBSCRIBE we are the publisher — the
@@ -4143,6 +4241,8 @@ export class MoqtConnection {
         // The update rides the inbound PUBLISH stream; its REQUEST_OK /
         // REQUEST_ERROR is matched FIFO by the context.
         const { requestId, actions } = this.session.updateIncomingSubscription(existingRequestId, options);
+        this.admitUpdate(requestId, admit);
+        this.markUpdateDispatched(requestId);
         const updateMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
         // The delivery runs INSIDE the context's read loop (wire-order barrier)
         // so a PUBLISH_DONE coalesced behind the REQUEST_OK is applied after it.
@@ -4177,6 +4277,8 @@ export class MoqtConnection {
       // NAMESPACE / PUBLISH_BLOCKED continuations).
       if (this.uniPair!.hasContinuingRequest(existingRequestId)) {
         const { requestId, actions } = this.session.requestUpdate(existingRequestId, options);
+        this.admitUpdate(requestId, admit);
+        this.markUpdateDispatched(requestId);
         const updateMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
         try {
           await this.uniPair!.sendUpdateOnContinuing(
@@ -4195,6 +4297,8 @@ export class MoqtConnection {
         throw new Error(`requestUpdate: no open draft-18 request stream for request ${existingRequestId}`);
       }
       const { requestId, actions } = this.session.requestUpdate(existingRequestId, options);
+      this.admitUpdate(requestId, admit);
+      this.markUpdateDispatched(requestId);
       const updateMsg = (actions.find((a) => a.type === 'send_control') as SendControlAction).message;
       // The response (REQUEST_OK/REQUEST_ERROR) correlates to the UPDATE's own
       // requestId, not the original — routeRequestResponse stamps with handle.requestId.
@@ -4219,9 +4323,12 @@ export class MoqtConnection {
       locationWindow: owner.locationWindow, requestedDeliveryTimeoutMs: owner.requestedDeliveryTimeoutMs };
     const forward = owner?.forwardState;
     const { requestId, actions } = this.session.requestUpdate(existingRequestId, options);
+    this.admitUpdate(requestId, admit);
+    if (check) this.updateDispatchChecks.set(requestId, check);
     try {
       await this.executeActions(actions);
     } catch (error) {
+      this.updateDispatchChecks.delete(requestId);
       this.session.rollbackRequestUpdate(requestId);
       if (this.session.draftVersion === 14 && owner && before && !owner.isTerminated) {
         Object.assign(owner, before);
@@ -6533,6 +6640,7 @@ export class MoqtConnection {
   private async executeActions(
     actions: SessionOutboundAction[],
   ): Promise<void> {
+    this.settleEndedUpdates();
     this.settlePublicationLifetimes();
     const fetchDataStops = new Map<bigint, { opened: boolean; stopped: Promise<void> }>();
     for (const action of actions) {
@@ -6593,9 +6701,18 @@ export class MoqtConnection {
             length: bytes.byteLength,
             message: action.message,
           });
+          if (action.message.type === 'REQUEST_UPDATE') {
+            const check = this.updateDispatchChecks.get(action.message.requestId);
+            this.updateDispatchChecks.delete(action.message.requestId);
+            check?.();
+            this.markUpdateDispatched(action.message.requestId);
+          }
           try { await this.controlWriter!.write(bytes); }
           catch (error) {
             // d16 §3.3: losing the control stream ends the session.
+            if (action.message.type === 'REQUEST_UPDATE') {
+              for (const wait of this.updateWaits) if (wait.id === action.message.requestId) wait.fail(error);
+            }
             this.closeSessionInternalError('Control-stream write failed');
             throw error;
           }
@@ -6813,6 +6930,7 @@ export class MoqtConnection {
                 (message as { requestId: bigint }).requestId)
             : Promise.resolve();
           const terminalActions = message.type === 'PUBLISH_DONE' ? this.session.handleControlMessage(message) : undefined;
+          if (terminalActions) this.settleEndedUpdates();
           if (!suppressOnMessage) {
             this.onMessage?.(message);
           }
@@ -6833,6 +6951,7 @@ export class MoqtConnection {
           });
           const fwdBefore = fwdTarget === undefined ? undefined : this.getPublishForwardState(fwdTarget);
           const actions = terminalActions ?? receiverErrorActions ?? this.session.handleControlMessage(message);
+          this.settleUpdateResponse(message);
           const fwdAfter = this.changedPublishForwardState(fwdTarget, fwdBefore);
           // Start protocol output before invoking application code. A pause
           // observer may terminalize the PUBLISH reentrantly; queuing the update
