@@ -1556,7 +1556,7 @@ export class Session {
     }
     sub.locationWindow = subscriptionWindow(
       sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, this._draftVersion),
-      this.extractLargestObjectParam(msg.parameters) ?? undefined,
+      this.extractLargestObjectParam(msg.parameters) ?? undefined, this._draftVersion,
     );
 
     // Register track alias - §9.10/§10.1: duplicate alias must close connection
@@ -1946,7 +1946,7 @@ export class Session {
           sub.currentFilter = pending.subscriptionFilter;
           sub.locationWindow = subscriptionWindow(
             decodeSubscriptionFilter(pending.subscriptionFilter, this._draftVersion),
-            this.extractLargestObjectParam(msg.parameters) ?? undefined,
+            this.extractLargestObjectParam(msg.parameters) ?? undefined, this._draftVersion,
           );
         }
       }
@@ -3519,7 +3519,7 @@ export class Session {
         sub.updateForwardState(requestedForward);
       }
       if (options.subscriptionFilter !== undefined) {
-        sub.locationWindow = subscriptionWindow(options.subscriptionFilter, undefined);
+        sub.locationWindow = subscriptionWindow(options.subscriptionFilter, undefined, this._draftVersion);
       }
       if (options.objectDeliveryTimeout !== undefined) {
         sub.requestedDeliveryTimeoutMs = Number(options.objectDeliveryTimeout);

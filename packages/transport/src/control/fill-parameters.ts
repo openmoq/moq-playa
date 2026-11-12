@@ -46,7 +46,7 @@ export function resolveFillWindow(
   largest: { group: bigint; object: bigint } | undefined,
 ): SubscriptionWindow | null {
   if (!largest) return null;
-  const window = subscriptionWindow(filter, largest);
+  const window = subscriptionWindow(filter, largest, 22);
   let end = largest;
   if (window.end && (window.end.group < largest.group
       || (window.end.group === largest.group && window.end.object !== undefined && window.end.object < largest.object))) {
