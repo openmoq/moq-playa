@@ -58,6 +58,8 @@ function peer() {
   const server = new MoqtConnection(18, { role: 'server' });
   const requests: Array<{ id: bigint; parameters?: MessageParameters } & Ref> = [];
   const errors: Error[] = [];
+  const watches: bigint[] = [];
+  server.onSubscribeNamespace = id => { watches.push(id); };
   const aliases = new Map<string, bigint>();
   let started: Promise<void> | null = null;
   server.onError = error => { errors.push(error); };
@@ -69,7 +71,7 @@ function peer() {
   };
   server.onFetch = () => {};
   const self = {
-    client, server, requests, errors, transport: a,
+    client, server, requests, errors, watches, transport: a,
     /** Media requests as full identities, catalog excluded. */
     media: (): Ref[] => requests.filter(r => r.name !== 'catalog')
       .map(({ name, namespace }) => ({ name, namespace })),
@@ -1674,4 +1676,25 @@ describe('initialization across source adoption', () => {
       expect(migrationState(h.player).currentMigration).toBeNull();
     } finally { await h.destroy(); }
   });
+});
+
+
+it('watches a publisher once per committed session and ignores a draining re-announcement', async () => {
+  const cat = msf00([videoTrack('video')]);
+  const h = await fixture({ catalog: cat, config: { publisherWaitMs: 20_000, disableAudio: true } });
+  try {
+    expect(h.old.watches).toHaveLength(1);
+    await h.old.server.acceptSubscribeNamespace(h.old.watches[0]!);
+    await h.old.server.sendNamespace(h.old.watches[0]!, []);
+    await h.old.accept(ref('video'), 200n);
+    await h.old.send(ref('video'), chunk('video', 1n));
+    await h.old.server.sendNamespaceDone(h.old.watches[0]!, []); await flush(128);
+    await h.migrate(cat);
+    expect(h.next.watches).toEqual([]);
+    await h.old.server.sendNamespace(h.old.watches[0]!, []); await flush(128);
+    expect(h.old.media()).toEqual([ref('video')]);
+    await h.next.accept(ref('video'), 400n); await flush(512);
+    expect(h.migrated).toHaveBeenCalledTimes(1);
+    expect(h.old.watches).toHaveLength(1); expect(h.next.watches).toHaveLength(1);
+  } finally { await h.destroy(); }
 });

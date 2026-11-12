@@ -94,6 +94,9 @@ import { extractLargestLocation } from './player-message.js';
 import { WarmStartHead } from './warm-start-head.js';
 
 interface LivenessRestart {
+  wake?: () => void;
+  announced?: boolean;
+  track: LivenessTrack;
   attempts: number;
   active: boolean;
   cancelled: boolean;
@@ -103,7 +106,7 @@ interface LivenessRestart {
   readonly trackName: string;
   readonly ownsOutput: () => boolean;
   requestId: bigint;
-  refusal: { retryInterval: bigint | null; atMs: number } | null;
+  refusal: { retryInterval: bigint | null; atMs: number; errorCode: bigint } | null;
   failure: string | null;
 }
 
@@ -1294,6 +1297,65 @@ export class MoqtPlayer {
    */
   private readonly announcedNamespaces = new Map<bigint, Uint8Array[]>();
 
+  private readonly publisherWatches = new WeakMap<MoqtConnection, {
+    id: Promise<bigint | null>;
+    withdrawn: Map<string, Set<string>>;
+    releasePublish: () => void;
+  }>();
+
+  private watchPublisher(conn: MoqtConnection): void {
+    if (!(this.config.publisherWaitMs! > 0) || this.publisherWatches.has(conn)
+        || conn.session.state !== SessionState.ESTABLISHED || !this.mediaRecoveryOwnsConnection(conn)) return;
+    const rejectPublish: MoqtConnection['onPublish'] = conn.draftVersion === 14 && !conn.onPublish
+      ? pub => { void conn.rejectSubscribe(pub.requestId, 4n, 'Uninterested').catch(() => {}); } : undefined;
+    if (rejectPublish) conn.onPublish = rejectPublish;
+    this.publisherWatches.set(conn, { withdrawn: new Map(),
+      releasePublish: () => { if (conn.onPublish === rejectPublish) delete conn.onPublish; },
+      id: conn.subscribeNamespace(encodeNamespace(this.config.namespace, this.enc), varint(1n)).catch(() => null) });
+  }
+
+  private publisherRecoveryTracks() {
+    const tracks = this.collectLivenessTracks().map(track => ({ ...track,
+      namespace: this.activeSubscriptions.get(track.requestId)!.namespace ?? namespaceFields(this.config.namespace) }));
+    for (const restart of this.livenessRestarts.values()) {
+      if (restart.announced && restart.connection === this.connection && restart.ownsOutput()
+          && !tracks.some(t => t.mediaType === restart.mediaType && t.trackName === restart.trackName
+            && sameNamespaceFields(t.namespace, restart.namespace)))
+        tracks.push({ ...restart.track, requestId: restart.requestId, namespace: [...restart.namespace] });
+    }
+    return tracks;
+  }
+
+  private async publisherAnnouncement(conn: MoqtConnection, requestId: bigint, msg: ControlMessage): Promise<void> {
+    const watch = this.publisherWatches.get(conn);
+    if (!watch) return;
+    const id = await watch.id;
+    if (id === null || !this.mediaRecoveryOwnsConnection(conn)
+        || !conn.session.getNamespaceSubscription(id)?.isActive) return;
+    let fields: string[], withdrawn: boolean;
+    if (msg.type === 'NAMESPACE' || msg.type === 'NAMESPACE_DONE') {
+      if (requestId !== id) return;
+      fields = [...namespaceFields(this.config.namespace), ...msg.trackNamespaceSuffix.map(f => new TextDecoder().decode(f))];
+      withdrawn = msg.type === 'NAMESPACE_DONE';
+    } else if (msg.type === 'PUBLISH_NAMESPACE' || msg.type === 'PUBLISH_NAMESPACE_DONE') {
+      if (conn.draftVersion !== 14 || !msg.trackNamespace) return;
+      fields = msg.trackNamespace.map(f => new TextDecoder().decode(f));
+      withdrawn = msg.type === 'PUBLISH_NAMESPACE_DONE';
+    } else return;
+    const key = JSON.stringify(fields);
+    if (withdrawn) {
+      watch.withdrawn.set(key, new Set(this.publisherRecoveryTracks()
+        .filter(track => sameNamespaceFields(track.namespace, fields)).map(track => track.trackName)));
+      return;
+    }
+    const silent = watch.withdrawn.get(key);
+    watch.withdrawn.delete(key); // Consume before dispatch: at most one replacement per announcement.
+    for (const track of this.publisherRecoveryTracks()) {
+      if (silent?.has(track.trackName) && sameNamespaceFields(track.namespace, fields))
+        void this.handleTrackStarvation(track, 0, 0, fields);
+    }
+  }
+
   /** The media source's permission to cross the hole a live restart leaves, held for one switch. */
   private videoSwitchRecovery: { readonly owner: object; readonly handle: MediaSwitchRecovery } | null = null;
 
@@ -2191,7 +2253,7 @@ export class MoqtPlayer {
     // Media-liveness monitor: detects per-track delivery starvation while
     // PLAYING and drives the restart ladder. Complements (does not replace)
     // the gap detector, which only handles gaps BETWEEN arrivals.
-    if (this.config.livenessTimeoutMs! > 0) {
+    if (this.config.livenessTimeoutMs! > 0 || this.config.publisherWaitMs! > 0) {
       this.livenessMonitor = new MediaLivenessMonitor({
         livenessTimeoutMs: this.config.livenessTimeoutMs!,
         resetProbeMs: this.config.livenessResetProbeMs!,
@@ -4957,6 +5019,7 @@ export class MoqtPlayer {
     // (Guarded: destroy() may have nulled the manager during the connect await.)
     if (this.subscriptionManager) this.subscriptionManager.draftVersion = conn.draftVersion;
 
+    this.watchPublisher(conn);
     this._stats.recordTransportConnected();
     this._stats.recordSetupComplete();
     this.emitter.emit('session_established', {
@@ -7938,6 +8001,7 @@ export class MoqtPlayer {
       }
     }
     this.connection = newConnection;
+    this.watchPublisher(newConnection);
     if (this.subscriptionManager) this.subscriptionManager.draftVersion = newConnection.draftVersion;
 
     // ── Adopt what the candidate PREPARED ───────────────────────────────
@@ -10566,6 +10630,9 @@ export class MoqtPlayer {
     delete conn.onDataStream;
     delete conn.onStreamClosed;
     delete conn.onDatagram;
+    const watch = this.publisherWatches.get(conn);
+    watch?.releasePublish();
+    if (watch) void watch.id.then(id => { if (id !== null) return conn.cancelNamespace(id); }).catch(() => {});
     delete conn.onNamespaceMessage;
     delete conn.onQlogEvent;
     delete conn.onSubgroupFin;
@@ -11750,6 +11817,7 @@ export class MoqtPlayer {
       // §6.1: Namespace discovery messages (bidi-stream NAMESPACE / NAMESPACE_DONE)
       // §6.2: Control-stream PUBLISH_NAMESPACE / PUBLISH_NAMESPACE_DONE
       onNamespaceMessage: stageable((requestId, msg) => {
+        void this.publisherAnnouncement(conn, requestId, msg);
         switch (msg.type) {
           case 'NAMESPACE':
             this.emitter.emit('namespace_discovered', {
@@ -12333,8 +12401,9 @@ export class MoqtPlayer {
               && restart.active && this.livenessLadderMayContinue(restart)) {
             // Draft14 SUBSCRIBE_ERROR has no Retry Interval; its codec's zero
             // placeholder is not a peer instruction against retry (draft14 §9.9).
-            restart.refusal = { retryInterval: conn.session.draftVersion === 14 ? null : retryInterval,
+            restart.refusal = { errorCode, retryInterval: conn.session.draftVersion === 14 ? null : retryInterval,
               atMs: performance.now() };
+            if (restart.announced) restart.wake?.();
           }
         }
         this._mediaSubsFailed++;
@@ -14326,6 +14395,11 @@ export class MoqtPlayer {
    * that delivers exactly one object before dying is still armed.
    */
   private stampMediaArrival(trackAlias: bigint): void {
+    const watch = this.connection && this.publisherWatches.get(this.connection);
+    if (watch?.withdrawn.size) for (const sub of this.activeSubscriptions.values()) {
+      if (sub.trackAlias === trackAlias) watch.withdrawn.get(JSON.stringify(
+        sub.namespace ?? namespaceFields(this.config.namespace)))?.delete(sub.trackName);
+    }
     const monitor = this.livenessMonitor;
     if (!monitor) return;
     const nowMs = performance.now();
@@ -14370,19 +14444,25 @@ export class MoqtPlayer {
     track: LivenessTrack,
     starvedForMs: number,
     healthyForMs: number,
+    announced?: readonly string[],
   ): Promise<void> {
     const connection = this.connection;
     if (!this.mediaRecoveryOwnsConnection(connection)) return;
     const issued = this.activeSubscriptions.get(track.requestId);
-    if (!issued || this.terminalMediaSubscriptions.has(issued)) return;
-    const namespace = [...(issued.namespace ?? namespaceFields(this.config.namespace))];
+    if ((!issued && !announced) || (issued && this.terminalMediaSubscriptions.has(issued))) return;
+    const namespace = [...(announced ?? issued?.namespace ?? namespaceFields(this.config.namespace))];
     const key = JSON.stringify([namespace, track.trackName, track.mediaType]);
     let restart = this.livenessRestarts.get(key);
-    if (!restart || restart.connection !== connection || !restart.ownsOutput()) {
+    // A changed publisher presence only exempts a DOES_NOT_EXIST refusal.
+    if (announced && restart?.refusal?.retryInterval === 0n
+        && restart.refusal.errorCode !== BigInt(RequestError.DOES_NOT_EXIST)) return;
+    if (announced && restart?.refusal?.retryInterval && restart.refusal.retryInterval > 0n
+        && BigInt(Math.max(0, Math.floor(performance.now() - restart.refusal.atMs))) < restart.refusal.retryInterval - 1n) return;
+    if (announced || !restart || restart.connection !== connection || !restart.ownsOutput()) {
       if (restart) restart.cancelled = true;
       const output = this.selectedOutputOwners.get(track.mediaType);
       const generation = this.bootstrapGeneration;
-      restart = { attempts: 0, active: false, cancelled: false, connection,
+      restart = { track, announced: !!announced, attempts: 0, active: false, cancelled: false, connection,
         namespace, mediaType: track.mediaType, trackName: track.trackName,
         requestId: track.requestId, refusal: null, failure: null,
         ownsOutput: () => this.bootstrapGeneration === generation
@@ -14390,7 +14470,7 @@ export class MoqtPlayer {
       };
       this.livenessRestarts.set(key, restart);
     }
-    if (restart.active) return;
+    if (restart.active || (!announced && restart.announced && this.livenessRetryRefused(restart))) return;
 
     // A pending video switch already implies a fresh subscription — let it
     // finish (it has its own staging timeout). If the track is still starved
@@ -14436,7 +14516,7 @@ export class MoqtPlayer {
         if (!this.livenessLadderMayContinue(restart)) return;
         this.flushForLivenessRestart(track);
         if (!this.livenessLadderMayContinue(restart)) return;
-        const refreshed = attempt === 1 && await this.tryRefreshSubscription(track, restart);
+        const refreshed = !announced && attempt === 1 && await this.tryRefreshSubscription(track, restart);
         if (!this.livenessLadderMayContinue(restart)) return;
         if (refreshed) {
           this.log.info('Liveness: refreshed %s "%s" via REQUEST_UPDATE (attempt %d)',
@@ -14447,13 +14527,19 @@ export class MoqtPlayer {
         }
 
         // A replacement updates the owned request ID before it reaches the wire.
-        if (await this.waitForTrackArrival(attemptStartMs, this.config.livenessTimeoutMs!, restart)) {
+        if (await this.waitForTrackArrival(attemptStartMs, this.config.livenessTimeoutMs! || (announced ? this.config.publisherWaitMs! : 0), restart)) {
           this.log.info('Liveness: %s "%s" recovered on attempt %d',
             track.mediaType, track.trackName, attempt);
           return;
         }
         // REQUEST_ERROR Retry Interval 0 advises against retrying as sent
         // (draft18 §10.6, draft22 §9.4). Do not turn it into a fresh incident.
+        if (announced) {
+          const refusal = restart.refusal as LivenessRestart['refusal'];
+          if (!restart.failure && refusal?.errorCode === (connection.draftVersion === 14 ? 4n : BigInt(RequestError.DOES_NOT_EXIST)))
+            await this.waitForTrackArrival(refusal.atMs, this.config.publisherWaitMs! - (performance.now() - refusal.atMs), restart, true);
+          break;
+        }
         if (restart.failure || this.livenessRetryRefused(restart)) break;
       }
 
@@ -14823,18 +14909,21 @@ export class MoqtPlayer {
     sinceMs: number,
     timeoutMs: number,
     restart: LivenessRestart,
+    awaitingAnnouncement = false,
   ): Promise<boolean> {
     const deadline = performance.now() + timeoutMs;
     const pollMs = Math.min(250, Math.max(10, timeoutMs / 5));
     // Arrival is checked AFTER each sleep too — an object landing between
     // the final poll and the deadline must count as recovery.
     for (;;) {
-      if (!this.livenessLadderMayContinue(restart) || restart.refusal || restart.failure) return false;
+      if (!this.livenessLadderMayContinue(restart) || (!awaitingAnnouncement && restart.refusal) || restart.failure) return false;
       const last = this.livenessMonitor?.lastArrivalForRequest(restart.requestId);
       if (last !== undefined && last >= sinceMs) return true;
       const remaining = deadline - performance.now();
       if (remaining <= 0) return false;
-      await new Promise((r) => setTimeout(r, Math.min(pollMs, remaining)));
+      let timer: ReturnType<typeof setTimeout>;
+      await new Promise<void>(resolve => { restart.wake = resolve; timer = setTimeout(resolve, Math.min(pollMs, remaining)); });
+      clearTimeout(timer!); delete restart.wake;
     }
   }
 
@@ -15037,6 +15126,7 @@ export class MoqtPlayer {
     // publishing: a recovery listener may synchronously destroy or migrate the
     // player, and `this.connection` is mutable. Announcing afterwards also
     // makes the event's contract true — the replacement has really started.
+    if (restart?.announced) restart.requestId = -1n; // No replacement owns an arrival until allocation.
     const pending = resubConn.subscribe(nsBytes, nameBytes,
       { ...(filter ?? {}), ...this.subscriberPriorityFor(mediaType), ...this.mediaTerminalOptions(resubConn),
         onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
@@ -15060,7 +15150,7 @@ export class MoqtPlayer {
       if (resubRegisteredId !== null) {
         this.retireMediaSubscription(resubRegisteredId, resubConn);
       }
-      if (restart) restart.failure = 'replacement subscription could not be sent';
+      if (restart) { restart.failure = 'replacement subscription could not be sent'; if (restart.announced) restart.wake?.(); }
       const failure = err instanceof Error ? err : new Error('Subscription send failed');
       this.log.warn('Resubscribe "%s" failed: %s', trackName, failure.message);
       this.emitError(createPlayerError(

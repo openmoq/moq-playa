@@ -11,7 +11,8 @@ import { createControlCodec, varint, RequestError, type ControlMessage } from '@
 import { MoqtConnection } from '@openmoq/webtransport';
 import type { PlayerError } from './errors.js';
 import { MoqtPlayer } from './player.js';
-import type { AudioDecoderLike, AudioOutputLike } from './interfaces.js';
+import { videoInit } from '../../locmaf/test-support/cmaf.js';
+import type { MediaSourceLike, AudioDecoderLike, AudioOutputLike } from './interfaces.js';
 import { createLoopback, flush } from '../../webtransport/src/testkit/loopback.js';
 
 const decoder = new TextDecoder();
@@ -491,4 +492,263 @@ describe('issue #52 legacy drafts: provenance of the Retry Interval', () => {
       expect(f.recovery.length).toBe(restarts);
     } finally { await f.close(); }
   });
+});
+
+// Opt-in announcement recovery; MSE output is modeled, not browser playback.
+async function announcedPlayer(draft: 14 | 16 | 18 | 22, enabled = true, refused = false, mse = false, monitor = true) {
+  const { a, b } = createLoopback();
+  const client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' });
+  const codec = createControlCodec(draft), isolated = createLoopback().a;
+  let namespaceOptions: bigint | undefined;
+  const requests: bigint[] = [], arrivals: number[] = [], watches: bigint[] = [];
+  server.onSubscribe = id => { requests.push(id); };
+  server.onSubscribeNamespace = id => { watches.push(id); };
+  // Legacy namespace serving is not implemented by the SDK. Inject only that
+  // peer protocol; media and the player still traverse the real adapters.
+  if (draft === 16) {
+    const open = a.createBidirectionalStream.bind(a);
+    vi.spyOn(a, 'createBidirectionalStream').mockImplementation(() =>
+      a.bidiOut.length ? isolated.createBidirectionalStream() : open());
+    const subscribe = client.subscribeNamespace.bind(client);
+    vi.spyOn(client, 'subscribeNamespace').mockImplementation(async (...args) => {
+      const id = await subscribe(...args); watches.push(id);
+      const chunks = isolated.bidiOut.at(-1)!.out.written;
+      const wire = Uint8Array.from(chunks.flatMap(chunk => [...chunk]));
+      const message = codec.decode(wire, 0).message;
+      expect(message.type).toBe('SUBSCRIBE_NAMESPACE');
+      if (message.type === 'SUBSCRIBE_NAMESPACE') namespaceOptions = message.subscribeOptions;
+      return id;
+    });
+  } else if (draft === 14) {
+    const handle = server.session.handleControlMessage.bind(server.session);
+    vi.spyOn(server.session, 'handleControlMessage').mockImplementation(msg => {
+      if (msg.type === 'SUBSCRIBE_NAMESPACE') {
+        watches.push(msg.requestId);
+        // Account for the legacy peer's sequential request-ID allocation.
+        (server.session as unknown as { validateAndReplenish(id: bigint): unknown }).validateAndReplenish(msg.requestId);
+        return [];
+      }
+      return handle(msg);
+    });
+  }
+  const source: MediaSourceLike = { initialize: () => true, appendChunk: vi.fn(), reset() {},
+    endOfStream() {}, destroy() {}, mediaElement: null, onFirstFrame: null, onError: null, onStall: null };
+  const player = new MoqtPlayer({
+    url: 'https://relay.invalid/moq', namespace: 'live', draftVersion: draft,
+    ...(enabled ? { publisherWaitMs: 20_000 } : {}),
+    createConnection: () => client,
+    createTransport: async () => { void server.connect(b, { maxRequestId: varint(1_000_000) }).catch(() => {}); return a; },
+    catalog: { version: 1, tracks: [{ name: 'video', role: 'video', packaging: mse ? 'cmaf' : 'loc', isLive: true,
+      ...(mse ? { initData: Buffer.from(videoInit()).toString('base64') } : {}),
+      codec: 'avc1.640028', width: 10, height: 10, renderGroup: 1 }] },
+    ...(mse ? { createMediaSource: () => source } : {}),
+    createCmafAssembler: callbacks => ({
+      push: (mediaType, track, group, payload) => callbacks.onSegment(mediaType, payload, track, group),
+      getEpoch: () => null, reset() {}, destroy() {},
+    }),
+    disableAudio: true, autoQuality: false, ...(monitor ? {} : { livenessTimeoutMs: 0 }),
+  });
+  player.on('media_object', e => { if (e.mediaType === 'video') arrivals.push(performance.now()); });
+  await player.load(); await flush(128);
+  let published: bigint | undefined;
+  async function announce(done = false) {
+    if (!watches.length || refused) return;
+    if (draft === 14) {
+      if (done) await server.publishNamespaceDone(published!);
+      else published = await server.publishNamespace([new TextEncoder().encode('live')]);
+    } else if (draft === 16) {
+      if (namespaceOptions !== 1n && namespaceOptions !== 2n) return;
+      isolated.bidiOut[0]!.in.injectRead(codec.encode({ type: done ? 'NAMESPACE_DONE' : 'NAMESPACE', trackNamespaceSuffix: [] }));
+    } else if (done) await server.sendNamespaceDone(watches[0]!, []);
+    else await server.sendNamespace(watches[0]!, []);
+    await flush(128);
+  }
+  if (watches.length) {
+    if (draft === 14 || draft === 16) {
+      const pipe = draft === 14 ? a.bidiOut[0]!.in : isolated.bidiOut[0]!.in;
+      pipe.injectRead(refused ? codec.encode({ type: 'REQUEST_ERROR', requestId: varint(watches[0]!),
+        errorCode: varint(1), errorReason: 'unavailable', retryInterval: varint(0), requestKind: 'SUBSCRIBE_NAMESPACE' })
+        : draft === 14 ? Uint8Array.of(0x12, 0, 1, Number(watches[0]!))
+        : codec.encode({ type: 'REQUEST_OK', requestId: varint(watches[0]!), parameters: new Map() }));
+    } else if (refused) await server.rejectSubscribeNamespace(watches[0]!, 1n, 'unavailable');
+    else await server.acceptSubscribeNamespace(watches[0]!);
+    await flush(128); await announce();
+  }
+  await server.acceptSubscribe(requests[0]!, 50n); await flush(128); player.play();
+  const stream = await server.openSubgroup(50n, 0n, 0n);
+  await server.sendObject(stream, 0n, Uint8Array.of(1)); await flush(128); player.tick();
+  if (mse) source.onFirstFrame?.();
+  expect(arrivals).toHaveLength(1);
+  server.setLargestLocationProvider(() => ({ group: 0n, object: 0n }));
+  return { a, player, client, server, requests, arrivals, watches, stream, namespaceOptions,
+    announce,
+    async advance(ms: number) { await vi.advanceTimersByTimeAsync(ms); await flush(128); player.tick(); },
+    async close() { await player.destroy(); await client.close(); await server.close(); },
+  };
+}
+
+describe.each([14, 16, 18, 22] as const)('publisher return draft %i', draft => {
+  it.each([false, true])('resumes within one second of a re-announcement during the old recovery probe (MSE=%s)', async mse => {
+    const f = await announcedPlayer(draft, true, false, mse);
+    try {
+      await f.announce(true); await f.advance(12_000);
+      const returned = performance.now(); await f.announce();
+      for (let elapsed = 0; f.requests.length < 2 && elapsed < 1000; elapsed += 50) await f.advance(50);
+      expect(f.requests).toHaveLength(2);
+      await f.server.acceptSubscribe(f.requests[1]!, 60n); await flush(128);
+      const stream = await f.server.openSubgroup(60n, 1n, 0n);
+      await f.server.sendObject(stream, 0n, Uint8Array.of(2)); await flush(128);
+      expect(f.arrivals).toHaveLength(2);
+      expect(f.arrivals[1]! - returned).toBeLessThan(1000);
+      await f.advance(5000); expect(f.requests).toHaveLength(2); expect(f.watches).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it.each(['off', 'refused'] as const)('preserves the original ladder when discovery is %s', async mode => {
+    const f = await announcedPlayer(draft, mode !== 'off', mode === 'refused');
+    try {
+      await f.advance(12_000); expect(f.requests).toHaveLength(1);
+      await f.advance(10_000); expect(f.requests).toHaveLength(2);
+      expect(f.watches).toHaveLength(mode === 'off' ? 0 : 1);
+    } finally { await f.close(); }
+  });
+
+  it('leaves a route that received after withdrawal alone', async () => {
+    const f = await announcedPlayer(draft);
+    try {
+      expect(f.requests).toHaveLength(1); await f.announce(true);
+      await f.server.sendObject(f.stream, 1n, Uint8Array.of(2)); await flush(128);
+      await f.announce(); await f.advance(500);
+      expect(f.arrivals).toHaveLength(2); expect(f.requests).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it('does not send a second SUBSCRIBE on a timer after announcement refusal', async () => {
+    const f = await announcedPlayer(draft);
+    try {
+      await f.announce(true); await f.announce(); await f.advance(50);
+      expect(f.requests).toHaveLength(2);
+      await f.server.rejectSubscribe(f.requests[1]!, 0x10n, 'gone'); await flush(128);
+      await f.advance(25_000); expect(f.requests).toHaveLength(2);
+    } finally { await f.close(); }
+  });
+});
+
+
+describe.each([18, 22] as const)('publisher discovery ownership draft %i', draft => {
+  it('surfaces PREFIX_OVERLAP for an application namespace subscription', async () => {
+    const f = await announcedPlayer(draft);
+    const messages: unknown[] = [];
+    const observe = f.client.onMessage;
+    f.client.onMessage = msg => { messages.push(msg); observe?.(msg); };
+    try {
+      const id = await f.player.subscribeNamespace('live'); await flush(128);
+      expect(messages).toContainEqual(expect.objectContaining({ type: 'REQUEST_ERROR', requestId: id, errorCode: 0x30n }));
+      expect(f.watches).toHaveLength(1); expect(f.client.session.state).toBe('established');
+    } finally { await f.close(); }
+  });
+
+  it('disables the watch for the session after its stream ends', async () => {
+    const f = await announcedPlayer(draft);
+    try {
+      expect(f.watches).toHaveLength(1); await f.announce(true);
+      // Peer FIN retires the watch; no replacement watch is opened.
+      const contexts = (f.server as unknown as { inboundRequestContexts: Map<bigint, { terminate(): Promise<void> }> }).inboundRequestContexts;
+      await contexts.get(f.watches[0]!)!.terminate(); await flush(128);
+      expect(f.client.session.getNamespaceSubscription(f.watches[0]!)).toBeUndefined();
+      await f.advance(12_000); expect(f.requests).toHaveLength(1); expect(f.watches).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+});
+
+
+it('replaces once on the announcement even with timer-based liveness disabled', async () => {
+  const f = await announcedPlayer(18, true, false, false, false);
+  try {
+    await f.announce(true); await f.advance(30_000); expect(f.requests).toHaveLength(1);
+    await f.announce(); await flush(128); expect(f.requests).toHaveLength(2);
+    await f.server.acceptSubscribe(f.requests[1]!, 60n); await flush(128);
+    const stream = await f.server.openSubgroup(60n, 1n, 0n);
+    await f.server.sendObject(stream, 0n, Uint8Array.of(2)); await flush(128);
+    expect(f.arrivals).toHaveLength(2);
+    await f.advance(30_000); expect(f.requests).toHaveLength(2);
+  } finally { await f.close(); }
+});
+
+
+it.each([0x10n, 1n])('a new announcement only exempts a DOES_NOT_EXIST zero retry refusal (code=%s)', async code => {
+  const f = await announcedPlayer(18);
+  try {
+    await f.announce(true); await f.announce(); await f.advance(50);
+    expect(f.requests).toHaveLength(2);
+    await f.server.rejectSubscribe(f.requests[1]!, code, 'refused'); await flush(128);
+    await f.announce(true); await f.announce(); await f.advance(50);
+    expect(f.requests).toHaveLength(code === 0x10n ? 3 : 2);
+  } finally { await f.close(); }
+});
+
+it('honors a positive media Retry Interval even on a new announcement', async () => {
+  const f = await announcedPlayer(18);
+  try {
+    await f.announce(true); await f.announce(); await f.advance(50);
+    expect(f.requests).toHaveLength(2);
+    f.a.bidiOut.at(-1)!.in.injectRead(createControlCodec(18).encode({ type: 'REQUEST_ERROR',
+      requestId: varint(f.requests[1]!), errorCode: varint(0x10), retryInterval: varint(10_001), errorReason: 'not yet' })); await flush(128);
+    await f.announce(true); await f.announce(); await f.advance(1000);
+    expect(f.requests).toHaveLength(2);
+  } finally { await f.close(); }
+});
+
+
+it('repair d16 requests NAMESPACE with Subscribe Options 0x01 on the wire', async () => {
+  const f = await announcedPlayer(16);
+  try { expect(f.namespaceOptions).toBe(1n); }
+  finally { await f.close(); }
+});
+
+describe.each([18, 22] as const)('repair announced media failure draft %i', draft => {
+  it.each([0x10n, 1n])('ends a refused replacement in MEDIA_STARVED within its bound (code=%s)', async code => {
+    const f = await announcedPlayer(draft), fatal: number[] = [];
+    f.player.on('error', event => { if (event.error.severity === 'fatal') fatal.push(event.error.code); });
+    try {
+      await f.announce(true); await f.announce(); expect(f.requests).toHaveLength(2);
+      await f.server.rejectSubscribe(f.requests[1]!, code, 'not ready'); await flush(128);
+      if (code === 0x10n) {
+        expect(fatal).toEqual([]); await f.advance(19_999); expect(fatal).toEqual([]);
+        await f.advance(1);
+      }
+      expect(fatal).toEqual([0x1005]); expect(f.player.state).toBe('error');
+      expect(f.requests).toHaveLength(2);
+    } finally { await f.close(); }
+  });
+  it('reports MEDIA_STARVED when the announced replacement fails to send', async () => {
+    const f = await announcedPlayer(draft), fatal: number[] = [];
+    f.player.on('error', event => { if (event.error.severity === 'fatal') fatal.push(event.error.code); });
+    try {
+      vi.spyOn(f.client, 'subscribe').mockRejectedValueOnce(new Error('send failed'));
+      await f.announce(true); await f.announce(); await flush(256);
+      expect(fatal).toEqual([0x1005]); expect(f.player.state).toBe('error');
+    } finally { await f.close(); }
+  });
+});
+
+it('repair healthy arrivals avoid the withdrawal subscription scan and JSON encoding', async () => {
+  const f = await announcedPlayer(18);
+  const owner = f.player as unknown as { activeSubscriptions: Map<bigint, unknown>; stampMediaArrival(alias: bigint): void };
+  const scan = vi.spyOn(owner.activeSubscriptions, 'values'), json = vi.spyOn(JSON, 'stringify');
+  try {
+    owner.stampMediaArrival(50n);
+    expect(scan).not.toHaveBeenCalled(); expect(json).not.toHaveBeenCalled();
+  } finally { scan.mockRestore(); json.mockRestore(); await f.close(); }
+});
+
+it('repair d14 refuses forwarded unsolicited PUBLISH with UNINTERESTED', async () => {
+  const f = await announcedPlayer(14), responses: ControlMessage[] = [];
+  f.server.onMessage = message => responses.push(message);
+  try {
+    const id = await f.server.publish([new TextEncoder().encode('live')], new TextEncoder().encode('unsolicited'), 90n);
+    await flush(256);
+    expect(responses).toContainEqual(expect.objectContaining({ type: 'REQUEST_ERROR', requestId: id, errorCode: 4n }));
+    await f.player.destroy(); expect(f.client.onPublish).toBeUndefined();
+  } finally { await f.close(); }
 });

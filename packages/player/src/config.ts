@@ -559,11 +559,24 @@ export interface RecoveryConfig {
   readonly locmafDecoding?: 'mse' | 'frame';
 
   /**
+   * Opt into publisher discovery and bound a refused media restart's announcement wait (ms).
+   * A relay announcement permits one DOES_NOT_EXIST retry despite Retry Interval 0:
+   * publisher presence changed. Positive Retry Interval minima still apply.
+   * A refused watch disables discovery for that session. Publishers announcing
+   * only through PUBLISH give no recovery signal. On d14, discovery also forwards
+   * PUBLISH; tracks the application did not request are refused with UNINTERESTED.
+   * Opens one extra SUBSCRIBE_NAMESPACE per session; applications' overlapping
+   * namespace subscriptions can receive PREFIX_OVERLAP. Relay re-announcements
+   * can immediately replace silent media subscriptions. Default: 0 (disabled).
+   */
+  readonly publisherWaitMs?: number;
+
+  /**
    * Media-liveness starvation threshold: while PLAYING, a track with no
    * object arrivals for this long triggers the restart ladder.
    * The gap detector handles gaps BETWEEN arrivals; this handles NO
    * arrivals (transport stream death, relay restart).
-   * Default: 10_000. Set 0 to disable liveness monitoring entirely.
+   * Default: 10_000. Set 0 to disable timer-driven starvation detection.
    */
   readonly livenessTimeoutMs?: number;
 
@@ -826,6 +839,7 @@ export const DEFAULT_PLAYER_CONFIG = {
   cmafFirstFrameMaxWaitMs: 60_000,
 
   // Media liveness (0 disables)
+  publisherWaitMs: 0,
   livenessTimeoutMs: 10_000,
   livenessResetProbeMs: 2_000,
   livenessMaxRestarts: 3,
@@ -1009,6 +1023,9 @@ export function validateConfig(config: MoqtPlayerConfig): void {
     }
   }
 
+  if (config.publisherWaitMs !== undefined && (!Number.isFinite(config.publisherWaitMs) || config.publisherWaitMs < 0)) {
+    throw new RangeError('publisherWaitMs must be finite and >= 0 (0 disables)');
+  }
   // livenessTimeoutMs: >= 0 (0 disables the liveness monitor)
   if (config.livenessTimeoutMs !== undefined && config.livenessTimeoutMs < 0) {
     throw new RangeError(`livenessTimeoutMs must be >= 0 (0 disables), got ${config.livenessTimeoutMs}`);
