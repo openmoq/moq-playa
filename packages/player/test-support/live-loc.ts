@@ -46,9 +46,9 @@ export async function liveLocFixture(config: Partial<MoqtPlayerConfig> = {}, dra
   const aliases: Record<string, bigint> = { v: 77n, a: 78n, v2: 79n };
   for (const request of requests) if (request.name !== 'v2') await server.acceptSubscribe(request.id, aliases[request.name]!);
   await flush(128);
-  async function send(name: 'v' | 'a' | 'v2', group: bigint, objectId = 0n) {
+  async function send(name: 'v' | 'a' | 'v2', group: bigint, objectId = 0n, captureOffsetUs = 0n) {
     const type = name === 'a' ? 'audio' : 'video';
-    const extensions = encodeLocHeaders({ captureTimestamp: BigInt(clock) + objectId * 20_000n,
+    const extensions = encodeLocHeaders({ captureTimestamp: BigInt(clock) + objectId * 20_000n + captureOffsetUs,
       ...(type === 'video' ? { videoFrameMarking: { startOfFrame: true, endOfFrame: true, independent: objectId === 0n, discardable: false, baseLayerSync: false, temporalId: 0 } } : {}) }, { wireProfile: locWireProfileForDraft(draft) });
     const payload = type === 'video' ? Uint8Array.of(0, 0, 0, 1, objectId === 0n ? 0x65 : 0x41) : Uint8Array.of(0x48, 0);
     const largest = largestByName.get(name);

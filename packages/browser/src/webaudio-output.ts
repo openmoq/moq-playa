@@ -83,7 +83,9 @@ export class WebAudioOutput implements AudioOutputLike {
     const idx = this.activeSources.indexOf(source);
     if (idx !== -1) this.activeSources.splice(idx, 1);
     if (this.hasOwnedSources) {
-      for (const entry of this.scheduledRing) if (entry.source === source) entry.ended = true;
+      for (const entry of this.scheduledRing) if (entry.source === source) {
+        entry.ended = true; delete entry.source; delete entry.outputTiming;
+      }
     }
     const token = this.scheduleTokens?.get(source);
     this.scheduleTokens?.delete(source);
@@ -146,7 +148,7 @@ export class WebAudioOutput implements AudioOutputLike {
   private toAudioCtxTime(renderTimeUs: number): number {
     const nowUs = this.clock.now();
     const deltaSec = (renderTimeUs - nowUs) / 1_000_000;
-    return this.audioCtx.currentTime + deltaSec;
+    return this.audioCtx.currentTime + deltaSec / this._playbackRate;
   }
 
   /**
@@ -305,6 +307,8 @@ export class WebAudioOutput implements AudioOutputLike {
         entry.outputTiming = outputTiming; entry.sourceOffsetUs = sourceOffsetUs; entry.source = source;
         this.hasOwnedSources = true;
       }
+      while (this.scheduledRing.length && (this.scheduledRing[0]!.ended
+        || this.scheduledRing[0]!.startSec + this.scheduledRing[0]!.durSec <= now)) this.scheduledRing.shift();
       this.scheduledRing.push(entry);
       if (token !== undefined) this.observeSchedule(token, 'scheduled', null, () => this.scheduleTokens?.get(owned) === token);
       if (ended) this.finishSource(source, 'released', null);
@@ -358,11 +362,48 @@ export class WebAudioOutput implements AudioOutputLike {
 
   /**
    * Set playback rate for live catch-up.
-   * Applied to each new AudioBufferSourceNode on schedule().
+   * Retimes queued PCM and changes the remaining duration of playing PCM.
+   * WebAudio changes pitch at rates other than 1; it does not time-stretch.
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */
   setPlaybackRate(rate: number): void {
+    if (!Number.isFinite(rate) || rate <= 0) throw new RangeError('Invalid playback rate');
+    if (this.destroyed || rate === this._playbackRate) return;
+    const now = this.audioCtx.currentTime, revision = ++this.scheduleRevision;
     this._playbackRate = rate;
+    for (const entry of [...this.scheduledRing]) {
+      const old = entry.source;
+      if (!old || entry.ended || entry.startSec + entry.durSec <= now) continue;
+      const elapsed = Math.max(0, now - entry.startSec), consumedUs = elapsed * entry.rate * 1_000_000;
+      const start = Math.max(now, now + (entry.startSec - now) * entry.rate / rate);
+      const duration = (entry.durSec - elapsed) * entry.rate / rate;
+      if (entry.startSec <= now) {
+        old.playbackRate.value = rate;
+        if (entry.captureUs !== null) entry.captureUs += consumedUs;
+        if (entry.sourceOffsetUs !== undefined) entry.sourceOffsetUs += consumedUs;
+      } else {
+        // start() is immutable: replace future nodes, retaining PCM and observation ownership.
+        const source = this.audioCtx.createBufferSource(), token = this.scheduleTokens?.get(old);
+        source.buffer = old.buffer; source.playbackRate.value = rate;
+        source.onended = () => this.finishSource(source, 'released', null);
+        const index = this.activeSources.indexOf(old);
+        if (index < 0) continue;
+        this.activeSources[index] = source; entry.source = source;
+        this.scheduleTokens?.delete(old);
+        if (token !== undefined) this.scheduleTokens?.set(source, token);
+        old.onended = null;
+        try { old.stop(); } catch { /* Already stopped. */ }
+        old.disconnect(); source.connect(this.destination);
+        if (this.destroyed || this.scheduleRevision !== revision) return;
+        source.start(start);
+      }
+      if (this.destroyed || this.scheduleRevision !== revision) return;
+      entry.startSec = start; entry.durSec = duration; entry.rate = rate;
+    }
+    if (this.nextScheduledTime !== null) {
+      const last = this.scheduledRing.at(-1);
+      this.nextScheduledTime = last ? last.startSec + last.durSec : null;
+    }
   }
 
   /**

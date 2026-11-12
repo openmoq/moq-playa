@@ -192,6 +192,11 @@ export interface VideoRendererLike {
   /** Enqueue a decoded frame for presentation at the specified time. */
   enqueue(frame: unknown, renderTimeUs: number, token?: object, outputTiming?: VideoProducedTiming): void;
 
+  /** Set the shared LOC output rate. Retimes queued frames about the current
+   * clock instant and schedules future frames at this rate. 1 restores normal
+   * timing. Optional: without this hook LOC catch-up is disabled. */
+  setPlaybackRate?(rate: number): void;
+
   /** Optional single presentation tick while the embedding's automatic loop is stopped. */
   renderTick?(nowUs: number): void;
 
@@ -277,6 +282,7 @@ export interface AudioOutputLike {
   /**
    * Set playback rate for live catch-up. Optional — if not implemented,
    * catch-up is unavailable for outputs containing audio.
+   * Retimes already-scheduled audio as well as future audio to keep shared output aligned.
    * Rate 1.0 = normal, >1.0 = faster (catching up).
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */

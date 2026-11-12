@@ -24,7 +24,7 @@ import { validateStallThresholdMs } from './mse-adapter.js';
 /** A queued frame awaiting presentation. */
 interface QueuedFrame {
   readonly frame: VideoFrame;
-  readonly renderTimeUs: number;
+  renderTimeUs: number;
   token?: object;
   outputTiming?: VideoProducedTiming;
 }
@@ -54,6 +54,7 @@ export class CanvasRenderer implements VideoRendererLike {
   private readonly queue: QueuedFrame[] = [];
   private readonly stallThresholdMs: number;
   private readonly clock: ClockSource;
+  private playbackRate = 1;
   private firstFrameRendered = false;
   private lastRenderTimeMs = 0;
   /**
@@ -142,6 +143,14 @@ export class CanvasRenderer implements VideoRendererLike {
     }
   }
 
+  /** Retime owned queued frames and future submissions together. */
+  setPlaybackRate(rate: number): void {
+    if (!Number.isFinite(rate) || rate <= 0) throw new RangeError('Invalid playback rate');
+    const now = this.clock.now(), ratio = this.playbackRate / rate;
+    for (const entry of this.queue) entry.renderTimeUs = now + (entry.renderTimeUs - now) * ratio;
+    this.playbackRate = rate;
+  }
+
   /**
    * Enqueue a decoded frame for presentation.
    *
@@ -149,6 +158,7 @@ export class CanvasRenderer implements VideoRendererLike {
    * The frame WILL be closed by this renderer — callers must NOT close it.
    */
   enqueue(frame: unknown, renderTimeUs: number, token?: object, outputTiming?: VideoProducedTiming): void {
+    if (this.playbackRate !== 1) { const now = this.clock.now(); renderTimeUs = now + (renderTimeUs - now) / this.playbackRate; }
     const observed = this.frameObservers?.size ? token : undefined;
     const entry: QueuedFrame = { frame: frame as VideoFrame, renderTimeUs,
       ...(observed === undefined ? {} : { token: observed, ...(outputTiming ? { outputTiming } : {}) }) };

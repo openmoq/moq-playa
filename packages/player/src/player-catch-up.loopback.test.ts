@@ -55,6 +55,7 @@ it.each(['stop', 'pause', 'seek', 'teardown', 'owner', 'history'] as const)('res
     if (action === 'history') { await landHistory(f); f.run(3); }
     if (action === 'teardown') await f.player.destroy();
     if (action === 'owner') {
+      // Retire only the input generation, leaving playback and subscriptions active.
       const manager = (f.player as unknown as { subscriptionManager: { invalidateMediaInputs(): void } }).subscriptionManager;
       manager.invalidateMediaInputs(); f.step();
     }
@@ -132,13 +133,13 @@ it.each(['activeMseSeek', 'paused-state', 'ended'] as const)('loses catch-up own
   const f = await setup();
   // Isolate each ownership guard while leaving the ordinary live subscription installed.
   const p = f.player as unknown as { activeMseSeek: unknown; stateMachine: { transition(state: string): void };
-    subscribedTrack(role: string): { isLive: boolean }; checkLiveCatchUp(): void };
+    subscribedTrack(role: string): { isLive: boolean } };
   try {
     f.run(3); expect(f.rate()).toBe(1.05);
     if (reason === 'activeMseSeek') p.activeMseSeek = {};
     if (reason === 'paused-state') p.stateMachine.transition('paused');
     if (reason === 'ended') p.subscribedTrack('video').isLive = false;
-    p.checkLiveCatchUp(); expect(f.rate()).toBe(1);
+    f.step(); expect(f.rate()).toBe(1);
     if (reason === 'activeMseSeek') p.activeMseSeek = null;
   } finally { p.activeMseSeek = null; await f.destroy(); }
 });

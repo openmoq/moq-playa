@@ -352,8 +352,7 @@ export interface LatencyConfig {
   readonly liveJumpThresholdMs?: number;
   /**
    * Target end-to-end latency in milliseconds.
-   * Caps catch-up when the output measures end-to-end latency; otherwise uses buffer ahead.
-   * Falls back to catalog targetLatency. Media elements currently have no latency reading.
+   * Uses the configured/catalog target when output latency is available; media elements use buffer ahead.
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */
   readonly targetLatencyMs?: number;
@@ -362,8 +361,9 @@ export interface LatencyConfig {
    * Maximum playback rate for catch-up (e.g., 1.05 = 5% faster).
    * Default: 1.0 (catch-up disabled).
    * Must be >= 1.0. Live ordinary playback only, through an output that changes
-   * audio and video together. Media elements preserve pitch. LOC catch-up is
-   * inactive until its queued audio/video output implements shared rate control.
+   * audio and video together. Media elements preserve pitch. LOC requires the
+   * renderer rate hook and timed audio output; WebAudio raises pitch (about
+   * 0.85 semitone at 1.05x). Queued audio and video are retimed together.
    */
   readonly maxCatchUpRate?: number;
 

@@ -153,6 +153,7 @@ interface LocmafChunkDetails {
 import type { MediaSourceLike, MediaAppendQueueLease, MediaSwitchRecovery, VideoPresentation, AudioOutputLike } from './interfaces.js';
 import { CommandDispatcher, type DispatcherOutputObserver } from './command-dispatcher.js';
 import { LiveCatchUp, type PlaybackRateOutput } from './live-catch-up.js';
+import { LocRateOutput } from './loc-rate-output.js';
 import { StatsAccumulator } from './stats.js';
 import type { PlayerStats, VideoEncodeObservation } from './stats.js';
 import type { CmafAssemblerLike, CmafSourceReceipt } from './interfaces.js';
@@ -849,6 +850,7 @@ export class MoqtPlayer {
     onRecovery: new HookChain<RecoveryAction>(),
   };
 
+  private locRateOutput: LocRateOutput | null = null;
   private liveCatchUp: LiveCatchUp | null = null;
   private catchUpOwner: object | null = null;
   private catchUpStopped: PlayerEventMap['catch_up_changed'] | null = null;
@@ -10274,8 +10276,17 @@ export class MoqtPlayer {
       && this.videoPipeline === video && this.audioPipeline === audio && this.mediaSource === media && routes.every(route => route?.())
       && roles.every(role => this.subscribedTrack(role)?.isLive === true)
       && subscriptions.every(([id, sub]) => this.activeSubscriptions.get(id) === sub && !this.terminalMediaSubscriptions.has(sub));
-    const output: PlaybackRateOutput | null = media?.setPlaybackRate && media.getBufferAheadUs && !video && !audio
-      ? { getBufferAheadUs: () => media.getBufferAheadUs!(), setPlaybackRate: rate => media.setPlaybackRate!(rate) } : null;
+    const loc: PlaybackRateOutput | null = this.locRateOutput;
+    const element = media?.setPlaybackRate && media.getBufferAheadUs ? media : null;
+    const output: PlaybackRateOutput | null = (media && !element) || ((video || audio) && !loc) ? null : {
+      latencyUs: () => loc?.latencyUs?.() ?? null,
+      getBufferAheadUs: () => {
+        const a = element ? element.getBufferAheadUs!() : Infinity, b = loc ? loc.getBufferAheadUs() : Infinity;
+        return a === null || b === null ? null : Math.min(a, b);
+      },
+      setPlaybackRate: rate => { element?.setPlaybackRate!(rate);
+        if (rate === 1 || this.livePlaybackRecord()?.output === output) loc?.setPlaybackRate(rate); },
+    };
     const tracks = roles.map(role => this.subscribedTrack(role)!);
     const floorUs = Math.max(...tracks.map(track => Math.max(track.buffers?.min ?? track.buffers?.target ?? 500, track.buffers?.target ?? 0))) * 1000;
     const target = this.config.targetLatencyMs ?? tracks.find(track => track.targetLatency !== undefined)?.targetLatency;
@@ -13427,7 +13438,7 @@ export class MoqtPlayer {
         this.consecutiveStallCount = 0;
       },
       onFeedback: (fb) => { if (ownsCommands()) this.handleFeedback(fb); },
-      onCommand: (cmd) => { if (ownsCommands()) this.handlePipelineCommand(cmd); },
+      onCommand: (cmd) => { if (ownsCommands()) this.handlePipelineCommand(this.locRateOutput?.command(cmd) ?? cmd); },
       onEvent: (mediaType, evt) => { if (ownsCommands()) this.handlePipelineEvent(mediaType, evt); },
       // A/V skew observability (LOC): record every sample, emit ~1/s.
       onAvSkew: (skewUs) => {
@@ -13452,6 +13463,20 @@ export class MoqtPlayer {
     this.videoPipeline = pipelines.videoPipeline;
     this.audioPipeline = pipelines.audioPipeline;
     this.syncController = pipelines.syncController;
+    const outputs = pipelines.frameOutput;
+    this.locRateOutput = (this.config.maxCatchUpRate ?? 1) > 1 && !!(pipelines.videoPipeline || pipelines.audioPipeline)
+      && (!pipelines.videoPipeline || outputs?.renderer?.setPlaybackRate)
+      && (!pipelines.audioPipeline || outputs?.audioOutput?.setPlaybackRate
+        && outputs.audioOutput.supportsOutputTiming && outputs.audioDecoder?.supportsOutputTiming)
+      ? new LocRateOutput(pipelines.syncController, this.clock, outputs?.renderer, outputs?.audioOutput, () => {
+          const owner = this.livePlaybackOwner;
+          const roles = (['video', 'audio'] as const).filter(role => role === 'video' ? pipelines.videoPipeline : pipelines.audioPipeline);
+          if (!owner || !pipelines.syncController.hasReference || roles.some(role => !owner.newest.has(role))) return null;
+          return Math.min(...roles.map(role => role === 'audio'
+            ? (this.audioTimingSource ?? pipelines.syncController).computeAudioRenderTime(owner.newest.get(role)!)?.offsetUs ?? 0
+            : (this.videoTimingSource ?? pipelines.syncController).computeVideoRenderTime(owner.newest.get(role)!)?.offsetUs ?? 0));
+        }, () => pipelines.getRenderCushionUs?.() ?? 0,
+        byUs => { this.lateAudioDebtUs = Math.max(0, this.lateAudioDebtUs - byUs); }) : null;
     this.lateAudioAsksUs.length = 0;
     this.lateAudioDebtUs = 0;
     if (pipelines.audioPipeline) pipelines.audioPipeline.lateAudioHandler = (offset, object) =>

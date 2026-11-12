@@ -5349,6 +5349,9 @@ describe('MseMediaSource — queued media leases', () => {
         } finally { adapter.destroy(); }
     });
 
+});
+
+describe('MseMediaSource — playback rate', () => {
  it('changes the shared media-element rate, preserves pitch, and restores normal speed', () => {
     const video = new MockVideoElement() as MockVideoElement & { playbackRate: number; preservesPitch: boolean };
     video.playbackRate = 1; video.preservesPitch = false;

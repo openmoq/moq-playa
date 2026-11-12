@@ -83,8 +83,8 @@ function run(maxCatchUpRate: number) {
   } finally { f.cleanup(); }
 }
 
-describe('opt-in catch-up on base', () => {
-  it('LOC opt-in is inactive until its output supports shared rate control', () => {
+describe('standalone graph has no player-owned catch-up policy', () => {
+  it('a standalone graph cannot change rate without a player-owned output implementation', () => {
     const control = run(1.0);
     expect(control).toEqual({ rates: [], timelineLatencyUs: 0, audioAheadOfTimelineUs: 0 });
     const r = run(1.1);

@@ -242,3 +242,16 @@ describe('unified playout cushion (delay unification)', () => {
     expect(ctx.started[1]!.when).toBeCloseTo(2.3, 5); // no hidden +200ms
   });
 });
+
+
+it('scales a new scheduling anchor by the active rate after an underrun', () => {
+  const { ctx, out } = makeOutput();
+  try {
+    ctx.currentTime = 1; out.setPlaybackRate(1.1);
+    out.schedule(audioData(0), 2_100_000);
+    expect(ctx.started.at(-1)!.when).toBeCloseTo(2, 9);
+    ctx.currentTime = 4;
+    out.schedule(audioData(20_000), 5_100_000);
+    expect(ctx.started.at(-1)!.when).toBeCloseTo(5, 9);
+  } finally { out.destroy(); }
+});

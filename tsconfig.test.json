@@ -48,7 +48,10 @@
 
     "packages/webtransport/src/adapter-primary-priority.test.ts",
     "packages/webtransport/src/send-order-setup.test.ts",
+    "packages/browser/src/webaudio-retention.test.ts",
     "packages/player/src/player-mixed-catch-up-gate.loopback.test.ts",
+    "packages/player/src/player-mixed-catch-up.loopback.test.ts",
+    "packages/player/src/player-loc-rate.loopback.test.ts",
     "packages/player/src/player-late-audio-burst.loopback.test.ts",
     "packages/player/src/player-late-audio-budget.loopback.test.ts",
     "packages/player/src/player-catch-up.loopback.test.ts",
