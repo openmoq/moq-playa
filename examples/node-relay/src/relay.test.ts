@@ -136,7 +136,7 @@ function subgroupHeader(alias: bigint, groupId: bigint, subgroupId = 0n): Subgro
 async function acceptPublisher(relay: Relay, publish: IncomingPublish): Promise<void> {
   const owner = { isPublishInitiated: true, isTerminated: false,
     trackNamespace: publish.trackNamespace, trackName: publish.trackName, trackAlias: publish.trackAlias };
-  const conn = { acceptSubscribe: vi.fn(async () => undefined), session: {
+  const conn = { observeObjectReception: () => () => {}, objectReceptionFor: () => undefined, observeObjectReceipts: () => () => {}, objectReceiptFor: () => undefined, acceptSubscribe: vi.fn(async () => undefined), session: {
     state: 'established', getIncomingSubscription: (id: bigint) => id === publish.requestId ? owner : undefined,
   } } as unknown as MoqtConnection;
   await relay.handlePublish(conn, publish);

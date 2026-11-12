@@ -1,7 +1,7 @@
 /**
  * Toy in-memory relay/fanout for the Node WebTransport MoQT example.
  *
- * One inbound publisher → many subscribers, over a small REGISTERED set of tracks
+ * Inbound publishers → many subscribers, over a small REGISTERED set of tracks
  * (a toy ABR media ladder + the simple demo track). Capabilities:
  *   - track registry (only registered tracks are accepted; others rejected);
  *   - multiple concurrent subscriptions PER viewer connection, one alias each
@@ -11,7 +11,7 @@
  *     WITHOUT closing the viewer connection;
  *   - SUBSCRIBE forwards only newly received Objects, including arrivals during
  *     acceptance; retrieve past Objects with FETCH (d18 §10.7);
- *   - standalone + joining FETCH served from the latest-group cache (§9.16 /
+ *   - standalone + joining FETCH served from bounded, proven history (§9.16 /
  *     draft-18 §10.12) — see handleFetch;
  *   - forwarding preserves the publisher's groupId/subgroupId/objectId and raw
  *     Object Properties/Extensions, and sends FIN only for complete subgroups so
@@ -19,7 +19,7 @@
  *     bit is preserved before forwarding its first object.
  *
  * Deliberately a TOY — see README:
- *   - The cache holds just the latest group (no DVR / init-segment retention).
+ *   - History defaults to one Group, 256 Objects and 4 MiB (no persistence).
  *   - NO route authorization, fairness, reconnect/migration, or persistence.
  *     A bounded per-subscription forwarder sheds a subscriber that cannot keep up.
  *   - Forwards DATA objects and their subgroup header evidence. Explicit wire
@@ -30,23 +30,13 @@ import type { MoqtConnection, IncomingPublish } from '@openmoq/webtransport';
 import { windowContains, MessageParam, RequestError18, SessionError, locationEncodingLength, varint, writeLocation, type Fetch, type Parameters, type StandaloneFetch } from '@openmoq/transport';
 import { DEMO_NAMESPACE, DEMO_TRACK, MEDIA_TRACKS, td, te, nsStr, hex } from './demo.js';
 import { SubgroupForwarder, type ForwardLimits } from './subgroup-forwarder.js';
-import { isRequestStreamDraft } from '@openmoq/transport';
+import { isRequestStreamDraft, decodeSubscriptionFilter, resolveFillWindow, MAX_VI64 } from '@openmoq/transport';
+import { HistoryCache, type HistoryLimits } from './history-cache.js';
 
 const log = (...a: unknown[]) => console.log('[relay]', ...a);
 
 /** Tracks this relay will route: the simple demo track + the toy media ladder. */
 const REGISTERED_TRACKS = new Set([DEMO_TRACK, ...MEDIA_TRACKS].map((name) => hex(te(name))));
-
-interface CachedObject {
-  readonly firstObject: boolean;
-  readonly endOfGroup: boolean;
-  readonly groupId: bigint;
-  readonly subgroupId: bigint;
-  readonly objectId: bigint;
-  readonly payload: Uint8Array;
-  /** Raw draft-18 Object Properties / draft-14/16 Extensions. */
-  readonly extensions: Uint8Array | undefined;
-}
 
 interface SubscriberSubgroup {
   readonly streamId: bigint;
@@ -91,6 +81,10 @@ class Subscriber {
 }
 
 export interface RelayOptions {
+  /** Whole-Group retention; defaults to 1 Group, 256 Objects, 4 MiB including properties. */
+  readonly historyCache?: Partial<HistoryLimits>;
+  /** Concurrent pinned FETCH snapshots; defaults to 32. */
+  readonly maxActiveHistoryRequests?: number;
   /** Exact namespace tuples this toy relay accepts. Defaults to DEMO_NAMESPACE. */
   readonly registeredNamespaces?: readonly (readonly string[])[];
   /** Maximum downstream subgroup streams held open by one subscription. */
@@ -112,11 +106,7 @@ interface Track {
   sources: Set<IncomingPublish>;
   upstream: Map<string, { groupId: bigint; objectId: bigint }>;
   subscribers: Subscriber[];
-  /** Latest group seen (for late-join replay), and that group's objects. */
-  cacheGroupId: bigint | null;
-  cache: CachedObject[];
-  /** Subgroups in the cached group whose publisher stream ended gracefully. */
-  cacheClosedSubgroups: Set<string>;
+  cache: HistoryCache;
 }
 
 /** ASCII-safe namespace key that preserves tuple-field boundaries. */
@@ -133,10 +123,23 @@ const trackKeyOf = (namespace: Uint8Array[], trackName: Uint8Array): string =>
 export class Relay {
   private readonly tracks = new Map<string, Track>();
   private nextAlias = 100n;
+  private readonly observed = new WeakSet<MoqtConnection>();
+  private readonly finReceipts = new WeakSet<object>();
+  private readonly finStreams = new WeakMap<object, bigint>();
+  private readonly receptionStreams = new WeakMap<object, bigint | null>();
+  private readonly historyLimits: HistoryLimits;
+  private readonly maxHistory: number;
+  private readonly historyResponses = new Set<{ conn: MoqtConnection; requestId: bigint; track: Track }>();
   private readonly forwardLimits: ForwardLimits;
   private readonly registeredNamespaceKeys: ReadonlySet<string>;
 
   constructor(options: RelayOptions = {}) {
+    this.historyLimits = {
+      maxGroups: positiveInteger('maxGroups', options.historyCache?.maxGroups ?? 1),
+      maxObjects: positiveInteger('maxObjects', options.historyCache?.maxObjects ?? 256),
+      maxBytes: positiveInteger('maxBytes', options.historyCache?.maxBytes ?? 4 * 1024 * 1024),
+    };
+    this.maxHistory = positiveInteger('maxActiveHistoryRequests', options.maxActiveHistoryRequests ?? 32);
     const registeredNamespaces = options.registeredNamespaces ?? [DEMO_NAMESPACE];
     if (registeredNamespaces.length === 0) {
       throw new RangeError('registeredNamespaces must contain at least one namespace');
@@ -167,9 +170,7 @@ export class Relay {
         sources: new Set(),
         upstream: new Map(),
         subscribers: [],
-        cacheGroupId: null,
-        cache: [],
-        cacheClosedSubgroups: new Set(),
+        cache: new HistoryCache(this.historyLimits),
       };
       this.tracks.set(key, track);
     }
@@ -240,6 +241,11 @@ export class Relay {
 
   /** A publisher's PUBLISH: accept and forward its objects to all subscribers. */
   async handlePublish(conn: MoqtConnection, publish: IncomingPublish): Promise<void> {
+    if (!this.observed.has(conn)) {
+      this.observed.add(conn);
+      conn.observeObjectReceipts(event => { if (event.origin === 'group-end') this.finReceipts.add(event.receipt); });
+      const fin = conn.onSubgroupFin; conn.onSubgroupFin = (id, header) => { this.finStreams.set(header, id); fin?.(id, header); };
+    }
     try {
       if (!this.isRegisteredTrack(publish.trackNamespace, publish.trackName)) {
         log(`PUBLISH ${nsStr(publish.trackNamespace)}/${td(publish.trackName)} — not registered; rejecting`);
@@ -250,7 +256,13 @@ export class Relay {
       const key = trackKeyOf(publish.trackNamespace, publish.trackName);
       const track = this.getTrack(key);
       track.sources.add(publish);
-      void publish.closed.then(() => { this.trackHead(track); track.sources.delete(publish); });
+      const stop = conn.observeObjectReception(event => {
+        if (event.type === 'progress' || event.trackAlias !== publish.trackAlias) return;
+        this.receptionStreams.set(event.reception, event.streamId);
+        track.cache.attribute(publish, event.groupId, event.subgroupId, event.streamId);
+      });
+      void publish.closed.then(stop);
+      void publish.closed.then(() => { this.trackHead(track); track.sources.delete(publish); track.cache.forgetSource(publish); });
       await conn.acceptSubscribe(publish.requestId, publish.trackAlias);
       // Create the track on accepted PUBLISH so a publisher that publishes BEFORE any
       // viewer subscribes still populates the history available to FETCH.
@@ -259,17 +271,18 @@ export class Relay {
       publish.onObject = (obj) => {
         if (!track.sources.has(publish)) return;
         this.trackHead(track);
-        if (obj.kind !== 'data') return; // §see README: gap/status objects are not relayed
-        // Maintain the latest-group cache for late joiners.
-        if (track.cacheGroupId !== obj.groupId) {
-          track.cacheGroupId = obj.groupId;
-          track.cache = [];
-          track.cacheClosedSubgroups.clear();
+        const receipt = conn.objectReceiptFor(obj);
+        if (receipt && this.finReceipts.has(receipt)) return; // FIN is handled below, never as a wire status.
+        const reception = conn.objectReceptionFor(obj);
+        track.cache.observe(publish, obj, reception && this.receptionStreams.get(reception));
+        if (obj.kind !== 'data') return;
+        if (!track.largest || obj.groupId > track.largest.groupId || (obj.groupId === track.largest.groupId && obj.objectId > track.largest.objectId)) {
+          track.largest = { groupId: obj.groupId, objectId: obj.objectId };
         }
         const extensions = obj.properties ?? obj.extensions;
         const firstObject = obj.isFirstObjectInSubgroup === true;
         const endOfGroup = obj.subgroupContainsEndOfGroup === true;
-        track.cache.push({
+        const added = track.cache.admit({
           firstObject,
           endOfGroup,
           groupId: obj.groupId,
@@ -278,6 +291,7 @@ export class Relay {
           payload: obj.payload,
           extensions,
         });
+        if (!added) return;
         track.upstream.set(subgroupKey(obj.groupId, obj.subgroupId), { groupId: obj.groupId, objectId: obj.objectId });
         // Live fanout (identity preserved), ordered per subgroup. Independent
         // subgroup streams may advance concurrently up to the configured bound.
@@ -288,103 +302,72 @@ export class Relay {
           });
         }
       };
-      publish.onSubgroupClosed = (header) => {
+      publish.onSubgroupClosed = (header) => queueMicrotask(() => {
         const skey = subgroupKey(header.groupId, header.subgroupId);
         track.upstream.delete(skey);
-        if (track.cacheGroupId === header.groupId) {
-          track.cacheClosedSubgroups.add(skey);
-        }
+        track.cache.finish(publish, header, this.finStreams.get(header));
         // onSubgroupClosed follows the final onObject from this incoming stream.
         // Its lane keeps FIN behind that subgroup's final downstream send.
         for (const sub of [...track.subscribers]) {
           sub.forwarder.enqueueClose(skey);
         }
-      };
+      });
     } catch (err) {
       console.error('[relay] PUBLISH handling failed:', (err as Error).message);
     }
   }
 
-  /**
-   * Answer a FETCH from the latest-group live cache (TOY semantics).
-   *
-   * Standalone (§9.16.3): serve `cache ∩ [startLocation, endLocation)` — the
-   * End Location's Object component is one-past ("the end Location, plus 1");
-   * value 0 requests the entire end group. Start beyond the largest cached
-   * object → REQUEST_ERROR INVALID_RANGE. Because only the LATEST group is
-   * retained, a range reaching further back is answered with what exists;
-   * per §9.16.3 gaps in the response stream indicate objects that do not
-   * exist (a real relay would confirm upstream — this toy has no upstream).
-   *
-   * Joining (§9.16.2 / §10.12.2): the session already validated the joining
-   * reference; the range resolves from the subscription's SAVED Joining
-   * Location (the SUBSCRIBE_OK snapshot) and is served identically. No saved
-   * Joining Location → REQUEST_ERROR INVALID_RANGE ("If no Objects have been
-   * published for the track").
-   */
+  /** FETCH refuses unknown coverage before acceptance (d18 §10.12.3). */
   private readonly servedTracks = new WeakMap<object, Track>();
   private readonly fetchTracks = new WeakMap<object, Track>();
 
   async handleFetch(conn: MoqtConnection, requestId: bigint, fetch: Fetch): Promise<void> {
     conn.setFetchLargestLocationProvider(id => this.currentLargestFor(conn, id));
+    const owner = conn.session.getIncomingFetch(requestId);
+    let response: { conn: MoqtConnection; requestId: bigint; track: Track } | undefined;
     try {
+      if (conn.draftVersion <= 16) { await conn.rejectFetch(requestId, 0x3n, 'history FETCH requires draft18 or newer'); return; }
+      let track: Track | undefined, start: { group: bigint; object: bigint }, end: { group: bigint; object: bigint };
       if (fetch.fetch.fetchType === 0x1) {
         const sf = fetch.fetch as StandaloneFetch;
         if (!this.isRegisteredTrack(sf.trackNamespace, sf.trackName)) {
-          log(`FETCH ${nsStr(sf.trackNamespace)}/${td(sf.trackName)} — not registered; rejecting`);
-          await conn.rejectFetch(requestId, RequestError18.DOES_NOT_EXIST as bigint, 'unknown track');
-          return;
+          await conn.rejectFetch(requestId, RequestError18.DOES_NOT_EXIST, 'unknown track'); return;
         }
-        const track = this.tracks.get(trackKeyOf(sf.trackNamespace, sf.trackName));
-        const largest = latestCached(track);
-        if (!largest) {
-          await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE as bigint, 'no objects published');
-          return;
-        }
-        const start = sf.startLocation;
-        // §9.16.3: "If Start Location is greater than the Largest Object the
-        // publisher MUST return REQUEST_ERROR with error code INVALID_RANGE."
-        if (start.group > largest.groupId
-          || (start.group === largest.groupId && start.object > largest.objectId)) {
-          await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE as bigint,
-            `start (${start.group},${start.object}) beyond largest (${largest.groupId},${largest.objectId})`);
-          return;
-        }
-        this.fetchTracks.set(conn.session.getIncomingFetch(requestId)!, track!);
-        await serveFetchFromCache(conn, requestId, track!, start, sf.endLocation);
-        return;
+        track = this.tracks.get(trackKeyOf(sf.trackNamespace, sf.trackName));
+        start = sf.startLocation; end = sf.endLocation;
+      } else {
+        track = this.findSubscriptionTrack(conn, (fetch.fetch as { joiningRequestId: bigint }).joiningRequestId);
+        const range = conn.resolveJoiningFetch(requestId);
+        start = range.startLocation; end = range.endLocation;
       }
-
-      // Joining (0x2/0x3): locate the joined subscription's track on THIS conn.
-      const joiningReqId = (fetch.fetch as { joiningRequestId: bigint }).joiningRequestId;
-      const track = this.findSubscriptionTrack(conn, joiningReqId);
-      const largest = latestCached(track);
-      if (!track || !largest) {
-        // §9.16.2: no objects published for the track → INVALID_RANGE.
-        await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE as bigint, 'no objects published');
-        return;
+      const largest = track && this.trackHead(track);
+      if (!track || !largest) throw new Error('no published head');
+      const head = { group: largest.groupId, object: largest.objectId };
+      if (conn.draftVersion !== 22) end = { group: end.group, object: end.object === 0n ? MAX_VI64 : end.object - 1n };
+      const filter = fetch.parameters.get(0x21n)?.[0];
+      if (conn.draftVersion === 22 && filter instanceof Uint8Array) {
+        const window = resolveFillWindow(decodeSubscriptionFilter(filter, 22), head);
+        if (!window?.end || window.end.object === undefined) throw new Error('empty relative range');
+        start = window.start; end = { group: window.end.group, object: window.end.object };
       }
-      let range;
-      try {
-        // ONLY the SAVED Joining Location (the SUBSCRIBE_OK snapshot) anchors
-        // the join. A subscription accepted before any object existed has no
-        // Joining Location — the compliant answer is INVALID_RANGE, never a
-        // range derived from the later cache head (it could overlap live
-        // delivery the subscription already carries).
-        range = conn.resolveJoiningFetch(requestId);
-      } catch {
-        // No saved Joining Location, or an absolute joining start beyond the
-        // largest group (§9.16.3).
-        await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE as bigint, 'no joining location / start beyond largest');
-        return;
-      }
-      log(`joining FETCH requestId=${requestId} → serving [${range.startLocation.group},${range.startLocation.object}) .. (${range.endLocation.group},${range.endLocation.object})`);
-      this.fetchTracks.set(conn.session.getIncomingFetch(requestId)!, track);
-      await serveFetchFromCache(conn, requestId, track, range.startLocation, range.endLocation);
+      if (end.group > head.group || (end.group === head.group && end.object > head.object)) end = head;
+      const rows = track.cache.plan(start, end);
+      if (!rows || this.historyResponses.size >= this.maxHistory) throw new Error('history unavailable');
+      if (fetch.parameters.get(0x22n)?.[0] === 2n) rows.sort((a, b) => a.groupId === b.groupId ? 0 : a.groupId > b.groupId ? -1 : 1);
+      this.fetchTracks.set(owner!, track);
+      response = { conn, requestId, track }; this.historyResponses.add(response);
+      const endLocation = conn.draftVersion === 22 ? end : { group: end.group, object: end.object === MAX_VI64 ? 0n : end.object + 1n };
+      await conn.acceptFetch(requestId, { endLocation });
+      const sid = await conn.openFetchStream(requestId);
+      for (const row of rows) await conn.sendFetchObject(sid, { ...row, publisherPriority: 128 });
+      await conn.closeFetchStream(sid);
     } catch (err) {
-      console.error('[relay] FETCH handling failed:', (err as Error).message);
-      try { await conn.rejectFetch(requestId, RequestError18.INTERNAL_ERROR as bigint, 'relay error'); } catch { /* stream gone */ }
-    }
+      if (!owner || conn.session.state !== 'established' || conn.session.getIncomingFetch(requestId) !== owner) return;
+      if (owner.state === 'transferring') await conn.abortIncomingFetch(requestId, { streamErrorCode: 0 }).catch(error => log('FETCH abort failed', error));
+      else if (conn.session.getIncomingFetch(requestId) === owner) {
+        await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE, String(err)).catch(error => log('FETCH refusal failed', error));
+      }
+    } finally { if (response) this.historyResponses.delete(response); }
   }
 
   /** Current upstream head for an exact live subscription or FETCH; null means known empty. */
@@ -402,7 +385,6 @@ export class Relay {
       if (head && (!track.largest || head.groupId > track.largest.groupId
           || (head.groupId === track.largest.groupId && head.objectId > track.largest.objectId))) track.largest = { ...head };
     };
-    merge(latestCached(track));
     for (const source of track.sources) merge(source.largestLocation);
     return track.largest;
   }
@@ -465,51 +447,6 @@ export class Relay {
       }
     }
   }
-}
-
-/** Largest cached object of a track (cache holds one group, appended in order). */
-function latestCached(track: Track | undefined): CachedObject | undefined {
-  return track && track.cache.length > 0 ? track.cache[track.cache.length - 1] : undefined;
-}
-
-/**
- * Serve `cache ∩ [start, end)` on a FETCH data stream, ascending. `end` is in
- * the wire convention (§9.16.3): Object is one-past; Object 0 requests the
- * entire end group. FETCH_OK's endLocation uses the same encoding and covers
- * exactly what was served (the request end capped at largest, per §10.13).
- */
-async function serveFetchFromCache(
-  conn: MoqtConnection,
-  requestId: bigint,
-  track: Track,
-  start: { group: bigint; object: bigint },
-  end: { group: bigint; object: bigint },
-): Promise<void> {
-  const beforeEnd = (groupId: bigint, objectId: bigint): boolean =>
-    groupId < end.group
-    || (groupId === end.group && (end.object === 0n || objectId < end.object));
-  const atOrAfterStart = (groupId: bigint, objectId: bigint): boolean =>
-    groupId > start.group
-    || (groupId === start.group && objectId >= start.object);
-
-  const servable = track.cache.filter((c) => atOrAfterStart(c.groupId, c.objectId) && beforeEnd(c.groupId, c.objectId));
-  const last = servable[servable.length - 1];
-  const endLocation = last
-    ? { group: last.groupId, object: last.objectId + 1n }
-    : { group: start.group, object: start.object }; // empty range: end == start is legal (§9.16.3)
-
-  await conn.acceptFetch(requestId, { endLocation });
-  const sid = await conn.openFetchStream(requestId);
-  for (const c of servable) {
-    await conn.sendFetchObject(sid, {
-      groupId: c.groupId, subgroupId: c.subgroupId, objectId: c.objectId,
-      publisherPriority: 128, extensions: c.extensions, payload: c.payload,
-    });
-  }
-  // §9.16.3: if no objects exist in the range, the stream carries only the
-  // FETCH_HEADER and closes with FIN.
-  await conn.closeFetchStream(sid);
-  log(`FETCH requestId=${requestId}: served ${servable.length} cached object(s)`);
 }
 
 /** Forward ONE object to one subscriber, preserving identity: reuse (or lazily open) an

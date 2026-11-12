@@ -141,7 +141,7 @@ async function handleSession(
       // ONLY that subscription — the viewer connection stays open.
       conn.onSubscribeClosed = (requestId) => relay.removeSubscription(conn, requestId);
       conn.onPublish = (publish) => { void relay.handlePublish(conn, publish); };
-      // Serve standalone + joining FETCH from the latest-group live cache (§10.12).
+      // Serve standalone + joining FETCH from bounded, proven history (§10.12).
       conn.onFetch = (requestId, fetch) => { void relay.handleFetch(conn, requestId, fetch); };
       // §5.1: a Forward 0→1 REQUEST_UPDATE_OK must communicate the CURRENT
       // Largest Location — supply it from the live cache per subscription.

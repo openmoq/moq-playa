@@ -106,4 +106,10 @@ describe.each([18, 16] as const)('draft-%i: SUBSCRIBE carries newly published or
     expect(r.largest).toEqual({ groupId: 5n, objectId: 2n });   // computed before the injection
     expect(r.all).toEqual(expect.arrayContaining(['5/4', '5/1']));
   });
+  // draft-18 §5.1.3 pairs a Joining FETCH with any SUBSCRIBE; the player's d18 switch uses AbsoluteStart{group,0}.
+  if (draft === 18) it('control: a Joining FETCH returns the stored history up to the Joining Location', async () => {
+    const r = await scenario(draft, { filter: { type: 'AbsoluteStart', startGroup: 5n, startObject: 0n }, joiningFetch: true });
+    expect(r.errors).toEqual([]);
+    expect(r.fetched).toEqual(['5/0', '5/1', '5/2']);
+  });
 });

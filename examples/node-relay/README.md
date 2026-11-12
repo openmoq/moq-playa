@@ -52,7 +52,7 @@ pnpm --filter @moqt/example-node-relay client https://127.0.0.1:4433/moq
 
 ## Run the toy relay/fanout
 
-Relay mode forwards objects from **one publisher** to **many subscribers** over a
+Relay mode forwards objects from **publishers of the same track** to **many subscribers** over a
 registered track set (a toy ABR ladder: `catalog`, `video-1080/720/360`,
 `audio-en/es`, plus the demo track), preserving each object's
 `groupId`/`subgroupId`/`objectId` and raw Object Properties/Extensions, while
@@ -65,15 +65,17 @@ Namespace registration defaults to the `['demo']` tuple. An embedded relay can
 set `RelayOptions.registeredNamespaces` to accept additional exact tuples;
 namespace fields and track names are compared byte-for-byte.
 
-The relay also answers **FETCH** from the latest-group cache (§9.16 / draft-18
-§10.12): standalone FETCH serves `cache ∩ [start, end)` with proper
-`INVALID_RANGE` / `DOES_NOT_EXIST` rejections, and a **relative joining FETCH**
-resolves its range from the joined subscription's largest cached object — the
-warm-start path a Largest Object subscriber uses to get the current group's
-head immediately. Every SUBSCRIBE delivers only newly received Objects;
-FETCH is the way to retrieve history. Arrivals during acceptance are queued
-within the configured object and byte bounds. Overflow ends that subscription
-with TOO_FAR_BEHIND after SUBSCRIBE_OK, leaving the session open.
+The relay answers standalone and joining **FETCH** on drafts 18/22 from bounded
+history. It refuses the request before FETCH_OK unless every requested Location
+is retained or proven absent beyond a data-only END_OF_GROUP subgroup's FIN.
+Missing or evicted Objects have unknown status. Joining FETCH uses the saved
+Joining Location, not the head at FETCH time. Responses retain their admission
+snapshot, honor group order, and cap their endpoint at the current Largest Location.
+Drafts 14/16 return NOT_SUPPORTED for FETCH; live subscriptions continue.
+
+Every SUBSCRIBE delivers only newly received Objects. Arrivals during acceptance
+are queued within the configured object and byte bounds. Overflow ends that
+subscription with TOO_FAR_BEHIND after SUBSCRIBE_OK, leaving the session open.
 
 ```bash
 # standalone relay-mode server (what the publisher example connects to):
@@ -119,11 +121,12 @@ generate a CMAF fixture from an MP4, publish it (optionally looped) into
   example still runs on one Node event loop; sustained CPU saturation requires more
   capacity or a production relay. The namespace smoke measures a synthetic local
   workload, not browser playback quality or production capacity.
-- **Live, latest-group cache only** — a late viewer can FETCH the most-recent group
-  only (no DVR, no init-segment retention policy). FETCH is served from the same
-  single-group cache: ranges reaching further back truncate honestly (gaps in the
-  response indicate objects that no longer exist, §9.16.3). The cache has no
-  configurable byte limit.
+- **Bounded in-memory history** — `historyCache` configures positive safe-integer
+  `maxGroups` (default 1), `maxObjects` (256) and `maxBytes` (4 MiB, including
+  properties). The lowest Group is evicted first. First copies are kept, and
+  history survives a publisher's completion or disconnect. Publishers of one
+  track contribute to the same history. `maxActiveHistoryRequests` defaults to 32;
+  excess requests are refused. No upstream gap recovery, DVR or persistence.
 - **Fixed track registry** — only the names above are routed; a catalog-driven
   registry is a possible follow-up.
 - **Data objects and subgroup header flags** — the incoming `END_OF_GROUP` flag
