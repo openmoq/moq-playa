@@ -25,6 +25,7 @@
     "scripts/player-acceptance/observer.test.ts",
     "examples/_tests/player-acceptance/main.ts",
     "packages/player/src/player-encode-observation.loopback.test.ts",
+    "packages/player/src/player-presentation-observation.loopback.test.ts",
     "packages/player/src/encode-anchor.test.ts",
     "vitest.config.ts",
     "vitest.shaper-performance.config.ts",

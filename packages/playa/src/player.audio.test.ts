@@ -293,18 +293,19 @@ describe('Player stats measurement mapping', () => {
   it.each([250, 0, -5])('forwards legacy age and nullable observations without changing frame semantics: %s', age => {
     const player = new Player(mockElement() as HTMLElement, { url: 'x', namespace: 'y' });
     const quality = { totalVideoFrames: 300, droppedVideoFrames: 3, displayedVideoFrames: 297, creationTimeMs: 10 };
+    const presented = { location: { groupId: '1', objectId: '0' }, encodeToPresentationMs: age };
     (player as unknown as { engine: { stats: object } }).engine.stats = {
-      currentLatencyMs: age, captureTimestampAgeMs: age, videoPlaybackQuality: quality,
+      currentLatencyMs: age, captureTimestampAgeMs: age, videoPlaybackQuality: quality, videoPresentationObservation: presented,
       framesDecoded: 7, framesRendered: 4, framesDropped: 1,
     };
     expect(player.stats).toMatchObject({ latencyMs: age, captureTimestampAgeMs: age, videoPlaybackQuality: quality,
-      framesDecoded: 7, framesRendered: 4, framesDropped: 1 });
+      videoPresentationObservation: presented, framesDecoded: 7, framesRendered: 4, framesDropped: 1 });
   });
 
   it('maps absent optional observations to null rather than measured zero', () => {
     const player = new Player(mockElement() as HTMLElement, { url: 'x', namespace: 'y' });
     (player as unknown as { engine: { stats: object } }).engine.stats = { currentLatencyMs: 0 };
-    expect(player.stats).toMatchObject({ latencyMs: 0, captureTimestampAgeMs: null, videoPlaybackQuality: null });
+    expect(player.stats).toMatchObject({ latencyMs: 0, captureTimestampAgeMs: null, videoPlaybackQuality: null, videoPresentationObservation: null });
   });
 });
 

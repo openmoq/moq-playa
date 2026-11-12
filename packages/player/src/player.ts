@@ -204,6 +204,16 @@ interface ReceivingVideoOwner {
   readonly isCurrent: () => boolean;
 }
 
+/** The requestVideoFrameCallback surface of an HTMLVideoElement. */
+interface PresentedFrameElement {
+  requestVideoFrameCallback(callback: (now: number, metadata: { readonly mediaTime: number }) => void): number;
+  cancelVideoFrameCallback(handle: number): void;
+}
+
+/** Engine timestamps are integer microseconds: offset and sample time may each lose under one. */
+const PRESENTED_FRAME_QUANTIZATION_US = 2n;
+const MAX_PRESENTATION_CANDIDATES = 64;
+
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 /**
@@ -228,16 +238,6 @@ interface ReceivingVideoOwner {
  *                (e.g. `["cmsf/clear"]` → one 10-byte field with the
  *                slash inside).
  */
-/** The requestVideoFrameCallback surface of an HTMLVideoElement. */
-interface PresentedFrameElement {
-  requestVideoFrameCallback(callback: (now: number, metadata: { readonly mediaTime: number }) => void): number;
-  cancelVideoFrameCallback(handle: number): void;
-}
-
-/** Engine timestamps are integer microseconds: offset and sample time may each lose under one. */
-const PRESENTED_FRAME_QUANTIZATION_US = 2n;
-const MAX_PRESENTATION_CANDIDATES = 64;
-
 function encodeNamespace(
   ns: string | readonly string[],
   enc: TextEncoder,
