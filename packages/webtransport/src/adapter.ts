@@ -5874,7 +5874,15 @@ export class MoqtConnection {
       return Promise.reject(new Error('Publication is terminating'));
     }
     let admitted = false;
-    const completion = this.writePublishDone(requestId, statusCode, reason, undefined, () => { admitted = true; });
+    const completion = this.writePublishDone(requestId, statusCode, reason, {
+      reason: new Error(reason), resetSendStream: this.transport?.resetSendStream?.bind(this.transport),
+    }, () => { admitted = true; }).catch(error => {
+      if (error instanceof PublisherTerminalFailure) {
+        if (error.receiveOnly) return;
+        throw error.original;
+      }
+      throw error;
+    });
     if (admitted) this.publisherTerminals.set(requestId, completion);
     return completion;
   }
@@ -5907,13 +5915,14 @@ export class MoqtConnection {
       const ctx = this.inboundRequestContexts.get(requestId);
       if (ctx) {
         const send = actions.find((a) => a.type === 'send_control') as SendControlAction | undefined;
-        if (terminal && send) await ctx.finishPublisher(send.message, terminal);
-        else {
-          if (send) await ctx.writeMessage(send.message);
-          ctx.seal();
-          await ctx.terminate();
-        }
-        this.inboundRequestContexts.delete(requestId);
+        try {
+          if (terminal && send) await ctx.finishPublisher(send.message, terminal);
+          else {
+            if (send) await ctx.writeMessage(send.message);
+            ctx.seal();
+            await ctx.terminate();
+          }
+        } finally { this.inboundRequestContexts.delete(requestId); }
         return;
       }
       // Outbound PUBLISH (§10.10): PUBLISH_DONE rides the PUBLISH request stream we

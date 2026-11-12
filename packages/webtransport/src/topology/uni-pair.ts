@@ -1006,7 +1006,10 @@ class RequestStreamContext {
       try {
         await finishPublisherTerminal(this.writer, this.reader,
           () => finalMessage ? this.writer.write(this.codec.encode(finalMessage)) : Promise.resolve(), terminal);
-      } finally { this.closedDeferred.resolve(); }
+      } finally {
+        for (const d of this.queue.splice(0)) d.reject(terminal.reason);
+        this.closedDeferred.resolve();
+      }
       return;
     }
     if (finalMessage) {

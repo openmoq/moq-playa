@@ -6,7 +6,7 @@ export interface PublisherTerminalOptions {
 }
 
 export class PublisherTerminalFailure extends Error {
-  constructor(readonly original: unknown, readonly ended: boolean) {
+  constructor(readonly original: unknown, readonly ended: boolean, readonly receiveOnly = false) {
     super('Publisher terminal did not complete', { cause: original });
   }
 }
@@ -36,6 +36,6 @@ export async function finishPublisherTerminal(
       throw new PublisherTerminalFailure(error, written && await reset);
     }
     try { await bounded(cancel()); }
-    catch (error) { throw new PublisherTerminalFailure(error, true); }
+    catch (error) { throw new PublisherTerminalFailure(error, true, true); }
   } finally { clearTimeout(timer); }
 }
