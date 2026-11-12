@@ -90,9 +90,14 @@ export interface WebTransportLike {
    */
   createUnidirectionalStream?(): Promise<WritableStream<Uint8Array>>;
 
-  /** Build a binding-native stream reset/STOP_SENDING reason, retaining `cause`.
-   * Called with this transport as receiver. Coded termination operations reject
-   * before changing ownership when this optional hook is absent or throws.
+  /**
+   * Build the binding-native RESET_STREAM/STOP_SENDING reason for the four
+   * explicit termination operations. Called once per active operation with
+   * this transport as receiver and `(code, cause)`; the same object is used for
+   * every direction it ends. Browser bindings must retain WebTransportError's
+   * stream brand and code. Omission or a thrown error rejects the operation
+   * before ownership changes. resetSubgroup supports all drafts; the request
+   * operations support drafts 18 and 22. This hook proves no peer acknowledgement.
    */
   createStreamError?(code: number, cause?: unknown): Error;
 

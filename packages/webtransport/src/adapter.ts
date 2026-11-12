@@ -289,16 +289,18 @@ function requestGoawayNotice(requestId: bigint, msg: Goaway): GoawayNotice {
     : { scope: 'request', requestId, newSessionUri: msg.newSessionUri, timeoutMs: msg.timeout };
 }
 
+/** Local source cancellation outcome; never a peer acknowledgement. */
+export interface MalformedSourceCancellationResult { readonly status: 'cancel-issued' | 'already-terminal' }
+
+/** Local publisher terminal outcome; the first terminal fixes the DONE code. */
+export interface MalformedPublicationTerminationResult { readonly status: 'done-written' | 'already-terminal' }
+
 /**
  * A PUBLISH received from a peer publisher on a new inbound bidi stream
  * (draft-18 §10.10). Set `onObject` and `onSubgroupClosed` to receive the
  * track's data-plane lifecycle (delivered via the bound Track Alias), then
  * accept/reject via the connection.
  */
-export interface MalformedSourceCancellationResult { readonly status: 'cancel-issued' | 'already-terminal' }
-
-export interface MalformedPublicationTerminationResult { readonly status: 'done-written' | 'already-terminal' }
-
 export interface IncomingPublish {
   /** Monotonic receive head; each read returns a fresh frozen snapshot. */
   readonly largestLocation: Readonly<{ groupId: bigint; objectId: bigint }> | null;
@@ -3189,6 +3191,20 @@ export class MoqtConnection {
   private readonly cancelledPublications = new WeakSet<SubscriptionStateMachine>();
   private readonly sourceCancellations = new WeakMap<IncomingPublish, Promise<MalformedSourceCancellationResult>>();
 
+  /**
+   * Cancel an accepted incoming PUBLISH on drafts 18 and 22, using the genuine
+   * onPublish handle. Retires delivery and resolves `closed` synchronously, then
+   * resets the request and stops its receive direction and exclusively owned
+   * data streams with CANCELLED (0x1). Shared draft-22 streams remain usable.
+   * `cancel-issued` means local cancellation completion, not peer acknowledgement;
+   * a retired genuine handle returns `already-terminal`. Concurrent calls join.
+   * Missing or throwing createStreamError rejects before changing ownership.
+   * Unproven request cancellation after the one-second bound closes the session
+   * with INTERNAL_ERROR; data-reader cancellation failure rejects locally.
+   * Late streams are discarded only during the existing bounded alias guard.
+   * @see draft-ietf-moq-transport-18 §2.4.2
+   * @see draft-ietf-moq-transport-22 §12.1
+   */
   cancelMalformedIncomingPublish(publication: IncomingPublish): Promise<MalformedSourceCancellationResult> {
     if (!this.publications.has(publication)) return Promise.reject(new Error('Unknown incoming publication handle'));
     const pending = this.sourceCancellations.get(publication);
@@ -5487,6 +5503,20 @@ export class MoqtConnection {
     if (this.retiredIncomingFetches.size > 256) this.retiredIncomingFetches.delete(this.retiredIncomingFetches.values().next().value!);
   }
 
+  /**
+   * Abort an accepted or accepting incoming FETCH on drafts 18 and 22. Revokes
+   * further sends synchronously and resets its response and request directions,
+   * including late response allocations. `streamErrorCode` is an unsigned 32-bit
+   * code, defaulting to CANCELLED (0x1); use MALFORMED_TRACK (0x12) for that case.
+   * `aborted` means local completion, not peer acknowledgement; a completed or
+   * winning response FIN returns `already-terminal`. Concurrent calls join.
+   * Unaccepted or unrelated IDs and invalid codes reject without mutation, as
+   * does an absent or throwing createStreamError. An unproven reset or allocation
+   * after the one-second bound closes the session with INTERNAL_ERROR. Sibling
+   * requests and the live subscription of a Joining FETCH remain unaffected.
+   * @see draft-ietf-moq-transport-18 §2.4.2
+   * @see draft-ietf-moq-transport-22 §12.1
+   */
   abortIncomingFetch(requestId: bigint, options?: { streamErrorCode?: number }): Promise<{ status: 'aborted' | 'already-terminal' }> {
     const pending = this.fetchAborts.get(requestId);
     if (pending) return pending;
@@ -5745,13 +5775,30 @@ export class MoqtConnection {
    *     Count, written and sealed on the correct request stream.
    * Failure policy: ONLY a proven already-terminated outcome (the session no
    * longer knows the subscription — a concurrent terminal won) is benign;
-   * any other write/seal failure closes the session, because a peer left
-   * believing the subscription is established would be split-brain.
+   * a missing DONE or an unproven send-side end closes the session. Once DONE
+   * is written, a proven FIN or reset ends the request; receive-side cleanup
+   * failures stay local (d22 §6.6).
    */
   private readonly publisherTerminals = new Map<bigint, Promise<void>>();
   private readonly malformedTerminations = new Map<bigint, Promise<MalformedPublicationTerminationResult>>();
   private readonly publisherResetReasons = new Map<bigint, Error>();
 
+  /**
+   * Terminate an accepted downstream SUBSCRIBE or outgoing PUBLISH on drafts
+   * 18 and 22. Fences opens, resets its data streams with MALFORMED_TRACK (0x12),
+   * then writes PUBLISH_DONE(MALFORMED_TRACK) and FIN. Concurrent calls join.
+   * `done-written` means local write and FIN completion, not peer acknowledgement;
+   * joining an active failed-update terminal also reports `done-written` with
+   * that winning code. `already-terminal` joins an ordinary or completed terminal
+   * without another DONE.
+   * Unknown IDs and incoming PUBLISHes reject. An absent or throwing binding
+   * createStreamError rejects before mutation. Unproven data resets or DONE
+   * writes close the session with INTERNAL_ERROR. A failed FIN stays local if
+   * reset proves that send direction ended; receive-only cleanup failure also
+   * rejects locally. Cleanup waits are bounded by one second per phase.
+   * @see draft-ietf-moq-transport-18 §2.4.2
+   * @see draft-ietf-moq-transport-22 §12.1
+   */
   terminateMalformedPublication(requestId: bigint): Promise<MalformedPublicationTerminationResult> {
     const pending = this.malformedTerminations.get(requestId);
     if (pending) return pending;
@@ -5869,6 +5916,13 @@ export class MoqtConnection {
     }
   }
 
+  /**
+   * Write PUBLISH_DONE and FIN after all data streams and opens have completed.
+   * Completion is local, not peer acknowledgement. A failed write or FIN rejects
+   * with its original error after initiating request-local reset and STOP_SENDING;
+   * cleanup errors never replace it. Receive-only cleanup failure after a written
+   * DONE and FIN is ignored. Cleanup waits are bounded; siblings remain usable.
+   */
   publishDone(requestId: bigint, statusCode: Varint, reason: string): Promise<void> {
     if (this.malformedTerminations.has(requestId) || this.failedUpdateTerminations.has(requestId)) {
       return Promise.reject(new Error('Publication is terminating'));
@@ -6537,6 +6591,18 @@ export class MoqtConnection {
     }
   }
 
+  /**
+   * Reset one open outgoing subgroup with CANCELLED (0x1), on every supported
+   * draft (14, 16, 18, 22). Other streams and the subscription remain usable.
+   * Further sends reject; closeSubgroup and repeated resets join the active reset.
+   * Resolves after local reset completion, not peer acknowledgement. The stream
+   * still counts in PUBLISH_DONE. An unproven reset closes the session with
+   * INTERNAL_ERROR; an absent or throwing createStreamError rejects before mutation.
+   * @see draft-ietf-moq-transport-14 §10.4.3
+   * @see draft-ietf-moq-transport-16 §10.4.3
+   * @see draft-ietf-moq-transport-18 §11.4.3
+   * @see draft-ietf-moq-transport-22 §11.3.2
+   */
   resetSubgroup(streamId: bigint): Promise<void> {
     const state = this.outgoingStreams.get(streamId);
     if (!state) return Promise.reject(new Error(`Unknown outgoing stream ${streamId}`));

@@ -604,9 +604,9 @@ export class UniPairTopology {
    * first (e.g. PUBLISH_DONE on an outbound PUBLISH, draft-18 §10.11). FINs our
    * writable and STOP_SENDINGs the readable, then drops the context. No response
    * is expected for the final message. No-op if no such stream is open.
+   * @param terminal - Experimental termination context carrying a shared binding
+   * reason and reset hook. Optional; existing calls keep their behavior.
    */
-  /** @experimental `terminal` supplies one binding-owned reason and reset hook
-   * for forced publisher termination. Omission preserves existing behavior. */
   async finishRequest(requestId: bigint, finalMessage?: ControlMessage, terminal?: PublisherTerminalOptions): Promise<void> {
     const ctx = this.contexts.get(requestId);
     if (!ctx) return;
