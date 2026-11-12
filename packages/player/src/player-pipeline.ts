@@ -226,10 +226,6 @@ export function createPipelines(
     driftThresholdUs: playbackConfig.driftThresholdUs,
     dropThresholdUs: config.lateFrameThresholdMs! * 1000,
     clock,
-    targetLatencyMs: config.targetLatencyMs,
-    maxCatchUpRate: config.maxCatchUpRate,
-    catchUpThresholdMs: config.catchUpThresholdMs,
-    catchUpRecoveryMs: config.catchUpRecoveryMs,
   }));
 
   // The default controller's windowed escalation — the only path by which
@@ -497,18 +493,6 @@ export function handlePipelineEvent(
       }
       break;
     }
-    case 'catch_up_changed':
-      ctx.log.debug('Catch-up %s rate=%.2f latency=%dms target=%dms',
-        evt.state.active ? 'active' : 'inactive',
-        evt.state.currentRate, evt.state.latencyMs, evt.state.targetMs);
-      ctx.emitEvent({
-        type: 'catch_up_changed',
-        active: evt.state.active,
-        rate: evt.state.currentRate,
-        latencyMs: evt.state.latencyMs,
-        targetMs: evt.state.targetMs,
-      });
-      break;
     case 'keyframe_validation_failed':
       ctx.log.warn('Keyframe validation failed %s group=%s object=%s codec=%s',
         mediaType, evt.groupId, evt.objectId, evt.codec);

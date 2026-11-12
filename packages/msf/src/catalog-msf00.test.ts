@@ -1027,3 +1027,11 @@ describe('parseMsfCatalog', () => {
         expect(sapTracks.map(t => t.depends).flat()).toEqual(['vide_1', 'soun_2']);
     });
 });
+
+
+it('retains msf-01 buffer minimum, target and maximum', () => {
+  const catalog = parseMsfCatalog(JSON.stringify({ version: 1, tracks: [
+    { name: 'v', packaging: 'loc', isLive: true, buffers: { min: 1800, target: 2200, max: 4000 } },
+  ] }));
+  expect(catalog.tracks[0]?.buffers).toEqual({ min: 1800, target: 2200, max: 4000 });
+});

@@ -152,6 +152,7 @@ interface LocmafChunkDetails {
 }
 import type { MediaSourceLike, MediaAppendQueueLease, MediaSwitchRecovery, VideoPresentation, AudioOutputLike } from './interfaces.js';
 import { CommandDispatcher, type DispatcherOutputObserver } from './command-dispatcher.js';
+import { LiveCatchUp, type PlaybackRateOutput } from './live-catch-up.js';
 import { StatsAccumulator } from './stats.js';
 import type { PlayerStats, VideoEncodeObservation } from './stats.js';
 import type { CmafAssemblerLike, CmafSourceReceipt } from './interfaces.js';
@@ -848,7 +849,10 @@ export class MoqtPlayer {
     onRecovery: new HookChain<RecoveryAction>(),
   };
 
-  private liveJump: { current: () => boolean; newest: Map<'video' | 'audio', bigint>; since: number | null } | null = null;
+  private liveCatchUp: LiveCatchUp | null = null;
+  private catchUpOwner: object | null = null;
+  private catchUpStopped: PlayerEventMap['catch_up_changed'] | null = null;
+  private livePlaybackOwner: { current: () => boolean; output: PlaybackRateOutput | null; floorUs: number; targetUs: number | undefined; newest: Map<'video' | 'audio', bigint>; since: number | null } | null = null;
   private lastLiveJumpUs = -Infinity;
   private readonly lateAudioAsksUs: number[] = [];
   private lateAudioDebtUs = 0;
@@ -3608,6 +3612,7 @@ export class MoqtPlayer {
       ...(abrAction ? { abrAction } : {}),
     };
     this.revokeVideoSwitchRecovery();
+    this.stopLiveCatchUp();
     this.pendingVideoSwitch = sw;
     this.armVideoSwitchTimeout(sw, this.config.connectionTimeoutMs || SWITCH_STAGING_TIMEOUT_MS, true);
     this.emitQualityEvent('quality_switching', {
@@ -4713,7 +4718,7 @@ export class MoqtPlayer {
       if (pipeline) this.recordDeliveredObject(obj);
       if (pipeline && (mediaType === 'video' || mediaType === 'audio') && obj.kind === 'data'
           && !delivery?.backfill && !delivery?.fetched && headers.captureTimestamp !== undefined) {
-        const record = this.liveJumpRecord(), previous = record?.newest.get(mediaType);
+        const record = this.livePlaybackRecord(), previous = record?.newest.get(mediaType);
         if (record && (previous === undefined || headers.captureTimestamp > previous)) record.newest.set(mediaType, headers.captureTimestamp);
       }
       if (mediaType === 'audio' && !delivery?.backfill && !delivery?.fetched) this.liveAudioObjects.add(obj);
@@ -5446,7 +5451,8 @@ export class MoqtPlayer {
     // last. See play() for why the announcement cannot come earlier.
     const fromState = this.applyState(PlayerState.PAUSED);
     this.subscriptionManager?.invalidateMediaInputs();
-    this.liveJump = null;
+    this.livePlaybackOwner = null;
+    this.stopLiveCatchUp();
     this.playbackIntent = false;
     this.pendingVideoSwitch?.frame?.cancelPending();
     this.seekPosition?.setPlaying(false);
@@ -5538,7 +5544,8 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-msf-01 §7.2 (Timeline dependency coverage)
    */
   async seek(timeMs: number): Promise<void> {
-    this.liveJump = null;
+    this.livePlaybackOwner = null;
+    this.stopLiveCatchUp();
     if (!Number.isFinite(timeMs) || timeMs < 0) {
       throw new RangeError('Seek target must be finite and nonnegative');
     }
@@ -6304,6 +6311,7 @@ export class MoqtPlayer {
       ...(audioLanguage !== undefined ? { audioLanguage } : {}),
       rawInputs: new WeakSet(), registrations: new Map(), releasedRequests: new Set(), terminalRequests: new Set(),
       retainedBytes: 0, inputCount: 0, aborted: false, committed: false, cancel };
+    this.stopLiveCatchUp();
     this.mediaSelection = txn;
     const operation = txn;
     const abort = () => this.failMediaSelection(operation, new Error('Media selection cancelled'));
@@ -6461,6 +6469,7 @@ export class MoqtPlayer {
     if (!oldIsCurrent() || this.mediaSelection || this.currentMigration || this.pendingVideoSwitch
         || this.switchInProgress || this.pendingRetypes.size) throw new Error('Audio ownership changed during selection');
     reservedAttempt = txn;
+    this.stopLiveCatchUp();
     this.mediaSelection = txn; // final guard and reservation are synchronous
     await this.runPreparedMediaSelection(txn, cancelled);
   }
@@ -6548,6 +6557,7 @@ export class MoqtPlayer {
   }
 
   private resetMediaClock(preserveMediaInputs = false): void {
+    this.stopLiveCatchUp();
     this.lateAudioAsksUs.length = 0;
     this.lateAudioDebtUs = 0;
     if (!preserveMediaInputs) this.subscriptionManager?.invalidateMediaInputs();
@@ -10231,6 +10241,7 @@ export class MoqtPlayer {
     // 1.5× the current track's bitrate, downshift before stalls occur.
     this.checkBandwidthAdaptation();
     this.checkLiveJump();
+    this.checkLiveCatchUp();
 
     // Media liveness: reconcile monitored tracks with the live subscription
     // map (a handful of entries — cheap at tick rate, and immune to drift
@@ -10239,42 +10250,48 @@ export class MoqtPlayer {
   }
 
   /** Observations belong to one ordinary live output graph, never a historical owner. */
-  private liveJumpRecord(): MoqtPlayer['liveJump'] {
-    if (!this.config.liveJumpThresholdMs || this._destroyed || this.state !== PlayerState.PLAYING || this.playbackIntent !== true
+  private livePlaybackRecord(): MoqtPlayer['livePlaybackOwner'] {
+    if ((!this.config.liveJumpThresholdMs && (this.config.maxCatchUpRate ?? 1) <= 1) || this._destroyed || this.state !== PlayerState.PLAYING || this.playbackIntent !== true
         || this.activeLocSeek || this.activeMseSeek || this.seekIsPreparing() || this.pendingVideoSwitch || this.switchInProgress
         || this.mediaSelection || this.currentMigration || this.pendingRetypes.size
         || this.config.subscriptionFilter?.type === 'AbsoluteStart' || this.config.subscriptionFilter?.type === 'AbsoluteRange') {
-      this.liveJump = null; return null;
+      this.livePlaybackOwner = null; return null;
     }
-    if (this.liveJump?.current()) return this.liveJump;
-    this.liveJump = null;
+    if (this.livePlaybackOwner?.current()) return this.livePlaybackOwner;
+    this.livePlaybackOwner = null;
+    this.stopLiveCatchUp();
     const selection = this._selection, manager = this.subscriptionManager, generation = manager?.mediaInputGeneration;
     const sync = this.syncController, dispatcher = this.commandDispatcher, connection = this.connection;
-    const video = this.videoPipeline, audio = this.audioPipeline;
+    const video = this.videoPipeline, audio = this.audioPipeline, media = this.mediaSource;
     const roles = (['video', 'audio'] as const).filter(role => selection[role] !== null);
     const subscriptions = [...this.activeSubscriptions].filter(([, sub]) => roles.includes(sub.mediaType as 'video' | 'audio'));
-    if (!sync || !dispatcher || !manager || !connection || roles.length === 0 || subscriptions.length !== roles.length
-        || roles.some(role => !(role === 'video' ? video : audio) || this.subscribedTrack(role)?.isLive !== true)
+    if (!sync || (!dispatcher && !media) || !manager || !connection || roles.length === 0 || subscriptions.length !== roles.length
+        || roles.some(role => (!media && !(role === 'video' ? video : audio)) || this.subscribedTrack(role)?.isLive !== true)
         || subscriptions.some(([, sub]) => sub.trackAlias === null || sub.trackName !== selection[sub.mediaType as 'video' | 'audio']?.name)) return null;
     const routes = subscriptions.map(([, sub]) => manager.captureRoute(sub.trackAlias!));
     const current = () => this.connection === connection && this._selection === selection && this.subscriptionManager === manager
       && manager.mediaInputGeneration === generation && this.syncController === sync && this.commandDispatcher === dispatcher
-      && this.videoPipeline === video && this.audioPipeline === audio && routes.every(route => route?.())
+      && this.videoPipeline === video && this.audioPipeline === audio && this.mediaSource === media && routes.every(route => route?.())
       && roles.every(role => this.subscribedTrack(role)?.isLive === true)
       && subscriptions.every(([id, sub]) => this.activeSubscriptions.get(id) === sub && !this.terminalMediaSubscriptions.has(sub));
-    return this.liveJump = { current, newest: new Map(), since: null };
+    const output: PlaybackRateOutput | null = media?.setPlaybackRate && media.getBufferAheadUs && !video && !audio
+      ? { getBufferAheadUs: () => media.getBufferAheadUs!(), setPlaybackRate: rate => media.setPlaybackRate!(rate) } : null;
+    const tracks = roles.map(role => this.subscribedTrack(role)!);
+    const floorUs = Math.max(...tracks.map(track => Math.max(track.buffers?.min ?? track.buffers?.target ?? 500, track.buffers?.target ?? 0))) * 1000;
+    const target = this.config.targetLatencyMs ?? tracks.find(track => track.targetLatency !== undefined)?.targetLatency;
+    return this.livePlaybackOwner = { current, output, floorUs, targetUs: target === undefined ? undefined : target * 1000, newest: new Map(), since: null };
   }
 
   private checkLiveJump(): void {
-    const record = this.liveJumpRecord(), sync = this.syncController;
-    if (!record || !sync?.hasReference) return;
+    const record = this.livePlaybackRecord(), sync = this.syncController;
+    if (!this.config.liveJumpThresholdMs || !record || !sync?.hasReference || !this.commandDispatcher) return;
     const roles = (['video', 'audio'] as const).filter(role => this._selection[role] !== null);
     const ahead = Math.min(...roles.map(role => {
       const newest = record.newest.get(role);
       return newest === undefined ? -Infinity : sync.computeAudioRenderTime(newest)?.offsetUs ?? -Infinity;
     }));
     const now = this.clock.now();
-    if (this.liveJumpRecord() !== record) return;
+    if (this.livePlaybackRecord() !== record) return;
     if (ahead <= this.config.liveJumpThresholdMs! * 1000) { record.since = null; return; }
     record.since ??= now;
     if (now - record.since < LIVE_JUMP_SUSTAIN_US || now - this.lastLiveJumpUs < LIVE_JUMP_COOLDOWN_US) return;
@@ -10290,6 +10307,40 @@ export class MoqtPlayer {
     dispatcher.dispatch({ type: 'reset', mediaType: 'audio', reason: 'live latency jump' });
     this.emitter.emit('recovery_action', { type: 'recovery_action',
       action: { type: 'jump_to_live', trigger: 'latency', byMs: Math.round(byUs / 1000) } });
+  }
+
+  private stopLiveCatchUp(): void {
+    this.catchUpOwner = null;
+    const changed = this.liveCatchUp?.currentRate !== undefined && this.liveCatchUp.currentRate !== 1;
+    this.liveCatchUp?.reset();
+    if (changed) {
+      this.catchUpStopped = { type: 'catch_up_changed', active: false, rate: 1,
+        latencyMs: Math.round(this.liveCatchUp!.latencyUs / 1000), targetMs: this.liveCatchUp!.targetUs / 1000 };
+      queueMicrotask(() => { if (!this._destroyed) this.publishCatchUpStop(); });
+    }
+  }
+
+  private publishCatchUpStop(): void {
+    const event = this.catchUpStopped; this.catchUpStopped = null;
+    if (event) try { this.emitter.emitIsolated('catch_up_changed', event); }
+    catch (error) { try { this.log.warn('Catch-up observer failed: %s', String(error)); } catch { /* Observer only. */ } }
+  }
+
+  private checkLiveCatchUp(): void {
+    if ((this.config.maxCatchUpRate ?? 1) <= 1) return;
+    this.publishCatchUpStop();
+    const owner = this.livePlaybackRecord();
+    if (!owner?.output) { this.stopLiveCatchUp(); return; }
+    if (this.catchUpOwner !== owner) { this.stopLiveCatchUp(); this.liveCatchUp = null; this.catchUpOwner = owner; }
+    const policy = this.liveCatchUp ??= new LiveCatchUp({ maxRate: this.config.maxCatchUpRate!,
+      thresholdUs: this.config.catchUpThresholdMs! * 1000, recoveryUs: this.config.catchUpRecoveryMs! * 1000,
+      floorAheadUs: owner.floorUs });
+    const now = this.clock.now();
+    if (this.livePlaybackRecord() !== owner) { this.stopLiveCatchUp(); return; }
+    const decision = policy.tick(owner.output, now, () => this.livePlaybackRecord() === owner, owner.targetUs);
+    if (this.livePlaybackRecord() !== owner) { this.stopLiveCatchUp(); return; }
+    if (decision) this.emitter.emit('catch_up_changed', { type: 'catch_up_changed', active: decision.active,
+      rate: decision.rate, latencyMs: Math.round(policy.latencyUs / 1000), targetMs: (owner.targetUs ?? 0) / 1000 });
   }
 
   /** Require 300 ms of uninterrupted lateness; bound added latency until it is repaid. */
@@ -10574,6 +10625,7 @@ export class MoqtPlayer {
   async destroy(): Promise<void> {
     if (this._destroyed) return;
     this._destroyed = true;
+    this.stopLiveCatchUp();
     const retirementFailures: unknown[] = [];
     for (const retire of [() => this.retireMseSeek(this.preparingMseSeek), () => this.retireMseSeek(this.activeMseSeek),
       () => this.retireLocSeek(this.preparingLocSeek), () => this.retireLocSeek(this.activeLocSeek)]) {
@@ -10751,6 +10803,7 @@ export class MoqtPlayer {
       for (const listener of destroyObservers ?? []) {
         try { listener(); } catch (error) { try { this.log.warn('Destroy observer failed: %s', String(error)); } catch { /* observer failure */ } }
       }
+      this.publishCatchUpStop();
       this.emitter.removeAllListeners();
     }
     if (retirementFailures.length === 1) throw retirementFailures[0];
@@ -14445,7 +14498,6 @@ export class MoqtPlayer {
     // Stats: record event-level metrics before delegating
     if (evt.type === 'gap_detected') this._stats.recordGapDetected();
     if (evt.type === 'recovery') this._stats.recordRecoveryAction();
-    if (evt.type === 'catch_up_changed') this._stats.recordLatency(evt.state.latencyMs);
     if (evt.type === 'partial_group_abandoned' && mediaType === 'video') {
       this.lastLocPartialAbandonUs = this.clock.now();
       this.locHealthyRenderCount = 0;
@@ -15349,6 +15401,7 @@ export class MoqtPlayer {
 
   /** Stop pipeline tick interval. */
   private stopTicking(): void {
+    this.stopLiveCatchUp();
     if (this.tickInterval) {
       clearInterval(this.tickInterval);
       this.tickInterval = null;
@@ -15715,6 +15768,7 @@ export class MoqtPlayer {
       } catch (error) { fail(error); }
     };
     this.revokeVideoSwitchRecovery();
+    this.stopLiveCatchUp();
     this.pendingVideoSwitch = sw;
     this.armVideoSwitchTimeout(sw, this.config.connectionTimeoutMs || SWITCH_STAGING_TIMEOUT_MS, true);
     try {

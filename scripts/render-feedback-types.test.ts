@@ -58,7 +58,6 @@ describe('render feedback types', () => {
     const cases = [
       [syncOptions!, 'clock', false],
       [syncOptions!, 'driftThresholdUs', false],
-      [syncOptions!, 'targetLatencyMs', true],
       [dispatcherOptions!, 'onFrameRendered', false],
       [dispatcherOptions!, 'renderer', true],
       [frameOutput!, 'videoDecoder', true],

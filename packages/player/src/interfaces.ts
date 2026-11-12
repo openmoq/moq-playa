@@ -276,7 +276,7 @@ export interface AudioOutputLike {
 
   /**
    * Set playback rate for live catch-up. Optional — if not implemented,
-   * catch-up degrades to video-only (frame dropping).
+   * catch-up is unavailable for outputs containing audio.
    * Rate 1.0 = normal, >1.0 = faster (catching up).
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */
@@ -622,6 +622,11 @@ export interface MediaSourceLike {
    * currentTime now outside all buffered ranges).
    */
   getBufferAheadUs?(): number | null;
+
+  /** Set the shared media-element A/V rate, preserving pitch. Optional: outputs
+   * require this capability and getBufferAheadUs to catch up. Called only when
+   * maxCatchUpRate > 1; the player restores 1 on retirement. */
+  setPlaybackRate?(rate: number): void;
 
   /** Native element-load-scoped video counters, or null without owned video,
    * support, or valid measurements. A supported all-zero snapshot is observed

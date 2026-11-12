@@ -2052,6 +2052,15 @@ export class MseMediaSource implements MediaSourceLike {
     } catch { return null; }
   }
 
+  private originalPitch: boolean | undefined;
+  /** Change the shared element rate while preserving audio pitch. */
+  setPlaybackRate(rate: number): void {
+    if (rate !== 1) this.originalPitch ??= this.video.preservesPitch;
+    this.video.preservesPitch = rate === 1 ? this.originalPitch ?? this.video.preservesPitch : true;
+    if (rate === 1) this.originalPitch = undefined;
+    this.video.playbackRate = rate;
+  }
+
   getBufferAheadUs(): number | null {
     const v = this.video;
     if (!v.buffered.length) {

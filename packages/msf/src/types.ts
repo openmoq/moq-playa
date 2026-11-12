@@ -186,6 +186,12 @@ export interface CatalogTrack {
     readonly spatialId?: number;
     /** @see draft-ietf-moq-msf-00 §5.1.16 — target latency in ms; MUST NOT be present if isLive=false */
     readonly targetLatency?: number;
+    /**
+     * Live playback buffer limits in ms (msf-01 §5.2.9). Players SHOULD stabilize
+     * at `target` and SHOULD NOT operate below `min` or above `max`. Ignored when
+     * the track is not live.
+     */
+    readonly buffers?: { readonly min?: number; readonly target?: number; readonly max?: number };
     /** @see draft-ietf-moq-msf-00 §5.1.37 — track duration in ms; MUST NOT be present if isLive=true */
     readonly trackDuration?: number;
     /** @see draft-ietf-moq-msf-00 §5.1.13 — required if packaging="eventtimeline", MUST NOT appear otherwise */

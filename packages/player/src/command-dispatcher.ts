@@ -812,12 +812,6 @@ export class CommandDispatcher {
         }
         break;
 
-      case 'set_playback_rate':
-        // Route to audio output — video catch-up uses frame dropping, not rate.
-        // Optional chaining: AudioOutputLike.setPlaybackRate is optional.
-        // @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
-        this.audioOutput?.setPlaybackRate?.(cmd.rate);
-        break;
     }
   }
 

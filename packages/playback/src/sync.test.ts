@@ -230,9 +230,9 @@ describe('SyncController', () => {
         expect(timing!.shouldDrop).toBe(false);
     });
 
-    // ─── Live Catch-Up (§5.1.16 targetLatency) ─────────────────────
+    // ─── Capture-age diagnostics ─────────────────────
 
-    describe('catch-up', () => {
+    describe('capture-age diagnostics', () => {
         // Mock wall clock — returns Unix epoch microseconds (same domain as CaptureTimestamp)
         class MockWallClock implements WallClockSource {
             private _now = 0;
@@ -240,26 +240,17 @@ describe('SyncController', () => {
             set(us: number): void { this._now = us; }
         }
 
-        const TARGET_MS = 1000;      // 1 second target latency
-        const THRESHOLD_MS = 500;    // activate at 1500ms latency
-        const RECOVERY_MS = 50;      // deactivate at 1050ms latency
-        const MAX_RATE = 1.1;        // 10% faster
-
-        function createCatchUpSync(wallClock: MockWallClock) {
+        function createCaptureAgeSync(wallClock: MockWallClock) {
             return new SyncController({
                 driftThresholdUs: DRIFT_THRESHOLD,
                 clock: new MockClock(),
-                targetLatencyMs: TARGET_MS,
-                maxCatchUpRate: MAX_RATE,
-                catchUpThresholdMs: THRESHOLD_MS,
-                catchUpRecoveryMs: RECOVERY_MS,
                 wallClock,
             });
         }
 
         it('measureLatency returns wall-clock difference (§2.3.1.1)', () => {
             const wallClock = new MockWallClock();
-            const sync = createCatchUpSync(wallClock);
+            const sync = createCaptureAgeSync(wallClock);
 
             // Publisher captured at t=1000s, subscriber wall clock is at t=1001s
             wallClock.set(1_001_000_000); // 1001 seconds in µs
@@ -269,147 +260,17 @@ describe('SyncController', () => {
 
         it('measureLatency returns null for 0n timestamp', () => {
             const wallClock = new MockWallClock();
-            const sync = createCatchUpSync(wallClock);
+            const sync = createCaptureAgeSync(wallClock);
             wallClock.set(1_000_000_000);
             expect(sync.measureLatency(0n)).toBeNull();
         });
 
-        it('evaluateCatchUp returns null when disabled (maxRate=1.0)', () => {
-            const wallClock = new MockWallClock();
-            const sync = new SyncController({
-                driftThresholdUs: DRIFT_THRESHOLD,
-                clock: new MockClock(),
-                maxCatchUpRate: 1.0, // disabled
-                targetLatencyMs: TARGET_MS,
-                wallClock,
-            });
-
-            wallClock.set(1_002_000_000);
-            expect(sync.evaluateCatchUp(1_000_000_000n)).toBeNull();
-        });
-
-        it('evaluateCatchUp returns null without targetLatencyMs', () => {
-            const wallClock = new MockWallClock();
-            const sync = new SyncController({
-                driftThresholdUs: DRIFT_THRESHOLD,
-                clock: new MockClock(),
-                maxCatchUpRate: MAX_RATE,
-                // No targetLatencyMs
-                wallClock,
-            });
-
-            wallClock.set(1_002_000_000);
-            expect(sync.evaluateCatchUp(1_000_000_000n)).toBeNull();
-        });
-
-        it('activates when latency exceeds target + threshold (§5.1.16)', () => {
-            const wallClock = new MockWallClock();
-            const sync = createCatchUpSync(wallClock);
-
-            // Latency = 1600ms > target(1000) + threshold(500) = 1500ms → activate
-            wallClock.set(1_001_600_000); // 1001.6s
-            const state = sync.evaluateCatchUp(1_000_000_000n); // 1000s
-            expect(state).not.toBeNull();
-            expect(state!.active).toBe(true);
-            expect(state!.latencyMs).toBe(1600);
-            expect(state!.targetMs).toBe(TARGET_MS);
-            expect(state!.currentRate).toBeGreaterThan(1.0);
-        });
-
-        it('does not activate below threshold', () => {
-            const wallClock = new MockWallClock();
-            const sync = createCatchUpSync(wallClock);
-
-            // Latency = 1400ms < target(1000) + threshold(500) = 1500ms → no activation
-            wallClock.set(1_001_400_000);
-            const state = sync.evaluateCatchUp(1_000_000_000n);
-            // Returns non-null (latency measured, catch-up evaluated) but not active
-            expect(state).not.toBeNull();
-            expect(state!.active).toBe(false);
-            expect(state!.currentRate).toBe(1.0);
-        });
-
-        it('deactivates when latency drops to target + recovery (§5.1.16)', () => {
-            const wallClock = new MockWallClock();
-            const sync = createCatchUpSync(wallClock);
-
-            // First: activate (latency = 1600ms > 1500ms threshold)
-            wallClock.set(1_001_600_000);
-            const active = sync.evaluateCatchUp(1_000_000_000n);
-            expect(active!.active).toBe(true);
-
-            // Then: drop latency to 1040ms <= target(1000) + recovery(50) = 1050ms → deactivate
-            wallClock.set(1_001_040_000);
-            const deactivated = sync.evaluateCatchUp(1_000_000_000n);
-            expect(deactivated!.active).toBe(false);
-            expect(deactivated!.currentRate).toBe(1.0);
-        });
-
-        it('rate is proportional to overshoot', () => {
-            const wallClock = new MockWallClock();
-            const sync = createCatchUpSync(wallClock);
-
-            // Latency = 1750ms → overshoot = 750ms, ratio = 750/500 = 1.0 (clamped), rate = 1.1
-            wallClock.set(1_001_750_000);
-            const full = sync.evaluateCatchUp(1_000_000_000n);
-            expect(full!.currentRate).toBe(MAX_RATE);
-
-            // Reset and try smaller overshoot
-            sync.reset();
-            // Latency = 1250ms → overshoot = 250ms, ratio = 250/500 = 0.5, rate = 1.0 + 0.1*0.5 = 1.05
-            wallClock.set(1_001_750_000);
-            // First activate
-            sync.evaluateCatchUp(1_000_000_000n);
-            // Now with less overshoot (need a new capture time)
-            wallClock.set(1_001_250_000);
-            // Already active from previous call, so this will update rate
-            // Actually, after reset() the sync is no longer active. Let me activate first.
-        });
-
-        it('rate is quantized to 0.05x increments', () => {
-            const wallClock = new MockWallClock();
-            const sync = createCatchUpSync(wallClock);
-
-            // Activate: latency = 1600ms → overshoot = 600, ratio = 600/500 = 1.0 (clamped)
-            // rate = 1.0 + 0.1 * 1.0 = 1.1, quantized = 1.1 ✓
-            wallClock.set(1_001_600_000);
-            const state = sync.evaluateCatchUp(1_000_000_000n);
-            expect(state!.active).toBe(true);
-            // 1.1 is a valid 0.05x increment
-            expect(state!.currentRate * 20 % 1).toBeCloseTo(0, 5);
-        });
-
-        it('rate is capped at maxCatchUpRate', () => {
-            const wallClock = new MockWallClock();
-            const sync = createCatchUpSync(wallClock);
-
-            // Extreme latency = 5000ms → overshoot = 4000ms, ratio clamped at 1.0
-            // rate = 1.0 + 0.1 * 1.0 = 1.1, capped at maxCatchUpRate 1.1
-            wallClock.set(1_005_000_000);
-            const state = sync.evaluateCatchUp(1_000_000_000n);
-            expect(state!.currentRate).toBeLessThanOrEqual(MAX_RATE);
-        });
-
-        it('reset clears catch-up state', () => {
-            const wallClock = new MockWallClock();
-            const sync = createCatchUpSync(wallClock);
-
-            // Activate
-            wallClock.set(1_001_600_000);
-            sync.evaluateCatchUp(1_000_000_000n);
-            expect(sync.catchUpActive).toBe(true);
-
-            sync.reset();
-            expect(sync.catchUpActive).toBe(false);
-            expect(sync.currentRate).toBe(1.0);
-        });
-
         it('latencyUs getter returns last measurement', () => {
             const wallClock = new MockWallClock();
-            const sync = createCatchUpSync(wallClock);
+            const sync = createCaptureAgeSync(wallClock);
 
             wallClock.set(1_001_500_000);
-            sync.evaluateCatchUp(1_000_000_000n);
+            sync.observeCaptureTimestamp(1_000_000_000n);
             expect(sync.latencyUs).toBe(1_500_000); // 1500ms in µs
         });
     });
@@ -596,11 +457,11 @@ describe('SyncController', () => {
             expect(sync.measureLatency(1_000_000n, false)).toBeNull();
         });
 
-        it('evaluateCatchUp returns null and invalidates capture age for media time', () => {
-            const sync = new SyncController({ clock: new MockClock(), driftThresholdUs: DRIFT_THRESHOLD, wallClock: { now: () => 5_000_000 }, targetLatencyMs: 100, maxCatchUpRate: 1.5 });
-            sync.evaluateCatchUp(1_000_000n);
+        it('observeCaptureTimestamp invalidates capture age for media time', () => {
+            const sync = new SyncController({ clock: new MockClock(), driftThresholdUs: DRIFT_THRESHOLD, wallClock: { now: () => 5_000_000 } });
+            sync.observeCaptureTimestamp(1_000_000n);
             expect(sync.captureTimestampAgeUs).toBe(4_000_000);
-            expect(sync.evaluateCatchUp(2_000_000n, false)).toBeNull();
+            sync.observeCaptureTimestamp(2_000_000n, false);
             expect(sync.latencyUs).toBe(0);
             expect(sync.captureTimestampAgeUs).toBeNull();
         });

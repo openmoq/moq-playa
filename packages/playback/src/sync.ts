@@ -13,17 +13,13 @@
  * The reference is set once to avoid audio glitching from re-anchor jumps.
  * In practice, gap recovery (skip_forward) and seek/pause naturally re-anchor.
  *
- * Live catch-up: uses the uncorrected age of CaptureTimestamp against the
- * subscriber wall-clock, assuming comparable clocks. When that age exceeds
- * targetLatency + threshold, activates catch-up (playback rate > 1.0).
- * Hysteresis prevents oscillation near the threshold boundary.
+ * Capture-age diagnostics compare timestamps against the receiver wall clock.
  *
  * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp)
- * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
  * @module
  */
 
-import type { ClockSource, CatchUpState } from './types.js';
+import type { ClockSource } from './types.js';
 
 // ─── Render timing ──────────────────────────────────────────────────
 
@@ -66,15 +62,6 @@ export interface SyncControllerConfig {
     readonly dropThresholdUs?: number;
     readonly clock: ClockSource;
 
-    // ── Catch-up (§5.1.16 targetLatency) ───────────────────────
-    /** Target end-to-end latency in ms. @see draft-ietf-moq-msf-00 §5.1.16 */
-    readonly targetLatencyMs?: number;
-    /** Max playback rate for catch-up (e.g., 1.1). Default: 1.0 (disabled). */
-    readonly maxCatchUpRate?: number;
-    /** Latency above target before catch-up activates (ms). Default: 500. */
-    readonly catchUpThresholdMs?: number;
-    /** Latency above target before catch-up deactivates (ms, hysteresis). Default: 50. */
-    readonly catchUpRecoveryMs?: number;
     /** Injectable wall-clock for testability. Default: Date.now() * 1000. */
     readonly wallClock?: WallClockSource;
 }
@@ -82,10 +69,9 @@ export interface SyncControllerConfig {
 // ─── SyncController ─────────────────────────────────────────────────
 
 /**
- * A/V sync controller with live catch-up.
+ * A/V sync controller with capture-age diagnostics.
  *
  * @see draft-ietf-moq-loc-01 §2.3.1.1
- * @see draft-ietf-moq-msf-00 §5.1.16
  */
 export class SyncController {
     private _driftThresholdUs: number;
@@ -114,15 +100,8 @@ export class SyncController {
      */
     private _videoJoinOffsetUs = 0;
 
-    // ── Catch-up state ─────────────────────────────────────────
+    // ── Capture-age diagnostics ─────────────────────────────────────────
     private readonly wallClock: WallClockSource;
-    private readonly targetLatencyMs: number | undefined;
-    private readonly maxCatchUpRate: number;
-    private readonly catchUpThresholdMs: number;
-    private readonly catchUpRecoveryMs: number;
-
-    private _catchUpActive = false;
-    private _currentRate = 1.0;
     private _captureTimestampAgeUs: number | null = null;
     /** Latest age per timestamp source whose latest observation was measurable,
      *  in measurement order (the last entry is the most recent). */
@@ -133,12 +112,7 @@ export class SyncController {
         this.dropThresholdUs = config.dropThresholdUs ?? DEFAULT_DROP_THRESHOLD_US;
         this.clock = config.clock;
 
-        // Catch-up config
         this.wallClock = config.wallClock ?? DEFAULT_WALL_CLOCK;
-        this.targetLatencyMs = config.targetLatencyMs;
-        this.maxCatchUpRate = config.maxCatchUpRate ?? 1.0;
-        this.catchUpThresholdMs = config.catchUpThresholdMs ?? 500;
-        this.catchUpRecoveryMs = config.catchUpRecoveryMs ?? 50;
     }
 
     /** Whether a sync reference has been established. */
@@ -179,16 +153,6 @@ export class SyncController {
         return Math.abs(this._currentDriftUs) >= this._driftThresholdUs;
     }
 
-    /** Whether catch-up is currently active. */
-    get catchUpActive(): boolean {
-        return this._catchUpActive;
-    }
-
-    /** Current playback rate (1.0 when catch-up inactive). */
-    get currentRate(): number {
-        return this._currentRate;
-    }
-
     /**
      * Legacy numeric alias for captureTimestampAgeUs; 0 also means unavailable.
      * This uncorrected clock difference is not verified presentation latency.
@@ -200,7 +164,7 @@ export class SyncController {
 
     /** Latest receiver-wall-clock minus capture timestamp, in microseconds.
      * Null before a wall-clock observation, after reset, and while no source's
-     * latest observation is measurable (see evaluateCatchUp).
+     * latest observation is measurable (see observeCaptureTimestamp).
      * May be zero or negative; no sender/receiver clock correction is implied.
      */
     get captureTimestampAgeUs(): number | null {
@@ -373,7 +337,7 @@ export class SyncController {
         this._currentDriftUs = actualLocalUs - expectedRenderUs;
     }
 
-    // ─── Live Catch-Up ──────────────────────────────────────────────
+    // ─── Capture-age diagnostics ──────────────────────────────────────────────
 
     /**
      * Measure uncorrected receiver-wall-clock minus capture timestamp.
@@ -397,67 +361,25 @@ export class SyncController {
     }
 
     /**
-     * Evaluate catch-up state based on current latency.
-     *
-     * Hysteresis: activates when latency > target + threshold,
-     * deactivates when latency <= target + recovery.
-     *
-     * Rate is proportional to overshoot, quantized to 0.05x increments.
+     * Record the capture-age diagnostic for a timestamp source.
      *
      * @param captureTimestampUs CaptureTimestamp in microseconds (Unix epoch)
      * @param isWallClock False when the timestamp is media time. Undefined means wall clock.
      * @param source Media role, or the empty source for legacy two-argument callers.
      *   An unmeasurable timestamp invalidates only its own source's age, so a
      *   media-time track cannot null out a wall-clock track's measurement.
-     * @returns CatchUpState if evaluated, null if catch-up is disabled or no timestamp
-     * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
      */
-    evaluateCatchUp(captureTimestampUs: bigint, isWallClock?: boolean, source: 'audio' | 'video' | '' = ''): CatchUpState | null {
+    observeCaptureTimestamp(captureTimestampUs: bigint, isWallClock?: boolean, source: 'audio' | 'video' | '' = ''): void {
         if (source !== '' && source !== 'audio' && source !== 'video') {
             throw new TypeError('Capture timestamp source must be audio, video, or the legacy empty source');
         }
-        // Measure latency
-        const latencyUs = this.measureLatency(captureTimestampUs, isWallClock);
+        const ageUs = this.measureLatency(captureTimestampUs, isWallClock);
         const ages = this._captureTimestampAgeBySource;
         ages.delete(source);
-        if (latencyUs !== null) ages.set(source, latencyUs);
+        if (ageUs !== null) ages.set(source, ageUs);
         let latest: number | null = null;
         for (const age of ages.values()) latest = age;
         this._captureTimestampAgeUs = latest;
-        if (latencyUs === null) return null;
-
-        // Catch-up disabled?
-        if (this.targetLatencyMs === undefined || this.maxCatchUpRate <= 1.0) return null;
-
-        const latencyMs = latencyUs / 1000;
-        const targetMs = this.targetLatencyMs;
-
-        // Hysteresis: activate/deactivate
-        if (!this._catchUpActive && latencyMs > targetMs + this.catchUpThresholdMs) {
-            this._catchUpActive = true;
-        } else if (this._catchUpActive && latencyMs <= targetMs + this.catchUpRecoveryMs) {
-            this._catchUpActive = false;
-            this._currentRate = 1.0;
-            return { active: false, currentRate: 1.0, latencyMs, targetMs };
-        }
-
-        if (this._catchUpActive) {
-            // Proportional rate: scale linearly with overshoot
-            const overshoot = latencyMs - targetMs;
-            const ratio = Math.min(Math.max(overshoot / this.catchUpThresholdMs, 0), 1);
-            const rawRate = 1.0 + (this.maxCatchUpRate - 1.0) * ratio;
-            // Quantize to 0.05x increments
-            const quantized = Math.round(rawRate * 20) / 20;
-            // Clamp to [1.0, maxCatchUpRate]
-            this._currentRate = Math.min(Math.max(quantized, 1.0), this.maxCatchUpRate);
-        }
-
-        return {
-            active: this._catchUpActive,
-            currentRate: this._currentRate,
-            latencyMs,
-            targetMs,
-        };
     }
 
     /**
@@ -471,8 +393,6 @@ export class SyncController {
         this.captureBaselineUs = undefined;
         this._currentDriftUs = 0;
         this._videoJoinOffsetUs = 0;
-        this._catchUpActive = false;
-        this._currentRate = 1.0;
     }
 
     // ─── Internal ───────────────────────────────────────────────────

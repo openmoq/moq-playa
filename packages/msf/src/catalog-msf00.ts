@@ -462,6 +462,7 @@ export function extractRecognizedOptionalFields(
         ...(Array.isArray(obj['depends']) ? { depends: obj['depends'] as string[] } : {}),
         ...(typeof obj['temporalId'] === 'number' ? { temporalId: obj['temporalId'] } : {}),
         ...(typeof obj['spatialId'] === 'number' ? { spatialId: obj['spatialId'] } : {}),
+        ...(obj['buffers'] && typeof obj['buffers'] === 'object' ? { buffers: Object.fromEntries(Object.entries(obj['buffers']).filter(([key, value]) => (key === 'min' || key === 'target' || key === 'max') && typeof value === 'number' && Number.isFinite(value) && value >= 0)) } : {}),
         ...(typeof obj['targetLatency'] === 'number' ? { targetLatency: obj['targetLatency'] } : {}),
         ...(typeof obj['trackDuration'] === 'number' ? { trackDuration: obj['trackDuration'] } : {}),
         ...(typeof obj['eventType'] === 'string' ? { eventType: obj['eventType'] } : {}),

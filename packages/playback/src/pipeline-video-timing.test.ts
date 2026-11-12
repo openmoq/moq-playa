@@ -9,7 +9,7 @@ function fixture(adaptiveTolerance = false) {
     let now = 0;
     const clock = { now: () => now };
     const sync = new SyncController({ clock, wallClock: { now: () => 1_000_250_000 },
-        driftThresholdUs: 500_000, targetLatencyMs: 250, catchUpThresholdMs: 100, maxCatchUpRate: 1.1 });
+        driftThresholdUs: 500_000 });
     sync.setAudioReference(990_000_000n);
     now = 9_980_000;
     const commands: DecoderCommand[] = [], events: PlaybackEvent[] = [];
@@ -97,17 +97,15 @@ describe('video producing timing context', () => {
         expect(f.sync.captureTimestampAgeUs).toBe(250_000);
     });
 
-    it.each([false, true])('mapped raw video does not control shared reference, join, age or catch-up: %s', wallClock => {
+    it.each([false, true])('mapped raw video does not control shared reference, join or age: %s', wallClock => {
         const f = fixture(true), join = vi.spyOn(f.sync, 'onVideoJoin');
-        f.sync.evaluateCatchUp(1_000_000_000n, true);
+        f.sync.observeCaptureTimestamp(1_000_000_000n, true);
         f.sync.driftThresholdUs = 321_000;
         f.pipeline.setVideoTimingSource({ computeVideoRenderTime: () => ({ renderTimeUs: 10_000_000, offsetUs: 20_000, shouldDrop: false }) });
         f.push(90_000_000n, wallClock);
         expect(join).not.toHaveBeenCalled();
         expect(f.sync.captureTimestampAgeUs).toBe(250_000);
-        expect(f.sync.currentRate).toBe(1);
         expect(f.sync.driftThresholdUs).toBe(321_000);
-        expect(f.events.filter(event => event.type === 'catch_up_changed')).toEqual([]);
         f.sync.reset();
         f.push(90_020_000n, wallClock);
         expect(f.sync.hasReference).toBe(false);

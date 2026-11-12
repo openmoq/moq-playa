@@ -1265,105 +1265,17 @@ describe('PlaybackPipeline', () => {
         });
     });
 
-    // ─── Live Catch-Up (§5.1.16) ──────────────────────────────────
-
-    describe('catch-up', () => {
-        // Mock wall clock for latency measurement
-        class MockWallClock {
-            private _now = 0;
-            now(): number { return this._now; }
-            set(us: number): void { this._now = us; }
-        }
-
-        function createCatchUpPipeline(wallClock: MockWallClock) {
-            const clock = new MockClock();
-            clock.set(5_000_000);
-            const sync = new SyncController({
-                driftThresholdUs: 500_000,
-                clock,
-                targetLatencyMs: 1000,
-                maxCatchUpRate: 1.1,
-                catchUpThresholdMs: 500,
-                catchUpRecoveryMs: 50,
-                wallClock,
-            });
-            const commands: DecoderCommand[] = [];
-            const events: PlaybackEvent[] = [];
-            const pipeline = new PlaybackPipeline({
-                mediaType: 'audio',
-                config: DEFAULT_CONFIG,
-                clock,
-                sync,
-                onCommand: (cmd) => commands.push(cmd),
-                onEvent: (evt) => events.push(evt),
-            });
-            return { pipeline, commands, events, sync, clock };
-        }
-
-        it('emits set_playback_rate command during catch-up (§5.1.16)', () => {
-            const wallClock = new MockWallClock();
-            const { pipeline, commands, sync } = createCatchUpPipeline(wallClock);
-
-            // Set up audio reference
-            sync.setAudioReference(1_000_000_000n);
-
-            // Configure audio decoder first
-            pipeline.configure(new Uint8Array([0x00]));
-
-            // Push audio object with high latency (1600ms > target 1000 + threshold 500)
-            wallClock.set(1_001_600_000);
-            pipeline.pushObject(
-                makeData(0, 0),
-                audioHeaders(1_000_000_000n),
-            );
-            pipeline.tick();
-
-            // Should have: configure + catch_up rate command + decode_audio
-            const rateCmd = commands.find(c => c.type === 'set_playback_rate');
-            expect(rateCmd).toBeDefined();
-            expect((rateCmd as any).rate).toBeGreaterThan(1.0);
-        });
-
-        it('emits catch_up_changed event on activation (§5.1.16)', () => {
-            const wallClock = new MockWallClock();
-            const { pipeline, events, sync } = createCatchUpPipeline(wallClock);
-
-            sync.setAudioReference(1_000_000_000n);
-            pipeline.configure(new Uint8Array([0x00]));
-
-            // Push with high latency
-            wallClock.set(1_001_600_000);
-            pipeline.pushObject(makeData(0, 0), audioHeaders(1_000_000_000n));
-            pipeline.tick();
-
-            const catchUpEvt = events.find(e => e.type === 'catch_up_changed');
-            expect(catchUpEvt).toBeDefined();
-            expect((catchUpEvt as any).state.active).toBe(true);
-            expect((catchUpEvt as any).state.latencyMs).toBe(1600);
-        });
-
-        it('does not spam commands when rate unchanged', () => {
-            const wallClock = new MockWallClock();
-            const { pipeline, commands, sync } = createCatchUpPipeline(wallClock);
-
-            sync.setAudioReference(1_000_000_000n);
-            pipeline.configure(new Uint8Array([0x00]));
-
-            // Push two objects at the same latency — rate should be emitted once
-            wallClock.set(1_001_600_000);
-            pipeline.pushObject(makeData(0, 0), audioHeaders(1_000_000_000n));
-            pipeline.tick();
-
-            const firstRateCount = commands.filter(c => c.type === 'set_playback_rate').length;
-            expect(firstRateCount).toBe(1);
-
-            // Push another object at same latency — rate unchanged, no new command
-            pipeline.pushObject(makeData(0, 1), audioHeaders(1_000_000_001n));
-            pipeline.tick();
-
-            const secondRateCount = commands.filter(c => c.type === 'set_playback_rate').length;
-            expect(secondRateCount).toBe(1); // Still 1 — not spammed
-        });
+    it('records capture age independently of rendering', () => {
+        const clock = new MockClock(); clock.set(5_000_000);
+        const sync = new SyncController({ clock, driftThresholdUs: 500_000,
+            wallClock: { now: () => 1_001_600_000 } });
+        const { pipeline } = createPipeline({ mediaType: 'audio', clock, sync });
+        sync.setAudioReference(1_000_000_000n);
+        pipeline.configure(new Uint8Array([0x00]));
+        pipeline.pushObject(makeData(0, 0), audioHeaders(1_000_000_000n));
+        pipeline.tick();
+        expect(sync.latencyUs).toBe(1_600_000);
+        expect(sync.captureTimestampAgeUs).toBe(1_600_000);
     });
 
     // ── Automatic sync re-anchor on drift ────────────────────────────
@@ -2129,7 +2041,7 @@ describe('PlaybackPipeline', () => {
             clock.set(5_000_000);
             const config: PlaybackConfig = { ...DEFAULT_CONFIG, adaptiveTolerance: true };
             const { pipeline, sync } = createPipeline({ mediaType: 'audio', clock, config });
-            const spy = vi.spyOn(sync, 'evaluateCatchUp');
+            const spy = vi.spyOn(sync, 'observeCaptureTimestamp');
 
             pipeline.pushObject(makeData(1, 0), { captureTimestamp: 1_000_000n, timestampIsWallClock: false });
             pipeline.tick();
@@ -2212,7 +2124,7 @@ it('excludes actual backfill arrivals from jitter without suppressing live arriv
 function joinedBackfill(backfill: boolean, audioFirst = true) {
     const clock = new MockClock(); clock.set(5_000_000);
     const sync = new SyncController({ clock, wallClock: { now: () => 1_000_250_000 },
-        driftThresholdUs: 150_000, targetLatencyMs: 250, catchUpThresholdMs: 100, maxCatchUpRate: 1.1 });
+        driftThresholdUs: 150_000 });
     const audio = createPipeline({ mediaType: 'audio', clock, sync });
     const video = createPipeline({ mediaType: 'video', clock, sync });
     audio.pipeline.configure(new Uint8Array([1]));
@@ -2221,7 +2133,6 @@ function joinedBackfill(backfill: boolean, audioFirst = true) {
     video.pipeline.pushObject(makeData(0, 0), videoHeaders(999_500_000n, true, new Uint8Array([1])), undefined, { backfill });
     video.pipeline.tick();
     const ageAfterHead = sync.latencyUs;
-    const headRates = video.commands.filter(command => command.type === 'set_playback_rate');
     if (!audioFirst) anchorAudio();
     clock.advance(50_000);
     audio.pipeline.pushObject(makeData(0, 1), audioHeaders(1_000_033_333n)); audio.pipeline.tick();
@@ -2229,7 +2140,7 @@ function joinedBackfill(backfill: boolean, audioFirst = true) {
     const a = audio.commands.filter(command => command.type === 'decode_audio').at(-1);
     const v = video.commands.filter(command => command.type === 'decode_video').at(-1);
     if (!a || !v) throw new Error('fixture did not emit both decode commands');
-    return { difference: v.renderTimeUs - a.renderTimeUs, ageAfterHead, headRates };
+    return { difference: v.renderTimeUs - a.renderTimeUs, ageAfterHead };
 }
 
 describe('backfill timing on the shared playback clock', () => {
@@ -2242,13 +2153,11 @@ describe('backfill timing on the shared playback clock', () => {
     it('preserves the ordinary live-join re-anchor', () => {
         expect(joinedBackfill(false).difference).toBe(516_000);
     });
-    it('does not change live capture age or catch-up rate in response to older backfill', () => {
+    it('does not change live capture age in response to older backfill', () => {
         const head = joinedBackfill(true);
         expect.soft(head.ageAfterHead).toBe(250_000);
-        expect(head.headRates).toEqual([]);
         const ordinary = joinedBackfill(false);
         expect(ordinary.ageAfterHead).toBe(750_000);
-        expect(ordinary.headRates).toHaveLength(1);
     });
     it.each(['reset', 'eviction'] as const)('forgets the backfill bit with buffered ownership on %s', action => {
         const clock = new MockClock(); clock.set(5_000_000);

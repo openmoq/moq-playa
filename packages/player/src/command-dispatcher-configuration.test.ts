@@ -123,7 +123,6 @@ describe('successful configure argument receipts', () => {
       { type: 'decode_audio', chunk: { type: 'key', timestamp: 0, data: Uint8Array.of(1) }, renderTimeUs: 0 },
       { type: 'flush', mediaType: 'video' }, { type: 'flush', mediaType: 'audio' },
       { type: 'reset', mediaType: 'video', reason: 'test' }, { type: 'reset', mediaType: 'audio', reason: 'test' },
-      { type: 'set_playback_rate', rate: 1.1 },
     ];
     for (const command of commands) expect(dispatcher.dispatch(command)).toBeUndefined();
     await Promise.resolve(); dispatcher.destroy();

@@ -16,8 +16,7 @@ function fixture(adaptiveTolerance = false) {
     let nowUs = 0;
     const clock = { now: () => nowUs };
     const sync = new SyncController({ clock, wallClock: { now: () => 1_000_250_000 },
-        driftThresholdUs: 500_000, targetLatencyMs: 250, catchUpThresholdMs: 100,
-        maxCatchUpRate: 1.1 });
+        driftThresholdUs: 500_000 });
     // Raw source epoch 990 seconds corresponds to local presentation time zero.
     sync.setAudioReference(990_000_000n);
     nowUs = 9_980_000;
@@ -80,18 +79,14 @@ describe('audio-only source timing', () => {
         expect(f.lastAudio().renderTimeUs).toBe(10_000_000);
         expect(f.lastAudio().chunk.timestamp).toBe(1_000_000_000);
         expect(f.sync.captureTimestampAgeUs).toBe(250_000);
-        expect(f.sync.currentRate).toBe(1);
     });
 
-    it.each([false, true])('mapped audio cannot change shared capture age or catch-up: wall-clock=%s', wallClock => {
+    it.each([false, true])('mapped audio cannot change shared capture age: wall-clock=%s', wallClock => {
         const f = fixture();
-        f.sync.evaluateCatchUp(1_000_000_000n, true);
+        f.sync.observeCaptureTimestamp(1_000_000_000n, true);
         f.pipeline.setAudioTimingSource(mapping(f.sync, 90_000_000n));
         f.push(90_000_000n, wallClock);
         expect(f.sync.captureTimestampAgeUs).toBe(250_000);
-        expect(f.sync.currentRate).toBe(1);
-        expect(f.events.filter(event => event.type === 'catch_up_changed')).toEqual([]);
-        expect(f.commands.filter(command => command.type === 'set_playback_rate')).toEqual([]);
         // Reference-domain video still owns its ordinary control path.
         const video = new PlaybackPipeline({ mediaType: 'video', clock: f.clock, sync: f.sync,
             config: { gapTimeoutUs: 200_000, driftThresholdUs: 500_000, maxBufferDepth: 100 },

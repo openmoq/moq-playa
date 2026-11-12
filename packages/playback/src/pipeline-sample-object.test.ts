@@ -398,10 +398,10 @@ describe('sample Objects in the playback pipeline', () => {
     expect(f.decoded().every(c => c.renderTimeUs === 777)).toBe(true);
   });
 
-  it('backfill excludes sample batches from join and live catch-up while keeping their source PTS', () => {
-    const f = fixture(), join = vi.spyOn(f.sync, 'onVideoJoin'), catchUp = vi.spyOn(f.sync, 'evaluateCatchUp');
+  it('backfill excludes sample batches from join and capture-age diagnostics while keeping their source PTS', () => {
+    const f = fixture(), join = vi.spyOn(f.sync, 'onVideoJoin'), captureAge = vi.spyOn(f.sync, 'observeCaptureTimestamp');
     f.pipeline.pushSampleObject(wire(), [sample(0), sample(1)], {}, { backfill: true }); f.pipeline.tick();
-    expect(f.decoded()).toHaveLength(2); expect(join).not.toHaveBeenCalled(); expect(catchUp).not.toHaveBeenCalled();
+    expect(f.decoded()).toHaveLength(2); expect(join).not.toHaveBeenCalled(); expect(captureAge).not.toHaveBeenCalled();
   });
 
   it('retains ordinary LOC admission and release policy without a sample sidecar', () => {

@@ -352,7 +352,8 @@ export interface LatencyConfig {
   readonly liveJumpThresholdMs?: number;
   /**
    * Target end-to-end latency in milliseconds.
-   * When undefined, uses the catalog's targetLatency or disables catch-up.
+   * Caps catch-up when the output measures end-to-end latency; otherwise uses buffer ahead.
+   * Falls back to catalog targetLatency. Media elements currently have no latency reading.
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */
   readonly targetLatencyMs?: number;
@@ -360,14 +361,15 @@ export interface LatencyConfig {
   /**
    * Maximum playback rate for catch-up (e.g., 1.05 = 5% faster).
    * Default: 1.0 (catch-up disabled).
-   * Must be >= 1.0.
+   * Must be >= 1.0. Live ordinary playback only, through an output that changes
+   * audio and video together. Media elements preserve pitch. LOC catch-up is
+   * inactive until its queued audio/video output implements shared rate control.
    */
   readonly maxCatchUpRate?: number;
 
   /**
-   * Latency threshold in ms before catch-up activates. Default: 500.
-   * Catch-up only kicks in when current latency exceeds
-   * targetLatencyMs + catchUpThresholdMs.
+   * Excess-buffer threshold in ms before catch-up activates. Default: 500.
+   * Uses the least buffer ahead over 2 seconds, less catalog buffers min/target (500 ms if absent).
    */
   readonly catchUpThresholdMs?: number;
 
@@ -385,8 +387,8 @@ export interface LatencyConfig {
   readonly maxDriftMs?: number;
 
   /**
-   * Latency threshold for deactivating catch-up (hysteresis).
-   * Catch-up deactivates when latency drops to targetLatencyMs + catchUpRecoveryMs.
+   * Excess-buffer threshold for deactivating catch-up (hysteresis).
+   * Catch-up stops when standing buffer minus the jitter floor falls to this value.
    * Default: 50ms.
    * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
    */

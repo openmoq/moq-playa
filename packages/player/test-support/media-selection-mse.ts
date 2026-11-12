@@ -49,7 +49,7 @@ export interface MseMediaAppend {
   readonly ctoTicks: number;
 }
 
-export async function mediaSelectionMseFixture(options: { timeoutMs?: number; packaging?: 'cmaf' | 'locmaf'; transform?: (object: MoqtObject) => MoqtObject; config?: Partial<MoqtPlayerConfig> } = {}) {
+export async function mediaSelectionMseFixture(options: { qualityView?: boolean; timeoutMs?: number; packaging?: 'cmaf' | 'locmaf'; transform?: (object: MoqtObject) => MoqtObject; config?: Partial<MoqtPlayerConfig> } = {}) {
   const packaging = options.packaging ?? 'cmaf';
   const wire = audioPeer(18), keys = Object.keys(mseMediaTracks) as MseMediaKey[];
   const headers = {
@@ -142,7 +142,7 @@ export async function mediaSelectionMseFixture(options: { timeoutMs?: number; pa
     const track = mseMediaTracks[key], ref = mseMediaRefs[key];
     return { name: ref.name, namespace: ref.namespace.join('/'), packaging, role: track.media,
       ...(packaging === 'locmaf' ? { locmafVersion: LOCMAF_VERSION } : {}),
-      renderGroup: track.renderGroup, altGroup: track.altGroup, isLive: true,
+      renderGroup: track.renderGroup, altGroup: options.qualityView && key === 'viewVideo' ? 11 : track.altGroup, isLive: true,
       initData: Buffer.from(headers[track.media]).toString('base64'),
       ...(track.media === 'video' ? { codec: 'avc1.640028', width: 640, height: 360, bitrate: 100000 }
         : { codec: 'mp4a.40.2', samplerate: 48000, channelConfig: '2', lang: 'en' }) };

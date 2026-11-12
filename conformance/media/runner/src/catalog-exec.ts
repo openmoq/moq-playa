@@ -67,6 +67,15 @@ function projectTrack(t: CatalogTrack): Record<string, unknown> {
   if (t.locmafVersion !== undefined) o['locmafVersion'] = t.locmafVersion;
   if (t.template !== undefined) o['template'] = numStrDeep(t.template);
   if (t.contentProtectionRefIDs !== undefined) o['contentProtectionRefIDs'] = [...t.contentProtectionRefIDs];
+  // MSF-01 §5.2.9.
+  if (t.buffers !== undefined) {
+    const b: Record<string, unknown> = {};
+    for (const key of ['min', 'target', 'max'] as const) {
+      const value = t.buffers[key];
+      if (value !== undefined) b[key] = numStr(value);
+    }
+    o['buffers'] = b;
+  }
   return o;
 }
 

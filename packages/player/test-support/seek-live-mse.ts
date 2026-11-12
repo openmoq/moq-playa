@@ -7,6 +7,7 @@ import { CmafAssembler } from '../../browser/src/cmaf-assembler.js';
 import { readFirstSamplePresentationTime } from '../../browser/src/mp4-box.js';
 import { buildInit, buildChunk, SYNC_FLAGS, NON_SYNC_FLAGS } from '../../locmaf/test-support/cmaf.js';
 import { MoqtPlayer } from '../src/player.js';
+import type { MoqtPlayerConfig } from '../src/config.js';
 import type { MediaAppendObserver, MediaSeekResource, MediaSeekSample, MediaSourceLike } from '../src/interfaces.js';
 
 
@@ -37,7 +38,7 @@ export function mdat(bytes: Uint8Array): Uint8Array {
 
 type WireFetch = { id: bigint; namespace: string[]; name: string; start: { group: bigint; object: bigint }; end: { group: bigint; object: bigint }; filter?: readonly bigint[] };
 // Real player + SDK/Session + format consumers. Native append and landing are controlled witnesses, not browser decoding.
-export async function fixture(draft: 18 | 22, live: boolean, indexed: readonly (typeof locations)[number][] = locations, options: {connectionTimeoutMs?:number; receiptClock?:boolean} = {}) {
+export async function fixture(draft: 18 | 22, live: boolean, indexed: readonly (typeof locations)[number][] = locations, options: {connectionTimeoutMs?:number; receiptClock?:boolean; startPaused?: boolean; playerConfig?: Partial<MoqtPlayerConfig>; rateOutput?: Pick<MediaSourceLike, 'setPlaybackRate' | 'getBufferAheadUs'>} = {}) {
   let now = 100_000;
   const { a, b } = createLoopback();
   const client = new MoqtConnection(draft, { terminatedAliasTtlMs: 50 }), server = new MoqtConnection(draft, { role: 'server' });
@@ -55,7 +56,7 @@ export async function fixture(draft: 18 | 22, live: boolean, indexed: readonly (
   const seeked = vi.fn(), ended = vi.fn();
   let resource: MediaSeekResource | null = null, sample: MediaSeekSample | null = null, nativeTime = 90;
   let positionResolve: ((sample: MediaSeekSample) => void) | undefined;
-  const source: MediaSourceLike = { mediaElement: {}, supportsTrackIdentity: true, onFirstFrame: null, onError: null, onStall: null,
+  const source: MediaSourceLike = { ...options.rateOutput, mediaElement: {}, supportsTrackIdentity: true, onFirstFrame: null, onError: null, onStall: null,
     initialize: vi.fn(() => true), appendChunk: vi.fn(), reset: vi.fn(), destroy: vi.fn(), endOfStream: vi.fn(),
     getTimestampOffset: () => 0, setTimestampOffset: vi.fn(), setPlaybackIntent: vi.fn(),
     observeAppends(observer) { observers.add(observer); return () => { observers.delete(observer); }; },
@@ -97,7 +98,7 @@ export async function fixture(draft: 18 | 22, live: boolean, indexed: readonly (
   };
   server.onError = error => { errors.push(`peer: ${error.message}`); };
   const connected = server.connect(b); void connected.catch(error => { errors.push(String(error)); });
-  const player = new MoqtPlayer({ url: 'https://seek-live.invalid/moq', namespace: ['live', 'show'], draftVersion: draft,
+  const player = new MoqtPlayer({ ...options.playerConfig, url: 'https://seek-live.invalid/moq', namespace: ['live', 'show'], draftVersion: draft,
     ...(options.receiptClock ? { clock: { now: () => now } } : {}),
     connectionTimeoutMs: options.connectionTimeoutMs ?? 10_000, disableAudio: true, catalogBootstrap: 'subscribe', locmafDecoding: 'mse', logLevel: 'none',
     createConnection: () => client, createTransport: async () => a, createMediaSource: () => source,
@@ -129,7 +130,7 @@ export async function fixture(draft: 18 | 22, live: boolean, indexed: readonly (
     await server.acceptSubscribe(subscriptions.find(sub => sub.name === 'video')!.id, 200n);
     await server.acceptSubscribe(subscriptions.find(sub => sub.name === 'timeline')!.id, 300n);
     await send(300n, enc.encode(JSON.stringify(live ? indexed : locations.slice(0, 2))));
-    expect(source.initialize).toHaveBeenCalledOnce(); player.play(); player.pause();
+    expect(source.initialize).toHaveBeenCalledOnce(); player.play(); if (options.startPaused !== false) player.pause();
     async function accept(index: number, endObject: bigint, endOfTrack: 0 | 1) {
       const request = fetches[index]; if (!request) throw new Error(`FETCH ${index + 1} was not issued`);
       await server.acceptFetch(request.id, { endOfTrack, endLocation: { group: 3n, object: draft === 22 ? endObject - 1n : endObject } });

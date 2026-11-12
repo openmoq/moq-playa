@@ -48,8 +48,12 @@
 
     "packages/webtransport/src/adapter-primary-priority.test.ts",
     "packages/webtransport/src/send-order-setup.test.ts",
+    "packages/player/src/player-mixed-catch-up-gate.loopback.test.ts",
     "packages/player/src/player-late-audio-burst.loopback.test.ts",
     "packages/player/src/player-late-audio-budget.loopback.test.ts",
+    "packages/player/src/player-catch-up.loopback.test.ts",
+    "packages/player/src/player-loc-catch-up.test.ts",
+    "packages/player/src/live-catch-up.test.ts",
     "packages/player/src/player-late-audio.loopback.test.ts",
     "examples/node-relay/src/wt-adapter.test.ts",
     "packages/transport/src/session/session-update-staging.test.ts",

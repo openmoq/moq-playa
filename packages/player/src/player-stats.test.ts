@@ -26,15 +26,15 @@ describe('player stats measurement semantics', () => {
     expect(player.stats.captureTimestampAgeMs).toBeNull();
     expect(player.stats.currentLatencyMs).toBe(0);
     for (const age of [250, 0, -5]) {
-      state.syncController.evaluateCatchUp(BigInt(now - age * 1000));
+      state.syncController.observeCaptureTimestamp(BigInt(now - age * 1000));
       expect(player.stats.captureTimestampAgeMs).toBe(age);
       expect(player.stats.currentLatencyMs).toBe(age);
     }
     state.syncController.reset();
     expect(player.stats.captureTimestampAgeMs).toBeNull();
     expect(player.stats.currentLatencyMs).toBe(0);
-    state.syncController.evaluateCatchUp(BigInt(now - 100_000));
-    state.syncController.evaluateCatchUp(500n, false);
+    state.syncController.observeCaptureTimestamp(BigInt(now - 100_000));
+    state.syncController.observeCaptureTimestamp(500n, false);
     expect(player.stats.captureTimestampAgeMs).toBeNull();
   });
 

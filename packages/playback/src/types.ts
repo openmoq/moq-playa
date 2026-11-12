@@ -73,8 +73,7 @@ export type DecoderCommand =
     | DecodeVideoCommand
     | DecodeAudioCommand
     | FlushCommand
-    | ResetCommand
-    | SetPlaybackRateCommand;
+    | ResetCommand;
 
 /** Configure the decoder with codec extradata. @see draft-ietf-moq-loc-01 §2.3.2.1 */
 export interface ConfigureCommand {
@@ -143,12 +142,6 @@ export interface ResetCommand {
     readonly reason: string;
 }
 
-/** Adjust audio playback rate for live catch-up. @see draft-ietf-moq-msf-00 §5.1.16 */
-export interface SetPlaybackRateCommand {
-    readonly type: 'set_playback_rate';
-    readonly rate: number;
-}
-
 // ─── Playback Events ────────────────────────────────────────────────
 
 /**
@@ -162,7 +155,6 @@ export type PlaybackEvent =
     | KeyframeValidationFailedEvent
     | TrackEndedEvent
     | RecoveryEvent
-    | CatchUpChangedEvent
     | BacklogShedEvent
     | PartialGroupAbandonedEvent;
 
@@ -228,29 +220,6 @@ export interface TrackEndedEvent {
 export interface RecoveryEvent {
     readonly type: 'recovery';
     readonly action: RecoveryAction;
-}
-
-/**
- * Catch-up state — latency measurement and rate adjustment.
- *
- * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
- * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for latency measurement)
- */
-export interface CatchUpState {
-    /** Whether catch-up is currently active. */
-    readonly active: boolean;
-    /** Current playback rate (1.0 = normal, >1.0 = catching up). */
-    readonly currentRate: number;
-    /** Current end-to-end latency in milliseconds. */
-    readonly latencyMs: number;
-    /** Target latency in milliseconds. */
-    readonly targetMs: number;
-}
-
-/** Catch-up state changed (activated, rate adjusted, or deactivated). @see draft-ietf-moq-msf-00 §5.1.16 */
-export interface CatchUpChangedEvent {
-    readonly type: 'catch_up_changed';
-    readonly state: CatchUpState;
 }
 
 // ─── Decoder Feedback ───────────────────────────────────────────────
@@ -320,16 +289,6 @@ export interface PlaybackConfig {
     readonly driftThresholdUs: number;
     /** Maximum number of objects in the jitter buffer. */
     readonly maxBufferDepth: number;
-
-    // ── Catch-up (Item 8) ───────────────────────────────────────
-    /** Target end-to-end latency in milliseconds. @see draft-ietf-moq-msf-00 §5.1.16 */
-    readonly targetLatencyMs?: number;
-    /** Maximum playback rate for catch-up (e.g., 1.1 = 10% faster). Default: 1.0 (disabled). */
-    readonly maxCatchUpRate?: number;
-    /** Latency above target before catch-up activates (ms). Default: 500. */
-    readonly catchUpThresholdMs?: number;
-    /** Latency above target before catch-up deactivates (ms, hysteresis). Default: 50. */
-    readonly catchUpRecoveryMs?: number;
 
     // ── Bounded release ───────────────────────────────────────────
     /**

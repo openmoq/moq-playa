@@ -465,6 +465,7 @@ interface Scenario {
 }
 
 interface Run {
+  readonly elementRates: number[];
   /** Rung playing at the end of the run. */
   readonly finalTrack: string | undefined;
   /** Every committed switch, in order. */
@@ -521,6 +522,7 @@ async function runScenario(s: Scenario): Promise<Run> {
     flush: vi.fn(() => Promise.resolve()),
     reset: vi.fn(), queueDepth: 0, onFrame: null as any, onError: null as any, destroy: vi.fn(),
   };
+  const elementRates: number[] = [];
   const mediaSource = {
     initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
     mediaElement: null,
@@ -529,6 +531,7 @@ async function runScenario(s: Scenario): Promise<Run> {
     onStall: null as ((ms: number) => void) | null,
     changeType: vi.fn(() => Promise.resolve()),
     reserveSwitchRecovery: vi.fn(() => null),
+    setPlaybackRate: vi.fn((rate: number) => { elementRates.push(rate); }),
     getBufferAheadUs: vi.fn(() => firstVideoUs === null ? null : s.bufferAheadUs?.(clockUs) ?? null),
     // The highest group handed to the assembler stands in for what MSE committed.
     getCommittedGroupFloor: vi.fn((_mt: string, trackName: string) => assembledGroups.get(trackName)?.at(-1)),
@@ -633,7 +636,7 @@ async function runScenario(s: Scenario): Promise<Run> {
       }
     }
     return {
-      errors, lastDeliveryUs, latency, jumps, recoveryReservations: mediaSource.reserveSwitchRecovery.mock.calls.length,
+      errors, elementRates, lastDeliveryUs, latency, jumps, recoveryReservations: mediaSource.reserveSwitchRecovery.mock.calls.length,
       finalTrack: internals.subscribedTrack('video')?.name,
       switches,
       stallsAtUs,
@@ -871,4 +874,17 @@ describe('LOC latency give-back after real simulated congestion', () => {
       expect(run.errors.filter(error => error.severity === 'fatal')).toEqual([]);
     }
   });
+});
+
+// Explicit opt-in, burst and default controls
+// share a positive live catch-up witness.
+it.each([14, 16, 18, 22] as const)('CMAF catch-up uses standing buffer, not burst refills (draft %i)', async draft => {
+  const scenario = { packaging: 'cmaf' as const, draft, capacityBps: AMPLE_BPS, durationUs: SECONDS(15),
+    playerConfig: { maxCatchUpRate: 1.05, autoQuality: false } };
+  const burst = await runScenario({ ...scenario, bufferAheadUs: now => 500_000 + now % 600_000 });
+  expect(burst.elementRates).toEqual([]);
+  const off = await runScenario({ ...scenario, playerConfig: { maxCatchUpRate: 1, autoQuality: false }, bufferAheadUs: () => 2_500_000 });
+  expect(off.elementRates).toEqual([]);
+  const standing = await runScenario({ ...scenario, bufferAheadUs: now => now > SECONDS(5) ? 2_500_000 : 300_000 });
+  expect(standing.elementRates).toEqual([1.05, 1]); // teardown restores the element
 });

@@ -479,7 +479,9 @@ export interface QualitySwitchFailedEvent {
  * Live catch-up state changed — activated, rate adjusted, or deactivated.
  *
  * Emitted when the player adjusts playback rate to catch up to the live
- * edge, or when catch-up deactivates after reaching the target latency.
+ * edge, or when catch-up deactivates or loses its live output owner.
+ * latencyMs is measured latency when available, otherwise standing buffer ahead;
+ * an explicit stop retains the last reading. targetMs is the configured/catalog target.
  *
  * @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
  * @see draft-ietf-moq-loc-01 §2.3.1.1 (CaptureTimestamp for latency measurement)

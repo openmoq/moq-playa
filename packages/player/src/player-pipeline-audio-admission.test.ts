@@ -317,12 +317,12 @@ describe('ordinary audio playout-delay admission boundary', () => {
   it('changes only shouldDrop when shared sync receives an output delay', () => {
     const f = admission(), source = ORIGIN + 850_000n;
     const nominal = f.sync.computeAudioRenderTime(source)!, reference = f.sync.computeAudioRenderTime(ORIGIN);
-    const age = f.sync.captureTimestampAgeUs, rate = f.sync.currentRate;
+    const age = f.sync.captureTimestampAgeUs;
     const admitted = f.sync.computeAudioRenderTime(source, 200_000)!;
     expect(nominal.shouldDrop).toBe(true); expect(admitted).toEqual({ ...nominal, shouldDrop: false });
     expect(f.sync.computeAudioRenderTime(source)).toEqual(nominal);
     expect(f.sync.computeAudioRenderTime(ORIGIN)).toEqual(reference);
-    expect(f.sync.captureTimestampAgeUs).toBe(age); expect(f.sync.currentRate).toBe(rate);
+    expect(f.sync.captureTimestampAgeUs).toBe(age);
   });
 
   it('never previews ordinary delay for mapped timing and adds the downstream cushion only once', () => {

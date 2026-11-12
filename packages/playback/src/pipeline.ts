@@ -297,9 +297,6 @@ export class PlaybackPipeline {
         };
     }
 
-    /** Last emitted playback rate — dedup to avoid spamming commands. */
-    private _lastEmittedRate = 1.0;
-
     /**
  * Throttle flag — set by decoder feedback when queue depth is high.
  * While true, tick() evaluates gaps but does NOT drain the buffer.
@@ -380,7 +377,7 @@ export class PlaybackPipeline {
     /**
      * Install engine-owned audio timing without changing raw decoder timestamps.
      * A provider distinct from shared sync uses a mapped source domain, so it
-     * cannot control the shared reference, capture age, catch-up or drift
+     * cannot control the shared reference, capture age or drift
      * threshold. Undefined restores the original timeline. The engine owns mapping composition and
      * must drain or retire buffered inputs before replacing this provider.
      * Emitted commands retain their already captured absolute render times.
@@ -648,7 +645,7 @@ export class PlaybackPipeline {
         this.pruneDroppedObjects();
 
         // Interarrival jitter uses transit differences, so the timestamp epoch
-        // cancels out. Media time is suitable here, but not for latency/catch-up.
+        // cancels out. Media time is suitable here, but not for capture-age measurement.
         if (this.adaptiveTolerance && headers?.captureTimestamp !== undefined && delivery?.backfill !== true) {
             const nowMs = this.clock.now() / 1000; // µs → ms
             const captureUs = Number(headers.captureTimestamp);
@@ -1525,18 +1522,12 @@ export class PlaybackPipeline {
         }
 
         // 3b. Backfill primes decoding on the existing A/V timeline; it must
-        // not re-anchor that clock or change the live catch-up decision.
-        // Evaluate live catch-up from CaptureTimestamp
+        // not re-anchor that clock or change capture-age diagnostics.
+        // Observe CaptureTimestamp age
         // @see draft-ietf-moq-loc-01 §2.3.1.1 (latency measurement)
-        // @see draft-ietf-moq-msf-00 §5.1.16 (targetLatency)
         if (originalTimeline && !backfill && headers.captureTimestamp !== undefined) {
-            const catchUp = this.sync.evaluateCatchUp(headers.captureTimestamp, headers.timestampIsWallClock, this.mediaType);
-            if (catchUp !== null && catchUp.currentRate !== this._lastEmittedRate) {
-                this._lastEmittedRate = catchUp.currentRate;
-                this.onEvent({ type: 'catch_up_changed', state: catchUp });
-                if (revision !== this.playbackRevision) { this.reportSample(inputs, input, batch, 'decoder reset'); return; }
-                this.onCommand({ type: 'set_playback_rate', rate: catchUp.currentRate });
-            }
+            // Capture-age diagnostics are independent of player rate policy.
+            this.sync.observeCaptureTimestamp(headers.captureTimestamp, headers.timestampIsWallClock, this.mediaType);
         }
 
         if (revision !== this.playbackRevision) { this.reportSample(inputs, input, batch, 'decoder reset'); return; }

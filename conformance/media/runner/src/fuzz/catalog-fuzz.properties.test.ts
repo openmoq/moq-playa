@@ -151,6 +151,7 @@ describe('Catalog crash fuzz — parseCatalogAuto', () => {
       initRef: 'i1', template: [0, 2002, [0, 0], [1, 0], 1759924158381, 2002], contentProtectionRefIDs: ['1'],
       // draft-einarsson-moq-locmaf-01 §5.
       locmafVersion: '0.3',
+      buffers: { min: 500, target: 1000, max: 3000 },
     } satisfies Required<CatalogTrack>;
     const cat: Catalog = { version: 1, generatedAt: 1700000000, isComplete: true, tracks: [track] };
 

@@ -5348,4 +5348,15 @@ describe('MseMediaSource — queued media leases', () => {
             lease.discard();
         } finally { adapter.destroy(); }
     });
+
+ it('changes the shared media-element rate, preserves pitch, and restores normal speed', () => {
+    const video = new MockVideoElement() as MockVideoElement & { playbackRate: number; preservesPitch: boolean };
+    video.playbackRate = 1; video.preservesPitch = false;
+    const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+    try {
+        adapter.setPlaybackRate(1.05);
+        expect(video.playbackRate).toBe(1.05); expect(video.preservesPitch).toBe(true);
+        adapter.setPlaybackRate(1); expect(video.playbackRate).toBe(1); expect(video.preservesPitch).toBe(false);
+    } finally { adapter.destroy(); }
+});
 });
