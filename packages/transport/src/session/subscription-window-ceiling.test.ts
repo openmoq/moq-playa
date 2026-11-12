@@ -48,11 +48,11 @@ for (const draft of [14, 16, 18, 22] as const) describe(`draft${draft} Session N
       const outgoing = client.getSubscription(opened.requestId)!;
       expect(incoming.state).toBe('established'); expect(outgoing.state).toBe('established');
       const expected = head === undefined ? 0n : draft === 22 && head === MAX_VI64 ? MAX_VI64 : head + 1n;
-      for (const owner of [outgoing]) {
+      for (const owner of [incoming, outgoing]) {
         expect(owner.locationWindow?.start).toEqual({ group: expected, object: 0n });
         expect(windowContains(owner.locationWindow!, ceiling, 0n)).toBe(expected <= ceiling);
       }
-      if (draft !== 22) return; // Only draft22 resolves the publisher head on filter-only updates.
+      if (draft === 14) return; // SUBSCRIBE_UPDATE has no acknowledgement.
       // Change away, then confirm NextGroupStart from the actual source head.
       server.setLargestLocationProvider(() => head === undefined ? null : { group: head, object: 5n });
       const absolute = client.requestUpdate(opened.requestId, { subscriptionFilter: { type: 'AbsoluteStart', startGroup: 0n, startObject: 0n } });
@@ -61,6 +61,7 @@ for (const draft of [14, 16, 18, 22] as const) describe(`draft${draft} Session N
       deliver(deliver(update.actions, server), client);
       expect(server.getIncomingSubscription(opened.requestId)).toBe(incoming);
       expect(client.getSubscription(opened.requestId)).toBe(outgoing);
+      expect(incoming.locationWindow?.start).toEqual({ group: expected, object: 0n });
       expect(outgoing.locationWindow?.start).toEqual({ group: expected, object: 0n });
     });
   }
@@ -95,4 +96,18 @@ it('draft18 confirmed update at MAX preserves exact request and excludes the pre
     expect(owner.locationWindow?.start).toEqual({ group: MAX_VI64 + 1n, object: 0n });
     expect(windowContains(owner.locationWindow!, MAX_VI64, 6n)).toBe(false);
   }
+});
+
+it('draft14 updates the publisher window without a head provider', () => {
+  const { client, server } = pair(14);
+  const opened = client.subscribe(ns, name, { subscriptionFilter: { type: 'AbsoluteStart', startGroup: 1n, startObject: 0n } });
+  deliver(opened.actions, server);
+  deliver(server.acceptSubscribe(opened.requestId, varint(7n)), client);
+  const update = client.requestUpdate(opened.requestId, { subscriptionFilter: { type: 'AbsoluteStart', startGroup: 3n, startObject: 2n } });
+  deliver(update.actions, server);
+  const window = server.getIncomingSubscription(opened.requestId)!.locationWindow;
+  expect(window?.start).toEqual({ group: 3n, object: 2n });
+  const omitted = client.requestUpdate(opened.requestId, { subscriberPriority: 42n });
+  deliver(omitted.actions, server);
+  expect(server.getIncomingSubscription(opened.requestId)!.locationWindow).toEqual(window);
 });

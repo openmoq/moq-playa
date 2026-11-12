@@ -2973,10 +2973,10 @@ export class Session {
         sub.setRemoteFilterType(decodeSubscriptionFilter(updatedFilter, this._draftVersion).type);
       } catch { /* malformed bytes were already rejected by parameter validation */ }
     }
-    if (isDraft22(this._draftVersion) && isSubscriptionScope && sub && updatedFilter instanceof Uint8Array) {
+    if (isSubscriptionScope && sub && updatedFilter instanceof Uint8Array) {
       sub.locationWindow = subscriptionWindow(
-        sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, 22),
-        resumeLocation ?? undefined,
+        sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, this._draftVersion),
+        resumeLocation ?? undefined, this._draftVersion,
       );
     }
 
@@ -5364,10 +5364,12 @@ export class Session {
 
     if (isDraft22(this._draftVersion)) {
       sub.publisherGroupOrder = trackProperties.get(0x22n)?.[0] === 2n ? 'descending' : 'ascending';
-      sub.locationWindow = subscriptionWindow(
-        sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, 22), communicated ?? undefined,
-      );
     }
+    // d14 §9.7 / d16 §9.9 / d18 §5.1.2: publisher sends stay inside the requested range.
+    sub.locationWindow = subscriptionWindow(
+      sub.currentFilter === undefined ? undefined : decodeSubscriptionFilter(sub.currentFilter, this._draftVersion),
+      communicated ?? undefined, this._draftVersion,
+    );
 
     const subscribeOk: SubscribeOk = {
       type: 'SUBSCRIBE_OK',
