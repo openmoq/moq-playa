@@ -6963,7 +6963,11 @@ export class MoqtConnection {
     state.isFirstObject = false;
   }
 
-  /** Close (FIN) a FETCH response data stream. */
+  /**
+   * Close (FIN) a FETCH response data stream. An ordinary FETCH's failed FIN
+   * rejects with the same error on every call and keeps the FETCH owned.
+   * On drafts 18/22, {@link abortIncomingFetch} aborts and reclaims that FETCH.
+   */
   async closeFetchStream(streamId: bigint): Promise<void> {
     const state = this.fetchOutgoingStreams.get(streamId);
     if (!state) return;
@@ -6980,8 +6984,9 @@ export class MoqtConnection {
       return fin;
     }
     state.closing = state.writer.close();
-    try { await state.closing; }
-    catch (error) { if (!this.fetchOutgoingStreams.has(streamId)) throw error; }
+    // Keep a failed FIN and its request owned by the caller until cancellation.
+    // Repeated closes observe the same stored rejection.
+    await state.closing;
     this.fetchOutgoingStreams.delete(streamId);
     // §10.13: the publisher finished serving — RECLAIM the accepted incoming fetch in
     // the Session so serving-side state is bounded. Do NOT release the one-stream

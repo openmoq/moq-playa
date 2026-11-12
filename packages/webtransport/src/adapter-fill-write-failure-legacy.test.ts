@@ -95,7 +95,8 @@ for (const kind of ['object', 'range'] as const) it(`ordinary draft22 FETCH ${ki
   (transport as WebTransportLike).resetSendStream = async writer => { resets++; await writer.abort(); };
   try {
     transport.openIncomingUni().push(bytes('af000000')); await conn.connect(transport);
-    transport.pushIncomingBidi().push(createControlCodec(22).encode({ type: 'FETCH', requestId: 1n,
+    const request = transport.pushIncomingBidi();
+    request.push(createControlCodec(22).encode({ type: 'FETCH', requestId: 1n,
       fetch: { fetchType: 1, trackNamespace: [], trackName: bytes('76'), startLocation: { group: 0n, object: 0n }, endLocation: { group: 9n, object: 0n } }, parameters: new Map() }));
     await flush(512);
     const stream = await conn.openFetchStream(1n), pipe = transport.uniOut.at(-1)!;
@@ -107,6 +108,38 @@ for (const kind of ['object', 'range'] as const) it(`ordinary draft22 FETCH ${ki
     expect(resets).toBe(0);
     await expect(conn.sendFetchEndOfRange(stream, false, 0n, 1n)).rejects.toThrow(/write failure/);
     expect(resets).toBe(0); expect(transport.closeInfo).toBeUndefined();
-    await conn.closeFetchStream(stream);
+    const owner = conn.session.getIncomingFetch(1n)!;
+    const closeError = await conn.closeFetchStream(stream).then(() => undefined, error => error);
+    expect(closeError).toBeInstanceOf(TypeError);
+    expect(pipe.writeClosed).toBe(false);
+    expect(await conn.closeFetchStream(stream).catch(error => error)).toBe(closeError);
+    expect(conn.session.getIncomingFetch(1n)).toBe(owner);
+    // FIN rejection is observable; the caller cancels this exact request.
+    request.resetReadable(); await flush(512);
+    expect(conn.session.getIncomingFetch(1n)).toBeUndefined();
+    await expect(conn.sendFetchEndOfRange(stream, false, 0n, 2n)).rejects.toThrow(/Unknown fetch stream/);
+    await expect(conn.openFetchStream(1n)).rejects.toThrow(/No admitted/);
+    expect(pipe.writeClosed).toBe(false);
+    expect(resets).toBe(0); expect(transport.closeInfo).toBeUndefined();
+    await healthyFetchFin();
   } finally { await conn.close(); }
 });
+
+async function healthyFetchFin() {
+  const conn = new MoqtConnection(22), transport = new TransportSim();
+  conn.onError = () => {};
+  try {
+    transport.openIncomingUni().push(bytes('af000000')); await conn.connect(transport);
+    transport.pushIncomingBidi().push(createControlCodec(22).encode({ type: 'FETCH', requestId: 1n,
+      fetch: { fetchType: 1, trackNamespace: [], trackName: bytes('76'), startLocation: { group: 0n, object: 0n }, endLocation: { group: 9n, object: 0n } }, parameters: new Map() }));
+    await flush(512);
+    await conn.acceptFetch(1n, { endLocation: { group: 9n, object: 0n } });
+    const stream = await conn.openFetchStream(1n), pipe = transport.uniOut.at(-1)!;
+    await conn.sendFetchObject(stream, { groupId: 0n, subgroupId: 0n, objectId: 0n, publisherPriority: 7, payload: bytes('aa') });
+    await expect(conn.closeFetchStream(stream)).resolves.toBeUndefined();
+    expect(pipe.writeClosed).toBe(true);
+    await expect(conn.sendFetchEndOfRange(stream, false, 0n, 1n)).rejects.toThrow(/Unknown fetch stream/);
+    expect(conn.session.getIncomingFetch(1n)).toBeUndefined();
+    expect(transport.closeInfo).toBeUndefined();
+  } finally { await conn.close(); }
+}
