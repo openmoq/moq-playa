@@ -7,10 +7,10 @@
  * State transitions:
  * - PENDING: SUBSCRIBE_NAMESPACE sent/received, awaiting REQUEST_OK or REQUEST_ERROR
  * - ACTIVE: REQUEST_OK exchanged, receiving/sending NAMESPACE messages
- * - TERMINATED: REQUEST_ERROR received or NAMESPACE_DONE sent/received
+ * - TERMINATED: REQUEST_ERROR or local subscription teardown
  *
  * The subscriber discovers namespaces matching their prefix via NAMESPACE messages.
- * The publisher announces matching namespaces until sending NAMESPACE_DONE.
+ * NAMESPACE_DONE withdraws a suffix; the subscription continues (d18 §10.18).
  *
  * @see draft-ietf-moq-transport-16 §6.1
  * @module
@@ -198,7 +198,7 @@ export class NamespaceStateMachine {
   }
 
   /**
-   * Handle NAMESPACE_DONE received (subscriber side).
+   * Terminate discovery on stream closure or cancellation (subscriber side).
    * Transitions from ACTIVE to TERMINATED.
    */
   handleNamespaceDone(): void {
@@ -247,7 +247,7 @@ export class NamespaceStateMachine {
   }
 
   /**
-   * Send NAMESPACE_DONE (publisher side).
+   * Terminate local discovery (publisher side); wire DONE uses withdrawNamespace.
    * Transitions from ACTIVE to TERMINATED.
    */
   sendNamespaceDone(): void {

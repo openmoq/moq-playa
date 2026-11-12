@@ -502,8 +502,8 @@ export interface NamespaceDiscoveredEvent {
 }
 
 /**
- * Namespace discovery completed (NAMESPACE_DONE received).
- * @see draft-ietf-moq-transport-16 §9.25
+ * A namespace suffix was withdrawn (NAMESPACE_DONE received).
+ * @see draft-ietf-moq-transport-16 §9.23
  */
 export interface NamespaceDoneEvent {
   readonly type: 'namespace_done';

@@ -132,8 +132,8 @@ bidi streams; draft-14/16 multiplex requests on a single bidi control stream.
   the matching namespace subscription and PUBLISH_BLOCKED only the matching tracks
   subscription (routed by Request ID); announced-suffix / blocked-track accounting
   is delivered ⊆ sent mid-step and exact after quiescence; a rejected continuing
-  request receives no continuation; `NAMESPACE_DONE` terminates the namespace
-  subscription (§6.1 — not a per-suffix withdrawal); `CANCEL_NAMESPACE` /
+  request receives no continuation; `NAMESPACE_DONE` withdraws only its suffix,
+  keeping discovery active (d18 §10.17–10.18); `CANCEL_NAMESPACE` /
   `CANCEL_TRACKS` close the continuing stream and suppress later continuation
   (pinned by preludes).
 - Deterministic replay: the same seed produces the same trace hash and log length

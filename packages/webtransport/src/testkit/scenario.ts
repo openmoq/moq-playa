@@ -119,7 +119,7 @@ interface PublishShadow {
 interface NamespaceShadow {
   readonly reqId: bigint;
   readonly prefix: Uint8Array[];
-  state: 'pending' | 'active' | 'rejected' | 'cancelled' | 'done';
+  state: 'pending' | 'active' | 'rejected' | 'cancelled';
   nextSuffix: number;
   /** Suffix keys the peer announced (NAMESPACE) / withdrew (NAMESPACE_DONE). */
   readonly announced: Set<string>;
@@ -441,15 +441,6 @@ export async function runScenario(opts: ScenarioOptions): Promise<ScenarioResult
           check(n.recvAnnounced.size === n.announced.size, `namespace ${n.reqId} announced delivered ${n.recvAnnounced.size} != sent ${n.announced.size}`, log);
           check(n.recvDone.size === n.doneSuffixes.size, `namespace ${n.reqId} NAMESPACE_DONE delivered ${n.recvDone.size} != sent ${n.doneSuffixes.size}`, log);
         }
-      } else if (n.state === 'done') {
-        // §6.1: NAMESPACE_DONE terminated the subscription. All prior NAMESPACE and
-        // the terminating NAMESPACE_DONE were delivered; the client sub is gone/TERMINATED.
-        const cs = client.session.getNamespaceSubscription(n.reqId);
-        check(cs === undefined || cs.state === NamespaceState.TERMINATED, `done namespace ${n.reqId} not TERMINATED/removed (state ${cs?.state})`, log);
-        if (quiesced) {
-          check(n.recvAnnounced.size === n.announced.size, `namespace ${n.reqId} announced delivered ${n.recvAnnounced.size} != sent ${n.announced.size}`, log);
-          check(n.recvDone.size === n.doneSuffixes.size, `namespace ${n.reqId} NAMESPACE_DONE delivered ${n.recvDone.size} != sent ${n.doneSuffixes.size}`, log);
-        }
       } else if (n.state === 'rejected') {
         const cs = client.session.getNamespaceSubscription(n.reqId);
         check(cs === undefined || cs.state !== NamespaceState.ACTIVE, `rejected namespace ${n.reqId} still ACTIVE`, log);
@@ -764,10 +755,7 @@ export async function runScenario(opts: ScenarioOptions): Promise<ScenarioResult
   }
 
   async function opSendNamespaceDone(): Promise<void> {
-    // §6.1: NAMESPACE_DONE must name a previously-announced suffix, and it
-    // TERMINATES the subscriber's namespace subscription (it is NOT a per-suffix
-    // withdrawal at the subscription level — see namespace.test.ts / §6.1). So this
-    // op only runs once per sub and moves it to 'done'.
+    // d18 §10.17–10.18: withdraw one announced suffix; discovery stays active.
     const cands = activeNamespace().filter((n) => [...n.announced].some((k) => !n.doneSuffixes.has(k)));
     if (cands.length === 0) { rec(Op.SEND_NAMESPACE_DONE, 1, { outcome: 0 }); return; }
     const n = prng.pick(cands);
@@ -775,7 +763,6 @@ export async function runScenario(opts: ScenarioOptions): Promise<ScenarioResult
     await server.sendNamespaceDone(n.reqId, [nm(key)]);
     n.doneSuffixes.add(key);
     await flush();
-    n.state = 'done'; // §6.1: the subscriber's namespace subscription terminates
     rec(Op.SEND_NAMESPACE_DONE, 1, { requestId: n.reqId, outcome: 1 });
   }
 

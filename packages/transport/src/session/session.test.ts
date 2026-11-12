@@ -2527,7 +2527,7 @@ describe('Session', () => {
         expect(ns?.discoveredNamespaces[0]).toEqual(suffix);
       });
 
-      it('terminates namespace SM on NAMESPACE_DONE', () => {
+      it('withdraws the suffix while keeping namespace discovery active', () => {
         const prefix = [new Uint8Array([0x6c])];
         const { requestId } = session.subscribeNamespace(prefix);
 
@@ -2549,7 +2549,13 @@ describe('Session', () => {
         });
 
         const ns = session.getNamespaceSubscription(requestId);
-        expect(ns?.state).toBe(NamespaceState.TERMINATED);
+        expect(ns?.state).toBe(NamespaceState.ACTIVE);
+        expect(ns?.discoveredNamespaces).toEqual([]);
+        for (const type of ['NAMESPACE', 'NAMESPACE_DONE'] as const) {
+          expect(session.handleNamespaceStreamMessage(requestId, { type, trackNamespaceSuffix: [] })).toEqual([]);
+        }
+        expect(ns?.state).toBe(NamespaceState.ACTIVE);
+        expect(ns?.discoveredNamespaces).toEqual([]);
       });
 
       it('terminates namespace SM on REQUEST_ERROR', () => {
@@ -2611,8 +2617,8 @@ describe('Session', () => {
         });
 
         const ns = session.getNamespaceSubscription(requestId);
-        expect(ns?.discoveredNamespaces.length).toBe(2);
-        expect(ns?.state).toBe(NamespaceState.TERMINATED);
+        expect(ns?.discoveredNamespaces).toEqual([[new Uint8Array([0x61, 0x75, 0x64, 0x69, 0x6f])]]);
+        expect(ns?.state).toBe(NamespaceState.ACTIVE);
       });
 
       // ─── Combined Namespace Validation (§2.4.1) ────────────────────────
@@ -2762,9 +2768,9 @@ describe('Session', () => {
           });
 
           expect(actions.length).toBe(0);
-          // SM transitions to TERMINATED (current behavior)
           const ns = session.getNamespaceSubscription(requestId);
-          expect(ns?.state).toBe(NamespaceState.TERMINATED);
+          expect(ns?.state).toBe(NamespaceState.ACTIVE);
+          expect(ns?.discoveredNamespaces).toEqual([]);
         });
 
         it('validates combined namespace on NAMESPACE_DONE too', () => {

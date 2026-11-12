@@ -98,7 +98,7 @@ export const NamespaceState = {
   PENDING: 'pending',
   /** REQUEST_OK received, receiving NAMESPACE messages. */
   ACTIVE: 'active',
-  /** Terminated (REQUEST_ERROR or NAMESPACE_DONE). */
+  /** Terminated (REQUEST_ERROR, stream closure or cancellation). */
   TERMINATED: 'terminated',
 } as const;
 

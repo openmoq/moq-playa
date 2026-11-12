@@ -347,7 +347,7 @@ describe('draft-18 publish preludes (hand-authored invariants)', () => {
 });
 
 describe('draft-18 continuing-stream preludes (hand-authored invariants)', () => {
-  it('subscribeNamespace → accept → NAMESPACE → NAMESPACE_DONE terminates the subscription (§6.1)', async () => {
+  it('subscribeNamespace → accept → NAMESPACE → NAMESPACE_DONE withdraws the suffix (§10.17–10.18)', async () => {
     const { client, server, errors } = await connectedPair();
     let snReqId = -1n;
     server.onSubscribeNamespace = (rid) => { snReqId = rid; };
@@ -365,13 +365,19 @@ describe('draft-18 continuing-stream preludes (hand-authored invariants)', () =>
     await flush();
     expect(recv.filter((m) => m.type === 'NAMESPACE').length).toBe(1);
 
-    // §6.1: NAMESPACE_DONE for an announced suffix TERMINATES the subscriber's
-    // namespace subscription (it is not a per-suffix withdrawal at the sub level).
+    // d18 §10.17–10.18: DONE withdraws this suffix; discovery keeps receiving updates.
     await server.sendNamespaceDone(snReqId, [nm('s1')]);
     await flush();
     expect(recv.some((m) => m.type === 'NAMESPACE_DONE')).toBe(true);
     const cs = client.session.getNamespaceSubscription(reqId);
-    expect(cs === undefined || cs.state === NamespaceState.TERMINATED).toBe(true);
+    expect(cs?.state).toBe(NamespaceState.ACTIVE);
+    expect(cs?.discoveredNamespaces).toEqual([]);
+    await server.sendNamespace(snReqId, [nm('s1')]); await flush();
+    expect(cs?.discoveredNamespaces).toEqual([[nm('s1')]]);
+    await server.sendNamespaceDone(snReqId, [nm('s1')]); await flush();
+    expect(cs?.state).toBe(NamespaceState.ACTIVE);
+    expect(cs?.discoveredNamespaces).toEqual([]);
+    expect(recv.map(m => m.type)).toEqual(['NAMESPACE', 'NAMESPACE_DONE', 'NAMESPACE', 'NAMESPACE_DONE']);
     expect(errors).toEqual([]);
     expect(client.session.state).toBe(SessionState.ESTABLISHED);
   });

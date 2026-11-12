@@ -498,6 +498,8 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-16 §6.1
    */
   private namespaceStreams = new Map<bigint, WritableStreamDefaultWriter<Uint8Array>>();
+  // Namespace response readers retained for STOP_SENDING on cancellation (d16 §6.1).
+  private namespaceReaders = new WeakMap<WritableStreamDefaultWriter<Uint8Array>, ReadableStreamDefaultReader<Uint8Array>>();
 
   /**
    * Map from streamId → readable stream reader, for STOP_SENDING.
@@ -4746,13 +4748,12 @@ export class MoqtConnection {
 
   /**
    * Background handler for a draft-18 SUBSCRIBE_NAMESPACE response stream ending.
-   * A clean FIN treats active namespaces as done (§10.18); a stream-ordering
+   * FIN or reset retires namespace discovery (§10.18); a stream-ordering
    * PROTOCOL_VIOLATION closes the whole session; any other error is surfaced.
    */
   private async handleNamespaceStreamClosed(requestId: bigint, closed: Promise<void>): Promise<void> {
     try {
       await closed;
-      await this.executeActions(this.session.handleNamespaceStreamClosed(requestId));
     } catch (err) {
       if (err instanceof ProtocolViolationError) {
         this.closeSessionFatal(err.message);
@@ -4762,6 +4763,8 @@ export class MoqtConnection {
         err instanceof Error ? err.message : String(err),
         { errorSource: 'control', ...(err instanceof Error ? { cause: err } : {}) },
       ));
+    } finally {
+      await this.executeActions(this.session.handleNamespaceStreamClosed(requestId));
     }
   }
 
@@ -4847,13 +4850,15 @@ export class MoqtConnection {
     // Draft-16: close the bidi stream
     const writer = this.namespaceStreams.get(requestId as bigint);
     if (!writer) return;
+    this.namespaceStreams.delete(requestId as bigint);
+    this.swallow(() => this.namespaceReaders.get(writer)?.cancel());
 
     try {
       await writer.close();
     } catch {
       // Stream may already be closed — ignore
     }
-    this.namespaceStreams.delete(requestId as bigint);
+    await this.executeActions(this.session.handleNamespaceStreamClosed(requestId));
   }
 
   /**
@@ -5833,10 +5838,8 @@ export class MoqtConnection {
 
   /**
    * Publisher-side: write NAMESPACE_DONE for a previously announced suffix on the
-   * existing SUBSCRIBE_NAMESPACE stream (§10.18). Locally this only withdraws that
-   * suffix from publisher bookkeeping and does NOT seal the stream; the receiving
-   * subscriber, however, treats NAMESPACE_DONE as TERMINATING its namespace
-   * subscription (§6.1), so it must not be used to keep the subscription alive.
+   * existing SUBSCRIBE_NAMESPACE stream (d18 §10.17–10.18). Both endpoints withdraw
+   * only that suffix; the subscription stays active for future namespace updates.
    *
    * @param requestId The request ID of the incoming SUBSCRIBE_NAMESPACE
    * @param suffix The namespace suffix to withdraw
@@ -9523,6 +9526,7 @@ export class MoqtConnection {
 
       // Start reading responses on the readable side
       const reader = bidiStream.readable.getReader();
+      this.namespaceReaders.set(writer, reader);
       this.runNamespaceStreamReadLoop(reader, requestId);
     } catch (err) {
       this.onError?.(new MoqtConnectionError(
@@ -9556,6 +9560,7 @@ export class MoqtConnection {
         framer.push(value);
         const messages = framer.drain();
         for (const framed of messages) {
+          if (!this.namespaceStreams.has(requestId)) return;
           // draft-16 namespace bidi stream carries fully-correlated messages;
           // Draft-18 correlation is handled by its request-stream topology.
           const message = framed.message as ControlMessage;
@@ -9578,6 +9583,7 @@ export class MoqtConnection {
       }
     } finally {
       this.namespaceStreams.delete(requestId as bigint);
+      await this.executeActions(this.session.handleNamespaceStreamClosed(requestId));
     }
   }
 

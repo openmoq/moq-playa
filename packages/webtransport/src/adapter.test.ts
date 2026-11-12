@@ -1643,7 +1643,7 @@ describe('MoqtConnection', () => {
       expect(nsSm!.state).toBe('terminated');
     });
 
-    it('routes NAMESPACE_DONE and terminates namespace subscription (§6.1)', async () => {
+    it('routes NAMESPACE_DONE as a suffix withdrawal (d16 §9.23)', async () => {
       const mock = createMockTransport();
       const adapter = await connectAdapter(mock);
 
@@ -1674,7 +1674,14 @@ describe('MoqtConnection', () => {
       await deepFlush();
 
       const nsSm = adapter.session.getNamespaceSubscription(requestId);
-      expect(nsSm!.state).toBe('terminated');
+      expect(nsSm!.state).toBe('active');
+      expect(nsSm!.discoveredNamespaces).toEqual([]);
+      for (const type of ['NAMESPACE', 'NAMESPACE_DONE'] as const) {
+        nsBidi.push(encodeControlMessage({ type, trackNamespaceSuffix: [enc.encode('stream1')] }));
+        await deepFlush();
+        expect(nsSm!.state).toBe('active');
+        expect(nsSm!.discoveredNamespaces).toEqual(type === 'NAMESPACE' ? [[enc.encode('stream1')]] : []);
+      }
     });
 
     it('closes session on unexpected message type on namespace stream', async () => {
