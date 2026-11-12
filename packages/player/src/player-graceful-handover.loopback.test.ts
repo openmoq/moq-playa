@@ -15,7 +15,7 @@ const OLD_URL = 'https://old.example/moq';
 const NEW_URL = 'https://new.example/moq';
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-type Draft = 16 | 18 | 22;
+type Draft = 14 | 16 | 18 | 22;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -46,7 +46,7 @@ function peer(draft: Draft, catalogName = 'catalog') {
       // A factory resolved after destroy: return its transport for orphan
       // cleanup, without starting a peer handshake nobody can answer.
       if (client.session.state === 'closed') return a;
-      started ??= server.connect(b, draft === 16 ? { maxRequestId: varint(1000n) } : {});
+      started ??= server.connect(b, draft <= 16 ? { maxRequestId: varint(1000n) } : {});
       void started.catch(error => { errors.push(error); });
       return a;
     },
@@ -54,7 +54,7 @@ function peer(draft: Draft, catalogName = 'catalog') {
       await flush(256);
       const index = requests.findIndex(r => r.name === name);
       expect(index, `${name} has a request stream`).toBeGreaterThanOrEqual(0);
-      const pipe = a.bidiOut[draft === 16 ? 0 : index]!.in;
+      const pipe = a.bidiOut[draft <= 16 ? 0 : index]!.in;
       pipe.faults.hold = true;
       return async () => { pipe.releaseHeld(); await flush(256); };
     },
@@ -67,7 +67,7 @@ function peer(draft: Draft, catalogName = 'catalog') {
         const location = { group: varint(largest.group), object: varint(largest.object) };
         const bytes = new Uint8Array(locationEncodingLength(location));
         writeLocation(location, bytes, 0);
-        options = { parameters: new Map([[MessageParam.LARGEST_OBJECT, [draft === 16 ? bytes : location]]]) as MessageParameters };
+        options = { parameters: new Map([[MessageParam.LARGEST_OBJECT, [draft <= 16 ? bytes : location]]]) as MessageParameters };
       }
       await server.acceptSubscribe(request!.id, alias, options);
       aliases.set(name, alias);
@@ -88,7 +88,7 @@ function peer(draft: Draft, catalogName = 'catalog') {
         expect(fetches).toHaveLength(1);
         expect(fetches[0]!.message.fetch).toMatchObject({ fetchType: 2, joiningRequestId: request.id });
         await server.acceptFetch(fetches[0]!.id, { endLocation: { group: 5n, object: 1n } });
-        if (draft === 16) {
+        if (draft <= 16) {
           // The adapter's serving API is draft-18+, but its legacy decoder is
           // exercised with the actual draft-16 encoder on a real uni stream.
           const writer = (await b.createUnidirectionalStream()).getWriter();
@@ -107,17 +107,34 @@ function peer(draft: Draft, catalogName = 'catalog') {
       await flush(256);
       return complete;
     },
+    async history(id: bigint, objects: bigint[], media: 'video' | 'audio', last = 3n) {
+      await server.acceptFetch(id, { endLocation: { group: 1n, object: draft === 22 ? last : last + 1n } });
+      if (draft <= 16) {
+        const writer = (await b.createUnidirectionalStream()).getWriter();
+        await writer.write(encodeFetchHeader({ requestId: varint(id) }));
+        for (const object of objects) await writer.write(encodeFetchObject({ flags: varint(0x1c),
+          groupId: varint(1n), subgroupId: varint(0n), objectId: varint(object), publisherPriority: 128,
+          isDatagram: false, extensions: undefined, payload: chunk(media, object + 1n) }));
+        await writer.close();
+      } else {
+        const stream = await server.openFetchStream(id);
+        for (const object of objects) await server.sendFetchObject(stream, { groupId: 1n, subgroupId: 0n,
+          objectId: object, publisherPriority: 128, payload: chunk(media, object + 1n) });
+        await server.closeFetchStream(stream);
+      }
+      await flush(512);
+    },
     async reject(name: string) {
       const request = requests.find(r => r.name === name);
       expect(request, `replacement requested ${name}`).toBeDefined();
       await server.rejectSubscribe(request!.id, 0x10n, 'track unavailable');
       await flush(128);
     },
-    async send(name: string, payload: Uint8Array, group = 1n) {
+    async send(name: string, payload: Uint8Array, group = 1n, object = 0n) {
       const alias = aliases.get(name);
       expect(alias, `${name} has an accepted alias`).toBeDefined();
       const stream = await server.openSubgroup(alias!, group, 0n, { publisherPriority: 128 });
-      await server.sendObject(stream, 0n, payload);
+      await server.sendObject(stream, object, payload);
       await server.closeSubgroup(stream);
       await flush(128);
     },
@@ -130,8 +147,8 @@ function peer(draft: Draft, catalogName = 'catalog') {
       };
       const object = { objectId: varint(0), extensions: undefined, payload, status: undefined };
       const writer = (await b.createUnidirectionalStream()).getWriter();
-      await writer.write(draft === 16 ? encodeSubgroupHeader(header) : encodeSubgroupHeader18(header));
-      await writer.write(draft === 16
+      await writer.write(draft <= 16 ? encodeSubgroupHeader(header) : encodeSubgroupHeader18(header));
+      await writer.write(draft <= 16
         ? encodeSubgroupObject(object, false, varint(0), true)
         : encodeSubgroupObject18(object, false, 0n, true));
       await writer.close();
@@ -184,6 +201,7 @@ async function fixture(draft: Draft, options: {
   defaultBootstrap?: boolean;
   oldSeparateInit?: boolean;
   oldCatalog?: Uint8Array;
+  noOldMedia?: boolean;
   replacementFactoryError?: Error;
   config?: Partial<MoqtPlayerConfig>;
 } = {}) {
@@ -258,8 +276,10 @@ async function fixture(draft: Draft, options: {
     }
     for (const type of media) {
       await old.accept(type, type === 'video' ? 200n : 201n);
-      await old.send(type, chunk(type, 1n));
-      expect(received).toContainEqual({ name: type, group: 1n });
+      if (!options.noOldMedia) {
+        await old.send(type, chunk(type, 1n));
+        expect(received).toContainEqual({ name: type, group: 1n });
+      }
     }
     expect(errors).toEqual([]);
   } catch (error) {
@@ -301,6 +321,178 @@ describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft
       expect(h.errors).toEqual([]);
       await h.next.send('video', chunk('video', 3n), 3n);
       expect(h.received).toContainEqual({ name: 'video', group: 3n });
+    } finally { await h.destroy(); }
+  });
+
+  for (const media of ['video', 'audio'] as const) for (const outcome of ['complete', 'refused', 'old ahead', 'destroyed'] as const) {
+    it(`backfills adopted ${media}: ${outcome}, preserving range-policy guards`, async () => {
+      // Real loopback transport; the fixture's media output is a modeled MSE sink.
+      const h = await fixture(draft, { config: { disableAudio: media === 'video', disableVideo: media === 'audio' } });
+      const locations: bigint[] = [];
+      h.player.on('media_object', event => { if (event.trackName === media) locations.push(event.objectId); });
+      try {
+        await h.old.send(media, chunk(media, 2n), 1n, 1n);
+        if (outcome === 'old ahead') await h.old.send(media, chunk(media, 6n), 1n, 5n);
+        await h.old.goaway();
+        await h.next.accept('catalog', 100n);
+        await h.next.send('catalog', catalog());
+        expect(h.next.fetches).toHaveLength(0); // No speculative history before commit.
+        await h.next.accept(media, 200n, { group: 1n, object: 3n });
+        await flush(512);
+        expect(h.migrated).toHaveBeenCalledTimes(1);
+        if (draft !== 22) await h.next.send(media, chunk(media, 2n), 1n, 1n);
+        if (outcome === 'old ahead') {
+          expect(h.next.fetches).toHaveLength(0);
+          await h.next.send(media, chunk(media, 5n), 1n, 4n);
+          await h.next.send(media, chunk(media, 7n), 1n, 6n);
+          expect(locations).toEqual([1n, 5n, 6n]);
+        } else {
+          expect(h.next.fetches).toHaveLength(1);
+          const request = h.next.fetches[0]!;
+          if (draft !== 22) expect(request.message.fetch).toMatchObject({ fetchType: 3, joiningStart: 1n });
+          await h.next.send(media, chunk(media, 5n), 1n, 4n);
+          expect(locations).toEqual([1n]); // Live must wait for the missing prefix.
+          if (outcome === 'destroyed') {
+            await h.player.destroy();
+            expect(h.next.client.session.state).toBe('closed');
+            expect(locations).toEqual([1n]);
+          } else if (outcome === 'refused') {
+            await h.next.server.rejectFetch(request.id, 0x10n, 'history unavailable');
+            await flush(256);
+            await h.next.send(media, chunk(media, 2n), 2n);
+            expect(h.received).toContainEqual({ name: media, group: 2n });
+            expect(locations).toEqual([1n, 0n]);
+          } else {
+            await h.next.history(request.id, draft === 22 ? [2n, 3n] : [0n, 1n, 2n, 3n], media);
+            expect(h.errors).toEqual([]);
+            expect(locations).toEqual([1n, 2n, 3n, 4n]);
+          }
+        }
+        expect(h.fatalErrors).toEqual([]);
+        expect(h.next.errors).toEqual([]);
+      } finally { await h.destroy(); }
+
+      // H5 controls share the same gap but leave range policy untouched.
+      const nonlive = JSON.parse(dec.decode(catalog())) as { tracks: Array<{ isLive: boolean }> };
+      for (const track of nonlive.tracks) track.isLive = false;
+      const payload = outcome === 'old ahead' ? enc.encode(JSON.stringify(nonlive)) : catalog();
+      const control = await fixture(draft, { oldCatalog: payload, noOldMedia: outcome === 'destroyed',
+        config: { disableAudio: true, ...(outcome === 'complete'
+          ? { subscriptionFilter: { type: 'AbsoluteStart' as const, startGroup: 1, startObject: 0 } } : {}) } });
+      try {
+        await control.old.goaway();
+        await control.next.accept('catalog', 100n);
+        await control.next.send('catalog', payload);
+        await control.next.accept('video', 200n, outcome === 'refused' ? undefined : { group: 1n, object: 3n });
+        await flush(512);
+        // Location 1/4 also passes the transport's LargestObject filter.
+        await control.next.send('video', chunk('video', 5n), 1n, 4n);
+        expect(control.next.fetches).toHaveLength(0);
+        expect(control.received.filter(event => event.name === 'video' && event.group === 1n))
+          .toHaveLength(outcome === 'destroyed' ? 1 : 2);
+        expect(control.fatalErrors).toEqual([]);
+      } finally { await control.destroy(); }
+    });
+  }
+
+  for (const largest of [0n, 1n, 3n]) for (const alias of [200n, 300n]) {
+    it(`uses delivered media with transform pending at adoption, L=${largest}, alias=${alias}`, async () => {
+      const gate = deferred<void>();
+      let held = false;
+      const appended: Uint8Array[] = [];
+      const h = await fixture(draft, { config: { disableAudio: true,
+        objectTransform: obj => {
+          if (!held && obj.kind === 'data' && obj.groupId === 1n && obj.objectId === 1n) {
+            held = true;
+            return gate.promise.then(() => obj);
+          }
+          return obj;
+        },
+        createMediaSource: () => ({ initialize: () => true, appendChunk: (_type, bytes) => { appended.push(bytes); },
+          reset: () => {}, endOfStream: () => {}, destroy: () => {}, mediaElement: null,
+          onFirstFrame: null, onError: null, onStall: null }),
+      } });
+      appended.length = 0;
+      try {
+        await h.old.send('video', chunk('video', 2n), 1n, 1n);
+        expect(appended).toEqual([]);
+        await h.old.goaway();
+        await h.next.accept('catalog', 100n);
+        await h.next.send('catalog', catalog());
+        await h.next.accept('video', alias, { group: 1n, object: largest });
+        await flush(512);
+        gate.resolve();
+        await flush(256);
+        if (largest > 0n) {
+          expect(h.next.fetches).toHaveLength(1);
+          const objects = largest === 1n ? [1n] : [1n, 2n, 3n];
+          await h.next.history(h.next.fetches[0]!.id, draft === 22 ? objects : [0n, ...objects], 'video', largest);
+        } else {
+          expect(h.next.fetches).toHaveLength(0);
+          await h.next.send('video', chunk('video', 2n), 1n, 1n);
+        }
+        const next = largest === 3n ? 4n : 2n;
+        await h.next.send('video', chunk('video', next + 1n), 1n, next);
+        expect(appended).toEqual((largest === 3n ? [2n, 3n, 4n, 5n] : [2n, 3n]).map(id => chunk('video', id)));
+        expect(h.fatalErrors).toEqual([]);
+      } finally { gate.resolve(); await h.destroy(); }
+    });
+  }
+
+  it('carries only delivered media into a second handover while backfill is outstanding', async () => {
+    const h = await fixture(draft, { config: { disableAudio: true } });
+    const seen: bigint[] = [];
+    h.player.on('media_object', event => { if (event.trackName === 'video') seen.push(event.objectId); });
+    const cancelled = vi.spyOn(h.next.client, 'fetchCancel');
+    try {
+      await h.old.goaway();
+      await h.next.accept('catalog', 100n);
+      await h.next.send('catalog', catalog());
+      await h.next.accept('video', 200n, { group: 1n, object: 3n });
+      await flush(512);
+      expect(h.next.fetches).toHaveLength(1);
+      await h.next.send('video', chunk('video', 5n), 1n, 4n);
+      expect(seen).toEqual([]);
+      await h.next.goaway('https://third.example/moq');
+      await h.third.accept('catalog', 100n);
+      await h.third.send('catalog', catalog());
+      await h.third.accept('video', 200n, { group: 1n, object: 3n });
+      await flush(512);
+      expect(h.third.fetches).toHaveLength(1);
+      expect(cancelled).toHaveBeenCalledWith(h.next.fetches[0]!.id);
+      await h.third.history(h.third.fetches[0]!.id, draft === 22 ? [1n, 2n, 3n] : [0n, 1n, 2n, 3n], 'video');
+      await h.third.send('video', chunk('video', 5n), 1n, 4n);
+      expect(seen).toEqual([1n, 2n, 3n, 4n]);
+      expect(h.fatalErrors).toEqual([]);
+    } finally { await h.destroy(); }
+  });
+
+  if (draft === 16) for (const configured of [
+    { subscriberPriority: 64 }, { deliveryTimeoutMs: 5000 }, { groupOrder: 'descending' as const },
+  ]) it(`keeps LargestObject with configured ${Object.keys(configured)[0]} during handover`, async () => {
+    const h = await fixture(draft, { config: { disableAudio: true, ...configured } });
+    const seen: bigint[] = [];
+    h.player.on('media_object', event => { if (event.trackName === 'video') seen.push(event.objectId); });
+    try {
+      await h.old.send('video', chunk('video', 2n), 1n, 1n);
+      await h.old.goaway();
+      await h.next.accept('catalog', 100n);
+      await h.next.send('catalog', catalog());
+      const request = h.next.requests.find(row => row.name === 'video')!;
+      expect(h.next.server.session.getIncomingSubscription(request.id)?.remoteFilterType).toBe('LargestObject');
+      const parameter = 'subscriberPriority' in configured ? MessageParam.SUBSCRIBER_PRIORITY
+        : 'deliveryTimeoutMs' in configured ? MessageParam.DELIVERY_TIMEOUT : MessageParam.GROUP_ORDER;
+      const old = h.old.requests.find(row => row.name === 'video')!;
+      expect(request.parameters?.get(parameter)).toEqual(old.parameters?.get(parameter));
+      await h.next.accept('video', 200n, { group: 1n, object: 3n });
+      await flush(512);
+      expect(h.next.fetches).toHaveLength(1);
+      await h.next.history(h.next.fetches[0]!.id, [0n, 1n, 2n, 3n], 'video');
+      await h.next.send('video', chunk('video', 5n), 1n, 4n);
+      expect(seen).toEqual([1n, 2n, 3n, 4n]);
+      expect(h.next.client.session.state).not.toBe('closed');
+      expect(h.next.errors).toEqual([]);
+      expect(h.fatalErrors).toEqual([]);
     } finally { await h.destroy(); }
   });
 
@@ -1843,5 +2035,30 @@ describe('queued GOAWAY entry rejection', () => {
       await flush(512);
       expect(h.fatalErrors).toEqual(['old relay network lost']);
     } finally { gate.resolve(); await flush(256); await h.destroy(); }
+  });
+});
+
+// Joining FETCH uses the same priority as the media waiting behind it.
+// Draft 14 uses public migrate(): its adapter cannot encode GOAWAY.
+describe.each([14, 16, 18] as const)('handover backfill priority draft-%i', draft => {
+  for (const media of ['video', 'audio'] as const) it(`copies ${media} subscription priority to backfill`, async () => {
+    const h = await fixture(draft, { config: { subscriberPriority: 64, audioSubscriberPriority: 60,
+      disableAudio: media === 'video', disableVideo: media === 'audio' } });
+    let migrating: Promise<void> | undefined;
+    try {
+      if (draft === 14) { migrating = h.player.migrate(h.next.client as unknown as PlayerConnection); void migrating.catch(() => {}); }
+      else await h.old.goaway();
+      await h.next.accept('catalog', 100n);
+      await h.next.send('catalog', catalog());
+      await h.next.accept(media, 200n, { group: 1n, object: 3n });
+      await flush(512);
+      await migrating;
+      expect(h.next.fetches).toHaveLength(1);
+      const priority = h.next.fetches[0]!.message.parameters.get(MessageParam.SUBSCRIBER_PRIORITY);
+      expect(priority).toBeDefined();
+      expect(priority).toEqual(h.next.requests.find(row => row.name === media)!.parameters?.get(MessageParam.SUBSCRIBER_PRIORITY));
+      await h.next.history(h.next.fetches[0]!.id, [0n, 1n, 2n, 3n], media);
+      expect(h.fatalErrors).toEqual([]);
+    } finally { await h.destroy(); }
   });
 });

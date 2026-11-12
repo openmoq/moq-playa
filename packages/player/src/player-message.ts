@@ -62,7 +62,7 @@ export interface MessageSubscriptionManager {
  * decodes location-kind parameters into a typed {group, object}. Absent or
  * malformed = null (track empty at subscribe time).
  */
-function extractLargestLocation(parameters: Parameters | undefined): { group: bigint; object: bigint } | null {
+export function extractLargestLocation(parameters: Parameters | undefined): { group: bigint; object: bigint } | null {
   const raw = parameters?.get(MessageParam.LARGEST_OBJECT)?.[0];
   if (raw instanceof Uint8Array) {
     try {

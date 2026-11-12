@@ -52,12 +52,14 @@ export interface PreparedSub {
   /** Bound by the candidate's own SUBSCRIBE_OK; null while unanswered — which
    *  is exactly why it is not readiness yet. */
   alias: bigint | null;
+  largest?: { group: bigint; object: bigint } | null;
   /** Stable terminal/routing owner, installed in the live registry only at adoption. */
   subscription?: {
     trackName: string;
     namespace: readonly string[];
     mediaType: 'video' | 'audio';
     trackAlias: bigint | null;
+    subscriberPriority?: number;
   };
 }
 

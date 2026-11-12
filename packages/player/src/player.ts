@@ -90,6 +90,7 @@ import { MediaStageObservers } from './media-stage-observers.js';
 import type { MediaDiagnosticRuntime, MediaDiagnosticsFactory, MediaStageObserver, MediaDiscardReason } from './media-diagnostic-types.js';
 import type { ObjectRoutingContext, ObjectRoutingDiscardReason, ObjectDeliveryAdmission, ObjectDeliveryOptions } from './subscription-manager.js';
 import { SubscriptionManager, type TrackPackaging } from './subscription-manager.js';
+import { extractLargestLocation } from './player-message.js';
 import { WarmStartHead } from './warm-start-head.js';
 
 interface LivenessRestart {
@@ -115,12 +116,13 @@ interface WarmMediaRoute {
 interface WarmMediaOwner {
   readonly connection: MoqtConnection;
   readonly requestId: bigint;
-  readonly subscription: { trackAlias: bigint | null; subscriberPriority?: number };
+  readonly subscription: { trackAlias: bigint | null; subscriberPriority?: number; mediaType: string; namespace?: readonly string[] };
   registration: (() => boolean) | null;
   head: WarmStartHead<WarmMediaRoute> | null;
   prefixFetch: MediaFetchInfo | null;
   readonly prefixStart?: { readonly group: bigint; readonly object: bigint };
   prefixCancelled?: boolean;
+  prefixStandalone?: boolean;
 }
 
 interface MediaFetchInfo {
@@ -1460,8 +1462,23 @@ export class MoqtPlayer {
   private _mediaSubsOk = 0;
   private _mediaSubsFailed = 0;
 
+  /** Only playback-admitted Objects advance the handover watermark. */
+  private readonly deliveredLocations = new WeakMap<object, { group: bigint; object: bigint }>();
+  private readonly deliverySubscriptions = new Map<bigint, object>();
+
   /** One initial retrieval and its completed/abandoned fence per issued owner. */
   private readonly warmMediaOwners = new Map<object, WarmMediaOwner>();
+
+  private recordDeliveredObject(obj: { kind: MoqtObject['kind']; trackAlias: bigint; groupId: bigint; objectId: bigint }): void {
+    if (obj.kind !== 'data') return;
+    const sub = this.deliverySubscriptions.get(BigInt(obj.trackAlias));
+    if (!sub) return;
+    const previous = this.deliveredLocations.get(sub);
+    const location = { group: BigInt(obj.groupId), object: BigInt(obj.objectId) };
+    if (!previous || location.group > previous.group || location.group === previous.group && location.object > previous.object) {
+      this.deliveredLocations.set(sub, location);
+    }
+  }
 
   private warmMediaOwnerCurrent(owner: WarmMediaOwner): boolean {
     if (this._destroyed || this.isTerminalState()
@@ -1489,6 +1506,7 @@ export class MoqtPlayer {
     if (!subscription) return null;
     const owner: WarmMediaOwner = { connection, requestId, subscription, registration: null, head: null, prefixFetch: null,
       ...(prefixStart ? { prefixStart: { ...prefixStart } } : {}) };
+    if (subscription.trackAlias !== null) owner.registration = this.subscriptionManager?.captureRoute(subscription.trackAlias) ?? null;
     this.warmMediaOwners.set(subscription, owner);
     const head = new WarmStartHead<WarmMediaRoute>({
       clock: this.clock,
@@ -1535,21 +1553,23 @@ export class MoqtPlayer {
     owner.prefixFetch = null;
     if (info && this.activeFetches.get(info.requestId) === info) this.quarantineFetchRequest(info.requestId);
     try {
-      const work = owner.connection.draftVersion === 22 ? owner.connection.cancelFill(owner.requestId)
+      const work = owner.connection.draftVersion === 22 && !owner.prefixStandalone ? owner.connection.cancelFill(owner.requestId)
         : info ? owner.connection.fetchCancel(info.requestId) : undefined;
       void work?.catch(() => {});
     } catch { /* A retired prefix cannot revoke the retained live subscription. */ }
   }
 
-  private requestWarmRange(owner: WarmMediaOwner, trackName: string): void {
+  private requestWarmRange(owner: WarmMediaOwner, trackName: string, end?: { group: bigint; object: bigint }): void {
     const start = owner.prefixStart;
+    const mediaType = owner.subscription.mediaType;
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
     if (!start || owner.prefixCancelled || !this.warmMediaOwnerCurrent(owner)) return;
     let registered = false;
     const register = (id: bigint): void => {
       if (registered) return;
       if (owner.prefixCancelled || !this.warmMediaOwnerCurrent(owner)) throw new Error('Switch history retired before emission');
       registered = true;
-      this.registerMediaFetch(id, { trackName, mediaType: 'video', subscriptionRequestId: owner.requestId,
+      this.registerMediaFetch(id, { trackName, mediaType, subscriptionRequestId: owner.requestId,
         trackAlias: null, warmStart: true, warmOwner: owner }, owner.connection);
     };
     const failed = (): void => {
@@ -1557,6 +1577,18 @@ export class MoqtPlayer {
       this.cancelWarmRange(owner);
     };
     try {
+      if (isDraft22(owner.connection.draftVersion) && end) {
+        // d22 §§3.2, 9.11: standalone FETCH has an inclusive exact range.
+        // The SDK converts its half-open end to that inclusive wire Location.
+        // Unlike a fill REQUEST_UPDATE, refusal cannot terminate the live
+        // subscription (d22 §9.5.1 UPDATE_FAILED); preserve live fallback.
+        owner.prefixStandalone = true;
+        void owner.connection.fetch((owner.subscription.namespace ?? namespaceFields(this.config.namespace)).map(field => this.enc.encode(field)),
+          this.enc.encode(trackName), { startGroup: start.group, startObject: start.object,
+            endGroup: end.group, endObject: end.object + 1n, groupOrder: 'ascending', onRequestId: register,
+          }).then(id => register(BigInt(id))).catch(failed);
+        return;
+      }
       void owner.connection.joiningFetch({ joiningFetchType: 'absolute', joiningRequestId: owner.requestId,
         joiningStart: start.group, groupOrder: 'ascending', onRequestId: register,
         ...(owner.subscription.subscriberPriority === undefined ? {}
@@ -1866,6 +1898,7 @@ export class MoqtPlayer {
     this.pendingMediaTerminals.get(conn)?.get(requestId)?.releaseEnd();
     this.pendingMediaTerminals.get(conn)?.delete(requestId);
     const ownerSubscription = this.activeSubscriptions.get(requestId);
+    if (ownerSubscription?.trackAlias != null && this.deliverySubscriptions.get(ownerSubscription.trackAlias) === ownerSubscription) this.deliverySubscriptions.delete(ownerSubscription.trackAlias);
     const warmOwner = ownerSubscription && this.warmMediaOwners.get(ownerSubscription);
     if (warmOwner?.connection === conn) {
       this.warmMediaOwners.delete(ownerSubscription!);
@@ -2664,7 +2697,7 @@ export class MoqtPlayer {
       if (!this.admitVideoSwitchObject(this.pendingVideoSwitch, decoded.bytes.byteLength)) {
         this.discardMediaInput(input, 'track superseded'); return;
       }
-      this.cmafSwitchStagingBuffer.push({ trackName, ...(sourceKey === undefined ? {} : { sourceKey }), mediaType, groupId, payload: decoded.bytes, sync: decoded.sync, ...(input ? { input } : {}) });
+      this.cmafSwitchStagingBuffer.push({ trackName, ...(sourceKey === undefined ? {} : { sourceKey }), mediaType, groupId, objectId: BigInt(obj.objectId), payload: decoded.bytes, sync: decoded.sync, ...(input ? { input } : {}) });
       this.armVideoSwitchTimeout(this.pendingVideoSwitch);
       if (decoded.sync) {
         this.completePendingVideoSwitch();
@@ -2679,6 +2712,7 @@ export class MoqtPlayer {
       if (floor !== undefined && groupId < floor) { this.discardMediaInput(input, 'stale group'); return; }
     }
 
+    if (this.cmafAssembler) this.recordDeliveredObject(obj);
     this.pushCmafInput(mediaType, trackName, groupId, decoded.bytes, input, sourceKey, undefined, lagOwner);
   }
 
@@ -3002,6 +3036,7 @@ export class MoqtPlayer {
       this.discardMediaInput(input, 'track superseded'); return;
     }
     const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
+    if (pipeline) this.recordDeliveredObject(frame);
     if (!pipeline) this.discardMediaInput(input, 'not attached');
     else if (samples && frame.kind === 'data') pipeline.pushSampleObject(frame, samples, input, {
       ...(delivery?.backfill ? { backfill: true } : {}), allowIndependentGap: samples[0]?.chunk.type === 'key',
@@ -3811,6 +3846,7 @@ export class MoqtPlayer {
     const toFlush = keyframeIdx >= 0 ? staged.slice(keyframeIdx) : staged;
     for (const entry of keyframeIdx > 0 ? staged.slice(0, keyframeIdx) : []) this.discardMediaInput(entry.input, 'awaiting keyframe');
     for (const { obj: stagedObj, headers: stagedHeaders, samples, input } of toFlush) {
+      if (this.videoPipeline) this.recordDeliveredObject(stagedObj);
       if (!this.videoPipeline) this.discardMediaInput(input, 'not attached');
       else if (samples && stagedObj.kind === 'data') this.videoPipeline.pushSampleObject(stagedObj, samples, input, { allowIndependentGap: samples[0]?.chunk.type === 'key' });
       else if (input) this.videoPipeline.pushObject(stagedObj, stagedHeaders, input);
@@ -4015,6 +4051,8 @@ export class MoqtPlayer {
     try {
       for (const { trackName: stagedTrack, sourceKey, mediaType: stagedMt, groupId, objectId, payload, input } of cmafStaged) {
         if (!this.switchIsCurrent(sw)) break;
+        const alias = sw.newRequestId === null ? undefined : this.activeSubscriptions.get(sw.newRequestId)?.trackAlias;
+        if (this.cmafAssembler && alias != null && objectId !== undefined) this.recordDeliveredObject({ kind: 'data', trackAlias: alias, groupId, objectId });
         this.pushCmafInput(stagedMt, stagedTrack, groupId, payload, input, sourceKey, objectId);
         replayed++;
       }
@@ -4553,6 +4591,7 @@ export class MoqtPlayer {
           this.discardMediaInput(input, deliveryState === PlayerState.PAUSED ? 'paused' : 'route retired'); return;
         }
       }
+      if (pipeline) this.recordDeliveredObject(obj);
       if (!pipeline) this.discardMediaInput(input, 'not attached');
       else if (delivery?.backfill) pipeline.pushObject(obj, headers, input, { backfill: true });
       else if (input) pipeline.pushObject(obj, headers, input);
@@ -4690,6 +4729,7 @@ export class MoqtPlayer {
       }
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
+      if (this.cmafAssembler) this.recordDeliveredObject(obj);
       this.pushCmafInput(mediaType, trackName, groupId, obj.payload, input, sourceKey, BigInt(obj.objectId), lagOwner);
     };
 
@@ -6695,8 +6735,12 @@ export class MoqtPlayer {
       // overwritten here: the replacement is authoritative for it now.
       this.pendingMediaSubs.delete(reqId);
       sub.subscription ??= { trackName: sub.trackName, mediaType: sub.mediaType, trackAlias: sub.alias, namespace: sub.namespace };
+      // FETCH priority is independent: d14 §9.16, d16 §9.2.2.3, d18 §10.2.7.
+      sub.subscription.subscriberPriority = Number(this.subscriberPriorityFor(sub.mediaType).subscriberPriority
+        ?? this.config.subscriberPriority ?? DEFAULT_SUBSCRIBER_PRIORITY);
       this.activeSubscriptions.set(reqId, sub.subscription);
       if (sub.alias !== null) {
+        this.deliverySubscriptions.set(sub.alias, sub.subscription);
         this.subscriptionManager?.registerTrack(sub.alias, sub.trackName, sub.mediaType, sub.packaging,
           { sourceConnection: conn, namespace: sub.namespace });
       }
@@ -7872,6 +7916,8 @@ export class MoqtPlayer {
     // retained-route ownership below is about that connection, and reading it
     // afterwards would name the replacement as its own predecessor.
     const retiring = this.connection;
+    const previousSubscriptions = [...this.activeSubscriptions.values()];
+    const ranges: Array<{ owner: WarmMediaOwner; name: string; end: { group: bigint; object: bigint } }> = [];
     if (retiring) this.cancelLivenessRestarts(retiring);
     txn.committed = true; // staging closed — further candidate events run live on the now-current session
     if (this.pendingVideoSwitch) {
@@ -8026,6 +8072,25 @@ export class MoqtPlayer {
       this.pendingAliasBinds.clear();
       this.mseCompletions = null;
       this.adoptPreparedSubscriptions(prep, txn.conn);
+      // d14/16 §9.16.2 and d18 §10.12.2 join the saved SUBSCRIBE_OK
+      // Largest. MSF-01 §5.2.7 limits this policy to ongoing live tracks.
+      if (this.config.subscriptionFilter === undefined) for (const [id, sub] of prep.media) {
+        if (prep.selection?.[sub.mediaType]?.isLive !== true || !sub.largest) continue;
+        const old = previousSubscriptions.find(old => old.trackName === sub.trackName
+          && sameNamespaceFields(old.namespace ?? namespaceFields(this.config.namespace), sub.namespace));
+        const delivered = old && this.deliveredLocations.get(old);
+        if (!delivered) continue;
+        this.deliveredLocations.set(sub.subscription!, delivered);
+        // Retire this track's old route at adoption so its delivered floor is
+        // final before the bounded prefix releases any replacement Objects.
+        if (old.trackAlias !== null) this.supersededRouting?.aliases.delete(old.trackAlias);
+        const owner = this.armWarmMediaOwner(txn.conn, id, { group: delivered.group, object: delivered.object + 1n });
+        owner?.head?.acceptLargest(sub.largest);
+        if (owner && (delivered.group < sub.largest.group
+            || delivered.group === sub.largest.group && delivered.object < sub.largest.object)) {
+          ranges.push({ owner, name: sub.trackName, end: sub.largest });
+        }
+      }
       this._mediaSubsExpected = prep.media.size;
       this._mediaSubsOk = prep.media.size;
       this._mediaSubsFailed = 0;
@@ -8066,6 +8131,7 @@ export class MoqtPlayer {
     this.quarantinedFetchRequests.clear();
     this.droppedFetchStreams.clear();
     this.rejectPendingCatalogFetches('Session migrated — fetchCatalog cancelled');
+    for (const range of ranges) this.requestWarmRange(range.owner, range.name, range.end);
   }
 
   /**
@@ -8106,7 +8172,7 @@ export class MoqtPlayer {
       this.activeSubscriptions.delete(reqId);
       this.pendingMediaSubs.delete(reqId);
     }
-    for (const alias of superseded.aliases) this.subscriptionManager?.unregisterTrack(alias);
+    for (const alias of superseded.aliases) { this.deliverySubscriptions.delete(alias); this.subscriptionManager?.unregisterTrack(alias); }
     // Current-session completion may have been waiting only for these overlap registrations to retire.
     try { this.reconsiderMseTrackEnds(); }
     catch (error) { try { this.log.warn('Track completion observer failed after retirement: %s', String(error)); } catch { /* observer failure */ } }
@@ -10313,6 +10379,7 @@ export class MoqtPlayer {
     try { seekOutput?.resource.cancel(); } catch (error) { retirementFailures.push(error); }
     let closedCandidate: MoqtConnection | null = null;
     try {
+      this.deliverySubscriptions.clear();
       this.receivingVideoOwners.clear();
       this.audioOutput = null; this.lastAudioDomainOwner = null; this.lastAudioDomain = null;
       this.installedDecoderConfigurations.clear(); this.preparedDecoderConfigurations.clear(); this.decoderConfigurationCommands.clear();
@@ -12025,6 +12092,7 @@ export class MoqtPlayer {
         if (msg.type === 'SUBSCRIBE_OK' && 'trackAlias' in msg) {
           // ACCEPTANCE — the §7.4.1 precondition for retiring the old
           // subscriptions. Sending the request proved nothing.
+          if (sub) sub.largest = extractLargestLocation(msg.parameters);
           this.onCandidateSubscribeAccepted(txn!, reqId, BigInt((msg as { trackAlias: bigint | number }).trackAlias));
         } else if (msg.type === 'REQUEST_ERROR') {
           const what = sub !== undefined ? `track "${sub.trackName}"` : `init track "${initName!}"`;
@@ -12490,6 +12558,8 @@ export class MoqtPlayer {
           requestId, fetchInfo.trackName, errorReason, errorCode.toString(16));
       },
       onMediaAliasBound: (requestId, alias) => {
+        const sub = this.activeSubscriptions.get(requestId);
+        if (sub) this.deliverySubscriptions.set(alias, sub);
         // The current session has bound this alias, so it is no longer a
         // retired session's route — whatever that session still sends on it
         // belongs to nobody.
