@@ -5194,7 +5194,7 @@ export class MoqtPlayer {
     const gen = this.bootstrapGeneration;
     const live = (): boolean => !this._destroyed && !this.isTerminalState() && this.connection === conn
       && gen === this.bootstrapGeneration && !this.catalogSlots.catalogReceived
-      && !this.catalogQuarantinedConns.has(conn);
+      && !this.catalogQuarantinedConns.has(conn) && this.mediaRecoveryOwnsConnection(conn);
     if (!live()) return;
     if (this.catalogSlots.catalogSubscribeRetryTimer !== null) return;
     let remaining = retryInterval - 1n;
@@ -13006,6 +13006,7 @@ export class MoqtPlayer {
           });
           doRecoveryAction(action, 'video', this.qualityController, this.log, {
             onQualityReduced: (newTrack) => {
+              if (!this.mediaRecoveryOwnsConnection(this.connection)) return;
               // No stats here — deferred to completePendingVideoSwitch.
               this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'recovery', 'downshift').catch((err) => {
                 this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
@@ -13215,7 +13216,7 @@ export class MoqtPlayer {
         // Emergency downshift: non-mutating peek, deferred commit.
         if (this.qualityController && this.bufferAbrController) {
           const newTrack = this.qualityController.peekLowerVideoQuality(true);
-          if (newTrack) {
+          if (newTrack && this.mediaRecoveryOwnsConnection(this.connection)) {
             this.lastAbrDownshiftUs = this.clock.now();
             this.log.warn('MSE stall %dms → emergency downshift to %s', durationMs, newTrack.name);
             this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'recovery', 'downshift').catch((err) => {
@@ -14228,6 +14229,7 @@ export class MoqtPlayer {
         if (result) {
           doRecoveryAction(result, mediaType, this.qualityController, this.log, {
             onQualityReduced: (newTrack) => {
+              if (!this.mediaRecoveryOwnsConnection(this.connection)) return;
               this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'recovery', 'downshift').catch((err) => {
                 this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
               });

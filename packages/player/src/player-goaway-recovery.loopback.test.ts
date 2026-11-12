@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createControlCodec, varint } from '@openmoq/transport';
 import { MoqtConnection } from '@openmoq/webtransport';
+import { videoInit } from '../../locmaf/test-support/cmaf.js';
+import type { MediaSourceLike } from './interfaces.js';
+import type { PlaybackEvent } from '@openmoq/playback';
 import type { PlayerError } from './errors.js';
 import { MoqtPlayer } from './player.js';
 import { createLoopback, flush } from '../../webtransport/src/testkit/loopback.js';
@@ -204,4 +207,160 @@ it('honors the peer catalog Retry Interval before first media', async () => {
     await vi.advanceTimersByTimeAsync(1099); await flush(128); expect(h.requests).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1); await flush(256); expect(h.requests).toHaveLength(2);
   } finally { await player.destroy(); await h.close(); }
+});
+
+type Mode = 'failed-migration' | 'no-factories';
+async function switching(draft: 18 | 22, mode: Mode, mse = false) {
+  const old = peer(draft);
+  // Modeled MSE sink; the real player installs and owns its stall callback.
+  const source: MediaSourceLike = { initialize: () => true, appendChunk: vi.fn(), reset() {},
+    endOfStream() {}, destroy() {}, mediaElement: null, onFirstFrame: null, onError: null, onStall: null };
+  let connects = 0;
+  const calls: Array<{ name: string; state: string }> = [];
+  const subscribe = old.client.subscribe.bind(old.client);
+  vi.spyOn(old.client, 'subscribe').mockImplementation((ns, name, ...rest) => {
+    calls.push({ name: decoder.decode(name), state: old.client.session.state });
+    return subscribe(ns, name, ...rest);
+  });
+  if (mode === 'no-factories') await old.client.connect(old.start());
+  const errors: PlayerError[] = [], arrivals: unknown[] = [];
+  const player = new MoqtPlayer({
+    url: 'https://relay.invalid/moq', namespace: 'live', draftVersion: draft, catalogBootstrap: 'subscribe',
+    ...(mode === 'no-factories' ? { connection: old.client } : {
+      createConnection: () => ++connects === 1 ? old.client : new MoqtConnection(draft),
+      // A draining relay that refuses the replacement session.
+      createTransport: async () => { if (connects === 1) return old.start(); throw new Error('connection refused while draining'); },
+    }),
+    catalog: { version: 1, tracks: [
+      { name: 'video', role: 'video', packaging: mse ? 'cmaf' : 'loc', ...(mse ? { initData: Buffer.from(videoInit()).toString('base64') } : {}), isLive: true, codec: 'avc1.640028', width: 10, height: 10, renderGroup: 1, altGroup: 1, bitrate: 200 },
+      { name: 'video2', role: 'video', packaging: mse ? 'cmaf' : 'loc', ...(mse ? { initData: Buffer.from(videoInit()).toString('base64') } : {}), isLive: true, codec: 'avc1.640028', width: 10, height: 10, renderGroup: 1, altGroup: 1, bitrate: 100 },
+    ] },
+    ...(mse ? { createMediaSource: () => source } : {}),
+    createCmafAssembler: callbacks => ({
+      push: (mediaType, track, group, payload) => callbacks.onSegment(mediaType, payload, track, group),
+      getEpoch: () => null, reset() {}, destroy() {},
+    }),
+    selection: { videoTrack: { name: 'video' } },
+    disableAudio: true, autoQuality: false, livenessTimeoutMs: 0, connectionTimeoutMs: 5000,
+  });
+  player.on('error', e => { errors.push(e.error); });
+  player.on('media_object', e => { arrivals.push(e); });
+  await player.load(); await flush(128);
+  const req = old.requests.find(r => r.name === 'video')!;
+  await old.server.acceptSubscribe(req.id, 50n); await flush(128); player.play();
+  const stream = await old.server.openSubgroup(50n, 0n, 0n);
+  await old.server.sendObject(stream, 0n, Uint8Array.of(1)); await flush(128); player.tick();
+  expect(arrivals).toHaveLength(1); expect(player.state).toBe('playing');
+  return { old, source, player, calls, errors, arrivals, stream,
+    async goaway() {
+      await old.server.sendGoaway({ newSessionUri: '', requestId: 100n, timeout: 10_000n }); await flush(256);
+      await vi.advanceTimersByTimeAsync(50); await flush(256);
+      expect(old.client.session.state).toBe('draining');
+    },
+    async close() { await player.destroy(); await old.close(); } };
+}
+
+
+// Enter the player's pipeline recovery callback, rather than impersonating policy
+// through the public reason string. Network requests still use the real SDK.
+function recoverQuality(player: MoqtPlayer): void {
+  player.setAutoQuality(true);
+  (player as unknown as { handlePipelineEvent(type: 'video', event: PlaybackEvent): void })
+    .handlePipelineEvent('video', { type: 'recovery', action: { type: 'reduce_quality', reason: 'stall' } });
+}
+
+describe.each([18, 22] as const)('policy switches during drain draft%i', draft => {
+  for (const mode of ['failed-migration', 'no-factories'] as const) {
+    it(`${mode}: keeps recovery downshifts off the draining session`, async () => {
+      // Healthy control: the same policy entry really does request the target.
+      const healthy = await switching(draft, 'no-factories');
+      try {
+        recoverQuality(healthy.player);
+        await flush(256);
+        expect(healthy.old.requests.map(r => r.name)).toContain('video2');
+      } finally { await healthy.close(); }
+      const f = await switching(draft, mode);
+      try {
+        await f.goaway();
+        const errorsBefore = f.errors.length; // Replacement refusal is independent of recovery.
+        recoverQuality(f.player);
+        await flush(256);
+        expect(f.calls.filter(c => c.state === 'draining')).toEqual([]);
+        expect(f.old.requests.map(r => r.name)).toEqual(['video']);
+        expect(f.errors).toHaveLength(errorsBefore);
+        await f.old.server.sendObject(f.stream, 1n, Uint8Array.of(2)); await flush(128);
+        expect(f.arrivals).toHaveLength(2);
+        expect(f.player.state).toBe('playing');
+        // R6: application selections still receive the SDK's local refusal.
+        await expect(f.player.selectVideoTrack('video2')).rejects.toThrow(/DRAINING/);
+        expect(f.old.requests.map(r => r.name)).toEqual(['video']);
+      } finally { await f.close(); }
+    });
+  }
+});
+
+it('keeps an MSE adapter stall downshift off a draining session', async () => {
+  for (const draining of [false, true]) {
+    const f = await switching(18, 'no-factories', true);
+    try {
+      f.player.setAutoQuality(true);
+      if (draining) await f.goaway();
+      const select = vi.spyOn(f.player, 'selectVideoTrack');
+      expect(f.source.onStall).toBeTypeOf('function');
+      f.source.onStall!(1000);
+      await flush(256);
+      if (draining) expect(select).not.toHaveBeenCalled();
+      else expect(select).toHaveBeenCalledWith(expect.objectContaining({ name: 'video2' }), 'recovery', 'downshift');
+      expect(f.calls.filter(c => c.state === 'draining')).toEqual([]);
+      expect(f.old.requests.map(r => r.name)).toEqual(draining ? ['video'] : ['video', 'video2']);
+      expect(f.errors).toEqual([]);
+      await f.old.server.sendObject(f.stream, 1n, Uint8Array.of(2)); await flush(128);
+      expect(f.arrivals).toHaveLength(2);
+    } finally { await f.close(); }
+  }
+});
+
+it('quarantines an armed catalog retry after GOAWAY with or without factories', async () => {
+  for (const factories of [true, false]) {
+    const h = peer(), errors: PlayerError[] = [];
+    if (!factories) await h.client.connect(h.start());
+    let connects = 0;
+    const player = new MoqtPlayer({ url: 'https://relay.invalid/moq', namespace: 'live', catalogBootstrap: 'subscribe',
+      ...(factories ? {
+        createConnection: () => ++connects === 1 ? h.client : new MoqtConnection(18),
+        createTransport: async () => { if (connects === 1) return h.start(); throw new Error('replacement refused'); },
+      } : { connection: h.client }) });
+    player.on('error', event => { errors.push(event.error); });
+    const subscribe = vi.spyOn(h.client, 'subscribe');
+    try {
+      await player.load(); await flush(128); expect(h.requests).toHaveLength(1);
+      h.a.bidiOut[0]!.in.injectRead(createControlCodec(18).encode({ type: 'REQUEST_ERROR',
+        requestId: varint(h.requests[0]!.id), errorCode: varint(0x10n), retryInterval: varint(1101n), errorReason: 'not yet' }));
+      await flush(256); expect(errors).toEqual([]);
+      await h.server.sendGoaway({ newSessionUri: '', requestId: 100n, timeout: 10_000n }); await flush(256);
+      expect(h.client.session.state).toBe('draining');
+      const errorsBefore = errors.length;
+      subscribe.mockClear();
+      await vi.advanceTimersByTimeAsync(1500); await flush(256);
+      expect(subscribe).not.toHaveBeenCalled();
+      expect(h.requests).toHaveLength(1);
+      expect(errors).toHaveLength(errorsBefore);
+    } finally { await player.destroy(); await h.close(); }
+  }
+});
+
+describe.each([18, 22] as const)('application switch reasons draft%i', draft => {
+  for (const mode of ['no-factories', 'failed-migration'] as const) {
+    it(`${mode}: refuses application switches regardless of their reason`, async () => {
+      const f = await switching(draft, mode);
+      try {
+        await f.goaway();
+        f.player.setAutoQuality(true);
+        for (const reason of ['user-selection', 'recovery', 'bandwidth']) {
+          await expect(f.player.selectVideoTrack('video2', reason, 'downshift')).rejects.toThrow(/DRAINING/);
+        }
+        expect(f.old.requests.map(r => r.name)).toEqual(['video']);
+      } finally { await f.close(); }
+    });
+  }
 });
