@@ -1360,6 +1360,7 @@ export class MoqtConnection {
      *  Concurrent closeSubgroup() callers await THIS promise, so every caller
      *  observes the same success or failure. */
     closing?: Promise<void>;
+    resetting?: Promise<void>;
   }>();
 
   /** Counter for synthetic outgoing stream IDs. */
@@ -6008,6 +6009,10 @@ export class MoqtConnection {
       for (const sid of [...open]) {
         const st = this.outgoingStreams.get(sid) ?? this.fetchOutgoingStreams.get(sid);
         if (st) {
+          if ('resetting' in st && st.resetting) {
+            aborts.push(st.resetting.then(() => true, () => false));
+            continue;
+          }
           this.outgoingStreams.delete(sid);
           this.removeOutgoingFetchStream(sid);
           // INITIATE every cancellation before awaiting any individual one.
@@ -6248,7 +6253,7 @@ export class MoqtConnection {
     }
     // FIN already initiated: the stream is still registered (see closeSubgroup)
     // but no further object may join the group.
-    if (state.closing) {
+    if (state.closing || state.resetting) {
       throw new MoqtConnectionError(
         `Outgoing stream ${streamId} is closing — no further objects may be sent`,
         { errorSource: 'data' },
@@ -6356,6 +6361,31 @@ export class MoqtConnection {
     }
   }
 
+  resetSubgroup(streamId: bigint): Promise<void> {
+    const state = this.outgoingStreams.get(streamId);
+    if (!state) return Promise.reject(new Error(`Unknown outgoing stream ${streamId}`));
+    if (state.resetting) return state.resetting;
+    let reason: Error;
+    try {
+      if (!this.transport?.createStreamError) throw new Error('createStreamError is unavailable');
+      reason = this.transport.createStreamError(1, new Error('Subgroup cancelled'));
+    } catch (error) { return Promise.reject(error); }
+    state.resetting = Promise.resolve().then(async () => {
+      const reset = Promise.resolve().then(() => this.transport?.resetSendStream
+        ? this.transport.resetSendStream(state.writer, reason, state.closing)
+        : state.writer.abort(reason)).then(() => true, () => false);
+      if (!await this.allFulfilledWithin([reset], MoqtConnection.PUBLISHER_ABORT_DEADLINE_MS)) {
+        this.closeSessionInternalError('Could not prove subgroup reset');
+        throw new Error('Could not prove subgroup reset');
+      }
+      this.outgoingStreams.delete(streamId);
+      if (state.subscriptionRequestId !== undefined) {
+        this.openSubgroupsByRequest.get(state.subscriptionRequestId)?.delete(streamId);
+      }
+    });
+    return state.resetting;
+  }
+
   /**
    * Close an outgoing subgroup stream (sends FIN).
    *
@@ -6370,6 +6400,7 @@ export class MoqtConnection {
     // so a second caller stays pending until the FIN settles and observes the
     // same outcome (a caller must not be told the group was delivered while its
     // FIN is still pending, nor miss a later FIN failure).
+    if (state.resetting) return state.resetting;
     if (state.closing) return state.closing;
 
     const fin = (async () => {
@@ -6390,8 +6421,8 @@ export class MoqtConnection {
         // Settled either way: release the slot so a failed FIN leaves no phantom
         // open subgroup and a retry is a clean no-op. (Teardown may have removed
         // these already — deletion is idempotent.)
-        this.outgoingStreams.delete(streamId);
-        if (state.subscriptionRequestId !== undefined) {
+        if (!state.resetting) this.outgoingStreams.delete(streamId);
+        if (!state.resetting && state.subscriptionRequestId !== undefined) {
           const open = this.openSubgroupsByRequest.get(state.subscriptionRequestId);
           if (open) {
             open.delete(streamId);
