@@ -1422,7 +1422,8 @@ describe('MoqtConnection(18) loopback — terminal-alias guard delivery timeout 
       const { client, server } = await connectedPair(18, { clientOptions: { terminatedAliasTtlMs: 1_000 } });
       let subReqId = -1n;
       server.onSubscribe = (rid) => { subReqId = rid; };
-      const subP = client.subscribeTrack(ns('live'), nm('vid'), { onObject: () => { /* none */ } });
+      // Exercise immediate discard and its terminal alias guard.
+      const subP = client.subscribeTrack(ns('live'), nm('vid'), { terminalDelivery: 'discard', onObject: () => { /* none */ } });
       await flush();
       await server.acceptSubscribe(subReqId, 9n); // no initial timeout
       await flush();
@@ -2294,7 +2295,8 @@ describe('MoqtConnection(18) loopback — coalesced reads, terminal PUBLISH_DONE
 
   it('receiver of PUBLISH_DONE takes the early-discard path: STOP_SENDING on the subscription\'s open data streams', async () => {
     const { client, server, a, b, errors } = await connectedPair();
-    const subReqId = await client.subscribe(ns('live'), nm('vid'));
+    // Exercise immediate discard and its terminal alias guard.
+    const subReqId = await client.subscribe(ns('live'), nm('vid'), { terminalDelivery: 'discard' });
     await flush();
     await server.acceptSubscribe(subReqId, 7n);
     await flush();
@@ -2333,7 +2335,8 @@ describe('MoqtConnection(18) loopback — terminal-lifecycle interleavings', () 
     const pair = await connectedPair(18, opts);
     const seen: ControlMessage[] = [];
     pair.client.onMessage = (m) => seen.push(m);
-    const subReqId = await pair.client.subscribe(ns('live'), nm('vid'));
+    // Exercise immediate discard and its terminal alias guard.
+    const subReqId = await pair.client.subscribe(ns('live'), nm('vid'), { terminalDelivery: 'discard' });
     await flush();
     await pair.server.acceptSubscribe(subReqId, 7n);
     await flush();
@@ -2672,7 +2675,8 @@ describe('MoqtConnection(18) loopback — receiver terminal/alias lifecycle', ()
     const { client, server, a, b, errors } = await connectedPair(18, { clientOptions: { terminatedAliasTtlMs: 10_000 } });
     const d1: string[] = [];
     let rid1 = -1n; server.onSubscribe = (r) => { rid1 = r; };
-    const p1 = client.subscribeTrack(ns('live'), nm('v1'), { onObject: (o) => d1.push(`${o.groupId}:${o.objectId}`) });
+    // Exercise immediate discard and its terminal alias guard.
+    const p1 = client.subscribeTrack(ns('live'), nm('v1'), { terminalDelivery: 'discard', onObject: (o) => d1.push(`${o.groupId}:${o.objectId}`) });
     await flush();
     await server.acceptSubscribe(rid1, 7n);
     await p1;
@@ -2753,7 +2757,8 @@ describe('MoqtConnection(18) loopback — receiver terminal/alias lifecycle', ()
 
   async function acceptedForReceiver(clientOptions?: { terminatedAliasTtlMs?: number }) {
     const pair = await connectedPair(18, { clientOptions });
-    const subReqId = await pair.client.subscribe(ns('live'), nm('vid'));
+    // Exercise immediate discard and its terminal alias guard.
+    const subReqId = await pair.client.subscribe(ns('live'), nm('vid'), { terminalDelivery: 'discard' });
     await flush();
     await pair.server.acceptSubscribe(subReqId, 7n);
     await flush();
@@ -2887,7 +2892,8 @@ describe('MoqtConnection(18) loopback — terminal session-state transitions and
     it(`alias reuse while an incomplete old generation (${kind}) is still guarded is REFUSED — never bound, never misdelivered`, async () => {
       const { client, server, a, b, errors } = await connectedPair(18, { clientOptions: { terminatedAliasTtlMs: 10_000 } });
       let rid1 = -1n; server.onSubscribe = (r) => { rid1 = r; };
-      const p1 = client.subscribeTrack(ns('live'), nm('v1'), { onObject: () => { /* sub1 */ } });
+      // Exercise immediate discard and its terminal alias guard.
+      const p1 = client.subscribeTrack(ns('live'), nm('v1'), { terminalDelivery: 'discard', onObject: () => { /* sub1 */ } });
       await flush();
       await server.acceptSubscribe(rid1, 7n);
       await p1;

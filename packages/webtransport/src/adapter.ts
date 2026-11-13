@@ -394,19 +394,22 @@ export interface RequestOwnershipOptions {
  *
  * PUBLISH_DONE is not a delivery barrier — the drafts expect it to precede
  * late objects and even late-opening streams, and recommend retaining
- * subscription state for a delivery-timeout window (§9.15/§10.11). By default
- * this adapter tombstones the alias on DONE and discards late streams. A
- * subscription opted in with `terminalDelivery: 'drain'` instead KEEPS its
- * routing alive for the effective timeout window
- * (`max(terminatedAliasTtlMs, effective alias delivery timeout)`), delivering
- * late streams and datagrams, then reports `onDrained(requestId)` exactly once.
+ * subscription state (d14 §9.12, d16 §9.15, d18 §10.11, d22 §9.9).
+ * By default, routing stays alive for late streams and datagrams until a
+ * exact Stream Count (including zero) is fully processed, or the bounded window
+ * `max(terminatedAliasTtlMs, effective alias delivery timeout)` expires.
+ * A default subscription ends immediately if a live sibling still shares its alias.
+ * This applies to every PUBLISH_DONE status. `terminalDelivery: 'discard'`
+ * opts out: cancel open streams immediately and discard late arrivals.
+ * Unsubscribe stops delivery to that request immediately and awaits its cleanup
+ * and onDrained; shared streams stay open while another subscriber needs them.
  *
  * Rules:
- * - Completion defaults to timeout-only, retaining late datagrams too.
- *   `terminalDeliveryCompletion: 'streams'` permits earlier completion once a
- *   positive exact Stream Count has been fully processed (§9.15/§10.11/§9.9).
- *   Zero, unknown and unmet counts retain the timeout policy. Stream completion
- *   is not a datagram delivery guarantee; use the default to retain datagrams.
+ * - Explicit `terminalDelivery: 'drain'` retains its timeout-only default.
+ *   Add `terminalDeliveryCompletion: 'streams'` for exact stream completion.
+ *   Explicit drain retains zero counts; unknown and unmet counts always wait. Stream completion
+ *   is not a datagram delivery guarantee; use explicit timeout-only drain to
+ *   retain datagrams for the full window.
  * - At the timeout, still-open streams are cancelled (STOP_SENDING) and their
  *   cleanup awaited before completion. If a cancellation never settles, the
  *   drain remains safely blocked — fail-closed by design.
@@ -415,10 +418,10 @@ export interface RequestOwnershipOptions {
  *   before any request allocation or wire emission.
  */
 export interface TerminalDeliveryOptions {
-  terminalDelivery?: 'drain';
+  terminalDelivery?: 'drain' | 'discard';
   /** Drain only these PUBLISH_DONE status codes; omitted means every status. Adapter-local, never encoded. */
   terminalDeliveryStatuses?: readonly bigint[];
-  /** Opt in to the drafts' exact processed-stream completion rule; default retains the full timeout. */
+  /** With explicit drain, opt in to exact processed-stream completion instead of timeout-only. */
   terminalDeliveryCompletion?: 'streams';
   onDrained?: (requestId: bigint) => void;
 }
@@ -1546,10 +1549,13 @@ export class MoqtConnection {
 
   /** Subscriptions opted into terminal drain, by request ID (§ terminal drain). */
   private readonly drainConfigs = new Map<bigint, { onDrained: ((requestId: bigint) => void) | null; statuses: ReadonlySet<bigint> | null;
-    completion: 'streams' | undefined }>();
+    completion: 'streams' | undefined; implicit: boolean }>();
 
   private terminalDrainSelected(requestId: bigint, status: bigint): boolean {
     const cfg = this.drainConfigs.get(requestId);
+    const alias = this.session.getSubscription(requestId)?.trackAlias;
+    // d22 §3.1: an implicit drain must not credit a live sibling's future Objects.
+    if (cfg?.implicit && alias !== undefined && this.aliasHasOtherSubscriber(alias, requestId)) return false;
     return cfg !== undefined && (cfg.statuses === null || cfg.statuses.has(BigInt(status)));
   }
   /** Live per-alias drain state; presence also blocks alias reuse. */
@@ -2010,6 +2016,9 @@ export class MoqtConnection {
   ): Promise<bigint> {
     // Terminal-delivery validation runs BEFORE any allocation or emission:
     // silently ignoring a dangling onDrained would hide bugs.
+    if (options?.terminalDelivery !== undefined && options.terminalDelivery !== 'drain' && options.terminalDelivery !== 'discard') {
+      throw new TypeError('terminalDelivery must be drain or discard when supplied');
+    }
     if ((options?.onDrained || options?.terminalDeliveryStatuses !== undefined || options?.terminalDeliveryCompletion !== undefined)
         && options.terminalDelivery !== 'drain') {
       throw new Error("terminal delivery options require terminalDelivery: 'drain'");
@@ -2034,8 +2043,9 @@ export class MoqtConnection {
     const { requestId, actions } = this.session.subscribe(namespace, name, restSession as SubscribeOptions);
     this.pendingGenericSubscriptions.add(requestId);
     this.registerPendingSubscription(requestId);
-    if (terminalDelivery === 'drain') {
-      this.drainConfigs.set(requestId, { onDrained: onDrained ?? null, statuses: statusSet, completion: terminalDeliveryCompletion });
+    if (terminalDelivery !== 'discard') {
+      this.drainConfigs.set(requestId, { onDrained: onDrained ?? null, statuses: statusSet, implicit: terminalDelivery === undefined,
+        completion: terminalDelivery === undefined ? 'streams' : terminalDeliveryCompletion });
     }
     try {
       this.invokeOwnershipCallback(requestId, onRequestId);
@@ -2051,6 +2061,9 @@ export class MoqtConnection {
 
   /** Validate raw terminal delivery before authorization or allocation. */
   private validateTerminalDeliveryOptions(options: TerminalDeliveryOptions | undefined): ReadonlySet<bigint> | null {
+    if (options?.terminalDelivery !== undefined && options.terminalDelivery !== 'drain' && options.terminalDelivery !== 'discard') {
+      throw new TypeError('terminalDelivery must be drain or discard when supplied');
+    }
     if ((options?.onDrained || options?.terminalDeliveryStatuses !== undefined || options?.terminalDeliveryCompletion !== undefined)
         && options.terminalDelivery !== 'drain') {
       throw new Error("terminal delivery options require terminalDelivery: 'drain'");
@@ -3181,8 +3194,9 @@ export class MoqtConnection {
     // Close/cancel may reject the raw result while the request write is pending.
     // The public async operation still returns that outcome once its send settles.
     void result.catch(() => {});
-    const drainConfig = options?.terminalDelivery === 'drain'
-      ? { onDrained: options.onDrained ?? null, statuses: statusSet, completion: options.terminalDeliveryCompletion }
+    const drainConfig = options?.terminalDelivery !== 'discard'
+      ? { onDrained: options?.onDrained ?? null, statuses: statusSet, implicit: options?.terminalDelivery === undefined,
+        completion: options?.terminalDelivery === undefined ? 'streams' as const : options.terminalDeliveryCompletion }
       : null;
     if (drainConfig) this.drainConfigs.set(reqIdBigint, drainConfig);
     try {
@@ -3983,8 +3997,8 @@ export class MoqtConnection {
    * generic onObject hook — {@link routeToTrackSubscription} claims and drops
    * objects for a live tombstone.
    *
-   * Already-open readers are NOT cancelled here, and on draft-14/16 unsubscribe()
-   * never cancels them: they run until the peer FINs or resets. The tombstone,
+   * Already-open readers are NOT cancelled here. Outside a drain, draft-14/16
+   * unsubscribe() leaves them running until the peer FINs or resets. The tombstone,
    * not reader teardown, is what keeps their objects from being delivered. The
    * request-stream paths that DO early-discard open streams use
    * {@link discardOpenStreamsForAlias} afterward.
@@ -4109,7 +4123,9 @@ export class MoqtConnection {
       : (streamCount > seen ? streamCount - seen : 0n);
     const ttlMs = Math.max(this.terminatedAliasTtlMs, this.aliasDeliveryTimeoutMs.get(alias) ?? 0);
     const state: AliasDrainState = { requestId: owningRequestId, acceptRemaining, cancelTimer: () => { /* set below */ }, drained: false,
-      exactStreams: streamCount > 0n && streamCount !== UNKNOWN_COUNT ? streamCount : null };
+      // d14 §9.12, d16 §9.15, d18 §10.11, d22 §9.9: zero processed streams also match zero.
+      exactStreams: (streamCount > 0n || this.drainConfigs.get(owningRequestId)?.implicit)
+        && streamCount !== UNKNOWN_COUNT ? streamCount : null };
     state.cancelTimer = this.armGuardTimer(ttlMs, () => { void this.completeDrain(alias); });
     this.drainingAliases.set(alias, state);
     // Let the DONE callback install the application's hold before releasing it.
@@ -4120,7 +4136,7 @@ export class MoqtConnection {
     const state = this.drainingAliases.get(alias);
     if (!state || state.drained || state.exactStreams === null
         || this.drainConfigs.get(state.requestId)?.completion !== 'streams'
-        || this.aliasStreamsSeen.get(alias) !== state.exactStreams
+        || (this.aliasStreamsSeen.get(alias) ?? 0n) !== state.exactStreams
         || this.pendingAliasReplays.has(alias)) return;
     // Counting headers is insufficient: every accepted stream must finish processing.
     if ([...this.incomingSubgroupAliases.values()].includes(alias)) return;
@@ -4569,6 +4585,21 @@ export class MoqtConnection {
    * @see draft-ietf-moq-transport-16 §2.4.2 (Malformed Track), draft-18 §3.3.2
    */
   async unsubscribe(requestId: bigint): Promise<void> {
+    // d22 §3.1: retire one member; shared streams and the existing deadline belong to the survivors.
+    const terminalAlias = this.terminalSubscribers.get(requestId)?.sub.trackAlias
+      ?? [...this.drainingAliases].find(([, drain]) => drain.requestId === requestId)?.[0];
+    if (terminalAlias !== undefined) {
+      const drain = this.drainingAliases.get(terminalAlias);
+      const sibling = this.deliverySubscribers22(terminalAlias).find(sub => sub.requestId !== requestId);
+      if (sibling) {
+        if (drain?.requestId === requestId) drain.requestId = sibling.requestId;
+        return this.finishTerminalSubscriber(requestId);
+      }
+      // d14 §9.12, d16 §9.15, d18 §10.11, d22 §9.9: the last uninterested member may stop retention.
+      this.applyTerminalDrain(terminalAlias, 0n, requestId);
+      this.armSubscriberAliasTeardown(terminalAlias);
+      return this.completeDrain(terminalAlias);
+    }
     // An unsubscribed subscription can never PUBLISH_DONE — reclaim its
     // terminal-drain opt-in so the config map cannot leak.
     this.drainConfigs.delete(requestId);

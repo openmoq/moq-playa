@@ -537,7 +537,7 @@ describe('draft-22 fill lifecycle (3.4 and 9.9)', () => {
     conn.onObject = (_sid, o) => objects.push(o);
     conn.onError = (e) => errors.push(e);
     await conn.connect(transport);
-    const id = await conn.subscribe(ns('live'), nm('video'), { fill: {}, ...(terminalDelivery === 'drain' ? { terminalDelivery } : {}) });
+    const id = await conn.subscribe(ns('live'), nm('video'), { fill: {}, terminalDelivery });
     transport.bidi[0]!.push(codec.encode({ type: 'SUBSCRIBE_OK', requestId: id, trackAlias: ALIAS,
       parameters: new Map([[0x09n, [{ group: 5n, object: 0n }]]]), trackExtensions: new Map(),
     }));

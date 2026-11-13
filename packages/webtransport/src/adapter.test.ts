@@ -2731,7 +2731,8 @@ describe('MoqtConnection draft-14', () => {
         } as ControlMessage);
 
         // sub1 established on alias 42.
-        const p1 = adapter.subscribeTrack([enc('live')], enc('v1'), { onObject: () => { /* live */ } });
+        // Exercise immediate discard and its terminal alias guard.
+        const p1 = adapter.subscribeTrack([enc('live')], enc('v1'), { terminalDelivery: 'discard', onObject: () => { /* live */ } });
         await deepFlush();
         const req1 = lastSubscribeRequestId(mock, codec);
         mock.pushControlBytes(subscribeOk(req1));
@@ -2782,6 +2783,8 @@ describe('MoqtConnection draft-14', () => {
     const codec = createControlCodec(16);
     const enc = (str: string) => new TextEncoder().encode(str);
     const p = adapter.subscribeTrack([enc('live')], enc('vid'), {
+      // These fixtures exercise local cancellation, including PUBLISH_DONE discard.
+      terminalDelivery: 'discard',
       onObject: (obj: unknown) => { sink?.push(obj); onObject?.(obj); },
     });
     await deepFlush();
@@ -3956,7 +3959,8 @@ describe('MoqtConnection draft-14', () => {
     const codec = createControlCodec(16);
     const enc = (s: string) => new TextEncoder().encode(s);
 
-    const p = adapter.subscribeTrack([enc('live')], enc('vid'), { onObject: () => { /* live */ } });
+    // Exercise immediate discard and its terminal alias guard.
+    const p = adapter.subscribeTrack([enc('live')], enc('vid'), { terminalDelivery: 'discard', onObject: () => { /* live */ } });
     await deepFlush();
     let reqId = -1n;
     for (let i = mock.controlWritten.length - 1; i >= 0; i--) {

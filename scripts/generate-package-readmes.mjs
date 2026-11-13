@@ -40,6 +40,16 @@ function render(pkg) {
     '```sh\n' +
     `npm install ${pkg.name}\n` +
     '```\n\n' +
+    (pkg.name === '@openmoq/webtransport'
+      ? `## Terminal delivery\n\n` +
+        `Subscriptions drain late objects after PUBLISH_DONE by default, for every status. ` +
+        `A default subscription ends immediately if a live sibling shares its alias. Otherwise, they finish once an exact Stream Count (including zero) is processed, or at ` +
+        `max(terminatedAliasTtlMs, effective delivery timeout); remaining streams are cancelled.\n\n` +
+        `Use terminalDelivery: 'discard' to cancel immediately and discard late arrivals. ` +
+        `Unsubscribe stops that request’s delivery and awaits its cleanup and onDrained; shared streams remain for other subscribers. Explicit terminalDelivery: 'drain' ` +
+        `keeps timeout-only completion unless terminalDeliveryCompletion: 'streams' is supplied. ` +
+        `Explicit drain retains the timeout for zero counts. Status selection and onDrained still require explicit 'drain'.\n\n`
+      : '') +
     `## License\n\n` +
     `[Apache-2.0](${REPO}/blob/main/LICENSE.txt)\n`
   );

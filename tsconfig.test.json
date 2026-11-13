@@ -161,6 +161,7 @@
     "packages/player/src/subscription-manager-input-reset.test.ts",
     "packages/player/src/subscription-manager-source-identity.test.ts",
     "packages/webtransport/src/adapter-terminal-status-selection.test.ts",
+    "packages/webtransport/src/adapter-default-drain.test.ts",
     "packages/playback/src/pipeline.test.ts",
     "packages/playback/src/pipeline-audio-timing.test.ts",
     "packages/playback/src/pipeline-video-timing.test.ts",

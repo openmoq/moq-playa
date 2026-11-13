@@ -14,6 +14,12 @@ Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implement
 npm install @openmoq/webtransport
 ```
 
+## Terminal delivery
+
+Subscriptions drain late objects after PUBLISH_DONE by default, for every status. A default subscription ends immediately if a live sibling shares its alias. Otherwise, they finish once an exact Stream Count (including zero) is processed, or at max(terminatedAliasTtlMs, effective delivery timeout); remaining streams are cancelled.
+
+Use terminalDelivery: 'discard' to cancel immediately and discard late arrivals. Unsubscribe stops that request’s delivery and awaits its cleanup and onDrained; shared streams remain for other subscribers. Explicit terminalDelivery: 'drain' keeps timeout-only completion unless terminalDeliveryCompletion: 'streams' is supplied. Explicit drain retains the timeout for zero counts. Status selection and onDrained still require explicit 'drain'.
+
 ## License
 
 [Apache-2.0](https://github.com/openmoq/moq-playa/blob/main/LICENSE.txt)
