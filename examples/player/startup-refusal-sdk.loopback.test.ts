@@ -109,6 +109,8 @@ function fixture(acceptWatch = false) {
     resolveRelayEndpoint: async () => 'https://test.invalid',
     log: (x: string) => logs.push(x),
     namespaceArg: 'live',
+    msfLink: undefined,
+    msfRefusal: undefined,
     authority: undefined,
     warmStart: false,
     catalogFromUrl: undefined,
