@@ -857,7 +857,7 @@ function createLocSeekQuality(fromTrackName: string, toTrackName: string, reason
 }
 export class MoqtPlayer {
   /** Player version (set at build time). */
-  static readonly version = '0.6.1';
+  static readonly version = '0.7.0';
 
   private readonly config: MoqtPlayerConfig & { readonly catalogTrackName: string };
   private readonly emitter = new TypedEmitter<PlayerEventMap>();

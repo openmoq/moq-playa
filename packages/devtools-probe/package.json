@@ -1,21 +1,38 @@
 {
   "name": "@openmoq/devtools-probe",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Owner-local MoQT diagnostic probes over WebTransport.",
   "license": "Apache-2.0",
   "author": "OpenMOQ (https://github.com/openmoq)",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
-  "files": ["dist", "README.md", "PROBE.md"],
-  "scripts": { "build": "tsc" },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "PROBE.md"
+  ],
+  "scripts": {
+    "build": "tsc"
+  },
   "dependencies": {
     "@openmoq/devtools": "workspace:*",
     "@openmoq/devtools-protocol": "workspace:*",
     "@openmoq/transport": "workspace:*",
     "@openmoq/webtransport": "workspace:*"
   },
-  "publishConfig": { "access": "public" },
-  "repository": { "type": "git", "url": "git+https://github.com/openmoq/moq-playa.git", "directory": "packages/devtools-probe" }
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openmoq/moq-playa.git",
+    "directory": "packages/devtools-probe"
+  }
 }
