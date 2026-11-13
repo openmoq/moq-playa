@@ -562,7 +562,7 @@ export async function runScenario(opts: ScenarioOptions): Promise<ScenarioResult
     const f: FetchShadow = { reqId, groupOrder, state: 'pending', nextObjectId: 0n, sent: new Set(), delivered: new Set() };
     // fetch() resolves with the assigned Request ID once the FETCH is SENT.
     const actualId = await client.fetch(ns(`f${reqId}`), nm(`fv${reqId}`), {
-      startGroup: 0n, startObject: 0n, endGroup: 9n, endObject: 0n, groupOrder,
+      startGroup: 0n, startObject: 0n, endGroup: FETCH_DATA_GROUP, endObject: 0n, groupOrder,
     });
     check(actualId === reqId, `fetch reqId ${actualId} != predicted ${reqId}`, log);
     fetches.set(reqId, f);
