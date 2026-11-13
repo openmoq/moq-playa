@@ -1677,7 +1677,7 @@ export class MoqtPlayer {
     owner.prefixFetch = null;
     if (info && this.activeFetches.get(info.requestId) === info) this.quarantineFetchRequest(info.requestId);
     try {
-      const work = owner.connection.draftVersion === 22 && !owner.prefixStandalone ? owner.connection.cancelFill(owner.requestId)
+      const work = isDraft22(owner.connection.draftVersion) && !owner.prefixStandalone ? owner.connection.cancelFill(owner.requestId)
         : info ? owner.connection.fetchCancel(info.requestId) : undefined;
       void work?.catch(() => {});
     } catch { /* A retired prefix cannot revoke the retained live subscription. */ }
