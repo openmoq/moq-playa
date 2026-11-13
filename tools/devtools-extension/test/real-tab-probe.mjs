@@ -230,14 +230,17 @@ try {
   // reports that FIN-derived end as a `group_bound` fact (exclusive bound at id 4, evidence end-of-group), never
   // as an `object` fact: a bound is a label on the row, not a cell. Judging too early would never see the bound,
   // so the facts are taken only once ONE group of THIS subscription (its DATA objects observed) has its bound on
-  // this session/alias: at most one synthetic group of pacing, and the bound branch below is then exercised
+  // this session/alias: at most two synthetic groups of pacing, and the bound branch below is then exercised
   // deterministically. This is the controlled fixture's completeness, not a rule for arbitrary traffic.
+  // The probe subscribes without a SUBSCRIPTION_FILTER, so the subscription is unfiltered (d18 §10.2.9) and
+  // requests only newly published or received Objects (d18 §10.7); the group in progress when it was accepted
+  // is legitimately partial yet still ends with FIN. Judge a group whose object 0 this subscription received.
   const onThisRequest = f => f.kind === 'object' && f.trackAlias === joined[1] && f.requestId === joined[2] && f.trackId === 'track-0';
   const boundOf = (facts, sessionId, groupId) => facts.find(f => f.kind === 'group_bound' && f.sessionId === sessionId && f.trackAlias === joined[1] && f.groupId === groupId);
   const boundedGroup = await until('END_OF_GROUP bound (group_bound) for a group of the accepted request', async () => {
     const f = await probeFacts();
     const data = f.filter(x => onThisRequest(x) && x.objectStatus === '0');
-    for (const o of data) { const b = boundOf(f, o.sessionId, o.groupId); if (b) return { groupId: o.groupId, sessionId: o.sessionId, bound: b }; }
+    for (const o of data) { if (o.objectId !== '0') continue; const b = boundOf(f, o.sessionId, o.groupId); if (b) return { groupId: o.groupId, sessionId: o.sessionId, bound: b }; }
     return null; }, 300);
   // Exact identities from the DECODED facts, then the rendering must agree with them.
   const facts = await probeFacts();
@@ -278,9 +281,12 @@ try {
   }
   for (const o of dataObjects) assert.ok(Number(o.objectId) >= 0 && Number(o.objectId) <= 3 && o.payloadBytes > 0, `data objects are 0..3 with payload, got id ${o.objectId} bytes ${o.payloadBytes}`);   // CHUNKS_PER_TRACK = 4
   const sample = dataObjects.find(o => o.groupId === boundedGroup.groupId);
-  const cell = painted.rows.flatMap(r => r.cells).find(c => c.present && c.g === `${sample.sessionId}/${sample.trackAlias}/${sample.groupId}` && c.o === sample.objectId);
+  // Re-read the view: the bounded group can arrive after the painted snapshot above.
+  const cellOf = v => v.rows.flatMap(r => r.cells).find(c => c.present && c.g === `${sample.sessionId}/${sample.trackAlias}/${sample.groupId}` && c.o === sample.objectId);
+  const rendered = await until('rendered cell for the bounded group', async () => { const v = await probeVm(); return cellOf(v) ? v : null; }, 50).catch(() => null);
+  const cell = rendered && cellOf(rendered);
   assert.ok(cell, `the rendered cell for object ${sample.groupId}/${sample.objectId} on alias ${sample.trackAlias} must exist with the same identity`);
-  const row = painted.rows.find(r => r.cells.includes(cell));
+  const row = rendered.rows.find(r => r.cells.includes(cell));
   assert.equal(row.label, `g ${sample.groupId}`);
   // The bound is rendered as the row's label text, never as a cell: the rendered row for the bounded group is
   // re-read after the bound arrived (the painted snapshot above may predate it).
