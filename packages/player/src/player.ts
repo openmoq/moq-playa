@@ -155,7 +155,7 @@ import { CommandDispatcher, type DispatcherOutputObserver } from './command-disp
 import { LiveCatchUp, type PlaybackRateOutput } from './live-catch-up.js';
 import { LocRateOutput } from './loc-rate-output.js';
 import { StatsAccumulator } from './stats.js';
-import type { PlayerStats, VideoEncodeObservation } from './stats.js';
+import type { PlayerStats, VideoEncodeObservation, VideoPresentationObservation } from './stats.js';
 import type { CmafAssemblerLike, CmafSourceReceipt } from './interfaces.js';
 import { buildConnectUrl, buildSetupOptions, buildSubscribeOptions, invalidGoawayUriReason } from './player-connect.js';
 import { computePlaybackDelayUs,
@@ -225,6 +225,16 @@ interface ReceivingMediaOwner {
   readonly retain: NonNullable<MediaSourceLike['retainReceivingGroup']>;
   readonly isCurrent: () => boolean;
 }
+
+/** The requestVideoFrameCallback surface of an HTMLVideoElement. */
+interface PresentedFrameElement {
+  requestVideoFrameCallback(callback: (now: number, metadata: { readonly mediaTime: number }) => void): number;
+  cancelVideoFrameCallback(handle: number): void;
+}
+
+/** Engine timestamps are integer microseconds: offset and sample time may each lose under one. */
+const PRESENTED_FRAME_QUANTIZATION_US = 2n;
+const MAX_PRESENTATION_CANDIDATES = 64;
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -882,6 +892,16 @@ export class MoqtPlayer {
     readonly current: () => boolean;
     readonly captured?: () => boolean;
   } | null = null;
+  /** Committed encode records by wire input, then by its delivery identity. */
+  private readonly encodeDeliveries = new WeakMap<object, NonNullable<MoqtPlayer['videoEncodeRecord']>>();
+  /** Anchored first samples appended to the element and not yet presented. */
+  private videoPresentationCandidates: Array<{
+    readonly encode: NonNullable<MoqtPlayer['videoEncodeRecord']>; readonly elementTimeUs: FractionUs;
+    readonly element: PresentedFrameElement; readonly source: MediaSourceLike; readonly assembler: CmafAssemblerLike;
+    readonly placementToken: object; readonly nativeOffset: number;
+  }> = [];
+  private videoPresentationRecord: { readonly observation: VideoPresentationObservation; readonly current: () => boolean } | null = null;
+  private videoFrameWatch: { readonly element: PresentedFrameElement; handle: number | null } | null = null;
   private videoDeliveryLag: {
     readonly owner: NonNullable<MoqtPlayer['videoPayloadMeasurement']>['owner'];
     readonly timescale: bigint | null;
@@ -1837,6 +1857,8 @@ export class MoqtPlayer {
       && (() => { const track = this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
         return track?.packaging === 'loc' || track !== null && track !== undefined && this.usesMse(track.packaging); })() ? {} : undefined;
     if (cadenceIdentity && cadenceOwner) this.cadenceInputOwners.set(cadenceIdentity, cadenceOwner);
+    const encode = cadenceIdentity && this.encodeDeliveries.get(receiptInput);
+    if (cadenceIdentity && encode) this.encodeDeliveries.set(cadenceIdentity, encode);
     // Datagram routing IDs are not stream identities. Only a real subgroup
     // receipt may establish receiving evidence; FETCH has its own ownership.
     if ('kind' in receiptInput && fetchInfo === undefined && sourceConnection !== undefined
@@ -2593,6 +2615,7 @@ export class MoqtPlayer {
       captureTimestampAgeMs,
       videoPlaybackQuality,
       videoEncodeObservation: this.readVideoEncodeObservation(),
+      videoPresentationObservation: this.readVideoPresentationObservation(),
       ...(this.audioTimingMapped ? { avSkewMs: null, avSkewEwmaMs: null } : {}),
     });
   }
@@ -4385,13 +4408,13 @@ export class MoqtPlayer {
 
   private pushCmafInput(mediaType: 'video' | 'audio', trackName: string, groupId: bigint, payload: Uint8Array,
     input?: ObjectRoutingContext, sourceKey?: string, objectId?: bigint,
-    lagOwner?: NonNullable<MoqtPlayer['videoDeliveryLag']>['owner']): void {
+    lagOwner?: NonNullable<MoqtPlayer['videoDeliveryLag']>['owner'], encode?: NonNullable<MoqtPlayer['videoEncodeRecord']>): void {
     const assembler = this.cmafAssembler;
     if (this.keyedCmafIdentity && sourceKey === undefined) {
       this.discardMediaInput(input, 'route retired'); return;
     }
     const collectTimeline = mediaType === 'audio' ? this.collectAudioTimeline : this.collectVideoTimeline;
-    if (!collectTimeline && lagOwner === undefined) {
+    if (!collectTimeline && lagOwner === undefined && encode === undefined) {
       if (objectId !== undefined) assembler?.push(mediaType, trackName, groupId, payload, input, undefined, sourceKey, objectId);
       else if (sourceKey !== undefined) assembler?.push(mediaType, trackName, groupId, payload, input, undefined, sourceKey);
       else if (input === undefined) assembler?.push(mediaType, trackName, groupId, payload);
@@ -4413,6 +4436,7 @@ export class MoqtPlayer {
       this.noteMediaTimeline(mediaType, receipt.sourcePresentationTimeUs, 'media-time');
     }
     if (lagOwner) this.recordCmafDeliveryReceipt(lagOwner, receipt);
+    if (encode && assembler && source) this.noteVideoPresentationCandidate(encode, receipt, assembler, source);
   }
 
   private recordCmafDeliveryReceipt(lagOwner: NonNullable<MoqtPlayer['videoDeliveryLag']>['owner'], receipt: CmafSourceReceipt | void): void {
@@ -4862,7 +4886,11 @@ export class MoqtPlayer {
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
       if (this.cmafAssembler) this.recordDeliveredObject(obj);
-      this.pushCmafInput(mediaType, trackName, groupId, obj.payload, input, sourceKey, BigInt(obj.objectId), lagOwner);
+      const encode = mediaType === 'video' && !delivery?.backfill && !delivery?.fetched && delivery?.identity
+        ? this.encodeDeliveries.get(delivery.identity) : undefined;
+      const anchored = encode && encode.observation.location.groupId === String(obj.groupId)
+        && encode.observation.location.objectId === String(obj.objectId) ? encode : undefined;
+      this.pushCmafInput(mediaType, trackName, groupId, obj.payload, input, sourceKey, BigInt(obj.objectId), lagOwner, anchored);
     };
 
     // §2.4.2: Malformed Track — MUST UNSUBSCRIBE, SHOULD deliver error
@@ -11560,7 +11588,7 @@ export class MoqtPlayer {
         // when SUBSCRIBE_OK resolves the alias via onAliasResolved → replayPendingObjects.
         // At replay time, the new track is registered and onObject fires normally.
         if (this.subscriptionManager?.getMediaType(alias) !== undefined) {
-          this.recordVideoPayload(receipt);
+          this.recordVideoPayload(receipt, obj);
           this.watchdog.fulfill('first_media_object');
           // Bind the LOC wire profile AND the malformed-recovery target to THIS
           // connection — a cross-draft migration must not decode a late
@@ -12070,7 +12098,7 @@ export class MoqtPlayer {
         const alias = BigInt(datagram.trackAlias);
         if (!this.mediaRouteBelongsTo(conn, alias)) return;
         if (this.subscriptionManager?.getMediaType(alias) === undefined) return;
-        this.recordVideoPayload(receipt);
+        this.recordVideoPayload(receipt, datagram);
         this.log.debug('Datagram alias=%s group=%s obj=%s', alias, datagram.groupId, datagram.objectId);
 
         const obj: MoqtObject = datagram.status !== undefined
@@ -14985,7 +15013,7 @@ export class MoqtPlayer {
     return { owner, bytes, nowUs, ...(encode && encode.captured?.() && encode.current() ? { encode } : {}) };
   }
 
-  private recordVideoPayload(receipt: ReturnType<MoqtPlayer['captureVideoPayload']>): void {
+  private recordVideoPayload(receipt: ReturnType<MoqtPlayer['captureVideoPayload']>, input?: object): void {
     if (!receipt) return;
     const { owner, bytes, nowUs } = receipt;
     if (!this.sameVideoMeasurementOwner(owner, this.captureVideoMeasurementOwner())) return;
@@ -14999,6 +15027,7 @@ export class MoqtPlayer {
     // routing and parked/candidate replay never forward that token here.
     if (receipt.encode?.captured?.() && receipt.encode.current()) {
       this.videoEncodeRecord = { observation: receipt.encode.observation, current: receipt.encode.current };
+      if (input) this.encodeDeliveries.set(input, this.videoEncodeRecord);
     }
   }
 
@@ -15065,6 +15094,120 @@ export class MoqtPlayer {
     return record.observation;
   }
 
+  /** Place an anchored Object's first sample exactly where the element will present it. */
+  private noteVideoPresentationCandidate(encode: NonNullable<MoqtPlayer['videoEncodeRecord']>, receipt: CmafSourceReceipt | void,
+    assembler: CmafAssemblerLike, source: MediaSourceLike): void {
+    const decode = receipt?.state === 'emitted' ? receipt.sourceDecodeTime : undefined;
+    const element = source.mediaElement as Partial<PresentedFrameElement> | null | undefined;
+    if (!decode || receipt?.state !== 'emitted' || !Number.isSafeInteger(decode.timescale) || decode.timescale <= 0
+        || decode.timescale > 1_000_000 || receipt.sourcePresentationTimeUs < 0n
+        || typeof element?.requestVideoFrameCallback !== 'function' || typeof element.cancelVideoFrameCallback !== 'function') return;
+    // Recover the exact tick from the assembler's floored microseconds; a
+    // timescale of at most 1 MHz leaves exactly one candidate tick.
+    const scale = BigInt(decode.timescale), us = receipt.sourcePresentationTimeUs;
+    const ticks = (us * scale + 999_999n) / 1_000_000n;
+    if (ticks * 1_000_000n / scale !== us) return;
+    // The anchor must name this sample: its declared PTS within its own millisecond unit.
+    const sourceMs = Number(ticks) * 1000 / decode.timescale;
+    if (!(Math.abs(sourceMs - encode.observation.mediaPtsMs) < 1)) return;
+    let placement: ReturnType<NonNullable<CmafAssemblerLike['capturePresentationPlacement']>> | undefined;
+    let nativeOffset: number | undefined;
+    try {
+      placement = assembler.capturePresentationPlacement?.('video');
+      nativeOffset = source.getTimestampOffset?.('video');
+      if (assembler.capturePresentationPlacement?.('video') !== placement) return;
+    } catch { return; }
+    const shift = placement?.token === decode.placementToken ? placement.toRebasedTimeUs(0n) : null;
+    const offset = nativeTimeUs(nativeOffset);
+    if (!placement || !shift || shift.denominator <= 0n || !offset || nativeOffset === undefined
+        || !encode.current() || this.cmafAssembler !== assembler || this.mediaSource !== source) return;
+    const den = scale * shift.denominator * offset.denominator;
+    const elementTimeUs = { numerator: ticks * 1_000_000n * shift.denominator * offset.denominator
+      + shift.numerator * scale * offset.denominator + offset.numerator * scale * shift.denominator, denominator: den };
+    const candidates = this.videoPresentationCandidates;
+    candidates.push({ encode, elementTimeUs, element: element as PresentedFrameElement, source, assembler,
+      placementToken: placement.token, nativeOffset });
+    if (candidates.length > MAX_PRESENTATION_CANDIDATES) candidates.shift();
+    this.watchVideoFrames(element as PresentedFrameElement);
+  }
+
+  private watchVideoFrames(element: PresentedFrameElement): void {
+    if (this.videoFrameWatch?.element === element) return;
+    this.stopVideoFrameWatch();
+    const watch: NonNullable<MoqtPlayer['videoFrameWatch']> = { element, handle: null };
+    this.videoFrameWatch = watch;
+    const next = (): void => {
+      try {
+        watch.handle = element.requestVideoFrameCallback((_now, metadata) => {
+          if (this.videoFrameWatch !== watch) return;
+          watch.handle = null;
+          this.notePresentedVideoFrame(element, metadata?.mediaTime);
+          if (this.videoFrameWatch !== watch) return;
+          if (this.videoPresentationCandidates.length) next();
+          else this.videoFrameWatch = null;
+        });
+      } catch { if (this.videoFrameWatch === watch) this.videoFrameWatch = null; }
+    };
+    next();
+  }
+
+  private stopVideoFrameWatch(): void {
+    const watch = this.videoFrameWatch;
+    this.videoFrameWatch = null;
+    if (watch?.handle != null) {
+      try { watch.element.cancelVideoFrameCallback(watch.handle); } catch { /* Optional measurement. */ }
+    }
+  }
+
+  /** Match the presented frame to one appended anchored sample; never between anchors. */
+  private notePresentedVideoFrame(element: PresentedFrameElement, mediaTime: number | undefined): void {
+    const presented = typeof mediaTime === 'number' ? nativeTimeUs(mediaTime) : null;
+    if (!presented) return;
+    const live = (c: MoqtPlayer['videoPresentationCandidates'][number]): boolean => {
+      try {
+        return c.element === element && c.encode.current() && this.mediaSource === c.source && this.cmafAssembler === c.assembler
+          && c.assembler.capturePresentationPlacement?.('video')?.token === c.placementToken
+          && Object.is(c.source.getTimestampOffset?.('video'), c.nativeOffset) && c.encode.current();
+      } catch { return false; }
+    };
+    // Signed distance (presented - candidate) in units of 1 / (both denominators) microseconds.
+    const distance = (c: MoqtPlayer['videoPresentationCandidates'][number]) => ({
+      value: presented.numerator * c.elementTimeUs.denominator - c.elementTimeUs.numerator * presented.denominator,
+      unit: presented.denominator * c.elementTimeUs.denominator,
+    });
+    const candidates = this.videoPresentationCandidates.filter(live);
+    const matches = candidates.filter(c => {
+      const { value, unit } = distance(c);
+      return (value < 0n ? -value : value) < PRESENTED_FRAME_QUANTIZATION_US * unit;
+    });
+    // Later anchored samples stay pending; presented and passed ones cannot be shown again.
+    this.videoPresentationCandidates = candidates.filter(c => {
+      const { value, unit } = distance(c);
+      return value <= -PRESENTED_FRAME_QUANTIZATION_US * unit;
+    });
+    if (matches.length !== 1) return;
+    const { encode } = matches[0]!;
+    const presentedWallclockMs = Date.now();
+    const encodeToPresentationMs = presentedWallclockMs - encode.observation.encodedWallclockMs;
+    if (!Number.isFinite(presentedWallclockMs) || !Number.isFinite(encodeToPresentationMs) || !live(matches[0]!)) return;
+    const { source, timeline, location, mediaPtsMs, encodedWallclockMs } = encode.observation;
+    this.videoPresentationRecord = {
+      observation: Object.freeze({ source, timeline, location, mediaPtsMs, encodedWallclockMs,
+        presentedMediaTime: mediaTime!, presentedWallclockMs, encodeToPresentationMs }),
+      current: encode.current,
+    };
+  }
+
+  private readVideoPresentationObservation(): VideoPresentationObservation | null {
+    const record = this.videoPresentationRecord;
+    if (!record) return null;
+    if (!record.current()) {
+      if (this.videoPresentationRecord === record) this.videoPresentationRecord = null;
+      return null;
+    }
+    return record.observation;
+  }
+
   private readVideoReceivedRate(): number | null {
     const measurement = this.videoPayloadMeasurement;
     if (!measurement) return null;
@@ -15097,6 +15240,9 @@ export class MoqtPlayer {
   private retireVideoMeasurement(): void {
     this.videoMeasurementMode = {};
     this.videoEncodeRecord = null;
+    this.videoPresentationRecord = null;
+    this.videoPresentationCandidates = [];
+    this.stopVideoFrameWatch();
     this.videoPayloadMeasurement = null;
     this.videoGroupCadence = null;
     this.videoDeliveryLag = null;

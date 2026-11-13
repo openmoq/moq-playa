@@ -358,6 +358,7 @@ export class Player {
       latencyMs: s.currentLatencyMs,
       captureTimestampAgeMs: s.captureTimestampAgeMs ?? null,
       videoPlaybackQuality: s.videoPlaybackQuality ?? null,
+      videoPresentationObservation: s.videoPresentationObservation ?? null,
       stallCount: s.stallCount,
       timeToFirstFrameMs: s.timeToFirstFrameMs,
       resolution: s.currentResolution ?? null,

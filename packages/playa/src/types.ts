@@ -8,7 +8,7 @@
  * @module
  */
 
-import type { MoqtPlayerConfig, VideoPlaybackQualityStats } from '@openmoq/player';
+import type { MoqtPlayerConfig, VideoPlaybackQualityStats, VideoPresentationObservation } from '@openmoq/player';
 
 /** Player state machine values. */
 export type PlayerState = 'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'error';
@@ -179,6 +179,8 @@ export interface PlayerStats {
   readonly captureTimestampAgeMs?: number | null;
   /** Native media-element-load counters, separate from legacy engine fields. */
   readonly videoPlaybackQuality?: Readonly<VideoPlaybackQualityStats> | null;
+  /** Explicit CMAF encode anchor of the presented frame; null without qualified evidence. */
+  readonly videoPresentationObservation?: VideoPresentationObservation | null;
   readonly stallCount: number;
   readonly timeToFirstFrameMs: number | null;
   readonly resolution: { readonly width: number; readonly height: number } | null;
