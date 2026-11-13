@@ -12,7 +12,7 @@ import type { DecoderCommand } from '@openmoq/playback';
 import { createMediaDiagnostics, type MediaStageObservation } from '../src/media-diagnostics.js';
 import type { AudioDecoderLike, AudioOutputLike, MediaSourceLike, VideoDecoderLike, VideoRendererLike } from '../src/interfaces.js';
 
-export type AudioDraft = 16 | 18 | 22;
+export type AudioDraft = 16 | 18 | 22 | 23;
 export type AudioPath = 'cmaf' | 'loc' | 'locmaf-mse' | 'locmaf-frame';
 export interface AudioRef { readonly name: string; readonly namespace: readonly string[] }
 export const refs = {

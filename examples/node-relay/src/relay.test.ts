@@ -253,7 +253,7 @@ describe('Relay subgroup lifecycle', () => {
     expect(sub.close).not.toHaveBeenCalled();
   });
 
-  it.each([18, 22] as const)('draft %s cancellation resets unfinished relay output instead of sending FIN', async (draft) => {
+  it.each([18, 22, 23] as const)('draft %s cancellation resets unfinished relay output instead of sending FIN', async (draft) => {
     const { a, b } = createLoopback();
     const client = new MoqtConnection(draft);
     const server = new MoqtConnection(draft, { role: 'server' });

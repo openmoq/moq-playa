@@ -3,7 +3,7 @@ import { createControlCodec, encodeObjectDatagram18, varint } from '@openmoq/tra
 import { connectedPair, ns, nm } from './testkit/pair.js';
 import { flush } from './testkit/loopback.js';
 
-describe.each([16, 18, 22] as const)('draft %i status-selective terminal drain', draft => {
+describe.each([16, 18, 22, 23] as const)('draft %i status-selective terminal drain', draft => {
   it.each([2n, 3n, 0n, 1n, 4n, 5n, 6n, 8n, 9n, 18n])('selects only normal completion code %s', async code => {
     const h = await connectedPair(draft, { clientOptions: { terminatedAliasTtlMs: 20 } });
     const drained = vi.fn();
@@ -33,7 +33,7 @@ it('validates terminal status selection before allocating or emitting a request'
   } finally { await h.client.close(); await h.server.close(); }
 });
 
-describe.each([16, 18, 22] as const)('draft %i exact processed-stream completion', draft => {
+describe.each([16, 18, 22, 23] as const)('draft %i exact processed-stream completion', draft => {
   it('retains fresh-alias stream evidence when data overtakes SUBSCRIBE_OK', async () => {
     const h = await connectedPair(draft);
     const drained = vi.fn(), objects = vi.fn();
@@ -112,7 +112,7 @@ describe.each([16, 18, 22] as const)('draft %i exact processed-stream completion
   });
 });
 
-describe.each([16, 18, 22] as const)('draft %i terminal grace cancellation ownership', draft => {
+describe.each([16, 18, 22, 23] as const)('draft %i terminal grace cancellation ownership', draft => {
   it('waits for held subgroup cancellation before publishing drained', async () => {
     const h = await connectedPair(draft, { clientOptions: { terminatedAliasTtlMs: 20 } });
     const events: string[] = [];

@@ -15,7 +15,7 @@ const OLD_URL = 'https://old.example/moq';
 const NEW_URL = 'https://new.example/moq';
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-type Draft = 14 | 16 | 18 | 22;
+type Draft = 14 | 16 | 18 | 22 | 23;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -77,7 +77,7 @@ function peer(draft: Draft, catalogName = 'catalog') {
       await this.accept(catalogName, 100n, { group: 5n, object: 0n });
       const request = requests.find(r => r.name === catalogName)!;
       let complete: () => Promise<void>;
-      if (draft === 22) {
+      if (draft >= 22) {
         expect(request.parameters?.get(0x23n)?.[0]).toEqual(Uint8Array.of(1, 0x21, 1, 1));
         expect(fetches).toEqual([]);
         const stream = await server.openFillStream(request.id);
@@ -108,7 +108,7 @@ function peer(draft: Draft, catalogName = 'catalog') {
       return complete;
     },
     async history(id: bigint, objects: bigint[], media: 'video' | 'audio', last = 3n) {
-      await server.acceptFetch(id, { endLocation: { group: 1n, object: draft === 22 ? last : last + 1n } });
+      await server.acceptFetch(id, { endLocation: { group: 1n, object: draft >= 22 ? last : last + 1n } });
       if (draft <= 16) {
         const writer = (await b.createUnidirectionalStream()).getWriter();
         await writer.write(encodeFetchHeader({ requestId: varint(id) }));
@@ -305,7 +305,7 @@ async function fixture(draft: Draft, options: {
   };
 }
 
-describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft => {
+describe.each([16, 18, 22, 23] as const)('draft-%i graceful session handover', draft => {
   it.each([undefined, '.catalog'])('keeps catalog name %s through default-bootstrap handover', async name => {
     const h = await fixture(draft, { defaultBootstrap: true,
       config: name === undefined ? {} : { catalogTrackName: name } });
@@ -340,7 +340,7 @@ describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft
         await h.next.accept(media, 200n, { group: 1n, object: 3n });
         await flush(512);
         expect(h.migrated).toHaveBeenCalledTimes(1);
-        if (draft !== 22) await h.next.send(media, chunk(media, 2n), 1n, 1n);
+        if (draft < 22) await h.next.send(media, chunk(media, 2n), 1n, 1n);
         if (outcome === 'old ahead') {
           expect(h.next.fetches).toHaveLength(0);
           await h.next.send(media, chunk(media, 5n), 1n, 4n);
@@ -349,7 +349,7 @@ describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft
         } else {
           expect(h.next.fetches).toHaveLength(1);
           const request = h.next.fetches[0]!;
-          if (draft !== 22) expect(request.message.fetch).toMatchObject({ fetchType: 3, joiningStart: 1n });
+          if (draft < 22) expect(request.message.fetch).toMatchObject({ fetchType: 3, joiningStart: 1n });
           await h.next.send(media, chunk(media, 5n), 1n, 4n);
           expect(locations).toEqual([1n]); // Live must wait for the missing prefix.
           if (outcome === 'destroyed') {
@@ -363,7 +363,7 @@ describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft
             expect(h.received).toContainEqual({ name: media, group: 2n });
             expect(locations).toEqual([1n, 0n]);
           } else {
-            await h.next.history(request.id, draft === 22 ? [2n, 3n] : [0n, 1n, 2n, 3n], media);
+            await h.next.history(request.id, draft >= 22 ? [2n, 3n] : [0n, 1n, 2n, 3n], media);
             expect(h.errors).toEqual([]);
             expect(locations).toEqual([1n, 2n, 3n, 4n]);
           }
@@ -426,7 +426,7 @@ describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft
         if (largest > 0n) {
           expect(h.next.fetches).toHaveLength(1);
           const objects = largest === 1n ? [1n] : [1n, 2n, 3n];
-          await h.next.history(h.next.fetches[0]!.id, draft === 22 ? objects : [0n, ...objects], 'video', largest);
+          await h.next.history(h.next.fetches[0]!.id, draft >= 22 ? objects : [0n, ...objects], 'video', largest);
         } else {
           expect(h.next.fetches).toHaveLength(0);
           await h.next.send('video', chunk('video', 2n), 1n, 1n);
@@ -460,7 +460,7 @@ describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft
       await flush(512);
       expect(h.third.fetches).toHaveLength(1);
       expect(cancelled).toHaveBeenCalledWith(h.next.fetches[0]!.id);
-      await h.third.history(h.third.fetches[0]!.id, draft === 22 ? [1n, 2n, 3n] : [0n, 1n, 2n, 3n], 'video');
+      await h.third.history(h.third.fetches[0]!.id, draft >= 22 ? [1n, 2n, 3n] : [0n, 1n, 2n, 3n], 'video');
       await h.third.send('video', chunk('video', 5n), 1n, 4n);
       expect(seen).toEqual([1n, 2n, 3n, 4n]);
       expect(h.fatalErrors).toEqual([]);
@@ -1682,7 +1682,7 @@ describe.each([16, 18, 22] as const)('draft-%i graceful session handover', draft
       await flush(256);
       expect(h.migrated).toHaveBeenCalledTimes(1);
       expect(h.next.requests.map(r => r.name).sort()).toEqual(['audio', 'catalog', 'video']);
-      expect(h.next.fetches).toHaveLength(draft === 22 ? 0 : 1);
+      expect(h.next.fetches).toHaveLength(draft >= 22 ? 0 : 1);
       await h.next.send('video', chunk('video', 3n), 3n);
       await h.next.send('audio', chunk('audio', 3n), 3n);
       const live = await h.next.server.openSubgroup(100n, 5n, 0n, { publisherPriority: 128 });

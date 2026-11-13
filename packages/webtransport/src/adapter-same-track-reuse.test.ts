@@ -7,7 +7,7 @@ import { flush } from './testkit/stream-sim.js';
 
 const enc = (s: string) => new TextEncoder().encode(s);
 
-async function fixture(draft: 14 | 16 | 18 | 22) {
+async function fixture(draft: 14 | 16 | 18 | 22 | 23) {
   const { a, b } = createLoopback();
   const client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' });
   const errors = vi.fn(), delivered = vi.fn(), messages: ControlMessage[] = [];
@@ -35,7 +35,7 @@ async function fixture(draft: 14 | 16 | 18 | 22) {
 }
 
 describe('same full track alias reuse after cancellation', () => {
-  it.each([14, 16, 18, 22] as const)('accepts an immediate generic retry on draft %i', async draft => {
+  it.each([14, 16, 18, 22, 23] as const)('accepts an immediate generic retry on draft %i', async draft => {
     const h = await fixture(draft);
     try {
       const first = await h.subscribe(); await h.send();
@@ -48,7 +48,7 @@ describe('same full track alias reuse after cancellation', () => {
     } finally { await h.close(); }
   });
 
-  it.each([14, 16, 18, 22] as const)('accepts an immediate raw retry on draft %i', async draft => {
+  it.each([14, 16, 18, 22, 23] as const)('accepts an immediate raw retry on draft %i', async draft => {
     const h = await fixture(draft), receive = vi.fn();
     try {
       const first = await h.client.subscribeTrack([enc('live')], enc('video'), { onObject: receive });
@@ -65,7 +65,7 @@ describe('same full track alias reuse after cancellation', () => {
     } finally { await h.close(); }
   });
 
-  it.each([14, 16, 18, 22] as const)('does not relabel a conflicting namespace on draft %i', async draft => {
+  it.each([14, 16, 18, 22, 23] as const)('does not relabel a conflicting namespace on draft %i', async draft => {
     const h = await fixture(draft);
     try {
       const first = await h.subscribe(['live/room']); await h.client.unsubscribe(first); await flush(100);
@@ -79,7 +79,7 @@ describe('same full track alias reuse after cancellation', () => {
     } finally { await h.close(); }
   });
 
-  it.each([14, 16, 18, 22] as const)('keeps the successor AbsoluteRange on draft %i', async draft => {
+  it.each([14, 16, 18, 22, 23] as const)('keeps the successor AbsoluteRange on draft %i', async draft => {
     const h = await fixture(draft);
     try {
       const first = await h.subscribe(); await h.client.unsubscribe(first); await flush(100);
@@ -91,7 +91,7 @@ describe('same full track alias reuse after cancellation', () => {
       expect(h.delivered).toHaveBeenCalledTimes(2);
     } finally { await h.close(); }
   });
-  it.each([14, 16, 18, 22] as const)('uses the acknowledged successor update and Forward State on draft %i', async draft => {
+  it.each([14, 16, 18, 22, 23] as const)('uses the acknowledged successor update and Forward State on draft %i', async draft => {
     const h = await fixture(draft);
     try {
       const first = await h.subscribe(); await h.client.unsubscribe(first); await flush(100);
@@ -110,13 +110,13 @@ describe('same full track alias reuse after cancellation', () => {
     } finally { await h.close(); }
   });
 
-  it.each([14, 16, 18, 22] as const)('filters late stream objects against the successor range on draft %i', async draft => {
+  it.each([14, 16, 18, 22, 23] as const)('filters late stream objects against the successor range on draft %i', async draft => {
     const h = await fixture(draft), delivered = vi.fn();
     h.client.onObject = (_stream, object) => delivered(object);
     try {
       const first = await h.subscribe(); await h.client.unsubscribe(first); await flush(100);
       await h.subscribe(['live'], 'video', { subscriptionFilter: { type: 'AbsoluteStart', startGroup: 10n, startObject: 2n } });
-      if (draft === 22) {
+      if (draft >= 22) {
         // Model an old in-flight stream, bypassing the publisher's correct
         // refusal to send outside the new subscription's own range.
         const writer = (await h.transport.createUnidirectionalStream()).getWriter();
@@ -138,7 +138,7 @@ describe('same full track alias reuse after cancellation', () => {
     } finally { await h.close(); }
   });
 
-  it.each([14, 16, 18, 22] as const)('keeps repeated in-range datagrams as distinct receipts on draft %i', async draft => {
+  it.each([14, 16, 18, 22, 23] as const)('keeps repeated in-range datagrams as distinct receipts on draft %i', async draft => {
     const h = await fixture(draft), receipts: unknown[] = [];
     const release = h.client.observeObjectReceipts(event => { receipts.push(event.receipt); });
     try {
@@ -163,14 +163,14 @@ describe('same full track alias reuse after cancellation', () => {
     } finally { await h.close(); }
   });
 
-  it.each([18, 22] as const)('fences a same-track PUBLISH successor after a peer reset on draft %i', async draft => {
+  it.each([18, 22, 23] as const)('fences a same-track PUBLISH successor after a peer reset on draft %i', async draft => {
     const h = await fixture(draft), delivered = vi.fn(), serverErrors = vi.fn();
     h.server.onDatagram = delivered; h.server.onError = serverErrors;
     let count = 0, latestPublish = -1n;
     h.client.setLargestLocationProvider(() => null);
     h.server.onPublish = publication => {
       count++; latestPublish = publication.requestId;
-      void h.server.acceptSubscribe(publication.requestId, 77n, draft === 22 ? undefined : {
+      void h.server.acceptSubscribe(publication.requestId, 77n, draft >= 22 ? undefined : {
         parameters: new Map([[MessageParam.FORWARD, [count === 1 ? 1n : 0n]]]),
       }).catch(serverErrors);
     };
@@ -181,7 +181,7 @@ describe('same full track alias reuse after cancellation', () => {
       h.publisherTransport.bidiOut[0]!.out.reset(0); await flush(100);
       await h.client.publish([enc('live')], enc('video'), 77n); await flush(100);
       expect(count).toBe(2); expect(serverErrors).not.toHaveBeenCalled();
-      if (draft === 22) { await h.server.requestUpdate(latestPublish, { forward: 0 }); await flush(100); }
+      if (draft >= 22) { await h.server.requestUpdate(latestPublish, { forward: 0 }); await flush(100); }
       expect(h.server.session.getIncomingSubscription(latestPublish)?.forwardState).toBe(0);
       await writer.write(encodeObjectDatagram18({ typeByte: 0, trackAlias: 77n, groupId: 10n, objectId: 0n,
         publisherPriority: 128, payload: Uint8Array.of(4), extensions: undefined, status: undefined, isEndOfGroup: false }));
@@ -189,7 +189,7 @@ describe('same full track alias reuse after cancellation', () => {
     } finally { writer.releaseLock(); await h.close(); }
   });
 
-  it.each([18, 22] as const)('does not replay guarded pre-OK stream data into the successor on draft %i', async draft => {
+  it.each([18, 22, 23] as const)('does not replay guarded pre-OK stream data into the successor on draft %i', async draft => {
     const h = await fixture(draft), delivered = vi.fn();
     h.client.onObject = (_stream, object) => delivered(object);
     try {
@@ -216,7 +216,7 @@ describe('same full track alias reuse after cancellation', () => {
     } finally { await h.close(); }
   });
 
-  it.each([16, 18, 22] as const)('keeps the prior window on update rejection before terminal cleanup in draft %i', async draft => {
+  it.each([16, 18, 22, 23] as const)('keeps the prior window on update rejection before terminal cleanup in draft %i', async draft => {
     const h = await fixture(draft);
     try {
       const first = await h.subscribe(); await h.client.unsubscribe(first); await flush(100);

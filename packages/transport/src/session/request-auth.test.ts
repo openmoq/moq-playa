@@ -27,7 +27,7 @@ function message(result: RequestResult): ControlMessage {
   return action.message;
 }
 
-describe.each([14, 16, 18, 22] as const)('draft %i request authorization', version => {
+describe.each([14, 16, 18, 22, 23] as const)('draft %i request authorization', version => {
   const encode = version >= 18 ? encodeAuthorizationToken18 : encodeAuthorizationToken;
   const tokens = [1n, 16n].map(tokenType => encode({
     aliasType: AliasType.USE_VALUE, tokenType, tokenValue: new Uint8Array([0xd2, 0x84, 0x41, 0xab]),
@@ -35,7 +35,7 @@ describe.each([14, 16, 18, 22] as const)('draft %i request authorization', versi
   const auth = { authTokens: tokens };
 
   const operations = ['subscribe', 'fetch', 'publish', 'publishNamespace', 'subscribeNamespace', 'trackStatus',
-    ...(version === 22 ? [] : ['joiningFetch'] as const)] as const;
+    ...(version >= 22 ? [] : ['joiningFetch'] as const)] as const;
   it.each(operations)(
     'preserves repeated tokens on %s through the wire codec', operation => {
       const session = established(version);
