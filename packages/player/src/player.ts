@@ -15107,9 +15107,8 @@ export class MoqtPlayer {
     const scale = BigInt(decode.timescale), us = receipt.sourcePresentationTimeUs;
     const ticks = (us * scale + 999_999n) / 1_000_000n;
     if (ticks * 1_000_000n / scale !== us) return;
-    // The anchor must name this sample: its declared PTS within its own millisecond unit.
-    const sourceMs = Number(ticks) * 1000 / decode.timescale;
-    if (!(Math.abs(sourceMs - encode.observation.mediaPtsMs) < 1)) return;
+    // MSF-01 §7.1.1: the entry MUST equal the first sample PTS floored to integral milliseconds.
+    if (!Number.isInteger(encode.observation.mediaPtsMs) || ticks * 1000n / scale !== BigInt(encode.observation.mediaPtsMs)) return;
     let placement: ReturnType<NonNullable<CmafAssemblerLike['capturePresentationPlacement']>> | undefined;
     let nativeOffset: number | undefined;
     try {

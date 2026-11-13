@@ -28,7 +28,7 @@ async function fixture(options: {entries?: Entries; offset?:number; element?:boo
  player.on('error',e=>errors.push(e.error.message));
  vi.spyOn(Date,'now').mockImplementation(()=>wall);
  const timeline=async(entries:Entries)=>wire.send(ref('timeline'),new TextEncoder().encode(JSON.stringify(entries)),0n,timelineObject++);
- const chunk=(pts=1000)=>buildChunk({trackId:1,bmdt:BigInt(pts)*90n,samples:[{duration:3600,size:4,flags:SYNC_FLAGS}],mdat:Uint8Array.of(0,0,0,0)});
+ const chunk=(pts=1000)=>buildChunk({trackId:1,bmdt:BigInt(pts*90),samples:[{duration:3600,size:4,flags:SYNC_FLAGS}],mdat:Uint8Array.of(0,0,0,0)});
  try{
  await player.load();await wire.accept(ref('catalog'),100n);await wire.send(ref('catalog'),catalog,1n);
  await wire.accept(ref('video'),200n);await wire.accept(ref('timeline'),300n);
@@ -38,7 +38,7 @@ async function fixture(options: {entries?: Entries; offset?:number; element?:boo
  observation:()=>player.stats.videoPresentationObservation,
  setWall:(n:number)=>{wall=n;},
  /** Element time of a source PTS: the assembler's own placement plus the native offset. */
- at(ptsMs:number){const f=assembler!.capturePresentationPlacement('video')!.toRebasedTimeUs(BigInt(ptsMs)*1000n)!;return Number(f.numerator)/Number(f.denominator)/1e6+offset;},
+ at(ptsMs:number){const f=assembler!.capturePresentationPlacement('video')!.toRebasedTimeUs(BigInt(ptsMs*1000))!;return Number(f.numerator)/Number(f.denominator)/1e6+offset;},
  setOffset:(n:number)=>{offset=n;},
  present(mediaTime:number){const pending=[...frames.values()];frames.clear();for(const cb of pending)cb(0,{mediaTime});},
  send:(pts=1000,group=1n,object=0n)=>wire.send(ref('video'),chunk(pts),group,object),
@@ -104,4 +104,16 @@ it('public stats JSON stays serializable with a presentation observation',async(
  const parsed=JSON.parse(JSON.stringify(f.player.stats)).videoPresentationObservation;
  expect(parsed.location).toEqual({groupId:'1',objectId:'0'});expect(parsed.encodeToPresentationMs).toBe(310);
  }finally{await f.close();}
+});
+
+it('matches the floor of the first sample PTS, including fractional milliseconds', async () => {
+ for (const pts of [1000.5, 999.5]) {
+  const f = await fixture({entries: [[1000, [1, 0], W]]});
+  try {
+   await f.send(pts);
+   expect(f.player.stats.videoEncodeObservation).not.toBeNull();
+   f.present(f.at(pts));
+   expect(f.observation() !== null).toBe(pts === 1000.5);
+  } finally { await f.close(); }
+ }
 });
