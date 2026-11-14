@@ -63,8 +63,7 @@ const MAX_C4M_BYTES = 32_768;
  *   without it (§5). Either way the encoding must be canonical and the two
  *   alphabets must not be mixed.
  *
- * `.` escapes are accepted with upper-case hex digits and for bytes that need
- * no escaping, although §11.1.2 only ever produces the lower-case, minimal form.
+ * `.` escapes must be lowercase and minimal (MOQT d18 §1.5.1, d22 §8.8).
  *
  * @throws {Error} missing `msf:` type, character outside the §11.1 grammar,
  *   malformed namespace-name string, malformed parameter, invalid or repeated
@@ -124,8 +123,10 @@ function decodeElement(text: string, what: string): string {
         const unit = text.charCodeAt(i);
         if (unit === 0x2e) {
             const hex = text.slice(i + 1, i + 3);
-            if (!/^[0-9A-Fa-f]{2}$/.test(hex)) throw new Error(`MSF ${what} has a "." not followed by two hexadecimal digits (§11.1.2)`);
-            bytes.push(parseInt(hex, 16));
+            if (!/^[0-9a-f]{2}$/.test(hex)) throw new Error(`MSF ${what} has a "." not followed by two hexadecimal digits (§11.1.2)`);
+            const byte = parseInt(hex, 16);
+            if (isLiteral(byte)) throw new Error(`MSF ${what} has a redundant escape (§11.1.2)`);
+            bytes.push(byte);
             i += 2;
         } else if (isLiteral(unit)) {
             bytes.push(unit);

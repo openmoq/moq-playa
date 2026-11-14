@@ -54,9 +54,8 @@ describe('MSF URL fragment — namespace-name string (§11.1.2)', () => {
         expect(parseMsfFragment(`msf:${encoded}`)).toMatchObject({ namespace, trackName });
     });
 
-    it('accepts upper-case and unnecessary escapes on input (moqxr)', () => {
-        expect(parseMsfFragment('msf:a.2Db--.74').namespace).toEqual(['a-b']);
-        expect(parseMsfFragment('msf:a.2Db--.74').trackName).toBe('t');
+    it.each(['a.2Db--t', 'live--.63atalog', '.61--t', 'a--.5f'])('refuses noncanonical escapes in %s', (encoded) => {
+        expect(() => parseMsfFragment(`msf:${encoded}`)).toThrow();
     });
 
     it.each([
