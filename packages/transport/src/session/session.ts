@@ -1477,19 +1477,19 @@ export class Session {
    * A GOAWAY arriving on a request stream is handled separately by the topology.
    */
   private handleGoaway(msg: Goaway): SessionOutboundAction[] {
-    // §9.4 / §10.4: at most one GOAWAY on the control stream.
+    // Draft 23 §9.2 assigns UNEXPECTED_MESSAGE to duplicate GOAWAY.
     if (this._goawayReceived) {
       return this.closeWithError(
-        SessionErrorCode.PROTOCOL_VIOLATION,
+        isDraft23(this._draftVersion) ? SessionErrorCode.UNEXPECTED_MESSAGE : SessionErrorCode.PROTOCOL_VIOLATION,
         'Received multiple GOAWAY messages on the control stream',
       );
     }
 
-    // §9.4 / §10.4: a server MUST close if it receives a non-empty New Session URI
+    // Draft 23 §9.2 assigns ROLE_VIOLATION to a server receiving a non-empty URI
     // (clients cannot instruct servers to initiate connections).
     if (this._role === EndpointRole.SERVER && msg.newSessionUri.length > 0) {
       return this.closeWithError(
-        SessionErrorCode.PROTOCOL_VIOLATION,
+        isDraft23(this._draftVersion) ? SessionErrorCode.ROLE_VIOLATION : SessionErrorCode.PROTOCOL_VIOLATION,
         'Server received GOAWAY with non-empty New Session URI',
       );
     }
@@ -1773,13 +1773,15 @@ export class Session {
     // §10.6.2: a server never receives a relocation to another session.
     if (this._role === EndpointRole.SERVER && redirect.connectUri.length > 0) {
       return this.closeWithError(
-        SessionErrorCode.PROTOCOL_VIOLATION,
+        isDraft23(this._draftVersion) ? SessionErrorCode.ROLE_VIOLATION : SessionErrorCode.PROTOCOL_VIOLATION,
         'REQUEST_ERROR Redirect with a non-empty Connect URI received by a server endpoint (§10.6.2)',
       );
     }
 
+    // Draft 23 §9.4.2.1 includes SUBSCRIBE_TRACKS among namespace-scoped redirects.
+    const isTracks = isDraft23(this._draftVersion) && this.trackSubscriptions.has(rid);
     // Request types for which REDIRECT is explicitly NOT allowed.
-    if (this.pendingUpdates.has(rid) || this.trackSubscriptions.has(rid) || this.outgoingPublishes.has(rid)) {
+    if (this.pendingUpdates.has(rid) || (this.trackSubscriptions.has(rid) && !isTracks) || this.outgoingPublishes.has(rid)) {
       return this.closeWithError(
         SessionErrorCode.PROTOCOL_VIOLATION,
         `REQUEST_ERROR Redirect is not valid for this request type (request ${rid})`,
@@ -1789,16 +1791,16 @@ export class Session {
     const isPubNs = this.publishedNamespaces.has(rid);
     const isSubNs = this.namespaceSubscriptions.has(rid);
     const allowed = this.subscriptions.has(rid) || this.fetches.has(rid)
-      || this.pendingTrackStatuses.has(rid) || isPubNs || isSubNs;
+      || this.pendingTrackStatuses.has(rid) || isPubNs || isSubNs || isTracks;
     if (!allowed) {
       // Unknown request ID — let the normal dispatch close with INVALID_REQUEST_ID.
       return null;
     }
 
     // §10.6.2: a namespace-scoped request must not carry a replacement Track Name.
-    if ((isPubNs || isSubNs) && redirect.trackName.length > 0) {
+    if ((isPubNs || isSubNs || isTracks) && redirect.trackName.length > 0) {
       return this.closeWithError(
-        SessionErrorCode.PROTOCOL_VIOLATION,
+        isDraft23(this._draftVersion) ? SessionErrorCode.INVALID_FIELD : SessionErrorCode.PROTOCOL_VIOLATION,
         'REQUEST_ERROR Redirect for a namespace-scoped request must have an empty Track Name (§10.6.2)',
       );
     }
@@ -2034,7 +2036,7 @@ export class Session {
     // them blind, so we enforce the request-stream context here.
     if (((msg.trackProperties ?? msg.trackExtensions)?.size ?? 0) > 0 && !this.pendingTrackStatuses.has(msg.requestId as bigint)) {
       return this.closeWithError(
-        SessionErrorCode.PROTOCOL_VIOLATION,
+        isDraft23(this._draftVersion) ? SessionErrorCode.INVALID_FIELD : SessionErrorCode.PROTOCOL_VIOLATION,
         `Track Properties are not valid on this REQUEST_OK (request ${msg.requestId})`,
       );
     }

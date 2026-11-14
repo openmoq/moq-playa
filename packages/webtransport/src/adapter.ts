@@ -1714,7 +1714,8 @@ export class MoqtConnection {
       // still observed once on the raw channel before the session closes.
       this.uniPair.onRequestGoawayViolation = (reason, message) => {
         this.qlogGoaway(message as Goaway);
-        this.handleControlStreamViolation(reason);
+        // Draft 23 §9.2: duplicate request-stream GOAWAY is UNEXPECTED_MESSAGE.
+        this.handleControlStreamViolation(reason, isDraft23(version) ? Number(SessionError.UNEXPECTED_MESSAGE) : undefined);
       };
       // A later control-stream message (draft-18 GOAWAY, §10.4): feed it to the
       // session (→ DRAINING, or close on a violation) and surface it to the app.
@@ -2361,7 +2362,10 @@ export class MoqtConnection {
     // would be silently absorbed as a local cancellation.
     const violation = this.requestGoawayViolation(goaway);
     if (violation) {
-      this.handleControlStreamViolation(violation);
+      // Draft 23 §9.2: a server cannot be redirected by GOAWAY.
+      this.handleControlStreamViolation(violation, isDraft23(this.session.draftVersion)
+        && this.session.role === EndpointRole.SERVER && goaway.newSessionUri !== ''
+        ? Number(SessionError.ROLE_VIOLATION) : undefined);
       return;
     }
     // Per-request settlement. This is NOT a subscription-state change: §10.4 and

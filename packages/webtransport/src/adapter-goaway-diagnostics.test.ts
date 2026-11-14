@@ -48,7 +48,7 @@ describe.each([18, 22, 23] as const)('draft-%i diagnostic isolation', (version) 
       });
       await flush(32);
       expect(notices).toEqual([]);
-      expect(b.closeInfo?.closeCode).toBe(Number(SessionError.PROTOCOL_VIOLATION));
+      expect(b.closeInfo?.closeCode).toBe(Number(version === 23 ? SessionError.ROLE_VIOLATION : SessionError.PROTOCOL_VIOLATION));
     } finally { await client.close(); await server.close(); }
   });
 
@@ -135,7 +135,7 @@ describe.each([18, 22, 23] as const)('draft-%i diagnostic isolation', (version) 
       await stream.writeMessage({ type: 'GOAWAY', newSessionUri: '', timeout: 0n });
       pipe.releaseHeld();
       await flush(32);
-      expect(a.closeInfo?.closeCode).toBe(Number(SessionError.PROTOCOL_VIOLATION));
+      expect(a.closeInfo?.closeCode).toBe(Number(version === 23 ? SessionError.UNEXPECTED_MESSAGE : SessionError.PROTOCOL_VIOLATION));
       expect(parsed).toHaveLength(2);
     } finally { await client.close(); await server.close(); }
   });
@@ -153,7 +153,7 @@ describe.each([18, 22, 23] as const)('draft-%i diagnostic isolation', (version) 
       await stream.writeMessage({ type: 'GOAWAY', newSessionUri: '', timeout: 0n });
       pipe.releaseHeld();
       await flush(32);
-      expect(a.closeInfo?.closeCode).toBe(Number(SessionError.PROTOCOL_VIOLATION));
+      expect(a.closeInfo?.closeCode).toBe(Number(version === 23 ? SessionError.UNEXPECTED_MESSAGE : SessionError.PROTOCOL_VIOLATION));
     } finally { await client.close(); await server.close(); }
   });
 

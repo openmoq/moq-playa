@@ -143,7 +143,7 @@ describe.each([16, 18, 22, 23] as const)('draft-%i session-scope GOAWAY notice',
       // act on a message the session refused.
       expect(seen.notices).toHaveLength(1);
       expect(seen.order).toEqual(['onMessage', 'notice']);
-      expect(closed[0]?.error).toBe(Number(SessionError.PROTOCOL_VIOLATION));
+      expect(closed[0]?.error).toBe(Number(version === 23 ? SessionError.UNEXPECTED_MESSAGE : SessionError.PROTOCOL_VIOLATION));
     } finally { await client.close(); await server.close(); }
   });
 });
@@ -188,7 +188,7 @@ describe.each([18, 22, 23] as const)('draft-%i request-scope GOAWAY notice', (ve
       pipe.releaseHeld();
       await flush(32);
 
-      expect(a.closeInfo?.closeCode).toBe(Number(SessionError.PROTOCOL_VIOLATION));
+      expect(a.closeInfo?.closeCode).toBe(Number(version === 23 ? SessionError.UNEXPECTED_MESSAGE : SessionError.PROTOCOL_VIOLATION));
       expect(seen.notices.length).toBeLessThanOrEqual(1);
     } finally { await client.close(); await server.close(); }
   });
@@ -285,7 +285,7 @@ describe.each([18, 22, 23] as const)('draft-%i request-scope GOAWAY notice', (ve
       await flush();
 
       expect(seen.notices).toEqual([]);
-      expect(closed[0]).toBe(Number(SessionError.PROTOCOL_VIOLATION));
+      expect(closed[0]).toBe(Number(version === 23 ? SessionError.ROLE_VIOLATION : SessionError.PROTOCOL_VIOLATION));
     } finally { await client.close(); await server.close(); }
   });
 
@@ -420,7 +420,7 @@ describe.each([16, 18, 22, 23] as const)('draft-%i GOAWAY delivery contract', (v
       await flush();
 
       expect(notices).toHaveLength(1); // only the accepted one
-      expect(closed[0]).toBe(Number(SessionError.PROTOCOL_VIOLATION));
+      expect(closed[0]).toBe(Number(version === 23 ? SessionError.UNEXPECTED_MESSAGE : SessionError.PROTOCOL_VIOLATION));
     } finally { await client.close(); await server.close(); }
   });
 
@@ -478,3 +478,27 @@ describe('GoawayNotice type', () => {
     expect([missing, extra]).toHaveLength(2);
   });
 });
+
+for (const draft of [22, 23] as const) for (const role of ['client', 'server'] as const) {
+  it(`draft${draft} ${role} request GOAWAY uses its specified close code`, async () => {
+    const p = await connectedPair(draft);
+    const receiver = role === 'client' ? p.client : p.server;
+    const sender = role === 'client' ? p.server : p.client;
+    sender.onSubscribe = id => { void sender.acceptSubscribe(id, 7n); };
+    const closed: number[] = [];
+    receiver.onClose = code => { if (code !== undefined) closed.push(code); };
+    try {
+      const sub = await receiver.subscribeTrack(ns('close'), nm('video'));
+      const stream = peerRequestStream(sender, sub.requestId);
+      if (role === 'client') {
+        const pipe = p.a.bidiOut[0]!.in;
+        pipe.faults.hold = true;
+        await stream.writeMessage({ type: 'GOAWAY', newSessionUri: '', timeout: 0n });
+        await stream.writeMessage({ type: 'GOAWAY', newSessionUri: '', timeout: 0n });
+        pipe.releaseHeld();
+      } else await stream.writeMessage({ type: 'GOAWAY', newSessionUri: 'https://example.test', timeout: 0n });
+      await flush(128);
+      expect(closed).toEqual([draft === 23 ? role === 'client' ? 0x303 : 0x304 : 3]);
+    } finally { await p.client.close(); await p.server.close(); }
+  });
+}

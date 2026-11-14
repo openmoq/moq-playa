@@ -234,3 +234,26 @@ describe('draft-23 Track Names (§2.4.1)', () => {
     expect(codec23.decode(codec23.encode(msg), 0).message).toMatchObject({ trackName: enc('v') });
   });
 });
+
+for (const draft of [18, 22, 23] as const) {
+  it(`draft${draft} GOAWAY URI length limit (§9.2)`, () => {
+    const codec = createControlCodec(draft);
+    for (const length of [8192, 8193]) {
+      // Literal framing bypasses the sender's URI limit.
+      const bodyLength = length + 3;
+      const frame = new Uint8Array(bodyLength + 3);
+      frame[0] = 0x10;
+      if (draft === 23) writeVi64(BigInt(bodyLength), frame, 1);
+      else new DataView(frame.buffer).setUint16(1, bodyLength);
+      writeVi64(BigInt(length), frame, 3);
+      frame.fill(0x61, 5, 5 + length);
+      if (length === 8192) expect(codec.decode(frame, 0).message.type).toBe('GOAWAY');
+      else {
+        let error: unknown;
+        try { codec.decode(frame, 0); } catch (caught) { error = caught; }
+        expect(error).toBeInstanceOf(ProtocolViolationError);
+        expect((error as ProtocolViolationError).code).toBe(draft === 23 ? 0x401 : undefined);
+      }
+    }
+  });
+}

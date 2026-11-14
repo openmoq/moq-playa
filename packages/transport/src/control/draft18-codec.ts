@@ -969,7 +969,8 @@ export class Draft18Codec implements ControlCodec {
     let p = 0;
     const uri = readVi64Bytes(payload, p); p += uri.bytesRead;
     if (uri.value.length > GOAWAY_MAX_URI_LENGTH) {
-      throw new ProtocolViolationError(`GOAWAY New Session URI length ${uri.value.length} exceeds maximum ${GOAWAY_MAX_URI_LENGTH} bytes`);
+      throw new ProtocolViolationError(`GOAWAY New Session URI length ${uri.value.length} exceeds maximum ${GOAWAY_MAX_URI_LENGTH} bytes`,
+        isDraft23(this.version) ? Number(SessionError.FIELD_LENGTH_EXCEEDED) : undefined);
     }
     const timeout = readVi64(payload, p); p += timeout.bytesRead;
     // Request ID is present only on the control stream (§10.4). The codec is
