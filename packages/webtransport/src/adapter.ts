@@ -1011,7 +1011,7 @@ export class MoqtConnection {
    * terminal shutdown. Idempotent via {@link terminate}.
    */
   private closeSessionFatal(reason: string, code: number = 0x3): void {
-    this.terminate(code, reason, { closeSession: true });
+    this.terminate(code, reason, { closeSession: true, sessionErrorCode: varint(code) });
   }
 
   /**

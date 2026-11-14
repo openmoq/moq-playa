@@ -232,6 +232,7 @@ export function decodeSubgroupObject18(
 export function decodeObjectDatagram18(
   buf: Uint8Array,
   offset: number,
+  version: RequestStreamDraft = 18,
 ): { datagram: ObjectDatagram; bytesRead: number } {
   let pos = offset;
   const t = readVi64(buf, pos); pos += t.bytesRead;
@@ -267,6 +268,7 @@ export function decodeObjectDatagram18(
     pos,
     (typeByte & DatagramFlags18.PROPERTIES) !== 0,
     /*rejectEmpty*/ true,
+    version,
   );
   pos += extensions.bytesRead;
 
@@ -314,12 +316,15 @@ function readOptionalProperties(
   offset: number,
   present: boolean,
   rejectEmpty: boolean,
+  version: RequestStreamDraft = 18,
 ): { value: Uint8Array | undefined; bytesRead: number } {
   if (!present) return { value: undefined, bytesRead: 0 };
   const r = readVi64Bytes(buf, offset);
   if (r.value.length === 0) {
     if (rejectEmpty) {
-      throw new ProtocolViolationError('PROPERTIES flag set but the Properties block is empty');
+      // Draft 23 §11.2.1 assigns MALFORMED_OBJECT to this datagram detector.
+      throw new ProtocolViolationError('PROPERTIES flag set but the Properties block is empty',
+        isDraft23(version) ? Number(SessionError.MALFORMED_OBJECT) : undefined);
     }
     return { value: undefined, bytesRead: r.bytesRead };
   }

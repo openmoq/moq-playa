@@ -43,7 +43,7 @@ export function createDataCodec18(version: RequestStreamDraft = 18): DataCodec {
     decodeFetchObject18: (buf, offset, prior, isFirstObject, groupOrder) =>
       decodeFetchObject18(buf, offset, prior, isFirstObject, groupOrder, version),
 
-    decodeObjectDatagram: (buf, offset) => decodeObjectDatagram18(buf, offset),
+    decodeObjectDatagram: (buf, offset) => decodeObjectDatagram18(buf, offset, version),
 
     decodeSubgroupObjectHeader: (buf, offset, hasProperties, previousObjectId, isFirstObject = true) =>
       decodeSubgroupObjectHeader18(buf, offset, hasProperties, previousObjectId, isFirstObject),
