@@ -2490,7 +2490,7 @@ export class MoqtConnection {
    */
   private trackPropertyFault(message: DecodedControlMessage): { code: Varint; reason: string } | null {
     const props = this.trackPropsOf(message);
-    if (hasUnsupportedMandatoryTrackProperty(props)) {
+    if (hasUnsupportedMandatoryTrackProperty(props, this.session.draftVersion)) {
       return { code: RequestError18.UNSUPPORTED_EXTENSION, reason: 'an unsupported Mandatory Track Property (§2.5.1)' };
     }
     const reason = supportedPropertyFault(props, 'track');
@@ -2507,7 +2507,7 @@ export class MoqtConnection {
       values.push(value);
       props.set(id, values);
     }
-    return supportedPropertyFault(props, 'object');
+    return supportedPropertyFault(props, 'object', this.session.draftVersion);
   }
 
   private assertLocalObjectProperties(properties: Uint8Array | undefined): void {

@@ -1,3 +1,4 @@
+import { isDraft23, type DraftVersion } from '../versions.js';
 import type { TrackExtensions } from './messages.js';
 
 /**
@@ -22,17 +23,19 @@ const SUPPORTED_PROPERTY_SCOPES = new Map<bigint, 'track' | 'object' | 'both'>([
 ]);
 
 /** Every type in the mandatory range is Track-only on draft18/22. */
-function isMandatoryTrackProperty(type: bigint): boolean {
-  return type >= 0x4000n && type <= 0x7fffn;
+function isMandatoryTrackProperty(type: bigint, draft: DraftVersion): boolean {
+  // Draft 23 §§3.7, 13 exclude grease from mandatory Track Properties.
+  return type >= 0x4000n && type <= 0x7fffn
+    && !(isDraft23(draft) && (type - 0x9dn) % 0x7fn === 0n);
 }
 
 /** A Property scope/multiplicity fault is track-semantic, not malformed KVP
  * encoding. Unknown optional Properties retain all occurrences. */
 export function supportedPropertyFault(
-  props: ReadonlyMap<bigint, readonly unknown[]>, scope: 'track' | 'object',
+  props: ReadonlyMap<bigint, readonly unknown[]>, scope: 'track' | 'object', draft: DraftVersion = 18,
 ): string | null {
   for (const [type, values] of props) {
-    if (scope === 'object' && isMandatoryTrackProperty(type)) {
+    if (scope === 'object' && isMandatoryTrackProperty(type, draft)) {
       return `Mandatory Track Property 0x${type.toString(16)} is track-only`;
     }
     const allowed = SUPPORTED_PROPERTY_SCOPES.get(type);
@@ -62,9 +65,9 @@ export function hasObjectOnlyTrackProperty(props: TrackExtensions): boolean {
  * implemented, every classified mandatory type qualifies — the request MUST be rejected
  * (PUBLISH) or cancelled (SUBSCRIBE_OK / FETCH_OK), NOT processed or forwarded.
  */
-export function hasUnsupportedMandatoryTrackProperty(props: TrackExtensions): boolean {
+export function hasUnsupportedMandatoryTrackProperty(props: TrackExtensions, draft: DraftVersion = 18): boolean {
   for (const type of props.keys()) {
-    if (isMandatoryTrackProperty(type as bigint)) return true;
+    if (isMandatoryTrackProperty(type as bigint, draft)) return true;
   }
   return false;
 }
