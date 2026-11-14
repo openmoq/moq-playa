@@ -16,7 +16,7 @@ const name = enc('video');
 const LARGEST_OBJECT = 0x09n;
 const SUBSCRIBE_TRACKS_ID = 0x36n;
 
-function established(draft: 22 | 23 = 23, role: 'client' | 'server' = 'client'): Session {
+function established(draft: 18 | 22 | 23 = 23, role: 'client' | 'server' = 'client'): Session {
   const session = new Session(role === 'client' ? EndpointRole.CLIENT : EndpointRole.SERVER, draft);
   if (role === 'client') session.initiateSetup();
   session.handleControlMessage({ type: 'SETUP', setupOptions: new Map() });
@@ -324,3 +324,94 @@ describe('draft-23 MAX_CONTROL_MESSAGE_SIZE (§9.1.8)', () => {
 it('SessionError is still exported for fetch acceptance misuse', () => {
   expect(() => established(23, 'server').acceptFetch(5n)).toThrow(SessionError);
 });
+
+for (const draft of [22, 23] as const) {
+  for (const provider of ['setLargestLocationProvider', 'setFetchLargestLocationProvider'] as const) {
+    it(`draft${draft} FETCH responder consults only its FETCH-keyed provider (${provider})`, () => {
+      const session = established(draft, 'server');
+      const calls: bigint[] = [];
+      session[provider](id => { calls.push(id); return { group: 5n, object: 3n }; });
+      inboundFetch(session, 0n);
+      const [ok] = sent(session.acceptFetch(0n));
+      expect((ok as RequestOk | FetchOk).parameters.get(LARGEST_OBJECT))
+        .toEqual(draft === 23 && provider === 'setFetchLargestLocationProvider' ? [{ group: 5n, object: 3n }] : undefined);
+      expect(calls).toEqual(draft === 23 && provider === 'setFetchLargestLocationProvider' ? [0n] : []);
+    });
+  }
+}
+it('draft23 FETCH provider respects range and explicit caller metadata', () => {
+  for (const explicit of [false, true]) {
+    const session = established(23, 'server');
+    session.setLargestLocationProvider(() => ({ group: 4n, object: 0n }));
+    session.setFetchLargestLocationProvider(() => ({ group: 9n, object: 0n }));
+    inboundFetch(session, 0n);
+    const [ok] = sent(session.acceptFetch(0n, explicit ? { largestObject: { group: 6n, object: 1n } } : {}));
+    expect((ok as RequestOk).parameters.get(LARGEST_OBJECT))
+      .toEqual(explicit ? [{ group: 6n, object: 1n }] : undefined);
+  }
+});
+
+for (const draft of [22, 23] as const) it(`draft${draft} known-empty FETCH head`, () => {
+  const session = established(draft, 'server');
+  session.setFetchLargestLocationProvider(() => null);
+  inboundFetch(session, 0n);
+  const [response] = sent(session.acceptFetch(0n));
+  expect(response).toMatchObject(draft === 23
+    ? { type: 'REQUEST_ERROR', errorCode: 0x11n } : { type: 'FETCH_OK' });
+  if (draft === 23) expect(session.getIncomingFetch(0n)).toBeUndefined();
+});
+for (const source of ['provider', 'explicit', 'throwing-provider'] as const) {
+  it(`draft23 failed acceptance leaves FETCH rejectable (${source})`, () => {
+    const session = established(23, 'server');
+    inboundFetch(session, 0n);
+    const fetch = session.getIncomingFetch(0n)!;
+    session.setFetchLargestLocationProvider(() => {
+      if (source === 'throwing-provider') throw new Error('provider unavailable');
+      return { group: 1n, object: 0n };
+    });
+    expect(() => session.acceptFetch(0n, source === 'explicit'
+      ? { largestObject: { group: 1n, object: 0n } } : {})).toThrow();
+    expect(fetch.responseSent).toBe(false);
+    expect(sent(session.rejectFetch(0n, 0x11n, 'invalid range')))
+      .toContainEqual(expect.objectContaining({ type: 'REQUEST_ERROR', errorCode: 0x11n }));
+  });
+}
+for (const source of ['option', 'parameter'] as const) it(`draft23 explicit ${source} overrides known-empty provider`, () => {
+  const session = established(23, 'server');
+  inboundFetch(session, 0n);
+  let calls = 0;
+  session.setFetchLargestLocationProvider(() => { calls++; return null; });
+  const largest = { group: 5n, object: 3n };
+  const [ok] = sent(session.acceptFetch(0n, source === 'option'
+    ? { largestObject: largest } : { parameters: new Map([[9n, [largest]]]) }));
+  expect((ok as RequestOk).parameters.get(9n)).toEqual([largest]);
+  expect(calls).toBe(0);
+});
+
+for (const draft of [18, 22, 23] as const) for (const group of [1n, 5n]) {
+  it(`draft${draft} validates raw FETCH Largest Object ${group}/0 before sending`, () => {
+    const session = established(draft, 'server');
+    inboundFetch(session, 0n);
+    const fetch = session.getIncomingFetch(0n)!;
+    let calls = 0;
+    session.setFetchLargestLocationProvider(() => { calls++; return null; });
+    const largest = { group, object: 0n };
+    const options = {
+      parameters: new Map([[LARGEST_OBJECT, [largest]]]),
+      // Raw metadata retains precedence over the option as well as the provider.
+      largestObject: { group: group === 1n ? 5n : 1n, object: 0n },
+    };
+    if (draft === 23 && group === 1n) {
+      expect(() => session.acceptFetch(0n, options)).toThrow(/before the FETCH start/);
+      expect(fetch.responseSent).toBe(false);
+      expect(sent(session.rejectFetch(0n, 0x11n, 'invalid range')))
+        .toContainEqual(expect.objectContaining({ type: 'REQUEST_ERROR', errorCode: 0x11n }));
+    } else {
+      const [ok] = sent(session.acceptFetch(0n, options));
+      expect(ok?.type).toBe(draft === 23 ? 'REQUEST_OK' : 'FETCH_OK');
+      expect((ok as RequestOk | FetchOk).parameters.get(LARGEST_OBJECT)).toEqual([largest]);
+      expect(fetch.responseSent).toBe(true);
+    }
+    expect(calls).toBe(0);
+  });
+}

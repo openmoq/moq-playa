@@ -319,13 +319,17 @@ function locationBefore(a: { group: bigint; object: bigint }, b: { group: bigint
  */
 function fetchOkParameters23(fetch: FetchStateMachine, options: FetchAcceptOptions): Parameters {
   const parameters: Parameters = new Map(options.parameters ?? []);
-  const largest = options.largestObject;
-  if (parameters.has(MessageParam.LARGEST_OBJECT as bigint) || largest === undefined) return parameters;
+  const explicit = parameters.get(MessageParam.LARGEST_OBJECT as bigint);
+  const largest = explicit === undefined ? options.largestObject : explicit[0];
+  if (largest === undefined && explicit === undefined) return parameters;
+  if (!isLocationValue(largest)) throw new SessionError('LARGEST_OBJECT must be a Location', 'INVALID_STATE');
   const start = fetch.startGroup === undefined ? undefined : { group: fetch.startGroup, object: fetch.startObject ?? 0n };
   if (start !== undefined && locationBefore(largest, start)) {
     // §3.2: a Start Location past Largest Object is INVALID_RANGE, not an OK.
     throw new SessionError(`Largest Object ${largest.group}/${largest.object} is before the FETCH start`, 'INVALID_STATE');
   }
+  // Explicit parameters take precedence, but cannot bypass the range validation.
+  if (explicit !== undefined) return parameters;
   const requestedEnd = requestedFetchEnd(fetch);
   if (requestedEnd === undefined || !locationBefore(requestedEnd, largest)) {
     parameters.set(MessageParam.LARGEST_OBJECT as bigint, [{ group: largest.group, object: largest.object }]);
@@ -5764,6 +5768,15 @@ export class Session {
         'INVALID_STATE',
       );
     }
+    // Draft 23 §3.2: report Largest Object when it lies in the requested range.
+    if (isDraft23(this._draftVersion) && options.largestObject === undefined
+      && !options.parameters?.has(MessageParam.LARGEST_OBJECT as bigint)) {
+      const largestObject = this.fetchLargestLocationProvider?.(requestId);
+      if (largestObject === null) {
+        return this.rejectFetch(requestId, RequestErrorCode.INVALID_RANGE, 'No Objects published for this track');
+      }
+      if (largestObject != null) options = { ...options, largestObject };
+    }
     const trackProperties = this.resolveTrackProperties(options.trackProperties, 'FETCH_OK');
     let endLocation = options.endLocation;
     // draft 23 answers with REQUEST_OK, which carries no End Location.
@@ -5774,8 +5787,6 @@ export class Session {
       endLocation = isDraft22(this._draftVersion) ? requestedFetchEnd(fetch)!
         : { group: fetch.endGroup, object: fetch.endObject ?? 0n };
     }
-
-    fetch.sendFetchOk();
 
     const response: FetchOk | RequestOk = isDraft23(this._draftVersion)
       ? {
@@ -5794,6 +5805,9 @@ export class Session {
         parameters: options.parameters ?? new Map(),
         trackProperties,
       };
+
+    // Validate all response metadata before committing the response state (§3.2).
+    fetch.sendFetchOk();
 
     // §10.13: the response stream may have closed BEFORE this FETCH_OK. If so, both
     // are now done — reclaim the served fetch; otherwise keep it (reclaimServedFetch
