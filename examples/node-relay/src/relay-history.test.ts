@@ -911,3 +911,41 @@ for (const draft of [18, 22, 23] as const) for (const knownEnd of [false, true])
     } finally { await f.close(); }
   });
 }
+
+for (const draft of [18, 22, 23] as const) for (const middle of [false, true]) {
+  it(`draft${draft} interrupted ${middle ? 'middle' : 'tail'} history Object preserves the draft response and cleanup`, async () => {
+    const f = await fixture(draft, { maxActiveHistoryRequests: 1 });
+    try {
+      const stalled = await stallHistoryObject(f, draft);
+      if (middle) await f.publish(8n, [2n], false);
+      const result = await f.fetch(8n, 8n, middle ? 3n : 2n);
+      expect(result.data).toEqual(['8/0']); expect(result.terminal).toEqual([]);
+      await stalled.writer.abort({ streamErrorCode: 1 }); await f.settled();
+      expect(result.data).toEqual(draft === 23 && middle ? ['8/0', '8/2'] : ['8/0']);
+      expect(result.terminal).toEqual([draft === 23 ? 'fin' : 'reset']);
+      expect(result.statuses).toEqual(draft === 23 ? [0n] : []);
+      expect(f.down.resetReasons).toEqual(draft === 23 ? [] : [expect.objectContaining({ streamErrorCode: 6 }), expect.objectContaining({ streamErrorCode: 6 })]);
+      expect(pendingHistoryCount(f.relay)).toBe(0);
+      const again = await f.fetch(8n, 8n, 1n); await f.settled();
+      expect(again.data).toEqual(['8/0']); expect(again.terminal).toEqual(['fin']);
+    } finally { await f.close(); }
+  });
+}
+
+for (const mode of ['cancel', 'malformed'] as const) it(`draft23 interrupted history retains the ${mode} guard`, async () => {
+  const f = await fixture(23);
+  try {
+    const source = mode === 'malformed' ? await f.replace() : f.up;
+    const stalled = await stallHistoryObject(f, 23, source);
+    const result = await f.fetch(8n, 8n, 2n);
+    const ranges = vi.spyOn(f.down.server, 'sendFetchEndOfRange');
+    if (mode === 'cancel') await f.down.client.fetchCancel(result.id);
+    else await distinctObject(f, 8n, 0n, false, false, Uint8Array.of(99));
+    await flush(256);
+    if (mode === 'malformed') expect(f.down.resetReasons).toContainEqual(expect.objectContaining({ streamErrorCode: 0x12 }));
+    await stalled.writer.abort({ streamErrorCode: 1 }); await f.settled();
+    expect(ranges).not.toHaveBeenCalled(); expect(result.statuses).toEqual([]);
+    expect(pendingHistoryCount(f.relay)).toBe(0);
+    expect(f.down.server.session.state).toBe('established');
+  } finally { await f.close(); }
+});

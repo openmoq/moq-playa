@@ -430,6 +430,11 @@ export class Relay {
         const location = { group: row.groupId, object: row.objectId };
         const complete = 'ready' in row ? track.cache.plan(location, location)?.[0] : row;
         if (!complete) {
+          // Draft 23 §§3.2.2–3, 11.4.2: Unknown preserves the remaining response.
+          if (isDraft23(conn.draftVersion)) {
+            await conn.sendFetchEndOfRange(sid, 'unknown', row.groupId, row.objectId);
+            continue;
+          }
           // UNKNOWN_OBJECT_STATUS (0x6): d18 §10.12.3/§3.3.3; d22 §3.2.2/§12.5.
           await conn.abortIncomingFetch(requestId, { streamErrorCode: 6 }); return;
         }
