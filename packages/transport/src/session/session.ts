@@ -2116,7 +2116,7 @@ export class Session {
       // Track Namespace Prefix on the outbound namespace/tracks subscription.
       if (pending.namespacePrefix && pending.prefixTarget) {
         if (pending.prefixTarget === 'namespace') {
-          this.namespaceSubscriptions.get(pending.existingRequestId)?.updatePrefix(pending.namespacePrefix);
+          this.namespaceSubscriptions.get(pending.existingRequestId)?.updatePrefix(pending.namespacePrefix, this._draftVersion);
         } else {
           const ts = this.trackSubscriptions.get(pending.existingRequestId);
           if (ts) ts.trackNamespacePrefix = pending.namespacePrefix;
@@ -3206,7 +3206,7 @@ export class Session {
           return this.prefixOverlapError(msg.requestId, 'SUBSCRIBE_NAMESPACE', existingRid, replenish);
         }
       }
-      incNs.updatePrefix(newPrefix);
+      incNs.updatePrefix(newPrefix, this._draftVersion);
     } else if (incTracks) {
       for (const [rid, existing] of overlapForbidden ? this.incomingTrackSubscriptions : []) {
         if (rid === existingRid) continue;

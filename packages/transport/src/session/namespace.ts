@@ -16,6 +16,7 @@
  * @module
  */
 
+import { isDraft23, type DraftVersion } from '../versions.js';
 import { NamespaceState, type NamespaceStateValue } from './types.js';
 
 /**
@@ -42,7 +43,16 @@ export class NamespaceStateMachine {
    * the subscriber applies it on REQUEST_OK, the publisher applies it when it
    * accepts the peer's update. Recomputes the prefix key.
    */
-  updatePrefix(newPrefix: Uint8Array[]): void {
+  updatePrefix(newPrefix: Uint8Array[], draft: DraftVersion = 18): void {
+    // Draft 23 §9.5.2: rebase retained names and implicitly withdraw exclusions.
+    // Older drafts retain the existing suffix behavior when no draft is supplied.
+    if (isDraft23(draft)) {
+      this._discoveredNamespaces = this._discoveredNamespaces.flatMap(suffix => {
+        const full = [...this._namespacePrefix, ...suffix];
+        return this.suffixEquals(full.slice(0, newPrefix.length), newPrefix)
+          ? [full.slice(newPrefix.length)] : [];
+      });
+    }
     this._namespacePrefix = newPrefix;
     this._prefixKey = this.computePrefixKey(newPrefix);
   }
