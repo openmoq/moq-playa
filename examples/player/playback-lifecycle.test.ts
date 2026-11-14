@@ -32,7 +32,7 @@ function fixture(fetchCatalog = false) {
     playEpoch: 0, startupDiscovery: null, startupTransport: null, teardownBarrier: new TeardownBarrier(100),
     ensureAudio: () => ({ ctx: {}, clock: {} }), newStartupLatch: () => ({}),
     resolveRelayEndpoint: async () => 'https://test.invalid', log: vi.fn(),
-    namespaceArg: 'live', authority: undefined, warmStart: false, catalogFromUrl: undefined, catalogBootstrap: undefined,
+    namespaceArg: 'live', msfLink: undefined, msfRefusal: undefined, authority: undefined, warmStart: false, catalogFromUrl: undefined, catalogBootstrap: undefined,
     certHash: undefined, draftVersion: undefined, CanvasRenderer: class { stop() {} start() {} },
     canvas: { style: {} }, renderer: null, startupSummaryEnabled: false, trace: null,
     createWebTransport: ({ signal }: { signal: AbortSignal }) => async () => {
@@ -223,5 +223,29 @@ describe('demo selection configuration and event ownership', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(f.context.catalogSelection).toBeNull();
     expect(f.context.buildTrackSelector).not.toHaveBeenCalled();
+  });
+  it('configures the player from an MSF link', async () => {
+    const f = fixture();
+    const authorization = { getTokens: () => [] };
+    f.context.msfLink = { namespace: ['live'], catalogTrackName: 'catalog-v2', authorization, notes: [] };
+    await f.context.startPlayback();
+    expect(f.instances[0]!.options).toMatchObject({ url: 'https://test.invalid', catalogTrackName: 'catalog-v2', authorization });
+  });
+  it('sets no authorization without a token, and nothing without an MSF link', async () => {
+    const f = fixture();
+    f.context.msfLink = { namespace: ['live'], catalogTrackName: 'catalog', notes: [] };
+    await f.context.startPlayback();
+    expect(f.instances[0]!.options).toMatchObject({ url: 'https://test.invalid', catalogTrackName: 'catalog' });
+    expect(f.instances[0]!.options).not.toHaveProperty('authorization');
+    const plain = fixture();
+    await plain.context.startPlayback();
+    expect(plain.instances[0]!.options).not.toHaveProperty('catalogTrackName');
+    expect(plain.instances[0]!.options).not.toHaveProperty('authorization');
+  });
+  it('refuses to start on a refused MSF link and does not ask for a retry', async () => {
+    const f = fixture();
+    f.context.msfRefusal = 'MSF URL requires a native QUIC connection';
+    await expect(f.context.startPlayback()).rejects.toMatchObject({ message: 'MSF URL requires a native QUIC connection', retryable: false });
+    expect(f.instances).toHaveLength(0);
   });
 });

@@ -129,6 +129,8 @@ export function fixture(configure?: (p: FakePlayer, index: number) => void) {
     resolveRelayEndpoint: async () => 'https://test.invalid',
     log: (message: string) => logs.push(message),
     namespaceArg: 'live',
+    msfLink: undefined,
+    msfRefusal: undefined,
     authority: undefined,
     warmStart: false,
     catalogFromUrl: undefined,
