@@ -128,6 +128,7 @@
     "examples/player/playback-lifecycle.test.ts",
     "examples/player/main.ts",
     "examples/player/msf-link.test.ts",
+    "examples/player/msf-page.test.ts",
     "examples/shared/msf-url.test.ts",
     "examples/player/startup-lifecycle.test.ts",
     "examples/player/startup-refusal-sdk.loopback.test.ts",

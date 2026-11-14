@@ -25,7 +25,7 @@ export interface PlayerMsfLink {
     readonly catalogTrackName: string;
     /** Presents the `c4m` token, typed per `?authProfile=`. */
     readonly authorization?: PlayerAuthorization;
-    /** Parts of the fragment this page does not act on. Safe to log: a count, never names or values. */
+    /** Safe to log: fixed notices and counts, never input names or values. */
     readonly notes: readonly string[];
 }
 
@@ -39,17 +39,14 @@ export interface PlayerMsfLink {
  * stays in the query string.
  *
  * @throws {Error} a malformed MSF fragment; `connection=q`, which a browser
- *   cannot honour and §11.1.1 does not allow it to ignore; a namespace given
- *   both in the fragment and in the query string; an invalid `?authProfile=`.
+ *   cannot honour and §11.1.1 does not allow it to ignore; unsupported ranges;
+ *   an invalid `?authProfile=`.
  */
 export function readMsfLink(hash: string, search: string): PlayerMsfLink | undefined {
     const text = hash.startsWith('#') ? hash.slice(1) : hash;
     if (!/^msf:/i.test(text)) return undefined;
     const query = new URLSearchParams(search);
     const fragment = parseMsfFragment(text);
-    for (const name of ['ns', 'nsField']) {
-        if (query.has(name)) throw new Error(`MSF URL and ?${name}= both set the same thing; remove ?${name}=`);
-    }
     if (fragment.connection === 'q') {
         throw new Error('MSF URL requires a native QUIC connection (connection=q); a browser can only use WebTransport');
     }
@@ -61,6 +58,10 @@ export function readMsfLink(hash: string, search: string): PlayerMsfLink | undef
 
     const ignored = fragment.parameters.length;
     const notes = ignored > 0 ? [`${ignored} parameter${ignored > 1 ? 's are' : ' is'} not supported by this page and ignored`] : [];
+
+    if (query.has('ns') || query.has('nsField')) {
+        notes.push('?ns= and ?nsField= are ignored in favor of the fragment');
+    }
 
     let authorization: PlayerAuthorization | undefined;
     if (fragment.c4m !== undefined) {

@@ -35,9 +35,6 @@ describe('player MSF link', () => {
   });
 
   it.each([
-    ['#msf:live--catalog', '?ns=live', '?ns='],
-    ['#msf:live--catalog', '?ns=', '?ns='],
-    ['#msf:live--catalog', '?nsField=live', '?nsField='],
     ['#msf:live--catalog&c4m=YWJj', '?fetchCatalog=1', '?fetchCatalog=1'],
   ])('refuses %j together with %j', (hash, search, message) => {
     expect(() => readMsfLink(hash, search)).toThrow(message);

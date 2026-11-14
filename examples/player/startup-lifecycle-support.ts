@@ -4,6 +4,7 @@ import ts from 'typescript';
 import { vi } from 'vitest';
 import { buildCatalogSelection, PlayerErrorCode, usesMsePath } from '@openmoq/player';
 import type { PlayerError, MediaSelectionSnapshot } from '@openmoq/player';
+import { readMsfLink } from './msf-link.js';
 import { TeardownBarrier, parseVideoAltGroup, waitForOutput } from './view-selection.js';
 import { playbackOwnerIsCurrent, selectionMenus } from './selection-controls.js';
 
@@ -78,14 +79,18 @@ export async function flush() {
     await Promise.resolve();
 }
 
-export function fixture(configure?: (p: FakePlayer, index: number) => void) {
+export function fixture(configure?: (p: FakePlayer, index: number) => void, page?: { hash: string; search: string }) {
+  const playerOptions: Array<{ namespace: string | readonly string[]; catalogTrackName?: string }> = [];
+  const hashListeners: Array<(event: { oldURL: string; newURL: string }) => void> = [];
+  const reload = vi.fn();
   const instances: FakePlayer[] = [], renderers: Array<{
     start: ReturnType<typeof vi.fn>;
     stop: ReturnType<typeof vi.fn>;
   }> = [], logs: string[] = [];
   class Player extends FakePlayer {
-    constructor() {
+    constructor(options: { namespace: string | readonly string[]; catalogTrackName?: string }) {
       super();
+      playerOptions.push(options);
       instances.push(this);
       configure?.(this, instances.length);
     }
@@ -161,7 +166,15 @@ export function fixture(configure?: (p: FakePlayer, index: number) => void) {
     player: null,
     externalConnection: null,
     mediaSourceRef: null,
-    window: {},
+    window: {
+      location: { hash: page?.hash ?? '', search: page?.search ?? '', reload },
+      addEventListener(type: string, listener: (event: { oldURL: string; newURL: string }) => void) {
+        if (type === 'hashchange') hashListeners.push(listener);
+      },
+    },
+    URL,
+    readMsfLink,
+    queryNamespaceArg: 'query-fallback',
     isPlaying: false,
     transitioning: false,
     reconnecting: false,
@@ -177,9 +190,20 @@ export function fixture(configure?: (p: FakePlayer, index: number) => void) {
     controls: { style: { display: 'none' } },
     centerPlay: { style: { display: '' } }
   });
+  if (page) {
+    context.params = new URLSearchParams(page.search);
+    // Execute the actual page initialization with modeled window/player APIs.
+    const start = source.statements.findIndex(n => ts.isVariableStatement(n) && n.declarationList.declarations.some(d => d.name.getText(source) === 'msfLink'));
+    const end = source.statements.findIndex(n => ts.isVariableStatement(n) && n.declarationList.declarations.some(d => d.name.getText(source) === 'namespaceArg'));
+    const initialization = source.statements.slice(start, end + 1).map(n => n.getText(source)).join('\n');
+    runInContext(ts.transpileModule(initialization, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  }
   runInContext(code, context);
   return {
     context,
+    playerOptions,
+    hashListeners,
+    reload,
     instances,
     renderers,
     logs,
