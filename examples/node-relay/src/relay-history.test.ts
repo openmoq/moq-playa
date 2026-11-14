@@ -47,6 +47,7 @@ async function fixture(draft: 16 | 18 | 22 | 23 = 18, options: RelayOptions = {}
   };
   const fetch = async (startGroup: bigint, endGroup: bigint, endObject: bigint, startObject = 0n, groupOrder: 'ascending' | 'descending' = 'ascending', locationFilter?: Uint8Array, fillTimeout?: bigint) => {
     const data: string[] = [], terminal: string[] = [], messages: ControlMessage[] = [];
+    const statuses: bigint[] = [];
     down.client.onMessage = m => { messages.push(m); };
     // Public FetchOptions lacks these wire parameters. Rewrite only the
     // actual encoded opener; SDK request allocation, decoding, validation,
@@ -70,10 +71,10 @@ async function fixture(draft: 16 | 18 | 22 | 23 = 18, options: RelayOptions = {}
     }) : undefined;
     let id: bigint;
     try { id = await down.client.fetch(ns, name, { startGroup, startObject, endGroup, endObject, groupOrder,
-      receiver: { onObject: o => { if (o.kind === 'data') data.push(`${o.groupId}/${o.objectId}`); }, onClosed: t => { terminal.push(t); } } });
+      receiver: { onObject: o => { if (o.kind === 'data') data.push(`${o.groupId}/${o.objectId}`); else statuses.push(o.status); }, onClosed: t => { terminal.push(t); } } });
     } finally { wire?.mockRestore(); }
     await flush(256);
-    return { id, data, terminal, messages };
+    return { id, data, terminal, messages, statuses };
   };
   const settled = async () => { await Promise.all(work); await flush(256); };
   const replace = async () => { const peer = await pair(draft, relay); peers.push(peer); bind(peer); await peer.client.publish(ns, name, 9n); await flush(128); await publication; return peer; };
@@ -595,10 +596,10 @@ for (const draft of [18, 22] as const) for (const mode of ['complete', 'reset', 
   });
 }
 
-async function stallHistoryObject(f: Awaited<ReturnType<typeof fixture>>, draft: 18 | 22 | 23, peer = f.up) {
+async function stallHistoryObject(f: Awaited<ReturnType<typeof fixture>>, draft: 18 | 22 | 23, peer = f.up, endOfGroup = false) {
   const writer = (await peer.a.createUnidirectionalStream()).getWriter();
-  await writer.write(encodeSubgroupHeader18({ typeByte: 0x54, trackAlias: 9n, groupId: 8n, subgroupId: 0n,
-    publisherPriority: 128, hasExtensions: false, isEndOfGroup: false, isFirstObjectInSubgroup: true }));
+  await writer.write(encodeSubgroupHeader18({ typeByte: endOfGroup ? 0x5c : 0x54, trackAlias: 9n, groupId: 8n, subgroupId: 0n,
+    publisherPriority: 128, hasExtensions: false, isEndOfGroup: endOfGroup, isFirstObjectInSubgroup: true }));
   await writer.write(encodeObject(draft, 0n, Uint8Array.of(8, 0), null));
   const bytes = encodeObject(draft, 1n, Uint8Array.of(8, 1), 0n);
   await writer.write(bytes.subarray(0, bytes.length - 1)); await flush(256);
@@ -885,3 +886,28 @@ it('draft23 relative FETCH filters remain refused', async () => {
     await f.settled(); refused(result);
   } finally { await f.close(); }
 });
+
+for (const draft of [18, 22, 23] as const) for (const knownEnd of [false, true]) {
+  it(`draft${draft} cached final Object marks only a known Group ending (${knownEnd})`, async () => {
+    const f = await fixture(draft);
+    try {
+      await f.publish(4n, [0n, 1n], knownEnd);
+      const result = await f.fetch(4n, 4n, 2n); await f.settled();
+      expect(result.data).toEqual(['4/0', '4/1']);
+      expect(result.statuses).toEqual(draft === 23 && knownEnd ? [3n] : []);
+      expect(result.terminal).toEqual(['fin']);
+    } finally { await f.close(); }
+  });
+  it(`draft${draft} pending final Object marks only a proven Group ending (${knownEnd})`, async () => {
+    const f = await fixture(draft);
+    try {
+      const stalled = await stallHistoryObject(f, draft, f.up, knownEnd);
+      const result = await f.fetch(8n, 8n, 2n);
+      expect(result.data).toEqual(['8/0']); expect(result.statuses).toEqual([]);
+      await stalled.writer.write(stalled.remainder); await stalled.writer.close(); await f.settled();
+      expect(result.data).toEqual(['8/0', '8/1']);
+      expect(result.statuses).toEqual(draft === 23 && knownEnd ? [3n] : []);
+      expect(result.terminal).toEqual(['fin']);
+    } finally { await f.close(); }
+  });
+}

@@ -434,6 +434,10 @@ export class Relay {
           await conn.abortIncomingFetch(requestId, { streamErrorCode: 6 }); return;
         }
         await conn.sendFetchObject(sid, complete);
+        // Draft 23 §3.2.2: mark a known Group ending, including newly admitted tails.
+        if (isDraft23(conn.draftVersion) && track.cache.isFinalObject(row.groupId, row.objectId)) {
+          await conn.sendFetchEndMarker(sid, 'end-of-group');
+        }
       }
       await conn.closeFetchStream(sid);
     } catch (err) {

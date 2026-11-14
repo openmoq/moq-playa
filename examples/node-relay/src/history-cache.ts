@@ -81,6 +81,11 @@ export class HistoryCache {
     return false;
   }
 
+  /** Only END_OF_GROUP plus a clean FIN establishes the final Object. */
+  isFinalObject(groupId: bigint, objectId: bigint): boolean {
+    return this.groups.get(groupId)?.final === objectId;
+  }
+
   clear(): void { this.groups.clear(); this.objects = 0; this.bytes = 0; }
 
   forgetSource(source: object): void { for (const group of this.groups.values()) group.carriers.delete(source); }
