@@ -54,6 +54,11 @@ export function readMsfLink(hash: string, search: string): PlayerMsfLink | undef
         throw new Error('MSF URL requires a native QUIC connection (connection=q); a browser can only use WebTransport');
     }
 
+    // MSF-01 §11.1.1 requires range unions; this page cannot play ranges.
+    if (fragment.parameters.some(({ name }) => ['wallclock-range', 'mediatime-range', 'location-range'].includes(name))) {
+        throw new Error('MSF URL ranges are not supported by this page');
+    }
+
     const ignored = fragment.parameters.length;
     const notes = ignored > 0 ? [`${ignored} parameter${ignored > 1 ? 's are' : ' is'} not supported by this page and ignored`] : [];
 

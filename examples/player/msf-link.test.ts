@@ -52,10 +52,15 @@ describe('player MSF link', () => {
   });
 
   it('counts what it does not act on, without names or values', () => {
-    const link = readMsfLink('#msf:live--catalog&location-range=34-64&secret=hunter2&other=1', '')!;
+    const link = readMsfLink('#msf:live--catalog&unknown=34-64&secret=hunter2&other=1', '')!;
     expect(link.notes).toEqual(['3 parameters are not supported by this page and ignored']);
     expect(readMsfLink('#msf:live--catalog&x=1', '')!.notes).toEqual(['1 parameter is not supported by this page and ignored']);
   });
+});
+
+it.each(['wallclock-range', 'mediatime-range', 'location-range', '%6cocation-range'])('refuses unsupported %s links without exposing values', name => {
+  expect(() => readMsfLink(`#msf:live--catalog&${name}=1-2&${name}=3-4&c4m=YWJj`, ''))
+    .toThrow('MSF URL ranges are not supported by this page');
 });
 
 it.each(['x=%ff', '%ff=1', 'x=%c3'])('accepts a link with one ignored non-UTF-8 parameter: %s', parameter => {
