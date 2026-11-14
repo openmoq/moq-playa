@@ -29,12 +29,12 @@ export function createDataCodec18(version: RequestStreamDraft = 18): DataCodec {
   return {
     version,
 
-    decodeSubgroupHeader: (buf, offset) => decodeSubgroupHeader18(buf, offset),
+    decodeSubgroupHeader: (buf, offset) => decodeSubgroupHeader18(buf, offset, version),
 
     decodeSubgroupObject: (buf, offset, hasProperties, previousObjectId, isFirstObject = true) =>
-      decodeSubgroupObject18(buf, offset, hasProperties, previousObjectId, isFirstObject),
+      decodeSubgroupObject18(buf, offset, hasProperties, previousObjectId, isFirstObject, version),
 
-    decodeFetchHeader: (buf, offset) => decodeFetchHeader18(buf, offset),
+    decodeFetchHeader: (buf, offset) => decodeFetchHeader18(buf, offset, version),
 
     decodeFetchObject: () => {
       throw new Error('Draft18DataCodec: use decodeFetchObject18 for draft-18 fetch streams');
@@ -46,7 +46,7 @@ export function createDataCodec18(version: RequestStreamDraft = 18): DataCodec {
     decodeObjectDatagram: (buf, offset) => decodeObjectDatagram18(buf, offset, version),
 
     decodeSubgroupObjectHeader: (buf, offset, hasProperties, previousObjectId, isFirstObject = true) =>
-      decodeSubgroupObjectHeader18(buf, offset, hasProperties, previousObjectId, isFirstObject),
+      decodeSubgroupObjectHeader18(buf, offset, hasProperties, previousObjectId, isFirstObject, version),
 
     decodeFetchObjectHeader: () => {
       throw new Error('Draft18DataCodec: use decodeFetchObjectHeader18 for draft-18 fetch streams');

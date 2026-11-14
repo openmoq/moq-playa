@@ -48,10 +48,10 @@ const SUBGROUP_ID_MODE_EXPLICIT = 0b10;
  */
 const VALID_STATUS_18 = new Set<bigint>([0n, 0x3n, 0x4n]);
 
-/** Validate a decoded Object Status against the draft-18 enumeration. */
-function validateStatus18(status: bigint): void {
+/** Draft 23 §§11.1.1–2 use INVALID_OBJECT_STATUS; older drafts retain their code. */
+function validateStatus18(status: bigint, version: RequestStreamDraft): void {
   if (!VALID_STATUS_18.has(status)) {
-    throw new ProtocolViolationError(`Invalid draft-18 Object Status 0x${status.toString(16)}`);
+    throw new ProtocolViolationError(`Invalid draft-18 Object Status 0x${status.toString(16)}`, isDraft23(version) ? Number(SessionError.INVALID_OBJECT_STATUS) : undefined);
   }
 }
 
@@ -60,10 +60,11 @@ function validateStatus18(status: bigint): void {
  * with a non-empty Properties block is a PROTOCOL_VIOLATION. An empty block
  * (`undefined` here) is fine — zero-length subgroup objects legally omit them.
  */
-function rejectPropertiesOnNonNormal(status: bigint, properties: Uint8Array | undefined): void {
+function rejectPropertiesOnNonNormal(status: bigint, properties: Uint8Array | undefined, version: RequestStreamDraft): void {
   if (status !== 0n && properties !== undefined && properties.length > 0) {
     throw new ProtocolViolationError(
       `Properties present on a non-Normal status object (status 0x${status.toString(16)})`,
+        isDraft23(version) ? Number(SessionError.INVALID_OBJECT_STATUS) : undefined,
     );
   }
 }
@@ -83,15 +84,16 @@ function readVi64Bytes(buf: Uint8Array, offset: number): { value: Uint8Array; by
 export function decodeSubgroupHeader18(
   buf: Uint8Array,
   offset: number,
+  version: RequestStreamDraft = 18,
 ): { header: SubgroupHeader; bytesRead: number } {
   let pos = offset;
   const t = readVi64(buf, pos); pos += t.bytesRead;
   const typeByte = Number(t.value);
   if (!isSubgroupHeaderForm18(typeByte)) {
-    throw new ProtocolViolationError(`Invalid SUBGROUP_HEADER type 0x${typeByte.toString(16)}`);
+    throw new ProtocolViolationError(`Invalid SUBGROUP_HEADER type 0x${typeByte.toString(16)}`, isDraft23(version) ? Number(SessionError.INVALID_STREAM_HEADER) : undefined);
   }
   if (!isValidSubgroupHeaderType18(typeByte)) {
-    throw new ProtocolViolationError(`SUBGROUP_HEADER uses the reserved subgroup-ID mode 0b11`);
+    throw new ProtocolViolationError(`SUBGROUP_HEADER uses the reserved subgroup-ID mode 0b11`, isDraft23(version) ? Number(SessionError.INVALID_STREAM_HEADER) : undefined);
   }
 
   const ta = readVi64(buf, pos); pos += ta.bytesRead;
@@ -164,15 +166,17 @@ export function decodeSubgroupObjectHeader18(
   hasProperties: boolean,
   previousObjectId: bigint,
   isFirstObject: boolean = true,
-): ObjectHeaderLayout {
+  version: RequestStreamDraft = 18,): ObjectHeaderLayout {
   let pos = offset;
   const d = readVi64(buf, pos); pos += d.bytesRead;
   const objectId = isFirstObject ? d.value : previousObjectId + d.value + 1n;
   // §11.4.2: "If the resulting Object ID would be greater than 2^64 - 1, the
   // endpoint MUST close the session with a PROTOCOL_VIOLATION."
+  // Draft 23 §11.3.1 instead specifies DELTA_ENCODING_OVERFLOW.
   if (objectId > MAX_VI64) {
     throw new ProtocolViolationError(
       `Subgroup Object ID overflow: ${objectId} exceeds 2^64 - 1 (prev ${previousObjectId} + delta ${d.value} + 1)`,
+        isDraft23(version) ? Number(SessionError.DELTA_ENCODING_OVERFLOW) : undefined,
     );
   }
 
@@ -186,10 +190,11 @@ export function decodeSubgroupObjectHeader18(
   if (pl.value === 0n) {
     const st = readVi64(buf, pos); pos += st.bytesRead;
     objectStatus = st.value;
-    validateStatus18(st.value);
+    validateStatus18(st.value, version);
     if (st.value !== 0n && props.offset !== undefined) {
       throw new ProtocolViolationError(
         `Properties present on a non-Normal status object (status 0x${st.value.toString(16)})`,
+        isDraft23(version) ? Number(SessionError.INVALID_OBJECT_STATUS) : undefined,
       );
     }
   }
@@ -208,8 +213,8 @@ export function decodeSubgroupObject18(
   hasProperties: boolean,
   previousObjectId: bigint,
   isFirstObject: boolean = true,
-): { object: SubgroupObject; bytesRead: number; header: ObjectHeaderLayout } {
-  const header = decodeSubgroupObjectHeader18(buf, offset, hasProperties, previousObjectId, isFirstObject);
+  version: RequestStreamDraft = 18,): { object: SubgroupObject; bytesRead: number; header: ObjectHeaderLayout } {
+  const header = decodeSubgroupObjectHeader18(buf, offset, hasProperties, previousObjectId, isFirstObject, version);
   let pos = offset + header.headerBytes;
   const n = Number(header.payloadLength);
 
@@ -238,10 +243,10 @@ export function decodeObjectDatagram18(
   const t = readVi64(buf, pos); pos += t.bytesRead;
   const typeByte = Number(t.value);
   if (!isDatagramForm18(typeByte)) {
-    throw new ProtocolViolationError(`Invalid OBJECT_DATAGRAM type 0x${typeByte.toString(16)}`);
+    throw new ProtocolViolationError(`Invalid OBJECT_DATAGRAM type 0x${typeByte.toString(16)}`, isDraft23(version) ? Number(SessionError.INVALID_STREAM_HEADER) : undefined);
   }
   if (!isValidDatagramType18(typeByte)) {
-    throw new ProtocolViolationError(`OBJECT_DATAGRAM sets both STATUS and END_OF_GROUP (0x${typeByte.toString(16)})`);
+    throw new ProtocolViolationError(`OBJECT_DATAGRAM sets both STATUS and END_OF_GROUP (0x${typeByte.toString(16)})`, isDraft23(version) ? Number(SessionError.INVALID_STREAM_HEADER) : undefined);
   }
 
   const ta = readVi64(buf, pos); pos += ta.bytesRead;
@@ -277,12 +282,12 @@ export function decodeObjectDatagram18(
   if ((typeByte & DatagramFlags18.STATUS) !== 0) {
     const st = readVi64(buf, pos); pos += st.bytesRead;
     status = st.value;
-    validateStatus18(status);
-    rejectPropertiesOnNonNormal(status, extensions.value);
+    validateStatus18(status, version);
+    rejectPropertiesOnNonNormal(status, extensions.value, version);
     payload = new Uint8Array(0);
-    // STATUS datagrams carry no payload; any remaining bytes are a violation.
+    // Draft 23 §11.2.1 forbids STATUS payload; extra bytes are malformed serialization (§12.2).
     if (pos !== buf.length) {
-      throw new ProtocolViolationError(`STATUS datagram has ${buf.length - pos} trailing payload byte(s)`);
+      throw new ProtocolViolationError(`STATUS datagram has ${buf.length - pos} trailing payload byte(s)`, isDraft23(version) ? Number(SessionError.MALFORMED_OBJECT) : undefined);
     }
   } else {
     // Datagram payload runs to the end of the datagram (no length prefix).
@@ -356,12 +361,14 @@ export interface FetchObjectPrior18 {
 export function decodeFetchHeader18(
   buf: Uint8Array,
   offset: number,
+  version: RequestStreamDraft = 18,
 ): { header: FetchHeader; bytesRead: number } {
   let pos = offset;
   const t = readVi64(buf, pos); pos += t.bytesRead;
   if (Number(t.value) !== StreamType18.FETCH_HEADER) {
     throw new ProtocolViolationError(
       `Invalid FETCH_HEADER type: expected 0x05, got 0x${t.value.toString(16)}`,
+        isDraft23(version) ? Number(SessionError.INVALID_STREAM_HEADER) : undefined,
     );
   }
   const rid = readVi64(buf, pos); pos += rid.bytesRead;
@@ -582,8 +589,9 @@ export function decodeFetchObjectHeader18(
         }
         if (subgroupMode === FetchSubgroupMode.PRIOR_PLUS_ONE) {
           subgroupId = prior.lastObjectSubgroupId + 1n;
+          // Draft 23 §12.2 classifies overflow of a delta-decoded value.
           if (subgroupId > MAX_VI64) {
-            throw new ProtocolViolationError(`Fetch Subgroup ID overflow: ${subgroupId} > 2^64-1`);
+            throw new ProtocolViolationError(`Fetch Subgroup ID overflow: ${subgroupId} > 2^64-1`, isDraft23(version) ? Number(SessionError.DELTA_ENCODING_OVERFLOW) : undefined);
           }
         } else {
           subgroupId = prior.lastObjectSubgroupId;
