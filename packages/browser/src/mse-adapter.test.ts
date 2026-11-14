@@ -21,6 +21,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { format } from 'node:util';
 import { MseMediaSource } from './mse-adapter.js';
+import { MoqtPlayer } from '../../player/src/player.js';
+import { varint } from '@openmoq/transport';
+import { MoqtConnection } from '@openmoq/webtransport';
+import { createLoopback, flush as flushWire } from '../../webtransport/src/testkit/loopback.js';
 import { CmafAssembler } from './cmaf-assembler.js';
 import type { DrmConfig, MseStartupReport, MseMediaSourceOptions } from './mse-adapter.js';
 
@@ -5362,4 +5366,123 @@ describe('MseMediaSource — playback rate', () => {
         adapter.setPlaybackRate(1); expect(video.playbackRate).toBe(1); expect(video.preservesPitch).toBe(false);
     } finally { adapter.destroy(); }
 });
+});
+
+
+describe('live startup cushion with modeled native buffers', () => {
+    it.each([[500_000, 500], [1_250_000, 500], [500_000, 250]])('waits for %i us plus a %i ms Object, with an immediate finite control', async (cushionUs, durationMs) => {
+        for (const live of [false, true]) {
+            const video = new MockVideoElement();
+            const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+            // Optional call lets the parent demonstrate premature play, not a missing-method error.
+            (adapter as { setLiveStartupCushion?: (us: number | null) => void })
+                .setLiveStartupCushion?.(live ? cushionUs : null);
+            adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, durationMs, 'vide', 1000) } });
+            currentMs.open(); await flush();
+            try {
+                video.buffered = makeTimeRanges([[0, durationMs / 1000]]);
+                adapter.appendChunk('video', makeSegment({ bmd: 0, defaultDur: durationMs, sampleCount: 1 }), 'video');
+                await flush();
+                expect(video.playCalls).toBe(live ? 0 : 1);
+                if (!live) continue;
+                expect(adapter.startupReport.playTimeSec).toBeNull();
+                const threshold = durationMs / 1000 + cushionUs / 1_000_000;
+                // Separate runs cannot be summed, and the actual currentTime matters.
+                video.currentTime = 0.25;
+                video.buffered = makeTimeRanges([[0, threshold], [10, 10.5]]);
+                adapter.resumePlayback(); await flush();
+                expect(video.playCalls).toBe(0);
+                video.buffered = makeTimeRanges([[0, threshold + 0.25 - 0.002]]);
+                adapter.resumePlayback(); await flush();
+                expect(video.playCalls).toBe(0);
+                video.buffered = makeTimeRanges([[0, threshold + 0.25]]);
+                adapter.resumePlayback(); await flush();
+                expect(video.playCalls).toBe(1);
+                expect(adapter.startupReport.playTimeSec).toBe(0.25);
+            } finally { adapter.destroy(); }
+        }
+    });
+});
+
+
+it.each(['AbsoluteRange', 'AbsoluteStart'] as const)('starts one Object from caller %s on a live track without a first-frame timeout', async type => {
+    vi.useFakeTimers();
+    const video = new MockVideoElement();
+    const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+    const { a, b } = createLoopback();
+    const client = new MoqtConnection(18), server = new MoqtConnection(18, { role: 'server' });
+    const requests = new Map<string, bigint>(), errors: string[] = [];
+    server.onSubscribe = (id, _namespace, name) => { requests.set(new TextDecoder().decode(name), id); };
+    const player = new MoqtPlayer({ url: 'https://startup.invalid/moq', namespace: ['test'], draftVersion: 18,
+        catalogBootstrap: 'subscribe', disableAudio: true, cmafBootstrapTimeoutMs: 100, logLevel: 'none',
+        subscriptionFilter: type === 'AbsoluteRange' ? { type, startGroup: 0, endGroup: 1 } : { type, startGroup: 0 },
+        createConnection: () => client, createTransport: async () => a, createMediaSource: () => adapter,
+        createCmafAssembler: callbacks => new CmafAssembler(callbacks) });
+    player.on('error', event => { errors.push(event.error.message); });
+    // The modeled element presents only after play was actually requested.
+    const play = video.play.bind(video);
+    vi.spyOn(video, 'play').mockImplementation(async () => { await play(); video.fire('playing'); });
+    try {
+        const connected = server.connect(b);
+        await player.load(); await connected; await flushWire(256);
+        await server.acceptSubscribe(requests.get('catalog')!, 100n);
+        const catalog = await server.openSubgroup(100n, 0n, 0n, { publisherPriority: 128 });
+        await server.sendObject(catalog, 0n, new TextEncoder().encode(JSON.stringify({ version: '1', tracks: [{
+            name: 'video', packaging: 'cmaf', role: 'video', isLive: true, codec: 'avc1.42c01e',
+            initData: Buffer.from(makeInit(1, 500, 'vide', 1000)).toString('base64'),
+        }] })));
+        await flushWire(256); currentMs.open(); await flushWire(256);
+        await server.acceptSubscribe(requests.get('video')!, 200n); player.play();
+        video.buffered = makeTimeRanges([[0, 0.5]]);
+        const stream = await server.openSubgroup(200n, 0n, 0n, { publisherPriority: 128 });
+        await server.sendObject(stream, 0n, makeSegment({ bmd: 0, defaultDur: 500, sampleCount: 1 }));
+        await server.closeSubgroup(stream); await flushWire(256);
+        await server.publishDone(requests.get('video')!, varint(0), 'Range complete'); await flushWire(256);
+        expect(video.playCalls).toBe(1);
+        await vi.advanceTimersByTimeAsync(150);
+        expect(errors.filter(error => /no frame rendered/.test(error))).toEqual([]);
+    } finally { await player.destroy(); await server.close(); vi.useRealTimers(); }
+});
+
+
+it.each([[126, 0, 0], [0, 0.064, 0.000001]])('starts two complete Objects at bmd=%i with native offset=%f and end loss=%f', async (bmd, offset, endLoss) => {
+    const video = new MockVideoElement();
+    const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+    adapter.setLiveStartupCushion(500_000);
+    adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 500, 'vide', 1000) } });
+    currentMs.open(); await flush();
+    const start = bmd / 1000;
+    video.currentTime = start + offset;
+    try {
+        video.buffered = makeTimeRanges([[start + offset, start + 0.5 - endLoss]]);
+        adapter.appendChunk('video', makeSegment({ bmd, defaultDur: 500, sampleCount: 1 }), 'video');
+        await flush(); expect(video.playCalls).toBe(0);
+        // Even two appended Objects do not justify playing over a shortened native tail.
+        video.buffered = makeTimeRanges([[start + offset, start + 0.95]]);
+        adapter.appendChunk('video', makeSegment({ bmd: bmd + 500, defaultDur: 500, sampleCount: 1 }), 'video');
+        await flush(); expect(video.playCalls).toBe(0);
+        video.buffered = makeTimeRanges([[start + offset, start + 1 - endLoss]]);
+        adapter.resumePlayback(); await flush();
+        expect(video.playCalls).toBe(1);
+    } finally { adapter.destroy(); }
+});
+
+
+it('fails open only after a successful append with unknown fragment timing', async () => {
+    const video = new MockVideoElement();
+    const adapter = new MseMediaSource(video as unknown as HTMLVideoElement);
+    adapter.setLiveStartupCushion(500_000);
+    adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 500, 'vide', 1000) } });
+    currentMs.open(); await flush();
+    try {
+        video.buffered = makeTimeRanges([[0, 2]]);
+        adapter.resumePlayback(); await flush();
+        expect(video.playCalls).toBe(0); // No media append yet, not an unknown duration.
+        const chunk = cat(box('moof', box('traf', cat(tfhd(1, 500), trun(1)))), box('mdat', new Uint8Array(16)));
+        currentMs.videoBuffer.errorNextAppend = true;
+        adapter.appendChunk('video', chunk, 'video'); await flush();
+        expect(video.playCalls).toBe(0); // A failed append cannot release startup either.
+        adapter.appendChunk('video', chunk, 'video'); await flush();
+        expect(video.playCalls).toBe(1);
+    } finally { adapter.destroy(); }
 });

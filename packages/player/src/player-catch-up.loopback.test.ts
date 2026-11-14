@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest';
 import { mediaSelectionMseFixture, mseMediaRefs } from '../test-support/media-selection-mse.js';
 import { flush } from '../../webtransport/src/testkit/loopback.js';
-import { fixture, locations, landHistory } from '../test-support/seek-live-mse.js';
+import { fixture, locations, landHistory, payloads } from '../test-support/seek-live-mse.js';
 
 async function setup(options: { live?: boolean; rate?: number; supported?: boolean; range?: boolean } = {}) {
   let rate = 1, ahead = 2_500_000, now = 100_000;
@@ -165,4 +165,18 @@ it('restores before a quality switch announces its committed preparation', async
     await flush(16);
     expect(seen).toEqual([1, true]);
   } finally { await f.destroy(); }
+});
+
+
+it.each([undefined, { target: 1250 }, { min: 1500, target: 1250 }])('shares the catalog startup cushion %j with MSE, excluding finite media', async buffers => {
+  for (const live of [true, false]) {
+    const cushions: Array<number | null> = [];
+    const output = { getBufferAheadUs: () => null, setLiveStartupCushion: (us: number | null) => { cushions.push(us); } };
+    const f = await fixture(18, live, locations, { startPaused: false, ...(buffers ? { buffers } : {}), rateOutput: output });
+    try {
+      const stream = await f.server.openSubgroup(200n, 3n, 0n, { publisherPriority: 128 });
+      await f.server.sendObject(stream, 0n, payloads[0]!); await flush(256);
+      expect(cushions.at(-1)).toBe(live ? Math.max(buffers?.min ?? buffers?.target ?? 500, buffers?.target ?? 0) * 1000 : null);
+    } finally { await f.destroy(); }
+  }
 });

@@ -2052,6 +2052,44 @@ export class MseMediaSource implements MediaSourceLike {
     } catch { return null; }
   }
 
+  private liveStartupCushionUs: number | null = null;
+  // 0: nothing successfully appended; -1: appended, but duration unavailable.
+  private readonly startupObjectSec = { video: 0, audio: 0 };
+  setLiveStartupCushion(cushionUs: number | null): void {
+    this.liveStartupCushionUs = cushionUs;
+  }
+
+  private startupBufferedAt(position: number): boolean {
+    if (this.liveStartupCushionUs === null) return true;
+    if ((this.videoBuffer && this.startupObjectSec.video === 0)
+      || (this.audioBuffer && this.startupObjectSec.audio === 0)) return false;
+    if ((this.videoBuffer && this.startupObjectSec.video < 0)
+      || (this.audioBuffer && this.startupObjectSec.audio < 0)) return true;
+    const required = Math.max(this.startupObjectSec.video, this.startupObjectSec.audio)
+      + this.liveStartupCushionUs / 1_000_000;
+    const ranges = this.video.buffered;
+    for (let i = 0; i < ranges.length; i++) {
+      if (ranges.start(i) > position || position >= ranges.end(i)) continue;
+      return (['video', 'audio'] as const).every(role => {
+        const buffer = role === 'video' ? this.videoBuffer : this.audioBuffer, scale = this.timescale[role];
+        if (!buffer || !scale) return true;
+        let start = position;
+        // Native ranges may omit the first presented frame. At the run's start,
+        // count that first Object's appended media; never count a preceding hole.
+        if (position === ranges.start(i)) {
+          const timelines = role === 'video' ? this.videoTimelines : this.audioTimelines;
+          for (const { index } of timelines.values()) for (const range of index.getRanges()) {
+            const origin = Number(range.start) / scale + buffer.timestampOffset;
+            if (origin <= position && position < Number(range.end) / scale + buffer.timestampOffset
+              && position < origin + this.startupObjectSec[role]) start = Math.min(start, origin);
+          }
+        }
+        return ranges.end(i) - start + Number(this.contiguousSlack(role)) / scale >= required;
+      });
+    }
+    return false;
+  }
+
   private originalPitch: boolean | undefined;
   /** Change the shared element rate while preserving audio pitch. */
   setPlaybackRate(rate: number): void {
@@ -2131,6 +2169,7 @@ export class MseMediaSource implements MediaSourceLike {
     // Cancel any in-flight startup FIRST: a late seeked/play from the
     // superseded generation must not resurrect playback against new buffers.
     this.cancelStartup();
+    this.startupObjectSec.video = this.startupObjectSec.audio = 0;
     if (this.sourceOpenListener) {
       this.ms.removeEventListener('sourceopen', this.sourceOpenListener);
       this.sourceOpenListener = null;
@@ -2727,6 +2766,8 @@ export class MseMediaSource implements MediaSourceLike {
       const needsSeek = this.video.currentTime < start
         || this.video.currentTime >= start + duration;
 
+      if (!this.startupBufferedAt(needsSeek ? start : this.video.currentTime)) return;
+
       // INVARIANT: never play while the element is still seeking.
       //
       // Assigning `currentTime` updates it SYNCHRONOUSLY even though the seek
@@ -2910,6 +2951,10 @@ export class MseMediaSource implements MediaSourceLike {
    */
   private async playElement(generation: number): Promise<boolean> {
     const source = this.ms;
+    // Positioning or an autoplay rejection may have outlasted buffered media.
+    if (!this.playTriggered && !this.startupBufferedAt(this.video.currentTime)) {
+      this.startupPhase = 'idle'; return false;
+    }
     await this.video.play();
     if (this.startupLive(generation)) return true;
     // Withdrawn/destroyed while the promise was pending: the element started
@@ -4126,6 +4171,11 @@ export class MseMediaSource implements MediaSourceLike {
     if (appended) {
       const pending =
         mediaType === 'video' ? this.pendingVideoRanges : this.pendingAudioRanges;
+      // CMSF-01 §3.3: one Object can contain multiple CMAF chunks. Measure
+      // the successful append's complete media duration, not arrival spacing.
+      const scale = this.timescale[mediaType];
+      this.startupObjectSec[mediaType] = scale && pending.length > 0
+        ? pending.reduce((sum, range) => sum + Number(range.endTime - range.startTime), 0) / scale : -1;
       const pendingTrack =
         mediaType === 'video' ? this.pendingVideoTrackIdentity : this.pendingAudioTrackIdentity;
       const pendingTrackName =
@@ -4198,6 +4248,7 @@ export class MseMediaSource implements MediaSourceLike {
       else this.appendOutcome(completing.token, 'unavailable', 'completion unproven');
     }
     if (this.destroyed || generation !== this.bufferGen) return;
+    if (appended && this.liveStartupCushionUs !== null) void this.requestStartup();
     // Behind-live cap: act on fresh data arrival (post-startup only).
     this.maybeChaseLiveEdge();
     this.drainQueue(mediaType);

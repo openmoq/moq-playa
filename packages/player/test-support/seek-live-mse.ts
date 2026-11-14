@@ -38,7 +38,7 @@ export function mdat(bytes: Uint8Array): Uint8Array {
 
 type WireFetch = { id: bigint; namespace: string[]; name: string; start: { group: bigint; object: bigint }; end: { group: bigint; object: bigint }; filter?: readonly bigint[] };
 // Real player + SDK/Session + format consumers. Native append and landing are controlled witnesses, not browser decoding.
-export async function fixture(draft: 18 | 22, live: boolean, indexed: readonly (typeof locations)[number][] = locations, options: {connectionTimeoutMs?:number; receiptClock?:boolean; startPaused?: boolean; playerConfig?: Partial<MoqtPlayerConfig>; rateOutput?: Pick<MediaSourceLike, 'setPlaybackRate' | 'getBufferAheadUs'>} = {}) {
+export async function fixture(draft: 18 | 22, live: boolean, indexed: readonly (typeof locations)[number][] = locations, options: {connectionTimeoutMs?:number; receiptClock?:boolean; startPaused?: boolean; playerConfig?: Partial<MoqtPlayerConfig>; buffers?: { min?: number; target?: number }; rateOutput?: Pick<MediaSourceLike, 'setPlaybackRate' | 'getBufferAheadUs'>} = {}) {
   let now = 100_000;
   const { a, b } = createLoopback();
   const client = new MoqtConnection(draft, { terminatedAliasTtlMs: 50 }), server = new MoqtConnection(draft, { role: 'server' });
@@ -123,7 +123,7 @@ export async function fixture(draft: 18 | 22, live: boolean, indexed: readonly (
     client.onStreamClosed = (id, error, terminal) => { terminals.push({ id, terminal }); onStreamClosed?.(id, error, terminal); };
     await server.acceptSubscribe(subscriptions.find(sub => sub.name === 'catalog')!.id, 100n);
     await send(100n, enc.encode(JSON.stringify({ version: '1', initDataList: [{ id: 'video-init', type: 'inline', data: Buffer.from(init).toString('base64') }], tracks: [
-      { name: 'video', packaging: 'locmaf', locmafVersion: '0.3', role: 'video', isLive: live, codec: 'avc1.640028', width: 640, height: 360, bitrate: 500000, initRef: 'video-init' },
+      { name: 'video', packaging: 'locmaf', locmafVersion: '0.3', role: 'video', isLive: live, buffers: options.buffers, codec: 'avc1.640028', width: 640, height: 360, bitrate: 500000, initRef: 'video-init' },
       { name: 'timeline', packaging: 'mediatimeline', isLive: live, mimeType: 'application/json', depends: ['video'] },
     ] })));
     expect(subscriptions.find(sub => sub.name === 'video'), JSON.stringify({ subscriptions, errors }, (_key, value) => typeof value === 'bigint' ? value.toString() : value)).toBeDefined();

@@ -2348,7 +2348,7 @@ export class MoqtPlayer {
           this.removeVisibilityListenerIfIdle();
           const detail = e.event === 'cmaf_init'
             ? 'CMAF media arriving but no init segment materialized (initData / initTrack / in-band ftyp+moov)'
-            : 'CMAF MediaSource initialized but no frame rendered (init/codec mismatch?)';
+            : 'CMAF MediaSource initialized but no frame rendered (startup buffering, positioning, or decode pending)';
           this.emitError(createPlayerError(
             'fatal', 'catalog', PlayerErrorCode.CMAF_INIT_TIMEOUT,
             `${detail} within ${e.timeoutMs}ms`,
@@ -10316,7 +10316,7 @@ export class MoqtPlayer {
     if ((!this.config.liveJumpThresholdMs && (this.config.maxCatchUpRate ?? 1) <= 1) || this._destroyed || this.state !== PlayerState.PLAYING || this.playbackIntent !== true
         || this.activeLocSeek || this.activeMseSeek || this.seekIsPreparing() || this.pendingVideoSwitch || this.switchInProgress
         || this.mediaSelection || this.currentMigration || this.pendingRetypes.size
-        || this.config.subscriptionFilter?.type === 'AbsoluteStart' || this.config.subscriptionFilter?.type === 'AbsoluteRange') {
+        || this.hasCallerRange()) {
       this.livePlaybackOwner = null; return null;
     }
     if (this.livePlaybackOwner?.current()) return this.livePlaybackOwner;
@@ -10348,9 +10348,18 @@ export class MoqtPlayer {
         if (rate === 1 || this.livePlaybackRecord()?.output === output) loc?.setPlaybackRate(rate); },
     };
     const tracks = roles.map(role => this.subscribedTrack(role)!);
-    const floorUs = Math.max(...tracks.map(track => Math.max(track.buffers?.min ?? track.buffers?.target ?? 500, track.buffers?.target ?? 0))) * 1000;
+    const floorUs = this.liveBufferTargetUs(tracks);
     const target = this.config.targetLatencyMs ?? tracks.find(track => track.targetLatency !== undefined)?.targetLatency;
     return this.livePlaybackOwner = { current, output, floorUs, targetUs: target === undefined ? undefined : target * 1000, newest: new Map(), since: null };
+  }
+
+  private hasCallerRange(): boolean {
+    return this.config.subscriptionFilter?.type === 'AbsoluteStart' || this.config.subscriptionFilter?.type === 'AbsoluteRange';
+  }
+
+  private liveBufferTargetUs(tracks: readonly CatalogTrack[]): number {
+    // MSF-01 §5.2.8/§5.2.9 permit a player default; share it with startup.
+    return Math.max(...tracks.map(track => Math.max(track.buffers?.min ?? track.buffers?.target ?? 500, track.buffers?.target ?? 0))) * 1000;
   }
 
   private checkLiveJump(): void {
@@ -17253,6 +17262,10 @@ export class MoqtPlayer {
     return {
       onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint, inputs?: readonly (object | undefined)[], sourceKey?: string) => {
         if (this._destroyed || this.mediaSource !== ms || !isCurrent()) return;
+        const tracks = (['video', 'audio'] as const).filter(role => this._selection[role] !== null)
+          .map(role => this.subscribedTrack(role));
+        ms.setLiveStartupCushion?.(!this.hasCallerRange() && tracks.length > 0 && tracks.every((track): track is CatalogTrack => track?.isLive === true)
+          ? this.liveBufferTargetUs(tracks) : null);
         const observation = this.observeCmafAppend(ms, inputs);
         if (this._destroyed || this.mediaSource !== ms || !isCurrent()) { observation?.discard('decoder reset'); return; }
         if (resetOffsets && !timestampOffsetSet[mediaType]) {

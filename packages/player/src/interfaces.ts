@@ -634,6 +634,11 @@ export interface MediaSourceLike {
    * maxCatchUpRate > 1; the player restores 1 on retirement. */
   setPlaybackRate?(rate: number): void;
 
+  /** Live startup cushion in microseconds, added to an appended Object's duration.
+   * null preserves immediate finite startup. Adapters omitting this hook retain
+   * their existing startup behavior. This is the player's shared buffer target. */
+  setLiveStartupCushion?(cushionUs: number | null): void;
+
   /** Native element-load-scoped video counters, or null without owned video,
    * support, or valid measurements. A supported all-zero snapshot is observed
    * zero, not unavailable. Optional for existing/custom media adapters.
