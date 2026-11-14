@@ -22,10 +22,11 @@
  * @module
  */
 
-/** A fragment parameter this module does not interpret, exactly as written. */
+/** A fragment parameter this module does not interpret. */
 export interface MsfUrlParameter {
+    /** Percent-decoded once if valid UTF-8; otherwise kept as written. */
     readonly name: string;
-    /** NOT percent-decoded: §11.1 does not say that a parameter value is. */
+    /** Kept exactly as written, without percent-decoding. */
     readonly value: string;
 }
 
@@ -63,6 +64,11 @@ const MAX_C4M_BYTES = 32_768;
  *   without it (§5). Either way the encoding must be canonical and the two
  *   alphabets must not be mixed.
  *
+ * After splitting, percent-decode the identifier, names, and `c4m`/`connection`
+ * values once. Undecodable names stay as written and cannot match reserved names;
+ * other values stay as written (MSF-01 §11.1.1 defines formats only for reserved keys).
+ * Undecodable identifiers and `c4m`/`connection` values are refused without echo.
+ *
  * `.` escapes must be lowercase and minimal (MOQT d18 §1.5.1, d22 §8.8).
  *
  * @throws {Error} missing `msf:` type, character outside the §11.1 grammar,
@@ -78,7 +84,8 @@ export function parseMsfFragment(fragment: string): MsfFragment {
     if (![identifier, ...parameters].every(part => FRAGMENT_COMPONENT.test(part))) {
         throw new Error('MSF URL fragment contains a character outside the msf-fragment grammar (§11.1)');
     }
-    const track = decodeNamespaceName(identifier);
+    // RFC 3986 §6.2.2.2: encoded unreserved characters include MSF dots and hyphens.
+    const track = decodeNamespaceName(decodeComponent(identifier));
 
     let connection: 'q' | 'wt' | undefined;
     let c4m: Uint8Array | undefined;
@@ -88,8 +95,11 @@ export function parseMsfFragment(fragment: string): MsfFragment {
         const equals = parameter.indexOf('=');
         if (equals < 0) throw new Error('MSF URL fragment parameter has no "=" (§11.1)');
         if (equals === 0) throw new Error('MSF URL fragment parameter has an empty name (§11.1)');
-        const name = parameter.slice(0, equals);
-        const value = parameter.slice(equals + 1);
+        let name = parameter.slice(0, equals);
+        try { name = decodeComponent(name); }
+        catch { /* An undecodable name is unknown; preserve it as written. */ }
+        const rawValue = parameter.slice(equals + 1);
+        const value = name === 'c4m' || name === 'connection' ? decodeComponent(rawValue) : rawValue;
         // Key names are case-sensitive (§11.1.1): `Connection` is not reserved.
         if (name === 'connection') {
             if (connection !== undefined) throw new Error('MSF URL repeats the "connection" parameter (§11.1.1)');
@@ -108,6 +118,12 @@ export function parseMsfFragment(fragment: string): MsfFragment {
         ...(c4m !== undefined ? { c4m } : {}),
         parameters: other,
     };
+}
+
+// RFC 3986 §2.4: split components first, then decode once; '+' is literal.
+function decodeComponent(text: string): string {
+    try { return decodeURIComponent(text); }
+    catch { throw new Error('MSF URL has invalid percent-encoding'); }
 }
 
 // ─── Namespace-name string (§11.1.2) ─────────────────────────────────

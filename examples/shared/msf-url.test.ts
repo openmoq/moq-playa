@@ -70,7 +70,6 @@ describe('MSF URL fragment — namespace-name string (§11.1.2)', () => {
         ['a--t.', 'two hexadecimal digits'],
         ['a~b--t', 'must be escaped'],
         ['a/b--t', 'must be escaped'],
-        ['a%2Db--t', 'must be escaped'],
         ['a.ff--t', 'not valid UTF-8'],
         ['', 'no "--"'],
     ])('refuses %j', (encoded, message) => {
@@ -79,7 +78,7 @@ describe('MSF URL fragment — namespace-name string (§11.1.2)', () => {
 });
 
 describe('MSF URL fragment — parameters (§11.1, §11.1.1)', () => {
-    it('preserves non-reserved parameters verbatim and in order (moqxr)', () => {
+    it('preserves uninterpreted parameter values and order', () => {
         expect(fragment('alpha=1&beta=2&alpha=&x=a=b&p=%26/%3F').parameters).toEqual([
             { name: 'alpha', value: '1' }, { name: 'beta', value: '2' }, { name: 'alpha', value: '' },
             { name: 'x', value: 'a=b' }, { name: 'p', value: '%26/%3F' },
@@ -137,7 +136,7 @@ describe('MSF URL fragment — c4m (§11.1.1)', () => {
         '', '=', 'Y', 'YWJjZ', 'Y===', 'YQ=', 'YWJj=', 'YWJj====', 'YR==', 'YR', 'YWJ', 'Y=Q=', '=YQ=',
         'AAH+/w',       // base64 with its padding removed
         'AAH+_w==',     // mixed alphabets
-        'YW.j', 'YW%6Aj', 'base64:YWJj',
+        'YW.j', 'base64:YWJj',
     ])('refuses %j without echoing it', (value) => {
         let message = '';
         try { fragment(`alpha=1&c4m=${value}`); } catch (error) { message = (error as Error).message; }
@@ -156,5 +155,37 @@ describe('MSF URL fragment — c4m (§11.1.1)', () => {
     it('bounds the decoded token at 32 KiB', () => {
         expect(fragment(`c4m=${'A'.repeat(43691)}`).c4m).toHaveLength(32768);
         expect(() => fragment(`c4m=${'A'.repeat(43692)}`)).toThrow('"c4m"');
+    });
+});
+
+describe('MSF URL percent decoding', () => {
+    it('decodes token bytes and reserved names exactly once, preserving plus', () => {
+        expect(fragment('c4m=AAH%2B%2Fw%3D%3D').c4m).toEqual(Uint8Array.of(0, 1, 254, 255));
+        expect(fragment('%63onnection=%71').connection).toBe('q');
+        expect(fragment('a%26b=x%3Dy%26z+%2526').parameters).toEqual([{ name: 'a&b', value: 'x%3Dy%26z+%2526' }]);
+        expect(() => fragment('connection=wt&%63onnection=q')).toThrow('repeats');
+        expect(() => fragment('c4m=YQ&%634m=Yg')).toThrow('repeats');
+    });
+
+    it.each(['%6cive%2Ddemo%2D%2Dcatalog', 'live-demo--%63atalog', 'live%2e2d-demo--catalog'])('normalizes URI unreserved characters in %s', identifier => {
+        const literal = identifier.replace(/%([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+        expect(parseMsfFragment(`msf:${identifier}`)).toEqual(parseMsfFragment(`msf:${literal}`));
+    });
+
+    it.each(['live--%2E63atalog', 'a%2E2Db--t', 'live--%252e63atalog', 'live--t%26connection=q'])('still refuses invalid namespace encoding in %s', identifier => {
+        expect(() => parseMsfFragment(`msf:${identifier}`)).toThrow();
+    });
+
+    it.each([['x=%ff', 'x', '%ff'], ['%ff=1', '%ff', '1'], ['x=%c3', 'x', '%c3']])('preserves ignored octets in %s', (parameter, name, value) => {
+        expect(fragment(parameter).parameters).toEqual([{ name, value }]);
+    });
+
+    it.each(['%ff--t', 'ns--t&c4m=%ff', 'ns--t&connection=%c3'])('refuses undecodable interpreted components without echoing %s', text => {
+        expect(() => parseMsfFragment(`msf:${text}`)).toThrow(/^MSF URL has invalid percent-encoding$/);
+    });
+
+    it('recognizes encoded c4m names and does not decode token values twice', () => {
+        expect(() => fragment('%634m=')).toThrow('"c4m"');
+        expect(() => fragment('c4m=AAH%252B%2Fw%3D%3D')).toThrow('"c4m"');
     });
 });

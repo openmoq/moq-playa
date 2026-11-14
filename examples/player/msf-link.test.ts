@@ -31,6 +31,7 @@ describe('player MSF link', () => {
   it('refuses a required native QUIC connection and accepts WebTransport', () => {
     expect(() => readMsfLink('#msf:live--catalog&connection=q', '')).toThrow('native QUIC');
     expect(readMsfLink('#msf:live--catalog&connection=wt', '')).toBeDefined();
+    expect(() => readMsfLink('#msf:live--catalog&%63onnection=q', '')).toThrow('native QUIC');
   });
 
   it.each([
@@ -54,5 +55,12 @@ describe('player MSF link', () => {
     const link = readMsfLink('#msf:live--catalog&location-range=34-64&secret=hunter2&other=1', '')!;
     expect(link.notes).toEqual(['3 parameters are not supported by this page and ignored']);
     expect(readMsfLink('#msf:live--catalog&x=1', '')!.notes).toEqual(['1 parameter is not supported by this page and ignored']);
+  });
+});
+
+it.each(['x=%ff', '%ff=1', 'x=%c3'])('accepts a link with one ignored non-UTF-8 parameter: %s', parameter => {
+  expect(readMsfLink(`#msf:live--catalog&${parameter}`, '')).toEqual({
+    namespace: ['live'], catalogTrackName: 'catalog',
+    notes: ['1 parameter is not supported by this page and ignored'],
   });
 });
