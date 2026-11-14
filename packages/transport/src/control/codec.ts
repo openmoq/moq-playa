@@ -24,6 +24,7 @@ import type {
   RequestUpdate,
 } from './messages.js';
 import type { DraftVersion } from '../versions.js';
+import { DEFAULT_DRAFT_VERSION } from '../versions.js';
 
 export type { DraftVersion };
 
@@ -77,9 +78,9 @@ export interface ControlCodec {
 
 /**
  * Create a ControlCodec for the given draft version.
- * @param version Draft version (default: 16)
+ * @param version Draft version (default: {@link DEFAULT_DRAFT_VERSION})
  */
-export function createControlCodec(version: DraftVersion = 16): ControlCodec {
+export function createControlCodec(version: DraftVersion = DEFAULT_DRAFT_VERSION): ControlCodec {
   switch (version) {
     case 16:
       return new Draft16Codec();
@@ -89,6 +90,8 @@ export function createControlCodec(version: DraftVersion = 16): ControlCodec {
       return new Draft18Codec();
     case 22:
       return new Draft18Codec(22);
+    case 23:
+      return new Draft18Codec(23);
     default:
       // Unknown/unwired draft: a programming error, not a silent fallback.
       throw new Error(`createControlCodec: draft-${version as number} control codec is not yet implemented`);

@@ -18,6 +18,8 @@ export const SessionError = {
   INVALID_REQUEST_ID: varint(0x4),
   DUPLICATE_TRACK_ALIAS: varint(0x5),
   KEY_VALUE_FORMATTING_ERROR: varint(0x6),
+  /** draft-23 §12.2: the draft-23 name of 0x6 (was KEY_VALUE_FORMATTING_ERROR). */
+  MALFORMED_KEY_VALUE: varint(0x6),
   TOO_MANY_REQUESTS: varint(0x7),
   INVALID_PATH: varint(0x8),
   MALFORMED_PATH: varint(0x9),
@@ -34,6 +36,21 @@ export const SessionError = {
   MALFORMED_AUTHORITY: varint(0x1a),
   /** draft-22: more than MAX_REQUEST_UPDATES updates outstanding on one request. */
   TOO_MANY_REQUEST_UPDATES: varint(0x1b),
+  // draft-23 §12.2: specific codes that replace most uses of PROTOCOL_VIOLATION.
+  // 0x200-0x2FF are data plane, 0x300-0x3FF control plane, 0x400-0x4FF either.
+  INVALID_STREAM_HEADER: varint(0x200),
+  MALFORMED_OBJECT: varint(0x201),
+  INVALID_OBJECT_STATUS: varint(0x202),
+  TRUNCATED_OBJECT: varint(0x203),
+  MALFORMED_MESSAGE: varint(0x300),
+  INVALID_FIELD: varint(0x301),
+  INVALID_TRACK_NAMESPACE: varint(0x302),
+  UNEXPECTED_MESSAGE: varint(0x303),
+  ROLE_VIOLATION: varint(0x304),
+  INVALID_PARAMETER: varint(0x305),
+  CLOSED_CONTROL_STREAM: varint(0x306),
+  DELTA_ENCODING_OVERFLOW: varint(0x400),
+  FIELD_LENGTH_EXCEEDED: varint(0x401),
 } as const;
 
 /**
@@ -154,6 +171,32 @@ export const RequestError22 = {
 } as const;
 
 /**
+ * REQUEST_ERROR codes — **draft-23** (§12.3): draft 22's without PREFIX_OVERLAP
+ * (overlapping namespace subscriptions are allowed, §4.2), plus UNAVAILABLE
+ * (no stream credit to forward the request, §7.4).
+ */
+export const RequestError23 = {
+  INTERNAL_ERROR: varint(0x0),
+  UNAUTHORIZED: varint(0x1),
+  TIMEOUT: varint(0x2),
+  NOT_SUPPORTED: varint(0x3),
+  MALFORMED_AUTH_TOKEN: varint(0x4),
+  EXPIRED_AUTH_TOKEN: varint(0x5),
+  GOING_AWAY: varint(0x6),
+  EXCESSIVE_LOAD: varint(0x9),
+  UNAVAILABLE: varint(0xa),
+  DOES_NOT_EXIST: varint(0x10),
+  INVALID_RANGE: varint(0x11),
+  MALFORMED_TRACK: varint(0x12),
+  UNINTERESTED: varint(0x20),
+  NAMESPACE_TOO_LARGE: varint(0x31),
+  UNSUPPORTED_EXTENSION: varint(0x33),
+  REDIRECT: varint(0x34),
+  CONFLICTING_FILTERS: varint(0x35),
+  INVALID_FILTER: varint(0x36),
+} as const;
+
+/**
  * PUBLISH_DONE Status Codes — **draft-18** (§15.10.3). Differs from legacy:
  * TOO_FAR_BEHIND = 0x5 and EXPIRED = 0x6 (swapped), plus EXCESSIVE_LOAD (0x9).
  */
@@ -166,6 +209,39 @@ export const PublishDoneCode18 = {
   TOO_FAR_BEHIND: varint(0x5),
   EXPIRED: varint(0x6),
   UPDATE_FAILED: varint(0x8),
+  EXCESSIVE_LOAD: varint(0x9),
+  MALFORMED_TRACK: varint(0x12),
+} as const;
+
+/**
+ * PUBLISH_DONE Status Codes — **draft-23** (§12.4): draft 18's without
+ * SUBSCRIPTION_ENDED, plus EXPIRED_AUTH_TOKEN (0x7, §9.9).
+ */
+export const PublishDoneCode23 = {
+  INTERNAL_ERROR: varint(0x0),
+  UNAUTHORIZED: varint(0x1),
+  TRACK_ENDED: varint(0x2),
+  GOING_AWAY: varint(0x4),
+  TOO_FAR_BEHIND: varint(0x5),
+  EXPIRED: varint(0x6),
+  EXPIRED_AUTH_TOKEN: varint(0x7),
+  UPDATE_FAILED: varint(0x8),
+  EXCESSIVE_LOAD: varint(0x9),
+  MALFORMED_TRACK: varint(0x12),
+} as const;
+
+/**
+ * Stream Reset Error Codes — **draft-23** (§12.5): draft 18's without
+ * UNKNOWN_OBJECT_STATUS (a FETCH marks unknown ranges instead, §3.2.2).
+ */
+export const StreamResetCode23 = {
+  INTERNAL_ERROR: varint(0x0),
+  CANCELLED: varint(0x1),
+  DELIVERY_TIMEOUT: varint(0x2),
+  SESSION_CLOSED: varint(0x3),
+  GOING_AWAY: varint(0x4),
+  TOO_FAR_BEHIND: varint(0x5),
+  EXPIRED_AUTH_TOKEN: varint(0x7),
   EXCESSIVE_LOAD: varint(0x9),
   MALFORMED_TRACK: varint(0x12),
 } as const;
@@ -207,8 +283,16 @@ export const DataStreamError18 = StreamResetCode18;
  * @see draft-ietf-moq-transport-16 §10.3.1 (datagram violations)
  */
 export class ProtocolViolationError extends Error {
-  constructor(message: string) {
+  /**
+   * The session termination code to close with, when a draft defines one more
+   * specific than PROTOCOL_VIOLATION (draft-23 §12.2). Absent on drafts before
+   * 23, where every violation closes with PROTOCOL_VIOLATION (0x3).
+   */
+  readonly code: number | undefined;
+
+  constructor(message: string, code?: number) {
     super(message);
     this.name = 'ProtocolViolationError';
+    this.code = code;
   }
 }

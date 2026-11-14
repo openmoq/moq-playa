@@ -31,7 +31,7 @@ import {
   type FetchObjectPrior18,
 } from './decoder-18.js';
 import { encodeSubgroupObject } from './encoder.js';
-import { encodeSubgroupObject18, encodeFetchObject18, encodeFetchEndOfRange18 } from './encoder-18.js';
+import { encodeSubgroupObject18, encodeFetchObject18, encodeFetchEndOfRange18, encodeFetchEndMarker23 } from './encoder-18.js';
 import type { GroupOrder, ObjectHeaderLayout, SubgroupObject } from './types.js';
 import { writeVarint, varint } from '../primitives/varint.js';
 import { writeVi64, vi64EncodingLength } from '../primitives/vi64.js';
@@ -78,13 +78,15 @@ function fromFetch(r: { item: DecodedFetchItem; bytesRead: number; nextPrior?: F
     };
   }
   // A draft-14 status Object is returned as an end-of-range item carrying its
-  // raw status; a draft-16/18/22 End-of-Range has no raw status.
+  // raw status; a draft-16/18/22/23 End-of-Range, and a draft-23 End of Group or
+  // End of Track marker, have no raw status.
+  const rawStatus = 'rawStatus' in item ? item.rawStatus : undefined;
   return {
-    kind: item.rawStatus !== undefined ? 'object' : 'range', bytesRead: r.bytesRead, payload: null,
-    status: item.rawStatus, extensions: undefined, groupId: item.groupId, subgroupId: undefined,
+    kind: rawStatus !== undefined ? 'object' : 'range', bytesRead: r.bytesRead, payload: null,
+    status: rawStatus, extensions: undefined, groupId: item.groupId, subgroupId: undefined,
     objectId: item.objectId, publisherPriority: undefined, isDatagram: false,
     ...(r.nextPrior ? { nextPrior: r.nextPrior } : {}),
-    ...(item.rawStatus !== undefined ? { itemOmitsFields: true as const } : {}),
+    ...(rawStatus !== undefined ? { itemOmitsFields: true as const } : {}),
   };
 }
 
@@ -222,9 +224,9 @@ describe('object header parsers agree with complete decoders on arbitrary bytes'
     ), fcParams());
   });
 
-  it('draft-18/22 FETCH items, including the version-specific End-of-Range set', () => {
+  it('draft-18/22/23 FETCH items, including the version-specific End-of-Range set', () => {
     fc.assert(fc.property(
-      fuzzBytes, fc.integer({ min: 0, max: 3 }), fetchPrior18, fc.boolean(), groupOrder, fc.constantFrom(18 as const, 22 as const),
+      fuzzBytes, fc.integer({ min: 0, max: 3 }), fetchPrior18, fc.boolean(), groupOrder, fc.constantFrom(18 as const, 22 as const, 23 as const),
       (raw, offset, prior, isFirst, order, version) => {
         everyPrefix(raw, prefix => {
           if (offset > prefix.length) return;
@@ -357,34 +359,49 @@ describe('object header parsers agree at every chunk boundary of valid streams',
     }), fcParams());
   });
 
-  it('draft-18/22 FETCH streams: threaded prior through objects and End-of-Range markers, both group orders', () => {
+  it('draft-18/22/23 FETCH streams: threaded prior through objects and End-of-Range markers, both group orders', () => {
     const item = fc.oneof(
       { weight: 3, arbitrary: fc.record({ kind: fc.constant('object' as const), groupStep: fc.bigInt({ min: 0n, max: 2n }),
         objectStep: fc.bigInt({ min: 0n, max: 3n }), subgroupId: smallId, priority: priorityByte,
         extensions: fc.option(bytes(12), { nil: undefined }), payload: payloadBytes }) },
-      { weight: 1, arbitrary: fc.record({ kind: fc.constant('range' as const), marker: fc.constantFrom('non-existent', 'unknown', 'timed-out'),
+      { weight: 1, arbitrary: fc.record({ kind: fc.constant('range' as const),
+        marker: fc.constantFrom('non-existent', 'unknown', 'timed-out', 'gone', 'end-of-group', 'end-of-track'),
         objectStep: fc.bigInt({ min: 1n, max: 3n }) }) },
     );
-    fc.assert(fc.property(fc.array(item, { minLength: 1, maxLength: 5 }), groupOrder, fc.constantFrom(18 as const, 22 as const),
+    fc.assert(fc.property(fc.array(item, { minLength: 1, maxLength: 5 }), groupOrder, fc.constantFrom(18 as const, 22 as const, 23 as const),
       (items, order, version) => {
         let prior: FetchObjectPrior18 | undefined, first = true;
         let groupId = order === 'ascending' ? 5n : 1000n, objectId = 0n;
+        // After a draft-23 End of Group / End of Track the next Object starts a new Group.
+        let groupEnded = false;
         for (const it of items) {
           let encoded: Uint8Array, nextPrior: FetchObjectPrior18;
           if (it.kind === 'object') {
-            if (!first && it.groupStep > 0n) { groupId = order === 'ascending' ? groupId + it.groupStep : groupId - it.groupStep; objectId = 0n; }
-            else if (!first) objectId += it.objectStep;
+            const step = groupEnded && it.groupStep === 0n ? 1n : it.groupStep;
+            if (!first && step > 0n) { groupId = order === 'ascending' ? groupId + step : groupId - step; objectId = 0n; }
+            // Draft 23's encoder requires Object IDs to increase within a Group.
+            else if (!first) objectId += version === 23 && it.objectStep === 0n ? 1n : it.objectStep;
+            groupEnded = false;
             ({ bytes: encoded, nextPrior } = encodeFetchObject18({ groupId, subgroupId: it.subgroupId, objectId,
-              publisherPriority: it.priority, extensions: it.extensions, payload: it.payload }, prior, first, order));
+              publisherPriority: it.priority, extensions: it.extensions, payload: it.payload }, prior, first, order, version));
           } else {
-            if (first) continue; // a stream begins with an Object in these generated streams
-            objectId += it.objectStep;
-            if (it.marker === 'timed-out') {
-              if (version !== 22) continue;
-              encoded = encodeTimedOut22(groupId, objectId);
-              nextPrior = { groupId, objectId, lastObjectSubgroupId: prior?.lastObjectSubgroupId, lastObjectPriority: prior?.lastObjectPriority };
+            if (first || groupEnded) continue; // a stream begins with an Object; a marker follows one
+            if (it.marker === 'end-of-group' || it.marker === 'end-of-track') {
+              if (version !== 23) continue;
+              ({ bytes: encoded, nextPrior } = encodeFetchEndMarker23(it.marker, prior));
+              groupEnded = true;
             } else {
-              ({ bytes: encoded, nextPrior } = encodeFetchEndOfRange18(it.marker === 'non-existent', groupId, objectId, prior, version));
+              if (it.marker === 'gone' && version !== 23) continue;
+              objectId += it.objectStep;
+              if (it.marker === 'timed-out' && version === 22) {
+                encoded = encodeTimedOut22(groupId, objectId);
+                nextPrior = { groupId, objectId, lastObjectSubgroupId: prior?.lastObjectSubgroupId, lastObjectPriority: prior?.lastObjectPriority };
+              } else if (it.marker === 'timed-out' && version === 18) {
+                continue;
+              } else {
+                const kind = it.marker === 'non-existent' ? true : it.marker === 'unknown' ? false : it.marker;
+                ({ bytes: encoded, nextPrior } = encodeFetchEndOfRange18(kind, groupId, objectId, prior, version, order));
+              }
             }
           }
           const priorNow = prior, firstNow = first;

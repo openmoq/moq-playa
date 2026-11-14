@@ -97,6 +97,7 @@ export function locWireProfileForDraft(draft: number): PropertyWireProfile {
             return 'd14-absolute-varint';
         case 18:
         case 22:
+        case 23:
             return 'd18-delta-vi64';
         default:
             return 'd16-delta-varint';

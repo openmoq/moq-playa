@@ -22,7 +22,7 @@ interface MoqtSetupRouting {
 }
 
 /** The MOQT ALPN tokens the native binding can negotiate. */
-export type MoqtQuicProtocol = 'moqt-18' | 'moqt-22';
+export type MoqtQuicProtocol = 'moqt-18' | 'moqt-22' | 'moqt-23';
 
 /** Native QUIC transport plus the routing fields required in MOQT SETUP. */
 export interface MoqtQuicTransport extends WebTransportLike {

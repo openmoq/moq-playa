@@ -105,7 +105,7 @@ export async function connectInteropWebTransport(
 
 export interface RelayTransportFactories {
   readonly webtransport: (url: string, draft: number) => Promise<any>;
-  readonly quic: (url: string, draft: 18 | 22) => Promise<any>;
+  readonly quic: (url: string, draft: 18 | 22 | 23) => Promise<any>;
 }
 
 /** Return the unconditional TAP diagnostic required for an insecure QUIC run. */
@@ -128,7 +128,9 @@ export async function selectRelayTransport(
     return factories.webtransport(url, draft);
   }
   if (scheme === 'moqt:') {
-    if (draft !== 18 && draft !== 22) throw new Error(`native QUIC supports drafts 18 and 22 only, not draft ${draft}`);
+    if (draft !== 18 && draft !== 22 && draft !== 23) {
+      throw new Error(`native QUIC supports drafts 18, 22 and 23 only, not draft ${draft}`);
+    }
     const transport = await factories.quic(url, draft);
     if (transport?.kind !== 'quic') {
       throw new Error('native QUIC factory returned a transport without kind="quic"');

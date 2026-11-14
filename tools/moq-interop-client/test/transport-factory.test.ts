@@ -14,7 +14,7 @@ const factories = () => ({
     wtCalls++;
     return { url, draft };
   },
-  quic: async (url: string, draft: 18 | 22) => {
+  quic: async (url: string, draft: 18 | 22 | 23) => {
     quicCalls++;
     return { kind: 'quic', url, draft, setupOptions: { authority: 'relay:4443', path: '/moq' } };
   },
@@ -190,6 +190,9 @@ async function main() {
   assert.equal(draft22.draft, 22);
   const wt22 = await selectRelayTransport('https://relay:4443/moq', 22, factories());
   assert.equal(wt22.draft, 22);
+  const draft23 = await selectRelayTransport('moqt://relay:4443/moq', 23, factories());
+  assert.equal(draft23.kind, 'quic');
+  assert.equal(draft23.draft, 23);
 
   wtCalls = 0;
   quicCalls = 0;
@@ -202,7 +205,7 @@ async function main() {
 
   await assert.rejects(
     selectRelayTransport('moqt://relay:4443/moq', 16, factories()),
-    /drafts 18 and 22 only/,
+    /drafts 18, 22 and 23 only/,
   );
 
   await assert.rejects(

@@ -29,7 +29,7 @@ async function connected() {
 }
 
 describe('object receipt provenance', () => {
-  it.each([18, 22] as const)('drops a generic subscription\'s late datagram after peer request reset in draft %i', async draft => {
+  it.each([18, 22, 23] as const)('drops a generic subscription\'s late datagram after peer request reset in draft %i', async draft => {
     const { a, b } = createLoopback();
     const client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' }), app = vi.fn();
     server.onSubscribe = id => { void server.acceptSubscribe(id, 77n); };
@@ -52,7 +52,7 @@ describe('object receipt provenance', () => {
     } finally { await client.close(); await server.close(); }
   });
 
-  it.each([14, 16, 18, 22] as const)('drops a generic subscription\'s late datagram without any receipt observer in draft %i', async draft => {
+  it.each([14, 16, 18, 22, 23] as const)('drops a generic subscription\'s late datagram without any receipt observer in draft %i', async draft => {
     const { a, b } = createLoopback();
     const client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' }), app = vi.fn();
     server.onSubscribe = id => { void server.acceptSubscribe(id, 77n); };
@@ -77,7 +77,7 @@ describe('object receipt provenance', () => {
     } finally { await client.close(); await server.close(); }
   });
 
-  it.each([14, 16, 18, 22] as const)('preserves callback identity and FIN provenance in draft %i', async draft => {
+  it.each([14, 16, 18, 22, 23] as const)('preserves callback identity and FIN provenance in draft %i', async draft => {
     const { a, b } = createLoopback();
     const client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' });
     const observed: ObjectReceiptObservation[] = [], tokens: unknown[] = [];

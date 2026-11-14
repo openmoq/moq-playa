@@ -17,6 +17,10 @@ export {
   SetupOption18,
   MessageParam18,
   MessageParam22,
+  MessageParam23,
+  SetupOption22,
+  SetupOption23,
+  ErrorDetail23,
   PropertyRange18,
   isMandatoryProperty,
 } from './control/codes-18.js';
@@ -41,6 +45,7 @@ export {
   messageParams18EncodingLength,
   DEFAULT_MESSAGE_PARAM_REGISTRY,
   DRAFT22_MESSAGE_PARAM_REGISTRY,
+  DRAFT23_MESSAGE_PARAM_REGISTRY,
   typedLocationFilterLength,
 } from './control/message-params-18.js';
 export type {
@@ -87,7 +92,7 @@ export { readReasonPhrase, writeReasonPhrase, reasonPhraseEncodingLength } from 
 // ─── Error Codes ─────────────────────────────────────────────────────
 export { SessionError, RequestError, PublishDoneCode, DataStreamError, ProtocolViolationError } from './errors.js';
 // draft-18 error code registries (canonical; the legacy exports above stay draft-14/16).
-export { RequestError18, RequestError22, PublishDoneCode18, StreamResetCode18, DataStreamError18 } from './errors.js';
+export { RequestError18, RequestError22, RequestError23, PublishDoneCode18, PublishDoneCode23, StreamResetCode18, StreamResetCode23, DataStreamError18 } from './errors.js';
 
 // ─── Control Messages ────────────────────────────────────────────────
 export { MessageType } from './control/codes.js';
@@ -150,7 +155,7 @@ export { createControlCodec } from './control/codec.js';
 export type { ControlCodec, DraftVersion, DecodedControlMessage } from './control/codec.js';
 
 // ─── Profile (per-draft behavior bundle) ─────────────────────────────
-export { isDraft22, isRequestStreamDraft, isWiredDraft, WIRED_DRAFTS } from './versions.js';
+export { DEFAULT_DRAFT_VERSION, isDraft22, isDraft23, isRequestStreamDraft, requestStreamDraftOf, isWiredDraft, WIRED_DRAFTS } from './versions.js';
 export type { RequestStreamDraft } from './versions.js';
 export { getProtocolProfile } from './profile.js';
 export type { ProtocolProfile, ProfileCapabilities } from './profile.js';
@@ -181,6 +186,8 @@ export type {
   FetchHeader,
   FetchObject,
   FetchEndOfRange,
+  FetchEndMarker,
+  FetchRangeKind,
   ObjectDatagram,
   DataStreamHeader,
   MoqtObject,
@@ -227,6 +234,7 @@ export {
   encodeFetchHeader18,
   encodeFetchObject18,
   encodeFetchEndOfRange18,
+  encodeFetchEndMarker23,
 } from './data/encoder-18.js';
 export type { FetchObjectFields } from './data/encoder-18.js';
 

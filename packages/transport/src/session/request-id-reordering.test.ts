@@ -108,7 +108,7 @@ describe('draft-16 cross-stream request admission', () => {
     expect(() => allocator.validateIncoming(1n)).not.toThrow();
   });
 
-  it.each([18, 22] as const)('draft %i still has no MAX_REQUEST_ID gate', draft => {
+  it.each([18, 22, 23] as const)('draft %i still has no MAX_REQUEST_ID gate', draft => {
     const allocator = new RequestIdAllocator('client', undefined, getRequestPolicy(draft));
     expect(() => allocator.validateIncoming(3n)).not.toThrow();
     expect(() => allocator.validateIncoming(1n)).not.toThrow();

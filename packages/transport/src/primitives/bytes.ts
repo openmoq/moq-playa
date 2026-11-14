@@ -260,14 +260,20 @@ export function validateTrackNamespacePrefix(segments: Uint8Array[]): void {
  * @param namespace Array of namespace field byte arrays
  * @param trackName Track name byte array
  * @param opts.allowEmptyNamespace Permit a zero-field namespace (draft-18 §2.4.1).
+ * @param opts.forbidEmptyTrackName Reject a zero-length Track Name (draft-23 §2.4.1).
  * @throws {ProtocolViolationError} If namespace invalid or combined length > 4096 bytes
  * @see draft-ietf-moq-transport-18 §2.4.1
  */
 export function validateFullTrackName(
   namespace: Uint8Array[],
   trackName: Uint8Array,
-  opts: { allowEmptyNamespace?: boolean } = {},
+  opts: { allowEmptyNamespace?: boolean; forbidEmptyTrackName?: boolean } = {},
 ): void {
+  if (opts.forbidEmptyTrackName && trackName.length === 0) {
+    // draft-23 §2.4.1: PROTOCOL_VIOLATION, set explicitly so it is not reported
+    // as a more general malformed message.
+    throw new ProtocolViolationError('Track Name must be at least 1 byte (draft-23 §2.4.1)', 0x3);
+  }
   // Validate namespace itself (≤ 32 fields, each non-empty; empty namespace only
   // when explicitly allowed for draft-18).
   validateTrackNamespace(namespace, opts.allowEmptyNamespace ? { allowEmpty: true } : {});

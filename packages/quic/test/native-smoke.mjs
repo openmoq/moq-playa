@@ -8,10 +8,10 @@ const TIMEOUT_MS = 5_000;
 const keyPath = process.argv[2];
 const certPath = process.argv[3];
 const draft = Number(process.argv[4] ?? 18);
-assert.ok(draft === 18 || draft === 22, 'native smoke supports drafts 18 and 22');
+assert.ok(draft === 18 || draft === 22 || draft === 23, 'native smoke supports drafts 18, 22 and 23');
 const protocol = `moqt-${draft}`;
 if (!keyPath || !certPath) {
-  throw new Error('usage: native-smoke.mjs <key.pem> <cert.pem> [18|22]');
+  throw new Error('usage: native-smoke.mjs <key.pem> <cert.pem> [18|22|23]');
 }
 
 function deferred() {

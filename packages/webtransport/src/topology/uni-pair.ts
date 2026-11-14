@@ -27,6 +27,8 @@ import { finishPublisherTerminal, type PublisherTerminalOptions } from './publis
 
 import {
   createControlCodec,
+  isDraft23,
+  requestStreamDraftOf,
   SessionError as SessionErrorCode,
   SessionState,
   StreamResetCode18,
@@ -144,8 +146,9 @@ export class UniPairTopology {
    *  a message assigned to a Request stream (§3.3; §10 Table 5), a decode failure,
    *  or a FIN/close (the control stream MUST stay open for the session, §3.3). The owner
    *  MUST close the session with PROTOCOL_VIOLATION — this is fatal, NOT a per-stream
-   *  error routed through {@link onStreamError}. */
-  onControlStreamViolation?: (reason: string) => void;
+   *  error routed through {@link onStreamError}. `code` is the more specific
+   *  draft-23 close code (§12.2), when one applies. */
+  onControlStreamViolation?: (reason: string, code?: number) => void;
 
   /**
    * Called for a subgroup, FETCH, or PADDING stream classified by
@@ -190,7 +193,7 @@ export class UniPairTopology {
   onRequestClosed?: (requestId: bigint, disposition: 'fin' | 'reset' | 'goaway') => void | Promise<void>;
 
   constructor(private readonly session: Session) {
-    this.version = session.draftVersion === 22 ? 22 : 18;
+    this.version = requestStreamDraftOf(session.draftVersion);
     this.codec = createControlCodec(this.version);
   }
 
@@ -407,6 +410,7 @@ export class UniPairTopology {
             // request streams and MUST NOT reach the session's request handler here.
             this.onControlStreamViolation?.(
               `unexpected ${message.type} on the control stream after SETUP (stream assignment: §3.3; §10 Table 5)`,
+              Number(SessionErrorCode.UNEXPECTED_MESSAGE),
             );
             return;
           }
@@ -419,7 +423,8 @@ export class UniPairTopology {
           if (!sawSetup) throw new Error('UniPairTopology: control stream ended before SETUP');
           // §3.3: the control stream MUST NOT be closed during the session — a FIN
           // after SETUP is a protocol violation (the owner skips it if already closed).
-          this.onControlStreamViolation?.('control stream closed (FIN) during the session (§3.3)');
+          this.onControlStreamViolation?.('control stream closed (FIN) during the session (§3.3)',
+            Number(SessionErrorCode.CLOSED_CONTROL_STREAM));
           return;
         }
       }
@@ -430,7 +435,7 @@ export class UniPairTopology {
       } else if (epoch === this.controlEpoch) {
         // A post-SETUP framer/codec decode failure is a fatal control-stream
         // protocol violation (NOT a per-request stream error).
-        this.onControlStreamViolation?.(e.message);
+        this.onControlStreamViolation?.(e.message, e instanceof ProtocolViolationError ? e.code : undefined);
       }
     } finally {
       if (this.controlReader === reader) this.controlReader = null;
@@ -817,6 +822,9 @@ const ALLOWED_RESPONSES: Record<string, ReadonlySet<string>> = {
   REQUEST_UPDATE: new Set(['REQUEST_OK', 'REQUEST_ERROR']),
 };
 
+/** draft-23 §9.3: the responses to a FETCH. */
+const FETCH_RESPONSES_23: ReadonlySet<string> = new Set(['REQUEST_OK', 'REQUEST_ERROR']);
+
 /** Request types that may OPEN a new bidi request stream (first message). */
 const STREAM_OPENING_REQUESTS: ReadonlySet<string> = new Set([
   'SUBSCRIBE', 'FETCH', 'TRACK_STATUS', 'PUBLISH_NAMESPACE', 'PUBLISH',
@@ -956,7 +964,10 @@ class RequestStreamContext {
   ): Promise<{ response: Promise<DecodedControlMessage> }> {
     if (this.cancelled) throw new RequestCancelledError(StreamResetCode18.CANCELLED);
     if (this.failure) throw this.failure;
-    const allowed = ALLOWED_RESPONSES[message.type];
+    // draft-23 §9.3: a FETCH is answered with REQUEST_OK (FETCH_OK is reserved).
+    const allowed = message.type === 'FETCH' && isDraft23(this.codec.version)
+      ? FETCH_RESPONSES_23
+      : ALLOWED_RESPONSES[message.type];
     if (!allowed) {
       throw new Error(`UniPairTopology: no response mapping for request type ${message.type}`);
     }

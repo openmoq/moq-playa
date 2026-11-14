@@ -24,7 +24,7 @@ import { flush } from '../../webtransport/src/testkit/loopback.js';
 import { MoqtPlayer } from './player.js';
 import { CATALOG_BOOTSTRAP_INACTIVITY_MS } from './catalog-bootstrap.js';
 
-async function boot(draft: 18 | 22, bootstrap: 'auto' | 'subscribe' = 'auto') {
+async function boot(draft: 18 | 22 | 23, bootstrap: 'auto' | 'subscribe' = 'auto') {
   const pair = await connectedPair(draft);
   const catalogIds: bigint[] = [];
   pair.server.onSubscribe = (id) => { catalogIds.push(id); };
@@ -55,7 +55,7 @@ async function boot(draft: 18 | 22, bootstrap: 'auto' | 'subscribe' = 'auto') {
   } };
 }
 
-describe.each([18, 22] as const)('draft-%i catalog retirement boundaries', (draft) => {
+describe.each([18, 22, 23] as const)('draft-%i catalog retirement boundaries', (draft) => {
   it('does not reissue a redirected catalog on the old session after its bootstrap timeout', async () => {
     vi.useFakeTimers();
     const h = await boot(draft);

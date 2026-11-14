@@ -30,7 +30,7 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-async function mediaPair(draft: 18 | 22) {
+async function mediaPair(draft: 18 | 22 | 23) {
   const pair = await connectedPair(draft, { clientOptions: { terminatedAliasTtlMs: 1 } });
   const requests: Array<{ id: bigint; name: string }> = [];
   pair.server.onSubscribe = (id, _ns, name) => {
@@ -83,7 +83,7 @@ async function mediaPair(draft: 18 | 22) {
   };
 }
 
-describe.each([18, 22] as const)('draft-%i remaining catalog ownership', (draft) => {
+describe.each([18, 22, 23] as const)('draft-%i remaining catalog ownership', (draft) => {
   it.each([false, true])('keeps an independent init send alive (catalog GOAWAY=%s)', async (redirect) => {
     const h = await mediaPair(draft);
     const gate = deferred<void>();

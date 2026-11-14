@@ -8,7 +8,7 @@ import { MoqtPlayer } from './player.js';
 import { PreparedAudioEvidence } from './prepared-audio-evidence.js';
 import { PlayerState } from './state.js';
 
-const drafts: AudioDraft[] = [16, 18, 22];
+const drafts: AudioDraft[] = [16, 18, 22, 23];
 const paths: AudioPath[] = ['cmaf', 'loc', 'locmaf-mse', 'locmaf-frame'];
 type Fixture = Awaited<ReturnType<typeof audioSelectionFixture>>;
 function watch(promise: Promise<void>) {

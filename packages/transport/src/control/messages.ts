@@ -221,6 +221,17 @@ export interface RequestErrorMsg {
   /** draft-18: present iff `errorCode === REDIRECT` (0x34). Absent on 14/16. */
   readonly redirect?: Redirect;
   /**
+   * draft-23 §9.4.2.2: the UNSUPPORTED_PROPERTY Error Details, one Property Type
+   * per Mandatory Track Property not understood. Only with UNSUPPORTED_EXTENSION.
+   */
+  readonly unsupportedProperties?: readonly bigint[];
+  /**
+   * draft-23 §9.4.2: every Error Detail received, keyed by Type (even Types hold
+   * a vi64, odd Types bytes), including unknown ones a relay may propagate. On
+   * encode, Types other than REDIRECT and UNSUPPORTED_PROPERTY are written as given.
+   */
+  readonly errorDetails?: SetupOptionMap;
+  /**
    * Draft-14 outbound-encoding context (see {@link RequestErrorKind}). Stamped
    * by the session at reject sites; consumed by the draft-14 codec to pick the
    * specific error wire type. Ignored by the draft-16 and draft-18 codecs, and
@@ -401,6 +412,11 @@ export interface PublishNamespace {
 export interface Namespace {
   readonly type: 'NAMESPACE';
   readonly trackNamespaceSuffix: Uint8Array[];
+  /**
+   * draft-23 §9.15: the namespace's parameters. Draft 23 defines none, so this
+   * is empty or absent; drafts before 23 have no Parameters field.
+   */
+  readonly parameters?: Parameters;
 }
 
 /**

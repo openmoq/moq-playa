@@ -12,11 +12,12 @@
 import { varint, type Varint } from '../primitives/varint.js';
 import type { ControlMessage, ClientSetup, ServerSetup, Parameters, Setup, SetupOptionMap } from '../control/messages.js';
 import { SetupParam } from '../control/parameters.js';
-import { SetupOption18, SetupOption22 } from '../control/codes-18.js';
+import { SetupOption18, SetupOption22, SetupOption23 } from '../control/codes-18.js';
+import { parseMaxControlMessageSize } from '../control/control-message-size.js';
 import type { DraftVersion } from '../control/codec.js';
 import { EndpointRole, type EndpointRoleValue, SessionState, type SessionStateValue } from './types.js';
 import { AliasType, parseAuthorizationToken, parseAuthorizationToken18, type AuthorizationToken } from '../control/auth-token.js';
-import { isDraft22, isRequestStreamDraft } from '../versions.js';
+import { DEFAULT_DRAFT_VERSION, isDraft22, isDraft23, isRequestStreamDraft } from '../versions.js';
 
 /**
  * Error thrown for setup handshake violations.
@@ -60,6 +61,8 @@ export interface SetupResult {
   readonly peerMaxAuthTokenCacheSize?: bigint;
   /** draft-22 §9.1.7 MAX_REQUEST_UPDATES from the peer's SETUP (absent = 0, no limit). */
   readonly peerMaxRequestUpdates?: bigint;
+  /** draft-23 §9.1.8 MAX_CONTROL_MESSAGE_SIZE from the peer's SETUP (absent = 65535). */
+  readonly peerMaxControlMessageSize?: bigint;
   /**
    * Parsed AUTHORIZATION_TOKEN parameters from the peer's setup message.
    * These are the raw parsed tokens — caller must process through AuthTokenCache.
@@ -111,7 +114,7 @@ export class SetupGate {
 
   constructor(
     private readonly role: EndpointRoleValue,
-    private readonly draftVersion: DraftVersion = 16,
+    private readonly draftVersion: DraftVersion = DEFAULT_DRAFT_VERSION,
     /**
      * Whether the underlying transport is WebTransport. Per §10.3.1.1/§10.3.1.2,
      * PATH and AUTHORITY MUST NOT be used over WebTransport — a received PATH /
@@ -276,6 +279,7 @@ export class SetupGate {
     let peerMaxAuthTokenCacheSize: bigint | undefined;
     let authTokens: AuthorizationToken[] | undefined;
     let peerMaxRequestUpdates: bigint | undefined;
+    let peerMaxControlMessageSize: bigint | undefined;
 
     for (const [type, values] of options) {
       // §10.3 / §10.3.1: a known singleton Setup Option MUST NOT be repeated
@@ -315,6 +319,25 @@ export class SetupGate {
           }
           if (typeof first === 'bigint') peerMaxRequestUpdates = first;
           break;
+        case SetupOption23.MAX_CONTROL_MESSAGE_SIZE: {
+          // draft-23 §9.1.8.
+          if (!isDraft23(this.draftVersion)) break;
+          if (values.length > 1) {
+            throw new SetupError('Repeated Setup Option MAX_CONTROL_MESSAGE_SIZE (singleton)', 'PROTOCOL_VIOLATION');
+          }
+          if (!(first instanceof Uint8Array)) break;
+          const size = parseMaxControlMessageSize(first);
+          if (size === 'malformed') {
+            throw new SetupError('MAX_CONTROL_MESSAGE_SIZE is not a single integer', 'KEY_VALUE_FORMATTING_ERROR');
+          }
+          if (size === 'too-small') {
+            throw new SetupError('MAX_CONTROL_MESSAGE_SIZE is below the minimum 65535', 'PROTOCOL_VIOLATION');
+          }
+          // We never send more than the default, which every peer accepts, so
+          // the peer's (larger) limit needs no further action.
+          peerMaxControlMessageSize = size;
+          break;
+        }
         // Unknown Setup Options are ignored (§10.3).
       }
     }
@@ -327,6 +350,7 @@ export class SetupGate {
       ...(peerMaxAuthTokenCacheSize !== undefined ? { peerMaxAuthTokenCacheSize } : {}),
       ...(authTokens !== undefined ? { authTokens } : {}),
       ...(peerMaxRequestUpdates !== undefined ? { peerMaxRequestUpdates } : {}),
+      ...(peerMaxControlMessageSize !== undefined ? { peerMaxControlMessageSize } : {}),
     };
   }
 

@@ -19,7 +19,7 @@ import { connectedPair } from '../../webtransport/src/testkit/pair.js';
 import { flush } from '../../webtransport/src/testkit/loopback.js';
 import { MoqtPlayer } from './player.js';
 
-async function boot(draft: 18 | 22) {
+async function boot(draft: 18 | 22 | 23) {
   const pair = await connectedPair(draft);
   const { client, server } = pair;
   const requests = new Map<string, bigint>();
@@ -66,7 +66,7 @@ async function boot(draft: 18 | 22) {
   } };
 }
 
-describe.each([18, 22] as const)('draft-%i request owner cleanup', (draft) => {
+describe.each([18, 22, 23] as const)('draft-%i request owner cleanup', (draft) => {
   it('retires a media FETCH when that FETCH gets GOAWAY', async () => {
     const h = await boot(draft);
     try {

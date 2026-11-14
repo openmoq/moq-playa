@@ -41,7 +41,7 @@ function assertSaneBytesRead(label: string, input: Uint8Array, offset: number, b
   expect(offset + n, `${label}: offset+bytesRead ≤ length (0x${toHex(input)})`).toBeLessThanOrEqual(input.length);
 }
 
-const VERSIONS: DraftVersion[] = [14, 16, 18];
+const VERSIONS: DraftVersion[] = [14, 16, 18, 22, 23];
 
 for (const version of VERSIONS) {
   const codec = createControlCodec(version);

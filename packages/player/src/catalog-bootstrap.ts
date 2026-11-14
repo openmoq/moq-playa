@@ -43,6 +43,7 @@
  * @module
  */
 
+import { isDraft22, type DraftVersion } from '@openmoq/transport';
 import type { DataStreamTerminal } from '@openmoq/webtransport';
 import type { CatalogState } from '@openmoq/msf';
 
@@ -177,7 +178,7 @@ interface Attempt {
 
 export class CatalogBootstrap {
   private readonly cb: CatalogBootstrapCallbacks;
-  private readonly draft: 14 | 16 | 18 | 22;
+  private readonly draft: DraftVersion;
 
   private _phase: BootstrapPhase = 'idle';
   private attemptSeq = 0;
@@ -224,7 +225,7 @@ export class CatalogBootstrap {
    *  degradation. */
   private readonly strict: boolean;
 
-  constructor(callbacks: CatalogBootstrapCallbacks, options: { draft: 14 | 16 | 18 | 22; startMode?: 'joining' | 'legacy'; strict?: boolean }) {
+  constructor(callbacks: CatalogBootstrapCallbacks, options: { draft: DraftVersion; startMode?: 'joining' | 'legacy'; strict?: boolean }) {
     this.cb = callbacks;
     this.draft = options.draft;
     this.startMode = options.startMode ?? 'joining';
@@ -309,7 +310,7 @@ export class CatalogBootstrap {
   private resolveEmptyFill(): void {
     const attempt = this.attempt;
     // `largest` is undefined until SUBSCRIBE_OK; null means it carried none.
-    if (this.draft !== 22 || this.largest !== null) return;
+    if (!isDraft22(this.draft) || this.largest !== null) return;
     if (!attempt || attempt.kind !== 'joining' || attempt.cancelled) return;
     this.cb.log('[catalog-bootstrap] SUBSCRIBE_OK has no Largest Object: the track is empty, no fill will open');
     this.onFetchError(attempt.id, 'invalid-range');

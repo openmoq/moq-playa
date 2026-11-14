@@ -4,7 +4,7 @@ import { MoqtConnection } from './adapter.js';
 import { createLoopback } from './testkit/loopback.js';
 import { TransportSim } from './testkit/stream-sim.js';
 
-describe.each([18, 22] as const)('draft %i initial SETUP observations', draft => {
+describe.each([18, 22, 23] as const)('draft %i initial SETUP observations', draft => {
   it('observes the actual outgoing and incoming SETUP once on both endpoints', async () => {
     const { a, b } = createLoopback(); const client = new MoqtConnection(draft), server = new MoqtConnection(draft, {role:'server'});
     const left = vi.fn(), right = vi.fn();const removeLeft=client.observeQlogEvents(left), removeRight=server.observeQlogEvents(right);

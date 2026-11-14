@@ -20,7 +20,7 @@
  */
 
 import type { DraftVersion } from '../versions.js';
-import { isRequestStreamDraft } from '../versions.js';
+import { DEFAULT_DRAFT_VERSION, isRequestStreamDraft } from '../versions.js';
 
 /** How a receiver validates an inbound Request ID. */
 export type InboundValidation = 'strict-sequence' | 'parity-and-duplicate';
@@ -58,8 +58,8 @@ const REORDERED_CREDITED: RequestPolicy = {
 
 /**
  * Resolve the {@link RequestPolicy} for a draft version.
- * @param version Draft version (default: 16).
+ * @param version Draft version (default: {@link DEFAULT_DRAFT_VERSION}).
  */
-export function getRequestPolicy(version: DraftVersion = 16): RequestPolicy {
+export function getRequestPolicy(version: DraftVersion = DEFAULT_DRAFT_VERSION): RequestPolicy {
   return isRequestStreamDraft(version) ? STREAM_LIMITED : version === 16 ? REORDERED_CREDITED : CREDITED;
 }

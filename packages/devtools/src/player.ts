@@ -156,7 +156,7 @@ export function installPlayerDiagnostics(target: PlayerDiagnosticSource | Player
     emit({ kind: 'session', sessionId: context.id, state: shown, transport: context.binding.kind, endpoint: context.endpoint,
       draft, draftEvidence: context.binding.protocol === expectedProtocol ? 'transport' : 'configured', offeredProtocols: [], negotiatedProtocol: context.binding.protocol,
       setupDurationMs: context.setupDuration,
-      maxRequestId: draft === 18 || draft === 22 ? { value: null, unavailable: 'not-applicable' }
+      maxRequestId: draft === 18 || draft === 22 || draft === 23 ? { value: null, unavailable: 'not-applicable' }
         : state === 'established' || state === 'draining' ? { value: String(context.connection.session.peerMaxRequestId), unavailable: null }
           : { value: null, unavailable: 'not-observed' } });
   };

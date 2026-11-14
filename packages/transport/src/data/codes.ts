@@ -129,6 +129,14 @@ export const FetchSpecialFlags = {
   END_NON_EXISTENT: 0x8c,
   /** End of Unknown Range - object status unknown. */
   END_UNKNOWN: 0x10c,
+  /** draft-22+: End of Timed-Out Range - the objects' delivery timeout expired. */
+  END_TIMED_OUT: 0x20c,
+  /** draft-23 §11.4.2: End of Gone Range - the original publisher cannot deliver them. */
+  END_GONE: 0x40c,
+  /** draft-23 §11.4.2.2: End of Group - the prior Object is the last in its Group. */
+  END_OF_GROUP: 0x80,
+  /** draft-23 §11.4.2.2: End of Track - the prior Object is the last in the Track. */
+  END_OF_TRACK: 0x81,
 } as const;
 
 /**

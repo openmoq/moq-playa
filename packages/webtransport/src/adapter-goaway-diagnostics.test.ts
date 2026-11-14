@@ -30,7 +30,7 @@ function requestStream(conn: MoqtConnection, id: bigint) {
   return ctx!;
 }
 
-describe.each([18, 22] as const)('draft-%i diagnostic isolation', (version) => {
+describe.each([18, 22, 23] as const)('draft-%i diagnostic isolation', (version) => {
   it('rejects a forbidden client URI even when qlog throws', async () => {
     const { client, server, b } = await connectedPair(version);
     const notices: GoawayNotice[] = [];
