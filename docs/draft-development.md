@@ -1,9 +1,10 @@
 # Transport Draft Development
 
-Supported transport drafts are 14, 16, 18, 22 and 23. The default remains draft
-16 (`DEFAULT_DRAFT_VERSION` in `@openmoq/transport`); drafts 22 and 23 are
-opt-in. Draft 22 replaced the experimental draft-21 implementation. Future drafts should develop on a separate
-branch until their integration is reviewed.
+Supported transport drafts are 14, 16, 18 and 22. The default remains draft 16
+(`DEFAULT_DRAFT_VERSION` in `@openmoq/transport`); draft 22 is opt-in.
+Draft 23 is opt-in, not tested against an independent draft-23 peer.
+Draft 22 replaced the experimental draft-21 implementation. Future drafts should
+develop on a separate branch until their integration is reviewed.
 
 Drafts 22 and 23 share the draft-18 codec, session and adapter. Draft-23 rules
 branch on `isDraft23`; checks written as `isDraft22` (draft 22 or later) cover
@@ -61,3 +62,33 @@ implementation alone: re-encoded draft-22 vectors plus vectors built from the
 draft text. They pin the encoding but are not interoperability evidence. Before
 a release that depends on draft 23, test against an independent draft-23 peer
 and record the result here.
+
+## Draft-23 Limitations
+
+The following are not implemented on draft 23:
+
+- Fills on PUBLISH and SUBSCRIBE_TRACKS. Incoming PUBLISH fill streams are
+  discarded with STOP_SENDING / CANCELLED (0x1), before or after PUBLISH_OK;
+  the live PUBLISH proceeds without its fill (§3.4.1). SUBSCRIBE_TRACKS fill
+  requests are refused by the public API's authorization-only options: it has
+  no fill or arbitrary-parameters input. Custom transports must supply the
+  existing `createStreamError` hook to encode the cancellation code.
+- Timed gaps for FILL_TIMEOUT (§9.19.5). The example relay refuses requests
+  requiring it to wait for unavailable Objects; cached requested ranges can
+  still be served.
+- UNSUPPORTED_PROPERTY details on our own refusals (§9.4.2.2, a SHOULD).
+- Relay upstream eligibility checks for LARGEST_OBJECT (§7.5).
+- Mandatory-property propagation in the relay (§3.7).
+- The persistent existence-contradiction cache (§12.1, item 10).
+- PUBLISH_SKIPPED (§9.18).
+- Seek, the history-live bridge, quality and DevTools on draft 23.
+
+A received SUBSCRIBE_TRACKS_ID is retained as a PUBLISH parameter but is not
+used to look up the originating request. Sections 3.6 and 9.19.21 specify its
+origin and value; neither attaches a receiver-side MUST to such a lookup.
+Duplicate PUBLISH_NAMESPACE announcements are tracked independently: withdrawing
+one leaves the namespace published until the last is withdrawn (§4.1).
+
+The raw qlog REQUEST_OK normalization remains a follow-up. The End of Range
+Payload Length question remains open (Figure 29 against §11.4.2); we keep
+draft 22's marker-only form as described above.
