@@ -6,7 +6,7 @@ import { Relay, type RelayOptions } from './relay.js';
 import { createLoopback, flush } from '../../../packages/webtransport/src/testkit/loopback.js';
 import { object as encodeObject } from '../../../packages/webtransport/src/testkit/object-reception.js';
 const ns = [new TextEncoder().encode('demo')], name = new TextEncoder().encode('objects');
-async function pair(draft: 16 | 18 | 22, relay?: Relay) {
+async function pair(draft: 16 | 18 | 22 | 23, relay?: Relay) {
   const { a, b } = createLoopback();
   const resetReasons: unknown[] = [];
   const resetWriters: WritableStreamDefaultWriter<Uint8Array>[] = [];
@@ -25,7 +25,7 @@ async function pair(draft: 16 | 18 | 22, relay?: Relay) {
   await Promise.all([client.connect(a, { maxRequestId: varint(1000n) }), server.connect(b, { maxRequestId: varint(1000n) })]);
   return { client, server, a, b, resetReasons, resetWriters };
 }
-async function fixture(draft: 16 | 18 | 22 = 18, options: RelayOptions = {}, advertisedHead?: { group: bigint; object: bigint }, doneEffect?: 'throw' | 'close', trackProperties?: TrackProperties, beforePublish?: (peer: Awaited<ReturnType<typeof pair>>) => Promise<void>) {
+async function fixture(draft: 16 | 18 | 22 | 23 = 18, options: RelayOptions = {}, advertisedHead?: { group: bigint; object: bigint }, doneEffect?: 'throw' | 'close', trackProperties?: TrackProperties, beforePublish?: (peer: Awaited<ReturnType<typeof pair>>) => Promise<void>) {
   const relay = new Relay(options), up = await pair(draft, relay), down = await pair(draft, relay);
   const peers = [up, down];
   up.server.onMessage = value => { if (value.type === 'PUBLISH_DONE') {
@@ -595,7 +595,7 @@ for (const draft of [18, 22] as const) for (const mode of ['complete', 'reset', 
   });
 }
 
-async function stallHistoryObject(f: Awaited<ReturnType<typeof fixture>>, draft: 18 | 22, peer = f.up) {
+async function stallHistoryObject(f: Awaited<ReturnType<typeof fixture>>, draft: 18 | 22 | 23, peer = f.up) {
   const writer = (await peer.a.createUnidirectionalStream()).getWriter();
   await writer.write(encodeSubgroupHeader18({ typeByte: 0x54, trackAlias: 9n, groupId: 8n, subgroupId: 0n,
     publisherPriority: 128, hasExtensions: false, isEndOfGroup: false, isFirstObjectInSubgroup: true }));
@@ -847,4 +847,41 @@ for (const draft of [18, 22] as const) it(`owned history G3 draft${draft} cancel
     await vi.advanceTimersByTimeAsync(0); await flush(256);
     expect(result.data).toEqual(['8/0']); expect(pendingHistoryCount(f.relay)).toBe(0);
   } finally { await Promise.all([peer.client.close(), peer.server.close()]); await f.close(); vi.useRealTimers(); }
+});
+
+for (const draft of [18, 22, 23] as const) {
+  it(`draft${draft} cached FETCH subrange excludes the next Object`, async () => {
+    const f = await fixture(draft);
+    try {
+      await f.publish(4n, [0n, 1n, 2n]);
+      const result = await f.fetch(4n, 4n, 2n); await f.settled();
+      expect(result.data).toEqual(['4/0', '4/1']); expect(result.terminal).toEqual(['fin']);
+    } finally { await f.close(); }
+  });
+  for (const timeout of [undefined, 0n, 100n]) it(`draft${draft} cached prefix excludes adjacent pending Object with timeout ${timeout}`, async () => {
+    const f = await fixture(draft);
+    try {
+      const stalled = await stallHistoryObject(f, draft);
+      const result = await f.fetch(8n, 8n, 1n, 0n, 'ascending', undefined, timeout);
+      expect(result.data).toEqual(['8/0']); expect(result.terminal).toEqual(['fin']);
+      await stalled.writer.write(stalled.remainder); await f.settled();
+    } finally { await f.close(); }
+  });
+  it(`draft${draft} FETCH includes maximum Group and Object boundaries`, async () => {
+    const max = (1n << 64n) - 1n, f = await fixture(draft);
+    try {
+      await f.publish(max, [max - 1n, max]);
+      const result = await f.fetch(max, max, 0n, max - 1n); await f.settled();
+      expect(result.data).toEqual([`${max}/${max - 1n}`, `${max}/${max}`]);
+      expect(result.terminal).toEqual(['fin']);
+    } finally { await f.close(); }
+  });
+}
+it('draft23 relative FETCH filters remain refused', async () => {
+  const f = await fixture(23);
+  try {
+    await f.publish(4n, [0n]);
+    const result = await f.fetch(0n, 9n, 0n, 0n, 'ascending', encodeSubscriptionFilter({ type: 'NextGroupStart' }, 23));
+    await f.settled(); refused(result);
+  } finally { await f.close(); }
 });

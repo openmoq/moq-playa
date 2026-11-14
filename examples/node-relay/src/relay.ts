@@ -403,8 +403,8 @@ export class Relay {
       // Draft 22 and later carry an inclusive End; earlier drafts one past it.
       if (!isDraft22(conn.draftVersion)) end = { group: end.group, object: end.object === 0n ? MAX_VI64 : end.object - 1n };
       const filter = fetch.parameters.get(0x21n)?.[0];
-      if (conn.draftVersion === 22 && filter instanceof Uint8Array) {
-        const window = resolveFillWindow(decodeSubscriptionFilter(filter, 22), head);
+      if (isDraft22(conn.draftVersion) && filter instanceof Uint8Array) {
+        const window = resolveFillWindow(decodeSubscriptionFilter(filter, conn.draftVersion), head);
         if (!window?.end || window.end.object === undefined) throw new Error('empty relative range');
         start = window.start; end = { group: window.end.group, object: window.end.object };
       }

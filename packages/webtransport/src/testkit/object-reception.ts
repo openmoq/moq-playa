@@ -18,7 +18,7 @@ import { MoqtConnection } from '../adapter.js';
 import type { ObjectReceptionEvent, ObjectReceptionOptions } from '../object-reception.js';
 import { TransportSim, flush, type SimStream } from './stream-sim.js';
 
-export type Draft = 14 | 16 | 18 | 22;
+export type Draft = 14 | 16 | 18 | 22 | 23;
 export const drafts = [14, 16, 18, 22] as const;
 export const legacy = (d: Draft): d is 14 | 16 => d === 14 || d === 16;
 export const ALIAS = 77n, GROUP = 5n, SUBGROUP = 2n, PRIORITY = 128;
