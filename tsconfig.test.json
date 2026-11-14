@@ -127,6 +127,8 @@
     "examples/player/view-selection.test.ts",
     "examples/player/playback-lifecycle.test.ts",
     "examples/player/main.ts",
+    "examples/player/msf-link.test.ts",
+    "examples/shared/msf-url.test.ts",
     "examples/player/startup-lifecycle.test.ts",
     "examples/player/startup-refusal-sdk.loopback.test.ts",
     "examples/player/startup-cancellation.test.ts",

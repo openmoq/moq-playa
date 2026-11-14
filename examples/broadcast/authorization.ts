@@ -1,4 +1,5 @@
 import type { ConnectionAuthorization } from '@openmoq/webtransport';
+import { catAuthorization, catTokenType } from '../shared/cat-authorization.js';
 
 export interface BroadcastAuthorizationSettings {
   enabled: boolean;
@@ -10,10 +11,7 @@ export interface BroadcastAuthorizationSettings {
 export function createBroadcastAuthorization(settings: BroadcastAuthorizationSettings):
   Omit<ConnectionAuthorization, 'relayUrl'> | undefined {
   if (!settings.enabled) return undefined;
-  if (settings.profile !== 'cat4moq' && settings.profile !== 'moqx-compat') {
-    throw new Error('Invalid authorization profile');
-  }
-  const tokenType = settings.profile === 'cat4moq' ? 1n : 16n;
+  const tokenType = catTokenType(settings.profile);
   const text = settings.token.trim().replace(/^base64:/, '');
   // Check the encoded size before decoding an untrusted pasted credential.
   if (!text || text.length > 4 * Math.ceil(32768 / 3) ||
@@ -22,6 +20,5 @@ export function createBroadcastAuthorization(settings: BroadcastAuthorizationSet
   }
   const binary = atob(text);
   if (binary.length > 32768 || btoa(binary) !== text) throw new Error('Invalid CAT token');
-  const value = Uint8Array.from(binary, char => char.charCodeAt(0));
-  return { getTokens: () => [{ tokenType, value: Uint8Array.from(value) }] };
+  return catAuthorization(tokenType, Uint8Array.from(binary, char => char.charCodeAt(0)));
 }
