@@ -892,6 +892,8 @@ export class MoqtConnection {
       for (const e of parked) clearTimeout(e.timer);
     }
     this.pendingJoinFetches.clear();
+    for (const record of this.publishFillDiscards.values()) record.cancelTimer?.();
+    this.publishFillDiscards.clear();
     // Receiver terminal tracker (tombstone TTL timers) + seen counts.
     for (const alias of [...this.terminatedAliases.keys()]) this.clearTerminatedAlias(alias);
     this.aliasStreamsSeen.clear();
@@ -3350,7 +3352,15 @@ export class MoqtConnection {
       get initialTrackProperties() { return copyInitialTrackProperties(initial); } };
   }
 
+  // Draft 23 §§3.4.1, 9.8–9.9: a fill header can arrive after PUBLISH retirement.
+  private readonly publishFillDiscards = new Map<bigint, { seen: boolean; cancelTimer?: () => void }>();
+
   private settlePublicationLifetimes(): void {
+    for (const [id, record] of this.publishFillDiscards) {
+      if (!record.cancelTimer && !this.session.getIncomingSubscription(id)) {
+        record.cancelTimer = this.armGuardTimer(this.terminatedAliasTtlMs, () => this.publishFillDiscards.delete(id));
+      }
+    }
     for (const [id, life] of this.publishLifetimes) {
       if (this._terminated || life.owner.isTerminated || this.session.getIncomingSubscription(id) !== life.owner) life.finish();
     }
@@ -5531,6 +5541,7 @@ export class MoqtConnection {
     actions: SessionOutboundAction[],
     finalize = false,
   ): Promise<boolean> {
+    this.settlePublicationLifetimes();
     if (!isRequestStreamDraft(this.session.draftVersion)) return false;
     const ctx = this.inboundRequestContexts.get(requestId);
     if (!ctx) return false;
@@ -8293,6 +8304,10 @@ export class MoqtConnection {
       this.notifyClose(closeAction, 'PUBLISH rejected');
       return;
     }
+    if (isDraft23(this.session.draftVersion) && pub.parameters.has(FILL_PARAMETERS)) {
+      this.publishFillDiscards.set(requestId, { seen: false });
+      this.settlePublicationLifetimes();
+    }
     // §5.1: the session may reject a duplicate PUBLISH with a per-request
     // REQUEST_ERROR. draft-18 has no control stream — write it on THIS request's
     // own bidi stream and seal, WITHOUT binding or surfacing via onPublish.
@@ -8797,6 +8812,18 @@ export class MoqtConnection {
       } else {
         const header = headerResult.header as FetchHeader;
         const fetchReqId = header.requestId as bigint;
+        const fillDiscard = this.publishFillDiscards.get(fetchReqId);
+        if (fillDiscard) {
+          if (fillDiscard.seen) throw new ProtocolViolationError('Duplicate PUBLISH fill FETCH_HEADER');
+          fillDiscard.seen = true;
+          // Draft 23 §3.4.1: a subscriber can cancel a fill fetch stream with
+          // STOP_SENDING without affecting the subscription. §12.5 defines CANCELLED (0x1).
+          const cause = new Error('PUBLISH fills are not supported');
+          const reason = this.transport?.createStreamError?.(1, cause) ?? cause;
+          await this.discardLocalReader(streamId, reader, reason);
+          this.onStreamClosed?.(streamId, undefined, 'local-discard');
+          return;
+        }
         if (this.session.isFillResponsePending(fetchReqId)) {
           if (!await this.waitForFillResponse(fetchReqId, streamId)) {
             this.session.cancelFillRequest(fetchReqId);
