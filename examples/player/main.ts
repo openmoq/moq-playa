@@ -74,7 +74,13 @@ let msfRefusal: string | undefined;
 try { msfLink = readMsfLink(window.location.hash, window.location.search); }
 catch (error) { msfRefusal = (error as Error).message; }
 // A fragment-only change does not load the page again by itself.
-window.addEventListener('hashchange', () => window.location.reload());
+window.addEventListener('hashchange', (event) => {
+    const oldHash = new URL(event.oldURL).hash;
+    const newHash = new URL(event.newURL).hash;
+    const oldMsf = /^#msf:/i.test(oldHash) ? oldHash : '';
+    const newMsf = /^#msf:/i.test(newHash) ? newHash : '';
+    if (oldMsf !== newMsf) window.location.reload();
+});
 
 const namespaceArg: string | readonly string[] = msfLink?.namespace ?? queryNamespaceArg;
 

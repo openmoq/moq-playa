@@ -19,3 +19,26 @@ it.each(['?ns=live', '?ns=other', '?nsField=other', '?ns=other&nsField=elsewhere
     await f.close();
   }
 });
+
+it.each([
+  ['#top', '#bottom', 0],
+  ['', '#top', 0],
+  ['#msf:live--catalog', '#msf:live--catalog', 0],
+  ['#top', '#msf:live--catalog', 1],
+  ['#msf:live--catalog', '#top', 1],
+  ['#msf:live--catalog', '#msf:other--catalog', 1],
+  ['#msf:live--catalog&c4m=YQ', '#msf:live--catalog&c4m=Yg', 1],
+  ['#msf:live', '#msf:live--catalog', 1],
+  ['#MSF:live--catalog', '#top', 1],
+])('reloads only for an MSF link change: %s → %s', async (oldHash, newHash, count) => {
+  const f = fixture(undefined, { hash: oldHash, search: '' });
+  try {
+    expect(f.hashListeners).toHaveLength(1);
+    for (const listener of f.hashListeners) {
+      listener({ oldURL: `https://player.test/${oldHash}`, newURL: `https://player.test/${newHash}` });
+    }
+    expect(f.reload).toHaveBeenCalledTimes(count);
+  } finally {
+    await f.close();
+  }
+});
