@@ -27,6 +27,8 @@ it.each(([18, 22] as const).flatMap(draft => (['pause', 'narrow', 'complete', 'i
     viewer.onDataStream = (_id, message) => { if (message.type === 'subgroup') headers.push(message.header); };
     viewer.onStreamClosed = (_id, _error, terminal) => terminals.push(terminal);
     try {
+      relay.setupConnection(ingress);
+      relay.setupConnection(egress);
       await Promise.all([origin.connect(up.a), ingress.connect(up.b), viewer.connect(down.a), egress.connect(down.b)]);
       const published = await origin.publish(nsBytes([...DEMO_NAMESPACE]), te(DEMO_TRACK), 41n);
       await flush(128);
@@ -96,6 +98,8 @@ it.each(([18, 22] as const).flatMap(draft => (['open', 'queued-send'] as const).
     viewer.onDataStream = (id, message) => { if (message.type === 'subgroup') headers.set(id, message.header); };
     viewer.onStreamClosed = (id, _error, terminal) => { const h = headers.get(id); if (h) terminals.push([h.groupId, terminal]); };
     try {
+      relay.setupConnection(ingress);
+      relay.setupConnection(egress);
       await Promise.all([origin.connect(up.a), ingress.connect(up.b), viewer.connect(down.a), egress.connect(down.b)]);
       await origin.publish(nsBytes([...DEMO_NAMESPACE]), te(DEMO_TRACK), 41n); await flush(128);
       const sub = await viewer.subscribeTrack(nsBytes([...DEMO_NAMESPACE]), te(DEMO_TRACK));

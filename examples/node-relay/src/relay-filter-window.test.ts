@@ -60,6 +60,7 @@ async function scenario(filter: TrackSubscribeOptions['filter'], draft: Draft = 
   server.setLargestLocationProvider(requestId => relay.currentLargestFor(server, requestId));   // as examples/node-relay/src/server.ts:147
   const received: Loc[] = [];
   try {
+    relay.setupConnection(server);
     await Promise.all([client.connect(a), server.connect(b, draft === 16 ? { maxRequestId: varint(1000n) } : {})]);
     const publish: IncomingPublish = { ...publicationMetadata(), requestId: 1n, trackNamespace: nsBytes([...DEMO_NAMESPACE]), trackName: te(DEMO_TRACK),
       trackAlias: ALIAS, onObject: null, onSubgroupClosed: null };

@@ -41,6 +41,7 @@ async function setup(options: RelayOptions = {}, draft: Draft = 18, provider?: P
   else if (provider !== 'none') server.setLargestLocationProvider(provider);
   const control: Array<Record<string, unknown>> = [];
   client.onMessage = m => { control.push(m as unknown as Record<string, unknown>); };
+  relay.setupConnection(server);
   await Promise.all([client.connect(a), server.connect(b, draft === 16 ? { maxRequestId: varint(1000n) } : {})]);
   const publish: IncomingPublish = { ...publicationMetadata(), requestId: 1n, trackNamespace: nsBytes([...DEMO_NAMESPACE]), trackName: te(DEMO_TRACK),
     trackAlias: ALIAS, onObject: null, onSubgroupClosed: null };

@@ -55,6 +55,7 @@ async function scenario(draft: Draft, options: Options) {
   }) as typeof server.acceptSubscribe;
   const subscribed: string[] = [], fetched: string[] = [];
   try {
+    relay.setupConnection(server);
     await Promise.all([client.connect(a), server.connect(b, draft === 16 ? { maxRequestId: varint(1000n) } : {})]);
     await acceptTestPublication(relay, publish);
     // History: group 5 Objects 0 and 2 (separate subgroups) are stored before the SUBSCRIBE exists. Largest = {5,2}.

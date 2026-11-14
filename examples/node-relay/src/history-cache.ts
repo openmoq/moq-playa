@@ -86,18 +86,23 @@ export class HistoryCache {
   forgetSource(source: object): void { for (const group of this.groups.values()) group.carriers.delete(source); }
 
   /** Iterate retained IDs, never the potentially enormous requested ID space. */
-  plan(start: Location, end: Location): CachedObject[] | undefined {
+  plan<T extends Pick<CachedObject, 'groupId' | 'objectId'> = never>(start: Location, end: Location, pending: T[] = []): (CachedObject | T)[] | undefined {
     if (compare(start.group, end.group) > 0 || (start.group === end.group && start.object > end.object)) return;
-    const rows: CachedObject[] = [];
+    const rows: (CachedObject | T)[] = [];
     let nextGroup = start.group;
-    for (const [id, group] of [...this.groups].sort(([a], [b]) => compare(a, b))) {
+    const ids = new Set([...this.groups.keys(), ...pending.map(row => row.groupId)]);
+    for (const id of [...ids].sort(compare)) {
+      const group = this.groups.get(id);
       if (id < start.group || id > end.group) continue;
       if (id !== nextGroup++) return;
       let next = id === start.group ? start.object : 0n;
-      const last = id === end.group ? end.object : group.final;
+      const last = id === end.group ? end.object : group?.final;
       if (last === undefined) return;
-      const through = group.final !== undefined && group.final < last ? group.final : last;
-      for (const row of [...group.objects.values()].sort((a, b) => compare(a.objectId, b.objectId))) {
+      const through = group?.final !== undefined && group.final < last ? group.final : last;
+      // Cached bytes win over reception metadata; pending entries prove only exact IDs.
+      const objects = new Map<bigint, CachedObject | T>(pending.filter(row => row.groupId === id).map(row => [row.objectId, row]));
+      for (const row of group?.objects.values() ?? []) objects.set(row.objectId, row);
+      for (const row of [...objects.values()].sort((a, b) => compare(a.objectId, b.objectId))) {
         if (row.objectId < next || row.objectId > through) continue;
         if (row.objectId !== next++) return;
         rows.push(row);

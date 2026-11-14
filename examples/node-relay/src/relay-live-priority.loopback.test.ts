@@ -11,6 +11,8 @@ it.each(([18,22] as const).flatMap(draft => (['explicit', 'inherited', 'immutabl
  egress.onSubscribe=(id,ns,name)=>{void relay.handleSubscribe(egress,id,ns,name)};
  egress.onFetch=(id,f)=>{void relay.handleFetch(egress,id,f)};
  try{
+ relay.setupConnection(ingress);
+ relay.setupConnection(egress);
  await Promise.all([origin.connect(up.a),ingress.connect(up.b),viewer.connect(down.a),egress.connect(down.b)]);
  await origin.publish(ns,name,9n, mode === 'immutable' ? {trackProperties: new Map([[0x0bn, [Uint8Array.of(14, 7)]]])} : mode === 'inherited' ? {trackProperties: new Map([[0x0en, [7n]]])} : undefined);await flush(128);
  await viewer.subscribeTrack(ns,name,{onObject:o=>{if(o.kind==='data')live.push(o.publisherPriority!)},filter:{type:'AbsoluteStart',startGroup:4n,startObject:0n}});await flush(128);
@@ -29,6 +31,8 @@ for (const priority of [42, 128]) for (const omittedFirst of [false, true]) {
   const ns=[new TextEncoder().encode('demo')], name=new TextEncoder().encode('objects'), priorities:number[]=[];
   ingress.onPublish=p=>{void relay.handlePublish(ingress,p)}; egress.onFetch=(id,f)=>{void relay.handleFetch(egress,id,f)};
   try {
+   relay.setupConnection(ingress);
+   relay.setupConnection(egress);
    await Promise.all([origin.connect(up.a),ingress.connect(up.b),viewer.connect(down.a),egress.connect(down.b)]);
    const id=await origin.publish(ns,name,9n,{trackProperties:new Map([[0x0en,[BigInt(priority)]]])}); await flush(128);
    for (const omitted of [omittedFirst,!omittedFirst]) {
@@ -47,6 +51,7 @@ it('a duplicate with a different resolved publisher priority retires the source'
  Object.assign(up.b,{createStreamError:(streamErrorCode:number)=>Object.assign(new Error('reset'),{streamErrorCode})});
  ingress.onPublish=p=>{void relay.handlePublish(ingress,p)};
  try {
+  relay.setupConnection(ingress);
   await Promise.all([origin.connect(up.a),ingress.connect(up.b)]);
   const id=await origin.publish([new TextEncoder().encode('demo')],new TextEncoder().encode('objects'),9n); await flush(128);
   for (const priority of [7,2]) {

@@ -65,13 +65,36 @@ Namespace registration defaults to the `['demo']` tuple. An embedded relay can
 set `RelayOptions.registeredNamespaces` to accept additional exact tuples;
 namespace fields and track names are compared byte-for-byte.
 
-The relay answers standalone and joining **FETCH** on drafts 18/22 from bounded
-history. It refuses the request before FETCH_OK unless every requested Location
-is retained or proven absent beyond a data-only END_OF_GROUP subgroup's FIN.
-Missing or evicted Objects have unknown status. Joining FETCH uses the saved
-Joining Location, not the head at FETCH time. Responses retain their admission
-snapshot, honor group order, and cap their endpoint at the current Largest Location.
+The relay answers **FETCH** on drafts 18/22, including Joining FETCH on draft 18,
+from bounded history. Without FILL_TIMEOUT, it serves cached Objects in order
+and waits at an in-flight Object for cache admission from any publisher or carrier.
+Completed reception metadata is kept only while a reserved FETCH owns it.
+A completed reception is excluded from new plans but does not wake an accepted
+wait: the SDK may still be holding its delivery. A later subgroup Object delivered by the
+same publication proves that an earlier completed Object was delivered or dropped.
+If that proof leaves the awaited Object unavailable, or its reception is interrupted,
+the relay resets the FETCH with UNKNOWN_OBJECT_STATUS (0x6). There is no relay wait timer.
+
+Embedders must call `relay.setupConnection(conn)` before `conn.connect(...)` so
+Objects that start before PUBLISH still receive delivery-order stamps. Missing or
+late setup is logged and refuses PUBLISH with INTERNAL_ERROR (0x0), Retry Interval 0.
+Datagrams and synthesized END_OF_GROUP status do not provide this proof; such waits settle
+on the next subgroup Object or at publication end.
+
+Requests carrying FILL_TIMEOUT never wait: they are refused before FETCH_OK
+unless every requested Location is retained or proven absent beyond a data-only
+END_OF_GROUP subgroup's FIN. Missing or evicted Objects that are not in flight
+are likewise refused. Fully cached requests with FILL_TIMEOUT remain supported.
+Joining FETCH uses the saved Joining Location, not the head at FETCH time.
+Responses honor group order and cap their endpoint at the current Largest Location.
 Drafts 14/16 return NOT_SUPPORTED for FETCH; live subscriptions continue.
+
+A cancelled request, or one whose requester session closed, keeps one history
+response slot until upstream delivery proof, interruption, or publication end or
+retirement wakes it. It then checks ownership and stops without sending. This accepted
+limitation is bounded by `maxActiveHistoryRequests` (default 32). An SDK
+FETCH-closed notification and Unknown/Timed-Out gap sending (0x10C/0x20C) remain
+follow-ups; gap sending would allow full FILL_TIMEOUT support.
 
 Every SUBSCRIBE delivers only newly received Objects. Arrivals during acceptance
 are queued within the configured object and byte bounds. Overflow ends that

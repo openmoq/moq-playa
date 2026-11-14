@@ -52,6 +52,7 @@ async function scenario(draft: Draft, held: Held, mode: 'accept' | 'reject' | 'c
     return result;
   }) as typeof server.acceptSubscribe;
   try {
+    relay.setupConnection(server);
     await Promise.all([client.connect(a), server.connect(b, draft === 16 ? { maxRequestId: varint(1000n) } : {})]);
     await acceptTestPublication(relay, publish);
     publish.onObject?.(data(draft, 5n, 0n, 0n)); publish.onObject?.(data(draft, 5n, 2n, 2n));   // history; Largest {5,2}

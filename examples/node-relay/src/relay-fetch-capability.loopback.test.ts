@@ -38,6 +38,7 @@ it.each(([14, 16, 18] as const).flatMap(draft => (['standalone', 'joining'] as c
   const accept = vi.spyOn(server, 'acceptFetch');
   const open = vi.spyOn(server, 'openFetchStream');
   try {
+    relay.setupConnection(server);
     await Promise.all([client.connect(a), server.connect(b, { maxRequestId: varint(1000n) })]);
     const sub = await client.subscribeTrack(nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK), {
       filter: { type: 'LargestObject' },

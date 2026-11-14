@@ -5,12 +5,13 @@ import { Relay } from './relay.js';
 import { createLoopback, flush } from '../../../packages/webtransport/src/testkit/loopback.js';
 import { varint } from '@openmoq/transport';
 const ns = [new TextEncoder().encode('demo')], name = new TextEncoder().encode('objects');
-async function pair(draft: 18 | 22) {
+async function pair(draft: 18 | 22, relay: Relay) {
   const { a, b } = createLoopback(); const client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' });
+  relay.setupConnection(server);
   await Promise.all([client.connect(a, { maxRequestId: varint(1000n) }), server.connect(b, { maxRequestId: varint(1000n) })]); return { client, server };
 }
 async function fixture(draft: 18 | 22) {
-  const relay = new Relay(), old = await pair(draft), viewer = await pair(draft); const peers = [old, viewer], tasks: Promise<void>[] = [];
+  const relay = new Relay(), old = await pair(draft, relay), viewer = await pair(draft, relay); const peers = [old, viewer], tasks: Promise<void>[] = [];
   old.server.onPublish = pub => { tasks.push(relay.handlePublish(old.server, pub)); };
   viewer.server.onFetch = (id, request) => { tasks.push(relay.handleFetch(viewer.server, id, request)); };
   await old.client.publish(ns, name, 9n); await flush(128); await Promise.all(tasks);
@@ -24,7 +25,7 @@ async function fixture(draft: 18 | 22) {
     await flush(128); return { data, terminal, messages };
   };
   const replacement = async (properties?: TrackProperties, mutate?: (pub: IncomingPublish, conn: MoqtConnection) => void, clearMessage = false) => {
-    const peer = await pair(draft); peers.push(peer);
+    const peer = await pair(draft, relay); peers.push(peer);
     if (clearMessage) peer.server.onMessage = m => { if (m.type === 'PUBLISH') m.trackProperties?.clear(); };
     const accept = vi.spyOn(peer.server, 'acceptSubscribe'), reject = vi.spyOn(peer.server, 'rejectSubscribe');
     const work: Promise<void>[] = [];

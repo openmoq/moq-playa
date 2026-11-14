@@ -13,6 +13,8 @@ it.each(([14,16,18,22] as const).flatMap(draft => (['missing-prefix', 'evicted-p
  egress.onSubscribe=(id,ns,name)=>{void relay.handleSubscribe(egress,id,ns,name)};
  viewer.onStreamClosed=(_id,_error,terminal)=>terms.push(terminal);
  try{
+ relay.setupConnection(ingress);
+ relay.setupConnection(egress);
  await Promise.all([origin.connect(up.a,{maxRequestId:varint(1000n)}),ingress.connect(up.b,{maxRequestId:varint(1000n)}),viewer.connect(down.a,{maxRequestId:varint(1000n)}),egress.connect(down.b,{maxRequestId:varint(1000n)})]);
  await origin.publish(ns,name,9n);await flush(128);
  const sid=await origin.openSubgroup(9n,4n,0n,{endOfGroup:true});

@@ -6,7 +6,7 @@ import { Relay, type RelayOptions } from './relay.js';
 import { createLoopback, flush } from '../../../packages/webtransport/src/testkit/loopback.js';
 import { object as encodeObject } from '../../../packages/webtransport/src/testkit/object-reception.js';
 const ns = [new TextEncoder().encode('demo')], name = new TextEncoder().encode('objects');
-async function pair(draft: 16 | 18 | 22) {
+async function pair(draft: 16 | 18 | 22, relay: Relay) {
   const { a, b } = createLoopback();
   const resetReasons: unknown[] = [];
   const resetWriters: WritableStreamDefaultWriter<Uint8Array>[] = [];
@@ -21,11 +21,12 @@ async function pair(draft: 16 | 18 | 22) {
     }
   };
   const client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' });
+  relay.setupConnection(server);
   await Promise.all([client.connect(a, { maxRequestId: varint(1000n) }), server.connect(b, { maxRequestId: varint(1000n) })]);
   return { client, server, a, b, resetReasons, resetWriters };
 }
 async function fixture(draft: 16 | 18 | 22 = 18, options: RelayOptions = {}, advertisedHead?: { group: bigint; object: bigint }, doneEffect?: 'throw' | 'close', trackProperties?: TrackProperties) {
-  const relay = new Relay(options), up = await pair(draft), down = await pair(draft);
+  const relay = new Relay(options), up = await pair(draft, relay), down = await pair(draft, relay);
   const peers = [up, down];
   up.server.onMessage = value => { if (value.type === 'PUBLISH_DONE') {
     if (doneEffect === 'throw') throw new Error('chained DONE callback');
@@ -72,7 +73,7 @@ async function fixture(draft: 16 | 18 | 22 = 18, options: RelayOptions = {}, adv
     return { id, data, terminal, messages };
   };
   const settled = async () => { await Promise.all(work); await flush(256); };
-  const replace = async () => { const peer = await pair(draft); peers.push(peer); bind(peer); await peer.client.publish(ns, name, 9n); await flush(128); await publication; return peer; };
+  const replace = async () => { const peer = await pair(draft, relay); peers.push(peer); bind(peer); await peer.client.publish(ns, name, 9n); await flush(128); await publication; return peer; };
   const close = async () => { await Promise.all(peers.flatMap(p => [p.client.close(), p.server.close()])); await Promise.all(work); };
   return { relay, up, down, publicationId, publish, fetch, settled, replace, close };
 }

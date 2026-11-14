@@ -29,6 +29,8 @@ async function rig(draft: 14 | 16 | 18 | 22, options: RelayOptions = {}, holdAcc
   viewer.onMessage = m => { log.push(`msg ${m.type}${(m as { statusCode?: bigint }).statusCode !== undefined ? ' status=0x' + (m as { statusCode: bigint }).statusCode.toString(16) : ''}${(m as { errorCode?: bigint }).errorCode !== undefined ? ' code=0x' + (m as { errorCode: bigint }).errorCode.toString(16) : ''}`); };
   viewer.onStreamClosed = (_id, _e, terminal) => { log.push(`stream ${terminal}`); };
   origin.onMessage = m => { log.push(`origin-msg ${m.type}${(m as { errorCode?: bigint }).errorCode !== undefined ? ' code=0x' + (m as { errorCode: bigint }).errorCode.toString(16) : ''}`); };
+  relay.setupConnection(ingress);
+  relay.setupConnection(egress);
   await Promise.all([origin.connect(up.a, opts), ingress.connect(up.b, opts), viewer.connect(down.a, opts), egress.connect(down.b, opts)]);
   const close = () => Promise.all([origin.close(), ingress.close(), viewer.close(), egress.close()]);
   return { origin, ingress, viewer, egress, relay, log, release, close };

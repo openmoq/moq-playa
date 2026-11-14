@@ -133,6 +133,7 @@ async function handleSession(
     conn.onMessage = (m) => log('onMessage:', m.type);
 
     if (relay) {
+      relay.setupConnection(conn);
       // Relay mode: forward new objects from accepted publishers to subscribers.
       conn.onSubscribe = (requestId, namespace, trackName) => {
         void relay.handleSubscribe(conn, requestId, namespace, trackName);

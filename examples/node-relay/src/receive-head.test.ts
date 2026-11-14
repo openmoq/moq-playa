@@ -15,13 +15,14 @@ function confirmedHead(parameters: Parameters) {
   const value = parameters.get(MessageParam.LARGEST_OBJECT)?.[0];
   return value instanceof Uint8Array ? readLocation(value, 0).value : value;
 }
-async function pair(draft: 16 | 18 | 22) {
+async function pair(draft: 16 | 18 | 22, relay: Relay) {
   const {a,b}=createLoopback(); const client=new MoqtConnection(draft),server=new MoqtConnection(draft,{role:'server'});
+  relay.setupConnection(server);
   await Promise.all([client.connect(a, { maxRequestId: varint(1000n) }),server.connect(b, { maxRequestId: varint(1000n) })]);return {a,b,client,server};
 }
 for (const draft of [16,18,22] as const) for (const mode of ['advertised','partial','wire-status','wire-eot','lower-data','complete','retired-owner'] as const) {
   it(`draft${draft} exact relay current head: ${mode}`,async()=>{
-    const relay=new Relay(),up=await pair(draft),down=await pair(draft);
+    const relay=new Relay(),up=await pair(draft, relay),down=await pair(draft, relay);
     let accepted!:()=>void;const ready=new Promise<void>(r=>{accepted=r;});
     let request=-1n;let completeData=0;
     up.server.onPublish=pub=>{request=pub.requestId;void relay.handlePublish(up.server,pub).then(()=>{
@@ -67,7 +68,7 @@ for (const draft of [16,18,22] as const) for (const mode of ['advertised','parti
 
 for (const draft of [16, 18, 22] as const) {
   it(`draft${draft} immediate relay query merges unpolled final head before closed reactions`, async () => {
-    const relay = new Relay(), up = await pair(draft), down = await pair(draft);
+    const relay = new Relay(), up = await pair(draft, relay), down = await pair(draft, relay);
     let pub: IncomingPublish | undefined;
     let handling: Promise<void> | undefined;
     up.server.onPublish = incoming => { pub = incoming; handling = relay.handlePublish(up.server, incoming); };
@@ -99,7 +100,7 @@ for (const draft of [16, 18, 22] as const) {
 
 for (const draft of [18, 22] as const) {
   it(`draft${draft} repeated exact publication retirement leaves only the scalar track maximum`, async () => {
-    const relay = new Relay(), up = await pair(draft), down = await pair(draft);
+    const relay = new Relay(), up = await pair(draft, relay), down = await pair(draft, relay);
     let handling: Promise<void> | undefined;
     up.server.onPublish = pub => { handling = relay.handlePublish(up.server, pub); };
     down.server.onSubscribe = (id, namespace, name) => { void relay.handleSubscribe(down.server, id, namespace, name); };

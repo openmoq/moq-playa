@@ -6,7 +6,7 @@ import { Relay, type RelayOptions } from './relay.js';
 import { createLoopback, flush } from '../../../packages/webtransport/src/testkit/loopback.js';
 import { object as encodeObject } from '../../../packages/webtransport/src/testkit/object-reception.js';
 const ns = [new TextEncoder().encode('demo')], name = new TextEncoder().encode('objects');
-async function pair(draft: 16 | 18 | 22) {
+async function pair(draft: 16 | 18 | 22, relay?: Relay) {
   const { a, b } = createLoopback();
   const resetReasons: unknown[] = [];
   const resetWriters: WritableStreamDefaultWriter<Uint8Array>[] = [];
@@ -21,11 +21,12 @@ async function pair(draft: 16 | 18 | 22) {
     }
   };
   const client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' });
+  relay?.setupConnection(server);
   await Promise.all([client.connect(a, { maxRequestId: varint(1000n) }), server.connect(b, { maxRequestId: varint(1000n) })]);
   return { client, server, a, b, resetReasons, resetWriters };
 }
-async function fixture(draft: 16 | 18 | 22 = 18, options: RelayOptions = {}, advertisedHead?: { group: bigint; object: bigint }, doneEffect?: 'throw' | 'close', trackProperties?: TrackProperties) {
-  const relay = new Relay(options), up = await pair(draft), down = await pair(draft);
+async function fixture(draft: 16 | 18 | 22 = 18, options: RelayOptions = {}, advertisedHead?: { group: bigint; object: bigint }, doneEffect?: 'throw' | 'close', trackProperties?: TrackProperties, beforePublish?: (peer: Awaited<ReturnType<typeof pair>>) => Promise<void>) {
+  const relay = new Relay(options), up = await pair(draft, relay), down = await pair(draft, relay);
   const peers = [up, down];
   up.server.onMessage = value => { if (value.type === 'PUBLISH_DONE') {
     if (doneEffect === 'throw') throw new Error('chained DONE callback');
@@ -36,6 +37,7 @@ async function fixture(draft: 16 | 18 | 22 = 18, options: RelayOptions = {}, adv
   const bind = (peer: typeof up) => { peer.server.onPublish = p => { publication = relay.handlePublish(peer.server, p); }; };
   bind(up);
   down.server.onFetch = (id, request) => { work.push(relay.handleFetch(down.server, id, request)); };
+  await beforePublish?.(up);
   const publicationId = await up.client.publish(ns, name, 9n, { ...(advertisedHead ? { parameters: new Map([[MessageParam.LARGEST_OBJECT, [advertisedHead]]]) } : {}), ...(trackProperties ? { trackProperties } : {}) }); await flush(128); await publication;
   const publish = async (group: bigint, ids: bigint[], eog = true, fin = true, peer = up) => {
     const stream = await peer.client.openSubgroup(9n, group, 0n, { endOfGroup: eog });
@@ -43,20 +45,22 @@ async function fixture(draft: 16 | 18 | 22 = 18, options: RelayOptions = {}, adv
     if (fin) await peer.client.closeSubgroup(stream);
     await flush(128); return stream;
   };
-  const fetch = async (startGroup: bigint, endGroup: bigint, endObject: bigint, startObject = 0n, groupOrder: 'ascending' | 'descending' = 'ascending', locationFilter?: Uint8Array) => {
+  const fetch = async (startGroup: bigint, endGroup: bigint, endObject: bigint, startObject = 0n, groupOrder: 'ascending' | 'descending' = 'ascending', locationFilter?: Uint8Array, fillTimeout?: bigint) => {
     const data: string[] = [], terminal: string[] = [], messages: ControlMessage[] = [];
     down.client.onMessage = m => { messages.push(m); };
-    // Public FetchOptions has no relative-filter field. Rewrite only the
+    // Public FetchOptions lacks these wire parameters. Rewrite only the
     // actual encoded opener; SDK request allocation, decoding, validation,
     // serving and response consumption all remain real.
     const open = down.a.createBidirectionalStream.bind(down.a);
-    const wire = locationFilter ? vi.spyOn(down.a, 'createBidirectionalStream').mockImplementationOnce(async () => {
+    const wire = locationFilter || fillTimeout !== undefined ? vi.spyOn(down.a, 'createBidirectionalStream').mockImplementationOnce(async () => {
       const stream = await open(), writer = stream.writable.getWriter(), codec = createControlCodec(draft);
       return { ...stream, writable: new WritableStream<Uint8Array>({
         write(bytes) {
           const decoded = codec.decode(bytes, 0).message;
           if (decoded.type === 'FETCH') {
-            const parameters = new Map(decoded.parameters); parameters.set(0x21n, [locationFilter]);
+            const parameters = new Map(decoded.parameters);
+            if (locationFilter) parameters.set(0x21n, [locationFilter]);
+            if (fillTimeout !== undefined) parameters.set(0x0an, [fillTimeout]);
             return writer.write(codec.encode({ ...decoded, parameters }));
           }
           return writer.write(bytes);
@@ -72,7 +76,7 @@ async function fixture(draft: 16 | 18 | 22 = 18, options: RelayOptions = {}, adv
     return { id, data, terminal, messages };
   };
   const settled = async () => { await Promise.all(work); await flush(256); };
-  const replace = async () => { const peer = await pair(draft); peers.push(peer); bind(peer); await peer.client.publish(ns, name, 9n); await flush(128); await publication; return peer; };
+  const replace = async () => { const peer = await pair(draft, relay); peers.push(peer); bind(peer); await peer.client.publish(ns, name, 9n); await flush(128); await publication; return peer; };
   const close = async () => { await Promise.all(peers.flatMap(p => [p.client.close(), p.server.close()])); await Promise.all(work); };
   return { relay, up, down, publicationId, publish, fetch, settled, replace, close };
 }
@@ -524,4 +528,323 @@ for (const draft of [18, 22] as const) it(`draft${draft} empty overlapping FIN c
     await f.up.client.closeSubgroup(a); await flush(128);
     expect(f.up.server.session.getIncomingSubscription(f.publicationId)?.isTerminated).toBe(false);
   } finally { await f.close(); }
+});
+
+// Real endpoints over controlled loopback: split the last payload, not its header.
+for (const draft of [18, 22] as const) for (const mode of ['complete', 'reset', 'fin', 'done', 'cancel', 'missing'] as const) {
+  it(`in-flight history draft${draft} ${mode}`, async () => {
+    const f = await fixture(draft, { maxActiveHistoryRequests: 1 });
+    try {
+      const writer = (await f.up.a.createUnidirectionalStream()).getWriter();
+      await writer.write(encodeSubgroupHeader18({ typeByte: 0x54, trackAlias: 9n, groupId: 8n, subgroupId: 0n,
+        publisherPriority: 128, hasExtensions: false, isEndOfGroup: false, isFirstObjectInSubgroup: true }));
+      let previous: bigint | null = null;
+      for (const id of [0n, 1n, 2n, 3n, 4n]) {
+        if (mode === 'missing' && id === 2n) continue;
+        await writer.write(encodeObject(draft, id, Uint8Array.of(8, Number(id)), previous)); previous = id;
+      }
+      const bytes = encodeObject(draft, 5n, Uint8Array.of(8, 5), previous);
+      await writer.write(bytes.subarray(0, bytes.length - 1)); await flush(256);
+      f.down.server.onSubscribe = (id, namespace, track) => { void f.relay.handleSubscribe(f.down.server, id, namespace, track); };
+      const sub = await f.down.client.subscribeTrack(ns, name); await flush(256);
+      const data: bigint[] = [], terminal: string[] = [], messages: ControlMessage[] = [];
+      f.down.client.onMessage = m => { messages.push(m); };
+      const receiver = { onObject: (o: import('@openmoq/transport').MoqtObject) => { if (o.kind === 'data') data.push(o.objectId); },
+        onClosed: (t: string) => { terminal.push(t); } };
+      // d22 §3.2 has no Joining FETCH; exercise its equivalent explicit prefix range.
+      const id = draft === 18
+        ? await f.down.client.joiningFetch({ joiningFetchType: 'relative', joiningRequestId: sub.requestId, joiningStart: 0n, receiver })
+        : await f.down.client.fetch(ns, name, { startGroup: 8n, startObject: 0n, endGroup: 8n, endObject: 6n, receiver });
+      await flush(256);
+      if (mode === 'missing') {
+        refused({ messages, terminal }); expect(data).toEqual([]);
+        // Positive control: the same in-flight tail is coverable when the missing prefix is excluded.
+        const tail = await f.fetch(8n, 8n, 6n, 3n);
+        expect(tail.messages.some(m => m.type === 'FETCH_OK')).toBe(true);
+        expect(tail.data).toEqual(['8/3', '8/4']);
+        await writer.write(bytes.subarray(bytes.length - 1)); await f.settled();
+        expect(tail.data).toEqual(['8/3', '8/4', '8/5']); expect(tail.terminal).toEqual(['fin']);
+        return;
+      }
+      expect(messages.find(m => m.type === 'FETCH_OK')).toMatchObject({ endLocation: { group: 8n, object: draft === 18 ? 6n : 5n } });
+      expect(data).toEqual([0n, 1n, 2n, 3n, 4n]); expect(terminal).toEqual([]);
+      const send = vi.spyOn(f.down.server, 'sendFetchObject'), finish = vi.spyOn(f.down.server, 'closeFetchStream');
+      if (mode === 'cancel') {
+        await f.down.client.fetchCancel(id); await flush(256);
+        const capped = await f.fetch(8n, 8n, 1n); refused(capped);
+      }
+      if (mode === 'reset') await writer.abort({ streamErrorCode: 1 });
+      else if (mode === 'fin') await writer.close();
+      else if (mode === 'done') await f.up.client.publishDone(f.publicationId, varint(2n), 'ended during reception');
+      else await writer.write(bytes.subarray(bytes.length - 1));
+      await f.settled();
+      if (mode === 'complete') { expect(data).toEqual([0n, 1n, 2n, 3n, 4n, 5n]); expect(terminal).toEqual(['fin']); }
+      else {
+        expect(data).toEqual([0n, 1n, 2n, 3n, 4n]); expect(terminal).not.toContain('fin');
+        expect(send).not.toHaveBeenCalled(); expect(finish).not.toHaveBeenCalled();
+        if (mode !== 'cancel') {
+          expect(terminal).toEqual(['reset']);
+          expect(f.down.resetReasons).toContainEqual(expect.objectContaining({ streamErrorCode: 6 }));
+        }
+      }
+      expect(f.down.server.session.getIncomingFetch(id)).toBeUndefined();
+      expect(f.down.server.session.state).toBe('established');
+      const next = await f.fetch(8n, 8n, 1n); await f.settled();
+      expect(next.data).toEqual(['8/0']); expect(next.terminal).toEqual(['fin']);
+    } finally { await f.close(); }
+  });
+}
+
+async function stallHistoryObject(f: Awaited<ReturnType<typeof fixture>>, draft: 18 | 22, peer = f.up) {
+  const writer = (await peer.a.createUnidirectionalStream()).getWriter();
+  await writer.write(encodeSubgroupHeader18({ typeByte: 0x54, trackAlias: 9n, groupId: 8n, subgroupId: 0n,
+    publisherPriority: 128, hasExtensions: false, isEndOfGroup: false, isFirstObjectInSubgroup: true }));
+  await writer.write(encodeObject(draft, 0n, Uint8Array.of(8, 0), null));
+  const bytes = encodeObject(draft, 1n, Uint8Array.of(8, 1), 0n);
+  await writer.write(bytes.subarray(0, bytes.length - 1)); await flush(256);
+  return { writer, remainder: bytes.subarray(bytes.length - 1) };
+}
+for (const draft of [18, 22] as const) it(`history repair R1 draft${draft} another publisher completes the awaited location`, async () => {
+  const f = await fixture(draft, { maxActiveHistoryRequests: 1 });
+  try {
+    await stallHistoryObject(f, draft);
+    const result = await f.fetch(8n, 8n, 2n);
+    expect(result.data).toEqual(['8/0']); expect(result.terminal).toEqual([]);
+    const other = await f.replace();
+    await f.publish(8n, [1n], false, false, other); await flush(256);
+    // Assert before awaiting the handler: A remains open and must not hold this slot.
+    expect(result.data).toEqual(['8/0', '8/1']); expect(result.terminal).toEqual(['fin']);
+    await f.settled();
+    const next = await f.fetch(8n, 8n, 2n); await f.settled();
+    expect(next.data).toEqual(['8/0', '8/1']); expect(next.terminal).toEqual(['fin']);
+  } finally { await f.close(); }
+});
+
+it('history repair R2 draft22 completed duplicate receptions cannot revive evicted history', async () => {
+  const f = await fixture(22, { historyCache: { maxGroups: 1 } });
+  try {
+    await f.publish(3n, [0n, 1n], false, false);
+    await f.publish(3n, [0n, 1n], false, false);
+    await f.publish(4n, [0n]);
+    const result = await f.fetch(3n, 3n, 1n);
+    refused(result); expect(result.data).toEqual([]);
+    await f.settled();
+  } finally { await f.close(); }
+});
+
+for (const draft of [18, 22] as const) for (const timeout of [0n, 100n]) {
+  it(`history repair R3 draft${draft} FILL_TIMEOUT=${timeout} refuses waiting but serves cached bytes`, async () => {
+    const f = await fixture(draft, { maxActiveHistoryRequests: 1 });
+    try {
+      const stalled = await stallHistoryObject(f, draft);
+      const result = await f.fetch(8n, 8n, 2n, 0n, 'ascending', undefined, timeout);
+      refused(result); expect(result.data).toEqual([]);
+      const cached = await f.fetch(8n, 8n, 1n, 0n, 'ascending', undefined, timeout); await f.settled();
+      expect(cached.data).toEqual(['8/0']); expect(cached.terminal).toEqual(['fin']);
+      const waiting = await f.fetch(8n, 8n, 2n);
+      expect(waiting.data).toEqual(['8/0']); expect(waiting.terminal).toEqual([]);
+      await stalled.writer.write(stalled.remainder); await f.settled();
+      expect(waiting.data).toEqual(['8/0', '8/1']); expect(waiting.terminal).toEqual(['fin']);
+    } finally { await f.close(); }
+  });
+}
+
+for (const draft of [18, 22] as const) it(`history repair R4 draft${draft} malformed retirement wakes another publication's wait`, async () => {
+  const f = await fixture(draft, { maxActiveHistoryRequests: 1 });
+  try {
+    const other = await f.replace();
+    await stallHistoryObject(f, draft, other);
+    const result = await f.fetch(8n, 8n, 2n);
+    expect(result.data).toEqual(['8/0']); expect(result.terminal).toEqual([]);
+    // Conflicting bytes retire A; B's incomplete carrier stays open.
+    await distinctObject(f, 8n, 0n, false, false, Uint8Array.of(99)); await flush(256);
+    expect(result.terminal).toEqual(['reset']);
+    expect(f.down.resetReasons).toContainEqual(expect.objectContaining({ streamErrorCode: 0x12 }));
+    let settled = false;
+    void f.settled().then(() => { settled = true; }); await flush(1024);
+    expect(settled).toBe(true);
+    expect(f.down.server.session.getIncomingFetch(result.id)).toBeUndefined();
+    expect(f.down.server.session.state).toBe('established');
+    await f.publish(9n, [0n], true, true, other);
+    const next = await f.fetch(9n, 9n, 1n); await f.settled();
+    expect(next.data).toEqual(['9/0']); expect(next.terminal).toEqual(['fin']);
+  } finally { await f.close(); }
+});
+
+// Control the SDK's setTimeout(0) hold replay; the relay itself has no timer.
+for (const draft of [18, 22] as const) for (const variant of ['new-head', 'handover'] as const) {
+  it(`delivery proof draft${draft} publish hold ${variant}`, async () => {
+    const f = await fixture(draft, { maxActiveHistoryRequests: 1 }), peer = await pair(draft, f.relay);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      if (variant === 'handover') await stallHistoryObject(f, draft);
+      let handled: Promise<void> | undefined;
+      peer.server.onPublish = p => { handled = f.relay.handlePublish(peer.server, p); };
+      const writer = (await peer.a.createUnidirectionalStream()).getWriter();
+      await writer.write(encodeSubgroupHeader18({ typeByte: 0x54, trackAlias: 9n, groupId: 8n, subgroupId: 0n,
+        publisherPriority: 128, hasExtensions: false, isEndOfGroup: false, isFirstObjectInSubgroup: true }));
+      await writer.write(encodeObject(draft, 0n, Uint8Array.of(8, 0), null)); await flush(256);
+      await peer.client.publish(ns, name, 9n, { parameters: new Map([[MessageParam.LARGEST_OBJECT, [{ group: 8n, object: 1n }]]]) });
+      await flush(256); await handled;
+      const bytes = encodeObject(draft, 1n, Uint8Array.of(8, 1), 0n);
+      await writer.write(bytes.subarray(0, bytes.length - 1)); await flush(256);
+      const result = await f.fetch(8n, 8n, 2n, variant === 'new-head' ? 1n : 0n);
+      expect(result.messages.some(m => m.type === 'FETCH_OK')).toBe(true);
+      expect(result.data).toEqual(variant === 'new-head' ? [] : ['8/0']);
+      await writer.write(bytes.subarray(bytes.length - 1)); await flush(512);
+      expect(result.terminal).toEqual([]); expect(f.down.resetReasons).toEqual([]);
+      await vi.advanceTimersByTimeAsync(0); await f.settled();
+      expect(result.data).toEqual(variant === 'new-head' ? ['8/1'] : ['8/0', '8/1']);
+      expect(result.terminal).toEqual(['fin']);
+      const cached = await f.fetch(8n, 8n, 2n, 1n); await f.settled();
+      expect(cached.data).toEqual(['8/1']); expect(cached.terminal).toEqual(['fin']);
+    } finally {
+      await Promise.all([peer.client.close(), peer.server.close()]); await f.close(); vi.useRealTimers();
+    }
+  });
+}
+it('delivery proof draft22 a later Object settles a suppressed, evicted duplicate', async () => {
+  const f = await fixture(22, { historyCache: { maxGroups: 1 }, maxActiveHistoryRequests: 1 });
+  try {
+    await f.publish(3n, [0n], false, false);
+    const writer = (await f.up.a.createUnidirectionalStream()).getWriter();
+    await writer.write(encodeSubgroupHeader18({ typeByte: 0x54, trackAlias: 9n, groupId: 3n, subgroupId: 0n,
+      publisherPriority: 128, hasExtensions: false, isEndOfGroup: false, isFirstObjectInSubgroup: true }));
+    const bytes = encodeObject(22, 0n, Uint8Array.of(3, 0), null);
+    await writer.write(bytes.subarray(0, bytes.length - 1)); await flush(256);
+    await f.publish(4n, [0n], false, false);
+    const result = await f.fetch(3n, 3n, 1n);
+    expect(result.messages.some(m => m.type === 'FETCH_OK')).toBe(true);
+    await writer.write(bytes.subarray(bytes.length - 1)); await flush(512);
+    expect(result.data).toEqual([]); expect(result.terminal).toEqual([]);
+    await f.publish(4n, [1n], false, false); await f.settled();
+    expect(result.terminal).toEqual(['reset']);
+    expect(f.down.resetReasons).toContainEqual(expect.objectContaining({ streamErrorCode: 6 }));
+    const missing = await f.fetch(3n, 3n, 1n); await f.settled(); refused(missing);
+    const next = await f.fetch(4n, 4n, 2n); await f.settled();
+    expect(next.data).toEqual(['4/0', '4/1']); expect(next.terminal).toEqual(['fin']);
+  } finally { await f.close(); }
+});
+
+// No public behavior exposes unused ended metadata, so inspect only its retention count.
+const pendingHistoryCount = (relay: Relay) => [...(relay as unknown as {
+  tracks: Map<string, { pending: Map<object, unknown> }>;
+}).tracks.values()].reduce((count, track) => count + track.pending.size, 0);
+
+it('owned history F1 completed duplicates without FETCH owners do not accumulate', async () => {
+  const f = await fixture(22);
+  try {
+    await f.publish(3n, [0n], false, false);
+    for (let i = 0; i < 100; i++) await f.publish(3n, [0n], false, true);
+    expect(pendingHistoryCount(f.relay)).toBe(0);
+  } finally { await f.close(); }
+});
+async function partialHistoryObject(peer: Awaited<ReturnType<typeof pair>>, draft: 18 | 22, group: bigint, id: bigint) {
+  const writer = (await peer.a.createUnidirectionalStream()).getWriter();
+  await writer.write(encodeSubgroupHeader18({ typeByte: 0x54, trackAlias: 9n, groupId: group, subgroupId: 0n,
+    publisherPriority: 128, hasExtensions: false, isEndOfGroup: false, isFirstObjectInSubgroup: true }));
+  const bytes = encodeObject(draft, id, Uint8Array.of(Number(group), Number(id)), null);
+  await writer.write(bytes.subarray(0, bytes.length - 1)); await flush(256);
+  return () => writer.write(bytes.subarray(bytes.length - 1));
+}
+// d22 suppresses repeated delivery; d18 admits the duplicate and already wakes by location.
+it('owned history F2 delivery of an Object started before PUBLISH releases a dropped wait', async () => {
+  let completeEarly!: () => Promise<void>;
+  const f = await fixture(22, { historyCache: { maxGroups: 1 }, maxActiveHistoryRequests: 1 }, undefined, undefined, undefined,
+    async peer => { completeEarly = await partialHistoryObject(peer, 22, 4n, 1n); });
+  try {
+    await f.publish(3n, [0n], false, false);
+    const completeDuplicate = await partialHistoryObject(f.up, 22, 3n, 0n);
+    await f.publish(4n, [0n], false, false);
+    const result = await f.fetch(3n, 3n, 1n);
+    expect(result.messages.some(m => m.type === 'FETCH_OK')).toBe(true);
+    await completeDuplicate(); await flush(256); expect(result.terminal).toEqual([]);
+    await completeEarly(); await flush(512);
+    expect(result.terminal).toEqual(['reset']);
+    expect(f.down.resetReasons).toContainEqual(expect.objectContaining({ streamErrorCode: 6 }));
+    const next = await f.fetch(4n, 4n, 2n); await f.settled();
+    expect(next.data).toEqual(['4/0', '4/1']); expect(next.terminal).toEqual(['fin']);
+    expect(pendingHistoryCount(f.relay)).toBe(0);
+  } finally { await f.close(); }
+});
+it('owned history completed owned entries are excluded from new plans', async () => {
+  const f = await fixture(22, { historyCache: { maxGroups: 1 }, maxActiveHistoryRequests: 2 });
+  try {
+    await f.publish(3n, [0n], false, false);
+    const complete = await partialHistoryObject(f.up, 22, 3n, 0n);
+    await f.publish(4n, [0n], false, false);
+    const owner = await f.fetch(3n, 3n, 1n);
+    expect(owner.messages.some(m => m.type === 'FETCH_OK')).toBe(true);
+    await complete(); await flush(256);
+    expect(owner.terminal).toEqual([]); expect(pendingHistoryCount(f.relay)).toBe(1);
+    const newRequest = await f.fetch(3n, 3n, 1n); refused(newRequest);
+    // The second slot really is available; refusal came from coverage, not the cap.
+    const cached = await f.fetch(4n, 4n, 1n);
+    expect(cached.data).toEqual(['4/0']); expect(cached.terminal).toEqual(['fin']);
+    await f.publish(4n, [1n], false, false); await f.settled();
+    expect(owner.terminal).toEqual(['reset']); expect(pendingHistoryCount(f.relay)).toBe(0);
+  } finally { await f.close(); }
+});
+
+for (const draft of [18, 22] as const) for (const setup of ['missing', 'late'] as const) {
+  it(`connection setup draft${draft} ${setup} refuses PUBLISH without caching or forwarding`, async () => {
+    const f = await fixture(draft), peer = await pair(draft);
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      if (setup === 'late') f.relay.setupConnection(peer.server);
+      let handled: Promise<void> | undefined;
+      peer.server.onPublish = p => { handled = f.relay.handlePublish(peer.server, p); };
+      const messages: ControlMessage[] = [], live: bigint[] = [];
+      peer.client.onMessage = m => { messages.push(m); };
+      f.down.server.onSubscribe = (id, namespace, track) => { void f.relay.handleSubscribe(f.down.server, id, namespace, track); };
+      const sub = await f.down.client.subscribeTrack(ns, name);
+      sub.onObject = obj => { if (obj.kind === 'data') live.push(obj.objectId); };
+      await flush(256);
+      // Data precedes the refused PUBLISH too: neither held nor subsequent bytes may escape.
+      const writer = (await peer.a.createUnidirectionalStream()).getWriter();
+      await writer.write(encodeSubgroupHeader18({ typeByte: 0x54, trackAlias: 9n, groupId: 8n, subgroupId: 0n,
+        publisherPriority: 128, hasExtensions: false, isEndOfGroup: false, isFirstObjectInSubgroup: true }));
+      await writer.write(encodeObject(draft, 0n, Uint8Array.of(8, 0), null)); await flush(256);
+      const id = await peer.client.publish(ns, name, 9n); await flush(256); await handled;
+      await writer.write(encodeObject(draft, 1n, Uint8Array.of(8, 1), 0n)); await flush(256);
+      expect(messages.find(m => m.type === 'REQUEST_ERROR')).toMatchObject({ requestId: id, errorCode: 0n, retryInterval: 0n,
+        errorReason: 'relay.setupConnection must precede connect' });
+      expect(messages.some(m => m.type === 'PUBLISH_OK')).toBe(false);
+      expect(errors).toHaveBeenCalledWith('[relay] PUBLISH handling failed:', 'relay.setupConnection must precede connect');
+      expect(live).toEqual([]); expect(pendingHistoryCount(f.relay)).toBe(0);
+      const cached = await f.fetch(8n, 8n, 2n); await f.settled(); refused(cached);
+      expect(cached.data).toEqual([]); expect(peer.server.session.state).toBe('established');
+    } finally { errors.mockRestore(); await Promise.all([peer.client.close(), peer.server.close()]); await f.close(); }
+  });
+}
+for (const draft of [18, 22] as const) it(`owned history G3 draft${draft} cancel releases an ended held entry on wake`, async () => {
+  const f = await fixture(draft, { maxActiveHistoryRequests: 1 }), peer = await pair(draft, f.relay);
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const stalled = await stallHistoryObject(f, draft);
+    let handled: Promise<void> | undefined;
+    peer.server.onPublish = p => { handled = f.relay.handlePublish(peer.server, p); };
+    const writer = (await peer.a.createUnidirectionalStream()).getWriter();
+    await writer.write(encodeSubgroupHeader18({ typeByte: 0x54, trackAlias: 9n, groupId: 7n, subgroupId: 0n,
+      publisherPriority: 128, hasExtensions: false, isEndOfGroup: false, isFirstObjectInSubgroup: true }));
+    await writer.write(encodeObject(draft, 0n, Uint8Array.of(7, 0), null)); await flush(256);
+    await peer.client.publish(ns, name, 9n, { parameters: new Map([[MessageParam.LARGEST_OBJECT, [{ group: 8n, object: 2n }]]]) });
+    await flush(256); await handled;
+    const completeHeld = await partialHistoryObject(peer, draft, 8n, 2n);
+    const result = await f.fetch(8n, 8n, 3n);
+    expect(result.messages.some(m => m.type === 'FETCH_OK')).toBe(true);
+    expect(result.data).toEqual(['8/0']);
+    await completeHeld(); await flush(256);
+    expect(pendingHistoryCount(f.relay)).toBe(2);
+    const send = vi.spyOn(f.down.server, 'sendFetchObject');
+    await f.down.client.fetchCancel(result.id); await flush(256);
+    // No cancellation callback exists. Wake the first entry while the second is still held.
+    await stalled.writer.abort({ streamErrorCode: 1 }); await f.settled();
+    expect(pendingHistoryCount(f.relay)).toBe(0);
+    expect(send).not.toHaveBeenCalled(); expect(result.data).toEqual(['8/0']);
+    const next = await f.fetch(8n, 8n, 1n); await f.settled();
+    expect(next.data).toEqual(['8/0']); expect(next.terminal).toEqual(['fin']);
+    await vi.advanceTimersByTimeAsync(0); await flush(256);
+    expect(result.data).toEqual(['8/0']); expect(pendingHistoryCount(f.relay)).toBe(0);
+  } finally { await Promise.all([peer.client.close(), peer.server.close()]); await f.close(); vi.useRealTimers(); }
 });

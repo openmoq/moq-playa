@@ -59,6 +59,7 @@ async function scenario(draft: Draft, hooks: Hooks) {
   const accept = server.acceptSubscribe.bind(server);
   server.acceptSubscribe = (async (...args: Parameters<typeof accept>) => { entered = true; await gate; return accept(...args); }) as typeof server.acceptSubscribe;
   try {
+    relay.setupConnection(server);
     await Promise.all([client.connect(a), server.connect(b, draft <= 16 ? { maxRequestId: varint(1000n) } : {})]);
     await acceptTestPublication(relay, publish);
     publish.onObject?.(data(draft, 5n, 0n, 0n)); publish.onObject?.(data(draft, 5n, 2n, 2n));   // stored history; Largest {5,2}

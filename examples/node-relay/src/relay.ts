@@ -103,12 +103,18 @@ const DEFAULT_FORWARD_LIMITS: ForwardLimits = {
   maxPendingBytes: 4 * 1024 * 1024,
 };
 
+interface PendingObject {
+  groupId: bigint; objectId: bigint; source: IncomingPublish;
+  ready: Promise<void>; finish: () => void;
+  ended?: number; owners: number;
+}
 interface Track {
   largest?: { groupId: bigint; objectId: bigint };
   sources: Set<IncomingPublish>;
   upstream: Map<string, { groupId: bigint; objectId: bigint }>;
   subscribers: Subscriber[];
   cache: HistoryCache;
+  pending: Map<object, PendingObject>;
 }
 
 /** ASCII-safe namespace key that preserves tuple-field boundaries. */
@@ -129,6 +135,8 @@ export class Relay {
   private readonly finReceipts = new WeakSet<object>();
   private readonly finStreams = new WeakMap<object, bigint>();
   private readonly receptionStreams = new WeakMap<object, bigint | null>();
+  private readonly receptionEnds = new WeakMap<object, number>();
+  private nextReceptionEnd = 0;
   private readonly historyLimits: HistoryLimits;
   private readonly maxHistory: number;
   private readonly historyResponses = new Set<{ conn: MoqtConnection; requestId: bigint; track: Track; malformed: boolean }>();
@@ -173,6 +181,7 @@ export class Relay {
         upstream: new Map(),
         subscribers: [],
         cache: new HistoryCache(this.historyLimits),
+        pending: new Map(),
       };
       this.tracks.set(key, track);
     }
@@ -242,14 +251,22 @@ export class Relay {
     }
   }
 
-  /** A publisher's PUBLISH: accept and forward its objects to all subscribers. */
-  async handlePublish(conn: MoqtConnection, publish: IncomingPublish): Promise<void> {
-    if (!this.observed.has(conn)) {
+  /** Call before connect(): the SDK starts all incoming stream readers there. */
+  setupConnection(conn: MoqtConnection): void {
+    if (!this.observed.has(conn) && conn.transportInfo === null) {
       this.observed.add(conn);
+      conn.observeObjectReception(event => { if (event.type === 'end' && event.origin !== 'datagram') this.receptionEnds.set(event.reception, ++this.nextReceptionEnd); });
       conn.observeObjectReceipts(event => { if (event.origin === 'group-end') this.finReceipts.add(event.receipt); });
       const fin = conn.onSubgroupFin; conn.onSubgroupFin = (id, header) => { this.finStreams.set(header, id); fin?.(id, header); };
     }
+  }
+  /** A publisher's PUBLISH: accept and forward its objects to all subscribers. */
+  async handlePublish(conn: MoqtConnection, publish: IncomingPublish): Promise<void> {
     try {
+      // PUBLISH refusal/INTERNAL_ERROR/retry 0: d18 §10.6/§10.6.2, Table 18; d22 §1.5/§9.4/§9.4.2/§12.3.
+      if (!this.observed.has(conn)) {
+        await conn.rejectSubscribe(publish.requestId, 0n, 'relay.setupConnection must precede connect'); throw new Error('relay.setupConnection must precede connect');
+      }
       let properties: IncomingPublish['initialTrackProperties'];
       try { properties = publish.initialTrackProperties; } catch { /* unavailable provenance */ }
       for (const container of properties?.get(0x0bn) ?? []) if (container instanceof Uint8Array) properties = new Map([...decodeTrackProperties18(container, 0).properties, ...properties!]);
@@ -270,9 +287,19 @@ export class Relay {
         if (event.type === 'progress' || event.trackAlias !== publish.trackAlias) return;
         this.receptionStreams.set(event.reception, event.streamId);
         track.cache.attribute(publish, event.groupId, event.subgroupId, event.streamId);
+        if (!track.sources.has(publish) || event.origin !== 'subgroup') return;
+        if (event.type === 'header' && event.objectStatus === null) {
+          let finish!: () => void;
+          const ready = new Promise<void>(resolve => { finish = resolve; });
+          track.pending.set(event.reception, { groupId: event.groupId, objectId: event.objectId, source: publish, ready, finish, owners: 0 });
+        } else if (event.type === 'end') {
+          const pending = track.pending.get(event.reception);
+          if (event.outcome === 'complete' && pending?.owners) pending.ended = this.receptionEnds.get(event.reception)!;
+          else { if (event.outcome === 'interrupted') pending?.finish(); track.pending.delete(event.reception); }
+        }
       });
       void publish.closed.then(stop);
-      void publish.closed.then(() => { this.trackHead(track); track.sources.delete(publish); track.cache.forgetSource(publish); });
+      void publish.closed.then(() => { this.trackHead(track); track.sources.delete(publish); track.cache.forgetSource(publish); this.finishPending(track, publish); });
       await conn.acceptSubscribe(publish.requestId, publish.trackAlias);
       // Create the track on accepted PUBLISH so a publisher that publishes BEFORE any
       // viewer subscribes still populates the history available to FETCH.
@@ -284,6 +311,12 @@ export class Relay {
         const receipt = conn.objectReceiptFor(obj);
         if (receipt && this.finReceipts.has(receipt)) return; // FIN is handled below, never as a wire status.
         const reception = conn.objectReceptionFor(obj);
+        const ended = reception && this.receptionEnds.get(reception);
+        // SDK publication delivery (including hold replay) follows reception completion order.
+        for (const [token, pending] of track.pending) if (pending.source === publish
+          && pending.ended !== undefined && ended !== undefined && pending.ended < ended) {
+          pending.finish(); track.pending.delete(token);
+        }
         track.cache.observe(publish, obj, reception && this.receptionStreams.get(reception));
         if (obj.kind !== 'data') return;
         if (!track.largest || obj.groupId > track.largest.groupId || (obj.groupId === track.largest.groupId && obj.objectId > track.largest.objectId)) {
@@ -304,6 +337,9 @@ export class Relay {
           extensions,
         });
         if (added === 'malformed') { this.retireMalformed(track, conn, publish); return; }
+        for (const [token, pending] of track.pending) if (pending.groupId === obj.groupId && pending.objectId === obj.objectId) {
+          pending.finish(); track.pending.delete(token);
+        }
         if (added === 'duplicate') return;
         track.upstream.set(subgroupKey(obj.groupId, obj.subgroupId), { groupId: obj.groupId, objectId: obj.objectId });
         // Live fanout (identity preserved), ordered per subgroup. Independent
@@ -331,13 +367,20 @@ export class Relay {
     }
   }
 
-  /** FETCH refuses unknown coverage before acceptance (d18 §10.12.3). */
+  private finishPending(track: Track, source?: IncomingPublish): void {
+    for (const [token, pending] of track.pending) if (!source || pending.source === source) {
+      pending.finish(); track.pending.delete(token);
+    }
+  }
+
+  /** d18 §10.12.3 / d22 §3.2, §3.1.4: serve the cached prefix, pause for in-flight Objects. */
   private readonly servedTracks = new WeakMap<object, Track>();
   private readonly fetchTracks = new WeakMap<object, Track>();
 
   async handleFetch(conn: MoqtConnection, requestId: bigint, fetch: Fetch): Promise<void> {
     conn.setFetchLargestLocationProvider(id => this.currentLargestFor(conn, id));
     const owner = conn.session.getIncomingFetch(requestId);
+    let owned: PendingObject[] = [];
     let response: { conn: MoqtConnection; requestId: bigint; track: Track; malformed: boolean } | undefined;
     try {
       if (conn.draftVersion <= 16) { await conn.rejectFetch(requestId, 0x3n, 'history FETCH requires draft18 or newer'); return; }
@@ -365,18 +408,29 @@ export class Relay {
         start = window.start; end = { group: window.end.group, object: window.end.object };
       }
       if (end.group > head.group || (end.group === head.group && end.object > head.object)) end = head;
-      const rows = track.cache.plan(start, end);
+      // d18 §10.2.5 / d22 §9.20.5: without timer/gap support, refuse any timed wait.
+      const rows = track.cache.plan(start, end, fetch.parameters.has(0x0an) ? [] : [...track.pending.values()].filter(row => row.ended === undefined));
       if (!rows || this.historyResponses.size >= this.maxHistory) throw new Error('history unavailable');
       if (fetch.parameters.get(0x22n)?.[0] === 2n) rows.sort((a, b) => a.groupId === b.groupId ? 0 : a.groupId > b.groupId ? -1 : 1);
       this.fetchTracks.set(owner!, track);
       response = { conn, requestId, track, malformed: false }; this.historyResponses.add(response);
+      owned = rows.filter((row): row is PendingObject => 'ready' in row);
+      for (const row of owned) row.owners++;
       const endLocation = conn.draftVersion === 22 ? end : { group: end.group, object: end.object === MAX_VI64 ? 0n : end.object + 1n };
       await conn.acceptFetch(requestId, { endLocation });
       if (response.malformed) { await conn.abortIncomingFetch(requestId, { streamErrorCode: 0x12 }); return; }
       const sid = await conn.openFetchStream(requestId);
       for (const row of rows) {
-        if (response.malformed) return;
-        await conn.sendFetchObject(sid, row);
+        if ('ready' in row) await row.ready;
+        // No cancel notification: retain at most maxHistory slots until upstream wakes us.
+        if (response.malformed || conn.session.getIncomingFetch(requestId) !== owner || owner?.isCompleted !== false) return;
+        const location = { group: row.groupId, object: row.objectId };
+        const complete = 'ready' in row ? track.cache.plan(location, location)?.[0] : row;
+        if (!complete) {
+          // UNKNOWN_OBJECT_STATUS (0x6): d18 §10.12.3/§3.3.3; d22 §3.2.2/§12.5.
+          await conn.abortIncomingFetch(requestId, { streamErrorCode: 6 }); return;
+        }
+        await conn.sendFetchObject(sid, complete);
       }
       await conn.closeFetchStream(sid);
     } catch (err) {
@@ -385,12 +439,17 @@ export class Relay {
       else if (conn.session.getIncomingFetch(requestId) === owner) {
         await conn.rejectFetch(requestId, RequestError18.INVALID_RANGE, String(err)).catch(error => log('FETCH refusal failed', error));
       }
-    } finally { if (response) this.historyResponses.delete(response); }
+    } finally {
+      for (const row of owned) row.owners--;
+      for (const [token, row] of response?.track.pending ?? []) if (row.ended !== undefined && !row.owners) response?.track.pending.delete(token);
+      if (response) this.historyResponses.delete(response);
+    }
   }
 
   private retireMalformed(track: Track, conn: MoqtConnection, publish: IncomingPublish): void {
     if (!isRequestStreamDraft(conn.draftVersion)) return;
     track.sources.delete(publish); // Fence callbacks even if cancellation cannot be issued.
+    this.finishPending(track);
     track.cache.clear(); track.upstream.clear(); delete track.largest;
     for (const sub of [...track.subscribers]) {
       sub.terminalStatus = 0x12n; sub.forwarder.abort();

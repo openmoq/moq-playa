@@ -5,9 +5,10 @@ import { Relay } from './relay.js';
 import { DEMO_NAMESPACE, DEMO_TRACK, nsBytes, te } from './demo.js';
 import { createLoopback, flush } from '../../../packages/webtransport/src/testkit/loopback.js';
 
-async function pair(draft: 18 | 22) {
+async function pair(draft: 18 | 22, relay: Relay) {
   const { a, b } = createLoopback();
   const client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' });
+  relay.setupConnection(server);
   await Promise.all([client.connect(a), server.connect(b)]);
   return { client, server };
 }
@@ -15,7 +16,7 @@ async function pair(draft: 18 | 22) {
 describe.each([18, 22] as const)('relay publication metadata draft %i', draft => {
   it('binds a transferring finite FETCH to the actual source head, not its finite end', async () => {
     const relay = new Relay();
-    const upstream = await pair(draft), downstream = await pair(draft);
+    const upstream = await pair(draft, relay), downstream = await pair(draft, relay);
     let accept!: () => void;
     const accepted = new Promise<void>(resolve => { accept = resolve; });
     upstream.server.onPublish = publication => { void relay.handlePublish(upstream.server, publication).then(accept); };
@@ -50,7 +51,7 @@ describe.each([18, 22] as const)('relay publication metadata draft %i', draft =>
   });
 
   it('does not report an unbound request as an empty publication', async () => {
-    const relay = new Relay(), { client, server } = await pair(draft);
+    const relay = new Relay(), { client, server } = await pair(draft, relay);
     try { expect(() => relay.currentLargestFor(server, 999n)).toThrow(); }
     finally { await Promise.all([client.close(), server.close()]); }
   });
