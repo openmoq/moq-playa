@@ -150,7 +150,7 @@ function decodeElement(text: string, what: string): string {
             throw new Error(`MSF ${what} contains a character that must be escaped (§11.1.2)`);
         }
     }
-    try { return new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes)); }
+    try { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Uint8Array.from(bytes)); }
     catch { throw new Error(`MSF ${what} is not valid UTF-8, which these pages require of a track identity`); }
 }
 

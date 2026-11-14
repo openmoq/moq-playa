@@ -189,3 +189,12 @@ describe('MSF URL percent decoding', () => {
         expect(() => fragment('c4m=AAH%252B%2Fw%3D%3D')).toThrow('"c4m"');
     });
 });
+
+it('preserves leading BOM bytes in namespace and track identities', () => {
+    const parsed = parseMsfFragment('msf:.ef.bb.bflive--.ef.bb.bfcatalog');
+    expect(parsed.namespace).toEqual(['\ufefflive']);
+    expect(parsed.trackName).toBe('\ufeffcatalog');
+    const encoder = new TextEncoder();
+    expect(encoder.encode(parsed.namespace[0])).toEqual(Uint8Array.of(239, 187, 191, 108, 105, 118, 101));
+    expect(encoder.encode(parsed.trackName)).toEqual(Uint8Array.of(239, 187, 191, 99, 97, 116, 97, 108, 111, 103));
+});
