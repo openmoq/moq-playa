@@ -69,9 +69,10 @@ The following are not implemented on draft 23:
 
 - Fills on PUBLISH and SUBSCRIBE_TRACKS. Incoming PUBLISH fill streams are
   discarded with STOP_SENDING / CANCELLED (0x1), before or after PUBLISH_OK;
-  the live PUBLISH proceeds without its fill (§3.4.1). SUBSCRIBE_TRACKS fill
-  requests are refused by the public API's authorization-only options: it has
-  no fill or arbitrary-parameters input. Custom transports must supply the
+  the live PUBLISH proceeds without its fill (§3.4.1). Inbound SUBSCRIBE_TRACKS
+  carrying FILL_PARAMETERS is refused with REQUEST_ERROR NOT_SUPPORTED (0x3),
+  per §§1.6 and 12.3. The public SUBSCRIBE_TRACKS API has authorization-only
+  options, with no fill or arbitrary-parameters input. Custom transports must supply the
   existing `createStreamError` hook to encode the cancellation code.
 - Timed gaps for FILL_TIMEOUT (§9.19.5). The example relay refuses requests
   requiring it to wait for unavailable Objects; cached requested ranges can

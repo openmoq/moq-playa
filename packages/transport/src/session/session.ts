@@ -4950,6 +4950,15 @@ export class Session {
     const validated = this.validateAndReplenish(msg.requestId);
     if (validated.error) return validated.error;
 
+    // Draft 23 §1.6 / §12.3: refuse unsupported fills rather than promise them.
+    if (isDraft23(this._draftVersion) && msg.parameters.has(FILL_PARAMETERS)) {
+      return [this.sendControl({
+        type: 'REQUEST_ERROR', requestId: msg.requestId,
+        errorCode: RequestErrorCode.NOT_SUPPORTED, retryInterval: varint(0n),
+        errorReason: 'SUBSCRIBE_TRACKS fills are not supported',
+      }), ...(validated.replenish ?? [])];
+    }
+
     const filterError = this.rejectUnsupportedRangeFilters(msg.requestId, msg.parameters);
     if (filterError) return filterError;
 
