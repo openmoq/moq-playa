@@ -41,9 +41,9 @@ export function supportedPropertyFault(
     const allowed = SUPPORTED_PROPERTY_SCOPES.get(type);
     if (allowed === undefined) continue;
     if (allowed !== 'both' && allowed !== scope) return `Property 0x${type.toString(16)} is ${allowed}-only`;
-    // Only the explicitly singleton Gap Properties prohibit repeats in
-    // draft18 §12.8/12.9 and draft22 §10.8/10.9. Other repeats stay opaque.
-    if (values.length > 1 && OBJECT_ONLY_TRACK_PROPERTIES.has(type)) {
+    // Draft 23 §§8.4, 12.1(9): supported Properties default to singleton.
+    // Earlier drafts enforce only the explicit Gap Property singletons.
+    if (values.length > 1 && (isDraft23(draft) || OBJECT_ONLY_TRACK_PROPERTIES.has(type))) {
       return `Repeated singleton Property 0x${type.toString(16)}`;
     }
   }

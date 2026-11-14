@@ -2493,7 +2493,7 @@ export class MoqtConnection {
     if (hasUnsupportedMandatoryTrackProperty(props, this.session.draftVersion)) {
       return { code: RequestError18.UNSUPPORTED_EXTENSION, reason: 'an unsupported Mandatory Track Property (§2.5.1)' };
     }
-    const reason = supportedPropertyFault(props, 'track');
+    const reason = supportedPropertyFault(props, 'track', this.session.draftVersion);
     if (reason) return { code: RequestError18.MALFORMED_TRACK, reason };
     return null;
   }

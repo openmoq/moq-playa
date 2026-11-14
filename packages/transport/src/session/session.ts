@@ -1969,7 +1969,7 @@ export class Session {
 
   private receivedTrackPropertyFault(props: TrackProperties | undefined): string | null {
     return isRequestStreamDraft(this._draftVersion) && props !== undefined
-      ? supportedPropertyFault(props, 'track') : null;
+      ? supportedPropertyFault(props, 'track', this._draftVersion) : null;
   }
 
   private rejectMalformedTrackResponse(requestId: bigint, reason: string): SessionOutboundAction[] {
