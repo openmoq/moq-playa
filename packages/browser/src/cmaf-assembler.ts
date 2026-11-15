@@ -197,7 +197,7 @@ export class CmafAssembler {
    * survives the rebase-to-zero. Without it, zero-basing each track at its
    * own first fragment bakes the audio-vs-video delivery-start gap (audio
    * joins at the live edge, video at the next GoP boundary) into every
-   * segment as a constant A/V desync (RED5DEV-2315).
+   * segment as a constant A/V desync.
    *
    * Only established by tracks whose timescale is known (init seen);
    * tracks without a timescale fall back to per-track zero-basing.
@@ -285,7 +285,7 @@ export class CmafAssembler {
   /**
    * DIAGNOSTIC ONLY — which rebase epoch to use. Default `shared` is production
    * behavior: both tracks derive from one cross-track origin, preserving the
-   * publisher's real A/V offset. `legacy` restores the pre-RED5DEV-2315
+   * publisher's real A/V offset. `legacy` restores the earlier
    * per-track zero-basing, which maps BOTH first fragments to 0 and therefore
    * ERASES that offset.
    *

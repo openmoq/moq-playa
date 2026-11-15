@@ -807,7 +807,7 @@ describe('CmafAssembler non-media payload diagnostics', () => {
   });
 });
 
-// ─── Shared cross-track epoch (A/V sync — RED5DEV-2315) ──────────
+// ─── Shared cross-track epoch (A/V sync) ──────────
 
 /**
  * When per-track timescales are known (from init segments), the two
@@ -819,7 +819,7 @@ describe('CmafAssembler non-media payload diagnostics', () => {
  * bmd is up to a full GoP ahead of audio's — zeroing both bakes
  * that gap in as a constant A/V desync.
  */
-describe('CmafAssembler — shared cross-track epoch (RED5DEV-2315)', () => {
+describe('CmafAssembler — shared cross-track epoch', () => {
   const VIDEO_TS = 90000;
   const AUDIO_TS = 48000;
 
@@ -1337,7 +1337,7 @@ describe('CmafAssembler — shared cross-track epoch (RED5DEV-2315)', () => {
 // The shared cross-track epoch (production) preserves the publisher's real A/V
 // offset, so a mid-stream join yields audio at 0 and video at +gap. The legacy
 // per-track mode zero-bases each track independently, mapping BOTH to 0 and
-// ERASING that offset — the pre-RED5DEV-2315 behavior. These pin that the two
+// ERASING that offset — the earlier behavior. These pin that the two
 // modes produce different startup geometry from IDENTICAL input, so the
 // geometry can be isolated in one build.
 
