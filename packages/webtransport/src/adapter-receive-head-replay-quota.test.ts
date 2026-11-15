@@ -5,7 +5,7 @@ import { object, streamHeader } from './testkit/object-reception.js';
 
 for (const draft of [16, 18, 22] as const) {
 for (const exceedsQuota of [false, true]) {
-  it(`S2 byte quota refusal leaves subsequent payload routable: draft${draft}/${exceedsQuota}`, async () => {
+  it(`byte quota refusal leaves subsequent payload routable: draft${draft}/${exceedsQuota}`, async () => {
     const faults: PipeFaults = {};
     const f = await connectedPair(draft, {
       faults: { a: faults },

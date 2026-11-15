@@ -1032,7 +1032,7 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
         } as unknown as ControlMessage);
     }
 
-    it('F5+F8a: a SUBSCRIBE_OK typed largest that beats the join continuation anchors rung 1', async () => {
+    it('a SUBSCRIBE_OK typed largest that beats the join continuation anchors rung 1', async () => {
         const adapter = createMockAdapter(16);
         // The joining fetch is refused; the largest arrived FIRST (even before
         // the join continuation) and must anchor the rung-1 standalone fetch.
@@ -1215,7 +1215,7 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
     });
 });
 
-describe('catalog bootstrap wiring — staged-recovery races (F1/F2/F4/F5/F6)', () => {
+describe('catalog bootstrap wiring — staged-recovery races', () => {
     /** Bring a player to READY, then trigger retriable DONE + drain → candidate. */
     async function toCandidate(adapter: ReturnType<typeof createMockAdapter>) {
         const loaded = await loadPlayer(adapter);
@@ -1423,7 +1423,7 @@ describe('catalog bootstrap wiring — staged-recovery races (F1/F2/F4/F5/F6)', 
         expect(errors.length).toBeGreaterThan(0);   // NOT silently inert
     });
 
-    it('F2/F6 (21i3b): retired-alias traffic racing the candidate SUBSCRIBE_OK parks and replays ONLY into the candidate', async () => {
+    it('retired-alias traffic racing the candidate SUBSCRIBE_OK parks and replays ONLY into the candidate', async () => {
         const adapter = createMockAdapter(16);
         const { events, candSubReqId, candFetchReqId } = await toCandidate(adapter);
         // The publisher REUSES the retired alias (1n): its first stream lands

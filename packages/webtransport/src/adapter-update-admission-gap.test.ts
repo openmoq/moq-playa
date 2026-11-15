@@ -1,7 +1,7 @@
-// RED for repair R1: draft-16 requestUpdateConfirmed whose onRequestId re-entrantly
+// Draft-16 requestUpdateConfirmed whose onRequestId re-entrantly
 // allocates another request and then refuses. The update's ID cannot be reclaimed, so
-// continuing would put a non-sequential Request ID on the wire (d16 §9.1). Base's
-// SUBSCRIBE/FETCH onRequestId closes locally with INTERNAL_ERROR in this case.
+// continuing would put a non-sequential Request ID on the wire (d16 §9.1). The
+// SUBSCRIBE/FETCH onRequestId paths close locally with INTERNAL_ERROR in this case.
 import { expect, it } from 'vitest';
 import { SessionError } from '@openmoq/transport';
 import { connectedPair, ns, nm } from './testkit/pair.js';

@@ -27,7 +27,7 @@ function publishBytes(draft: 18 | 22, alias: bigint) {
 for (const draft of [18, 22] as const) {
   // P1: early Object, PUBLISH, handler installed in onPublish, acceptance after the hold TTL,
   // then the same subgroup stream continues.
-  it(`P1 draft${draft} acceptance after the hold TTL: later Objects on the same stream`, async () => {
+  it(`draft${draft} acceptance after the hold TTL: later Objects on the same stream`, async () => {
     const { conn, transport } = await connect(draft, 50);
     const delivered: bigint[] = [];
     conn.onPublish = pub => { pub.onObject = o => delivered.push(o.objectId); };
@@ -47,7 +47,7 @@ for (const draft of [18, 22] as const) {
   });
 
   // P1b: PUBLISH itself arrives after the TTL of the first early Object.
-  it(`P1b draft${draft} PUBLISH arriving after the hold TTL: later Objects on the same stream`, async () => {
+  it(`draft${draft} PUBLISH arriving after the hold TTL: later Objects on the same stream`, async () => {
     const { conn, transport } = await connect(draft, 50);
     const delivered: bigint[] = [];
     conn.onPublish = pub => { pub.onObject = o => delivered.push(o.objectId); };
@@ -66,7 +66,7 @@ for (const draft of [18, 22] as const) {
   });
 
   // P3: an unclaimed hold on another alias shares the byte quota with subscribeTrack's early buffer.
-  it(`P3 draft${draft} unknown-alias hold vs a pending subscribeTrack early Object`, async () => {
+  it(`draft${draft} unknown-alias hold vs a pending subscribeTrack early Object`, async () => {
     const { conn, transport, codec } = await connect(draft, 10_000);
     const generic: bigint[] = [];
     conn.onObject = (_sid, o) => generic.push(o.trackAlias as bigint);
@@ -90,7 +90,7 @@ for (const draft of [18, 22] as const) {
 
 for (const draft of [18, 22] as const) for (const [remaining, suffix] of [[10, 20], [2, 2]]) {
   // P7: a publish hold's bytes count against the SUBSCRIBE replay window's fatal overflow check.
-  it(`P7 draft${draft} unknown-alias hold during a subscribeTrack replay window (${remaining}/${suffix})`, async () => {
+  it(`draft${draft} unknown-alias hold during a subscribeTrack replay window (${remaining}/${suffix})`, async () => {
     const { conn, transport, codec } = await connect(draft, 10_000);
     let closed = false;
     conn.onClose = () => { closed = true; };

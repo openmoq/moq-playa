@@ -74,7 +74,7 @@ async function scenario(draft: Draft, held: Held, mode: 'accept' | 'reject' | 'c
 const objs = (sent: readonly string[]) => sent.filter(s => s.startsWith('obj ')).map(s => s.slice(4)).sort();
 
 describe.each([18, 16, 22] as const)('draft-%i: arrivals during a pending SUBSCRIBE acceptance', draft => {
-  it('RED: a tail Object, its FIN and a following group all arriving during acceptance reach the subscriber (cache rotation)', async () => {
+  it('a tail Object, its FIN and a following group all arriving during acceptance reach the subscriber (cache rotation)', async () => {
     const r = await scenario(draft, (p, d) => {
       p.onObject?.(data(d, 5n, 3n, 3n)); p.onSubgroupClosed?.(header(5n, 3n));   // new tail of group 5, then its FIN
       p.onObject?.(data(d, 6n, 0n, 0n));                                         // the cache rotates to group 6

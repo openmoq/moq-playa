@@ -144,7 +144,7 @@ describe('MSF-01 op-array delta — parse-layer scope is intentional (no base ca
     });
 });
 
-describe('MSF-00 grouped delta dialect is unaffected by M2', () => {
+describe('MSF-00 grouped delta dialect is unaffected by MSF-01 delta parsing', () => {
     it('parseDeltaUpdate still parses the {deltaUpdate:true, addTracks:[…]} form', () => {
         const d = parseDeltaUpdate('{"deltaUpdate":true,"addTracks":[{"name":"new","packaging":"loc","isLive":true,"role":"video"}]}');
         expect(d.deltaUpdate).toBe(true);

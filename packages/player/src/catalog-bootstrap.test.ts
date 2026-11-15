@@ -812,7 +812,7 @@ describe('CatalogBootstrap — retained chain (rung 2)', () => {
     }
 });
 
-describe('CatalogBootstrap — live profile bookkeeping (F6/F10)', () => {
+describe('CatalogBootstrap — live profile bookkeeping', () => {
     const cf01Indep = () => enc({
         version: 1, streamingFormat: 1, streamingFormatVersion: '0.2', supportsDeltaUpdates: true,
         commonTrackFields: { namespace: 'live/test', packaging: 'cmaf', renderGroup: 1 },

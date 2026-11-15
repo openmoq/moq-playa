@@ -388,7 +388,7 @@ it.each([14, 16, 18, 22] as const)('draft %s client hint failures identify contr
   expect(errors).toEqual([]);
 });
 
-// Evaluator reproductions: synchronous warning-driven close must fence new requests.
+// A synchronous warning-driven close must fence new requests.
 it.each(['subscribe', 'namespace'] as const)('warning close during outgoing %s retires the allocation before writing', async kind => {
   const p = await pair(18);
   let writes = 0, attempts = 0, cancelled = 0, aborted = 0;

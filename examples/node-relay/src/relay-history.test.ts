@@ -605,7 +605,7 @@ async function stallHistoryObject(f: Awaited<ReturnType<typeof fixture>>, draft:
   await writer.write(bytes.subarray(0, bytes.length - 1)); await flush(256);
   return { writer, remainder: bytes.subarray(bytes.length - 1) };
 }
-for (const draft of [18, 22] as const) it(`history repair R1 draft${draft} another publisher completes the awaited location`, async () => {
+for (const draft of [18, 22] as const) it(`draft${draft} history wait wakes when another publisher completes the awaited location`, async () => {
   const f = await fixture(draft, { maxActiveHistoryRequests: 1 });
   try {
     await stallHistoryObject(f, draft);
@@ -621,7 +621,7 @@ for (const draft of [18, 22] as const) it(`history repair R1 draft${draft} anoth
   } finally { await f.close(); }
 });
 
-it('history repair R2 draft22 completed duplicate receptions cannot revive evicted history', async () => {
+it('draft22 completed duplicate receptions cannot revive evicted history', async () => {
   const f = await fixture(22, { historyCache: { maxGroups: 1 } });
   try {
     await f.publish(3n, [0n, 1n], false, false);
@@ -634,7 +634,7 @@ it('history repair R2 draft22 completed duplicate receptions cannot revive evict
 });
 
 for (const draft of [18, 22] as const) for (const timeout of [0n, 100n]) {
-  it(`history repair R3 draft${draft} FILL_TIMEOUT=${timeout} refuses waiting but serves cached bytes`, async () => {
+  it(`draft${draft} FILL_TIMEOUT=${timeout} refuses waiting but serves cached bytes`, async () => {
     const f = await fixture(draft, { maxActiveHistoryRequests: 1 });
     try {
       const stalled = await stallHistoryObject(f, draft);
@@ -650,7 +650,7 @@ for (const draft of [18, 22] as const) for (const timeout of [0n, 100n]) {
   });
 }
 
-for (const draft of [18, 22] as const) it(`history repair R4 draft${draft} malformed retirement wakes another publication's wait`, async () => {
+for (const draft of [18, 22] as const) it(`draft${draft} malformed retirement wakes another publication's wait`, async () => {
   const f = await fixture(draft, { maxActiveHistoryRequests: 1 });
   try {
     const other = await f.replace();
@@ -732,7 +732,7 @@ const pendingHistoryCount = (relay: Relay) => [...(relay as unknown as {
   tracks: Map<string, { pending: Map<object, unknown> }>;
 }).tracks.values()].reduce((count, track) => count + track.pending.size, 0);
 
-it('owned history F1 completed duplicates without FETCH owners do not accumulate', async () => {
+it('completed duplicates without FETCH owners do not accumulate', async () => {
   const f = await fixture(22);
   try {
     await f.publish(3n, [0n], false, false);
@@ -749,7 +749,7 @@ async function partialHistoryObject(peer: Awaited<ReturnType<typeof pair>>, draf
   return () => writer.write(bytes.subarray(bytes.length - 1));
 }
 // d22 suppresses repeated delivery; d18 admits the duplicate and already wakes by location.
-it('owned history F2 delivery of an Object started before PUBLISH releases a dropped wait', async () => {
+it('delivery of an Object started before PUBLISH releases a dropped wait', async () => {
   let completeEarly!: () => Promise<void>;
   const f = await fixture(22, { historyCache: { maxGroups: 1 }, maxActiveHistoryRequests: 1 }, undefined, undefined, undefined,
     async peer => { completeEarly = await partialHistoryObject(peer, 22, 4n, 1n); });
@@ -818,7 +818,7 @@ for (const draft of [18, 22] as const) for (const setup of ['missing', 'late'] a
     } finally { errors.mockRestore(); await Promise.all([peer.client.close(), peer.server.close()]); await f.close(); }
   });
 }
-for (const draft of [18, 22] as const) it(`owned history G3 draft${draft} cancel releases an ended held entry on wake`, async () => {
+for (const draft of [18, 22] as const) it(`draft${draft} cancel releases an ended held entry on wake`, async () => {
   const f = await fixture(draft, { maxActiveHistoryRequests: 1 }), peer = await pair(draft, f.relay);
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   try {

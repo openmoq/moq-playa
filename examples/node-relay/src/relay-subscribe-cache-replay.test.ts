@@ -84,14 +84,14 @@ async function scenario(draft: Draft, options: Options) {
 }
 
 describe.each([18, 16] as const)('draft-%i: SUBSCRIBE carries newly published or received Objects only (§10.7)', draft => {
-  it('RED: Objects stored before an AbsoluteStart{5,0} SUBSCRIBE is processed are not delivered by that SUBSCRIBE', async () => {
+  it('Objects stored before an AbsoluteStart{5,0} SUBSCRIBE is processed are not delivered by that SUBSCRIBE', async () => {
     const r = await scenario(draft, { filter: { type: 'AbsoluteStart', startGroup: 5n, startObject: 0n } });
     expect(r.errors).toEqual([]);
     expect(r.largest).toEqual({ groupId: 5n, objectId: 2n });   // the SUBSCRIBE_OK snapshot
     expect(r.afterSubscribe, 'history arrived on the subscription').toEqual([]);
     expect(r.all).toEqual(['5/1', '5/3', '6/0']);
   });
-  it('RED: an unfiltered SUBSCRIBE likewise does not replay stored history', async () => {
+  it('an unfiltered SUBSCRIBE likewise does not replay stored history', async () => {
     const r = await scenario(draft, {});
     expect(r.errors).toEqual([]);
     expect(r.afterSubscribe).toEqual([]);
