@@ -13,7 +13,6 @@ const testIncludes = [
   'examples/player/**/*.test.ts',
   'examples/shared/**/*.test.ts',
   'scripts/**/*.test.ts',
-  '_migration/**/*.test.ts',
 ];
 // External probe differential tests are opt-in and remain outside both projects.
 const testExcludes = [...configDefaults.exclude, '**/*.diff.test.ts'];

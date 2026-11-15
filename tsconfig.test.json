@@ -353,7 +353,6 @@
     "packages/player/src/frame-audio-output.test.ts",
     "packages/player/src/player-frame-output.test.ts",
     "packages/player/src/frame-audio-successor.test.ts",
-    "_migration/**/*.test.ts",
     "packages/locmaf/src/frame-reader-committed.test.ts",
     "packages/playa/src/player-destroy.test.ts",
     "packages/playa/src/player-position.test.ts",

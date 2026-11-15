@@ -16,12 +16,14 @@ packages, and the regular release workflow packs and publishes both sets.
 ## Release Order
 
 1. Choose a new release version, build, test, and review the tarballs.
-2. Bootstrap the canonical packages using the existing migration instructions and
-   configure their npm trusted publishers. Bootstrap packs only `@openmoq/*`.
+2. Make sure every canonical `@openmoq/*` package exists on npm with a trusted
+   publisher configured. A new package is published by hand once before the
+   release workflow can publish it.
 3. Publish the compatibility packages through the regular release workflow. Keep
    trusted publishing configured for the existing names too.
-4. After verifying both sets are installable, explicitly run
-   `bash _migration/step9_deprecate_old_scopes.sh` as an owner of the old packages.
+4. After verifying both sets are installable, deprecate each old name as an
+   owner of the old packages, for example
+   `npm deprecate "@moqt/player@*" "@moqt/player has moved. Install @openmoq/player instead."`.
    This applies npm installation warnings directing users to the replacements;
    it does not prevent installation. Repeat after subsequent compatibility releases
    so those new versions also carry the registry deprecation notice.
