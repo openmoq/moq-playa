@@ -1,7 +1,7 @@
 /**
  * Bounded LOC decode-order waits across two temporal-layer streams:
  * even Objects on Subgroup0, odd Objects on Subgroup1.
- * @see docs/draft-ietf-moq-loc-04.txt sections4.2/4.3.
+ * @see draft-ietf-moq-loc-04 §4.2, §4.3.
  * Sans-I/O command/input assertions; no decoder/native/network claim.
  */
 import { describe, expect, it } from 'vitest';
