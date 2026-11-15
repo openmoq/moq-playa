@@ -588,7 +588,6 @@ Example pages:
 | `/connect/` | Protocol explorer — raw message log |
 | `/catalog/` | Catalog browser |
 | `/broadcast/` | Camera/screen publisher example with opt-in CAT4MOQ |
-| `/video/` | Video-only player |
 
 The `/player/` page takes URL parameters: `?url=` (relay), `?ns=` / `?nsField=`
 (namespace), `?hash=` (cert hash), `?v=14|16|18|22|23` (draft), `?authority=`

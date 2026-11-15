@@ -138,7 +138,7 @@ It does not validate:
 - CMAF segment assembly
 - end-to-end playback timing
 
-For those paths, use the other examples such as `/video/`, `/player/`, or `/simple/`.
+For those paths, use the other examples such as `/player/` or `/simple/`.
 
 ## Common Failures
 
