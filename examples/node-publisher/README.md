@@ -57,7 +57,7 @@ each group), so a tiny fixture plays indefinitely with a sane timeline.
 `--loop-count N` sends exactly N groups (finite smoke/debug).
 
 ```bash
-pnpm --filter @moqt/example-node-publisher prepare-fixture /Users/Shared/Examples/Videos/test-1080p-h264-24fps-300s-1M.mp4 fixtures/test-pattern 4 500
+pnpm --filter @moqt/example-node-publisher prepare-fixture /path/to/source.mp4 fixtures/test-pattern 4 500
 pnpm --filter @moqt/example-node-publisher validate-fixture fixtures/test-pattern
 PORT=4433 pnpm --filter @moqt/example-node-relay relay-server                        # terminal 1
 pnpm --filter @moqt/example-node-publisher publish-fixture --loop https://127.0.0.1:4433/moq fixtures/test-pattern
