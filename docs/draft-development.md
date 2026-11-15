@@ -3,23 +3,10 @@
 Supported transport drafts are 14, 16, 18, 22 and 23. The default remains draft 16
 (`DEFAULT_DRAFT_VERSION` in `@openmoq/transport`). Draft 22 is opt-in. Draft 23 is
 opt-in, not tested against an independent draft-23 peer.
-Future drafts should develop on a separate branch until their integration is reviewed.
 
 Drafts 22 and 23 share the draft-18 codec, session and adapter. Draft-23 rules
 branch on `isDraft23`; checks written as `isDraft22` (draft 22 or later) cover
 draft 23 too. A new draft must not rely on checks for one exact version.
-
-## Keeping Draft Branches Aligned
-
-- Land fixes for existing drafts on main first, then merge main into draft branches.
-- Keep draft-only codecs, parameter definitions, and conformance tests separate.
-- Share lifecycle machinery where the ownership model is the same. Gate changed
-  wire rules by draft and test both sides of each boundary.
-- Avoid broad renames, formatting changes, or duplicate session implementations.
-- Merge main regularly, including its regression tests. Do not wait for a draft
-  release to bring in player, browser, or catalog fixes.
-- Keep draft-specific fixes separate from maintenance commits where practical.
-  Updating the experimental draft does not authorize changes to older drafts.
 
 The session and transport adapter still share stream ownership and cancellation
 logic. Changes there need the old-draft suites as well as draft-22 loopback tests;
@@ -88,7 +75,3 @@ used to look up the originating request. Sections 3.6 and 9.19.21 specify its
 origin and value; neither attaches a receiver-side MUST to such a lookup.
 Duplicate PUBLISH_NAMESPACE announcements are tracked independently: withdrawing
 one leaves the namespace published until the last is withdrawn (§4.1).
-
-The raw qlog REQUEST_OK normalization remains a follow-up. The End of Range
-Payload Length question remains open (Figure 29 against §11.4.2); we keep
-draft 22's marker-only form as described above.
