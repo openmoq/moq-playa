@@ -1,14 +1,13 @@
 # Simulation & Protocol-Confidence Harness
 
 Playa's deterministic test harness for the MoQT transport. This is the layer that
-proves the draft-14/16/18 implementation behaves correctly **before** it meets a
+proves the transport behaves correctly **before** it meets a
 real relay or browser — it catches session-state, codec, and topology bugs in
 fully deterministic, in-process runs (no network, no timers, no randomness that
 isn't seeded).
 
-It is the Playa equivalent of LibMoQ's `docs/simulation.md`, adapted to a
-sans-I/O TypeScript core: the protocol logic (`@openmoq/transport`) is driven through
-an in-memory loopback (`@openmoq/webtransport`) so the same code paths that run in
+The protocol logic (`@openmoq/transport`) is sans-I/O and is driven through an
+in-memory loopback (`@openmoq/webtransport`), so the same code paths that run in
 production are exercised under a controlled, repeatable schedule.
 
 ## Why it exists
@@ -30,9 +29,9 @@ clock, network, or `Math.random`.
 
 | Layer | What it proves | Where |
 | --- | --- | --- |
-| **Golden vectors** | Committed bytes still decode and re-encode identically; the d16 codec matches LibMoQ-authored bytes | `packages/transport/vectors/` (`d16-libmoq/` 39 vectors, `d18/` 16 vectors), `packages/transport/src/vectors/*.test.ts` |
+| **Golden vectors** | Committed bytes still decode and re-encode identically; the d16 codec matches LibMoQ-authored bytes; the d22 codec matches vectors shared with other implementations | `packages/transport/vectors/` (`d16-libmoq/` 39 vectors, `d18/` 17 vectors, `d22/` and `d23/` `wire-vectors.txt`), `packages/transport/src/vectors/*.test.ts` |
 | **Codec properties** | Pure encode→decode→re-encode round-trips and out-of-range rejection over boundary-biased inputs (fast-check, with shrinking) | `packages/transport/src/**/*.properties.test.ts`, `packages/transport/src/primitives/codec-properties.test.ts`, arbitraries in `packages/transport/src/testkit/arbitraries.ts` |
-| **Parser crash fuzz** | Arbitrary/truncated/malformed byte strings into every draft-14/16/18 control + data parser entrypoint never hard-crash (only `ProtocolViolationError`/`RangeError`, never a `TypeError`/plain `Error`, never `bytesRead` out of bounds) | `packages/transport/src/control/parser-crash.properties.test.ts`, `packages/transport/src/data/parser-crash.properties.test.ts` |
+| **Parser crash fuzz** | Arbitrary/truncated/malformed byte strings into every draft-14/16/18/22/23 control + data parser entrypoint never hard-crash (only `ProtocolViolationError`/`RangeError`, never a `TypeError`/plain `Error`, never `bytesRead` out of bounds) | `packages/transport/src/control/parser-crash.properties.test.ts`, `packages/transport/src/data/parser-crash.properties.test.ts` |
 | **Deterministic loopback** | Two real `MoqtConnection` endpoints establish and exchange messages over an in-memory transport | `packages/webtransport/src/testkit/loopback.ts`, `pair.ts` |
 | **Scenario runner** | Session/topology invariants hold over seeded clean operation schedules; double-run trace-hash determinism | `packages/webtransport/src/testkit/scenario.ts`, `scenario-d18.test.ts`, `scenario-legacy.test.ts` |
 | **Fault injection** | Deterministic transport chaos — write chunking (incl. 1 byte/read), mid-stream RESET, and truncating FIN — with precise close/error + cleanup oracles. Chunking is semantically transparent (trace hash unchanged); a request-stream RESET/FIN fails only that request; a data-stream RESET is benign; a truncated object or malformed header closes the session with PROTOCOL_VIOLATION. d18 plus a draft-14/16 chunking + control-stream-FIN smoke. | `packages/webtransport/src/testkit/loopback.ts` (`PipeFaults`), `scenario-faults-d18.test.ts`, `scenario-faults-legacy.test.ts` |
@@ -46,7 +45,12 @@ decoder consumes every byte, and re-encodes to the exact frozen bytes. Fixtures
 are only (re)written under an explicit generation command (`GEN_VECTORS=1`), so
 the committed corpus is the source of truth and never drifts silently. The d16
 corpus is vendored from LibMoQ and cross-validates Playa's draft-16 codec; the
-d18 corpus is Playa-authored, spec-anchored to draft-18.
+d18 corpus is Playa-authored, spec-anchored to draft-18. The d22 set
+(`wire-vectors.txt`) is shared with other draft-22 implementations; its source
+labels mark which vectors were verified externally, converted, or corrected
+locally. The d23 set comes from Playa alone, converted from the d22 set or built
+from the draft text, so it pins the encoding but is not interoperability
+evidence.
 
 ### Codec properties
 
@@ -83,7 +87,11 @@ adds hand-authored fault scenarios).
 - `packages/webtransport/src/scenario-legacy.test.ts` — the draft-14/16 suite
   (defaults: 4 seeds × 30 steps) plus hand-authored preludes.
 
-**Drafts covered:** 14, 16, 18.
+**Drafts covered:** 14, 16, 18. Drafts 22 and 23 share the draft-18 codec,
+session and adapter; the seeded runner does not drive them yet. Their behavior is
+covered by the parser crash fuzz, their wire vectors, and their own loopback
+tests (`packages/webtransport/src/adapter-d22*.test.ts`,
+`adapter-d23*.test.ts`).
 
 **Operation set:** the subscriber lifecycle — `SUBSCRIBE` / `ACCEPT` / `REJECT` /
 `SEND` / `UNSUBSCRIBE` / `QUIESCE` — runs on every draft. **draft-18** additionally
@@ -219,6 +227,6 @@ Factual log of real bugs caught before any live integration:
   simulated clock.
 - **Automatic Redirect-follow** is intentionally not provided — following a
   Redirect is application policy.
-- LibMoQ's **OOM/allocation testing** does not map directly to JS; we substitute
-  state-leak invariants (no dangling subscriptions/aliases after teardown,
+- **Allocation-failure testing** does not map directly to JavaScript; state-leak
+  invariants stand in for it (no dangling subscriptions/aliases after teardown,
   endpoints converge with no pending requests at quiescence).
