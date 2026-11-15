@@ -1,10 +1,9 @@
 # Transport Draft Development
 
-Supported transport drafts are 14, 16, 18 and 22. The default remains draft 16
-(`DEFAULT_DRAFT_VERSION` in `@openmoq/transport`); draft 22 is opt-in.
-Draft 23 is opt-in, not tested against an independent draft-23 peer.
-Draft 22 replaced the experimental draft-21 implementation. Future drafts should
-develop on a separate branch until their integration is reviewed.
+Supported transport drafts are 14, 16, 18, 22 and 23. The default remains draft 16
+(`DEFAULT_DRAFT_VERSION` in `@openmoq/transport`). Draft 22 is opt-in. Draft 23 is
+opt-in, not tested against an independent draft-23 peer.
+Future drafts should develop on a separate branch until their integration is reviewed.
 
 Drafts 22 and 23 share the draft-18 codec, session and adapter. Draft-23 rules
 branch on `isDraft23`; checks written as `isDraft22` (draft 22 or later) cover

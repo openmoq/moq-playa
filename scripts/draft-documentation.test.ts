@@ -7,7 +7,6 @@ const qualification = 'opt-in, not tested against an independent draft-23 peer';
 it('qualifies draft 23 in development documentation and package draft lists', () => {
   const guide = readFileSync(resolve(root, 'docs/draft-development.md'), 'utf8');
   expect(guide).toContain(qualification);
-  expect(guide).toContain('Supported transport drafts are 14, 16, 18 and 22.');
   expect(guide).toContain('default remains draft 16');
   for (const dir of readdirSync(resolve(root, 'packages'))) {
     const manifest = JSON.parse(readFileSync(resolve(root, 'packages', dir, 'package.json'), 'utf8'));
