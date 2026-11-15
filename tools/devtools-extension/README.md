@@ -579,10 +579,7 @@ difference is never shown or read as drops.
 
 ## Not yet
 
-The native optional-permission prompt,
-which remains a MANUAL check (the automated attachment gate uses a labelled
-test build that pre-grants the loopback origin and a denial control that
-wraps the API); a GitHub Actions run of the wired CI (never dispatched; all
-evidence above is local macOS plus Codex's clean Linux containers on earlier
-candidates); and media correctness itself, which is the player acceptance
-harness's job, not this panel's.
+The native optional-permission prompt remains a manual check: the automated
+attachment gate uses a labelled test build that pre-grants the loopback origin,
+and a denial control that wraps the API. Media correctness itself is the player
+acceptance harness's job, not this panel's.
