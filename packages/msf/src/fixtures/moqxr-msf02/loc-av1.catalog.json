@@ -1,0 +1,46 @@
+{
+  "generatedAt": 1795038649297,
+  "initDataList": [
+    {
+      "data": "0x0D",
+      "id": "vide_1-init",
+      "type": "object-property"
+    }
+  ],
+  "tracks": [
+    {
+      "bitrate": 2000000,
+      "codec": "av01.0.00M.08",
+      "framerate": 4,
+      "initRef": "vide_1-init",
+      "isLive": true,
+      "name": "vide_1",
+      "packaging": "loc",
+      "renderGroup": 1,
+      "role": "video",
+      "timescale": 16384
+    },
+    {
+      "depends": [
+        1
+      ],
+      "isLive": true,
+      "mimeType": "application/json",
+      "name": "timeline",
+      "packaging": "mediatimeline",
+      "role": "mediatimeline"
+    },
+    {
+      "depends": [
+        "vide_1"
+      ],
+      "eventType": "org.ietf.moq.cmsf.sap",
+      "isLive": true,
+      "mimeType": "application/json",
+      "name": "vide_1_sap",
+      "packaging": "eventtimeline",
+      "role": "eventtimeline"
+    }
+  ],
+  "version": "draft-02"
+}

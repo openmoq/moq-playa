@@ -1588,34 +1588,6 @@
       }
     },
     {
-      "id": "catalog/msf01-version-draft-02",
-      "kind": "catalog-parse",
-      "profile": "msf-01",
-      "description": "Playa MSF-01 profile policy (interpretation of §5.1.1 \"MUST NOT parse a version it does not understand\"): \"draft-02\" is not among the versions this profile understands (\"1\"/\"draft-01\"), so it is rejected — the draft suffix is a draft revision, never decoded to a numeric version. Playa returns the same invalid-version category by ACCIDENT (it rejects all string versions), not by MSF-01 support — forward-looking with no currentBehavior.",
-      "input": {
-        "file": "msf01_version_draft_02.json",
-        "byteLength": 34,
-        "sha256": "1f311a3e5d3aa7f86c9281c3a76aca13eb95f11fbef258fe3c9c432490c924aa"
-      },
-      "expect": {
-        "status": "error",
-        "stage": "semantic",
-        "error": {
-          "category": "invalid-version"
-        }
-      },
-      "expectationBasis": "interpretation",
-      "provenance": {
-        "class": "spec-derived",
-        "source": "draft-ietf-moq-msf-01",
-        "section": "5.1.1",
-        "generator": "hand-authored",
-        "generatorVersion": "n/a",
-        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
-        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
-      }
-    },
-    {
       "id": "catalog/msf01-version-draft-abc",
       "kind": "catalog-parse",
       "profile": "msf-01",
@@ -1641,6 +1613,35 @@
         "generatorVersion": "n/a",
         "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
         "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+      }
+    },
+    {
+      "id": "catalog/msf02-version-draft-02",
+      "kind": "catalog-parse",
+      "profile": "msf-02",
+      "description": "MSF-02 §5.1.1: the catalog version is the String \"draft-02\" (the spelling used by every catalog example in the draft); a subscriber that supports MSF-02 accepts it and normalizes it to catalogVersion \"1\". Under the MSF-01 profile this spelling was rejected; Playa now understands both.",
+      "input": {
+        "file": "msf02_version_draft_02.json",
+        "byteLength": 34,
+        "sha256": "1f311a3e5d3aa7f86c9281c3a76aca13eb95f11fbef258fe3c9c432490c924aa"
+      },
+      "expect": {
+        "status": "ok",
+        "stage": "semantic",
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": []
+        }
+      },
+      "expectationBasis": "interpretation",
+      "provenance": {
+        "class": "spec-derived",
+        "source": "draft-ietf-moq-msf-02",
+        "section": "5.1.1",
+        "generator": "hand-authored",
+        "generatorVersion": "n/a",
+        "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
+        "sourceHash": "171b0dec53aa312baa2c807c1ac24377672c8a7c01adc30cbd0f7e6124ec851a"
       }
     },
     {

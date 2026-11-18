@@ -22,10 +22,10 @@
 import { namespaceDisplay, referenceIdentityKey, resolveTrackNamespace, trackIdentityKey } from './track-identity.js';
 import type { CatalogNamespaceContext } from './track-identity.js';
 import type { CatalogTrack, CatalogState, Msf01Delta, Msf01DeltaOp, Msf01DeltaOpKind } from './types.js';
-import { extractRecognizedOptionalFields, validateLocmafVersion, validateReferences } from './catalog-msf00.js';
+import { extractRecognizedOptionalFields, resolveDependsRenderGroups, validateLocmafVersion, validateReferences } from './catalog-msf00.js';
 import { assertFiniteMsf01Delta, assertFiniteCatalogNumbers } from './catalog-validate.js';
 
-const VALID_OPS = new Set<string>(['add', 'remove', 'clone']);
+const VALID_OPS = new Set<string>(['add', 'remove', 'clone', 'update']);
 
 /**
  * Parse an MSF-01 op-array delta document.
@@ -84,13 +84,13 @@ function parseOp(raw: unknown, index: number): Msf01DeltaOp {
         throw new Error(`deltaUpdate[${index}]: op is required and must be a string (§5.3)`);
     }
     if (!VALID_OPS.has(op)) {
-        throw new Error(`unknown delta operation "${op}"; expected one of add, remove, clone (§5.3)`);
+        throw new Error(`unknown delta operation "${op}"; expected one of add, remove, clone, update (§5.3)`);
     }
     if (!Array.isArray(o['tracks'])) {
         throw new Error(`deltaUpdate[${index}]: tracks is required and must be an array (§5.3)`);
     }
 
-    const tracks = (o['tracks'] as unknown[]).map((t, j) => parseOpTrack(t, index, j));
+    const tracks = (o['tracks'] as unknown[]).map((t, j) => parseOpTrack(t, index, j, op === 'update'));
     return { op: op as Msf01DeltaOpKind, tracks };
 }
 
@@ -101,18 +101,20 @@ function parseOp(raw: unknown, index: number): Msf01DeltaOp {
  * dropped, the lowercase `mimetype` misspelling stays unknown, and the template
  * is validated — all via the shared M1 field extractor.
  */
-function parseOpTrack(raw: unknown, opIndex: number, trackIndex: number): Partial<CatalogTrack> {
+function parseOpTrack(raw: unknown, opIndex: number, trackIndex: number, update = false): Partial<CatalogTrack> {
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
         throw new Error(`deltaUpdate[${opIndex}].tracks[${trackIndex}] must be a JSON object (§5.3)`);
     }
     const obj = raw as Record<string, unknown>;
 
-    if (typeof obj['name'] !== 'string') {
+    // MSF-02 §5.1.6: an "update" entry names its target with parentName and need not carry a name.
+    if (typeof obj['name'] !== 'string' && !(update && obj['name'] === undefined)) {
         throw new Error(`deltaUpdate[${opIndex}].tracks[${trackIndex}]: name is required and must be a string (§5.3)`);
     }
+    const trackName = typeof obj['name'] === 'string' ? obj['name'] : String(obj['parentName'] ?? '');
 
     return {
-        name: obj['name'],
+        ...(typeof obj['name'] === 'string' ? { name: obj['name'] } : {}),
         // Identity / clone-context fields carried PRESENT-ONLY (no defaults). An
         // op-track packaging is kept verbatim (not enum-restricted) to mirror the
         // projection contract — the base catalog owns full-track validation.
@@ -121,7 +123,7 @@ function parseOpTrack(raw: unknown, opIndex: number, trackIndex: number): Partia
         ...(typeof obj['namespace'] === 'string' ? { namespace: obj['namespace'] } : {}),
         ...(typeof obj['parentName'] === 'string' ? { parentName: obj['parentName'] } : {}),
         ...(typeof obj['parentNamespace'] === 'string' ? { parentNamespace: obj['parentNamespace'] } : {}),
-        ...extractRecognizedOptionalFields(obj, obj['name']),
+        ...extractRecognizedOptionalFields(obj, trackName),
     };
 }
 
@@ -157,6 +159,40 @@ function materializeAddTrack(
         ...(inheritedText !== undefined ? { namespace: inheritedText } : {}),
         ...(resolvedNamespace !== undefined ? { resolvedNamespace } : {}),
     };
+}
+
+/**
+ * Apply an MSF-02 `update` entry: the target is named by parentName (in the catalog namespace
+ * unless parentNamespace says otherwise) and the declared attributes override its existing values.
+ * The track keeps its identity, so an update may not carry a name or namespace of its own.
+ * @see draft-ietf-moq-msf-02 §5.1.6, §5.3
+ */
+function applyUpdateOp(
+    t: Partial<CatalogTrack>, tracks: readonly CatalogTrack[],
+    catalogNamespace?: CatalogNamespaceContext,
+): CatalogTrack[] {
+    const parentName = t.parentName;
+    if (parentName === undefined) {
+        throw new Error('Update operation requires parentName (§5.1.6)');
+    }
+    if (t.name !== undefined || t.namespace !== undefined) {
+        throw new Error(`Update operation for track "${parentName}" must not carry name or namespace; the target is named by parentName (§5.1.6)`);
+    }
+    const key = referenceIdentityKey(
+        { name: parentName, ...(t.parentNamespace !== undefined ? { namespace: t.parentNamespace } : {}) },
+        catalogNamespace);
+    const target = tracks.find((x) => trackKey(x) === key);
+    if (!target) {
+        const ns = t.parentNamespace !== undefined ? ` in namespace "${t.parentNamespace}"` : '';
+        throw new Error(`Cannot update track "${parentName}"${ns}: track not found in the current catalog (§5.3)`);
+    }
+    const { parentName: _pn, parentNamespace: _pns, ...overrides } = t;
+    // A depends override replaces the declared names; drop the previous expansion so it is recomputed.
+    const reset = overrides.depends !== undefined || overrides.dependsRenderGroups !== undefined
+        ? { dependsDeclared: undefined, dependsRenderGroups: overrides.dependsRenderGroups }
+        : {};
+    const updated = { ...target, ...overrides, ...reset } as CatalogTrack;
+    return tracks.map((x) => (x === target ? updated : x));
 }
 
 /**
@@ -255,6 +291,10 @@ export function applyMsf01Delta(
                 }
                 tracks = tracks.filter((x) => trackKey(x) !== key);
             }
+        } else if (op.op === 'update') {
+            for (const raw of op.tracks) {
+                tracks = applyUpdateOp(raw, tracks, catalogNamespace);
+            }
         } else {
             for (const raw of op.tracks) {
                 const cloned = applyCloneOp(raw, tracks, catalogNamespace);
@@ -265,6 +305,9 @@ export function applyMsf01Delta(
             }
         }
     }
+
+    // MSF-02 §5.2.15: recompute renderGroup depends against the resulting track list.
+    tracks = resolveDependsRenderGroups(tracks);
 
     const generatedAt = delta.generatedAt ?? state.generatedAt;
     const next: CatalogState = {

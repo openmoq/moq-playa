@@ -29,7 +29,6 @@ const REQUIREMENTS: Record<string, Req> = {
   'catalog/msf01-version-draft-99': { profile: 'msf-01', kind: 'catalog-parse', basis: 'interpretation', status: 'error', category: 'invalid-version', draft: 'msf-01', capability: 'executable' },
   'catalog/msf01-version-draft-1': { profile: 'msf-01', kind: 'catalog-parse', basis: 'interpretation', status: 'error', category: 'invalid-version', draft: 'msf-01', capability: 'executable' },
   'catalog/msf01-version-draft-00': { profile: 'msf-01', kind: 'catalog-parse', basis: 'interpretation', status: 'error', category: 'invalid-version', draft: 'msf-01', capability: 'executable' },
-  'catalog/msf01-version-draft-02': { profile: 'msf-01', kind: 'catalog-parse', basis: 'interpretation', status: 'error', category: 'invalid-version', draft: 'msf-01', capability: 'executable' },
   'catalog/msf01-version-draft-abc': { profile: 'msf-01', kind: 'catalog-parse', basis: 'interpretation', status: 'error', category: 'invalid-version', draft: 'msf-01', capability: 'executable' },
   'catalog/msf00-numeric-unchanged': { profile: 'msf-00', kind: 'catalog-parse', basis: 'normative', status: 'ok', draft: 'msf-00', capability: 'executable' },
   // MSF-01 semantics
@@ -57,9 +56,9 @@ const REQUIREMENTS: Record<string, Req> = {
 const DRAFT_SOURCE: Record<Draft, string> = { 'msf-00': 'draft-ietf-moq-msf-00', 'msf-01': 'draft-ietf-moq-msf-01', 'cmsf-01': 'draft-ietf-moq-cmsf-01' };
 
 describe('spec vectors — every listed requirement has a spec-derived vector with correct provenance', () => {
-  it('the exact set of 26 spec vectors is present (clone-before-add removed; 5 unsupported-version detectors)', () => {
+  it('the exact set of 25 spec vectors is present (clone-before-add removed; 4 unsupported-version detectors; draft-02 moved to msf02-)', () => {
     expect(new Set(SPEC_VECTORS.map((e) => e.id))).toEqual(new Set(Object.keys(REQUIREMENTS)));
-    expect(SPEC_VECTORS.length).toBe(26);
+    expect(SPEC_VECTORS.length).toBe(25);
   });
 
   for (const [id, want] of Object.entries(REQUIREMENTS)) {
@@ -122,7 +121,7 @@ describe('independent literals; wide integers stay decimal strings', () => {
 describe('reference & delta error vectors discriminate', () => {
   const errorIds = Object.entries(REQUIREMENTS).filter(([, w]) => w.status === 'error').map(([id]) => id);
 
-  it('the reference/delta error categories are all DISTINCT; the 5 version detectors share invalid-version', () => {
+  it('the reference/delta error categories are all DISTINCT; the 4 version detectors share invalid-version', () => {
     const cats = errorIds.map((id) => byId.get(id)!.expect.error!.category);
     // The seven distinct intended categories are all present.
     expect(new Set(cats)).toEqual(new Set(['dangling-init-ref', 'duplicate-init-ref', 'dangling-protection-ref', 'duplicate-protection-ref', 'unknown-delta-op', 'illegal-delta-field', 'invalid-version']));
@@ -130,8 +129,8 @@ describe('reference & delta error vectors discriminate', () => {
     const nonVersion = cats.filter((c) => c !== 'invalid-version');
     expect(new Set(nonVersion).size).toBe(nonVersion.length);
     expect(nonVersion.length).toBe(6);
-    // The five version-rejection vectors deliberately share invalid-version.
-    expect(cats.filter((c) => c === 'invalid-version').length).toBe(5);
+    // The four version-rejection vectors deliberately share invalid-version (draft-02 is accepted since MSF-02).
+    expect(cats.filter((c) => c === 'invalid-version').length).toBe(4);
   });
 
   it('EVERY error vector carries NO differential.playa (production categorizes them all correctly)', () => {
@@ -151,8 +150,8 @@ describe('capability reflects the parser promotions; nothing forward-looking rem
     }
   });
 
-  it('ALL five unsupported-version spellings reject with invalid-version and are now executable', () => {
-    const drafts = ['draft-99', 'draft-1', 'draft-00', 'draft-02', 'draft-abc'];
+  it('ALL four unsupported-version spellings reject with invalid-version and are now executable', () => {
+    const drafts = ['draft-99', 'draft-1', 'draft-00', 'draft-abc'];
     for (const d of drafts) {
       const e = byId.get(`catalog/msf01-version-${d}`)!;
       expect(e, d).toBeDefined();
@@ -165,9 +164,9 @@ describe('capability reflects the parser promotions; nothing forward-looking rem
     }
   });
 
-  it('all 26 spec vectors are executable — zero forward-looking', () => {
+  it('all 25 spec vectors are executable — zero forward-looking', () => {
     const caps = SPEC_VECTORS.map((e) => executionCapability(e).capability);
-    expect(caps.filter((c) => c === 'executable').length).toBe(26);
+    expect(caps.filter((c) => c === 'executable').length).toBe(25);
     expect(caps.filter((c) => c === 'forward-looking').length).toBe(0);
   });
 
