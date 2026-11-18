@@ -101,15 +101,19 @@ export function parseEventTimeline(
 
         const obj = entry as Record<string, unknown>;
 
-        // Validate exactly one index field
-        const hasT = 't' in obj;
-        const hasL = 'l' in obj;
-        const hasM = 'm' in obj;
-        const indexCount = (hasT ? 1 : 0) + (hasL ? 1 : 0) + (hasM ? 1 : 0);
+        // Validate exactly one index field. MSF-02 §8.2 spells the keys in uppercase ('T', 'L',
+        // 'M'); MSF-01 used lowercase. Either spelling is accepted, and a record may not mix them.
+        const keyT = 'T' in obj ? 'T' : 't';
+        const keyL = 'L' in obj ? 'L' : 'l';
+        const keyM = 'M' in obj ? 'M' : 'm';
+        const hasT = 't' in obj || 'T' in obj;
+        const hasL = 'l' in obj || 'L' in obj;
+        const indexCount = ('t' in obj ? 1 : 0) + ('T' in obj ? 1 : 0) + ('l' in obj ? 1 : 0) + ('L' in obj ? 1 : 0)
+            + ('m' in obj ? 1 : 0) + ('M' in obj ? 1 : 0);
 
         if (indexCount !== 1) {
             throw new Error(
-                `Event timeline record[${i}]: must have exactly one index field ('t', 'l', or 'm') (§8.1)`,
+                `Event timeline record[${i}]: must have exactly one index field ('t'/'T', 'l'/'L', or 'm'/'M') (§8.1)`,
             );
         }
 
@@ -125,14 +129,14 @@ export function parseEventTimeline(
         //  value is an Array of Numbers [groupId, objectId]."
         let index: EventIndex;
         if (hasT) {
-            if (typeof obj['t'] !== 'number') {
+            if (typeof obj[keyT] !== 'number') {
                 throw new Error(
                     `Event timeline record[${i}]: 't' index must be a number (§8.1)`,
                 );
             }
-            index = { t: obj['t'] };
+            index = { t: obj[keyT] };
         } else if (hasL) {
-            const loc = obj['l'];
+            const loc = obj[keyL];
             if (
                 !Array.isArray(loc) ||
                 loc.length !== 2 ||
@@ -145,12 +149,12 @@ export function parseEventTimeline(
             }
             index = { l: [loc[0], loc[1]] as readonly [number, number] };
         } else {
-            if (typeof obj['m'] !== 'number') {
+            if (typeof obj[keyM] !== 'number') {
                 throw new Error(
                     `Event timeline record[${i}]: 'm' index must be a number (§8.1)`,
                 );
             }
-            index = { m: obj['m'] };
+            index = { m: obj[keyM] };
         }
 
         return {

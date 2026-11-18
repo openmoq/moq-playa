@@ -32,9 +32,13 @@ describe('MSF-01 — version detection (§5.1.1)', () => {
     });
 
     it('rejects every other draft/version spelling with an unsupported-version error', () => {
-        for (const v of ['draft-1', 'draft-00', 'draft-02', 'draft-99', 'draft-abc', '2', 'draft-1.0', '']) {
+        for (const v of ['draft-1', 'draft-00', 'draft-03', 'draft-99', 'draft-abc', '2', 'draft-1.0', '']) {
             expect(() => parse({ version: v, tracks: [] }), v).toThrow(/version/i);
         }
+    });
+
+    it('accepts the MSF-02 spelling "draft-02" (see catalog-msf02.test.ts for the rest of MSF-02)', () => {
+        expect(() => parse({ version: 'draft-02', tracks: [] })).not.toThrow();
     });
 
     it('rejects the numeric version 2 (unsupported)', () => {

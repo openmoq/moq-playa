@@ -25,7 +25,7 @@ import { assertFiniteCatalogNumbers } from './catalog-validate.js';
  */
 function normalizeMsfVersion(v: unknown): number | null {
     if (typeof v === 'number') return v === MSF_VERSION ? MSF_VERSION : null;
-    if (typeof v === 'string') return v === '1' || v === 'draft-01' ? MSF_VERSION : null;
+    if (typeof v === 'string') return v === '1' || v === 'draft-01' || v === 'draft-02' ? MSF_VERSION : null;
     return null;
 }
 
@@ -102,9 +102,11 @@ export function parseMsfCatalog(
     // spelling the corpus oracle accepts.
     const legacyMsf00 = typeof obj['version'] === 'number';
 
-    const tracks = (obj['tracks'] as unknown[]).map(
+    const parsedTracks = (obj['tracks'] as unknown[]).map(
         (raw, i) => parseTrack(raw, i, catalogNamespace, legacyMsf00),
     );
+    // MSF-02 §5.2.15: expand renderGroup entries of depends into track names.
+    const tracks = resolveDependsRenderGroups(parsedTracks);
 
     // §5.1.11: Track names must be unique per namespace
     validateTrackUniqueness(tracks);
@@ -436,6 +438,59 @@ function parseTrack(
  * parser and the MSF-01 delta op-track parser so both recognize the same field
  * set with identical drop / template-validation semantics.
  */
+/**
+ * Parse a `depends` array. Entries are track names (strings) and, from MSF-02, renderGroup numbers
+ * (non-negative integers). Names stay in `depends`; numbers move to `dependsRenderGroups` and are
+ * expanded to track names by {@link resolveDependsRenderGroups} once the whole track list is known.
+ * @see draft-ietf-moq-msf-02 §5.2.15
+ */
+function parseDepends(raw: unknown, trackName: string): Partial<CatalogTrack> {
+    if (!Array.isArray(raw)) return {};
+    const names: string[] = [];
+    const groups: number[] = [];
+    for (const entry of raw as unknown[]) {
+        if (typeof entry === 'string') {
+            names.push(entry);
+        } else if (typeof entry === 'number' && Number.isSafeInteger(entry) && entry >= 0) {
+            if (!groups.includes(entry)) groups.push(entry);
+        } else {
+            throw new Error(`Track "${trackName}": depends entries must be track names or renderGroup numbers (§5.2.15)`);
+        }
+    }
+    return {
+        depends: names,
+        ...(groups.length > 0 ? { dependsRenderGroups: groups } : {}),
+    };
+}
+
+/**
+ * Expand every track's renderGroup `depends` entries into the names of the other tracks that
+ * carry that renderGroup, so consumers that test `depends.includes(trackName)` keep working.
+ * Idempotent: it always expands from the names the track declared, so re-running it after a
+ * delta recomputes membership.
+ *
+ * @throws {Error} when a renderGroup resolves to no other track (the catalog is invalid, §5.2.15)
+ * @see draft-ietf-moq-msf-02 §5.2.15, §7.2
+ */
+export function resolveDependsRenderGroups(tracks: readonly CatalogTrack[]): CatalogTrack[] {
+    return tracks.map((track) => {
+        const groups = track.dependsRenderGroups;
+        if (groups === undefined || groups.length === 0) return track;
+        const declared = track.dependsDeclared ?? track.depends ?? [];
+        const names = [...declared];
+        for (const group of groups) {
+            const members = tracks.filter((other) => other !== track && other.renderGroup === group);
+            if (members.length === 0) {
+                throw new Error(`Track "${track.name}": depends renderGroup ${group} resolves to no other track (§5.2.15)`);
+            }
+            for (const member of members) {
+                if (!names.includes(member.name)) names.push(member.name);
+            }
+        }
+        return { ...track, depends: names, dependsDeclared: [...declared] };
+    });
+}
+
 export function extractRecognizedOptionalFields(
     obj: Record<string, unknown>,
     trackName: string,
@@ -459,7 +514,7 @@ export function extractRecognizedOptionalFields(
         ...(typeof obj['label'] === 'string' ? { label: obj['label'] } : {}),
         ...(typeof obj['initData'] === 'string' ? { initData: obj['initData'] } : {}),
         ...(typeof obj['initTrack'] === 'string' ? { initTrack: obj['initTrack'] } : {}),
-        ...(Array.isArray(obj['depends']) ? { depends: obj['depends'] as string[] } : {}),
+        ...parseDepends(obj['depends'], trackName),
         ...(typeof obj['temporalId'] === 'number' ? { temporalId: obj['temporalId'] } : {}),
         ...(typeof obj['spatialId'] === 'number' ? { spatialId: obj['spatialId'] } : {}),
         ...(obj['buffers'] && typeof obj['buffers'] === 'object' ? { buffers: Object.fromEntries(Object.entries(obj['buffers']).filter(([key, value]) => (key === 'min' || key === 'target' || key === 'max') && typeof value === 'number' && Number.isFinite(value) && value >= 0)) } : {}),

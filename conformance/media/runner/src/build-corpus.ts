@@ -51,6 +51,7 @@ const DRAFT_SHA: Record<string, string> = {
   'draft-ietf-moq-loc-04': 'fb29e2805be0511a188683b60fc830fb7fd3ecf19931968755d60d83707c3b47',
   'draft-ietf-moq-msf-00': '55bcc55a4b93a2e8bd707bb9b02a9cc7370a99cd20b493819bf62a50ad0aaf3f',
   'draft-ietf-moq-msf-01': 'c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af',
+  'draft-ietf-moq-msf-02': '171b0dec53aa312baa2c807c1ac24377672c8a7c01adc30cbd0f7e6124ec851a',
   'draft-ietf-moq-cmsf-00': '8dee5af3d6c028a3be8e808ac2afcf50f4aeaf6074a39f6804b2385814a68a86',
   'draft-ietf-moq-cmsf-01': 'c0ba68d09d6d42540ca0ac7f5df30b66aae7ede11fdc14e8338de977da9cc04d',
   'draft-ietf-moq-catalogformat-01': '65bb99327880b3de33a233331aa724fb60a5c78eb1ce34ab6b52c3351e72c507',
@@ -993,12 +994,21 @@ function buildSpecMsf01(): void {
   // and draft-N is NOT decoded to version N. Each rejects with invalid-version;
   // Playa returns the SAME category by accident (it rejects all string versions),
   // so these stay forward-looking with NO currentBehavior.
-  for (const [tag, ver] of [['draft-99', 'draft-99'], ['draft-1', 'draft-1'], ['draft-00', 'draft-00'], ['draft-02', 'draft-02'], ['draft-abc', 'draft-abc']] as const) {
+  for (const [tag, ver] of [['draft-99', 'draft-99'], ['draft-1', 'draft-1'], ['draft-00', 'draft-00'], ['draft-abc', 'draft-abc']] as const) {
     spec(`catalog/msf01-version-${tag}`, 'catalog-parse', 'msf-01',
       `{"version":"${ver}","tracks":[]}`,
       errc('invalid-version'), 'interpretation', MSF, '5.1.1', `msf01_version_${tag.replace('-', '_')}.json`,
       `Playa MSF-01 profile policy (interpretation of §5.1.1 "MUST NOT parse a version it does not understand"): "${ver}" is not among the versions this profile understands ("1"/"draft-01"), so it is rejected — the draft suffix is a draft revision, never decoded to a numeric version. Playa returns the same invalid-version category by ACCIDENT (it rejects all string versions), not by MSF-01 support — forward-looking with no currentBehavior.`);
   }
+  // MSF-02 §5.1.1 / Appendix A.1.1: the catalog examples use the version string "draft-02". The
+  // normative text only says "the version of MSF referenced", so accepting this spelling is an
+  // INTERPRETATION. It was a rejected spelling under the MSF-01 profile; Playa now understands MSF-02
+  // and normalizes it to the same typed catalogVersion as "1". It has its own id (not msf01-*) so it
+  // stays out of the MSF-01 differential cohorts.
+  spec('catalog/msf02-version-draft-02', 'catalog-parse', 'msf-02',
+    '{"version":"draft-02","tracks":[]}',
+    okc([]), 'interpretation', 'draft-ietf-moq-msf-02', '5.1.1', 'msf02_version_draft_02.json',
+    'MSF-02 §5.1.1: the catalog version is the String "draft-02" (the spelling used by every catalog example in the draft); a subscriber that supports MSF-02 accepts it and normalizes it to catalogVersion "1". Under the MSF-01 profile this spelling was rejected; Playa now understands both.');
   spec('catalog/msf00-numeric-unchanged', 'catalog-parse', 'msf-00',
     '{"version":1,"tracks":[{"name":"v","packaging":"loc","isLive":true}]}',
     okc([{ name: 'v', packaging: 'loc', isLive: true }]), 'normative', MSF0, '5.1.1', 'msf00_numeric_unchanged.json',

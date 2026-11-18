@@ -180,6 +180,14 @@ export interface CatalogTrack {
     readonly initTrack?: string;
     /** @see draft-ietf-moq-msf-00 §5.1.21 — array of track names this track depends on */
     readonly depends?: string[];
+    /**
+     * MSF-02 §5.2.15: renderGroup numbers named in `depends`. {@link depends} then holds the
+     * effective track names, with each group expanded into the other tracks that carry it.
+     * @see draft-ietf-moq-msf-02 §5.2.15, §7.2
+     */
+    readonly dependsRenderGroups?: number[];
+    /** The track names written in `depends` before renderGroup expansion; present with {@link dependsRenderGroups}. */
+    readonly dependsDeclared?: string[];
     /** @see draft-ietf-moq-msf-00 §5.1.22 — temporal layer (0 = base) */
     readonly temporalId?: number;
     /** @see draft-ietf-moq-msf-00 §5.1.23 — spatial layer (0 = base) */
@@ -291,7 +299,7 @@ export interface CatalogDelta {
  * parse-layer projection — no base-catalog application is performed.
  * @see draft-ietf-moq-msf-01 §5.3
  */
-export type Msf01DeltaOpKind = 'add' | 'remove' | 'clone';
+export type Msf01DeltaOpKind = 'add' | 'remove' | 'clone' | 'update';
 export interface Msf01DeltaOp {
     readonly op: Msf01DeltaOpKind;
     readonly tracks: readonly Partial<CatalogTrack>[];

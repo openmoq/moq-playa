@@ -1,0 +1,48 @@
+{
+  "generatedAt": 1795038649254,
+  "initDataList": [
+    {
+      "data": "0x0F",
+      "id": "soun_1-init",
+      "type": "object-property"
+    }
+  ],
+  "tracks": [
+    {
+      "avgBitrate": 64000,
+      "bitrate": 64000,
+      "channelConfig": "2",
+      "codec": "opus",
+      "initRef": "soun_1-init",
+      "isLive": true,
+      "name": "soun_1",
+      "packaging": "loc",
+      "renderGroup": 1,
+      "role": "audio",
+      "samplerate": 48000,
+      "timescale": 48000
+    },
+    {
+      "depends": [
+        1
+      ],
+      "isLive": true,
+      "mimeType": "application/json",
+      "name": "timeline",
+      "packaging": "mediatimeline",
+      "role": "mediatimeline"
+    },
+    {
+      "depends": [
+        "soun_1"
+      ],
+      "eventType": "org.ietf.moq.cmsf.sap",
+      "isLive": true,
+      "mimeType": "application/json",
+      "name": "soun_1_sap",
+      "packaging": "eventtimeline",
+      "role": "eventtimeline"
+    }
+  ],
+  "version": "draft-02"
+}

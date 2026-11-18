@@ -1,0 +1,82 @@
+{
+  "generatedAt": 1795038649220,
+  "initDataList": [
+    {
+      "data": "AAAAHGZ0eXBpc281AAACAGlzbzVpc282bXA0MQAAAu1tb292AAAAbG12aGQAAAAAAAAAAAAAAAAAALuAAAAAAAABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAB8HRyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAQAAAAEAAAAAAAYxtZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAADwAAAAAAFXEAAAAAAAtaGRscgAAAAAAAAAAdmlkZQAAAAAAAAAAAAAAAFZpZGVvSGFuZGxlcgAAAAE3bWluZgAAABR2bWhkAAAAAQAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAAA93N0YmwAAACrc3RzZAAAAAAAAAABAAAAm2F2YzEAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAQABAAEgAAABIAAAAAAAAAAEUTGF2YzYzLjEuMTAyIGxpYngyNjQAAAAAAAAAAAAAAAAY//8AAAA1YXZjQwFkAAr/4QAYZ2QACqyyCE2AiAAAAwAIAAADAeR4kTJAAQAGaOvDyyLA/fj4AAAAABBwYXNwAAAAAQAAAAEAAAAQc3R0cwAAAAAAAAAAAAAAEHN0c2MAAAAAAAAAAAAAABRzdHN6AAAAAAAAAAAAAAAAAAAAEHN0Y28AAAAAAAAAAAAAAChtdmV4AAAAIHRyZXgAAAAAAAAAAQAAAAEAAAAAAAAAAAAAAAAAAABhdWR0YQAAAFltZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBwbAAAAAAAAAAAAAAAACxpbHN0AAAAJKl0b28AAAAcZGF0YQAAAAEAAAAATGF2ZjYzLjEuMTAy",
+      "id": "vide_1-init",
+      "type": "inline"
+    },
+    {
+      "data": "AAAAHGZ0eXBpc281AAACAGlzbzVpc282bXA0MQAAArxtb292AAAAbG12aGQAAAAAAAAAAAAAAAAAALuAAAAAAAABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAABv3RyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAQEAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAVttZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAALuAAAAAAFXEAAAAAAAtaGRscgAAAAAAAAAAc291bgAAAAAAAAAAAAAAAFNvdW5kSGFuZGxlcgAAAAEGbWluZgAAABBzbWhkAAAAAAAAAAAAAAAkZGluZgAAABxkcmVmAAAAAAAAAAEAAAAMdXJsIAAAAAEAAADKc3RibAAAAH5zdHNkAAAAAAAAAAEAAABubXA0YQAAAAAAAAABAAAAAAAAAAAAAQAQAAAAALuAAAAAAAA2ZXNkcwAAAAADgICAJQACAASAgIAXQBUAAAAAAH0AAAB9AAWAgIAFEYhW5QAGgICAAQIAAAAUYnRydAAAAAAAAH0AAAB9AAAAABBzdHRzAAAAAAAAAAAAAAAQc3RzYwAAAAAAAAAAAAAAFHN0c3oAAAAAAAAAAAAAAAAAAAAQc3RjbwAAAAAAAAAAAAAAKG12ZXgAAAAgdHJleAAAAAAAAAACAAAAAQAAAAAAAAAAAAAAAAAAAGF1ZHRhAAAAWW1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAALGlsc3QAAAAkqXRvbwAAABxkYXRhAAAAAQAAAABMYXZmNjMuMS4xMDI=",
+      "id": "soun_2-init",
+      "type": "inline"
+    }
+  ],
+  "tracks": [
+    {
+      "bitrate": 2000000,
+      "codec": "avc1.64000A",
+      "framerate": 30,
+      "height": 64,
+      "initRef": "vide_1-init",
+      "isLive": true,
+      "maxGrpSapStartingType": 2,
+      "maxObjSapStartingType": 2,
+      "name": "vide_1",
+      "packaging": "cmaf",
+      "renderGroup": 1,
+      "role": "video",
+      "timescale": 15360,
+      "width": 64
+    },
+    {
+      "avgBitrate": 32000,
+      "bitrate": 32000,
+      "channelConfig": "1",
+      "codec": "mp4a.40.2",
+      "initRef": "soun_2-init",
+      "isLive": true,
+      "maxGrpSapStartingType": 1,
+      "maxObjSapStartingType": 1,
+      "name": "soun_2",
+      "packaging": "cmaf",
+      "renderGroup": 1,
+      "role": "audio",
+      "samplerate": 48000,
+      "timescale": 48000
+    },
+    {
+      "depends": [
+        1
+      ],
+      "isLive": true,
+      "mimeType": "application/json",
+      "name": "timeline",
+      "packaging": "mediatimeline",
+      "role": "mediatimeline"
+    },
+    {
+      "depends": [
+        "vide_1"
+      ],
+      "eventType": "org.ietf.moq.cmsf.sap",
+      "isLive": true,
+      "mimeType": "application/json",
+      "name": "vide_1_sap",
+      "packaging": "eventtimeline",
+      "role": "eventtimeline"
+    },
+    {
+      "depends": [
+        "soun_2"
+      ],
+      "eventType": "org.ietf.moq.cmsf.sap",
+      "isLive": true,
+      "mimeType": "application/json",
+      "name": "soun_2_sap",
+      "packaging": "eventtimeline",
+      "role": "eventtimeline"
+    }
+  ],
+  "version": "draft-02"
+}
