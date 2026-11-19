@@ -10449,6 +10449,8 @@ export class MoqtPlayer {
 
   /** Timestamp of last ABR downshift — gates upshift for stability. */
   private lastAbrDownshiftUs = 0;
+  /** Timestamp (µs) of the last automatic switch that failed to start. */
+  private lastAbrSwitchFailureUs = Number.NEGATIVE_INFINITY;
   /** Timestamp (µs) of last video stall — gates LOC upshift. */
   private lastLocStallUs = 0;
   /** Timestamp (µs) of last video decode error — gates LOC upshift. */
@@ -10471,6 +10473,10 @@ export class MoqtPlayer {
   private videoRecoveryHealthyRenders = 0;
   private static readonly RECOVERY_HEALTHY_THRESHOLD = 3;
   private static readonly ABR_UPSHIFT_STABILITY_US = 15_000_000; // 15s
+  /** Longest backoff between liveness retries after a refusal. */
+  private static readonly LIVENESS_REFUSED_BACKOFF_MAX_MS = 5_000;
+  /** Delay after an automatic switch fails before another is attempted. */
+  private static readonly ABR_SWITCH_FAILURE_HOLDOFF_US = 1_000_000;
 
   private isLocDeliveryHealthy(): boolean {
     const now = this.clock.now();
@@ -10680,6 +10686,12 @@ export class MoqtPlayer {
       ? controller.peekLowerVideoQuality(isEmergency)
       : controller.peekHigherVideoQuality();
 
+    // Nothing to switch from while video delivery is being re-established
+    // (e.g. a liveness resubscribe was refused): selectVideoTrack would only
+    // throw, and this runs on every tick. A failed attempt also holds the
+    // next one off briefly, so a persistent refusal cannot become a loop.
+    if (newTrack && (!(this.subscribedTrack('video') ?? this.historicalOutputTrack('video'))
+        || this.clock.now() - this.lastAbrSwitchFailureUs < MoqtPlayer.ABR_SWITCH_FAILURE_HOLDOFF_US)) return;
     if (newTrack) {
       const nowUs = this.clock.now();
       if (!live()) return;
@@ -10694,6 +10706,7 @@ export class MoqtPlayer {
       // No stats or controller mutation here — deferred to completePendingVideoSwitch.
       this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'bandwidth', isDown ? 'downshift' : 'upshift')
         .catch((err) => {
+          this.lastAbrSwitchFailureUs = this.clock.now();
           this.log.warn('ABR %s to "%s" failed: %s', verb, newTrack.name, err);
         });
     }
@@ -14804,15 +14817,19 @@ export class MoqtPlayer {
       track.mediaType, track.trackName, Math.round(starvedForMs));
     try {
       const maxAttempts = this.config.livenessMaxRestarts!;
+      const refusedBudgetMs = this.config.livenessRefusedRetryMs!;
+      // Retries after a refusal that permits retrying: see livenessRefusedRetryMs.
+      let refusedSinceMs: number | null = null, refusedRetries = 0, backedOff = false;
       while (restart.attempts < maxAttempts && this.livenessLadderMayContinue(restart)) {
         const attempt = restart.attempts + 1;
         // Backoff before retries (not before the first attempt — the
         // starvation timeout already waited).
-        if (restart.attempts > 0) {
+        if (restart.attempts > 0 && !backedOff) {
           const backoffMs = this.config.livenessRestartBackoffMs! * 2 ** (restart.attempts - 1);
           await this.livenessSleep(backoffMs, restart);
           if (!this.livenessLadderMayContinue(restart)) return;
         }
+        backedOff = false;
         const attemptStartMs = performance.now();
         restart.refusal = null;
         restart.failure = null;
@@ -14830,7 +14847,7 @@ export class MoqtPlayer {
         if (!this.livenessLadderMayContinue(restart)) return;
         this.flushForLivenessRestart(track);
         if (!this.livenessLadderMayContinue(restart)) return;
-        const refreshed = !announced && attempt === 1 && await this.tryRefreshSubscription(track, restart);
+        const refreshed = !announced && attempt === 1 && refusedRetries === 0 && await this.tryRefreshSubscription(track, restart);
         if (!this.livenessLadderMayContinue(restart)) return;
         if (refreshed) {
           this.log.info('Liveness: refreshed %s "%s" via REQUEST_UPDATE (attempt %d)',
@@ -14855,12 +14872,35 @@ export class MoqtPlayer {
           break;
         }
         if (restart.failure || this.livenessRetryRefused(restart)) break;
+        // A REQUEST_ERROR that permits a retry comes from a peer that is
+        // still answering, e.g. a relay whose upstream is briefly
+        // unavailable. It is not a failed restart: keep trying, with backoff,
+        // while the budget lasts, so delivery resumes when the upstream does.
+        const refusal = restart.refusal as LivenessRestart['refusal'];
+        if (refusal && refusedBudgetMs > 0) {
+          refusedSinceMs ??= refusal.atMs;
+          if (performance.now() - refusedSinceMs < refusedBudgetMs) {
+            restart.attempts--;
+            refusedRetries++;
+            this.log.info('Liveness: %s "%s" restart refused (code=0x%s); retrying (%d)',
+              track.mediaType, track.trackName, refusal.errorCode.toString(16), refusedRetries);
+            const backoffMs = Math.min(this.config.livenessRestartBackoffMs! * 2 ** (refusedRetries - 1),
+              MoqtPlayer.LIVENESS_REFUSED_BACKOFF_MAX_MS);
+            // Also waits out the refusal's Retry Interval.
+            await this.livenessSleep(backoffMs, restart);
+            if (!this.livenessLadderMayContinue(restart)) return;
+            backedOff = true;
+          }
+        }
       }
 
       if (this.livenessLadderMayContinue(restart)) {
+        const lastRefusal = restart.refusal as LivenessRestart['refusal'];
         const detail = restart.failure ?? (this.livenessRetryRefused(restart)
           ? 'publisher refused automatic retry'
-          : `${restart.attempts} restart attempts failed`);
+          : refusedSinceMs !== null && lastRefusal
+            ? `restart refused for ${Math.round((performance.now() - refusedSinceMs) / 1000)} s (code=0x${lastRefusal.errorCode.toString(16)})`
+            : `${restart.attempts} restart attempts failed`);
         this.emitError(createPlayerError(
           'fatal', 'connection', PlayerErrorCode.MEDIA_STARVED,
           `Media delivery starved: ${track.mediaType} "${track.trackName}" — ${detail}`,

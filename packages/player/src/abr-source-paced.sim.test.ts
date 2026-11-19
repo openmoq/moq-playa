@@ -184,6 +184,11 @@ class SourcePacedRelay {
         const requestId = relay.allocateRequestId();
         relay.subscribes.push({ atUs: relay.nowUs, requestId, trackName: new TextDecoder().decode(name), options: opts });
         opts?.onRequestId?.(requestId);
+        if (relay.refuseSubscribes) {
+          queueMicrotask(() => relay.adapter.onMessage?.({ type: 'REQUEST_ERROR', requestId: varint(requestId), errorCode: varint(0),
+            retryInterval: varint(1_001), errorReason: 'origin unreachable' } as unknown as ControlMessage));
+          return varint(requestId);
+        }
         relay.addSubscription(requestId, new TextDecoder().decode(name), opts?.subscriptionFilter, opts?.subscriberPriority);
         const fillStart = opts?.fill?.filter?.type === 'AbsoluteStart' ? Number(opts.fill.filter.startGroup) * GOP_FRAMES : undefined;
         const sub = relay.subs.get(requestId)!;
@@ -408,6 +413,18 @@ class SourcePacedRelay {
 
   onFrameDelivered: ((trackName: string, captureUs: number) => void) | undefined;
 
+  /** The source is gone: end every media subscription, refuse new ones. */
+  sourceGone(): void {
+    this.refuseSubscribes = true;
+    for (const sub of this.subs.values()) {
+      if (!sub.active || sub.trackName === 'catalog') continue;
+      sub.active = false;
+      this.adapter.onMessage?.({ type: 'PUBLISH_DONE', requestId: varint(sub.requestId), statusCode: varint(0),
+        streamCount: varint(0), errorReason: 'track ended' } as unknown as ControlMessage);
+    }
+  }
+  refuseSubscribes = false;
+
   /** The relay drops the session: in-flight media is lost, and requests fail from now on. */
   close(): void {
     this.closed = true;
@@ -457,6 +474,12 @@ interface Scenario {
   readonly relayPriority?: boolean;
   /** The relay drops the session at this time (µs). */
   readonly closeAtUs?: number;
+  /**
+   * From this time (µs) the source is gone: the relay ends the playing video
+   * subscription with PUBLISH_DONE, sends nothing more, and refuses every
+   * new SUBSCRIBE (as a relay does while its upstream is unavailable).
+   */
+  readonly sourceGoneAtUs?: number;
   /**
    * CMAF: a readable CMAF Header in the catalog (default), or opaque bytes —
    * a header the player cannot parse, which leaves it no delivery-lag signal.
@@ -619,6 +642,7 @@ async function runScenario(s: Scenario): Promise<Run> {
   try {
     for (let t = TICK_US; t <= s.durationUs; t += TICK_US) {
       if (s.closeAtUs !== undefined && !relay.closed && t >= s.closeAtUs) relay.close();
+      if (s.sourceGoneAtUs !== undefined && !relay.refuseSubscribes && t >= s.sourceGoneAtUs) relay.sourceGone();
       for (const selection of s.selections ?? []) {
         if (selection.atUs > t - TICK_US && selection.atUs <= t) {
           void player.selectVideoTrack(selection.track).catch(() => {});
@@ -887,4 +911,25 @@ it.each([14, 16, 18, 22] as const)('CMAF catch-up uses standing buffer, not burs
   expect(off.elementRates).toEqual([]);
   const standing = await runScenario({ ...scenario, bufferAheadUs: now => now > SECONDS(5) ? 2_500_000 : 300_000 });
   expect(standing.elementRates).toEqual([1.05, 1]); // teardown restores the element
+});
+
+describe('when the source is gone', () => {
+  // The relay ends the playing subscription and refuses every resubscribe
+  // while its upstream is unavailable. The MSE buffer then empties, which
+  // asks ABR for an emergency downshift on every tick; with no video
+  // subscription to switch from, each attempt could only fail.
+  it.each(['cmaf'] as const)('%s: does not retry an automatic switch on every tick', async packaging => {
+    const select = vi.spyOn(MoqtPlayer.prototype, 'selectVideoTrack');
+    try {
+      const goneAtUs = SECONDS(10);
+      const run = await runScenario({
+        packaging, capacityBps: AMPLE_BPS, durationUs: SECONDS(14), sourceGoneAtUs: goneAtUs,
+        bufferAheadUs: now => now < goneAtUs ? 300_000 : 0,
+      });
+      expect(run.subscribes.filter(sub => sub.atUs >= goneAtUs).length).toBeLessThanOrEqual(8);
+      const attempts = select.mock.invocationCallOrder.length;
+      // 4 s of 100 ms ticks would be 40 attempts; at most one per holdoff is allowed.
+      expect(attempts).toBeLessThanOrEqual(6);
+    } finally { select.mockRestore(); }
+  });
 });
