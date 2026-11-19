@@ -281,7 +281,7 @@ export interface MseMediaSourceOptions {
    *  receiving-stream evidence can extend it to at least 2s (never beyond
    *  max(this value, 2s)). Zero preserves immediate append scheduling. */
   readonly reorderWindowMs?: number;
-  /** Retained append-queue limits, per media type. Defaults 100 chunks / 8 MiB. */
+  /** Retained append-queue limits, per media type. Defaults 1,000 chunks / 8 MiB. */
   readonly maxQueuedChunks?: number;
   readonly maxQueuedBytes?: number;
   /** DRM configuration. When set, EME is initialized and license requests
@@ -993,7 +993,7 @@ export class MseMediaSource implements MediaSourceLike {
     };
     this.reorderWindowMs = boundedInteger('reorderWindowMs', options.reorderWindowMs ?? 250, 0);
     if (this.reorderWindowMs > 0x7fffffff) throw new Error('reorderWindowMs exceeds the timer range');
-    this.maxQueuedChunks = boundedInteger('maxQueuedChunks', options.maxQueuedChunks ?? 100, 1);
+    this.maxQueuedChunks = boundedInteger('maxQueuedChunks', options.maxQueuedChunks ?? 1000, 1);
     this.maxQueuedBytes = boundedInteger('maxQueuedBytes', options.maxQueuedBytes ?? 8 * 1024 * 1024, 1);
     this.keepBehindSec = options.keepBehindSec ?? 10;
     this.maxAheadSec = options.maxAheadSec ?? 15;

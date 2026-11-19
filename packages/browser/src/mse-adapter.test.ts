@@ -4559,6 +4559,26 @@ describe.each(['audio', 'video'] as const)('MSE %s append scheduling', mediaType
         const buffer = mediaType === 'video' ? currentMs.videoBuffer : currentMs.audioBuffer;
         return { adapter, video, buffer, initial: buffer.appendedPayloads.length };
     };
+    it.each([118, 940])('retains a whole burst of %i frames behind a hole with default limits', async count => {
+        vi.useFakeTimers(); const h = await ready({}, 48000);
+        const events: Array<{ state: string }> = [];
+        h.adapter.observeAppends(event => { events.push(event); });
+        const frame = (bmd: number) => makeSegment({ bmd, defaultDur: 1024, sampleCount: 1 });
+        const prefix = frame(0), burst = Array.from({ length: count }, (_, i) => frame((i + 2) * 1024));
+        try {
+            h.adapter.appendChunk(mediaType, prefix, 'track', 1n); await flush();
+            for (const chunk of burst) h.adapter.appendChunk(mediaType, chunk, 'track', 2n, {});
+            expect(events).toEqual([]);
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix]);
+            await vi.advanceTimersByTimeAsync(250);
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([prefix, ...burst]);
+            expect(events).toHaveLength(count);
+            expect(events.every(event => event.state === 'appended')).toBe(true);
+            const next = frame((count + 2) * 1024);
+            h.adapter.appendChunk(mediaType, next, 'track', 3n); await flush();
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(next);
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
     it.each([[90000, 3000, 1], [90000, 3000, 90], [48000, 960, 48], [1000, 33, 1]])(
         'appends and coalesces 1 ms drift at %i Hz, duration %i, drift %i', async (scale, dur, drift) => {
         vi.useFakeTimers(); const h = await ready({}, scale);
