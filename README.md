@@ -725,10 +725,16 @@ Draft-02 automatic and manual quality switches refuse dissimilar `keyframeSpacin
 (including a declaration on only one track), report a warning and
 `quality_switch_failed` error, and keep the current track. Equal spacing and two
 absent declarations retain the existing switch. Seamless switching across different
-spacings and active-track reconfiguration after updates are not
-yet implemented by the player. MSF-02 seeks use
-resolved dependency identities (including render groups) and floor rounding. Indexed
-retrieval refuses targets outside the most restrictive selected track’s
+spacings remains unsupported. A draft-02 update that changes a playing track's codec,
+packaging, initialization, role, alternate/render group or keyframe spacing retires
+the current presentation and reselects through fresh output factories and subscriptions.
+This can interrupt playback; it does not promise a seamless cut or preserve an active
+seek. Playback intent and configured selection constraints remain in force. Pending
+switches and superseded subscriptions are cancelled; subscription preparation is bounded
+by `connectionTimeoutMs`. Other field updates, including bitrate, change catalog state
+without restarting playback. MSF-01 still rejects the `update` operation.
+MSF-02 seeks use resolved dependency identities (including render groups) and floor
+rounding. Indexed retrieval refuses targets outside the most restrictive selected track’s
 `accessibleWindowTime`; wallclock thresholds use UTC milliseconds, and zero-wallclock
 indexes use media time relative to their newest entry. These catalogs
 therefore do not imply complete MSF-02 playback support. Live LOC subscriptions can

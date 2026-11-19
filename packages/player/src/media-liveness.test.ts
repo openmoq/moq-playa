@@ -217,6 +217,20 @@ describe('MediaLivenessMonitor', () => {
     expect(onStarved.mock.calls[0]![0]).toMatchObject({ mediaType: 'video' });
   });
 
+  it('watches a missing replacement without crediting healthy delivery until real arrivals', () => {
+    const { m, onStarved } = monitor();
+    m.expectArrival(VIDEO, 1_000);
+    m.expectArrival(VIDEO, 5_000);
+    expect(m.lastArrivalForRequest(VIDEO.requestId)).toBeUndefined();
+    m.check(11_001);
+    expect(onStarved).toHaveBeenLastCalledWith(VIDEO, 10_001, 0);
+    onStarved.mockClear();
+    for (let t = 12_000; t <= 52_000; t += 5_000) m.noteArrival(VIDEO.trackAlias, t);
+    m.check(62_001);
+    expect(onStarved).toHaveBeenCalledOnce();
+    expect(onStarved).toHaveBeenLastCalledWith(VIDEO, 10_001, 40_000);
+  });
+
   it('clear() retires everything (stop/destroy)', () => {
     const { m, onStarved } = monitor();
     m.registerTrack(VIDEO);

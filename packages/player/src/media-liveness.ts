@@ -14,7 +14,8 @@
  * always points at the newest registration.
  *
  * A track arms on its FIRST arrival; before that, startup is the
- * WatchdogController's job ('first_media_object'). A data-stream reset
+ * WatchdogController's job ('first_media_object'). Missing replacement media
+ * can be watched explicitly without recording a healthy arrival. A data-stream reset
  * shortens the armed track's fuse to `resetProbeMs`: a healthy track delivers
  * a successor stream within the probe and re-stamps, a dead one starves fast
  * instead of waiting out the full timeout.
@@ -51,8 +52,9 @@ export interface MediaLivenessOptions {
 
 interface TrackEntry {
   readonly track: LivenessTrack;
-  /** undefined = not yet armed (no object seen for this subscription). */
+  /** undefined = no object seen for this subscription. */
   lastArrivalMs: number | undefined;
+  waitingSinceMs: number | undefined;
   /** Start of the current uninterrupted arrival streak (set with arming). */
   streakStartMs: number | undefined;
   /** Shortened deadline after a stream reset; cleared by the next arrival. */
@@ -93,11 +95,19 @@ export class MediaLivenessMonitor {
     this.entries.set(track.requestId, {
       track,
       lastArrivalMs: existing?.lastArrivalMs,
+      waitingSinceMs: existing?.waitingSinceMs,
       streakStartMs: existing?.streakStartMs,
       fuseDeadlineMs: existing?.fuseDeadlineMs,
       incidentActive: existing?.incidentActive ?? false,
     });
     this.aliasIndex.set(track.trackAlias, track.requestId);
+  }
+
+  /** Watch missing replacement media without crediting it as a healthy arrival. */
+  expectArrival(track: LivenessTrack, nowMs: number): void {
+    this.registerTrack(track);
+    const entry = this.entries.get(track.requestId)!;
+    if (entry.lastArrivalMs === undefined && entry.waitingSinceMs === undefined) entry.waitingSinceMs = nowMs;
   }
 
   /** Retire a subscription (unsubscribe/switch). Stale aliases stop stamping. */
@@ -127,6 +137,7 @@ export class MediaLivenessMonitor {
       entry.streakStartMs = nowMs;
     }
     entry.lastArrivalMs = nowMs;
+    entry.waitingSinceMs = undefined;
     entry.fuseDeadlineMs = undefined;
     entry.incidentActive = false;
     return true;
@@ -149,14 +160,15 @@ export class MediaLivenessMonitor {
   check(nowMs: number): void {
     if (this.livenessTimeoutMs <= 0) return;
     for (const entry of this.entries.values()) {
-      if (entry.lastArrivalMs === undefined || entry.incidentActive) continue;
-      const sinceArrival = nowMs - entry.lastArrivalMs;
+      const since = entry.lastArrivalMs ?? entry.waitingSinceMs;
+      if (since === undefined || entry.incidentActive) continue;
+      const sinceArrival = nowMs - since;
       const timedOut = sinceArrival > this.livenessTimeoutMs;
       const fuseBlown = entry.fuseDeadlineMs !== undefined && nowMs > entry.fuseDeadlineMs;
       if (timedOut || fuseBlown) {
         entry.incidentActive = true;
         const healthyForMs = entry.streakStartMs !== undefined
-          ? entry.lastArrivalMs - entry.streakStartMs
+          ? since - entry.streakStartMs
           : 0;
         this.onStarved(entry.track, sinceArrival, healthyForMs);
       }
