@@ -4,7 +4,7 @@
 
 # @openmoq/msf
 
-Media over QUIC Streaming Format (MSF) catalog: JSON catalog parsing, validation, track selection and ABR, delta updates, and timeline parsing.
+Media over QUIC Streaming Format catalogs, including MSF-02: parsing, validation, dependencies, ordered delta updates and timeline parsing. Catalog references, encrypted playback, variable substitution and compressed payloads are not processed.
 
 Part of [Playa](https://github.com/openmoq/moq-playa) — a TypeScript implementation of Media over QUIC (MoQ). See the [project README](https://github.com/openmoq/moq-playa#readme) for architecture and API documentation.
 

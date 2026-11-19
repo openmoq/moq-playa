@@ -432,6 +432,7 @@ object; the higher-level `Player` instead emits `severity`, `code` and `message`
 - **draft-ietf-moq-transport-18** — uni control-stream pair + per-request bidi streams (`draftVersion: 18` / `moqt-18`)
 - **draft-ietf-moq-transport-16** — default supported transport draft
 - **draft-ietf-moq-transport-14** — Red5/moq-rs interop (`draftVersion: 14`)
+- **draft-ietf-moq-msf-02** — Catalog parsing and validation, ordered add/remove/clone/update deltas, render-group dependencies, and uppercase event/SAP timeline indexes. Parsed catalogs and states retain `msfDraft: 'draft-02'`; earlier drafts retain their existing rules.
 - **draft-ietf-moq-msf-00** — Catalog, track selection, ABR (`altGroup`), timeline
 - **draft-ietf-moq-msf-01** - Independent catalogs, op-array deltas and referenced initialization data; catalog bootstrap uses Joining FETCH on drafts 14/16/18 and fills on drafts 22/23
 - **draft-ietf-moq-loc-05** — Low Overhead Container, LOC-04 plus the Codec String property (0x11); `locVersion: 5` to emit
@@ -700,6 +701,26 @@ REQUEST_OK has been applied and returns a private copy of its parameters.
 update, and a late acknowledgement can still apply. Draft 14 has no confirmation.
 `IncomingPublish.largestLocation` reports a frozen receive-head snapshot; `closed`
 resolves with the final snapshot when the publication ends.
+
+## MSF-02 catalog limits
+
+`@openmoq/msf` accepts MSF-02 catalogs and the CMSF track extensions. New metadata
+includes `accessibleWindowTime`, `keyframeSpacing`, recognized `packagingMetadata`
+parameters, `encryptionScheme`, and opaque `authInfo`. `resolveTrackDependencies`
+returns direct dependencies with their full namespace identities; pass the
+catalog's draft to enable render-group and catalog-wide name resolution.
+`resolveDependencies` also accepts this draft option for recursive dependencies.
+The compatibility packages re-export the same APIs.
+
+Selection reports catalog references, encrypted tracks, unresolved naming variables,
+and unsupported packaging as exclusions. Catalog references are not followed;
+publish tracks are metadata only. Authorization metadata is not presented automatically.
+The catalog parser accepts uncompressed UTF-8 JSON only. Compression-property checks
+and GZIP decoding, event header delivery, render-group timeline coverage, accessible
+window seek enforcement, variable-keyframe switching, and active-track
+reconfiguration after updates are not implemented by the player. These catalogs
+therefore do not imply complete MSF-02 playback support. Live LOC subscriptions can
+use initialization signaled by an MSF-02 `track-property` init reference.
 
 ## License
 
