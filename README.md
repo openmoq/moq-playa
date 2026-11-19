@@ -716,9 +716,12 @@ Selection reports catalog references, encrypted tracks, unresolved naming variab
 and unsupported packaging as exclusions. Catalog references are not followed;
 publish tracks are metadata only. Authorization metadata is not presented automatically.
 The catalog parser accepts uncompressed UTF-8 JSON only. Compression-property checks
-and GZIP decoding, event header delivery, render-group timeline coverage, accessible
-window seek enforcement, variable-keyframe switching, and active-track
-reconfiguration after updates are not implemented by the player. These catalogs
+and GZIP decoding, event header delivery, variable-keyframe switching, and active-track
+reconfiguration after updates are not implemented by the player. MSF-02 seeks use
+resolved dependency identities (including render groups) and floor rounding. Indexed
+retrieval refuses targets outside the most restrictive selected track’s
+`accessibleWindowTime`; wallclock thresholds use UTC milliseconds, and zero-wallclock
+indexes use media time relative to their newest entry. These catalogs
 therefore do not imply complete MSF-02 playback support. Live LOC subscriptions can
 use initialization signaled by an MSF-02 `track-property` init reference.
 
