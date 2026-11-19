@@ -138,7 +138,7 @@ export type ScopeId =
  */
 export interface ExcludedTrack {
   readonly id: TrackIdentity;
-  readonly reason: 'unsupported-packaging' | 'no-media-role';
+  readonly reason: 'unsupported-packaging' | 'no-media-role' | 'catalog-reference' | 'encrypted' | 'unresolved-variable';
   /** Declared role, when the track declared one. */
   readonly mediaType?: 'video' | 'audio';
   /** Declared render group; absent when the track declared none. */
@@ -344,6 +344,19 @@ export function buildCatalogSelection(
   for (const [catalogIndex, track] of catalog.tracks.entries()) {
     const mediaType = mediaRoleOf(track);
     const where = track.renderGroup !== undefined ? { renderGroup: track.renderGroup } : {};
+    if (catalog.msfDraft === 'draft-02') {
+      // MSF-02 §5, §4.4.1 and §5.4: retain unsupported declarations and report why.
+      const reason = track.packaging === 'catalog' ? 'catalog-reference'
+        : track.encryptionScheme !== undefined ? 'encrypted'
+        : [track.name, track.namespace, ...(track.depends ?? []), track.parentName, track.parentNamespace]
+          .some(value => typeof value === 'string' && value.includes('%')) ? 'unresolved-variable'
+        : !isTrackPackagingSupported(track, catalog) ? 'unsupported-packaging' : undefined;
+      if (reason) {
+        excluded.push({ id: identityOf(track, contextFieldsValue), reason, ...where,
+          ...(mediaType !== null ? { mediaType } : {}) });
+        continue;
+      }
+    }
     if (mediaType === null) {
       excluded.push({ id: identityOf(track, contextFieldsValue), reason: 'no-media-role', ...where });
       continue;

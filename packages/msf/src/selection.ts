@@ -23,7 +23,10 @@ import { SUPPORTED_LOCMAF_VERSIONS } from './types.js';
  * capability is a separate, runtime concern).
  * @see draft-einarsson-moq-locmaf-01 §5
  */
-export function isTrackPackagingSupported(track: CatalogTrack): boolean {
+export function isTrackPackagingSupported(track: CatalogTrack): boolean;
+export function isTrackPackagingSupported(track: CatalogTrack, options: { readonly msfDraft?: 'draft-02' }): boolean;
+export function isTrackPackagingSupported(track: CatalogTrack, options?: { readonly msfDraft?: 'draft-02' }): boolean {
+    if (options?.msfDraft === 'draft-02' && !['loc', 'locmaf', 'cmaf', 'mediatimeline', 'eventtimeline'].includes(track.packaging)) return false;
     if (track.packaging !== 'locmaf') return true;
     return track.locmafVersion !== undefined && SUPPORTED_LOCMAF_VERSIONS.includes(track.locmafVersion);
 }
