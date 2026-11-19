@@ -721,7 +721,11 @@ uncompressed and GZIP payloads. Each decompressed object is limited to 8 MiB; pe
 preparation holds input by reference and is bounded to 256 objects, without an input-byte limit. Unsupported compression
 is refused. MSF-00 and catalogformat-01 do not use this signal. MSF-02 event and SAP
 events include optional raw `header` bytes from track property `0x7B`.
-Variable-keyframe switching and active-track reconfiguration after updates are not
+Draft-02 automatic and manual quality switches refuse dissimilar `keyframeSpacing`
+(including a declaration on only one track), report a warning and
+`quality_switch_failed` error, and keep the current track. Equal spacing and two
+absent declarations retain the existing switch. Seamless switching across different
+spacings and active-track reconfiguration after updates are not
 yet implemented by the player. MSF-02 seeks use
 resolved dependency identities (including render groups) and floor rounding. Indexed
 retrieval refuses targets outside the most restrictive selected track’s

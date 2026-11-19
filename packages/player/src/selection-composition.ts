@@ -16,7 +16,7 @@
 
 import type { CatalogNamespaceContext, CatalogState, CatalogTrack, TrackConstraints } from '@openmoq/msf';
 import { selectTrack } from '@openmoq/msf';
-import type { QualityController } from './quality-controller.js';
+import { setQualityCatalog, type QualityController } from './quality-controller.js';
 import { preferredLanguage } from './language-preference.js';
 import {
   buildCatalogSelection,
@@ -120,6 +120,7 @@ export function composeSelection(
     readonly controller: QualityController;
   } & CompositionOptions,
 ): ComposedSelection {
+  setQualityCatalog(options.controller, catalog);
   const selection = buildCatalogSelection(catalog, { catalogNamespace: options.catalogNamespace });
   return composeResolvedSelection(selection, options);
 }

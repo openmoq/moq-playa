@@ -3629,6 +3629,7 @@ export class MoqtPlayer {
     const historical = this.historicalMseOutput();
     const currentTrack = this.subscribedTrack('video') ?? this.historicalOutputTrack('video');
     if (!currentTrack) throw new Error('Cannot switch track: video selection not ready');
+    this.assertQualitySpacing(currentTrack, targetTrack, reason);
     const currentKey = this.initKey(currentTrack), targetKey = this.initKey(targetTrack);
     // A preparing or retiring video request is not the current output owner.
     let currentVideoRequestId: bigint | null = null;
@@ -3840,6 +3841,18 @@ export class MoqtPlayer {
       if (this.switchIsCurrent(sw)) this.abortPendingVideoSwitch(sw, error instanceof Error ? error : new Error(String(error)));
       if (sw.phase !== 'committed') throw error;
     }
+  }
+
+  /** MSF-02 §6.3: decline dissimilar intervals until exact source cuts are supported. */
+  private assertQualitySpacing(source: CatalogTrack, target: CatalogTrack, reason: string): void {
+    if (this._catalogState?.msfDraft !== 'draft-02' || source.keyframeSpacing === target.keyframeSpacing) return;
+    const error = new Error(`Cannot switch from "${source.name}" to "${target.name}": dissimilar keyframeSpacing `
+      + `(${source.keyframeSpacing ?? 'absent'} → ${target.keyframeSpacing ?? 'absent'}) is unsupported`);
+    this.log.warn('%s', error.message);
+    this.emitQualityEvent('quality_switch_failed', {
+      type: 'quality_switch_failed', fromTrackName: source.name, toTrackName: target.name, reason, error,
+    });
+    throw error;
   }
 
   private isVideoSwitchAlias(alias: bigint, side: 'old' | 'new'): boolean {
@@ -15945,6 +15958,7 @@ export class MoqtPlayer {
       throw new Error('Playing frame rendition requires a supported member of the same declared alternate set');
     }
     if (this.initKey(old) === this.initKey(declared)) return;
+    this.assertQualitySpacing(old, declared, reason);
     const target = structuredClone(declared), targetNs = [...trackNamespaceFields(target, this.config.namespace)];
     const timeline = this.timelineState;
     const common = () => source !== null && this.timelineSource === source && this.timelineState !== null
@@ -16222,6 +16236,7 @@ export class MoqtPlayer {
     if (candidates.length > 1) throw new Error(`Ambiguous video track: "${name}"`);
     const target = candidates[0];
     if (!target || old.altGroup === undefined || target.altGroup !== old.altGroup) throw new Error('Frame quality requires the same declared video alternate set');
+    this.assertQualitySpacing(old, target, reason);
     const seed = this.installedDecoderConfigurations.get('video');
     const fields = ['packaging', 'codec', 'width', 'height'] as const;
     if (!isTrackPackagingSupported(target) || target.packaging !== 'loc' && !(target.packaging === 'locmaf' && this.locmafFramePath)

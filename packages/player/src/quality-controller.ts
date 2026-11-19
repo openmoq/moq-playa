@@ -18,6 +18,13 @@ import type { CatalogTrack, CatalogState, TrackConstraints } from '@openmoq/msf'
 import { selectVideoAltGroup, selectTrack, isTrackPackagingSupported } from '@openmoq/msf';
 import type { ClockSource } from '@openmoq/playback';
 
+// Internal catalog context; deliberately absent from the package exports.
+const restrictedSpacing = new WeakSet<QualityController>();
+export function setQualityCatalog(controller: QualityController, catalog: CatalogState): void {
+  if (catalog.msfDraft === 'draft-02') restrictedSpacing.add(controller);
+  else restrictedSpacing.delete(controller);
+}
+
 /** Configuration for the quality controller. */
 export interface QualityControllerConfig {
   /** Enable automatic quality selection. Default: true. */
@@ -107,6 +114,7 @@ export class QualityController {
   ): SelectedTracks {
     // LOCMAF §5: a receiver MUST NOT subscribe to a locmafVersion it does not
     // support — exclude those tracks so an alternative packaging is chosen.
+    setQualityCatalog(this, catalog);
     const usable = catalog.tracks.filter(isTrackPackagingSupported);
 
     // Split tracks by role
@@ -229,6 +237,8 @@ export class QualityController {
       this.videoAlternatives = alts;
     }
 
+    if (restrictedSpacing.has(this)) this.videoAlternatives = this.videoAlternatives.filter(t => t.keyframeSpacing === video.keyframeSpacing);
+
     // Set videoIndex to match selected track in the narrowed list
     this.videoIndex = this.videoAlternatives.indexOf(video);
     if (this.videoIndex === -1) this.videoIndex = 0;
@@ -301,6 +311,7 @@ export class QualityController {
     const family = track.codec?.split('.')[0];
     this.videoAlternatives = family === undefined ? [...this.allVideoAlternatives]
       : this.allVideoAlternatives.filter(t => t.codec?.split('.')[0] === family);
+    if (restrictedSpacing.has(this)) this.videoAlternatives = this.videoAlternatives.filter(t => t.keyframeSpacing === track.keyframeSpacing);
     this.videoIndex = this.videoAlternatives.indexOf(track);
     this.lastSwitchTimeUs = this.clock.now();
   }
