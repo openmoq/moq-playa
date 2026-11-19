@@ -42,6 +42,7 @@ interface AppendEntry {
 interface TrackTimeline {
   readonly trackName: string;
   readonly index: TimelineIndex;
+  refused?: TimelineIndex;
 }
 type NativeRanges = Array<[number, number]>;
 /** See MediaSwitchRecovery. Times are seconds on the media element timeline, read from the native video SourceBuffer. */
@@ -1571,10 +1572,33 @@ export class MseMediaSource implements MediaSourceLike {
     if (wait?.timer !== null && wait?.timer !== undefined) clearTimeout(wait.timer);
   }
 
+  private pruneRefused(timeline: TrackTimeline): void {
+    if (!timeline.refused) return;
+    const end = timeline.index.extent?.end;
+    // Keep the latest exact spans; forgetting evidence restores the ordinary wait.
+    const kept = timeline.refused.getRanges().filter(r => end === undefined || r.end > end).slice(-32);
+    timeline.refused.clear();
+    for (const range of kept) timeline.refused.insert(range.start, range.end);
+  }
+
   private enqueueAppend(mediaType: 'video' | 'audio', entry: AppendEntry): boolean {
     const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
     const bytes = queue.reduce((total, queued) => total + queued.data.byteLength, 0);
     if (queue.length >= this.maxQueuedChunks || entry.data.byteLength > this.maxQueuedBytes - bytes) {
+      const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
+      const ranges = this.scoreAppend(mediaType, entry);
+      if (ranges?.length) {
+        let timeline = timelines.get(entry.trackIdentity);
+        if (!timeline) {
+          timeline = { trackName: entry.trackName, index: new TimelineIndex() };
+          timelines.set(entry.trackIdentity, timeline);
+        }
+        // Exact coverage only: never excuse media that was not offered.
+        for (const range of ranges) if (range.sampleCount > 0) {
+          (timeline.refused ??= new TimelineIndex()).insert(range.startTime, range.endTime);
+          this.pruneRefused(timeline);
+        }
+      }
       this.appendOutcome(entry.token, 'discarded', 'queue capacity');
       this.logWarn('[MSE] %s append queue capacity reached', mediaType);
       return false;
@@ -1629,13 +1653,18 @@ export class MseMediaSource implements MediaSourceLike {
     if (this.reorderWindowMs === 0) return false;
     const ranges = this.scoreAppend(mediaType, entry);
     const timelines = mediaType === 'video' ? this.videoTimelines : this.audioTimelines;
-    const end = timelines.get(entry.trackIdentity)?.index.extent?.end;
+    const timeline = timelines.get(entry.trackIdentity);
+    const end = timeline?.index.extent?.end;
     // The first segment anchors the clock. Unknown layouts retain the existing
     // fail-open policy; tick values are compared only within this track/context.
     if (!ranges?.length || end === undefined || ranges[0]!.startTime <= end) return false;
     const media = ranges.filter(r => r.sampleCount > 0 && r.endTime > r.startTime);
     const gaps = media.reduce((sum, r, i) => { const gap = r.startTime - (media[i - 1]?.endTime ?? end); return sum + (gap > 0n ? gap : 0n); }, 0n);
     if (media.length && gaps <= this.contiguousSlack(mediaType)) return false;
+    if (media.length && timeline?.refused && media.every((range, i) => {
+      const from = media[i - 1]?.endTime ?? end;
+      return range.startTime <= from || timeline.refused!.containsRange(from, range.startTime);
+    })) { entry.skipsGap = true; return false; }
     const previous = this.appendGapWait[mediaType];
     const now = performance.now();
     entry.waitStartedAt ??= now;
@@ -4194,6 +4223,7 @@ export class MseMediaSource implements MediaSourceLike {
         for (const r of pending) {
           timeline.insert(r.startTime, r.endTime, slack);
         }
+        this.pruneRefused(timelines.get(pendingTrack)!);
         if (this.pendingGapSkip[mediaType] || this.lateAppendFloor[mediaType].has(pendingTrack)) {
           const end = timeline.extent?.end;
           if (end !== undefined) this.lateAppendFloor[mediaType].set(pendingTrack, end);

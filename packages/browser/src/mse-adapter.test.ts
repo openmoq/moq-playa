@@ -4559,6 +4559,95 @@ describe.each(['audio', 'video'] as const)('MSE %s append scheduling', mediaType
         const buffer = mediaType === 'video' ? currentMs.videoBuffer : currentMs.audioBuffer;
         return { adapter, video, buffer, initial: buffer.appendedPayloads.length };
     };
+    it('forgets old sparse refusals while preserving recent refused holes', async () => {
+        vi.useFakeTimers(); const h = await ready({ maxQueuedChunks: 1 });
+        const frame = (bmd: number) => makeSegment({ bmd, sampleCount: 1 });
+        const last = 400 + 4095 * 200;
+        try {
+            h.adapter.appendChunk(mediaType, frame(0), 'track'); await flush();
+            h.buffer.autoComplete = false;
+            h.adapter.appendChunk(mediaType, frame(100), 'track');
+            h.adapter.appendChunk(mediaType, frame(200), 'track');
+            for (let bmd = 400; bmd <= last; bmd += 200) h.adapter.appendChunk(mediaType, frame(bmd), 'track');
+            h.buffer.autoComplete = true; h.buffer.updating = false;
+            h.buffer.fire('update'); h.buffer.fire('updateend'); await flush();
+            h.adapter.appendChunk(mediaType, frame(300), 'track'); await flush();
+            h.adapter.appendChunk(mediaType, frame(500), 'track'); await flush();
+            await vi.advanceTimersByTimeAsync(249);
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(frame(300));
+            await vi.advanceTimersByTimeAsync(1);
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(frame(500));
+            h.adapter.appendChunk(mediaType, frame(last - 100), 'track');
+            await vi.advanceTimersByTimeAsync(250);
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(frame(last - 100));
+            h.adapter.appendChunk(mediaType, frame(last + 100), 'track'); await flush();
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(frame(last + 100));
+            // Obsolete metadata cannot affect playback, so inspect only its retained size.
+            const state = h.adapter as unknown as Record<'audioTimelines' | 'videoTimelines',
+                Map<string, { refused?: { size: number } }>>;
+            expect([...state[`${mediaType}Timelines`].values()].map(t => t.refused?.size ?? 0)).toEqual([0]);
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
+    it.each(['chunks', 'bytes'] as const)('skips only holes wholly covered by refused %s', async bound => {
+        vi.useFakeTimers();
+        const frame = (bmd: number) => makeSegment({ bmd, sampleCount: 1 });
+        const h = await ready(bound === 'chunks' ? { maxQueuedChunks: 4 } : { maxQueuedBytes: frame(0).length * 4 });
+        const events: Array<{ reason: string | null }> = [];
+        h.adapter.observeAppends(event => { events.push(event); });
+        try {
+            h.adapter.appendChunk(mediaType, frame(0), 'track'); await flush();
+            for (let i = 2; i < 8; i++) h.adapter.appendChunk(mediaType, frame(i * 100), 'track', undefined, {});
+            expect(events.map(event => event.reason)).toEqual(['queue capacity', 'queue capacity']);
+            await vi.advanceTimersByTimeAsync(250);
+            expect(h.buffer.appendedPayloads.slice(h.initial)).toEqual([0, 200, 300, 400, 500].map(frame));
+            h.adapter.appendChunk(mediaType, frame(800), 'track'); await flush();
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(frame(800));
+            // An equally large span never offered to the adapter still waits.
+            h.adapter.appendChunk(mediaType, frame(1100), 'track'); await flush();
+            await vi.advanceTimersByTimeAsync(249);
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(frame(800));
+            await vi.advanceTimersByTimeAsync(1);
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(frame(1100));
+            // A refused span cannot excuse an adjacent unoffered frame.
+            for (let i = 13; i < 19; i++) h.adapter.appendChunk(mediaType, frame(i * 100), 'track');
+            await vi.advanceTimersByTimeAsync(250);
+            h.adapter.appendChunk(mediaType, frame(2000), 'track'); await flush();
+            await vi.advanceTimersByTimeAsync(249);
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(frame(1600));
+            await vi.advanceTimersByTimeAsync(1);
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(frame(2000));
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
+    it.each(['clear', 'retype', 'reset', 'seek'] as const)('retires refused ranges with the timeline on %s', async action => {
+        vi.useFakeTimers(); const h = await ready({ maxQueuedChunks: 4 });
+        const frame = (bmd: number) => makeSegment({ bmd, sampleCount: 1 });
+        const config = { [mediaType]: { codec: mediaType === 'video' ? 'avc1.42c01e' : 'mp4a.40.2',
+            initData: makeInit(1, 100, mediaType === 'video' ? 'vide' : 'soun') } };
+        try {
+            h.adapter.appendChunk(mediaType, frame(0), 'track'); await flush();
+            for (let i = 2; i < 8; i++) h.adapter.appendChunk(mediaType, frame(i * 100), 'track');
+            await vi.advanceTimersByTimeAsync(250);
+            h.adapter.appendChunk(mediaType, frame(800), 'track'); await flush();
+            expect(h.buffer.appendedPayloads.at(-1)).toEqual(frame(800));
+            for (let i = 10; i < 16; i++) h.adapter.appendChunk(mediaType, frame(i * 100), 'track');
+            await vi.advanceTimersByTimeAsync(250);
+            if (action === 'clear') h.adapter.clearTimeline(mediaType, 'track');
+            else if (action === 'retype') await h.adapter.changeType(mediaType, config[mediaType]!.codec, config[mediaType]!.initData);
+            else if (action === 'reset') { h.adapter.reset(); h.adapter.initialize(config); }
+            else {
+                h.video.removeAttribute = name => { if (name === 'src') h.video.src = ''; };
+                currentMs = new MockMediaSource(); h.adapter.beginSeek({}).initialize(config); currentMs.open();
+            }
+            await flush();
+            const buffer = mediaType === 'video' ? currentMs.videoBuffer : currentMs.audioBuffer;
+            h.adapter.appendChunk(mediaType, frame(1300), 'track'); await flush();
+            h.adapter.appendChunk(mediaType, frame(1600), 'track'); await flush();
+            await vi.advanceTimersByTimeAsync(249);
+            expect(buffer.appendedPayloads.at(-1)).toEqual(frame(1300));
+            await vi.advanceTimersByTimeAsync(1);
+            expect(buffer.appendedPayloads.at(-1)).toEqual(frame(1600));
+        } finally { h.adapter.destroy(); vi.useRealTimers(); }
+    });
     it.each([118, 940])('retains a whole burst of %i frames behind a hole with default limits', async count => {
         vi.useFakeTimers(); const h = await ready({}, 48000);
         const events: Array<{ state: string }> = [];
