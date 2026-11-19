@@ -3645,7 +3645,14 @@ export class MseMediaSource implements MediaSourceLike {
     let postHole = false;
     if (this.gapJumpMs > 0 && hole !== null && quality !== null && ((v.readyState ?? 0) === 2 || wideHole)) {
       postHole = this.hasPostHoleCoverage(ct, wideHole);
-      if (!postHole) { this.clearVideoHoleEvidence(); this.handleWatchdogSeeked(); }
+      // The audio clock carries the playhead to the end of the buffered video
+      // before it freezes, so the first frozen sample can see under a second
+      // ahead. Thin forward coverage of a still-standing narrow hole only
+      // holds recovery off; a changed hole or a playhead outside its upper
+      // range retires the witness.
+      if (!postHole && (wideHole || !this.isInsideWitnessedUpperRange(ct))) {
+        this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
+      }
     }
     if (v.paused || (v.seeking && !ownSeek) || !this.playbackIntent || (wideHole && (!postHole || (v.readyState ?? 0) < 2))
         || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec <= 1) {
@@ -3767,6 +3774,16 @@ export class MseMediaSource implements MediaSourceLike {
         && ((!requireAudio && !audio) || (audio !== undefined && Array.from({ length: audio.length }, (_, i) => i)
           .some(i => audio.start(i) <= ct && audio.end(i) - ct > 1)));
     } catch { return false; /* Detached/evicted native media cannot justify a seek. */ }
+  }
+
+  private isInsideWitnessedUpperRange(ct: number): boolean {
+    const hole = this.wedgeVideoHole;
+    if (hole === null || this.observeVideoHole(ct, ct) !== hole) return false;
+    try {
+      const ranges = this.videoBuffer?.buffered;
+      return ranges !== undefined && Array.from({ length: ranges.length }, (_, i) => i).some(i =>
+        ranges.start(i) === hole.start && ranges.start(i) <= ct && ct <= ranges.end(i));
+    } catch { return false; }
   }
 
   private observeVideoHole(from: number, to: number): typeof this.wedgeVideoHole {
