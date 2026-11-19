@@ -715,9 +715,14 @@ The compatibility packages re-export the same APIs.
 Selection reports catalog references, encrypted tracks, unresolved naming variables,
 and unsupported packaging as exclusions. Catalog references are not followed;
 publish tracks are metadata only. Authorization metadata is not presented automatically.
-The catalog parser accepts uncompressed UTF-8 JSON only. Compression-property checks
-and GZIP decoding, event header delivery, variable-keyframe switching, and active-track
-reconfiguration after updates are not implemented by the player. MSF-02 seeks use
+The catalog parser accepts uncompressed UTF-8 JSON. The player honors compression
+property `0x78` for MSF-02, MSF-01, and CMSF-01 catalogs and timelines, accepting
+uncompressed and GZIP payloads. Each decompressed object is limited to 8 MiB; pending
+preparation holds input by reference and is bounded to 256 objects, without an input-byte limit. Unsupported compression
+is refused. MSF-00 and catalogformat-01 do not use this signal. MSF-02 event and SAP
+events include optional raw `header` bytes from track property `0x7B`.
+Variable-keyframe switching and active-track reconfiguration after updates are not
+yet implemented by the player. MSF-02 seeks use
 resolved dependency identities (including render groups) and floor rounding. Indexed
 retrieval refuses targets outside the most restrictive selected track’s
 `accessibleWindowTime`; wallclock thresholds use UTC milliseconds, and zero-wallclock

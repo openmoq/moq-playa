@@ -601,6 +601,8 @@ export interface DurationChangedEvent {
  */
 export interface SapEventReceivedEvent {
   readonly type: 'sap_event';
+  /** MSF-02 §8.1 header bytes; absent when no header was provided. */
+  readonly header?: Uint8Array;
   /** Name of the SAP timeline track in the catalog. */
   readonly trackName: string;
   /** The SAP timeline entries parsed from this object. */
@@ -618,6 +620,8 @@ export interface SapEventReceivedEvent {
  */
 export interface EventTimelineReceivedEvent {
   readonly type: 'event_timeline';
+  /** MSF-02 §8.1 header bytes; absent when no header was provided. */
+  readonly header?: Uint8Array;
   /** Name of the eventtimeline track in the catalog. */
   readonly trackName: string;
   /** EventType URI from the catalog (§5.1.13). */

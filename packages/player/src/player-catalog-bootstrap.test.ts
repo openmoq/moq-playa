@@ -128,7 +128,7 @@ async function expireCatalogWait(action: () => void): Promise<void> {
 function ackCatalog(adapter: ReturnType<typeof createMockAdapter>, reqId = 1n, alias = 1n): void {
     adapter._triggerMessage({
         type: 'SUBSCRIBE_OK', requestId: varint(reqId), trackAlias: varint(alias),
-        parameters: new Map(), trackExtensions: [],
+        parameters: new Map(), trackExtensions: new Map(),
     } as unknown as ControlMessage);
 }
 
@@ -156,7 +156,7 @@ async function acceptCandidateMedia(
         await flush();
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(requestId), trackAlias: varint(trackAlias),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
     }
     await flush(); await flush();
@@ -194,6 +194,9 @@ describe.each([14, 16, 18] as const)('draft %i catalog track naming', draft => {
             await flush();
             const [namespace, track] = adapter.fetch.mock.calls[0]!;
             const id = BigInt(await adapter.fetch.mock.results[0]!.value);
+            adapter._triggerMessage({ type: 'FETCH_OK', requestId: varint(id), endOfTrack: 0,
+                endLocation: { group: varint(0n), object: varint(1n) }, parameters: new Map(), trackProperties: new Map(),
+            } as ControlMessage);
             await deliverFetchObject(adapter, id, 400n, 0n, 0n, enc(CATALOG));
             expect(await result).toMatchObject({ value: { tracks: expect.any(Array) } });
             expect((namespace as Uint8Array[]).map(field => new TextDecoder().decode(field))).toEqual(['live', 'broadcast']);
@@ -296,7 +299,7 @@ describe('catalog failure state and pending delivery', () => {
         // Progress keeps the joining attempt alive beyond the diagnostic deadline.
         adapter._triggerDataStream(100n, { type: 'fetch', header: { requestId: 3n } } as DataStreamHeader);
         adapter._triggerMessage({ type: 'FETCH_OK', requestId: 3n, endOfTrack: 0,
-            endLocation: { group: 0n, object: 2n }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: 0n, object: 2n }, parameters: new Map(), trackExtensions: new Map(),
         } as ControlMessage);
         for (let i = 0; i < 3; i++) {
             await vi.advanceTimersByTimeAsync(4000);
@@ -374,7 +377,7 @@ describe('catalog failure state and pending delivery', () => {
                 subgroupId: 0n, objectId: 0n, publisherPriority: 128, payload: enc(CATALOG),
             } as MoqtObject);
             adapter._triggerMessage({ type: 'FETCH_OK', requestId: 3n, endOfTrack: 0,
-                endLocation: { group: 0n, object: 1n }, parameters: new Map(), trackExtensions: [],
+                endLocation: { group: 0n, object: 1n }, parameters: new Map(), trackExtensions: new Map(),
             } as ControlMessage);
             adapter._triggerStreamClosed(100n);
         }
@@ -597,7 +600,7 @@ describe('catalog retry with Joining FETCH', () => {
         } as MoqtObject);
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId, endOfTrack: 0,
-            endLocation: { group: 10n, object: 1n }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: 10n, object: 1n }, parameters: new Map(), trackExtensions: new Map(),
         } as ControlMessage);
         adapter._triggerStreamClosed(100n);
     }
@@ -824,7 +827,7 @@ describe('catalog bootstrap wiring — convergence end-to-end', () => {
                 ],
             }));
             adapter._triggerMessage({ type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-                endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+                endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
             } as unknown as ControlMessage);
             adapter._triggerStreamClosed(100n);
             await flush();
@@ -846,7 +849,7 @@ describe('catalog bootstrap wiring — convergence end-to-end', () => {
         expect(events).toEqual([]);                        // prefix incomplete
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(2n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(2n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         expect(events).toEqual([]);                        // FETCH_OK alone ≠ complete
@@ -881,7 +884,7 @@ describe('catalog bootstrap wiring — convergence end-to-end', () => {
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -952,7 +955,7 @@ describe('catalog bootstrap wiring — convergence end-to-end', () => {
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -967,7 +970,7 @@ describe('catalog bootstrap wiring — convergence end-to-end', () => {
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush(); await flush();
@@ -1013,7 +1016,7 @@ describe('catalog bootstrap wiring — convergence end-to-end', () => {
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -1028,7 +1031,7 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n),
             parameters: new Map([[varint(0x09n), [{ group, object }]]]),  // MessageParam.LARGEST_OBJECT
-            trackExtensions: [],
+            trackExtensions: new Map(),
         } as unknown as ControlMessage);
     }
 
@@ -1102,7 +1105,7 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -1136,7 +1139,7 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
         // Candidate SUBSCRIBE_OK, prefix served, converges → ADOPTION.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(9n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc({
             version: 'draft-01',
@@ -1147,7 +1150,7 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
         }));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
@@ -1165,7 +1168,7 @@ describe('catalog bootstrap wiring — review-finding coverage', () => {
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -1224,7 +1227,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -1338,12 +1341,12 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
     ): Promise<void> {
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(alias),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
@@ -1376,7 +1379,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
         try {
             await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
             adapter._triggerMessage({ type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-                endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+                endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
             } as unknown as ControlMessage);
             adapter._triggerStreamClosed(500n);
             await flush();
@@ -1442,7 +1445,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
         // replays into the CANDIDATE, which reaches readiness → adoption.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(1n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush(); await flush();
         // (The candidate's fetch is still open; the replayed independent at a
@@ -1487,7 +1490,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -1541,7 +1544,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
@@ -1549,7 +1552,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
         // SUBSCRIBE_OK binds → adoption fires now.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(9n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         expect(events).toEqual(['catalog_received', 'catalog_updated']);
@@ -1560,7 +1563,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
         const { events, errors, candSubReqId, candFetchReqId } = await toCandidate(adapter);
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(9n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         // The candidate's subscription dies retriably and drains BEFORE its
         // prefix completes.
@@ -1576,7 +1579,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
@@ -1591,7 +1594,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
         player.on('catalog_updated', (e) => catalogs.push(e.catalog.tracks.map((t: { name: string }) => t.name)));
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(9n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         // LATE traffic on the retired alias (1n): a NEWER-group independent
@@ -1614,7 +1617,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
@@ -1661,7 +1664,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
                     if (td.decode(name) === 'video') {
                         adapter._triggerMessage({
                             type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(77n),
-                            parameters: new Map(), trackExtensions: [],
+                            parameters: new Map(), trackExtensions: new Map(),
                         } as unknown as ControlMessage);
                     }
                 },
@@ -1674,7 +1677,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush(); await flush();
@@ -1702,7 +1705,7 @@ describe('catalog bootstrap wiring — staged-recovery races', () => {
         await deliverFetchObject(adapter, 51n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(51n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush(); await flush();
@@ -1726,7 +1729,7 @@ describe('catalog bootstrap wiring — candidate adoption and ownership tombston
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -1745,7 +1748,7 @@ describe('catalog bootstrap wiring — candidate adoption and ownership tombston
     function bindCandidate(adapter: ReturnType<typeof createMockAdapter>, candSubReqId: bigint, alias: bigint): void {
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(alias),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
     }
 
@@ -1753,7 +1756,7 @@ describe('catalog bootstrap wiring — candidate adoption and ownership tombston
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
@@ -1854,7 +1857,7 @@ describe('catalog bootstrap wiring — candidate adoption and ownership tombston
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -1917,7 +1920,7 @@ describe('catalog bootstrap wiring — candidate adoption and ownership tombston
                     if (td.decode(name) === 'catalog') {
                         adapter._triggerMessage({
                             type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(33n),
-                            parameters: new Map(), trackExtensions: [],
+                            parameters: new Map(), trackExtensions: new Map(),
                         } as unknown as ControlMessage);
                     }
                 },
@@ -1950,7 +1953,7 @@ describe('catalog bootstrap wiring — candidate adoption and ownership tombston
                         if (videoSubs === 2) {          // the RESUBSCRIBE
                             adapter._triggerMessage({
                                 type: 'SUBSCRIBE_OK', requestId: varint(id), trackAlias: varint(88n),
-                                parameters: new Map(), trackExtensions: [],
+                                parameters: new Map(), trackExtensions: new Map(),
                             } as unknown as ControlMessage);
                         }
                     }
@@ -1964,7 +1967,7 @@ describe('catalog bootstrap wiring — candidate adoption and ownership tombston
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush(); await flush();
@@ -1997,7 +2000,7 @@ describe('catalog bootstrap wiring — candidate adoption and ownership tombston
         await deliverFetchObject(adapter, 51n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(51n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush(); await flush();
@@ -2035,7 +2038,7 @@ describe('catalog bootstrap wiring — terminal drain and shared parking budgets
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -2077,7 +2080,7 @@ describe('catalog bootstrap wiring — terminal drain and shared parking budgets
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -2092,12 +2095,12 @@ describe('catalog bootstrap wiring — terminal drain and shared parking budgets
         const candFetchReqId = BigInt(await adapter.joiningFetch.mock.results[1]!.value);
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(9n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
@@ -2171,12 +2174,12 @@ describe('catalog bootstrap wiring — terminal drain and shared parking budgets
         // The NEW session's catalog binds the SAME alias (1n) the old one used.
         second._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await deliverFetchObject(second, 3n, 100n, 5n, 0n, enc(CATALOG));
         second._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         second._triggerStreamClosed(100n);
         await flush(); await flush();
@@ -2234,7 +2237,7 @@ describe('catalog bootstrap wiring — terminal drain and shared parking budgets
             await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
             adapter._triggerMessage({
                 type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-                endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+                endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
             } as unknown as ControlMessage);
             adapter._triggerStreamClosed(100n);
             await flush();
@@ -2285,7 +2288,7 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -2305,7 +2308,7 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         for (const reqId of [5n, 7n]) {
             adapter._triggerMessage({
                 type: 'SUBSCRIBE_OK', requestId: varint(reqId), trackAlias: varint(reqId),
-                parameters: new Map(), trackExtensions: [],
+                parameters: new Map(), trackExtensions: new Map(),
             } as unknown as ControlMessage);
         }
     }
@@ -2316,7 +2319,7 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         ackMedia(adapter);                              // media OKs answered
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(9n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         const pending = (player as unknown as { pendingObjectsByAlias: Map<bigint, unknown[]> }).pendingObjectsByAlias;
@@ -2413,7 +2416,7 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         // Candidate SUBSCRIBE_OK + first independent → atomic adoption.
         a1._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candReqId), trackAlias: varint(2n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         a1._triggerObject(200n, {
             kind: 'data', trackAlias: varint(2n), groupId: varint(3n), subgroupId: varint(0n),
@@ -2443,7 +2446,7 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -2481,7 +2484,7 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         await flush();
         second._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(21n), trackAlias: varint(1n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         second._triggerObject(300n, {
             kind: 'data', trackAlias: varint(1n), groupId: varint(0n), subgroupId: varint(0n),
@@ -2528,13 +2531,13 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(9n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         expect(events).toEqual(['catalog_received', 'catalog_updated']);   // adopted for content
@@ -2556,7 +2559,7 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -2593,7 +2596,7 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -2609,18 +2612,18 @@ describe('catalog bootstrap wiring — staged recovery adoption and alias quaran
         // replacement's catalog and media to be usable.
         second._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(40n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await deliverFetchObject(second, 3n, 100n, 5n, 0n, enc(CATALOG));
         second._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         second._triggerStreamClosed(100n);
         await flush(); await flush();
         second._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(5n), trackAlias: varint(1n),   // video ← old catalog alias
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await acceptCandidateMedia(second, [{ requestId: 7n, trackAlias: 70n }]);
         await m;
@@ -2659,7 +2662,7 @@ describe('catalog bootstrap wiring — parked-data ownership and candidate teard
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -2667,7 +2670,7 @@ describe('catalog bootstrap wiring — parked-data ownership and candidate teard
         for (const reqId of [5n, 7n]) {
             adapter._triggerMessage({
                 type: 'SUBSCRIBE_OK', requestId: varint(reqId), trackAlias: varint(reqId),
-                parameters: new Map(), trackExtensions: [],
+                parameters: new Map(), trackExtensions: new Map(),
             } as unknown as ControlMessage);
         }
         await flush();
@@ -2699,7 +2702,7 @@ describe('catalog bootstrap wiring — parked-data ownership and candidate teard
         // A resolves to a DIFFERENT alias (60): entry still owned by B.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(resubA), trackAlias: varint(60n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         expect(pending.get(50n)).toHaveLength(1);
@@ -2707,7 +2710,7 @@ describe('catalog bootstrap wiring — parked-data ownership and candidate teard
         // later unrelated request that gets alias 50 must never inherit it.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(resubB), trackAlias: varint(61n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         expect(pending.get(50n)).toBeUndefined();
@@ -2794,7 +2797,7 @@ describe('catalog bootstrap wiring — parked-data ownership and candidate teard
         // The candidate's own subscription reports GOING_AWAY.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(9n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerMessage({
             type: 'PUBLISH_DONE', requestId: varint(candSubReqId), statusCode: varint(0x4n),   // GOING_AWAY
@@ -2806,7 +2809,7 @@ describe('catalog bootstrap wiring — parked-data ownership and candidate teard
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
@@ -2827,14 +2830,14 @@ describe('catalog bootstrap wiring — parked replay binding and candidate fetch
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
         for (const reqId of [5n, 7n]) {
             adapter._triggerMessage({
                 type: 'SUBSCRIBE_OK', requestId: varint(reqId), trackAlias: varint(reqId),
-                parameters: new Map(), trackExtensions: [],
+                parameters: new Map(), trackExtensions: new Map(),
             } as unknown as ControlMessage);
         }
         await flush();
@@ -2868,7 +2871,7 @@ describe('catalog bootstrap wiring — parked replay binding and candidate fetch
         // A binds alias 50: B's parked data must NOT replay into A's track.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(resubA), trackAlias: varint(50n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         expect(routeSpy).not.toHaveBeenCalled();
@@ -2936,7 +2939,7 @@ describe('catalog bootstrap wiring — parked replay binding and candidate fetch
         // the transaction must fail (not hang forever), active retained.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candReqId), trackAlias: varint(2n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerMessage({
             type: 'PUBLISH_DONE', requestId: varint(candReqId), statusCode: varint(0x2n),
@@ -3069,7 +3072,7 @@ describe('catalog bootstrap wiring — legacy terminal deferral and owner-scoped
         // New session's catalog loads… before adoption, which now waits for it.
         second._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         second._triggerObject(100n, {
             kind: 'data', trackAlias: varint(1n), groupId: varint(0n), subgroupId: varint(0n),
@@ -3113,7 +3116,7 @@ describe('catalog bootstrap wiring — legacy terminal deferral and owner-scoped
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -3130,7 +3133,7 @@ describe('catalog bootstrap wiring — legacy terminal deferral and owner-scoped
         // future parking); the MEDIA subscribes are still awaiting their OKs.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(9n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         // 300 tiny media pre-roll objects across three aliases — over the
@@ -3149,7 +3152,7 @@ describe('catalog bootstrap wiring — legacy terminal deferral and owner-scoped
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
@@ -3195,7 +3198,7 @@ describe('catalog bootstrap wiring — legacy terminal deferral and owner-scoped
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -3213,7 +3216,7 @@ describe('catalog bootstrap wiring — legacy terminal deferral and owner-scoped
         // through the MEDIA branch — which must consume the record too.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(5n), trackAlias: varint(66n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         expect(internals.pendingStreamEvents.size).toBe(0);
@@ -3239,7 +3242,7 @@ describe('catalog bootstrap wiring — anchor-before-replay and lifecycle owners
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n),
             parameters: new Map([[varint(0x09n), [{ group: 10n, object: 0n }]]]),  // LARGEST_OBJECT
-            trackExtensions: [],
+            trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         expect(adapter.fetchCancel).not.toHaveBeenCalled();   // join NOT superseded
@@ -3248,7 +3251,7 @@ describe('catalog bootstrap wiring — anchor-before-replay and lifecycle owners
         await deliverFetchObject(adapter, 3n, 100n, 10n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(10n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(10n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -3291,7 +3294,7 @@ describe('catalog bootstrap wiring — anchor-before-replay and lifecycle owners
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -3307,7 +3310,7 @@ describe('catalog bootstrap wiring — anchor-before-replay and lifecycle owners
         // The candidate binds — from here, parked data is MEDIA-owned only.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(9n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         // 65 media pre-roll objects, each on its OWN stream — and each stream
@@ -3326,7 +3329,7 @@ describe('catalog bootstrap wiring — anchor-before-replay and lifecycle owners
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
@@ -3390,7 +3393,7 @@ describe('catalog bootstrap wiring — attempt identity and lifecycle evidence s
         }));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(bReqId), endOfTrack: 0,
-            endLocation: { group: varint(0n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(0n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(200n);
         await flush();
@@ -3405,7 +3408,7 @@ describe('catalog bootstrap wiring — attempt identity and lifecycle evidence s
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -3445,12 +3448,12 @@ describe('catalog bootstrap wiring — attempt identity and lifecycle evidence s
         // Candidate still adoptable.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(9n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
@@ -3466,7 +3469,7 @@ describe('catalog bootstrap wiring — attempt identity and lifecycle evidence s
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -3479,12 +3482,12 @@ describe('catalog bootstrap wiring — attempt identity and lifecycle evidence s
         // is adopted only once it is usable.
         second._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await deliverFetchObject(second, 3n, 101n, 5n, 0n, enc(CATALOG));
         second._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         second._triggerStreamClosed(101n);
         await flush(); await flush();
@@ -3549,7 +3552,7 @@ describe('catalog bootstrap wiring — unified lifecycle budget and explicit ove
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -3636,7 +3639,7 @@ describe('catalog bootstrap wiring — unified lifecycle budget and explicit ove
             adapter._triggerMessage({
                 type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n),
                 parameters: new Map([[varint(0x09n), [{ group: 5n, object: 1n }]]]),
-                trackExtensions: [],
+                trackExtensions: new Map(),
             } as unknown as ControlMessage);
             await flush();
             // The join AND the rung-1 emulation are refused → rung 2.
@@ -3656,7 +3659,7 @@ describe('catalog bootstrap wiring — unified lifecycle budget and explicit ove
             const rung2ReqId = BigInt(await adapter.subscribe.mock.results[adapter.subscribe.mock.results.length - 1]!.value);
             adapter._triggerMessage({
                 type: 'SUBSCRIBE_OK', requestId: varint(rung2ReqId), trackAlias: varint(2n),
-                parameters: new Map(), trackExtensions: [],
+                parameters: new Map(), trackExtensions: new Map(),
             } as unknown as ControlMessage);
             adapter._triggerObject(400n, {
                 kind: 'data', trackAlias: varint(2n), groupId: varint(2n), subgroupId: varint(0n),
@@ -3746,7 +3749,7 @@ describe('catalog bootstrap wiring — main-bootstrap fail-closed budgets', () =
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n);
         await flush();
@@ -3763,7 +3766,7 @@ describe('catalog bootstrap wiring — main-bootstrap fail-closed budgets', () =
         // media is NOT catalog-owned.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(candSubReqId), trackAlias: varint(9n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         await flush();
         // 257 media pre-roll objects on ONE unresolved alias overflow the
@@ -3780,7 +3783,7 @@ describe('catalog bootstrap wiring — main-bootstrap fail-closed budgets', () =
         await deliverFetchObject(adapter, candFetchReqId, 500n, 8n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(candFetchReqId), endOfTrack: 0,
-            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(8n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(500n);
         await flush(); await flush();
@@ -3830,7 +3833,7 @@ describe('catalog bootstrap wiring — final-rung overflow terminals', () => {
         expect(internals.pendingAliasBinds.size).toBe(0);
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(rung2ReqId), trackAlias: varint(2n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerObject(9000n, {
             kind: 'data', trackAlias: varint(2n), groupId: varint(9n), subgroupId: varint(0n),
@@ -3920,7 +3923,7 @@ describe('catalog bootstrap wiring — exception-safe terminal cleanup', () => {
         // Late SUBSCRIBE_OK + data are inert.
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(rung2ReqId), trackAlias: varint(2n),
-            parameters: new Map(), trackExtensions: [],
+            parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerObject(9500n, {
             kind: 'data', trackAlias: varint(2n), groupId: varint(9n), subgroupId: varint(0n),
@@ -4003,7 +4006,7 @@ describe('catalog bootstrap wiring — strict mode and draft boundaries', () => 
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n),
             parameters: new Map([[varint(0x09n), [{ group: 5n, object: 1n }]]]),
-            trackExtensions: [],
+            trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerMessage({
             type: 'REQUEST_ERROR', requestId: varint(3n), errorCode: varint(0x1n),
@@ -4049,7 +4052,7 @@ describe('catalog bootstrap wiring — strict mode and draft boundaries', () => 
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n),
             parameters: new Map([[varint(0x09n), [{ group: big, object: 3n }]]]),
-            trackExtensions: [],
+            trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerMessage({
             type: 'REQUEST_ERROR', requestId: varint(3n), errorCode: varint(0x1n),
@@ -4074,7 +4077,7 @@ describe('catalog bootstrap wiring — MSF-01 fallback conformance', () => {
         adapter._triggerMessage({
             type: 'SUBSCRIBE_OK', requestId: varint(1n), trackAlias: varint(1n),
             parameters: new Map([[varint(0x09n), [{ group: 5n, object: 1n }]]]),
-            trackExtensions: [],
+            trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerMessage({
             type: 'REQUEST_ERROR', requestId: varint(3n), errorCode: varint(0x1n),
@@ -4085,7 +4088,7 @@ describe('catalog bootstrap wiring — MSF-01 fallback conformance', () => {
         await deliverFetchObject(adapter, emuReqId, 200n, 5n, 0n, payload);
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(emuReqId), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(200n);
         await flush();
@@ -4228,7 +4231,7 @@ describe('catalog bootstrap wiring — terminal evidence requires a peer FIN', (
         await deliverFetchObject(adapter, 3n, 100n, 5n, 0n, enc(CATALOG));
         adapter._triggerMessage({
             type: 'FETCH_OK', requestId: varint(3n), endOfTrack: 0,
-            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: [],
+            endLocation: { group: varint(5n), object: varint(1n) }, parameters: new Map(), trackExtensions: new Map(),
         } as unknown as ControlMessage);
         adapter._triggerStreamClosed(100n, undefined, 'fin');
         await flush();

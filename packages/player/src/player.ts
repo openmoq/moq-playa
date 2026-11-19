@@ -1,3 +1,4 @@
+import { MsfPayloadQueue, MsfPayloadSource } from './msf-payload.js';
 import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import type { MediaSeekResource, MediaSeekSample } from './interfaces.js';
 import { nativeTimeUs, nativeRangeMayReachBoundary } from './presentation-placement.js';
@@ -2079,6 +2080,7 @@ export class MoqtPlayer {
     this.pendingMediaTerminals.get(conn)?.get(requestId)?.releaseEnd();
     this.pendingMediaTerminals.get(conn)?.delete(requestId);
     const ownerSubscription = this.activeSubscriptions.get(requestId);
+    this.msfSources.get(conn)?.forget(requestId, ownerSubscription?.trackAlias ?? null);
     if (ownerSubscription?.trackAlias != null && this.deliverySubscriptions.get(ownerSubscription.trackAlias) === ownerSubscription) this.deliverySubscriptions.delete(ownerSubscription.trackAlias);
     const warmOwner = ownerSubscription && this.warmMediaOwners.get(ownerSubscription);
     if (warmOwner?.connection === conn) {
@@ -4946,6 +4948,7 @@ export class MoqtPlayer {
 
     // §7: Media timeline object delivery → update timeline state
     this.subscriptionManager.onTimelineObject = (trackName, obj) => {
+      if (this.prepareTimelineObject(trackName, obj, this.subscriptionManager!.onTimelineObject!)) return;
       if (obj.kind !== 'data' || !obj.payload) return;
       if (!this.timelineState) return;
       const source = this.timelineSource;
@@ -5011,6 +5014,7 @@ export class MoqtPlayer {
     // @see draft-ietf-moq-msf-00 §8 (Event Timeline track)
     // @see draft-ietf-moq-cmsf-00 §3.6 (SAP Type Timeline)
     this.subscriptionManager.onEventTimelineObject = (trackName, obj) => {
+      if (this.prepareTimelineObject(trackName, obj, this.subscriptionManager!.onEventTimelineObject!)) return;
       if (obj.kind !== 'data' || !obj.payload) return;
 
       // Look up the catalog track to determine the eventType
@@ -5019,6 +5023,7 @@ export class MoqtPlayer {
       const key = this.mediaKey(trackName, undefined, BigInt(obj.trackAlias));
       const catalogTrack = catalog?.tracks.find(track => this.initKey(track) === key);
       const eventType = catalogTrack?.eventType ?? '';
+      const header = catalog?.msfDraft === 'draft-02' && this.connection ? this.msfSource(this.connection).header(obj.payload) : undefined;
 
       try {
         if (eventType === CMSF_SAP_EVENT_TYPE) {
@@ -5027,6 +5032,7 @@ export class MoqtPlayer {
           const entries = parseSapTimeline(obj.payload, catalog?.msfDraft);
           this.emitter.emit('sap_event', {
             type: 'sap_event',
+            ...(header === undefined ? {} : { header }),
             trackName,
             entries,
           });
@@ -5036,6 +5042,7 @@ export class MoqtPlayer {
           const records = parseEventTimeline(obj.payload, catalog?.msfDraft);
           this.emitter.emit('event_timeline', {
             type: 'event_timeline',
+            ...(header === undefined ? {} : { header }),
             trackName,
             eventType,
             records,
@@ -8831,6 +8838,63 @@ export class MoqtPlayer {
     });
   }
 
+  private readonly msfSources = new WeakMap<MoqtConnection, MsfPayloadSource>();
+  private readonly msfObjects = new WeakMap<Uint8Array, MoqtConnection>();
+  private readonly msfQueues = new WeakMap<object, MsfPayloadQueue>();
+  private readonly preparedCatalogs = new WeakSet<MoqtObject>();
+  private readonly preparingCatalogFetches = new Set<bigint>();
+  private readonly poisonedCatalogs = new WeakSet<CatalogSlots>();
+  private timelinePayloadFailure: string | null = null;
+
+  private msfSource(conn: MoqtConnection): MsfPayloadSource {
+    let source = this.msfSources.get(conn);
+    if (!source) {
+      source = new MsfPayloadSource(conn.draftVersion, (id, subscription) => {
+        const slots = this.slotsFor(conn);
+        if (!slots || this._destroyed || this.isTerminalState()) return;
+        if (subscription ? slots.catalogRequestId !== id && slots.catalogRecovery?.reqId !== id
+          && !(conn === this.connection && this.activeSubscriptions.has(id))
+          : slots.bootstrapFetch?.reqId !== id && slots.catalogRecovery?.fetch?.reqId !== id
+          && !(conn === this.connection && this.pendingCatalogFetches.has(id))) return;
+        if (subscription && conn === this.connection && this.activeSubscriptions.get(id)?.mediaType === 'mediatimeline') this.timelineState = null;
+        void (subscription ? conn.unsubscribe(varint(id)) : conn.fetchCancel(varint(id))).catch(() => {});
+      }, this.config.connectionTimeoutMs);
+      this.msfSources.set(conn, source);
+    }
+    return source;
+  }
+  private msfQueue(owner: object): MsfPayloadQueue {
+    let queue = this.msfQueues.get(owner);
+    if (!queue) { queue = new MsfPayloadQueue(); this.msfQueues.set(owner, queue); }
+    return queue;
+  }
+  private prepareTimelineObject(trackName: string, obj: MoqtObject, receive: (name: string, object: MoqtObject) => void): boolean {
+    if (obj.kind !== 'data' || this.preparedCatalogs.has(obj)) return false;
+    const conn = this.msfObjects.get(obj.payload) ?? this.connection;
+    const subscription = [...this.activeSubscriptions.values()].find(s => s.trackAlias === BigInt(obj.trackAlias));
+    if (!conn || !subscription) return true;
+    this.msfQueue(subscription).run(() => this.readMsfObject(obj, false), payload => {
+      this.msfSource(conn).copy(obj.payload, payload); this.msfObjects.set(payload, conn);
+      const prepared = { ...obj, payload }; this.preparedCatalogs.add(prepared); receive(trackName, prepared);
+    }, error => {
+      if (subscription.mediaType === 'mediatimeline') this.timelinePayloadFailure = error.message;
+      this.log.warn('Timeline "%s": %s', trackName, error.message);
+    }, () => !this._destroyed && !this.isTerminalState() && this.connection === conn
+      && [...this.activeSubscriptions.values()].includes(subscription));
+    return true;
+  }
+
+  private readMsfObject(obj: Extract<MoqtObject, { kind: 'data' }>, catalog: boolean): Uint8Array | Promise<Uint8Array> {
+    const conn = this.msfObjects.get(obj.payload) ?? this.connection;
+    if (!conn) return obj.payload;
+    const slots = this.slotsFor(conn), recovery = slots?.catalogRecovery;
+    const manager = recovery && (recovery.alias === BigInt(obj.trackAlias)
+      || recovery.fetch && recovery.fetch.reqId === this.msfSource(conn).request(obj.payload)) ? recovery.manager : slots?.catalogManager;
+    const format = manager?.wireFormat;
+    const supported = catalog && BigInt(obj.objectId) === 0n ? undefined : format ? format === 'msf-01' || format === 'msf-02' : this._catalogState?.msfDraft === 'draft-02' ? true : catalog ? undefined : false;
+    return this.msfSource(conn).read(obj.payload, obj.properties ?? obj.extensions, supported, catalog);
+  }
+
   /**
    * Process a single CMAF / catalog object delivered on a FETCH stream
    * for `fetchCatalog`. Parses through a *fresh* `CatalogManager`
@@ -8841,6 +8905,15 @@ export class MoqtPlayer {
   private handleCatalogFetchObject(reqId: bigint, obj: MoqtObject): void {
     const pending = this.pendingCatalogFetches.get(reqId);
     if (!pending) return;
+    if (obj.kind === 'data' && !this.preparedCatalogs.has(obj)) {
+      this.preparingCatalogFetches.add(reqId);
+      this.msfQueue(pending).run(() => this.readMsfObject(obj, true), payload => {
+        this.preparingCatalogFetches.delete(reqId);
+        const prepared = { ...obj, payload }; this.preparedCatalogs.add(prepared); this.handleCatalogFetchObject(reqId, prepared);
+      }, error => { this.preparingCatalogFetches.delete(reqId); this.settleCatalogFetch(reqId, { ok: false, error }); },
+      () => this.pendingCatalogFetches.get(reqId) === pending);
+      return;
+    }
     if (obj.kind === 'gap') {
       this.settleCatalogFetch(reqId, {
         ok: false,
@@ -9341,7 +9414,7 @@ export class MoqtPlayer {
       const missing = BigInt((obj as { status?: bigint }).status ?? 0n) === 0x1n;
       return { location, kind: 'gap', gapKind: missing ? 'missing' : 'terminator' };
     }
-    return { location, kind: 'payload', payload: obj.payload };
+    return { location, kind: 'payload', payload: obj.payload, prepare: () => this.readMsfObject(obj, true) };
   }
 
   /** Readiness: today's first-catalog block, run once with the converged state. */
@@ -9466,6 +9539,7 @@ export class MoqtPlayer {
    *  Post-drain traffic on the alias parks in the ordinary pre-SUBSCRIBE_OK
    *  buffer and belongs to whichever request next binds it. */
   private retireCatalogAliasRoute(slots: CatalogSlots = this.catalogSlots): void {
+    if (slots === this.catalogSlots && this.connection) this.msfSources.get(this.connection)?.forget(slots.catalogRequestId, slots.catalogTrackAlias);
     slots.catalogTrackAlias = null;
   }
 
@@ -9781,6 +9855,8 @@ export class MoqtPlayer {
     if (!recovery) return false;
     this.catalogSlots.catalogRecovery = null;
     recovery.coord.abort();
+    this.msfSources.get(recovery.conn)?.forget(recovery.reqId, recovery.alias);
+    if (recovery.fetch) this.msfSources.get(recovery.conn)?.forget(recovery.fetch.reqId, null);
     // The candidate's SUBSCRIBE ownership settles like any other failed
     // request: entries it owned exclusively drop; an entry ALSO owned by a
     // concurrent media request survives for that owner.
@@ -10143,6 +10219,8 @@ export class MoqtPlayer {
   }
 
   private cleanupCatalogFetch(reqId: bigint): void {
+    this.preparingCatalogFetches.delete(reqId);
+    if (this.connection) this.msfSources.get(this.connection)?.forget(reqId, null);
     const pending = this.pendingCatalogFetches.get(reqId);
     if (pending) {
       clearTimeout(pending.timeout);
@@ -11293,6 +11371,10 @@ export class MoqtPlayer {
       cost: (args: unknown[]) => number,
       buffer: (args: unknown[]) => boolean,
     ) => (streamId: bigint, obj: MoqtObject): void => {
+      if (obj.kind === 'data' && (conn !== this.connection || this.msfSource(conn).isFetch(streamId)
+          || !['video', 'audio'].includes(this.subscriptionManager?.getMediaType(BigInt(obj.trackAlias)) ?? ''))) {
+        this.msfObjects.set(obj.payload, conn); this.msfSource(conn).observe(obj.payload, BigInt(obj.trackAlias), streamId);
+      }
       // Capture before parking, callbacks or transforms. Replayed data is not
       // a new receipt, and data received before ownership is never re-attributed.
       const receipt = obj.kind === 'data'
@@ -11315,6 +11397,7 @@ export class MoqtPlayer {
     ) => {
       const deliver = stageable(fn, source, cost, buffer);
       return (datagram: ObjectDatagram): void => {
+        if (datagram.payload) { this.msfObjects.set(datagram.payload, conn); this.msfSource(conn).observe(datagram.payload, BigInt(datagram.trackAlias)); }
         const receipt = datagram.status === undefined
           ? this.captureVideoPayload(BigInt(datagram.trackAlias), datagram.payload.byteLength, conn,
             { groupId: BigInt(datagram.groupId), objectId: BigInt(datagram.objectId) }) : undefined;
@@ -11755,6 +11838,7 @@ export class MoqtPlayer {
 
       // §10.4: Stream reset vs FIN
       onStreamClosed: stageable((streamId, error, terminal) => {
+        this.msfSource(conn).closeStream(streamId);
         const fills = this.seekFillStreams.get(conn), bridge = fills?.get(streamId);
         if (bridge && fills) {
           fills.delete(streamId);
@@ -11820,7 +11904,7 @@ export class MoqtPlayer {
         // state through a reused stream ID.
         const closeMapsAuthoritative = conn === this.connection;
         const catalogReqId = closeMapsAuthoritative ? this.catalogFetchStreams.get(streamId) : undefined;
-        if (catalogReqId !== undefined) {
+        if (catalogReqId !== undefined && !this.preparingCatalogFetches.has(catalogReqId)) {
           this.settleCatalogFetch(catalogReqId, {
             ok: false,
             error: new Error(terminal === 'reset'
@@ -11968,6 +12052,7 @@ export class MoqtPlayer {
       }, 'data', undefined, bufferStream),
 
       onDataStream: stageable((streamId, header) => {
+        if (header.type === 'fetch') this.msfSource(conn).stream(streamId, BigInt(header.header.requestId));
         if (this.seekRequestsFor(conn).some(owner => owner.handleStreamOpen(streamId, header))) return;
         const bridge = this.seekBridgesFor(conn).find(owner => owner.handleStreamOpen(streamId, header));
         if (bridge) {
@@ -12586,6 +12671,14 @@ export class MoqtPlayer {
   }
 
   private handleControlMessage(msg: ControlMessage, conn: MoqtConnection): void {
+    if (msg.type === 'SUBSCRIBE_OK' || msg.type === 'FETCH_OK') {
+      this.msfSource(conn).accept(BigInt(msg.requestId), msg.trackProperties ?? msg.trackExtensions ?? new Map(),
+        msg.type === 'SUBSCRIBE_OK' ? BigInt(msg.trackAlias) : undefined);
+    }
+    if (msg.type === 'PUBLISH_DONE') {
+      const owner = this.slotsFor(conn);
+      if (owner?.catalogRequestId === BigInt(msg.requestId) && this.msfQueue(owner).defer(() => this.handleControlMessage(msg, conn))) return;
+    }
     if (this.seekRequestsFor(conn).some(owner => owner.handleControl(msg))) return;
     if (this.handleSeekBridgeControl(msg, conn)) return;
     const slots = this.slotsFor(conn);
@@ -13208,6 +13301,21 @@ export class MoqtPlayer {
     // catalog playback is running on: it converges its own retrieval and
     // publishes nothing until adoption.
     const candidate = this.candidateTxnFor(slots);
+    if (obj.kind === 'data' && !this.preparedCatalogs.has(obj)) {
+      const conn = this.msfObjects.get(obj.payload) ?? this.connection;
+      this.msfQueue(slots).run(() => this.readMsfObject(obj, true), payload => {
+        if (BigInt(obj.objectId) === 0n) this.poisonedCatalogs.delete(slots);
+        else if (this.poisonedCatalogs.has(slots)) return;
+        const prepared = { ...obj, payload }; this.preparedCatalogs.add(prepared); this.handleCatalogObject(prepared, slots);
+      }, error => {
+        this.poisonedCatalogs.add(slots);
+        error = new Error(`${obj.groupId}:${obj.objectId}: ${error.message}`, { cause: error });
+        if (candidate) this.failCandidateCatalog(candidate.conn, error.message);
+        else if (slots.catalogReceived) this.emitError(createPlayerError('degraded', 'catalog', PlayerErrorCode.CATALOG_DELTA_ERROR, error.message));
+        else this.failCatalogPlayback(createPlayerError('fatal', 'catalog', PlayerErrorCode.CATALOG_PARSE_ERROR, error.message));
+      }, () => !!conn && this.slotsFor(conn) === slots && !this.catalogQuarantinedConns.has(conn) && !this._destroyed && !this.isTerminalState());
+      return;
+    }
     if (candidate !== null) { this.handleCandidateCatalogObject(obj, slots, candidate); return; }
     const conn = this.connection;
     const gen = this.bootstrapGeneration;
@@ -14345,6 +14453,7 @@ export class MoqtPlayer {
       (t: CatalogTrack) => t.packaging === 'mediatimeline' && dependsOnSelected(t),
     );
     if (timelineTrack && this.connection && this.subscriptionManager) {
+      this.timelinePayloadFailure = null;
       this.timelineState = createTimelineState(timelineTrack, catalog, namespaceFields(this.config.namespace));
       this.timelineSource = null;
       const timelineConnection = this.connection;
@@ -16498,7 +16607,7 @@ export class MoqtPlayer {
   private getSeekContext() {
     const timeline = this.timelineState;
     if (!timeline || timeline.entries.length === 0) {
-      return { error: 'Cannot seek: no media timeline loaded' };
+      return { error: this.timelinePayloadFailure ?? 'Cannot seek: no media timeline loaded' };
     }
     const source = this.timelineSource;
     // Library safety policy: a replacement connection must revalidate the
