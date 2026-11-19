@@ -44,6 +44,7 @@ const VECTORS = join(HERE, '../../vectors');
 
 // Real SHA-256 of the cited draft files under ~/Projects/MoQ/Spec.
 const DRAFT_SHA: Record<string, string> = {
+  'draft-ietf-moq-msf-02': '171b0dec53aa312baa2c807c1ac24377672c8a7c01adc30cbd0f7e6124ec851a',
   'draft-ietf-moq-transport-14': '1e6f59bd6d15c8d372932cfbb00dd1c8db7da10771eb57291b9732ea557582b8',
   'draft-ietf-moq-transport-16': '2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18',
   'draft-ietf-moq-transport-18': '9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6',
@@ -994,6 +995,12 @@ function buildSpecMsf01(): void {
   // Playa returns the SAME category by accident (it rejects all string versions),
   // so these stay forward-looking with NO currentBehavior.
   for (const [tag, ver] of [['draft-99', 'draft-99'], ['draft-1', 'draft-1'], ['draft-00', 'draft-00'], ['draft-02', 'draft-02'], ['draft-abc', 'draft-abc']] as const) {
+    if (ver === 'draft-02') {
+      spec('catalog/msf02-version-draft', 'catalog-parse', 'msf-02',
+        '{"version":"draft-02","tracks":[]}', okc([]), 'interpretation', 'draft-ietf-moq-msf-02', '5.1.1',
+        'msf01_version_draft_02.json', 'MSF-02 §5.1.1: the declared draft-02 selects MSF-02 rules and is accepted.');
+      continue;
+    }
     spec(`catalog/msf01-version-${tag}`, 'catalog-parse', 'msf-01',
       `{"version":"${ver}","tracks":[]}`,
       errc('invalid-version'), 'interpretation', MSF, '5.1.1', `msf01_version_${tag.replace('-', '_')}.json`,

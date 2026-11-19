@@ -235,6 +235,8 @@ export interface CatalogTrack {
 export interface Catalog {
     /** @see draft-ietf-moq-msf-00 §5.1.1 — Required; normalized to 1 (accepts "1"/"draft-01") */
     readonly version: number;
+    /** MSF-02 rules apply only when declared; absent preserves earlier profiles. */
+    readonly msfDraft?: 'draft-02';
     /** @see draft-ietf-moq-msf-00 §5.1.8 — Required */
     readonly tracks: readonly CatalogTrack[];
     /** @see draft-ietf-moq-msf-00 §5.1.6 — wallclock time in ms since epoch */
@@ -323,6 +325,8 @@ export type CatalogObject = Catalog | CatalogDelta;
  */
 export interface CatalogState {
     readonly version: number;
+    /** MSF-02 rules apply only when declared; absent preserves earlier profiles. */
+    readonly msfDraft?: 'draft-02';
     readonly tracks: CatalogTrack[];
     readonly generatedAt?: number;
     readonly isComplete?: boolean;

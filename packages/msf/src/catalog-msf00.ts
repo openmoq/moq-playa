@@ -25,7 +25,7 @@ import { assertFiniteCatalogNumbers } from './catalog-validate.js';
  */
 function normalizeMsfVersion(v: unknown): number | null {
     if (typeof v === 'number') return v === MSF_VERSION ? MSF_VERSION : null;
-    if (typeof v === 'string') return v === '1' || v === 'draft-01' ? MSF_VERSION : null;
+    if (typeof v === 'string') return v === '1' || v === 'draft-01' || v === 'draft-02' ? MSF_VERSION : null;
     return null;
 }
 
@@ -79,14 +79,14 @@ export function parseMsfCatalog(
     const obj = raw as Record<string, unknown>;
 
     // §5.1.1: version — Required. Accept numeric 1 (MSF-00), "1" and "draft-01"
-    // (MSF-01); reject everything else as an unsupported version.
+    // (MSF-01), and "draft-02" (MSF-02); reject other versions.
     if (!('version' in obj)) {
         throw new Error('Catalog version is required (§5.1.1)');
     }
     const version = normalizeMsfVersion(obj['version']);
     if (version === null) {
         throw new Error(
-            `Unsupported catalog version ${JSON.stringify(obj['version'])}; expected 1, "1", or "draft-01" (§5.1.1)`,
+            `Unsupported catalog version ${JSON.stringify(obj['version'])}; expected 1, "1", "draft-01", or "draft-02" (§5.1.1)`,
         );
     }
 
@@ -130,6 +130,7 @@ export function parseMsfCatalog(
 
     const catalog: Catalog = {
         version,
+        ...(obj['version'] === 'draft-02' ? { msfDraft: 'draft-02' as const } : {}),
         tracks,
         ...(typeof obj['generatedAt'] === 'number' ? { generatedAt: obj['generatedAt'] } : {}),
         ...(obj['isComplete'] === true ? { isComplete: true } : {}),

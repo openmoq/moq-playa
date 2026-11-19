@@ -1588,31 +1588,32 @@
       }
     },
     {
-      "id": "catalog/msf01-version-draft-02",
+      "id": "catalog/msf02-version-draft",
       "kind": "catalog-parse",
-      "profile": "msf-01",
-      "description": "Playa MSF-01 profile policy (interpretation of §5.1.1 \"MUST NOT parse a version it does not understand\"): \"draft-02\" is not among the versions this profile understands (\"1\"/\"draft-01\"), so it is rejected — the draft suffix is a draft revision, never decoded to a numeric version. Playa returns the same invalid-version category by ACCIDENT (it rejects all string versions), not by MSF-01 support — forward-looking with no currentBehavior.",
+      "profile": "msf-02",
+      "description": "MSF-02 §5.1.1: the declared draft-02 selects MSF-02 rules and is accepted.",
       "input": {
         "file": "msf01_version_draft_02.json",
         "byteLength": 34,
         "sha256": "1f311a3e5d3aa7f86c9281c3a76aca13eb95f11fbef258fe3c9c432490c924aa"
       },
       "expect": {
-        "status": "error",
+        "status": "ok",
         "stage": "semantic",
-        "error": {
-          "category": "invalid-version"
+        "semantics": {
+          "catalogVersion": "1",
+          "tracks": []
         }
       },
       "expectationBasis": "interpretation",
       "provenance": {
         "class": "spec-derived",
-        "source": "draft-ietf-moq-msf-01",
+        "source": "draft-ietf-moq-msf-02",
         "section": "5.1.1",
         "generator": "hand-authored",
         "generatorVersion": "n/a",
         "command": "AUTHOR_CORPUS=1 tsx build-corpus.ts",
-        "sourceHash": "c3e68aac09c36ae1db4afde6fd0600a949e7265348f592520304a31e993c35af"
+        "sourceHash": "171b0dec53aa312baa2c807c1ac24377672c8a7c01adc30cbd0f7e6124ec851a"
       }
     },
     {

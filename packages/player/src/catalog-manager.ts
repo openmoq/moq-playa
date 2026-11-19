@@ -46,7 +46,7 @@ export class CatalogManager {
 
     /** Current materialized catalog state. Null until first catalog received. */
     private state: CatalogState | null = null;
-    private _wireFormat: 'msf-00' | 'msf-01' | 'catalogformat-01' | null = null;
+    private _wireFormat: 'msf-00' | 'msf-01' | 'msf-02' | 'catalogformat-01' | null = null;
 
     /** Number of catalog objects processed. */
     private _objectCount = 0;
@@ -292,6 +292,7 @@ export class CatalogManager {
                 this.lastRawDocument = null;
                 this.state = {
                     version: catalog.version,
+                    ...(catalog.msfDraft !== undefined ? { msfDraft: catalog.msfDraft } : {}),
                     tracks: [...catalog.tracks],
                     ...(catalog.generatedAt !== undefined
                         ? { generatedAt: catalog.generatedAt }
@@ -312,7 +313,8 @@ export class CatalogManager {
                         ? { publishTracks: catalog.publishTracks }
                         : {}),
                 };
-                this._wireFormat = typeof obj['version'] === 'number' ? 'msf-00' : 'msf-01';
+                this._wireFormat = catalog.msfDraft === 'draft-02' ? 'msf-02'
+                    : typeof obj['version'] === 'number' ? 'msf-00' : 'msf-01';
             }
         }
 
