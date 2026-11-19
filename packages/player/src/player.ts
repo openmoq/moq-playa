@@ -2530,6 +2530,125 @@ export class MoqtPlayer {
     else this.videoTimelineRecord = record;
   }
 
+  private catalogReselection: object | null = null;
+
+  /** MSF-02 §5.2.4 updates replace the playing declaration, not its old decoder. */
+  private adoptUpdatedCatalog(state: CatalogState): void {
+    const previous = this._catalogState;
+    const changed = previous?.msfDraft === 'draft-02' && state.msfDraft === 'draft-02'
+      && (['video', 'audio'] as const).some(role => {
+        const identity = this._selection[role];
+        if (!identity) return false;
+        const key = identityKey(identity.namespaceFields, identity.name);
+        const before = previous.tracks.find(track => this.initKey(track) === key);
+        const after = state.tracks.find(track => this.initKey(track) === key);
+        return before && after && (['codec', 'packaging', 'initData', 'initRef', 'role', 'altGroup', 'renderGroup', 'keyframeSpacing'] as const)
+          .some(field => before[field] !== after[field]);
+      });
+    this._catalogState = state;
+    // Retire excluded routes synchronously, before observers can deliver more media.
+    if (state.msfDraft === 'draft-02' && this.connection) {
+      const excluded = buildCatalogSelection(state, { catalogNamespace: this.config.namespace }).excluded;
+      for (const [id, sub] of this.activeSubscriptions) {
+        const declared = state.tracks.find(track => this.initKey(track)
+          === identityKey(sub.namespace ?? namespaceFields(this.config.namespace), sub.trackName));
+        if (declared && !this.catalogTrackAllowed(declared, state)) {
+          this.retireMediaSubscription(id, this.connection);
+          void this.connection.unsubscribe(varint(id)).catch(() => {});
+          const reason = excluded.find(item => identityKey(item.id.namespaceFields, item.id.name) === this.initKey(declared))?.reason;
+          this.log.warn('Catalog update excludes "%s": %s', sub.trackName, reason);
+        }
+      }
+    }
+    if (changed) {
+      const owner = {}; this.catalogReselection = owner;
+      const connection = this.connection, generation = this.bootstrapGeneration;
+      const current = () => this.catalogReselection === owner && this.connection === connection
+        && this.bootstrapGeneration === generation && !this._destroyed && !this.isTerminalState();
+      // Publish the complete catalog before callbacks can observe the new graph.
+      queueMicrotask(() => {
+        if (!current()) return;
+        void this.reselectUpdatedCatalog(current).catch(error => {
+          if (current()) this.failCatalogPlayback(createPlayerError('fatal', 'player', PlayerErrorCode.LOAD_FAILED,
+            `Catalog replacement could not start playback: ${String(error)}`));
+        }).finally(() => { if (this.catalogReselection === owner) this.catalogReselection = null; });
+      });
+    }
+    this.refreshMediaSelection();
+  }
+
+  /** Remove the old presentation before adding a new one, retaining the session and user intent. */
+  private async reselectUpdatedCatalog(current: () => boolean): Promise<void> {
+    const conn = this.connection;
+    if (!conn || !current()) return;
+    const cause = new Error('Playing catalog declaration replaced');
+    this.stopLiveCatchUp();
+    this.cancelLivenessRestarts(conn);
+    if (this.currentMigration) {
+      const txn = this.currentMigration; this.currentMigration = null; this.abandonCandidate(txn);
+    }
+    if (this.mediaSelection) this.failMediaSelection(this.mediaSelection, cause);
+    if (this.pendingVideoSwitch) this.discardPendingVideoSwitch(this.pendingVideoSwitch, cause);
+    for (const retire of [() => this.retireMseSeek(this.preparingMseSeek), () => this.retireMseSeek(this.activeMseSeek),
+      () => this.retireLocSeek(this.preparingLocSeek), () => this.retireLocSeek(this.activeLocSeek)]) retire();
+    this.seekPosition?.retire(); this.seekPosition = null;
+    this.mseOutputEpoch = null;
+    const seekOutput = this.ownedSeekOutput;
+    this.ownedSeekOutput = null; this.ownedSeekTransformAliases = null;
+    seekOutput?.resource.cancel();
+    if (!current()) return;
+    this.retireInitWaiters(conn);
+    for (const id of [...this.activeSubscriptions.keys()]) {
+      this.retireMediaSubscription(id, conn);
+      void conn.unsubscribe(varint(id)).catch(() => {});
+      if (!current()) return;
+    }
+    this.subscriptionManager?.resetMediaConsumer();
+    this.subscriptionManager?.clear();
+    this.livenessMonitor?.clear();
+    this.deliverySubscriptions.clear(); this.receivingMediaOwners.clear();
+    this.initTrackRequestIds.clear(); this.initSegmentByTrack.clear();
+    this.timelineState = null; this.timelineSource = null;
+    this.installedDecoderConfigurations.clear(); this.preparedDecoderConfigurations.clear(); this.decoderConfigurationCommands.clear();
+    const dispatcher = this.commandDispatcher, assembler = this.cmafAssembler, source = this.mediaSource;
+    // Invalidate old asynchronous retypes before destroying their resources.
+    this.commandDispatcher = null; this.cmafAssembler = null; this.mediaSource = null;
+    this.pendingRetypes.clear(); this.retypingMedia.clear(); this.mediaSelection = null;
+    this.videoPipeline = null; this.audioPipeline = null; this.audioOutput = null;
+    this.syncController = null; this.recoveryController = null; this.locRateOutput = null;
+    this.pipelinesCreated = false;
+    this.cmafInitialized = false; this.cmafPendingInit = null; this.cmafVideoSynced = false;
+    this.cmafHoldingForAttach = false; this.keyedCmafIdentity = false;
+    this.installedCmafInit.clear(); this.cmafPreInitDropWarned.clear();
+    this.locmafDecoders.clear(); this.locmafDecoderInit.clear(); this.locmafHealth.clear();
+    this.clearLocmafFrameReaders(); this.locmafWarned.clear(); this.locmafBadInit.clear();
+    this.revokeVideoSwitchRecovery();
+    this.fulfillCmafBootstrapDeadline('cmaf_init'); this.fulfillCmafBootstrapDeadline('cmaf_first_frame');
+    this.cmafInitDeadlineArmed = false;
+    this.cmafFirstFrameDeadlineStartedAt = undefined; this.cmafFirstFrameHiddenAt = undefined;
+    this.cmafFirstFrameDeferredTimeoutMs = undefined;
+    this.mseCompletions = null;
+    for (const stream of this.subgroupStreams.values()) stream.releaseReceiving?.();
+    this.subgroupStreams.clear();
+    this.audioTimingMapped = false; this.videoTimingMapped = false;
+    this.audioPresentationOffsetUs = 0n; this.videoPresentationOffsetUs = 0n;
+    this.audioTimingSource = undefined; this.videoTimingSource = undefined;
+    this.audioTimelineRecord = null; this.videoTimelineRecord = null;
+    this.lastAudioDomainOwner = null; this.lastAudioDomain = null;
+    this.retireVideoMeasurement();
+    for (const resource of [dispatcher, assembler, source]) resource?.destroy();
+    if (!current()) return;
+    this.refreshMediaSelection({ video: null, audio: null }, true);
+    if (!current() || !this._catalogState) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([this.subscribeToMediaTracks(this._catalogState, current), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Catalog replacement subscription deadline exceeded')),
+          this.config.connectionTimeoutMs || SWITCH_STAGING_TIMEOUT_MS);
+      })]);
+    } finally { if (timer !== undefined) clearTimeout(timer); }
+  }
+
   private refreshMediaSelection(outputs: Partial<Pick<MediaSelectionSnapshot, 'video' | 'audio'>> = {}, force = false): void {
     if (this._destroyed || (this.currentMigration?.adopting && !force)) return;
     for (const type of ['video', 'audio'] as const) {
@@ -3580,6 +3699,7 @@ export class MoqtPlayer {
     if (!this._catalogState || !this.connection || !this.subscriptionManager) {
       throw new Error('Cannot switch track: player not loaded');
     }
+    if (this.catalogReselection) throw new Error('Catalog replacement is preparing playback');
     const automatic = reason === 'bandwidth' && abrAction !== undefined;
     const automaticController = this.qualityController, automaticSelection = this._selection;
     const automaticManager = this.subscriptionManager, automaticPipeline = this.videoPipeline;
@@ -6251,7 +6371,7 @@ export class MoqtPlayer {
     if (this._destroyed || this.isTerminalState() || !this.connection || !this.subscriptionManager || !this._catalogState) {
       throw new Error('Cannot select media: playback is not accepting selections');
     }
-    if (this.currentMigration || this.mediaSelection || this.pendingVideoSwitch || this.switchInProgress || this.pendingRetypes.size || this.seekIsPreparing()) {
+    if (this.catalogReselection || this.currentMigration || this.mediaSelection || this.pendingVideoSwitch || this.switchInProgress || this.pendingRetypes.size || this.seekIsPreparing()) {
       throw new Error('Cannot select media: media selection is busy');
     }
     const seekOutput = this.ownedSeekOutput;
@@ -6426,7 +6546,7 @@ export class MoqtPlayer {
     if (this._destroyed || this.isTerminalState() || !this.connection || !this.subscriptionManager || !this._catalogState) {
       throw new Error('Cannot select audio: playback is not accepting selections');
     }
-    if (this.currentMigration || this.mediaSelection || this.pendingVideoSwitch || this.switchInProgress || this.pendingRetypes.size || this.seekIsPreparing()) {
+    if (this.catalogReselection || this.currentMigration || this.mediaSelection || this.pendingVideoSwitch || this.switchInProgress || this.pendingRetypes.size || this.seekIsPreparing()) {
       throw new Error('Cannot select audio: media selection is busy');
     }
     const seekOutput = this.ownedSeekOutput;
@@ -9218,8 +9338,7 @@ export class MoqtPlayer {
           candidate.prep!.state = state;
           return;
         }
-        this._catalogState = state;
-        this.refreshMediaSelection();
+        this.adoptUpdatedCatalog(state);
         this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
       },
       requestLegacyResubscribe: () => {
@@ -9745,8 +9864,7 @@ export class MoqtPlayer {
           return;
         }
         if (!ownedAsMain()) return;
-        this._catalogState = state;
-        this.refreshMediaSelection();
+        this.adoptUpdatedCatalog(state);
         this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
       },
       requestLegacyResubscribe: () => {
@@ -10198,8 +10316,7 @@ export class MoqtPlayer {
     // Adoption is an ordinary catalog update: no second catalog_received, no
     // media churn (documented limitation: a removed currently-active track
     // keeps its old media subscription running until a later selection).
-    this._catalogState = state;
-    this.refreshMediaSelection();
+    this.adoptUpdatedCatalog(state);
     this.emitter.emit('catalog_updated', { type: 'catalog_updated', catalog: state });
   }
 
@@ -11410,7 +11527,10 @@ export class MoqtPlayer {
     ) => {
       const deliver = stageable(fn, source, cost, buffer);
       return (datagram: ObjectDatagram): void => {
-        if (datagram.payload) { this.msfObjects.set(datagram.payload, conn); this.msfSource(conn).observe(datagram.payload, BigInt(datagram.trackAlias)); }
+        if (datagram.payload && (conn !== this.connection
+            || !['video', 'audio'].includes(this.subscriptionManager?.getMediaType(BigInt(datagram.trackAlias)) ?? ''))) {
+          this.msfObjects.set(datagram.payload, conn); this.msfSource(conn).observe(datagram.payload, BigInt(datagram.trackAlias));
+        }
         const receipt = datagram.status === undefined
           ? this.captureVideoPayload(BigInt(datagram.trackAlias), datagram.payload.byteLength, conn,
             { groupId: BigInt(datagram.groupId), objectId: BigInt(datagram.objectId) }) : undefined;
@@ -13395,9 +13515,8 @@ export class MoqtPlayer {
         // A delta (or a re-sent independent catalog) changed the catalog —
         // refresh the cached state so track selection and initRef resolution see
         // delta-added tracks and the preserved root initDataList / protections.
-        this._catalogState = catalogState;
+        this.adoptUpdatedCatalog(catalogState);
         this.log.info('Catalog updated');
-        this.refreshMediaSelection();
         this.emitter.emit('catalog_updated', {
           type: 'catalog_updated',
           catalog: catalogState,
@@ -14210,10 +14329,10 @@ export class MoqtPlayer {
   }
 
   /** Subscribe to selected media tracks in parallel through beforeSubscribe. */
-  private async subscribeToMediaTracks(catalog: CatalogState): Promise<void> {
+  private async subscribeToMediaTracks(catalog: CatalogState, current: () => boolean = () => true): Promise<void> {
     const conn = this.connection;
     const gen = this.bootstrapGeneration;
-    const live = (): boolean => !this._destroyed && !this.isTerminalState()
+    const live = (): boolean => current() && !this._destroyed && !this.isTerminalState()
       && this.subscriptionManager !== null && this.connection === conn && this.bootstrapGeneration === gen;
     if (!conn || !live()) return;
     this._mediaSubsExpected = 0;
