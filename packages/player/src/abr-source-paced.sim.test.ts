@@ -480,6 +480,8 @@ interface Scenario {
    * new SUBSCRIBE (as a relay does while its upstream is unavailable).
    */
   readonly sourceGoneAtUs?: number;
+  /** CMAF: the media element's playhead and buffered ranges (s), when the scenario needs them. */
+  readonly element?: (nowUs: number) => { currentTime: number; buffered: Array<[number, number]> };
   /**
    * CMAF: a readable CMAF Header in the catalog (default), or opaque bytes —
    * a header the player cannot parse, which leaves it no delivery-lag signal.
@@ -548,7 +550,11 @@ async function runScenario(s: Scenario): Promise<Run> {
   const elementRates: number[] = [];
   const mediaSource = {
     initialize: vi.fn(), appendChunk: vi.fn(), endOfStream: vi.fn(), reset: vi.fn(), destroy: vi.fn(),
-    mediaElement: null,
+    get mediaElement() {
+      if (!s.element) return null;
+      const { currentTime, buffered } = s.element(clockUs);
+      return { currentTime, buffered: { length: buffered.length, start: (i: number) => buffered[i]![0], end: (i: number) => buffered[i]![1] } };
+    },
     onFirstFrame: null as (() => void) | null,
     onError: null as ((e: Error) => void) | null,
     onStall: null as ((ms: number) => void) | null,
@@ -931,5 +937,51 @@ describe('when the source is gone', () => {
       // 4 s of 100 ms ticks would be 40 attempts; at most one per holdoff is allowed.
       expect(attempts).toBeLessThanOrEqual(6);
     } finally { select.mockRestore(); }
+  });
+});
+
+describe('after a downshift', () => {
+  // The new rung starts at its next keyframe, so for a moment after the
+  // commit the MSE buffer can read empty. In the lab that read started a
+  // second downshift 1-3.5 s after the first, whose own switch hole then
+  // froze video. One empty spell asks for one downshift.
+  it('cmaf: a brief empty buffer reading starts one downshift, not a cascade', async () => {
+    const run = await runScenario({
+      packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(16), startLevel: 0,
+      bufferAheadUs: now => now >= SECONDS(10) && now < SECONDS(12.5) ? 0 : 300_000,
+    });
+    const downs = run.switches.filter(sw => rungIndex(sw.to) > rungIndex(sw.from));
+    expect(downs).toHaveLength(1);
+    expect(run.stallsAtUs).toEqual([]);
+  });
+});
+
+describe('a short video hole ahead of the playhead', () => {
+  // A committed switch begins at the new rung's next keyframe, so video can
+  // resume a fraction of a second past where the old rung ended. The buffer
+  // reading at the old rung's edge is 0, but media is already buffered just
+  // ahead and the media source crosses the hole; it is not starvation.
+  it('cmaf: is not read as an empty buffer', async () => {
+    const hole = (now: number) => now >= SECONDS(10) && now < SECONDS(11);
+    const run = await runScenario({
+      packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(14), startLevel: 1,
+      bufferAheadUs: now => hole(now) ? 0 : 300_000,
+      element: now => hole(now)
+        ? { currentTime: 30.2, buffered: [[20, 30.2], [31, 33.8]] }
+        : { currentTime: 30, buffered: [[20, 30.3]] },
+    });
+    expect(run.switches.filter(sw => rungIndex(sw.to) > rungIndex(sw.from))).toEqual([]);
+  });
+
+  it('cmaf: a hole wider than the media source crosses is still empty', async () => {
+    const hole = (now: number) => now >= SECONDS(10) && now < SECONDS(11);
+    const run = await runScenario({
+      packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(14), startLevel: 1,
+      bufferAheadUs: now => hole(now) ? 0 : 300_000,
+      element: now => hole(now)
+        ? { currentTime: 30.2, buffered: [[20, 30.2], [33, 35]] }
+        : { currentTime: 30, buffered: [[20, 30.3]] },
+    });
+    expect(run.switches.filter(sw => rungIndex(sw.to) > rungIndex(sw.from))).toHaveLength(1);
   });
 });
