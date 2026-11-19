@@ -86,6 +86,7 @@ export function parseMediaTimeline(
  */
 export function parseEventTimeline(
     json: string | Uint8Array,
+    msfDraft?: 'draft-02',
 ): EventTimelineRecord[] {
     const text = typeof json === 'string' ? json : new TextDecoder().decode(json);
     const raw: unknown = JSON.parse(text);
@@ -99,7 +100,12 @@ export function parseEventTimeline(
             throw new Error(`Event timeline record[${i}]: must be a JSON object (§8.1)`);
         }
 
-        const obj = entry as Record<string, unknown>;
+        const wire = entry as Record<string, unknown>;
+        // MSF-02 §8.2 changes wire keys; the normalized EventIndex stays stable.
+        const obj = msfDraft === 'draft-02'
+            ? { ...('T' in wire ? { t: wire['T'] } : {}), ...('L' in wire ? { l: wire['L'] } : {}),
+                ...('M' in wire ? { m: wire['M'] } : {}), ...('data' in wire ? { data: wire['data'] } : {}) }
+            : wire;
 
         // Validate exactly one index field
         const hasT = 't' in obj;
@@ -247,9 +253,10 @@ export function mergeMediaTimeline(
  */
 export function parseSapTimeline(
     json: string | Uint8Array,
+    msfDraft?: 'draft-02',
 ): SapTimelineEntry[] {
     // Parse as generic event timeline first (validates base structure)
-    const records = parseEventTimeline(json);
+    const records = parseEventTimeline(json, msfDraft);
 
     return records.map((record, i) => {
         // §3.6.1: "The index reference MUST be 'l' for Location"
