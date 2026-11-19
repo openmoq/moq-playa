@@ -146,6 +146,8 @@ describe('Catalog crash fuzz — parseCatalogAuto', () => {
       samplerate: 48000, channelConfig: '2', displayWidth: 1920, displayHeight: 1080,
       lang: 'en', label: 'Main', initData: 'AAAA', initTrack: 'init',
       depends: ['x'], temporalId: 1, spatialId: 0, targetLatency: 200, trackDuration: 5000,
+      accessibleWindowTime: 3000, keyframeSpacing: 2, packagingMetadata: { streamMapping: 'group' },
+      encryptionScheme: 'cenc', authInfo: { token: 'example' },
       eventType: 'sap', parentName: 'base', parentNamespace: 'base-ns', maxGrpSapStartingType: 1, maxObjSapStartingType: 2,
       // MSF-01 / CMSF-01: template carried in its canonical 6-tuple wire shape.
       initRef: 'i1', template: [0, 2002, [0, 0], [1, 0], 1759924158381, 2002], contentProtectionRefIDs: ['1'],

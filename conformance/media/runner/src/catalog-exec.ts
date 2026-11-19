@@ -59,6 +59,11 @@ function projectTrack(t: CatalogTrack): Record<string, unknown> {
   if (t.parentNamespace !== undefined) o['parentNamespace'] = t.parentNamespace;
   if (t.targetLatency !== undefined) o['targetLatency'] = numStr(t.targetLatency);
   if (t.trackDuration !== undefined) o['trackDuration'] = numStr(t.trackDuration);
+  if (t.accessibleWindowTime !== undefined) o['accessibleWindowTime'] = numStr(t.accessibleWindowTime);
+  if (t.keyframeSpacing !== undefined) o['keyframeSpacing'] = numStr(t.keyframeSpacing);
+  if (t.packagingMetadata !== undefined) o['packagingMetadata'] = t.packagingMetadata;
+  if (t.encryptionScheme !== undefined) o['encryptionScheme'] = t.encryptionScheme;
+  if (t.authInfo !== undefined) o['authInfo'] = t.authInfo;
   if (t.maxGrpSapStartingType !== undefined) o['maxGrpSapStartingType'] = numStr(t.maxGrpSapStartingType);
   if (t.maxObjSapStartingType !== undefined) o['maxObjSapStartingType'] = numStr(t.maxObjSapStartingType);
   // MSF-01 / CMSF-01.

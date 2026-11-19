@@ -16006,7 +16006,7 @@ export class MoqtPlayer {
           validate();
           const config = target.packaging === 'locmaf' && init ? codecDescriptionFromInit(init) : init;
           if (config === null) throw new Error('Target frame initialization has no video codec description');
-          const track: LocVideoRoleTrack = { role: 'video', info: { packaging: target.packaging,
+          const track: LocVideoRoleTrack = { role: 'video', info: { packaging: target.packaging as TrackPackaging,
             ...(target.codec === undefined ? {} : { codec: target.codec }), ...(target.width === undefined ? {} : { width: target.width }),
             ...(target.height === undefined ? {} : { height: target.height }),
             ...(config === undefined ? {} : { initData: btoa(String.fromCharCode(...config)) }) },

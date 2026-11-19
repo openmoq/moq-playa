@@ -16,7 +16,7 @@ import type { ResolvedTrackNamespace } from './track-identity.js';
  * @see draft-ietf-moq-cmsf-00 §3.5.1 (adds 'cmaf')
  * @see draft-einarsson-moq-locmaf-01 §5 (adds 'locmaf'; CMSF catalogs only)
  */
-export type Packaging = 'loc' | 'mediatimeline' | 'eventtimeline' | 'cmaf' | 'locmaf';
+export type Packaging = 'loc' | 'mediatimeline' | 'eventtimeline' | 'cmaf' | 'locmaf' | 'moqlog' | 'moqmetrics' | 'catalog';
 
 /**
  * MSF-01 media-timeline template (§5.2.15 / §7.4): the inline fixed-duration
@@ -97,6 +97,9 @@ export type TrackRole =
     | 'eventtimeline'
     | 'caption'
     | 'subtitle'
+    | 'data'
+    | 'log'
+    | 'metrics'
     | 'signlanguage'
     | (string & {});
 
@@ -222,6 +225,16 @@ export interface CatalogTrack {
 
     /** @see draft-ietf-moq-msf-01 §5.2.13 — reference to an initDataList id */
     readonly initRef?: string;
+    /** MSF-02 §5.2.45: trailing accessible window in milliseconds; absent is unspecified. */
+    readonly accessibleWindowTime?: number;
+    /** MSF-02 §5.2.46: positive integral objects per keyframe interval. */
+    readonly keyframeSpacing?: number;
+    /** MSF-02 §5.2.5: recognized packaging parameters; LOC defaults streamMapping to group. */
+    readonly packagingMetadata?: Readonly<Record<string, string>>;
+    /** MSF-02 §5.2.38: signaling only; encrypted playback is unsupported. */
+    readonly encryptionScheme?: string;
+    /** MSF-02 §5.2.42: opaque authorization metadata for the application's provider. */
+    readonly authInfo?: unknown;
     /** @see draft-ietf-moq-msf-01 §5.2.15 — inline media-timeline template */
     readonly template?: MsfMediaTemplate;
     /** @see draft-ietf-moq-cmsf-01 §4.1.2 — content-protection refIDs applying to this track */

@@ -12,6 +12,7 @@ import type {
     Catalog, CatalogDelta, CatalogObject, CatalogTrack, Packaging,
     MsfMediaTemplate, MsfInitDataEntry, CmsfContentProtection, CmsfDrmSystem, CmsfUrlRef,
 } from './types.js';
+import { validateMsf02Encoding, validateMsf02Fields, parsePackagingMetadata } from './catalog-msf02.js';
 import { assertFiniteCatalogNumbers } from './catalog-validate.js';
 
 /**
@@ -100,10 +101,12 @@ export function parseMsfCatalog(
     // strictly for legacy MSF-00 (behavior unchanged) but relaxed for MSF-01 (see
     // parseTrack), where a mediatimeline may carry only the non-canonical mime
     // spelling the corpus oracle accepts.
+    const msfDraft = obj['version'] === 'draft-02' ? 'draft-02' : undefined;
+    if (msfDraft) validateMsf02Encoding(json);
     const legacyMsf00 = typeof obj['version'] === 'number';
 
     const tracks = (obj['tracks'] as unknown[]).map(
-        (raw, i) => parseTrack(raw, i, catalogNamespace, legacyMsf00),
+        (raw, i) => parseTrack(raw, i, catalogNamespace, legacyMsf00, msfDraft),
     );
 
     // §5.1.11: Track names must be unique per namespace
@@ -119,8 +122,10 @@ export function parseMsfCatalog(
 
     // MSF-01 §5.1.5: publishTracks — an array of track objects (reverse direction).
     const publishTracks = Array.isArray(obj['publishTracks'])
-        ? (obj['publishTracks'] as unknown[]).map((raw, i) => parseTrack(raw, i, catalogNamespace, legacyMsf00))
+        ? (obj['publishTracks'] as unknown[]).map((raw, i) => parseTrack(raw, i, catalogNamespace, legacyMsf00, msfDraft))
         : undefined;
+
+    if (msfDraft && publishTracks) validateTrackUniqueness(publishTracks);
 
     // MSF-01 §5.1.7: root Initialization Data List (ids unique within the catalog).
     const initDataList = 'initDataList' in obj ? parseInitDataList(obj['initDataList']) : undefined;
@@ -290,17 +295,19 @@ export function validateLocmafVersion(track: {
  * Parse and validate a single track object.
  * Strips unknown fields per §5.1.
  */
-function parseTrack(
+export function parseTrack(
     raw: unknown,
     index: number,
     catalogNamespace: CatalogNamespaceContext,
     legacyMsf00: boolean,
+    msfDraft?: 'draft-02',
 ): CatalogTrack {
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
         throw new Error(`Track at index ${index} must be a JSON object`);
     }
 
     const obj = raw as Record<string, unknown>;
+    if (msfDraft) validateMsf02Fields(obj);
 
     // §5.1.11: name — Required
     if (typeof obj['name'] !== 'string') {
@@ -309,7 +316,7 @@ function parseTrack(
     const name = obj['name'];
 
     // §5.1.12: packaging — Required
-    if (typeof obj['packaging'] !== 'string' || !VALID_PACKAGING.has(obj['packaging'])) {
+    if (typeof obj['packaging'] !== 'string' || (!msfDraft && !VALID_PACKAGING.has(obj['packaging']))) {
         throw new Error(
             `Track "${name}" at index ${index}: packaging is required and must be one of ${[...VALID_PACKAGING].join(', ')} (§5.1.12)`,
         );
@@ -325,7 +332,7 @@ function parseTrack(
     const isLive = obj['isLive'];
 
     // §5.1.16: targetLatency MUST NOT be included if isLive is false
-    if (!isLive && obj['targetLatency'] !== undefined) {
+    if (!msfDraft && !isLive && obj['targetLatency'] !== undefined) {
         throw new Error(
             `Track "${name}": targetLatency MUST NOT be included when isLive is false (§5.1.16)`,
         );
@@ -363,7 +370,7 @@ function parseTrack(
     // NOT required, because the corpus oracle accepts a mediatimeline whose only
     // mime spelling is the non-standard lowercase "mimetype" (dropped as unknown,
     // leaving no canonical mimeType); enforcing it would contradict that oracle.
-    if (packaging === 'mediatimeline' || packaging === 'eventtimeline') {
+    if (packaging === 'mediatimeline' || (!msfDraft && packaging === 'eventtimeline')) {
         const section = packaging === 'mediatimeline' ? '§7.2' : '§8.2';
         if (!Array.isArray(obj['depends']) || (obj['depends'] as unknown[]).length === 0) {
             throw new Error(
@@ -396,7 +403,7 @@ function parseTrack(
     }
 
     // §5.1.36: parentName MUST only appear in clone context (delta cloneTracks)
-    if ('parentName' in obj) {
+    if ('parentName' in obj || (msfDraft && 'parentNamespace' in obj)) {
         throw new Error(
             `Track "${name}" at index ${index}: parentName MUST only appear in clone context (§5.1.36)`,
         );
@@ -423,7 +430,7 @@ function parseTrack(
         isLive,
         ...(namespace !== undefined ? { namespace } : {}),
         ...(resolvedNamespace !== undefined ? { resolvedNamespace } : {}),
-        ...extractRecognizedOptionalFields(obj, name),
+        ...extractRecognizedOptionalFields(obj, name, msfDraft),
     };
 
     return track;
@@ -440,6 +447,7 @@ function parseTrack(
 export function extractRecognizedOptionalFields(
     obj: Record<string, unknown>,
     trackName: string,
+    msfDraft?: 'draft-02',
 ): Partial<CatalogTrack> {
     return {
         ...(typeof obj['role'] === 'string' ? { role: obj['role'] } : {}),
@@ -464,9 +472,17 @@ export function extractRecognizedOptionalFields(
         ...(typeof obj['temporalId'] === 'number' ? { temporalId: obj['temporalId'] } : {}),
         ...(typeof obj['spatialId'] === 'number' ? { spatialId: obj['spatialId'] } : {}),
         ...(obj['buffers'] && typeof obj['buffers'] === 'object' ? { buffers: Object.fromEntries(Object.entries(obj['buffers']).filter(([key, value]) => (key === 'min' || key === 'target' || key === 'max') && typeof value === 'number' && Number.isFinite(value) && value >= 0)) } : {}),
-        ...(typeof obj['targetLatency'] === 'number' ? { targetLatency: obj['targetLatency'] } : {}),
+        ...(typeof obj['targetLatency'] === 'number' && !(msfDraft && obj['isLive'] === false) ? { targetLatency: obj['targetLatency'] } : {}),
         ...(typeof obj['trackDuration'] === 'number' ? { trackDuration: obj['trackDuration'] } : {}),
         ...(typeof obj['eventType'] === 'string' ? { eventType: obj['eventType'] } : {}),
+        ...(msfDraft ? {
+            ...(typeof obj['accessibleWindowTime'] === 'number' ? { accessibleWindowTime: obj['accessibleWindowTime'] } : {}),
+            ...(typeof obj['keyframeSpacing'] === 'number' ? { keyframeSpacing: obj['keyframeSpacing'] } : {}),
+            ...(typeof obj['encryptionScheme'] === 'string' ? { encryptionScheme: obj['encryptionScheme'] } : {}),
+            ...('authInfo' in obj ? { authInfo: obj['authInfo'] } : {}),
+            ...(typeof obj['packaging'] === 'string' || 'packagingMetadata' in obj
+                ? { packagingMetadata: parsePackagingMetadata(obj['packagingMetadata'], obj['packaging']) } : {}),
+        } : {}),
         // CMSF extensions (draft-ietf-moq-cmsf-00 §3.5.2)
         ...(typeof obj['maxGrpSapStartingType'] === 'number' ? { maxGrpSapStartingType: obj['maxGrpSapStartingType'] } : {}),
         ...(typeof obj['maxObjSapStartingType'] === 'number' ? { maxObjSapStartingType: obj['maxObjSapStartingType'] } : {}),

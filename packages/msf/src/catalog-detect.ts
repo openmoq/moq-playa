@@ -47,5 +47,5 @@ export function parseCatalogAuto(
     if ('streamingFormat' in obj) {
         return parseCatalogFormat01(text, catalogNamespace).catalog;
     }
-    return parseMsfCatalog(text, catalogNamespace);
+    return parseMsfCatalog(json, catalogNamespace);
 }
