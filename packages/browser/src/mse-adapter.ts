@@ -3258,10 +3258,10 @@ export class MseMediaSource implements MediaSourceLike {
 
     // Accepted native work can still fill the hole. Neither buffered ranges
     // nor elapsed wall time authorizes skipping that work, including finite EOS.
-    if (this.hasPendingNativeWork()) {
-      this.disarmGap();
-      return;
-    }
+    // It holds this check without restarting the wait: live media appends
+    // many times a second, so a check often finds an append in flight. If
+    // that work fills or moves the hole, the next idle check sees it.
+    if (this.hasPendingNativeWork()) return;
     const ct = v.currentTime;
     if (this.switchRecovery?.state === 'armed' && ct > this.switchRecovery.boundStart) this.switchRecovery = null;
     const quality = this.getVideoPlaybackQuality();
