@@ -1599,8 +1599,16 @@ export class MseMediaSource implements MediaSourceLike {
           this.pruneRefused(timeline);
         }
       }
+      const bound = queue.length >= this.maxQueuedChunks ? 'maxQueuedChunks' : 'maxQueuedBytes';
+      const key = `${mediaType}:capacity:${entry.trackIdentity}`;
+      const message = `[MSE] ${mediaType} track "${entry.trackName}" append queue capacity reached (${bound})`;
+      if (!this.seenDiagnostics.has(key)) {
+        this.seenDiagnostics.add(key);
+        console.warn(message);
+      } else {
+        this.diag(message);
+      }
       this.appendOutcome(entry.token, 'discarded', 'queue capacity');
-      this.logWarn('[MSE] %s append queue capacity reached', mediaType);
       return false;
     }
     // Retaining a small view must not retain or append its larger backing pool.

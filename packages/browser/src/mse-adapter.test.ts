@@ -4588,6 +4588,28 @@ describe.each(['audio', 'video'] as const)('MSE %s append scheduling', mediaType
             expect([...state[`${mediaType}Timelines`].values()].map(t => t.refused?.size ?? 0)).toEqual([0]);
         } finally { h.adapter.destroy(); vi.useRealTimers(); }
     });
+    it.each(['maxQueuedChunks', 'maxQueuedBytes'] as const)('warns once per track when %s refuses media', async bound => {
+        const frame = (bmd: number) => makeSegment({ bmd, sampleCount: 1 });
+        const h = await ready({ [bound]: bound === 'maxQueuedChunks' ? 1 : frame(0).length });
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+        try {
+            h.adapter.appendChunk(mediaType, frame(0), 'track'); await flush();
+            h.adapter.appendChunk(mediaType, frame(200), 'track');
+            for (const name of ['track', 'other']) {
+                h.adapter.appendChunk(mediaType, frame(300), name);
+                h.adapter.appendChunk(mediaType, frame(400), name);
+            }
+            expect(warn.mock.calls.map(call => format(...call))).toEqual(['track', 'other'].map(name =>
+                expect.stringMatching(new RegExp(`${mediaType}.*${name}.*${bound}`))));
+            expect(log.mock.calls.map(call => format(...call)).filter(line => line.includes('queue capacity'))).toEqual([]);
+            h.adapter.debug = true;
+            h.adapter.appendChunk(mediaType, frame(500), 'track');
+            expect(warn).toHaveBeenCalledTimes(2);
+            expect(log.mock.calls.map(call => format(...call)).filter(line => line.includes('queue capacity')))
+                .toEqual([expect.stringContaining(bound)]);
+        } finally { h.adapter.destroy(); warn.mockRestore(); log.mockRestore(); }
+    });
     it.each(['chunks', 'bytes'] as const)('skips only holes wholly covered by refused %s', async bound => {
         vi.useFakeTimers();
         const frame = (bmd: number) => makeSegment({ bmd, sampleCount: 1 });
