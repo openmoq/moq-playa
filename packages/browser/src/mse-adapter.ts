@@ -1881,7 +1881,16 @@ export class MseMediaSource implements MediaSourceLike {
 
     this.changingType[mediaType] = true;
     this.clearReceivingGroups(mediaType);
-    this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
+    // A retype keeps the coded frames already buffered, so a narrow video
+    // hole the playhead was seen to cross is still there; hasPostHoleCoverage
+    // revalidates it against the native ranges before any recovery. Keeping
+    // it lets the watchdog recover a playhead frozen just past a switch hole
+    // when the next switch changes codec profile (as consecutive downshifts
+    // across an H.264 profile boundary do). A wide-hole witness, which can
+    // authorize skipping media, still retires.
+    const hole = this.wedgeVideoHole;
+    if (hole === null || hole.start - hole.end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC) this.clearVideoHoleEvidence();
+    this.handleWatchdogSeeked();
     this.endRequested = false;
     try {
       const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
