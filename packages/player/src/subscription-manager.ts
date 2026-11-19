@@ -19,6 +19,7 @@ import type { MoqtObject, ObjectDatagram } from '@openmoq/transport';
 import type { LocHeaders, LocHeaderOptions } from '@openmoq/loc';
 import { parseLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import type { DraftVersion } from '@openmoq/transport';
+import { liveLocContexts } from './loc-live-context.js';
 import { identityKey } from '@openmoq/msf';
 
 /**
@@ -364,6 +365,7 @@ export class SubscriptionManager {
    */
   unregisterTrack(trackAlias: bigint): void {
     this.tracks.delete(trackAlias);
+    liveLocContexts.get(this)?.delete(trackAlias);
     for (const pending of this.pendingLocmafTransforms) {
       if (pending.alias === trackAlias) pending.valid = false;
     }
@@ -404,6 +406,7 @@ export class SubscriptionManager {
 
   clear(): void {
     this.tracks.clear();
+    liveLocContexts.delete(this);
     for (const pending of this.pendingLocmafTransforms) pending.valid = false;
   }
 
@@ -623,7 +626,8 @@ export class SubscriptionManager {
         // @see draft-ietf-moq-transport-18 §1.4.1, §1.4.3
         const opts: LocHeaderOptions | undefined =
           draft !== undefined
-            ? { wireProfile: locWireProfileForDraft(draft) }
+            ? { wireProfile: locWireProfileForDraft(draft),
+                ...(liveLocContexts.get(this)?.get(alias) ? { track: liveLocContexts.get(this)!.get(alias)! } : {}) }
             : undefined;
         const parse = this.extensionParser
           ?? ((ext: Uint8Array | undefined) => parseLocHeaders(ext, opts));

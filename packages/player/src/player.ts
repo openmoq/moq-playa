@@ -89,6 +89,7 @@ import { copyMediaSelection, emptyMediaSelection, type MediaSelectionSnapshot, t
 import { MediaStageObservers } from './media-stage-observers.js';
 import type { MediaDiagnosticRuntime, MediaDiagnosticsFactory, MediaStageObserver, MediaDiscardReason } from './media-diagnostic-types.js';
 import type { ObjectRoutingContext, ObjectRoutingDiscardReason, ObjectDeliveryAdmission, ObjectDeliveryOptions } from './subscription-manager.js';
+import { liveLocContexts } from './loc-live-context.js';
 import { SubscriptionManager, type TrackPackaging } from './subscription-manager.js';
 import { extractLargestLocation } from './player-message.js';
 import { WarmStartHead } from './warm-start-head.js';
@@ -5180,6 +5181,7 @@ export class MoqtPlayer {
       const injectedCatalog = this.config.catalog;
       const catalogState: CatalogState = {
         version: injectedCatalog.version ?? 1,
+        ...(injectedCatalog.msfDraft !== undefined ? { msfDraft: injectedCatalog.msfDraft } : {}),
         tracks: [...injectedCatalog.tracks] as CatalogTrack[],
         ...(injectedCatalog.generatedAt !== undefined ? { generatedAt: injectedCatalog.generatedAt } : {}),
         ...(injectedCatalog.isComplete !== undefined ? { isComplete: injectedCatalog.isComplete } : {}),
@@ -12649,6 +12651,15 @@ export class MoqtPlayer {
       },
       onMediaSubscribeOk: (requestId, _trackName, _mediaType, largest) => {
         const accepted = this.activeSubscriptions.get(requestId);
+        if (this._catalogState?.msfDraft === 'draft-02' && accepted?.trackAlias != null && this.subscriptionManager
+            && msg.type === 'SUBSCRIBE_OK' && msg.trackProperties !== undefined) {
+          const track = this.catalogTrackFor(accepted.trackName, accepted.namespace ?? namespaceFields(this.config.namespace), _mediaType);
+          if (track?.packaging === 'loc' && this._catalogState.initDataList?.some(e => e.id === track.initRef && e.type === 'track-property')) {
+            const contexts = liveLocContexts.get(this.subscriptionManager) ?? new Map();
+            contexts.set(accepted.trackAlias, locSeekTrackContext(msg.trackProperties));
+            liveLocContexts.set(this.subscriptionManager, contexts);
+          }
+        }
         const planned = _mediaType === 'video' ? this.qualityController?.currentVideoTrack : this.qualityController?.currentAudioTrack;
         const known = this.config.knownTracks?.[_mediaType];
         const intended = planned ? { name: planned.name, namespaceFields: trackNamespaceFields(planned, this.config.namespace) }
