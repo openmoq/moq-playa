@@ -3607,8 +3607,9 @@ export class MseMediaSource implements MediaSourceLike {
     // Accepted work vetoes recovery while pending. Its completion alone does
     // not repair a witnessed video hole: revalidate the actual buffers/ranges
     // and continue sampling clock/quality progress through the pending period.
+    // It holds the action without restarting the freeze timer: live media
+    // appends many times a second, so a check often finds an append in flight.
     if (this.hasPendingNativeWork()) {
-      this.wedgeFrozenSinceMs = null;
       this.handleWatchdogSeeked();
       return;
     }
