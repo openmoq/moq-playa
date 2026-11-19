@@ -37,6 +37,17 @@ export function validateMsf02Fields(obj: Record<string, unknown>, partial = fals
             throw new Error(`Invalid MSF-02 ${key} (§5.2.45–46)`);
         }
     }
+    if ('depends' in obj) {
+        if (!Array.isArray(obj['depends'])) throw new Error('MSF-02 depends must be an array (§5.2.15)');
+        for (const dep of obj['depends']) {
+            if (typeof dep === 'string') {
+                assertUtf8EncodableIdentityText(dep, 'Dependency');
+                if (dep.includes('\0')) throw new Error('MSF-02 dependency contains NUL (§11.2.1)');
+            } else if (typeof dep !== 'number' || !Number.isFinite(dep)) {
+                throw new Error('MSF-02 dependency must be a string or finite number (§5.2.15)');
+            }
+        }
+    }
     if (partial) return;
     const required: string[] = [];
     const role = obj['role'];

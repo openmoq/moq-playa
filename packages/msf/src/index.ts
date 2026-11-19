@@ -65,7 +65,7 @@ export { parseDeltaUpdate, applyCatalogUpdate } from './delta.js';
 
 // ─── Track selection ─────────────────────────────────────────────────
 
-export { groupByRender, groupByAlt, selectVideoAltGroup, selectTrack, resolveDependencies, isTrackPackagingSupported } from './selection.js';
+export { groupByRender, groupByAlt, selectVideoAltGroup, selectTrack, resolveDependencies, resolveTrackDependencies, isTrackPackagingSupported } from './selection.js';
 export {
     fieldsFromCatalogText, namespaceDisplay, contextFields, resolveTrackNamespace,
     identityKey, trackIdentityKey, namespaceFieldsOf, sameNamespaceFields,

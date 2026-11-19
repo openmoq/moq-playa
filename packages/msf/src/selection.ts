@@ -191,6 +191,7 @@ export function selectTrack(
 export function resolveDependencies(
     track: CatalogTrack,
     allTracks: readonly CatalogTrack[],
+    options?: { readonly msfDraft?: 'draft-02' },
 ): CatalogTrack[] {
     // Key by namespace + '\0' + name per §5.1.21: dependencies are assumed
     // to be in the same namespace as the declaring track.
@@ -213,12 +214,14 @@ export function resolveDependencies(
 
         visiting.add(key);
 
-        if (t.depends) {
+        if (options?.msfDraft === 'draft-02') {
+            for (const dep of resolveTrackDependencies(t, allTracks, options)) visit(dep);
+        } else if (t.depends) {
             for (const depName of t.depends) {
                 // msf-01 §5.2.14 / cf01 §3.2.18: a dependency name resolves in
                 // the DECLARING track's namespace, so the key is built from
                 // that track's resolved fields rather than from the name alone.
-                const depKey = identityKey(namespaceFieldsOf(t), depName);
+                const depKey = identityKey(namespaceFieldsOf(t), depName as string);
                 const dep = byKey.get(depKey);
                 if (!dep) {
                     throw new Error(
@@ -241,4 +244,32 @@ export function resolveDependencies(
 /** Composite key for track identity: resolved namespace fields plus name. */
 function trackKey(t: CatalogTrack): string {
     return trackIdentityKey(t);
+}
+
+/**
+ * Resolve direct dependencies to tracks carrying full namespace identities.
+ * MSF-02 §5.2.15 resolves names catalog-wide and numbers to render groups;
+ * omission preserves namespace-scoped names. Order is retained, duplicates
+ * removed, and a render group's declaring track is excluded. No input is mutated.
+ * @throws {Error} if a dependency is unresolved or ambiguous.
+ */
+export function resolveTrackDependencies(
+    track: CatalogTrack, allTracks: readonly CatalogTrack[],
+    options?: { readonly msfDraft?: 'draft-02' },
+): CatalogTrack[] {
+    const result = new Map<string, CatalogTrack>();
+    for (const dep of track.depends ?? []) {
+        const matches = options?.msfDraft === 'draft-02'
+            ? allTracks.filter(t => typeof dep === 'number' ? t.renderGroup === dep : t.name === dep && trackKey(t) !== trackKey(track))
+            : allTracks.filter(t => trackKey(t) === identityKey(namespaceFieldsOf(track), dep as string));
+        if (!matches.length || (typeof dep === 'string' && (matches.length !== 1
+            || (options?.msfDraft === 'draft-02' && trackKey(matches[0]!) === trackKey(track))))) {
+            throw new Error(`Unresolved or ambiguous dependency "${dep}" for "${track.name}" (${options?.msfDraft === 'draft-02' ? 'MSF-02 §5.2.15' : 'MSF-01 §5.2.14'})`);
+        }
+        for (const match of matches) {
+            if (typeof dep === 'number' && trackKey(match) === trackKey(track)) continue;
+            result.set(trackKey(match), match);
+        }
+    }
+    return [...result.values()];
 }

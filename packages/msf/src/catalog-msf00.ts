@@ -5,6 +5,7 @@
  * @module
  */
 
+import { resolveTrackDependencies } from './selection.js';
 import { MSF_VERSION } from './types.js';
 import { namespaceDisplay, resolveTrackNamespace, trackIdentityKey } from './track-identity.js';
 import type { CatalogNamespaceContext } from './track-identity.js';
@@ -147,6 +148,7 @@ export function parseMsfCatalog(
     // MSF-01 §5.2.13 / CMSF-01 §4.1.2: reference topology — initRef and
     // contentProtectionRefIDs MUST resolve to declared ids/refIDs.
     validateReferences(catalog);
+    if (msfDraft) for (const track of tracks) resolveTrackDependencies(track, tracks, { msfDraft });
 
     assertFiniteCatalogNumbers(catalog);
     return catalog;

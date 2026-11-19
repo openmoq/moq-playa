@@ -182,7 +182,7 @@ export interface CatalogTrack {
     /** @see draft-ietf-moq-catalogformat-01 §3.2.16 — name of separate initialization track */
     readonly initTrack?: string;
     /** @see draft-ietf-moq-msf-00 §5.1.21 — array of track names this track depends on */
-    readonly depends?: string[];
+    readonly depends?: readonly (string | number)[];
     /** @see draft-ietf-moq-msf-00 §5.1.22 — temporal layer (0 = base) */
     readonly temporalId?: number;
     /** @see draft-ietf-moq-msf-00 §5.1.23 — spatial layer (0 = base) */

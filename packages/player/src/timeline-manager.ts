@@ -39,7 +39,7 @@ export function createTimelineState(track: CatalogTrack): TimelineState {
     trackDuration: track.trackDuration,
     isLive: track.isLive,
     trackName: track.name,
-    depends: track.depends ?? [],
+    depends: (track.depends as string[] | undefined) ?? [],
   };
 }
 

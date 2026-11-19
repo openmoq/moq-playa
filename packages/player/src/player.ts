@@ -14316,7 +14316,7 @@ export class MoqtPlayer {
     const selectedIdentities = new Set([selected.video, selected.audio]
       .filter((track): track is CatalogTrack => track !== undefined).map(track => this.initKey(track)));
     const dependsOnSelected = (track: CatalogTrack): boolean => track.depends?.some(name =>
-      selectedIdentities.has(this.initKey(track, name))) === true;
+      selectedIdentities.has(this.initKey(track, name as string))) === true;
     const timelineTrack = catalog.tracks.find(
       (t: CatalogTrack) => t.packaging === 'mediatimeline' && dependsOnSelected(t),
     );
