@@ -31,6 +31,7 @@ function copyBoundary(boundary: Boundary): SeekLiveBoundary {
 interface Options {
   readonly track: { readonly namespace: readonly string[]; readonly name: string };
   readonly start: Location;
+  readonly validateStart?: () => void;
   readonly maxObjects: number;
   readonly maxBytes: number;
   readonly isCurrent: () => boolean;
@@ -108,7 +109,8 @@ export class SeekLiveBridge {
       if (typeof value !== 'bigint' || value < 0n || value > this.maxLocationId) throw new RangeError('Invalid seek live start Location');
     }
     this.datagramInputs = options.capture ? new WeakMap() : null;
-    this.requests = new SeekFetchRequests(connection, { isCurrent: () => this.current(), onError: error => this.fail(error) });
+    this.requests = new SeekFetchRequests(connection, { isCurrent: () => this.current(),
+      onRegister: () => options.validateStart?.(), onError: error => this.fail(error) });
     this.queue = new SeekLiveQueue({
       maxObjects: options.maxObjects, maxBytes: options.maxBytes, isCurrent: () => this.current(),
       ...(options.capture ? { capture: (object: MoqtObject) => options.capture!(this.datagramInputs?.get(object) ?? object) } : {}),
@@ -223,7 +225,7 @@ export class SeekLiveBridge {
         }, groupOrder: 'ascending' as const } } : {}),
         onRequestId: id => {
           this.registering = true;
-          try { this.requestId = id; if (!this.current()) throw aborted(); }
+          try { this.requestId = id; if (!this.current()) throw aborted(); this.options.validateStart?.(); }
           finally { this.registering = false; }
         },
         onObject: object => {

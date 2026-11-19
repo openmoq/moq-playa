@@ -14,6 +14,7 @@ export interface SeekRetrievalTrack {
 }
 
 interface Page {
+  readonly start: { readonly groupId: bigint; readonly objectId: bigint };
   readonly identity: object;
   readonly receiver: SeekInputReceiver;
   readonly transport: FetchReceiver | null;
@@ -42,6 +43,8 @@ interface Options {
   readonly maxBytes: number;
   readonly isCurrent: () => boolean;
   readonly getTimeline: () => TimelineState | null;
+  readonly boundRange?: NonNullable<ConstructorParameters<typeof SeekFetchRequests>[1]['boundRange']>;
+  readonly validateLocation?: (location: { groupId: bigint; objectId: bigint }) => void;
   /** Non-null only while this consumer prepares a complete indexed group. */
   readonly getPreparingGroup?: () => bigint | null;
   readonly canProbeLive: () => boolean;
@@ -90,10 +93,11 @@ export class SeekRoleRetrieval {
     void this.firstIssued.catch(() => {});
     this.draft = draft;
     this.cut = { kind: 'before', ...options.location };
-    this.requests = new SeekFetchRequests(options.connection, { isCurrent: () => this.current(),
-      ...(options.onFirstRequest ? { onRegister: (receiver: FetchReceiver) => {
-        if (receiver === this.firstReceiver) options.onFirstRequest!();
-      } } : {}), onError: (error, receiver) => {
+    this.requests = new SeekFetchRequests(options.connection, { isCurrent: () => this.current(), ...(options.boundRange ? { boundRange: options.boundRange } : {}),
+      onRegister: (receiver: FetchReceiver) => {
+        if (this.page?.transport === receiver) options.validateLocation?.(this.page.start);
+        if (receiver === this.firstReceiver) options.onFirstRequest?.();
+      }, onError: (error, receiver) => {
       if (receiver === this.firstReceiver) this.settleFirst(error);
       const page = this.page;
       if (page?.transport === receiver) this.failPage(page, error);
@@ -189,6 +193,8 @@ export class SeekRoleRetrieval {
     }
     if (plan?.kind === 'probe-live') { this.openBridge(plan.proof); return; }
     if (plan && plan.kind !== 'fetch-page') return;
+    const start = this.first ? { groupId: this.options.location.groupId, objectId: 0n } : plan!.start;
+    this.options.validateLocation?.(start);
     const identity = {}, receiver = this.options.beginPage(identity);
     const transport: FetchReceiver = {
       onObject: async (object, receiving) => {
@@ -199,8 +205,7 @@ export class SeekRoleRetrieval {
       },
       onClosed: terminal => receiver.onClosed(terminal),
     };
-    const page: Page = { identity, receiver, transport, proof: plan?.proof, accepted: null, cancel: null };
-    const start = this.first ? { groupId: this.options.location.groupId, objectId: 0n } : plan!.start;
+    const page: Page = { start, identity, receiver, transport, proof: plan?.proof, accepted: null, cancel: null };
     const first = this.first;
     this.page = page; this.first = false;
     const accept = (response: SeekFetchResponse) => {
@@ -224,6 +229,7 @@ export class SeekRoleRetrieval {
     const draft = this.draft;
     if (this.cut.kind !== 'before' || !this.options.canProbeLive() || !this.current()) return;
     const start = Object.freeze({ groupId: this.cut.groupId, objectId: this.cut.objectId });
+    this.options.validateLocation?.(start);
     const track = this.options.track, abort = new AbortController();
     let retired = false, timer: ReturnType<typeof setTimeout> | null = null;
     const current = () => this.current() && !retired && this.bridge === owner && !this.stopped;
@@ -255,7 +261,7 @@ export class SeekRoleRetrieval {
       if (!this.options.beforeSubscribe()) { refused(); return; }
       if (!current()) { cancel(); return; }
       const bridge = new SeekLiveBridge(this.options.connection, {
-        track, start,
+        track, start, validateStart: () => this.options.validateLocation?.(start),
         maxObjects: this.options.maxObjects, maxBytes: this.options.maxBytes, isCurrent: current, signal: abort.signal,
         admitHead: async () => current() && this.options.admitHead(),
         capture: this.options.capture, onDiscard: this.options.discard,
@@ -279,7 +285,7 @@ export class SeekRoleRetrieval {
           owner.ending ||= boundary.endOfTrack;
           const identity = {}, receiver = this.options.beginPage(identity);
           if (!current()) return;
-          this.page = { identity, receiver, transport: null, proof: undefined,
+          this.page = { start, identity, receiver, transport: null, proof: undefined,
             accepted: { cut: seekCutAfterLocation(draft, boundary.head), advanced: true, endOfTrack: boundary.endOfTrack }, cancel };
           owner.accepted = true;
           this.options.acceptPage(identity, boundary.endOfTrack, Object.freeze({ start,

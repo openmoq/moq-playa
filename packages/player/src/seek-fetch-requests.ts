@@ -35,6 +35,7 @@ interface Owner {
 }
 type ReceiverOptions = Required<Pick<Parameters<MoqtConnection['fetch']>[2], 'onRequestId' | 'receiver'>>;
 interface Options {
+  readonly boundRange?: (start: { groupId: bigint; objectId: bigint }, end: Parameters<SeekFetchRequests['open']>[4]) => Parameters<SeekFetchRequests['open']>[4];
   readonly isCurrent: () => boolean;
   readonly onError: (error: Error, receiver: FetchReceiver) => void;
   /** Before bytes are sent; throwing leaves rollback to the SDK. */
@@ -75,12 +76,20 @@ export class SeekFetchRequests {
   ): () => void {
     return this.issue(receiver, onResponse, ownership => {
       const encoder = new TextEncoder();
+      end = this.options.boundRange?.(start, end) ?? end;
       // An omitted SDK endGroup means zero. Without an explicit endpoint,
       // request the current published snapshot using the selected wire width.
       return this.connection.fetch(track.namespace.map(field => encoder.encode(field)), encoder.encode(track.name), {
         startGroup: start.groupId, startObject: start.objectId, groupOrder: 'ascending',
         endGroup: end?.groupId ?? (this.connection.draftVersion >= 18 ? MAX_VI64 : MAX_VARINT), endObject: end?.objectId ?? 0n,
         ...ownership,
+        onRequestId: id => {
+          const checked = this.options.boundRange?.(start, end) ?? end;
+          if (checked?.groupId !== end?.groupId || checked?.objectId !== end?.objectId) {
+            throw new RangeError('FETCH range aged outside accessibleWindowTime');
+          }
+          ownership.onRequestId(id);
+        },
       });
     }, issuance);
   }

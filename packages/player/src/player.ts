@@ -5631,6 +5631,7 @@ export class MoqtPlayer {
       throw new RangeError(`Seek target ${timeMs}ms is before the first timeline sample`);
     }
 
+    this.assertTimelineWindow({ groupId: BigInt(target.groupId), objectId: BigInt(target.objectId) });
     if (this.mediaSource && this.cmafAssembler && this.cmafInitialized) {
       this.startMseSeek(timeMs, target, context);
       return;
@@ -15845,6 +15846,7 @@ export class MoqtPlayer {
     const plan = selectFrameQualityCut({ draftVersion: connection.draftVersion, trackName: target.name, namespace: trackNamespaceFields(target, this.config.namespace), timeline,
       afterContentMs: Math.max(observed, frontier.positionMs) });
     if (plan.kind !== 'candidate') throw new Error(`No declared future frame boundary: ${plan.reason}`);
+    this.assertTimelineWindow(plan.location, target);
     if (!baseCurrent() || !selectionCurrent() || attempt.playback.videoRoleOwner() !== oldOwner) throw new Error('Playing frame rendition was superseded');
     if (!automaticAllowed()) return;
     if (reason === 'manual') this.qualityController?.lockManual();
@@ -16050,6 +16052,8 @@ export class MoqtPlayer {
             timeoutMs: this.config.connectionTimeoutMs!, maxObjects: 512, maxBytes: 8 * 1024 * 1024,
             isCurrent: () => current() && (phase !== 'adopted' || retained.current),
             getTimeline: () => this.timelineSource === source ? this.timelineState : null,
+            validateLocation: location => this.assertTimelineWindow(location, target),
+            boundRange: (start, end) => this.boundTimelineRange(start, end, target),
             getPreparingGroup: () => retained.preparingGroup(), canProbeLive: () => phase === 'adopted', admitHead: () => current(),
             beforeSubscribe: () => this.hooks.beforeSubscribe.run({ trackName: target.name, namespace: targetNs, mediaType: 'video' }) !== null,
             beginPage: identity => retained.beginPage(identity), acceptPage: (identity, end, receipt) => retained.acceptPage(identity, end, receipt),
@@ -16204,6 +16208,7 @@ export class MoqtPlayer {
       timestampRounding: rounding, placement: nativeAnchor,
       headSeconds: sample.currentTime, afterSubmittedGroup: submitted.highestSubmittedGroup });
     if (plan.kind !== 'candidate') throw new Error(`No safe indexed rendition boundary: ${plan.reason}`);
+    this.assertTimelineWindow(plan.location, target);
     const indexUs = BigInt(plan.indexedPts) * 1000n;
     const placement = placePresentationAnchor(reference, indexUs, indexUs, offset, offset);
     if (!placement || !current() || !this.switchIsCurrent(sw)) throw new Error('Historical video placement changed');
@@ -16417,6 +16422,52 @@ export class MoqtPlayer {
     }
   }
 
+
+  /** MSF-02 §7 and §5.2.45: check each retrieval Location against its group's time. */
+  private assertTimelineWindow(location: { groupId: bigint; objectId: bigint }, extra?: CatalogTrack): void {
+    if (this._catalogState?.msfDraft !== 'draft-02') return;
+    const tracks = [extra, ...(['video', 'audio'] as const).map(role => {
+      const selected = this._selection[role];
+      return selected && this.catalogTrackFor(selected.name, selected.namespaceFields, role);
+    })];
+    const windows = tracks.flatMap(t => t?.accessibleWindowTime === undefined ? [] : [t.accessibleWindowTime]);
+    if (!windows.length) return;
+    const entries = this.timelineState?.entries ?? [], window = Math.min(...windows);
+    const group = entries.filter(entry => BigInt(entry.location[0]) === location.groupId)
+      .sort((a, b) => a.location[1] - b.location[1]);
+    // Unindexed groups inherit the admitted seek/cut; indexed groups own their time.
+    if (!group.length) return;
+    const anchor = group.filter(entry => BigInt(entry.location[1]) <= location.objectId).at(-1) ?? group[0]!;
+    // Playback's microsecond clock is monotonic; indexed wallclocks are UTC milliseconds.
+    const now = Date.now(), newest = entries.at(-1)?.mediaPts ?? 0;
+    if (anchor.wallclockTime === 0
+      ? anchor.mediaPts <= newest - window : anchor.wallclockTime <= now - window) {
+      throw new RangeError('Timeline target is outside accessibleWindowTime (MSF-02 §7)');
+    }
+  }
+
+  /** MSF-02 §7: a historical range cannot cross a known-expired group. */
+  private boundTimelineRange(start: { groupId: bigint; objectId: bigint },
+      end: { groupId: bigint; objectId?: bigint } | undefined, extra?: CatalogTrack): typeof end {
+    this.assertTimelineWindow(start, extra);
+    if (this._catalogState?.msfDraft !== 'draft-02') return end;
+    const entries = [...(this.timelineState?.entries ?? [])].sort((a, b) => a.location[0] - b.location[0] || a.location[1] - b.location[1]);
+    for (const entry of entries) {
+      const location = { groupId: BigInt(entry.location[0]), objectId: BigInt(entry.location[1]) };
+      if (location.groupId < start.groupId || (location.groupId === start.groupId && location.objectId <= start.objectId)) continue;
+      if (end && location.groupId > end.groupId) break;
+      try {
+        if (location.groupId > start.groupId) this.assertTimelineWindow({ groupId: location.groupId, objectId: 0n }, extra);
+        if (end && location.groupId === end.groupId && end.objectId && location.objectId >= end.objectId) break;
+        this.assertTimelineWindow(location, extra);
+      }
+      catch (error) {
+        if (!(error instanceof RangeError) || location.groupId === start.groupId) throw error;
+        return { groupId: location.groupId - 1n, objectId: 0n };
+      }
+    }
+    return end;
+  }
 
   private trackDependsOn(track: CatalogTrack, name: string, namespace: readonly string[]): boolean {
     const catalog = this._catalogState;
@@ -16673,6 +16724,7 @@ export class MoqtPlayer {
     if (wireFormat !== 'msf-00' && wireFormat !== 'msf-01' && wireFormat !== 'msf-02') throw new Error('Cannot seek: media timeline representation is unavailable');
     const entry = context.timeline.entries.find(item => item.location[0] === target.groupId && item.location[1] === target.objectId);
     if (!entry) throw new Error('Cannot seek: indexed media timestamp is unavailable');
+    this.assertTimelineWindow({ groupId: BigInt(entry.location[0]), objectId: BigInt(entry.location[1]) });
     const epoch = continuation?.admission ?? {};
     this.locSeekAdmission = epoch;
     const activeQuality = this.activeLocSeek?.quality;
@@ -16841,6 +16893,8 @@ export class MoqtPlayer {
       const retrieval = new SeekRoleRetrieval({ connection, track, location, timeoutMs: this.config.connectionTimeoutMs!,
       maxObjects: 512, maxBytes: 8 * 1024 * 1024, isCurrent: live,
       getTimeline: () => this.timelineSource === context.source ? this.timelineState : null,
+      validateLocation: location => this.assertTimelineWindow(location, this.catalogTrackFor(track.name, track.namespace)),
+        boundRange: (start, end) => this.boundTimelineRange(start, end, this.catalogTrackFor(track.name, track.namespace)),
       // A finite index's last entry is a start anchor, not its final Object.
       // Let the shared service take its initial published snapshot; subsequent
       // requests retain the consumer's complete-group preparation boundary.
@@ -16978,6 +17032,7 @@ export class MoqtPlayer {
     }
     const entry = context.timeline.entries.find(item => item.location[0] === target.groupId && item.location[1] === target.objectId);
     if (!entry) throw new Error('Cannot seek: indexed media timestamp is unavailable');
+    this.assertTimelineWindow({ groupId: BigInt(entry.location[0]), objectId: BigInt(entry.location[1]) });
     const tracks: SeekTrack[] = [];
     const aliases = new Map<'video' | 'audio', bigint>();
     for (const role of ['video', 'audio'] as const) {
@@ -17065,6 +17120,8 @@ export class MoqtPlayer {
           return this.timelineSource === context.source && timeline && timeline.trackName === context.source.trackName
             && this.timelineCoversTrack(track.name, track.namespace) ? timeline : null;
         },
+        validateLocation: location => this.assertTimelineWindow(location, this.catalogTrackFor(track.name, track.namespace)),
+        boundRange: (start, end) => this.boundTimelineRange(start, end, this.catalogTrackFor(track.name, track.namespace)),
         canProbeLive: () => adopted !== null,
         admitHead: () => this.timelineSource === context.source,
         beforeSubscribe: () => this.hooks.beforeSubscribe.run({ trackName: track.name, mediaType: role, namespace: track.namespace }) !== null,
