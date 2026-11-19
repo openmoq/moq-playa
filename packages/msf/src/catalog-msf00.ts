@@ -320,6 +320,7 @@ export function parseTrack(
     // §5.1.12: packaging — Required
     if (typeof obj['packaging'] !== 'string' || (!msfDraft && !VALID_PACKAGING.has(obj['packaging']))) {
         throw new Error(
+            msfDraft ? `MSF-02 packaging for "${name}" is required and must be a string (§5.2.4)` :
             `Track "${name}" at index ${index}: packaging is required and must be one of ${[...VALID_PACKAGING].join(', ')} (§5.1.12)`,
         );
     }
@@ -433,6 +434,7 @@ export function parseTrack(
         ...(namespace !== undefined ? { namespace } : {}),
         ...(resolvedNamespace !== undefined ? { resolvedNamespace } : {}),
         ...extractRecognizedOptionalFields(obj, name, msfDraft),
+        ...(msfDraft ? { packagingMetadata: parsePackagingMetadata(obj['packagingMetadata'], packaging) } : {}),
     };
 
     return track;
@@ -482,8 +484,8 @@ export function extractRecognizedOptionalFields(
             ...(typeof obj['keyframeSpacing'] === 'number' ? { keyframeSpacing: obj['keyframeSpacing'] } : {}),
             ...(typeof obj['encryptionScheme'] === 'string' ? { encryptionScheme: obj['encryptionScheme'] } : {}),
             ...('authInfo' in obj ? { authInfo: obj['authInfo'] } : {}),
-            ...(typeof obj['packaging'] === 'string' || 'packagingMetadata' in obj
-                ? { packagingMetadata: parsePackagingMetadata(obj['packagingMetadata'], obj['packaging']) } : {}),
+            ...('packagingMetadata' in obj
+                ? { packagingMetadata: parsePackagingMetadata(obj['packagingMetadata'], obj['packaging'] ?? 'loc') } : {}),
         } : {}),
         // CMSF extensions (draft-ietf-moq-cmsf-00 §3.5.2)
         ...(typeof obj['maxGrpSapStartingType'] === 'number' ? { maxGrpSapStartingType: obj['maxGrpSapStartingType'] } : {}),
@@ -527,7 +529,7 @@ function parseStringArray(trackName: string, field: string, raw: unknown[]): str
  * the same renderGroup or altGroup.
  * @see draft-ietf-moq-msf-00 §5.1.16
  */
-function validateTargetLatencyConsistency(tracks: CatalogTrack[]): void {
+export function validateTargetLatencyConsistency(tracks: CatalogTrack[]): void {
     validateGroupLatency(tracks, 'renderGroup');
     validateGroupLatency(tracks, 'altGroup');
 }

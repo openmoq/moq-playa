@@ -25,6 +25,8 @@ import {
     parseMsfCatalog,
     parseDeltaUpdate,
     applyCatalogUpdate,
+    parseMsf02Delta,
+    applyMsf02Delta,
     parseMsf01Delta,
     applyMsf01Delta,
     parseCatalogFormat01,
@@ -215,7 +217,9 @@ export class CatalogManager {
         const text = new TextDecoder().decode(payload);
         const raw: unknown = JSON.parse(text);
 
-        if (Array.isArray(raw)) {
+        if (this.state?.msfDraft === 'draft-02' && typeof raw === 'object' && raw !== null && 'deltaUpdate' in raw) {
+            this.state = applyMsf02Delta(this.state, parseMsf02Delta(payload), this.catalogNamespace);
+        } else if (Array.isArray(raw)) {
             // ── cf01 JSON Patch delta ──────────────────────────────
             if (!this.cf01DeltaSupport || !this.lastRawDocument) {
                 throw new Error(

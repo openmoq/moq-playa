@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseMsfCatalog, parseCatalogAuto } from './index.js';
+import { parseMsfCatalog, parseCatalogAuto, parseMsf02Delta } from './index.js';
 import { CatalogManager } from '../../player/src/catalog-manager.js';
 const track = { name: 'v', packaging: 'loc', isLive: true };
 const parse = (tracks: unknown[], version = 'draft-02', extra = {}) =>
@@ -74,4 +74,10 @@ describe('MSF-02 catalog constraints', () => {
             expect(() => parser(bad)).toThrow();
         }
     });
+});
+
+it('describes draft-02 packaging requirements for incomplete additions', () => {
+    expect(() => parseMsf02Delta(JSON.stringify({ generatedAt: 2, deltaUpdate: [
+        { op: 'add', tracks: [{ name: 'missing', isLive: true }] },
+    ] }))).toThrow(/MSF-02.*packaging.*string/);
 });

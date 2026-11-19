@@ -48,7 +48,13 @@ export function validateMsf02Fields(obj: Record<string, unknown>, partial = fals
             }
         }
     }
-    if (partial) return;
+    if (partial) {
+        for (const [key, type] of Object.entries({ packaging: 'string', isLive: 'boolean', codec: 'string',
+            bitrate: 'number', samplerate: 'number', channelConfig: 'string', framerate: 'number', lang: 'string' })) {
+            if (key in obj && typeof obj[key] !== type) throw new Error(`Invalid MSF-02 ${key} (§5.2.4.1)`);
+        }
+        return;
+    }
     const required: string[] = [];
     const role = obj['role'];
     if (role === 'audio' || role === 'video') required.push('codec', 'bitrate');

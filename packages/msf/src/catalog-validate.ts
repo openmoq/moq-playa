@@ -7,7 +7,7 @@
  * @module
  */
 
-import type { Catalog, CatalogDelta, CatalogState, Msf01Delta } from './types.js';
+import type { Catalog, CatalogDelta, CatalogState, Msf01Delta, Msf02Delta } from './types.js';
 
 /**
  * Reject a normalized catalog carrying a non-finite number. JSON permits an
@@ -36,8 +36,8 @@ export function assertFiniteCatalogDelta(delta: CatalogDelta): void {
  * any op-track numeric field from a JSON overflow exponent). Same contract as
  * {@link assertFiniteCatalogDelta}; the op-array shape is walked generically.
  */
-export function assertFiniteMsf01Delta(delta: Msf01Delta): void {
-  walk(delta, 'MSF-01 delta', 0);
+export function assertFiniteMsf01Delta(delta: Msf01Delta | Msf02Delta, msfDraft?: 'draft-02'): void {
+  walk(delta, msfDraft ? 'MSF-02 delta' : 'MSF-01 delta', 0);
 }
 
 /**

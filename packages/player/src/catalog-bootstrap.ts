@@ -145,6 +145,8 @@ function classify(payload: Uint8Array): Classified {
     if (obj['deltaUpdate'] !== undefined) return { kind: 'msf-delta' };
     if ('streamingFormat' in obj) return { kind: 'independent', profile: 'cf01' };
     if (typeof obj['version'] === 'number') return { kind: 'independent', profile: 'msf00' };
+    // MSF-02 §5 retains the MSF-01 group-head and Joining FETCH rules.
+    if (obj['version'] === 'draft-02') return { kind: 'independent', profile: 'msf01' };
     if (typeof obj['version'] === 'string') return { kind: 'independent', profile: 'msf01' };
   }
   return { kind: 'independent', profile: 'unknown' };

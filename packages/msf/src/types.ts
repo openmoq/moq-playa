@@ -477,3 +477,15 @@ export const SUPPORTED_LOCMAF_VERSIONS: readonly string[] = [LOCMAF_VERSION];
  * @see draft-ietf-moq-msf-00 §5
  */
 export const CATALOG_TRACK_NAME = 'catalog';
+
+/** MSF-02 §5.1.6: ordered operations, including partial updates. */
+export type Msf02DeltaOpKind = Msf01DeltaOpKind | 'update';
+export interface Msf02DeltaOp {
+    readonly op: Msf02DeltaOpKind;
+    readonly tracks: readonly Partial<CatalogTrack>[];
+}
+/** MSF-02 §5.3: generatedAt is required; no independent root fields. */
+export interface Msf02Delta {
+    readonly generatedAt: number;
+    readonly deltaUpdate: readonly Msf02DeltaOp[];
+}
