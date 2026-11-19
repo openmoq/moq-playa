@@ -54,3 +54,32 @@ it.each(['track-property', 'object-property'])('uses MSF-02 %s initialization wh
         expect(errors).toEqual([]);
     } finally { await player.destroy(); await server.close(); await serving; }
 });
+
+it.each(['example.event', 'org.ietf.moq.cmsf.sap'])('delivers uppercase MSF-02 records for %s', async eventType => {
+    const { a, b } = createLoopback();
+    const client = new MoqtConnection(23), server = new MoqtConnection(23, { role: 'server' });
+    const requests: { id: bigint; name: string }[] = [];
+    server.onSubscribe = (id, _ns, name) => { requests.push({ id, name: new TextDecoder().decode(name) }); };
+    const catalog = parseMsfCatalog(JSON.stringify({ version: 'draft-02', tracks: [
+        { name: 'v', packaging: 'loc', isLive: true, role: 'video', codec: 'avc1', bitrate: 1, framerate: 30 },
+        { name: 'events', packaging: 'eventtimeline', isLive: true, eventType, depends: ['v'] },
+    ] }), ['live']);
+    let serving: Promise<void> | undefined;
+    const player = new MoqtPlayer({ url: 'https://relay.example/moq', namespace: ['live'], draftVersion: 23,
+        catalog, disableAudio: true, autoQuality: false,
+        createConnection: () => client, createTransport: async () => { serving = server.connect(b); return a; } });
+    const events = vi.fn(), sap = vi.fn();
+    player.on('event_timeline', events); player.on('sap_event', sap);
+    try {
+        await player.load(); await flush(128);
+        expect(requests.map(r => r.name)).toContain('events');
+        for (const request of requests) await server.acceptSubscribe(request.id, request.name === 'v' ? 77n : 78n);
+        await flush(128);
+        const payload = eventType === 'example.event' ? [{ T: 123, data: null }] : [{ L: [3, 0], data: [1, 25] }];
+        const stream = await server.openSubgroup(78n, 0n, 0n, { publisherPriority: 128 });
+        await server.sendObject(stream, 0n, new TextEncoder().encode(JSON.stringify(payload)));
+        await server.closeSubgroup(stream); await flush(128);
+        if (eventType === 'example.event') expect(events.mock.calls[0]?.[0]).toMatchObject({ eventType, records: [{ index: { t: 123 }, data: null }] });
+        else expect(sap.mock.calls[0]?.[0].entries).toEqual([{ location: [3, 0], sapType: 1, earliestPresentationTimeMs: 25 }]);
+    } finally { await player.destroy(); await server.close(); await serving; }
+});

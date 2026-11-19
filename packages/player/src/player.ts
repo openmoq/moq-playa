@@ -5006,7 +5006,8 @@ export class MoqtPlayer {
       if (obj.kind !== 'data' || !obj.payload) return;
 
       // Look up the catalog track to determine the eventType
-      const catalog = this.catalogSlots.catalogManager?.currentState;
+      const catalog = this.catalogSlots.catalogManager?.currentState
+        ?? (this._catalogState?.msfDraft === 'draft-02' ? this._catalogState : undefined);
       const key = this.mediaKey(trackName, undefined, BigInt(obj.trackAlias));
       const catalogTrack = catalog?.tracks.find(track => this.initKey(track) === key);
       const eventType = catalogTrack?.eventType ?? '';
@@ -5015,7 +5016,7 @@ export class MoqtPlayer {
         if (eventType === CMSF_SAP_EVENT_TYPE) {
           // CMSF SAP timeline: parse as SAP entries and emit sap_event
           // @see draft-ietf-moq-cmsf-00 §3.6.1
-          const entries = parseSapTimeline(obj.payload);
+          const entries = parseSapTimeline(obj.payload, catalog?.msfDraft);
           this.emitter.emit('sap_event', {
             type: 'sap_event',
             trackName,
@@ -5024,7 +5025,7 @@ export class MoqtPlayer {
         } else {
           // Generic event timeline: parse records and emit event_timeline
           // @see draft-ietf-moq-msf-00 §8.1
-          const records = parseEventTimeline(obj.payload);
+          const records = parseEventTimeline(obj.payload, catalog?.msfDraft);
           this.emitter.emit('event_timeline', {
             type: 'event_timeline',
             trackName,
