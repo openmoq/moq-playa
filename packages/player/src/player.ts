@@ -2680,7 +2680,7 @@ export class MoqtPlayer {
 
   /** Catalog video views for selecting videoAltGroup on a new player. */
   get availableVideoGroups(): AltGroup[] {
-    const tracks = this._catalogState?.tracks.filter(t => t.role === 'video' && isTrackPackagingSupported(t)) ?? [];
+    const tracks = this._catalogState?.tracks.filter(t => t.role === 'video' && isTrackPackagingSupported(t) && this.catalogTrackAllowed(t)) ?? [];
     return groupByAlt(tracks).groups.map(group => ({
       altGroup: group.altGroup, tracks: group.tracks.map(track => ({ ...track })),
     }));
@@ -3452,6 +3452,13 @@ export class MoqtPlayer {
       if (track !== undefined) return track;
     }
     return undefined;
+  }
+
+  private catalogTrackAllowed(track: CatalogTrack, catalog = this._catalogState): boolean {
+    if (catalog?.msfDraft !== 'draft-02') return true;
+    // Use the same refusal reasons for auxiliary subscriptions and media selection.
+    return !buildCatalogSelection(catalog, { catalogNamespace: this.config.namespace }).excluded.some(t =>
+      t.reason !== 'no-media-role' && identityKey(t.id.namespaceFields, t.id.name) === this.initKey(track));
   }
 
   private initKey(track: CatalogTrack, name: string = track.name): string {
@@ -7433,6 +7440,8 @@ export class MoqtPlayer {
       name: string, namespace: readonly string[], mediaType: 'video' | 'audio',
       packaging: TrackPackaging, isLive: boolean, initKey: string | null,
     ): Promise<void> => {
+      const declared = catalog.tracks.find(t => t.name === name && sameNamespaceFields(nsOf(t), namespace));
+      if (declared && !this.catalogTrackAllowed(declared, catalog)) throw new Error(`Catalog excludes subscription to "${name}"`);
       if (initKey !== null && this.hooks.beforeSubscribe.run({
         trackName: name, namespace, mediaType: 'init',
       }) === null) throw new Error(`replacement init subscription "${name}" cancelled by beforeSubscribe`);
@@ -14329,9 +14338,9 @@ export class MoqtPlayer {
     // §7.2: MUST have depends, mimeType "application/json".
     const selectedIdentities = new Set([selected.video, selected.audio]
       .filter((track): track is CatalogTrack => track !== undefined).map(track => this.initKey(track)));
-    const dependsOnSelected = (track: CatalogTrack): boolean => catalog.msfDraft === 'draft-02'
+    const dependsOnSelected = (track: CatalogTrack): boolean => this.catalogTrackAllowed(track, catalog) && (catalog.msfDraft === 'draft-02'
       ? resolveTrackDependencies(track, catalog.tracks, catalog).some(t => selectedIdentities.has(this.initKey(t)))
-      : track.depends?.some(name => selectedIdentities.has(this.initKey(track, name as string))) === true;
+      : track.depends?.some(name => selectedIdentities.has(this.initKey(track, name as string))) === true);
     const timelineTrack = catalog.tracks.find(
       (t: CatalogTrack) => t.packaging === 'mediatimeline' && dependsOnSelected(t),
     );
@@ -14472,6 +14481,8 @@ export class MoqtPlayer {
   ): Promise<bigint | undefined> {
     const conn = this.connection;
     if (!conn) throw new Error('subscribeAuxTrackOwned: no connection');
+    const declared = this.catalogTrackFor(info.trackName, nsBytes.map(field => new TextDecoder().decode(field)));
+    if (declared && !this.catalogTrackAllowed(declared)) return undefined;
     const gen = this.bootstrapGeneration;
     const live = (): boolean => !this._destroyed && !this.isTerminalState()
       && this.subscriptionManager !== null && this.connection === conn && this.bootstrapGeneration === gen;
