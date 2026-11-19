@@ -177,7 +177,7 @@ export class SeekRoleRetrieval {
     const preparingGroup = this.options.getPreparingGroup?.() ?? null;
     if (!this.current() || this.page || this.stopped || this.ended) return;
     const snapshot = preparingGroup === null && this.first && !timeline.isLive;
-    const plan = snapshot ? null : planSeekFetchPage({ draftVersion: this.draft, trackName: this.options.track.name,
+    const plan = snapshot ? null : planSeekFetchPage({ draftVersion: this.draft, trackName: this.options.track.name, namespace: this.options.track.namespace,
       timeline, cut: this.cut, endOfTrack: false, includeIndexedTip: this.first,
       ...(preparingGroup === null ? {} : { preparingGroup }),
       ...(this.lastNonProgress ? { lastNonProgress: this.lastNonProgress } : {}) });

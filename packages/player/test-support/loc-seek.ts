@@ -12,6 +12,7 @@ const enc = new TextEncoder(), dec = new TextDecoder();
 
 export async function locSeekFixture(draft: 14 | 16 | 18 | 22, audio = false, coverAudio = true, options: {
   playerConfig?: Partial<MoqtPlayerConfig>;
+  catalogDocument?: unknown;
   configuredDraft?: 14 | 16 | 18 | 22 | null; autoNegotiation?: boolean;
   frameVideo?: boolean; frameAudio?: boolean; frameAlternative?: boolean; reorderVideoOutput?: boolean;
   isLive?: boolean; namespace?: string; audioNamespace?: string; shadowTimeline?: boolean; timelineBeforeOk?: boolean; catalogVersion?: 1 | '1';
@@ -132,7 +133,7 @@ export async function locSeekFixture(draft: 14 | 16 | 18 | 22, audio = false, co
     expect(catalog).toBeDefined();
     await server.acceptSubscribe(catalog.id, 100n); await flush(64);
     const stream = await server.openSubgroup(100n, 0n, 0n, { publisherPriority: 128 }); streams.push(stream);
-    await server.sendObject(stream, 0n, enc.encode(JSON.stringify({ version: options.catalogVersion ?? (options.frameVideo || options.frameAudio || options.frameAlternative ? '1' : 1),
+    await server.sendObject(stream, 0n, enc.encode(JSON.stringify(options.catalogDocument ?? { version: options.catalogVersion ?? (options.frameVideo || options.frameAudio || options.frameAlternative ? '1' : 1),
       ...(options.frameVideo || options.frameAudio || options.frameAlternative ? { initDataList: [
         ...(options.frameVideo || options.frameAlternative ? [{ id: 'video-init', type: 'inline', data: Buffer.from(videoInit()).toString('base64') }] : []),
         ...(options.frameAudio ? [{ id: 'audio-init', type: 'inline', data: Buffer.from(audioInit()).toString('base64') }] : []),

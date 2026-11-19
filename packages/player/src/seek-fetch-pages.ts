@@ -1,6 +1,6 @@
 import { MAX_VARINT, MAX_VI64 } from '@openmoq/transport';
 import type { SeekFetchResponse } from './seek-fetch-requests.js';
-import type { TimelineState } from './timeline-manager.js';
+import { timelineCovers, type TimelineState } from './timeline-manager.js';
 import { nativeTimeUs, type FractionUs } from './presentation-placement.js';
 
 type Draft = 14 | 16 | 18 | 22;
@@ -19,8 +19,9 @@ export interface SeekFetchPageProof {
 export interface SeekFetchPageInput {
   readonly draftVersion: Draft;
   readonly trackName: string;
+  readonly namespace?: readonly string[];
   /** Caller checks the issued timeline's source/namespace and consumer epoch. */
-  readonly timeline: Pick<TimelineState, 'entries' | 'depends' | 'isLive'>;
+  readonly timeline: Pick<TimelineState, 'entries' | 'depends' | 'coverage' | 'isLive'>;
   readonly cut: SeekFetchCut;
   readonly endOfTrack: boolean;
   /** Initial media preparation can include the last indexed Object itself.
@@ -137,7 +138,7 @@ export function planSeekFetchPage(options: SeekFetchPageInput): SeekFetchPagePla
   if (typeof options.endOfTrack !== 'boolean') throw new TypeError('Expected End Of Track boolean');
   if (options.endOfTrack) return { kind: 'finished', cut };
   if (cut.kind === 'after-group') return { kind: 'wait-for-index', reason: 'address-space-exhausted' };
-  if (!options.timeline.depends.includes(options.trackName)) return { kind: 'wait-for-index', reason: 'timeline-does-not-cover-track' };
+  if (!timelineCovers(options.timeline, options.trackName, options.namespace)) return { kind: 'wait-for-index', reason: 'timeline-does-not-cover-track' };
   const entries = index(draft, options.timeline.entries), tip = entries[entries.length - 1];
   if (!tip) return { kind: 'wait-for-index', reason: 'no-index' };
   const prior = options.lastNonProgress;
@@ -198,8 +199,9 @@ export function planSeekFetchPage(options: SeekFetchPageInput): SeekFetchPagePla
 export interface SeekQualityCandidateInput {
   readonly draftVersion: Draft;
   readonly trackName: string;
+  readonly namespace?: readonly string[];
   /** Caller proves common source, namespace, alternate set and current ownership. */
-  readonly timeline: Pick<TimelineState, 'entries' | 'depends'>;
+  readonly timeline: Pick<TimelineState, 'entries' | 'depends' | 'coverage'>;
   readonly timestampRounding: 'nearest' | 'floor';
   /** Slope-one source-to-native anchor, including the actual native timestampOffset. */
   readonly placement: { readonly sourceTimeUs: bigint; readonly rebasedTimeUs: FractionUs };
@@ -231,8 +233,8 @@ function qualityProjection(options: Pick<SeekQualityCandidateInput, 'placement' 
     lowerUs: timestampRounding === 'nearest' ? 500n : 0n, upperUs: timestampRounding === 'nearest' ? 500n : 1000n };
 }
 
-function qualityGroupStarts(options: Pick<SeekQualityCandidateInput, 'draftVersion' | 'trackName' | 'timeline'>): IndexedLocation[] | QualityIndexRefusal {
-  if (!options.timeline.depends.includes(options.trackName)) return 'timeline-does-not-cover-track';
+function qualityGroupStarts(options: Pick<SeekQualityCandidateInput, 'draftVersion' | 'trackName' | 'namespace' | 'timeline'>): IndexedLocation[] | QualityIndexRefusal {
+  if (!timelineCovers(options.timeline, options.trackName, options.namespace)) return 'timeline-does-not-cover-track';
   const entries = index(options.draftVersion, options.timeline.entries);
   if (!entries.length) return 'no-index';
   // index() returns validated, deduplicated Location order without changing input.
@@ -298,8 +300,9 @@ export function selectSeekQualityCut(options: SeekQualityCutInput): SeekQualityC
 export interface FrameQualityCutInput {
   readonly draftVersion: Draft;
   readonly trackName: string;
+  readonly namespace?: readonly string[];
   /** Caller proves shared source, namespace, alternate set and current output ownership. */
-  readonly timeline: Pick<TimelineState, 'entries' | 'depends'>;
+  readonly timeline: Pick<TimelineState, 'entries' | 'depends' | 'coverage'>;
   /** Maximum observed playhead and committed video output position, in indexed content time. */
   readonly afterContentMs: number;
 }

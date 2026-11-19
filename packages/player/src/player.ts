@@ -54,7 +54,7 @@ import { selectionIntentFromConfig } from './configured-selection.js';
 import type { LocHeaders } from '@openmoq/loc';
 import { LocmafFormatError, LocmafTrackDecoder, deserializeLocmafObject, readVi64, LocmafFrameReader, LocmafFrameReadError, LocmafReadLimitError, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseLocmafTrackContext, parseEmsgBoxes } from '@openmoq/locmaf';
 import type { LocmafFrameHeader, EmsgEvent, LocmafEffectiveSamples, GenBox, LocmafTrackContext } from '@openmoq/locmaf';
-import { groupByAlt, parseSapTimeline, parseEventTimeline, parseMediaTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported,
+import { resolveTrackDependencies, groupByAlt, parseSapTimeline, parseEventTimeline, parseMediaTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported,
   fieldsFromCatalogText, identityKey, namespaceFieldsOf, sameNamespaceFields } from '@openmoq/msf';
 
 import { TypedEmitter } from './emitter.js';
@@ -178,6 +178,7 @@ import {
   findEncodeAnchor,
   mergeTimelineEntries,
   findSeekTarget,
+  timelineCovers,
   getTimelineDuration,
   type TimelineState,
 } from './timeline-manager.js';
@@ -14327,16 +14328,17 @@ export class MoqtPlayer {
     // §7.2: MUST have depends, mimeType "application/json".
     const selectedIdentities = new Set([selected.video, selected.audio]
       .filter((track): track is CatalogTrack => track !== undefined).map(track => this.initKey(track)));
-    const dependsOnSelected = (track: CatalogTrack): boolean => track.depends?.some(name =>
-      selectedIdentities.has(this.initKey(track, name as string))) === true;
+    const dependsOnSelected = (track: CatalogTrack): boolean => catalog.msfDraft === 'draft-02'
+      ? resolveTrackDependencies(track, catalog.tracks, catalog).some(t => selectedIdentities.has(this.initKey(t)))
+      : track.depends?.some(name => selectedIdentities.has(this.initKey(track, name as string))) === true;
     const timelineTrack = catalog.tracks.find(
       (t: CatalogTrack) => t.packaging === 'mediatimeline' && dependsOnSelected(t),
     );
     if (timelineTrack && this.connection && this.subscriptionManager) {
-      this.timelineState = createTimelineState(timelineTrack);
+      this.timelineState = createTimelineState(timelineTrack, catalog, namespaceFields(this.config.namespace));
       this.timelineSource = null;
       const timelineConnection = this.connection;
-      const timelineWireFormat = this.catalogSlots.catalogManager?.wireFormat ?? null;
+      const timelineWireFormat = this.catalogSlots.catalogManager?.wireFormat ?? (catalog.msfDraft === 'draft-02' ? 'msf-02' : null);
       let registration: NonNullable<MoqtPlayer['timelineSource']> | null = null;
 
       const nsBytes = trackNamespaceFields(timelineTrack, this.config.namespace).map(field => this.enc.encode(field));
@@ -15096,14 +15098,15 @@ export class MoqtPlayer {
     if (owner.kind !== 'ordinary' || !selected || !source || !timeline || request === null || !catalog
         || !configuration || configuration.source !== owner.source || !owner.output || !owner.assembler
         || source.connection !== owner.connection || !timeline.isLive
-        || (source.wireFormat !== 'msf-00' && source.wireFormat !== 'msf-01')) return;
+        || (source.wireFormat !== 'msf-00' && source.wireFormat !== 'msf-01' && source.wireFormat !== 'msf-02')) return;
     const track = this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
     const applicable = () => this._catalogState?.tracks.filter(t => t.packaging === 'mediatimeline'
-      && t.depends?.includes(selected.name) && sameNamespaceFields(trackNamespaceFields(t, this.config.namespace), selected.namespaceFields));
+      && this.trackDependsOn(t, selected.name, selected.namespaceFields));
     const candidates = applicable();
     if (!track?.isLive || track.packaging !== 'cmaf' || candidates?.length !== 1
-        || candidates[0]!.name !== source.trackName || !sameNamespaceFields(source.namespace, selected.namespaceFields)
-        || !timeline.depends.includes(selected.name)) return;
+        || candidates[0]!.name !== source.trackName
+        || !sameNamespaceFields(trackNamespaceFields(candidates[0]!, this.config.namespace), source.namespace)
+        || !this.timelineCoversTrack(selected.name, selected.namespaceFields)) return;
     const subscription = this.activeSubscriptions.get(request);
     if (!subscription || subscription.trackAlias === null || subscription.trackName !== source.trackName
         || !sameNamespaceFields(subscription.namespace ?? [], source.namespace)) return;
@@ -15824,9 +15827,8 @@ export class MoqtPlayer {
     const target = structuredClone(declared), targetNs = [...trackNamespaceFields(target, this.config.namespace)];
     const timeline = this.timelineState;
     const common = () => source !== null && this.timelineSource === source && this.timelineState !== null
-      && sameNamespaceFields(source.namespace, oldTrack.namespace) && sameNamespaceFields(source.namespace, targetNs)
-      && (source.wireFormat === 'msf-00' || source.wireFormat === 'msf-01')
-      && this.timelineState.depends.includes(oldTrack.name) && this.timelineState.depends.includes(target.name);
+      && this.timelineCoversTrack(oldTrack.name, oldTrack.namespace) && this.timelineCoversTrack(target.name, targetNs)
+      && (source.wireFormat === 'msf-00' || source.wireFormat === 'msf-01' || source.wireFormat === 'msf-02');
     const selectionCurrent = () => (['video', 'audio'] as const).every(role => {
       const before = selection[role], now = this._selection[role];
       return before === null ? now === null : now !== null
@@ -15840,7 +15842,7 @@ export class MoqtPlayer {
     if (!timeline || !common() || !baseCurrent() || observed === null || !frontier || frontier.owner !== oldOwner) {
       throw new Error('Playing frame rendition has no current common indexed frontier');
     }
-    const plan = selectFrameQualityCut({ draftVersion: connection.draftVersion, trackName: target.name, timeline,
+    const plan = selectFrameQualityCut({ draftVersion: connection.draftVersion, trackName: target.name, namespace: trackNamespaceFields(target, this.config.namespace), timeline,
       afterContentMs: Math.max(observed, frontier.positionMs) });
     if (plan.kind !== 'candidate') throw new Error(`No declared future frame boundary: ${plan.reason}`);
     if (!baseCurrent() || !selectionCurrent() || attempt.playback.videoRoleOwner() !== oldOwner) throw new Error('Playing frame rendition was superseded');
@@ -16131,9 +16133,8 @@ export class MoqtPlayer {
       const targetNs = trackNamespaceFields(snapshot, this.config.namespace);
       if (!source || this.timelineSource !== source || source !== previous.timelineSource || context.source !== source
           || source.connection !== connection || !timeline || timeline.trackName !== source.trackName
-          || !sameNamespaceFields(source.namespace, owned.namespace) || !sameNamespaceFields(source.namespace, targetNs)
-          || !timeline.depends.includes(old.name) || !timeline.depends.includes(snapshot.name)
-          || declaring?.packaging !== 'mediatimeline' || !declaring.depends?.includes(old.name) || !declaring.depends.includes(snapshot.name)
+          || !this.timelineCoversTrack(old.name, owned.namespace) || !this.timelineCoversTrack(snapshot.name, targetNs)
+          || declaring?.packaging !== 'mediatimeline' || !this.trackDependsOn(declaring, old.name, owned.namespace) || !this.trackDependsOn(declaring, snapshot.name, targetNs)
           || !timeline.entries.some(item => item.mediaPts === entry.mediaPts
             && item.location[0] === location.groupId && item.location[1] === location.objectId)) {
         throw new Error('Frame quality requires a common media timeline with a current owned index');
@@ -16180,10 +16181,8 @@ export class MoqtPlayer {
         || !this.usesMse(target.packaging) || !sw.initData || !target.codec
         || !attempt.source.holdQueuedAppends) throw new Error('Historical video output is not ready for rendition preparation');
     if (!timelineSource || !timeline || timelineSource.connection !== attempt.connection
-        || !sameNamespaceFields(timelineSource.namespace, old.namespace)
-        || !sameNamespaceFields(timelineSource.namespace, namespace)
-        || !timeline.depends.includes(old.name) || !timeline.depends.includes(target.name)
-        || (timelineSource.wireFormat !== 'msf-00' && timelineSource.wireFormat !== 'msf-01')) {
+        || !this.timelineCoversTrack(old.name, old.namespace) || !this.timelineCoversTrack(target.name, namespace)
+        || (timelineSource.wireFormat !== 'msf-00' && timelineSource.wireFormat !== 'msf-01' && timelineSource.wireFormat !== 'msf-02')) {
       throw new Error('Historical video renditions need a common media timeline');
     }
     const draft = attempt.connection.draftVersion;
@@ -16201,7 +16200,7 @@ export class MoqtPlayer {
     if (!submitted || submitted.highestSubmittedGroup === null || submitted.resource !== resource.resource
         || submitted.epoch !== attempt.epoch || submitted.sourceKey !== old.sourceKey
         || !current() || !this.switchIsCurrent(sw)) throw new Error('Historical video submission frontier is unavailable');
-    const plan = selectSeekQualityCut({ draftVersion: draft, trackName: target.name, timeline,
+    const plan = selectSeekQualityCut({ draftVersion: draft, trackName: target.name, namespace: trackNamespaceFields(target, this.config.namespace), timeline,
       timestampRounding: rounding, placement: nativeAnchor,
       headSeconds: sample.currentTime, afterSubmittedGroup: submitted.highestSubmittedGroup });
     if (plan.kind !== 'candidate') throw new Error(`No safe indexed rendition boundary: ${plan.reason}`);
@@ -16419,6 +16418,20 @@ export class MoqtPlayer {
   }
 
 
+  private trackDependsOn(track: CatalogTrack, name: string, namespace: readonly string[]): boolean {
+    const catalog = this._catalogState;
+    return catalog?.msfDraft === 'draft-02'
+      ? resolveTrackDependencies(track, catalog.tracks, catalog).some(t => t.name === name
+        && sameNamespaceFields(trackNamespaceFields(t, this.config.namespace), namespace))
+      : track.depends?.includes(name) === true && sameNamespaceFields(trackNamespaceFields(track, this.config.namespace), namespace);
+  }
+
+  private timelineCoversTrack(name: string, namespace: readonly string[]): boolean {
+    const timeline = this.timelineState, source = this.timelineSource;
+    return !!timeline && !!source && timelineCovers(timeline, name, namespace)
+      && (source.wireFormat === 'msf-02' || sameNamespaceFields(source.namespace, namespace));
+  }
+
   /** Shared availability policy; cached metadata alone does not admit a seek. */
   private getSeekContext() {
     const timeline = this.timelineState;
@@ -16434,11 +16447,11 @@ export class MoqtPlayer {
     const initIds = new Set(this.initTrackRequestIds.values());
     const mediaSubscriptions = [...this.activeSubscriptions].filter(([id, sub]) =>
       (sub.mediaType === 'video' || sub.mediaType === 'audio') && !initIds.has(id));
-    // MSF §7.2 depends names resolve within the declaring track's namespace.
+    // MSF-02 §7.2 expands dependencies to identities; older drafts scope names locally.
     // Validate issued identities, including pending media requests; an
     // auxiliary init's placeholder media type does not make it seekable.
     const coverageError = (role: string, name: string, namespace: readonly string[] | undefined): string | null =>
-      !timeline.depends.includes(name) || namespace === undefined || !sameNamespaceFields(source.namespace, namespace)
+      namespace === undefined || !this.timelineCoversTrack(name, namespace)
         ? `Cannot seek: ${role} track "${name}" is not covered by the media timeline` : null;
     // Adopted outputs survive finite subscription completion. Their coverage
     // requirement does not disappear when their request leaves the live map.
@@ -16657,7 +16670,7 @@ export class MoqtPlayer {
       throw new Error('Cannot seek while another media change is preparing');
     }
     const wireFormat = context.source.wireFormat;
-    if (wireFormat !== 'msf-00' && wireFormat !== 'msf-01') throw new Error('Cannot seek: media timeline representation is unavailable');
+    if (wireFormat !== 'msf-00' && wireFormat !== 'msf-01' && wireFormat !== 'msf-02') throw new Error('Cannot seek: media timeline representation is unavailable');
     const entry = context.timeline.entries.find(item => item.location[0] === target.groupId && item.location[1] === target.objectId);
     if (!entry) throw new Error('Cannot seek: indexed media timestamp is unavailable');
     const epoch = continuation?.admission ?? {};
@@ -16960,7 +16973,7 @@ export class MoqtPlayer {
       throw new Error('Cannot seek while another media change is preparing');
     }
     const wireFormat = context.source.wireFormat;
-    if (wireFormat !== 'msf-00' && wireFormat !== 'msf-01') {
+    if (wireFormat !== 'msf-00' && wireFormat !== 'msf-01' && wireFormat !== 'msf-02') {
       throw new Error('Cannot seek: media timeline catalog representation is unavailable');
     }
     const entry = context.timeline.entries.find(item => item.location[0] === target.groupId && item.location[1] === target.objectId);
@@ -17050,7 +17063,7 @@ export class MoqtPlayer {
         getTimeline: () => {
           const timeline = this.timelineState;
           return this.timelineSource === context.source && timeline && timeline.trackName === context.source.trackName
-            && timeline.depends.includes(track.name) && sameNamespaceFields(context.source.namespace, track.namespace) ? timeline : null;
+            && this.timelineCoversTrack(track.name, track.namespace) ? timeline : null;
         },
         canProbeLive: () => adopted !== null,
         admitHead: () => this.timelineSource === context.source,

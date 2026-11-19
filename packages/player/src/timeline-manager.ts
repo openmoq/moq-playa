@@ -9,8 +9,8 @@
  * @module
  */
 
-import type { CatalogTrack, MediaTimelineEntry } from '@openmoq/msf';
-import { parseMediaTimeline, mergeMediaTimeline, findLocationForPts } from '@openmoq/msf';
+import type { CatalogState, CatalogTrack, MediaTimelineEntry } from '@openmoq/msf';
+import { parseMediaTimeline, mergeMediaTimeline, findLocationForPts, resolveTrackDependencies, namespaceFieldsOf, sameNamespaceFields } from '@openmoq/msf';
 
 /**
  * Materialized state of a media timeline track.
@@ -27,19 +27,22 @@ export interface TimelineState {
   trackName: string;
   /** Track names this timeline covers. §7.2: MUST have depends. */
   depends: string[];
+  coverage?: readonly { readonly name: string; readonly namespace: readonly string[] }[];
 }
 
 /**
  * Create initial timeline state from a catalog track.
  * @see draft-ietf-moq-msf-00 §7.2 (catalog requirements)
  */
-export function createTimelineState(track: CatalogTrack): TimelineState {
+export function createTimelineState(track: CatalogTrack, catalog?: CatalogState, namespace: readonly string[] = []): TimelineState {
   return {
+    ...(catalog?.msfDraft === 'draft-02' ? { coverage: resolveTrackDependencies(track, catalog.tracks, catalog)
+      .map(t => ({ name: t.name, namespace: namespaceFieldsOf(t) ?? namespace })) } : {}),
     entries: [],
     trackDuration: track.trackDuration,
     isLive: track.isLive,
     trackName: track.name,
-    depends: (track.depends as string[] | undefined) ?? [],
+    depends: catalog?.msfDraft === 'draft-02' ? [] : (track.depends as string[] | undefined) ?? [],
   };
 }
 
@@ -105,4 +108,10 @@ export function findEncodeAnchor(state: TimelineState, groupId: bigint, objectId
   const entry = matches[0]!;
   return Number.isFinite(entry.mediaPts) && Number.isFinite(entry.wallclockTime) && entry.wallclockTime > 0
     ? entry : undefined;
+}
+
+/** MSF-02 §7.2: coverage is a full identity after dependency expansion. */
+export function timelineCovers(state: Pick<TimelineState, 'depends' | 'coverage'>, name: string, namespace?: readonly string[]): boolean {
+  return state.coverage === undefined ? state.depends.includes(name)
+    : namespace !== undefined && state.coverage.some(t => t.name === name && sameNamespaceFields(t.namespace, namespace));
 }
