@@ -466,6 +466,29 @@ it('a narrow post-hole witness survives a frozen sample with thin forward video'
   } finally { f.adapter.destroy(); }
 });
 
+// A switch commit can retype (a prefetched init is applied even for the same
+// codec) after the playhead has run past the old video but before the new
+// rendition's first range lands. The retype keeps the coded frames, so the
+// covered position observed before the hole still anchors the late witness.
+it.each(['avc1.640028', 'avc1.4d401e'])('a retype to %s before the upper range lands keeps the covered position', async codec => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  try {
+    source.videoBuffer.buffered = makeTimeRanges([[0, 1]]);
+    source.audioBuffer.buffered = makeTimeRanges([[0, 7]]);
+    f.video.buffered = makeTimeRanges([[0, 1]]);
+    f.video.advancePlayback(0.9); await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(1.4); await vi.advanceTimersByTimeAsync(1000);
+    await f.adapter.changeType('video', codec, buildInit({ trackId: 1, timescale: 1000, handler: 'vide' }));
+    f.setHole(); f.video.advancePlayback(2.6); await vi.advanceTimersByTimeAsync(1000);
+    f.video.readyState = 2;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(rungs[0]).toBe(1);
+    expect(f.video.seekCount).toBeGreaterThan(0);
+    expect(f.jumps).toHaveLength(0);
+  } finally { f.adapter.destroy(); }
+});
+
 it.each(['progress', 'quality', 'historical', 'pending'] as const)('post-hole recovery refuses %s without a continuing frozen crossing witness', async mode => {
   const f = await ready();
   const rungs: number[] = [];

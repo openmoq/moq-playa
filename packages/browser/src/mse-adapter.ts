@@ -1887,9 +1887,13 @@ export class MseMediaSource implements MediaSourceLike {
     // it lets the watchdog recover a playhead frozen just past a switch hole
     // when the next switch changes codec profile (as consecutive downshifts
     // across an H.264 profile boundary do). A wide-hole witness, which can
-    // authorize skipping media, still retires.
+    // authorize skipping media, still retires. With no hole yet, the covered
+    // position also survives: a switch commit can retype after the playhead
+    // has run past the old video but before the new rendition's first range
+    // lands, and that position is what later anchors the hole. Its generation
+    // and buffer identity are revalidated whenever it is used.
     const hole = this.wedgeVideoHole;
-    if (hole === null || hole.start - hole.end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC) this.clearVideoHoleEvidence();
+    if (hole !== null && hole.start - hole.end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC) this.clearVideoHoleEvidence();
     this.handleWatchdogSeeked();
     this.endRequested = false;
     try {
