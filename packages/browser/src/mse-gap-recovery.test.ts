@@ -466,6 +466,36 @@ it('a narrow post-hole witness survives a frozen sample with thin forward video'
   } finally { f.adapter.destroy(); }
 });
 
+// A later downshift can leave a second narrow video hole just under a second
+// past where the clock stopped. The capped range must not hold recovery off
+// for good: media past a hole within the jump bound counts as coverage, as
+// long as the nudge still fits inside the current range. Without that room
+// the playhead is at the hole's edge, which the gap-jump owns. A wider later
+// hole does not count.
+it.each(['narrow', 'no nudge room', 'wide'] as const)('a frozen playhead before a later %s hole', async mode => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const capEnd = mode === 'no nudge room' ? 3.6 : 4.5, nextStart = mode === 'wide' ? 7 : capEnd + 0.5;
+  const ranges: Array<[number, number]> = [[0, 1], [2, capEnd], [nextStart, 14]];
+  source.videoBuffer.buffered = makeTimeRanges(ranges);
+  source.audioBuffer.buffered = makeTimeRanges([[0, 14]]);
+  f.video.buffered = makeTimeRanges(ranges);
+  try {
+    f.video.advancePlayback(0.9); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(2.1); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(3.508); f.video.readyState = 2;
+    await vi.advanceTimersByTimeAsync(6000);
+    if (mode === 'narrow') {
+      expect(rungs[0]).toBe(1); expect(f.video.seekCount).toBeGreaterThan(0);
+      expect(f.video.currentTime).toBeLessThan(capEnd); expect(f.jumps).toHaveLength(0);
+    } else if (mode === 'no nudge room') {
+      expect(rungs).toEqual([]); expect(f.jumps).toHaveLength(1);
+    } else {
+      expect(rungs).toEqual([]); expect(f.video.seekCount).toBe(0); expect(f.jumps).toHaveLength(0);
+    }
+  } finally { f.adapter.destroy(); }
+});
+
 // A switch commit can retype (a prefetched init is applied even for the same
 // codec) after the playhead has run past the old video but before the new
 // rendition's first range lands. The retype keeps the coded frames, so the
