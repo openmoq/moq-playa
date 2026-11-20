@@ -796,6 +796,8 @@ export class MseMediaSource implements MediaSourceLike {
   /** Watchdog cadence; detection threshold per escalation rung. */
   private static readonly WEDGE_CHECK_INTERVAL_MS = 1_000;
   private static readonly WEDGE_FROZEN_MS = 2_500;
+  /** Room a rung-1 nudge needs inside the containing range. */
+  private static readonly WEDGE_NUDGE_ROOM_SEC = 0.15;
   private wedgeTimer: ReturnType<typeof setInterval> | null = null;
   /** Last observed currentTime; ladder resets only on ORGANIC movement. */
   private wedgeLastTime: number | null = null;
@@ -1881,7 +1883,20 @@ export class MseMediaSource implements MediaSourceLike {
 
     this.changingType[mediaType] = true;
     this.clearReceivingGroups(mediaType);
-    this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
+    // A retype keeps the coded frames already buffered, so a narrow video
+    // hole the playhead was seen to cross is still there; hasPostHoleCoverage
+    // revalidates it against the native ranges before any recovery. Keeping
+    // it lets the watchdog recover a playhead frozen just past a switch hole
+    // when the next switch changes codec profile (as consecutive downshifts
+    // across an H.264 profile boundary do). A wide-hole witness, which can
+    // authorize skipping media, still retires. With no hole yet, the covered
+    // position also survives: a switch commit can retype after the playhead
+    // has run past the old video but before the new rendition's first range
+    // lands, and that position is what later anchors the hole. Its generation
+    // and buffer identity are revalidated whenever it is used.
+    const hole = this.wedgeVideoHole;
+    if (hole !== null && hole.start - hole.end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC) this.clearVideoHoleEvidence();
+    this.handleWatchdogSeeked();
     this.endRequested = false;
     try {
       const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
@@ -3623,23 +3638,28 @@ export class MseMediaSource implements MediaSourceLike {
     // not paused, not seeking, decodable data ready, media ahead of the
     // playhead within its containing range. Anything else is a normal
     // pause/buffer/seek state owned by the existing paths.
-    let aheadSec = 0;
+    // A narrow hole just ahead (a later switch) caps the containing range. The
+    // media beyond it still counts, as long as a nudge fits inside the range.
+    let aheadSec = 0, forwardSec = 0;
     try {
-      const buffered = v.buffered;
-      for (let i = 0; i < buffered.length; i++) {
-        if (ct >= buffered.start(i) && ct <= buffered.end(i)) {
-          aheadSec = buffered.end(i) - ct;
-          break;
-        }
-      }
+      aheadSec = MseMediaSource.aheadIn(v.buffered, ct, null, false);
+      forwardSec = MseMediaSource.aheadIn(v.buffered, ct, null, true);
     } catch { /* detached element */ }
     let postHole = false;
     if (this.gapJumpMs > 0 && hole !== null && quality !== null && ((v.readyState ?? 0) === 2 || wideHole)) {
       postHole = this.hasPostHoleCoverage(ct, wideHole);
-      if (!postHole) { this.clearVideoHoleEvidence(); this.handleWatchdogSeeked(); }
+      // The audio clock carries the playhead to the end of the buffered video
+      // before it freezes, so the first frozen sample can see under a second
+      // ahead. Thin forward coverage of a still-standing narrow hole only
+      // holds recovery off; a changed hole or a playhead outside its upper
+      // range retires the witness.
+      if (!postHole && (wideHole || !this.isInsideWitnessedUpperRange(ct))) {
+        this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
+      }
     }
     if (v.paused || (v.seeking && !ownSeek) || !this.playbackIntent || (wideHole && (!postHole || (v.readyState ?? 0) < 2))
-        || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec <= 1) {
+        || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec <= MseMediaSource.WEDGE_NUDGE_ROOM_SEC
+        || forwardSec <= 1) {
       this.wedgeFrozenSinceMs = null;
       return;
     }
@@ -3748,16 +3768,43 @@ export class MseMediaSource implements MediaSourceLike {
     } catch { this.wedgeCoveredPosition = null; }
   }
 
+  /** Seconds ahead of `ct` in the range containing it (optionally only one
+   * starting at `start`), continued across later holes no wider than the jump
+   * bound when `bridgeNarrow` is set. */
+  private static aheadIn(ranges: TimeRanges, ct: number, start: number | null, bridgeNarrow: boolean): number {
+    for (let i = 0; i < ranges.length; i++) {
+      if (ct < ranges.start(i) || ct > ranges.end(i) || (start !== null && ranges.start(i) !== start)) continue;
+      let end = ranges.end(i);
+      for (let j = i + 1; bridgeNarrow && j < ranges.length
+          && ranges.start(j) - end <= MseMediaSource.GAP_JUMP_MAX_HOLE_SEC; j++) end = ranges.end(j);
+      return end - ct;
+    }
+    return 0;
+  }
+
   private hasPostHoleCoverage(ct: number, requireAudio: boolean): boolean {
     const hole = this.wedgeVideoHole;
     if (hole === null || this.observeVideoHole(ct, ct) !== hole) return false;
     try {
       const ranges = this.videoBuffer?.buffered, audio = this.audioBuffer?.buffered;
-      return ranges !== undefined && Array.from({ length: ranges.length }, (_, i) => i).some(i =>
-        ranges.start(i) === hole.start && ranges.start(i) <= ct && ranges.end(i) - ct > 1)
+      // A narrow later hole may cap the upper range; media past it counts, but
+      // a nudge must still fit inside the range itself.
+      return ranges !== undefined
+        && MseMediaSource.aheadIn(ranges, ct, hole.start, false) > MseMediaSource.WEDGE_NUDGE_ROOM_SEC
+        && MseMediaSource.aheadIn(ranges, ct, hole.start, true) > 1
         && ((!requireAudio && !audio) || (audio !== undefined && Array.from({ length: audio.length }, (_, i) => i)
           .some(i => audio.start(i) <= ct && audio.end(i) - ct > 1)));
     } catch { return false; /* Detached/evicted native media cannot justify a seek. */ }
+  }
+
+  private isInsideWitnessedUpperRange(ct: number): boolean {
+    const hole = this.wedgeVideoHole;
+    if (hole === null || this.observeVideoHole(ct, ct) !== hole) return false;
+    try {
+      const ranges = this.videoBuffer?.buffered;
+      return ranges !== undefined && Array.from({ length: ranges.length }, (_, i) => i).some(i =>
+        ranges.start(i) === hole.start && ranges.start(i) <= ct && ct <= ranges.end(i));
+    } catch { return false; }
   }
 
   private observeVideoHole(from: number, to: number): typeof this.wedgeVideoHole {
