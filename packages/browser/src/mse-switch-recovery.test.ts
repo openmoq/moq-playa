@@ -391,3 +391,23 @@ it('an armed wide switch hole remains ineligible after crossing both track edges
     expect(f.jumps).toHaveLength(1); expect(f.video.currentTime).toBeCloseTo(6.01, 5);
   } finally { f.adapter.destroy(); }
 });
+
+// A short audio hole at the switch moves the element's gap edge earlier than
+// the reserved video edge, and the playhead stops just inside that gap. The
+// reservation cannot authorize it (its edge differs, and a crossed gap never
+// borrows it), so the gap escalates; nor may the reservation veto the
+// recovery the player then asks for.
+it('an armed reservation neither crosses nor blocks recovery of a crossed gap at an earlier audio edge', async () => {
+  const f = await ready();
+  try {
+    Object.assign(f.video, { duration: Infinity, ended: false });
+    await f.armed(); f.ranges(HOLE, [[0, 3.2], [3.7, 9]]);
+    const escalations: string[] = []; let recovered: boolean | null = null;
+    f.adapter.onError = error => { escalations.push(error.name); recovered = f.adapter.tryRecoverBufferedGap(error); };
+    await f.stall(3.25, 9000);
+    uncrossed(f, 3.25); expect(escalations).toEqual([]);
+    await f.stall(3.25, 3000);
+    expect(escalations).toEqual(['MediaGapUnrecoverableError']); expect(recovered).toBe(true);
+    expect(f.jumps).toHaveLength(1); expect(f.video.currentTime).toBeCloseTo(6.01, 5);
+  } finally { f.adapter.destroy(); }
+});

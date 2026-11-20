@@ -3302,8 +3302,9 @@ export class MseMediaSource implements MediaSourceLike {
     // video-only exception below also checks both native SourceBuffers.
     const tol = MseMediaSource.GAP_IDENTITY_TOLERANCE_SEC;
     let kind: 'combined' | 'video' = 'combined';
-    // Recognize only the immediately crossed BOTH-track gap. This is a
-    // bounded library policy, independent of the wider switch exception.
+    // Recognize only the immediately crossed combined gap. Its width is
+    // judged below exactly as at an edge: a narrow one is jumped after the
+    // wait; a wide one is warned about and escalated, never skipped here.
     const source = this.ms, videoBuffer = this.videoBuffer, audioBuffer = this.audioBuffer;
     const readCrossedGap = () => {
       try {
@@ -3319,16 +3320,29 @@ export class MseMediaSource implements MediaSourceLike {
           }
           return null;
         };
+        // Each SourceBuffer must hold the combined gap's edge in one range and
+        // the landing in the very next one. A track whose range runs past the
+        // playhead (video buffered beyond an audio-only shortfall) qualifies:
+        // the element cannot play there either.
+        const bracket = (ranges: TimeRanges, edge: number, landing: number) => {
+          for (let i = 0; i + 1 < ranges.length; i++) {
+            const begin = ranges.start(i), end = ranges.end(i);
+            const start = ranges.start(i + 1), tail = ranges.end(i + 1);
+            if (![begin, end, start, tail].every(Number.isFinite)
+                || begin >= end || start >= tail) return null;
+            if (begin <= edge && edge <= end && start <= landing && landing < tail) return { begin, end, start, tail };
+          }
+          return null;
+        };
         const combined = adjacent(v.buffered);
         if (!combined || !Number.isFinite(ct)
             || ct - combined.end >= MseMediaSource.GAP_EDGE_WINDOW_SEC
-            || combined.start - combined.end <= tol
-            || combined.start - combined.end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9) return null;
+            || combined.start - combined.end <= tol) return null;
         const landing = combined.start + Math.min(0.01, (combined.tail - combined.start) / 2);
         const duration = v.duration;
         if (!Number.isFinite(landing) || landing <= combined.start || landing >= combined.tail
             || !(duration === Infinity || Number.isFinite(duration) && landing < duration)) return null;
-        const vr = adjacent(videoBuffer.buffered), ar = adjacent(audioBuffer.buffered);
+        const vr = bracket(videoBuffer.buffered, combined.end, landing), ar = bracket(audioBuffer.buffered, combined.end, landing);
         if (!vr || !ar || [vr, ar].some(r => r.begin > combined.end || r.end < combined.end
             || r.start >= landing || r.tail <= landing)
             || Math.abs(Math.max(vr.start, ar.start) - combined.start) > tol
@@ -3408,12 +3422,16 @@ export class MseMediaSource implements MediaSourceLike {
       const landing = nextStart! + Math.min(0.01, ((nextEnd ?? nextStart!) - nextStart!) / 2);
       const covered = [this.videoBuffer, ...(this.audioBuffer ? [this.audioBuffer] : [])].every(buffer =>
         this.nativeRanges(buffer)?.some(([start, end]) => start <= landing && landing < end));
-      if (receiving || !covered || this.switchRecovery || this.hasPendingNativeWork()
+      // A reservation vetoes recovery only for a gap it could authorize; a
+      // crossed gap never borrows it, so it cannot hold that gap's recovery.
+      if (receiving || !covered || (this.switchRecovery && !crossed) || this.hasPendingNativeWork()
           || this.destroyed || generation !== this.bufferGen || this.gapCandidate !== c
           || !this.playbackIntent || v.paused || v.seeking || v.error !== null
           || this.seekResource && !this.seekResource.released) return;
     }
-    if (wide && !recovery && !this.switchRecoveryCovers(curEnd!, nextStart!)) {
+    // A crossed wide gap never borrows the switch allowance: it is only
+    // reported, and escalated if it persists, so the player can recover.
+    if (wide && !recovery && (crossed || !this.switchRecoveryCovers(curEnd!, nextStart!))) {
       if (!c.wideWarned) {
         c.wideWarned = true;
         this.logWarn(

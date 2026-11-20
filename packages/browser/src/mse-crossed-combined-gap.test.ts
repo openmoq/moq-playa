@@ -333,3 +333,47 @@ for (const attachment of ['object-url', 'src-object'] as const) {
     },
   );
 }
+
+// A playhead that stopped a few ms past the edge of a wide combined gap used
+// to be ignored for good: no candidate, no warning, no escalation. It now
+// takes the edge path's wide-hole outcome: no skip, then one escalation after
+// GAP_WIDE_HOLE_FATAL_MS that the player can turn into a recovery.
+it.each(['both-track', 'audio-shortfall'] as const)('a crossed wide %s gap escalates once and is recoverable, never skipped on its own', async shape => {
+  const f = await fixture();
+  try {
+    if (shape === 'both-track') {
+      native.videoBuffer.buffered = makeTimeRanges([[1.5, END], [13.2, 131.499999]]);
+      native.audioBuffer.buffered = makeTimeRanges([[1.045333, 11.013333], [13.221333, 131.930666]]);
+      f.video.buffered = makeTimeRanges([[1.5, END], [13.221333, 131.499999]]);
+    } else {
+      // The acceptance shape: video runs past the playhead, audio has a short
+      // hole, so the element's gap starts at the audio edge and spans both.
+      native.videoBuffer.buffered = makeTimeRanges([[1.5, 11.5], [13.2, 131.499999]]);
+      native.audioBuffer.buffered = makeTimeRanges([[1.045333, END], [11.541333, 131.930666]]);
+      f.video.buffered = makeTimeRanges([[1.5, END], [13.2, 131.499999]]);
+    }
+    const landing = (shape === 'both-track' ? 13.221333 : 13.2) + 0.01;
+    const escalations: string[] = []; let recovered: boolean | null = null;
+    f.adapter.onError = e => { escalations.push(e.name); recovered = f.adapter.tryRecoverBufferedGap(e); };
+    await vi.advanceTimersByTimeAsync(9000);
+    f.record(`crossed-wide-${shape}-before`);
+    expect(f.video.seekCount).toBe(0); expect(f.jumps).toHaveLength(0); expect(escalations).toEqual([]);
+    await vi.advanceTimersByTimeAsync(3000);
+    f.record(`crossed-wide-${shape}-after`);
+    expect(escalations).toEqual(['MediaGapUnrecoverableError']);
+    expect(recovered).toBe(true);
+    expect(f.jumps).toHaveLength(1); expect(f.video.currentTime).toBeCloseTo(landing, 5);
+  } finally { await f.close(); }
+});
+
+it('a crossed wide gap past the edge window stays ignored', async () => {
+  const f = await fixture(11.6);
+  try {
+    native.videoBuffer.buffered = makeTimeRanges([[1.5, END], [13.2, 131.499999]]);
+    native.audioBuffer.buffered = makeTimeRanges([[1.045333, 11.013333], [13.221333, 131.930666]]);
+    f.video.buffered = makeTimeRanges([[1.5, END], [13.221333, 131.499999]]);
+    await vi.advanceTimersByTimeAsync(15000);
+    f.record('crossed-wide-deep');
+    expect(f.errors).toEqual([]); expect(f.video.seekCount).toBe(0); expect(f.jumps).toHaveLength(0);
+  } finally { await f.close(); }
+});
