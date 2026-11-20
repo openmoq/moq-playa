@@ -38,6 +38,9 @@ import {
   type TrunSample,
 } from './mp4-box.js';
 
+// Matches the player's default lateFrameThresholdMs.
+const AUDIO_START_CLAMP_MS = 100;
+
 const SOURCE_PARTIAL = Object.freeze({ state: 'partial' as const });
 const SOURCE_REFUSED = Object.freeze({ state: 'refused' as const });
 const SOURCE_UNAVAILABLE = Object.freeze({ state: 'unavailable' as const });
@@ -606,6 +609,7 @@ export class CmafAssembler {
         const segment = new Uint8Array(payload.byteLength);
         segment.set(payload);
         let pos = moofOffset;
+        let segmentStart = 0, hasPlayableChunk = false;
         let sourcePresentationTimeUs: bigint | null = null;
         let sourceDecodeTimeUs: bigint | null = null;
         let sourceTimescale: number | null = null;
@@ -625,12 +629,22 @@ export class CmafAssembler {
               if (ticks === null || timescale === null) sourceTimingAvailable = false;
               else sourcePresentationTimeUs = ticks * 1_000_000n / BigInt(timescale);
             }
-            if (!this.patchEpoch(mediaType, trackName, chunkMoof, groupId, trackIdentity, sourceKey)) { this.discardInput(input, 'epoch refused'); return sourceTiming ? SOURCE_REFUSED : undefined; }
+            const patched = this.patchEpoch(mediaType, trackName, chunkMoof, groupId, trackIdentity, sourceKey);
+            if (patched !== true) {
+              // draft-ietf-moq-cmsf-01 §3.3: retain successive playable audio chunks.
+              if (mediaType === 'audio' && !hasPlayableChunk && patched === 'before zero') {
+                segmentStart = -1; sourceTimingAvailable = true; pos += size; continue;
+              }
+              this.discardInput(input, 'epoch refused'); return sourceTiming ? SOURCE_REFUSED : undefined;
+            }
+            if (segmentStart < 0) segmentStart = pos;
+            hasPlayableChunk = true;
           }
           pos += size;
         }
+        if (segmentStart < 0) { this.discardInput(input, 'epoch refused'); return sourceTiming ? SOURCE_REFUSED : undefined; }
         const revision = sourceTiming ? this.placementState(mediaType).revision : -1;
-        this.emitSegment(mediaType, segment, trackName, groupId, input === undefined ? undefined : [input], sourceKey);
+        this.emitSegment(mediaType, segmentStart === 0 ? segment : segment.subarray(segmentStart), trackName, groupId, input === undefined ? undefined : [input], sourceKey);
         this.flushStartupGeometry();
         return sourceTiming ? this.sourceTimingReceipt(mediaType,
           sourceTimingAvailable ? sourcePresentationTimeUs : null,
@@ -688,7 +702,7 @@ export class CmafAssembler {
           if (decodeTicks !== null) sourceDecodeTimeUs = decodeTicks * 1_000_000n / BigInt(timescale);
         }
       }
-      if (!this.patchEpoch(mediaType, trackName, pending, groupId, trackIdentity, sourceKey)) {
+      if (this.patchEpoch(mediaType, trackName, pending, groupId, trackIdentity, sourceKey) !== true) {
         this.discardInput(priorInput, 'epoch refused'); this.discardInput(input, 'epoch refused'); return sourceTiming ? SOURCE_REFUSED : undefined;
       }
 
@@ -1033,8 +1047,12 @@ export class CmafAssembler {
     }
 
     const shared = this.scaledSharedEpoch(timescale)!;
-    if (shared <= bmd) return shared;
+    // Startup audio retains the shared clock even when its first output is refused
+    // (draft-ietf-moq-msf-02 §5.2.12), so restart history survives that refusal.
+    if (shared <= bmd || (mediaType === 'audio' && this.sharedEpochGen === 0)) return shared;
     const outputOffset = this.scaledSharedOutputOffset(timescale) ?? 0n;
+    // Earlier video still depends on arrival order: it must start at a sync
+    // sample, so refusal costs a GOP or more (draft-ietf-moq-cmsf-01 §3.4).
     return outputOffset >= shared - bmd ? shared : bmd;
   }
 
@@ -1095,7 +1113,7 @@ export class CmafAssembler {
     groupId: bigint,
     trackIdentity: string,
     sourceKey?: string,
-  ): boolean {
+  ): boolean | 'before zero' {
     const rawBmd = readBaseMediaDecodeTime(moof);
     if (rawBmd === null) return true;
     const placement = this.placementState(mediaType);
@@ -1252,15 +1270,23 @@ export class CmafAssembler {
       }
     }
 
-    const currentEpoch = mediaType === 'video' ? this.videoEpoch! : this.audioEpoch!;
+    let currentEpoch = mediaType === 'video' ? this.videoEpoch! : this.audioEpoch!;
     const outputOffset = mediaType === 'video' ? this.videoOutputOffset : this.audioOutputOffset;
+    const startupAudio = mediaType === 'audio' && this.epochMode === 'shared' && this.sharedEpochGen === 0
+      && this.audioTimescale !== null && !mappedAudio && (!isTrackSwitch || this.lastAudioOutputBmd === null);
+    // Keep a straddling first frame with bounded skew; wholly early frames remain refused.
+    if (startupAudio && this.lastAudioOutputBmd === null && bmd < currentEpoch
+        && (currentEpoch - bmd) * 1000n <= BigInt(this.audioTimescale! * AUDIO_START_CLAMP_MS)) {
+      const end = readSegmentTimeRanges(moof, this.audioTrex ?? undefined)?.[0]?.endTime;
+      if (end !== undefined && end > currentEpoch) this.audioEpoch = currentEpoch = bmd;
+    }
     if (currentEpoch !== previousEpoch || outputOffset !== previousOffset
         || (mediaType === 'video' ? this.videoEpochGen : this.audioEpochGen) !== previousEpochGen
         || (mediaType === 'video' ? this.videoTrackIdentity : this.audioTrackIdentity) !== previousTrack) {
       this.invalidatePlacement(placement);
     }
     const patchedBmd = outputOffset + bmd - currentEpoch;
-    if (patchedBmd < 0n) return false;
+    if (patchedBmd < 0n) return startupAudio ? 'before zero' : false;
     patchBaseMediaDecodeTime(moof, patchedBmd);
     placement.patched = placement.revision;
     if (mediaType === 'video') {
@@ -1301,7 +1327,7 @@ export class CmafAssembler {
   private patchPresentationPlacement(
     mediaType: 'video' | 'audio', trackIdentity: string, moof: Uint8Array, groupId: bigint,
     rawBmd: bigint, placement: PlacementState,
-  ): boolean {
+  ): boolean | 'before zero' {
     const map = placement.map!;
     const timescale = mediaType === 'video' ? this.videoTimescale : this.audioTimescale;
     if (map.refused || timescale === null || timescale <= 0) return false;
@@ -1323,7 +1349,8 @@ export class CmafAssembler {
     const tfdt = findTfdtOffset(moof);
     if (tfdt === null || tfdt.version !== 0 && tfdt.version !== 1) return false;
     const max = tfdt.version === 0 ? 0xffff_ffffn : 0xffff_ffff_ffff_ffffn;
-    if (patched < 0n || patched > max) return false;
+    if (patched < 0n) return 'before zero';
+    if (patched > max) return false;
     if (newSource) {
       map.replaced = false;
       if (mediaType === 'video') {

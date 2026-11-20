@@ -10,7 +10,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { CmafAssembler } from './cmaf-assembler.js';
 import {
-  readU32, writeU32, boxType,
+  writeU32, boxType,
   findTfdtOffset, readBaseMediaDecodeTime, patchBaseMediaDecodeTime,
   readSegmentTimeRanges,
 } from './mp4-box.js';
@@ -850,7 +850,7 @@ describe('CmafAssembler — shared cross-track epoch', () => {
 
   function assemblerWithInits(onDiscontinuity?: ReturnType<typeof vi.fn>) {
     const onSegment = vi.fn();
-    const assembler = new CmafAssembler({ onSegment, onDiscontinuity });
+    const assembler = new CmafAssembler({ onSegment, ...(onDiscontinuity ? { onDiscontinuity } : {}) });
     assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
     assembler.setInitSegment('audio', initWithTimescale(AUDIO_TS));
     return { assembler, onSegment };
@@ -885,17 +885,184 @@ describe('CmafAssembler — shared cross-track epoch', () => {
     expect(outBmd(onSegment, 3)).toBe(BigInt(2.75 * VIDEO_TS));
   });
 
-  it('clamps to its own bmd when the second track starts before the epoch track (no negative tfdt)', () => {
-    const { assembler, onSegment } = assemblerWithInits();
-
-    // Video fragment arrives first at t=10s, audio then arrives with
-    // EARLIER content (t=9.5s). Rebasing audio against the shared
-    // epoch would go negative — it must clamp to its own start.
+  it('refuses early audio without shifting later audio or emitting negative decode times', () => {
+    const onSegment = vi.fn(), onDiscard = vi.fn(), onStartupGeometry = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscard });
+    assembler.onStartupGeometry = onStartupGeometry;
+    assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+    assembler.setInitSegment('audio', initWithTimescale(AUDIO_TS));
+    const input = {};
     assembler.push('video', 'video0', 0n, concat(buildMoof(10 * VIDEO_TS), buildMdat(new Uint8Array([1]))));
-    assembler.push('audio', 'audio0', 0n, concat(buildMoof(9.5 * AUDIO_TS), buildMdat(new Uint8Array([2]))));
+    expect(assembler.push('audio', 'audio0', 0n,
+      concat(buildMoof(9.5 * AUDIO_TS), buildMdat(new Uint8Array([2]))), input, true)).toEqual({ state: 'refused' });
+    expect(onDiscard).toHaveBeenCalledExactlyOnceWith(input, 'epoch refused');
+    expect(onSegment).toHaveBeenCalledTimes(1);
+    expect(onStartupGeometry).not.toHaveBeenCalled();
+    assembler.push('audio', 'audio0', 1n, concat(buildMoof(10 * AUDIO_TS), buildMdat(new Uint8Array([3]))));
+    expect([outBmd(onSegment, 0), outBmd(onSegment, 1)]).toEqual([0n, 0n]);
+    expect(onStartupGeometry).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      audioRawBmd: String(10 * AUDIO_TS), videoRawBmd: String(10 * VIDEO_TS),
+      audioStartSec: 0, videoStartSec: 0, gapSec: 0,
+    }));
+  });
 
-    expect(outBmd(onSegment, 0)).toBe(0n);
-    expect(outBmd(onSegment, 1)).toBe(0n); // clamped, not -0.5s
+  it('preserves retained timestamp geometry in both arrival orders with different timescales', () => {
+    // draft-ietf-moq-msf-02 §5.2.12: render-group tracks accompany one another.
+    const geometries = [false, true].map(audioFirst => {
+      const { assembler, onSegment } = assemblerWithInits();
+      const audio = (seconds: number) => assembler.push('audio', 'audio0', 0n,
+        concat(buildMoof(seconds * AUDIO_TS), buildMdat(new Uint8Array([1]))));
+      if (audioFirst) audio(9.5);
+      assembler.push('video', 'video0', 0n, concat(buildMoof(10 * VIDEO_TS), buildMdat(new Uint8Array([2]))));
+      if (!audioFirst) audio(9.5);
+      audio(10); audio(10.5);
+      const video = onSegment.mock.calls.find(call => call[0] === 'video')!;
+      const videoStart = Number(readBaseMediaDecodeTime(video[1])) / VIDEO_TS;
+      return onSegment.mock.calls.slice(-2).map(call =>
+        Number(readBaseMediaDecodeTime(call[1])) / AUDIO_TS - videoStart);
+    });
+    expect(geometries).toEqual([[0, 0.5], [0, 0.5]]);
+  });
+
+  it.each([false, true])('keeps the playable audio suffix and its receipt with explicit placement=%s', placed => {
+    // draft-ietf-moq-cmsf-01 §3.3 permits successive chunks in one Object.
+    const onSegment = vi.fn(), onDiscard = vi.fn(), onStartupGeometry = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscard });
+    assembler.onStartupGeometry = onStartupGeometry;
+    assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+    assembler.setInitSegment('audio', initWithTimescale(AUDIO_TS));
+    assembler.push('video', 'video0', 0n, concat(buildMoof(10 * VIDEO_TS), buildMdat(new Uint8Array([1]))));
+    if (placed) assembler.setPresentationPlacement('audio', {
+      sourceTimeUs: 10_000_000n, rebasedTimeUs: { numerator: 0n, denominator: 1n },
+    });
+    const chunk = (seconds: number) => concat(buildMoof(seconds * AUDIO_TS, 1, AUDIO_TS / 2), buildMdat(new Uint8Array([2])));
+    const refused = {};
+    expect(assembler.push('audio', 'audio0', 0n, concat(chunk(9), chunk(9.5)), refused, true))
+      .toEqual({ state: 'refused' });
+    expect(onDiscard).toHaveBeenCalledExactlyOnceWith(refused, 'epoch refused');
+    const input = {}, bytes = concat(chunk(9.5), chunk(10), chunk(10.5)), original = bytes.slice();
+    const receipt = assembler.push('audio', 'audio0', 1n, bytes, input, true);
+    expect(receipt?.state).toBe('emitted');
+    expect(receipt).toEqual({ state: 'emitted', sourcePresentationTimeUs: 10_500_000n,
+      sourceDecodeTime: { timeUs: 10_500_000n, timescale: AUDIO_TS,
+        placementToken: assembler.capturePresentationPlacement('audio')!.token } });
+    expect(onSegment).toHaveBeenCalledTimes(2);
+    expect(onSegment.mock.calls[1]![4]).toEqual([input]);
+    expect(readSegmentTimeRanges(onSegment.mock.calls[1]![1])!.map(range => range.startTime)).toEqual([0n, 24000n]);
+    expect(bytes).toEqual(original);
+    expect(onDiscard).toHaveBeenCalledTimes(1);
+    expect(onStartupGeometry).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      audioRawBmd: String(10 * AUDIO_TS), audioStartSec: 0, gapSec: 0,
+    }));
+  });
+
+  it('discards both pending audio halves before zero and accepts the next pair', () => {
+    const onSegment = vi.fn(), onDiscard = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscard });
+    assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+    assembler.setInitSegment('audio', initWithTimescale(AUDIO_TS));
+    assembler.push('video', 'video0', 0n, concat(buildMoof(10 * VIDEO_TS), buildMdat(new Uint8Array([1]))));
+    const moofInput = {}, mdatInput = {}, mdat = buildMdat(new Uint8Array([2]));
+    expect(assembler.push('audio', 'audio0', 0n, buildMoof(9.5 * AUDIO_TS), moofInput, true)).toEqual({ state: 'partial' });
+    expect(assembler.push('audio', 'audio0', 0n, mdat, mdatInput, true)).toEqual({ state: 'refused' });
+    expect(onDiscard.mock.calls).toEqual([[moofInput, 'epoch refused'], [mdatInput, 'epoch refused']]);
+    assembler.push('audio', 'audio0', 1n, buildMoof(10 * AUDIO_TS));
+    assembler.push('audio', 'audio0', 1n, mdat);
+    expect(onSegment).toHaveBeenCalledTimes(2);
+    expect(outBmd(onSegment, 1)).toBe(0n);
+  });
+
+  it.each([
+    { start: 9, next: 10, description: 'wholly before zero' },
+    { start: 9.6, next: 10.1, description: 'straddling zero by more than 100 ms' },
+  ])('refuses switched startup audio $description without shifting later audio', ({ start, next }) => {
+    const onSegment = vi.fn(), onDiscard = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscard });
+    assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+    assembler.setInitSegment('audio', initWithTimescale(AUDIO_TS));
+    const chunk = (seconds: number) => concat(buildMoof(Math.round(seconds * AUDIO_TS), 1, AUDIO_TS / 2),
+      buildMdat(new Uint8Array([1])));
+    assembler.push('video', 'video0', 0n, concat(buildMoof(10 * VIDEO_TS), buildMdat(new Uint8Array([1]))));
+    assembler.push('audio', 'audio0', 0n, chunk(9.5));
+    assembler.selectTrack('audio', 'audio1');
+    const input = {};
+    expect(assembler.push('audio', 'audio1', 0n, chunk(start), input, true)).toEqual({ state: 'refused' });
+    expect(onDiscard).toHaveBeenCalledExactlyOnceWith(input, 'epoch refused');
+    expect(onSegment).toHaveBeenCalledTimes(1);
+    assembler.push('audio', 'audio1', 1n, chunk(next));
+    expect(onSegment).toHaveBeenCalledTimes(2);
+    expect(outBmd(onSegment, 1)).toBe(BigInt(Math.round((next - 10) * AUDIO_TS)));
+  });
+
+  it('rejoins audio after a restart during startup refusal with delayed old audio', () => {
+    const { assembler, onSegment } = assemblerWithInits();
+    const push = (type: 'video' | 'audio', group: bigint, seconds: number, duration: number) =>
+      assembler.push(type, type, group, concat(buildMoof(Math.round(seconds * (type === 'video' ? VIDEO_TS : AUDIO_TS)),
+        1, duration * (type === 'video' ? VIDEO_TS : AUDIO_TS)), buildMdat(new Uint8Array([1]))));
+    push('video', 100n, 200, 1);
+    push('audio', 100n, 199.4, 0.5);
+    push('video', 101n, 1, 1);
+    push('audio', 100n, 199.9, 0.5);
+    push('audio', 101n, 0.4, 0.5);
+    push('audio', 101n, 0.9, 0.5);
+    const audio = onSegment.mock.calls.filter(call => call[0] === 'audio');
+    expect(audio.map(call => Number(readBaseMediaDecodeTime(call[1])) / AUDIO_TS)).toEqual([0.4, 0.9]);
+    expect(Number(outBmd(onSegment, 1)) / VIDEO_TS).toBe(1);
+  });
+
+  it('accepts an audio presentation offset after refusing its first fragment', () => {
+    const { assembler, onSegment } = assemblerWithInits();
+    assembler.push('video', 'video0', 0n, concat(buildMoof(10 * VIDEO_TS), buildMdat(new Uint8Array([1]))));
+    assembler.push('audio', 'audio0', 0n, concat(buildMoof(9.5 * AUDIO_TS), buildMdat(new Uint8Array([1]))));
+    expect(() => assembler.setAudioPresentationOffsetUs(0n)).not.toThrow();
+    assembler.push('audio', 'audio0', 0n, concat(buildMoof(10 * AUDIO_TS), buildMdat(new Uint8Array([1]))));
+    expect(outBmd(onSegment, 1)).toBe(0n);
+  });
+
+  it('clamps a straddling audio chunk only when its pre-zero part is at most 100 ms', () => {
+    for (const leadMs of [16, 100, 150]) {
+      const { assembler, onSegment } = assemblerWithInits();
+      assembler.push('video', 'video0', 0n, concat(buildMoof(10 * VIDEO_TS), buildMdat(new Uint8Array([1]))));
+      const start = 10 * AUDIO_TS - leadMs * AUDIO_TS / 1000;
+      assembler.push('audio', 'audio0', 0n, concat(buildMoof(start, 1, 2 * AUDIO_TS), buildMdat(new Uint8Array([1]))));
+      expect(onSegment).toHaveBeenCalledTimes(leadMs <= 100 ? 2 : 1);
+      if (leadMs <= 100) {
+        expect(outBmd(onSegment, 1)).toBe(0n);
+        expect(assembler.getEpoch('audio')).toBe(BigInt(start));
+        assembler.push('audio', 'audio0', 1n, concat(buildMoof(12 * AUDIO_TS, 2, 2 * AUDIO_TS), buildMdat(new Uint8Array([1]))));
+        expect(outBmd(onSegment, 2)).toBe(BigInt(2 * AUDIO_TS + leadMs * AUDIO_TS / 1000));
+      }
+    }
+  });
+
+  it('refuses whole audio frames before zero and keeps the first straddling frame', () => {
+    const onSegment = vi.fn(), onDiscard = vi.fn();
+    const assembler = new CmafAssembler({ onSegment, onDiscard });
+    assembler.setInitSegment('video', initWithTimescale(VIDEO_TS));
+    assembler.setInitSegment('audio', initWithTimescale(AUDIO_TS));
+    assembler.push('video', 'video0', 0n, concat(buildMoof(10 * VIDEO_TS), buildMdat(new Uint8Array([1]))));
+    for (const lead of [3072, 2304, 1536, 1024, 768]) assembler.push('audio', 'audio0', 0n,
+      concat(buildMoof(10 * AUDIO_TS - lead, 1, 1024), buildMdat(new Uint8Array([1]))), {});
+    expect(onDiscard).toHaveBeenCalledTimes(4);
+    expect(onSegment).toHaveBeenCalledTimes(2);
+    expect(outBmd(onSegment, 1)).toBe(0n);
+    expect(assembler.getEpoch('audio')).toBe(479232n);
+  });
+
+  it('retains a pre-zero object suffix after audio anchoring but refuses retired groups', () => {
+    const { assembler, onSegment } = assemblerWithInits();
+    const chunk = (seconds: number) => concat(buildMoof(seconds * AUDIO_TS, 1, AUDIO_TS / 2), buildMdat(new Uint8Array([1])));
+    assembler.push('video', 'video0', 100n, concat(buildMoof(10 * VIDEO_TS, 1, VIDEO_TS), buildMdat(new Uint8Array([1]))));
+    assembler.push('audio', 'audio0', 100n, chunk(10));
+    const receipt = assembler.push('audio', 'audio0', 100n, concat(chunk(9.5), chunk(10), chunk(10.5)), undefined, true);
+    expect(receipt?.state).toBe('emitted');
+    expect(readSegmentTimeRanges(onSegment.mock.calls[2]![1])!.map(range => range.startTime)).toEqual([0n, 24000n]);
+    assembler.push('video', 'video0', 101n, concat(buildMoof(VIDEO_TS, 1, VIDEO_TS), buildMdat(new Uint8Array([1]))));
+    assembler.push('audio', 'audio0', 101n, chunk(1));
+    const count = onSegment.mock.calls.length;
+    expect(assembler.push('audio', 'audio0', 100n, concat(chunk(0.5), chunk(1), chunk(1.5)), undefined, true))
+      .toEqual({ state: 'refused' });
+    expect(onSegment).toHaveBeenCalledTimes(count);
   });
 
   it('re-anchors BOTH tracks to one new shared epoch after a publisher restart', () => {
