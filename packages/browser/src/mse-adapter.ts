@@ -1918,7 +1918,20 @@ export class MseMediaSource implements MediaSourceLike {
 
     this.changingType[mediaType] = true;
     this.clearReceivingGroups(mediaType);
-    this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
+    // A retype keeps the coded frames already buffered, so a narrow video
+    // hole the playhead was seen to cross is still there; hasPostHoleCoverage
+    // revalidates it against the native ranges before any recovery. Keeping
+    // it lets the watchdog recover a playhead frozen just past a switch hole
+    // when the next switch changes codec profile (as consecutive downshifts
+    // across an H.264 profile boundary do). A wide-hole witness, which can
+    // authorize skipping media, still retires. With no hole yet, the covered
+    // position also survives: a switch commit can retype after the playhead
+    // has run past the old video but before the new rendition's first range
+    // lands, and that position is what later anchors the hole. Its generation
+    // and buffer identity are revalidated whenever it is used.
+    const hole = this.wedgeVideoHole;
+    if (hole !== null && hole.start - hole.end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC) this.clearVideoHoleEvidence();
+    this.handleWatchdogSeeked();
     this.endRequested = false;
     try {
       const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
@@ -3691,7 +3704,14 @@ export class MseMediaSource implements MediaSourceLike {
     let postHole = false;
     if (this.gapJumpMs > 0 && hole !== null && quality !== null && ((v.readyState ?? 0) === 2 || wideHole)) {
       postHole = this.hasPostHoleCoverage(ct, wideHole);
-      if (!postHole) { this.clearVideoHoleEvidence(); this.handleWatchdogSeeked(); }
+      // The audio clock carries the playhead to the end of the buffered video
+      // before it freezes, so the first frozen sample can see under a second
+      // ahead. Thin forward coverage of a still-standing narrow hole only
+      // holds recovery off; a changed hole or a playhead outside its upper
+      // range retires the witness.
+      if (!postHole && (wideHole || !this.isInsideWitnessedUpperRange(ct))) {
+        this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
+      }
     }
     if (v.paused || (v.seeking && !ownSeek) || !this.playbackIntent || (wideHole && (!postHole || (v.readyState ?? 0) < 2))
         || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec <= 1) {
@@ -3813,6 +3833,16 @@ export class MseMediaSource implements MediaSourceLike {
         && ((!requireAudio && !audio) || (audio !== undefined && Array.from({ length: audio.length }, (_, i) => i)
           .some(i => audio.start(i) <= ct && audio.end(i) - ct > 1)));
     } catch { return false; /* Detached/evicted native media cannot justify a seek. */ }
+  }
+
+  private isInsideWitnessedUpperRange(ct: number): boolean {
+    const hole = this.wedgeVideoHole;
+    if (hole === null || this.observeVideoHole(ct, ct) !== hole) return false;
+    try {
+      const ranges = this.videoBuffer?.buffered;
+      return ranges !== undefined && Array.from({ length: ranges.length }, (_, i) => i).some(i =>
+        ranges.start(i) === hole.start && ranges.start(i) <= ct && ct <= ranges.end(i));
+    } catch { return false; }
   }
 
   private observeVideoHole(from: number, to: number): typeof this.wedgeVideoHole {
