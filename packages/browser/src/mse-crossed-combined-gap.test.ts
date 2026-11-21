@@ -43,6 +43,41 @@ it('measured crossed BOTH-track narrow gap seeks into the shared future range af
  expect(f.jumps[0].holeSec).toBeCloseTo(NEXT-END,6);expect(f.jumps[0].waitedMs).toBeGreaterThanOrEqual(2000);
  }finally{await f.close();}
 });
+it.each(['audio', 'video'] as const)(
+  'a narrow crossed %s-shortfall gap jumps once into the shared range after the wait with modeled buffers',
+  async shortfall => {
+    const f = await fixture();
+    try {
+      const sharedStart = shortfall === 'audio' ? 12.5 : 12.52;
+      native.videoBuffer.buffered = makeTimeRanges([
+        [1.5, shortfall === 'audio' ? 11.5 : END], [12.5, 131.5],
+      ]);
+      native.audioBuffer.buffered = makeTimeRanges(shortfall === 'audio'
+        ? [[1.045333, END], [11.541333, 131.930666]]
+        : [[1.045333, 11.6], [12.52, 131.930666]]);
+      f.video.buffered = makeTimeRanges([[1.5, END], [sharedStart, 131.5]]);
+
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(f.video.currentTime).toBe(CT);
+      expect(f.video.seekCount).toBe(0);
+      expect(f.jumps).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(f.video.seekCount).toBe(1);
+      expect(f.jumps).toHaveLength(1);
+      expect(f.video.currentTime).toBeCloseTo(sharedStart + 0.01, 6);
+      expect(f.jumps[0].from).toBe(CT);
+      expect(f.jumps[0].to).toBeCloseTo(sharedStart + 0.01, 6);
+      expect(f.jumps[0].holeSec).toBeCloseTo(sharedStart - END, 6);
+      expect(f.jumps[0].waitedMs).toBe(2000);
+
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(f.video.seekCount).toBe(1);
+      expect(f.jumps).toHaveLength(1);
+      expect(f.errors).toEqual([]);
+    } finally { await f.close(); }
+  },
+);
 it('CONTROL: inside previous combined range recovers to the safe combined landing',async()=>{
  const f=await fixture(EDGE);try{await vi.advanceTimersByTimeAsync(4000);f.record('inside-previous');expect(f.jumps).toHaveLength(1);expect(f.video.currentTime).toBeCloseTo(LAND,6);}finally{await f.close();}
 });
