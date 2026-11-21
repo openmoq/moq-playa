@@ -111,7 +111,8 @@ async function startPlaying(adapter: any, overrides?: Partial<MoqtPlayerConfig>)
   adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: catalogReqId, trackAlias: catalogReqId, parameters: new Map() } as unknown as ControlMessage);
   adapter._triggerObject(0n, { kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
     objectId: varint(0), payload: new TextEncoder().encode(CATALOG_JSON) } as MoqtObject);
-  await new Promise((r) => setTimeout(r, 0));
+  if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(0);
+  else await new Promise((r) => setTimeout(r, 0));
   expect(names(adapter).slice(1, 3)).toEqual(['video-hi', 'audio']);
   const videoReqId = await adapter.subscribe.mock.results[1]?.value;
   const audioReqId = await adapter.subscribe.mock.results[2]?.value;
@@ -187,5 +188,34 @@ describe('refused video switch target', () => {
         videoReqId, expect.objectContaining({ subscriptionFilter: { type: 'NextGroupStart' } })), { timeout: 1_000 });
       feedVideo(adapter); // the origin is back
     } finally { await player.destroy(); }
+  });
+});
+
+// Unit doubles: no target response arrives before the switch deadline.
+describe('starvation during an unanswered switch', () => {
+  it('refreshes the playing track after the switch deadline', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'performance'] });
+    const adapter = createMockAdapter();
+    const { player, videoReqId } = await startPlaying(adapter, {
+      livenessTimeoutMs: 60, livenessResetProbeMs: 40, livenessMaxRestarts: 2,
+      livenessRestartBackoffMs: 20, livenessHealthyResetMs: 10_000,
+    });
+    const failed: Error[] = [];
+    player.on('quality_switch_failed', e => { if (e.error) failed.push(e.error); });
+    try {
+      feedVideo(adapter);
+      await startSwitch(player, adapter);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(failed).toHaveLength(0);
+      expect(adapter.requestUpdate).not.toHaveBeenCalledWith(videoReqId, expect.anything());
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(failed).toHaveLength(1);
+      expect(failed[0]?.message).toMatch(/deadline/);
+      expect(adapter.requestUpdate).toHaveBeenCalledWith(videoReqId,
+        expect.objectContaining({ subscriptionFilter: { type: 'NextGroupStart' } }));
+    } finally {
+      await player.destroy();
+      vi.useRealTimers();
+    }
   });
 });
