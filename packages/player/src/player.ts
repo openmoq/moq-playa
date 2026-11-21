@@ -1606,6 +1606,9 @@ export class MoqtPlayer {
    * (livenessTimeoutMs: 0).
    */
   private livenessMonitor: MediaLivenessMonitor | null = null;
+  /** A video starvation incident deferred because a switch was pending. */
+  private starvedDuringSwitch: { track: LivenessTrack; starvedForMs: number; healthyForMs: number;
+    connection: MoqtConnection | null; lastArrivalMs: number | undefined } | null = null;
 
   /**
    * streamId to track alias and group for SUBGROUP data streams only. Lets a stream
@@ -4466,6 +4469,7 @@ export class MoqtPlayer {
     sw: NonNullable<MoqtPlayer['pendingVideoSwitch']>, cause: Error,
   ): boolean {
     if (sw.phase === 'retired' || sw.phase === 'committed') return false;
+    this.resumeStarvationAfterSwitch();
     this.revokeVideoSwitchRecovery(sw);
     sw.phase = 'retired';
     sw.failure = cause;
@@ -8703,6 +8707,22 @@ export class MoqtPlayer {
   private handoverBlocked(): boolean {
     return this.currentMigration !== null || this.mediaSelection !== null || this.pendingRetypes.size > 0
       || this.pendingVideoSwitch !== null || this.switchInProgress;
+  }
+
+  /**
+   * Raise again a video starvation incident that a pending switch deferred,
+   * once that switch has failed and the track is still silent.
+   */
+  private resumeStarvationAfterSwitch(): void {
+    const deferred = this.starvedDuringSwitch;
+    this.starvedDuringSwitch = null;
+    if (!deferred) return;
+    queueMicrotask(() => {
+      if (this.pendingVideoSwitch || this.connection !== deferred.connection) return;
+      if (!this.activeSubscriptions.has(deferred.track.requestId)) return;
+      if (this.livenessMonitor?.lastArrivalForRequest(deferred.track.requestId) !== deferred.lastArrivalMs) return;
+      void this.handleTrackStarvation(deferred.track, deferred.starvedForMs, deferred.healthyForMs);
+    });
   }
 
   /** A video switch released its slot; act on a GOAWAY it deferred once its settlement finishes. */
@@ -12950,6 +12970,15 @@ export class MoqtPlayer {
         }
       },
       onMediaSubscribeError: (requestId, trackName, mediaType, reason, errorCode, retryInterval) => {
+        // A refused switch target can never deliver: fail the switch now and
+        // keep the playing track, rather than waiting out the staging deadline.
+        const sw = this.pendingVideoSwitch;
+        if (sw && sw.newRequestId === requestId && sw.connection === conn && this.switchIsCurrent(sw)) {
+          // The refusal ended the request; there is nothing to unsubscribe.
+          if (sw.connection === this.connection) this.clearLocmafDecoderForRequest(requestId);
+          sw.requestReleased = true;
+          this.abortPendingVideoSwitch(sw, new Error(`Switch target "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`));
+        }
         // Latch the owning response before application callbacks can replace or
         // cancel recovery. Errors for another request/session cannot end its probe.
         let recovering = false;
@@ -15112,9 +15141,13 @@ export class MoqtPlayer {
         || (!announced && restart.announced && this.livenessRetryRefused(restart))) return;
 
     // A pending video switch already implies a fresh subscription — let it
-    // finish (it has its own staging timeout). If the track is still starved
-    // afterwards, the monitor fires again.
-    if (track.mediaType === 'video' && this.pendingVideoSwitch) return;
+    // finish (it has its own staging timeout). The monitor reports an
+    // incident only once, so a switch that fails hands it back.
+    if (track.mediaType === 'video' && this.pendingVideoSwitch) {
+      this.starvedDuringSwitch = { track, starvedForMs, healthyForMs, connection,
+        lastArrivalMs: this.livenessMonitor?.lastArrivalForRequest(track.requestId) };
+      return;
+    }
 
     // Budget reset on REAL health: the monitor reports the uninterrupted
     // arrival streak that preceded this starvation — not merely time since
