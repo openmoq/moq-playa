@@ -130,9 +130,9 @@ function feedVideo(adapter: any): void {
 }
 
 /** Start a switch to video-lo and return its request ID once it is on the wire. */
-async function startSwitch(player: MoqtPlayer, adapter: any): Promise<{ requestId: bigint; done: Promise<unknown> }> {
+async function startSwitch(player: MoqtPlayer, adapter: any, reason = 'recovery'): Promise<{ requestId: bigint; done: Promise<unknown> }> {
   const before = adapter.subscribe.mock.calls.length;
-  const done = player.selectVideoTrack('video-lo', 'recovery', 'downshift').then(() => 'ok', (e: unknown) => e);
+  const done = player.selectVideoTrack('video-lo', reason, 'downshift').then(() => 'ok', (e: unknown) => e);
   await vi.waitFor(() => expect(adapter.subscribe.mock.calls.length).toBeGreaterThan(before));
   expect(names(adapter).at(-1)).toBe('video-lo');
   return { requestId: BigInt(await adapter.subscribe.mock.results.at(-1)!.value), done };
@@ -163,9 +163,9 @@ describe('refused video switch target', () => {
       await done;
       expect(adapter.unsubscribe).not.toHaveBeenCalledWith(videoReqId);
       expect(player.state).toBe(PlayerState.PLAYING);
-      // The old track still plays, and a later switch can start.
+      // The old track still plays, and a manual switch can start.
       feedVideo(adapter);
-      const again = await startSwitch(player, adapter);
+      const again = await startSwitch(player, adapter, 'manual');
       expect(again.requestId).not.toBe(requestId);
     } finally { await player.destroy(); }
   });

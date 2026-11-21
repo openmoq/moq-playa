@@ -1477,6 +1477,9 @@ export class MoqtPlayer {
   /** The media source's permission to cross the hole a live restart leaves, held for one switch. */
   private videoSwitchRecovery: { readonly owner: object; readonly handle: MediaSwitchRecovery } | null = null;
 
+  /** Automatic refusals retain the staging wait, bounded by the current catalog. */
+  private refusedVideoTargets = new Map<string, number>();
+
   /**
    * Pending track switch — defers old subscription teardown until the
    * new track's keyframe is ready (make-before-break switching).
@@ -2551,6 +2554,7 @@ export class MoqtPlayer {
         return before && after && (!this.catalogTrackAllowed(after, state) || (['codec', 'packaging', 'initData', 'initRef', 'role', 'altGroup', 'renderGroup', 'keyframeSpacing', 'samplerate', 'channelConfig'] as const)
           .some(field => before[field] !== after[field]));
       });
+    this.refusedVideoTargets.clear();
     this._catalogState = state;
     // Retire excluded routes synchronously, before observers can deliver more media.
     if (state.msfDraft === 'draft-02' && this.connection) {
@@ -3778,6 +3782,8 @@ export class MoqtPlayer {
     if (!currentTrack) throw new Error('Cannot switch track: video selection not ready');
     this.assertQualitySpacing(currentTrack, targetTrack, reason);
     const currentKey = this.initKey(currentTrack), targetKey = this.initKey(targetTrack);
+    if ((reason === 'bandwidth' || reason === 'recovery')
+        && performance.now() < (this.refusedVideoTargets.get(targetKey) ?? 0)) return;
     // A preparing or retiring video request is not the current output owner.
     let currentVideoRequestId: bigint | null = null;
     let currentVideoTrackName: string | null = null;
@@ -4793,6 +4799,7 @@ export class MoqtPlayer {
         : this.createDefaultConnection();
       this._adapterOwned = true;
     }
+    this.refusedVideoTargets.clear();
     this.connection = conn;
 
     // Wire connection callbacks before connect
@@ -5369,6 +5376,7 @@ export class MoqtPlayer {
 
       // Emit catalog_received so the app knows tracks are available
       this.catalogSlots.catalogReceived = true;
+      this.refusedVideoTargets.clear();
       this._catalogState = catalogState;
       this._stats.recordCatalogReceived();
       this.refreshMediaSelection();
@@ -8276,6 +8284,7 @@ export class MoqtPlayer {
       if (this.connection === newConnection) {
         this.releaseMediaTerminals(newConnection);
         this.retireInitWaiters(newConnection);
+        this.refusedVideoTargets.clear();
         this.connection = null;
       }
       delete txn.prep;
@@ -8322,6 +8331,7 @@ export class MoqtPlayer {
         this.quarantinedCatalogAliases.set(this.connection, this.catalogSlots.catalogTrackAlias);
       }
     }
+    this.refusedVideoTargets.clear();
     this.connection = newConnection;
     this.watchPublisher(newConnection);
     if (this.subscriptionManager) this.subscriptionManager.draftVersion = newConnection.draftVersion;
@@ -9599,6 +9609,7 @@ export class MoqtPlayer {
     const conn = this.connection;
     const gen = this.bootstrapGeneration;
     this.catalogSlots.catalogReceived = true;
+    this.refusedVideoTargets.clear();
     this._catalogState = catalogState;
     this._stats.recordCatalogReceived();
     this.watchdog.fulfill('catalog_received');
@@ -11129,6 +11140,7 @@ export class MoqtPlayer {
           }
           this.detachConnectionCallbacks(this.connection);
         }
+        this.refusedVideoTargets.clear();
         this.connection = null;
       }
       this.activeSubscriptions.clear();
@@ -12976,6 +12988,9 @@ export class MoqtPlayer {
         if (sw && sw.newRequestId === requestId && sw.connection === conn && this.switchIsCurrent(sw)) {
           // The refusal ended the request; there is nothing to unsubscribe.
           if (sw.connection === this.connection) this.clearLocmafDecoderForRequest(requestId);
+          if (sw.reason === 'bandwidth' || sw.reason === 'recovery') {
+            this.refusedVideoTargets.set(this.initKey(sw.targetTrack), performance.now() + SWITCH_STAGING_TIMEOUT_MS);
+          }
           sw.requestReleased = true;
           this.abortPendingVideoSwitch(sw, new Error(`Switch target "${trackName}" refused: ${reason} (code=0x${errorCode.toString(16)})`));
         }
@@ -13533,6 +13548,7 @@ export class MoqtPlayer {
 
       if (!this.catalogSlots.catalogReceived) {
         this.catalogSlots.catalogReceived = true;
+        this.refusedVideoTargets.clear();
         this._catalogState = catalogState;
         this._stats.recordCatalogReceived();
         this.watchdog.fulfill('catalog_received');
