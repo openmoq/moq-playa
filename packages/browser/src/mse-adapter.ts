@@ -797,6 +797,8 @@ export class MseMediaSource implements MediaSourceLike {
   /** Watchdog cadence; detection threshold per escalation rung. */
   private static readonly WEDGE_CHECK_INTERVAL_MS = 1_000;
   private static readonly WEDGE_FROZEN_MS = 2_500;
+  /** Room a rung-1 nudge needs inside the containing range. */
+  private static readonly WEDGE_NUDGE_ROOM_SEC = 0.15;
   private wedgeTimer: ReturnType<typeof setInterval> | null = null;
   /** Last observed currentTime; ladder resets only on ORGANIC movement. */
   private wedgeLastTime: number | null = null;
@@ -3691,15 +3693,12 @@ export class MseMediaSource implements MediaSourceLike {
     // not paused, not seeking, decodable data ready, media ahead of the
     // playhead within its containing range. Anything else is a normal
     // pause/buffer/seek state owned by the existing paths.
-    let aheadSec = 0;
+    // A narrow hole just ahead (a later switch) caps the containing range. The
+    // media beyond it still counts, as long as a nudge fits inside the range.
+    let aheadSec = 0, forwardSec = 0;
     try {
-      const buffered = v.buffered;
-      for (let i = 0; i < buffered.length; i++) {
-        if (ct >= buffered.start(i) && ct <= buffered.end(i)) {
-          aheadSec = buffered.end(i) - ct;
-          break;
-        }
-      }
+      aheadSec = MseMediaSource.aheadIn(v.buffered, ct, null, false);
+      forwardSec = MseMediaSource.aheadIn(v.buffered, ct, null, true);
     } catch { /* detached element */ }
     let postHole = false;
     if (this.gapJumpMs > 0 && hole !== null && quality !== null && ((v.readyState ?? 0) === 2 || wideHole)) {
@@ -3714,7 +3713,8 @@ export class MseMediaSource implements MediaSourceLike {
       }
     }
     if (v.paused || (v.seeking && !ownSeek) || !this.playbackIntent || (wideHole && (!postHole || (v.readyState ?? 0) < 2))
-        || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec <= 1) {
+        || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec <= MseMediaSource.WEDGE_NUDGE_ROOM_SEC
+        || forwardSec <= 1) {
       this.wedgeFrozenSinceMs = null;
       return;
     }
@@ -3823,13 +3823,30 @@ export class MseMediaSource implements MediaSourceLike {
     } catch { this.wedgeCoveredPosition = null; }
   }
 
+  /** Seconds ahead of `ct` in the range containing it (optionally only one
+   * starting at `start`), continued across later holes no wider than the jump
+   * bound when `bridgeNarrow` is set. */
+  private static aheadIn(ranges: TimeRanges, ct: number, start: number | null, bridgeNarrow: boolean): number {
+    for (let i = 0; i < ranges.length; i++) {
+      if (ct < ranges.start(i) || ct > ranges.end(i) || (start !== null && ranges.start(i) !== start)) continue;
+      let end = ranges.end(i);
+      for (let j = i + 1; bridgeNarrow && j < ranges.length
+          && ranges.start(j) - end <= MseMediaSource.GAP_JUMP_MAX_HOLE_SEC; j++) end = ranges.end(j);
+      return end - ct;
+    }
+    return 0;
+  }
+
   private hasPostHoleCoverage(ct: number, requireAudio: boolean): boolean {
     const hole = this.wedgeVideoHole;
     if (hole === null || this.observeVideoHole(ct, ct) !== hole) return false;
     try {
       const ranges = this.videoBuffer?.buffered, audio = this.audioBuffer?.buffered;
-      return ranges !== undefined && Array.from({ length: ranges.length }, (_, i) => i).some(i =>
-        ranges.start(i) === hole.start && ranges.start(i) <= ct && ranges.end(i) - ct > 1)
+      // A narrow later hole may cap the upper range; media past it counts, but
+      // a nudge must still fit inside the range itself.
+      return ranges !== undefined
+        && MseMediaSource.aheadIn(ranges, ct, hole.start, false) > MseMediaSource.WEDGE_NUDGE_ROOM_SEC
+        && MseMediaSource.aheadIn(ranges, ct, hole.start, true) > 1
         && ((!requireAudio && !audio) || (audio !== undefined && Array.from({ length: audio.length }, (_, i) => i)
           .some(i => audio.start(i) <= ct && audio.end(i) - ct > 1)));
     } catch { return false; /* Detached/evicted native media cannot justify a seek. */ }
