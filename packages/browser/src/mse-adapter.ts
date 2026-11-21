@@ -797,8 +797,6 @@ export class MseMediaSource implements MediaSourceLike {
   /** Watchdog cadence; detection threshold per escalation rung. */
   private static readonly WEDGE_CHECK_INTERVAL_MS = 1_000;
   private static readonly WEDGE_FROZEN_MS = 2_500;
-  /** Room a rung-1 nudge needs inside the containing range. */
-  private static readonly WEDGE_NUDGE_ROOM_SEC = 0.15;
   private wedgeTimer: ReturnType<typeof setInterval> | null = null;
   /** Last observed currentTime; ladder resets only on ORGANIC movement. */
   private wedgeLastTime: number | null = null;
@@ -3073,9 +3071,9 @@ export class MseMediaSource implements MediaSourceLike {
     this.wedgeTimer = setInterval(
       () => {
         const nowMs = performance.now();
-        // Gap-jump first: the wedge detector structurally ignores the
-        // at-a-hole case (aheadSec is computed only within the containing
-        // range), so the two never race for the same playhead state.
+        // Gap-jump first: the wedge detector excludes the gap-jump edge
+        // window inside the containing range, so the two never race for
+        // the same playhead state.
         this.checkGapJump(nowMs);
         this.checkPlayheadWedge(nowMs);
       },
@@ -3694,7 +3692,7 @@ export class MseMediaSource implements MediaSourceLike {
     // playhead within its containing range. Anything else is a normal
     // pause/buffer/seek state owned by the existing paths.
     // A narrow hole just ahead (a later switch) caps the containing range. The
-    // media beyond it still counts, as long as a nudge fits inside the range.
+    // media beyond it still counts outside the gap-jump edge window.
     let aheadSec = 0, forwardSec = 0;
     try {
       aheadSec = MseMediaSource.aheadIn(v.buffered, ct, null, false);
@@ -3713,7 +3711,7 @@ export class MseMediaSource implements MediaSourceLike {
       }
     }
     if (v.paused || (v.seeking && !ownSeek) || !this.playbackIntent || (wideHole && (!postHole || (v.readyState ?? 0) < 2))
-        || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec <= MseMediaSource.WEDGE_NUDGE_ROOM_SEC
+        || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec < MseMediaSource.GAP_EDGE_WINDOW_SEC
         || forwardSec <= 1) {
       this.wedgeFrozenSinceMs = null;
       return;
@@ -3843,9 +3841,9 @@ export class MseMediaSource implements MediaSourceLike {
     try {
       const ranges = this.videoBuffer?.buffered, audio = this.audioBuffer?.buffered;
       // A narrow later hole may cap the upper range; media past it counts, but
-      // a nudge must still fit inside the range itself.
+      // the playhead must stay outside the gap-jump edge window.
       return ranges !== undefined
-        && MseMediaSource.aheadIn(ranges, ct, hole.start, false) > MseMediaSource.WEDGE_NUDGE_ROOM_SEC
+        && MseMediaSource.aheadIn(ranges, ct, hole.start, false) >= MseMediaSource.GAP_EDGE_WINDOW_SEC
         && MseMediaSource.aheadIn(ranges, ct, hole.start, true) > 1
         && ((!requireAudio && !audio) || (audio !== undefined && Array.from({ length: audio.length }, (_, i) => i)
           .some(i => audio.start(i) <= ct && audio.end(i) - ct > 1)));

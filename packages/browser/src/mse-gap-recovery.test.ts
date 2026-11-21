@@ -469,9 +469,8 @@ it('a narrow post-hole witness survives a frozen sample with thin forward video'
 // A later downshift can leave a second narrow video hole just under a second
 // past where the clock stopped. The capped range must not hold recovery off
 // for good: media past a hole within the jump bound counts as coverage, as
-// long as the nudge still fits inside the current range. Without that room
-// the playhead is at the hole's edge, which the gap-jump owns. A wider later
-// hole does not count.
+// long as the playhead stays outside the gap-jump edge window. Inside that
+// window the gap-jump owns recovery. A wider later hole does not count.
 it.each(['narrow', 'no nudge room', 'wide'] as const)('a frozen playhead before a later %s hole', async mode => {
   const f = await ready(), rungs: number[] = [];
   f.adapter.onWedge = info => { rungs.push(info.rung); };
@@ -493,6 +492,39 @@ it.each(['narrow', 'no nudge room', 'wide'] as const)('a frozen playhead before 
     } else {
       expect(rungs).toEqual([]); expect(f.video.seekCount).toBe(0); expect(f.jumps).toHaveLength(0);
     }
+  } finally { f.adapter.destroy(); }
+});
+
+// A frozen playhead inside the edge window belongs to the gap-jump even
+// when media beyond a narrow hole would otherwise qualify it for a wedge.
+it.each([5000, 8000])('a frozen playhead before a combined hole waits for the %d ms gap-jump', async gapJumpMs => {
+  const f = await ready(gapJumpMs), rungs: number[] = [], errors: Error[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  f.adapter.onError = error => { errors.push(error); };
+  try {
+    const ranges: Array<[number, number]> = [[0, 4.3], [4.8, 14]];
+    source.videoBuffer.buffered = makeTimeRanges(ranges);
+    source.audioBuffer.buffered = makeTimeRanges(ranges);
+    f.video.buffered = makeTimeRanges(ranges); f.video.modelSeekLifecycle = true;
+    f.video.advancePlayback(3); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(4); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    for (let i = 0; i < 16 && f.jumps.length === 0 && errors.length === 0; i++) await vi.advanceTimersByTimeAsync(1000);
+    expect.soft(rungs).toEqual([]); expect.soft(errors).toEqual([]); expect(f.jumps).toHaveLength(1);
+  } finally { f.adapter.destroy(); }
+});
+
+it('a witnessed post-hole freeze before a later hole waits for the gap-jump', async () => {
+  const f = await ready(4000), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  try {
+    const ranges: Array<[number, number]> = [[0, 1], [2, 4.3], [4.8, 14]];
+    source.videoBuffer.buffered = makeTimeRanges(ranges);
+    source.audioBuffer.buffered = makeTimeRanges([[0, 14]]);
+    f.video.buffered = makeTimeRanges(ranges); f.video.modelSeekLifecycle = true;
+    f.video.advancePlayback(0.9); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(4); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000);
+    for (let i = 0; i < 12 && f.jumps.length === 0; i++) await vi.advanceTimersByTimeAsync(1000);
+    expect.soft(rungs).toEqual([]); expect(f.jumps).toHaveLength(1);
   } finally { f.adapter.destroy(); }
 });
 
