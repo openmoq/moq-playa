@@ -3672,15 +3672,6 @@ export class MseMediaSource implements MediaSourceLike {
       this.wedgeRung = 0;
       return;
     }
-    // Accepted work vetoes recovery while pending. Its completion alone does
-    // not repair a witnessed video hole: revalidate the actual buffers/ranges
-    // and continue sampling clock/quality progress through the pending period.
-    // It holds the action without restarting the freeze timer: live media
-    // appends many times a second, so a check often finds an append in flight.
-    if (this.hasPendingNativeWork()) {
-      this.handleWatchdogSeeked();
-      return;
-    }
     const hole = this.wedgeVideoHole;
     const wideHole = hole !== null && hole.start - hole.end > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC;
     if (wideHole && (v.ended || v.error !== null || this.appendQueueHold !== null)) {
@@ -3707,7 +3698,7 @@ export class MseMediaSource implements MediaSourceLike {
       // ahead. Thin forward coverage of a still-standing narrow hole only
       // holds recovery off; a changed hole or a playhead outside its upper
       // range retires the witness.
-      if (!postHole && (wideHole || !this.isInsideWitnessedUpperRange(ct))) {
+      if (!postHole && !this.hasPendingNativeWork() && (wideHole || !this.isInsideWitnessedUpperRange(ct))) {
         this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
       }
     }
@@ -3715,6 +3706,12 @@ export class MseMediaSource implements MediaSourceLike {
         || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec < MseMediaSource.GAP_EDGE_WINDOW_SEC
         || forwardSec <= 1) {
       this.wedgeFrozenSinceMs = null;
+      return;
+    }
+
+    // Pending work holds recovery only while the freeze remains eligible.
+    if (this.hasPendingNativeWork()) {
+      this.handleWatchdogSeeked();
       return;
     }
 

@@ -1715,10 +1715,34 @@ describe('playhead-wedge watchdog', () => {
         expect(wedges[0].decodedFrames).toBe(100);
     });
 
+    it.each(['readiness', 'pause', 'seek', 'coverage'])('restarts the freeze after pending work masks %s', (cause) => {
+        const { adapter, video, wedges, check } = wedgeSetup();
+        let pending = false;
+        // Control native work independently of element eligibility.
+        (adapter as unknown as { hasPendingNativeWork(): boolean }).hasPendingNativeWork = () => pending;
+        try {
+            check(0); check(1_000);
+            pending = true;
+            if (cause === 'readiness') video.readyState = 2;
+            if (cause === 'pause') video.paused = true;
+            if (cause === 'seek') video.seeking = true;
+            if (cause === 'coverage') video.buffered = makeTimeRanges([[5, 10.5]]);
+            check(2_000); check(4_000);
+            pending = false;
+            video.readyState = 4; video.paused = false; video.seeking = false;
+            video.buffered = makeTimeRanges([[5, 25]]);
+            check(4_100);
+            expect(wedges).toHaveLength(0);
+            expect(video.currentTime).toBe(10);
+            check(6_599);
+            expect(wedges).toHaveLength(0);
+            check(6_600);
+            expect(wedges).toHaveLength(1);
+        } finally { adapter.destroy(); }
+    });
+
     it('an append in flight holds the nudge without restarting the freeze timer', () => {
-        // Live media appends many times a second, so checks often find one in
-        // flight. Restarting the timer on each kept a lab playhead frozen for
-        // 17-26 s with media buffered ahead.
+        // Frequent appends hold recovery without erasing a continuous freeze.
         const { adapter, video, wedges, check } = wedgeSetup();
         let pending = false;
         (adapter as any).hasPendingNativeWork = () => pending;
