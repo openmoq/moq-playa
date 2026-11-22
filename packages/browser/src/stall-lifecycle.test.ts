@@ -50,6 +50,8 @@ describe('MSE stall lifecycle', () => {
     detected = [];
     recovered = [];
     adapter = new MseMediaSource(makeVideo(), { stallThresholdMs: THRESHOLD });
+    // Isolated stall handlers model playback after startup has completed.
+    (adapter as unknown as { playTriggered: boolean }).playTriggered = true;
     adapter.onStall = (ms) => detected.push(ms);
     adapter.onStallRecovered = (ms) => recovered.push(ms);
   });
@@ -247,6 +249,8 @@ describe('MSE episode ownership across intentional playback changes', () => {
     detected = [];
     recovered = [];
     adapter = new MseMediaSource(makeVideo(), { stallThresholdMs: THRESHOLD });
+    // Isolated stall handlers model playback after startup has completed.
+    (adapter as unknown as { playTriggered: boolean }).playTriggered = true;
     adapter.onStall = (ms) => detected.push(ms);
     adapter.onStallRecovered = (ms) => recovered.push(ms);
   });
@@ -329,6 +333,8 @@ describe('MSE publishes recovery only after committing its own state', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     try {
       const adapter = new MseMediaSource(makeVideo(), { stallThresholdMs: THRESHOLD });
+      // Isolated stall handlers model playback after startup has completed.
+      (adapter as unknown as { playTriggered: boolean }).playTriggered = true;
       let firstFrames = 0;
       adapter.onFirstFrame = () => { firstFrames++; };
       adapter.onStall = () => {};

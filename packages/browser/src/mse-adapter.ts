@@ -499,6 +499,12 @@ function safeBuffered(buffer: SourceBuffer): TimeRanges | null {
  * live-buffer hygiene: back-buffer eviction, a behind-live cap, and
  * QuotaExceededError recovery (evict + retry, escalating to flush-and-rejoin).
  *
+ * The adapter owns the element: it clears autoplay when it takes the element and
+ * restores the original value on destroy. Playback started by anything else
+ * before startup completes is paused, and the adapter's startup then starts playback
+ * once its conditions hold. Embedders resume through resumePlayback()
+ * rather than video.play(), including recovery from an unexpected pause.
+ *
  * @see draft-ietf-moq-cmsf-00 §3 (CMAF Packaging)
  */
 export class MseMediaSource implements MediaSourceLike {
@@ -531,6 +537,8 @@ export class MseMediaSource implements MediaSourceLike {
    * never calls setPlaybackIntent keeps the previous behavior.
    */
   private playbackIntent = true;
+  private readonly originalAutoplay: boolean;
+  private pendingElementPlays = 0;
 
   /**
    * Declare (or withdraw) playback intent. Withdrawing cancels an in-flight
@@ -1057,6 +1065,8 @@ export class MseMediaSource implements MediaSourceLike {
       this.objectUrl = URL.createObjectURL(this.ms);
       this.video.src = this.objectUrl;
     }
+    this.originalAutoplay = this.video.autoplay;
+    this.video.autoplay = false;
     this.video.addEventListener('playing', this.handlePlaying);
     this.video.addEventListener('waiting', this.handleWaiting);
     this.video.addEventListener('seeking', this.handleWatchdogSeek);
@@ -2324,6 +2334,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.removeAttribute('src');
     (this.video as any).srcObject = null;
     this.video.load();
+    this.video.autoplay = this.originalAutoplay;
     this.onFirstFrame = null;
     this.onAttached = null;
     this.onError = null;
@@ -3005,7 +3016,9 @@ export class MseMediaSource implements MediaSourceLike {
     if (!this.playTriggered && !this.startupBufferedAt(this.video.currentTime)) {
       this.startupPhase = 'idle'; return false;
     }
-    await this.video.play();
+    this.pendingElementPlays++;
+    try { await this.video.play(); }
+    finally { this.pendingElementPlays--; }
     if (this.startupLive(generation)) return true;
     // Withdrawn/destroyed while the promise was pending: the element started
     // anyway. Undo it — this is the late-playback hole a generation check alone
@@ -4457,6 +4470,16 @@ export class MseMediaSource implements MediaSourceLike {
   // ─── Event handlers ────────────────────────────────────────────
 
   private handlePlaying = (): void => {
+    // Only the startup transaction may begin playback before startup succeeds.
+    if (!this.playTriggered && this.pendingElementPlays === 0) {
+      const recoveredMs = this.stallDetected && this.stallStartTime !== null
+        ? performance.now() - this.stallStartTime : null;
+      this.cancelStallEpisode();
+      this.video.pause();
+      void this.requestStartup();
+      if (recoveredMs !== null) this.onStallRecovered?.(recoveredMs);
+      return;
+    }
     if (this.seekResource && !this.seekResource.released) return;
     this.gapStallEpisode = false;                 // post-jump churn episode over
     // `playing` is the only genuine resumption signal: it is queued when ready

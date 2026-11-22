@@ -108,7 +108,7 @@ async function prepare(kind: Kind, fixture: Fixture) {
         mseImplementation: 'standard', mseAttachment: 'object-url', ...(kind === 'zero-window' ? { reorderWindowMs: 0 } : {}),
       };
       source = new MseMediaSource(video, options);
-      source.setPlaybackIntent(false); // Also stays false during direct test-button play.
+      source.setPlaybackIntent(false); // Wait for the capture clock before starting playback.
       source.onError = error => fail(String(error));
       assert('standard native MSE', source.selectedImplementation === 'standard');
       unobserve = source.observeAppends(event => {
@@ -228,7 +228,11 @@ async function prepare(kind: Kind, fixture: Fixture) {
         gate.arm();
         await timed(settled, 'audio clock settle');
         if (failures.length) throw new Error(failures.join('; '));
-        await timed(video.play(), 'native play');
+        if (source) {
+          const playing = new Promise<void>(resolve => video.addEventListener('playing', () => resolve(), { once: true }));
+          source.setPlaybackIntent(true);
+          await timed(playing, 'adapter play');
+        } else await timed(video.play(), 'native play');
         await timed(capture, 'PCM completion', 10000);
         assert('ended at 1.408 seconds', video.ended && Math.abs(video.currentTime - 1.408) <= 1e-6, video.currentTime);
         assert('playback rate is one', video.playbackRate === 1, video.playbackRate);

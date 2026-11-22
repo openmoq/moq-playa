@@ -143,6 +143,7 @@ class MockVideoElement extends MockEventTarget {
     /** Present on real elements; the adapter feature-detects it for attachment. */
     srcObject: unknown = null;
     disableRemotePlayback = false;
+    autoplay = false;
     muted = false;
     paused = false;
     seeking = false;
@@ -195,6 +196,8 @@ class MockVideoElement extends MockEventTarget {
     buffered = makeTimeRanges([]);
     /** When true, play() rejects (autoplay blocked) → playTriggered stays false. */
     rejectPlay = false;
+    /** Emit playing before play resolves, as the native event precedes settlement. */
+    modelPlayEvents = false;
     playCalls = 0;
     pauseCalls = 0;
     /**
@@ -206,8 +209,13 @@ class MockVideoElement extends MockEventTarget {
     async play(): Promise<void> {
         this.playCalls++;
         if (this.rejectPlay) throw new Error('autoplay blocked');
+        if (this.modelPlayEvents && this.readyState < 3) {
+            this.paused = false;
+            this.fire('waiting');
+        }
         if (this.deferPlay) await this.deferPlay();
         this.paused = false;
+        if (this.modelPlayEvents) this.fire('playing');
     }
     pause(): void {
         this.pauseCalls++;
