@@ -2,6 +2,8 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import { MessageParam } from '@openmoq/transport';
 import { catToken } from '@openmoq/webtransport';
+import type { CatalogTrack } from '@openmoq/msf';
+import type { QualityController } from './quality-controller.js';
 import type { MoqtPlayerConfig } from './config.js';
 import { flush } from '../../webtransport/src/testkit/loopback.js';
 import { locSeekFixture } from '../test-support/playing-frame-quality.js';
@@ -270,4 +272,44 @@ it.each(['pause','throw'] as const)('classifies actual role publication when the
       expect(f.errors).toEqual([expect.stringContaining('failed after video adoption: target adoption failed')]);
     }
   }finally{await f.destroy();await operation;}
+});
+
+it('routes an automatic switch during a playing seek', async () => {
+  const f = await landed(true, true, true);
+  try {
+    const audio = f.audioOutputs[0]!;
+    const initialTiming = vi.mocked(audio.output.schedule).mock.calls[0]![3]!;
+    audio.head.value = { epoch: initialTiming.context.epoch, sourceTimestampUs: 3_000_000n, sourceOffsetUs: 0 };
+    f.advance(1_000_000); await flush(512);
+    await f.updateTimeline([[1000,[3,0],0],[3000,[4,0],0],[3100,[4,1],0]]);
+    await bridge(f, 'video', 401n); await bridge(f, 'audio', 402n);
+    const schedule = vi.mocked(audio.output.schedule).mock.calls[0]![3]!;
+    audio.head.value = { epoch: schedule.context.epoch, sourceTimestampUs: 3_300_000n, sourceOffsetUs: 0 };
+    f.advance(1_300_000); await flush(512);
+    // Limit access to the routing gates and the decision being exercised.
+    const p = f.player as unknown as {
+      playingLocQualityAvailable(): boolean;
+      subscribedTrack(role: 'video'): CatalogTrack | undefined;
+      historicalOutputTrack(role: 'video'): CatalogTrack | undefined;
+      qualityController: QualityController;
+      bufferAbrController: { evaluate(): { action: 'downshift' } };
+      lastAbrDownshiftUs: number;
+      checkBandwidthAdaptation(): void;
+    };
+    const playingLoc = p.playingLocQualityAvailable();
+    const subscribed = p.subscribedTrack('video')?.name ?? null;
+    const historical = p.historicalOutputTrack('video')?.name ?? null;
+    // Force an ABR decision to switch (narrow internal stubs), then run one evaluation.
+    const target = p.qualityController?.alternatives?.find(t => t.name === 'alternate-video') ?? null;
+    const select = vi.spyOn(f.player, 'selectVideoTrack').mockImplementation(async () => {});
+    if (p.qualityController) { p.qualityController.peekHigherVideoQuality = () => target; p.qualityController.peekLowerVideoQuality = () => target; }
+    if (p.bufferAbrController) p.bufferAbrController.evaluate = () => ({ action: 'downshift' });
+    p.lastAbrDownshiftUs = -1e15;
+    p.qualityController?.unlockAuto();
+    expect(playingLoc).toBe(true);
+    expect(subscribed).toBeNull();
+    expect(historical).toBeNull();
+    p.checkBandwidthAdaptation();
+    expect(select).toHaveBeenCalledOnce();
+  } finally { await f.destroy(); }
 });

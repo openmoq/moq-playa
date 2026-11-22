@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createControlCodec, varint, RequestError, type ControlMessage } from '@openmoq/transport';
 import { MoqtConnection } from '@openmoq/webtransport';
-import type { PlayerError } from './errors.js';
+import { PlayerErrorCode, type PlayerError } from './errors.js';
 import { MoqtPlayer } from './player.js';
 import { videoInit } from '../../locmaf/test-support/cmaf.js';
 import type { MediaSourceLike, AudioDecoderLike, AudioOutputLike } from './interfaces.js';
@@ -959,4 +959,101 @@ it('repair d14 refuses forwarded unsolicited PUBLISH with UNINTERESTED', async (
     expect(responses).toContainEqual(expect.objectContaining({ type: 'REQUEST_ERROR', requestId: id, errorCode: 4n }));
     await f.player.destroy(); expect(f.client.onPublish).toBeUndefined();
   } finally { await f.close(); }
+});
+
+
+describe.each([18, 22] as const)('retry clocks, draft %i', draft => {
+  it.each([
+    [1n, 2_496, 22_996], [5_001n, 5_250, 21_996], [15_001n, 15_250, 25_000], [30_001n, 30_250, 40_000],
+  ] as const)('honours interval %s without shortening recovery', async (interval, earliestFatalMs, fatalAfterMs) => {
+    const f = await playing(draft, { config: { livenessTimeoutMs: 10_000,
+      livenessRestartBackoffMs: 1_000, livenessMaxRestarts: 3, livenessResetProbeMs: 2_000 } });
+    try {
+      await f.run(10_000);
+      const rep = await f.replacementSeen(30_000), refusedAt = f.now();
+      const refused = new Set([rep.id]);
+      let lastRefusalAt = refusedAt;
+      await f.refuse(rep.id, interval);
+      for (let elapsed = 0; elapsed < 100_000 && f.player.state !== 'error'; elapsed += 100) {
+        await f.run(100);
+        for (const request of f.identitySubscribesAfter(rep.id)) {
+          if (refused.has(request.id)) continue;
+          expect(request.t - lastRefusalAt).toBeGreaterThanOrEqual(Number(interval - 1n));
+          refused.add(request.id);
+          lastRefusalAt = f.now();
+          await f.refuse(request.id, interval);
+        }
+      }
+      const fatal = f.events.find(e => e.kind === 'player:error' && e.detail?.includes('fatal'));
+      expect(fatal).toBeDefined();
+      // The established ladder's fatal times with these same refusal inputs.
+      expect(fatal!.t - refusedAt).toBeGreaterThanOrEqual(earliestFatalMs);
+      expect(f.identitySubscribesAfter(rep.id).length).toBeGreaterThan(0);
+      // The first silent refresh has already used one of the three windows.
+      expect(fatal!.t - refusedAt).toBe(fatalAfterMs);
+      if (interval === 1n) expect(fatal!.t - refusedAt).toBeLessThan(30_000);
+    } finally { await f.close(); }
+  });
+
+  it('honours a refusal received during backoff before starting another attempt', async () => {
+    const f = await playing(draft, { config: { livenessRestartBackoffMs: 100 } });
+    try {
+      const rep = await f.replacementSeen();
+      await f.run(60); // The arrival probe has ended; the next backoff is running.
+      const refusedAt = f.now();
+      await f.refuse(rep.id, 60_001n);
+      await f.run(59_995);
+      expect(f.player.state).toBe('playing');
+      expect(f.identitySubscribesAfter(rep.id)).toEqual([]);
+      await f.run(255);
+      const next = f.identitySubscribesAfter(rep.id)[0];
+      expect(next).toBeDefined();
+      expect(next!.t - refusedAt).toBeGreaterThanOrEqual(60_000);
+      expect(next!.t - refusedAt).toBeLessThanOrEqual(60_250);
+      expect(f.recovery.at(-1)!.attempt).toBe(3);
+    } finally { await f.close(); }
+  });
+
+  it('preserves refusal backoff across attempt boundaries', async () => {
+    const f = await playing(draft, { config: { livenessTimeoutMs: 100,
+      livenessRestartBackoffMs: 20, livenessMaxRestarts: 5 } });
+    const refused = new Set<bigint>(), trace: { sent: number; refused: number }[] = [];
+    try {
+      const rep = await f.replacementSeen();
+      for (let elapsed = 0; elapsed < 3_500 && f.player.state !== 'error'; elapsed += 5) {
+        for (const request of f.requests.filter(r => r.name === 'video' && r.id >= rep.id)) {
+          if (refused.has(request.id)) continue;
+          refused.add(request.id);
+          trace.push({ sent: request.t, refused: f.now() });
+          await f.refuse(request.id, 1n);
+        }
+        await f.run(5);
+      }
+      expect(trace.length).toBeGreaterThan(3);
+      for (let i = 1; i < trace.length; i++) {
+        expect(trace[i]!.sent - trace[i - 1]!.refused).toBeGreaterThanOrEqual(Math.min(20 * 2 ** (i - 1), 5_000));
+      }
+    } finally { await f.close(); }
+  });
+});
+
+
+it.each([18, 22] as const)('bounds a blocked replacement stream on draft %s', async draft => {
+  const f = await playing(draft);
+  const open = f.a.createBidirectionalStream.bind(f.a);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const blocked = vi.spyOn(f.a, 'createBidirectionalStream').mockImplementation(async () => {
+    await gate;
+    return open();
+  });
+  try {
+    await f.run(6_000);
+    expect(blocked).toHaveBeenCalled();
+    expect(f.player.state).toBe('error');
+    expect(f.errors).toContainEqual(expect.objectContaining({ code: PlayerErrorCode.MEDIA_STARVED, severity: 'fatal' }));
+    const fatal = f.events.find(e => e.kind === 'player:error' && e.detail?.includes('fatal'));
+    expect(fatal!.t).toBeGreaterThanOrEqual(389);
+    expect(fatal!.t).toBeLessThanOrEqual(639);
+  } finally { blocked.mockRestore(); release(); await flush(128); await f.close(); }
 });

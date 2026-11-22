@@ -7,8 +7,8 @@
  * stream-reset shortened fuse, and the quiet paths (benign resets,
  * pause/resume, destroy mid-incident).
  *
- * Uses real timers with millisecond-scale liveness config — the ladder is
- * wall-clock driven (performance.now), so fake timers would skew it.
+ * Refusal deadlines use fake timers including performance.now. Other cases
+ * use millisecond-scale liveness settings.
  *
  * @module
  */
@@ -123,7 +123,10 @@ async function startPlaying(
 ): Promise<{ player: MoqtPlayer; videoReqId: ReturnType<typeof varint> }> {
   const player = new MoqtPlayer(createConfig(adapter, overrides));
   const loadPromise = player.load();
-  await vi.waitFor(() => expect(adapter.connect).toHaveBeenCalled());
+  if (vi.isFakeTimers()) {
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+    expect(adapter.connect).toHaveBeenCalled();
+  } else await vi.waitFor(() => expect(adapter.connect).toHaveBeenCalled());
   adapter._connectResolve?.();
   await loadPromise;
 
@@ -135,7 +138,8 @@ async function startPlaying(
     kind: 'data', trackAlias: catalogReqId, groupId: varint(0), subgroupId: varint(0),
     objectId: varint(0), payload: new TextEncoder().encode(CATALOG_JSON),
   } as MoqtObject);
-  await new Promise((r) => setTimeout(r, 0)); // media subscribes are async
+  if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(0);
+  else await new Promise((r) => setTimeout(r, 0)); // media subscribes are async
 
   const videoReqId = await adapter.subscribe.mock.results[1]?.value;
   const audioReqId = await adapter.subscribe.mock.results[2]?.value;
@@ -263,10 +267,11 @@ describe('media liveness (starvation detection + restart ladder)', () => {
 
   describe('restarts the peer refuses but permits retrying (e.g. a relay whose upstream is down)', () => {
     /** Refuse every later SUBSCRIBE for `name` until `refusing()` turns false. */
-    function refuseResubscribes(adapter: any, name: string, refusing: () => boolean, retryInterval = 1n) {
+    function refuseResubscribes(adapter: any, name: string, refusing: () => boolean, retryInterval = 1n, sentAt: number[] = []) {
       const original = adapter.subscribe.getMockImplementation();
       adapter.subscribe.mockImplementation(async (ns: unknown, n: Uint8Array, opts: unknown) => {
         const id = await original(ns, n, opts);
+        if (new TextDecoder().decode(n) === name) sentAt.push(performance.now());
         if (new TextDecoder().decode(n) === name && refusing()) {
           setTimeout(() => adapter._triggerMessage({ type: 'REQUEST_ERROR', requestId: id, errorCode: varint(0),
             retryInterval: varint(retryInterval), errorReason: 'origin unreachable' } as unknown as ControlMessage), 0);
@@ -277,61 +282,81 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     const videoSubscribes = (adapter: any) => adapter.subscribe.mock.calls.filter(
       (c: any[]) => new TextDecoder().decode(c[1] as Uint8Array) === 'video').length;
 
-    it('keeps retrying past livenessMaxRestarts and recovers when delivery resumes', async () => {
+    it.each([false, true])('charges retryable refusals by elapsed attempts (recover=%s)', async (recover) => {
       const adapter = createMockAdapter();
+      adapter.session.draftVersion = adapter.draftVersion = 18;
       adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
-      const { player } = await startPlaying(adapter, { livenessRefusedRetryMs: 5_000 });
-      const errors: any[] = [];
-      player.on('error', (e) => errors.push(e.error));
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'performance'] });
+      const { player } = await startPlaying(adapter, {
+        livenessTimeoutMs: 1_000, livenessMaxRestarts: 3, livenessRestartBackoffMs: 20,
+      });
+      const errors: { code: number; message: string }[] = [];
+      const attempts: number[] = [];
+      player.on('error', e => errors.push(e.error));
+      player.on('recovery_action', e => { if (e.action.type === 'track_restart') attempts.push(e.action.attempt); });
       try {
-        let upstreamDown = true;
-        refuseResubscribes(adapter, 'video', () => upstreamDown);
+        let refusing = true;
+        const sentAt: number[] = [];
+        refuseResubscribes(adapter, 'video', () => refusing, 101n, sentAt);
         feedVideo(adapter);
-        // Well past the 2-attempt budget, every refused retry keeps the ladder going.
-        await vi.waitFor(() => expect(videoSubscribes(adapter)).toBeGreaterThanOrEqual(5), { timeout: 3_000 });
-        expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(false);
+        await vi.advanceTimersByTimeAsync(2_800);
         expect(player.state).toBe(PlayerState.PLAYING);
-        // The upstream is back: the next resubscribe is accepted and delivers.
-        upstreamDown = false;
-        const before = videoSubscribes(adapter);
-        await vi.waitFor(() => expect(videoSubscribes(adapter)).toBeGreaterThan(before), { timeout: 3_000 });
-        const newReqId = await adapter.subscribe.mock.results.at(-1)?.value;
-        adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: newReqId, trackAlias: varint(60n), parameters: new Map(), trackExtensions: [] } as unknown as ControlMessage);
-        adapter._triggerObject(0n, { kind: 'data', trackAlias: varint(60n), groupId: varint(5), subgroupId: varint(0),
-          objectId: varint(0), payload: new Uint8Array([0xcc]) } as MoqtObject);
-        await sleep(100);
-        expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(false);
-        expect(player.state).toBe(PlayerState.PLAYING);
-      } finally { await player.destroy(); }
+        expect(attempts).toContain(2);
+        expect(videoSubscribes(adapter)).toBeGreaterThan(3);
+        if (recover) {
+          refusing = false;
+          const original = adapter.subscribe.getMockImplementation()!;
+          adapter.subscribe.mockImplementation(async (...args: unknown[]) => {
+            const id = await original(...args);
+            setTimeout(() => {
+              adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: id, trackAlias: varint(60n), parameters: new Map(), trackExtensions: [] } as unknown as ControlMessage);
+              adapter._triggerObject(0n, { kind: 'data', trackAlias: varint(60n), groupId: varint(5), subgroupId: varint(0),
+                objectId: varint(0), payload: new Uint8Array([0xcc]) } as MoqtObject);
+            }, 0);
+            return id;
+          });
+        }
+        await vi.advanceTimersByTimeAsync(recover ? 700 : 6_000);
+        for (let i = 1; i < sentAt.length; i++) expect(sentAt[i]! - sentAt[i - 1]!).toBeGreaterThanOrEqual(100);
+        if (recover) {
+          expect(errors.some(e => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(false);
+          expect(player.state).toBe(PlayerState.PLAYING);
+        } else {
+          expect(errors.find(e => e.code === PlayerErrorCode.MEDIA_STARVED)?.message).toMatch(/refused.*code=0x0/);
+          expect(player.state).toBe(PlayerState.ERROR);
+        }
+      } finally { await player.destroy(); vi.useRealTimers(); }
     });
 
-    it('ends fatally once the refusal budget runs out', async () => {
+    it.each([
+      [16, 0n, 0n, 1],
+      [14, 1n, 0n, 2],
+      [18, 0x34n, 1n, 2],
+      [16, 0n, 60_001n, 1],
+    ])('bounds refusal retries on draft %s with code %s and interval %s', async (draft, code, interval, count) => {
       const adapter = createMockAdapter();
+      adapter.session.draftVersion = adapter.draftVersion = draft;
       adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
-      const { player } = await startPlaying(adapter, { livenessRefusedRetryMs: 300 });
-      const errors: any[] = [];
-      player.on('error', (e) => errors.push(e.error));
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'performance'] });
+      const { player } = await startPlaying(adapter, { livenessTimeoutMs: 100, livenessMaxRestarts: count });
+      const errors: { code: number; message: string }[] = [];
+      let firstRestartAt = -1, fatalAt = -1;
+      player.on('recovery_action', e => { if (e.action.type === 'track_restart' && firstRestartAt < 0) firstRestartAt = performance.now(); });
+      player.on('error', e => { errors.push(e.error); if (e.error.code === PlayerErrorCode.MEDIA_STARVED) fatalAt = performance.now(); });
       try {
-        refuseResubscribes(adapter, 'video', () => true);
+        const original = adapter.subscribe.getMockImplementation()!;
+        adapter.subscribe.mockImplementation(async (...args: unknown[]) => {
+          const id = await original(...args);
+          setTimeout(() => adapter._triggerMessage({ type: 'REQUEST_ERROR', requestId: id,
+            errorCode: varint(code), retryInterval: varint(interval), errorReason: 'unavailable' } as unknown as ControlMessage), 0);
+          return id;
+        });
         feedVideo(adapter);
-        await vi.waitFor(() => expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(true), { timeout: 3_000 });
-        expect(errors.find((e) => e.code === PlayerErrorCode.MEDIA_STARVED).message).toMatch(/restart refused for \d+ s \(code=0x0\)/);
-        expect(player.state).toBe(PlayerState.ERROR);
-      } finally { await player.destroy(); }
-    });
-
-    it('a refusal with Retry Interval 0 still ends the ladder at once', async () => {
-      const adapter = createMockAdapter();
-      adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
-      const { player } = await startPlaying(adapter, { livenessRefusedRetryMs: 60_000, draftVersion: 16 });
-      const errors: any[] = [];
-      player.on('error', (e) => errors.push(e.error));
-      try {
-        refuseResubscribes(adapter, 'video', () => true, 0n);
-        feedVideo(adapter);
-        await vi.waitFor(() => expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(true), { timeout: 3_000 });
-        expect(errors.find((e) => e.code === PlayerErrorCode.MEDIA_STARVED).message).toMatch(/refused automatic retry/);
-      } finally { await player.destroy(); }
+        await vi.advanceTimersByTimeAsync(450);
+        expect(errors.some(e => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(true);
+        expect(videoSubscribes(adapter)).toBe(1 + count);
+        if (interval === 60_001n) expect(fatalAt - firstRestartAt).toBe(100);
+      } finally { await player.destroy(); vi.useRealTimers(); }
     });
   });
 
@@ -480,4 +505,103 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     expect(adapter.requestUpdate).not.toHaveBeenCalled();
     await player.destroy();
   });
+});
+
+it.each([[80, 0, true], [80, 0, false], [0, 80, true], [0, 80, false]] as const)(
+  'gives the replacement a full arrival probe (retirement=%s, send=%s, delivery=%s)', async (retirementMs, sendMs, delivery) => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'performance'] });
+  const adapter = createMockAdapter();
+  adapter.session.draftVersion = adapter.draftVersion = 18;
+  const { player } = await startPlaying(adapter, { livenessTimeoutMs: 100, livenessMaxRestarts: 1 });
+  let sentAt = -1, fatalAt = -1, arrivedAt = -1;
+  player.on('error', e => { if (e.error.code === PlayerErrorCode.MEDIA_STARVED) fatalAt = performance.now(); });
+  adapter.requestUpdate.mockRejectedValue(new Error('refresh unavailable'));
+  adapter.unsubscribe.mockImplementation(async () => {
+    if (retirementMs) await new Promise(resolve => setTimeout(resolve, retirementMs));
+  });
+  const original = adapter.subscribe.getMockImplementation()!;
+  adapter.subscribe.mockImplementation(async (...args: unknown[]) => {
+    if (sendMs) await new Promise(resolve => setTimeout(resolve, sendMs));
+    const id = await original(...args);
+    sentAt = performance.now();
+    if (delivery) setTimeout(() => {
+      arrivedAt = performance.now();
+      adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: id, trackAlias: varint(60n),
+        parameters: new Map(), trackExtensions: [] } as unknown as ControlMessage);
+      adapter._triggerObject(0n, { kind: 'data', trackAlias: varint(60n), groupId: varint(5),
+        subgroupId: varint(0), objectId: varint(0), payload: new Uint8Array([0xcc]) } as MoqtObject);
+    }, 40);
+    return id;
+  });
+  try {
+    feedVideo(adapter);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(sentAt).toBe(192);
+    if (delivery) {
+      expect(arrivedAt - sentAt).toBe(40);
+      expect(fatalAt).toBe(-1);
+      expect(player.state).toBe(PlayerState.PLAYING);
+    } else {
+      expect(fatalAt - sentAt).toBe(100);
+      expect(player.state).toBe(PlayerState.ERROR);
+    }
+  } finally { await player.destroy(); vi.useRealTimers(); }
+});
+
+
+it('bounds a replacement send that never settles', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'performance'] });
+  const adapter = createMockAdapter();
+  adapter.draftVersion = adapter.session.draftVersion = 18;
+  const { player } = await startPlaying(adapter, {
+    livenessTimeoutMs: 100, livenessMaxRestarts: 1, connectionTimeoutMs: 100,
+  });
+  adapter.requestUpdate.mockRejectedValue(new Error('refresh unavailable'));
+  adapter.subscribe.mockImplementation(() => new Promise(() => {}));
+  let fatalAt = -1;
+  player.on('error', e => {
+    if (e.error.code === PlayerErrorCode.MEDIA_STARVED && e.error.severity === 'fatal') fatalAt = performance.now();
+  });
+  try {
+    feedVideo(adapter);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(player.state).toBe(PlayerState.ERROR);
+    expect(fatalAt).toBeGreaterThanOrEqual(212);
+    expect(fatalAt).toBeLessThanOrEqual(312);
+  } finally { await player.destroy(); vi.useRealTimers(); }
+});
+
+it('clears the replacement send timer on the first cancellation check after destroy', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'performance'] });
+  const adapter = createMockAdapter();
+  adapter.draftVersion = adapter.session.draftVersion = 18;
+  const { player } = await startPlaying(adapter, { livenessTimeoutMs: 1_000, livenessMaxRestarts: 1 });
+  adapter.requestUpdate.mockRejectedValue(new Error('refresh unavailable'));
+  let sentAt = -1;
+  adapter.subscribe.mockImplementation(() => {
+    sentAt = performance.now();
+    return new Promise(() => {});
+  });
+  const scheduled = vi.spyOn(globalThis, 'setTimeout');
+  const cleared = vi.spyOn(globalThis, 'clearTimeout');
+  try {
+    feedVideo(adapter);
+    await vi.advanceTimersByTimeAsync(1_020);
+    expect(sentAt).toBe(1_008);
+    const sendTimers = scheduled.mock.calls.flatMap((call, i) =>
+      call[1] === 250 || call[1] === 1_000 ? [scheduled.mock.results[i]!.value] : [])
+      .filter(timer => !cleared.mock.calls.some(([id]) => id === timer));
+    expect(sendTimers).toHaveLength(1);
+    await player.destroy();
+    const callsAfterDestroy = scheduled.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(250);
+    for (const timer of sendTimers) expect(cleared).toHaveBeenCalledWith(timer);
+    expect(scheduled).toHaveBeenCalledTimes(callsAfterDestroy);
+    expect(player.state).toBe(PlayerState.ENDED);
+  } finally {
+    await player.destroy();
+    scheduled.mockRestore();
+    cleared.mockRestore();
+    vi.useRealTimers();
+  }
 });

@@ -10975,7 +10975,9 @@ export class MoqtPlayer {
     // (e.g. a liveness resubscribe was refused): selectVideoTrack would only
     // throw, and this runs on every tick. A failed attempt also holds the
     // next one off briefly, so a persistent refusal cannot become a loop.
-    if (newTrack && (!(this.subscribedTrack('video') ?? this.historicalOutputTrack('video'))
+    const playingLocSeek = this.activeLocSeek && !this.preparingLocSeek
+      && this.state === PlayerState.PLAYING && this.playbackIntent === true;
+    if (newTrack && (!playingLocSeek && !(this.subscribedTrack('video') ?? this.historicalOutputTrack('video'))
         || this.clock.now() - this.lastAbrSwitchFailureUs < MoqtPlayer.ABR_SWITCH_FAILURE_HOLDOFF_US)) return;
     if (newTrack) {
       const nowUs = this.clock.now();
@@ -15215,21 +15217,19 @@ export class MoqtPlayer {
       track.mediaType, track.trackName, Math.round(starvedForMs));
     try {
       const maxAttempts = this.config.livenessMaxRestarts!;
-      const refusedBudgetMs = this.config.livenessRefusedRetryMs!;
-      // Retries after a refusal that permits retrying: see livenessRefusedRetryMs.
-      let refusedSinceMs: number | null = null, refusedRetries = 0, backedOff = false;
+      let refusedRetries = 0;
+      let attemptDeadline = Infinity, retryNotBefore = 0, retrying = false;
       while (restart.attempts < maxAttempts && this.livenessLadderMayContinue(restart)) {
         if (restart.failure || this.livenessRetryRefused(restart)) break;
         const attempt = restart.attempts + 1;
         // Backoff before retries (not before the first attempt — the
         // starvation timeout already waited).
-        if ((restart.attempts > 0 || restart.refusal) && !backedOff) {
+        if ((restart.attempts > 0 || restart.refusal) && !retrying) {
           const backoffMs = restart.attempts > 0 ? this.config.livenessRestartBackoffMs! * 2 ** (restart.attempts - 1) : 0;
-          await this.livenessSleep(backoffMs, restart);
+          await this.livenessSleep(Math.max(backoffMs, retryNotBefore - performance.now()), restart);
           if (!this.livenessLadderMayContinue(restart)) return;
         }
-        backedOff = false;
-        const attemptStartMs = performance.now();
+        const arrivalSinceMs = performance.now();
         restart.refusal = null;
         restart.failure = null;
         restart.attempts++;
@@ -15256,8 +15256,11 @@ export class MoqtPlayer {
           await this.fullResubscribeForLiveness(track, restart);
         }
 
-        // A replacement updates the owned request ID before it reaches the wire.
-        if (await this.waitForTrackArrival(attemptStartMs, this.config.livenessTimeoutMs! || (announced ? this.config.publisherWaitMs! : 0), restart)) {
+        // Retirement and retry pacing do not consume the new request's probe.
+        const timeoutMs = this.config.livenessTimeoutMs! || (announced ? this.config.publisherWaitMs! : 0);
+        if (!retrying) attemptDeadline = performance.now() + timeoutMs;
+        retrying = false;
+        if (await this.waitForTrackArrival(arrivalSinceMs, timeoutMs, restart)) {
           restart.waitingForMedia = false;
           this.log.info('Liveness: %s "%s" recovered on attempt %d',
             track.mediaType, track.trackName, attempt);
@@ -15272,25 +15275,17 @@ export class MoqtPlayer {
           break;
         }
         if (restart.failure || this.livenessRetryRefused(restart)) break;
-        // A REQUEST_ERROR that permits a retry comes from a peer that is
-        // still answering, e.g. a relay whose upstream is briefly
-        // unavailable. It is not a failed restart: keep trying, with backoff,
-        // while the budget lasts, so delivery resumes when the upstream does.
-        const refusal = restart.refusal as LivenessRestart['refusal'];
-        if (refusal && refusedBudgetMs > 0) {
-          refusedSinceMs ??= refusal.atMs;
-          if (performance.now() - refusedSinceMs < refusedBudgetMs) {
-            restart.attempts--;
-            refusedRetries++;
-            this.log.info('Liveness: %s "%s" restart refused (code=0x%s); retrying (%d)',
-              track.mediaType, track.trackName, refusal.errorCode.toString(16), refusedRetries);
-            const backoffMs = Math.min(this.config.livenessRestartBackoffMs! * 2 ** (refusedRetries - 1),
-              MoqtPlayer.LIVENESS_REFUSED_BACKOFF_MAX_MS);
-            // Also waits out the refusal's Retry Interval.
-            await this.livenessSleep(backoffMs, restart);
-            if (!this.livenessLadderMayContinue(restart)) return;
-            backedOff = true;
-          }
+        // Retryable refusals share the silent-attempt deadline (d16 §9.8,
+        // d18 §10.6.2, d22 §9.4.2). Redirects require a different session.
+        if (this.livenessRetryableRefusal(restart)) {
+          const backoffMs = Math.min(this.config.livenessRestartBackoffMs! * 2 ** refusedRetries++,
+            MoqtPlayer.LIVENESS_REFUSED_BACKOFF_MAX_MS);
+          // Keep the unfinished backoff when this attempt expires.
+          retryNotBefore = performance.now() + backoffMs;
+          await this.livenessSleep(backoffMs, restart, attemptDeadline);
+          if (!this.livenessLadderMayContinue(restart)) return;
+          retrying = performance.now() < attemptDeadline;
+          if (retrying) restart.attempts--;
         }
       }
 
@@ -15298,8 +15293,8 @@ export class MoqtPlayer {
         const lastRefusal = restart.refusal as LivenessRestart['refusal'];
         const detail = restart.failure ?? (this.livenessRetryRefused(restart)
           ? 'publisher refused automatic retry'
-          : refusedSinceMs !== null && lastRefusal
-            ? `restart refused for ${Math.round((performance.now() - refusedSinceMs) / 1000)} s (code=0x${lastRefusal.errorCode.toString(16)})`
+          : lastRefusal
+            ? `restart refused (code=0x${lastRefusal.errorCode.toString(16)})`
             : `${restart.attempts} restart attempts failed`);
         this.emitError(createPlayerError(
           'fatal', 'connection', PlayerErrorCode.MEDIA_STARVED,
@@ -15765,12 +15760,19 @@ export class MoqtPlayer {
     return restart.refusal?.retryInterval === 0n;
   }
 
+  private livenessRetryableRefusal(restart: LivenessRestart): boolean {
+    const refusal = restart.refusal;
+    return restart.connection.draftVersion >= 16 && refusal?.retryInterval != null
+      && refusal.retryInterval > 0n && refusal.errorCode !== BigInt(RequestError.REDIRECT);
+  }
+
   /** Cancellation-aware sleep (checks every 250ms). */
-  private async livenessSleep(ms: number, restart: LivenessRestart): Promise<void> {
+  private async livenessSleep(ms: number, restart: LivenessRestart, attemptDeadline = Infinity): Promise<void> {
     const deadline = performance.now() + ms;
     for (;;) {
       if (!this.livenessLadderMayContinue(restart)) return;
       const now = performance.now();
+      if (now >= attemptDeadline) return;
       const remaining = deadline - now;
       const refusal = restart.refusal;
       // Keep the wire integer exact, including values beyond Number.MAX_SAFE_INTEGER.
@@ -15778,7 +15780,7 @@ export class MoqtPlayer {
         - BigInt(Math.max(0, Math.floor(now - refusal.atMs)));
       if (remaining <= 0 && retryRemaining <= 0n) return;
       const wait = Math.max(0, remaining, Number(retryRemaining > 250n ? 250n : retryRemaining));
-      await new Promise((r) => setTimeout(r, Math.min(250, wait)));
+      await new Promise((r) => setTimeout(r, Math.min(250, wait, attemptDeadline - now)));
     }
   }
 
@@ -15919,7 +15921,19 @@ export class MoqtPlayer {
     }
     if (!this.livenessLadderMayContinue(restart)) return;
     if (outcome.value !== 'done') { restart.failure = 'local subscription retirement did not complete'; return; }
-    this.replaceSubscription(track.trackName, 'liveness', catalogTrack, restart);
+    let sendTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([this.replaceSubscription(track.trackName, 'liveness', catalogTrack, restart),
+        new Promise<void>(resolve => {
+          const sendDeadline = performance.now() + retirementTimeoutMs;
+          const check = (): void => {
+            const remaining = sendDeadline - performance.now();
+            if (!this.livenessLadderMayContinue(restart) || remaining <= 0) { resolve(); return; }
+            sendTimer = setTimeout(check, Math.min(250, remaining));
+          };
+          check();
+        })]);
+    } finally { if (sendTimer !== undefined) clearTimeout(sendTimer); }
   }
 
   /**
@@ -15939,7 +15953,7 @@ export class MoqtPlayer {
     cause: 'too_far_behind' | 'liveness',
     issuedTrack?: CatalogTrack,
     restart?: LivenessRestart,
-  ): void {
+  ): Promise<void> | void {
     if (!this.mediaRecoveryOwnsConnection(this.connection) || !this.subscriptionManager || !this._catalogState) return;
     const operationConn = this.connection;
     const generation = this.bootstrapGeneration;
@@ -16050,7 +16064,7 @@ export class MoqtPlayer {
         action: { type: 'track_resubscribe', trigger: 'too_far_behind', trackName, mediaType },
       });
     }
-    void pending;
+    return pending;
   }
 
   /** Start pipeline tick interval (~60fps). */
