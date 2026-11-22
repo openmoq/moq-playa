@@ -10727,6 +10727,10 @@ export class MoqtPlayer {
 
   /** Timestamp of last ABR downshift — gates upshift for stability. */
   private lastAbrDownshiftUs = 0;
+  /** When (µs) the last automatic downshift was started; never before the first one. */
+  private lastAbrDownshiftAtUs = Number.NEGATIVE_INFINITY;
+  /** Timestamp (µs) of the last automatic switch that failed to start. */
+  private lastAbrSwitchFailureUs = Number.NEGATIVE_INFINITY;
   /** Timestamp (µs) of last video stall — gates LOC upshift. */
   private lastLocStallUs = 0;
   /** Timestamp (µs) of last video decode error — gates LOC upshift. */
@@ -10749,6 +10753,14 @@ export class MoqtPlayer {
   private videoRecoveryHealthyRenders = 0;
   private static readonly RECOVERY_HEALTHY_THRESHOLD = 3;
   private static readonly ABR_UPSHIFT_STABILITY_US = 15_000_000; // 15s
+  /** Longest backoff between liveness retries after a refusal. */
+  private static readonly LIVENESS_REFUSED_BACKOFF_MAX_MS = 5_000;
+  /** After a downshift starts, how long buffer-led downshifts wait. */
+  private static readonly ABR_DOWNSHIFT_SETTLE_US = 4_000_000;
+  /** Widest hole the MSE source crosses on its own (its gap-jump bound). */
+  private static readonly MSE_SHORT_HOLE_SEC = 2;
+  /** Delay after an automatic switch fails before another is attempted. */
+  private static readonly ABR_SWITCH_FAILURE_HOLDOFF_US = 1_000_000;
 
   private isLocDeliveryHealthy(): boolean {
     const now = this.clock.now();
@@ -10909,7 +10921,12 @@ export class MoqtPlayer {
       // bandwidth can't sustain the current track.
       const bufferUs = source.getBufferAheadUs();
       if (bufferUs === null || !Number.isFinite(bufferUs) || bufferUs < 0) return;
-      if (bufferUs === 0) {
+      if (bufferUs === 0 && this.mediaBufferedPastShortHole(source)) {
+        // Video resumes just past a short hole (a committed switch begins at
+        // its next keyframe): the hole is crossed by the media source, and a
+        // lower rung would not fill it. Thin, not empty.
+        effectiveBufferUs = abr.lowThresholdUs;
+      } else if (bufferUs === 0) {
         // Truly empty — always report emergency, don't let stale
         // bandwidth estimates suppress the downshift.
         effectiveBufferUs = 0;
@@ -10943,6 +10960,14 @@ export class MoqtPlayer {
 
     if (decision.action === 'hold') return;
 
+    // A downshift's own commit can leave the buffer reading empty for a
+    // moment: the new rung starts at its next keyframe, and in the lab a
+    // second, buffer-led downshift followed within 1-3.5 s. Buffer-led
+    // downshifts wait out a settle period; a real stall still downshifts
+    // through onStall, and a rising delivery trend still does here.
+    if (decision.action === 'downshift' && !lag
+        && this.clock.now() - this.lastAbrDownshiftAtUs < MoqtPlayer.ABR_DOWNSHIFT_SETTLE_US) return;
+
     // Block upshift for 15s after any downshift — prevents oscillation
     // where a lower-bitrate stream inflates the throughput estimate.
     if (decision.action === 'upshift') {
@@ -10958,6 +10983,12 @@ export class MoqtPlayer {
       ? controller.peekLowerVideoQuality(isEmergency)
       : controller.peekHigherVideoQuality();
 
+    // Nothing to switch from while video delivery is being re-established
+    // (e.g. a liveness resubscribe was refused): selectVideoTrack would only
+    // throw, and this runs on every tick. A failed attempt also holds the
+    // next one off briefly, so a persistent refusal cannot become a loop.
+    if (newTrack && (!(this.subscribedTrack('video') ?? this.historicalOutputTrack('video'))
+        || this.clock.now() - this.lastAbrSwitchFailureUs < MoqtPlayer.ABR_SWITCH_FAILURE_HOLDOFF_US)) return;
     if (newTrack) {
       const nowUs = this.clock.now();
       if (!live()) return;
@@ -10967,14 +10998,29 @@ export class MoqtPlayer {
         effectiveBufferUs / 1_000_000, bandwidthKbps, verb, newTrack.name);
       const freshLag = lag ? this.risingVideoDeliveryLag() : null;
       if (!live() || lag && freshLag?.state !== lag.state) return;
-      if (isDown) this.lastAbrDownshiftUs = nowUs;
+      if (isDown) { this.lastAbrDownshiftUs = nowUs; this.lastAbrDownshiftAtUs = nowUs; }
       if (freshLag) freshLag.state.lastAttemptUs = freshLag.nowUs;
       // No stats or controller mutation here — deferred to completePendingVideoSwitch.
       this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'bandwidth', isDown ? 'downshift' : 'upshift')
         .catch((err) => {
+          this.lastAbrSwitchFailureUs = this.clock.now();
           this.log.warn('ABR %s to "%s" failed: %s', verb, newTrack.name, err);
         });
     }
+  }
+
+  /** Media is buffered in a range that starts within a short hole ahead of the playhead. */
+  private mediaBufferedPastShortHole(source: { readonly mediaElement: unknown }): boolean {
+    const element = source.mediaElement as { readonly currentTime?: unknown; readonly buffered?: TimeRanges } | null;
+    try {
+      const ct = element?.currentTime, buffered = element?.buffered;
+      if (typeof ct !== 'number' || !Number.isFinite(ct) || !buffered) return false;
+      for (let i = 0; i < buffered.length; i++) {
+        const start = buffered.start(i);
+        if (start > ct) return start - ct <= MoqtPlayer.MSE_SHORT_HOLE_SEC && buffered.end(i) > start;
+      }
+    } catch { /* A detached element shows no coverage. */ }
+    return false;
   }
 
   /**
@@ -13939,6 +13985,7 @@ export class MoqtPlayer {
           const newTrack = this.qualityController.peekLowerVideoQuality(true);
           if (newTrack && this.mediaRecoveryOwnsConnection(this.connection)) {
             this.lastAbrDownshiftUs = this.clock.now();
+            this.lastAbrDownshiftAtUs = this.lastAbrDownshiftUs;
             this.log.warn('MSE stall %dms → emergency downshift to %s', durationMs, newTrack.name);
             this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'recovery', 'downshift').catch((err) => {
               this.log.warn('Stall downshift to "%s" failed: %s', newTrack.name, err);
@@ -15178,16 +15225,20 @@ export class MoqtPlayer {
       track.mediaType, track.trackName, Math.round(starvedForMs));
     try {
       const maxAttempts = this.config.livenessMaxRestarts!;
+      const refusedBudgetMs = this.config.livenessRefusedRetryMs!;
+      // Retries after a refusal that permits retrying: see livenessRefusedRetryMs.
+      let refusedSinceMs: number | null = null, refusedRetries = 0, backedOff = false;
       while (restart.attempts < maxAttempts && this.livenessLadderMayContinue(restart)) {
         if (restart.failure || this.livenessRetryRefused(restart)) break;
         const attempt = restart.attempts + 1;
         // Backoff before retries (not before the first attempt — the
         // starvation timeout already waited).
-        if (restart.attempts > 0 || restart.refusal) {
+        if ((restart.attempts > 0 || restart.refusal) && !backedOff) {
           const backoffMs = restart.attempts > 0 ? this.config.livenessRestartBackoffMs! * 2 ** (restart.attempts - 1) : 0;
           await this.livenessSleep(backoffMs, restart);
           if (!this.livenessLadderMayContinue(restart)) return;
         }
+        backedOff = false;
         const attemptStartMs = performance.now();
         restart.refusal = null;
         restart.failure = null;
@@ -15205,7 +15256,7 @@ export class MoqtPlayer {
         if (!this.livenessLadderMayContinue(restart)) return;
         this.flushForLivenessRestart(track);
         if (!this.livenessLadderMayContinue(restart)) return;
-        const refreshed = !announced && attempt === 1 && await this.tryRefreshSubscription(track, restart);
+        const refreshed = !announced && attempt === 1 && refusedRetries === 0 && await this.tryRefreshSubscription(track, restart);
         if (!this.livenessLadderMayContinue(restart)) return;
         if (refreshed) {
           this.log.info('Liveness: refreshed %s "%s" via REQUEST_UPDATE (attempt %d)',
@@ -15231,12 +15282,35 @@ export class MoqtPlayer {
           break;
         }
         if (restart.failure || this.livenessRetryRefused(restart)) break;
+        // A REQUEST_ERROR that permits a retry comes from a peer that is
+        // still answering, e.g. a relay whose upstream is briefly
+        // unavailable. It is not a failed restart: keep trying, with backoff,
+        // while the budget lasts, so delivery resumes when the upstream does.
+        const refusal = restart.refusal as LivenessRestart['refusal'];
+        if (refusal && refusedBudgetMs > 0) {
+          refusedSinceMs ??= refusal.atMs;
+          if (performance.now() - refusedSinceMs < refusedBudgetMs) {
+            restart.attempts--;
+            refusedRetries++;
+            this.log.info('Liveness: %s "%s" restart refused (code=0x%s); retrying (%d)',
+              track.mediaType, track.trackName, refusal.errorCode.toString(16), refusedRetries);
+            const backoffMs = Math.min(this.config.livenessRestartBackoffMs! * 2 ** (refusedRetries - 1),
+              MoqtPlayer.LIVENESS_REFUSED_BACKOFF_MAX_MS);
+            // Also waits out the refusal's Retry Interval.
+            await this.livenessSleep(backoffMs, restart);
+            if (!this.livenessLadderMayContinue(restart)) return;
+            backedOff = true;
+          }
+        }
       }
 
       if (this.livenessLadderMayContinue(restart)) {
+        const lastRefusal = restart.refusal as LivenessRestart['refusal'];
         const detail = restart.failure ?? (this.livenessRetryRefused(restart)
           ? 'publisher refused automatic retry'
-          : `${restart.attempts} restart attempts failed`);
+          : refusedSinceMs !== null && lastRefusal
+            ? `restart refused for ${Math.round((performance.now() - refusedSinceMs) / 1000)} s (code=0x${lastRefusal.errorCode.toString(16)})`
+            : `${restart.attempts} restart attempts failed`);
         this.emitError(createPlayerError(
           'fatal', 'connection', PlayerErrorCode.MEDIA_STARVED,
           `Media delivery starved: ${track.mediaType} "${track.trackName}" — ${detail}`,

@@ -613,6 +613,18 @@ export interface RecoveryConfig {
    * budget. Default: 30_000.
    */
   readonly livenessHealthyResetMs?: number;
+
+  /**
+   * How long a starvation incident keeps retrying while the peer refuses
+   * the restart with REQUEST_ERROR and still permits a retry (Retry
+   * Interval other than 0), as a relay does while its own upstream is
+   * unavailable. Such refusals do not use up `livenessMaxRestarts`; retries
+   * back off (doubling from `livenessRestartBackoffMs`, at most 5 s, and
+   * never sooner than the Retry Interval) until this budget, counted from
+   * the first refusal, runs out. Default: 60_000. Set 0 to count refusals
+   * as failed attempts.
+   */
+  readonly livenessRefusedRetryMs?: number;
 }
 
 /** Audio options. */
@@ -854,6 +866,7 @@ export const DEFAULT_PLAYER_CONFIG = {
   livenessMaxRestarts: 3,
   livenessRestartBackoffMs: 1_000,
   livenessHealthyResetMs: 30_000,
+  livenessRefusedRetryMs: 60_000,
 
   // Audio
   audioScheduleAheadMs: 200,
@@ -1037,6 +1050,11 @@ export function validateConfig(config: MoqtPlayerConfig): void {
 
   if (config.publisherWaitMs !== undefined && (!Number.isFinite(config.publisherWaitMs) || config.publisherWaitMs < 0)) {
     throw new RangeError('publisherWaitMs must be finite and >= 0 (0 disables)');
+  }
+  // livenessRefusedRetryMs: finite, >= 0 (0 counts refusals as failed attempts)
+  if (config.livenessRefusedRetryMs !== undefined
+      && !(Number.isFinite(config.livenessRefusedRetryMs) && config.livenessRefusedRetryMs >= 0)) {
+    throw new RangeError(`livenessRefusedRetryMs must be finite and >= 0, got ${config.livenessRefusedRetryMs}`);
   }
   // livenessTimeoutMs: >= 0 (0 disables the liveness monitor)
   if (config.livenessTimeoutMs !== undefined && config.livenessTimeoutMs < 0) {

@@ -1715,6 +1715,25 @@ describe('playhead-wedge watchdog', () => {
         expect(wedges[0].decodedFrames).toBe(100);
     });
 
+    it('an append in flight holds the nudge without restarting the freeze timer', () => {
+        // Live media appends many times a second, so checks often find one in
+        // flight. Restarting the timer on each kept a lab playhead frozen for
+        // 17-26 s with media buffered ahead.
+        const { adapter, video, wedges, check } = wedgeSetup();
+        let pending = false;
+        (adapter as any).hasPendingNativeWork = () => pending;
+        check(0);
+        check(1_000);                       // freeze timer starts
+        pending = true;
+        check(2_000); check(3_000); check(3_600);
+        expect(wedges).toHaveLength(0);     // never acts while work is pending
+        expect(video.currentTime).toBe(10);
+        pending = false;
+        check(3_700);                       // first idle check, frozen 2.7 s
+        expect(wedges).toHaveLength(1);
+        expect(video.currentTime).toBeCloseTo(10.1, 5);
+    });
+
     it('stays quiet when the playhead is advancing', () => {
         const { video, wedges, check } = wedgeSetup();
         check(0);

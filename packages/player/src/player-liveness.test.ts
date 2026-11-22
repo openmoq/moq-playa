@@ -261,6 +261,80 @@ describe('media liveness (starvation detection + restart ladder)', () => {
     await player.destroy();
   });
 
+  describe('restarts the peer refuses but permits retrying (e.g. a relay whose upstream is down)', () => {
+    /** Refuse every later SUBSCRIBE for `name` until `refusing()` turns false. */
+    function refuseResubscribes(adapter: any, name: string, refusing: () => boolean, retryInterval = 1n) {
+      const original = adapter.subscribe.getMockImplementation();
+      adapter.subscribe.mockImplementation(async (ns: unknown, n: Uint8Array, opts: unknown) => {
+        const id = await original(ns, n, opts);
+        if (new TextDecoder().decode(n) === name && refusing()) {
+          setTimeout(() => adapter._triggerMessage({ type: 'REQUEST_ERROR', requestId: id, errorCode: varint(0),
+            retryInterval: varint(retryInterval), errorReason: 'origin unreachable' } as unknown as ControlMessage), 0);
+        }
+        return id;
+      });
+    }
+    const videoSubscribes = (adapter: any) => adapter.subscribe.mock.calls.filter(
+      (c: any[]) => new TextDecoder().decode(c[1] as Uint8Array) === 'video').length;
+
+    it('keeps retrying past livenessMaxRestarts and recovers when delivery resumes', async () => {
+      const adapter = createMockAdapter();
+      adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
+      const { player } = await startPlaying(adapter, { livenessRefusedRetryMs: 5_000 });
+      const errors: any[] = [];
+      player.on('error', (e) => errors.push(e.error));
+      try {
+        let upstreamDown = true;
+        refuseResubscribes(adapter, 'video', () => upstreamDown);
+        feedVideo(adapter);
+        // Well past the 2-attempt budget, every refused retry keeps the ladder going.
+        await vi.waitFor(() => expect(videoSubscribes(adapter)).toBeGreaterThanOrEqual(5), { timeout: 3_000 });
+        expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(false);
+        expect(player.state).toBe(PlayerState.PLAYING);
+        // The upstream is back: the next resubscribe is accepted and delivers.
+        upstreamDown = false;
+        const before = videoSubscribes(adapter);
+        await vi.waitFor(() => expect(videoSubscribes(adapter)).toBeGreaterThan(before), { timeout: 3_000 });
+        const newReqId = await adapter.subscribe.mock.results.at(-1)?.value;
+        adapter._triggerMessage({ type: 'SUBSCRIBE_OK', requestId: newReqId, trackAlias: varint(60n), parameters: new Map(), trackExtensions: [] } as unknown as ControlMessage);
+        adapter._triggerObject(0n, { kind: 'data', trackAlias: varint(60n), groupId: varint(5), subgroupId: varint(0),
+          objectId: varint(0), payload: new Uint8Array([0xcc]) } as MoqtObject);
+        await sleep(100);
+        expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(false);
+        expect(player.state).toBe(PlayerState.PLAYING);
+      } finally { await player.destroy(); }
+    });
+
+    it('ends fatally once the refusal budget runs out', async () => {
+      const adapter = createMockAdapter();
+      adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
+      const { player } = await startPlaying(adapter, { livenessRefusedRetryMs: 300 });
+      const errors: any[] = [];
+      player.on('error', (e) => errors.push(e.error));
+      try {
+        refuseResubscribes(adapter, 'video', () => true);
+        feedVideo(adapter);
+        await vi.waitFor(() => expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(true), { timeout: 3_000 });
+        expect(errors.find((e) => e.code === PlayerErrorCode.MEDIA_STARVED).message).toMatch(/restart refused for \d+ s \(code=0x0\)/);
+        expect(player.state).toBe(PlayerState.ERROR);
+      } finally { await player.destroy(); }
+    });
+
+    it('a refusal with Retry Interval 0 still ends the ladder at once', async () => {
+      const adapter = createMockAdapter();
+      adapter.requestUpdate.mockRejectedValue(new Error('request stream gone'));
+      const { player } = await startPlaying(adapter, { livenessRefusedRetryMs: 60_000, draftVersion: 16 });
+      const errors: any[] = [];
+      player.on('error', (e) => errors.push(e.error));
+      try {
+        refuseResubscribes(adapter, 'video', () => true, 0n);
+        feedVideo(adapter);
+        await vi.waitFor(() => expect(errors.some((e) => e.code === PlayerErrorCode.MEDIA_STARVED)).toBe(true), { timeout: 3_000 });
+        expect(errors.find((e) => e.code === PlayerErrorCode.MEDIA_STARVED).message).toMatch(/refused automatic retry/);
+      } finally { await player.destroy(); }
+    });
+  });
+
   it('a data-stream reset shortens the fuse — starvation fires long before the full timeout', async () => {
     const adapter = createMockAdapter();
     // Full timeout far away (5s): only the reset fuse (40ms) can fire below.
