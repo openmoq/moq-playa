@@ -42,7 +42,7 @@ export type {
     Msf01DeltaOpKind,
 } from './types.js';
 
-export { MSF_VERSION, CATALOG_TRACK_NAME, CMSF_SAP_EVENT_TYPE, LOCMAF_VERSION, SUPPORTED_LOCMAF_VERSIONS } from './types.js';
+export { MSF_VERSION, CATALOG_TRACK_NAME, CMSF_SAP_EVENT_TYPE, LOCMAF_VERSION, SUPPORTED_LOCMAF_VERSIONS, SUPPORTED_PACKAGINGS } from './types.js';
 
 // ─── Catalog parsing ─────────────────────────────────────────────────
 

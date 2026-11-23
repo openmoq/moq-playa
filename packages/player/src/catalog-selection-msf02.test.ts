@@ -17,8 +17,7 @@ it('reports draft-02 catalog, encryption, variable, and packaging exclusions', (
     expect(selection.excluded.map(t => t.reason)).toEqual([
         'catalog-reference', 'encrypted', 'unresolved-variable', 'unresolved-variable', 'unsupported-packaging', 'no-media-role',
     ]);
-    expect(isTrackPackagingSupported(catalog.tracks[4]!, { msfDraft: 'draft-02' })).toBe(false);
-    expect(isTrackPackagingSupported(catalog.tracks[4]!)).toBe(true);
+    expect(isTrackPackagingSupported(catalog.tracks[4]!)).toBe(false);
     const legacy = parseMsfCatalog(JSON.stringify({ version: 'draft-01', tracks: [{ ...media, name: 'encrypted', encryptionScheme: 'custom' }] }), 'live');
     expect(buildCatalogSelection({ ...legacy, tracks: [...legacy.tracks] }, { catalogNamespace: 'live' }).excluded).toEqual([]);
 });

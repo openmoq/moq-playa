@@ -11,22 +11,22 @@
 
 import { identityKey, namespaceFieldsOf, trackIdentityKey } from './track-identity.js';
 import type { CatalogTrack, CatalogState, RenderGroup, AltGroup, TrackConstraints } from './types.js';
-import { SUPPORTED_LOCMAF_VERSIONS } from './types.js';
+import { SUPPORTED_LOCMAF_VERSIONS, SUPPORTED_PACKAGINGS } from './types.js';
 
 /**
- * Whether a receiver may subscribe to this track given its packaging version.
+ * Whether a receiver may subscribe to this track given its packaging and
+ * packaging version.
  *
- * Returns false only for a `locmaf` track whose `locmafVersion` is not in
- * {@link SUPPORTED_LOCMAF_VERSIONS}: such a track MUST NOT be subscribed, but the
- * catalog remains valid and an alternative packaging of the same source MAY be
- * selected instead. Every other packaging is reported supported here (codec
- * capability is a separate, runtime concern).
+ * Returns false for a packaging not in {@link SUPPORTED_PACKAGINGS}, and for a
+ * `locmaf` track whose `locmafVersion` is not in
+ * {@link SUPPORTED_LOCMAF_VERSIONS}. Such a track MUST NOT be subscribed, but
+ * the catalog remains valid and an alternative packaging of the same source MAY
+ * be selected instead. Codec capability is a separate, runtime concern.
+ * @see draft-ietf-moq-msf-02 §5.2.4
  * @see draft-einarsson-moq-locmaf-01 §5
  */
-export function isTrackPackagingSupported(track: CatalogTrack): boolean;
-export function isTrackPackagingSupported(track: CatalogTrack, options: { readonly msfDraft?: 'draft-02' }): boolean;
-export function isTrackPackagingSupported(track: CatalogTrack, options?: { readonly msfDraft?: 'draft-02' }): boolean {
-    if (options?.msfDraft === 'draft-02' && !['loc', 'locmaf', 'cmaf', 'mediatimeline', 'eventtimeline'].includes(track.packaging)) return false;
+export function isTrackPackagingSupported(track: CatalogTrack): boolean {
+    if (!SUPPORTED_PACKAGINGS.includes(track.packaging)) return false;
     if (track.packaging !== 'locmaf') return true;
     return track.locmafVersion !== undefined && SUPPORTED_LOCMAF_VERSIONS.includes(track.locmafVersion);
 }
