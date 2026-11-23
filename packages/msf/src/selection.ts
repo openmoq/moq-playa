@@ -22,10 +22,15 @@ import { SUPPORTED_LOCMAF_VERSIONS, SUPPORTED_PACKAGINGS } from './types.js';
  * {@link SUPPORTED_LOCMAF_VERSIONS}. Such a track MUST NOT be subscribed, but
  * the catalog remains valid and an alternative packaging of the same source MAY
  * be selected instead. Codec capability is a separate, runtime concern.
+ *
+ * The `msfDraft` option is accepted for compatibility and no longer changes the
+ * result: an unknown packaging is refused in every catalog draft.
  * @see draft-ietf-moq-msf-02 §5.2.4
  * @see draft-einarsson-moq-locmaf-01 §5
  */
-export function isTrackPackagingSupported(track: CatalogTrack): boolean {
+export function isTrackPackagingSupported(track: CatalogTrack): boolean;
+export function isTrackPackagingSupported(track: CatalogTrack, options: { readonly msfDraft?: 'draft-02' }): boolean;
+export function isTrackPackagingSupported(track: CatalogTrack, _options?: { readonly msfDraft?: 'draft-02' }): boolean {
     if (!SUPPORTED_PACKAGINGS.includes(track.packaging)) return false;
     if (track.packaging !== 'locmaf') return true;
     return track.locmafVersion !== undefined && SUPPORTED_LOCMAF_VERSIONS.includes(track.locmafVersion);

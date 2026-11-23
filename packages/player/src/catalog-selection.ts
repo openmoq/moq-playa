@@ -350,7 +350,8 @@ export function buildCatalogSelection(
       const reason = track.packaging === 'catalog' ? 'catalog-reference'
         : track.encryptionScheme !== undefined ? 'encrypted'
         : [track.name, track.namespace, ...(track.depends ?? []), track.parentName, track.parentNamespace]
-          .some(value => typeof value === 'string' && value.includes('%')) ? 'unresolved-variable' : undefined;
+          .some(value => typeof value === 'string' && value.includes('%')) ? 'unresolved-variable'
+        : !isTrackPackagingSupported(track, catalog) ? 'unsupported-packaging' : undefined;
       if (reason) {
         excluded.push({ id: identityOf(track, contextFieldsValue), reason, ...where,
           ...(mediaType !== null ? { mediaType } : {}) });
