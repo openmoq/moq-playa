@@ -16,11 +16,11 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { parseCatalogAuto, type Catalog, type CatalogTrack } from '@openmoq/msf';
+import { isTrackPackagingSupported, parseCatalogAuto, type Catalog, type CatalogTrack } from '@openmoq/msf';
 import { catalogProjection } from '../catalog-exec.js';
 import { fc, fcParams, catalogFuzzInput, catalogFuzzBytes, toHex, describeText, expectParserSafe, allowCatalogError, assertJsonSafe, assertNoMutation } from './media-fuzz.js';
 
-const PACKAGINGS = new Set(['loc', 'cmaf', 'mediatimeline', 'eventtimeline']);
+const PACKAGINGS = new Set(['loc', 'cmaf', 'mediatimeline', 'eventtimeline', 'locmaf']);
 
 /** Assert the structural invariants of a successfully-parsed Catalog. */
 function assertCatalogShape(label: string, cat: Catalog, inputRepr: string): void {
@@ -35,7 +35,10 @@ function assertCatalogShape(label: string, cat: Catalog, inputRepr: string): voi
   for (const t of cat.tracks) {
     expect(typeof t.name, `${label}: track.name string`).toBe('string');
     expect(typeof t.isLive, `${label}: track.isLive boolean`).toBe('boolean');
-    expect(PACKAGINGS.has(t.packaging), `${label}: track.packaging is a known value (${t.packaging})`).toBe(true);
+    expect(typeof t.packaging, `${label}: track.packaging string`).toBe('string');
+    if (!PACKAGINGS.has(t.packaging)) {
+      expect(isTrackPackagingSupported(t), `${label}: unknown packaging ${t.packaging} is never subscribed`).toBe(false);
+    }
     // Optional numeric fields, when present, must be finite (no NaN/Infinity from
     // a JSON number like 1e999).
     for (const [k, v] of Object.entries(t)) {
