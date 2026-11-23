@@ -7,6 +7,7 @@
  *
  * RELAY_MAX_PENDING_OBJECTS / RELAY_MAX_PENDING_BYTES override the per-subscription
  * backlog at which a subscriber that cannot keep up is disconnected.
+ * RELAY_HISTORY_GROUPS overrides the number of cached history groups per track.
  *
  * Prints the same parseable "[server] listening on <url>" line as the demo server.
  */
@@ -18,9 +19,11 @@ const envLimit = (name: string): number | undefined =>
 
 const maxPendingObjects = envLimit('RELAY_MAX_PENDING_OBJECTS');
 const maxPendingBytes = envLimit('RELAY_MAX_PENDING_BYTES');
+const historyGroups = envLimit('RELAY_HISTORY_GROUPS');
 
 startRelayServer({
   relayOptions: {
+    ...(historyGroups !== undefined ? { historyCache: { maxGroups: historyGroups } } : {}),
     ...(maxPendingObjects !== undefined ? { maxPendingObjectsPerSubscription: maxPendingObjects } : {}),
     ...(maxPendingBytes !== undefined ? { maxPendingBytesPerSubscription: maxPendingBytes } : {}),
   },

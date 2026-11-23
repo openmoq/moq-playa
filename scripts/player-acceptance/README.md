@@ -282,9 +282,12 @@ physical A/V synchronization or certify a remote relay.
 their ordinary behavior. The browser connects through the proxy using the same
 certificate pin; the publisher connects directly to the relay. Warm/handover
 relay launchers are not supported with shaping. Shaped ordinary relay children
-explicitly use 4096 objects / 32 MiB backlog limits; unshaped defaults stay
-256 objects / 4 MiB. These are scenario resource limits, not a guarantee that
-all constrained-link backlogs will drain.
+explicitly set `RELAY_MAX_PENDING_OBJECTS=4096` and `RELAY_MAX_PENDING_BYTES=33554432`
+for 4096 objects / 32 MiB backlog limits, plus `RELAY_HISTORY_GROUPS=4` to retain
+four history Groups per track. The history override sets `historyCache.maxGroups`;
+it does not change the cache's object or byte limits. Unshaped defaults stay
+256 objects / 4 MiB backlog and one history Group. These are scenario resource
+limits, not a guarantee that all constrained-link backlogs will drain.
 
 | Preset | Downlink | Uplink |
 | --- | --- | --- |
