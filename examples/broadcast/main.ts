@@ -360,6 +360,7 @@ async function startBroadcast(source: 'camera' | 'screen'): Promise<void> {
       conn.onSubscribe = (requestId, _ns, trackName) => {
         session.handleSubscribe(requestId, new TextDecoder().decode(trackName));
       };
+      conn.onFetch = (requestId) => session.handleFetch(requestId);
       conn.onSubscribeClosed = (requestId) => session.handleSubscribeClosed(requestId);
       const logMessage = conn.onMessage;
       conn.onMessage = (message) => {

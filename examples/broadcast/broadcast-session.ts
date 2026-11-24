@@ -1,3 +1,4 @@
+import { RequestError, RequestError18, RequestError22, RequestError23 } from '@openmoq/transport';
 import { publicationState, type PublicationConnection } from '../shared/publication-state.js';
 /**
  * One broadcast generation, session-local and DOM-free.
@@ -19,6 +20,7 @@ import type { MediaPublishConnection, MediaPublisherOptions } from './media-publ
 export interface BroadcastSessionConnection extends MediaPublishConnection, PublicationConnection {
   acceptSubscribe(requestId: unknown, alias: unknown): Promise<void>;
   rejectSubscribe(requestId: unknown, errorCode: unknown, reason: string): Promise<void>;
+  rejectFetch(requestId: unknown, errorCode: unknown, reason: string): Promise<void>;
   /** Terminal for a subscription accepted but not servable (catalog transaction). */
   publishDone(requestId: unknown, statusCode: unknown, reason: string): Promise<void>;
   close(): Promise<void>;
@@ -84,6 +86,13 @@ export class BroadcastSession {
         ...opts.publisher.codecStrings,
       },
     });
+  }
+
+  /** d22 §3.2: every FETCH needs a response; this publisher retains no history. */
+  handleFetch(requestId: bigint): void {
+    const codes = { 14: RequestError, 16: RequestError, 18: RequestError18, 22: RequestError22, 23: RequestError23 };
+    void this.connection.rejectFetch(this.wrapInt(requestId), codes[this.opts.publisher.draft].NOT_SUPPORTED, 'FETCH is not supported')
+      .catch(error => this.safeLog(`Failed to reject FETCH: ${(error as Error)?.message ?? error}`));
   }
 
   /**

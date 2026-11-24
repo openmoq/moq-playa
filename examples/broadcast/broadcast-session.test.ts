@@ -27,6 +27,7 @@ function recordingConnection() {
     session: { draftVersion: 16, getOutgoingPublish: () => undefined, getIncomingSubscription: id => requests.get(id) },
     acceptSubscribe: async (_requestId, alias) => { calls.push('acceptSubscribe'); accepted.push(alias as bigint); },
     rejectSubscribe: async () => { calls.push('rejectSubscribe'); },
+    rejectFetch: async () => { calls.push('rejectFetch'); },
     openSubgroup: async () => { calls.push('openSubgroup'); return nextStream++; },
     sendObject: async (_sid, _oid, payload) => { calls.push('sendObject'); sends.push(payload); },
     closeSubgroup: async () => { calls.push('closeSubgroup'); },
