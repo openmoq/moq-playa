@@ -466,6 +466,65 @@ it('a narrow post-hole witness survives a frozen sample with thin forward video'
   } finally { f.adapter.destroy(); }
 });
 
+// Two downshifts in quick succession leave two narrow video holes back to
+// back. The audio clock carries the playhead across both at full readiness,
+// and the short range between them can pass between two samples, so no
+// sample sees the playhead in the range just below the later hole. The
+// crossing is still witnessed from the last covered point before the first
+// hole, when every hole crossed since is narrow and audio covered the span.
+it.each([
+  ['narrow then narrow', [[0, 1], [1.3, 1.9]], true],
+  ['wide then narrow', [[0, 1], [3.3, 3.9]], false],
+] as const)('a crossing of chained holes (%s) is witnessed from the last covered point', async (_name, lower, acts) => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const top = lower[1][1] + 0.3;
+  const ranges = (videoEnd: number) => {
+    const video: Array<[number, number]> = [[lower[0][0], lower[0][1]], [lower[1][0], lower[1][1]], [top, videoEnd]];
+    source.videoBuffer.buffered = makeTimeRanges(video);
+    source.audioBuffer.buffered = makeTimeRanges([[0, videoEnd + 0.5]]);
+    f.video.buffered = makeTimeRanges(video);
+  };
+  try {
+    ranges(top + 1); f.video.advancePlayback(0.9); await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(lower[1][1] + 0.1); await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(top + 0.6); await vi.advanceTimersByTimeAsync(1000);
+    f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual([]);
+    ranges(top + 4);
+    await vi.advanceTimersByTimeAsync(6000);
+    if (acts) { expect(rungs[0]).toBe(1); expect(f.video.seekCount).toBeGreaterThan(0); }
+    else expect(rungs).toEqual([]);
+    expect(f.jumps).toHaveLength(0);
+  } finally { f.adapter.destroy(); }
+});
+
+// A switch during startup can leave one hole wider than the jump bound. The
+// audio clock carries the playhead across it and on into the upper range,
+// where it freezes with under a second of video ahead. Thin coverage holds
+// recovery off without retiring the witness, as for a narrow hole.
+it('a witnessed wide-hole crossing survives a frozen sample with thin forward video', async () => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const ranges = (videoEnd: number) => {
+    source.videoBuffer.buffered = makeTimeRanges([[0, 1], [3.4, videoEnd]]);
+    source.audioBuffer.buffered = makeTimeRanges([[0, videoEnd + 0.5]]);
+    f.video.buffered = makeTimeRanges([[0, 1], [3.4, videoEnd]]);
+  };
+  try {
+    ranges(4.4); f.video.advancePlayback(0.9); await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(1.9); await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(2.9); await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(3.8); await vi.advanceTimersByTimeAsync(1000);
+    f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual([]);
+    ranges(9);
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(rungs[0]).toBe(1);
+    expect(f.video.seekCount).toBeGreaterThan(0);
+  } finally { f.adapter.destroy(); }
+});
+
 // A later downshift can leave a second narrow video hole just under a second
 // past where the clock stopped. The capped range must not hold recovery off
 // for good: media past a hole within the jump bound counts as coverage, as
