@@ -579,6 +579,35 @@ it.each(['carry', 'frames', 'not playing'] as const)('a stop after a thin post-h
   } finally { f.adapter.destroy(); }
 });
 
+// Lab shape: a second downshift about a second after the first leaves a
+// second narrow hole. The clock carries past the first hole with frames flat,
+// then crosses the second between samples and is already stopping (readyState
+// 2) on the sample that sees it. The carry continues across the second hole,
+// so the stop gets the same timing. Frames moving between the two holes end
+// the carry, and the stop waits the normal deadline.
+it.each(['chained', 'frames between'] as const)('a stop after a thin carry across two holes (%s)', async mode => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const set = (midEnd: number, videoEnd: number) => {
+    const video: Array<[number, number]> = [[0, 1], [2, midEnd], ...(videoEnd > 0 ? [[3.5, videoEnd] as [number, number]] : [])];
+    source.videoBuffer.buffered = makeTimeRanges(video);
+    source.audioBuffer.buffered = makeTimeRanges([[0, Math.max(midEnd, videoEnd) + 0.5]]);
+    f.video.buffered = makeTimeRanges(video);
+  };
+  try {
+    set(2.4, 0); f.video.advancePlayback(0.9); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    set(2.4, 0); f.video.advancePlayback(2.1); await vi.advanceTimersByTimeAsync(1000); // carry past the first hole
+    set(3.1, 0); f.video.advancePlayback(2.8); if (mode === 'frames between') f.video.frames += 30;
+    await vi.advanceTimersByTimeAsync(1000);
+    set(3.1, 4.1); f.video.advancePlayback(3.6); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000); // second hole, stopping
+    set(3.1, 4.3); await vi.advanceTimersByTimeAsync(1000); // first frozen sample
+    expect(rungs).toEqual([]);
+    set(3.1, 4.5); await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual(mode === 'chained' ? [1] : []);
+    expect(f.jumps).toHaveLength(0);
+  } finally { f.adapter.destroy(); }
+});
+
 // Lab shape: a buffer append is often in flight at the check where rung 1
 // falls due. Rung 1 is retried once that work completes, not a second later.
 it('a due advancing-stall rung held by an in-flight append fires once it completes', async () => {

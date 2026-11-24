@@ -3695,11 +3695,13 @@ export class MseMediaSource implements MediaSourceLike {
       // Video arriving at about real time after a downshift keeps under half a
       // second ahead while the clock carries on audio. That carry is still the
       // evidence: when the clock stops, the frozen path times it like an
-      // advancing stall instead of waiting for a second of video ahead.
+      // advancing stall instead of waiting for a second of video ahead. A
+      // second downshift's hole crossed while frames are still flat continues
+      // the same carry, even if the clock is already stopping when it is seen.
       const carryHole = this.wedgeVideoHole;
       this.wedgeCarriedHole = framesFlat && carryHole !== null
         && carryHole.start - carryHole.end <= MseMediaSource.GAP_JUMP_MAX_HOLE_SEC && ct >= carryHole.start
-        && (this.wedgeCarriedHole === carryHole || (ct - from! >= MseMediaSource.WEDGE_ADVANCING_MIN_SEC
+        && (this.wedgeCarriedHole !== null || (ct - from! >= MseMediaSource.WEDGE_ADVANCING_MIN_SEC
           && (v.readyState ?? 0) >= 3 && !v.paused && this.playbackIntent)) ? carryHole : null;
       this.handleWatchdogSeeked();
       this.wedgeLastTime = ct;
