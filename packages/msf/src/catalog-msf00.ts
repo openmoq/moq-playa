@@ -6,7 +6,7 @@
  */
 
 import { resolveTrackDependencies } from './selection.js';
-import { MSF_VERSION, SUPPORTED_PACKAGINGS } from './types.js';
+import { MSF_VERSION } from './types.js';
 import { namespaceDisplay, resolveTrackNamespace, trackIdentityKey } from './track-identity.js';
 import type { CatalogNamespaceContext } from './track-identity.js';
 import type {
@@ -46,8 +46,8 @@ export function isDelta(obj: CatalogObject): obj is CatalogDelta {
  * - version must be 1 (§5.1.1)
  * - tracks array must be present (§5.1.8)
  * - each track must have name, packaging, isLive (§5.1.11, §5.1.12, §5.1.15)
- * - a packaging this build does not support is carried, held only to the
- *   packaging-independent rules, and never subscribed (`isTrackPackagingSupported`)
+ * - a packaging this build does not support is carried and never subscribed
+ *   (`isTrackPackagingSupported`)
  * - track names must be unique per namespace (§5.1.11)
  * - targetLatency MUST NOT appear if isLive=false (§5.1.16)
  * - trackDuration MUST NOT appear if isLive=true (§5.1.37)
@@ -266,8 +266,7 @@ export function validateReferences(catalog: {
  * Validate the LOCMAF locmafVersion presence rule: it MUST be present (as a JSON
  * string) when packaging is "locmaf" and MUST NOT be present otherwise. The
  * version VALUE is not checked here — an unsupported version parses and is
- * excluded from subscription by `isTrackPackagingSupported`. Nor is a
- * packaging this build does not support: its own specification owns its fields.
+ * excluded from subscription by `isTrackPackagingSupported`.
  * @see draft-einarsson-moq-locmaf-01 §5
  */
 export function validateLocmafVersion(track: {
@@ -281,7 +280,7 @@ export function validateLocmafVersion(track: {
                 `Track "${track.name}": locmafVersion is required and must be a string when packaging is "locmaf" (LOCMAF §5)`,
             );
         }
-    } else if (track.locmafVersion !== undefined && SUPPORTED_PACKAGINGS.includes(track.packaging)) {
+    } else if (track.locmafVersion !== undefined) {
         throw new Error(
             `Track "${track.name}": locmafVersion MUST NOT be present when packaging is not "locmaf" (LOCMAF §5)`,
         );
@@ -313,8 +312,8 @@ export function parseTrack(
     const name = obj['name'];
 
     // §5.1.12: packaging — Required. As in MSF-02, a value this build does not
-    // support is carried rather than rejected: the packaging-specific rules below
-    // skip it and `isTrackPackagingSupported` keeps it from being subscribed.
+    // support is carried rather than rejected; `isTrackPackagingSupported` keeps
+    // it from being subscribed.
     if (typeof obj['packaging'] !== 'string') {
         throw new Error(
             msfDraft ? `MSF-02 packaging for "${name}" is required and must be a string (§5.2.4)` :
@@ -322,7 +321,6 @@ export function parseTrack(
         );
     }
     const packaging = obj['packaging'] as Packaging;
-    const supportedPackaging = SUPPORTED_PACKAGINGS.includes(packaging);
 
     // §5.1.15: isLive — Required
     if (typeof obj['isLive'] !== 'boolean') {
@@ -352,7 +350,7 @@ export function parseTrack(
             `Track "${name}": eventType is required when packaging is "eventtimeline" (§5.1.13)`,
         );
     }
-    if (supportedPackaging && packaging !== 'eventtimeline' && obj['eventType'] !== undefined) {
+    if (packaging !== 'eventtimeline' && obj['eventType'] !== undefined) {
         throw new Error(
             `Track "${name}": eventType MUST NOT be used when packaging is not "eventtimeline" (§5.1.13)`,
         );
