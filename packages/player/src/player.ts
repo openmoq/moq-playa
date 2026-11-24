@@ -13692,6 +13692,8 @@ export class MoqtPlayer {
         if (this.videoDeliveryEnding()) return;
         this._stats.recordStall(durationMs);
         this.emitter.emit('stall', { type: 'stall', durationMs });
+        // A closed session still contributes stall stats, but cannot recover media.
+        if (this.connection?.session.state === SessionState.CLOSED) return;
         this.lastLocStallUs = this.clock.now();
         this.locHealthyRenderCount = 0;
 
@@ -15033,7 +15035,7 @@ export class MoqtPlayer {
     mediaType: 'video' | 'audio',
     startGroup?: bigint,
   ): void {
-    if (!this.connection) return;
+    if (!this.connection || this.connection.session.state === SessionState.CLOSED) return;
 
     const matching = [...this.activeSubscriptions.entries()]
       .filter(([requestId, sub]) => sub.mediaType === mediaType && requestId !== this.timelineRequestId
