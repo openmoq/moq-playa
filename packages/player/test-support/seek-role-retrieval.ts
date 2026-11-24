@@ -39,13 +39,14 @@ async function fixture(draft: 18 | 22, live = false, observation?: NonNullable<C
     const liveCancelled = vi.fn();
     let onBeginLive: (() => void) | undefined;
     let identity: object | null = null;
+    const finished = new Set<object>();
     const owner = new SeekRoleRetrieval({ connection: client, track, location: { groupId: 3n, objectId: 0n },
       timeoutMs: 1000, maxObjects: 16, maxBytes: 1024, isCurrent: () => true, getTimeline: () => timeline,
       canProbeLive: () => live, admitHead: () => live, beforeSubscribe: () => true,
       beginPage: page => {
         identity = page;
         return { onObject: async object => { if (object.kind === 'data') received.push(object.payload[0]!); },
-          onClosed: terminal => { if (terminal === 'fin') owner.onPageDrained(page); } };
+          onClosed: terminal => { if (terminal === 'fin') { finished.add(page); owner.onPageDrained(page); } } };
       },
       acceptPage: accepted, beginLive: (_owner, properties) => {
         if (!live) throw new Error('Finite fixture cannot enter live input');
@@ -59,6 +60,10 @@ async function fixture(draft: 18 | 22, live = false, observation?: NonNullable<C
       onBridgeAdded: bridge => { if (!live) throw new Error('Finite fixture cannot open a bridge'); bridges.push(bridge); },
       onBridgeRemoved: bridge => { const index = bridges.indexOf(bridge); if (index >= 0) bridges.splice(index, 1); },
       onEnded: ended, onProgress: vi.fn(), onFailure: failures,
+    });
+    accepted.mockImplementation((page: object) => {
+      // The output host completes only after both its data FIN and response.
+      if (finished.has(page)) queueMicrotask(() => owner.onPageDrained(page));
     });
     owners.push(owner); owner.pump();
     return { owner, received, ended, failures, accepted, liveProperties, liveCancelled,

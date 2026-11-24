@@ -38,7 +38,7 @@ export function mdat(bytes: Uint8Array): Uint8Array {
 
 type WireFetch = { id: bigint; namespace: string[]; name: string; start: { group: bigint; object: bigint }; end: { group: bigint; object: bigint }; filter?: readonly bigint[] };
 // Real player + SDK/Session + format consumers. Native append and landing are controlled witnesses, not browser decoding.
-export async function fixture(draft: 18 | 22, live: boolean, indexed: readonly (typeof locations)[number][] = locations, options: {connectionTimeoutMs?:number; receiptClock?:boolean; startPaused?: boolean; playerConfig?: Partial<MoqtPlayerConfig>; buffers?: { min?: number; target?: number }; rateOutput?: Pick<MediaSourceLike, 'setPlaybackRate' | 'getBufferAheadUs'>} = {}) {
+export async function fixture(draft: 18 | 22, live: boolean, indexed: readonly (readonly [number, readonly [number, number], number])[] = locations, options: {connectionTimeoutMs?:number; receiptClock?:boolean; startPaused?: boolean; playerConfig?: Partial<MoqtPlayerConfig>; buffers?: { min?: number; target?: number }; rateOutput?: Pick<MediaSourceLike, 'setPlaybackRate' | 'getBufferAheadUs'>} = {}) {
   let now = 100_000;
   const { a, b } = createLoopback();
   const client = new MoqtConnection(draft, { terminatedAliasTtlMs: 50 }), server = new MoqtConnection(draft, { role: 'server' });
@@ -144,7 +144,7 @@ export async function fixture(draft: 18 | 22, live: boolean, indexed: readonly (
     }
     return { player, client, server, a, b, draft, subscriptions, joins, headers, wire, opened, fetches, errors, submissions, nativeBytes, resources, placements, seeked, ended, source, terminals, nativeByResource,
       accept, begin, close, setNow: (value: number) => { now = value; },
-      async updateIndex(next: readonly (typeof locations)[number][], group = 1n) { await send(300n, enc.encode(JSON.stringify(next)), group); },
+      async updateIndex(next: readonly (readonly [number, readonly [number, number], number])[], group = 1n) { await send(300n, enc.encode(JSON.stringify(next)), group); },
       advance(time: number) { nativeTime = time; },
       publishHead(head: {group:bigint;object:bigint}) { published.set(200n,head); },
       async liveObject(index: number, close = true) {

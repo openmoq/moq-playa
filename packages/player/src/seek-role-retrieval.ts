@@ -80,6 +80,7 @@ export class SeekRoleRetrieval {
   private cut: SeekFetchCut;
   private lastNonProgress: SeekFetchPageProof | undefined;
   private page: Page | null = null;
+  private responseTimer: ReturnType<typeof setTimeout> | null = null;
   private bridge: SeekRoleBridgeOwner | null = null;
   private first = true;
   private stopped = false;
@@ -97,6 +98,8 @@ export class SeekRoleRetrieval {
       onRegister: (receiver: FetchReceiver) => {
         if (this.page?.transport === receiver) options.validateLocation?.(this.page.start);
         if (receiver === this.firstReceiver) options.onFirstRequest?.();
+        const page = this.page;
+        if (page?.transport === receiver && this.current()) this.armResponseDeadline(page);
       }, onError: (error, receiver) => {
       if (receiver === this.firstReceiver) this.settleFirst(error);
       const page = this.page;
@@ -148,6 +151,7 @@ export class SeekRoleRetrieval {
   cancel(): void {
     if (this.retired) return;
     this.retired = true;
+    this.clearResponseDeadline();
     this.settleFirst(Object.assign(new Error('Seek role issuance retired'), { name: 'AbortError' }));
     this.bridge?.cancel();
     this.requests.dispose();
@@ -166,8 +170,18 @@ export class SeekRoleRetrieval {
 
   private current(): boolean { return !this.retired && this.options.isCurrent() && !this.retired; }
 
+  private armResponseDeadline(page: Page): void {
+    this.responseTimer = setTimeout(() => this.failPage(page, new Error('Seek FETCH response timed out')), this.options.timeoutMs);
+  }
+
+  private clearResponseDeadline(): void {
+    if (this.responseTimer !== null) clearTimeout(this.responseTimer);
+    this.responseTimer = null;
+  }
+
   private failPage(page: Page, error: Error): void {
     if (!this.current() || this.page !== page) return;
+    this.clearResponseDeadline();
     if (page.transport === this.firstReceiver) this.settleFirst(error);
     this.page = null; this.stopped = true;
     page.cancel?.(); page.receiver.onClosed('error');
@@ -200,6 +214,10 @@ export class SeekRoleRetrieval {
       onObject: async (object, receiving) => {
         const current = () => this.current() && !receiving.signal.aborted;
         if (!current()) return;
+        if (this.page === page && !page.accepted) {
+          this.clearResponseDeadline();
+          this.armResponseDeadline(page);
+        }
         const captured = this.options.capture(object);
         await this.options.consume(object, captured, current, (value, input) => receiver.onObject(value, input));
       },
@@ -210,6 +228,7 @@ export class SeekRoleRetrieval {
     this.page = page; this.first = false;
     const accept = (response: SeekFetchResponse) => {
       if (!this.current() || this.page !== page) return;
+      this.clearResponseDeadline();
       page.accepted = advanceSeekFetchCut(this.draft, this.cut, response);
       this.options.acceptPage(identity, response.endOfTrack, Object.freeze({ start: Object.freeze({ ...start }),
         through: Object.freeze({ ...page.accepted.cut }), endOfTrack: response.endOfTrack, groupOrder: 'ascending', rangeFilters: false,
