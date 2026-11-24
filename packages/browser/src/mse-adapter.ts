@@ -3092,6 +3092,14 @@ export class MseMediaSource implements MediaSourceLike {
       },
       MseMediaSource.WEDGE_CHECK_INTERVAL_MS,
     );
+    // The first sample comes a full interval after playback starts. By then
+    // the audio clock may have carried the playhead past the end of the
+    // startup video, so the start position is the only covered point a
+    // crossing of a startup hole can anchor on.
+    const v = this.video;
+    if (!v.paused && !v.seeking && this.playbackIntent && v.error === null && !v.ended) {
+      this.rememberCoveredVideoPosition(v.currentTime);
+    }
   }
 
   // ─── Buffered-hole gap-jump ──────────────────────────────────────
@@ -3708,10 +3716,12 @@ export class MseMediaSource implements MediaSourceLike {
       postHole = this.hasPostHoleCoverage(ct, wideHole);
       // The audio clock carries the playhead to the end of the buffered video
       // before it freezes, so the first frozen sample can see under a second
-      // ahead. Thin forward coverage of a still-standing narrow hole only
-      // holds recovery off; a changed hole or a playhead outside its upper
-      // range retires the witness.
-      if (!postHole && !this.hasPendingNativeWork() && (wideHole || !this.isInsideWitnessedUpperRange(ct))) {
+      // ahead. Thin forward video of a still-standing hole only holds
+      // recovery off; a changed hole or a playhead outside its upper range
+      // retires the witness. A wide hole also needs the audio that carried
+      // the clock still ahead: an audio shortfall is not a video wedge.
+      if (!postHole && !this.hasPendingNativeWork()
+          && ((wideHole && !this.audioAheadOf(ct, 1)) || !this.isInsideWitnessedUpperRange(ct))) {
         this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
       }
     }
@@ -3861,6 +3871,15 @@ export class MseMediaSource implements MediaSourceLike {
     } catch { return false; /* Detached/evicted native media cannot justify a seek. */ }
   }
 
+  /** More than `sec` of audio is buffered ahead of `ct` (true without an audio buffer). */
+  private audioAheadOf(ct: number, sec: number): boolean {
+    try {
+      const audio = this.audioBuffer?.buffered;
+      return audio === undefined || Array.from({ length: audio.length }, (_, i) => i)
+        .some(i => audio.start(i) <= ct && audio.end(i) - ct > sec);
+    } catch { return false; }
+  }
+
   private isInsideWitnessedUpperRange(ct: number): boolean {
     const hole = this.wedgeVideoHole;
     if (hole === null || this.observeVideoHole(ct, ct) !== hole) return false;
@@ -3885,11 +3904,16 @@ export class MseMediaSource implements MediaSourceLike {
           && prior.generation === this.bufferGen && prior.end === end && prior.start === start;
         // A fresh witness needs an observed lower buffered point. A late upper
         // range can make the immediately preceding sample already be in the gap.
+        // Holes back to back (two switches in quick succession) can leave a
+        // lower range so short that no sample lands in it: the point may then
+        // sit in an earlier range, provided every hole crossed since is narrow.
+        let lowest = i;
+        while (lowest > 0 && ranges.start(lowest) - ranges.end(lowest - 1) <= MseMediaSource.GAP_JUMP_MAX_HOLE_SEC) lowest--;
         const point = this.wedgeCoveredPosition;
         const anchor = from >= ranges.start(i) && from <= end ? from
           : point !== null && point.videoBuffer === videoBuffer && point.audioBuffer === audioBuffer
             && point.generation === this.bufferGen && point.time <= from ? point.time : null;
-        if (!same && (anchor === null || anchor < ranges.start(i) || anchor > end || to <= anchor)) continue;
+        if (!same && (anchor === null || anchor < ranges.start(lowest) || anchor > end || to <= anchor)) continue;
         const coverageFrom = same ? from : anchor!;
         let covered = audio === undefined;
         if (audio) for (let j = 0; j < audio.length; j++) {

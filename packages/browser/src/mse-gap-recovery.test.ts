@@ -14,8 +14,9 @@ afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 const settle = async () => { for (let i = 0; i < 50; i++) await Promise.resolve(); };
 const segment = (pts: number) => buildChunk({ trackId: 1, bmdt: BigInt(pts * 1000),
   samples: [{ duration: 1000, size: 4, flags: SYNC_FLAGS }], mdat: Uint8Array.of(1, 2, 3, 4) });
-async function ready(gapJumpMs = 2000, options: { reorderWindowMs?: number; maxQueuedChunks?: number } = {}) {
+async function ready(gapJumpMs = 2000, options: { reorderWindowMs?: number; maxQueuedChunks?: number } = {}, atPlay?: () => void) {
   const video = Object.assign(new MockVideoElement(), { duration: Infinity, ended: false }); video.buffered = makeTimeRanges([[0, 7]]);
+  if (atPlay) video.deferPlay = async () => { atPlay(); };
   const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { gapJumpMs, maxAheadSec: Infinity, ...options });
   const reports: unknown[] = [], jumps: unknown[] = [];
   adapter.onStartupReport = report => { reports.push(report); };
@@ -460,6 +461,94 @@ it('a narrow post-hole witness survives a frozen sample with thin forward video'
     expect(rungs).toEqual([]);
     ranges(9, 9.5);
     await vi.advanceTimersByTimeAsync(6000);
+    expect(rungs[0]).toBe(1);
+    expect(f.video.seekCount).toBeGreaterThan(0);
+    expect(f.jumps).toHaveLength(0);
+  } finally { f.adapter.destroy(); }
+});
+
+// Two downshifts in quick succession leave two narrow video holes back to
+// back. The audio clock carries the playhead across both at full readiness,
+// and the short range between them can pass between two samples, so no
+// sample sees the playhead in the range just below the later hole. The
+// crossing is still witnessed from the last covered point before the first
+// hole, when every hole crossed since is narrow and audio covered the span.
+it.each([
+  ['narrow then narrow', [[0, 1], [1.3, 1.9]], true],
+  ['wide then narrow', [[0, 1], [3.3, 3.9]], false],
+] as const)('a crossing of chained holes (%s) is witnessed from the last covered point', async (_name, lower, acts) => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const top = lower[1][1] + 0.3;
+  const ranges = (videoEnd: number) => {
+    const video: Array<[number, number]> = [[lower[0][0], lower[0][1]], [lower[1][0], lower[1][1]], [top, videoEnd]];
+    source.videoBuffer.buffered = makeTimeRanges(video);
+    source.audioBuffer.buffered = makeTimeRanges([[0, videoEnd + 0.5]]);
+    f.video.buffered = makeTimeRanges(video);
+  };
+  try {
+    ranges(top + 1); f.video.advancePlayback(0.9); await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(lower[1][1] + 0.1); await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(top + 0.6); await vi.advanceTimersByTimeAsync(1000);
+    f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual([]);
+    ranges(top + 4);
+    await vi.advanceTimersByTimeAsync(6000);
+    if (acts) { expect(rungs[0]).toBe(1); expect(f.video.seekCount).toBeGreaterThan(0); }
+    else expect(rungs).toEqual([]);
+    expect(f.jumps).toHaveLength(0);
+  } finally { f.adapter.destroy(); }
+});
+
+// A switch during startup can leave one hole wider than the jump bound. The
+// audio clock carries the playhead across it and on into the upper range,
+// where it freezes with under a second of video ahead. Thin coverage holds
+// recovery off without retiring the witness, as for a narrow hole.
+it('a witnessed wide-hole crossing survives a frozen sample with thin forward video', async () => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const ranges = (videoEnd: number) => {
+    source.videoBuffer.buffered = makeTimeRanges([[0, 1], [3.4, videoEnd]]);
+    source.audioBuffer.buffered = makeTimeRanges([[0, videoEnd + 0.5]]);
+    f.video.buffered = makeTimeRanges([[0, 1], [3.4, videoEnd]]);
+  };
+  try {
+    ranges(4.4); f.video.advancePlayback(0.9); await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(1.9); await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(2.9); await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(3.8); await vi.advanceTimersByTimeAsync(1000);
+    f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual([]);
+    ranges(9);
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(rungs[0]).toBe(1);
+    expect(f.video.seekCount).toBeGreaterThan(0);
+  } finally { f.adapter.destroy(); }
+});
+
+// The first watchdog sample comes a full interval after playback starts. A
+// switch during startup can leave a hole the audio clock carries the playhead
+// into before that sample, so no sample ever sees it in the lower range. The
+// start position is the covered point the crossing is witnessed from.
+it.each([
+  ['narrow', 1.6, [2.2, 2.5]],
+  ['wide', 3.4, [2.4, 3.8]],
+] as const)('a %s hole crossed before the first watchdog sample is witnessed from the start position', async (_name, upper, steps) => {
+  // Startup plays from inside the first video range.
+  const f = await ready(2000, {}, () => { source.videoBuffer.buffered = makeTimeRanges([[0, 1]]); }), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const ranges = (videoEnd: number) => {
+    source.videoBuffer.buffered = makeTimeRanges([[0, 1], [upper, videoEnd]]);
+    source.audioBuffer.buffered = makeTimeRanges([[0, videoEnd + 0.5]]);
+    f.video.buffered = makeTimeRanges([[0, 1], [upper, videoEnd]]);
+  };
+  try {
+    ranges(upper + 1); f.video.advancePlayback(1.2); await vi.advanceTimersByTimeAsync(1000);
+    for (const t of steps) { f.video.advancePlayback(t); await vi.advanceTimersByTimeAsync(1000); }
+    f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual([]);
+    ranges(upper + 6);
+    await vi.advanceTimersByTimeAsync(8000);
     expect(rungs[0]).toBe(1);
     expect(f.video.seekCount).toBeGreaterThan(0);
     expect(f.jumps).toHaveLength(0);
