@@ -815,6 +815,9 @@ export class MseMediaSource implements MediaSourceLike {
   private static readonly WEDGE_RETRY_MS = 150;
   /** The current episode began as an advancing video stall. */
   private wedgeAdvancingStall = false;
+  /** The witnessed narrow hole the clock ran past on audio with video frames
+   * flat, though too little video was ahead to call it an advancing stall. */
+  private wedgeCarriedHole: typeof this.wedgeVideoHole = null;
   private wedgeRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private wedgeTimer: ReturnType<typeof setInterval> | null = null;
   /** Last observed currentTime; ladder resets only on ORGANIC movement. */
@@ -3662,7 +3665,7 @@ export class MseMediaSource implements MediaSourceLike {
       this.clearVideoHoleEvidence(); this.handleWatchdogSeeked();
       this.wedgeLastTime = null;
       this.wedgeFrozenSinceMs = null;
-      this.wedgeRung = 0; this.wedgeAdvancingStall = false;
+      this.wedgeRung = 0; this.wedgeAdvancingStall = false; this.wedgeCarriedHole = null;
       return;
     }
     // Counter progress always vetoes recovery on this sample. A crossing
@@ -3689,6 +3692,15 @@ export class MseMediaSource implements MediaSourceLike {
       const framesFlat = qualitySampled && !qualityMoved && from !== null;
       const advancing = framesFlat && this.isAdvancingVideoStall(from!, ct, ownSeek);
       if (this.destroyed || generation !== this.bufferGen) return;
+      // Video arriving at about real time after a downshift keeps under half a
+      // second ahead while the clock carries on audio. That carry is still the
+      // evidence: when the clock stops, the frozen path times it like an
+      // advancing stall instead of waiting for a second of video ahead.
+      const carryHole = this.wedgeVideoHole;
+      this.wedgeCarriedHole = framesFlat && carryHole !== null
+        && carryHole.start - carryHole.end <= MseMediaSource.GAP_JUMP_MAX_HOLE_SEC && ct >= carryHole.start
+        && (this.wedgeCarriedHole === carryHole || (ct - from! >= MseMediaSource.WEDGE_ADVANCING_MIN_SEC
+          && (v.readyState ?? 0) >= 3 && !v.paused && this.playbackIntent)) ? carryHole : null;
       this.handleWatchdogSeeked();
       this.wedgeLastTime = ct;
       if (!advancing) {
@@ -3720,7 +3732,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.wedgeVideoHole = this.observeVideoHole(ct, ct);
     if (qualityMoved) {
       if (this.wedgeVideoHole !== null && from >= this.wedgeVideoHole.start) this.clearVideoHoleEvidence();
-      this.wedgeAdvancingStall = false;
+      this.wedgeAdvancingStall = false; this.wedgeCarriedHole = null;
       this.handleWatchdogSeeked();
       this.wedgeFrozenSinceMs = null;
       this.wedgeRung = 0;
@@ -3741,9 +3753,12 @@ export class MseMediaSource implements MediaSourceLike {
     // media beyond it still counts outside the gap-jump edge window.
     const aheadSec = this.elementAheadSec(ct);
     const forwardSec = this.elementAheadSec(ct, true);
+    // After a frameless carry past a narrow hole, half a second of coverage
+    // past the playhead is enough, as for an advancing stall.
+    const minAheadSec = this.carriedNarrowStall() ? MseMediaSource.WEDGE_ADVANCING_MIN_SEC : 1;
     let postHole = false;
     if (this.gapJumpMs > 0 && hole !== null && quality !== null && ((v.readyState ?? 0) === 2 || wideHole)) {
-      postHole = this.hasPostHoleCoverage(ct, wideHole);
+      postHole = this.hasPostHoleCoverage(ct, wideHole, minAheadSec);
       // The audio clock carries the playhead to the end of the buffered video
       // before it freezes, so the first frozen sample can see under a second
       // ahead. Thin forward coverage of a still-standing narrow hole only
@@ -3755,7 +3770,7 @@ export class MseMediaSource implements MediaSourceLike {
     }
     if (v.paused || (v.seeking && !ownSeek) || !this.playbackIntent || (wideHole && (!postHole || (v.readyState ?? 0) < 2))
         || ((v.readyState ?? 0) < 3 && !postHole) || aheadSec < MseMediaSource.GAP_EDGE_WINDOW_SEC
-        || forwardSec <= 1) {
+        || forwardSec <= minAheadSec) {
       this.wedgeFrozenSinceMs = null;
       return;
     }
@@ -3779,11 +3794,17 @@ export class MseMediaSource implements MediaSourceLike {
     this.fireWedgeRung(nowMs, ct, quality!, hole, wideHole, aheadSec, ownSeek, generation);
   }
 
-  /** An advancing stall's first rung fires on its second frameless sample;
-   * every other rung waits the normal freeze deadline. */
+  /** An advancing stall's first rung fires on its second frameless sample,
+   * and a stop after a frameless carry on its first frozen sample after the
+   * stop; every other rung waits the normal freeze deadline. */
   private wedgeDeadlineMs(): number {
-    return this.wedgeAdvancingStall && this.wedgeRung === 0
+    return (this.wedgeAdvancingStall || this.carriedNarrowStall()) && this.wedgeRung === 0
       ? MseMediaSource.WEDGE_ADVANCING_FROZEN_MS : MseMediaSource.WEDGE_FROZEN_MS;
+  }
+
+  /** The current witness is a narrow hole the clock carried past on audio with frames flat. */
+  private carriedNarrowStall(): boolean {
+    return this.wedgeCarriedHole !== null && this.wedgeCarriedHole === this.wedgeVideoHole;
   }
 
   private scheduleWedgeRetry(): void {
@@ -3813,7 +3834,7 @@ export class MseMediaSource implements MediaSourceLike {
         || quality.droppedVideoFrames !== last.droppedVideoFrames) return;
     if (v.paused || v.seeking || !this.playbackIntent || v.error !== null || v.ended || (v.readyState ?? 0) < 2
         || (this.wedgeLastTime !== null && ct < this.wedgeLastTime)) return;
-    const min = this.wedgeAdvancingStall ? MseMediaSource.WEDGE_ADVANCING_MIN_SEC : 1;
+    const min = this.wedgeAdvancingStall || this.carriedNarrowStall() ? MseMediaSource.WEDGE_ADVANCING_MIN_SEC : 1;
     const aheadSec = this.elementAheadSec(ct);
     if (!this.hasPostHoleCoverage(ct, true, min) || aheadSec < MseMediaSource.GAP_EDGE_WINDOW_SEC
         || this.elementAheadSec(ct, true) <= min) return;
@@ -3944,6 +3965,7 @@ export class MseMediaSource implements MediaSourceLike {
   private clearVideoHoleEvidence(): void {
     this.wedgeVideoHole = null;
     this.wedgeCoveredPosition = null;
+    this.wedgeCarriedHole = null;
   }
 
   private rememberCoveredVideoPosition(time: number): void {
