@@ -11337,7 +11337,7 @@ export class MoqtPlayer {
    *
    * 1. Applies config.errorFilter (return null = suppress)
    * 2. Emits structured `error` event
-   * 3. Emits legacy `session_error` for backward compatibility
+   * 3. Emits legacy `session_error` if the filtered error is fatal or its source is connection
    */
   private emitError(playerError: PlayerError): void {
     // An intentionally destroyed player emits NO error events: teardown noise
@@ -11357,9 +11357,10 @@ export class MoqtPlayer {
 
     this.emitter.emit('error', { type: 'error', error: filtered });
 
-    // Backward compat: also fire session_error with an Error wrapping the message
-    const legacyError = filtered.cause ?? new Error(filtered.message);
-    this.emitter.emit('session_error', { type: 'session_error', error: legacyError });
+    if (filtered.severity === 'fatal' || filtered.source === 'connection') {
+      const legacyError = filtered.cause ?? new Error(filtered.message);
+      this.emitter.emit('session_error', { type: 'session_error', error: legacyError });
+    }
   }
 
   /**

@@ -115,9 +115,9 @@ export interface SessionClosedEvent {
 }
 
 /**
- * Session error (protocol violation, transport error).
+ * Fatal error or an error whose source is connection.
  * @deprecated Use `error` event with structured PlayerError instead.
- * Retained for backward compatibility — fires alongside `error`.
+ * Retained for backward compatibility; `errorFilter` applies to both events.
  * @see draft-ietf-moq-transport-16 §13.4 (Error Codes)
  */
 export interface SessionErrorEvent {

@@ -5196,6 +5196,28 @@ describe('MoqtPlayer', () => {
       expect(errors[0].error.source).toBe('catalog');
     });
 
+    it.each([
+      ['degraded', 'player', false],
+      ['fatal', 'player', true],
+      ['degraded', 'connection', true],
+    ] as const)('emits session_error for %s/%s only when fatal or connection sourced', async (severity, source, legacy) => {
+      const adapter = createMockAdapter();
+      const player = new MoqtPlayer({ ...createConfig(adapter),
+        errorFilter: error => ({ ...error, severity, source }),
+      });
+      const loading = player.load();
+      await resolveConnect(adapter); await loading;
+      const errors = vi.fn(), sessionErrors = vi.fn();
+      player.on('error', errors); player.on('session_error', sessionErrors);
+      const cause = new Error('request failed');
+      adapter._triggerError(cause);
+      expect(errors).toHaveBeenCalledOnce();
+      expect(errors.mock.calls[0]![0].error).toMatchObject({ severity, source, cause });
+      expect(sessionErrors).toHaveBeenCalledTimes(legacy ? 1 : 0);
+      if (legacy) expect(sessionErrors.mock.calls[0]![0].error).toBe(cause);
+      await player.destroy();
+    });
+
     it('errorFilter suppresses errors when returning null', async () => {
       const adapter = createMockAdapter();
       const player = new MoqtPlayer({
