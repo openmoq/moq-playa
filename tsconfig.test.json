@@ -17,6 +17,7 @@
   // `*.test.ts` corpus predates any typecheck gate and does not compile clean
   // under these options; widening this include is a separate cleanup.
   "include": [
+    "packages/webtransport/src/adapter-fetch-order.test.ts",
     "packages/webtransport/src/adapter-update-held-stop.test.ts",
     "packages/webtransport/src/adapter-cancelled-allocation.test.ts",
     "packages/browser/src/webtransport-factory.test.ts",

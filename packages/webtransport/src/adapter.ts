@@ -2636,11 +2636,8 @@ export class MoqtConnection {
     }
 
     if (message.type === 'FETCH_OK') {
-      const refusal = this.session.prepareFetchDataResponse({ ...message, requestId } as FetchOk);
-      if (refusal) {
-        await this.executeActions(refusal);
-        return;
-      }
+      await this.handleFetchOkOrdered({ ...message, requestId } as FetchOk);
+      return;
     }
 
     // §5.1: a response (e.g. REQUEST_ERROR) crossing a cancellation is consumed by
@@ -2663,10 +2660,24 @@ export class MoqtConnection {
     if (fwdTarget !== undefined && fwdAfter !== undefined) {
       this.notifyPublishForwardChange(fwdTarget, fwdAfter);
     }
-    // §10.13: a FETCH_OK may complete the fetch (its data stream already FIN'd, in
-    // the object-delivery-before-response order) — close the request bidi so the
-    // fetcher's topology context does not leak.
-    if (message.type === 'FETCH_OK') await this.closeCompletedFetchRequest(requestId);
+  }
+
+  private async handleFetchOkOrdered(message: FetchOk): Promise<void> {
+    // d14/16 §9.17, d18 §10.13, d22 §9.12: validate before application
+    // cancellation can turn an invalid range into a tolerated crossed response.
+    const crossed = this.session.isCancelledRequest(message.requestId);
+    const actions = this.session.handleControlMessage(message);
+    const close = actions.find((action) => action.type === 'close_connection');
+    if (close || actions.some((action) => action.type === 'cancel_request')) {
+      await this.executeActions(actions);
+      if (close) this.notifyClose(close, 'FETCH_OK rejected');
+      return;
+    }
+    const suppress = this.handleRawSubControlMessage(message) || crossed;
+    if (!suppress) this.onMessage?.(message);
+    this.settleFillHeaders();
+    await this.executeActions(actions);
+    await this.closeCompletedFetchRequest(message.requestId);
   }
 
   /**
@@ -7477,11 +7488,8 @@ export class MoqtConnection {
             message,
           });
           if (message.type === 'FETCH_OK') {
-            const refusal = this.session.prepareFetchDataResponse(message as FetchOk);
-            if (refusal) {
-              await this.executeActions(refusal);
-              continue;
-            }
+            await this.handleFetchOkOrdered(message as FetchOk);
+            continue;
           }
           // §10.11 / §9.15: a subscriber-side PUBLISH_DONE terminates the
           // subscription — apply its Stream Count so the alias routing is torn
