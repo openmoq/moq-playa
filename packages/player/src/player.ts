@@ -4438,6 +4438,7 @@ export class MoqtPlayer {
     this.pendingVideoSwitch = null;
     this.switchInProgress = false;
     this.videoSwitchSettled();
+    if (sw.abrAction === 'downshift') this.lastAbrDownshiftCommitUs = this.clock.now();
 
     // Switch is now committed — commit controllers, record stat, fire event.
     // All mutation is deferred to this point. ABR/recovery initiation paths
@@ -10729,6 +10730,8 @@ export class MoqtPlayer {
   private lastAbrDownshiftUs = 0;
   /** Timestamp (µs) of the last automatic switch that failed to start. */
   private lastAbrSwitchFailureUs = Number.NEGATIVE_INFINITY;
+  /** When (µs) the last automatic downshift committed; never before the first one. */
+  private lastAbrDownshiftCommitUs = Number.NEGATIVE_INFINITY;
   /** Timestamp (µs) of last video stall — gates LOC upshift. */
   private lastLocStallUs = 0;
   /** Timestamp (µs) of last video decode error — gates LOC upshift. */
@@ -10755,6 +10758,12 @@ export class MoqtPlayer {
   private static readonly LIVENESS_REFUSED_BACKOFF_MAX_MS = 5_000;
   /** Widest hole the MSE source crosses on its own (its gap-jump bound). */
   private static readonly MSE_SHORT_HOLE_SEC = 2;
+  /**
+   * After a downshift commits, how long an empty MSE reading is read as thin:
+   * the new rung's first media is still being appended. In the lab it landed
+   * within about 0.2 s of the commit.
+   */
+  private static readonly ABR_COMMIT_APPEND_GRACE_US = 1_000_000;
   /** Delay after an automatic switch fails before another is attempted. */
   private static readonly ABR_SWITCH_FAILURE_HOLDOFF_US = 1_000_000;
 
@@ -10921,6 +10930,14 @@ export class MoqtPlayer {
         // Video resumes just past a short hole (a committed switch begins at
         // its next keyframe): the hole is crossed by the media source, and a
         // lower rung would not fill it. Thin, not empty.
+        effectiveBufferUs = abr.lowThresholdUs;
+      } else if (bufferUs === 0
+          && this.clock.now() - this.lastAbrDownshiftCommitUs < MoqtPlayer.ABR_COMMIT_APPEND_GRACE_US) {
+        // A downshift just committed and its first media is not appended yet,
+        // so neither side of its switch hole is visible. Thin, not empty: the
+        // reading says nothing about the new rung. A sustained empty buffer
+        // still downshifts once the grace ends, and a stall or a rising
+        // delivery trend downshifts at once.
         effectiveBufferUs = abr.lowThresholdUs;
       } else if (bufferUs === 0) {
         // Truly empty — always report emergency, don't let stale
