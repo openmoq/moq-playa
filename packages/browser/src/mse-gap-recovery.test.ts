@@ -549,8 +549,9 @@ it.each(['deep', 'live edge', 'thin at stop'] as const)('an advancing stall keep
 // Lab shape: after a downshift the new rung's video can arrive at about real
 // time, so the carry runs only 0.2-0.5 s behind the newest video, too little
 // to call it an advancing stall. When the clock then stops, the frameless
-// carry is the evidence: half a second ahead is enough coverage and rung 1
-// fires on the second frozen sample, as for an advancing stall. Without a carry
+// carry is the evidence: half a second ahead is enough coverage, and the
+// deadline starts on the sample that sees the clock stopping, so rung 1 fires
+// on the first frozen sample. Without a carry
 // (frames advancing, or a clock that only moved below readyState 3) the stop
 // still needs over a second ahead and the normal deadline.
 it.each(['carry', 'frames', 'not playing'] as const)('a stop after a thin post-hole carry (%s)', async mode => {
@@ -570,8 +571,9 @@ it.each(['carry', 'frames', 'not playing'] as const)('a stop after a thin post-h
     }
     expect(rungs).toEqual([]);
     set(3.9); f.video.advancePlayback(3.3); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000); // stops
-    set(4.1); await vi.advanceTimersByTimeAsync(1000); // first frozen sample
     expect(rungs).toEqual([]);
+    set(4.1); await vi.advanceTimersByTimeAsync(1000); // first frozen sample
+    expect(rungs).toEqual(mode === 'carry' ? [1] : []);
     set(4.2); await vi.advanceTimersByTimeAsync(1000);
     expect(rungs).toEqual(mode === 'carry' ? [1] : []);
     expect(f.video.seekCount).toBe(mode === 'carry' ? 1 : 0);
@@ -600,8 +602,9 @@ it.each(['chained', 'frames between'] as const)('a stop after a thin carry acros
     set(3.1, 0); f.video.advancePlayback(2.8); if (mode === 'frames between') f.video.frames += 30;
     await vi.advanceTimersByTimeAsync(1000);
     set(3.1, 4.1); f.video.advancePlayback(3.6); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000); // second hole, stopping
-    set(3.1, 4.3); await vi.advanceTimersByTimeAsync(1000); // first frozen sample
     expect(rungs).toEqual([]);
+    set(3.1, 4.3); await vi.advanceTimersByTimeAsync(1000); // first frozen sample
+    expect(rungs).toEqual(mode === 'chained' ? [1] : []);
     set(3.1, 4.5); await vi.advanceTimersByTimeAsync(1000);
     expect(rungs).toEqual(mode === 'chained' ? [1] : []);
     expect(f.jumps).toHaveLength(0);

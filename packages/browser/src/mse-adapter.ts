@@ -3716,8 +3716,12 @@ export class MseMediaSource implements MediaSourceLike {
           return;
         }
         this.wedgeAdvancingStall = false;
-        this.wedgeFrozenSinceMs = null;
         this.wedgeRung = 0;
+        // The sample after a carry's stop usually still sees the last bit of
+        // movement, at readyState 2. The deadline starts there, so the first
+        // frozen sample can fire rung 1 once the frozen path finds the
+        // freeze eligible.
+        this.wedgeFrozenSinceMs = framesFlat && this.carriedNarrowStall() && (v.readyState ?? 0) < 3 ? nowMs : null;
         return;
       }
       // Video stopped at a crossed narrow hole while audio keeps the clock
@@ -3797,8 +3801,8 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   /** An advancing stall's first rung fires on its second frameless sample,
-   * and a stop after a frameless carry on its first frozen sample after the
-   * stop; every other rung waits the normal freeze deadline. */
+   * and a stop after a frameless carry on its first frozen sample; every
+   * other rung waits the normal freeze deadline. */
   private wedgeDeadlineMs(): number {
     return (this.wedgeAdvancingStall || this.carriedNarrowStall()) && this.wedgeRung === 0
       ? MseMediaSource.WEDGE_ADVANCING_FROZEN_MS : MseMediaSource.WEDGE_FROZEN_MS;
