@@ -14,8 +14,9 @@ afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 const settle = async () => { for (let i = 0; i < 50; i++) await Promise.resolve(); };
 const segment = (pts: number) => buildChunk({ trackId: 1, bmdt: BigInt(pts * 1000),
   samples: [{ duration: 1000, size: 4, flags: SYNC_FLAGS }], mdat: Uint8Array.of(1, 2, 3, 4) });
-async function ready(gapJumpMs = 2000, options: { reorderWindowMs?: number; maxQueuedChunks?: number } = {}) {
+async function ready(gapJumpMs = 2000, options: { reorderWindowMs?: number; maxQueuedChunks?: number } = {}, atPlay?: () => void) {
   const video = Object.assign(new MockVideoElement(), { duration: Infinity, ended: false }); video.buffered = makeTimeRanges([[0, 7]]);
+  if (atPlay) video.deferPlay = async () => { atPlay(); };
   const adapter = new MseMediaSource(video as unknown as HTMLVideoElement, { gapJumpMs, maxAheadSec: Infinity, ...options });
   const reports: unknown[] = [], jumps: unknown[] = [];
   adapter.onStartupReport = report => { reports.push(report); };
@@ -522,6 +523,35 @@ it('a witnessed wide-hole crossing survives a frozen sample with thin forward vi
     await vi.advanceTimersByTimeAsync(8000);
     expect(rungs[0]).toBe(1);
     expect(f.video.seekCount).toBeGreaterThan(0);
+  } finally { f.adapter.destroy(); }
+});
+
+// The first watchdog sample comes a full interval after playback starts. A
+// switch during startup can leave a hole the audio clock carries the playhead
+// into before that sample, so no sample ever sees it in the lower range. The
+// start position is the covered point the crossing is witnessed from.
+it.each([
+  ['narrow', 1.6, [2.2, 2.5]],
+  ['wide', 3.4, [2.4, 3.8]],
+] as const)('a %s hole crossed before the first watchdog sample is witnessed from the start position', async (_name, upper, steps) => {
+  // Startup plays from inside the first video range.
+  const f = await ready(2000, {}, () => { source.videoBuffer.buffered = makeTimeRanges([[0, 1]]); }), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const ranges = (videoEnd: number) => {
+    source.videoBuffer.buffered = makeTimeRanges([[0, 1], [upper, videoEnd]]);
+    source.audioBuffer.buffered = makeTimeRanges([[0, videoEnd + 0.5]]);
+    f.video.buffered = makeTimeRanges([[0, 1], [upper, videoEnd]]);
+  };
+  try {
+    ranges(upper + 1); f.video.advancePlayback(1.2); await vi.advanceTimersByTimeAsync(1000);
+    for (const t of steps) { f.video.advancePlayback(t); await vi.advanceTimersByTimeAsync(1000); }
+    f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual([]);
+    ranges(upper + 6);
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(rungs[0]).toBe(1);
+    expect(f.video.seekCount).toBeGreaterThan(0);
+    expect(f.jumps).toHaveLength(0);
   } finally { f.adapter.destroy(); }
 });
 

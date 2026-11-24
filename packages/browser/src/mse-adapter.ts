@@ -3092,6 +3092,14 @@ export class MseMediaSource implements MediaSourceLike {
       },
       MseMediaSource.WEDGE_CHECK_INTERVAL_MS,
     );
+    // The first sample comes a full interval after playback starts. By then
+    // the audio clock may have carried the playhead past the end of the
+    // startup video, so the start position is the only covered point a
+    // crossing of a startup hole can anchor on.
+    const v = this.video;
+    if (!v.paused && !v.seeking && this.playbackIntent && v.error === null && !v.ended) {
+      this.rememberCoveredVideoPosition(v.currentTime);
+    }
   }
 
   // ─── Buffered-hole gap-jump ──────────────────────────────────────
