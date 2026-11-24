@@ -5161,12 +5161,6 @@ export class MoqtPlayer {
           entryCount: this.timelineState.entries.length,
           ...(duration !== undefined ? { duration } : {}),
         });
-        if (duration !== undefined && current()) {
-          this.emitter.emit('duration_changed', {
-            type: 'duration_changed',
-            durationMs: duration,
-          });
-        }
       } else {
         // Incremental update — emit timeline_updated
         this.emitter.emit('timeline_updated', {
@@ -5175,6 +5169,9 @@ export class MoqtPlayer {
           entryCount: this.timelineState.entries.length,
           ...(duration !== undefined ? { duration } : {}),
         });
+      }
+      if (duration !== undefined && (prevEntryCount === 0 || duration !== getTimelineDuration(timeline)) && current()) {
+        this.emitter.emit('duration_changed', { type: 'duration_changed', durationMs: duration });
       }
     };
 

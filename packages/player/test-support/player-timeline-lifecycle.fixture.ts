@@ -7,7 +7,7 @@ import type { VideoDecoderLike, VideoRendererLike, AudioDecoderLike, AudioOutput
 const enc = new TextEncoder(), dec = new TextDecoder();
 
 export async function fixture(draft: 18 | 22, audio = false, coverAudio = true, options: {
-  namespace?: string; audioNamespace?: string; shadowTimeline?: boolean; timelineBeforeOk?: boolean; catalogVersion?: 1 | '1'; skipInitialTimeline?: boolean;
+  namespace?: string; audioNamespace?: string; shadowTimeline?: boolean; timelineBeforeOk?: boolean; catalogVersion?: 1 | '1'; skipInitialTimeline?: boolean; trackDuration?: number;
 } = {}) {
   const { a, b } = createLoopback();
   const client = new MoqtConnection(draft), server = new MoqtConnection(draft, { role: 'server' });
@@ -58,7 +58,7 @@ export async function fixture(draft: 18 | 22, audio = false, coverAudio = true, 
         codec: 'opus', samplerate: 48000, channelConfig: '2', bitrate: 32000 }] : []),
       ...(options.shadowTimeline ? [{ name: 'timeline', namespace: 'live/show',
         packaging: 'mediatimeline', isLive: false, mimeType: 'application/json', depends: ['video', 'audio'] }] : []),
-      { name: 'timeline', namespace: options.namespace, packaging: 'mediatimeline', isLive: false, mimeType: 'application/json',
+      { name: 'timeline', namespace: options.namespace, packaging: 'mediatimeline', trackDuration: options.trackDuration, isLive: false, mimeType: 'application/json',
         depends: audio && coverAudio ? ['video', 'audio'] : ['video'] },
     ] })));
     await flush(256);
