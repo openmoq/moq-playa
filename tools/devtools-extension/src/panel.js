@@ -15,6 +15,7 @@ const owner = { id: params.get('owner'), tab: params.get('tab') };
 
 // Declared before the sources: a source may emit synchronously on construction.
 const rowNodes = [];
+const listNodes = new Map();
 let vm = null;
 // Attach and Probe are two LANES, each with its own adapter: a page source and an owner-local probe
 // never share state. The mode is panel-local view state. The mock is an explicit preview
@@ -223,6 +224,21 @@ function probeStatusLine() {
 function compactStats(text) {
   return text.replace('delivery drops: ', 'drops ').replace(/ over (\d+ batch(?:es)?)/, ' · $1').replace('source evicted ', 'src evicted ').replace('panel evicted ', 'panel ').replace('snapshot omitted ', 'omitted ');
 }
+// Keep equal subtrees intact across a mouse press/release; handlers always use this render's data.
+// onclick is the only handler or non-attribute state carried onto kept rows; carry any future additions too.
+function renderList(parent, nextNodes) {
+  const nodes = listNodes.get(parent) ?? [];
+  while (nodes.length > nextNodes.length) nodes.pop().remove();
+  nextNodes.forEach((next, i) => {
+    const node = nodes[i];
+    if (node && node.isEqualNode(next)) node.onclick = next.onclick;
+    else {
+      if (node) node.replaceWith(next); else parent.append(next);
+      nodes[i] = next;
+    }
+  });
+  listNodes.set(parent, nodes);
+}
 function render() {
   // Keep applying and acknowledging observations while hidden; the next shown host state paints the latest VM.
   // Losing the owner must still clear the live indicator, since that port can no longer send a shown state.
@@ -275,7 +291,7 @@ function render() {
     for (const id of ['probeUrl', 'probeNs', 'probeTracks', 'probeDraft', 'probePolicy']) $(id).disabled = running;
     $('probeStatus').textContent = probeStatusLine() + (presets.status ? ` · ${presets.status}` : '');
     $('probePresetList').classList.toggle('hidden', presets.items.length === 0);
-    $('probePresetList').replaceChildren(...presets.items.map(p => {
+    renderList($('probePresetList'), presets.items.map(p => {
       const d = el('div', 'inst'); d.append(el('span', 'name', p.name), el('span', 'meta', `${p.label ? p.label + ' · ' : ''}ns ${p.namespace}`));
       d.onclick = () => { $('probeNs').value = JSON.stringify([p.namespace]); };
       return d;
@@ -288,7 +304,7 @@ function render() {
   // Sources the page exposed but nothing attached yet: let the user pick one.
   const pickable = host?.core && (host.core.phase === 'discovered' || host.core.phase === 'withdrawn') ? host.core.sources : [];
   $('pickList').classList.toggle('hidden', pickable.length === 0);
-  $('pickList').replaceChildren(...pickable.map(s => {
+  renderList($('pickList'), pickable.map(s => {
     // One line per exposed source: its label and exposure, an explicit attach affordance; kind and run id in the tooltip.
     const d = el('div', 'inst mono');
     d.append(el('span', 'name', s.label ?? s.sourceId), el('span', 'meta', s.exposure ?? s.kind), el('span', 'go', 'attach ▸'));
@@ -306,7 +322,7 @@ function render() {
 
   // track tabs
   const tabs = $('trackTabs');
-  tabs.replaceChildren(...vm.tracks.map(t => {
+  renderList(tabs, vm.tracks.map(t => {
     const b = el('span', 'segBtn track' + (t.on ? ' on' : ''), t.name);
     b.style.color = t.on ? 'var(--grn)' : '';
     b.onclick = () => active().selectTrack(t.id ?? t.name);
@@ -315,7 +331,7 @@ function render() {
   $('ring').textContent = vm.ring.replace('ring buffer: ', '').replace('-object window', '-id window'); $('ring').title = vm.ring;   // compact; exact wording in the tooltip
 
   // left column
-  $('instances').replaceChildren(...vm.instances.map(i => {
+  renderList($('instances'), vm.instances.map(i => {
     const d = el('div', 'inst' + (i.on ? ' on' : ''));
     d.append(el('span', 'name', i.name), el('span', 'meta', i.sub));
     // Switching sources is detach-then-attach at the page; the owner refuses a second lease otherwise.
