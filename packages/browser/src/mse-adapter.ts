@@ -3539,8 +3539,13 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
 
-    // Jumpable: wait + rate limit.
-    if (nowMs - c.armedAtMs < this.gapJumpMs) return;
+    // Jumpable: wait + rate limit. After a frameless carry past an earlier
+    // narrow hole, a stop at this hole's edge is the same freeze the wedge
+    // ladder times from its stopping sample, so one check interval (less timer
+    // jitter) is enough. The configured wait still bounds it.
+    const waitMs = this.carriedNarrowStall()
+      ? Math.min(this.gapJumpMs, MseMediaSource.WEDGE_ADVANCING_FROZEN_MS) : this.gapJumpMs;
+    if (nowMs - c.armedAtMs < waitMs) return;
     if (nowMs - this.lastGapJumpAtMs < MseMediaSource.GAP_JUMP_MIN_INTERVAL_MS) return;
 
     // Re-validate the landing at jump time (the tail may have grown; the

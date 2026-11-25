@@ -653,6 +653,34 @@ it.each(['run', 'frames', 'not playing'] as const)('a stop that first witnesses 
   } finally { f.adapter.destroy(); }
 });
 
+// Lab shape: after a second downshift, the clock outruns the video, carries
+// past the first switch hole on audio with frames flat, and stops at the end of
+// its range, at the second switch hole's edge. That edge belongs to the
+// gap-jump. After the carry it jumps one check after it arms, not after the
+// full wait. Frames advancing during the run leave the full wait.
+it.each(['carry', 'frames'] as const)('a gap-jump at a hole edge after a frameless carry (%s)', async mode => {
+  const f = await ready();
+  const set = (video: Array<[number, number]>) => {
+    source.videoBuffer.buffered = makeTimeRanges(video);
+    source.audioBuffer.buffered = makeTimeRanges([[0, 4.5]]);
+    f.video.buffered = makeTimeRanges(video);
+  };
+  try {
+    set([[0, 1]]); f.video.advancePlayback(0.9); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    set([[0, 1]]); f.video.advancePlayback(1.6); if (mode === 'frames') f.video.frames += 30; // past all video
+    await vi.advanceTimersByTimeAsync(1000);
+    set([[0, 1], [2, 2.3]]); f.video.advancePlayback(2.4); if (mode === 'frames') f.video.frames += 30; // past the upper range
+    await vi.advanceTimersByTimeAsync(1000);
+    set([[0, 1], [2, 2.6]]); f.video.advancePlayback(2.55); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000); // stops at the edge
+    set([[0, 1], [2, 2.6], [3, 4]]); await vi.advanceTimersByTimeAsync(1000); // the next range lands: armed
+    expect(f.jumps).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.jumps).toHaveLength(mode === 'carry' ? 1 : 0);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.jumps).toHaveLength(1);
+  } finally { f.adapter.destroy(); }
+});
+
 // Lab shape: a buffer append is often in flight at the check where rung 1
 // falls due. Rung 1 is retried once that work completes, not a second later.
 it('a due advancing-stall rung held by an in-flight append fires once it completes', async () => {
