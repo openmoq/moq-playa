@@ -10631,10 +10631,10 @@ describe('MoqtPlayer', () => {
       // Populate a 3-track ladder
       qc.selectInitialTracks({
         tracks: [
-          { name: 'v0', role: 'video', altGroup: 1, codec: 'avc1.640028', bitrate: 3_000_000 },
-          { name: 'v1', role: 'video', altGroup: 1, codec: 'avc1.64001f', bitrate: 1_500_000 },
-          { name: 'v2', role: 'video', altGroup: 1, codec: 'avc1.4d4015', bitrate: 500_000 },
-          { name: 'v3', role: 'video', altGroup: 1, codec: 'avc1.64000d', bitrate: 250_000 },
+          { name: 'v0', packaging: 'cmaf', role: 'video', altGroup: 1, codec: 'avc1.640028', bitrate: 3_000_000 },
+          { name: 'v1', packaging: 'cmaf', role: 'video', altGroup: 1, codec: 'avc1.64001f', bitrate: 1_500_000 },
+          { name: 'v2', packaging: 'cmaf', role: 'video', altGroup: 1, codec: 'avc1.4d4015', bitrate: 500_000 },
+          { name: 'v3', packaging: 'cmaf', role: 'video', altGroup: 1, codec: 'avc1.64000d', bitrate: 250_000 },
         ],
       } as any, {});
 
@@ -10707,9 +10707,9 @@ describe('MoqtPlayer', () => {
       });
       qc.selectInitialTracks({
         tracks: [
-          { name: 'v0', role: 'video', altGroup: 1, codec: 'avc1.640028', bitrate: 3_000_000 },
-          { name: 'v1', role: 'video', altGroup: 1, codec: 'avc1.64001f', bitrate: 1_500_000 },
-          { name: 'v2', role: 'video', altGroup: 1, codec: 'avc1.4d4015', bitrate: 500_000 },
+          { name: 'v0', packaging: 'cmaf', role: 'video', altGroup: 1, codec: 'avc1.640028', bitrate: 3_000_000 },
+          { name: 'v1', packaging: 'cmaf', role: 'video', altGroup: 1, codec: 'avc1.64001f', bitrate: 1_500_000 },
+          { name: 'v2', packaging: 'cmaf', role: 'video', altGroup: 1, codec: 'avc1.4d4015', bitrate: 500_000 },
         ],
       } as any, {});
 
@@ -10739,8 +10739,8 @@ describe('MoqtPlayer', () => {
       });
       qc.selectInitialTracks({
         tracks: [
-          { name: 'v0', role: 'video', altGroup: 1, codec: 'avc1.640028', bitrate: 3_000_000 },
-          { name: 'v1', role: 'video', altGroup: 1, codec: 'avc1.64001f', bitrate: 1_500_000 },
+          { name: 'v0', packaging: 'cmaf', role: 'video', altGroup: 1, codec: 'avc1.640028', bitrate: 3_000_000 },
+          { name: 'v1', packaging: 'cmaf', role: 'video', altGroup: 1, codec: 'avc1.64001f', bitrate: 1_500_000 },
         ],
       } as any, {});
 

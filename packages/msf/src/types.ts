@@ -473,6 +473,14 @@ export const LOCMAF_VERSION = '0.3';
 export const SUPPORTED_LOCMAF_VERSIONS: readonly string[] = [LOCMAF_VERSION];
 
 /**
+ * Packaging values this implementation consumes. A track declaring any other
+ * packaging still parses, is held only to the rules every track obeys, and
+ * MUST NOT be subscribed.
+ * @see draft-ietf-moq-msf-02 §5.2.4
+ */
+export const SUPPORTED_PACKAGINGS: readonly string[] = ['loc', 'mediatimeline', 'eventtimeline', 'cmaf', 'locmaf'];
+
+/**
  * The fixed catalog track name.
  * @see draft-ietf-moq-msf-00 §5
  */

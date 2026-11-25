@@ -40,20 +40,14 @@ export function isDelta(obj: CatalogObject): obj is CatalogDelta {
 }
 
 /**
- * Set of known packaging values.
- * @see draft-ietf-moq-msf-00 §5.1.12 Table 3
- * @see draft-ietf-moq-cmsf-00 §3.5.1 (adds 'cmaf')
- * @see draft-einarsson-moq-locmaf-01 §5 (adds 'locmaf')
- */
-const VALID_PACKAGING = new Set<string>(['loc', 'mediatimeline', 'eventtimeline', 'cmaf', 'locmaf']);
-
-/**
  * Parse an independent (non-delta) MSF catalog from JSON.
  *
  * Validates all MUST requirements from the spec:
  * - version must be 1 (§5.1.1)
  * - tracks array must be present (§5.1.8)
  * - each track must have name, packaging, isLive (§5.1.11, §5.1.12, §5.1.15)
+ * - a packaging this build does not support is carried and never subscribed
+ *   (`isTrackPackagingSupported`)
  * - track names must be unique per namespace (§5.1.11)
  * - targetLatency MUST NOT appear if isLive=false (§5.1.16)
  * - trackDuration MUST NOT appear if isLive=true (§5.1.37)
@@ -317,11 +311,13 @@ export function parseTrack(
     }
     const name = obj['name'];
 
-    // §5.1.12: packaging — Required
-    if (typeof obj['packaging'] !== 'string' || (!msfDraft && !VALID_PACKAGING.has(obj['packaging']))) {
+    // §5.1.12: packaging — Required. As in MSF-02, a value this build does not
+    // support is carried rather than rejected; `isTrackPackagingSupported` keeps
+    // it from being subscribed.
+    if (typeof obj['packaging'] !== 'string') {
         throw new Error(
             msfDraft ? `MSF-02 packaging for "${name}" is required and must be a string (§5.2.4)` :
-            `Track "${name}" at index ${index}: packaging is required and must be one of ${[...VALID_PACKAGING].join(', ')} (§5.1.12)`,
+            `Track "${name}" at index ${index}: packaging is required ${obj['packaging'] === undefined ? 'but missing' : 'and must be a string'} (§5.1.12)`,
         );
     }
     const packaging = obj['packaging'] as Packaging;

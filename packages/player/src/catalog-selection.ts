@@ -327,8 +327,9 @@ function alternateSets(
  * a parameter because a parsed catalog does not carry it.
  *
  * Excluded, and reported in `excluded` rather than dropped silently: tracks
- * with no media role, and tracks whose PACKAGING this build cannot handle
- * (LOCMAF §5 forbids subscribing to a locmafVersion we do not support). That
+ * with no media role, and tracks whose PACKAGING this build cannot handle (a
+ * packaging it does not know, or a locmafVersion LOCMAF §5 forbids subscribing
+ * to). That
  * check is about packaging only — it says nothing about whether a decoder
  * exists for the codec, which is decided later and elsewhere. A set left
  * empty by exclusion disappears rather than gaining a substitute.
@@ -357,14 +358,13 @@ export function buildCatalogSelection(
         continue;
       }
     }
-    if (mediaType === null) {
-      excluded.push({ id: identityOf(track, contextFieldsValue), reason: 'no-media-role', ...where });
+    if (!isTrackPackagingSupported(track)) {
+      excluded.push({ id: identityOf(track, contextFieldsValue), reason: 'unsupported-packaging', ...where,
+        ...(mediaType !== null ? { mediaType } : {}) });
       continue;
     }
-    if (!isTrackPackagingSupported(track)) {
-      excluded.push({
-        id: identityOf(track, contextFieldsValue), reason: 'unsupported-packaging', mediaType, ...where,
-      });
+    if (mediaType === null) {
+      excluded.push({ id: identityOf(track, contextFieldsValue), reason: 'no-media-role', ...where });
       continue;
     }
     selectable.push(toSelectable(track, mediaType, contextFieldsValue, catalogIndex));

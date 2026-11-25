@@ -102,9 +102,9 @@ describe('mapLevels', () => {
 
   const catalog: CatalogState = {
     tracks: [
-      { name: 'video-0', codec: 'avc1.640028', width: 1920, height: 1080, bitrate: 3_000_000 } as any,
-      { name: 'video-1', codec: 'avc1.64001f', width: 1280, height: 720, bitrate: 1_500_000 } as any,
-      { name: 'video-2', codec: 'avc1.64001e', width: 640, height: 480, bitrate: 500_000 } as any,
+      { name: 'video-0', packaging: 'loc', codec: 'avc1.640028', width: 1920, height: 1080, bitrate: 3_000_000 } as any,
+      { name: 'video-1', packaging: 'loc', codec: 'avc1.64001f', width: 1280, height: 720, bitrate: 1_500_000 } as any,
+      { name: 'video-2', packaging: 'loc', codec: 'avc1.64001e', width: 640, height: 480, bitrate: 500_000 } as any,
     ],
   } as CatalogState;
 
