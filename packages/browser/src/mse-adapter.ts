@@ -818,6 +818,9 @@ export class MseMediaSource implements MediaSourceLike {
   /** The witnessed narrow hole the clock ran past on audio with video frames
    * flat, though too little video was ahead to call it an advancing stall. */
   private wedgeCarriedHole: typeof this.wedgeVideoHole = null;
+  /** Consecutive moving samples with video frames flat: where the clock was
+   * when they began, and whether one of them saw the element playing. */
+  private wedgeFramelessRun: { from: number; played: boolean } | null = null;
   private wedgeRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private wedgeTimer: ReturnType<typeof setInterval> | null = null;
   /** Last observed currentTime; ladder resets only on ORGANIC movement. */
@@ -3698,11 +3701,19 @@ export class MseMediaSource implements MediaSourceLike {
       // advancing stall instead of waiting for a second of video ahead. A
       // second downshift's hole crossed while frames are still flat continues
       // the same carry, even if the clock is already stopping when it is seen.
+      // Video slower than real time can leave the playhead past all buffered
+      // video at every sample, so the hole is first witnessed on the sample
+      // where the clock stops. The carry then counts the whole frameless run.
+      const playing = (v.readyState ?? 0) >= 3 && !v.paused && this.playbackIntent;
+      const run = !framesFlat || ownSeek || v.seeking ? null
+        : this.wedgeFramelessRun ?? { from: from!, played: false };
+      if (run !== null && playing) run.played = true;
+      this.wedgeFramelessRun = run;
       const carryHole = this.wedgeVideoHole;
       this.wedgeCarriedHole = framesFlat && carryHole !== null
         && carryHole.start - carryHole.end <= MseMediaSource.GAP_JUMP_MAX_HOLE_SEC && ct >= carryHole.start
-        && (this.wedgeCarriedHole !== null || (ct - from! >= MseMediaSource.WEDGE_ADVANCING_MIN_SEC
-          && (v.readyState ?? 0) >= 3 && !v.paused && this.playbackIntent)) ? carryHole : null;
+        && (this.wedgeCarriedHole !== null || (run !== null && run.played
+          && ct - run.from >= MseMediaSource.WEDGE_ADVANCING_MIN_SEC)) ? carryHole : null;
       this.handleWatchdogSeeked();
       this.wedgeLastTime = ct;
       if (!advancing) {
@@ -3736,6 +3747,7 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
     this.wedgeVideoHole = this.observeVideoHole(ct, ct);
+    this.wedgeFramelessRun = null;
     if (qualityMoved) {
       if (this.wedgeVideoHole !== null && from >= this.wedgeVideoHole.start) this.clearVideoHoleEvidence();
       this.wedgeAdvancingStall = false; this.wedgeCarriedHole = null;
@@ -3972,6 +3984,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.wedgeVideoHole = null;
     this.wedgeCoveredPosition = null;
     this.wedgeCarriedHole = null;
+    this.wedgeFramelessRun = null;
   }
 
   private rememberCoveredVideoPosition(time: number): void {

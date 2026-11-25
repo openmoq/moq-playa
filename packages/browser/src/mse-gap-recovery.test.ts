@@ -240,6 +240,16 @@ it.each(['single hop', 'sampled inside hole', 'advances after crossing', 'health
       }
       f.video.advancePlayback(2.6); f.video.readyState = mode === 'disabled ordinary wedge' ? 3 : 2;
       await vi.advanceTimersByTimeAsync(1000);
+      if (mode === 'sampled inside hole') {
+        // The sample inside the hole saw the clock playing with frames flat,
+        // a frameless carry, so rung 1 fires on the first frozen sample and
+        // the normal deadline then applies to rung 2.
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(rungs).toEqual([1]);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(rungs).toEqual([1, 2]); expect(f.jumps).toHaveLength(0);
+        return;
+      }
       if (mode === 'advances after crossing' || mode === 'healthy output') {
         if (mode === 'healthy output') f.video.frames += 8;
         f.video.advancePlayback(3.1); await vi.advanceTimersByTimeAsync(1000);
@@ -607,6 +617,38 @@ it.each(['chained', 'frames between'] as const)('a stop after a thin carry acros
     expect(rungs).toEqual(mode === 'chained' ? [1] : []);
     set(3.1, 4.5); await vi.advanceTimersByTimeAsync(1000);
     expect(rungs).toEqual(mode === 'chained' ? [1] : []);
+    expect(f.jumps).toHaveLength(0);
+  } finally { f.adapter.destroy(); }
+});
+
+// Lab shape: video arriving slower than real time leaves the playhead past all
+// buffered video at every sample while audio carries the clock, so no sample
+// sees it inside the post-hole range. The hole is first witnessed on the
+// sample where the clock stops, at readyState 2, after moving only 0.1 s. The
+// frameless run before it is the carry. Frames advancing during the run, or a
+// run that never saw readyState 3, still wait the normal deadline.
+it.each(['run', 'frames', 'not playing'] as const)('a stop that first witnesses the hole after a frameless run (%s)', async mode => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const set = (upperEnd: number) => {
+    const video: Array<[number, number]> = [[0, 1], ...(upperEnd > 0 ? [[2, upperEnd] as [number, number]] : [])];
+    source.videoBuffer.buffered = makeTimeRanges(video);
+    source.audioBuffer.buffered = makeTimeRanges([[0, Math.max(upperEnd, 1.6) + 0.6]]);
+    f.video.buffered = makeTimeRanges(video);
+  };
+  try {
+    set(0); f.video.advancePlayback(0.9); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    if (mode === 'not playing') f.video.readyState = 2;
+    set(0); f.video.advancePlayback(1.6); if (mode === 'frames') f.video.frames += 30; // past all video
+    await vi.advanceTimersByTimeAsync(1000);
+    set(2.3); f.video.advancePlayback(2.5); if (mode === 'frames') f.video.frames += 30; // past the upper range
+    await vi.advanceTimersByTimeAsync(1000);
+    set(3.0); f.video.advancePlayback(2.6); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000); // stops; hole seen
+    expect(rungs).toEqual([]);
+    set(3.2); await vi.advanceTimersByTimeAsync(1000); // first frozen sample
+    expect(rungs).toEqual(mode === 'run' ? [1] : []);
+    set(3.3); await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual(mode === 'run' ? [1] : []);
     expect(f.jumps).toHaveLength(0);
   } finally { f.adapter.destroy(); }
 });
