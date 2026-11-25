@@ -941,6 +941,22 @@ describe('when the source is gone', () => {
 });
 
 describe('after a downshift', () => {
+  // A committed CMAF downshift begins at the new rung's next keyframe, and its
+  // first media takes a moment to append. Until then the playhead sits at the
+  // old rung's edge with nothing visible ahead, so the buffer reads empty. In
+  // the lab that reading started a second downshift 7-60 ms after the first
+  // committed; the two switch holes back to back then froze video.
+  it('cmaf: the empty reading before a committed downshift appends starts no second downshift', async () => {
+    const run = await runScenario({
+      packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(14), startLevel: 0,
+      bufferAheadUs: now => now >= SECONDS(10) && now < SECONDS(10.8) ? 0 : 300_000,
+    });
+    const downs = run.switches.filter(sw => rungIndex(sw.to) > rungIndex(sw.from));
+    expect(downs).toHaveLength(1);
+    expect(downs[0]!.atUs).toBeLessThan(SECONDS(10.6));
+    expect(run.stallsAtUs).toEqual([]);
+  });
+
   it('cmaf: a sustained empty buffer allows another downshift without a stall', async () => {
     const run = await runScenario({
       packaging: 'cmaf', capacityBps: AMPLE_BPS, durationUs: SECONDS(13), startLevel: 0,
