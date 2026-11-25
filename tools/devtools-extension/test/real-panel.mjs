@@ -335,6 +335,13 @@ if (evidence.fatal === null) {
       report.layout = { dock, passes: [] };
       let inset = null;   // window chrome: outer width − panel CSS width, derived once from the first pass
       let passIndex = 0;
+      // Wait for origin discovery and its visible host line so it cannot shift the grid during a layout click.
+      let hostState;
+      for (let i = 0; i < 80; i++) {
+        hostState = await evaluate(panelSession, `({ host: window.__playaPanel?.host ?? null, shown: document.getElementById('hostLine').getBoundingClientRect().height > 0, line: document.getElementById('hostLine').textContent })`);
+        if (hostState.host?.outer?.stage === 'unsupported-origin' && hostState.shown && hostState.line === `attach unavailable · ${hostState.host.outer.detail}`) break;
+        if (i === 79) throw new Error(`timeout waiting for origin discovery (unsupported-origin) and its visible host line: ${JSON.stringify(hostState)}`); await pause(100);
+      }
       for (const target of [1200, 800, 550]) {
         const requested = inset === null ? target : target + inset;
         const before = await evaluate(panelSession, 'innerWidth');
