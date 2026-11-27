@@ -242,11 +242,12 @@ it.each(['single hop', 'sampled inside hole', 'advances after crossing', 'health
       await vi.advanceTimersByTimeAsync(1000);
       if (mode === 'sampled inside hole') {
         // The sample inside the hole saw the clock playing with frames flat,
-        // a frameless carry, so rung 1 fires on the first frozen sample and
-        // the normal deadline then applies to rung 2.
+        // a frameless carry, so rung 1 fires on the sample that sees the
+        // stop at readyState 2, and the normal deadline then applies to rung 2.
+        expect(rungs).toEqual([1]);
         await vi.advanceTimersByTimeAsync(1000);
         expect(rungs).toEqual([1]);
-        await vi.advanceTimersByTimeAsync(5000);
+        await vi.advanceTimersByTimeAsync(2000);
         expect(rungs).toEqual([1, 2]); expect(f.jumps).toHaveLength(0);
         return;
       }
@@ -393,9 +394,11 @@ it.each(['frames', 'pause/resume', 'filled hole', 'changed hole', 'clear', 'rese
     const f = await ready(), rungs: number[] = [];
     f.adapter.onWedge = info => { rungs.push(info.rung); };
     try {
+      // The sample inside the hole is at readyState 2, so it is not a carry,
+      // and the freeze waits the normal deadline for the boundary to retire it.
       f.setHole(); f.video.advancePlayback(0.9); await vi.advanceTimersByTimeAsync(1000);
-      f.video.advancePlayback(1.4); await vi.advanceTimersByTimeAsync(1000);
-      f.video.advancePlayback(2.6); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000);
+      f.video.readyState = 2; f.video.advancePlayback(1.4); await vi.advanceTimersByTimeAsync(1000);
+      f.video.advancePlayback(2.6); await vi.advanceTimersByTimeAsync(1000);
       if (boundary === 'frames') {
         f.video.frames += 5;
         f.video.advancePlayback(3.1); await vi.advanceTimersByTimeAsync(1000);
@@ -559,9 +562,9 @@ it.each(['deep', 'live edge', 'thin at stop'] as const)('an advancing stall keep
 // Lab shape: after a downshift the new rung's video can arrive at about real
 // time, so the carry runs only 0.2-0.5 s behind the newest video, too little
 // to call it an advancing stall. When the clock then stops, the frameless
-// carry is the evidence: half a second ahead is enough coverage, and the
-// deadline starts on the sample that sees the clock stopping, so rung 1 fires
-// on the first frozen sample. Without a carry
+// carry is the evidence: half a second ahead is enough coverage. The sample
+// that sees the clock stopped at readyState 2 fires rung 1 itself, since the
+// clock stopped some time since the last sample. Without a carry
 // (frames advancing, or a clock that only moved below readyState 3) the stop
 // still needs over a second ahead and the normal deadline.
 it.each(['carry', 'frames', 'not playing'] as const)('a stop after a thin post-hole carry (%s)', async mode => {
@@ -580,8 +583,8 @@ it.each(['carry', 'frames', 'not playing'] as const)('a stop after a thin post-h
       await vi.advanceTimersByTimeAsync(1000);
     }
     expect(rungs).toEqual([]);
-    set(3.9); f.video.advancePlayback(3.3); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000); // stops
-    expect(rungs).toEqual([]);
+    set(3.9); f.video.advancePlayback(3.3); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000); // stopped
+    expect(rungs).toEqual(mode === 'carry' ? [1] : []);
     set(4.1); await vi.advanceTimersByTimeAsync(1000); // first frozen sample
     expect(rungs).toEqual(mode === 'carry' ? [1] : []);
     set(4.2); await vi.advanceTimersByTimeAsync(1000);

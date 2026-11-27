@@ -3742,7 +3742,13 @@ export class MseMediaSource implements MediaSourceLike {
         // movement, at readyState 2. The deadline starts there, so the first
         // frozen sample can fire rung 1 once the frozen path finds the
         // freeze eligible.
-        this.wedgeFrozenSinceMs = framesFlat && this.carriedNarrowStall() && (v.readyState ?? 0) < 3 ? nowMs : null;
+        // At readyState 2 the clock has already stopped, some time since the
+        // last sample, after frames were flat across the carry. Rung 1 is
+        // then due on this sample: it fires now, revalidated, and pending work
+        // only defers it to the retry.
+        const stopped = framesFlat && this.carriedNarrowStall() && (v.readyState ?? 0) < 3;
+        this.wedgeFrozenSinceMs = stopped ? nowMs - MseMediaSource.WEDGE_ADVANCING_FROZEN_MS : null;
+        if (stopped && this.wedgeRung === 0) this.retryDueWedge(nowMs);
         return;
       }
       // Video stopped at a crossed narrow hole while audio keeps the clock
