@@ -811,6 +811,8 @@ export class MseMediaSource implements MediaSourceLike {
   /** Rung-1 deadline for an advancing video stall: the second consecutive
    * frameless post-hole sample (one check interval, less timer jitter). */
   private static readonly WEDGE_ADVANCING_FROZEN_MS = 900;
+  /** Timer jitter allowed when a wait is timed by the one-second checks. */
+  private static readonly CHECK_JITTER_MS = 100;
   /** Delay before retrying a due rung that native work held off. */
   private static readonly WEDGE_RETRY_MS = 150;
   /** The current episode began as an advancing video stall. */
@@ -3543,9 +3545,12 @@ export class MseMediaSource implements MediaSourceLike {
     // narrow hole, a stop at this hole's edge is the same freeze the wedge
     // ladder times from its stopping sample, so one check interval (less timer
     // jitter) is enough. The configured wait still bounds it.
+    // The candidate arms on a check, so a wait that is a whole number of check
+    // intervals allows for timer jitter. Otherwise a check a fraction of a
+    // millisecond early would put the jump off by a full interval.
     const waitMs = this.carriedNarrowStall()
       ? Math.min(this.gapJumpMs, MseMediaSource.WEDGE_ADVANCING_FROZEN_MS) : this.gapJumpMs;
-    if (nowMs - c.armedAtMs < waitMs) return;
+    if (nowMs - c.armedAtMs < waitMs - MseMediaSource.CHECK_JITTER_MS) return;
     if (nowMs - this.lastGapJumpAtMs < MseMediaSource.GAP_JUMP_MIN_INTERVAL_MS) return;
 
     // Re-validate the landing at jump time (the tail may have grown; the

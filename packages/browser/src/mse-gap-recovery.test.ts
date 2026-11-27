@@ -681,6 +681,25 @@ it.each(['carry', 'frames'] as const)('a gap-jump at a hole edge after a framele
   } finally { f.adapter.destroy(); }
 });
 
+// Lab shape: the gap-jump arms on a check, and its 2 s wait is two check
+// intervals. A check that runs a millisecond early still jumps, instead of a
+// full interval later.
+it('a gap-jump check a millisecond early still jumps on time', async () => {
+  const f = await ready();
+  const now = performance.now.bind(performance);
+  let earlyMs = 0;
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now() - earlyMs);
+  try {
+    f.setHole(); f.video.advancePlayback(1.4); f.video.readyState = 2;
+    await vi.advanceTimersByTimeAsync(1000); // armed
+    earlyMs = 1;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.jumps).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1000); // 1999 ms after arming by the clock
+    expect(f.jumps).toHaveLength(1); expect(f.video.seekCount).toBe(1);
+  } finally { clock.mockRestore(); f.adapter.destroy(); }
+});
+
 // Lab shape: a buffer append is often in flight at the check where rung 1
 // falls due. Rung 1 is retried once that work completes, not a second later.
 it('a due advancing-stall rung held by an in-flight append fires once it completes', async () => {
