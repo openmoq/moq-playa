@@ -240,6 +240,17 @@ it.each(['single hop', 'sampled inside hole', 'advances after crossing', 'health
       }
       f.video.advancePlayback(2.6); f.video.readyState = mode === 'disabled ordinary wedge' ? 3 : 2;
       await vi.advanceTimersByTimeAsync(1000);
+      if (mode === 'sampled inside hole') {
+        // The sample inside the hole saw the clock playing with frames flat,
+        // a frameless carry, so rung 1 fires on the sample that sees the
+        // stop at readyState 2, and the normal deadline then applies to rung 2.
+        expect(rungs).toEqual([1]);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(rungs).toEqual([1]);
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(rungs).toEqual([1, 2]); expect(f.jumps).toHaveLength(0);
+        return;
+      }
       if (mode === 'advances after crossing' || mode === 'healthy output') {
         if (mode === 'healthy output') f.video.frames += 8;
         f.video.advancePlayback(3.1); await vi.advanceTimersByTimeAsync(1000);
@@ -383,9 +394,11 @@ it.each(['frames', 'pause/resume', 'filled hole', 'changed hole', 'clear', 'rese
     const f = await ready(), rungs: number[] = [];
     f.adapter.onWedge = info => { rungs.push(info.rung); };
     try {
+      // The sample inside the hole is at readyState 2, so it is not a carry,
+      // and the freeze waits the normal deadline for the boundary to retire it.
       f.setHole(); f.video.advancePlayback(0.9); await vi.advanceTimersByTimeAsync(1000);
-      f.video.advancePlayback(1.4); await vi.advanceTimersByTimeAsync(1000);
-      f.video.advancePlayback(2.6); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000);
+      f.video.readyState = 2; f.video.advancePlayback(1.4); await vi.advanceTimersByTimeAsync(1000);
+      f.video.advancePlayback(2.6); await vi.advanceTimersByTimeAsync(1000);
       if (boundary === 'frames') {
         f.video.frames += 5;
         f.video.advancePlayback(3.1); await vi.advanceTimersByTimeAsync(1000);
@@ -463,6 +476,253 @@ it('a narrow post-hole witness survives a frozen sample with thin forward video'
     expect(rungs[0]).toBe(1);
     expect(f.video.seekCount).toBeGreaterThan(0);
     expect(f.jumps).toHaveLength(0);
+  } finally { f.adapter.destroy(); }
+});
+
+// After a narrow video-only hole, Chrome keeps the clock running on audio at
+// readyState 4 for about 3 s with video frames flat, before it stops at
+// readyState 2. The freeze is timed from the first frameless post-hole
+// sample, and rung 1 fires on the second.
+type AdvancingMode = 'stall' | 'frames' | 'hidden' | 'continuous' | 'wide' | 'creeping';
+it.each(['stall', 'frames', 'hidden', 'continuous', 'wide', 'creeping'] as AdvancingMode[])(
+  'an advancing clock with flat video frames after a crossed narrow hole: %s', async mode => {
+    const f = await ready(), rungs: number[] = [];
+    f.adapter.onWedge = info => { rungs.push(info.rung); };
+    if (mode === 'hidden') vi.stubGlobal('document', { visibilityState: 'hidden' });
+    const lowerEnd = mode === 'continuous' ? 2 : 1, upperStart = mode === 'wide' ? 3.5 : 2;
+    source.videoBuffer.buffered = makeTimeRanges(mode === 'continuous' ? [[0, 14]] : [[0, lowerEnd], [upperStart, 14]]);
+    source.audioBuffer.buffered = makeTimeRanges([[0, 14]]);
+    f.video.buffered = makeTimeRanges(mode === 'continuous' ? [[0, 14]] : [[0, lowerEnd], [upperStart, 14]]);
+    try {
+      f.video.advancePlayback(0.9); await vi.advanceTimersByTimeAsync(1000);
+      let ct = mode === 'wide' ? 3.6 : 2.1, firedAt = -1;
+      for (let i = 0; i < 5; i++) {
+        f.video.advancePlayback(ct); if (mode === 'frames') f.video.frames += 30;
+        await vi.advanceTimersByTimeAsync(1000);
+        if (firedAt < 0 && rungs.length > 0) firedAt = i;
+        ct += mode === 'creeping' ? 0.2 : 1;
+      }
+      if (mode === 'stall') {
+        expect(firedAt).toBe(1); expect(rungs[0]).toBe(1);
+        // Rung 2 still waits the normal deadline after rung 1.
+        expect(rungs).toEqual([1, 2]);
+      } else {
+        expect(rungs).toEqual([]); expect(f.video.seekCount).toBe(0);
+      }
+      expect(f.jumps).toHaveLength(0);
+    } finally { f.adapter.destroy(); }
+  });
+
+it('an advancing video stall escalates only while frames stay flat', async () => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  source.videoBuffer.buffered = makeTimeRanges([[0, 1], [2, 30]]);
+  source.audioBuffer.buffered = makeTimeRanges([[0, 30]]);
+  f.video.buffered = makeTimeRanges([[0, 1], [2, 30]]);
+  try {
+    f.video.advancePlayback(0.9); await vi.advanceTimersByTimeAsync(1000);
+    let ct = 2.1;
+    for (let i = 0; i < 2; i++) { f.video.advancePlayback(ct); ct += 1; await vi.advanceTimersByTimeAsync(1000); }
+    expect(rungs).toEqual([1]);
+    // The nudge restarts video: frames advance and the episode resets.
+    for (let i = 0; i < 6; i++) {
+      f.video.advancePlayback(ct); ct += 1; f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(rungs).toEqual([1]); expect(f.video.seekCount).toBe(1);
+  } finally { f.adapter.destroy(); }
+});
+
+// Lab shape: the carry lasts only about 3 s, then the clock stops at
+// readyState 2. A deadline started during the carry continues into the
+// stopped freeze instead of restarting there: a due rung fires on the sample
+// where the clock stops, or (with thin coverage there) on the next frozen
+// sample. Near the live edge, the carry runs under a second behind the
+// newest video.
+it.each(['deep', 'live edge', 'thin at stop'] as const)('an advancing stall keeps its deadline when the clock stops (%s)', async mode => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const set = (videoEnd: number, audioEnd: number) => {
+    source.videoBuffer.buffered = makeTimeRanges([[0, 1], [2, videoEnd]]);
+    source.audioBuffer.buffered = makeTimeRanges([[0, audioEnd]]);
+    f.video.buffered = makeTimeRanges([[0, 1], [2, Math.min(videoEnd, audioEnd)]]);
+  };
+  const edge = (ct: number) => mode === 'deep' ? set(14, 14) : set(ct + 0.8, ct + 0.85);
+  try {
+    edge(0.9); f.video.advancePlayback(0.9); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    edge(2.1); f.video.advancePlayback(2.1); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000); // crossed
+    edge(3.1); f.video.advancePlayback(3.1); await vi.advanceTimersByTimeAsync(1000); // first frameless sample
+    if (mode === 'thin at stop') set(3.6, 3.65); else edge(3.3);
+    f.video.advancePlayback(3.3); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual(mode === 'thin at stop' ? [] : [1]);
+    set(14, 14); await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual([1]); expect(f.video.seekCount).toBe(1); expect(f.jumps).toHaveLength(0);
+  } finally { f.adapter.destroy(); }
+});
+
+// Lab shape: after a downshift the new rung's video can arrive at about real
+// time, so the carry runs only 0.2-0.5 s behind the newest video, too little
+// to call it an advancing stall. When the clock then stops, the frameless
+// carry is the evidence: half a second ahead is enough coverage. The sample
+// that sees the clock stopped at readyState 2 fires rung 1 itself, since the
+// clock stopped some time since the last sample. Without a carry
+// (frames advancing, or a clock that only moved below readyState 3) the stop
+// still needs over a second ahead and the normal deadline.
+it.each(['carry', 'frames', 'not playing'] as const)('a stop after a thin post-hole carry (%s)', async mode => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const set = (videoEnd: number) => {
+    source.videoBuffer.buffered = makeTimeRanges([[0, 1], [2, videoEnd]]);
+    source.audioBuffer.buffered = makeTimeRanges([[0, videoEnd + 0.5]]);
+    f.video.buffered = makeTimeRanges([[0, 1], [2, videoEnd]]);
+  };
+  try {
+    set(2.4); f.video.advancePlayback(0.9); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    if (mode === 'not playing') f.video.readyState = 2;
+    for (const ct of [2.1, 3.1]) {
+      set(ct + 0.3); f.video.advancePlayback(ct); if (mode === 'frames') f.video.frames += 30;
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(rungs).toEqual([]);
+    set(3.9); f.video.advancePlayback(3.3); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000); // stopped
+    expect(rungs).toEqual(mode === 'carry' ? [1] : []);
+    set(4.1); await vi.advanceTimersByTimeAsync(1000); // first frozen sample
+    expect(rungs).toEqual(mode === 'carry' ? [1] : []);
+    set(4.2); await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual(mode === 'carry' ? [1] : []);
+    expect(f.video.seekCount).toBe(mode === 'carry' ? 1 : 0);
+    expect(f.jumps).toHaveLength(0);
+  } finally { f.adapter.destroy(); }
+});
+
+// Lab shape: a second downshift about a second after the first leaves a
+// second narrow hole. The clock carries past the first hole with frames flat,
+// then crosses the second between samples and is already stopping (readyState
+// 2) on the sample that sees it. The carry continues across the second hole,
+// so the stop gets the same timing. Frames moving between the two holes end
+// the carry, and the stop waits the normal deadline.
+it.each(['chained', 'frames between'] as const)('a stop after a thin carry across two holes (%s)', async mode => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const set = (midEnd: number, videoEnd: number) => {
+    const video: Array<[number, number]> = [[0, 1], [2, midEnd], ...(videoEnd > 0 ? [[3.5, videoEnd] as [number, number]] : [])];
+    source.videoBuffer.buffered = makeTimeRanges(video);
+    source.audioBuffer.buffered = makeTimeRanges([[0, Math.max(midEnd, videoEnd) + 0.5]]);
+    f.video.buffered = makeTimeRanges(video);
+  };
+  try {
+    set(2.4, 0); f.video.advancePlayback(0.9); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    set(2.4, 0); f.video.advancePlayback(2.1); await vi.advanceTimersByTimeAsync(1000); // carry past the first hole
+    set(3.1, 0); f.video.advancePlayback(2.8); if (mode === 'frames between') f.video.frames += 30;
+    await vi.advanceTimersByTimeAsync(1000);
+    set(3.1, 4.1); f.video.advancePlayback(3.6); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000); // second hole, stopping
+    expect(rungs).toEqual([]);
+    set(3.1, 4.3); await vi.advanceTimersByTimeAsync(1000); // first frozen sample
+    expect(rungs).toEqual(mode === 'chained' ? [1] : []);
+    set(3.1, 4.5); await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual(mode === 'chained' ? [1] : []);
+    expect(f.jumps).toHaveLength(0);
+  } finally { f.adapter.destroy(); }
+});
+
+// Lab shape: video arriving slower than real time leaves the playhead past all
+// buffered video at every sample while audio carries the clock, so no sample
+// sees it inside the post-hole range. The hole is first witnessed on the
+// sample where the clock stops, at readyState 2, after moving only 0.1 s. The
+// frameless run before it is the carry. Frames advancing during the run, or a
+// run that never saw readyState 3, still wait the normal deadline.
+it.each(['run', 'frames', 'not playing'] as const)('a stop that first witnesses the hole after a frameless run (%s)', async mode => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  const set = (upperEnd: number) => {
+    const video: Array<[number, number]> = [[0, 1], ...(upperEnd > 0 ? [[2, upperEnd] as [number, number]] : [])];
+    source.videoBuffer.buffered = makeTimeRanges(video);
+    source.audioBuffer.buffered = makeTimeRanges([[0, Math.max(upperEnd, 1.6) + 0.6]]);
+    f.video.buffered = makeTimeRanges(video);
+  };
+  try {
+    set(0); f.video.advancePlayback(0.9); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    if (mode === 'not playing') f.video.readyState = 2;
+    set(0); f.video.advancePlayback(1.6); if (mode === 'frames') f.video.frames += 30; // past all video
+    await vi.advanceTimersByTimeAsync(1000);
+    set(2.3); f.video.advancePlayback(2.5); if (mode === 'frames') f.video.frames += 30; // past the upper range
+    await vi.advanceTimersByTimeAsync(1000);
+    set(3.0); f.video.advancePlayback(2.6); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000); // stops; hole seen
+    expect(rungs).toEqual([]);
+    set(3.2); await vi.advanceTimersByTimeAsync(1000); // first frozen sample
+    expect(rungs).toEqual(mode === 'run' ? [1] : []);
+    set(3.3); await vi.advanceTimersByTimeAsync(1000);
+    expect(rungs).toEqual(mode === 'run' ? [1] : []);
+    expect(f.jumps).toHaveLength(0);
+  } finally { f.adapter.destroy(); }
+});
+
+// Lab shape: after a second downshift, the clock outruns the video, carries
+// past the first switch hole on audio with frames flat, and stops at the end of
+// its range, at the second switch hole's edge. That edge belongs to the
+// gap-jump. After the carry it jumps one check after it arms, not after the
+// full wait. Frames advancing during the run leave the full wait.
+it.each(['carry', 'frames'] as const)('a gap-jump at a hole edge after a frameless carry (%s)', async mode => {
+  const f = await ready();
+  const set = (video: Array<[number, number]>) => {
+    source.videoBuffer.buffered = makeTimeRanges(video);
+    source.audioBuffer.buffered = makeTimeRanges([[0, 4.5]]);
+    f.video.buffered = makeTimeRanges(video);
+  };
+  try {
+    set([[0, 1]]); f.video.advancePlayback(0.9); f.video.frames += 30; await vi.advanceTimersByTimeAsync(1000);
+    set([[0, 1]]); f.video.advancePlayback(1.6); if (mode === 'frames') f.video.frames += 30; // past all video
+    await vi.advanceTimersByTimeAsync(1000);
+    set([[0, 1], [2, 2.3]]); f.video.advancePlayback(2.4); if (mode === 'frames') f.video.frames += 30; // past the upper range
+    await vi.advanceTimersByTimeAsync(1000);
+    set([[0, 1], [2, 2.6]]); f.video.advancePlayback(2.55); f.video.readyState = 2; await vi.advanceTimersByTimeAsync(1000); // stops at the edge
+    set([[0, 1], [2, 2.6], [3, 4]]); await vi.advanceTimersByTimeAsync(1000); // the next range lands: armed
+    expect(f.jumps).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.jumps).toHaveLength(mode === 'carry' ? 1 : 0);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.jumps).toHaveLength(1);
+  } finally { f.adapter.destroy(); }
+});
+
+// Lab shape: the gap-jump arms on a check, and its 2 s wait is two check
+// intervals. A check that runs a millisecond early still jumps, instead of a
+// full interval later.
+it('a gap-jump check a millisecond early still jumps on time', async () => {
+  const f = await ready();
+  const now = performance.now.bind(performance);
+  let earlyMs = 0;
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now() - earlyMs);
+  try {
+    f.setHole(); f.video.advancePlayback(1.4); f.video.readyState = 2;
+    await vi.advanceTimersByTimeAsync(1000); // armed
+    earlyMs = 1;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.jumps).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1000); // 1999 ms after arming by the clock
+    expect(f.jumps).toHaveLength(1); expect(f.video.seekCount).toBe(1);
+  } finally { clock.mockRestore(); f.adapter.destroy(); }
+});
+
+// Lab shape: a buffer append is often in flight at the check where rung 1
+// falls due. Rung 1 is retried once that work completes, not a second later.
+it('a due advancing-stall rung held by an in-flight append fires once it completes', async () => {
+  const f = await ready(), rungs: number[] = [];
+  f.adapter.onWedge = info => { rungs.push(info.rung); };
+  source.videoBuffer.buffered = makeTimeRanges([[0, 1], [2, 30]]);
+  source.audioBuffer.buffered = makeTimeRanges([[0, 30]]);
+  f.video.buffered = makeTimeRanges([[0, 1], [2, 30]]);
+  try {
+    f.video.advancePlayback(0.9); await vi.advanceTimersByTimeAsync(1000);
+    f.video.advancePlayback(2.1); await vi.advanceTimersByTimeAsync(1000); // first frameless sample
+    source.videoBuffer.autoComplete = false;
+    f.adapter.appendChunk('video', segment(1), 'video', 7n);
+    expect(source.videoBuffer.updating).toBe(true);
+    f.video.advancePlayback(3.1); await vi.advanceTimersByTimeAsync(1000); // due, but held
+    expect(rungs).toEqual([]);
+    source.videoBuffer.updating = false; source.videoBuffer.fire('update'); source.videoBuffer.fire('updateend');
+    await settle();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(rungs).toEqual([1]); expect(f.video.seekCount).toBe(1); expect(f.jumps).toHaveLength(0);
   } finally { f.adapter.destroy(); }
 });
 
